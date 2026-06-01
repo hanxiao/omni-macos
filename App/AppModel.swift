@@ -37,7 +37,7 @@ final class AppModel: ObservableObject {
     @Published var filterKinds: Set<FileKind> = []   // empty = all
     @Published var filterFolder: URL? = nil
     @Published var filterExt: String = ""
-    @Published var minScore: Double = 0
+    @Published var minScore: Double = 0.5   // default relevance threshold (50%)
     @Published var indexedKinds: Set<String> = []
 
     @Published var viewMode: ResultViewMode = .list {
