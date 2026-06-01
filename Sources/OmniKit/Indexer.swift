@@ -13,6 +13,14 @@ public protocol Embedder: AnyObject {
     func embedAudio(_ url: URL) -> [Float]?
 }
 
+/// Per-folder progress for a determinate ring.
+public struct RootProgress: Sendable {
+    public var done = 0
+    public var total = 0
+    public init() {}
+    public var fraction: Double { total > 0 ? Double(done) / Double(total) : 0 }
+}
+
 public struct IndexProgress: Sendable {
     public var scanned = 0
     public var embedded = 0
@@ -21,6 +29,7 @@ public struct IndexProgress: Sendable {
     public var currentPath = ""
     public var done = false
     public var cancelled = false   // ended via pause rather than completing
+    public var perRoot: [String: RootProgress] = [:]
     public init() {}
 }
 
@@ -55,28 +64,47 @@ public final class Indexer: @unchecked Sendable {
         let known = store.indexedModified()
         var seen = Set<String>()
 
-        let crawler = FileCrawler(roots: roots, enabledKinds: settings.enabledKinds)
-        crawler.walk(shouldContinue: { !self.isCancelled }) { file in
-            if self.isCancelled { return }
-            let path = file.url.path
-            seen.insert(path)
-            p.scanned += 1
-            p.currentPath = path
+        // Pass 1: count supported files per root (stat-only, no reads) so each folder
+        // gets a determinate progress ring.
+        for root in roots {
+            if isCancelled { break }
+            var total = 0
+            FileCrawler(roots: [root], enabledKinds: settings.enabledKinds)
+                .walk(shouldContinue: { !self.isCancelled }) { _ in total += 1 }
+            var rp = RootProgress(); rp.total = total
+            p.perRoot[root.path] = rp
+        }
+        onProgress(p)
 
-            if let prev = known[path], prev >= file.modified {
-                p.skipped += 1
-                if p.scanned % 50 == 0 { onProgress(p) }
-                return
-            }
+        // Pass 2: process each root, advancing its ring.
+        for root in roots {
+            if isCancelled { break }
+            var done = 0
+            FileCrawler(roots: [root], enabledKinds: settings.enabledKinds)
+                .walk(shouldContinue: { !self.isCancelled }) { file in
+                    if self.isCancelled { return }
+                    let path = file.url.path
+                    seen.insert(path)
+                    p.scanned += 1
+                    p.currentPath = path
+                    done += 1
+                    p.perRoot[root.path]?.done = done
 
-            do {
-                let chunks = try self.embedFile(file)
-                if chunks.isEmpty { p.skipped += 1 }
-                else { try self.store.replace(path: path, chunks: chunks); p.embedded += 1 }
-            } catch {
-                p.failed += 1
-            }
-            if p.scanned % 10 == 0 { onProgress(p) }
+                    if let prev = known[path], prev >= file.modified {
+                        p.skipped += 1
+                        if p.scanned % 50 == 0 { onProgress(p) }
+                        return
+                    }
+                    do {
+                        let chunks = try self.embedFile(file)
+                        if chunks.isEmpty { p.skipped += 1 }
+                        else { try self.store.replace(path: path, chunks: chunks); p.embedded += 1 }
+                    } catch {
+                        p.failed += 1
+                    }
+                    if p.scanned % 10 == 0 { onProgress(p) }
+                }
+            if !isCancelled, var rp = p.perRoot[root.path] { rp.done = rp.total; p.perRoot[root.path] = rp }
         }
 
         // Only reconcile deletions on a complete pass. A paused (cancelled) run has

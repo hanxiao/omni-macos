@@ -12,8 +12,8 @@ struct Sidebar: View {
             }
             Section("Folders") {
                 ForEach(model.roots, id: \.self) { url in
-                    HStack {
-                        Image(systemName: "folder").foregroundStyle(.secondary)
+                    HStack(spacing: 7) {
+                        folderLeading(url)
                         Text(url.lastPathComponent).lineLimit(1).truncationMode(.middle)
                         Spacer()
                         Button { model.removeRoot(url) } label: {
@@ -28,6 +28,16 @@ struct Sidebar: View {
             }
         }
         .listStyle(.sidebar)
+    }
+
+    /// Folder leading glyph: an AirDrop-style progress ring while that folder is being
+    /// indexed, otherwise the folder icon.
+    @ViewBuilder private func folderLeading(_ url: URL) -> some View {
+        if model.isIndexing, let rp = model.progress.perRoot[url.path], rp.total > 0, rp.done < rp.total {
+            FolderProgressRing(fraction: rp.fraction)
+        } else {
+            Image(systemName: "folder").foregroundStyle(.secondary).frame(width: 16)
+        }
     }
 
     @ViewBuilder private var indexStatus: some View {
@@ -82,5 +92,21 @@ struct Sidebar: View {
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = true
         if panel.runModal() == .OK { for url in panel.urls { model.addRoot(url) } }
+    }
+}
+
+/// AirDrop-style determinate progress ring.
+struct FolderProgressRing: View {
+    let fraction: Double
+    var body: some View {
+        ZStack {
+            Circle().stroke(Color.secondary.opacity(0.25), lineWidth: 2)
+            Circle()
+                .trim(from: 0, to: max(0.03, min(1, fraction)))
+                .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+        }
+        .frame(width: 14, height: 14)
+        .animation(.easeInOut(duration: 0.25), value: fraction)
     }
 }
