@@ -28,9 +28,9 @@ public enum OmniAudioPreprocess {
     private static let melFMin: Float = 0.0
     private static let melFMax: Float = 8000.0
 
-    /// Decode `url` and compute log-mel features.
-    /// Returns mel-major `[128, total_frames]` and `[total_frames]`, or nil on failure.
-    public static func features(url: URL) -> (inputFeatures: MLXArray, featureLens: [Int])? {
+    /// Decode + log-mel as a plain Float buffer (mel-major `[128*frames]`) + frame count.
+    /// CPU-only and Sendable, so it can run in the concurrent decode stage of indexing.
+    public static func melFeatures(url: URL) -> (mel: [Float], frames: Int)? {
         guard let samples = decodeMono16k(url: url), !samples.isEmpty else { return nil }
 
         let nBins = nFFT / 2 + 1   // 201
@@ -40,11 +40,8 @@ public enum OmniAudioPreprocess {
 
         let melFB = melFilterbank()                      // [nMel, nBins] row-major
 
-        // mel = melFB @ power -> [nMel, frames], then log10/clamp/scale.
-        // Build directly into a mel-major flat buffer [nMel, frames].
         var feat = [Float](repeating: 0, count: numMelBins * frames)
         var maxLog: Float = -Float.greatestFiniteMagnitude
-        // mel[m, t] = sum_b melFB[m, b] * power[b, t]
         for m in 0 ..< numMelBins {
             let fbRow = m * nBins
             for t in 0 ..< frames {
@@ -57,15 +54,17 @@ public enum OmniAudioPreprocess {
                 if v > maxLog { maxLog = v }
             }
         }
-        // clamp to (maxLog - 8), then (x + 4) / 4.
         let floorVal = maxLog - 8.0
         for i in 0 ..< feat.count {
-            let v = Swift.max(feat[i], floorVal)
-            feat[i] = (v + 4.0) / 4.0
+            feat[i] = (Swift.max(feat[i], floorVal) + 4.0) / 4.0
         }
+        return (feat, frames)
+    }
 
-        let arr = MLXArray(feat).reshaped([numMelBins, frames])   // mel-major
-        return (arr, [frames])
+    /// Decode `url` and compute log-mel features as an MLXArray (mel-major `[128, frames]`).
+    public static func features(url: URL) -> (inputFeatures: MLXArray, featureLens: [Int])? {
+        guard let (mel, frames) = melFeatures(url: url) else { return nil }
+        return (MLXArray(mel).reshaped([numMelBins, frames]), [frames])
     }
 
     // MARK: - Decode

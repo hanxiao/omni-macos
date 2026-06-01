@@ -11,6 +11,8 @@ public protocol Embedder: AnyObject {
     func embedVideoFrames(_ frames: [CGImage]) -> [Float]?
     /// Embed an audio file (decode + mel + audio tower). Nil if unavailable.
     func embedAudio(_ url: URL) -> [Float]?
+    /// Embed from a precomputed mel buffer (lets mel run in the concurrent decode stage).
+    func embedAudioMel(_ mel: [Float], frames: Int) -> [Float]?
 }
 
 /// Per-folder progress for a determinate ring.
@@ -32,6 +34,20 @@ public struct IndexProgress: Sendable {
     public var perRoot: [String: RootProgress] = [:]
     public init() {}
 }
+
+/// Decoded, embed-ready content for one file. @unchecked Sendable so it can cross the
+/// concurrent-decode -> serial-embed boundary (it may hold CGImages).
+final class DecodedItem: @unchecked Sendable {
+    enum Payload { case empty, text([String]), images([CGImage]), audioMel([Float], Int) }
+    let file: CrawledFile
+    let kind: String
+    let payload: Payload
+    init(file: CrawledFile, kind: String = "", payload: Payload = .empty) {
+        self.file = file; self.kind = kind; self.payload = payload
+    }
+}
+
+private final class ReadyBox: @unchecked Sendable { var items = [Int: DecodedItem]() }
 
 /// Crawl -> extract -> chunk -> embed -> store, incrementally.
 public final class Indexer: @unchecked Sendable {
@@ -76,37 +92,33 @@ public final class Indexer: @unchecked Sendable {
         }
         onProgress(p)
 
-        // Pass 2: process each root, advancing its ring.
+        // Pass 2: process each root through a concurrent-decode -> serial-embed pipeline
+        // so the GPU stays fed while CPU decode (image/video/audio + mel STFT) runs ahead
+        // on multiple cores. The consumer (embed + store) runs serially in file order.
         for root in roots {
             if isCancelled { break }
-            var done = 0
+            let rootKey = root.path
+            var files: [CrawledFile] = []
             FileCrawler(roots: [root], enabledKinds: settings.enabledKinds)
-                .walk(shouldContinue: { !self.isCancelled }) { file in
-                    if self.isCancelled { return }
-                    let path = file.url.path
-                    seen.insert(path)
-                    p.scanned += 1
-                    p.currentPath = path
-                    done += 1
-                    p.perRoot[root.path]?.done = done
+                .walk(shouldContinue: { !self.isCancelled }) { files.append($0) }
 
-                    // Skip only when both mtime AND size are unchanged (catches
-                    // backdated edits, restores, and same-second changes). force re-embeds all.
-                    if !force, let prev = known[path], prev.modified == file.modified, prev.size == file.size {
-                        p.skipped += 1
-                        if p.scanned % 50 == 0 { onProgress(p) }
-                        return
-                    }
-                    do {
-                        let chunks = try self.embedFile(file)
-                        if chunks.isEmpty { p.skipped += 1 }
-                        else { try self.store.replace(path: path, chunks: chunks); p.embedded += 1 }
-                    } catch {
-                        p.failed += 1
-                    }
-                    if p.scanned % 10 == 0 { onProgress(p) }
+            var done = 0
+            pipeline(files, force: force, known: known) { item in
+                let path = item.file.url.path
+                seen.insert(path)
+                p.scanned += 1
+                p.currentPath = path
+                done += 1
+                p.perRoot[rootKey]?.done = done
+                let chunks = self.embed(item)
+                if chunks.isEmpty { p.skipped += 1 }
+                else {
+                    do { try self.store.replace(path: path, chunks: chunks); p.embedded += 1 }
+                    catch { p.failed += 1 }
                 }
-            if !isCancelled, var rp = p.perRoot[root.path] { rp.done = rp.total; p.perRoot[root.path] = rp }
+                if p.scanned % 10 == 0 { onProgress(p) }
+            }
+            if !isCancelled, var rp = p.perRoot[rootKey] { rp.done = rp.total; p.perRoot[rootKey] = rp }
         }
 
         // Only reconcile deletions on a complete pass. A paused (cancelled) run has
@@ -123,65 +135,119 @@ public final class Indexer: @unchecked Sendable {
         onProgress(p)
     }
 
-    private func embedFile(_ file: CrawledFile) throws -> [IndexedChunk] {
-        // "kind" is the file category (image/video/audio/text) used by the search
-        // filter, independent of which tower produced the vector.
+    // MARK: - Pipeline
+
+    /// Bounded concurrent-decode -> serial-consume. `consume` is invoked in file order,
+    /// serially, on the calling thread; decode runs on up to `activeProcessorCount`
+    /// background cores. At most that many items are outstanding (bounds memory).
+    private func pipeline(_ files: [CrawledFile], force: Bool, known: [String: StoredFile],
+                          consume: (DecodedItem) -> Void) {
+        if files.isEmpty { return }
+        let maxInFlight = max(2, ProcessInfo.processInfo.activeProcessorCount)
+        let decodeQ = DispatchQueue(label: "omni.decode", attributes: .concurrent)
+        let producerQ = DispatchQueue(label: "omni.producer")
+        let cond = NSCondition()
+        let ready = ReadyBox()            // shared mailbox, guarded by `cond`
+        let sem = DispatchSemaphore(value: maxInFlight)
+
+        producerQ.async {
+            for (i, file) in files.enumerated() {
+                sem.wait()   // bound outstanding (decoding + decoded-not-consumed)
+                let unchanged = !force && (known[file.url.path].map {
+                    $0.modified == file.modified && $0.size == file.size
+                } ?? false)
+                if self.isCancelled || unchanged {
+                    cond.lock(); ready.items[i] = DecodedItem(file: file); cond.signal(); cond.unlock()
+                } else {
+                    decodeQ.async {
+                        let item = self.isCancelled ? DecodedItem(file: file) : self.decode(file)
+                        cond.lock(); ready.items[i] = item; cond.signal(); cond.unlock()
+                    }
+                }
+            }
+        }
+
+        for i in 0 ..< files.count {
+            cond.lock()
+            while ready.items[i] == nil { cond.wait() }
+            let item = ready.items.removeValue(forKey: i)!
+            cond.unlock()
+            sem.signal()
+            consume(item)
+        }
+    }
+
+    /// CPU-only decode: extraction, thresholds, frame sampling, audio mel. No GPU/MLX.
+    private func decode(_ file: CrawledFile) -> DecodedItem {
         let category = FileExtractor.kind(for: file.url) ?? .text
         let kind = category.rawValue
 
-        // Index-time minimums: skip files below the configured thresholds.
         switch category {
         case .image:
             if active.minImageDimension > 0, let s = FileExtractor.imagePixelSize(file.url),
-               max(s.width, s.height) < active.minImageDimension { return [] }
+               max(s.width, s.height) < active.minImageDimension { return DecodedItem(file: file) }
         case .video:
             if active.minVideoSeconds > 0, let d = FileExtractor.mediaDuration(file.url),
-               d < active.minVideoSeconds { return [] }
+               d < active.minVideoSeconds { return DecodedItem(file: file) }
         case .audio:
             if active.minAudioSeconds > 0, let d = FileExtractor.mediaDuration(file.url),
-               d < active.minAudioSeconds { return [] }
+               d < active.minAudioSeconds { return DecodedItem(file: file) }
         case .text:
             break
         }
 
-        // Video and audio are single-vector embeddings (temporal video / audio tower).
         if category == .video {
             let frames = FileExtractor.videoFrames(file.url, maxFrames: active.maxVideoFrames, maxDimension: active.maxImageDimension)
-            guard !frames.isEmpty, let vec = embedder.embedVideoFrames(frames) else { return [] }
-            return [IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
-                                 chunkIndex: 0, snippet: file.url.lastPathComponent, embedding: vec)]
+            return frames.isEmpty ? DecodedItem(file: file) : DecodedItem(file: file, kind: kind, payload: .images(frames))
         }
         if category == .audio {
-            guard let vec = embedder.embedAudio(file.url) else { return [] }
-            return [IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
-                                 chunkIndex: 0, snippet: file.url.lastPathComponent, embedding: vec)]
+            guard let (mel, frames) = OmniAudioPreprocess.melFeatures(url: file.url) else { return DecodedItem(file: file) }
+            return DecodedItem(file: file, kind: kind, payload: .audioMel(mel, frames))
         }
-
-        let content = try FileExtractor.extract(file.url, maxImageDimension: active.maxImageDimension, maxVideoFrames: active.maxVideoFrames)
+        let content = (try? FileExtractor.extract(file.url, maxImageDimension: active.maxImageDimension, maxVideoFrames: active.maxVideoFrames)) ?? .empty
         switch content {
         case .empty:
-            return []
+            return DecodedItem(file: file)
         case .text(let text):
-            if active.minTextChars > 0, text.count < active.minTextChars { return [] }
-            let pieces = chunk(text)
+            if active.minTextChars > 0, text.count < active.minTextChars { return DecodedItem(file: file) }
+            return DecodedItem(file: file, kind: kind, payload: .text(chunk(text)))
+        case .images(let images):
+            return images.isEmpty ? DecodedItem(file: file) : DecodedItem(file: file, kind: kind, payload: .images(images))
+        }
+    }
+
+    /// GPU embed of decoded content. Runs serially in the consumer.
+    private func embed(_ item: DecodedItem) -> [IndexedChunk] {
+        let file = item.file, kind = item.kind
+        switch item.payload {
+        case .empty:
+            return []
+        case .text(let pieces):
             var out: [IndexedChunk] = []
             for (i, piece) in pieces.enumerated() {
                 if isCancelled { break }
                 let vec = embedder.embedText(piece, as: .passage)
-                out.append(IndexedChunk(
-                    path: file.url.path, modified: file.modified, size: file.size, kind: kind,
-                    chunkIndex: i, snippet: snippet(piece), embedding: vec))
+                out.append(IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
+                                        chunkIndex: i, snippet: snippet(piece), embedding: vec))
             }
             return out
+        case .audioMel(let mel, let frames):
+            guard let vec = embedder.embedAudioMel(mel, frames: frames) else { return [] }
+            return [IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
+                                 chunkIndex: 0, snippet: file.url.lastPathComponent, embedding: vec)]
         case .images(let images):
+            if kind == FileKind.video.rawValue {
+                guard let vec = embedder.embedVideoFrames(images) else { return [] }
+                return [IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
+                                     chunkIndex: 0, snippet: file.url.lastPathComponent, embedding: vec)]
+            }
             var out: [IndexedChunk] = []
             for (i, img) in images.enumerated() {
                 if isCancelled { break }
                 guard let vec = embedder.embedImage(img) else { continue }
                 let label = images.count > 1 ? "page \(i + 1)" : file.url.lastPathComponent
-                out.append(IndexedChunk(
-                    path: file.url.path, modified: file.modified, size: file.size, kind: kind,
-                    chunkIndex: i, snippet: "\(file.url.lastPathComponent) - \(label)", embedding: vec))
+                out.append(IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
+                                        chunkIndex: i, snippet: "\(file.url.lastPathComponent) - \(label)", embedding: vec))
             }
             return out
         }

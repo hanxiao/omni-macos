@@ -24,6 +24,13 @@ public final class OmniAudioEncoder: @unchecked Sendable {
         return encode(inputFeatures: feats, featureLens: lens, prefixIds: prefixIds)
     }
 
+    /// Embed from a precomputed mel buffer (mel-major [numMelBins*frames]). Lets the
+    /// CPU-heavy mel run in the indexer's concurrent decode stage.
+    public func encode(mel: [Float], frames: Int, prefixIds: [Int] = []) -> [Float] {
+        let feats = MLXArray(mel).reshaped([cfg.audio.numMelBins, frames])
+        return encode(inputFeatures: feats, featureLens: [frames], prefixIds: prefixIds)
+    }
+
     /// Embed from already-computed mel input_features (used by the parity test).
     /// Sequence: [prefix] + [audio_start] + features + [audio_end], last-token pooled.
     public func encode(inputFeatures: MLXArray, featureLens: [Int], prefixIds: [Int] = []) -> [Float] {

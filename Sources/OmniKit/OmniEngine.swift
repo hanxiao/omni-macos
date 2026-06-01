@@ -124,6 +124,11 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         return run(highPriority: false) { enc.encode(url, prefixIds: docPrefix) }
     }
 
+    public func embedAudioMel(_ mel: [Float], frames: Int) -> [Float]? {
+        guard let enc = audioEncoder else { return nil }
+        return run(highPriority: false) { enc.encode(mel: mel, frames: frames, prefixIds: docPrefix) }
+    }
+
     /// Exposed for parity tests: embed already-preprocessed inputs.
     public func imageEncoderForTesting() -> OmniImageEncoder? { imageEncoder }
     public func audioEncoderForTesting() -> OmniAudioEncoder? { audioEncoder }
