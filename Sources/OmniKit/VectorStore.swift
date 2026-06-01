@@ -234,11 +234,14 @@ public final class VectorStore: @unchecked Sendable {
             guard n > 0, dim > 0, query.count == dim else { return [] }
 
             var scores = [Float](repeating: 0, count: n)
+            let d = vDSP_Length(dim)
             query.withUnsafeBufferPointer { qp in
                 flat.withUnsafeBufferPointer { mp in
                     scores.withUnsafeMutableBufferPointer { sp in
-                        cblas_sgemv(CblasRowMajor, CblasNoTrans, Int32(n), Int32(dim), 1,
-                                    mp.baseAddress, Int32(dim), qp.baseAddress, 1, 0, sp.baseAddress, 1)
+                        guard let q = qp.baseAddress, let m = mp.baseAddress, let s = sp.baseAddress else { return }
+                        for i in 0 ..< n {
+                            vDSP_dotpr(m + i * dim, 1, q, 1, s + i, d)
+                        }
                     }
                 }
             }

@@ -1,6 +1,7 @@
 import Foundation
 import CoreGraphics
 import MLX
+import Tokenizers
 
 /// Locates a usable model directory (one containing model.safetensors).
 public enum ModelLocator {
@@ -58,8 +59,11 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         if gpuCacheBytes > 0 { MLX.Memory.cacheLimit = gpuCacheBytes }
         self.modelDir = modelDir
         let config = try OmniConfig(modelDir: modelDir)
+        // Parse the BPE tokenizer concurrently with the (synchronous) weight load.
+        async let tokenizerTask = AutoTokenizer.from(modelFolder: modelDir)
         let weights = try WeightStore(modelDir: modelDir, loraScale: config.loraScale, keepVision: true, keepAudio: true)
-        let text = try await OmniTextEncoder(modelDir: modelDir, weights: weights, config: config)
+        let tokenizer = try await tokenizerTask
+        let text = OmniTextEncoder(weights: weights, config: config, tokenizer: tokenizer)
         self.textEncoder = text
         self.docPrefix = text.prefixTokenIds(.passage)
         self.imageEncoder = OmniImageEncoder(weights: weights, config: config)

@@ -10,10 +10,16 @@ public final class OmniTextEncoder: @unchecked Sendable {
     private let tokenizer: Tokenizer
     private let dim: Int
 
-    public init(modelDir: URL, weights: WeightStore, config: OmniConfig) async throws {
+    public init(weights: WeightStore, config: OmniConfig, tokenizer: Tokenizer) {
         self.backbone = Qwen3Backbone(weights: weights, config: config)
-        self.tokenizer = try await AutoTokenizer.from(modelFolder: modelDir)
+        self.tokenizer = tokenizer
         self.dim = config.text.hiddenSize
+    }
+
+    /// Convenience initializer that loads the tokenizer from the model directory.
+    public convenience init(modelDir: URL, weights: WeightStore, config: OmniConfig) async throws {
+        let tokenizer = try await AutoTokenizer.from(modelFolder: modelDir)
+        self.init(weights: weights, config: config, tokenizer: tokenizer)
     }
 
     public var embeddingDim: Int { dim }

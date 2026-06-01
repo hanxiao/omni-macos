@@ -27,12 +27,10 @@ final class Qwen3Backbone: @unchecked Sendable {
 
     /// Run the transformer over precomputed embeddings -> hidden after final norm [1, L, dim].
     func forward(inputsEmbeds: MLXArray, length L: Int) -> MLXArray {
-        // Single sequence, no padding -> causality is the only mask. Use SDPA's fused
-        // .causal mode instead of materializing an L×L additive mask each call.
         var h = inputsEmbeds.asType(.float32)
         for i in 0 ..< cfg.text.numLayers {
             let p = "language_model.layers.\(i)."
-            h = h + attention(rmsNorm(h, p + "input_layernorm.weight"), p, L)
+            h = h + attention(rmsNorm(h, p + "input_layernorm.weight"), p)
             h = h + mlp(rmsNorm(h, p + "post_attention_layernorm.weight"), p)
         }
         return rmsNorm(h, "language_model.norm.weight")
@@ -63,18 +61,19 @@ final class Qwen3Backbone: @unchecked Sendable {
         return xf * MLX.rsqrt(v + cfg.text.rmsNormEps) * w[key]
     }
 
-    private func attention(_ x: MLXArray, _ p: String, _ L: Int) -> MLXArray {
+    private func attention(_ x: MLXArray, _ p: String) -> MLXArray {
         let t = cfg.text
-        var q = linear(x, p + "self_attn.q_proj.weight").reshaped([1, L, t.numHeads, t.headDim]).transposed(0, 2, 1, 3)
-        var k = linear(x, p + "self_attn.k_proj.weight").reshaped([1, L, t.numKVHeads, t.headDim]).transposed(0, 2, 1, 3)
-        let v = linear(x, p + "self_attn.v_proj.weight").reshaped([1, L, t.numKVHeads, t.headDim]).transposed(0, 2, 1, 3)
+        // -1 infers the sequence length so the compiled graph stays shapeless.
+        var q = linear(x, p + "self_attn.q_proj.weight").reshaped([1, -1, t.numHeads, t.headDim]).transposed(0, 2, 1, 3)
+        var k = linear(x, p + "self_attn.k_proj.weight").reshaped([1, -1, t.numKVHeads, t.headDim]).transposed(0, 2, 1, 3)
+        let v = linear(x, p + "self_attn.v_proj.weight").reshaped([1, -1, t.numKVHeads, t.headDim]).transposed(0, 2, 1, 3)
         q = headNorm(q, p + "self_attn.q_norm.weight")
         k = headNorm(k, p + "self_attn.k_norm.weight")
         q = rope(q, offset: 0)
         k = rope(k, offset: 0)
         let scale = Float(pow(Double(t.headDim), -0.5))
         var out = MLXFast.scaledDotProductAttention(queries: q, keys: k, values: v, scale: scale, mask: .causal)
-        out = out.transposed(0, 2, 1, 3).reshaped([1, L, t.numHeads * t.headDim])
+        out = out.transposed(0, 2, 1, 3).reshaped([1, -1, t.numHeads * t.headDim])
         return linear(out, p + "self_attn.o_proj.weight")
     }
 

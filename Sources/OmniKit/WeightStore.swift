@@ -54,8 +54,10 @@ public struct WeightStore {
             }
         }
 
-        // Force-evaluate so the merge cost is paid once, not on first encode.
-        eval(Array(w.values))
+        // Force-evaluate only the language backbone (it was merged + upcast). The
+        // vision/audio tower weights stay lazily memory-mapped until their first
+        // image/audio embed, so launch doesn't pay for towers a text query never uses.
+        eval(w.compactMap { $0.key.hasPrefix("language_model.") ? $0.value : nil })
         self.weights = w
     }
 }
