@@ -271,9 +271,10 @@ def main():
     m = load_ref()
     m.switch_task("retrieval")
     base = m.model  # JinaOmniSmallEmbeddingModel
+    prefix_ids = list(m.tokenizer.encode("Document: ").ids)  # retrieval document prefix (all modalities)
 
-    # 4. input_ids = [vision_start] + video_token * N_merged + [vision_end].
-    ids = [VISION_START] + [VIDEO_TOKEN] * n_merged + [VISION_END]
+    # 4. input_ids = [Document: ] + [vision_start] + video_token * N_merged + [vision_end].
+    ids = prefix_ids + [VISION_START] + [VIDEO_TOKEN] * n_merged + [VISION_END]
     L = len(ids)
     input_ids = mx.array([ids], dtype=mx.int32)
     attention_mask = mx.ones((1, L), dtype=mx.int32)

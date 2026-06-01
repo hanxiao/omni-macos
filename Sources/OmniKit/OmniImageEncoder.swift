@@ -19,36 +19,40 @@ public final class OmniImageEncoder: @unchecked Sendable {
         self.cfg = config
     }
 
-    /// Embed one image from a CGImage (preprocess + tower + backbone).
-    public func encode(_ image: CGImage) -> [Float]? {
+    /// Embed one image from a CGImage. `prefixIds` is the retrieval prefix
+    /// ("Query: " / "Document: ") tokenized - prepended per the official model card.
+    public func encode(_ image: CGImage, prefixIds: [Int] = []) -> [Float]? {
         let (pixelValues, grid) = OmniVisionPreprocess.preprocess(image)
-        return encode(pixelValues: pixelValues, gridTHW: grid)
+        return encode(pixelValues: pixelValues, gridTHW: grid, prefixIds: prefixIds)
     }
 
     /// Embed a clip from sampled frames as a single temporal video embedding.
     /// Reuses the vision tower (grid_t > 1) and the same vision-wrapper injection;
     /// the placeholder token is overwritten, so the image and video paths are
     /// identical given the (temporal) features.
-    public func encodeVideo(_ frames: [CGImage]) -> [Float]? {
+    public func encodeVideo(_ frames: [CGImage], prefixIds: [Int] = []) -> [Float]? {
         guard let (pixelValues, grid) = OmniVideoPreprocess.preprocess(frames) else { return nil }
-        return encode(pixelValues: pixelValues, gridTHW: grid)
+        return encode(pixelValues: pixelValues, gridTHW: grid, prefixIds: prefixIds)
     }
 
     /// Embed from already-preprocessed pixel values (used by the parity test).
-    public func encode(pixelValues: MLXArray, gridTHW: [(Int, Int, Int)]) -> [Float] {
+    /// Sequence: [prefix] + [vision_start] + features + [vision_end], last-token pooled.
+    public func encode(pixelValues: MLXArray, gridTHW: [(Int, Int, Int)], prefixIds: [Int] = []) -> [Float] {
         let features = tower.forward(pixelValues, gridTHW: gridTHW)   // [N_merged, dim]
         let n = features.dim(0)
         let dim = cfg.text.hiddenSize
 
-        // input_ids = [vision_start] + image_token * N + [vision_end]; the image
-        // tokens are replaced by the vision features. Since they are contiguous we
+        // image/video tokens are replaced by the vision features. Contiguous, so we
         // build inputs_embeds by concatenation rather than scatter.
-        let vStart = backbone.embed([cfg.visionStartTokenId])          // [1,1,dim]
-        let vEnd = backbone.embed([cfg.visionEndTokenId])              // [1,1,dim]
         let feats = features.asType(.float32).reshaped([1, n, dim])
-        let inputsEmbeds = MLX.concatenated([vStart, feats, vEnd], axis: 1)  // [1, N+2, dim]
+        var parts: [MLXArray] = []
+        if !prefixIds.isEmpty { parts.append(backbone.embed(prefixIds)) }
+        parts.append(backbone.embed([cfg.visionStartTokenId]))
+        parts.append(feats)
+        parts.append(backbone.embed([cfg.visionEndTokenId]))
+        let inputsEmbeds = MLX.concatenated(parts, axis: 1)
 
-        let length = n + 2
+        let length = prefixIds.count + n + 2
         let hidden = backbone.forward(inputsEmbeds: inputsEmbeds, length: length)
         return backbone.pool(hidden, length: length)
     }

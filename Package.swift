@@ -36,6 +36,8 @@ let package = Package(
                 .copy("Resources/test_image.png"),
                 .copy("Resources/video_ref.safetensors"),
                 .copy("Resources/audio_ref.safetensors"),
+                .copy("Resources/test_audio.wav"),
+                .copy("Resources/video_frames"),
             ]
         ),
     ]

@@ -213,9 +213,10 @@ def main():
     mx.eval(audio_hidden)
     n_audio = int(audio_hidden.shape[0])
     print(f"[tower] audio_features={tuple(audio_hidden.shape)} N_audio={n_audio}")
+    prefix_ids = list(m.tokenizer.encode("Document: ").ids)  # retrieval document prefix (all modalities)
 
-    # 5. Build input_ids = [audio_start] + audio_token * N_audio + [audio_end].
-    ids = [AUDIO_START] + [AUDIO_TOKEN] * n_audio + [AUDIO_END]
+    # 5. input_ids = [Document: ] + [audio_start] + audio_token * N_audio + [audio_end].
+    ids = prefix_ids + [AUDIO_START] + [AUDIO_TOKEN] * n_audio + [AUDIO_END]
     L = len(ids)
     input_ids = mx.array([ids], dtype=mx.int32)
     attention_mask = mx.ones((1, L), dtype=mx.int32)

@@ -70,55 +70,54 @@ public enum OmniAudioPreprocess {
 
     // MARK: - Decode
 
-    /// Decode any audio file to 16 kHz mono Float32 PCM via AVAudioFile + AVAudioConverter.
+    /// Decode any audio file to 16 kHz mono Float32 PCM. Reads at the file's native
+    /// float32 processing format, downmixes to mono, and linearly resamples to 16 kHz.
+    /// Avoids AVAudioConverter (whose single-shot streaming is brittle for same-rate
+    /// passthrough) for a robust, dependency-free path.
     private static func decodeMono16k(url: URL) -> [Float]? {
         guard let file = try? AVAudioFile(forReading: url) else { return nil }
-        let srcFormat = file.processingFormat
-        guard let dstFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: sampleRate,
-            channels: 1,
-            interleaved: false)
+        let fmt = file.processingFormat
+        let frameCount = AVAudioFrameCount(file.length)
+        guard frameCount > 0,
+              let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: frameCount)
         else { return nil }
+        do { try file.read(into: buf) } catch { return nil }
 
-        guard let converter = AVAudioConverter(from: srcFormat, to: dstFormat) else { return nil }
-        converter.sampleRateConverterQuality = AVAudioQuality.high.rawValue
+        let n = Int(buf.frameLength)
+        guard n > 0, let chans = buf.floatChannelData else { return nil }
+        let channelCount = Int(fmt.channelCount)
 
-        let srcFrameCount = AVAudioFrameCount(file.length)
-        guard srcFrameCount > 0,
-              let inBuffer = AVAudioPCMBuffer(pcmFormat: srcFormat, frameCapacity: srcFrameCount)
-        else { return nil }
-        do {
-            try file.read(into: inBuffer)
-        } catch {
-            return nil
+        // Downmix to mono.
+        var mono = [Float](repeating: 0, count: n)
+        for c in 0 ..< channelCount {
+            let p = chans[c]
+            for i in 0 ..< n { mono[i] += p[i] }
+        }
+        if channelCount > 1 {
+            let inv = 1.0 / Float(channelCount)
+            for i in 0 ..< n { mono[i] *= inv }
         }
 
-        // Output capacity estimate with headroom for the resample ratio.
-        let ratio = sampleRate / srcFormat.sampleRate
-        let outCapacity = AVAudioFrameCount(Double(inBuffer.frameLength) * ratio + 4096)
-        guard let outBuffer = AVAudioPCMBuffer(pcmFormat: dstFormat, frameCapacity: outCapacity)
-        else { return nil }
+        if abs(fmt.sampleRate - sampleRate) < 0.5 { return mono }
+        return resampleLinear(mono, from: fmt.sampleRate, to: sampleRate)
+    }
 
-        // Single-shot input block: hand the whole buffer once, then end the stream.
-        final class Feed: @unchecked Sendable { var done = false }
-        let feed = Feed()
-        var convError: NSError?
-        let status = converter.convert(to: outBuffer, error: &convError) { _, outStatus in
-            if feed.done {
-                outStatus.pointee = .endOfStream
-                return nil
-            }
-            feed.done = true
-            outStatus.pointee = .haveData
-            return inBuffer
+    /// Linear-interpolation resample. Adequate for mel features; the embedding is robust.
+    private static func resampleLinear(_ x: [Float], from: Double, to: Double) -> [Float] {
+        guard x.count > 1, from > 0 else { return x }
+        let outN = Int((Double(x.count) * to / from).rounded())
+        guard outN > 1 else { return x }
+        var out = [Float](repeating: 0, count: outN)
+        let step = from / to
+        for i in 0 ..< outN {
+            let pos = Double(i) * step
+            let i0 = Int(pos)
+            let frac = Float(pos - Double(i0))
+            let a = x[Swift.min(i0, x.count - 1)]
+            let b = x[Swift.min(i0 + 1, x.count - 1)]
+            out[i] = a + (b - a) * frac
         }
-        if status == .error || convError != nil { return nil }
-
-        let n = Int(outBuffer.frameLength)
-        guard n > 0, let ch = outBuffer.floatChannelData else { return nil }
-        let ptr = ch[0]
-        return Array(UnsafeBufferPointer(start: ptr, count: n))
+        return out
     }
 
     // MARK: - STFT power spectrum
@@ -146,28 +145,30 @@ public enum OmniAudioPreprocess {
         let twoPiOverN = 2.0 * Float.pi / Float(nFFT)
         for n in 0 ..< nFFT { window[n] = 0.5 - 0.5 * cosf(twoPiOverN * Float(n)) }
 
-        // nFFT=400 is not a power of two; vDSP_DFT_zop supports arbitrary even
-        // lengths and preserves the 201-bin frequency grid (no zero-padding).
-        guard let dft = vDSP_DFT_zop_CreateSetup(nil, vDSP_Length(nFFT), .FORWARD) else {
-            return []
+        // nFFT=400 is not a vDSP-supported DFT length (vDSP needs f*2^n, f in {1,3,5,15};
+        // 400 = 2^4 * 25). Use a direct DFT via precomputed [nBins x nFFT] cos/sin
+        // matrices + vDSP_mmul, preserving the exact 201-bin grid (no zero-padding).
+        var cosM = [Float](repeating: 0, count: nBins * nFFT)
+        var sinM = [Float](repeating: 0, count: nBins * nFFT)
+        for b in 0 ..< nBins {
+            for n in 0 ..< nFFT {
+                let ang = -2.0 * Float.pi * Float(b) * Float(n) / Float(nFFT)
+                cosM[b * nFFT + n] = cosf(ang)
+                sinM[b * nFFT + n] = sinf(ang)
+            }
         }
-        defer { vDSP_DFT_DestroySetup(dft) }
 
         var out = [Float](repeating: 0, count: nBins * frames)
-        var reIn = [Float](repeating: 0, count: nFFT)
-        var imIn = [Float](repeating: 0, count: nFFT)
-        var reOut = [Float](repeating: 0, count: nFFT)
-        var imOut = [Float](repeating: 0, count: nFFT)
-
+        var frame = [Float](repeating: 0, count: nFFT)
+        var re = [Float](repeating: 0, count: nBins)
+        var im = [Float](repeating: 0, count: nBins)
         for t in 0 ..< frames {
             let base = t * hop
-            for n in 0 ..< nFFT { reIn[n] = x[base + n] * window[n] }
-            for n in 0 ..< nFFT { imIn[n] = 0 }
-            vDSP_DFT_Execute(dft, reIn, imIn, &reOut, &imOut)
-            for b in 0 ..< nBins {
-                let re = reOut[b], im = imOut[b]
-                out[b * frames + t] = re * re + im * im   // power |STFT|^2
-            }
+            for n in 0 ..< nFFT { frame[n] = x[base + n] * window[n] }
+            // re = cosM[nBins x nFFT] * frame[nFFT]; im = sinM * frame.
+            vDSP_mmul(cosM, 1, frame, 1, &re, 1, vDSP_Length(nBins), 1, vDSP_Length(nFFT))
+            vDSP_mmul(sinM, 1, frame, 1, &im, 1, vDSP_Length(nBins), 1, vDSP_Length(nFFT))
+            for b in 0 ..< nBins { out[b * frames + t] = re[b] * re[b] + im[b] * im[b] }
         }
         return out
     }

@@ -23,6 +23,12 @@ public final class OmniTextEncoder: @unchecked Sendable {
         tokenizer.encode(text: type.prefix + text, addSpecialTokens: false)
     }
 
+    /// Token ids for just the retrieval prefix ("Query: " / "Document: "). The official
+    /// model applies this prefix to media too, prepended before the media wrapper.
+    public func prefixTokenIds(_ type: OmniInputType) -> [Int] {
+        tokenizer.encode(text: type.prefix, addSpecialTokens: false)
+    }
+
     /// Encode a single string to an L2-normalized embedding (optionally Matryoshka-truncated).
     public func encode(_ text: String, as type: OmniInputType, truncateDim: Int? = nil) -> [Float] {
         let ids = tokenIds(text, type)

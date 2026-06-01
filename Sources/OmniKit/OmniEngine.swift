@@ -39,6 +39,8 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     private let imageEncoder: OmniImageEncoder?
     private let audioEncoder: OmniAudioEncoder?
     private let lock = NSLock()
+    /// Media is indexed as documents -> the "Document: " prefix (official model card).
+    private let docPrefix: [Int]
     public let dim: Int
     public let modelDir: URL
     public var supportsImages: Bool { imageEncoder != nil }
@@ -52,7 +54,9 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         self.modelDir = modelDir
         let config = try OmniConfig(modelDir: modelDir)
         let weights = try WeightStore(modelDir: modelDir, loraScale: config.loraScale, keepVision: true, keepAudio: true)
-        self.textEncoder = try await OmniTextEncoder(modelDir: modelDir, weights: weights, config: config)
+        let text = try await OmniTextEncoder(modelDir: modelDir, weights: weights, config: config)
+        self.textEncoder = text
+        self.docPrefix = text.prefixTokenIds(.passage)
         self.imageEncoder = OmniImageEncoder(weights: weights, config: config)
         self.audioEncoder = OmniAudioEncoder(weights: weights, config: config)
         self.dim = config.text.hiddenSize
@@ -74,19 +78,19 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     public func embedImage(_ image: CGImage) -> [Float]? {
         guard let enc = imageEncoder else { return nil }
         lock.lock(); defer { lock.unlock() }
-        return enc.encode(image)
+        return enc.encode(image, prefixIds: docPrefix)
     }
 
     public func embedVideoFrames(_ frames: [CGImage]) -> [Float]? {
         guard let enc = imageEncoder, !frames.isEmpty else { return nil }
         lock.lock(); defer { lock.unlock() }
-        return enc.encodeVideo(frames)
+        return enc.encodeVideo(frames, prefixIds: docPrefix)
     }
 
     public func embedAudio(_ url: URL) -> [Float]? {
         guard let enc = audioEncoder else { return nil }
         lock.lock(); defer { lock.unlock() }
-        return enc.encode(url)
+        return enc.encode(url, prefixIds: docPrefix)
     }
 
     /// Exposed for parity tests: embed already-preprocessed inputs.

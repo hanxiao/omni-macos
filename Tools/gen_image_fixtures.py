@@ -251,9 +251,12 @@ def main():
     m = load_ref()
     m.switch_task("retrieval")
     base = m.model  # JinaOmniSmallEmbeddingModel
+    # The "Query: "/"Document: " prefix applies to EVERY modality (official model
+    # card). Media is indexed as documents, so prepend the document prefix ids.
+    prefix_ids = list(m.tokenizer.encode("Document: ").ids)
 
-    # 4. Build input_ids = [vision_start] + image_token * N_merged + [vision_end].
-    ids = [VISION_START] + [IMAGE_TOKEN] * n_merged + [VISION_END]
+    # 4. input_ids = [Document: ] + [vision_start] + image_token * N_merged + [vision_end].
+    ids = prefix_ids + [VISION_START] + [IMAGE_TOKEN] * n_merged + [VISION_END]
     L = len(ids)
     input_ids = mx.array([ids], dtype=mx.int32)
     attention_mask = mx.ones((1, L), dtype=mx.int32)

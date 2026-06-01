@@ -17,26 +17,29 @@ public final class OmniAudioEncoder: @unchecked Sendable {
         self.cfg = config
     }
 
-    /// Embed an audio file (decode + mel + tower).
-    public func encode(_ url: URL) -> [Float]? {
+    /// Embed an audio file (decode + mel + tower). `prefixIds` is the tokenized
+    /// retrieval prefix ("Query: " / "Document: "), prepended per the official card.
+    public func encode(_ url: URL, prefixIds: [Int] = []) -> [Float]? {
         guard let (feats, lens) = OmniAudioPreprocess.features(url: url) else { return nil }
-        return encode(inputFeatures: feats, featureLens: lens)
+        return encode(inputFeatures: feats, featureLens: lens, prefixIds: prefixIds)
     }
 
     /// Embed from already-computed mel input_features (used by the parity test).
-    public func encode(inputFeatures: MLXArray, featureLens: [Int]) -> [Float] {
+    /// Sequence: [prefix] + [audio_start] + features + [audio_end], last-token pooled.
+    public func encode(inputFeatures: MLXArray, featureLens: [Int], prefixIds: [Int] = []) -> [Float] {
         let features = tower.forward(inputFeatures: inputFeatures, featureLens: featureLens)  // [N_audio, dim]
         let n = features.dim(0)
         let dim = cfg.text.hiddenSize
 
-        // input_ids = [audio_start] + audio_token * N + [audio_end]; the audio tokens
-        // are replaced by the audio features (contiguous -> build by concatenation).
-        let start = backbone.embed([cfg.audioStartTokenId])
-        let end = backbone.embed([cfg.audioEndTokenId])
         let feats = features.asType(.float32).reshaped([1, n, dim])
-        let inputsEmbeds = MLX.concatenated([start, feats, end], axis: 1)  // [1, N+2, dim]
+        var parts: [MLXArray] = []
+        if !prefixIds.isEmpty { parts.append(backbone.embed(prefixIds)) }
+        parts.append(backbone.embed([cfg.audioStartTokenId]))
+        parts.append(feats)
+        parts.append(backbone.embed([cfg.audioEndTokenId]))
+        let inputsEmbeds = MLX.concatenated(parts, axis: 1)
 
-        let length = n + 2
+        let length = prefixIds.count + n + 2
         let hidden = backbone.forward(inputsEmbeds: inputsEmbeds, length: length)
         return backbone.pool(hidden, length: length)
     }

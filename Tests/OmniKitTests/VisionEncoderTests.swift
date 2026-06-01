@@ -29,7 +29,7 @@ final class VisionEncoderTests: XCTestCase {
         return enc
     }
 
-    private func loadFixture() throws -> (pixelValues: MLXArray, grid: [(Int, Int, Int)], embedding: [Float]) {
+    private func loadFixture() throws -> (pixelValues: MLXArray, grid: [(Int, Int, Int)], embedding: [Float], prefix: [Int]) {
         guard let url = Bundle.module.url(forResource: "image_ref", withExtension: "safetensors") else {
             throw XCTSkip("image_ref fixture missing")
         }
@@ -38,14 +38,16 @@ final class VisionEncoderTests: XCTestCase {
         let g = arrays["grid_thw"]!.asArray(Int32.self)   // [1,3] -> [t,h,w]
         let grid = [(Int(g[0]), Int(g[1]), Int(g[2]))]
         let emb = arrays["embedding"]!.reshaped([-1]).asArray(Float.self)
-        return (pv, grid, emb)
+        let ids = arrays["input_ids"]!.reshaped([-1]).asArray(Int32.self).map { Int($0) }
+        let prefix = ids.firstIndex(of: 151652).map { Array(ids[0 ..< $0]) } ?? []   // before vision_start
+        return (pv, grid, emb, prefix)
     }
 
     /// Feed the reference's exact pixel_values: isolates the tower + injection + pooling.
     func testVisionTowerParity() async throws {
         let enc = try await makeEncoder()
-        let (pv, grid, refEmb) = try loadFixture()
-        let out = enc.encode(pixelValues: pv, gridTHW: grid)
+        let (pv, grid, refEmb, prefix) = try loadFixture()
+        let out = enc.encode(pixelValues: pv, gridTHW: grid, prefixIds: prefix)
         let c = cosine(out, refEmb)
         print(String(format: "[vision tower] cosine vs reference = %.5f", c))
         XCTAssertGreaterThanOrEqual(c, 0.999, "vision tower parity (same pixel_values)")
@@ -55,13 +57,13 @@ final class VisionEncoderTests: XCTestCase {
     /// resize differs from PIL bicubic, so this is a looser, informational bound).
     func testEndToEndImageEmbedding() async throws {
         let enc = try await makeEncoder()
-        let (_, _, refEmb) = try loadFixture()
+        let (_, _, refEmb, prefix) = try loadFixture()
         guard let url = Bundle.module.url(forResource: "test_image", withExtension: "png"),
               let src = CGImageSourceCreateWithURL(url as CFURL, nil),
               let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
             throw XCTSkip("test image missing")
         }
-        guard let out = enc.encode(img) else { return XCTFail("encode returned nil") }
+        guard let out = enc.encode(img, prefixIds: prefix) else { return XCTFail("encode returned nil") }
         let c = cosine(out, refEmb)
         print(String(format: "[vision e2e] cosine vs reference = %.5f (resize-path dependent)", c))
         XCTAssertGreaterThanOrEqual(c, 0.90, "end-to-end image embedding sanity")
