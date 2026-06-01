@@ -1,18 +1,21 @@
 import Foundation
 import SQLite3
+import Accelerate
 
 /// A single indexed chunk: one file may produce several chunks.
 public struct IndexedChunk: Sendable {
     public var path: String
     public var modified: Double          // file mtime (epoch seconds)
-    public var kind: String              // "text" | "image" (embedding modality)
+    public var size: Int                 // file size in bytes (change detection)
+    public var kind: String              // image | video | audio | text (file category)
     public var chunkIndex: Int
     public var snippet: String           // short preview for the UI
     public var embedding: [Float]        // L2-normalized
 
-    public init(path: String, modified: Double, kind: String, chunkIndex: Int, snippet: String, embedding: [Float]) {
+    public init(path: String, modified: Double, size: Int = 0, kind: String, chunkIndex: Int, snippet: String, embedding: [Float]) {
         self.path = path
         self.modified = modified
+        self.size = size
         self.kind = kind
         self.chunkIndex = chunkIndex
         self.snippet = snippet
@@ -29,11 +32,17 @@ public struct SearchHit: Sendable {
     public let modified: Double
 }
 
+/// Signature used for incremental change detection.
+public struct StoredFile: Sendable {
+    public let modified: Double
+    public let size: Int
+}
+
 /// Constraints applied to search results. Score thresholding is intentionally NOT
 /// here: the view fetches unfiltered-by-score and splits, so it can offer "show all".
 public struct SearchFilter: Sendable {
     public var kinds: Set<String> = []        // empty = all kinds
-    public var folderPrefix: String? = nil    // restrict to a folder path prefix
+    public var folderPrefix: String? = nil    // restrict to a folder (path-boundary aware)
     public var ext: String? = nil             // restrict to a file extension (no dot)
     public var since: Double? = nil           // modified >= since (epoch seconds)
 
@@ -41,24 +50,29 @@ public struct SearchFilter: Sendable {
 
     func accepts(path: String, kind: String, modified: Double) -> Bool {
         if !kinds.isEmpty && !kinds.contains(kind) { return false }
-        if let f = folderPrefix, !path.hasPrefix(f) { return false }
+        if let f = folderPrefix, !(path == f || path.hasPrefix(f + "/")) { return false }
         if let e = ext, !e.isEmpty, !path.lowercased().hasSuffix("." + e.lowercased()) { return false }
         if let s = since, modified < s { return false }
         return true
     }
 }
 
-/// SQLite-backed store of normalized embeddings with brute-force cosine search.
-/// Embeddings are unit vectors so cosine == dot product. Vectors are kept in
-/// memory (mirrored from disk) for fast scoring; SQLite is the source of truth.
+/// SQLite-backed store of L2-normalized embeddings with brute-force cosine search.
+/// Vectors are mirrored in one contiguous Float buffer and scored with a single
+/// Accelerate GEMV (cblas_sgemv) per query; SQLite is the durable source of truth.
 public final class VectorStore: @unchecked Sendable {
+    private static let schemaVersion: Int32 = 2
+
     private var db: OpaquePointer?
     private let queue = DispatchQueue(label: "omni.vectorstore")
     private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-    // In-memory mirror for scoring.
-    private struct Row { let path: String; let snippet: String; let kind: String; let chunkIndex: Int; let modified: Double; let vec: [Float] }
+    private struct Row { let path: String; let snippet: String; let kind: String; let chunkIndex: Int; let modified: Double }
     private var rows: [Row] = []
+    private var vectors: [[Float]] = []      // parallel to rows (kept for mutation)
+    private var flat: [Float] = []           // contiguous [count*dim] for GEMV
+    private var flatDirty = true
+    private var dim = 0
 
     public let dbURL: URL
 
@@ -70,10 +84,15 @@ public final class VectorStore: @unchecked Sendable {
         }
         exec("PRAGMA journal_mode=WAL;")
         exec("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+        // The index is a rebuildable cache: on a schema change, drop and recreate.
+        if userVersion() != Self.schemaVersion {
+            exec("DROP TABLE IF EXISTS chunks;")
+        }
         exec("""
             CREATE TABLE IF NOT EXISTS chunks(
                 path TEXT NOT NULL,
                 modified REAL NOT NULL,
+                size INTEGER NOT NULL DEFAULT 0,
                 kind TEXT NOT NULL,
                 chunk_index INTEGER NOT NULL,
                 snippet TEXT NOT NULL,
@@ -83,6 +102,7 @@ public final class VectorStore: @unchecked Sendable {
             );
         """)
         exec("CREATE INDEX IF NOT EXISTS idx_path ON chunks(path);")
+        setUserVersion(Self.schemaVersion)
         loadIntoMemory()
     }
 
@@ -93,9 +113,16 @@ public final class VectorStore: @unchecked Sendable {
     /// Replace all chunks for a path with the given set (atomic per file).
     public func replace(path: String, chunks: [IndexedChunk]) throws {
         try queue.sync {
+            // Dimension guard: all vectors must share the index dimension.
+            for c in chunks {
+                if dim == 0 { dim = c.embedding.count }
+                guard c.embedding.count == dim else {
+                    throw OmniError.store("embedding dim \(c.embedding.count) != index dim \(dim)")
+                }
+            }
             exec("BEGIN;")
             deletePathLocked(path)
-            let sql = "INSERT INTO chunks(path, modified, kind, chunk_index, snippet, dim, vec) VALUES(?,?,?,?,?,?,?);"
+            let sql = "INSERT INTO chunks(path, modified, size, kind, chunk_index, snippet, dim, vec) VALUES(?,?,?,?,?,?,?,?);"
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                 exec("ROLLBACK;")
@@ -106,12 +133,13 @@ public final class VectorStore: @unchecked Sendable {
                 sqlite3_reset(stmt)
                 sqlite3_bind_text(stmt, 1, c.path, -1, SQLITE_TRANSIENT)
                 sqlite3_bind_double(stmt, 2, c.modified)
-                sqlite3_bind_text(stmt, 3, c.kind, -1, SQLITE_TRANSIENT)
-                sqlite3_bind_int(stmt, 4, Int32(c.chunkIndex))
-                sqlite3_bind_text(stmt, 5, c.snippet, -1, SQLITE_TRANSIENT)
-                sqlite3_bind_int(stmt, 6, Int32(c.embedding.count))
+                sqlite3_bind_int64(stmt, 3, Int64(c.size))
+                sqlite3_bind_text(stmt, 4, c.kind, -1, SQLITE_TRANSIENT)
+                sqlite3_bind_int(stmt, 5, Int32(c.chunkIndex))
+                sqlite3_bind_text(stmt, 6, c.snippet, -1, SQLITE_TRANSIENT)
+                sqlite3_bind_int(stmt, 7, Int32(c.embedding.count))
                 c.embedding.withUnsafeBytes { raw in
-                    _ = sqlite3_bind_blob(stmt, 7, raw.baseAddress, Int32(raw.count), SQLITE_TRANSIENT)
+                    _ = sqlite3_bind_blob(stmt, 8, raw.baseAddress, Int32(raw.count), SQLITE_TRANSIENT)
                 }
                 guard sqlite3_step(stmt) == SQLITE_DONE else {
                     exec("ROLLBACK;")
@@ -119,8 +147,12 @@ public final class VectorStore: @unchecked Sendable {
                 }
             }
             exec("COMMIT;")
-            rows.removeAll { $0.path == path }
-            rows.append(contentsOf: chunks.map { Row(path: $0.path, snippet: $0.snippet, kind: $0.kind, chunkIndex: $0.chunkIndex, modified: $0.modified, vec: $0.embedding) })
+            removeRowsLocked { $0.path == path }
+            for c in chunks {
+                rows.append(Row(path: c.path, snippet: c.snippet, kind: c.kind, chunkIndex: c.chunkIndex, modified: c.modified))
+                vectors.append(c.embedding)
+            }
+            flatDirty = true
         }
     }
 
@@ -129,19 +161,58 @@ public final class VectorStore: @unchecked Sendable {
             exec("BEGIN;")
             deletePathLocked(path)
             exec("COMMIT;")
-            rows.removeAll { $0.path == path }
+            removeRowsLocked { $0.path == path }
+            flatDirty = true
         }
     }
 
-    /// path -> max modified time currently stored (for incremental crawl).
-    public func indexedModified() -> [String: Double] {
+    /// Delete every chunk whose path is under `folder` (path-boundary aware).
+    public func deleteUnderFolder(_ folder: String) {
         queue.sync {
-            var out: [String: Double] = [:]
             var stmt: OpaquePointer?
-            if sqlite3_prepare_v2(db, "SELECT path, MAX(modified) FROM chunks GROUP BY path;", -1, &stmt, nil) == SQLITE_OK {
+            if sqlite3_prepare_v2(db, "DELETE FROM chunks WHERE path = ? OR path LIKE ?;", -1, &stmt, nil) == SQLITE_OK {
+                sqlite3_bind_text(stmt, 1, folder, -1, SQLITE_TRANSIENT)
+                sqlite3_bind_text(stmt, 2, folder + "/%", -1, SQLITE_TRANSIENT)
+                sqlite3_step(stmt)
+            }
+            sqlite3_finalize(stmt)
+            removeRowsLocked { $0.path == folder || $0.path.hasPrefix(folder + "/") }
+            flatDirty = true
+        }
+    }
+
+    /// Delete every chunk of a given file kind (used when a content type is disabled).
+    public func deleteKind(_ kind: String) {
+        queue.sync {
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, "DELETE FROM chunks WHERE kind = ?;", -1, &stmt, nil) == SQLITE_OK {
+                sqlite3_bind_text(stmt, 1, kind, -1, SQLITE_TRANSIENT)
+                sqlite3_step(stmt)
+            }
+            sqlite3_finalize(stmt)
+            removeRowsLocked { $0.kind == kind }
+            flatDirty = true
+        }
+    }
+
+    /// Drop all vectors (e.g. before a forced full reindex into a new embedding space).
+    public func wipeChunks() {
+        queue.sync {
+            exec("DELETE FROM chunks;")
+            rows.removeAll(); vectors.removeAll(); flat.removeAll()
+            dim = 0; flatDirty = false
+        }
+    }
+
+    /// path -> (modified, size) for incremental change detection.
+    public func indexedFiles() -> [String: StoredFile] {
+        queue.sync {
+            var out: [String: StoredFile] = [:]
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, "SELECT path, MAX(modified), MAX(size) FROM chunks GROUP BY path;", -1, &stmt, nil) == SQLITE_OK {
                 while sqlite3_step(stmt) == SQLITE_ROW {
                     let p = String(cString: sqlite3_column_text(stmt, 0))
-                    out[p] = sqlite3_column_double(stmt, 1)
+                    out[p] = StoredFile(modified: sqlite3_column_double(stmt, 1), size: Int(sqlite3_column_int64(stmt, 2)))
                 }
             }
             sqlite3_finalize(stmt)
@@ -152,28 +223,49 @@ public final class VectorStore: @unchecked Sendable {
     public var count: Int { queue.sync { rows.count } }
     public var fileCount: Int { queue.sync { Set(rows.map { $0.path }).count } }
 
-    // MARK: - Search
+    // MARK: - Search (Accelerate GEMV)
 
-    /// Top-K cosine search. Keeps the best-scoring chunk per file. Score thresholding
-    /// is left to the caller (the UI splits above/below so it can offer "show all").
+    /// Top-K cosine search. Scores all vectors with one cblas_sgemv, then keeps the
+    /// best-scoring chunk per file. Score thresholding is left to the caller.
     public func search(_ query: [Float], filter: SearchFilter = SearchFilter(), topK: Int = 40) -> [SearchHit] {
         queue.sync {
+            if flatDirty { rebuildFlatLocked() }
+            let n = rows.count
+            guard n > 0, dim > 0, query.count == dim else { return [] }
+
+            var scores = [Float](repeating: 0, count: n)
+            query.withUnsafeBufferPointer { qp in
+                flat.withUnsafeBufferPointer { mp in
+                    scores.withUnsafeMutableBufferPointer { sp in
+                        cblas_sgemv(CblasRowMajor, CblasNoTrans, Int32(n), Int32(dim), 1,
+                                    mp.baseAddress, Int32(dim), qp.baseAddress, 1, 0, sp.baseAddress, 1)
+                    }
+                }
+            }
+
             var best: [String: SearchHit] = [:]
-            for r in rows {
+            best.reserveCapacity(min(n, 512))
+            for i in 0 ..< n {
+                let r = rows[i]
                 if !filter.accepts(path: r.path, kind: r.kind, modified: r.modified) { continue }
-                var dot: Float = 0
-                let n = min(query.count, r.vec.count)
-                var i = 0
-                while i < n { dot += query[i] * r.vec[i]; i += 1 }
-                if let existing = best[r.path], existing.score >= dot { continue }
+                let dot = scores[i]
+                if let e = best[r.path], e.score >= dot { continue }
                 best[r.path] = SearchHit(path: r.path, score: dot, snippet: r.snippet, kind: r.kind, chunkIndex: r.chunkIndex, modified: r.modified)
             }
             return Array(best.values).sorted { $0.score > $1.score }.prefix(topK).map { $0 }
         }
     }
 
-    /// Distinct file kinds currently in the index (for populating filter chips).
     public func kinds() -> Set<String> { queue.sync { Set(rows.map { $0.kind }) } }
+
+    public func extensions() -> Set<String> {
+        queue.sync {
+            Set(rows.compactMap { row -> String? in
+                let e = (row.path as NSString).pathExtension.lowercased()
+                return e.isEmpty ? nil : e
+            })
+        }
+    }
 
     // MARK: - Metadata + stats
 
@@ -198,7 +290,6 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
-    /// On-disk size of the database (including the WAL).
     public func sizeBytes() -> Int64 {
         let fm = FileManager.default
         var total: Int64 = 0
@@ -209,17 +300,31 @@ public final class VectorStore: @unchecked Sendable {
         return total
     }
 
-    /// Distinct lowercased file extensions currently in the index.
-    public func extensions() -> Set<String> {
-        queue.sync {
-            Set(rows.compactMap { row -> String? in
-                let e = (row.path as NSString).pathExtension.lowercased()
-                return e.isEmpty ? nil : e
-            })
+    // MARK: - Internals
+
+    private func removeRowsLocked(_ predicate: (Row) -> Bool) {
+        var keptRows: [Row] = []; var keptVecs: [[Float]] = []
+        keptRows.reserveCapacity(rows.count); keptVecs.reserveCapacity(vectors.count)
+        for i in 0 ..< rows.count where !predicate(rows[i]) {
+            keptRows.append(rows[i]); keptVecs.append(vectors[i])
         }
+        rows = keptRows; vectors = keptVecs
     }
 
-    // MARK: - Internals
+    private func rebuildFlatLocked() {
+        let n = rows.count
+        if n == 0 || dim == 0 { flat = []; flatDirty = false; return }
+        flat = [Float](repeating: 0, count: n * dim)
+        let stride = dim * MemoryLayout<Float>.size
+        flat.withUnsafeMutableBufferPointer { fb in
+            for i in 0 ..< n {
+                vectors[i].withUnsafeBytes { vb in
+                    memcpy(fb.baseAddress!.advanced(by: i * dim), vb.baseAddress, min(stride, vb.count))
+                }
+            }
+        }
+        flatDirty = false
+    }
 
     private func deletePathLocked(_ path: String) {
         var stmt: OpaquePointer?
@@ -231,7 +336,7 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     private func loadIntoMemory() {
-        rows.removeAll()
+        rows.removeAll(); vectors.removeAll(); dim = 0
         var stmt: OpaquePointer?
         if sqlite3_prepare_v2(db, "SELECT path, snippet, kind, chunk_index, dim, vec, modified FROM chunks;", -1, &stmt, nil) == SQLITE_OK {
             while sqlite3_step(stmt) == SQLITE_ROW {
@@ -239,23 +344,32 @@ public final class VectorStore: @unchecked Sendable {
                 let snippet = String(cString: sqlite3_column_text(stmt, 1))
                 let kind = String(cString: sqlite3_column_text(stmt, 2))
                 let ci = Int(sqlite3_column_int(stmt, 3))
-                let dim = Int(sqlite3_column_int(stmt, 4))
+                let d = Int(sqlite3_column_int(stmt, 4))
                 let modified = sqlite3_column_double(stmt, 6)
-                if let blob = sqlite3_column_blob(stmt, 5) {
-                    let bytes = Int(sqlite3_column_bytes(stmt, 5))
-                    var vec = [Float](repeating: 0, count: dim)
-                    let copyCount = min(bytes, dim * MemoryLayout<Float>.size)
-                    vec.withUnsafeMutableBytes { dst in _ = memcpy(dst.baseAddress, blob, copyCount) }
-                    rows.append(Row(path: path, snippet: snippet, kind: kind, chunkIndex: ci, modified: modified, vec: vec))
-                }
+                guard d > 0, let blob = sqlite3_column_blob(stmt, 5) else { continue }
+                if dim == 0 { dim = d }
+                guard d == dim else { continue }   // skip mismatched-dimension rows
+                var vec = [Float](repeating: 0, count: d)
+                let bytes = Int(sqlite3_column_bytes(stmt, 5))
+                vec.withUnsafeMutableBytes { dst in _ = memcpy(dst.baseAddress, blob, min(bytes, d * MemoryLayout<Float>.size)) }
+                rows.append(Row(path: path, snippet: snippet, kind: kind, chunkIndex: ci, modified: modified))
+                vectors.append(vec)
             }
         }
         sqlite3_finalize(stmt)
+        flatDirty = true
     }
 
-    private func exec(_ sql: String) {
-        sqlite3_exec(db, sql, nil, nil, nil)
+    private func userVersion() -> Int32 {
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, "PRAGMA user_version;", -1, &stmt, nil) == SQLITE_OK else { return 0 }
+        return sqlite3_step(stmt) == SQLITE_ROW ? sqlite3_column_int(stmt, 0) : 0
     }
+
+    private func setUserVersion(_ v: Int32) { exec("PRAGMA user_version = \(v);") }
+
+    private func exec(_ sql: String) { sqlite3_exec(db, sql, nil, nil, nil) }
 }
 
 public enum OmniError: Error, CustomStringConvertible {

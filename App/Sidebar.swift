@@ -81,6 +81,7 @@ struct Sidebar: View {
                     Label("Index", systemImage: "arrow.clockwise")
                 }
                 .controlSize(.small)
+                .disabled(!model.canIndex)
             }
             .padding(.vertical, 2)
         }

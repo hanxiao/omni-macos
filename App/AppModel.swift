@@ -51,6 +51,9 @@ final class AppModel: ObservableObject {
     @Published var query: String = ""
     @Published var rawResults: [SearchHit] = []   // kind/folder/ext/date filtered, score-sorted
     @Published var searching = false
+    @Published var selection: String?             // selected result path (lifted out of the view)
+
+    var canIndex: Bool { phase == .ready && !roots.isEmpty }
 
     @Published var indexState: IndexState = .idle
     var isIndexing: Bool { indexState == .indexing }
@@ -96,6 +99,9 @@ final class AppModel: ObservableObject {
     @Published var lastIndexed: Date?
     @Published var indexObsolete = false
     let embeddingVersion = omniEmbeddingVersion
+    /// Composite fingerprint that captures everything which changes the vectors:
+    /// code version + model identity + dimension + prefixes + vector-affecting preprocessing.
+    private var fingerprint = ""
 
     private var engine: OmniEngine?
     private var store: VectorStore?
@@ -139,6 +145,13 @@ final class AppModel: ObservableObject {
     func setIndexKind(_ k: FileKind, _ on: Bool) {
         settings.set(k, on)
         UserDefaults.standard.set(settings.enabledKinds.map { $0.rawValue }, forKey: "omni.indexKinds")
+        // Disabling a kind immediately removes its vectors so search/filters stay truthful.
+        if !on, let store {
+            store.deleteKind(k.rawValue)
+            filterKinds.remove(k)
+            refreshIndexStats(store)
+            if !query.isEmpty { search() }
+        }
     }
     private func loadPerf() {
         let d = UserDefaults.standard
@@ -212,11 +225,22 @@ final class AppModel: ObservableObject {
             self.indexer = Indexer(store: store, embedder: engine)
             self.supportsImages = engine.supportsImages
             self.audioSupported = engine.supportsAudio
+            self.fingerprint = computeFingerprint(modelDir: dir, dim: engine.dim)
             refreshIndexStats(store)
             self.phase = .ready
         } catch {
             self.phase = .failed("\(error)")
         }
+    }
+
+    private func computeFingerprint(modelDir: URL, dim: Int) -> String {
+        let sf = modelDir.appendingPathComponent("model.safetensors")
+        let attrs = try? FileManager.default.attributesOfItem(atPath: sf.path)
+        let size = (attrs?[.size] as? Int64) ?? 0
+        let mtime = Int((attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)
+        // Anything that changes the produced vectors belongs here.
+        return [embeddingVersion, "dim\(dim)", "model\(size)-\(mtime)",
+                "img\(maxImageDimension)", "vid\(maxVideoFrames)"].joined(separator: "|")
     }
 
     private func refreshIndexStats(_ store: VectorStore) {
@@ -227,9 +251,8 @@ final class AppModel: ObservableObject {
         dbPath = store.dbURL.path
         dbSizeBytes = store.sizeBytes()
         if let ts = store.metaGet("last_indexed"), let t = Double(ts) { lastIndexed = Date(timeIntervalSince1970: t) }
-        let storedVersion = store.metaGet("embedding_version")
-        // Obsolete if the index was built by a different (or unstamped) embedding version.
-        indexObsolete = indexedFiles > 0 && storedVersion != embeddingVersion
+        // Obsolete if built by a different (or unstamped) fingerprint than the current engine.
+        indexObsolete = indexedFiles > 0 && store.metaGet("embedding_version") != fingerprint
     }
 
     static func indexURL() throws -> URL {
@@ -251,7 +274,17 @@ final class AppModel: ObservableObject {
     }
     private func saveRoots() { UserDefaults.standard.set(roots.map { $0.path }, forKey: "omni.roots") }
     func addRoot(_ url: URL) { guard !roots.contains(url) else { return }; roots.append(url); saveRoots() }
-    func removeRoot(_ url: URL) { roots.removeAll { $0 == url }; if filterFolder == url { filterFolder = nil }; saveRoots() }
+    func removeRoot(_ url: URL) {
+        roots.removeAll { $0 == url }
+        if filterFolder == url { filterFolder = nil }
+        saveRoots()
+        // Drop that folder's vectors so removed folders stop appearing in results.
+        if let store {
+            store.deleteUnderFolder(url.path)
+            refreshIndexStats(store)
+            if !query.isEmpty { search() }
+        }
+    }
 
     // MARK: - Search
 
@@ -269,6 +302,7 @@ final class AppModel: ObservableObject {
             await MainActor.run {
                 guard token == self.searchToken else { return }
                 self.rawResults = hits
+                if let sel = self.selection, !hits.contains(where: { $0.path == sel }) { self.selection = nil }
                 self.searching = false
             }
         }
@@ -280,6 +314,13 @@ final class AppModel: ObservableObject {
     /// skipped by modification time, so resuming simply continues where it left off.
     func startIndexing() {
         guard let indexer, let store, indexState != .indexing else { return }
+        // An out-of-date index is in a different vector space: rebuild it, don't top up.
+        let force = indexObsolete
+        if force { store.wipeChunks(); indexedFiles = 0; indexedChunks = 0; indexedKinds = []; rawResults = [] }
+        // Stamp the fingerprint at the START so a paused/partial index is not later
+        // mis-flagged obsolete - its content is already in the current space.
+        store.metaSet("embedding_version", fingerprint)
+        indexObsolete = false
         indexState = .indexing
         progress = IndexProgress()
         let roots = self.roots
@@ -290,18 +331,14 @@ final class AppModel: ObservableObject {
         settings.minAudioSeconds = minAudioSeconds
         settings.minVideoSeconds = minVideoSeconds
         settings.minTextChars = minTextChars
-        let version = embeddingVersion
         Task.detached(priority: .utility) {
-            indexer.index(roots: roots, settings: settings) { p in
+            indexer.index(roots: roots, settings: settings, force: force) { p in
                 Task { @MainActor in
                     self.progress = p
                     if p.scanned % 25 == 0 { self.indexedFiles = store.fileCount }  // live count
                     if p.done {
                         self.indexState = p.cancelled ? .paused : .idle
-                        if !p.cancelled {
-                            store.metaSet("embedding_version", version)
-                            store.metaSet("last_indexed", "\(Date().timeIntervalSince1970)")
-                        }
+                        if !p.cancelled { store.metaSet("last_indexed", "\(Date().timeIntervalSince1970)") }
                         self.refreshIndexStats(store)
                         if !self.query.isEmpty { self.search() }
                     }

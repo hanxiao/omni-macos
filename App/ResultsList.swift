@@ -7,10 +7,9 @@ struct ResultsList<Footer: View>: View {
     @EnvironmentObject var model: AppModel
     let results: [SearchHit]
     @ViewBuilder var footer: Footer
-    @State private var selection: String?
     @State private var previewURL: URL?
 
-    private var selectedURL: URL? { selection.map { URL(fileURLWithPath: $0) } }
+    private var selectedURL: URL? { model.selection.map { URL(fileURLWithPath: $0) } }
 
     var body: some View {
         Group {
@@ -21,13 +20,13 @@ struct ResultsList<Footer: View>: View {
         }
         .quickLookPreview($previewURL)
         .onKeyPress(.space) { if let u = selectedURL { previewURL = u; return .handled }; return .ignored }
-        .onKeyPress(.return) { if let p = selection { open(p); return .handled }; return .ignored }
+        .onKeyPress(.return) { if let p = model.selection { open(p); return .handled }; return .ignored }
     }
 
     // MARK: - List
 
     private var listView: some View {
-        List(selection: $selection) {
+        List(selection: $model.selection) {
             ForEach(results, id: \.path) { hit in
                 ResultRow(hit: hit)
                     .tag(hit.path)
@@ -46,9 +45,9 @@ struct ResultsList<Footer: View>: View {
         ScrollView {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 140, maximum: 196), spacing: Design.gapLarge)], spacing: Design.gapLarge) {
                 ForEach(results, id: \.path) { hit in
-                    ResultGridItem(hit: hit, selected: selection == hit.path)
+                    ResultGridItem(hit: hit, selected: model.selection == hit.path)
                         .draggable(URL(fileURLWithPath: hit.path))
-                        .onTapGesture { selection = hit.path }
+                        .onTapGesture { model.selection = hit.path }
                         .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
                         .contextMenu { menu(hit.path) }
                 }

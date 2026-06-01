@@ -105,7 +105,7 @@ struct ContentView: View {
                 }
             } label: { Image(systemName: "arrow.up.arrow.down") }
             .help("Sort results")
-            .disabled(model.results.isEmpty)
+            .disabled(model.rawResults.isEmpty)
         }
         ToolbarItem(placement: .primaryAction) {
             Picker("View", selection: $model.viewMode) {
@@ -126,6 +126,7 @@ struct ContentView: View {
             case .idle:
                 Button { model.startIndexing() } label: { Image(systemName: "arrow.clockwise") }
                     .help("Index")
+                    .disabled(!model.canIndex)
             }
         }
     }

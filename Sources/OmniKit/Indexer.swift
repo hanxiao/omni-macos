@@ -58,10 +58,10 @@ public final class Indexer: @unchecked Sendable {
 
     /// Full incremental pass over `roots`. `onProgress` is called on a background
     /// thread; marshal to the main actor in the UI.
-    public func index(roots: [URL], settings: IndexSettings = .default, onProgress: @escaping (IndexProgress) -> Void) {
+    public func index(roots: [URL], settings: IndexSettings = .default, force: Bool = false, onProgress: @escaping (IndexProgress) -> Void) {
         queue.sync { cancelled = false; active = settings }
         var p = IndexProgress()
-        let known = store.indexedModified()
+        let known = store.indexedFiles()
         var seen = Set<String>()
 
         // Pass 1: count supported files per root (stat-only, no reads) so each folder
@@ -90,7 +90,9 @@ public final class Indexer: @unchecked Sendable {
                     done += 1
                     p.perRoot[root.path]?.done = done
 
-                    if let prev = known[path], prev >= file.modified {
+                    // Skip only when both mtime AND size are unchanged (catches
+                    // backdated edits, restores, and same-second changes). force re-embeds all.
+                    if !force, let prev = known[path], prev.modified == file.modified, prev.size == file.size {
                         p.skipped += 1
                         if p.scanned % 50 == 0 { onProgress(p) }
                         return
@@ -146,12 +148,12 @@ public final class Indexer: @unchecked Sendable {
         if category == .video {
             let frames = FileExtractor.videoFrames(file.url, maxFrames: active.maxVideoFrames, maxDimension: active.maxImageDimension)
             guard !frames.isEmpty, let vec = embedder.embedVideoFrames(frames) else { return [] }
-            return [IndexedChunk(path: file.url.path, modified: file.modified, kind: kind,
+            return [IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
                                  chunkIndex: 0, snippet: file.url.lastPathComponent, embedding: vec)]
         }
         if category == .audio {
             guard let vec = embedder.embedAudio(file.url) else { return [] }
-            return [IndexedChunk(path: file.url.path, modified: file.modified, kind: kind,
+            return [IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
                                  chunkIndex: 0, snippet: file.url.lastPathComponent, embedding: vec)]
         }
 
@@ -167,7 +169,7 @@ public final class Indexer: @unchecked Sendable {
                 if isCancelled { break }
                 let vec = embedder.embedText(piece, as: .passage)
                 out.append(IndexedChunk(
-                    path: file.url.path, modified: file.modified, kind: kind,
+                    path: file.url.path, modified: file.modified, size: file.size, kind: kind,
                     chunkIndex: i, snippet: snippet(piece), embedding: vec))
             }
             return out
@@ -178,7 +180,7 @@ public final class Indexer: @unchecked Sendable {
                 guard let vec = embedder.embedImage(img) else { continue }
                 let label = images.count > 1 ? "page \(i + 1)" : file.url.lastPathComponent
                 out.append(IndexedChunk(
-                    path: file.url.path, modified: file.modified, kind: kind,
+                    path: file.url.path, modified: file.modified, size: file.size, kind: kind,
                     chunkIndex: i, snippet: "\(file.url.lastPathComponent) - \(label)", embedding: vec))
             }
             return out
