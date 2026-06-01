@@ -7,17 +7,15 @@ struct Sidebar: View {
 
     var body: some View {
         List {
-            Section("Index") {
-                indexStatus
-                Toggle("Keep up to date automatically", isOn: $model.liveUpdates)
-                    .controlSize(.small)
-            }
             Section("Folders") {
                 ForEach(model.roots, id: \.self) { url in
                     HStack(spacing: 7) {
                         folderLeading(url)
                         Text(url.lastPathComponent).lineLimit(1).truncationMode(.middle)
                         Spacer()
+                        if let c = model.folderFileCounts[url.path], c > 0 {
+                            Text(c.formatted()).font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
+                        }
                         Button { model.removeRoot(url) } label: {
                             Image(systemName: "minus.circle").foregroundStyle(.tertiary)
                         }
@@ -27,6 +25,13 @@ struct Sidebar: View {
                 }
                 Button { pickFolder() } label: { Label("Add Folder", systemImage: "plus") }
                     .buttonStyle(.plain)
+            }
+            Section("Index") {
+                indexStatus
+                Toggle(isOn: $model.liveUpdates) {
+                    Text("Auto-update").font(.caption).foregroundStyle(.secondary)
+                }
+                .toggleStyle(.switch).controlSize(.mini)
             }
         }
         .listStyle(.sidebar)
@@ -45,7 +50,7 @@ struct Sidebar: View {
     @ViewBuilder private var indexStatus: some View {
         switch model.indexState {
         case .indexing:
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 6) {
                 HStack {
                     ProgressView().controlSize(.small)
                     Text("Indexing\u{2026}").font(.callout).foregroundStyle(.secondary)
@@ -59,31 +64,23 @@ struct Sidebar: View {
             }
             .padding(.vertical, 2)
         case .paused:
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 6) {
-                    Image(systemName: "pause.circle.fill").foregroundStyle(.orange)
-                    Text("Paused").font(.callout).foregroundStyle(.secondary)
-                    Spacer()
-                    Button("Resume") { model.startIndexing() }.controlSize(.small)
-                }
-                Text("\(model.indexedFiles) files indexed")
-                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            HStack(spacing: 6) {
+                Image(systemName: "pause.circle.fill").foregroundStyle(.orange)
+                Text("Paused \u{00B7} \(model.indexedFiles) files").font(.callout).foregroundStyle(.secondary)
+                Spacer()
+                Button("Resume") { model.startIndexing() }.controlSize(.small)
             }
             .padding(.vertical, 2)
         case .idle:
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 6) {
-                    Image(systemName: "circle.fill").font(.system(size: 7)).foregroundStyle(.green)
-                    Text("\(model.indexedFiles) files indexed")
-                        .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
-                }
-                Button {
-                    model.startIndexing()
-                } label: {
-                    Label("Index", systemImage: "arrow.clockwise")
-                }
-                .controlSize(.small)
-                .disabled(!model.canIndex)
+            HStack(spacing: 6) {
+                Image(systemName: "circle.fill").font(.system(size: 7)).foregroundStyle(.green)
+                Text(model.indexedFiles == 0 ? "Not indexed" : "\(model.indexedFiles.formatted()) files indexed")
+                    .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                Spacer()
+                Button { model.startIndexing() } label: { Image(systemName: "arrow.clockwise") }
+                    .buttonStyle(.plain).foregroundStyle(.secondary)
+                    .help(model.indexedFiles == 0 ? "Index" : "Reindex")
+                    .disabled(!model.canIndex)
             }
             .padding(.vertical, 2)
         }

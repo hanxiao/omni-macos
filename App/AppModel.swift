@@ -76,6 +76,7 @@ final class AppModel: ObservableObject {
     @Published var settings = IndexSettings.default
     @Published var indexedKinds: Set<String> = []
     @Published var indexedExts: [String] = []
+    @Published var folderFileCounts: [String: Int] = [:]
 
     // Search filters.
     @Published var filterKinds: Set<FileKind> = [] { didSet { search() } }
@@ -325,6 +326,7 @@ final class AppModel: ObservableObject {
         indexedChunks = store.count
         indexedKinds = store.kinds()
         indexedExts = store.extensions().sorted()
+        folderFileCounts = Dictionary(uniqueKeysWithValues: roots.map { ($0.path, store.fileCount(underFolder: $0.path)) })
         dbPath = store.dbURL.path
         dbSizeBytes = store.sizeBytes()
         if let ts = store.metaGet("last_indexed"), let t = Double(ts) { lastIndexed = Date(timeIntervalSince1970: t) }

@@ -231,6 +231,15 @@ public final class VectorStore: @unchecked Sendable {
     public var count: Int { queue.sync { rows.count } }
     public var fileCount: Int { queue.sync { Set(rows.map { $0.path }).count } }
 
+    /// Distinct indexed files under a folder (path-boundary aware).
+    public func fileCount(underFolder folder: String) -> Int {
+        queue.sync {
+            var seen = Set<String>()
+            for r in rows where r.path == folder || r.path.hasPrefix(folder + "/") { seen.insert(r.path) }
+            return seen.count
+        }
+    }
+
     // MARK: - Search (Accelerate GEMV)
 
     /// Top-K cosine search. Scores all vectors with one cblas_sgemv, then keeps the
