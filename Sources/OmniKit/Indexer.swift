@@ -20,6 +20,7 @@ public struct IndexProgress: Sendable {
     public var failed = 0
     public var currentPath = ""
     public var done = false
+    public var cancelled = false   // ended via pause rather than completing
     public init() {}
 }
 
@@ -78,11 +79,17 @@ public final class Indexer: @unchecked Sendable {
             if p.scanned % 10 == 0 { onProgress(p) }
         }
 
-        // Remove entries whose files vanished.
-        for path in known.keys where !seen.contains(path) {
-            store.deletePath(path)
+        // Only reconcile deletions on a complete pass. A paused (cancelled) run has
+        // not seen every file yet, so it must not delete "unseen" files - that would
+        // corrupt the index and break resume.
+        let wasCancelled = isCancelled
+        if !wasCancelled {
+            for path in known.keys where !seen.contains(path) {
+                store.deletePath(path)
+            }
         }
         p.done = true
+        p.cancelled = wasCancelled
         onProgress(p)
     }
 

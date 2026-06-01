@@ -4,6 +4,9 @@ import OmniKit
 
 enum ResultViewMode: String, CaseIterable { case list, grid }
 
+/// The only indexing states the user sees: idle, indexing, paused.
+enum IndexState { case idle, indexing, paused }
+
 enum SortOrder: String, CaseIterable, Identifiable {
     case relevance, name, dateModified
     var id: String { rawValue }
@@ -49,7 +52,9 @@ final class AppModel: ObservableObject {
     @Published var rawResults: [SearchHit] = []   // kind/folder/ext/date filtered, score-sorted
     @Published var searching = false
 
-    @Published var isIndexing = false
+    @Published var indexState: IndexState = .idle
+    var isIndexing: Bool { indexState == .indexing }
+    var isPaused: Bool { indexState == .paused }
     @Published var progress = IndexProgress()
     @Published var indexedFiles = 0
     @Published var indexedChunks = 0
@@ -109,13 +114,6 @@ final class AppModel: ObservableObject {
         !filterKinds.isEmpty || filterFolder != nil
             || !filterExt.isEmpty || dateRange != .any
             || minScore != Self.defaultMinScore
-    }
-
-    var needsReindex: Bool {
-        guard !indexedKinds.isEmpty || !isIndexing else { return false }
-        let wanted = Set(settings.enabledKinds.map { $0.rawValue })
-        // Only nudge when a wanted kind has nothing indexed yet, or an indexed kind is now off.
-        return wanted != indexedKinds && (indexedFiles > 0)
     }
 
     // MARK: - Settings persistence
@@ -251,9 +249,11 @@ final class AppModel: ObservableObject {
 
     // MARK: - Indexing
 
+    /// Start or resume indexing. Indexing is incremental - already-embedded files are
+    /// skipped by modification time, so resuming simply continues where it left off.
     func startIndexing() {
-        guard let indexer, let store, !isIndexing else { return }
-        isIndexing = true
+        guard let indexer, let store, indexState != .indexing else { return }
+        indexState = .indexing
         progress = IndexProgress()
         let roots = self.roots
         var settings = self.settings
@@ -264,7 +264,7 @@ final class AppModel: ObservableObject {
                 Task { @MainActor in
                     self.progress = p
                     if p.done {
-                        self.isIndexing = false
+                        self.indexState = p.cancelled ? .paused : .idle
                         self.refreshIndexStats(store)
                         if !self.query.isEmpty { self.search() }
                     }
@@ -272,5 +272,7 @@ final class AppModel: ObservableObject {
             }
         }
     }
-    func cancelIndexing() { indexer?.cancel() }
+
+    /// Pause indexing. Files embedded so far are kept; resume continues from there.
+    func pauseIndexing() { indexer?.cancel() }
 }

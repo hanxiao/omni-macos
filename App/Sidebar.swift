@@ -9,14 +9,6 @@ struct Sidebar: View {
         List {
             Section("Index") {
                 indexStatus
-                if model.needsReindex {
-                    Button {
-                        model.startIndexing()
-                    } label: {
-                        Label("Reindex to apply changes", systemImage: "exclamationmark.arrow.circlepath")
-                    }
-                    .controlSize(.small)
-                }
             }
             Section("Folders") {
                 ForEach(model.roots, id: \.self) { url in
@@ -39,25 +31,46 @@ struct Sidebar: View {
     }
 
     @ViewBuilder private var indexStatus: some View {
-        if model.isIndexing {
+        switch model.indexState {
+        case .indexing:
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     ProgressView().controlSize(.small)
-                    Text("Indexing...").font(.callout).foregroundStyle(.secondary)
+                    Text("Indexing\u{2026}").font(.callout).foregroundStyle(.secondary)
                     Spacer()
-                    Button("Stop") { model.cancelIndexing() }.controlSize(.small)
+                    Button("Pause") { model.pauseIndexing() }.controlSize(.small)
                 }
-                Text("\(model.progress.embedded) embedded · \(model.progress.scanned) scanned")
+                Text("\(model.progress.embedded) added")
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 Text(URL(fileURLWithPath: model.progress.currentPath).lastPathComponent)
                     .font(.caption2).foregroundStyle(.tertiary).lineLimit(1).truncationMode(.middle)
             }
             .padding(.vertical, 2)
-        } else {
-            HStack(spacing: 6) {
-                Image(systemName: "circle.fill").font(.system(size: 7)).foregroundStyle(.green)
-                Text("\(model.indexedFiles) files · \(model.indexedChunks) chunks")
-                    .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+        case .paused:
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 6) {
+                    Image(systemName: "pause.circle.fill").foregroundStyle(.orange)
+                    Text("Paused").font(.callout).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Resume") { model.startIndexing() }.controlSize(.small)
+                }
+                Text("\(model.indexedFiles) files indexed")
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 2)
+        case .idle:
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 6) {
+                    Image(systemName: "circle.fill").font(.system(size: 7)).foregroundStyle(.green)
+                    Text("\(model.indexedFiles) files indexed")
+                        .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                }
+                Button {
+                    model.startIndexing()
+                } label: {
+                    Label("Index", systemImage: "arrow.clockwise")
+                }
+                .controlSize(.small)
             }
             .padding(.vertical, 2)
         }

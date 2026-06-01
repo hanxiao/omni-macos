@@ -18,9 +18,11 @@ struct OmniApp: App {
                 Button("About Omni") { showAbout() }
             }
             CommandGroup(after: .toolbar) {
-                Button("Reindex") { model.startIndexing() }
-                    .keyboardShortcut("r", modifiers: [.command, .shift])
+                Button(model.isPaused ? "Resume Indexing" : "Index") { model.startIndexing() }
+                    .keyboardShortcut("i", modifiers: [.command, .shift])
                     .disabled(model.isIndexing)
+                Button("Pause Indexing") { model.pauseIndexing() }
+                    .disabled(!model.isIndexing)
             }
         }
 

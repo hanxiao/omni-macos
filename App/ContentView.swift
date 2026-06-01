@@ -61,7 +61,7 @@ struct ContentView: View {
         if model.indexedFiles == 0 {
             CenteredStatus(symbol: "square.stack.3d.up", title: "Nothing indexed yet",
                            subtitle: "Index your folders to start searching.", showSpinner: false,
-                           action: ("Index Now", { model.startIndexing() }))
+                           action: ("Index", { model.startIndexing() }))
         } else if model.query.isEmpty {
             CenteredStatus(symbol: "sparkle.magnifyingglass", title: "Search \(model.indexedFiles) files",
                            subtitle: "Type a phrase. Results are ranked by meaning, across images, video, audio, and text.", showSpinner: false)
@@ -109,12 +109,16 @@ struct ContentView: View {
             .help("View as list or gallery")
         }
         ToolbarItem(placement: .primaryAction) {
-            if model.isIndexing {
-                Button { model.cancelIndexing() } label: { Image(systemName: "stop.circle") }
-                    .help("Stop indexing")
-            } else {
+            switch model.indexState {
+            case .indexing:
+                Button { model.pauseIndexing() } label: { Image(systemName: "pause.circle") }
+                    .help("Pause indexing")
+            case .paused:
+                Button { model.startIndexing() } label: { Image(systemName: "play.circle") }
+                    .help("Resume indexing")
+            case .idle:
                 Button { model.startIndexing() } label: { Image(systemName: "arrow.clockwise") }
-                    .help("Reindex (\u{21E7}\u{2318}R)")
+                    .help("Index")
             }
         }
     }
