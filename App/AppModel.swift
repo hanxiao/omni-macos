@@ -52,8 +52,15 @@ final class AppModel: ObservableObject {
     @Published var rawResults: [SearchHit] = []   // kind/folder/ext/date filtered, score-sorted
     @Published var searching = false
     @Published var selection: String?             // selected result path (lifted out of the view)
+    private var lastQueryVector: [Float]?
 
     var canIndex: Bool { phase == .ready && !roots.isEmpty }
+
+    /// Matching passages (ranked chunks) of a file for the current query.
+    func passages(for path: String) -> [ChunkHit] {
+        guard let store, let v = lastQueryVector else { return [] }
+        return store.rankChunks(v, path: path)
+    }
 
     @Published var indexState: IndexState = .idle
     var isIndexing: Bool { indexState == .indexing }
@@ -372,6 +379,7 @@ final class AppModel: ObservableObject {
             let hits = store.search(vec, filter: filter, topK: 60)
             await MainActor.run {
                 guard token == self.searchToken else { return }
+                self.lastQueryVector = vec
                 self.rawResults = hits
                 if let sel = self.selection, !hits.contains(where: { $0.path == sel }) { self.selection = nil }
                 self.searching = false

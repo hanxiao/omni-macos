@@ -8,8 +8,14 @@ struct ResultsList<Footer: View>: View {
     let results: [SearchHit]
     @ViewBuilder var footer: Footer
     @State private var previewURL: URL?
+    @State private var expanded: Set<String> = []
+    @State private var passagesCache: [String: [ChunkHit]] = [:]
 
     private var selectedURL: URL? { model.selection.map { URL(fileURLWithPath: $0) } }
+    private func toggle(_ path: String) {
+        if expanded.contains(path) { expanded.remove(path) }
+        else { expanded.insert(path); passagesCache[path] = model.passages(for: path) }
+    }
 
     var body: some View {
         Group {
@@ -28,15 +34,24 @@ struct ResultsList<Footer: View>: View {
     private var listView: some View {
         List(selection: $model.selection) {
             ForEach(results, id: \.path) { hit in
-                ResultRow(hit: hit)
-                    .tag(hit.path)
-                    .draggable(URL(fileURLWithPath: hit.path))
-                    .onTapGesture(count: 2) { open(hit.path) }
-                    .contextMenu { menu(hit.path) }
+                VStack(spacing: 0) {
+                    ResultRow(hit: hit,
+                              expandable: hit.kind == FileKind.text.rawValue,
+                              expanded: expanded.contains(hit.path),
+                              onToggle: { toggle(hit.path) })
+                        .draggable(URL(fileURLWithPath: hit.path))
+                        .onTapGesture(count: 2) { open(hit.path) }
+                    if expanded.contains(hit.path) {
+                        PassagesView(passages: passagesCache[hit.path] ?? [])
+                    }
+                }
+                .tag(hit.path)
+                .contextMenu { menu(hit.path) }
             }
             footer.listRowSeparator(.hidden)
         }
         .listStyle(.inset)
+        .onChange(of: results.map(\.path)) { _, _ in expanded = []; passagesCache = [:] }
     }
 
     // MARK: - Gallery
@@ -74,6 +89,9 @@ struct ResultsList<Footer: View>: View {
 
 struct ResultRow: View {
     let hit: SearchHit
+    var expandable: Bool = false
+    var expanded: Bool = false
+    var onToggle: (() -> Void)? = nil
     private var url: URL { URL(fileURLWithPath: hit.path) }
 
     var body: some View {
@@ -97,8 +115,49 @@ struct ResultRow: View {
             }
             Spacer()
             Text(scoreText(hit.score)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            if expandable {
+                Button { onToggle?() } label: {
+                    Image(systemName: "chevron.right")
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+                .help("Show matching passages")
+            }
         }
         .padding(.vertical, 4)
+    }
+}
+
+/// The matching passages (chunks) of a file, each shown as an excerpt with a top/bottom
+/// alpha fade to signal there is more text before and after it in the file.
+struct PassagesView: View {
+    let passages: [ChunkHit]
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(passages) { p in
+                HStack(alignment: .top, spacing: 8) {
+                    RoundedRectangle(cornerRadius: 1.5).fill(.quaternary).frame(width: 3)
+                    Text(p.snippet)
+                        .font(.callout).foregroundStyle(.secondary)
+                        .lineLimit(3)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Text(scoreText(p.score)).font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
+                }
+                .mask(LinearGradient(stops: [
+                    .init(color: .clear, location: 0),
+                    .init(color: .black, location: 0.22),
+                    .init(color: .black, location: 0.78),
+                    .init(color: .clear, location: 1),
+                ], startPoint: .top, endPoint: .bottom))
+            }
+            if passages.isEmpty {
+                Text("No passages").font(.caption).foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.leading, 52)
+        .padding(.trailing, 12)
+        .padding(.bottom, 8)
     }
 }
 

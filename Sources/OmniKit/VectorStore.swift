@@ -32,6 +32,14 @@ public struct SearchHit: Sendable {
     public let modified: Double
 }
 
+/// One matching passage (chunk) within a file.
+public struct ChunkHit: Sendable, Identifiable {
+    public let chunkIndex: Int
+    public let score: Float
+    public let snippet: String
+    public var id: Int { chunkIndex }
+}
+
 /// Signature used for incremental change detection.
 public struct StoredFile: Sendable {
     public let modified: Double
@@ -260,6 +268,29 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     public func kinds() -> Set<String> { queue.sync { Set(rows.map { $0.kind }) } }
+
+    /// Rank a single file's chunks against the query (for the "which passage matched" UI).
+    public func rankChunks(_ query: [Float], path: String, topK: Int = 6) -> [ChunkHit] {
+        queue.sync {
+            guard dim > 0, query.count == dim else { return [] }
+            var hits: [ChunkHit] = []
+            let d = vDSP_Length(dim)
+            query.withUnsafeBufferPointer { q in
+                guard let qp = q.baseAddress else { return }
+                for i in 0 ..< rows.count where rows[i].path == path {
+                    var dot: Float = 0
+                    vectors[i].withUnsafeBufferPointer { v in
+                        if let vp = v.baseAddress { vDSP_dotpr(vp, 1, qp, 1, &dot, d) }
+                    }
+                    hits.append(ChunkHit(chunkIndex: rows[i].chunkIndex, score: dot, snippet: rows[i].snippet))
+                }
+            }
+            return hits.sorted { $0.score > $1.score }.prefix(topK).map { $0 }
+        }
+    }
+
+    /// Number of indexed chunks for a path.
+    public func chunkCount(path: String) -> Int { queue.sync { rows.reduce(0) { $1.path == path ? $0 + 1 : $0 } } }
 
     public func extensions() -> Set<String> {
         queue.sync {
