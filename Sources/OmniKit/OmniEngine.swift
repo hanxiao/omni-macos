@@ -3,8 +3,21 @@ import CoreGraphics
 import MLX
 import Tokenizers
 
+/// The jina-embeddings-v5-omni model variants the app can run.
+public enum ModelVariant: String, CaseIterable, Sendable {
+    case small, nano
+    public var title: String { self == .small ? "Omni Small" : "Omni Nano" }
+    public var detail: String { self == .small ? "~1.7B, higher quality" : "smaller, faster, lighter" }
+    var hfFragment: String { "models--jinaai--jina-embeddings-v5-omni-\(rawValue)-mlx" }
+}
+
 /// Locates a usable model directory (one containing model.safetensors).
 public enum ModelLocator {
+    private static let hubRoots = [
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cache/huggingface/hub"),
+        URL(fileURLWithPath: "/Volumes/One Touch/ai-models/huggingface/hub"),
+    ]
+
     public static func candidates() -> [URL] {
         var out: [URL] = []
         if let env = ProcessInfo.processInfo.environment["OMNI_MODEL_DIR"] {
@@ -15,21 +28,46 @@ public enum ModelLocator {
             out.append(appSup.appendingPathComponent("Omni/model"))
         }
         out.append(URL(fileURLWithPath: "/private/tmp/omni-model"))
-        // HuggingFace cache layout fallback.
-        let home = fm.homeDirectoryForCurrentUser
-        let hub = home.appendingPathComponent(".cache/huggingface/hub/models--jinaai--jina-embeddings-v5-omni-small-mlx/snapshots")
-        if let snaps = try? fm.contentsOfDirectory(at: hub, includingPropertiesForKeys: nil) {
-            out.append(contentsOf: snaps)
+        out.append(contentsOf: variantSnapshots(.small))
+        return out
+    }
+
+    public static func resolve() -> URL? { firstWithWeights(candidates()) }
+
+    /// Resolve a specific variant's model directory (HuggingFace cache / App Support).
+    public static func resolve(variant: ModelVariant) -> URL? {
+        let fm = FileManager.default
+        var dirs: [URL] = []
+        if let appSup = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false) {
+            dirs.append(appSup.appendingPathComponent("Omni/\(variant.rawValue)"))
+        }
+        if variant == .small { dirs.append(URL(fileURLWithPath: "/private/tmp/omni-model")) }
+        dirs.append(contentsOf: variantSnapshots(variant))
+        return firstWithWeights(dirs)
+    }
+
+    /// Which variants are installed and where.
+    public static func installedVariants() -> [ModelVariant: URL] {
+        var out: [ModelVariant: URL] = [:]
+        for v in ModelVariant.allCases { if let u = resolve(variant: v) { out[v] = u } }
+        return out
+    }
+
+    private static func variantSnapshots(_ variant: ModelVariant) -> [URL] {
+        let fm = FileManager.default
+        var out: [URL] = []
+        for hub in hubRoots {
+            let snaps = hub.appendingPathComponent("\(variant.hfFragment)/snapshots")
+            if let dirs = try? fm.contentsOfDirectory(at: snaps, includingPropertiesForKeys: nil) {
+                out.append(contentsOf: dirs)
+            }
         }
         return out
     }
 
-    public static func resolve() -> URL? {
+    private static func firstWithWeights(_ dirs: [URL]) -> URL? {
         let fm = FileManager.default
-        for dir in candidates() {
-            if fm.fileExists(atPath: dir.appendingPathComponent("model.safetensors").path) { return dir }
-        }
-        return nil
+        return dirs.first { fm.fileExists(atPath: $0.appendingPathComponent("model.safetensors").path) }
     }
 }
 
@@ -39,6 +77,18 @@ public enum ModelLocator {
 /// produced vectors changes (model, prefix, pooling) so an existing index can be
 /// flagged obsolete and reindexed. "docprefix" = media carries the Document: prefix.
 public let omniEmbeddingVersion = "omni-small-1-docprefix"
+
+/// Hard-cap MLX memory usage (bytes). 0 = library default (no explicit cap). The
+/// buffer cache is set to half the limit. Takes effect immediately and globally.
+public func omniSetMemoryLimit(_ bytes: Int) {
+    if bytes > 0 {
+        MLX.Memory.memoryLimit = bytes
+        MLX.Memory.cacheLimit = max(bytes / 2, 256 * 1024 * 1024)
+    }
+}
+
+/// Physical RAM in bytes (for choosing a sensible memory-limit slider range).
+public func omniPhysicalMemory() -> Int { Int(ProcessInfo.processInfo.physicalMemory) }
 
 public final class OmniEngine: Embedder, @unchecked Sendable {
     private let textEncoder: OmniTextEncoder

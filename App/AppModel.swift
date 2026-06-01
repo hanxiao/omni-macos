@@ -85,7 +85,13 @@ final class AppModel: ObservableObject {
     // Indexing performance settings.
     @Published var maxImageDimension: Int = 1568 { didSet { persistPerf() } }
     @Published var maxVideoFrames: Int = 6 { didSet { persistPerf() } }
-    @Published var gpuCacheMB: Int = 0 { didSet { persistPerf() } }   // 0 = unlimited
+    /// Hard memory cap in GB (0 = unlimited). Applied to MLX immediately.
+    @Published var maxMemoryGB: Double = 0 { didSet { persistPerf(); applyMemoryLimit() } }
+    var physicalMemoryGB: Double { Double(omniPhysicalMemory()) / 1_000_000_000 }
+
+    // Model variant (small / nano).
+    @Published var modelVariant: ModelVariant = .small
+    @Published var installedVariants: [ModelVariant: URL] = [:]
 
     // Index-time minimum thresholds (0 = no minimum).
     @Published var minImageDimension: Int = 0 { didSet { persistPerf() } }
@@ -157,7 +163,7 @@ final class AppModel: ObservableObject {
         let d = UserDefaults.standard
         if d.object(forKey: "omni.maxImageDim") != nil { maxImageDimension = max(512, d.integer(forKey: "omni.maxImageDim")) }
         if d.object(forKey: "omni.maxVideoFrames") != nil { maxVideoFrames = max(1, d.integer(forKey: "omni.maxVideoFrames")) }
-        if d.object(forKey: "omni.gpuCacheMB") != nil { gpuCacheMB = max(0, d.integer(forKey: "omni.gpuCacheMB")) }
+        if d.object(forKey: "omni.maxMemoryGB") != nil { maxMemoryGB = max(0, d.double(forKey: "omni.maxMemoryGB")) }
         if d.object(forKey: "omni.minImageDim") != nil { minImageDimension = max(0, d.integer(forKey: "omni.minImageDim")) }
         if d.object(forKey: "omni.minAudioSec") != nil { minAudioSeconds = max(0, d.double(forKey: "omni.minAudioSec")) }
         if d.object(forKey: "omni.minVideoSec") != nil { minVideoSeconds = max(0, d.double(forKey: "omni.minVideoSec")) }
@@ -167,7 +173,7 @@ final class AppModel: ObservableObject {
         let d = UserDefaults.standard
         d.set(maxImageDimension, forKey: "omni.maxImageDim")
         d.set(maxVideoFrames, forKey: "omni.maxVideoFrames")
-        d.set(gpuCacheMB, forKey: "omni.gpuCacheMB")
+        d.set(maxMemoryGB, forKey: "omni.maxMemoryGB")
         d.set(minImageDimension, forKey: "omni.minImageDim")
         d.set(minAudioSeconds, forKey: "omni.minAudioSec")
         d.set(minVideoSeconds, forKey: "omni.minVideoSec")
@@ -214,12 +220,27 @@ final class AppModel: ObservableObject {
 
     // MARK: - Bootstrap
 
+    private func applyMemoryLimit() {
+        omniSetMemoryLimit(maxMemoryGB > 0 ? Int(maxMemoryGB * 1_000_000_000) : 0)
+    }
+
+    /// Switch model variant (small/nano). Reloads the engine; the index is flagged
+    /// out-of-date and can be rebuilt.
+    func switchVariant(_ v: ModelVariant) {
+        guard v != modelVariant, let dir = ModelLocator.resolve(variant: v) else { return }
+        modelVariant = v
+        setModelDir(dir)
+    }
+
     private func bootstrap() async {
+        applyMemoryLimit()
+        installedVariants = ModelLocator.installedVariants()
         guard let dir = resolvedModelDir() else { phase = .noModel; return }
         modelPath = dir.path
+        modelVariant = dir.path.contains("-nano-") ? .nano : .small
         do {
             let store = try VectorStore(dbURL: try Self.indexURL())
-            let engine = try await OmniEngine(modelDir: dir, gpuCacheBytes: gpuCacheMB > 0 ? gpuCacheMB * 1_000_000 : 0)
+            let engine = try await OmniEngine(modelDir: dir)
             self.store = store
             self.engine = engine
             self.indexer = Indexer(store: store, embedder: engine)

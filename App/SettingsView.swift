@@ -86,6 +86,7 @@ private struct FiltersTab: View {
 
 private struct PerformanceTab: View {
     @EnvironmentObject var model: AppModel
+    private var memoryCeiling: Double { max(8, min(model.physicalMemoryGB.rounded(), 128)) }
     var body: some View {
         Form {
             Section {
@@ -103,17 +104,19 @@ private struct PerformanceTab: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
-                Picker("GPU cache limit", selection: $model.gpuCacheMB) {
-                    Text("Unlimited").tag(0)
-                    Text("2 GB").tag(2048)
-                    Text("4 GB").tag(4096)
-                    Text("8 GB").tag(8192)
-                    Text("16 GB").tag(16384)
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("Maximum memory")
+                        Spacer()
+                        Text(model.maxMemoryGB == 0 ? "Unlimited" : "\(Int(model.maxMemoryGB)) GB")
+                            .foregroundStyle(.secondary).monospacedDigit()
+                    }
+                    Slider(value: $model.maxMemoryGB, in: 0 ... memoryCeiling, step: 1)
                 }
             } header: {
                 Text("Memory")
             } footer: {
-                Text("Caps the MLX buffer cache to bound memory during long indexing runs. Applies after the model reloads (relaunch).")
+                Text("Hard cap on the model's GPU/unified memory, enforced by MLX immediately. 0 = unlimited. The model needs a few GB resident, so keep this above ~4 GB. (Embeddings run one at a time, so there is no batch size to trade off yet.)")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -161,10 +164,24 @@ private struct IndexTab: View {
             } header: {
                 Text("Database location")
             }
-            Section("Model") {
-                LabeledContent("Engine", value: "jina-embeddings-v5-omni-small")
+            Section {
+                Picker("Variant", selection: Binding(
+                    get: { model.modelVariant },
+                    set: { model.switchVariant($0) }
+                )) {
+                    ForEach(ModelVariant.allCases, id: \.self) { v in
+                        Text(model.installedVariants[v] != nil ? v.title : "\(v.title) (not installed)").tag(v)
+                    }
+                }
                 LabeledContent("Audio", value: model.audioSupported ? "Available" : "Unavailable")
                 Button("Change Model Folder...") { pickModel() }
+            } header: {
+                Text("Model")
+            } footer: {
+                Text(model.installedVariants[.nano] == nil
+                     ? "Omni Nano is not installed. Add it to ~/Library/Application Support/Omni/nano or the HuggingFace cache to switch. Switching variant rebuilds the index."
+                     : "Switching variant rebuilds the index.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
