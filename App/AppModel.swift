@@ -297,7 +297,7 @@ final class AppModel: ObservableObject {
         searching = true
         let filter = currentFilter()
         Task.detached(priority: .userInitiated) {
-            let vec = engine.embedText(q, as: .query)
+            let vec = engine.embedQuery(q)   // high priority: jumps ahead of indexing
             let hits = store.search(vec, filter: filter, topK: 60)
             await MainActor.run {
                 guard token == self.searchToken else { return }

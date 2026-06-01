@@ -44,7 +44,12 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     private let textEncoder: OmniTextEncoder
     private let imageEncoder: OmniImageEncoder?
     private let audioEncoder: OmniAudioEncoder?
-    private let lock = NSLock()
+    // Priority-aware serializer: MLX work runs one at a time, but a high-priority
+    // query (interactive search) jumps ahead of pending low-priority indexing work,
+    // so search stays responsive while indexing runs.
+    private let cond = NSCondition()
+    private var busy = false
+    private var highWaiting = 0
     /// Media is indexed as documents -> the "Document: " prefix (official model card).
     private let docPrefix: [Int]
     public let dim: Int
@@ -79,27 +84,44 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         return try await OmniEngine(modelDir: dir)
     }
 
+    /// Serialize MLX work. `highPriority` calls run before any waiting low-priority
+    /// (indexing) calls; a low-priority call also yields whenever a high-priority call
+    /// is queued, so a search waits at most one in-flight embed.
+    private func run<T>(highPriority: Bool, _ work: () -> T) -> T {
+        cond.lock()
+        if highPriority { highWaiting += 1 }
+        while busy || (!highPriority && highWaiting > 0) { cond.wait() }
+        busy = true
+        if highPriority { highWaiting -= 1 }
+        cond.unlock()
+        let result = work()
+        cond.lock(); busy = false; cond.broadcast(); cond.unlock()
+        return result
+    }
+
+    /// Embed a query for interactive search - runs at high priority.
+    public func embedQuery(_ text: String) -> [Float] {
+        run(highPriority: true) { textEncoder.encode(text, as: .query) }
+    }
+
+    // Embedder conformance - used by the indexer, so these run at low (indexing) priority.
     public func embedText(_ text: String, as type: OmniInputType) -> [Float] {
-        lock.lock(); defer { lock.unlock() }
-        return textEncoder.encode(text, as: type)
+        run(highPriority: type == .query) { textEncoder.encode(text, as: type) }
     }
 
     public func embedImage(_ image: CGImage) -> [Float]? {
         guard let enc = imageEncoder else { return nil }
-        lock.lock(); defer { lock.unlock() }
-        return enc.encode(image, prefixIds: docPrefix)
+        return run(highPriority: false) { enc.encode(image, prefixIds: docPrefix) }
     }
 
     public func embedVideoFrames(_ frames: [CGImage]) -> [Float]? {
         guard let enc = imageEncoder, !frames.isEmpty else { return nil }
-        lock.lock(); defer { lock.unlock() }
-        return enc.encodeVideo(frames, prefixIds: docPrefix)
+        return run(highPriority: false) { enc.encodeVideo(frames, prefixIds: docPrefix) }
     }
 
     public func embedAudio(_ url: URL) -> [Float]? {
         guard let enc = audioEncoder else { return nil }
-        lock.lock(); defer { lock.unlock() }
-        return enc.encode(url, prefixIds: docPrefix)
+        return run(highPriority: false) { enc.encode(url, prefixIds: docPrefix) }
     }
 
     /// Exposed for parity tests: embed already-preprocessed inputs.
