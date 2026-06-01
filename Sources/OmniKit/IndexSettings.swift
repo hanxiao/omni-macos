@@ -9,6 +9,12 @@ public struct IndexSettings: Sendable, Equatable {
     /// Frames sampled per video.
     public var maxVideoFrames: Int = 6
 
+    // Index-time minimums: files below these are skipped (0 = no minimum).
+    public var minImageDimension: Int = 0   // largest image side, px
+    public var minAudioSeconds: Double = 0
+    public var minVideoSeconds: Double = 0
+    public var minTextChars: Int = 0
+
     public init(enabledKinds: Set<FileKind> = [.image, .video, .audio]) {
         self.enabledKinds = enabledKinds
     }

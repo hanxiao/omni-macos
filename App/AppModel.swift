@@ -84,6 +84,19 @@ final class AppModel: ObservableObject {
     @Published var maxVideoFrames: Int = 6 { didSet { persistPerf() } }
     @Published var gpuCacheMB: Int = 0 { didSet { persistPerf() } }   // 0 = unlimited
 
+    // Index-time minimum thresholds (0 = no minimum).
+    @Published var minImageDimension: Int = 0 { didSet { persistPerf() } }
+    @Published var minAudioSeconds: Double = 0 { didSet { persistPerf() } }
+    @Published var minVideoSeconds: Double = 0 { didSet { persistPerf() } }
+    @Published var minTextChars: Int = 0 { didSet { persistPerf() } }
+
+    // Index storage info (for the Settings > Model tab).
+    @Published var dbPath = ""
+    @Published var dbSizeBytes: Int64 = 0
+    @Published var lastIndexed: Date?
+    @Published var indexObsolete = false
+    let embeddingVersion = omniEmbeddingVersion
+
     private var engine: OmniEngine?
     private var store: VectorStore?
     private var indexer: Indexer?
@@ -132,12 +145,20 @@ final class AppModel: ObservableObject {
         if d.object(forKey: "omni.maxImageDim") != nil { maxImageDimension = max(512, d.integer(forKey: "omni.maxImageDim")) }
         if d.object(forKey: "omni.maxVideoFrames") != nil { maxVideoFrames = max(1, d.integer(forKey: "omni.maxVideoFrames")) }
         if d.object(forKey: "omni.gpuCacheMB") != nil { gpuCacheMB = max(0, d.integer(forKey: "omni.gpuCacheMB")) }
+        if d.object(forKey: "omni.minImageDim") != nil { minImageDimension = max(0, d.integer(forKey: "omni.minImageDim")) }
+        if d.object(forKey: "omni.minAudioSec") != nil { minAudioSeconds = max(0, d.double(forKey: "omni.minAudioSec")) }
+        if d.object(forKey: "omni.minVideoSec") != nil { minVideoSeconds = max(0, d.double(forKey: "omni.minVideoSec")) }
+        if d.object(forKey: "omni.minTextChars") != nil { minTextChars = max(0, d.integer(forKey: "omni.minTextChars")) }
     }
     private func persistPerf() {
         let d = UserDefaults.standard
         d.set(maxImageDimension, forKey: "omni.maxImageDim")
         d.set(maxVideoFrames, forKey: "omni.maxVideoFrames")
         d.set(gpuCacheMB, forKey: "omni.gpuCacheMB")
+        d.set(minImageDimension, forKey: "omni.minImageDim")
+        d.set(minAudioSeconds, forKey: "omni.minAudioSec")
+        d.set(minVideoSeconds, forKey: "omni.minVideoSec")
+        d.set(minTextChars, forKey: "omni.minTextChars")
     }
 
     // MARK: - Filters
@@ -203,6 +224,12 @@ final class AppModel: ObservableObject {
         indexedChunks = store.count
         indexedKinds = store.kinds()
         indexedExts = store.extensions().sorted()
+        dbPath = store.dbURL.path
+        dbSizeBytes = store.sizeBytes()
+        if let ts = store.metaGet("last_indexed"), let t = Double(ts) { lastIndexed = Date(timeIntervalSince1970: t) }
+        let storedVersion = store.metaGet("embedding_version")
+        // Obsolete if the index was built by a different (or unstamped) embedding version.
+        indexObsolete = indexedFiles > 0 && storedVersion != embeddingVersion
     }
 
     static func indexURL() throws -> URL {
@@ -259,12 +286,22 @@ final class AppModel: ObservableObject {
         var settings = self.settings
         settings.maxImageDimension = maxImageDimension
         settings.maxVideoFrames = maxVideoFrames
+        settings.minImageDimension = minImageDimension
+        settings.minAudioSeconds = minAudioSeconds
+        settings.minVideoSeconds = minVideoSeconds
+        settings.minTextChars = minTextChars
+        let version = embeddingVersion
         Task.detached(priority: .utility) {
             indexer.index(roots: roots, settings: settings) { p in
                 Task { @MainActor in
                     self.progress = p
+                    if p.scanned % 25 == 0 { self.indexedFiles = store.fileCount }  // live count
                     if p.done {
                         self.indexState = p.cancelled ? .paused : .idle
+                        if !p.cancelled {
+                            store.metaSet("embedding_version", version)
+                            store.metaSet("last_indexed", "\(Date().timeIntervalSince1970)")
+                        }
                         self.refreshIndexStats(store)
                         if !self.query.isEmpty { self.search() }
                     }

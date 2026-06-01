@@ -6,10 +6,11 @@ struct SettingsView: View {
     var body: some View {
         TabView {
             ContentTypesTab().tabItem { Label("Content", systemImage: "square.grid.2x2") }
+            FiltersTab().tabItem { Label("Filters", systemImage: "line.3.horizontal.decrease") }
             PerformanceTab().tabItem { Label("Performance", systemImage: "speedometer") }
-            ModelTab().tabItem { Label("Model", systemImage: "cpu") }
+            IndexTab().tabItem { Label("Index", systemImage: "cylinder.split.1x2") }
         }
-        .frame(width: 460, height: 320)
+        .frame(width: 480, height: 360)
     }
 }
 
@@ -40,6 +41,49 @@ private struct ContentTypesTab: View {
     }
 }
 
+private struct FiltersTab: View {
+    @EnvironmentObject var model: AppModel
+    var body: some View {
+        Form {
+            Section {
+                Picker("Minimum image size", selection: $model.minImageDimension) {
+                    Text("No minimum").tag(0)
+                    Text("64 px").tag(64)
+                    Text("128 px").tag(128)
+                    Text("256 px").tag(256)
+                    Text("512 px").tag(512)
+                }
+                Picker("Minimum audio length", selection: $model.minAudioSeconds) {
+                    Text("No minimum").tag(0.0)
+                    Text("1 second").tag(1.0)
+                    Text("3 seconds").tag(3.0)
+                    Text("5 seconds").tag(5.0)
+                    Text("10 seconds").tag(10.0)
+                }
+                Picker("Minimum video length", selection: $model.minVideoSeconds) {
+                    Text("No minimum").tag(0.0)
+                    Text("1 second").tag(1.0)
+                    Text("3 seconds").tag(3.0)
+                    Text("5 seconds").tag(5.0)
+                    Text("10 seconds").tag(10.0)
+                }
+                Picker("Minimum text length", selection: $model.minTextChars) {
+                    Text("No minimum").tag(0)
+                    Text("16 characters").tag(16)
+                    Text("64 characters").tag(64)
+                    Text("256 characters").tag(256)
+                }
+            } header: {
+                Text("Skip small files")
+            } footer: {
+                Text("Files below these thresholds are not indexed - useful for ignoring icons, thumbnails, and very short clips. Applies on the next index.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+    }
+}
+
 private struct PerformanceTab: View {
     @EnvironmentObject var model: AppModel
     var body: some View {
@@ -55,7 +99,7 @@ private struct PerformanceTab: View {
             } header: {
                 Text("Throughput")
             } footer: {
-                Text("Large images are downscaled before embedding; the model resizes to about 1.3 MP regardless, so a smaller cap speeds indexing with no quality loss. Fewer video frames index faster.")
+                Text("Large images are downscaled before embedding; the model resizes to about 1.3 MP regardless, so a smaller cap speeds indexing with no quality loss.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
@@ -77,29 +121,55 @@ private struct PerformanceTab: View {
     }
 }
 
-private struct ModelTab: View {
+private struct IndexTab: View {
     @EnvironmentObject var model: AppModel
     var body: some View {
         Form {
-            Section("Model") {
-                LabeledContent("Engine", value: "jina-embeddings-v5-omni-small")
-                LabeledContent("Runtime", value: "MLX-Swift (in-process)")
-                LabeledContent("Image embedding", value: model.supportsImages ? "Available" : "Unavailable")
-                LabeledContent("Audio embedding", value: model.audioSupported ? "Available" : "Unavailable")
+            if model.indexObsolete {
+                Section {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Index is out of date").fontWeight(.medium)
+                            Text("It was built with an older embedding version. Reindex so results stay accurate.")
+                                .font(.caption).foregroundStyle(.secondary)
+                            Button("Reindex Now") { model.startIndexing() }
+                                .controlSize(.small)
+                                .disabled(model.isIndexing)
+                        }
+                    }
+                }
+            }
+            Section("Storage") {
+                LabeledContent("Indexed files", value: "\(model.indexedFiles)")
+                LabeledContent("Embeddings", value: "\(model.indexedChunks)")
+                LabeledContent("Size", value: ByteCountFormatter.string(fromByteCount: model.dbSizeBytes, countStyle: .file))
+                if let last = model.lastIndexed {
+                    LabeledContent("Last indexed", value: last.formatted(.relative(presentation: .named)))
+                }
+                LabeledContent("Embedding version", value: model.embeddingVersion)
             }
             Section {
-                if !model.modelPath.isEmpty {
-                    Text(model.modelPath).font(.caption.monospaced()).foregroundStyle(.secondary)
-                        .lineLimit(2).truncationMode(.middle).textSelection(.enabled)
+                if !model.dbPath.isEmpty {
+                    Text(model.dbPath).font(.caption.monospaced()).foregroundStyle(.secondary)
+                        .lineLimit(3).truncationMode(.middle).textSelection(.enabled)
                 }
-                Button("Change Model Folder...") { pick() }
+                Button("Reveal in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.dbPath)])
+                }
+                .disabled(model.dbPath.isEmpty)
             } header: {
-                Text("Location")
+                Text("Database location")
+            }
+            Section("Model") {
+                LabeledContent("Engine", value: "jina-embeddings-v5-omni-small")
+                LabeledContent("Audio", value: model.audioSupported ? "Available" : "Unavailable")
+                Button("Change Model Folder...") { pickModel() }
             }
         }
         .formStyle(.grouped)
     }
-    private func pick() {
+    private func pickModel() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true; panel.canChooseFiles = false
         if panel.runModal() == .OK, let url = panel.url { model.setModelDir(url) }

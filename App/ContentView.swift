@@ -58,7 +58,10 @@ struct ContentView: View {
     }
 
     @ViewBuilder private var emptyState: some View {
-        if model.indexedFiles == 0 {
+        if model.isIndexing {
+            CenteredStatus(symbol: "circle.dotted", title: "Indexing\u{2026}",
+                           subtitle: "\(model.progress.embedded) files added so far.", showSpinner: true)
+        } else if model.indexedFiles == 0 {
             CenteredStatus(symbol: "square.stack.3d.up", title: "Nothing indexed yet",
                            subtitle: "Index your folders to start searching.", showSpinner: false,
                            action: ("Index", { model.startIndexing() }))
@@ -91,6 +94,10 @@ struct ContentView: View {
     // MARK: - Toolbar
 
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
+        ToolbarItem(placement: .primaryAction) {
+            SettingsLink { Image(systemName: "gearshape") }
+                .help("Settings (\u{2318},)")
+        }
         ToolbarItem(placement: .primaryAction) {
             Menu {
                 Picker("Sort By", selection: $model.sortOrder) {

@@ -87,6 +87,7 @@ struct ResultRow: View {
                 }
                 HStack(spacing: 5) {
                     KindGlyph(kind: hit.kind)
+                    MediaInfoLabel(path: hit.path, kind: hit.kind, separator: true)
                     Text(prettyDir(url)).lineLimit(1).truncationMode(.middle)
                     if hit.modified > 0 {
                         Text("·")
@@ -121,9 +122,52 @@ struct ResultGridItem: View {
                 }
             Text(url.lastPathComponent).font(.caption).lineLimit(2)
                 .multilineTextAlignment(.center).frame(maxWidth: 150)
+            MediaInfoLabel(path: hit.path, kind: hit.kind, separator: false)
+                .font(.caption2).foregroundStyle(.tertiary)
         }
         .padding(6)
     }
+}
+
+/// Original resolution (images) or duration (audio/video), loaded off the main thread.
+struct MediaInfoLabel: View {
+    let path: String
+    let kind: String
+    var separator: Bool
+    @State private var text: String?
+
+    var body: some View {
+        if let text {
+            HStack(spacing: 5) {
+                Text(text)
+                if separator { Text("\u{00B7}") }
+            }
+        } else {
+            Color.clear.frame(width: 0, height: 0).task(id: path) { text = await load() }
+        }
+    }
+
+    private func load() async -> String? {
+        let p = path, k = kind
+        return await Task.detached(priority: .utility) { () -> String? in
+            let url = URL(fileURLWithPath: p)
+            switch FileKind(rawValue: k) {
+            case .image:
+                if let s = FileExtractor.imagePixelSize(url) { return "\(s.width)\u{00D7}\(s.height)" }
+            case .video, .audio:
+                if let d = FileExtractor.mediaDuration(url) { return formatDuration(d) }
+            default:
+                return nil
+            }
+            return nil
+        }.value
+    }
+}
+
+private func formatDuration(_ seconds: Double) -> String {
+    let s = Int(seconds.rounded())
+    let h = s / 3600, m = (s % 3600) / 60, sec = s % 60
+    return h > 0 ? String(format: "%d:%02d:%02d", h, m, sec) : String(format: "%d:%02d", m, sec)
 }
 
 struct KindGlyph: View {

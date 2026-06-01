@@ -156,6 +156,21 @@ public enum FileExtractor {
 
     /// Decode an image, downsampled so the largest side is <= maxDimension. The vision
     /// model resizes to <= ~1.3MP, so decoding full-resolution photos is wasted work.
+    /// Pixel dimensions of an image without decoding it (reads only metadata).
+    public static func imagePixelSize(_ url: URL) -> (width: Int, height: Int)? {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+              let w = props[kCGImagePropertyPixelWidth] as? Int,
+              let h = props[kCGImagePropertyPixelHeight] as? Int else { return nil }
+        return (w, h)
+    }
+
+    /// Duration in seconds of an audio/video file, or nil.
+    public static func mediaDuration(_ url: URL) -> Double? {
+        let d = CMTimeGetSeconds(AVURLAsset(url: url).duration)
+        return d.isFinite && d > 0 ? d : nil
+    }
+
     static func loadImage(_ url: URL, maxDimension: Int = 1568) -> CGImage? {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let opts: [CFString: Any] = [

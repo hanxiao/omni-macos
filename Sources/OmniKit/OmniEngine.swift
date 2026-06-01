@@ -34,6 +34,11 @@ public enum ModelLocator {
 
 /// Public embedding facade: loads the model once and serializes MLX calls
 /// (MLX evaluation is not safe to run concurrently from multiple threads).
+/// Identifies the embedding construction. Bump when anything that changes the
+/// produced vectors changes (model, prefix, pooling) so an existing index can be
+/// flagged obsolete and reindexed. "docprefix" = media carries the Document: prefix.
+public let omniEmbeddingVersion = "omni-small-1-docprefix"
+
 public final class OmniEngine: Embedder, @unchecked Sendable {
     private let textEncoder: OmniTextEncoder
     private let imageEncoder: OmniImageEncoder?

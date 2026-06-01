@@ -60,12 +60,16 @@ public final class VectorStore: @unchecked Sendable {
     private struct Row { let path: String; let snippet: String; let kind: String; let chunkIndex: Int; let modified: Double; let vec: [Float] }
     private var rows: [Row] = []
 
+    public let dbURL: URL
+
     public init(dbURL: URL) throws {
+        self.dbURL = dbURL
         try FileManager.default.createDirectory(at: dbURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         guard sqlite3_open(dbURL.path, &db) == SQLITE_OK else {
             throw OmniError.store("open failed: \(String(cString: sqlite3_errmsg(db)))")
         }
         exec("PRAGMA journal_mode=WAL;")
+        exec("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);")
         exec("""
             CREATE TABLE IF NOT EXISTS chunks(
                 path TEXT NOT NULL,
@@ -170,6 +174,40 @@ public final class VectorStore: @unchecked Sendable {
 
     /// Distinct file kinds currently in the index (for populating filter chips).
     public func kinds() -> Set<String> { queue.sync { Set(rows.map { $0.kind }) } }
+
+    // MARK: - Metadata + stats
+
+    public func metaGet(_ key: String) -> String? {
+        queue.sync {
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_prepare_v2(db, "SELECT value FROM meta WHERE key = ?;", -1, &stmt, nil) == SQLITE_OK else { return nil }
+            sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT)
+            return sqlite3_step(stmt) == SQLITE_ROW ? String(cString: sqlite3_column_text(stmt, 0)) : nil
+        }
+    }
+
+    public func metaSet(_ key: String, _ value: String) {
+        queue.sync {
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?);", -1, &stmt, nil) == SQLITE_OK else { return }
+            sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(stmt, 2, value, -1, SQLITE_TRANSIENT)
+            sqlite3_step(stmt)
+        }
+    }
+
+    /// On-disk size of the database (including the WAL).
+    public func sizeBytes() -> Int64 {
+        let fm = FileManager.default
+        var total: Int64 = 0
+        for suffix in ["", "-wal", "-shm"] {
+            let url = URL(fileURLWithPath: dbURL.path + suffix)
+            if let size = try? fm.attributesOfItem(atPath: url.path)[.size] as? Int64 { total += size }
+        }
+        return total
+    }
 
     /// Distinct lowercased file extensions currently in the index.
     public func extensions() -> Set<String> {

@@ -127,6 +127,21 @@ public final class Indexer: @unchecked Sendable {
         let category = FileExtractor.kind(for: file.url) ?? .text
         let kind = category.rawValue
 
+        // Index-time minimums: skip files below the configured thresholds.
+        switch category {
+        case .image:
+            if active.minImageDimension > 0, let s = FileExtractor.imagePixelSize(file.url),
+               max(s.width, s.height) < active.minImageDimension { return [] }
+        case .video:
+            if active.minVideoSeconds > 0, let d = FileExtractor.mediaDuration(file.url),
+               d < active.minVideoSeconds { return [] }
+        case .audio:
+            if active.minAudioSeconds > 0, let d = FileExtractor.mediaDuration(file.url),
+               d < active.minAudioSeconds { return [] }
+        case .text:
+            break
+        }
+
         // Video and audio are single-vector embeddings (temporal video / audio tower).
         if category == .video {
             let frames = FileExtractor.videoFrames(file.url, maxFrames: active.maxVideoFrames, maxDimension: active.maxImageDimension)
@@ -145,6 +160,7 @@ public final class Indexer: @unchecked Sendable {
         case .empty:
             return []
         case .text(let text):
+            if active.minTextChars > 0, text.count < active.minTextChars { return [] }
             let pieces = chunk(text)
             var out: [IndexedChunk] = []
             for (i, piece) in pieces.enumerated() {
