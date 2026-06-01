@@ -2,24 +2,46 @@ import Foundation
 import PDFKit
 import CoreGraphics
 import ImageIO
+import AVFoundation
 import UniformTypeIdentifiers
 #if canImport(AppKit)
 import AppKit
 #endif
 
+/// Coarse file category used for indexing decisions and the search "kind" filter.
+public enum FileKind: String, Sendable, CaseIterable {
+    case image, video, audio, text
+
+    public var title: String {
+        switch self {
+        case .image: return "Images"
+        case .video: return "Video"
+        case .audio: return "Audio"
+        case .text: return "Text"
+        }
+    }
+
+    public var symbol: String {
+        switch self {
+        case .image: return "photo"
+        case .video: return "film"
+        case .audio: return "waveform"
+        case .text: return "doc.text"
+        }
+    }
+}
+
 /// Content pulled from a file, ready to embed.
 public enum ExtractedContent {
     case text(String)         // embed with the text tower
-    case images([CGImage])    // embed with the vision tower (scanned PDFs, image files)
+    case images([CGImage])    // embed with the vision tower (images, scanned PDFs, video frames)
     case empty
 }
 
 /// Pulls embeddable content from a file. Plain text and code are read directly;
-/// PDFs use PDFKit (falling back to page rasterization when there is no text
-/// layer, i.e. scans); office documents go through NSAttributedString; image
-/// files are handed to the vision path.
+/// PDFs use PDFKit (rasterizing scans); office docs go through NSAttributedString;
+/// image files and sampled video frames are handed to the vision path.
 public enum FileExtractor {
-    /// Extensions read as UTF-8/Latin-1 text directly.
     public static let textExtensions: Set<String> = [
         "txt", "text", "md", "markdown", "rst", "org", "tex",
         "csv", "tsv", "json", "jsonl", "ndjson", "yaml", "yml", "toml", "ini", "cfg", "conf",
@@ -32,19 +54,29 @@ public enum FileExtractor {
     public static let pdfExtensions: Set<String> = ["pdf"]
     public static let officeExtensions: Set<String> = ["rtf", "rtfd", "doc", "docx", "odt", "pages", "webarchive"]
     public static let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "heic", "heif", "webp"]
+    public static let videoExtensions: Set<String> = ["mp4", "mov", "m4v", "avi", "mkv", "webm", "mpg", "mpeg", "wmv", "flv", "3gp"]
+    public static let audioExtensions: Set<String> = ["mp3", "wav", "m4a", "aac", "flac", "ogg", "oga", "aiff", "aif", "caf", "wma"]
 
-    public static func isSupported(_ url: URL) -> Bool {
+    public static let maxTextBytes = 2_000_000
+    public static let maxScanPages = 8
+    public static let minCharsPerPage = 8
+    public static let maxVideoFrames = 6
+
+    /// File category from extension, or nil if unknown.
+    public static func kind(for url: URL) -> FileKind? {
         let ext = url.pathExtension.lowercased()
-        return textExtensions.contains(ext) || pdfExtensions.contains(ext)
-            || officeExtensions.contains(ext) || imageExtensions.contains(ext)
+        if imageExtensions.contains(ext) { return .image }
+        if videoExtensions.contains(ext) { return .video }
+        if audioExtensions.contains(ext) { return .audio }
+        if textExtensions.contains(ext) || pdfExtensions.contains(ext) || officeExtensions.contains(ext) { return .text }
+        return nil
     }
 
-    /// Maximum bytes read from a plain-text file (avoid pathological large logs).
-    public static let maxTextBytes = 2_000_000
-    /// Maximum PDF pages rasterized when a PDF has no text layer.
-    public static let maxScanPages = 8
-    /// A PDF with fewer than this many characters per page is treated as a scan.
-    public static let minCharsPerPage = 8
+    /// Is this file one of `enabledKinds` and extractable?
+    public static func isSupported(_ url: URL, enabledKinds: Set<FileKind>) -> Bool {
+        guard let k = kind(for: url) else { return false }
+        return enabledKinds.contains(k)
+    }
 
     public static func extract(_ url: URL) throws -> ExtractedContent {
         let ext = url.pathExtension.lowercased()
@@ -55,7 +87,11 @@ public enum FileExtractor {
             if let img = loadImage(url) { return .images([img]) }
             return .empty
         }
-        return .empty
+        if videoExtensions.contains(ext) {
+            let frames = videoFrames(url)
+            return frames.isEmpty ? .empty : .images(frames)
+        }
+        return .empty   // audio: not embeddable yet
     }
 
     // MARK: - Text
@@ -79,7 +115,6 @@ public enum FileExtractor {
         if pageCount > 0, trimmed.count >= minCharsPerPage * pageCount {
             return .text(trimmed)
         }
-        // No usable text layer -> rasterize pages for the vision tower.
         var images: [CGImage] = []
         for i in 0 ..< min(pageCount, maxScanPages) {
             if let page = doc.page(at: i), let img = render(page: page) { images.append(img) }
@@ -120,5 +155,32 @@ public enum FileExtractor {
     static func loadImage(_ url: URL) -> CGImage? {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         return CGImageSourceCreateImageAtIndex(src, 0, nil)
+    }
+
+    // MARK: - Video
+
+    /// Sample up to `maxVideoFrames` frames evenly across the video for vision embedding.
+    static func videoFrames(_ url: URL) -> [CGImage] {
+        let asset = AVURLAsset(url: url)
+        let durationSec = CMTimeGetSeconds(asset.duration)
+        guard durationSec.isFinite, durationSec > 0 else { return [] }
+        let gen = AVAssetImageGenerator(asset: asset)
+        gen.appliesPreferredTrackTransform = true
+        gen.requestedTimeToleranceBefore = .positiveInfinity
+        gen.requestedTimeToleranceAfter = .positiveInfinity
+        let maxDim: CGFloat = 1024
+        gen.maximumSize = CGSize(width: maxDim, height: maxDim)
+
+        let n = max(1, min(maxVideoFrames, Int(durationSec / 5) + 1))
+        var frames: [CGImage] = []
+        for i in 0 ..< n {
+            // Sample at the midpoint of each of n equal segments.
+            let t = durationSec * (Double(i) + 0.5) / Double(n)
+            let time = CMTime(seconds: t, preferredTimescale: 600)
+            if let img = try? gen.copyCGImage(at: time, actualTime: nil) {
+                frames.append(img)
+            }
+        }
+        return frames
     }
 }

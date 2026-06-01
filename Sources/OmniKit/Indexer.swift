@@ -42,13 +42,13 @@ public final class Indexer: @unchecked Sendable {
 
     /// Full incremental pass over `roots`. `onProgress` is called on a background
     /// thread; marshal to the main actor in the UI.
-    public func index(roots: [URL], onProgress: @escaping (IndexProgress) -> Void) {
+    public func index(roots: [URL], settings: IndexSettings = .default, onProgress: @escaping (IndexProgress) -> Void) {
         queue.sync { cancelled = false }
         var p = IndexProgress()
         let known = store.indexedModified()
         var seen = Set<String>()
 
-        let crawler = FileCrawler(roots: roots)
+        let crawler = FileCrawler(roots: roots, enabledKinds: settings.enabledKinds)
         crawler.walk(shouldContinue: { !self.isCancelled }) { file in
             if self.isCancelled { return }
             let path = file.url.path
@@ -82,6 +82,10 @@ public final class Indexer: @unchecked Sendable {
 
     private func embedFile(_ file: CrawledFile) throws -> [IndexedChunk] {
         let content = try FileExtractor.extract(file.url)
+        // "kind" is the file category (image/video/audio/text) used by the search
+        // filter, independent of which tower (text vs vision) produced the vector.
+        let kind = (FileExtractor.kind(for: file.url) ?? .text).rawValue
+        let isVideo = FileExtractor.kind(for: file.url) == .video
         switch content {
         case .empty:
             return []
@@ -92,7 +96,7 @@ public final class Indexer: @unchecked Sendable {
                 if isCancelled { break }
                 let vec = embedder.embedText(piece, as: .passage)
                 out.append(IndexedChunk(
-                    path: file.url.path, modified: file.modified, kind: "text",
+                    path: file.url.path, modified: file.modified, kind: kind,
                     chunkIndex: i, snippet: snippet(piece), embedding: vec))
             }
             return out
@@ -101,9 +105,10 @@ public final class Indexer: @unchecked Sendable {
             for (i, img) in images.enumerated() {
                 if isCancelled { break }
                 guard let vec = embedder.embedImage(img) else { continue }
+                let label = isVideo ? "frame \(i + 1)" : (images.count > 1 ? "page \(i + 1)" : file.url.lastPathComponent)
                 out.append(IndexedChunk(
-                    path: file.url.path, modified: file.modified, kind: "image",
-                    chunkIndex: i, snippet: "\(file.url.lastPathComponent) (page \(i + 1))", embedding: vec))
+                    path: file.url.path, modified: file.modified, kind: kind,
+                    chunkIndex: i, snippet: "\(file.url.lastPathComponent) - \(label)", embedding: vec))
             }
             return out
         }

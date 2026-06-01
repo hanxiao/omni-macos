@@ -13,7 +13,9 @@ No Python, no server, no network at query time.
   parity vs the Python `encode_image` reference is cosine 1.00000; full
   CGImage-to-embedding is cosine 0.985 (the gap is CoreGraphics vs PIL resize).
 - SQLite vector store with brute-force cosine search.
-- Indexes plain text, source code, Markdown, PDFs, office documents, and images.
+- Indexes images and video (sampled frames) by default; text/code/PDF/office is an
+  opt-in toggle. Audio is next (the audio tower port is pending).
+- Search filters by file kind, folder, extension, and minimum score.
 
 ## Requirements
 

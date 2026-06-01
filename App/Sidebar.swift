@@ -10,6 +10,14 @@ struct Sidebar: View {
             Section("Index") {
                 indexStatus
             }
+            Section("Content Types") {
+                indexToggle(.image, "Images")
+                indexToggle(.video, "Video")
+                indexToggle(.audio, "Audio")
+                indexToggle(.text, "Text & Documents")
+                Text("Reindex to apply changes.")
+                    .font(.caption2).foregroundStyle(.tertiary)
+            }
             Section("Folders") {
                 ForEach(model.roots, id: \.self) { url in
                     HStack {
@@ -38,6 +46,28 @@ struct Sidebar: View {
         }
         .listStyle(.sidebar)
         .safeAreaInset(edge: .bottom) { footer }
+    }
+
+    @ViewBuilder private func indexToggle(_ kind: FileKind, _ label: String) -> some View {
+        let unavailable = (kind == .audio && !model.audioSupported)
+        Toggle(isOn: Binding(
+            get: { model.settings.contains(kind) },
+            set: { model.setIndexKind(kind, $0) }
+        )) {
+            Label {
+                HStack(spacing: 6) {
+                    Text(label)
+                    if unavailable {
+                        Text("soon").font(.caption2).foregroundStyle(.tertiary)
+                    }
+                }
+            } icon: {
+                Image(systemName: kind.symbol)
+            }
+        }
+        .toggleStyle(.switch)
+        .controlSize(.mini)
+        .disabled(unavailable)
     }
 
     @ViewBuilder private var indexStatus: some View {

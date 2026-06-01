@@ -22,8 +22,24 @@ final class AppModel: ObservableObject {
     @Published var indexedChunks = 0
     @Published var modelPath: String = ""
     @Published var supportsImages = false
+    let audioSupported = false   // audio tower not ported yet
 
     @Published var roots: [URL] = []
+
+    // Index settings (which modalities to index).
+    @Published var settings = IndexSettings.default
+
+    // Search filters.
+    @Published var filterKinds: Set<FileKind> = []   // empty = all
+    @Published var filterFolder: URL? = nil
+    @Published var filterExt: String = ""
+    @Published var minScore: Double = 0
+    @Published var indexedKinds: Set<String> = []
+
+    var filtersActive: Bool {
+        !filterKinds.isEmpty || filterFolder != nil
+            || !filterExt.trimmingCharacters(in: .whitespaces).isEmpty || minScore > 0
+    }
 
     private var engine: OmniEngine?
     private var store: VectorStore?
@@ -32,10 +48,47 @@ final class AppModel: ObservableObject {
 
     private let rootsKey = "omni.roots"
     private let modelDirKey = "omni.modelDir"
+    private let kindsKey = "omni.indexKinds"
 
     init() {
         loadRoots()
+        loadSettings()
         Task { await bootstrap() }
+    }
+
+    // MARK: - Index settings
+
+    private func loadSettings() {
+        if let raw = UserDefaults.standard.array(forKey: kindsKey) as? [String] {
+            settings = IndexSettings(enabledKinds: Set(raw.compactMap { FileKind(rawValue: $0) }))
+        }
+    }
+
+    func setIndexKind(_ k: FileKind, _ on: Bool) {
+        settings.set(k, on)
+        UserDefaults.standard.set(settings.enabledKinds.map { $0.rawValue }, forKey: kindsKey)
+    }
+
+    // MARK: - Search filters
+
+    func toggleFilterKind(_ k: FileKind) {
+        if filterKinds.contains(k) { filterKinds.remove(k) } else { filterKinds.insert(k) }
+        search()
+    }
+
+    func clearFilters() {
+        filterKinds = []; filterFolder = nil; filterExt = ""; minScore = 0
+        search()
+    }
+
+    private func currentFilter() -> SearchFilter {
+        var f = SearchFilter()
+        f.kinds = Set(filterKinds.map { $0.rawValue })
+        f.folderPrefix = filterFolder?.path
+        let e = filterExt.trimmingCharacters(in: .whitespaces)
+        f.ext = e.isEmpty ? nil : e
+        f.minScore = Float(minScore)
+        return f
     }
 
     func setModelDir(_ url: URL) {
@@ -71,6 +124,7 @@ final class AppModel: ObservableObject {
             self.supportsImages = engine.supportsImages
             self.indexedFiles = store.fileCount
             self.indexedChunks = store.count
+            self.indexedKinds = store.kinds()
             self.phase = .ready
         } catch {
             self.phase = .failed("\(error)")
@@ -119,9 +173,10 @@ final class AppModel: ObservableObject {
         searchToken += 1
         let token = searchToken
         searching = true
+        let filter = currentFilter()
         Task.detached(priority: .userInitiated) {
             let vec = engine.embedText(q, as: .query)
-            let hits = store.search(vec, topK: 30)
+            let hits = store.search(vec, filter: filter, topK: 40)
             await MainActor.run {
                 guard token == self.searchToken else { return }
                 self.results = hits
@@ -137,14 +192,16 @@ final class AppModel: ObservableObject {
         isIndexing = true
         progress = IndexProgress()
         let roots = self.roots
+        let settings = self.settings
         Task.detached(priority: .utility) {
-            indexer.index(roots: roots) { p in
+            indexer.index(roots: roots, settings: settings) { p in
                 Task { @MainActor in
                     self.progress = p
                     if p.done {
                         self.isIndexing = false
                         self.indexedFiles = store.fileCount
                         self.indexedChunks = store.count
+                        self.indexedKinds = store.kinds()
                         if !self.query.isEmpty { self.search() }
                     }
                 }

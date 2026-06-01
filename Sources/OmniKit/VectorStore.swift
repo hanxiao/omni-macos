@@ -28,6 +28,28 @@ public struct SearchHit: Sendable {
     public let chunkIndex: Int
 }
 
+/// Optional constraints applied to search results.
+public struct SearchFilter: Sendable {
+    public var kinds: Set<String> = []        // empty = all kinds
+    public var folderPrefix: String? = nil    // restrict to a folder path prefix
+    public var ext: String? = nil             // restrict to a file extension (no dot)
+    public var minScore: Float = 0
+
+    public init() {}
+
+    var isEmpty: Bool {
+        kinds.isEmpty && folderPrefix == nil && (ext?.isEmpty ?? true) && minScore <= 0
+    }
+
+    func accepts(path: String, kind: String, score: Float) -> Bool {
+        if score < minScore { return false }
+        if !kinds.isEmpty && !kinds.contains(kind) { return false }
+        if let f = folderPrefix, !path.hasPrefix(f) { return false }
+        if let e = ext, !e.isEmpty, !path.lowercased().hasSuffix("." + e.lowercased()) { return false }
+        return true
+    }
+}
+
 /// SQLite-backed store of normalized embeddings with brute-force cosine search.
 /// Embeddings are unit vectors so cosine == dot product. Vectors are kept in
 /// memory (mirrored from disk) for fast scoring; SQLite is the source of truth.
@@ -131,7 +153,7 @@ public final class VectorStore: @unchecked Sendable {
     // MARK: - Search
 
     /// Top-K cosine search. Keeps the best-scoring chunk per file.
-    public func search(_ query: [Float], topK: Int = 20) -> [SearchHit] {
+    public func search(_ query: [Float], filter: SearchFilter = SearchFilter(), topK: Int = 20) -> [SearchHit] {
         queue.sync {
             var best: [String: SearchHit] = [:]
             for r in rows {
@@ -139,12 +161,16 @@ public final class VectorStore: @unchecked Sendable {
                 let n = min(query.count, r.vec.count)
                 var i = 0
                 while i < n { dot += query[i] * r.vec[i]; i += 1 }
+                if !filter.accepts(path: r.path, kind: r.kind, score: dot) { continue }
                 if let existing = best[r.path], existing.score >= dot { continue }
                 best[r.path] = SearchHit(path: r.path, score: dot, snippet: r.snippet, kind: r.kind, chunkIndex: r.chunkIndex)
             }
             return Array(best.values).sorted { $0.score > $1.score }.prefix(topK).map { $0 }
         }
     }
+
+    /// Distinct file kinds currently in the index (for populating filter chips).
+    public func kinds() -> Set<String> { queue.sync { Set(rows.map { $0.kind }) } }
 
     // MARK: - Internals
 

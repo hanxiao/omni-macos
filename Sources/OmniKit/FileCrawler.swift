@@ -10,6 +10,7 @@ public struct CrawledFile: Sendable {
 /// dirs, package bundles, and well-known noise (node_modules, .git, caches).
 public struct FileCrawler: Sendable {
     public var roots: [URL]
+    public var enabledKinds: Set<FileKind>
     public var maxFileSize: Int
 
     public static let skipDirNames: Set<String> = [
@@ -18,8 +19,9 @@ public struct FileCrawler: Sendable {
         "Caches", ".Trash", "vendor", "dist", "build", ".next", "target",
     ]
 
-    public init(roots: [URL], maxFileSize: Int = 50_000_000) {
+    public init(roots: [URL], enabledKinds: Set<FileKind> = [.image, .video], maxFileSize: Int = 200_000_000) {
         self.roots = roots
+        self.enabledKinds = enabledKinds
         self.maxFileSize = maxFileSize
     }
 
@@ -49,7 +51,7 @@ public struct FileCrawler: Sendable {
                     }
                     continue
                 }
-                guard vals.isRegularFile == true, FileExtractor.isSupported(url) else { continue }
+                guard vals.isRegularFile == true, FileExtractor.isSupported(url, enabledKinds: enabledKinds) else { continue }
                 let size = vals.fileSize ?? 0
                 if size > maxFileSize { continue }
                 let mtime = vals.contentModificationDate?.timeIntervalSince1970 ?? 0

@@ -36,7 +36,8 @@ final class IndexerTests: XCTestCase {
 
         var final = IndexProgress()
         let done = expectation(description: "indexing done")
-        indexer.index(roots: [root]) { p in if p.done { final = p; done.fulfill() } }
+        let settings = IndexSettings(enabledKinds: [.text])
+        indexer.index(roots: [root], settings: settings) { p in if p.done { final = p; done.fulfill() } }
         await fulfillment(of: [done], timeout: 120)
 
         XCTAssertEqual(store.fileCount, 4, "all four files indexed")

@@ -30,6 +30,7 @@ struct ContentView: View {
     private var searchSurface: some View {
         VStack(spacing: 0) {
             searchField
+            if model.indexedFiles > 0 { FilterBar() }
             Divider()
             if model.results.isEmpty {
                 emptyResults
