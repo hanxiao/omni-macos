@@ -32,6 +32,8 @@ public struct OmniConfig: Sendable {
     public var vision = Vision()
     public var imageTokenId = 151655
     public var videoTokenId = 151656
+    public var visionStartTokenId = 151652
+    public var visionEndTokenId = 151653
 
     /// LoRA scale (alpha / r). Retrieval adapter is alpha=32, r=32 -> 1.0.
     public var loraScale: Float = 1.0

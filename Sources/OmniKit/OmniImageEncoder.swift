@@ -1,28 +1,46 @@
 import Foundation
 import CoreGraphics
+import MLX
 
-/// Vision path (Qwen3-VL ViT + merger + feature injection) for embedding images
-/// and scanned PDF pages into the same space as text.
-///
-/// Status: the text path is the verified primary path. The vision port is being
-/// brought up against a Python `model.py` reference; until it passes parity,
-/// `encode` returns nil and the indexer skips image content gracefully.
+/// Vision path: Qwen3-VL ViT + merger embed an image, the features are wrapped as
+/// `<|vision_start|>` + image tokens + `<|vision_end|>` and run through the shared
+/// Qwen3 backbone, last-token pooled + L2. Same embedding space as the text path,
+/// so scanned PDFs and image files are searchable with text queries.
 public final class OmniImageEncoder: @unchecked Sendable {
-    private let weights: WeightStore
-    private let config: OmniConfig
-    private let available: Bool
+    private let backbone: Qwen3Backbone
+    private let tower: OmniVisionTower
+    private let cfg: OmniConfig
 
     public init?(weights: WeightStore, config: OmniConfig) {
-        // Require the vision tower weights to be present.
         guard weights.has("vision_tower.patch_embed.proj.weight"),
               weights.has("merger.linear_fc2.weight") else { return nil }
-        self.weights = weights
-        self.config = config
-        self.available = false   // flipped on once OmniVisionTower passes parity
+        self.backbone = Qwen3Backbone(weights: weights, config: config)
+        self.tower = OmniVisionTower(weights: weights, config: config)
+        self.cfg = config
     }
 
+    /// Embed one image from a CGImage (preprocess + tower + backbone).
     public func encode(_ image: CGImage) -> [Float]? {
-        guard available else { return nil }
-        return nil
+        let (pixelValues, grid) = OmniVisionPreprocess.preprocess(image)
+        return encode(pixelValues: pixelValues, gridTHW: grid)
+    }
+
+    /// Embed from already-preprocessed pixel values (used by the parity test).
+    public func encode(pixelValues: MLXArray, gridTHW: [(Int, Int, Int)]) -> [Float] {
+        let features = tower.forward(pixelValues, gridTHW: gridTHW)   // [N_merged, dim]
+        let n = features.dim(0)
+        let dim = cfg.text.hiddenSize
+
+        // input_ids = [vision_start] + image_token * N + [vision_end]; the image
+        // tokens are replaced by the vision features. Since they are contiguous we
+        // build inputs_embeds by concatenation rather than scatter.
+        let vStart = backbone.embed([cfg.visionStartTokenId])          // [1,1,dim]
+        let vEnd = backbone.embed([cfg.visionEndTokenId])              // [1,1,dim]
+        let feats = features.asType(.float32).reshaped([1, n, dim])
+        let inputsEmbeds = MLX.concatenated([vStart, feats, vEnd], axis: 1)  // [1, N+2, dim]
+
+        let length = n + 2
+        let hidden = backbone.forward(inputsEmbeds: inputsEmbeds, length: length)
+        return backbone.pool(hidden, length: length)
     }
 }

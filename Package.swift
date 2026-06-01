@@ -30,7 +30,11 @@ let package = Package(
         .testTarget(
             name: "OmniKitTests",
             dependencies: ["OmniKit"],
-            resources: [.copy("Resources/text_fixtures.json")]
+            resources: [
+                .copy("Resources/text_fixtures.json"),
+                .copy("Resources/image_ref.safetensors"),
+                .copy("Resources/test_image.png"),
+            ]
         ),
     ]
 )

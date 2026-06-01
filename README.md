@@ -8,9 +8,12 @@ No Python, no server, no network at query time.
 - Qwen3 text tower ported to MLX-Swift, retrieval LoRA merged at load time.
 - Last-token pooling, L2 normalization, Matryoshka dimensions (1024 default).
 - Numerically identical to the Python reference: cosine 1.00000 on the fixture set.
+- Qwen3-VL vision tower also ported: scanned PDFs (no text layer) and image files
+  route to the vision path and land in the same embedding space as text. Tower
+  parity vs the Python `encode_image` reference is cosine 1.00000; full
+  CGImage-to-embedding is cosine 0.985 (the gap is CoreGraphics vs PIL resize).
 - SQLite vector store with brute-force cosine search.
-- Indexes plain text, source code, Markdown, PDFs, and office documents.
-  Scanned PDFs (no text layer) and images route to the vision tower (in progress).
+- Indexes plain text, source code, Markdown, PDFs, office documents, and images.
 
 ## Requirements
 
