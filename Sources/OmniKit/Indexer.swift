@@ -135,6 +135,35 @@ public final class Indexer: @unchecked Sendable {
         onProgress(p)
     }
 
+    /// Targeted update for a set of changed paths (from the file watcher). Re-embeds
+    /// changed/added supported files and removes deleted/unsupported ones. No crawl.
+    public func update(paths: [String], settings: IndexSettings) {
+        queue.sync { active = settings }
+        let known = store.indexedFiles()
+        let fm = FileManager.default
+        for path in Set(paths) {
+            let url = URL(fileURLWithPath: path)
+            var isDir: ObjCBool = false
+            if !fm.fileExists(atPath: path, isDirectory: &isDir) {
+                store.deletePath(path)               // deleted / moved away
+                continue
+            }
+            if isDir.boolValue { continue }
+            guard FileExtractor.isSupported(url, enabledKinds: settings.enabledKinds) else {
+                if known[path] != nil { store.deletePath(path) }   // now unsupported/disabled
+                continue
+            }
+            guard let vals = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]) else { continue }
+            let mtime = vals.contentModificationDate?.timeIntervalSince1970 ?? 0
+            let size = vals.fileSize ?? 0
+            if let prev = known[path], prev.modified == mtime, prev.size == size { continue }  // unchanged
+            let file = CrawledFile(url: url, modified: mtime, size: size)
+            let chunks = embed(decode(file))
+            if chunks.isEmpty { store.deletePath(path) }
+            else { try? store.replace(path: path, chunks: chunks) }
+        }
+    }
+
     // MARK: - Pipeline
 
     /// Bounded concurrent-decode -> serial-consume. `consume` is invoked in file order,

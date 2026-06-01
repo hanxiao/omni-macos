@@ -93,6 +93,12 @@ final class AppModel: ObservableObject {
     @Published var modelVariant: ModelVariant = .small
     @Published var installedVariants: [ModelVariant: URL] = [:]
 
+    // Keep the index fresh automatically (FSEvents).
+    @Published var liveUpdates: Bool = true {
+        didSet { UserDefaults.standard.set(liveUpdates, forKey: "omni.liveUpdates"); restartWatcher() }
+    }
+    private var watcher: FSWatcher?
+
     // Index-time minimum thresholds (0 = no minimum).
     @Published var minImageDimension: Int = 0 { didSet { persistPerf() } }
     @Published var minAudioSeconds: Double = 0 { didSet { persistPerf() } }
@@ -118,6 +124,9 @@ final class AppModel: ObservableObject {
         loadRoots()
         loadSettings()
         loadPerf()
+        if UserDefaults.standard.object(forKey: "omni.liveUpdates") != nil {
+            liveUpdates = UserDefaults.standard.bool(forKey: "omni.liveUpdates")
+        }
         if let raw = UserDefaults.standard.string(forKey: "omni.viewMode"), let m = ResultViewMode(rawValue: raw) { viewMode = m }
         Task { await bootstrap() }
     }
@@ -249,6 +258,7 @@ final class AppModel: ObservableObject {
             self.fingerprint = computeFingerprint(modelDir: dir, dim: engine.dim)
             refreshIndexStats(store)
             self.phase = .ready
+            restartWatcher()
         } catch {
             self.phase = .failed("\(error)")
         }
@@ -294,7 +304,7 @@ final class AppModel: ObservableObject {
         }
     }
     private func saveRoots() { UserDefaults.standard.set(roots.map { $0.path }, forKey: "omni.roots") }
-    func addRoot(_ url: URL) { guard !roots.contains(url) else { return }; roots.append(url); saveRoots() }
+    func addRoot(_ url: URL) { guard !roots.contains(url) else { return }; roots.append(url); saveRoots(); restartWatcher() }
     func removeRoot(_ url: URL) {
         roots.removeAll { $0 == url }
         if filterFolder == url { filterFolder = nil }
@@ -305,6 +315,7 @@ final class AppModel: ObservableObject {
             refreshIndexStats(store)
             if !query.isEmpty { search() }
         }
+        restartWatcher()
     }
 
     // MARK: - Search
@@ -331,6 +342,45 @@ final class AppModel: ObservableObject {
 
     // MARK: - Indexing
 
+    /// All settings the indexer needs (modalities + perf + thresholds).
+    private func effectiveSettings() -> IndexSettings {
+        var s = settings
+        s.maxImageDimension = maxImageDimension
+        s.maxVideoFrames = maxVideoFrames
+        s.minImageDimension = minImageDimension
+        s.minAudioSeconds = minAudioSeconds
+        s.minVideoSeconds = minVideoSeconds
+        s.minTextChars = minTextChars
+        return s
+    }
+
+    // MARK: - Live updates (FSEvents)
+
+    private func restartWatcher() {
+        watcher?.stop(); watcher = nil
+        guard liveUpdates, engine != nil, !roots.isEmpty else { return }
+        let since = UserDefaults.standard.string(forKey: "omni.fsEventId").flatMap { UInt64($0) }
+        let w = FSWatcher(paths: roots.map { $0.path }, since: since) { [weak self] paths in
+            Task { @MainActor in self?.handleFSChange(paths) }
+        }
+        w.start()
+        watcher = w
+    }
+
+    private func handleFSChange(_ paths: [String]) {
+        guard liveUpdates, indexState != .indexing, let indexer, let store else { return }
+        let settings = effectiveSettings()
+        let eid = watcher?.latestEventId()
+        Task.detached(priority: .utility) {
+            indexer.update(paths: paths, settings: settings)
+            await MainActor.run {
+                if let eid { UserDefaults.standard.set(String(eid), forKey: "omni.fsEventId") }
+                self.refreshIndexStats(store)
+                if !self.query.isEmpty { self.search() }
+            }
+        }
+    }
+
     /// Start or resume indexing. Indexing is incremental - already-embedded files are
     /// skipped by modification time, so resuming simply continues where it left off.
     func startIndexing() {
@@ -345,13 +395,7 @@ final class AppModel: ObservableObject {
         indexState = .indexing
         progress = IndexProgress()
         let roots = self.roots
-        var settings = self.settings
-        settings.maxImageDimension = maxImageDimension
-        settings.maxVideoFrames = maxVideoFrames
-        settings.minImageDimension = minImageDimension
-        settings.minAudioSeconds = minAudioSeconds
-        settings.minVideoSeconds = minVideoSeconds
-        settings.minTextChars = minTextChars
+        let settings = effectiveSettings()
         Task.detached(priority: .utility) {
             indexer.index(roots: roots, settings: settings, force: force) { p in
                 Task { @MainActor in

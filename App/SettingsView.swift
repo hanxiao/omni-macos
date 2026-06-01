@@ -143,6 +143,12 @@ private struct IndexTab: View {
                     }
                 }
             }
+            Section {
+                Toggle("Keep index up to date automatically", isOn: $model.liveUpdates)
+            } footer: {
+                Text("Watches your folders and re-indexes added, changed, and deleted files in the background.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Section("Storage") {
                 LabeledContent("Indexed files", value: "\(model.indexedFiles)")
                 LabeledContent("Embeddings", value: "\(model.indexedChunks)")
