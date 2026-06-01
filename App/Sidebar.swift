@@ -9,6 +9,8 @@ struct Sidebar: View {
         List {
             Section("Index") {
                 indexStatus
+                Toggle("Keep up to date automatically", isOn: $model.liveUpdates)
+                    .controlSize(.small)
             }
             Section("Folders") {
                 ForEach(model.roots, id: \.self) { url in

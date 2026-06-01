@@ -43,10 +43,7 @@ struct ContentView: View {
     }
 
     @ViewBuilder private var ready: some View {
-        VStack(spacing: 0) {
-            if model.indexedFiles > 0 { FilterBar(); Divider() }
-            content
-        }
+        content
     }
 
     @ViewBuilder private var content: some View {
@@ -94,41 +91,69 @@ struct ContentView: View {
     // MARK: - Toolbar
 
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
-        ToolbarItem(placement: .primaryAction) {
-            SettingsLink { Image(systemName: "gearshape") }
-                .help("Settings (\u{2318},)")
+        // Filtering - one home.
+        ToolbarItem(placement: .automatic) {
+            filterMenu.disabled(model.indexedFiles == 0)
         }
+        // Result presentation - sort + view grouped together.
         ToolbarItem(placement: .primaryAction) {
-            Menu {
-                Picker("Sort By", selection: $model.sortOrder) {
-                    ForEach(SortOrder.allCases) { Text($0.title).tag($0) }
+            ControlGroup {
+                Menu {
+                    Picker("Sort By", selection: $model.sortOrder) {
+                        ForEach(SortOrder.allCases) { Text($0.title).tag($0) }
+                    }
+                } label: { Image(systemName: "arrow.up.arrow.down") }
+                .help("Sort results")
+                .disabled(model.rawResults.isEmpty)
+
+                Picker("View", selection: $model.viewMode) {
+                    Image(systemName: "list.bullet").tag(ResultViewMode.list)
+                    Image(systemName: "square.grid.2x2").tag(ResultViewMode.grid)
                 }
-            } label: { Image(systemName: "arrow.up.arrow.down") }
-            .help("Sort results")
-            .disabled(model.rawResults.isEmpty)
-        }
-        ToolbarItem(placement: .primaryAction) {
-            Picker("View", selection: $model.viewMode) {
-                Image(systemName: "list.bullet").tag(ResultViewMode.list)
-                Image(systemName: "square.grid.2x2").tag(ResultViewMode.grid)
-            }
-            .pickerStyle(.segmented)
-            .help("View as list or gallery")
-        }
-        ToolbarItem(placement: .primaryAction) {
-            switch model.indexState {
-            case .indexing:
-                Button { model.pauseIndexing() } label: { Image(systemName: "pause.circle") }
-                    .help("Pause indexing")
-            case .paused:
-                Button { model.startIndexing() } label: { Image(systemName: "play.circle") }
-                    .help("Resume indexing")
-            case .idle:
-                Button { model.startIndexing() } label: { Image(systemName: "arrow.clockwise") }
-                    .help("Index")
-                    .disabled(!model.canIndex)
+                .pickerStyle(.segmented)
+                .help("List or gallery")
             }
         }
+    }
+
+    private var filterKinds: [FileKind] {
+        let present = FileKind.allCases.filter { model.indexedKinds.contains($0.rawValue) }
+        return present.isEmpty ? [.image, .video, .audio] : present
+    }
+
+    private var filterMenu: some View {
+        Menu {
+            Section("Show") {
+                ForEach(filterKinds, id: \.self) { kind in
+                    Toggle(isOn: Binding(
+                        get: { model.filterKinds.contains(kind) },
+                        set: { on in if on { model.filterKinds.insert(kind) } else { model.filterKinds.remove(kind) } }
+                    )) { Label(kind.title, systemImage: kind.symbol) }
+                }
+            }
+            Picker("Folder", selection: Binding(
+                get: { model.filterFolder?.path ?? "" },
+                set: { model.filterFolder = $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
+            )) {
+                Text("All Folders").tag("")
+                ForEach(model.roots, id: \.self) { Text($0.lastPathComponent).tag($0.path) }
+            }
+            Picker("Type", selection: $model.filterExt) {
+                Text("Any Extension").tag("")
+                ForEach(model.indexedExts, id: \.self) { Text(".\($0)").tag($0) }
+            }
+            Picker("Date", selection: $model.dateRange) {
+                ForEach(DateRange.allCases) { Text($0.title).tag($0) }
+            }
+            Picker("Relevance", selection: $model.minScore) {
+                Text("Any").tag(0.0); Text("25%").tag(0.25); Text("50%").tag(0.5); Text("70%").tag(0.7)
+            }
+            Divider()
+            Button("Clear Filters") { model.clearFilters() }.disabled(!model.filtersActive)
+        } label: {
+            Image(systemName: model.filtersActive ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
+        }
+        .help("Filter results")
     }
 
     private func scheduleSearch() {
