@@ -42,4 +42,14 @@ public final class OmniTextEncoder: @unchecked Sendable {
         let hidden = backbone.forward(inputsEmbeds: embeds, length: ids.count)
         return backbone.pool(hidden, length: ids.count, truncateDim: truncateDim)
     }
+
+    /// Encode several strings in one batched forward pass (right-padded). Output order
+    /// matches the input. Result is identical to per-string encode (parity-verified).
+    public func encodeBatch(_ texts: [String], as type: OmniInputType) -> [[Float]] {
+        if texts.isEmpty { return [] }
+        let idsList = texts.map { tokenIds($0, type) }
+        let (embeds, lengths) = backbone.embedBatch(idsList)
+        let hidden = backbone.forward(inputsEmbeds: embeds, length: 0)
+        return backbone.poolBatch(hidden, lengths: lengths)
+    }
 }

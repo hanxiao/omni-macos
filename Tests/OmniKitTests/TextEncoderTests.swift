@@ -52,4 +52,30 @@ final class TextEncoderTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(worstQ, 0.999, "query embedding parity")
         XCTAssertGreaterThanOrEqual(worstP, 0.999, "passage embedding parity")
     }
+
+    /// Batched encoding (right-padded) must match per-string encoding and the reference.
+    func testBatchedMatchesSingle() async throws {
+        let modelDir = URL(fileURLWithPath: env("OMNI_MODEL_DIR", "/private/tmp/omni-model"))
+        guard FileManager.default.fileExists(atPath: modelDir.appendingPathComponent("model.safetensors").path) else {
+            throw XCTSkip("model dir not found")
+        }
+        guard let fixturesURL = Bundle.module.url(forResource: "text_fixtures", withExtension: "json") else { throw XCTSkip("fixtures missing") }
+        let fx = try JSONDecoder().decode(Fixtures.self, from: Data(contentsOf: fixturesURL))
+        let config = try OmniConfig(modelDir: modelDir)
+        let weights = try WeightStore(modelDir: modelDir, loraScale: config.loraScale, keepVision: false)
+        let encoder = try await OmniTextEncoder(modelDir: modelDir, weights: weights, config: config)
+
+        let texts = fx.records.map { $0.text }
+        let batched = encoder.encodeBatch(texts, as: .passage)   // varying lengths -> exercises padding
+        var worst: Float = 1
+        for (i, r) in fx.records.enumerated() {
+            let single = encoder.encode(r.text, as: .passage)
+            let cSingle = cosine(batched[i], single)
+            let cRef = cosine(batched[i], r.passage_embedding)
+            worst = min(worst, min(cSingle, cRef))
+            print(String(format: "batch vs single=%.5f  vs ref=%.5f  %@", cSingle, cRef, String(r.text.prefix(36))))
+        }
+        print(String(format: "WORST batched parity=%.5f", worst))
+        XCTAssertGreaterThanOrEqual(worst, 0.999, "batched embedding parity")
+    }
 }

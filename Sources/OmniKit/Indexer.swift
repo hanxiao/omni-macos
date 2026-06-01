@@ -5,6 +5,8 @@ import CoreGraphics
 public protocol Embedder: AnyObject {
     var dim: Int { get }
     func embedText(_ text: String, as type: OmniInputType) -> [Float]
+    /// Embed several texts in one batched forward pass (output order matches input).
+    func embedTextBatch(_ texts: [String], as type: OmniInputType) -> [[Float]]
     /// Embed a single image (vision tower). Returns nil if the vision path is unavailable.
     func embedImage(_ image: CGImage) -> [Float]?
     /// Embed sampled video frames as one temporal embedding. Nil if unavailable.
@@ -61,6 +63,7 @@ public final class Indexer: @unchecked Sendable {
     public var chunkOverlap = 200
     public var maxChunksPerFile = 40
     public var snippetLength = 220
+    public var textBatchSize = 16   // chunks embedded per batched forward pass
 
     private var active: IndexSettings = .default
 
@@ -253,11 +256,16 @@ public final class Indexer: @unchecked Sendable {
             return []
         case .text(let pieces):
             var out: [IndexedChunk] = []
-            for (i, piece) in pieces.enumerated() {
+            var i = 0
+            while i < pieces.count {
                 if isCancelled { break }
-                let vec = embedder.embedText(piece, as: .passage)
-                out.append(IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
-                                        chunkIndex: i, snippet: snippet(piece), embedding: vec))
+                let group = Array(pieces[i ..< min(i + textBatchSize, pieces.count)])
+                let vecs = embedder.embedTextBatch(group, as: .passage)
+                for (j, vec) in vecs.enumerated() {
+                    out.append(IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
+                                            chunkIndex: i + j, snippet: snippet(group[j]), embedding: vec))
+                }
+                i += textBatchSize
             }
             return out
         case .audioMel(let mel, let frames):

@@ -25,7 +25,35 @@ final class Qwen3Backbone: @unchecked Sendable {
         return rows.asType(.float32).reshaped([1, ids.count, cfg.text.hiddenSize])
     }
 
-    /// Run the transformer over precomputed embeddings -> hidden after final norm [1, L, dim].
+    /// Embed a batch of token-id sequences, right-padded to the longest, with the pad
+    /// id 0. Returns [B, Lmax, dim] (fp32) and the real lengths.
+    func embedBatch(_ idsList: [[Int]]) -> (embeds: MLXArray, lengths: [Int]) {
+        let lengths = idsList.map { $0.count }
+        let lmax = lengths.max() ?? 0
+        let b = idsList.count
+        var flat = [Int32](); flat.reserveCapacity(b * lmax)
+        for ids in idsList {
+            for id in ids { flat.append(Int32(id)) }
+            if ids.count < lmax { flat.append(contentsOf: repeatElement(0, count: lmax - ids.count)) }
+        }
+        let idArr = MLXArray(flat, [b, lmax])
+        let rows = w["language_model.embed_tokens.weight"][idArr]   // [B, Lmax, dim]
+        return (rows.asType(.float32), lengths)
+    }
+
+    /// Last-token pool per row (using real lengths) + L2 normalize. One eval.
+    func poolBatch(_ hidden: MLXArray, lengths: [Int]) -> [[Float]] {
+        let dim = cfg.text.hiddenSize
+        let rows = lengths.enumerated().map { hidden[$0.offset, $0.element - 1] }   // each [dim]
+        var stacked = MLX.stacked(rows, axis: 0)                                    // [B, dim]
+        stacked = stacked / MLX.sqrt((stacked * stacked).sum(axis: 1, keepDims: true))
+        stacked = stacked.asType(.float32)
+        eval(stacked)
+        let flat = stacked.asArray(Float.self)
+        return (0 ..< lengths.count).map { Array(flat[$0 * dim ..< ($0 + 1) * dim]) }
+    }
+
+    /// Run the transformer over precomputed embeddings -> hidden after final norm [B, L, dim].
     func forward(inputsEmbeds: MLXArray, length L: Int) -> MLXArray {
         var h = inputsEmbeds.asType(.float32)
         for i in 0 ..< cfg.text.numLayers {
@@ -63,17 +91,19 @@ final class Qwen3Backbone: @unchecked Sendable {
 
     private func attention(_ x: MLXArray, _ p: String) -> MLXArray {
         let t = cfg.text
-        // -1 infers the sequence length so the compiled graph stays shapeless.
-        var q = linear(x, p + "self_attn.q_proj.weight").reshaped([1, -1, t.numHeads, t.headDim]).transposed(0, 2, 1, 3)
-        var k = linear(x, p + "self_attn.k_proj.weight").reshaped([1, -1, t.numKVHeads, t.headDim]).transposed(0, 2, 1, 3)
-        let v = linear(x, p + "self_attn.v_proj.weight").reshaped([1, -1, t.numKVHeads, t.headDim]).transposed(0, 2, 1, 3)
+        let B = x.dim(0)   // batch (1 for single, B for batched right-padded sequences)
+        var q = linear(x, p + "self_attn.q_proj.weight").reshaped([B, -1, t.numHeads, t.headDim]).transposed(0, 2, 1, 3)
+        var k = linear(x, p + "self_attn.k_proj.weight").reshaped([B, -1, t.numKVHeads, t.headDim]).transposed(0, 2, 1, 3)
+        let v = linear(x, p + "self_attn.v_proj.weight").reshaped([B, -1, t.numKVHeads, t.headDim]).transposed(0, 2, 1, 3)
         q = headNorm(q, p + "self_attn.q_norm.weight")
         k = headNorm(k, p + "self_attn.k_norm.weight")
         q = rope(q, offset: 0)
         k = rope(k, offset: 0)
         let scale = Float(pow(Double(t.headDim), -0.5))
+        // Right-padding + causal: real tokens never attend to (future) pad, so .causal
+        // alone is correct; we pool the last real token per row.
         var out = MLXFast.scaledDotProductAttention(queries: q, keys: k, values: v, scale: scale, mask: .causal)
-        out = out.transposed(0, 2, 1, 3).reshaped([1, -1, t.numHeads * t.headDim])
+        out = out.transposed(0, 2, 1, 3).reshaped([B, -1, t.numHeads * t.headDim])
         return linear(out, p + "self_attn.o_proj.weight")
     }
 

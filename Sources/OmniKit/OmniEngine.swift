@@ -159,6 +159,10 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         run(highPriority: type == .query) { textEncoder.encode(text, as: type) }
     }
 
+    public func embedTextBatch(_ texts: [String], as type: OmniInputType) -> [[Float]] {
+        run(highPriority: type == .query) { textEncoder.encodeBatch(texts, as: type) }
+    }
+
     public func embedImage(_ image: CGImage) -> [Float]? {
         guard let enc = imageEncoder else { return nil }
         return run(highPriority: false) { enc.encode(image, prefixIds: docPrefix) }
