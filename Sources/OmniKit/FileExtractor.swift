@@ -184,7 +184,9 @@ public enum FileExtractor {
 
     // MARK: - Video
 
-    /// Sample up to `maxFrames` frames evenly across the video for vision embedding.
+    /// Extract up to `maxFrames` visually-distinct ("key") frames. Samples densely,
+    /// then keeps only frames that differ perceptually (average-hash dedup), so a
+    /// static clip yields one frame and a dynamic one spreads across scene changes.
     static func videoFrames(_ url: URL, maxFrames: Int = 6, maxDimension: Int = 1568) -> [CGImage] {
         let asset = AVURLAsset(url: url)
         let durationSec = CMTimeGetSeconds(asset.duration)
@@ -195,16 +197,40 @@ public enum FileExtractor {
         gen.requestedTimeToleranceAfter = .positiveInfinity
         gen.maximumSize = CGSize(width: maxDimension, height: maxDimension)
 
-        let n = max(1, min(maxFrames, Int(durationSec / 5) + 1))
-        var frames: [CGImage] = []
-        for i in 0 ..< n {
-            // Sample at the midpoint of each of n equal segments.
-            let t = durationSec * (Double(i) + 0.5) / Double(n)
-            let time = CMTime(seconds: t, preferredTimescale: 600)
-            if let img = try? gen.copyCGImage(at: time, actualTime: nil) {
-                frames.append(img)
+        let candidates = max(maxFrames, min(maxFrames * 4, Int(durationSec) + 1))
+        var kept: [CGImage] = []
+        var hashes: [UInt64] = []
+        for i in 0 ..< candidates {
+            if kept.count >= maxFrames { break }
+            let t = durationSec * (Double(i) + 0.5) / Double(candidates)
+            guard let img = try? gen.copyCGImage(at: CMTime(seconds: t, preferredTimescale: 600), actualTime: nil) else { continue }
+            let h = averageHash(img)
+            if hashes.allSatisfy({ hammingDistance($0, h) >= 8 }) {   // distinct from every kept frame
+                kept.append(img); hashes.append(h)
             }
         }
-        return frames
+        if kept.isEmpty,
+           let img = try? gen.copyCGImage(at: CMTime(seconds: durationSec * 0.5, preferredTimescale: 600), actualTime: nil) {
+            kept.append(img)
+        }
+        return kept
     }
+
+    /// 64-bit average hash: render to 8x8 grayscale, bit set where the pixel is brighter
+    /// than the frame mean. Hamming distance approximates perceptual difference.
+    private static func averageHash(_ image: CGImage) -> UInt64 {
+        let side = 8
+        var pixels = [UInt8](repeating: 0, count: side * side)
+        guard let ctx = CGContext(data: &pixels, width: side, height: side, bitsPerComponent: 8,
+                                  bytesPerRow: side, space: CGColorSpaceCreateDeviceGray(),
+                                  bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return 0 }
+        ctx.interpolationQuality = .low
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: side, height: side))
+        let avg = pixels.reduce(0) { $0 + Int($1) } / (side * side)
+        var hash: UInt64 = 0
+        for (i, p) in pixels.enumerated() where Int(p) > avg { hash |= (1 << UInt64(i)) }
+        return hash
+    }
+
+    private static func hammingDistance(_ a: UInt64, _ b: UInt64) -> Int { (a ^ b).nonzeroBitCount }
 }

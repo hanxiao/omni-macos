@@ -1,42 +1,65 @@
 import SwiftUI
 import AppKit
+import OmniKit
 
 struct OnboardingView: View {
     @EnvironmentObject var model: AppModel
 
     var body: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "shippingbox")
+        VStack(spacing: 18) {
+            Image(systemName: "sparkles.rectangle.stack")
                 .font(.system(size: 46, weight: .light))
                 .foregroundStyle(.tertiary)
-            Text("Locate the omni model")
-                .font(.title2).fontWeight(.semibold)
-            Text("Omni needs the jina-embeddings-v5-omni-small-mlx model directory (the folder containing model.safetensors, tokenizer.json, and adapters/).")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 460)
+            Text("Welcome to Omni")
+                .font(.title).fontWeight(.semibold)
+            Text("Search your files by meaning - images, video, audio, and documents. Omni runs the model on-device. Pick one to download and you're set.")
+                .font(.callout).foregroundStyle(.secondary)
+                .multilineTextAlignment(.center).frame(maxWidth: 440)
 
-            Button {
-                pick()
-            } label: {
-                Label("Choose Model Folder", systemImage: "folder")
-            }
-            .controlSize(.large)
-            .buttonStyle(.borderedProminent)
+            if model.isDownloading {
+                VStack(spacing: 8) {
+                    ProgressView(value: model.downloadFraction)
+                        .frame(width: 360)
+                    Text(model.downloadLabel)
+                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                }
+                .padding(.top, 4)
+            } else {
+                VStack(spacing: 10) {
+                    variantButton(.small, size: "~3.1 GB", prominent: true)
+                    variantButton(.nano, size: "smaller, faster", prominent: false)
+                }
+                .padding(.top, 4)
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Searched automatically:").font(.caption).foregroundStyle(.secondary)
-                Text("· $OMNI_MODEL_DIR")
-                Text("· ~/Library/Application Support/Omni/model")
-                Text("· HuggingFace cache (models--jinaai--jina-embeddings-v5-omni-small-mlx)")
+                Button("Use an existing model folder\u{2026}") { pick() }
+                    .buttonStyle(.plain).font(.callout).foregroundStyle(.secondary).padding(.top, 6)
             }
-            .font(.caption.monospaced())
-            .foregroundStyle(.tertiary)
-            .padding(.top, 8)
+
+            if model.downloadLabel.hasPrefix("Download failed") {
+                Text(model.downloadLabel).font(.caption).foregroundStyle(.red).frame(maxWidth: 440)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding()
+    }
+
+    @ViewBuilder private func variantButton(_ v: ModelVariant, size: String, prominent: Bool) -> some View {
+        let content = HStack {
+            Image(systemName: "arrow.down.circle")
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Download \(v.title)").fontWeight(.medium)
+                Text(size).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .frame(width: 260, alignment: .leading)
+
+        if prominent {
+            Button { model.downloadModel(v) } label: { content }
+                .controlSize(.large).buttonStyle(.borderedProminent)
+        } else {
+            Button { model.downloadModel(v) } label: { content }
+                .controlSize(.large).buttonStyle(.bordered)
+        }
     }
 
     private func pick() {
@@ -44,8 +67,6 @@ struct OnboardingView: View {
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.prompt = "Select"
-        if panel.runModal() == .OK, let url = panel.url {
-            model.setModelDir(url)
-        }
+        if panel.runModal() == .OK, let url = panel.url { model.setModelDir(url) }
     }
 }

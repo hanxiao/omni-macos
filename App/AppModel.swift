@@ -93,6 +93,12 @@ final class AppModel: ObservableObject {
     @Published var modelVariant: ModelVariant = .small
     @Published var installedVariants: [ModelVariant: URL] = [:]
 
+    // Model download.
+    @Published var isDownloading = false
+    @Published var downloadFraction: Double = 0
+    @Published var downloadLabel = ""
+    private var downloader: ModelDownloader?
+
     // Keep the index fresh automatically (FSEvents).
     @Published var liveUpdates: Bool = true {
         didSet { UserDefaults.standard.set(liveUpdates, forKey: "omni.liveUpdates"); restartWatcher() }
@@ -239,6 +245,39 @@ final class AppModel: ObservableObject {
         guard v != modelVariant, let dir = ModelLocator.resolve(variant: v) else { return }
         modelVariant = v
         setModelDir(dir)
+    }
+
+    /// Download a model variant from HuggingFace and load it when finished.
+    func downloadModel(_ variant: ModelVariant) {
+        guard !isDownloading, let dest = ModelDownloader.installDir(for: variant) else { return }
+        isDownloading = true; downloadFraction = 0; downloadLabel = "Preparing\u{2026}"
+        let dl = ModelDownloader(); downloader = dl
+        Task {
+            do {
+                try await dl.download(variant: variant, to: dest) { p in
+                    Task { @MainActor in
+                        if p.file == "model.safetensors" {
+                            self.downloadFraction = p.total > 0 ? Double(p.received) / Double(p.total) : 0
+                            let gb = Double(p.received) / 1_000_000_000, tgb = Double(p.total) / 1_000_000_000
+                            self.downloadLabel = p.total > 0 ? String(format: "Downloading model  %.2f / %.2f GB", gb, tgb) : "Downloading model\u{2026}"
+                        } else {
+                            self.downloadLabel = "Preparing\u{2026}"
+                        }
+                    }
+                }
+                await MainActor.run {
+                    self.isDownloading = false
+                    self.installedVariants = ModelLocator.installedVariants()
+                    self.modelVariant = variant
+                    self.setModelDir(dest)
+                }
+            } catch {
+                await MainActor.run {
+                    self.isDownloading = false
+                    self.downloadLabel = "Download failed: \(error.localizedDescription)"
+                }
+            }
+        }
     }
 
     private func bootstrap() async {

@@ -111,7 +111,17 @@ private struct PerformanceTab: View {
                         Text(model.maxMemoryGB == 0 ? "Unlimited" : "\(Int(model.maxMemoryGB)) GB")
                             .foregroundStyle(.secondary).monospacedDigit()
                     }
-                    Slider(value: $model.maxMemoryGB, in: 0 ... memoryCeiling, step: 1)
+                    Slider(value: Binding(
+                        get: { model.maxMemoryGB },
+                        set: { model.maxMemoryGB = $0.rounded() }
+                    ), in: 0 ... memoryCeiling) {
+                        Text("Maximum memory")
+                    } minimumValueLabel: {
+                        Text("Off").font(.caption2).foregroundStyle(.tertiary)
+                    } maximumValueLabel: {
+                        Text("\(Int(memoryCeiling))").font(.caption2).foregroundStyle(.tertiary)
+                    }
+                    .labelsHidden()
                 }
             } header: {
                 Text("Memory")
@@ -179,14 +189,24 @@ private struct IndexTab: View {
                         Text(model.installedVariants[v] != nil ? v.title : "\(v.title) (not installed)").tag(v)
                     }
                 }
+                .disabled(model.isDownloading)
                 LabeledContent("Audio", value: model.audioSupported ? "Available" : "Unavailable")
-                Button("Change Model Folder...") { pickModel() }
+
+                if model.isDownloading {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ProgressView(value: model.downloadFraction)
+                        Text(model.downloadLabel).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    }
+                } else {
+                    ForEach(ModelVariant.allCases.filter { model.installedVariants[$0] == nil }, id: \.self) { v in
+                        Button("Download \(v.title)") { model.downloadModel(v) }
+                    }
+                    Button("Change Model Folder...") { pickModel() }
+                }
             } header: {
                 Text("Model")
             } footer: {
-                Text(model.installedVariants[.nano] == nil
-                     ? "Omni Nano is not installed. Add it to ~/Library/Application Support/Omni/nano or the HuggingFace cache to switch. Switching variant rebuilds the index."
-                     : "Switching variant rebuilds the index.")
+                Text("Switching variant rebuilds the index. Both variants share one embedding space.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
