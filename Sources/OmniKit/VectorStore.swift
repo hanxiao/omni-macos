@@ -26,26 +26,24 @@ public struct SearchHit: Sendable {
     public let snippet: String
     public let kind: String
     public let chunkIndex: Int
+    public let modified: Double
 }
 
-/// Optional constraints applied to search results.
+/// Constraints applied to search results. Score thresholding is intentionally NOT
+/// here: the view fetches unfiltered-by-score and splits, so it can offer "show all".
 public struct SearchFilter: Sendable {
     public var kinds: Set<String> = []        // empty = all kinds
     public var folderPrefix: String? = nil    // restrict to a folder path prefix
     public var ext: String? = nil             // restrict to a file extension (no dot)
-    public var minScore: Float = 0
+    public var since: Double? = nil           // modified >= since (epoch seconds)
 
     public init() {}
 
-    var isEmpty: Bool {
-        kinds.isEmpty && folderPrefix == nil && (ext?.isEmpty ?? true) && minScore <= 0
-    }
-
-    func accepts(path: String, kind: String, score: Float) -> Bool {
-        if score < minScore { return false }
+    func accepts(path: String, kind: String, modified: Double) -> Bool {
         if !kinds.isEmpty && !kinds.contains(kind) { return false }
         if let f = folderPrefix, !path.hasPrefix(f) { return false }
         if let e = ext, !e.isEmpty, !path.lowercased().hasSuffix("." + e.lowercased()) { return false }
+        if let s = since, modified < s { return false }
         return true
     }
 }
@@ -59,7 +57,7 @@ public final class VectorStore: @unchecked Sendable {
     private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
     // In-memory mirror for scoring.
-    private struct Row { let path: String; let snippet: String; let kind: String; let chunkIndex: Int; let vec: [Float] }
+    private struct Row { let path: String; let snippet: String; let kind: String; let chunkIndex: Int; let modified: Double; let vec: [Float] }
     private var rows: [Row] = []
 
     public init(dbURL: URL) throws {
@@ -118,7 +116,7 @@ public final class VectorStore: @unchecked Sendable {
             }
             exec("COMMIT;")
             rows.removeAll { $0.path == path }
-            rows.append(contentsOf: chunks.map { Row(path: $0.path, snippet: $0.snippet, kind: $0.kind, chunkIndex: $0.chunkIndex, vec: $0.embedding) })
+            rows.append(contentsOf: chunks.map { Row(path: $0.path, snippet: $0.snippet, kind: $0.kind, chunkIndex: $0.chunkIndex, modified: $0.modified, vec: $0.embedding) })
         }
     }
 
@@ -152,18 +150,19 @@ public final class VectorStore: @unchecked Sendable {
 
     // MARK: - Search
 
-    /// Top-K cosine search. Keeps the best-scoring chunk per file.
-    public func search(_ query: [Float], filter: SearchFilter = SearchFilter(), topK: Int = 20) -> [SearchHit] {
+    /// Top-K cosine search. Keeps the best-scoring chunk per file. Score thresholding
+    /// is left to the caller (the UI splits above/below so it can offer "show all").
+    public func search(_ query: [Float], filter: SearchFilter = SearchFilter(), topK: Int = 40) -> [SearchHit] {
         queue.sync {
             var best: [String: SearchHit] = [:]
             for r in rows {
+                if !filter.accepts(path: r.path, kind: r.kind, modified: r.modified) { continue }
                 var dot: Float = 0
                 let n = min(query.count, r.vec.count)
                 var i = 0
                 while i < n { dot += query[i] * r.vec[i]; i += 1 }
-                if !filter.accepts(path: r.path, kind: r.kind, score: dot) { continue }
                 if let existing = best[r.path], existing.score >= dot { continue }
-                best[r.path] = SearchHit(path: r.path, score: dot, snippet: r.snippet, kind: r.kind, chunkIndex: r.chunkIndex)
+                best[r.path] = SearchHit(path: r.path, score: dot, snippet: r.snippet, kind: r.kind, chunkIndex: r.chunkIndex, modified: r.modified)
             }
             return Array(best.values).sorted { $0.score > $1.score }.prefix(topK).map { $0 }
         }
@@ -171,6 +170,16 @@ public final class VectorStore: @unchecked Sendable {
 
     /// Distinct file kinds currently in the index (for populating filter chips).
     public func kinds() -> Set<String> { queue.sync { Set(rows.map { $0.kind }) } }
+
+    /// Distinct lowercased file extensions currently in the index.
+    public func extensions() -> Set<String> {
+        queue.sync {
+            Set(rows.compactMap { row -> String? in
+                let e = (row.path as NSString).pathExtension.lowercased()
+                return e.isEmpty ? nil : e
+            })
+        }
+    }
 
     // MARK: - Internals
 
@@ -186,19 +195,20 @@ public final class VectorStore: @unchecked Sendable {
     private func loadIntoMemory() {
         rows.removeAll()
         var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, "SELECT path, snippet, kind, chunk_index, dim, vec FROM chunks;", -1, &stmt, nil) == SQLITE_OK {
+        if sqlite3_prepare_v2(db, "SELECT path, snippet, kind, chunk_index, dim, vec, modified FROM chunks;", -1, &stmt, nil) == SQLITE_OK {
             while sqlite3_step(stmt) == SQLITE_ROW {
                 let path = String(cString: sqlite3_column_text(stmt, 0))
                 let snippet = String(cString: sqlite3_column_text(stmt, 1))
                 let kind = String(cString: sqlite3_column_text(stmt, 2))
                 let ci = Int(sqlite3_column_int(stmt, 3))
                 let dim = Int(sqlite3_column_int(stmt, 4))
+                let modified = sqlite3_column_double(stmt, 6)
                 if let blob = sqlite3_column_blob(stmt, 5) {
                     let bytes = Int(sqlite3_column_bytes(stmt, 5))
                     var vec = [Float](repeating: 0, count: dim)
                     let copyCount = min(bytes, dim * MemoryLayout<Float>.size)
                     vec.withUnsafeMutableBytes { dst in _ = memcpy(dst.baseAddress, blob, copyCount) }
-                    rows.append(Row(path: path, snippet: snippet, kind: kind, chunkIndex: ci, vec: vec))
+                    rows.append(Row(path: path, snippet: snippet, kind: kind, chunkIndex: ci, modified: modified, vec: vec))
                 }
             }
         }

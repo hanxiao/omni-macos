@@ -78,20 +78,20 @@ public enum FileExtractor {
         return enabledKinds.contains(k)
     }
 
-    public static func extract(_ url: URL) throws -> ExtractedContent {
+    public static func extract(_ url: URL, maxImageDimension: Int = 1568, maxVideoFrames: Int = 6) throws -> ExtractedContent {
         let ext = url.pathExtension.lowercased()
         if textExtensions.contains(ext) { return try extractText(url) }
-        if pdfExtensions.contains(ext) { return try extractPDF(url) }
+        if pdfExtensions.contains(ext) { return try extractPDF(url, maxImageDimension: maxImageDimension) }
         if officeExtensions.contains(ext) { return extractOffice(url) }
         if imageExtensions.contains(ext) {
-            if let img = loadImage(url) { return .images([img]) }
+            if let img = loadImage(url, maxDimension: maxImageDimension) { return .images([img]) }
             return .empty
         }
         if videoExtensions.contains(ext) {
-            let frames = videoFrames(url)
+            let frames = videoFrames(url, maxFrames: maxVideoFrames, maxDimension: maxImageDimension)
             return frames.isEmpty ? .empty : .images(frames)
         }
-        return .empty   // audio: not embeddable yet
+        return .empty   // audio handled separately by the audio tower
     }
 
     // MARK: - Text
@@ -107,7 +107,7 @@ public enum FileExtractor {
 
     // MARK: - PDF
 
-    private static func extractPDF(_ url: URL) throws -> ExtractedContent {
+    private static func extractPDF(_ url: URL, maxImageDimension: Int) throws -> ExtractedContent {
         guard let doc = PDFDocument(url: url) else { throw OmniError.extraction("cannot open PDF \(url.lastPathComponent)") }
         let pageCount = doc.pageCount
         let text = doc.string ?? ""
@@ -117,14 +117,16 @@ public enum FileExtractor {
         }
         var images: [CGImage] = []
         for i in 0 ..< min(pageCount, maxScanPages) {
-            if let page = doc.page(at: i), let img = render(page: page) { images.append(img) }
+            if let page = doc.page(at: i), let img = render(page: page, maxDimension: maxImageDimension) { images.append(img) }
         }
         if images.isEmpty { return trimmed.isEmpty ? .empty : .text(trimmed) }
         return .images(images)
     }
 
-    private static func render(page: PDFPage, scale: CGFloat = 2.0) -> CGImage? {
+    private static func render(page: PDFPage, maxDimension: Int) -> CGImage? {
         let bounds = page.bounds(for: .mediaBox)
+        let maxSide = max(bounds.width, bounds.height)
+        let scale = maxSide > 0 ? min(2.0, CGFloat(maxDimension) / maxSide) : 1.0
         let w = Int(bounds.width * scale), h = Int(bounds.height * scale)
         guard w > 0, h > 0,
               let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
@@ -152,15 +154,23 @@ public enum FileExtractor {
 
     // MARK: - Image
 
-    static func loadImage(_ url: URL) -> CGImage? {
+    /// Decode an image, downsampled so the largest side is <= maxDimension. The vision
+    /// model resizes to <= ~1.3MP, so decoding full-resolution photos is wasted work.
+    static func loadImage(_ url: URL, maxDimension: Int = 1568) -> CGImage? {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
-        return CGImageSourceCreateImageAtIndex(src, 0, nil)
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxDimension,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+        ]
+        return CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary)
+            ?? CGImageSourceCreateImageAtIndex(src, 0, nil)
     }
 
     // MARK: - Video
 
-    /// Sample up to `maxVideoFrames` frames evenly across the video for vision embedding.
-    static func videoFrames(_ url: URL) -> [CGImage] {
+    /// Sample up to `maxFrames` frames evenly across the video for vision embedding.
+    static func videoFrames(_ url: URL, maxFrames: Int = 6, maxDimension: Int = 1568) -> [CGImage] {
         let asset = AVURLAsset(url: url)
         let durationSec = CMTimeGetSeconds(asset.duration)
         guard durationSec.isFinite, durationSec > 0 else { return [] }
@@ -168,10 +178,9 @@ public enum FileExtractor {
         gen.appliesPreferredTrackTransform = true
         gen.requestedTimeToleranceBefore = .positiveInfinity
         gen.requestedTimeToleranceAfter = .positiveInfinity
-        let maxDim: CGFloat = 1024
-        gen.maximumSize = CGSize(width: maxDim, height: maxDim)
+        gen.maximumSize = CGSize(width: maxDimension, height: maxDimension)
 
-        let n = max(1, min(maxVideoFrames, Int(durationSec / 5) + 1))
+        let n = max(1, min(maxFrames, Int(durationSec / 5) + 1))
         var frames: [CGImage] = []
         for i in 0 ..< n {
             // Sample at the midpoint of each of n equal segments.

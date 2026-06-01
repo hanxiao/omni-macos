@@ -9,112 +9,57 @@ struct Sidebar: View {
         List {
             Section("Index") {
                 indexStatus
-            }
-            Section("Content Types") {
-                indexToggle(.image, "Images")
-                indexToggle(.video, "Video")
-                indexToggle(.audio, "Audio")
-                indexToggle(.text, "Text & Documents")
-                Text("Reindex to apply changes.")
-                    .font(.caption2).foregroundStyle(.tertiary)
+                if model.needsReindex {
+                    Button {
+                        model.startIndexing()
+                    } label: {
+                        Label("Reindex to apply changes", systemImage: "exclamationmark.arrow.circlepath")
+                    }
+                    .controlSize(.small)
+                }
             }
             Section("Folders") {
                 ForEach(model.roots, id: \.self) { url in
                     HStack {
-                        Image(systemName: "folder")
-                            .foregroundStyle(.secondary)
-                        Text(url.lastPathComponent)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
+                        Image(systemName: "folder").foregroundStyle(.secondary)
+                        Text(url.lastPathComponent).lineLimit(1).truncationMode(.middle)
                         Spacer()
-                        Button {
-                            model.removeRoot(url)
-                        } label: {
+                        Button { model.removeRoot(url) } label: {
                             Image(systemName: "minus.circle").foregroundStyle(.tertiary)
                         }
                         .buttonStyle(.plain)
                     }
                     .help(url.path)
                 }
-                Button {
-                    pickFolder()
-                } label: {
-                    Label("Add Folder", systemImage: "plus")
-                }
-                .buttonStyle(.plain)
+                Button { pickFolder() } label: { Label("Add Folder", systemImage: "plus") }
+                    .buttonStyle(.plain)
             }
         }
         .listStyle(.sidebar)
-        .safeAreaInset(edge: .bottom) { footer }
-    }
-
-    @ViewBuilder private func indexToggle(_ kind: FileKind, _ label: String) -> some View {
-        let unavailable = (kind == .audio && !model.audioSupported)
-        Toggle(isOn: Binding(
-            get: { model.settings.contains(kind) },
-            set: { model.setIndexKind(kind, $0) }
-        )) {
-            Label {
-                HStack(spacing: 6) {
-                    Text(label)
-                    if unavailable {
-                        Text("soon").font(.caption2).foregroundStyle(.tertiary)
-                    }
-                }
-            } icon: {
-                Image(systemName: kind.symbol)
-            }
-        }
-        .toggleStyle(.switch)
-        .controlSize(.mini)
-        .disabled(unavailable)
     }
 
     @ViewBuilder private var indexStatus: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if model.isIndexing {
+        if model.isIndexing {
+            VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     ProgressView().controlSize(.small)
                     Text("Indexing...").font(.callout).foregroundStyle(.secondary)
                     Spacer()
-                    Button("Stop") { model.cancelIndexing() }
-                        .controlSize(.small)
+                    Button("Stop") { model.cancelIndexing() }.controlSize(.small)
                 }
                 Text("\(model.progress.embedded) embedded · \(model.progress.scanned) scanned")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 Text(URL(fileURLWithPath: model.progress.currentPath).lastPathComponent)
                     .font(.caption2).foregroundStyle(.tertiary).lineLimit(1).truncationMode(.middle)
-            } else {
-                HStack(spacing: 6) {
-                    Image(systemName: "circle.fill").font(.system(size: 7)).foregroundStyle(.green)
-                    Text("\(model.indexedFiles) files · \(model.indexedChunks) chunks")
-                        .font(.callout).foregroundStyle(.secondary)
-                }
-                Button {
-                    model.startIndexing()
-                } label: {
-                    Label(model.indexedFiles == 0 ? "Index Folders" : "Reindex", systemImage: "arrow.clockwise")
-                }
-                .controlSize(.small)
             }
-        }
-        .padding(.vertical, 2)
-    }
-
-    private var footer: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Divider()
+            .padding(.vertical, 2)
+        } else {
             HStack(spacing: 6) {
-                Image(systemName: "cpu")
-                Text("jina-v5-omni · MLX")
-                if model.supportsImages {
-                    Image(systemName: "photo").help("Image embedding available")
-                }
+                Image(systemName: "circle.fill").font(.system(size: 7)).foregroundStyle(.green)
+                Text("\(model.indexedFiles) files · \(model.indexedChunks) chunks")
+                    .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
             }
-            .font(.caption2)
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 12)
-            .padding(.bottom, 8)
+            .padding(.vertical, 2)
         }
     }
 
@@ -123,8 +68,6 @@ struct Sidebar: View {
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = true
-        if panel.runModal() == .OK {
-            for url in panel.urls { model.addRoot(url) }
-        }
+        if panel.runModal() == .OK { for url in panel.urls { model.addRoot(url) } }
     }
 }

@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import MLX
 
 /// Locates a usable model directory (one containing model.safetensors).
 public enum ModelLocator {
@@ -44,7 +45,10 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     public var supportsVideo: Bool { imageEncoder != nil }
     public var supportsAudio: Bool { audioEncoder != nil }
 
-    public init(modelDir: URL) async throws {
+    /// - Parameter gpuCacheBytes: cap on MLX's buffer cache (0 = library default).
+    ///   Bounds memory growth during long indexing runs on unified memory.
+    public init(modelDir: URL, gpuCacheBytes: Int = 0) async throws {
+        if gpuCacheBytes > 0 { MLX.Memory.cacheLimit = gpuCacheBytes }
         self.modelDir = modelDir
         let config = try OmniConfig(modelDir: modelDir)
         let weights = try WeightStore(modelDir: modelDir, loraScale: config.loraScale, keepVision: true, keepAudio: true)

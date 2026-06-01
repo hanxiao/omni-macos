@@ -36,6 +36,8 @@ public final class Indexer: @unchecked Sendable {
     public var maxChunksPerFile = 40
     public var snippetLength = 220
 
+    private var active: IndexSettings = .default
+
     public init(store: VectorStore, embedder: Embedder) {
         self.store = store
         self.embedder = embedder
@@ -47,7 +49,7 @@ public final class Indexer: @unchecked Sendable {
     /// Full incremental pass over `roots`. `onProgress` is called on a background
     /// thread; marshal to the main actor in the UI.
     public func index(roots: [URL], settings: IndexSettings = .default, onProgress: @escaping (IndexProgress) -> Void) {
-        queue.sync { cancelled = false }
+        queue.sync { cancelled = false; active = settings }
         var p = IndexProgress()
         let known = store.indexedModified()
         var seen = Set<String>()
@@ -92,7 +94,7 @@ public final class Indexer: @unchecked Sendable {
 
         // Video and audio are single-vector embeddings (temporal video / audio tower).
         if category == .video {
-            let frames = FileExtractor.videoFrames(file.url)
+            let frames = FileExtractor.videoFrames(file.url, maxFrames: active.maxVideoFrames, maxDimension: active.maxImageDimension)
             guard !frames.isEmpty, let vec = embedder.embedVideoFrames(frames) else { return [] }
             return [IndexedChunk(path: file.url.path, modified: file.modified, kind: kind,
                                  chunkIndex: 0, snippet: file.url.lastPathComponent, embedding: vec)]
@@ -103,7 +105,7 @@ public final class Indexer: @unchecked Sendable {
                                  chunkIndex: 0, snippet: file.url.lastPathComponent, embedding: vec)]
         }
 
-        let content = try FileExtractor.extract(file.url)
+        let content = try FileExtractor.extract(file.url, maxImageDimension: active.maxImageDimension, maxVideoFrames: active.maxVideoFrames)
         switch content {
         case .empty:
             return []

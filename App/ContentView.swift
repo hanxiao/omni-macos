@@ -8,11 +8,26 @@ struct ContentView: View {
     var body: some View {
         NavigationSplitView {
             Sidebar()
-                .navigationSplitViewColumnWidth(min: 240, ideal: 270, max: 340)
+                .navigationSplitViewColumnWidth(min: 230, ideal: 260, max: 320)
         } detail: {
             detail
+                .navigationTitle("Omni")
+                .navigationSubtitle(subtitle)
+                .toolbar { toolbar }
         }
+        .searchable(text: $model.query, placement: .toolbar, prompt: "Search your files by meaning")
+        .onChange(of: model.query) { _, _ in scheduleSearch() }
+        .onSubmit(of: .search) { model.search() }
     }
+
+    private var subtitle: String {
+        guard model.phase == .ready, !model.query.isEmpty, !model.searching else { return "" }
+        let n = model.results.count
+        if n == 0 { return "" }
+        return n >= 60 ? "Top \(n) results" : "\(n) result\(n == 1 ? "" : "s")"
+    }
+
+    // MARK: - Detail
 
     @ViewBuilder private var detail: some View {
         switch model.phase {
@@ -21,46 +36,87 @@ struct ContentView: View {
         case .noModel:
             OnboardingView()
         case .failed(let msg):
-            CenteredStatus(symbol: "exclamationmark.triangle", title: "Engine failed to load", subtitle: msg, showSpinner: false)
+            EngineFailedView(message: msg)
         case .ready:
-            searchSurface
+            ready
         }
     }
 
-    private var searchSurface: some View {
+    @ViewBuilder private var ready: some View {
         VStack(spacing: 0) {
-            searchField
-            if model.indexedFiles > 0 { FilterBar() }
-            Divider()
-            if model.results.isEmpty {
-                emptyResults
-            } else {
-                ResultsList(results: model.results)
-            }
+            if model.indexedFiles > 0 { FilterBar(); Divider() }
+            content
         }
     }
 
-    private var searchField: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "magnifyingglass")
-                .foregroundStyle(.secondary)
-                .font(.title3)
-            TextField("Search your files by meaning", text: $model.query)
-                .textFieldStyle(.plain)
-                .font(.title3)
-                .onSubmit { model.search() }
-                .onChange(of: model.query) { _, _ in scheduleSearch() }
-            if model.searching {
-                ProgressView().controlSize(.small)
-            } else if !model.query.isEmpty {
-                Button { model.query = ""; model.results = [] } label: {
-                    Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
+    @ViewBuilder private var content: some View {
+        if !model.results.isEmpty {
+            ResultsList(results: model.results) { belowThresholdFooter }
+        } else {
+            emptyState
+        }
+    }
+
+    @ViewBuilder private var emptyState: some View {
+        if model.indexedFiles == 0 {
+            CenteredStatus(symbol: "square.stack.3d.up", title: "Nothing indexed yet",
+                           subtitle: "Index your folders to start searching.", showSpinner: false,
+                           action: ("Index Now", { model.startIndexing() }))
+        } else if model.query.isEmpty {
+            CenteredStatus(symbol: "sparkle.magnifyingglass", title: "Search \(model.indexedFiles) files",
+                           subtitle: "Type a phrase. Results are ranked by meaning, across images, video, audio, and text.", showSpinner: false)
+        } else if model.hiddenByThreshold > 0 {
+            CenteredStatus(symbol: "line.3.horizontal.decrease.circle",
+                           title: "No results above \(Int(model.minScore * 100))%",
+                           subtitle: "\(model.hiddenByThreshold) weaker match\(model.hiddenByThreshold == 1 ? "" : "es") are hidden by the relevance threshold.",
+                           showSpinner: false, action: ("Show All Matches", { model.showAllBelowThreshold() }))
+        } else {
+            CenteredStatus(symbol: "magnifyingglass", title: "No matches", subtitle: "Try a different phrase.", showSpinner: false)
+        }
+    }
+
+    @ViewBuilder private var belowThresholdFooter: some View {
+        if model.hiddenByThreshold > 0 {
+            Button { model.showAllBelowThreshold() } label: {
+                Label("Show \(model.hiddenByThreshold) more below \(Int(model.minScore * 100))%", systemImage: "chevron.down")
+                    .font(.callout)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
+        }
+    }
+
+    // MARK: - Toolbar
+
+    @ToolbarContentBuilder private var toolbar: some ToolbarContent {
+        ToolbarItem(placement: .primaryAction) {
+            Menu {
+                Picker("Sort By", selection: $model.sortOrder) {
+                    ForEach(SortOrder.allCases) { Text($0.title).tag($0) }
                 }
-                .buttonStyle(.plain)
+            } label: { Image(systemName: "arrow.up.arrow.down") }
+            .help("Sort results")
+            .disabled(model.results.isEmpty)
+        }
+        ToolbarItem(placement: .primaryAction) {
+            Picker("View", selection: $model.viewMode) {
+                Image(systemName: "list.bullet").tag(ResultViewMode.list)
+                Image(systemName: "square.grid.2x2").tag(ResultViewMode.grid)
+            }
+            .pickerStyle(.segmented)
+            .help("View as list or gallery")
+        }
+        ToolbarItem(placement: .primaryAction) {
+            if model.isIndexing {
+                Button { model.cancelIndexing() } label: { Image(systemName: "stop.circle") }
+                    .help("Stop indexing")
+            } else {
+                Button { model.startIndexing() } label: { Image(systemName: "arrow.clockwise") }
+                    .help("Reindex (\u{21E7}\u{2318}R)")
             }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
     }
 
     private func scheduleSearch() {
@@ -68,27 +124,6 @@ struct ContentView: View {
         debounce = Task {
             try? await Task.sleep(nanoseconds: 180_000_000)
             if !Task.isCancelled { model.search() }
-        }
-    }
-
-    private var emptyResults: some View {
-        Group {
-            if model.indexedFiles == 0 {
-                CenteredStatus(
-                    symbol: "square.stack.3d.up",
-                    title: "Nothing indexed yet",
-                    subtitle: "Index your folders to start searching.",
-                    showSpinner: false,
-                    action: ("Index now", { model.startIndexing() }))
-            } else if model.query.isEmpty {
-                CenteredStatus(
-                    symbol: "sparkle.magnifyingglass",
-                    title: "Search \(model.indexedFiles) files",
-                    subtitle: "Type a phrase. Results are ranked by meaning, not keywords.",
-                    showSpinner: false)
-            } else {
-                CenteredStatus(symbol: "magnifyingglass", title: "No matches", subtitle: "Try a different phrase.", showSpinner: false)
-            }
         }
     }
 }
@@ -102,24 +137,44 @@ struct CenteredStatus: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            Image(systemName: symbol)
-                .font(.system(size: 42, weight: .light))
-                .foregroundStyle(.tertiary)
+            Image(systemName: symbol).font(.system(size: 40, weight: .light)).foregroundStyle(.tertiary)
             Text(title).font(.title2).fontWeight(.semibold)
-            Text(subtitle)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 380)
+            Text(subtitle).font(.callout).foregroundStyle(.secondary)
+                .multilineTextAlignment(.center).frame(maxWidth: 400)
             if showSpinner { ProgressView().controlSize(.small).padding(.top, 4) }
             if let action {
-                Button(action.0, action: action.1)
-                    .controlSize(.large)
-                    .buttonStyle(.borderedProminent)
-                    .padding(.top, 4)
+                Button(action.0, action: action.1).controlSize(.large).buttonStyle(.borderedProminent).padding(.top, 4)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding()
+    }
+}
+
+struct EngineFailedView: View {
+    @EnvironmentObject var model: AppModel
+    let message: String
+    var body: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "exclamationmark.triangle").font(.system(size: 40, weight: .light)).foregroundStyle(.tertiary)
+            Text("Engine failed to load").font(.title2).fontWeight(.semibold)
+            HStack {
+                Button("Retry") { model.retryBootstrap() }.buttonStyle(.borderedProminent)
+                Button("Choose Model Folder...") { pickModel() }
+            }
+            .controlSize(.large)
+            DisclosureGroup("Details") {
+                Text(message).font(.caption.monospaced()).foregroundStyle(.secondary)
+                    .textSelection(.enabled).frame(maxWidth: 460, alignment: .leading)
+            }
+            .frame(maxWidth: 460)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding()
+    }
+    private func pickModel() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true; panel.canChooseFiles = false
+        if panel.runModal() == .OK, let url = panel.url { model.setModelDir(url) }
     }
 }
