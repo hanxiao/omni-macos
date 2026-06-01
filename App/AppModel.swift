@@ -2,6 +2,10 @@ import Foundation
 import SwiftUI
 import OmniKit
 
+enum ResultViewMode: String, CaseIterable {
+    case list, grid
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     enum Phase: Equatable {
@@ -22,7 +26,7 @@ final class AppModel: ObservableObject {
     @Published var indexedChunks = 0
     @Published var modelPath: String = ""
     @Published var supportsImages = false
-    let audioSupported = false   // audio tower not ported yet
+    @Published var audioSupported = false
 
     @Published var roots: [URL] = []
 
@@ -35,6 +39,11 @@ final class AppModel: ObservableObject {
     @Published var filterExt: String = ""
     @Published var minScore: Double = 0
     @Published var indexedKinds: Set<String> = []
+
+    @Published var viewMode: ResultViewMode = .list {
+        didSet { UserDefaults.standard.set(viewMode.rawValue, forKey: viewModeKey) }
+    }
+    private let viewModeKey = "omni.viewMode"
 
     var filtersActive: Bool {
         !filterKinds.isEmpty || filterFolder != nil
@@ -53,6 +62,9 @@ final class AppModel: ObservableObject {
     init() {
         loadRoots()
         loadSettings()
+        if let raw = UserDefaults.standard.string(forKey: viewModeKey), let m = ResultViewMode(rawValue: raw) {
+            viewMode = m
+        }
         Task { await bootstrap() }
     }
 
@@ -122,6 +134,7 @@ final class AppModel: ObservableObject {
             self.engine = engine
             self.indexer = indexer
             self.supportsImages = engine.supportsImages
+            self.audioSupported = engine.supportsAudio
             self.indexedFiles = store.fileCount
             self.indexedChunks = store.count
             self.indexedKinds = store.kinds()

@@ -7,14 +7,18 @@ No Python, no server, no network at query time.
 
 - Qwen3 text tower ported to MLX-Swift, retrieval LoRA merged at load time.
 - Last-token pooling, L2 normalization, Matryoshka dimensions (1024 default).
-- Numerically identical to the Python reference: cosine 1.00000 on the fixture set.
-- Qwen3-VL vision tower also ported: scanned PDFs (no text layer) and image files
-  route to the vision path and land in the same embedding space as text. Tower
-  parity vs the Python `encode_image` reference is cosine 1.00000; full
-  CGImage-to-embedding is cosine 0.985 (the gap is CoreGraphics vs PIL resize).
+- All four modalities ported to MLX-Swift and verified against the original
+  v5-omni `model.py` to **cosine 1.00000** (identical preprocessed inputs):
+  text, image (vision tower), video (`encode_video`, temporal), audio
+  (`encode_audio`, Whisper-style tower). Image end-to-end from a CGImage is 0.985,
+  the only non-1.0 number, and the gap is CoreGraphics-vs-PIL resize on the input
+  pixels, not the model.
+- Everything lands in one shared embedding space, so a text query finds images,
+  video, audio, scanned PDFs, and documents together.
 - SQLite vector store with brute-force cosine search.
-- Indexes images and video (sampled frames) by default; text/code/PDF/office is an
-  opt-in toggle. Audio is next (the audio tower port is pending).
+- Indexes images, video, and audio by default; text/code/PDF/office is an opt-in
+  toggle (per-modality switches in the sidebar).
+- Finder-style results: List and Gallery views with real QuickLook thumbnails.
 - Search filters by file kind, folder, extension, and minimum score.
 
 ## Requirements

@@ -28,12 +28,26 @@ public struct OmniConfig: Sendable {
         public var numPositionEmbeddings = 2304
     }
 
+    public struct Audio: Sendable {
+        public var dModel = 1280
+        public var encoderLayers = 32
+        public var encoderAttentionHeads = 20
+        public var encoderFFNDim = 5120
+        public var maxSourcePositions = 1500
+        public var nWindow = 100
+        public var numMelBins = 128
+    }
+
     public var text = Text()
     public var vision = Vision()
+    public var audio = Audio()
     public var imageTokenId = 151655
     public var videoTokenId = 151656
     public var visionStartTokenId = 151652
     public var visionEndTokenId = 151653
+    public var audioTokenId = 151669
+    public var audioStartTokenId = 151670
+    public var audioEndTokenId = 151671
 
     /// LoRA scale (alpha / r). Retrieval adapter is alpha=32, r=32 -> 1.0.
     public var loraScale: Float = 1.0
@@ -74,8 +88,18 @@ public struct OmniConfig: Sendable {
             cfg.vision.intermediateSize = vc["intermediate_size"] as? Int ?? cfg.vision.intermediateSize
             cfg.vision.numPositionEmbeddings = vc["num_position_embeddings"] as? Int ?? cfg.vision.numPositionEmbeddings
         }
+        if let ac = root["audio_config"] as? [String: Any] {
+            cfg.audio.dModel = ac["d_model"] as? Int ?? cfg.audio.dModel
+            cfg.audio.encoderLayers = ac["encoder_layers"] as? Int ?? cfg.audio.encoderLayers
+            cfg.audio.encoderAttentionHeads = ac["encoder_attention_heads"] as? Int ?? cfg.audio.encoderAttentionHeads
+            cfg.audio.encoderFFNDim = ac["encoder_ffn_dim"] as? Int ?? cfg.audio.encoderFFNDim
+            cfg.audio.maxSourcePositions = ac["max_source_positions"] as? Int ?? cfg.audio.maxSourcePositions
+            cfg.audio.nWindow = ac["n_window"] as? Int ?? cfg.audio.nWindow
+            cfg.audio.numMelBins = ac["num_mel_bins"] as? Int ?? cfg.audio.numMelBins
+        }
         cfg.imageTokenId = root["image_token_id"] as? Int ?? cfg.imageTokenId
         cfg.videoTokenId = root["video_token_id"] as? Int ?? cfg.videoTokenId
+        cfg.audioTokenId = root["audio_token_id"] as? Int ?? cfg.audioTokenId
         self = cfg
     }
 }

@@ -36,17 +36,21 @@ public enum ModelLocator {
 public final class OmniEngine: Embedder, @unchecked Sendable {
     private let textEncoder: OmniTextEncoder
     private let imageEncoder: OmniImageEncoder?
+    private let audioEncoder: OmniAudioEncoder?
     private let lock = NSLock()
     public let dim: Int
     public let modelDir: URL
     public var supportsImages: Bool { imageEncoder != nil }
+    public var supportsVideo: Bool { imageEncoder != nil }
+    public var supportsAudio: Bool { audioEncoder != nil }
 
     public init(modelDir: URL) async throws {
         self.modelDir = modelDir
         let config = try OmniConfig(modelDir: modelDir)
-        let weights = try WeightStore(modelDir: modelDir, loraScale: config.loraScale, keepVision: true)
+        let weights = try WeightStore(modelDir: modelDir, loraScale: config.loraScale, keepVision: true, keepAudio: true)
         self.textEncoder = try await OmniTextEncoder(modelDir: modelDir, weights: weights, config: config)
         self.imageEncoder = OmniImageEncoder(weights: weights, config: config)
+        self.audioEncoder = OmniAudioEncoder(weights: weights, config: config)
         self.dim = config.text.hiddenSize
     }
 
@@ -68,4 +72,20 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         return enc.encode(image)
     }
+
+    public func embedVideoFrames(_ frames: [CGImage]) -> [Float]? {
+        guard let enc = imageEncoder, !frames.isEmpty else { return nil }
+        lock.lock(); defer { lock.unlock() }
+        return enc.encodeVideo(frames)
+    }
+
+    public func embedAudio(_ url: URL) -> [Float]? {
+        guard let enc = audioEncoder else { return nil }
+        lock.lock(); defer { lock.unlock() }
+        return enc.encode(url)
+    }
+
+    /// Exposed for parity tests: embed already-preprocessed inputs.
+    public func imageEncoderForTesting() -> OmniImageEncoder? { imageEncoder }
+    public func audioEncoderForTesting() -> OmniAudioEncoder? { audioEncoder }
 }

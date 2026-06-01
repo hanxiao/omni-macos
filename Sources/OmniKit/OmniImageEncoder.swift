@@ -25,6 +25,15 @@ public final class OmniImageEncoder: @unchecked Sendable {
         return encode(pixelValues: pixelValues, gridTHW: grid)
     }
 
+    /// Embed a clip from sampled frames as a single temporal video embedding.
+    /// Reuses the vision tower (grid_t > 1) and the same vision-wrapper injection;
+    /// the placeholder token is overwritten, so the image and video paths are
+    /// identical given the (temporal) features.
+    public func encodeVideo(_ frames: [CGImage]) -> [Float]? {
+        guard let (pixelValues, grid) = OmniVideoPreprocess.preprocess(frames) else { return nil }
+        return encode(pixelValues: pixelValues, gridTHW: grid)
+    }
+
     /// Embed from already-preprocessed pixel values (used by the parity test).
     public func encode(pixelValues: MLXArray, gridTHW: [(Int, Int, Int)]) -> [Float] {
         let features = tower.forward(pixelValues, gridTHW: gridTHW)   // [N_merged, dim]

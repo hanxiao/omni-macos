@@ -34,6 +34,8 @@ let package = Package(
                 .copy("Resources/text_fixtures.json"),
                 .copy("Resources/image_ref.safetensors"),
                 .copy("Resources/test_image.png"),
+                .copy("Resources/video_ref.safetensors"),
+                .copy("Resources/audio_ref.safetensors"),
             ]
         ),
     ]

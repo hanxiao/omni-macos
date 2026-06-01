@@ -7,6 +7,10 @@ public protocol Embedder: AnyObject {
     func embedText(_ text: String, as type: OmniInputType) -> [Float]
     /// Embed a single image (vision tower). Returns nil if the vision path is unavailable.
     func embedImage(_ image: CGImage) -> [Float]?
+    /// Embed sampled video frames as one temporal embedding. Nil if unavailable.
+    func embedVideoFrames(_ frames: [CGImage]) -> [Float]?
+    /// Embed an audio file (decode + mel + audio tower). Nil if unavailable.
+    func embedAudio(_ url: URL) -> [Float]?
 }
 
 public struct IndexProgress: Sendable {
@@ -81,11 +85,25 @@ public final class Indexer: @unchecked Sendable {
     }
 
     private func embedFile(_ file: CrawledFile) throws -> [IndexedChunk] {
-        let content = try FileExtractor.extract(file.url)
         // "kind" is the file category (image/video/audio/text) used by the search
-        // filter, independent of which tower (text vs vision) produced the vector.
-        let kind = (FileExtractor.kind(for: file.url) ?? .text).rawValue
-        let isVideo = FileExtractor.kind(for: file.url) == .video
+        // filter, independent of which tower produced the vector.
+        let category = FileExtractor.kind(for: file.url) ?? .text
+        let kind = category.rawValue
+
+        // Video and audio are single-vector embeddings (temporal video / audio tower).
+        if category == .video {
+            let frames = FileExtractor.videoFrames(file.url)
+            guard !frames.isEmpty, let vec = embedder.embedVideoFrames(frames) else { return [] }
+            return [IndexedChunk(path: file.url.path, modified: file.modified, kind: kind,
+                                 chunkIndex: 0, snippet: file.url.lastPathComponent, embedding: vec)]
+        }
+        if category == .audio {
+            guard let vec = embedder.embedAudio(file.url) else { return [] }
+            return [IndexedChunk(path: file.url.path, modified: file.modified, kind: kind,
+                                 chunkIndex: 0, snippet: file.url.lastPathComponent, embedding: vec)]
+        }
+
+        let content = try FileExtractor.extract(file.url)
         switch content {
         case .empty:
             return []
@@ -105,7 +123,7 @@ public final class Indexer: @unchecked Sendable {
             for (i, img) in images.enumerated() {
                 if isCancelled { break }
                 guard let vec = embedder.embedImage(img) else { continue }
-                let label = isVideo ? "frame \(i + 1)" : (images.count > 1 ? "page \(i + 1)" : file.url.lastPathComponent)
+                let label = images.count > 1 ? "page \(i + 1)" : file.url.lastPathComponent
                 out.append(IndexedChunk(
                     path: file.url.path, modified: file.modified, kind: kind,
                     chunkIndex: i, snippet: "\(file.url.lastPathComponent) - \(label)", embedding: vec))

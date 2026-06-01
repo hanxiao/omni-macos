@@ -34,6 +34,14 @@ struct FilterBar: View {
             .buttonStyle(.plain)
             .foregroundStyle(model.filtersActive ? Color.accentColor : .secondary)
             .popover(isPresented: $showAdvanced, arrowEdge: .bottom) { advanced }
+
+            Picker("View", selection: $model.viewMode) {
+                Image(systemName: "list.bullet").tag(ResultViewMode.list)
+                Image(systemName: "square.grid.2x2").tag(ResultViewMode.grid)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fixedSize()
         }
         .padding(.horizontal, 16)
         .padding(.bottom, 8)

@@ -16,14 +16,13 @@ public struct WeightStore {
     ///   - modelDir: directory with model.safetensors and adapters/retrieval/adapter_model.safetensors
     ///   - loraScale: alpha / r (retrieval = 1.0)
     ///   - keepVision: also keep vision_tower.* / merger.* (image path); audio always dropped
-    public init(modelDir: URL, loraScale: Float = 1.0, keepVision: Bool = true) throws {
+    public init(modelDir: URL, loraScale: Float = 1.0, keepVision: Bool = true, keepAudio: Bool = true) throws {
         var w = try loadArrays(url: modelDir.appendingPathComponent("model.safetensors"))
 
         // Drop modalities we do not run.
         for key in Array(w.keys) {
             if key.contains("position_ids")
-                || key.hasPrefix("audio_tower.")
-                || key.hasPrefix("audio_projector.")
+                || (!keepAudio && (key.hasPrefix("audio_tower.") || key.hasPrefix("audio_projector.")))
                 || (!keepVision && (key.hasPrefix("vision_tower.") || key.hasPrefix("merger.")))
             {
                 w.removeValue(forKey: key)

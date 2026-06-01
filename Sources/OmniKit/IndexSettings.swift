@@ -4,7 +4,7 @@ import Foundation
 public struct IndexSettings: Sendable, Equatable {
     public var enabledKinds: Set<FileKind>
 
-    public init(enabledKinds: Set<FileKind> = [.image, .video]) {
+    public init(enabledKinds: Set<FileKind> = [.image, .video, .audio]) {
         self.enabledKinds = enabledKinds
     }
 
