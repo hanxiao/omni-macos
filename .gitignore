@@ -1,0 +1,22 @@
+# Swift / SPM
+.build/
+.swiftpm/
+*.xcodeproj
+*.xcworkspace
+DerivedData/
+
+# Xcode user state
+xcuserdata/
+*.xcuserstate
+
+# Model weights (multi-GB, never commit)
+.models/
+*.safetensors
+*.gguf
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+.venv/

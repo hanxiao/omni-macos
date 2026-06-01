@@ -1,0 +1,10 @@
+{
+  "model_dir": "/Volumes/One Touch/ai-models/huggingface/hub/models--jinaai--jina-embeddings-v5-omni-small-mlx/snapshots/716c5b684db3f6ba574dd9b4f6b14af3b2eb8bda",
+  "dim": 1024,
+  "task": "retrieval",
+  "query_prefix": "Query: ",
+  "passage_prefix": "Document: ",
+  "lora_alpha": 32,
+  "lora_r": 32,
+  "notes": "language_model upcast to fp32; vision/merger bf16; audio dropped"
+}

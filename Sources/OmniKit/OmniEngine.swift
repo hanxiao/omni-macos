@@ -1,0 +1,71 @@
+import Foundation
+import CoreGraphics
+
+/// Locates a usable model directory (one containing model.safetensors).
+public enum ModelLocator {
+    public static func candidates() -> [URL] {
+        var out: [URL] = []
+        if let env = ProcessInfo.processInfo.environment["OMNI_MODEL_DIR"] {
+            out.append(URL(fileURLWithPath: env))
+        }
+        let fm = FileManager.default
+        if let appSup = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false) {
+            out.append(appSup.appendingPathComponent("Omni/model"))
+        }
+        out.append(URL(fileURLWithPath: "/private/tmp/omni-model"))
+        // HuggingFace cache layout fallback.
+        let home = fm.homeDirectoryForCurrentUser
+        let hub = home.appendingPathComponent(".cache/huggingface/hub/models--jinaai--jina-embeddings-v5-omni-small-mlx/snapshots")
+        if let snaps = try? fm.contentsOfDirectory(at: hub, includingPropertiesForKeys: nil) {
+            out.append(contentsOf: snaps)
+        }
+        return out
+    }
+
+    public static func resolve() -> URL? {
+        let fm = FileManager.default
+        for dir in candidates() {
+            if fm.fileExists(atPath: dir.appendingPathComponent("model.safetensors").path) { return dir }
+        }
+        return nil
+    }
+}
+
+/// Public embedding facade: loads the model once and serializes MLX calls
+/// (MLX evaluation is not safe to run concurrently from multiple threads).
+public final class OmniEngine: Embedder, @unchecked Sendable {
+    private let textEncoder: OmniTextEncoder
+    private let imageEncoder: OmniImageEncoder?
+    private let lock = NSLock()
+    public let dim: Int
+    public let modelDir: URL
+    public var supportsImages: Bool { imageEncoder != nil }
+
+    public init(modelDir: URL) async throws {
+        self.modelDir = modelDir
+        let config = try OmniConfig(modelDir: modelDir)
+        let weights = try WeightStore(modelDir: modelDir, loraScale: config.loraScale, keepVision: true)
+        self.textEncoder = try await OmniTextEncoder(modelDir: modelDir, weights: weights, config: config)
+        self.imageEncoder = OmniImageEncoder(weights: weights, config: config)
+        self.dim = config.text.hiddenSize
+    }
+
+    /// Convenience initializer that locates the model automatically.
+    public static func load() async throws -> OmniEngine {
+        guard let dir = ModelLocator.resolve() else {
+            throw OmniError.model("no model found. Set OMNI_MODEL_DIR or install to ~/Library/Application Support/Omni/model")
+        }
+        return try await OmniEngine(modelDir: dir)
+    }
+
+    public func embedText(_ text: String, as type: OmniInputType) -> [Float] {
+        lock.lock(); defer { lock.unlock() }
+        return textEncoder.encode(text, as: type)
+    }
+
+    public func embedImage(_ image: CGImage) -> [Float]? {
+        guard let enc = imageEncoder else { return nil }
+        lock.lock(); defer { lock.unlock() }
+        return enc.encode(image)
+    }
+}
