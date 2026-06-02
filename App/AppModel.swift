@@ -107,10 +107,7 @@ final class AppModel: ObservableObject {
     @Published var downloadLabel = ""
     private var downloader: ModelDownloader?
 
-    // Keep the index fresh automatically (FSEvents).
-    @Published var liveUpdates: Bool = true {
-        didSet { UserDefaults.standard.set(liveUpdates, forKey: "omni.liveUpdates"); restartWatcher() }
-    }
+    // The index is always kept fresh in the background (FSEvents).
     private var watcher: FSWatcher?
 
     // Index-time minimum thresholds (0 = no minimum).
@@ -138,9 +135,6 @@ final class AppModel: ObservableObject {
         loadRoots()
         loadSettings()
         loadPerf()
-        if UserDefaults.standard.object(forKey: "omni.liveUpdates") != nil {
-            liveUpdates = UserDefaults.standard.bool(forKey: "omni.liveUpdates")
-        }
         if let raw = UserDefaults.standard.string(forKey: "omni.viewMode"), let m = ResultViewMode(rawValue: raw) { viewMode = m }
         Task { await bootstrap() }
     }
@@ -407,7 +401,7 @@ final class AppModel: ObservableObject {
 
     private func restartWatcher() {
         watcher?.stop(); watcher = nil
-        guard liveUpdates, engine != nil, !roots.isEmpty else { return }
+        guard engine != nil, !roots.isEmpty else { return }
         let since = UserDefaults.standard.string(forKey: "omni.fsEventId").flatMap { UInt64($0) }
         let w = FSWatcher(paths: roots.map { $0.path }, since: since) { [weak self] paths in
             Task { @MainActor in self?.handleFSChange(paths) }
@@ -417,7 +411,7 @@ final class AppModel: ObservableObject {
     }
 
     private func handleFSChange(_ paths: [String]) {
-        guard liveUpdates, indexState != .indexing, let indexer, let store else { return }
+        guard indexState != .indexing, let indexer, let store else { return }
         let settings = effectiveSettings()
         let eid = watcher?.latestEventId()
         Task.detached(priority: .utility) {

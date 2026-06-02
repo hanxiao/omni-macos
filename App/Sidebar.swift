@@ -28,10 +28,6 @@ struct Sidebar: View {
             }
             Section("Index") {
                 indexStatus
-                Toggle(isOn: $model.liveUpdates) {
-                    Text("Auto-update").font(.caption).foregroundStyle(.secondary)
-                }
-                .toggleStyle(.switch).controlSize(.mini)
             }
         }
         .listStyle(.sidebar)
