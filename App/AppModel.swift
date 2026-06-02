@@ -94,7 +94,7 @@ final class AppModel: ObservableObject {
     @Published var maxImageDimension: Int = 1568 { didSet { persistPerf() } }
     @Published var maxVideoFrames: Int = 6 { didSet { persistPerf() } }
     /// Hard memory cap in GB (0 = unlimited). Applied to MLX immediately.
-    @Published var maxMemoryGB: Double = 0 { didSet { persistPerf(); applyMemoryLimit() } }
+    @Published var maxMemoryGB: Double = 6 { didSet { persistPerf(); applyMemoryLimit() } }
     var physicalMemoryGB: Double { Double(omniPhysicalMemory()) / 1_000_000_000 }
 
     // Model variant (small / nano).

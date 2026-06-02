@@ -13,8 +13,13 @@ struct Sidebar: View {
                         folderLeading(url)
                         Text(url.lastPathComponent).lineLimit(1).truncationMode(.middle)
                         Spacer()
-                        if let c = model.folderFileCounts[url.path], c > 0 {
-                            Text(c.formatted()).font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
+                        // Once anything is indexed, show every folder's real count - a
+                        // plain "0" is an unambiguous "nothing here yet" rather than blank.
+                        if model.indexedFiles > 0, let c = model.folderFileCounts[url.path] {
+                            Text(c.formatted())
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(c == 0 ? .tertiary : .secondary)
+                                .help(c == 0 ? "No files indexed in this folder yet" : "\(c) files indexed")
                         }
                         Button { model.removeRoot(url) } label: {
                             Image(systemName: "minus.circle").foregroundStyle(.tertiary)

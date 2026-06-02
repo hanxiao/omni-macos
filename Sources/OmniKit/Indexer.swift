@@ -95,33 +95,53 @@ public final class Indexer: @unchecked Sendable {
         }
         onProgress(p)
 
-        // Pass 2: process each root through a concurrent-decode -> serial-embed pipeline
+        // Pass 2: process roots through a concurrent-decode -> serial-embed pipeline
         // so the GPU stays fed while CPU decode (image/video/audio + mel STFT) runs ahead
-        // on multiple cores. The consumer (embed + store) runs serially in file order.
+        // on multiple cores. The consumer (embed + store) runs serially.
+        //
+        // Files are interleaved round-robin across roots so every folder makes progress
+        // from the start. Embedding is one-at-a-time and slow, so draining a large first
+        // root (e.g. Documents with thousands of files) before touching the others would
+        // starve them for the whole run - a paused/interrupted index would then leave
+        // later folders (Downloads, Desktop) with nothing indexed at all.
+        var perRootFiles: [(key: String, files: [CrawledFile])] = []
         for root in roots {
             if isCancelled { break }
-            let rootKey = root.path
             var files: [CrawledFile] = []
             FileCrawler(roots: [root], enabledKinds: settings.enabledKinds)
                 .walk(shouldContinue: { !self.isCancelled }) { files.append($0) }
+            perRootFiles.append((root.path, files))
+        }
 
-            var done = 0
-            pipeline(files, force: force, known: known) { item in
-                let path = item.file.url.path
-                seen.insert(path)
-                p.scanned += 1
-                p.currentPath = path
-                done += 1
-                p.perRoot[rootKey]?.done = done
-                let chunks = self.embed(item)
-                if chunks.isEmpty { p.skipped += 1 }
-                else {
-                    do { try self.store.replace(path: path, chunks: chunks); p.embedded += 1 }
-                    catch { p.failed += 1 }
-                }
-                if p.scanned % 10 == 0 { onProgress(p) }
+        var interleaved: [CrawledFile] = []
+        interleaved.reserveCapacity(perRootFiles.reduce(0) { $0 + $1.files.count })
+        let maxLen = perRootFiles.map { $0.files.count }.max() ?? 0
+        for i in 0 ..< maxLen {
+            for pr in perRootFiles where i < pr.files.count { interleaved.append(pr.files[i]) }
+        }
+
+        var doneByRoot: [String: Int] = [:]
+        pipeline(interleaved, force: force, known: known) { item in
+            let path = item.file.url.path
+            seen.insert(path)
+            p.scanned += 1
+            p.currentPath = path
+            if let rootKey = roots.first(where: { path == $0.path || path.hasPrefix($0.path + "/") })?.path {
+                doneByRoot[rootKey, default: 0] += 1
+                p.perRoot[rootKey]?.done = doneByRoot[rootKey]!
             }
-            if !isCancelled, var rp = p.perRoot[rootKey] { rp.done = rp.total; p.perRoot[rootKey] = rp }
+            let chunks = self.embed(item)
+            if chunks.isEmpty { p.skipped += 1 }
+            else {
+                do { try self.store.replace(path: path, chunks: chunks); p.embedded += 1 }
+                catch { p.failed += 1 }
+            }
+            if p.scanned % 10 == 0 { onProgress(p) }
+        }
+        if !isCancelled {
+            for pr in perRootFiles {
+                if var rp = p.perRoot[pr.key] { rp.done = rp.total; p.perRoot[pr.key] = rp }
+            }
         }
 
         // Only reconcile deletions on a complete pass. A paused (cancelled) run has
