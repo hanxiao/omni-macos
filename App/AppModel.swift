@@ -408,13 +408,17 @@ final class AppModel: ObservableObject {
         let settings = effectiveSettings()
         let key = url.path
         activeRoots.insert(key)
+        progress.perRoot[key] = RootProgress()   // drives the clock pie from 0
         Task.detached(priority: .utility) {
             indexer.index(roots: [url], settings: settings, force: false) { p in
-                guard p.done else { return }
                 Task { @MainActor in
-                    self.activeRoots.remove(key)
-                    self.refreshIndexStats(store)
-                    if !self.query.isEmpty { self.search() }
+                    if let rp = p.perRoot[key] { self.progress.perRoot[key] = rp }   // live progress -> pie fill
+                    if p.done {
+                        self.activeRoots.remove(key)
+                        self.progress.perRoot[key] = nil
+                        self.refreshIndexStats(store)
+                        if !self.query.isEmpty { self.search() }
+                    }
                 }
             }
         }

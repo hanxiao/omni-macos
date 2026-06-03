@@ -48,10 +48,10 @@ struct Sidebar: View {
         return false
     }
 
-    /// Determinate progress for a folder mid-index, or nil for an indeterminate background
-    /// reconcile (a brief FSEvents update / a freshly added root) where no total is tracked.
+    /// Real clock progress for a folder being indexed (full index or a freshly added root),
+    /// or nil for a brief background reconcile (FSEvents) where there is no countable total.
     private func activeFraction(_ url: URL) -> Double? {
-        if model.isIndexing, let rp = model.progress.perRoot[url.path], rp.total > 0 { return rp.fraction }
+        if let rp = model.progress.perRoot[url.path], rp.total > 0 { return rp.fraction }
         return nil
     }
 
@@ -64,33 +64,31 @@ struct Sidebar: View {
     }
 }
 
-/// iCloud-Drive-style transfer indicator: a thin ring with a pie that fills clear -> accent
-/// as a transfer progresses (Apple: "changes gradually from clear to dark to indicate the
-/// progress of a file transfer"). `fraction == nil` is the indeterminate case - a small fixed
-/// wedge sweeps continuously to signal ongoing background activity.
+/// iCloud-Drive-style transfer indicator: a thin ring with a pie that fills clockwise,
+/// clear -> accent, in step with real progress (Apple: "changes gradually from clear to dark
+/// to indicate the progress of a file transfer"). `fraction == nil` is the brief, uncountable
+/// reconcile case - the platform's standard indeterminate spinner, not a fake-progress sweep.
 struct CloudSyncPie: View {
     let fraction: Double?
-    @State private var sweep = false
 
     var body: some View {
-        ZStack {
-            Circle().strokeBorder(Color.secondary.opacity(0.5), lineWidth: 1)
-            if let fraction {
+        if let fraction {
+            ZStack {
+                Circle().strokeBorder(Color.secondary.opacity(0.5), lineWidth: 1)
                 PieWedge(fraction: max(0.02, min(1, fraction)))
                     .fill(Color.accentColor)
                     .padding(1.5)
                     .animation(.easeInOut(duration: 0.2), value: fraction)
-            } else {
-                PieWedge(fraction: 0.25)
-                    .fill(Color.accentColor)
-                    .padding(1.5)
-                    .rotationEffect(.degrees(sweep ? 360 : 0))
-                    .animation(.linear(duration: 1).repeatForever(autoreverses: false), value: sweep)
-                    .onAppear { sweep = true }
             }
+            .frame(width: 12, height: 12)
+            .accessibilityHidden(true)
+        } else {
+            ProgressView()
+                .controlSize(.small)
+                .scaleEffect(0.7)
+                .frame(width: 12, height: 12)
+                .accessibilityHidden(true)
         }
-        .frame(width: 12, height: 12)
-        .accessibilityHidden(true)
     }
 }
 
