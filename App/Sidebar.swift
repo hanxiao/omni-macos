@@ -10,12 +10,17 @@ struct Sidebar: View {
             Section("Folders") {
                 ForEach(model.roots, id: \.self) { url in
                     HStack(spacing: 7) {
-                        folderLeading(url)
+                        Image(systemName: "folder").foregroundStyle(.secondary).frame(width: 16)
                         Text(url.lastPathComponent).lineLimit(1).truncationMode(.middle)
                         Spacer()
-                        // Once anything is indexed, show every folder's real count - a
-                        // plain "0" is an unambiguous "nothing here yet" rather than blank.
-                        if model.indexedFiles > 0, let c = model.folderFileCounts[url.path] {
+                        if isActive(url) {
+                            // iCloud-Drive-style transfer indicator: a pie that fills as this
+                            // folder is indexed (or sweeps when reconciling in the background).
+                            CloudSyncPie(fraction: activeFraction(url))
+                                .help("Indexing\u{2026}")
+                        } else if model.indexedFiles > 0, let c = model.folderFileCounts[url.path] {
+                            // Once anything is indexed, show every folder's real count - a
+                            // plain "0" is an unambiguous "nothing here yet" rather than blank.
                             Text(c.formatted())
                                 .font(.caption.monospacedDigit())
                                 .foregroundStyle(c == 0 ? .tertiary : .secondary)
@@ -35,23 +40,19 @@ struct Sidebar: View {
         .listStyle(.sidebar)
     }
 
-    /// Folder leading glyph. While this folder has background work - a full index in
-    /// progress or a live reconcile of file-system changes - it shows an AirDrop-style
-    /// radar pulse (concentric rings rippling outward from a center blip), the system's
-    /// idiom for "actively scanning". Otherwise a plain folder icon. The determinate
-    /// done/total lives in Settings > Indexing, mirroring AirDrop's indeterminate cue.
+    /// A folder has background work when it is mid full-index or mid live reconcile of
+    /// file-system changes.
     private func isActive(_ url: URL) -> Bool {
         if model.activeRoots.contains(url.path) { return true }
         if model.isIndexing, let rp = model.progress.perRoot[url.path], rp.total > 0, rp.done < rp.total { return true }
         return false
     }
 
-    @ViewBuilder private func folderLeading(_ url: URL) -> some View {
-        if isActive(url) {
-            RadarPulse()
-        } else {
-            Image(systemName: "folder").foregroundStyle(.secondary).frame(width: 16)
-        }
+    /// Determinate progress for a folder mid-index, or nil for an indeterminate background
+    /// reconcile (a brief FSEvents update / a freshly added root) where no total is tracked.
+    private func activeFraction(_ url: URL) -> Double? {
+        if model.isIndexing, let rp = model.progress.perRoot[url.path], rp.total > 0 { return rp.fraction }
+        return nil
     }
 
     private func pickFolder() {
@@ -63,33 +64,53 @@ struct Sidebar: View {
     }
 }
 
-/// AirDrop-style radar pulse: concentric rings ripple outward from a center blip and fade,
-/// staggered and looping, the system idiom for "actively scanning / working". Indeterminate
-/// by design - it signals activity, not a percentage.
-struct RadarPulse: View {
-    private let ringCount = 3
-    private let period = 1.5
-    @State private var animating = false
+/// iCloud-Drive-style transfer indicator: a thin ring with a pie that fills clear -> accent
+/// as a transfer progresses (Apple: "changes gradually from clear to dark to indicate the
+/// progress of a file transfer"). `fraction == nil` is the indeterminate case - a small fixed
+/// wedge sweeps continuously to signal ongoing background activity.
+struct CloudSyncPie: View {
+    let fraction: Double?
+    @State private var sweep = false
 
     var body: some View {
         ZStack {
-            // The central blip the waves emanate from.
-            Circle().fill(Color.accentColor).frame(width: 3, height: 3)
-            ForEach(0 ..< ringCount, id: \.self) { i in
-                Circle()
-                    .strokeBorder(Color.accentColor, lineWidth: 1.2)
-                    .scaleEffect(animating ? 1 : 0.1)
-                    .opacity(animating ? 0 : 0.9)
-                    .animation(
-                        .easeOut(duration: period)
-                            .repeatForever(autoreverses: false)
-                            .delay(period / Double(ringCount) * Double(i)),
-                        value: animating
-                    )
+            Circle().strokeBorder(Color.secondary.opacity(0.5), lineWidth: 1)
+            if let fraction {
+                PieWedge(fraction: max(0.02, min(1, fraction)))
+                    .fill(Color.accentColor)
+                    .padding(1.5)
+                    .animation(.easeInOut(duration: 0.2), value: fraction)
+            } else {
+                PieWedge(fraction: 0.25)
+                    .fill(Color.accentColor)
+                    .padding(1.5)
+                    .rotationEffect(.degrees(sweep ? 360 : 0))
+                    .animation(.linear(duration: 1).repeatForever(autoreverses: false), value: sweep)
+                    .onAppear { sweep = true }
             }
         }
-        .frame(width: 14, height: 14)
-        .onAppear { animating = true }
+        .frame(width: 12, height: 12)
         .accessibilityHidden(true)
+    }
+}
+
+/// A pie slice from 12 o'clock, sweeping clockwise for `fraction` of the circle.
+struct PieWedge: Shape {
+    var fraction: Double
+    var animatableData: Double {
+        get { fraction }
+        set { fraction = newValue }
+    }
+    func path(in rect: CGRect) -> Path {
+        var p = Path()
+        let c = CGPoint(x: rect.midX, y: rect.midY)
+        let r = min(rect.width, rect.height) / 2
+        p.move(to: c)
+        p.addArc(center: c, radius: r,
+                 startAngle: .degrees(-90),
+                 endAngle: .degrees(-90 + 360 * fraction),
+                 clockwise: false)
+        p.closeSubpath()
+        return p
     }
 }
