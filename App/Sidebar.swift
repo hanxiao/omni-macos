@@ -35,14 +35,20 @@ struct Sidebar: View {
         .listStyle(.sidebar)
     }
 
-    /// Folder leading glyph. A ring while this folder has background work:
-    /// determinate during a full index, indeterminate while reconciling file-system
-    /// changes (add/change/remove). Otherwise a plain folder icon.
+    /// Folder leading glyph. While this folder has background work - a full index in
+    /// progress or a live reconcile of file-system changes - it shows an AirDrop-style
+    /// radar pulse (concentric rings rippling outward from a center blip), the system's
+    /// idiom for "actively scanning". Otherwise a plain folder icon. The determinate
+    /// done/total lives in Settings > Indexing, mirroring AirDrop's indeterminate cue.
+    private func isActive(_ url: URL) -> Bool {
+        if model.activeRoots.contains(url.path) { return true }
+        if model.isIndexing, let rp = model.progress.perRoot[url.path], rp.total > 0, rp.done < rp.total { return true }
+        return false
+    }
+
     @ViewBuilder private func folderLeading(_ url: URL) -> some View {
-        if model.isIndexing, let rp = model.progress.perRoot[url.path], rp.total > 0, rp.done < rp.total {
-            FolderProgressRing(fraction: rp.fraction)
-        } else if model.activeRoots.contains(url.path) {
-            FolderProgressRing(fraction: nil)
+        if isActive(url) {
+            RadarPulse()
         } else {
             Image(systemName: "folder").foregroundStyle(.secondary).frame(width: 16)
         }
@@ -57,31 +63,33 @@ struct Sidebar: View {
     }
 }
 
-/// AirDrop-style progress ring. `fraction == nil` spins as an indeterminate arc;
-/// a value draws a determinate trim.
-struct FolderProgressRing: View {
-    /// nil = indeterminate (spinning arc), otherwise 0...1 determinate.
-    let fraction: Double?
-    @State private var spin = false
+/// AirDrop-style radar pulse: concentric rings ripple outward from a center blip and fade,
+/// staggered and looping, the system idiom for "actively scanning / working". Indeterminate
+/// by design - it signals activity, not a percentage.
+struct RadarPulse: View {
+    private let ringCount = 3
+    private let period = 1.5
+    @State private var animating = false
 
     var body: some View {
         ZStack {
-            Circle().stroke(Color.secondary.opacity(0.25), lineWidth: 2)
-            if let fraction {
+            // The central blip the waves emanate from.
+            Circle().fill(Color.accentColor).frame(width: 3, height: 3)
+            ForEach(0 ..< ringCount, id: \.self) { i in
                 Circle()
-                    .trim(from: 0, to: max(0.03, min(1, fraction)))
-                    .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                    .rotationEffect(.degrees(-90))
-                    .animation(.easeInOut(duration: 0.25), value: fraction)
-            } else {
-                Circle()
-                    .trim(from: 0, to: 0.28)
-                    .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                    .rotationEffect(.degrees(spin ? 360 : 0))
-                    .animation(.linear(duration: 0.8).repeatForever(autoreverses: false), value: spin)
-                    .onAppear { spin = true }
+                    .strokeBorder(Color.accentColor, lineWidth: 1.2)
+                    .scaleEffect(animating ? 1 : 0.1)
+                    .opacity(animating ? 0 : 0.9)
+                    .animation(
+                        .easeOut(duration: period)
+                            .repeatForever(autoreverses: false)
+                            .delay(period / Double(ringCount) * Double(i)),
+                        value: animating
+                    )
             }
         }
         .frame(width: 14, height: 14)
+        .onAppear { animating = true }
+        .accessibilityHidden(true)
     }
 }
