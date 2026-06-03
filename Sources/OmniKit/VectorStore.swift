@@ -77,9 +77,10 @@ public final class VectorStore: @unchecked Sendable {
 
     private struct Row { let path: String; let snippet: String; let kind: String; let chunkIndex: Int; let modified: Double }
     private var rows: [Row] = []
-    private var vectors: [[Float]] = []      // parallel to rows (kept for mutation)
-    private var flat: [Float] = []           // contiguous [count*dim] for GEMV
-    private var flatDirty = true
+    // Single source of truth for embeddings: contiguous [count*dim], row i = rows[i]. Kept in
+    // sync on every mutation so search never rebuilds it (no full re-scan during indexing), and
+    // there is no second parallel [[Float]] copy (halves embedding residency).
+    private var flat: [Float] = []
     private var dim = 0
 
     public let dbURL: URL
@@ -91,6 +92,14 @@ public final class VectorStore: @unchecked Sendable {
             throw OmniError.store("open failed: \(String(cString: sqlite3_errmsg(db)))")
         }
         exec("PRAGMA journal_mode=WAL;")
+        // The index is a rebuildable cache, so NORMAL sync under WAL is safe (a crash at worst
+        // loses the tail of an in-progress reindex, which the next pass redoes). mmap_size and a
+        // bounded page cache cut read syscalls on load; temp_store=MEMORY keeps sorts off disk.
+        exec("PRAGMA synchronous=NORMAL;")
+        exec("PRAGMA mmap_size=268435456;")     // 256MB memory-mapped IO (virtual, demand-paged)
+        exec("PRAGMA cache_size=-65536;")        // 64MB page cache
+        exec("PRAGMA temp_store=MEMORY;")
+        exec("PRAGMA wal_autocheckpoint=2000;")
         exec("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);")
         // The index is a rebuildable cache: on a schema change, drop and recreate.
         if userVersion() != Self.schemaVersion {
@@ -114,7 +123,13 @@ public final class VectorStore: @unchecked Sendable {
         loadIntoMemory()
     }
 
-    deinit { sqlite3_close(db) }
+    deinit {
+        // Fold the WAL back into the main db on the way out so the next launch opens a compact
+        // file and no -wal/-shm lingers. deinit runs after all queued work, so this is safe.
+        exec("PRAGMA wal_checkpoint(TRUNCATE);")
+        sqlite3_close(db)
+        db = nil
+    }
 
     // MARK: - Mutations
 
@@ -156,11 +171,11 @@ public final class VectorStore: @unchecked Sendable {
             }
             exec("COMMIT;")
             removeRowsLocked { $0.path == path }
+            flat.reserveCapacity(flat.count + chunks.count * dim)
             for c in chunks {
                 rows.append(Row(path: c.path, snippet: c.snippet, kind: c.kind, chunkIndex: c.chunkIndex, modified: c.modified))
-                vectors.append(c.embedding)
+                flat.append(contentsOf: c.embedding)
             }
-            flatDirty = true
         }
     }
 
@@ -170,7 +185,6 @@ public final class VectorStore: @unchecked Sendable {
             deletePathLocked(path)
             exec("COMMIT;")
             removeRowsLocked { $0.path == path }
-            flatDirty = true
         }
     }
 
@@ -185,7 +199,6 @@ public final class VectorStore: @unchecked Sendable {
             }
             sqlite3_finalize(stmt)
             removeRowsLocked { $0.path == folder || $0.path.hasPrefix(folder + "/") }
-            flatDirty = true
         }
     }
 
@@ -199,7 +212,6 @@ public final class VectorStore: @unchecked Sendable {
             }
             sqlite3_finalize(stmt)
             removeRowsLocked { $0.kind == kind }
-            flatDirty = true
         }
     }
 
@@ -207,8 +219,8 @@ public final class VectorStore: @unchecked Sendable {
     public func wipeChunks() {
         queue.sync {
             exec("DELETE FROM chunks;")
-            rows.removeAll(); vectors.removeAll(); flat.removeAll()
-            dim = 0; flatDirty = false
+            rows.removeAll(); flat.removeAll()
+            dim = 0
         }
     }
 
@@ -231,6 +243,18 @@ public final class VectorStore: @unchecked Sendable {
     public var count: Int { queue.sync { rows.count } }
     public var fileCount: Int { queue.sync { Set(rows.map { $0.path }).count } }
 
+    /// All four summary stats in a single lock acquisition + single pass over rows.
+    public func allIndexStats() -> (fileCount: Int, chunkCount: Int, kinds: Set<String>, exts: Set<String>) {
+        queue.sync {
+            var paths = Set<String>(), k = Set<String>(), e = Set<String>()
+            for r in rows {
+                paths.insert(r.path); k.insert(r.kind)
+                let x = (r.path as NSString).pathExtension.lowercased(); if !x.isEmpty { e.insert(x) }
+            }
+            return (paths.count, rows.count, k, e)
+        }
+    }
+
     /// Distinct indexed files under a folder (path-boundary aware).
     public func fileCount(underFolder folder: String) -> Int {
         queue.sync {
@@ -246,7 +270,6 @@ public final class VectorStore: @unchecked Sendable {
     /// best-scoring chunk per file. Score thresholding is left to the caller.
     public func search(_ query: [Float], filter: SearchFilter = SearchFilter(), topK: Int = 40) -> [SearchHit] {
         queue.sync {
-            if flatDirty { rebuildFlatLocked() }
             let n = rows.count
             guard n > 0, dim > 0, query.count == dim else { return [] }
 
@@ -285,13 +308,13 @@ public final class VectorStore: @unchecked Sendable {
             var hits: [ChunkHit] = []
             let d = vDSP_Length(dim)
             query.withUnsafeBufferPointer { q in
-                guard let qp = q.baseAddress else { return }
-                for i in 0 ..< rows.count where rows[i].path == path {
-                    var dot: Float = 0
-                    vectors[i].withUnsafeBufferPointer { v in
-                        if let vp = v.baseAddress { vDSP_dotpr(vp, 1, qp, 1, &dot, d) }
+                flat.withUnsafeBufferPointer { fb in
+                    guard let qp = q.baseAddress, let mb = fb.baseAddress else { return }
+                    for i in 0 ..< rows.count where rows[i].path == path {
+                        var dot: Float = 0
+                        vDSP_dotpr(mb + i * dim, 1, qp, 1, &dot, d)
+                        hits.append(ChunkHit(chunkIndex: rows[i].chunkIndex, score: dot, snippet: rows[i].snippet))
                     }
-                    hits.append(ChunkHit(chunkIndex: rows[i].chunkIndex, score: dot, snippet: rows[i].snippet))
                 }
             }
             return hits.sorted { $0.score > $1.score }.prefix(topK).map { $0 }
@@ -345,28 +368,20 @@ public final class VectorStore: @unchecked Sendable {
 
     // MARK: - Internals
 
+    /// Drop rows (and their contiguous embedding slices) matching the predicate, compacting
+    /// `flat` in one pass. Only runs on deletes, never on search.
     private func removeRowsLocked(_ predicate: (Row) -> Bool) {
-        var keptRows: [Row] = []; var keptVecs: [[Float]] = []
-        keptRows.reserveCapacity(rows.count); keptVecs.reserveCapacity(vectors.count)
-        for i in 0 ..< rows.count where !predicate(rows[i]) {
-            keptRows.append(rows[i]); keptVecs.append(vectors[i])
-        }
-        rows = keptRows; vectors = keptVecs
-    }
-
-    private func rebuildFlatLocked() {
-        let n = rows.count
-        if n == 0 || dim == 0 { flat = []; flatDirty = false; return }
-        flat = [Float](repeating: 0, count: n * dim)
-        let stride = dim * MemoryLayout<Float>.size
-        flat.withUnsafeMutableBufferPointer { fb in
-            for i in 0 ..< n {
-                vectors[i].withUnsafeBytes { vb in
-                    memcpy(fb.baseAddress!.advanced(by: i * dim), vb.baseAddress, min(stride, vb.count))
-                }
+        guard dim > 0 else { rows.removeAll(where: predicate); return }
+        var keptRows: [Row] = []; keptRows.reserveCapacity(rows.count)
+        var keptFlat: [Float] = []; keptFlat.reserveCapacity(flat.count)
+        flat.withUnsafeBufferPointer { fb in
+            guard let base = fb.baseAddress else { return }
+            for i in 0 ..< rows.count where !predicate(rows[i]) {
+                keptRows.append(rows[i])
+                keptFlat.append(contentsOf: UnsafeBufferPointer(start: base + i * dim, count: dim))
             }
         }
-        flatDirty = false
+        rows = keptRows; flat = keptFlat
     }
 
     private func deletePathLocked(_ path: String) {
@@ -379,7 +394,7 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     private func loadIntoMemory() {
-        rows.removeAll(); vectors.removeAll(); dim = 0
+        rows.removeAll(); flat.removeAll(); dim = 0
         var stmt: OpaquePointer?
         if sqlite3_prepare_v2(db, "SELECT path, snippet, kind, chunk_index, dim, vec, modified FROM chunks;", -1, &stmt, nil) == SQLITE_OK {
             while sqlite3_step(stmt) == SQLITE_ROW {
@@ -392,15 +407,16 @@ public final class VectorStore: @unchecked Sendable {
                 guard d > 0, let blob = sqlite3_column_blob(stmt, 5) else { continue }
                 if dim == 0 { dim = d }
                 guard d == dim else { continue }   // skip mismatched-dimension rows
-                var vec = [Float](repeating: 0, count: d)
                 let bytes = Int(sqlite3_column_bytes(stmt, 5))
-                vec.withUnsafeMutableBytes { dst in _ = memcpy(dst.baseAddress, blob, min(bytes, d * MemoryLayout<Float>.size)) }
+                let count = min(bytes / MemoryLayout<Float>.size, d)
+                // Append the row's embedding straight into the contiguous buffer - no per-row
+                // [Float] allocation and no later rebuild pass.
+                flat.append(contentsOf: UnsafeBufferPointer(start: blob.assumingMemoryBound(to: Float.self), count: count))
+                if count < d { flat.append(contentsOf: repeatElement(0, count: d - count)) }
                 rows.append(Row(path: path, snippet: snippet, kind: kind, chunkIndex: ci, modified: modified))
-                vectors.append(vec)
             }
         }
         sqlite3_finalize(stmt)
-        flatDirty = true
     }
 
     private func userVersion() -> Int32 {

@@ -353,10 +353,11 @@ final class AppModel: ObservableObject {
     }
 
     private func refreshIndexStats(_ store: VectorStore) {
-        indexedFiles = store.fileCount
-        indexedChunks = store.count
-        indexedKinds = store.kinds()
-        indexedExts = store.extensions().sorted()
+        let stats = store.allIndexStats()
+        indexedFiles = stats.fileCount
+        indexedChunks = stats.chunkCount
+        indexedKinds = stats.kinds
+        indexedExts = stats.exts.sorted()
         folderFileCounts = Dictionary(uniqueKeysWithValues: roots.map { ($0.path, store.fileCount(underFolder: $0.path)) })
         dbPath = store.dbURL.path
         dbSizeBytes = store.sizeBytes()

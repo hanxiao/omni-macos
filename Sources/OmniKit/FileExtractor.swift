@@ -117,7 +117,11 @@ public enum FileExtractor {
         }
         var images: [CGImage] = []
         for i in 0 ..< min(pageCount, maxScanPages) {
-            if let page = doc.page(at: i), let img = render(page: page, maxDimension: maxImageDimension) { images.append(img) }
+            // Pool each page render so transient CGContext/backing buffers are freed between
+            // pages instead of accumulating across a long PDF.
+            autoreleasepool {
+                if let page = doc.page(at: i), let img = render(page: page, maxDimension: maxImageDimension) { images.append(img) }
+            }
         }
         if images.isEmpty { return trimmed.isEmpty ? .empty : .text(trimmed) }
         return .images(images)
@@ -202,11 +206,16 @@ public enum FileExtractor {
         var hashes: [UInt64] = []
         for i in 0 ..< candidates {
             if kept.count >= maxFrames { break }
-            let t = durationSec * (Double(i) + 0.5) / Double(candidates)
-            guard let img = try? gen.copyCGImage(at: CMTime(seconds: t, preferredTimescale: 600), actualTime: nil) else { continue }
-            let h = averageHash(img)
-            if hashes.allSatisfy({ hammingDistance($0, h) >= 8 }) {   // distinct from every kept frame
-                kept.append(img); hashes.append(h)
+            // Pool each candidate so discarded frames (the majority - dedup keeps few) are
+            // freed immediately rather than piling up for the whole clip. Kept frames live in
+            // `kept` and survive the drain.
+            autoreleasepool {
+                let t = durationSec * (Double(i) + 0.5) / Double(candidates)
+                guard let img = try? gen.copyCGImage(at: CMTime(seconds: t, preferredTimescale: 600), actualTime: nil) else { return }
+                let h = averageHash(img)
+                if hashes.allSatisfy({ hammingDistance($0, h) >= 8 }) {   // distinct from every kept frame
+                    kept.append(img); hashes.append(h)
+                }
             }
         }
         if kept.isEmpty,
