@@ -54,14 +54,31 @@ final class Qwen3Backbone: @unchecked Sendable {
     }
 
     /// Run the transformer over precomputed embeddings -> hidden after final norm [B, L, dim].
-    func forward(inputsEmbeds: MLXArray, length L: Int) -> MLXArray {
+    /// `lengths` (batched, right-padded) is used to build the bidirectional padding mask for
+    /// Nano; pass nil for a single sequence.
+    func forward(inputsEmbeds: MLXArray, length L: Int, lengths: [Int]? = nil) -> MLXArray {
+        let mask = attentionMask(inputsEmbeds, lengths: lengths)
         var h = inputsEmbeds.asType(.float32)
         for i in 0 ..< cfg.text.numLayers {
             let p = "language_model.layers.\(i)."
-            h = h + attention(rmsNorm(h, p + "input_layernorm.weight"), p)
+            h = h + attention(rmsNorm(h, p + "input_layernorm.weight"), p, mask: mask)
             h = h + mlp(rmsNorm(h, p + "post_attention_layernorm.weight"), p)
         }
         return rmsNorm(h, "language_model.norm.weight")
+    }
+
+    /// Small (Qwen3) is causal. Nano (bidirectional LLaMA / EuroBERT) attends everywhere, with a
+    /// padding-only additive mask (-1e9 on pad columns) when batched - matching the reference
+    /// `_bidi_mask` - and full attention for a single sequence.
+    private func attentionMask(_ embeds: MLXArray, lengths: [Int]?) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        if cfg.text.isCausal { return .causal }
+        let B = embeds.dim(0), Lmax = embeds.dim(1)
+        guard let lengths, B > 1 else { return .none }
+        var m = [Float](repeating: 0, count: B * Lmax)
+        for b in 0 ..< B where lengths[b] < Lmax {
+            for j in lengths[b] ..< Lmax { m[b * Lmax + j] = -1e9 }
+        }
+        return .array(MLXArray(m, [B, 1, 1, Lmax]))
     }
 
     /// Last-token pool of a [1, L, dim] hidden state -> L2-normalized [Float].
@@ -89,20 +106,20 @@ final class Qwen3Backbone: @unchecked Sendable {
         return xf * MLX.rsqrt(v + cfg.text.rmsNormEps) * w[key]
     }
 
-    private func attention(_ x: MLXArray, _ p: String) -> MLXArray {
+    private func attention(_ x: MLXArray, _ p: String, mask: MLXFast.ScaledDotProductAttentionMaskMode) -> MLXArray {
         let t = cfg.text
         let B = x.dim(0)   // batch (1 for single, B for batched right-padded sequences)
         var q = linear(x, p + "self_attn.q_proj.weight").reshaped([B, -1, t.numHeads, t.headDim]).transposed(0, 2, 1, 3)
         var k = linear(x, p + "self_attn.k_proj.weight").reshaped([B, -1, t.numKVHeads, t.headDim]).transposed(0, 2, 1, 3)
         let v = linear(x, p + "self_attn.v_proj.weight").reshaped([B, -1, t.numKVHeads, t.headDim]).transposed(0, 2, 1, 3)
-        q = headNorm(q, p + "self_attn.q_norm.weight")
-        k = headNorm(k, p + "self_attn.k_norm.weight")
+        // Per-head q/k RMSNorm is a Qwen3 feature (Small). Nano is Qwen2-style and omits these
+        // weights, so apply the norm only when present - matching the reference.
+        if w.has(p + "self_attn.q_norm.weight") { q = headNorm(q, p + "self_attn.q_norm.weight") }
+        if w.has(p + "self_attn.k_norm.weight") { k = headNorm(k, p + "self_attn.k_norm.weight") }
         q = rope(q, offset: 0)
         k = rope(k, offset: 0)
         let scale = Float(pow(Double(t.headDim), -0.5))
-        // Right-padding + causal: real tokens never attend to (future) pad, so .causal
-        // alone is correct; we pool the last real token per row.
-        var out = MLXFast.scaledDotProductAttention(queries: q, keys: k, values: v, scale: scale, mask: .causal)
+        var out = MLXFast.scaledDotProductAttention(queries: q, keys: k, values: v, scale: scale, mask: mask)
         out = out.transposed(0, 2, 1, 3).reshaped([B, -1, t.numHeads * t.headDim])
         return linear(out, p + "self_attn.o_proj.weight")
     }

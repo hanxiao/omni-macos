@@ -18,7 +18,9 @@ public enum ModelLocator {
         URL(fileURLWithPath: "/Volumes/One Touch/ai-models/huggingface/hub"),
     ]
 
-    public static func candidates() -> [URL] {
+    /// Explicit overrides that win regardless of variant: an env pointer and the legacy
+    /// single-model path.
+    private static func overrides() -> [URL] {
         var out: [URL] = []
         if let env = ProcessInfo.processInfo.environment["OMNI_MODEL_DIR"] {
             out.append(URL(fileURLWithPath: env))
@@ -27,21 +29,31 @@ public enum ModelLocator {
         if let appSup = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false) {
             out.append(appSup.appendingPathComponent("Omni/model"))
         }
-        out.append(URL(fileURLWithPath: "/private/tmp/omni-model"))
-        out.append(contentsOf: variantSnapshots(.small))
         return out
     }
 
-    public static func resolve() -> URL? { firstWithWeights(candidates()) }
+    public static func candidates() -> [URL] {
+        overrides() + (resolve(variant: .nano).map { [$0] } ?? []) + (resolve(variant: .small).map { [$0] } ?? [])
+    }
 
-    /// Resolve a specific variant's model directory (HuggingFace cache / App Support).
+    /// Default model: an explicit override, else Nano (smaller and faster) when present,
+    /// else Small.
+    public static func resolve() -> URL? {
+        firstWithWeights(overrides()) ?? resolve(variant: .nano) ?? resolve(variant: .small)
+    }
+
+    /// Resolve a specific variant's model directory (staged dev path / HuggingFace cache /
+    /// App Support).
     public static func resolve(variant: ModelVariant) -> URL? {
         let fm = FileManager.default
         var dirs: [URL] = []
         if let appSup = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false) {
             dirs.append(appSup.appendingPathComponent("Omni/\(variant.rawValue)"))
         }
-        if variant == .small { dirs.append(URL(fileURLWithPath: "/private/tmp/omni-model")) }
+        switch variant {
+        case .small: dirs.append(URL(fileURLWithPath: "/private/tmp/omni-model"))
+        case .nano: dirs.append(URL(fileURLWithPath: "/private/tmp/omni-nano"))
+        }
         dirs.append(contentsOf: variantSnapshots(variant))
         return firstWithWeights(dirs)
     }

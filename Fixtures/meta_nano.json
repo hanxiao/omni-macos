@@ -1,0 +1,10 @@
+{
+  "model_dir": "/private/tmp/omni-nano",
+  "dim": 768,
+  "task": "retrieval",
+  "query_prefix": "Query: ",
+  "passage_prefix": "Document: ",
+  "lora_alpha": 32,
+  "lora_r": 32,
+  "notes": "language_model upcast to fp32; vision/merger bf16; audio dropped"
+}

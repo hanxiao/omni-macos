@@ -13,6 +13,8 @@ public struct OmniConfig: Sendable {
         public var rmsNormEps: Float = 1e-6
         public var vocabSize = 151672
         public var ropeTheta: Float = 3_500_000
+        /// Small (Qwen3) is causal; Nano (bidirectional LLaMA / EuroBERT) is not.
+        public var isCausal = true
     }
 
     public struct Vision: Sendable {
@@ -76,6 +78,7 @@ public struct OmniConfig: Sendable {
             cfg.text.headDim = tc["head_dim"] as? Int ?? cfg.text.headDim
             cfg.text.vocabSize = tc["vocab_size"] as? Int ?? cfg.text.vocabSize
             if let eps = tc["rms_norm_eps"] as? Double { cfg.text.rmsNormEps = Float(eps) }
+            cfg.text.isCausal = tc["is_causal"] as? Bool ?? cfg.text.isCausal
             if let rp = tc["rope_parameters"] as? [String: Any],
                let theta = rp["rope_theta"] as? Double {
                 cfg.text.ropeTheta = Float(theta)

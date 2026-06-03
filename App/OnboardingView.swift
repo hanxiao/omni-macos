@@ -26,8 +26,8 @@ struct OnboardingView: View {
                 .padding(.top, 4)
             } else {
                 VStack(spacing: 10) {
-                    variantButton(.small, size: "~3.1 GB", prominent: true)
-                    variantButton(.nano, size: "smaller, faster", prominent: false)
+                    variantButton(.nano, size: "~1.9 GB, faster", prominent: true)
+                    variantButton(.small, size: "~3.1 GB, higher quality", prominent: false)
                 }
                 .padding(.top, 4)
 

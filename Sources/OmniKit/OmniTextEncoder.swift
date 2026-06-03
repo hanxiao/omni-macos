@@ -24,9 +24,11 @@ public final class OmniTextEncoder: @unchecked Sendable {
 
     public var embeddingDim: Int { dim }
 
-    /// Token ids for `prefix + text` (no special tokens added), matching the reference.
+    /// Token ids for `prefix + text`, applying the tokenizer's own post-processor so each
+    /// variant matches its reference: Small's is ByteLevel only (adds nothing), while Nano's
+    /// TemplateProcessing appends the end-of-text token that last-token pooling depends on.
     public func tokenIds(_ text: String, _ type: OmniInputType) -> [Int] {
-        tokenizer.encode(text: type.prefix + text, addSpecialTokens: false)
+        tokenizer.encode(text: type.prefix + text, addSpecialTokens: true)
     }
 
     /// Token ids for just the retrieval prefix ("Query: " / "Document: "). The official
@@ -49,7 +51,7 @@ public final class OmniTextEncoder: @unchecked Sendable {
         if texts.isEmpty { return [] }
         let idsList = texts.map { tokenIds($0, type) }
         let (embeds, lengths) = backbone.embedBatch(idsList)
-        let hidden = backbone.forward(inputsEmbeds: embeds, length: 0)
+        let hidden = backbone.forward(inputsEmbeds: embeds, length: 0, lengths: lengths)
         return backbone.poolBatch(hidden, lengths: lengths)
     }
 }

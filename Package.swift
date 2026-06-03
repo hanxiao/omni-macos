@@ -32,6 +32,7 @@ let package = Package(
             dependencies: ["OmniKit"],
             resources: [
                 .copy("Resources/text_fixtures.json"),
+                .copy("Resources/text_fixtures_nano.json"),
                 .copy("Resources/image_ref.safetensors"),
                 .copy("Resources/test_image.png"),
                 .copy("Resources/video_ref.safetensors"),

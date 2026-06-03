@@ -314,7 +314,7 @@ final class AppModel: ObservableObject {
         installedVariants = ModelLocator.installedVariants()
         guard let dir = resolvedModelDir() else { phase = .noModel; return }
         modelPath = dir.path
-        modelVariant = dir.path.contains("-nano-") ? .nano : .small
+        modelVariant = dir.path.contains("nano") ? .nano : .small
         do {
             let store = try VectorStore(dbURL: try Self.indexURL())
             let engine = try await OmniEngine(modelDir: dir)

@@ -53,6 +53,41 @@ final class TextEncoderTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(worstP, 0.999, "passage embedding parity")
     }
 
+    /// Nano variant parity: the MLX-Swift port of jina-embeddings-v5-omni-nano must match the
+    /// nano reference (its bundled utils.py, dim 768) to high precision. Uses fixed paths so it
+    /// does not depend on env propagation; skips when the nano model is not staged locally.
+    func testNanoEmbeddingsMatchReference() async throws {
+        let modelDir = URL(fileURLWithPath: env("OMNI_NANO_MODEL_DIR", "/private/tmp/omni-nano"))
+        guard FileManager.default.fileExists(atPath: modelDir.appendingPathComponent("model.safetensors").path) else {
+            throw XCTSkip("nano model not found: \(modelDir.path)")
+        }
+        guard let fixturesURL = Bundle.module.url(forResource: "text_fixtures_nano", withExtension: "json") else {
+            throw XCTSkip("nano fixtures resource missing")
+        }
+        let fx = try JSONDecoder().decode(Fixtures.self, from: Data(contentsOf: fixturesURL))
+
+        let config = try OmniConfig(modelDir: modelDir)
+        let weights = try WeightStore(modelDir: modelDir, loraScale: config.loraScale, keepVision: false)
+        let encoder = try await OmniTextEncoder(modelDir: modelDir, weights: weights, config: config)
+
+        // Guard against a silent model/fixture mismatch (e.g. the small model loaded by accident).
+        XCTAssertEqual(encoder.encode(fx.records[0].text, as: .query).count, fx.records[0].query_embedding.count,
+                       "nano output dim must match the nano fixtures (768)")
+
+        var worstQ: Float = 1, worstP: Float = 1
+        for r in fx.records {
+            XCTAssertEqual(encoder.tokenIds(r.text, .query), r.query_token_ids, "nano query token ids: \(r.text.prefix(30))")
+            XCTAssertEqual(encoder.tokenIds(r.text, .passage), r.passage_token_ids, "nano passage token ids: \(r.text.prefix(30))")
+            let cq = cosine(encoder.encode(r.text, as: .query), r.query_embedding)
+            let cp = cosine(encoder.encode(r.text, as: .passage), r.passage_embedding)
+            worstQ = min(worstQ, cq); worstP = min(worstP, cp)
+            print(String(format: "nano cosQ=%.5f cosP=%.5f  %@", cq, cp, String(r.text.prefix(40))))
+        }
+        print(String(format: "NANO WORST cosQ=%.5f cosP=%.5f", worstQ, worstP))
+        XCTAssertGreaterThanOrEqual(worstQ, 0.999, "nano query embedding parity")
+        XCTAssertGreaterThanOrEqual(worstP, 0.999, "nano passage embedding parity")
+    }
+
     /// Batched encoding (right-padded) must match per-string encoding and the reference.
     func testBatchedMatchesSingle() async throws {
         let modelDir = URL(fileURLWithPath: env("OMNI_MODEL_DIR", "/private/tmp/omni-model"))
