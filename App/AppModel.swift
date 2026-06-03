@@ -117,6 +117,11 @@ final class AppModel: ObservableObject {
 
     // The index is always kept fresh in the background (FSEvents).
     private var watcher: FSWatcher?
+    // File-system changes that arrive while a full index is running are buffered here and
+    // drained when it completes, so they are never lost (and omni.fsEventId is not advanced
+    // past unprocessed work).
+    private var pendingFSPaths = Set<String>()
+    private var pendingFSEventId: UInt64 = 0
 
     // Index-time minimum thresholds (0 = no minimum).
     @Published var minImageDimension: Int = 0 { didSet { persistPerf() } }
@@ -130,9 +135,16 @@ final class AppModel: ObservableObject {
     @Published var lastIndexed: Date?
     @Published var indexObsolete = false
     let embeddingVersion = omniEmbeddingVersion
-    /// Composite fingerprint that captures everything which changes the vectors:
-    /// code version + model identity + dimension + prefixes + vector-affecting preprocessing.
-    private var fingerprint = ""
+    /// Engine vector dimension, captured at load; used to derive the fingerprint.
+    private var engineDim = 0
+    /// Composite fingerprint of everything that changes which vectors land in the index:
+    /// code version + model identity + dimension + enabled kinds + index-time thresholds.
+    /// Computed on demand so it always reflects the current settings (changing a vector
+    /// affecting setting mid-session immediately re-derives indexObsolete).
+    private var fingerprint: String {
+        guard !modelPath.isEmpty, engineDim > 0 else { return "" }
+        return computeFingerprint(modelDir: URL(fileURLWithPath: modelPath), dim: engineDim)
+    }
 
     private var engine: OmniEngine?
     private var store: VectorStore?
@@ -176,12 +188,19 @@ final class AppModel: ObservableObject {
     func setIndexKind(_ k: FileKind, _ on: Bool) {
         settings.set(k, on)
         UserDefaults.standard.set(settings.enabledKinds.map { $0.rawValue }, forKey: "omni.indexKinds")
-        // Disabling a kind immediately removes its vectors so search/filters stay truthful.
-        if !on, let store {
-            store.deleteKind(k.rawValue)
-            filterKinds.remove(k)
-            refreshIndexStats(store)
-            if !query.isEmpty { search() }
+        if !on {
+            // Disabling a kind immediately removes its vectors so search/filters stay truthful.
+            if let store {
+                store.deleteKind(k.rawValue)
+                filterKinds.remove(k)
+                refreshIndexStats(store)
+                if !query.isEmpty { search() }
+            }
+        } else {
+            // Enabling a previously-skipped kind: incrementally index so its pre-existing
+            // files get embedded (already-indexed files are skipped by mtime). No wipe - the
+            // vector space is unchanged.
+            startIndexing()
         }
     }
     private func loadPerf() {
@@ -304,7 +323,14 @@ final class AppModel: ObservableObject {
             self.indexer = Indexer(store: store, embedder: engine)
             self.supportsImages = engine.supportsImages
             self.audioSupported = engine.supportsAudio
-            self.fingerprint = computeFingerprint(modelDir: dir, dim: engine.dim)
+            self.engineDim = engine.dim
+            // Migrate older fingerprint formats that encode the same vector space (they
+            // carried extra decode-knob suffixes). Re-stamp so a cosmetic format change does
+            // not force a full rebuild of a perfectly valid index.
+            if let stamped = store.metaGet("embedding_version"), stamped != fingerprint,
+               !fingerprint.isEmpty, stamped.hasPrefix(fingerprint) {
+                store.metaSet("embedding_version", fingerprint)
+            }
             refreshIndexStats(store)
             self.phase = .ready
             restartWatcher()
@@ -318,9 +344,12 @@ final class AppModel: ObservableObject {
         let attrs = try? FileManager.default.attributesOfItem(atPath: sf.path)
         let size = (attrs?[.size] as? Int64) ?? 0
         let mtime = Int((attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)
-        // Anything that changes the produced vectors belongs here.
-        return [embeddingVersion, "dim\(dim)", "model\(size)-\(mtime)",
-                "img\(maxImageDimension)", "vid\(maxVideoFrames)"].joined(separator: "|")
+        // Identifies the VECTOR SPACE only: the embedding code, dimension, and model identity.
+        // A mismatch means existing vectors are incomparable and the index must be wiped and
+        // rebuilt. Decode-quality knobs (maxImageDimension/maxVideoFrames), enabled kinds, and
+        // index-time thresholds deliberately do NOT belong here - they change which files are
+        // included, not the space, and are reconciled incrementally without a wipe.
+        return [embeddingVersion, "dim\(dim)", "model\(size)-\(mtime)"].joined(separator: "|")
     }
 
     private func refreshIndexStats(_ store: VectorStore) {
@@ -354,7 +383,41 @@ final class AppModel: ObservableObject {
         }
     }
     private func saveRoots() { UserDefaults.standard.set(roots.map { $0.path }, forKey: "omni.roots") }
-    func addRoot(_ url: URL) { guard !roots.contains(url) else { return }; roots.append(url); saveRoots(); restartWatcher() }
+
+    /// Collapse roots so none is nested inside another - overlapping roots would crawl,
+    /// embed, and count the same files twice.
+    private func canonicalizeRoots(_ roots: [URL]) -> [URL] {
+        let sorted = roots.sorted { $0.path.count < $1.path.count }   // ancestors first
+        var canonical: [URL] = []
+        for r in sorted where !canonical.contains(where: { r.path == $0.path || r.path.hasPrefix($0.path + "/") }) {
+            canonical.append(r)
+        }
+        return canonical
+    }
+
+    func addRoot(_ url: URL) {
+        guard !roots.contains(url) else { return }
+        roots = canonicalizeRoots(roots + [url])
+        saveRoots()
+        restartWatcher()
+        // FSEvents only sees future changes, so the folder's pre-existing files would never
+        // be indexed without a manual reindex. Index just this new root now (incremental:
+        // already-known files are skipped by mtime, so it is cheap if it overlapped).
+        guard indexState != .indexing, let indexer, let store, roots.contains(url) else { return }
+        let settings = effectiveSettings()
+        let key = url.path
+        activeRoots.insert(key)
+        Task.detached(priority: .utility) {
+            indexer.index(roots: [url], settings: settings, force: false) { p in
+                guard p.done else { return }
+                Task { @MainActor in
+                    self.activeRoots.remove(key)
+                    self.refreshIndexStats(store)
+                    if !self.query.isEmpty { self.search() }
+                }
+            }
+        }
+    }
     func removeRoot(_ url: URL) {
         roots.removeAll { $0 == url }
         if filterFolder == url { filterFolder = nil }
@@ -419,7 +482,14 @@ final class AppModel: ObservableObject {
     }
 
     private func handleFSChange(_ paths: [String]) {
-        guard indexState != .indexing, let indexer, let store else { return }
+        guard let indexer, let store else { return }
+        // During a full index, buffer changes instead of dropping them; startIndexing drains
+        // the buffer on completion.
+        if indexState == .indexing {
+            pendingFSPaths.formUnion(paths)
+            if let eid = watcher?.latestEventId() { pendingFSEventId = max(pendingFSEventId, eid) }
+            return
+        }
         let settings = effectiveSettings()
         let eid = watcher?.latestEventId()
         let touched = Set(paths.compactMap { rootKey(for: $0) })
@@ -460,8 +530,30 @@ final class AppModel: ObservableObject {
                         if !p.cancelled { store.metaSet("last_indexed", "\(Date().timeIntervalSince1970)") }
                         self.refreshIndexStats(store)
                         if !self.query.isEmpty { self.search() }
+                        if !p.cancelled { self.drainPendingFSChanges() }
                     }
                 }
+            }
+        }
+    }
+
+    /// Apply file-system changes that were buffered while a full index was running. Called
+    /// only after a completed (non-cancelled) pass, so a paused index never advances
+    /// omni.fsEventId past work it has not processed.
+    private func drainPendingFSChanges() {
+        guard !pendingFSPaths.isEmpty, let indexer, let store else { return }
+        let drained = Array(pendingFSPaths); pendingFSPaths.removeAll()
+        let eid = pendingFSEventId; pendingFSEventId = 0
+        let settings = effectiveSettings()
+        let touched = Set(drained.compactMap { rootKey(for: $0) })
+        activeRoots.formUnion(touched)
+        Task.detached(priority: .utility) {
+            indexer.update(paths: drained, settings: settings)
+            await MainActor.run {
+                if eid > 0 { UserDefaults.standard.set(String(eid), forKey: "omni.fsEventId") }
+                self.activeRoots.subtract(touched)
+                self.refreshIndexStats(store)
+                if !self.query.isEmpty { self.search() }
             }
         }
     }

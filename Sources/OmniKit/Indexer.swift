@@ -171,20 +171,34 @@ public final class Indexer: @unchecked Sendable {
                 store.deletePath(path)               // deleted / moved away
                 continue
             }
-            if isDir.boolValue { continue }
-            guard FileExtractor.isSupported(url, enabledKinds: settings.enabledKinds) else {
-                if known[path] != nil { store.deletePath(path) }   // now unsupported/disabled
+            // A directory event (new folder, bulk move-in) carries only the folder path,
+            // not its children. Crawl it so freshly added subtrees get indexed instead of
+            // being silently skipped until the next full pass.
+            if isDir.boolValue {
+                FileCrawler(roots: [url], enabledKinds: settings.enabledKinds)
+                    .walk(shouldContinue: { true }) { self.indexFile($0.url, known: known, settings: settings) }
                 continue
             }
-            guard let vals = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]) else { continue }
-            let mtime = vals.contentModificationDate?.timeIntervalSince1970 ?? 0
-            let size = vals.fileSize ?? 0
-            if let prev = known[path], prev.modified == mtime, prev.size == size { continue }  // unchanged
-            let file = CrawledFile(url: url, modified: mtime, size: size)
-            let chunks = embed(decode(file))
-            if chunks.isEmpty { store.deletePath(path) }
-            else { try? store.replace(path: path, chunks: chunks) }
+            indexFile(url, known: known, settings: settings)
         }
+    }
+
+    /// Embed (or remove) a single file, skipping it when unchanged. Shared by the targeted
+    /// watcher update and the directory re-crawl above.
+    private func indexFile(_ url: URL, known: [String: StoredFile], settings: IndexSettings) {
+        let path = url.path
+        guard FileExtractor.isSupported(url, enabledKinds: settings.enabledKinds) else {
+            if known[path] != nil { store.deletePath(path) }   // now unsupported/disabled
+            return
+        }
+        guard let vals = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]) else { return }
+        let mtime = vals.contentModificationDate?.timeIntervalSince1970 ?? 0
+        let size = vals.fileSize ?? 0
+        if let prev = known[path], prev.modified == mtime, prev.size == size { return }  // unchanged
+        let file = CrawledFile(url: url, modified: mtime, size: size)
+        let chunks = embed(decode(file))
+        if chunks.isEmpty { store.deletePath(path) }
+        else { try? store.replace(path: path, chunks: chunks) }
     }
 
     // MARK: - Pipeline

@@ -32,7 +32,7 @@ struct ContentView: View {
     @ViewBuilder private var detail: some View {
         switch model.phase {
         case .loadingModel:
-            CenteredStatus(symbol: "brain", title: "Loading omni model", subtitle: "Bringing up the MLX engine...", showSpinner: true)
+            CenteredStatus(symbol: "brain", title: "Loading omni model", subtitle: "Bringing up the MLX engine\u{2026}", showSpinner: true)
         case .noModel:
             OnboardingView()
         case .failed(let msg):
@@ -103,12 +103,12 @@ struct ContentView: View {
                         ForEach(SortOrder.allCases) { Text($0.title).tag($0) }
                     }
                 } label: { Image(systemName: "arrow.up.arrow.down") }
-                .help("Sort results")
+                .help("Sort by \(model.sortOrder.title)")
                 .disabled(model.rawResults.isEmpty)
 
                 Picker("View", selection: $model.viewMode) {
-                    Image(systemName: "list.bullet").tag(ResultViewMode.list)
-                    Image(systemName: "square.grid.2x2").tag(ResultViewMode.grid)
+                    Image(systemName: "list.bullet").accessibilityLabel("List view").tag(ResultViewMode.list)
+                    Image(systemName: "square.grid.2x2").accessibilityLabel("Gallery view").tag(ResultViewMode.grid)
                 }
                 .pickerStyle(.segmented)
                 .help("List or gallery")
@@ -197,7 +197,7 @@ struct EngineFailedView: View {
             Text("Engine failed to load").font(.title2).fontWeight(.semibold)
             HStack {
                 Button("Retry") { model.retryBootstrap() }.buttonStyle(.borderedProminent)
-                Button("Choose Model Folder...") { pickModel() }
+                Button("Choose Model Folder\u{2026}") { pickModel() }
             }
             .controlSize(.large)
             DisclosureGroup("Details") {

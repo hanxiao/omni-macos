@@ -7,7 +7,7 @@ struct OnboardingView: View {
 
     var body: some View {
         VStack(spacing: 18) {
-            Image(systemName: "sparkles.rectangle.stack")
+            Image(systemName: "square.stack")
                 .font(.system(size: 46, weight: .light))
                 .foregroundStyle(.tertiary)
             Text("Welcome to Omni")
@@ -31,7 +31,7 @@ struct OnboardingView: View {
                 }
                 .padding(.top, 4)
 
-                Button("Use an existing model folder\u{2026}") { pick() }
+                Button("Use an Existing Model Folder\u{2026}") { pick() }
                     .buttonStyle(.plain).font(.callout).foregroundStyle(.secondary).padding(.top, 6)
             }
 

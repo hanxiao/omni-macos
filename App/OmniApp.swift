@@ -19,7 +19,7 @@ struct OmniApp: App {
             }
             CommandGroup(after: .toolbar) {
                 Button(model.isPaused ? "Resume Indexing" : "Index") { model.startIndexing() }
-                    .keyboardShortcut("i", modifiers: [.command, .shift])
+                    .keyboardShortcut("r", modifiers: [.command])
                     .disabled(model.isIndexing || !model.canIndex)
                 Button("Pause Indexing") { model.pauseIndexing() }
                     .disabled(!model.isIndexing)

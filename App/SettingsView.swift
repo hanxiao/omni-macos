@@ -9,7 +9,7 @@ struct SettingsView: View {
             ContentTypesTab().tabItem { Label("Content", systemImage: "square.grid.2x2") }
             FiltersTab().tabItem { Label("Filters", systemImage: "line.3.horizontal.decrease") }
             PerformanceTab().tabItem { Label("Performance", systemImage: "speedometer") }
-            IndexTab().tabItem { Label("Storage", systemImage: "cylinder.split.1x2") }
+            IndexTab().tabItem { Label("Storage", systemImage: "externaldrive") }
         }
         .frame(width: 480, height: 380)
     }
@@ -107,7 +107,7 @@ private struct ContentTypesTab: View {
             } header: {
                 Text("What to index")
             } footer: {
-                Text("Everything is embedded into one space, so a text query finds any modality. Reindex after changing these.")
+                Text("Everything is embedded into one space, so a text query finds any modality. Turning a type off removes it right away; turning it on indexes those files in the background.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -276,7 +276,7 @@ private struct IndexTab: View {
                     ForEach(ModelVariant.allCases.filter { model.installedVariants[$0] == nil }, id: \.self) { v in
                         Button("Download \(v.title)") { model.downloadModel(v) }
                     }
-                    Button("Change Model Folder...") { pickModel() }
+                    Button("Change Model Folder\u{2026}") { pickModel() }
                 }
             } header: {
                 Text("Model")

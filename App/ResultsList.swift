@@ -159,6 +159,8 @@ struct PassagesView: View {
                 Text("No passages").font(.caption).foregroundStyle(.tertiary)
             }
         }
+        .padding(10)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
         .padding(.leading, 52)
         .padding(.trailing, 12)
         .padding(.bottom, 8)

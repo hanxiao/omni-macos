@@ -33,7 +33,12 @@ struct Thumbnail: View {
             }
         }
         .frame(width: side, height: side)
-        .background(Color(.controlBackgroundColor))
+        .background {
+            // Translucent well so thumbnails sit on the glass detail pane on macOS 26;
+            // opaque control background below. The border keeps definition either way.
+            if #available(macOS 26, *) { Rectangle().fill(.ultraThinMaterial) }
+            else { Color(.controlBackgroundColor) }
+        }
         .clipShape(RoundedRectangle(cornerRadius: corner, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: corner, style: .continuous)
