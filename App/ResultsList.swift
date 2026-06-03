@@ -25,11 +25,11 @@ struct ResultsList<Footer: View>: View {
             }
         }
         .quickLookPreview($previewURL)
-        .onKeyPress(.space) {
-            if previewURL != nil { previewURL = nil; return .handled }   // space again dismisses
-            if let u = selectedURL { previewURL = u; return .handled }
-            return .ignored
-        }
+        .background(QuickLookKeyMonitor(onSpace: {
+            // Finder-style toggle: space dismisses the preview if open, else previews the selection.
+            if previewURL != nil { previewURL = nil }
+            else { previewURL = selectedURL }
+        }))
         .onKeyPress(.return) { if let p = model.selection { open(p); return .handled }; return .ignored }
     }
 
