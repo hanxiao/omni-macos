@@ -5,12 +5,93 @@ import OmniKit
 struct SettingsView: View {
     var body: some View {
         TabView {
+            ActivityTab().tabItem { Label("Indexing", systemImage: "arrow.triangle.2.circlepath") }
             ContentTypesTab().tabItem { Label("Content", systemImage: "square.grid.2x2") }
             FiltersTab().tabItem { Label("Filters", systemImage: "line.3.horizontal.decrease") }
             PerformanceTab().tabItem { Label("Performance", systemImage: "speedometer") }
-            IndexTab().tabItem { Label("Index", systemImage: "cylinder.split.1x2") }
+            IndexTab().tabItem { Label("Storage", systemImage: "cylinder.split.1x2") }
         }
-        .frame(width: 480, height: 360)
+        .frame(width: 480, height: 380)
+    }
+}
+
+/// Live indexing status and the manual Index / Reindex / Pause controls. This is the
+/// single home for the detail that used to clutter the sidebar.
+private struct ActivityTab: View {
+    @EnvironmentObject var model: AppModel
+
+    private var overall: Double {
+        let rs = model.progress.perRoot.values
+        let total = rs.reduce(0) { $0 + $1.total }
+        guard total > 0 else { return 0 }
+        return Double(rs.reduce(0) { $0 + $1.done }) / Double(total)
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                switch model.indexState {
+                case .indexing:
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            ProgressView().controlSize(.small)
+                            Text("Indexing\u{2026}").fontWeight(.medium)
+                            Spacer()
+                            Button("Pause") { model.pauseIndexing() }.controlSize(.small)
+                        }
+                        ProgressView(value: overall)
+                        HStack {
+                            Text("\(model.progress.embedded) added")
+                            if model.progress.skipped > 0 { Text("\u{00B7} \(model.progress.skipped) skipped") }
+                            if model.progress.failed > 0 { Text("\u{00B7} \(model.progress.failed) failed") }
+                        }
+                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                        Text(URL(fileURLWithPath: model.progress.currentPath).lastPathComponent)
+                            .font(.caption2).foregroundStyle(.tertiary).lineLimit(1).truncationMode(.middle)
+                    }
+                case .paused:
+                    HStack(spacing: 8) {
+                        Image(systemName: "pause.circle.fill").foregroundStyle(.orange)
+                        Text("Paused \u{00B7} \(model.indexedFiles.formatted()) files indexed")
+                        Spacer()
+                        Button("Resume") { model.startIndexing() }.controlSize(.small)
+                    }
+                case .idle:
+                    HStack(spacing: 8) {
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                        Text(model.indexedFiles == 0 ? "Nothing indexed yet" : "Up to date \u{00B7} \(model.indexedFiles.formatted()) files")
+                        Spacer()
+                        Button(model.indexedFiles == 0 ? "Index" : "Reindex") { model.startIndexing() }
+                            .controlSize(.small).disabled(!model.canIndex)
+                    }
+                }
+            } header: {
+                Text("Status")
+            } footer: {
+                Text("The index keeps itself current in the background as files change. Reindex to rebuild from scratch.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            Section("Folders") {
+                ForEach(model.roots, id: \.self) { url in
+                    let rp = model.progress.perRoot[url.path]
+                    HStack {
+                        Image(systemName: "folder").foregroundStyle(.secondary)
+                        Text(url.lastPathComponent).lineLimit(1).truncationMode(.middle)
+                        Spacer()
+                        if model.isIndexing, let rp, rp.total > 0, rp.done < rp.total {
+                            Text("\(rp.done.formatted()) / \(rp.total.formatted())")
+                                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                        } else if model.activeRoots.contains(url.path) {
+                            Text("Updating\u{2026}").font(.caption).foregroundStyle(.secondary)
+                        } else if let c = model.folderFileCounts[url.path] {
+                            Text("\(c.formatted()) files").font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
+                        }
+                    }
+                }
+            }
+        }
+        .formStyle(.grouped)
     }
 }
 

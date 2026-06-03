@@ -77,6 +77,14 @@ final class AppModel: ObservableObject {
     @Published var indexedKinds: Set<String> = []
     @Published var indexedExts: [String] = []
     @Published var folderFileCounts: [String: Int] = [:]
+    /// Roots with an in-flight background reconcile (FSEvents add/change/remove). Drives
+    /// an indeterminate progress ring on that folder in the sidebar.
+    @Published var activeRoots: Set<String> = []
+
+    /// The configured root that `path` lives under, if any.
+    func rootKey(for path: String) -> String? {
+        roots.first { path == $0.path || path.hasPrefix($0.path + "/") }?.path
+    }
 
     // Search filters.
     @Published var filterKinds: Set<FileKind> = [] { didSet { search() } }
@@ -414,10 +422,13 @@ final class AppModel: ObservableObject {
         guard indexState != .indexing, let indexer, let store else { return }
         let settings = effectiveSettings()
         let eid = watcher?.latestEventId()
+        let touched = Set(paths.compactMap { rootKey(for: $0) })
+        activeRoots.formUnion(touched)
         Task.detached(priority: .utility) {
             indexer.update(paths: paths, settings: settings)
             await MainActor.run {
                 if let eid { UserDefaults.standard.set(String(eid), forKey: "omni.fsEventId") }
+                self.activeRoots.subtract(touched)
                 self.refreshIndexStats(store)
                 if !self.query.isEmpty { self.search() }
             }
