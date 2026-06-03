@@ -413,6 +413,9 @@ final class AppModel: ObservableObject {
             indexer.index(roots: [url], settings: settings, force: false) { p in
                 Task { @MainActor in
                     if let rp = p.perRoot[key] { self.progress.perRoot[key] = rp }   // live progress -> pie fill
+                    // Tick the visible counts while this background index runs (isIndexing is
+                    // false here, so nothing else would update them until it finished).
+                    if p.scanned % 24 == 0 { self.refreshIndexStats(store) }
                     if p.done {
                         self.activeRoots.remove(key)
                         self.progress.perRoot[key] = nil
@@ -529,7 +532,9 @@ final class AppModel: ObservableObject {
             indexer.index(roots: roots, settings: settings, force: force) { p in
                 Task { @MainActor in
                     self.progress = p
-                    if p.scanned % 25 == 0 { self.indexedFiles = store.fileCount }  // live count
+                    // Refresh the visible stats periodically so the file count, embeddings,
+                    // and per-folder counts tick up live in the sidebar and Settings.
+                    if p.scanned % 24 == 0 { self.refreshIndexStats(store) }
                     if p.done {
                         self.indexState = p.cancelled ? .paused : .idle
                         if !p.cancelled { store.metaSet("last_indexed", "\(Date().timeIntervalSince1970)") }

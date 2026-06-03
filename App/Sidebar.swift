@@ -64,29 +64,30 @@ struct Sidebar: View {
     }
 }
 
-/// iCloud-Drive-style transfer indicator: a thin ring with a pie that fills clockwise,
-/// clear -> accent, in step with real progress (Apple: "changes gradually from clear to dark
-/// to indicate the progress of a file transfer"). `fraction == nil` is the brief, uncountable
-/// reconcile case - the platform's standard indeterminate spinner, not a fake-progress sweep.
+/// iCloud-Drive-style transfer indicator. Matches Finder's sidebar pie: a faint monochrome
+/// ring with a grey pie (secondary label color, NOT accent) that fills clockwise from the top
+/// in step with real progress - Apple: "changes gradually from clear to dark to indicate the
+/// progress of a file transfer". `fraction == nil` is the brief, uncountable reconcile case,
+/// where the platform's standard indeterminate spinner is used instead of a fake sweep.
 struct CloudSyncPie: View {
     let fraction: Double?
 
     var body: some View {
         if let fraction {
             ZStack {
-                Circle().strokeBorder(Color.secondary.opacity(0.5), lineWidth: 1)
-                PieWedge(fraction: max(0.02, min(1, fraction)))
-                    .fill(Color.accentColor)
-                    .padding(1.5)
+                Circle().strokeBorder(Color.secondary.opacity(0.4), lineWidth: 1)
+                PieWedge(fraction: max(0.03, min(1, fraction)))
+                    .fill(Color.secondary)
+                    .padding(1)
                     .animation(.easeInOut(duration: 0.2), value: fraction)
             }
-            .frame(width: 12, height: 12)
+            .frame(width: 13, height: 13)
             .accessibilityHidden(true)
         } else {
             ProgressView()
                 .controlSize(.small)
-                .scaleEffect(0.7)
-                .frame(width: 12, height: 12)
+                .scaleEffect(0.6)
+                .frame(width: 13, height: 13)
                 .accessibilityHidden(true)
         }
     }
