@@ -292,6 +292,7 @@ public final class VectorStore: @unchecked Sendable {
                 let r = rows[i]
                 if !filter.accepts(path: r.path, kind: r.kind, modified: r.modified) { continue }
                 let dot = scores[i]
+                if !dot.isFinite { continue }   // ignore any degenerate (NaN/inf) stored vector
                 if let e = best[r.path], e.score >= dot { continue }
                 best[r.path] = SearchHit(path: r.path, score: dot, snippet: r.snippet, kind: r.kind, chunkIndex: r.chunkIndex, modified: r.modified)
             }
@@ -313,7 +314,7 @@ public final class VectorStore: @unchecked Sendable {
                     for i in 0 ..< rows.count where rows[i].path == path {
                         var dot: Float = 0
                         vDSP_dotpr(mb + i * dim, 1, qp, 1, &dot, d)
-                        hits.append(ChunkHit(chunkIndex: rows[i].chunkIndex, score: dot, snippet: rows[i].snippet))
+                        if dot.isFinite { hits.append(ChunkHit(chunkIndex: rows[i].chunkIndex, score: dot, snippet: rows[i].snippet)) }
                     }
                 }
             }

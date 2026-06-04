@@ -57,6 +57,7 @@ private final class ReadyBox: @unchecked Sendable { var items = [Int: DecodedIte
 /// Crawl -> extract -> chunk -> embed -> store, incrementally.
 public final class Indexer: @unchecked Sendable {
     static let log = Logger(subsystem: "ai.jina.omni", category: "indexer")
+    static func isFinite(_ v: [Float]) -> Bool { v.allSatisfy { $0.isFinite } }
 
     private let store: VectorStore
     private let embedder: Embedder
@@ -138,10 +139,16 @@ public final class Indexer: @unchecked Sendable {
             if item.unchanged {
                 p.unchanged += 1   // already indexed and current - nothing to do, not a skip
             } else {
-                let chunks = self.embed(item)
+                // Drop any chunk whose embedding is not finite (a degenerate NaN/inf vector
+                // from a problematic image, etc.) so it never pollutes search ranking.
+                let raw = self.embed(item)
+                let chunks = raw.filter { Self.isFinite($0.embedding) }
+                if chunks.count < raw.count {
+                    Self.log.error("non-finite embedding dropped: \(path, privacy: .public)")
+                }
                 if chunks.isEmpty {
                     p.skipped += 1
-                    Self.log.info("skip [\(item.kind, privacy: .public)] \(path, privacy: .public)")
+                    if raw.isEmpty { Self.log.info("skip [\(item.kind, privacy: .public)] \(path, privacy: .public)") }
                 } else {
                     do { try self.store.replace(path: path, chunks: chunks); p.embedded += 1 }
                     catch { p.failed += 1; Self.log.error("fail \(path, privacy: .public): \(String(describing: error), privacy: .public)") }
@@ -207,7 +214,7 @@ public final class Indexer: @unchecked Sendable {
         let size = vals.fileSize ?? 0
         if let prev = known[path], prev.modified == mtime, prev.size == size { return }  // unchanged
         let file = CrawledFile(url: url, modified: mtime, size: size)
-        let chunks = embed(decode(file))
+        let chunks = embed(decode(file)).filter { Self.isFinite($0.embedding) }
         if chunks.isEmpty { store.deletePath(path) }
         else { try? store.replace(path: path, chunks: chunks) }
     }
