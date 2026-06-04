@@ -37,11 +37,16 @@ private struct ActivityTab: View {
                             ProgressView().controlSize(.small)
                             Text("Indexing\u{2026}").fontWeight(.medium)
                             Spacer()
+                            if model.filesPerSec > 0 {
+                                Text(String(format: "%.1f files/sec", model.filesPerSec))
+                                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                            }
                             Button("Pause") { model.pauseIndexing() }.controlSize(.small)
                         }
                         ProgressView(value: overall)
                         HStack {
                             Text("\(model.progress.embedded) added")
+                            if model.progress.unchanged > 0 { Text("\u{00B7} \(model.progress.unchanged) up to date") }
                             if model.progress.skipped > 0 { Text("\u{00B7} \(model.progress.skipped) skipped") }
                             if model.progress.failed > 0 { Text("\u{00B7} \(model.progress.failed) failed") }
                         }
@@ -265,7 +270,6 @@ private struct IndexTab: View {
                     }
                 }
                 .disabled(model.isDownloading)
-                LabeledContent("Audio", value: model.audioSupported ? "Available" : "Unavailable")
 
                 if model.isDownloading {
                     VStack(alignment: .leading, spacing: 4) {

@@ -73,6 +73,11 @@ final class AppModel: ObservableObject {
     @Published var progress = IndexProgress()
     @Published var indexedFiles = 0
     @Published var indexedChunks = 0
+    /// Live embedding throughput during indexing: files (embeds) per second, smoothed. This is
+    /// the meaningful, exactly-measurable indexing rate (one embed per file).
+    @Published var filesPerSec: Double = 0
+    private var rateLastEmbedded = 0
+    private var rateLastTime: CFAbsoluteTime = 0
     @Published var modelPath = ""
     @Published var supportsImages = false
     @Published var audioSupported = false
@@ -568,17 +573,20 @@ final class AppModel: ObservableObject {
         indexObsolete = false
         indexState = .indexing
         progress = IndexProgress()
+        rateLastTime = 0; rateLastEmbedded = 0; filesPerSec = 0
         let roots = self.roots
         let settings = effectiveSettings()
         Task.detached(priority: .utility) {
             indexer.index(roots: roots, settings: settings, force: force) { p in
                 Task { @MainActor in
                     self.progress = p
+                    self.updateIndexRate(embedded: p.embedded)
                     // Refresh the visible stats periodically so the file count, embeddings,
                     // and per-folder counts tick up live in the sidebar and Settings.
                     if p.scanned % 24 == 0 { self.refreshIndexStats(store) }
                     if p.done {
                         self.indexState = p.cancelled ? .paused : .idle
+                        self.filesPerSec = 0
                         if !p.cancelled { store.metaSet("last_indexed", "\(Date().timeIntervalSince1970)") }
                         self.refreshIndexStats(store)
                         if !self.query.isEmpty { self.search() }
@@ -587,6 +595,17 @@ final class AppModel: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Smoothed embedding throughput (files/sec) from successive progress samples.
+    private func updateIndexRate(embedded: Int) {
+        let now = CFAbsoluteTimeGetCurrent()
+        if rateLastTime == 0 { rateLastTime = now; rateLastEmbedded = embedded; return }
+        let dt = now - rateLastTime
+        guard dt >= 0.5 else { return }   // sample ~twice a second
+        let inst = Double(embedded - rateLastEmbedded) / dt
+        filesPerSec = filesPerSec == 0 ? inst : filesPerSec * 0.5 + inst * 0.5   // EWMA
+        rateLastTime = now; rateLastEmbedded = embedded
     }
 
     /// Apply file-system changes that were buffered while a full index was running. Called
