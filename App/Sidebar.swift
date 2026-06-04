@@ -82,23 +82,23 @@ struct CloudSyncPie: View {
     let fraction: Double?
 
     var body: some View {
-        if let fraction {
-            ZStack {
-                Circle().strokeBorder(Color.secondary.opacity(0.4), lineWidth: 1)
-                PieWedge(fraction: max(0.03, min(1, fraction)))
-                    .fill(Color.secondary)
-                    .padding(1)
-                    .animation(.easeInOut(duration: 0.2), value: fraction)
+        Group {
+            if let fraction {
+                ZStack {
+                    Circle().strokeBorder(Color.secondary.opacity(0.4), lineWidth: 1)
+                    PieWedge(fraction: max(0.03, min(1, fraction)))
+                        .fill(Color.secondary)
+                        .padding(1)
+                        .animation(.easeInOut(duration: 0.2), value: fraction)
+                }
+            } else {
+                ProgressView().controlSize(.small).scaleEffect(0.6)
             }
-            .frame(width: 13, height: 13)
-            .accessibilityHidden(true)
-        } else {
-            ProgressView()
-                .controlSize(.small)
-                .scaleEffect(0.6)
-                .frame(width: 13, height: 13)
-                .accessibilityHidden(true)
         }
+        // A solid hover target so the .help tooltip fires anywhere over the glyph (the shapes
+        // alone leave transparent gaps), and no accessibilityHidden - which would drop the help.
+        .frame(width: 16, height: 16)
+        .contentShape(Rectangle())
     }
 }
 
