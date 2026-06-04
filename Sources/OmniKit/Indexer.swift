@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import os
 
 /// What the indexer needs from the embedding engine. OmniEngine conforms.
 public protocol Embedder: AnyObject {
@@ -28,7 +29,8 @@ public struct RootProgress: Sendable {
 public struct IndexProgress: Sendable {
     public var scanned = 0
     public var embedded = 0
-    public var skipped = 0
+    public var skipped = 0       // genuinely nothing to embed (no content / undecodable)
+    public var unchanged = 0     // already indexed and current
     public var failed = 0
     public var currentPath = ""
     public var done = false
@@ -44,8 +46,9 @@ final class DecodedItem: @unchecked Sendable {
     let file: CrawledFile
     let kind: String
     let payload: Payload
-    init(file: CrawledFile, kind: String = "", payload: Payload = .empty) {
-        self.file = file; self.kind = kind; self.payload = payload
+    let unchanged: Bool   // already indexed and not modified - not a "skip", just nothing to do
+    init(file: CrawledFile, kind: String = "", payload: Payload = .empty, unchanged: Bool = false) {
+        self.file = file; self.kind = kind; self.payload = payload; self.unchanged = unchanged
     }
 }
 
@@ -53,6 +56,8 @@ private final class ReadyBox: @unchecked Sendable { var items = [Int: DecodedIte
 
 /// Crawl -> extract -> chunk -> embed -> store, incrementally.
 public final class Indexer: @unchecked Sendable {
+    static let log = Logger(subsystem: "ai.jina.omni", category: "indexer")
+
     private let store: VectorStore
     private let embedder: Embedder
     private let queue = DispatchQueue(label: "omni.indexer")
@@ -130,11 +135,17 @@ public final class Indexer: @unchecked Sendable {
                 doneByRoot[rootKey, default: 0] += 1
                 p.perRoot[rootKey]?.done = doneByRoot[rootKey]!
             }
-            let chunks = self.embed(item)
-            if chunks.isEmpty { p.skipped += 1 }
-            else {
-                do { try self.store.replace(path: path, chunks: chunks); p.embedded += 1 }
-                catch { p.failed += 1 }
+            if item.unchanged {
+                p.unchanged += 1   // already indexed and current - nothing to do, not a skip
+            } else {
+                let chunks = self.embed(item)
+                if chunks.isEmpty {
+                    p.skipped += 1
+                    Self.log.info("skip [\(item.kind, privacy: .public)] \(path, privacy: .public)")
+                } else {
+                    do { try self.store.replace(path: path, chunks: chunks); p.embedded += 1 }
+                    catch { p.failed += 1; Self.log.error("fail \(path, privacy: .public): \(String(describing: error), privacy: .public)") }
+                }
             }
             if p.scanned % 10 == 0 { onProgress(p) }
         }
@@ -223,7 +234,7 @@ public final class Indexer: @unchecked Sendable {
                     $0.modified == file.modified && $0.size == file.size
                 } ?? false)
                 if self.isCancelled || unchanged {
-                    cond.lock(); ready.items[i] = DecodedItem(file: file); cond.signal(); cond.unlock()
+                    cond.lock(); ready.items[i] = DecodedItem(file: file, unchanged: unchanged); cond.signal(); cond.unlock()
                 } else {
                     decodeQ.async {
                         let item = self.isCancelled ? DecodedItem(file: file) : self.decode(file)

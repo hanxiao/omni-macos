@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import OmniKit
 
 struct ContentView: View {
@@ -55,15 +56,15 @@ struct ContentView: View {
     }
 
     @ViewBuilder private var emptyState: some View {
-        if model.isIndexing {
-            CenteredStatus(symbol: "circle.dotted", title: "Indexing\u{2026}",
-                           subtitle: "\(model.progress.embedded) files added so far.", showSpinner: true)
-        } else if model.indexedFiles == 0 {
-            CenteredStatus(symbol: "square.stack.3d.up", title: "Nothing indexed yet",
-                           subtitle: "Index your folders to start searching.", showSpinner: false,
-                           action: ("Index", { model.startIndexing() }))
+        // Indexing is invisible here - the sidebar's per-folder progress is the only cue, and
+        // search works while it runs. The user just adds folders and searches.
+        if model.roots.isEmpty {
+            CenteredStatus(symbol: "folder.badge.plus", title: "Add a folder to search",
+                           subtitle: "Choose the folders you want to search. Omni indexes them automatically and keeps them up to date.",
+                           showSpinner: false, action: ("Add Folder\u{2026}", { pickFolder() }))
         } else if model.query.isEmpty {
-            CenteredStatus(symbol: "sparkle.magnifyingglass", title: "Search \(model.indexedFiles) files",
+            CenteredStatus(symbol: "sparkle.magnifyingglass",
+                           title: model.indexedFiles > 0 ? "Search \(model.indexedFiles.formatted()) files" : "Search your files",
                            subtitle: "Type a phrase. Results are ranked by meaning, across images, video, audio, and text.", showSpinner: false)
         } else if model.hiddenByThreshold > 0 {
             CenteredStatus(symbol: "line.3.horizontal.decrease.circle",
@@ -162,6 +163,14 @@ struct ContentView: View {
             try? await Task.sleep(nanoseconds: 180_000_000)
             if !Task.isCancelled { model.search() }
         }
+    }
+
+    private func pickFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = true
+        if panel.runModal() == .OK { for url in panel.urls { model.addRoot(url) } }
     }
 }
 

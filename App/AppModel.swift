@@ -334,6 +334,12 @@ final class AppModel: ObservableObject {
             refreshIndexStats(store)
             self.phase = .ready
             restartWatcher()
+            // Indexing is invisible to the user: kick a background pass on every launch so the
+            // index catches up (finishes an interrupted crawl, picks up files added while the
+            // app was closed, rebuilds after a model switch) and stays current. It is
+            // incremental - already-embedded, unchanged files are skipped by mtime, so a
+            // complete index just does a quick crawl and stops. The flow is: add folders, search.
+            if canIndex { startIndexing() }
         } catch {
             self.phase = .failed("\(error)")
         }
