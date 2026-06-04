@@ -45,7 +45,7 @@ enum DateRange: String, CaseIterable, Identifiable {
 final class AppModel: ObservableObject {
     enum Phase: Equatable { case loadingModel, noModel, ready, failed(String) }
 
-    static let defaultMinScore = 0.0
+    static let defaultMinScore = 0.5
 
     /// Cosine similarity is -1...1; the UI presents it as a 0...100% relevance, clamping the
     /// (rare, semantically-opposite) negative scores to 0. Filtering uses this same clamped
@@ -91,13 +91,13 @@ final class AppModel: ObservableObject {
         roots.first { path == $0.path || path.hasPrefix($0.path + "/") }?.path
     }
 
-    // Search filters.
-    @Published var filterKinds: Set<FileKind> = [] { didSet { search() } }
-    @Published var filterFolder: URL? = nil { didSet { search() } }
-    @Published var filterExt: String = "" { didSet { search() } }
-    @Published var dateRange: DateRange = .any { didSet { search() } }
-    @Published var minScore: Double = defaultMinScore
-    @Published var sortOrder: SortOrder = .relevance
+    // Search filters + presentation. All persisted so the toolbar/view state survives relaunch.
+    @Published var filterKinds: Set<FileKind> = [] { didSet { persistFilters(); search() } }
+    @Published var filterFolder: URL? = nil { didSet { persistFilters(); search() } }
+    @Published var filterExt: String = "" { didSet { persistFilters(); search() } }
+    @Published var dateRange: DateRange = .any { didSet { persistFilters(); search() } }
+    @Published var minScore: Double = defaultMinScore { didSet { persistFilters() } }
+    @Published var sortOrder: SortOrder = .relevance { didSet { persistFilters() } }
 
     @Published var viewMode: ResultViewMode = .list {
         didSet { UserDefaults.standard.set(viewMode.rawValue, forKey: "omni.viewMode") }
@@ -160,6 +160,7 @@ final class AppModel: ObservableObject {
         loadRoots()
         loadSettings()
         loadPerf()
+        loadFilters()
         if let raw = UserDefaults.standard.string(forKey: "omni.viewMode"), let m = ResultViewMode(rawValue: raw) { viewMode = m }
         Task { await bootstrap() }
     }
@@ -181,6 +182,30 @@ final class AppModel: ObservableObject {
         !filterKinds.isEmpty || filterFolder != nil
             || !filterExt.isEmpty || dateRange != .any
             || minScore != Self.defaultMinScore
+    }
+
+    private func persistFilters() {
+        let d = UserDefaults.standard
+        d.set(filterKinds.map { $0.rawValue }, forKey: "omni.filterKinds")
+        d.set(filterFolder?.path ?? "", forKey: "omni.filterFolder")
+        d.set(filterExt, forKey: "omni.filterExt")
+        d.set(dateRange.rawValue, forKey: "omni.dateRange")
+        d.set(minScore, forKey: "omni.minScore")
+        d.set(sortOrder.rawValue, forKey: "omni.sortOrder")
+    }
+    private func loadFilters() {
+        let d = UserDefaults.standard
+        if let raw = d.array(forKey: "omni.filterKinds") as? [String] {
+            filterKinds = Set(raw.compactMap { FileKind(rawValue: $0) })
+        }
+        if let p = d.string(forKey: "omni.filterFolder"), !p.isEmpty {
+            let u = URL(fileURLWithPath: p)
+            if roots.contains(u) { filterFolder = u }   // ignore a folder no longer configured
+        }
+        if let e = d.string(forKey: "omni.filterExt") { filterExt = e }
+        if let dr = d.string(forKey: "omni.dateRange").flatMap(DateRange.init(rawValue:)) { dateRange = dr }
+        if d.object(forKey: "omni.minScore") != nil { minScore = d.double(forKey: "omni.minScore") }
+        if let so = d.string(forKey: "omni.sortOrder").flatMap(SortOrder.init(rawValue:)) { sortOrder = so }
     }
 
     // MARK: - Settings persistence
