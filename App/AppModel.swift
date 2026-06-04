@@ -73,10 +73,12 @@ final class AppModel: ObservableObject {
     @Published var progress = IndexProgress()
     @Published var indexedFiles = 0
     @Published var indexedChunks = 0
-    /// Live embedding throughput during indexing: files (embeds) per second, smoothed. This is
-    /// the meaningful, exactly-measurable indexing rate (one embed per file).
+    /// Live embedding throughput during indexing (smoothed): files (embeds) per second and
+    /// tokens (backbone sequence positions) per second. Both exactly measured.
     @Published var filesPerSec: Double = 0
+    @Published var tokensPerSec: Double = 0
     private var rateLastEmbedded = 0
+    private var rateLastTokens = 0
     private var rateLastTime: CFAbsoluteTime = 0
     @Published var modelPath = ""
     @Published var supportsImages = false
@@ -573,7 +575,7 @@ final class AppModel: ObservableObject {
         indexObsolete = false
         indexState = .indexing
         progress = IndexProgress()
-        rateLastTime = 0; rateLastEmbedded = 0; filesPerSec = 0
+        rateLastTime = 0; rateLastEmbedded = 0; rateLastTokens = 0; filesPerSec = 0; tokensPerSec = 0
         let roots = self.roots
         let settings = effectiveSettings()
         Task.detached(priority: .utility) {
@@ -586,7 +588,7 @@ final class AppModel: ObservableObject {
                     if p.scanned % 24 == 0 { self.refreshIndexStats(store) }
                     if p.done {
                         self.indexState = p.cancelled ? .paused : .idle
-                        self.filesPerSec = 0
+                        self.filesPerSec = 0; self.tokensPerSec = 0
                         if !p.cancelled { store.metaSet("last_indexed", "\(Date().timeIntervalSince1970)") }
                         self.refreshIndexStats(store)
                         if !self.query.isEmpty { self.search() }
@@ -597,15 +599,18 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Smoothed embedding throughput (files/sec) from successive progress samples.
+    /// Smoothed embedding throughput (files/sec and tokens/sec) from successive samples.
     private func updateIndexRate(embedded: Int) {
         let now = CFAbsoluteTimeGetCurrent()
-        if rateLastTime == 0 { rateLastTime = now; rateLastEmbedded = embedded; return }
+        let tokens = engine?.tokensProcessed ?? 0
+        if rateLastTime == 0 { rateLastTime = now; rateLastEmbedded = embedded; rateLastTokens = tokens; return }
         let dt = now - rateLastTime
         guard dt >= 0.5 else { return }   // sample ~twice a second
-        let inst = Double(embedded - rateLastEmbedded) / dt
-        filesPerSec = filesPerSec == 0 ? inst : filesPerSec * 0.5 + inst * 0.5   // EWMA
-        rateLastTime = now; rateLastEmbedded = embedded
+        let instFiles = Double(embedded - rateLastEmbedded) / dt
+        let instToks = Double(tokens - rateLastTokens) / dt
+        filesPerSec = filesPerSec == 0 ? instFiles : filesPerSec * 0.5 + instFiles * 0.5   // EWMA
+        tokensPerSec = tokensPerSec == 0 ? instToks : tokensPerSec * 0.5 + instToks * 0.5
+        rateLastTime = now; rateLastEmbedded = embedded; rateLastTokens = tokens
     }
 
     /// Apply file-system changes that were buffered while a full index was running. Called

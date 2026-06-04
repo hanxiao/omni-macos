@@ -8,6 +8,8 @@ public final class OmniAudioEncoder: @unchecked Sendable {
     private let backbone: Qwen3Backbone
     private let tower: OmniAudioTower
     private let cfg: OmniConfig
+    /// Sequence length (tokens: prefix + audio frames + wrappers) of the last encode.
+    public private(set) var lastSequenceLength = 0
 
     public init?(weights: WeightStore, config: OmniConfig) {
         guard weights.has("audio_tower.conv1.weight"),
@@ -47,6 +49,7 @@ public final class OmniAudioEncoder: @unchecked Sendable {
         let inputsEmbeds = MLX.concatenated(parts, axis: 1)
 
         let length = prefixIds.count + n + 2
+        lastSequenceLength = length
         let hidden = backbone.forward(inputsEmbeds: inputsEmbeds, length: length)
         return backbone.pool(hidden, length: length)
     }

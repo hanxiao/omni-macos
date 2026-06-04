@@ -166,33 +166,48 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         run(highPriority: true) { textEncoder.encode(text, as: .query) }
     }
 
+    // Cumulative backbone sequence positions (tokens) processed by INDEXING embeds (queries
+    // excluded). Thread-safe; the UI samples it to show live tok/s.
+    private let tokenLock = NSLock()
+    private var _tokensProcessed = 0
+    public var tokensProcessed: Int { tokenLock.withLock { _tokensProcessed } }
+    private func addTokens(_ n: Int) { tokenLock.withLock { _tokensProcessed += n } }
+
     // Embedder conformance - used by the indexer, so these run at low (indexing) priority.
     public func embedText(_ text: String, as type: OmniInputType) -> [Float] {
-        run(highPriority: type == .query) { textEncoder.encode(text, as: type) }
+        run(highPriority: type == .query) {
+            let v = textEncoder.encode(text, as: type)
+            if type != .query { addTokens(textEncoder.lastSequenceLength) }
+            return v
+        }
     }
 
     public func embedTextBatch(_ texts: [String], as type: OmniInputType) -> [[Float]] {
-        run(highPriority: type == .query) { textEncoder.encodeBatch(texts, as: type) }
+        run(highPriority: type == .query) {
+            let v = textEncoder.encodeBatch(texts, as: type)
+            if type != .query { addTokens(textEncoder.lastSequenceLength) }
+            return v
+        }
     }
 
     public func embedImage(_ image: CGImage) -> [Float]? {
         guard let enc = imageEncoder else { return nil }
-        return run(highPriority: false) { enc.encode(image, prefixIds: docPrefix) }
+        return run(highPriority: false) { let v = enc.encode(image, prefixIds: docPrefix); addTokens(enc.lastSequenceLength); return v }
     }
 
     public func embedVideoFrames(_ frames: [CGImage]) -> [Float]? {
         guard let enc = imageEncoder, !frames.isEmpty else { return nil }
-        return run(highPriority: false) { enc.encodeVideo(frames, prefixIds: docPrefix) }
+        return run(highPriority: false) { let v = enc.encodeVideo(frames, prefixIds: docPrefix); addTokens(enc.lastSequenceLength); return v }
     }
 
     public func embedAudio(_ url: URL) -> [Float]? {
         guard let enc = audioEncoder else { return nil }
-        return run(highPriority: false) { enc.encode(url, prefixIds: docPrefix) }
+        return run(highPriority: false) { let v = enc.encode(url, prefixIds: docPrefix); addTokens(enc.lastSequenceLength); return v }
     }
 
     public func embedAudioMel(_ mel: [Float], frames: Int) -> [Float]? {
         guard let enc = audioEncoder else { return nil }
-        return run(highPriority: false) { enc.encode(mel: mel, frames: frames, prefixIds: docPrefix) }
+        return run(highPriority: false) { let v = enc.encode(mel: mel, frames: frames, prefixIds: docPrefix); addTokens(enc.lastSequenceLength); return v }
     }
 
     /// Exposed for parity tests: embed already-preprocessed inputs.

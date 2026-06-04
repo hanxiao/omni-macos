@@ -10,6 +10,8 @@ public final class OmniImageEncoder: @unchecked Sendable {
     private let backbone: Qwen3Backbone
     private let tower: OmniVisionTower
     private let cfg: OmniConfig
+    /// Sequence length (tokens: prefix + vision patches + wrappers) of the last encode.
+    public private(set) var lastSequenceLength = 0
 
     public init?(weights: WeightStore, config: OmniConfig) {
         guard weights.has("vision_tower.patch_embed.proj.weight"),
@@ -53,6 +55,7 @@ public final class OmniImageEncoder: @unchecked Sendable {
         let inputsEmbeds = MLX.concatenated(parts, axis: 1)
 
         let length = prefixIds.count + n + 2
+        lastSequenceLength = length
         let hidden = backbone.forward(inputsEmbeds: inputsEmbeds, length: length)
         return backbone.pool(hidden, length: length)
     }

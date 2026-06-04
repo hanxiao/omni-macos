@@ -9,6 +9,8 @@ public final class OmniTextEncoder: @unchecked Sendable {
     private let backbone: Qwen3Backbone
     private let tokenizer: Tokenizer
     private let dim: Int
+    /// Sequence length (tokens) the backbone ran over in the last encode - for throughput.
+    public private(set) var lastSequenceLength = 0
 
     public init(weights: WeightStore, config: OmniConfig, tokenizer: Tokenizer) {
         self.backbone = Qwen3Backbone(weights: weights, config: config)
@@ -40,6 +42,7 @@ public final class OmniTextEncoder: @unchecked Sendable {
     /// Encode a single string to an L2-normalized embedding (optionally Matryoshka-truncated).
     public func encode(_ text: String, as type: OmniInputType, truncateDim: Int? = nil) -> [Float] {
         let ids = tokenIds(text, type)
+        lastSequenceLength = ids.count
         let embeds = backbone.embed(ids)
         let hidden = backbone.forward(inputsEmbeds: embeds, length: ids.count)
         return backbone.pool(hidden, length: ids.count, truncateDim: truncateDim)
@@ -51,6 +54,7 @@ public final class OmniTextEncoder: @unchecked Sendable {
         if texts.isEmpty { return [] }
         let idsList = texts.map { tokenIds($0, type) }
         let (embeds, lengths) = backbone.embedBatch(idsList)
+        lastSequenceLength = lengths.reduce(0, +)
         let hidden = backbone.forward(inputsEmbeds: embeds, length: 0, lengths: lengths)
         return backbone.poolBatch(hidden, lengths: lengths)
     }

@@ -38,7 +38,8 @@ private struct ActivityTab: View {
                             Text("Indexing\u{2026}").fontWeight(.medium)
                             Spacer()
                             if model.filesPerSec > 0 {
-                                Text(String(format: "%.1f files/sec", model.filesPerSec))
+                                Text(String(format: "%.1f files/sec \u{00B7} %@ tok/s", model.filesPerSec,
+                                            model.tokensPerSec >= 1000 ? String(format: "%.1fk", model.tokensPerSec / 1000) : String(format: "%.0f", model.tokensPerSec)))
                                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                             }
                             Button("Pause") { model.pauseIndexing() }.controlSize(.small)
