@@ -404,7 +404,9 @@ final class AppModel: ObservableObject {
         // FSEvents only sees future changes, so the folder's pre-existing files would never
         // be indexed without a manual reindex. Index just this new root now (incremental:
         // already-known files are skipped by mtime, so it is cheap if it overlapped).
-        guard indexState != .indexing, let indexer, let store, roots.contains(url) else { return }
+        // Skip the per-root catch-up when the index is obsolete (wrong vector space) or mid
+        // full index - the pending full reindex will cover the new folder cleanly.
+        guard indexState != .indexing, !indexObsolete, let indexer, let store, roots.contains(url) else { return }
         let settings = effectiveSettings()
         let key = url.path
         activeRoots.insert(key)
@@ -491,6 +493,10 @@ final class AppModel: ObservableObject {
 
     private func handleFSChange(_ paths: [String]) {
         guard let indexer, let store else { return }
+        // An obsolete index is in a different vector space (e.g. just switched models): writing
+        // new-dimension vectors into it would fail the store's dimension guard. Skip background
+        // updates until the user reindexes, which wipes and rebuilds in the new space.
+        guard !indexObsolete else { return }
         // During a full index, buffer changes instead of dropping them; startIndexing drains
         // the buffer on completion.
         if indexState == .indexing {
