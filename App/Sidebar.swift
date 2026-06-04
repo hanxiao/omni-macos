@@ -17,7 +17,6 @@ struct Sidebar: View {
                             // iCloud-Drive-style transfer indicator: a pie that fills as this
                             // folder is indexed (or sweeps when reconciling in the background).
                             CloudSyncPie(fraction: activeFraction(url))
-                                .help(indexingHelp(url))
                         } else if model.indexedFiles > 0, let c = model.folderFileCounts[url.path] {
                             // Once anything is indexed, show every folder's real count - a
                             // plain "0" is an unambiguous "nothing here yet" rather than blank.
@@ -31,7 +30,9 @@ struct Sidebar: View {
                         }
                         .buttonStyle(.plain)
                     }
-                    .help(url.path)
+                    // While this folder indexes, the row tooltip shows live progress;
+                    // otherwise the full path (useful when the name is truncated).
+                    .help(isActive(url) ? indexingHelp(url) : url.path)
                 }
                 Button { pickFolder() } label: { Label("Add Folder", systemImage: "plus") }
                     .buttonStyle(.plain)
