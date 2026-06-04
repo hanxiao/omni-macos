@@ -45,7 +45,12 @@ enum DateRange: String, CaseIterable, Identifiable {
 final class AppModel: ObservableObject {
     enum Phase: Equatable { case loadingModel, noModel, ready, failed(String) }
 
-    static let defaultMinScore = 0.5
+    static let defaultMinScore = 0.0
+
+    /// Cosine similarity is -1...1; the UI presents it as a 0...100% relevance, clamping the
+    /// (rare, semantically-opposite) negative scores to 0. Filtering uses this same clamped
+    /// value so the threshold matches what the user sees and never reads "below 0%".
+    static func relevance(_ score: Float) -> Double { Double(max(0, min(1, score))) }
 
     @Published var phase: Phase = .loadingModel
     @Published var query: String = ""
@@ -163,14 +168,14 @@ final class AppModel: ObservableObject {
 
     /// Results above the relevance threshold, sorted by the chosen order.
     var results: [SearchHit] {
-        let above = rawResults.filter { Double($0.score) >= minScore }
+        let above = rawResults.filter { Self.relevance($0.score) >= minScore }
         switch sortOrder {
         case .relevance: return above
         case .name: return above.sorted { ($0.path as NSString).lastPathComponent.localizedCaseInsensitiveCompare(($1.path as NSString).lastPathComponent) == .orderedAscending }
         case .dateModified: return above.sorted { $0.modified > $1.modified }
         }
     }
-    var hiddenByThreshold: Int { rawResults.count - rawResults.filter { Double($0.score) >= minScore }.count }
+    var hiddenByThreshold: Int { rawResults.count - rawResults.filter { Self.relevance($0.score) >= minScore }.count }
 
     var filtersActive: Bool {
         !filterKinds.isEmpty || filterFolder != nil

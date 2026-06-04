@@ -17,7 +17,7 @@ struct Sidebar: View {
                             // iCloud-Drive-style transfer indicator: a pie that fills as this
                             // folder is indexed (or sweeps when reconciling in the background).
                             CloudSyncPie(fraction: activeFraction(url))
-                                .help("Indexing\u{2026}")
+                                .help(indexingHelp(url))
                         } else if model.indexedFiles > 0, let c = model.folderFileCounts[url.path] {
                             // Once anything is indexed, show every folder's real count - a
                             // plain "0" is an unambiguous "nothing here yet" rather than blank.
@@ -53,6 +53,15 @@ struct Sidebar: View {
     private func activeFraction(_ url: URL) -> Double? {
         if let rp = model.progress.perRoot[url.path], rp.total > 0 { return rp.fraction }
         return nil
+    }
+
+    /// Tooltip for the progress pie: "Indexing 1,234 / 5,678 files" when a total is known,
+    /// otherwise a plain "Indexing" for the brief reconcile case.
+    private func indexingHelp(_ url: URL) -> String {
+        if let rp = model.progress.perRoot[url.path], rp.total > 0 {
+            return "Indexing \(rp.done.formatted()) / \(rp.total.formatted()) files"
+        }
+        return "Indexing\u{2026}"
     }
 
     private func pickFolder() {
