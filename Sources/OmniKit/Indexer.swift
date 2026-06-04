@@ -69,7 +69,7 @@ public final class Indexer: @unchecked Sendable {
     public var chunkOverlap = 200
     public var maxChunksPerFile = 40
     public var snippetLength = 220
-    public var textBatchSize = 16   // chunks embedded per batched forward pass
+    public var textBatchSize = 48   // chunks embedded per batched forward pass (GPU-efficient)
 
     private var active: IndexSettings = .default
 
@@ -126,35 +126,81 @@ public final class Indexer: @unchecked Sendable {
             for pr in perRootFiles where i < pr.files.count { interleaved.append(pr.files[i]) }
         }
 
+        // Group the interleaved files by modality and process one kind fully before the next
+        // (text, image, audio, video). A uniform phase lets text chunks be embedded in
+        // cross-file batches (one GPU forward for many files) instead of a tiny per-file
+        // forward, which keeps the GPU fed. Decode stays concurrent within each phase.
+        var byKind: [FileKind: [CrawledFile]] = [:]
+        for f in interleaved { byKind[FileExtractor.kind(for: f.url) ?? .text, default: []].append(f) }
+
         var doneByRoot: [String: Int] = [:]
-        pipeline(interleaved, force: force, known: known) { item in
-            let path = item.file.url.path
-            seen.insert(path)
-            p.scanned += 1
-            p.currentPath = path
-            if let rootKey = roots.first(where: { path == $0.path || path.hasPrefix($0.path + "/") })?.path {
-                doneByRoot[rootKey, default: 0] += 1
-                p.perRoot[rootKey]?.done = doneByRoot[rootKey]!
-            }
-            if item.unchanged {
-                p.unchanged += 1   // already indexed and current - nothing to do, not a skip
-            } else {
-                // Drop any chunk whose embedding is not finite (a degenerate NaN/inf vector
-                // from a problematic image, etc.) so it never pollutes search ranking.
-                let raw = self.embed(item)
-                let chunks = raw.filter { Self.isFinite($0.embedding) }
-                if chunks.count < raw.count {
-                    Self.log.error("non-finite embedding dropped: \(path, privacy: .public)")
-                }
-                if chunks.isEmpty {
-                    p.skipped += 1
-                    if raw.isEmpty { Self.log.info("skip [\(item.kind, privacy: .public)] \(path, privacy: .public)") }
-                } else {
-                    do { try self.store.replace(path: path, chunks: chunks); p.embedded += 1 }
-                    catch { p.failed += 1; Self.log.error("fail \(path, privacy: .public): \(String(describing: error), privacy: .public)") }
-                }
+        func tick(_ path: String) {
+            seen.insert(path); p.scanned += 1; p.currentPath = path
+            if let rk = roots.first(where: { path == $0.path || path.hasPrefix($0.path + "/") })?.path {
+                doneByRoot[rk, default: 0] += 1; p.perRoot[rk]?.done = doneByRoot[rk]!
             }
             if p.scanned % 10 == 0 { onProgress(p) }
+        }
+        func storeChunks(_ path: String, _ raw: [IndexedChunk]) {
+            let chunks = raw.filter { Self.isFinite($0.embedding) }
+            if chunks.count < raw.count { Self.log.error("non-finite embedding dropped: \(path, privacy: .public)") }
+            if chunks.isEmpty {
+                p.skipped += 1
+                if raw.isEmpty { Self.log.info("skip \(path, privacy: .public)") }
+            } else {
+                do { try self.store.replace(path: path, chunks: chunks); p.embedded += 1 }
+                catch { p.failed += 1; Self.log.error("fail \(path, privacy: .public): \(String(describing: error), privacy: .public)") }
+            }
+        }
+
+        for kind in [FileKind.text, .image, .audio, .video] {
+            guard !isCancelled, let files = byKind[kind], !files.isEmpty else { continue }
+            if kind == .text {
+                // Cross-file text batching: buffer chunks from many files and embed them in
+                // batches of textBatchSize (one GPU forward). A file is stored once all of its
+                // chunks have come back, so per-file atomicity is preserved.
+                var buf: [(fid: Int, idx: Int, text: String, snippet: String)] = []
+                var acc: [Int: (file: CrawledFile, kind: String, total: Int, done: [IndexedChunk])] = [:]
+                var nextFid = 0
+                func flushText(min minCount: Int) {
+                    while buf.count >= minCount, !buf.isEmpty {
+                        let take = Swift.min(textBatchSize, buf.count)
+                        let batch = Array(buf.prefix(take)); buf.removeFirst(take)
+                        let vecs = self.embedder.embedTextBatch(batch.map { $0.text }, as: .passage)
+                        for (k, b) in batch.enumerated() {
+                            guard var a = acc[b.fid] else { continue }
+                            a.done.append(IndexedChunk(path: a.file.url.path, modified: a.file.modified, size: a.file.size,
+                                                       kind: a.kind, chunkIndex: b.idx, snippet: b.snippet, embedding: vecs[k]))
+                            acc[b.fid] = a
+                            if a.done.count == a.total { storeChunks(a.file.url.path, a.done); acc[b.fid] = nil }
+                        }
+                        onProgress(p)
+                    }
+                }
+                pipeline(files, force: force, known: known) { item in
+                    let path = item.file.url.path
+                    defer { tick(path) }
+                    if item.unchanged { p.unchanged += 1; return }
+                    switch item.payload {
+                    case .text(let pieces) where !pieces.isEmpty:
+                        let fid = nextFid; nextFid += 1
+                        acc[fid] = (item.file, item.kind, pieces.count, [])
+                        for (j, piece) in pieces.enumerated() { buf.append((fid, j, piece, self.snippet(piece))) }
+                        flushText(min: self.textBatchSize)
+                    case .images:
+                        storeChunks(path, self.embed(item))   // scanned PDF rendered to images
+                    default:
+                        p.skipped += 1
+                    }
+                }
+                flushText(min: 1)                                   // drain the partial last batch
+                for (_, a) in acc { storeChunks(a.file.url.path, a.done) }   // any stragglers
+            } else {
+                pipeline(files, force: force, known: known) { item in
+                    if item.unchanged { p.unchanged += 1 } else { storeChunks(item.file.url.path, self.embed(item)) }
+                    tick(item.file.url.path)
+                }
+            }
         }
         if !isCancelled {
             for pr in perRootFiles {
