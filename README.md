@@ -21,6 +21,19 @@ No Python, no server, no network at query time.
 - Finder-style results: List and Gallery views with real QuickLook thumbnails.
 - Search filters by file kind, folder, extension, and minimum score.
 
+## Install
+
+Download the latest `Omni-*.dmg` from
+[Releases](https://github.com/hanxiao/omni-macos/releases), open it, and drag
+**Omni** onto **Applications**.
+
+Omni is not notarized by Apple yet, so macOS warns the first time you launch a
+downloaded copy. To open it (once): open **System Settings - Privacy & Security**,
+scroll down, and click **Open Anyway** next to Omni, then confirm. Or run once in
+Terminal: `xattr -dr com.apple.quarantine /Applications/Omni.app`
+
+On first run Omni downloads the search model (Nano ~1.9 GB or Small ~3.1 GB) on-device.
+
 ## Requirements
 
 - Apple silicon Mac, macOS 14+.

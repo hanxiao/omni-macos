@@ -24,6 +24,24 @@ trap 'rm -rf "$STAGE"' EXIT
 cp -R "$APP" "$STAGE/$NAME.app"
 ln -s /Applications "$STAGE/Applications"
 
+# First-launch help: the app is not notarized yet, so macOS warns once on a downloaded copy.
+cat > "$STAGE/How to Open Omni.txt" <<'TXT'
+First launch on macOS
+
+Omni is not yet notarized by Apple, so macOS shows a warning the first time
+you open a downloaded copy. To open it (you only do this once):
+
+  1. Drag Omni onto Applications.
+  2. Open System Settings - Privacy & Security.
+  3. Scroll down, click "Open Anyway" next to Omni, then confirm.
+
+Or run this once in Terminal:
+
+  xattr -dr com.apple.quarantine /Applications/Omni.app
+
+After that Omni opens normally. On first run it downloads the search model.
+TXT
+
 # Compressed read-only DMG (UDZO) named "Omni <version>".
 hdiutil create -volname "$NAME $VERSION" -srcfolder "$STAGE" -fs HFS+ -format UDZO -ov "$DMG" >/dev/null
 

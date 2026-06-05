@@ -80,4 +80,8 @@ jobs:
             --title "Omni ${{ steps.ver.outputs.version }}" \
             --notes "Automated build from \`${{ github.sha }}\`.
 
-          Not yet notarized: on first launch, right-click Omni and choose **Open** (Gatekeeper asks once). Drag Omni onto Applications to install."
+          ## Install
+          1. Open the DMG and drag **Omni** onto **Applications**.
+          2. Omni is not notarized yet, so macOS warns on first launch. Open **System Settings - Privacy & Security**, scroll down, and click **Open Anyway** next to Omni.
+             Or run once in Terminal: \`xattr -dr com.apple.quarantine /Applications/Omni.app\`
+          3. You only do this once. On first run Omni downloads the search model on-device."
