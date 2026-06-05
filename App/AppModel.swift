@@ -47,7 +47,7 @@ enum DateRange: String, CaseIterable, Identifiable {
 final class AppModel {
     enum Phase: Equatable { case loadingModel, noModel, ready, failed(String) }
 
-    static let defaultMinScore = 0.5
+    static let defaultMinScore = 0.0   // show all matches by default; users can raise the bar in Search settings
 
     /// Cosine similarity is -1...1; the UI presents it as a 0...100% relevance, clamping the
     /// (rare, semantically-opposite) negative scores to 0. Filtering uses this same clamped
