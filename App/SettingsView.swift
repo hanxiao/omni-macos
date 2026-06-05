@@ -54,7 +54,7 @@ private struct ActivityTab: View {
                             if let rateLabel {
                                 Text(rateLabel).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                             }
-                            Button("Pause Indexing") { model.pauseIndexing() }.controlSize(.small)
+                            Button("Pause") { model.pauseIndexing() }.controlSize(.small)
                         }
                         ProgressView(value: overall)
                         HStack {
@@ -72,7 +72,7 @@ private struct ActivityTab: View {
                         Image(systemName: "pause.circle.fill").foregroundStyle(.orange)
                         Text("Paused \u{00B7} \(model.indexedFiles.formatted()) files indexed")
                         Spacer()
-                        Button("Resume Indexing") { model.startIndexing() }.controlSize(.small)
+                        Button("Resume") { model.startIndexing() }.controlSize(.small)
                     }
                 case .idle:
                     if !model.activeRoots.isEmpty {
@@ -90,7 +90,7 @@ private struct ActivityTab: View {
                             Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
                             Text(model.indexedFiles == 0 ? "Nothing indexed yet" : "Up to date \u{00B7} \(model.indexedFiles.formatted()) files")
                             Spacer()
-                            Button(model.indexedFiles == 0 ? "Index" : "Reindex") { model.startIndexing() }
+                            Button(model.indexedFiles == 0 ? "Index" : "Update") { model.startIndexing() }
                                 .controlSize(.small).disabled(!model.canIndex)
                         }
                     }
@@ -98,7 +98,7 @@ private struct ActivityTab: View {
             } header: {
                 Text("Status")
             } footer: {
-                Text("Keeps itself current in the background as files change; Reindex rebuilds from scratch.")
+                Text("Keeps itself current in the background as files change; Update catches up any changes now.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 

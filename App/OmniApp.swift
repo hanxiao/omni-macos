@@ -48,7 +48,7 @@ struct OmniApp: App {
             CommandGroup(after: .toolbar) {
                 // Cmd-Shift-I, not Cmd-R: in a file browser Cmd-R reads as Finder's Show Original /
                 // Reload, so it is reserved (Reveal uses Cmd-Shift-R above).
-                Button(model.isPaused ? "Resume Indexing" : (model.indexedFiles == 0 ? "Index" : "Reindex")) { model.startIndexing() }
+                Button(model.isPaused ? "Resume Indexing" : (model.indexedFiles == 0 ? "Index" : "Update")) { model.startIndexing() }
                     .keyboardShortcut("i", modifiers: [.command, .shift])
                     .disabled(model.isIndexing || !model.canIndex)
                 Button("Pause Indexing") { model.pauseIndexing() }
@@ -73,7 +73,7 @@ struct OmniApp: App {
             ("Quick Look", "\u{2318}Y  /  Space"),
             ("Reveal in Finder", "\u{21E7}\u{2318}R"),
             ("Gallery / List", "\u{2318}1  /  \u{2318}2"),
-            ("Index or Resume Indexing", "\u{21E7}\u{2318}I"),
+            ("Index / Update / Resume", "\u{21E7}\u{2318}I"),
             ("Move Selection", "Arrow Keys"),
         ]
         let body = rows.map { "\($0.0)\t\($0.1)" }.joined(separator: "\n")

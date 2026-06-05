@@ -47,7 +47,11 @@ struct ResultsList<Footer: View>: View {
                               expanded: expanded.contains(hit.path),
                               onToggle: { toggle(hit.path) })
                         .draggable(URL(fileURLWithPath: hit.path))
-                        .onTapGesture(count: 2) { open(hit.path) }
+                        // Make the whole row a uniform hit area and let double-click ride alongside
+                        // the List's own single-click selection (a plain .onTapGesture would swallow
+                        // single clicks on the text, so only the blank part selected).
+                        .contentShape(Rectangle())
+                        .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
                     if expanded.contains(hit.path) {
                         PassagesView(passages: passagesCache[hit.path] ?? [])
                     }
