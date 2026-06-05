@@ -51,6 +51,11 @@ echo "==> Packaging the DMG (no Gatekeeper-warning note: this build is notarized
 NOTARIZED=1 ./Scripts/make_dmg.sh "$APP" "$VERSION"
 DMG="dist/Omni-${VERSION}.dmg"
 
+# Sign the disk image itself with Developer ID before notarizing. The stapled ticket alone is not
+# enough for `spctl --type open` - Gatekeeper also wants a Developer ID signature on the DMG.
+echo "==> Signing the DMG with Developer ID"
+codesign --force --sign "Developer ID Application" --timestamp "$DMG"
+
 echo "==> Notarizing and stapling the DMG"
 xcrun notarytool submit "$DMG" --keychain-profile "$PROFILE" --wait
 xcrun stapler staple "$DMG"
