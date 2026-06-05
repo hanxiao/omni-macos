@@ -44,13 +44,33 @@ jobs:
           brew install xcodegen
           xcodegen generate
 
-      # No "Apple Development" cert on CI, so ad-hoc sign. (For notarized builds see the
-      # commented block below + the macos-spm-app-packaging skill's sign-and-notarize.sh.)
-      - name: Build (ad-hoc signed)
+      # Import the Developer ID Application cert (base64 .p12 in a secret) into an ephemeral
+      # keychain so codesign can use it, then forget it at job end.
+      - name: Import Developer ID certificate
+        env:
+          DEVELOPER_ID_P12: ${{ secrets.DEVELOPER_ID_P12 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          KC=build.keychain; KP=ci-temp-pass
+          echo "$DEVELOPER_ID_P12" | base64 --decode > /tmp/devid.p12
+          security create-keychain -p "$KP" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KP" "$KC"
+          security import /tmp/devid.p12 -k "$KC" -P "$DEVELOPER_ID_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security list-keychains -d user -s "$KC" login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KP" "$KC" >/dev/null
+          rm -f /tmp/devid.p12
+          security find-identity -v -p codesigning "$KC" | grep "Developer ID Application"
+
+      - name: Build (Developer ID signed)
         run: |
           ./Scripts/build-app.sh Release \
-            CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= CODE_SIGN_STYLE=Manual \
-            CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=YES
+            CODE_SIGN_IDENTITY="Developer ID Application" \
+            DEVELOPMENT_TEAM=MTECXQ97E6 \
+            CODE_SIGN_STYLE=Manual \
+            PROVISIONING_PROFILE_SPECIFIER= \
+            CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO \
+            OTHER_CODE_SIGN_FLAGS=--timestamp
 
       - name: Compute version
         id: ver
@@ -60,15 +80,17 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Package DMG
-        run: ./Scripts/make_dmg.sh .build/xcode-rel/Build/Products/Release/Omni.app "${{ steps.ver.outputs.version }}"
-
-      # OPTIONAL notarization (enable once you have a Developer ID Application cert):
-      #   add repo secrets DEVELOPER_ID_P12 (base64), DEVELOPER_ID_P12_PASSWORD,
-      #   AC_API_KEY_P8 (base64), AC_KEY_ID, AC_ISSUER_ID, then import the cert into a
-      #   temp keychain, rebuild with CODE_SIGN_IDENTITY="Developer ID Application", and run
-      #   `xcrun notarytool submit ... --wait` + `xcrun stapler staple` on Omni.app before
-      #   packaging the DMG. See the macos-spm-app-packaging skill (sign-and-notarize.sh).
+      # Store notary credentials under the "omni-notary" profile, then notarize + staple the app
+      # and the (signed) DMG via the same script used locally.
+      - name: Notarize and package DMG
+        env:
+          AC_APPLE_ID: ${{ secrets.AC_APPLE_ID }}
+          AC_PASSWORD: ${{ secrets.AC_PASSWORD }}
+        run: |
+          xcrun notarytool store-credentials omni-notary \
+            --apple-id "$AC_APPLE_ID" --team-id MTECXQ97E6 --password "$AC_PASSWORD"
+          ./Scripts/notarize.sh omni-notary \
+            .build/xcode-rel/Build/Products/Release/Omni.app "${{ steps.ver.outputs.version }}"
 
       - name: Publish GitHub release
         env:
@@ -78,10 +100,11 @@ jobs:
             "dist/Omni-${{ steps.ver.outputs.version }}.dmg" \
             --target "${{ github.sha }}" \
             --title "Omni ${{ steps.ver.outputs.version }}" \
-            --notes "Automated build from \`${{ github.sha }}\`.
+            --notes "Automated, Apple-notarized build from \`${{ github.sha }}\`.
 
           ## Install
-          1. Open the DMG and drag **Omni** onto **Applications**.
-          2. Omni is not notarized yet, so macOS warns on first launch. Open **System Settings - Privacy & Security**, scroll down, and click **Open Anyway** next to Omni.
-             Or run once in Terminal: \`xattr -dr com.apple.quarantine /Applications/Omni.app\`
-          3. You only do this once. On first run Omni downloads the search model on-device."
+          Open the DMG and drag **Omni** onto **Applications**. No Gatekeeper prompt - the build is notarized.
+
+          ## Requirements
+          - Apple Silicon Mac (M1 or later), macOS 14+.
+          - First launch downloads the on-device search model (~1.9 GB), then runs offline."
