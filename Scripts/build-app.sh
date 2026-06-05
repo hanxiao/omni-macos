@@ -19,10 +19,13 @@ ART="$PWD/$DD/SourcePackages/artifacts/swift-tokenizers/TokenizersRust/Tokenizer
 # Resolve packages first so the artifact (module map + .a) exists before compile.
 xcodebuild -resolvePackageDependencies -project Omni.xcodeproj -scheme Omni -derivedDataPath "$DD" >/dev/null
 
+# Any extra args after the config are passed straight to xcodebuild (e.g. CI signing overrides
+# like CODE_SIGN_IDENTITY=- CODE_SIGNING_REQUIRED=NO, since CI has no "Apple Development" cert).
 xcodebuild -project Omni.xcodeproj -scheme Omni -configuration "$CONFIG" \
   -destination 'platform=macOS' -derivedDataPath "$DD" \
   OTHER_SWIFT_FLAGS="\$(inherited) -Xcc -fmodule-map-file=$ART/include/module.modulemap -Xcc -I$ART/include" \
   OTHER_LDFLAGS="\$(inherited) $ART/apple-macos/libtokenizers_rust.a" \
+  "${@:2}" \
   build
 
 echo "Built: $PWD/$DD/Build/Products/$CONFIG/Omni.app"

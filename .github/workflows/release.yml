@@ -1,0 +1,83 @@
+name: Release
+
+# Builds the app, packages a DMG, and publishes a GitHub release on every push to main.
+# Doc-only pushes are skipped. Rapid pushes collapse to the latest commit.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'dist/**'
+      - '.gitignore'
+  workflow_dispatch: {}   # allow manual runs from the Actions tab
+
+concurrency:
+  group: release
+  cancel-in-progress: true   # a burst of pushes only releases the latest
+
+permissions:
+  contents: write   # GITHUB_TOKEN needs this to create the tag + release
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # The app needs Xcode 26 (Swift 6.2 + the swift-tokenizers SE-0482 artifact).
+      - name: Select newest Xcode 26
+        run: |
+          XC=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
+          [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          echo "Using $XC"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+
+      # MLX-Swift compiles Metal shaders; Xcode 26 needs the Metal toolchain component.
+      - name: Install Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      # The .xcodeproj is generated from project.yml (gitignored), so regenerate it on CI.
+      - name: Generate Xcode project
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      # No "Apple Development" cert on CI, so ad-hoc sign. (For notarized builds see the
+      # commented block below + the macos-spm-app-packaging skill's sign-and-notarize.sh.)
+      - name: Build (ad-hoc signed)
+        run: |
+          ./Scripts/build-app.sh Release \
+            CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= CODE_SIGN_STYLE=Manual \
+            CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=YES
+
+      - name: Compute version
+        id: ver
+        run: |
+          BASE=$(grep -m1 'MARKETING_VERSION' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
+          VERSION="${BASE}-b${{ github.run_number }}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Package DMG
+        run: ./Scripts/make_dmg.sh .build/xcode-rel/Build/Products/Release/Omni.app "${{ steps.ver.outputs.version }}"
+
+      # OPTIONAL notarization (enable once you have a Developer ID Application cert):
+      #   add repo secrets DEVELOPER_ID_P12 (base64), DEVELOPER_ID_P12_PASSWORD,
+      #   AC_API_KEY_P8 (base64), AC_KEY_ID, AC_ISSUER_ID, then import the cert into a
+      #   temp keychain, rebuild with CODE_SIGN_IDENTITY="Developer ID Application", and run
+      #   `xcrun notarytool submit ... --wait` + `xcrun stapler staple` on Omni.app before
+      #   packaging the DMG. See the macos-spm-app-packaging skill (sign-and-notarize.sh).
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.ver.outputs.tag }}" \
+            "dist/Omni-${{ steps.ver.outputs.version }}.dmg" \
+            --target "${{ github.sha }}" \
+            --title "Omni ${{ steps.ver.outputs.version }}" \
+            --notes "Automated build from \`${{ github.sha }}\`.
+
+          Not yet notarized: on first launch, right-click Omni and choose **Open** (Gatekeeper asks once). Drag Omni onto Applications to install."

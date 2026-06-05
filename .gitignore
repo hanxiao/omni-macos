@@ -20,3 +20,6 @@ xcuserdata/
 # Python
 __pycache__/
 .venv/
+
+# Release artifacts
+dist/
