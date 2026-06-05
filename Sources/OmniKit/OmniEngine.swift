@@ -88,7 +88,9 @@ public enum ModelLocator {
 /// Identifies the embedding construction. Bump when anything that changes the
 /// produced vectors changes (model, prefix, pooling) so an existing index can be
 /// flagged obsolete and reindexed. "docprefix" = media carries the Document: prefix.
-public let omniEmbeddingVersion = "omni-small-1-docprefix"
+/// "mediasuffix" = media sequences append the text end-token so image/audio/video pool at the
+/// same position as text, fixing cross-modal alignment (Nano's image vectors were orthogonal).
+public let omniEmbeddingVersion = "omni-2-mediasuffix"
 
 /// Hard-cap MLX memory usage (bytes). 0 = library default (no explicit cap). The
 /// buffer cache is set to half the limit. Takes effect immediately and globally.
@@ -114,6 +116,9 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     private var highWaiting = 0
     /// Media is indexed as documents -> the "Document: " prefix (official model card).
     private let docPrefix: [Int]
+    /// Trailing special tokens (e.g. Nano's end-of-text) appended after the media wrapper so
+    /// image/audio/video pool at the same token the text path does - required for cross-modal.
+    private let mediaSuffix: [Int]
     public let dim: Int
     public let modelDir: URL
     public var supportsImages: Bool { imageEncoder != nil }
@@ -127,12 +132,13 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         self.modelDir = modelDir
         let config = try OmniConfig(modelDir: modelDir)
         // Parse the BPE tokenizer concurrently with the (synchronous) weight load.
-        async let tokenizerTask = AutoTokenizer.from(modelFolder: modelDir)
+        async let tokenizerTask = AutoTokenizer.from(directory: modelDir)
         let weights = try WeightStore(modelDir: modelDir, loraScale: config.loraScale, keepVision: true, keepAudio: true)
         let tokenizer = try await tokenizerTask
         let text = OmniTextEncoder(weights: weights, config: config, tokenizer: tokenizer)
         self.textEncoder = text
         self.docPrefix = text.prefixTokenIds(.passage)
+        self.mediaSuffix = text.suffixTokenIds
         self.imageEncoder = OmniImageEncoder(weights: weights, config: config)
         self.audioEncoder = OmniAudioEncoder(weights: weights, config: config)
         self.dim = config.text.hiddenSize
@@ -190,27 +196,72 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         }
     }
 
+    /// Embed several pre-bucketed batches as ONE serialized embed, double-buffering each batch's
+    /// GPU forward over the prior batch's host readout when OMNI_ASYNC_EVAL=1 (else a plain loop).
+    /// Tokenization runs in parallel up front, off the GPU path. Output order matches input.
+    public func embedTextBatches(_ batches: [[String]], as type: OmniInputType) -> [[[Float]]] {
+        if batches.isEmpty { return [] }
+        // Tokenize every batch across cores BEFORE taking the serial gate, so the GPU pipeline
+        // inside run() is never stalled waiting on the (single-threaded per call) BPE tokenizer.
+        let tokenized = batches.map { textEncoder.tokenizeParallel($0, type) }
+        return run(highPriority: type == .query) {
+            let v = textEncoder.encodeTokenBatchesPipelined(tokenized)
+            if type != .query { addTokens(textEncoder.lastSequenceLength) }
+            return v
+        }
+    }
+
+
     public func embedImage(_ image: CGImage) -> [Float]? {
         guard let enc = imageEncoder else { return nil }
-        return run(highPriority: false) { let v = enc.encode(image, prefixIds: docPrefix); addTokens(enc.lastSequenceLength); return v }
+        return run(highPriority: false) { let v = enc.encode(image, prefixIds: docPrefix, suffixIds: mediaSuffix); addTokens(enc.lastSequenceLength); return v }
+    }
+
+    /// Batch-N image embedding from already-preprocessed (Sendable) raw patches. The CPU preprocess
+    /// runs in the indexer's concurrent decode stage; this call only does the GPU tower+backbone.
+    /// One block-diagonal vision forward per `patchBudget` chunk; returns one vector per input.
+    public func embedImages(_ raws: [OmniVisionPreprocess.RawPatches]) -> [[Float]]? {
+        guard let enc = imageEncoder, !raws.isEmpty else { return nil }
+        return run(highPriority: false) {
+            // Build tensors on the GPU thread (MLXArray is not Sendable, so it can't cross the
+            // decode boundary). Then one batched encode.
+            let inputs: [OmniImageEncoder.Preprocessed] = raws.map { (pixelValues: $0.tensor(), gridTHW: $0.gridTHW) }
+            let v = enc.encode(images: inputs, prefixIds: docPrefix, suffixIds: mediaSuffix)
+            addTokens(enc.lastSequenceLength)
+            return v
+        }
     }
 
     public func embedVideoFrames(_ frames: [CGImage]) -> [Float]? {
         guard let enc = imageEncoder, !frames.isEmpty else { return nil }
-        return run(highPriority: false) { let v = enc.encodeVideo(frames, prefixIds: docPrefix); addTokens(enc.lastSequenceLength); return v }
+        return run(highPriority: false) { let v = enc.encodeVideo(frames, prefixIds: docPrefix, suffixIds: mediaSuffix); addTokens(enc.lastSequenceLength); return v }
     }
 
     public func embedAudio(_ url: URL) -> [Float]? {
         guard let enc = audioEncoder else { return nil }
-        return run(highPriority: false) { let v = enc.encode(url, prefixIds: docPrefix); addTokens(enc.lastSequenceLength); return v }
+        return run(highPriority: false) { let v = enc.encode(url, prefixIds: docPrefix, suffixIds: mediaSuffix); addTokens(enc.lastSequenceLength); return v }
     }
 
     public func embedAudioMel(_ mel: [Float], frames: Int) -> [Float]? {
         guard let enc = audioEncoder else { return nil }
-        return run(highPriority: false) { let v = enc.encode(mel: mel, frames: frames, prefixIds: docPrefix); addTokens(enc.lastSequenceLength); return v }
+        return run(highPriority: false) { let v = enc.encode(mel: mel, frames: frames, prefixIds: docPrefix, suffixIds: mediaSuffix); addTokens(enc.lastSequenceLength); return v }
+    }
+
+    /// Batch-N audio: embed several precomputed mels in one tower + one backbone forward.
+    /// Returns one vector per clip, in input order. The caller bounds N by a frame budget.
+    public func embedAudioMelBatch(_ mels: [[Float]], frames: [Int]) -> [[Float]]? {
+        guard let enc = audioEncoder, !mels.isEmpty else { return nil }
+        return run(highPriority: false) {
+            let v = enc.encodeBatch(mels: mels, frames: frames, prefixIds: docPrefix, suffixIds: mediaSuffix)
+            addTokens(enc.lastSequenceLength)
+            return v
+        }
     }
 
     /// Exposed for parity tests: embed already-preprocessed inputs.
     public func imageEncoderForTesting() -> OmniImageEncoder? { imageEncoder }
     public func audioEncoderForTesting() -> OmniAudioEncoder? { audioEncoder }
+    /// The Document: prefix / media suffix the indexer uses (parity tests reproduce the index path).
+    public var docPrefixForTesting: [Int] { docPrefix }
+    public var mediaSuffixForTesting: [Int] { mediaSuffix }
 }

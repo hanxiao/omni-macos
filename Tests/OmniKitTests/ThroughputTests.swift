@@ -43,4 +43,41 @@ final class ThroughputTests: XCTestCase {
         print(String(format: "SPEEDUP end-to-end: %.2fx", r48 / r1))
         XCTAssertEqual(b1.files, N); XCTAssertEqual(b48.files, N)
     }
+
+    func testStoreOnlyThroughput() throws {
+        let fm = FileManager.default
+        let dbURL = fm.temporaryDirectory.appendingPathComponent("store-only-\(UUID().uuidString).sqlite")
+        defer { try? fm.removeItem(at: dbURL) }
+        let store = try VectorStore(dbURL: dbURL)
+        let dim = 768
+        var vec = [Float](repeating: 0, count: dim); for i in 0 ..< dim { vec[i] = Float(i) / 768 }
+        let N = 600
+        let t0 = Date()
+        for i in 0 ..< N {
+            let path = "/tmp/doc\(i).txt"
+            try store.replace(path: path, chunks: [IndexedChunk(path: path, modified: 1, size: 1, kind: "text", chunkIndex: 0, snippet: "d\(i)", embedding: vec)])
+        }
+        let sec = Date().timeIntervalSince(t0)
+        print(String(format: "STORE-ONLY: %d files in %.3fs = %.3f ms/file = %.0f files/s", N, sec, sec / Double(N) * 1000, Double(N) / sec))
+        XCTAssertEqual(store.fileCount, N)
+    }
+
+    func testDecodeOnlyThroughput() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("decode-\(UUID().uuidString)")
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+        let N = 600
+        let body = "The quarterly revenue report shows strong cloud growth this year. Document with extra context."
+        var urls: [URL] = []
+        for i in 0 ..< N {
+            let u = root.appendingPathComponent("doc\(i).txt")
+            try body.write(to: u, atomically: true, encoding: .utf8)
+            urls.append(u)
+        }
+        let t0 = Date()
+        for u in urls { _ = try FileExtractor.extract(u) }   // read + text extraction (no chunk/embed/store)
+        let sec = Date().timeIntervalSince(t0)
+        print(String(format: "DECODE-ONLY: %d files in %.3fs = %.3f ms/file = %.0f files/s", N, sec, sec / Double(N) * 1000, Double(N) / sec))
+    }
 }

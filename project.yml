@@ -26,8 +26,13 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         SWIFT_VERSION: "6.0"
         SWIFT_STRICT_CONCURRENCY: complete
-        CODE_SIGN_IDENTITY: "-"
-        CODE_SIGNING_REQUIRED: NO
+        # Sign with a stable Apple Development identity (not ad-hoc) so the code signature is
+        # consistent across rebuilds. TCC then remembers the Documents/Downloads/Desktop grant
+        # instead of re-prompting on every build.
+        CODE_SIGN_IDENTITY: "Apple Development"
+        CODE_SIGN_STYLE: Manual
+        DEVELOPMENT_TEAM: MTECXQ97E6
+        CODE_SIGNING_REQUIRED: YES
         ENABLE_HARDENED_RUNTIME: YES
         ENABLE_APP_SANDBOX: NO
         INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.productivity"

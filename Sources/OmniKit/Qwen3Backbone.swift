@@ -11,18 +11,39 @@ final class Qwen3Backbone: @unchecked Sendable {
     let cfg: OmniConfig
     let w: WeightStore
     private let rope: RoPE
+    /// Activation precision for the transformer matmuls + attention. Default fp32 (reference
+    /// fidelity). OMNI_BF16_COMPUTE=1 runs them in bf16 (NaN-safe: bf16 keeps fp32's 8-bit
+    /// exponent, unlike fp16) for throughput - RMSNorm variance and the pooled output stay fp32.
+    /// Requires bf16 weights (OMNI_BACKBONE_BF16) for the matmul to actually run in bf16.
+    private let computeDType: DType
+
+    /// SAFE TEXT LEVER (b): mx.compile of the fixed-shape per-layer transformer block.
+    /// Default OFF. OMNI_COMPILE_BLOCK=1 fuses the per-layer (rmsNorm+attn+rmsNorm+mlp+residuals)
+    /// subgraph into one kernel to cut per-op dispatch. Output is bit-identical to the eager path
+    /// (same ops, same order); compile only changes the execution schedule. See `compiledBlock`.
+    let useCompiledBlock: Bool
+    /// Compiled block cache keyed by the shape variant `(B, Lmax, hasArrayMask)`. Bucketing keeps
+    /// the number of distinct keys small (a handful of near-uniform Lmax), so compile cost amortizes.
+    /// If this map grows without bound on a workload, compile is recompiling too much -> turn the
+    /// flag off (it then costs more than it saves). NSLock-guarded; the engine serializes anyway.
+    private let blockCacheLock = NSLock()
+    private var blockCache: [BlockKey: @Sendable ([MLXArray]) -> [MLXArray]] = [:]
+
+    private struct BlockKey: Hashable { let b: Int; let l: Int; let hasMask: Bool; let causal: Bool }
 
     init(weights: WeightStore, config: OmniConfig) {
         self.w = weights
         self.cfg = config
         self.rope = RoPE(dimensions: config.text.headDim, traditional: false, base: config.text.ropeTheta)
+        self.computeDType = ProcessInfo.processInfo.environment["OMNI_BF16_COMPUTE"] == "1" ? .bfloat16 : .float32
+        self.useCompiledBlock = ProcessInfo.processInfo.environment["OMNI_COMPILE_BLOCK"] == "1"
     }
 
     /// Embed token ids -> [1, L, dim] (fp32, batch 1).
     func embed(_ ids: [Int]) -> MLXArray {
         let idArray = MLXArray(ids.map { Int32($0) })
         let rows = w["language_model.embed_tokens.weight"][idArray]  // [L, dim]
-        return rows.asType(.float32).reshaped([1, ids.count, cfg.text.hiddenSize])
+        return rows.asType(computeDType).reshaped([1, ids.count, cfg.text.hiddenSize])
     }
 
     /// Embed a batch of token-id sequences, right-padded to the longest, with the pad
@@ -38,19 +59,36 @@ final class Qwen3Backbone: @unchecked Sendable {
         }
         let idArr = MLXArray(flat, [b, lmax])
         let rows = w["language_model.embed_tokens.weight"][idArr]   // [B, Lmax, dim]
-        return (rows.asType(.float32), lengths)
+        return (rows.asType(computeDType), lengths)
     }
 
     /// Last-token pool per row (using real lengths) + L2 normalize. One eval.
     func poolBatch(_ hidden: MLXArray, lengths: [Int]) -> [[Float]] {
         let dim = cfg.text.hiddenSize
-        let rows = lengths.enumerated().map { hidden[$0.offset, $0.element - 1] }   // each [dim]
-        var stacked = MLX.stacked(rows, axis: 0)                                    // [B, dim]
-        stacked = stacked / MLX.sqrt((stacked * stacked).sum(axis: 1, keepDims: true))
-        stacked = stacked.asType(.float32)
+        let stacked = poolBatchGraph(hidden, lengths: lengths)
         eval(stacked)
         let flat = stacked.asArray(Float.self)
         return (0 ..< lengths.count).map { Array(flat[$0 * dim ..< ($0 + 1) * dim]) }
+    }
+
+    /// SAFE TEXT LEVER (a): build the pooled [B, dim] graph but DO NOT host-sync. The caller
+    /// drives `asyncEval` and reads it later, so the GPU forward of the next batch can overlap
+    /// the CPU readout of this one. Identical math to `poolBatch` - only the eval is deferred.
+    func poolBatchGraph(_ hidden: MLXArray, lengths: [Int]) -> MLXArray {
+        let rows = lengths.enumerated().map { hidden[$0.offset, $0.element - 1] }   // each [dim]
+        var stacked = MLX.stacked(rows, axis: 0).asType(.float32)                   // [B, dim], norm in fp32
+        stacked = stacked / MLX.sqrt((stacked * stacked).sum(axis: 1, keepDims: true))
+        return stacked
+    }
+
+    /// Read an already-(async)evaluated pooled [B, dim] tensor back to host rows. `eval` here is
+    /// a no-op wait if `asyncEval` already finished (the pipeline overlapped it with the next GPU
+    /// forward); it blocks only if the GPU is still mid-batch - so no torn reads either way.
+    func poolBatchReadout(_ stacked: MLXArray, count: Int) -> [[Float]] {
+        let dim = cfg.text.hiddenSize
+        eval(stacked)
+        let flat = stacked.asArray(Float.self)
+        return (0 ..< count).map { Array(flat[$0 * dim ..< ($0 + 1) * dim]) }
     }
 
     /// Run the transformer over precomputed embeddings -> hidden after final norm [B, L, dim].
@@ -58,13 +96,140 @@ final class Qwen3Backbone: @unchecked Sendable {
     /// Nano; pass nil for a single sequence.
     func forward(inputsEmbeds: MLXArray, length L: Int, lengths: [Int]? = nil) -> MLXArray {
         let mask = attentionMask(inputsEmbeds, lengths: lengths)
-        var h = inputsEmbeds.asType(.float32)
-        for i in 0 ..< cfg.text.numLayers {
-            let p = "language_model.layers.\(i)."
-            h = h + attention(rmsNorm(h, p + "input_layernorm.weight"), p, mask: mask)
-            h = h + mlp(rmsNorm(h, p + "post_attention_layernorm.weight"), p)
+        var h = inputsEmbeds.asType(computeDType)
+        if useCompiledBlock {
+            h = forwardCompiled(h, mask: mask)
+        } else {
+            for i in 0 ..< cfg.text.numLayers {
+                let p = "language_model.layers.\(i)."
+                h = h + attention(rmsNorm(h, p + "input_layernorm.weight"), p, mask: mask)
+                h = h + mlp(rmsNorm(h, p + "post_attention_layernorm.weight"), p)
+            }
         }
         return rmsNorm(h, "language_model.norm.weight")
+    }
+
+    /// SAFE TEXT LEVER (b): run all `numLayers` blocks through one compiled kernel.
+    ///
+    /// The block function takes `h` plus that layer's weight tensors as MLXArray *inputs* (never
+    /// closed-over constants), so a single compiled graph is reused for every layer - only the
+    /// input weights differ per call. It is keyed by the shape variant `(B, Lmax, maskKind)`;
+    /// bucketing keeps Lmax near-uniform so only a handful of compiles ever happen. The mask, when
+    /// it is an additive array (Nano batched), is also an input so its values don't bake in.
+    ///
+    /// Numerics are identical to the eager loop: the exact same ops (rmsNorm, q/k/v proj, optional
+    /// head-norm, rope, SDPA, o_proj, gate/up/down) in the exact same order. compile() only fuses
+    /// dispatch; it does not reorder or re-associate float math.
+    private func forwardCompiled(_ hIn: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode) -> MLXArray {
+        let B = hIn.dim(0), Lmax = hIn.dim(1)
+        // Distinguish an additive array mask (whose VALUES we pass as an input) from the
+        // structural .causal / .none modes (baked into the compiled graph, no values to vary).
+        var maskArray: MLXArray? = nil
+        var causal = false
+        switch mask {
+        case .array(let m): maskArray = m
+        case .causal: causal = true
+        default: break
+        }
+        let key = BlockKey(b: B, l: Lmax, hasMask: maskArray != nil, causal: causal)
+        let block = compiledBlock(for: key)
+
+        var h = hIn
+        // Per-layer weight set, in a FIXED order that both the call site and the compiled body agree on.
+        for i in 0 ..< cfg.text.numLayers {
+            let p = "language_model.layers.\(i)."
+            var args: [MLXArray] = [h]
+            for name in Qwen3Backbone.layerWeightNames {
+                // q_norm / k_norm are absent on Nano. Feed a 1x1 sentinel so the input arity is
+                // fixed; the compiled body skips it when the model has no head-norm (cfg-constant).
+                let key = p + name
+                args.append(w.has(key) ? w[key] : MLXArray([Float(1)]))
+            }
+            if let m = maskArray { args.append(m) }
+            h = block(args)[0]
+        }
+        return h
+    }
+
+    /// Weight tensor names consumed by one transformer block, in the order `forwardCompiled` packs
+    /// them and `buildBlock` unpacks them. Must stay in sync between the two.
+    private static let layerWeightNames = [
+        "input_layernorm.weight",
+        "self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight",
+        "self_attn.q_norm.weight", "self_attn.k_norm.weight",
+        "self_attn.o_proj.weight",
+        "post_attention_layernorm.weight",
+        "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight",
+    ]
+
+    private func compiledBlock(for key: BlockKey) -> @Sendable ([MLXArray]) -> [MLXArray] {
+        blockCacheLock.lock(); defer { blockCacheLock.unlock() }
+        if let f = blockCache[key] { return f }
+        let f = compile(shapeless: false, buildBlock(causal: key.causal, hasMask: key.hasMask))
+        blockCache[key] = f
+        // OMNI_COMPILE_DEBUG=1 surfaces recompile churn: if this count climbs past a handful of
+        // buckets on a sustained index, compile is recompiling too much and is a net loss.
+        if ProcessInfo.processInfo.environment["OMNI_COMPILE_DEBUG"] == "1" {
+            FileHandle.standardError.write(Data("compiledBlock cache size=\(blockCache.count) key=(B=\(key.b),L=\(key.l),mask=\(key.hasMask),causal=\(key.causal))\n".utf8))
+        }
+        return f
+    }
+
+    /// Pure-graph body of one transformer block, taking `[h, <layer weights...>, mask?]` and
+    /// returning `[h_out]`. Closes over only cfg constants (dims, eps, whether head-norm exists),
+    /// never over any MLXArray - so compile sees the weights/mask purely as inputs.
+    private func buildBlock(causal: Bool, hasMask: Bool) -> ([MLXArray]) -> [MLXArray] {
+        let t = cfg.text
+        let eps = t.rmsNormEps
+        let cdt = computeDType
+        let rope = self.rope
+        let hasHeadNorm = w.has("language_model.layers.0.self_attn.q_norm.weight")
+        let scale = Float(pow(Double(t.headDim), -0.5))
+
+        func rms(_ x: MLXArray, _ wt: MLXArray) -> MLXArray {
+            let xf = x.asType(.float32)
+            let v = MLX.mean(xf * xf, axis: -1, keepDims: true)
+            return (xf * MLX.rsqrt(v + eps) * wt.asType(.float32)).asType(cdt)
+        }
+        func lin(_ x: MLXArray, _ wt: MLXArray) -> MLXArray { matmul(x, wt.transposed(1, 0)) }
+
+        return { args in
+            var idx = 0
+            func next() -> MLXArray { defer { idx += 1 }; return args[idx] }
+            let h = next()
+            let inLN = next()
+            let qW = next(), kW = next(), vW = next()
+            let qNorm = next(), kNorm = next()      // sentinels when !hasHeadNorm
+            let oW = next()
+            let postLN = next()
+            let gateW = next(), upW = next(), downW = next()
+            let mArr: MLXArray? = hasMask ? args[idx] : nil
+
+            // --- attention ---
+            let xn = rms(h, inLN)
+            let B = xn.dim(0)
+            var q = lin(xn, qW).reshaped([B, -1, t.numHeads, t.headDim]).transposed(0, 2, 1, 3)
+            var k = lin(xn, kW).reshaped([B, -1, t.numKVHeads, t.headDim]).transposed(0, 2, 1, 3)
+            let v = lin(xn, vW).reshaped([B, -1, t.numKVHeads, t.headDim]).transposed(0, 2, 1, 3)
+            if hasHeadNorm {
+                q = rms(q, qNorm)
+                k = rms(k, kNorm)
+            }
+            q = rope(q, offset: 0)
+            k = rope(k, offset: 0)
+            let maskMode: MLXFast.ScaledDotProductAttentionMaskMode =
+                causal ? .causal : (mArr.map { .array($0) } ?? .none)
+            var o = MLXFast.scaledDotProductAttention(queries: q, keys: k, values: v, scale: scale, mask: maskMode)
+            o = o.transposed(0, 2, 1, 3).reshaped([B, -1, t.numHeads * t.headDim])
+            let h1 = h + lin(o, oW)
+
+            // --- mlp ---
+            let xn2 = rms(h1, postLN)
+            let gate = MLXNN.silu(lin(xn2, gateW))
+            let up = lin(xn2, upW)
+            let h2 = h1 + lin(gate * up, downW)
+            return [h2]
+        }
     }
 
     /// Small (Qwen3) is causal. Nano (bidirectional LLaMA / EuroBERT) attends everywhere, with a
@@ -83,7 +248,7 @@ final class Qwen3Backbone: @unchecked Sendable {
 
     /// Last-token pool of a [1, L, dim] hidden state -> L2-normalized [Float].
     func pool(_ hidden: MLXArray, length L: Int, truncateDim: Int? = nil) -> [Float] {
-        var pooled = hidden[0, L - 1]
+        var pooled = hidden[0, L - 1].asType(.float32)
         pooled = pooled / MLX.sqrt((pooled * pooled).sum())
         if let d = truncateDim, d < cfg.text.hiddenSize {
             pooled = pooled[0 ..< d]
@@ -103,7 +268,7 @@ final class Qwen3Backbone: @unchecked Sendable {
     private func rmsNorm(_ x: MLXArray, _ key: String) -> MLXArray {
         let xf = x.asType(.float32)
         let v = MLX.mean(xf * xf, axis: -1, keepDims: true)
-        return xf * MLX.rsqrt(v + cfg.text.rmsNormEps) * w[key]
+        return (xf * MLX.rsqrt(v + cfg.text.rmsNormEps) * w[key].asType(.float32)).asType(computeDType)
     }
 
     private func attention(_ x: MLXArray, _ p: String, mask: MLXFast.ScaledDotProductAttentionMaskMode) -> MLXArray {
@@ -127,7 +292,7 @@ final class Qwen3Backbone: @unchecked Sendable {
     private func headNorm(_ x: MLXArray, _ key: String) -> MLXArray {
         let xf = x.asType(.float32)
         let v = MLX.mean(xf * xf, axis: -1, keepDims: true)
-        return xf * MLX.rsqrt(v + cfg.text.rmsNormEps) * w[key]
+        return (xf * MLX.rsqrt(v + cfg.text.rmsNormEps) * w[key].asType(.float32)).asType(computeDType)
     }
 
     private func mlp(_ x: MLXArray, _ p: String) -> MLXArray {

@@ -40,20 +40,40 @@ public enum OmniAudioPreprocess {
 
         let melFB = melFilterbank()                      // [nMel, nBins] row-major
 
+        // Mel projection + log10, parallelized across mel bins (rows are independent;
+        // the max reduction is deferred to a second pass). This is CPU-bound matmul work
+        // that runs off the GPU stage, in the indexer's concurrent decode phase.
         var feat = [Float](repeating: 0, count: numMelBins * frames)
-        var maxLog: Float = -Float.greatestFiniteMagnitude
-        for m in 0 ..< numMelBins {
-            let fbRow = m * nBins
-            for t in 0 ..< frames {
-                var acc: Float = 0
-                for b in 0 ..< nBins {
-                    acc += melFB[fbRow + b] * power[b * frames + t]
+        var rowMax = [Float](repeating: -Float.greatestFiniteMagnitude, count: numMelBins)
+        feat.withUnsafeMutableBufferPointer { featBuf in
+            rowMax.withUnsafeMutableBufferPointer { rowMaxBuf in
+                melFB.withUnsafeBufferPointer { fbBuf in
+                    power.withUnsafeBufferPointer { powBuf in
+                        let featP = featBuf.baseAddress!
+                        let rowMaxP = rowMaxBuf.baseAddress!
+                        let fbP = fbBuf.baseAddress!
+                        let powP = powBuf.baseAddress!
+                        DispatchQueue.concurrentPerform(iterations: numMelBins) { m in
+                            let fbRow = m * nBins
+                            let outRow = m * frames
+                            var localMax: Float = -Float.greatestFiniteMagnitude
+                            for t in 0 ..< frames {
+                                var acc: Float = 0
+                                for b in 0 ..< nBins {
+                                    acc += fbP[fbRow + b] * powP[b * frames + t]
+                                }
+                                let v = log10f(Swift.max(acc, 1e-10))
+                                featP[outRow + t] = v
+                                if v > localMax { localMax = v }
+                            }
+                            rowMaxP[m] = localMax
+                        }
+                    }
                 }
-                let v = log10f(Swift.max(acc, 1e-10))
-                feat[m * frames + t] = v
-                if v > maxLog { maxLog = v }
             }
         }
+        var maxLog: Float = -Float.greatestFiniteMagnitude
+        for m in 0 ..< numMelBins where rowMax[m] > maxLog { maxLog = rowMax[m] }
         let floorVal = maxLog - 8.0
         for i in 0 ..< feat.count {
             feat[i] = (Swift.max(feat[i], floorVal) + 4.0) / 4.0
@@ -157,17 +177,36 @@ public enum OmniAudioPreprocess {
             }
         }
 
+        // Per-frame DFT is independent across frames -> parallelize the outer loop.
+        // Each worker owns thread-local scratch (frame/re/im) and writes disjoint
+        // columns of `out`, so there is no contention. Bit-identical to the serial
+        // version (same vDSP_mmul, same arithmetic, deterministic accumulation order).
         var out = [Float](repeating: 0, count: nBins * frames)
-        var frame = [Float](repeating: 0, count: nFFT)
-        var re = [Float](repeating: 0, count: nBins)
-        var im = [Float](repeating: 0, count: nBins)
-        for t in 0 ..< frames {
-            let base = t * hop
-            for n in 0 ..< nFFT { frame[n] = x[base + n] * window[n] }
-            // re = cosM[nBins x nFFT] * frame[nFFT]; im = sinM * frame.
-            vDSP_mmul(cosM, 1, frame, 1, &re, 1, vDSP_Length(nBins), 1, vDSP_Length(nFFT))
-            vDSP_mmul(sinM, 1, frame, 1, &im, 1, vDSP_Length(nBins), 1, vDSP_Length(nFFT))
-            for b in 0 ..< nBins { out[b * frames + t] = re[b] * re[b] + im[b] * im[b] }
+        out.withUnsafeMutableBufferPointer { outBuf in
+            x.withUnsafeBufferPointer { xBuf in
+                window.withUnsafeBufferPointer { winBuf in
+                    cosM.withUnsafeBufferPointer { cosBuf in
+                        sinM.withUnsafeBufferPointer { sinBuf in
+                            let outP = outBuf.baseAddress!
+                            let xP = xBuf.baseAddress!
+                            let winP = winBuf.baseAddress!
+                            let cosP = cosBuf.baseAddress!
+                            let sinP = sinBuf.baseAddress!
+                            DispatchQueue.concurrentPerform(iterations: frames) { t in
+                                var frame = [Float](repeating: 0, count: nFFT)
+                                var re = [Float](repeating: 0, count: nBins)
+                                var im = [Float](repeating: 0, count: nBins)
+                                let base = t * hop
+                                for n in 0 ..< nFFT { frame[n] = xP[base + n] * winP[n] }
+                                // re = cosM[nBins x nFFT] * frame[nFFT]; im = sinM * frame.
+                                vDSP_mmul(cosP, 1, frame, 1, &re, 1, vDSP_Length(nBins), 1, vDSP_Length(nFFT))
+                                vDSP_mmul(sinP, 1, frame, 1, &im, 1, vDSP_Length(nBins), 1, vDSP_Length(nFFT))
+                                for b in 0 ..< nBins { outP[b * frames + t] = re[b] * re[b] + im[b] * im[b] }
+                            }
+                        }
+                    }
+                }
+            }
         }
         return out
     }

@@ -10,7 +10,9 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.31.3"),
-        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.3"),
+        // Rust-backed tokenizer (HF `tokenizers` crate), ~6.5x faster than swift-transformers'
+        // pure-Swift BPE. Loads the same tokenizer.json, so token ids stay identical (parity).
+        .package(url: "https://github.com/DePasqualeOrg/swift-tokenizers", from: "0.5.0"),
     ],
     targets: [
         .target(
@@ -20,7 +22,7 @@ let package = Package(
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXFast", package: "mlx-swift"),
                 .product(name: "MLXLinalg", package: "mlx-swift"),
-                .product(name: "Transformers", package: "swift-transformers"),
+                .product(name: "Tokenizers", package: "swift-tokenizers"),
             ]
         ),
         .executableTarget(

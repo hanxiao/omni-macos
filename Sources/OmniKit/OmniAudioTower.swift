@@ -50,9 +50,38 @@ public final class OmniAudioTower: @unchecked Sendable {
             length: config.audio.maxSourcePositions, channels: config.audio.dModel)
     }
 
+    /// Batched tower: inputFeatures [num_mel_bins, total_frames] holding the concatenated
+    /// REAL mel frames of N clips, featureLens the per-clip frame counts. Returns ONE
+    /// feature block per clip ([Ni_audio, 1024] each).
+    ///
+    /// Parity: this is bit-identical to calling `forward` on each clip alone. Windowing,
+    /// the conv frontend, the sinusoid add, the block-diagonal (cu_seqlens) attention, the
+    /// per-audio factor-2 pool, ln_post and the projector are ALL already per-chunk /
+    /// per-audio (no cross-clip mixing). Concatenating clips only changes how many 200-frame
+    /// windows share the single tower pass; it never lets clip i attend to clip j. We then
+    /// slice the [sum Ni, 1024] projector output back into per-clip blocks by the same
+    /// per-audio post-conv lengths the single-clip path derives.
+    public func forwardPerAudio(inputFeatures: MLXArray, featureLens: [Int]) -> [MLXArray] {
+        let (out, perAudioN) = forwardImpl(inputFeatures: inputFeatures, featureLens: featureLens)
+        if perAudioN.count == 1 { return [out] }
+        var blocks: [MLXArray] = []
+        var off = 0
+        for n in perAudioN {
+            blocks.append(out[off ..< (off + n), 0...])
+            off += n
+        }
+        return blocks
+    }
+
     /// inputFeatures [num_mel_bins, total_frames] (mel-major), featureLens per-audio
     /// frame counts -> audio features [N_audio, 1024].
     public func forward(inputFeatures: MLXArray, featureLens: [Int]) -> MLXArray {
+        return forwardImpl(inputFeatures: inputFeatures, featureLens: featureLens).out
+    }
+
+    /// Core tower forward. Returns the flat [sum Ni, 1024] projector output and the
+    /// per-audio output-row counts (Ni) so callers can split into per-clip blocks.
+    private func forwardImpl(inputFeatures: MLXArray, featureLens: [Int]) -> (out: MLXArray, perAudioN: [Int]) {
         let windowSize = nWindow * 2   // 200
 
         // --- Window each audio's frames into chunks of `windowSize` (200), tail kept.
@@ -154,6 +183,7 @@ public final class OmniAudioTower: @unchecked Sendable {
         }
 
         var perAudio: [MLXArray] = []
+        var perAudioN: [Int] = []
         offset = 0
         for totalAfter in perAudioAfter {
             var seg = hidden[offset ..< (offset + totalAfter), 0...]   // [totalAfter, d]
@@ -164,6 +194,7 @@ public final class OmniAudioTower: @unchecked Sendable {
                 .mean(axis: 1)                                          // [tEven/2, d]
             seg = layerNorm(seg, "audio_tower.ln_post")
             perAudio.append(seg)
+            perAudioN.append(tEven / 2)
         }
         let audioHidden = perAudio.count == 1 ? perAudio[0] : MLX.concatenated(perAudio, axis: 0)
 
@@ -171,7 +202,7 @@ public final class OmniAudioTower: @unchecked Sendable {
         let projW = w["audio_projector.weight"]
         let projB = w["audio_projector.bias"]
         let out = matmul(audioHidden, projW.transposed(1, 0)) + projB   // [N_audio, 1024]
-        return out
+        return (out, perAudioN)
     }
 
     // MARK: - Attention (windowed over cu_seqlens; q/v/o have bias, k has NO bias)

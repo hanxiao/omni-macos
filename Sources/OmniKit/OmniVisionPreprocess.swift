@@ -29,8 +29,33 @@ public enum OmniVisionPreprocess {
     private static let imageStd: Float = 0.5
     private static let rescale: Float = 1.0 / 255.0
 
+    /// Sendable preprocessed image: flat float pixel buffer + grid. CGImage and MLXArray are not
+    /// Sendable, so this is the form that crosses the indexer's concurrent-decode -> serial-embed
+    /// boundary. The GPU thread turns `pixels` into an MLXArray with `tensor()`.
+    public struct RawPatches: Sendable {
+        public let pixels: [Float]                  // [num_patches * 1536], row order matches grid
+        public let gridTHW: [(Int, Int, Int)]
+        public init(pixels: [Float], gridTHW: [(Int, Int, Int)]) {
+            self.pixels = pixels; self.gridTHW = gridTHW
+        }
+        public var rowLen: Int { OmniVisionPreprocess.inChannels * OmniVisionPreprocess.temporalPatchSize
+            * OmniVisionPreprocess.patchSize * OmniVisionPreprocess.patchSize }
+        public var numPatches: Int { pixels.count / rowLen }
+        /// Build the [num_patches, 1536] Float32 MLXArray (call on the GPU thread).
+        public func tensor() -> MLXArray { MLXArray(pixels, [numPatches, rowLen]).asType(.float32) }
+    }
+
     /// Returns pixel_values `[num_patches, 1536]` (Float32 MLXArray) and grid `[(t,h,w)]`.
     public static func preprocess(_ image: CGImage) -> (pixelValues: MLXArray, gridTHW: [(Int, Int, Int)]) {
+        let raw = preprocessRaw(image)
+        return (raw.tensor(), raw.gridTHW)
+    }
+
+    /// CPU-only preprocess producing a Sendable raw buffer. The patchify transpose is run in
+    /// parallel across cores via `concurrentPerform` over merged blocks (each block writes a
+    /// disjoint slice of `out`, so no synchronization is needed). This is the heavy CPU step the
+    /// indexer can now do in its concurrent decode stage instead of on the serialized GPU thread.
+    public static func preprocessRaw(_ image: CGImage) -> RawPatches {
         let h0 = image.height
         let w0 = image.width
         let (hBar, wBar) = smartResize(height: h0, width: w0)
@@ -48,31 +73,38 @@ public enum OmniVisionPreprocess {
         let numPatches = gridT * gridH * gridW
         var out = [Float](repeating: 0, count: numPatches * rowLen)
 
-        // Normalized HWC pixel accessor: (x-0.5)/0.5 of rescaled value, with the
-        // single frame repeated `temporalPatchSize` times (temporal axis is constant).
-        @inline(__always) func px(_ row: Int, _ col: Int, _ c: Int) -> Float {
-            let v = rgb[(row * wBar + col) * inChannels + c]
-            return (v * rescale - imageMean) / imageStd
-        }
-
-        // Materialize the HF transpose (0,3,6,4,7,2,1,5,8) directly.
-        // Patch (output-row) order: grid_t, merged_h, merged_w, m_h, m_w.
-        // Within a row: channel, temporal, ph, pw.
-        var rowIdx = 0
-        for _ in 0 ..< gridT {                       // grid_t (always 1 here)
-            for bh in 0 ..< mergedH {                // merged_h
-                for bw in 0 ..< mergedW {            // merged_w
-                    for mh in 0 ..< mergeSize {      // intra-block row
-                        for mw in 0 ..< mergeSize {  // intra-block col
+        // Each merged block (bh,bw) owns mergeSize*mergeSize consecutive output rows. The HF
+        // transpose (0,3,6,4,7,2,1,5,8) fixes the output-row order: grid_t, merged_h, merged_w,
+        // m_h, m_w; within a row: channel, temporal, ph, pw. Parallelize over the mergedH*mergedW
+        // blocks; each writes a disjoint, contiguous region of `out`.
+        let blocks = mergedH * mergedW
+        let perBlockRows = mergeSize * mergeSize
+        rgb.withUnsafeBufferPointer { rgbBuf in
+            out.withUnsafeMutableBufferPointer { outBuf in
+                let rgbPtr = rgbBuf.baseAddress!
+                let outPtr = outBuf.baseAddress!
+                @inline(__always) func px(_ row: Int, _ col: Int, _ c: Int) -> Float {
+                    let v = rgbPtr[(row * wBar + col) * inChannels + c]
+                    return (v * rescale - imageMean) / imageStd
+                }
+                // nonisolated(unsafe) capture: disjoint index ranges -> no overlapping writes.
+                nonisolated(unsafe) let outP = outPtr
+                DispatchQueue.concurrentPerform(iterations: blocks) { blk in
+                    let bh = blk / mergedW
+                    let bw = blk % mergedW
+                    let rowBase = blk * perBlockRows          // first output row for this block
+                    var rowIdx = rowBase
+                    for mh in 0 ..< mergeSize {
+                        for mw in 0 ..< mergeSize {
                             let patchRow0 = (bh * mergeSize + mh) * patchSize
                             let patchCol0 = (bw * mergeSize + mw) * patchSize
                             var o = rowIdx * rowLen
-                            for c in 0 ..< inChannels {            // channel
-                                for _ in 0 ..< temporalPatchSize { // temporal (repeated frame)
-                                    for ph in 0 ..< patchSize {    // patch_h
+                            for c in 0 ..< inChannels {
+                                for _ in 0 ..< temporalPatchSize {
+                                    for ph in 0 ..< patchSize {
                                         let r = patchRow0 + ph
-                                        for pw in 0 ..< patchSize { // patch_w
-                                            out[o] = px(r, patchCol0 + pw, c)
+                                        for pw in 0 ..< patchSize {
+                                            outP[o] = px(r, patchCol0 + pw, c)
                                             o += 1
                                         }
                                     }
@@ -85,8 +117,7 @@ public enum OmniVisionPreprocess {
             }
         }
 
-        let pixelValues = MLXArray(out, [numPatches, rowLen]).asType(.float32)
-        return (pixelValues, [(gridT, gridH, gridW)])
+        return RawPatches(pixels: out, gridTHW: [(gridT, gridH, gridW)])
     }
 
     // MARK: - smart_resize

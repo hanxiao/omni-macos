@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import AppKit
 import OmniKit
 
 enum ResultViewMode: String, CaseIterable { case list, grid }
@@ -42,7 +43,8 @@ enum DateRange: String, CaseIterable, Identifiable {
 }
 
 @MainActor
-final class AppModel: ObservableObject {
+@Observable
+final class AppModel {
     enum Phase: Equatable { case loadingModel, noModel, ready, failed(String) }
 
     static let defaultMinScore = 0.5
@@ -52,14 +54,46 @@ final class AppModel: ObservableObject {
     /// value so the threshold matches what the user sees and never reads "below 0%".
     static func relevance(_ score: Float) -> Double { Double(max(0, min(1, score))) }
 
-    @Published var phase: Phase = .loadingModel
-    @Published var query: String = ""
-    @Published var rawResults: [SearchHit] = []   // kind/folder/ext/date filtered, score-sorted
-    @Published var searching = false
-    @Published var selection: String?             // selected result path (lifted out of the view)
+    var phase: Phase = .loadingModel
+    var query: String = ""
+    var rawResults: [SearchHit] = [] { didSet { recomputeResults() } }   // kind/folder/ext/date filtered, score-sorted
+    var searching = false
+    /// The query text the currently displayed results actually correspond to. Lets the UI tell
+    /// "results not ready for what you just typed" apart from "this query genuinely has no matches",
+    /// so it never flashes "No matches" during the debounce/search window.
+    private(set) var resolvedQuery = ""
+    var selection: String? {           // selected result path (lifted out of the view)
+        didSet {
+            // If Quick Look is already open, follow the selection like Finder does - arrowing
+            // through results updates the live preview instead of leaving it on the old file.
+            if previewURL != nil, let s = selection { previewURL = URL(fileURLWithPath: s) }
+        }
+    }
+    var previewURL: URL?               // drives Quick Look; set from the Space key and the menu
     private var lastQueryVector: [Float]?
 
     var canIndex: Bool { phase == .ready && !roots.isEmpty }
+
+    // MARK: - Selected-result actions (shared by the context menu, the File menu, and key handlers)
+
+    var selectedURL: URL? { selection.map { URL(fileURLWithPath: $0) } }
+    var hasSelection: Bool { selection != nil }
+
+    func openSelected() { if let u = selectedURL { NSWorkspace.shared.open(u) } }
+    func revealSelected() { if let u = selectedURL { NSWorkspace.shared.activateFileViewerSelecting([u]) } }
+    /// Finder-style toggle: dismiss the preview if open, else preview the current selection.
+    func toggleQuickLook() { previewURL = previewURL != nil ? nil : selectedURL }
+
+    /// Move the selection by `rowDelta` positions through the visible (filtered, sorted) results.
+    /// `rowDelta == ±1` is left/right in the gallery or up/down in the list; `±columns` is a grid
+    /// row. Lets the gallery share the list's arrow-key navigation instead of being click-only.
+    func moveSelection(rowDelta: Int) {
+        let r = results
+        guard !r.isEmpty else { return }
+        let current = selection.flatMap { sel in r.firstIndex { $0.path == sel } }
+        let idx = current.map { max(0, min(r.count - 1, $0 + rowDelta)) } ?? (rowDelta >= 0 ? 0 : r.count - 1)
+        selection = r[idx].path
+    }
 
     /// Matching passages (ranked chunks) of a file for the current query.
     func passages(for path: String) -> [ChunkHit] {
@@ -67,31 +101,56 @@ final class AppModel: ObservableObject {
         return store.rankChunks(v, path: path)
     }
 
-    @Published var indexState: IndexState = .idle
+    var indexState: IndexState = .idle
     var isIndexing: Bool { indexState == .indexing }
     var isPaused: Bool { indexState == .paused }
-    @Published var progress = IndexProgress()
-    @Published var indexedFiles = 0
-    @Published var indexedChunks = 0
+    /// Any embedding work in flight: a full index pass or a background FSEvents reconcile. The
+    /// throughput readout follows this, not just the full pass.
+    var isWorking: Bool { indexState == .indexing || !activeRoots.isEmpty }
+    var progress = IndexProgress()
+    var indexedFiles = 0
+    var indexedChunks = 0
     /// Live embedding throughput during indexing (smoothed): files (embeds) per second and
     /// tokens (backbone sequence positions) per second. Both exactly measured.
-    @Published var filesPerSec: Double = 0
-    @Published var tokensPerSec: Double = 0
+    var filesPerSec: Double = 0
+    var tokensPerSec: Double = 0
     private var rateLastEmbedded = 0
     private var rateLastTokens = 0
     private var rateLastTime: CFAbsoluteTime = 0
-    @Published var modelPath = ""
-    @Published var supportsImages = false
-    @Published var audioSupported = false
+    private var rateTimer: Timer?
+    var modelPath = ""
+    var supportsImages = false
+    var audioSupported = false
 
-    @Published var roots: [URL] = []
-    @Published var settings = IndexSettings.default
-    @Published var indexedKinds: Set<String> = []
-    @Published var indexedExts: [String] = []
-    @Published var folderFileCounts: [String: Int] = [:]
+    var roots: [URL] = []
+    var settings = IndexSettings.default
+    var indexedKinds: Set<String> = []
+    var indexedExts: [String] = []
+    var folderFileCounts: [String: Int] = [:]
     /// Roots with an in-flight background reconcile (FSEvents add/change/remove). Drives
     /// an indeterminate progress ring on that folder in the sidebar.
-    @Published var activeRoots: Set<String> = []
+    var activeRoots: Set<String> = []
+
+    /// Folders the user paused: excluded from every index pass and from live reconcile, so
+    /// indexing moves on to the other folders. Already-indexed files stay searchable. Persisted.
+    var pausedRoots: Set<String> = []
+    /// When a folder is paused/resumed mid-pass, cancel and restart re-scoped to the unpaused roots.
+    private var restartAfterPause = false
+
+    func isFolderPaused(_ url: URL) -> Bool { pausedRoots.contains(url.path) }
+
+    func setFolderPaused(_ url: URL, _ paused: Bool) {
+        if paused { pausedRoots.insert(url.path) } else { pausedRoots.remove(url.path) }
+        UserDefaults.standard.set(Array(pausedRoots), forKey: "omni.pausedRoots")
+        if indexState == .indexing {
+            // Re-scope the running pass. Restart is incremental (mtime-skips done files), so the
+            // still-active folders pick up where they left off and the paused one is left as-is.
+            restartAfterPause = true
+            indexer?.cancel()
+        } else if !paused {
+            startIndexing()   // resuming while idle: kick a pass to catch the folder up
+        }
+    }
 
     /// The configured root that `path` lives under, if any.
     func rootKey(for path: String) -> String? {
@@ -99,32 +158,35 @@ final class AppModel: ObservableObject {
     }
 
     // Search filters + presentation. All persisted so the toolbar/view state survives relaunch.
-    @Published var filterKinds: Set<FileKind> = [] { didSet { persistFilters(); search() } }
-    @Published var filterFolder: URL? = nil { didSet { persistFilters(); search() } }
-    @Published var filterExt: String = "" { didSet { persistFilters(); search() } }
-    @Published var dateRange: DateRange = .any { didSet { persistFilters(); search() } }
-    @Published var minScore: Double = defaultMinScore { didSet { persistFilters() } }
-    @Published var sortOrder: SortOrder = .relevance { didSet { persistFilters() } }
+    var filterKinds: Set<FileKind> = [] { didSet { persistFilters(); search() } }
+    var filterFolder: URL? = nil { didSet { persistFilters(); search() } }
+    var filterExt: String = "" { didSet { persistFilters(); search() } }
+    var dateRange: DateRange = .any { didSet { persistFilters(); search() } }
+    var minScore: Double = defaultMinScore { didSet { persistFilters(); recomputeResults() } }
+    var sortOrder: SortOrder = .relevance { didSet { persistFilters(); recomputeResults() } }
 
-    @Published var viewMode: ResultViewMode = .list {
+    var viewMode: ResultViewMode = .list {
         didSet { UserDefaults.standard.set(viewMode.rawValue, forKey: "omni.viewMode") }
     }
 
     // Indexing performance settings.
-    @Published var maxImageDimension: Int = 1568 { didSet { persistPerf() } }
-    @Published var maxVideoFrames: Int = 6 { didSet { persistPerf() } }
+    var maxImageDimension: Int = 1568 { didSet { persistPerf() } }
+    var maxVideoFrames: Int = 6 { didSet { persistPerf() } }
+    /// Longest text slice (characters) embedded as one chunk.
+    var maxTextChunkChars: Int = 1800 { didSet { persistPerf() } }
     /// Hard memory cap in GB (0 = unlimited). Applied to MLX immediately.
-    @Published var maxMemoryGB: Double = 6 { didSet { persistPerf(); applyMemoryLimit() } }
+    var maxMemoryGB: Double = 6 { didSet { persistPerf(); applyMemoryLimit() } }
     var physicalMemoryGB: Double { Double(omniPhysicalMemory()) / 1_000_000_000 }
 
     // Model variant (small / nano).
-    @Published var modelVariant: ModelVariant = .small
-    @Published var installedVariants: [ModelVariant: URL] = [:]
+    var modelVariant: ModelVariant = .small
+    var installedVariants: [ModelVariant: URL] = [:]
 
     // Model download.
-    @Published var isDownloading = false
-    @Published var downloadFraction: Double = 0
-    @Published var downloadLabel = ""
+    var isDownloading = false
+    var downloadFraction: Double = 0
+    var downloadLabel = ""
+    var downloadFailed = false   // explicit error state; the view branches on this, not on label text
     private var downloader: ModelDownloader?
 
     // The index is always kept fresh in the background (FSEvents).
@@ -135,17 +197,21 @@ final class AppModel: ObservableObject {
     private var pendingFSPaths = Set<String>()
     private var pendingFSEventId: UInt64 = 0
 
+    // Folders removed while a full pass is running. The pass holds an old roots snapshot and
+    // keeps re-inserting these files, so we defer the vector delete until it stops, then restart.
+    private var pendingRootRemovals = Set<String>()
+
     // Index-time minimum thresholds (0 = no minimum).
-    @Published var minImageDimension: Int = 0 { didSet { persistPerf() } }
-    @Published var minAudioSeconds: Double = 0 { didSet { persistPerf() } }
-    @Published var minVideoSeconds: Double = 0 { didSet { persistPerf() } }
-    @Published var minTextChars: Int = 0 { didSet { persistPerf() } }
+    var minImageDimension: Int = 0 { didSet { persistPerf() } }
+    var minAudioSeconds: Double = 0 { didSet { persistPerf() } }
+    var minVideoSeconds: Double = 0 { didSet { persistPerf() } }
+    var minTextChars: Int = 0 { didSet { persistPerf() } }
 
     // Index storage info (for the Settings > Model tab).
-    @Published var dbPath = ""
-    @Published var dbSizeBytes: Int64 = 0
-    @Published var lastIndexed: Date?
-    @Published var indexObsolete = false
+    var dbPath = ""
+    var dbSizeBytes: Int64 = 0
+    var lastIndexed: Date?
+    var indexObsolete = false
     let embeddingVersion = omniEmbeddingVersion
     /// Engine vector dimension, captured at load; used to derive the fingerprint.
     private var engineDim = 0
@@ -163,6 +229,12 @@ final class AppModel: ObservableObject {
     private var indexer: Indexer?
     private var searchToken = 0
 
+    /// Owns the in-process HTTP serving layer. Constructed eagerly so it can load its own
+    /// "omni.serving.*" defaults in init; the engine and store are handed to it in bootstrap via
+    /// attach(), which also auto-starts the server when the user had it enabled last session. The
+    /// engine/store stay private - attach() is the only seam the serving layer sees.
+    let serving = ServingController()
+
     init() {
         loadRoots()
         loadSettings()
@@ -174,16 +246,28 @@ final class AppModel: ObservableObject {
 
     // MARK: - Derived results
 
-    /// Results above the relevance threshold, sorted by the chosen order.
-    var results: [SearchHit] {
+    /// Results above the relevance threshold, sorted by the chosen order. Memoized: recomputed only
+    /// when an input (rawResults / minScore / sortOrder) changes, not on every render. The frequent
+    /// indexing updates never touch these, so the results list is never re-filtered/sorted then.
+    private(set) var results: [SearchHit] = []
+    private(set) var hiddenByThreshold: Int = 0
+
+    private func recomputeResults() {
         let above = rawResults.filter { Self.relevance($0.score) >= minScore }
+        hiddenByThreshold = rawResults.count - above.count
         switch sortOrder {
-        case .relevance: return above
-        case .name: return above.sorted { ($0.path as NSString).lastPathComponent.localizedCaseInsensitiveCompare(($1.path as NSString).lastPathComponent) == .orderedAscending }
-        case .dateModified: return above.sorted { $0.modified > $1.modified }
+        case .relevance: results = above
+        case .name: results = above.sorted { ($0.path as NSString).lastPathComponent.localizedCaseInsensitiveCompare(($1.path as NSString).lastPathComponent) == .orderedAscending }
+        case .dateModified: results = above.sorted { $0.modified > $1.modified }
         }
     }
-    var hiddenByThreshold: Int { rawResults.count - rawResults.filter { Self.relevance($0.score) >= minScore }.count }
+
+    /// True while a non-empty query's results are not yet ready (debouncing or searching). The UI
+    /// shows a calm "Searching" state during this window instead of prematurely saying "No matches".
+    var isResolving: Bool {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !q.isEmpty && (searching || resolvedQuery != q)
+    }
 
     var filtersActive: Bool {
         !filterKinds.isEmpty || filterFolder != nil
@@ -221,6 +305,69 @@ final class AppModel: ObservableObject {
         if let raw = UserDefaults.standard.array(forKey: "omni.indexKinds") as? [String] {
             settings.enabledKinds = Set(raw.compactMap { FileKind(rawValue: $0) })
         }
+        if let raw = UserDefaults.standard.array(forKey: "omni.disabledExtensions") as? [String] {
+            settings.disabledExtensions = Set(raw)
+        }
+        if let raw = UserDefaults.standard.array(forKey: "omni.kindOrder") as? [String] {
+            var order = raw.compactMap { FileKind(rawValue: $0) }
+            for k in FileKind.allCases where !order.contains(k) { order.append(k) }   // keep all four
+            settings.kindOrder = order
+        }
+        if let raw = UserDefaults.standard.array(forKey: "omni.pausedRoots") as? [String] {
+            pausedRoots = Set(raw)
+        }
+    }
+
+    /// The modality order shown (and dragged) in the Content tab; drives indexing order.
+    var kindOrder: [FileKind] { settings.kindOrder }
+
+    func moveKind(fromOffsets source: IndexSet, toOffset destination: Int) {
+        settings.kindOrder.move(fromOffsets: source, toOffset: destination)
+        persistKindOrder()
+    }
+
+    /// Move `kind` to just before `target` (drag-and-drop reorder; `.onMove` is unreliable in a
+    /// grouped Form on macOS, so the UI uses explicit draggable/dropDestination).
+    func moveKind(_ kind: FileKind, before target: FileKind) {
+        guard kind != target, let from = settings.kindOrder.firstIndex(of: kind) else { return }
+        settings.kindOrder.remove(at: from)
+        let to = settings.kindOrder.firstIndex(of: target) ?? settings.kindOrder.count
+        settings.kindOrder.insert(kind, at: to)
+        persistKindOrder()
+    }
+
+    private func persistKindOrder() {
+        UserDefaults.standard.set(settings.kindOrder.map { $0.rawValue }, forKey: "omni.kindOrder")
+    }
+
+    func isExtensionEnabled(_ ext: String) -> Bool { !settings.disabledExtensions.contains(ext) }
+
+    /// Turn a single extension on/off within its (enabled) kind. Like setIndexKind: disabling drops
+    /// those files from the index right away; enabling re-indexes the previously-skipped ones. No
+    /// wipe - the vector space is unchanged, only which files are included.
+    func setExtensionEnabled(_ ext: String, _ on: Bool) { setExtensionsEnabled([ext], on) }
+
+    /// Batch version (used by Enable/Disable All over the filtered set) so it costs one reconcile,
+    /// not one per extension.
+    func setExtensionsEnabled(_ exts: [String], _ on: Bool) {
+        guard !exts.isEmpty else { return }
+        if on { exts.forEach { settings.disabledExtensions.remove($0) } }
+        else { exts.forEach { settings.disabledExtensions.insert($0) } }
+        UserDefaults.standard.set(Array(settings.disabledExtensions), forKey: "omni.disabledExtensions")
+        if !on {
+            if let store {
+                Task.detached {
+                    store.deleteExtensions(Set(exts))
+                    store.compact()
+                    await MainActor.run {
+                        self.refreshIndexStats(store)
+                        if !self.query.isEmpty { self.search() }
+                    }
+                }
+            }
+        } else {
+            startIndexing()
+        }
     }
     func setIndexKind(_ k: FileKind, _ on: Bool) {
         settings.set(k, on)
@@ -228,10 +375,15 @@ final class AppModel: ObservableObject {
         if !on {
             // Disabling a kind immediately removes its vectors so search/filters stay truthful.
             if let store {
-                store.deleteKind(k.rawValue)
                 filterKinds.remove(k)
-                refreshIndexStats(store)
-                if !query.isEmpty { search() }
+                Task.detached {
+                    store.deleteKind(k.rawValue)
+                    store.compact()
+                    await MainActor.run {
+                        self.refreshIndexStats(store)
+                        if !self.query.isEmpty { self.search() }
+                    }
+                }
             }
         } else {
             // Enabling a previously-skipped kind: incrementally index so its pre-existing
@@ -244,6 +396,7 @@ final class AppModel: ObservableObject {
         let d = UserDefaults.standard
         if d.object(forKey: "omni.maxImageDim") != nil { maxImageDimension = max(512, d.integer(forKey: "omni.maxImageDim")) }
         if d.object(forKey: "omni.maxVideoFrames") != nil { maxVideoFrames = max(1, d.integer(forKey: "omni.maxVideoFrames")) }
+        if d.object(forKey: "omni.maxTextChunkChars") != nil { maxTextChunkChars = max(200, d.integer(forKey: "omni.maxTextChunkChars")) }
         if d.object(forKey: "omni.maxMemoryGB") != nil { maxMemoryGB = max(0, d.double(forKey: "omni.maxMemoryGB")) }
         if d.object(forKey: "omni.minImageDim") != nil { minImageDimension = max(0, d.integer(forKey: "omni.minImageDim")) }
         if d.object(forKey: "omni.minAudioSec") != nil { minAudioSeconds = max(0, d.double(forKey: "omni.minAudioSec")) }
@@ -254,6 +407,7 @@ final class AppModel: ObservableObject {
         let d = UserDefaults.standard
         d.set(maxImageDimension, forKey: "omni.maxImageDim")
         d.set(maxVideoFrames, forKey: "omni.maxVideoFrames")
+        d.set(maxTextChunkChars, forKey: "omni.maxTextChunkChars")
         d.set(maxMemoryGB, forKey: "omni.maxMemoryGB")
         d.set(minImageDimension, forKey: "omni.minImageDim")
         d.set(minAudioSeconds, forKey: "omni.minAudioSec")
@@ -316,7 +470,7 @@ final class AppModel: ObservableObject {
     /// Download a model variant from HuggingFace and load it when finished.
     func downloadModel(_ variant: ModelVariant) {
         guard !isDownloading, let dest = ModelDownloader.installDir(for: variant) else { return }
-        isDownloading = true; downloadFraction = 0; downloadLabel = "Preparing\u{2026}"
+        isDownloading = true; downloadFraction = 0; downloadLabel = "Preparing\u{2026}"; downloadFailed = false
         let dl = ModelDownloader(); downloader = dl
         Task {
             do {
@@ -340,6 +494,7 @@ final class AppModel: ObservableObject {
             } catch {
                 await MainActor.run {
                     self.isDownloading = false
+                    self.downloadFailed = true
                     self.downloadLabel = "Download failed: \(error.localizedDescription)"
                 }
             }
@@ -358,6 +513,11 @@ final class AppModel: ObservableObject {
             self.store = store
             self.engine = engine
             self.indexer = Indexer(store: store, embedder: engine)
+            // Hand the live engine and store to the serving layer. attach() swaps in the new
+            // backend and reconciles: it auto-starts the server if serving was enabled last
+            // session, and on a variant switch (bootstrap reruns) it replaces the backend under
+            // any in-flight server. modelName is reported by /health and /v1/models.
+            self.serving.attach(engine: engine, store: store, modelName: "omni-\(modelVariant.rawValue)")
             self.supportsImages = engine.supportsImages
             self.audioSupported = engine.supportsAudio
             self.engineDim = engine.dim
@@ -371,6 +531,10 @@ final class AppModel: ObservableObject {
             refreshIndexStats(store)
             self.phase = .ready
             restartWatcher()
+            // Reclaim space left by a previously-emptied or heavily-pruned index. compact()
+            // self-skips unless a large fraction of the file is free, so a healthy index is
+            // untouched; a mostly-empty one compacts fast (cost scales with live data).
+            Task.detached { if store.compact(minFreeRatio: 0.5) > 0 { await MainActor.run { self.refreshIndexStats(store) } } }
             // Indexing is invisible to the user: kick a background pass on every launch so the
             // index catches up (finishes an interrupted crawl, picks up files added while the
             // app was closed, rebuilds after a model switch) and stays current. It is
@@ -395,18 +559,35 @@ final class AppModel: ObservableObject {
         return [embeddingVersion, "dim\(dim)", "model\(size)-\(mtime)"].joined(separator: "|")
     }
 
+    /// Recompute the visible index stats. The work (allIndexStats / per-folder counts iterate the
+    /// whole in-memory row set - hundreds of thousands of rows on a large index) runs OFF the main
+    /// thread; only the small result assignment hops back to the main actor. Doing it on the main
+    /// thread is what hung the app during a fast crawl of a large index.
     private func refreshIndexStats(_ store: VectorStore) {
-        let stats = store.allIndexStats()
-        indexedFiles = stats.fileCount
-        indexedChunks = stats.chunkCount
-        indexedKinds = stats.kinds
-        indexedExts = stats.exts.sorted()
-        folderFileCounts = Dictionary(uniqueKeysWithValues: roots.map { ($0.path, store.fileCount(underFolder: $0.path)) })
-        dbPath = store.dbURL.path
-        dbSizeBytes = store.sizeBytes()
-        if let ts = store.metaGet("last_indexed"), let t = Double(ts) { lastIndexed = Date(timeIntervalSince1970: t) }
-        // Obsolete if built by a different (or unstamped) fingerprint than the current engine.
-        indexObsolete = indexedFiles > 0 && store.metaGet("embedding_version") != fingerprint
+        let rootPaths = roots.map(\.path)
+        let fp = fingerprint
+        let dimReady = engineDim > 0
+        Task.detached(priority: .utility) {
+            let stats = store.allIndexStats()
+            let folders = Dictionary(uniqueKeysWithValues: rootPaths.map { ($0, store.fileCount(underFolder: $0)) })
+            let size = store.sizeBytes()
+            let path = store.dbURL.path
+            let lastTs = store.metaGet("last_indexed").flatMap { Double($0) }
+            let stampedVersion = store.metaGet("embedding_version")
+            await MainActor.run {
+                self.indexedFiles = stats.fileCount
+                self.indexedChunks = stats.chunkCount
+                self.indexedKinds = stats.kinds
+                self.indexedExts = stats.exts.sorted()
+                self.folderFileCounts = folders
+                self.dbPath = path
+                self.dbSizeBytes = size
+                if let lastTs { self.lastIndexed = Date(timeIntervalSince1970: lastTs) }
+                // Require engineDim > 0: before the engine reports its dimension the fingerprint is
+                // "...|dim0|model0-0", which would spuriously flag obsolete and wipe a valid index.
+                self.indexObsolete = dimReady && stats.fileCount > 0 && stampedVersion != fp
+            }
+        }
     }
 
     static func indexURL() throws -> URL {
@@ -474,14 +655,30 @@ final class AppModel: ObservableObject {
     func removeRoot(_ url: URL) {
         roots.removeAll { $0 == url }
         if filterFolder == url { filterFolder = nil }
-        saveRoots()
-        // Drop that folder's vectors so removed folders stop appearing in results.
-        if let store {
-            store.deleteUnderFolder(url.path)
-            refreshIndexStats(store)
-            if !query.isEmpty { search() }
+        if pausedRoots.remove(url.path) != nil {
+            UserDefaults.standard.set(Array(pausedRoots), forKey: "omni.pausedRoots")
         }
+        saveRoots()
         restartWatcher()
+        guard let store else { return }
+        if indexState == .indexing {
+            // A pass is mid-flight with the old root set; deleting now just races its
+            // re-insertion. Defer the delete and cancel - the completion handler drops the
+            // vectors once the pass has stopped, then resumes indexing the remaining roots.
+            pendingRootRemovals.insert(url.path)
+            indexer?.cancel()
+        } else {
+            // Drop that folder's vectors so removed folders stop appearing in results, then
+            // reclaim the disk space those rows held (SQLite keeps freed pages until VACUUM).
+            Task.detached {
+                store.deleteUnderFolder(url.path)
+                store.compact()
+                await MainActor.run {
+                    self.refreshIndexStats(store)
+                    if !self.query.isEmpty { self.search() }
+                }
+            }
+        }
     }
 
     // MARK: - Search
@@ -489,7 +686,7 @@ final class AppModel: ObservableObject {
     func search() {
         guard let engine, let store else { return }
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty else { rawResults = []; return }
+        guard !q.isEmpty else { rawResults = []; resolvedQuery = ""; return }
         searchToken += 1
         let token = searchToken
         searching = true
@@ -501,6 +698,7 @@ final class AppModel: ObservableObject {
                 guard token == self.searchToken else { return }
                 self.lastQueryVector = vec
                 self.rawResults = hits
+                self.resolvedQuery = q
                 if let sel = self.selection, !hits.contains(where: { $0.path == sel }) { self.selection = nil }
                 self.searching = false
             }
@@ -514,6 +712,7 @@ final class AppModel: ObservableObject {
         var s = settings
         s.maxImageDimension = maxImageDimension
         s.maxVideoFrames = maxVideoFrames
+        s.maxCharsPerChunk = maxTextChunkChars
         s.minImageDimension = minImageDimension
         s.minAudioSeconds = minAudioSeconds
         s.minVideoSeconds = minVideoSeconds
@@ -534,12 +733,16 @@ final class AppModel: ObservableObject {
         watcher = w
     }
 
-    private func handleFSChange(_ paths: [String]) {
+    private func handleFSChange(_ rawPaths: [String]) {
         guard let indexer, let store else { return }
         // An obsolete index is in a different vector space (e.g. just switched models): writing
         // new-dimension vectors into it would fail the store's dimension guard. Skip background
         // updates until the user reindexes, which wipes and rebuilds in the new space.
         guard !indexObsolete else { return }
+        // Drop changes inside paused folders - pausing means "stop indexing this folder".
+        let paths = pausedRoots.isEmpty ? rawPaths
+            : rawPaths.filter { p in !pausedRoots.contains(where: { p == $0 || p.hasPrefix($0 + "/") }) }
+        guard !paths.isEmpty else { return }
         // During a full index, buffer changes instead of dropping them; startIndexing drains
         // the buffer on completion.
         if indexState == .indexing {
@@ -551,21 +754,37 @@ final class AppModel: ObservableObject {
         let eid = watcher?.latestEventId()
         let touched = Set(paths.compactMap { rootKey(for: $0) })
         activeRoots.formUnion(touched)
+        startRateSampler()   // show throughput during the background reconcile too, not only full passes
         Task.detached(priority: .utility) {
             indexer.update(paths: paths, settings: settings)
             await MainActor.run {
                 if let eid { UserDefaults.standard.set(String(eid), forKey: "omni.fsEventId") }
                 self.activeRoots.subtract(touched)
+                self.markIndexed(store)   // a reconcile brought the index current just now
                 self.refreshIndexStats(store)
                 if !self.query.isEmpty { self.search() }
             }
         }
     }
 
+    /// Stamp "now" as the last time the index was brought current - persisted and reflected live.
+    /// Called from both the full pass and the background reconcile, since both keep the index up
+    /// to date; otherwise the value would freeze whenever a long pass is interrupted or only
+    /// background reconciles run.
+    private func markIndexed(_ store: VectorStore) {
+        let now = Date()
+        lastIndexed = now
+        store.metaSet("last_indexed", "\(now.timeIntervalSince1970)")
+    }
+
     /// Start or resume indexing. Indexing is incremental - already-embedded files are
     /// skipped by modification time, so resuming simply continues where it left off.
     func startIndexing() {
         guard let indexer, let store, indexState != .indexing else { return }
+        // Paused folders are excluded from the pass; if every folder is paused (or there are
+        // none), there is nothing to index.
+        let activeRootsToIndex = roots.filter { !pausedRoots.contains($0.path) }
+        guard !activeRootsToIndex.isEmpty else { return }
         // An out-of-date index is in a different vector space: rebuild it, don't top up.
         let force = indexObsolete
         if force { store.wipeChunks(); indexedFiles = 0; indexedChunks = 0; indexedKinds = []; rawResults = [] }
@@ -575,21 +794,60 @@ final class AppModel: ObservableObject {
         indexObsolete = false
         indexState = .indexing
         progress = IndexProgress()
-        rateLastTime = 0; rateLastEmbedded = 0; rateLastTokens = 0; filesPerSec = 0; tokensPerSec = 0
-        let roots = self.roots
+        startRateSampler()
+        let roots = activeRootsToIndex
         let settings = effectiveSettings()
         Task.detached(priority: .utility) {
+            // Coalesce UI updates by wall-clock time. onProgress fires per ~10 scanned files;
+            // on a fast crawl of a large index that floods the main actor (thousands of @Published
+            // writes + O(n) stats), which hangs the app and kills the Pause button. Publish the
+            // progress at most ~12x/sec and the heavy stats at most ~every 1.5s. (These clocks are
+            // local to this single producer thread, so no cross-actor isolation is involved.)
+            var progressClock = 0.0, statsClock = 0.0
             indexer.index(roots: roots, settings: settings, force: force) { p in
+                let now = CFAbsoluteTimeGetCurrent()
+                guard p.done || now - progressClock >= 0.08 else { return }
+                progressClock = now
+                let doStats = p.done || now - statsClock >= 1.5
+                if doStats { statsClock = now }
                 Task { @MainActor in
                     self.progress = p
-                    self.updateIndexRate(embedded: p.embedded)
                     // Refresh the visible stats periodically so the file count, embeddings,
                     // and per-folder counts tick up live in the sidebar and Settings.
-                    if p.scanned % 24 == 0 { self.refreshIndexStats(store) }
+                    if doStats { self.refreshIndexStats(store) }
                     if p.done {
+                        // Any pass that embedded files - even one later cancelled by a pause or
+                        // folder-removal restart - updated the index just now; a clean finish with
+                        // nothing left to do also confirms it is current as of now.
+                        if p.embedded > 0 || !p.cancelled { self.markIndexed(store) }
+                        if p.cancelled, !self.pendingRootRemovals.isEmpty {
+                            // Cancelled to apply folder removals: now that the pass has stopped
+                            // re-inserting, drop those vectors, reclaim their disk space, then
+                            // resume indexing the remaining roots.
+                            let removed = self.pendingRootRemovals; self.pendingRootRemovals.removeAll()
+                            self.restartAfterPause = false
+                            self.indexState = .idle
+                            Task.detached {
+                                for path in removed { store.deleteUnderFolder(path) }
+                                store.compact()
+                                await MainActor.run {
+                                    self.refreshIndexStats(store)
+                                    if !self.query.isEmpty { self.search() }
+                                    if !self.roots.isEmpty { self.startIndexing() }
+                                }
+                            }
+                            return
+                        }
+                        if p.cancelled, self.restartAfterPause {
+                            // A folder was paused/resumed mid-pass: restart re-scoped to the
+                            // current unpaused roots (incremental, so the rest resume in place).
+                            self.restartAfterPause = false
+                            self.indexState = .idle
+                            self.refreshIndexStats(store)
+                            self.startIndexing()   // no-op if every folder is now paused
+                            return
+                        }
                         self.indexState = p.cancelled ? .paused : .idle
-                        self.filesPerSec = 0; self.tokensPerSec = 0
-                        if !p.cancelled { store.metaSet("last_indexed", "\(Date().timeIntervalSince1970)") }
                         self.refreshIndexStats(store)
                         if !self.query.isEmpty { self.search() }
                         if !p.cancelled { self.drainPendingFSChanges() }
@@ -599,18 +857,38 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Smoothed embedding throughput (files/sec and tokens/sec) from successive samples.
-    private func updateIndexRate(embedded: Int) {
+    /// Smoothed embedding throughput, sampled on a timer from the engine's cumulative token count.
+    /// Unlike the old progress-callback rate, this also covers the background FSEvents reconcile,
+    /// which does real embedding but never enters a full index pass. files/sec needs the per-file
+    /// `embedded` count that only the full pass reports, so a reconcile shows tok/s alone.
+    private func startRateSampler() {
+        rateLastTokens = engine?.tokensProcessed ?? 0
+        rateLastEmbedded = progress.embedded
+        rateLastTime = CFAbsoluteTimeGetCurrent()
+        filesPerSec = 0; tokensPerSec = 0
+        guard rateTimer == nil else { return }
+        rateTimer = Timer.scheduledTimer(withTimeInterval: 0.6, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.sampleRate() }
+        }
+    }
+
+    private func sampleRate() {
+        guard isWorking else { stopRateSampler(); return }
         let now = CFAbsoluteTimeGetCurrent()
-        let tokens = engine?.tokensProcessed ?? 0
-        if rateLastTime == 0 { rateLastTime = now; rateLastEmbedded = embedded; rateLastTokens = tokens; return }
         let dt = now - rateLastTime
-        guard dt >= 0.5 else { return }   // sample ~twice a second
-        let instFiles = Double(embedded - rateLastEmbedded) / dt
-        let instToks = Double(tokens - rateLastTokens) / dt
-        filesPerSec = filesPerSec == 0 ? instFiles : filesPerSec * 0.5 + instFiles * 0.5   // EWMA
-        tokensPerSec = tokensPerSec == 0 ? instToks : tokensPerSec * 0.5 + instToks * 0.5
-        rateLastTime = now; rateLastEmbedded = embedded; rateLastTokens = tokens
+        guard dt >= 0.4 else { return }
+        let tokens = engine?.tokensProcessed ?? 0
+        let dToks = tokens - rateLastTokens
+        let dFiles = progress.embedded - rateLastEmbedded
+        rateLastTime = now; rateLastTokens = tokens; rateLastEmbedded = progress.embedded
+        // Hold the last rate through brief gaps (batch flushes, decode) rather than blinking to 0.
+        if dToks > 0 { let r = Double(dToks) / dt; tokensPerSec = tokensPerSec == 0 ? r : tokensPerSec * 0.5 + r * 0.5 }
+        if dFiles > 0 { let r = Double(dFiles) / dt; filesPerSec = filesPerSec == 0 ? r : filesPerSec * 0.5 + r * 0.5 }
+    }
+
+    private func stopRateSampler() {
+        rateTimer?.invalidate(); rateTimer = nil
+        filesPerSec = 0; tokensPerSec = 0
     }
 
     /// Apply file-system changes that were buffered while a full index was running. Called

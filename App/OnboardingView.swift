@@ -3,7 +3,7 @@ import AppKit
 import OmniKit
 
 struct OnboardingView: View {
-    @EnvironmentObject var model: AppModel
+    @Environment(AppModel.self) private var model: AppModel
 
     var body: some View {
         VStack(spacing: 18) {
@@ -12,7 +12,7 @@ struct OnboardingView: View {
                 .foregroundStyle(.tertiary)
             Text("Welcome to Omni")
                 .font(.title).fontWeight(.semibold)
-            Text("Search your files by meaning - images, video, audio, and documents. Omni runs the model on-device. Pick one to download and you're set.")
+            Text("Search images, video, audio, and text by meaning. The model runs on-device - pick one to download.")
                 .font(.callout).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center).frame(maxWidth: 440)
 
@@ -26,16 +26,16 @@ struct OnboardingView: View {
                 .padding(.top, 4)
             } else {
                 VStack(spacing: 10) {
-                    variantButton(.nano, size: "~1.9 GB, faster", prominent: true)
-                    variantButton(.small, size: "~3.1 GB, higher quality", prominent: false)
+                    variantButton(.nano, size: "~1.9 GB \u{00B7} faster", prominent: true)
+                    variantButton(.small, size: "~3.1 GB \u{00B7} higher quality", prominent: false)
                 }
                 .padding(.top, 4)
 
-                Button("Use an Existing Model Folder\u{2026}") { pick() }
+                Button("Choose Model Folder\u{2026}") { pick() }
                     .buttonStyle(.plain).font(.callout).foregroundStyle(.secondary).padding(.top, 6)
             }
 
-            if model.downloadLabel.hasPrefix("Download failed") {
+            if model.downloadFailed {
                 Text(model.downloadLabel).font(.caption).foregroundStyle(.red).frame(maxWidth: 440)
             }
         }

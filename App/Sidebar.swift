@@ -3,17 +3,26 @@ import AppKit
 import OmniKit
 
 struct Sidebar: View {
-    @EnvironmentObject var model: AppModel
+    @Environment(AppModel.self) private var model: AppModel
+    @State private var dropTargeted = false
+    @State private var selection: URL?
 
     var body: some View {
-        List {
+        List(selection: $selection) {
             Section("Folders") {
                 ForEach(model.roots, id: \.self) { url in
                     HStack(spacing: 7) {
                         Image(systemName: "folder").foregroundStyle(.secondary).frame(width: 16)
                         Text(url.lastPathComponent).lineLimit(1).truncationMode(.middle)
                         Spacer()
-                        if isActive(url) {
+                        if model.isFolderPaused(url) {
+                            // Paused: indexing skips this folder. Show the count it already has,
+                            // plus a pause glyph so the stopped state is unambiguous.
+                            if model.indexedFiles > 0, let c = model.folderFileCounts[url.path], c > 0 {
+                                Text(c.formatted()).font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
+                            }
+                            Image(systemName: "pause.circle").foregroundStyle(.tertiary)
+                        } else if isActive(url) {
                             // iCloud-Drive-style transfer indicator: a pie that fills as this
                             // folder is indexed (or sweeps when reconciling in the background).
                             CloudSyncPie(fraction: activeFraction(url))
@@ -25,20 +34,47 @@ struct Sidebar: View {
                                 .foregroundStyle(c == 0 ? .tertiary : .secondary)
                                 .help(c == 0 ? "No files indexed in this folder yet" : "\(c) files indexed")
                         }
-                        Button { model.removeRoot(url) } label: {
-                            Image(systemName: "minus.circle").foregroundStyle(.tertiary)
-                        }
-                        .buttonStyle(.plain)
                     }
                     // While this folder indexes, the row tooltip shows live progress;
                     // otherwise the full path (useful when the name is truncated).
-                    .help(isActive(url) ? indexingHelp(url) : url.path)
+                    .help(model.isFolderPaused(url) ? "This folder is paused" : (isActive(url) ? indexingHelp(url) : url.path))
+                    // Native source-list management: right-click to act, Delete to remove the
+                    // selected folder. No always-on button cluttering the row.
+                    .contextMenu {
+                        // Persistent per-folder toggle (not a transient pause of a running pass):
+                        // a paused folder is excluded from indexing and from live file-change
+                        // updates; its already-indexed files stay searchable.
+                        if model.isFolderPaused(url) {
+                            Button("Resume This Folder") { model.setFolderPaused(url, false) }
+                        } else {
+                            Button("Pause This Folder") { model.setFolderPaused(url, true) }
+                        }
+                        Button("Reveal in Finder") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+                        Divider()
+                        Button("Remove from Omni") { remove(url) }
+                    }
                 }
-                Button { pickFolder() } label: { Label("Add Folder", systemImage: "plus") }
+                Button { pickFolder() } label: { Label("Add Folder\u{2026}", systemImage: "plus") }
                     .buttonStyle(.plain)
             }
         }
         .listStyle(.sidebar)
+        .onDeleteCommand { if let s = selection { remove(s) } }
+        // Drag a folder in from Finder to add it as a search root - the most natural gesture on
+        // macOS, alongside the existing Add Folder button.
+        .dropDestination(for: URL.self) { urls, _ in
+            let dirs = urls.filter { $0.hasDirectoryPath }
+            dirs.forEach { model.addRoot($0) }
+            return !dirs.isEmpty
+        } isTargeted: { dropTargeted = $0 }
+        .overlay {
+            if dropTargeted {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(Color.accentColor, lineWidth: 2)
+                    .padding(6)
+                    .allowsHitTesting(false)
+            }
+        }
     }
 
     /// A folder has background work when it is mid full-index or mid live reconcile of
@@ -62,7 +98,12 @@ struct Sidebar: View {
         if let rp = model.progress.perRoot[url.path], rp.total > 0 {
             return "Indexing \(rp.done.formatted()) / \(rp.total.formatted()) files"
         }
-        return "Indexing\u{2026}"
+        return "Updating\u{2026}"
+    }
+
+    private func remove(_ url: URL) {
+        if selection == url { selection = nil }
+        model.removeRoot(url)
     }
 
     private func pickFolder() {

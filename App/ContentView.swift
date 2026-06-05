@@ -3,10 +3,40 @@ import AppKit
 import OmniKit
 
 struct ContentView: View {
-    @EnvironmentObject var model: AppModel
+    @Environment(AppModel.self) private var model: AppModel
     @State private var debounce: Task<Void, Never>?
 
+    // Progressive disclosure: only offer search once there is something to search. During model
+    // loading, onboarding, and the no-folders state the search field stays hidden (not dimmed).
+    private var showsSearch: Bool { model.phase == .ready && !model.roots.isEmpty }
+
     var body: some View {
+        Group {
+            if showsSearch {
+                split
+                    .searchable(text: Binding(get: { model.query }, set: { model.query = $0 }), placement: .toolbar, prompt: "Search your files by meaning")
+                    .onChange(of: model.query) { _, _ in scheduleSearch() }
+                    .onSubmit(of: .search) { model.search() }
+            } else {
+                split
+            }
+        }
+        // Spotlight-style: put the caret in the search field as soon as the app can search. The
+        // macOS 15 .searchFocused API is unavailable on our 14 target, so focus the toolbar's
+        // NSSearchField directly once it exists.
+        .onChange(of: showsSearch, initial: true) { _, shows in if shows { focusSearchField() } }
+    }
+
+    private func focusSearchField() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            guard let window = NSApp.windows.first(where: { $0.isVisible && $0.toolbar != nil }),
+                  let item = window.toolbar?.items.compactMap({ $0 as? NSSearchToolbarItem }).first
+            else { return }
+            window.makeFirstResponder(item.searchField)
+        }
+    }
+
+    private var split: some View {
         NavigationSplitView {
             Sidebar()
                 .navigationSplitViewColumnWidth(min: 230, ideal: 260, max: 320)
@@ -16,13 +46,10 @@ struct ContentView: View {
                 .navigationSubtitle(subtitle)
                 .toolbar { toolbar }
         }
-        .searchable(text: $model.query, placement: .toolbar, prompt: "Search your files by meaning")
-        .onChange(of: model.query) { _, _ in scheduleSearch() }
-        .onSubmit(of: .search) { model.search() }
     }
 
     private var subtitle: String {
-        guard model.phase == .ready, !model.query.isEmpty, !model.searching else { return "" }
+        guard model.phase == .ready, !model.query.isEmpty, !model.isResolving else { return "" }
         let n = model.results.count
         if n == 0 { return "" }
         return n >= 60 ? "Top \(n) results" : "\(n) result\(n == 1 ? "" : "s")"
@@ -33,7 +60,7 @@ struct ContentView: View {
     @ViewBuilder private var detail: some View {
         switch model.phase {
         case .loadingModel:
-            CenteredStatus(symbol: "brain", title: "Loading omni model", subtitle: "Bringing up the MLX engine\u{2026}", showSpinner: true)
+            CenteredStatus(symbol: "brain", title: "Loading the Omni model", subtitle: "Starting the on-device model\u{2026}", showSpinner: true)
         case .noModel:
             OnboardingView()
         case .failed(let msg):
@@ -62,15 +89,24 @@ struct ContentView: View {
             CenteredStatus(symbol: "folder.badge.plus", title: "Add a folder to search",
                            subtitle: "Choose the folders you want to search. Omni indexes them automatically and keeps them up to date.",
                            showSpinner: false, action: ("Add Folder\u{2026}", { pickFolder() }))
-        } else if model.query.isEmpty {
+        } else if model.query.isEmpty || model.isResolving {
+            // Idle prompt, and the in-flight search state. They share one calm placeholder so a
+            // pending search only fades a small spinner in under the same prompt - it never flashes
+            // "No matches" while the debounce/search for what you just typed is still running.
             CenteredStatus(symbol: "sparkle.magnifyingglass",
                            title: model.indexedFiles > 0 ? "Search \(model.indexedFiles.formatted()) files" : "Search your files",
-                           subtitle: "Type a phrase. Results are ranked by meaning, across images, video, audio, and text.", showSpinner: false)
+                           subtitle: "Type a phrase. Results are ranked by meaning, across images, video, audio, and text.",
+                           showSpinner: model.isResolving)
         } else if model.hiddenByThreshold > 0 {
             CenteredStatus(symbol: "line.3.horizontal.decrease.circle",
                            title: "No results above \(Int(model.minScore * 100))%",
-                           subtitle: "\(model.hiddenByThreshold) weaker match\(model.hiddenByThreshold == 1 ? "" : "es") are hidden by the relevance threshold.",
+                           subtitle: "\(model.hiddenByThreshold) weaker \(model.hiddenByThreshold == 1 ? "match is" : "matches are") hidden by the relevance threshold.",
                            showSpinner: false, action: ("Show All Matches", { model.showAllBelowThreshold() }))
+        } else if model.filtersActive {
+            // Filters can hide every result; the empty state is the only place left to escape them.
+            CenteredStatus(symbol: "line.3.horizontal.decrease.circle", title: "No matches",
+                           subtitle: "Filters are hiding every result.", showSpinner: false,
+                           action: ("Clear Filters", { model.clearFilters() }))
         } else {
             CenteredStatus(symbol: "magnifyingglass", title: "No matches", subtitle: "Try a different phrase.", showSpinner: false)
         }
@@ -79,7 +115,7 @@ struct ContentView: View {
     @ViewBuilder private var belowThresholdFooter: some View {
         if model.hiddenByThreshold > 0 {
             Button { model.showAllBelowThreshold() } label: {
-                Label("Show \(model.hiddenByThreshold) more below \(Int(model.minScore * 100))%", systemImage: "chevron.down")
+                Label("Show \(model.hiddenByThreshold) More Matches", systemImage: "chevron.down")
                     .font(.callout)
             }
             .buttonStyle(.plain)
@@ -92,33 +128,42 @@ struct ContentView: View {
     // MARK: - Toolbar
 
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
+        // Progressive disclosure: the filter/sort/view chrome appears only once there are results
+        // to act on - hidden, not greyed out, during onboarding and the idle/empty states.
+        // Exception: keep the filter menu reachable whenever a filter is active, so a filter that
+        // hides every result can still be cleared (otherwise the menu vanishes with the results).
+        if model.phase == .ready, !model.rawResults.isEmpty || model.filtersActive {
         // Filtering - one home.
         ToolbarItem(placement: .automatic) {
             filterMenu.disabled(model.indexedFiles == 0)
         }
-        // Result presentation - sort + view grouped together.
+        }
+        // Result presentation - sort + view grouped together. Only meaningful with results.
+        if model.phase == .ready, !model.rawResults.isEmpty {
         ToolbarItem(placement: .primaryAction) {
             ControlGroup {
                 Menu {
-                    Picker("Sort By", selection: $model.sortOrder) {
+                    Picker("Sort By", selection: Binding(get: { model.sortOrder }, set: { model.sortOrder = $0 })) {
                         ForEach(SortOrder.allCases) { Text($0.title).tag($0) }
                     }
                 } label: { Image(systemName: "arrow.up.arrow.down") }
                 .help("Sort by \(model.sortOrder.title)")
-                .disabled(model.rawResults.isEmpty)
 
-                Picker("View", selection: $model.viewMode) {
+                Picker("View", selection: Binding(get: { model.viewMode }, set: { model.viewMode = $0 })) {
                     Image(systemName: "list.bullet").accessibilityLabel("List view").tag(ResultViewMode.list)
                     Image(systemName: "square.grid.2x2").accessibilityLabel("Gallery view").tag(ResultViewMode.grid)
                 }
                 .pickerStyle(.segmented)
-                .help("List or gallery")
+                .help("Switch between list and gallery")
             }
+        }
         }
     }
 
     private var filterKinds: [FileKind] {
-        let present = FileKind.allCases.filter { model.indexedKinds.contains($0.rawValue) }
+        // Show indexed kinds, plus any kind currently being filtered on - otherwise a filter for a
+        // kind that is not (yet) in the index would be invisible and impossible to untoggle.
+        let present = FileKind.allCases.filter { model.indexedKinds.contains($0.rawValue) || model.filterKinds.contains($0) }
         return present.isEmpty ? [.image, .video, .audio] : present
     }
 
@@ -139,14 +184,14 @@ struct ContentView: View {
                 Text("All Folders").tag("")
                 ForEach(model.roots, id: \.self) { Text($0.lastPathComponent).tag($0.path) }
             }
-            Picker("Type", selection: $model.filterExt) {
+            Picker("Extension", selection: Binding(get: { model.filterExt }, set: { model.filterExt = $0 })) {
                 Text("Any Extension").tag("")
                 ForEach(model.indexedExts, id: \.self) { Text(".\($0)").tag($0) }
             }
-            Picker("Date", selection: $model.dateRange) {
+            Picker("Date", selection: Binding(get: { model.dateRange }, set: { model.dateRange = $0 })) {
                 ForEach(DateRange.allCases) { Text($0.title).tag($0) }
             }
-            Picker("Relevance", selection: $model.minScore) {
+            Picker("Relevance", selection: Binding(get: { model.minScore }, set: { model.minScore = $0 })) {
                 Text("Any").tag(0.0); Text("25%").tag(0.25); Text("50%").tag(0.5); Text("70%").tag(0.7)
             }
             Divider()
@@ -183,8 +228,8 @@ struct CenteredStatus: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            Image(systemName: symbol).font(.system(size: 40, weight: .light)).foregroundStyle(.tertiary)
-            Text(title).font(.title2).fontWeight(.semibold)
+            Image(systemName: symbol).font(.system(size: 44, weight: .light)).foregroundStyle(.tertiary)
+            Text(title).font(.title)
             Text(subtitle).font(.callout).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center).frame(maxWidth: 400)
             if showSpinner { ProgressView().controlSize(.small).padding(.top, 4) }
@@ -198,7 +243,7 @@ struct CenteredStatus: View {
 }
 
 struct EngineFailedView: View {
-    @EnvironmentObject var model: AppModel
+    @Environment(AppModel.self) private var model: AppModel
     let message: String
     var body: some View {
         VStack(spacing: 12) {

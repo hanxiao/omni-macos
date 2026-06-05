@@ -41,8 +41,11 @@ struct Thumbnail: View {
         }
         .clipShape(RoundedRectangle(cornerRadius: corner, style: .continuous))
         .overlay(
+            // A soft edge for definition. separatorColor is tuned for list dividers and reads as a
+            // hard hairline boxing every thumbnail; a faint primary tint defines the edge without
+            // drawing a grid of lines across the content.
             RoundedRectangle(cornerRadius: corner, style: .continuous)
-                .strokeBorder(Color(.separatorColor), lineWidth: 0.5)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
         )
         .task(id: "\(path)@\(Int(side))") { await load() }
     }

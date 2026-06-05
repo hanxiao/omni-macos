@@ -4,14 +4,13 @@ import QuickLook
 import OmniKit
 
 struct ResultsList<Footer: View>: View {
-    @EnvironmentObject var model: AppModel
+    @Environment(AppModel.self) private var model: AppModel
     let results: [SearchHit]
     @ViewBuilder var footer: Footer
-    @State private var previewURL: URL?
     @State private var expanded: Set<String> = []
     @State private var passagesCache: [String: [ChunkHit]] = [:]
+    @State private var gridWidth: CGFloat = 0
 
-    private var selectedURL: URL? { model.selection.map { URL(fileURLWithPath: $0) } }
     private func toggle(_ path: String) {
         if expanded.contains(path) { expanded.remove(path) }
         else { expanded.insert(path); passagesCache[path] = model.passages(for: path) }
@@ -24,19 +23,23 @@ struct ResultsList<Footer: View>: View {
             case .grid: gridView
             }
         }
-        .quickLookPreview($previewURL)
-        .background(QuickLookKeyMonitor(onSpace: {
-            // Finder-style toggle: space dismisses the preview if open, else previews the selection.
-            if previewURL != nil { previewURL = nil }
-            else { previewURL = selectedURL }
+        .quickLookPreview(Binding(get: { model.previewURL }, set: { model.previewURL = $0 }))
+        // Space toggles Quick Look in both views regardless of focus, and is left alone while
+        // editing text (the search field). The selection drives what is previewed.
+        .background(QuickLookKeyMonitor(onSpace: { model.toggleQuickLook() }, onPreviewArrow: { delta in
+            // Only hijack arrows while Quick Look is open - then move the selection (which, via
+            // its didSet, keeps previewURL on the selected row so the panel updates live).
+            guard model.previewURL != nil else { return false }
+            model.moveSelection(rowDelta: delta)
+            return true
         }))
-        .onKeyPress(.return) { if let p = model.selection { open(p); return .handled }; return .ignored }
+        .onKeyPress(.return) { if model.hasSelection { model.openSelected(); return .handled }; return .ignored }
     }
 
     // MARK: - List
 
     private var listView: some View {
-        List(selection: $model.selection) {
+        List(selection: Binding(get: { model.selection }, set: { model.selection = $0 })) {
             ForEach(results, id: \.path) { hit in
                 VStack(spacing: 0) {
                     ResultRow(hit: hit,
@@ -60,9 +63,15 @@ struct ResultsList<Footer: View>: View {
 
     // MARK: - Gallery
 
+    private let gridMin: CGFloat = 172
+    private var gridColumns: Int {
+        let usable = gridWidth - Design.gapLarge * 2
+        return max(1, Int((usable + Design.gapLarge) / (gridMin + Design.gapLarge)))
+    }
+
     private var gridView: some View {
         ScrollView {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 140, maximum: 196), spacing: Design.gapLarge)], spacing: Design.gapLarge) {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: gridMin, maximum: 220), spacing: Design.gapLarge)], spacing: Design.gapLarge) {
                 ForEach(results, id: \.path) { hit in
                     ResultGridItem(hit: hit, selected: model.selection == hit.path)
                         .draggable(URL(fileURLWithPath: hit.path))
@@ -74,17 +83,39 @@ struct ResultsList<Footer: View>: View {
             .padding(Design.gapLarge)
             footer
         }
+        .background(GeometryReader { g in
+            Color.clear
+                .onAppear { gridWidth = g.size.width }
+                .onChange(of: g.size.width) { _, w in gridWidth = w }
+        })
+        // Make the gallery keyboard-navigable like the list: arrow keys move the selection by
+        // column/row, and Return/Space (handled on the body) then open/preview it.
+        .focusable()
+        .focusEffectDisabled()
+        .onMoveCommand { direction in
+            switch direction {
+            case .up: model.moveSelection(rowDelta: -gridColumns)
+            case .down: model.moveSelection(rowDelta: gridColumns)
+            case .left: model.moveSelection(rowDelta: -1)
+            case .right: model.moveSelection(rowDelta: 1)
+            @unknown default: break
+            }
+        }
     }
 
     @ViewBuilder private func menu(_ path: String) -> some View {
         Button("Open") { open(path) }
-        Button("Quick Look") { previewURL = URL(fileURLWithPath: path) }
+            .keyboardShortcut("o", modifiers: .command)
+        Button("Quick Look") { model.previewURL = URL(fileURLWithPath: path) }
+            .keyboardShortcut("y", modifiers: .command)
         Button("Reveal in Finder") { reveal(path) }
+            .keyboardShortcut("r", modifiers: [.command, .shift])
         Divider()
         Button("Copy Path") {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(path, forType: .string)
         }
+        .keyboardShortcut("c", modifiers: [.command, .option])
     }
 
     private func open(_ path: String) { NSWorkspace.shared.open(URL(fileURLWithPath: path)) }
@@ -104,7 +135,7 @@ struct ResultRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(url.lastPathComponent).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
                 if !hit.snippet.isEmpty, hit.snippet != url.lastPathComponent {
-                    Text(hit.snippet).font(.callout).foregroundStyle(.secondary).lineLimit(1)
+                    Text(hit.snippet).font(.body).foregroundStyle(.secondary).lineLimit(1)
                 }
                 HStack(spacing: 5) {
                     KindGlyph(kind: hit.kind)
@@ -143,7 +174,7 @@ struct PassagesView: View {
                 HStack(alignment: .top, spacing: 8) {
                     RoundedRectangle(cornerRadius: 1.5).fill(.quaternary).frame(width: 3)
                     Text(p.snippet)
-                        .font(.callout).foregroundStyle(.secondary)
+                        .font(.body).foregroundStyle(.secondary)
                         .lineLimit(3)
                         .frame(maxWidth: .infinity, alignment: .leading)
                     Text(scoreText(p.score)).font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
@@ -160,7 +191,9 @@ struct PassagesView: View {
             }
         }
         .padding(10)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+        // A flat elevated fill, not vibrancy: blur belongs on sidebars/toolbars, but this excerpt
+        // card sits inside the opaque scrolling content where text must stay crisp and high-contrast.
+        .background(Color(.controlBackgroundColor), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
         .padding(.leading, 52)
         .padding(.trailing, 12)
         .padding(.bottom, 8)
@@ -176,20 +209,28 @@ struct ResultGridItem: View {
         VStack(spacing: 6) {
             Thumbnail(path: hit.path, side: 128, corner: Design.corner)
                 .overlay(alignment: .topTrailing) {
-                    Text(scoreText(hit.score)).font(.caption2.monospacedDigit()).foregroundStyle(.white)
+                    // A material chip over imagery (the one legitimate in-content use of vibrancy):
+                    // stays legible over both bright and dark thumbnails, adapts to light/dark mode.
+                    Text(scoreText(hit.score)).font(.caption2.monospacedDigit()).foregroundStyle(.primary)
                         .padding(.horizontal, 5).padding(.vertical, 2)
-                        .background(.black.opacity(0.5), in: Capsule()).padding(5)
-                }
-                .overlay {
-                    RoundedRectangle(cornerRadius: Design.corner, style: .continuous)
-                        .strokeBorder(Color.accentColor, lineWidth: selected ? 2.5 : 0)
+                        .glassChip().padding(5)
                 }
             Text(url.lastPathComponent).font(.caption).lineLimit(2)
-                .multilineTextAlignment(.center).frame(maxWidth: 150)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(selected ? .white : .primary)
+                .padding(.horizontal, 6).padding(.vertical, 1)
+                .background(selected ? Color.accentColor : .clear, in: Capsule())
+                .frame(maxWidth: 150)
             MediaInfoLabel(path: hit.path, kind: hit.kind, separator: false)
                 .font(.caption2).foregroundStyle(.tertiary)
         }
-        .padding(6)
+        .padding(8)
+        // Native selection: a translucent accent fill behind the whole cell (thumbnail + label),
+        // the way Finder and Photos indicate selection - not a hard ring hugging the image.
+        .background(
+            selected ? Color.accentColor.opacity(0.18) : .clear,
+            in: RoundedRectangle(cornerRadius: Design.corner + 2, style: .continuous)
+        )
     }
 }
 

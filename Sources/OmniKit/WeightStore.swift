@@ -54,6 +54,15 @@ public struct WeightStore {
             }
         }
 
+        // Optional: run the backbone in bf16 for indexing throughput. The fp32 upcast above
+        // (and the fp32 LoRA merge) preserve fidelity during load; this only lowers the compute
+        // dtype, which is far faster on the GPU. Gated by env so parity runs stay fp32.
+        if ProcessInfo.processInfo.environment["OMNI_BACKBONE_BF16"] == "1" {
+            for key in Array(w.keys) where key.hasPrefix("language_model.") {
+                w[key] = w[key]!.asType(.bfloat16)
+            }
+        }
+
         // Force-evaluate only the language backbone (it was merged + upcast). The
         // vision/audio tower weights stay lazily memory-mapped until their first
         // image/audio embed, so launch doesn't pay for towers a text query never uses.

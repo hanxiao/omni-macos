@@ -72,9 +72,20 @@ public enum FileExtractor {
         return nil
     }
 
-    /// Is this file one of `enabledKinds` and extractable?
-    public static func isSupported(_ url: URL, enabledKinds: Set<FileKind>) -> Bool {
-        guard let k = kind(for: url) else { return false }
+    /// All extensions a kind covers, sorted for display. Text bundles code/plain-text, PDF, office.
+    public static func extensions(for kind: FileKind) -> [String] {
+        switch kind {
+        case .image: return imageExtensions.sorted()
+        case .video: return videoExtensions.sorted()
+        case .audio: return audioExtensions.sorted()
+        case .text: return (textExtensions.union(pdfExtensions).union(officeExtensions)).sorted()
+        }
+    }
+
+    /// Is this file an enabled kind, extractable, and not an individually disabled extension?
+    public static func isSupported(_ url: URL, enabledKinds: Set<FileKind>, disabledExtensions: Set<String> = []) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        guard !disabledExtensions.contains(ext), let k = kind(for: url) else { return false }
         return enabledKinds.contains(k)
     }
 

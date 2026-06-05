@@ -8,14 +8,37 @@ public protocol Embedder: AnyObject {
     func embedText(_ text: String, as type: OmniInputType) -> [Float]
     /// Embed several texts in one batched forward pass (output order matches input).
     func embedTextBatch(_ texts: [String], as type: OmniInputType) -> [[Float]]
+    /// Embed several already-bucketed batches in one serialized call, double-buffering the GPU
+    /// forward of batch K+1 over the host pool-readout of batch K (OMNI_ASYNC_EVAL). Output is a
+    /// per-batch array of vectors, order matching input. Default impl just maps embedTextBatch.
+    func embedTextBatches(_ batches: [[String]], as type: OmniInputType) -> [[[Float]]]
     /// Embed a single image (vision tower). Returns nil if the vision path is unavailable.
     func embedImage(_ image: CGImage) -> [Float]?
+    /// Batch-N image: embed several already-preprocessed images in ONE block-diagonal vision
+    /// forward (output order matches input). Nil if the vision path is unavailable.
+    func embedImages(_ raws: [OmniVisionPreprocess.RawPatches]) -> [[Float]]?
     /// Embed sampled video frames as one temporal embedding. Nil if unavailable.
     func embedVideoFrames(_ frames: [CGImage]) -> [Float]?
     /// Embed an audio file (decode + mel + audio tower). Nil if unavailable.
     func embedAudio(_ url: URL) -> [Float]?
     /// Embed from a precomputed mel buffer (lets mel run in the concurrent decode stage).
     func embedAudioMel(_ mel: [Float], frames: Int) -> [Float]?
+    /// Batch-N audio: embed several precomputed mels in one tower + backbone forward
+    /// (output order matches input). Nil if the audio path is unavailable.
+    func embedAudioMelBatch(_ mels: [[Float]], frames: [Int]) -> [[Float]]?
+}
+
+public extension Embedder {
+    /// Default: no pipelining, just embed each batch in turn. Conformances that support the
+    /// async double-buffer (OmniEngine) override this.
+    func embedTextBatches(_ batches: [[String]], as type: OmniInputType) -> [[[Float]]] {
+        batches.map { embedTextBatch($0, as: type) }
+    }
+
+    /// Default: preprocess each raw to a tensor and embed serially via embedImage's CGImage path is
+    /// not possible here (raws are already preprocessed), so fall back to one-at-a-time using the
+    /// batched call with a single element. OmniEngine overrides with the true batched forward.
+    func embedImages(_ raws: [OmniVisionPreprocess.RawPatches]) -> [[Float]]? { nil }
 }
 
 /// Per-folder progress for a determinate ring.
@@ -42,7 +65,10 @@ public struct IndexProgress: Sendable {
 /// Decoded, embed-ready content for one file. @unchecked Sendable so it can cross the
 /// concurrent-decode -> serial-embed boundary (it may hold CGImages).
 final class DecodedItem: @unchecked Sendable {
-    enum Payload { case empty, text([String]), images([CGImage]), audioMel([Float], Int) }
+    // .images stays for VIDEO frames (one temporal clip). Still images / PDF pages are
+    // preprocessed in the decode stage to .imagePatches so the heavy CPU patchify runs off the
+    // serialized GPU thread and the vision tower can batch them.
+    enum Payload { case empty, text([String]), images([CGImage]), imagePatches([OmniVisionPreprocess.RawPatches]), audioMel([Float], Int) }
     let file: CrawledFile
     let kind: String
     let payload: Payload
@@ -64,12 +90,17 @@ public final class Indexer: @unchecked Sendable {
     private let queue = DispatchQueue(label: "omni.indexer")
     private var cancelled = false
 
-    // Text chunking.
-    public var maxCharsPerChunk = 1800
+    // Text chunking. maxCharsPerChunk now comes per-pass from IndexSettings (user-set).
     public var chunkOverlap = 200
     public var maxChunksPerFile = 40
     public var snippetLength = 220
     public var textBatchSize = 48   // chunks embedded per batched forward pass (GPU-efficient)
+
+    // Audio batch-N: cap clips per tower+backbone forward by a TOTAL-FRAME budget so peak
+    // VRAM is bounded (the backbone forward is O(B*Lmax^2); Lmax grows ~frames/4). A clip
+    // longer than the budget on its own is embedded alone. 24000 frames ~= 4 min of audio.
+    public var audioFrameBudget = 24000
+    public var audioMaxClipsPerBatch = 16
 
     private var active: IndexSettings = .default
 
@@ -94,7 +125,7 @@ public final class Indexer: @unchecked Sendable {
         for root in roots {
             if isCancelled { break }
             var total = 0
-            FileCrawler(roots: [root], enabledKinds: settings.enabledKinds)
+            FileCrawler(roots: [root], enabledKinds: settings.enabledKinds, disabledExtensions: settings.disabledExtensions)
                 .walk(shouldContinue: { !self.isCancelled }) { _ in total += 1 }
             var rp = RootProgress(); rp.total = total
             p.perRoot[root.path] = rp
@@ -114,7 +145,7 @@ public final class Indexer: @unchecked Sendable {
         for root in roots {
             if isCancelled { break }
             var files: [CrawledFile] = []
-            FileCrawler(roots: [root], enabledKinds: settings.enabledKinds)
+            FileCrawler(roots: [root], enabledKinds: settings.enabledKinds, disabledExtensions: settings.disabledExtensions)
                 .walk(shouldContinue: { !self.isCancelled }) { files.append($0) }
             perRootFiles.append((root.path, files))
         }
@@ -153,7 +184,11 @@ public final class Indexer: @unchecked Sendable {
             }
         }
 
-        for kind in [FileKind.text, .image, .audio, .video] {
+        // Index modalities in the user-chosen order, but always cover all four (a stale persisted
+        // order could omit one).
+        var kindOrder = settings.kindOrder
+        for k in [FileKind.text, .image, .audio, .video] where !kindOrder.contains(k) { kindOrder.append(k) }
+        for kind in kindOrder {
             guard !isCancelled, let files = byKind[kind], !files.isEmpty else { continue }
             if kind == .text {
                 // Cross-file text batching: buffer chunks from many files and embed them in
@@ -162,11 +197,29 @@ public final class Indexer: @unchecked Sendable {
                 var buf: [(fid: Int, idx: Int, text: String, snippet: String)] = []
                 var acc: [Int: (file: CrawledFile, kind: String, total: Int, done: [IndexedChunk])] = [:]
                 var nextFid = 0
-                func flushText(min minCount: Int) {
-                    while buf.count >= minCount, !buf.isEmpty {
+                // Buffer several batches before draining so we can LENGTH-BUCKET them: sorting the
+                // staging window by length makes each 48-wide GPU batch pad to a near-uniform Lmax,
+                // cutting the compute wasted on right-padding (~1.5-1.7x on varied-length corpora).
+                // Reordering is output-neutral: vectors are scattered back by (fid,idx), so each
+                // file's chunks reassemble identically regardless of batch composition.
+                let textStageWindow = textBatchSize * 6
+                func flushText(drainAll: Bool) {
+                    let floor = drainAll ? 0 : textBatchSize    // keep up to one partial batch between flushes
+                    guard buf.count > floor else { return }
+                    buf.sort { $0.text.count < $1.text.count }
+                    // Carve the sorted window into textBatchSize buckets, then hand the WHOLE set to
+                    // embedTextBatches in one serialized call. With OMNI_ASYNC_EVAL=1 that double-
+                    // buffers batch K+1's GPU forward over batch K's host readout; otherwise it is a
+                    // plain per-batch loop. Same vectors either way (just scheduling).
+                    var groups: [[(fid: Int, idx: Int, text: String, snippet: String)]] = []
+                    while buf.count > floor {
                         let take = Swift.min(textBatchSize, buf.count)
-                        let batch = Array(buf.prefix(take)); buf.removeFirst(take)
-                        let vecs = self.embedder.embedTextBatch(batch.map { $0.text }, as: .passage)
+                        groups.append(Array(buf.prefix(take))); buf.removeFirst(take)
+                    }
+                    if groups.isEmpty { return }
+                    let vecBatches = self.embedder.embedTextBatches(groups.map { $0.map { $0.text } }, as: .passage)
+                    for (gi, batch) in groups.enumerated() {
+                        let vecs = vecBatches[gi]
                         for (k, b) in batch.enumerated() {
                             guard var a = acc[b.fid] else { continue }
                             a.done.append(IndexedChunk(path: a.file.url.path, modified: a.file.modified, size: a.file.size,
@@ -186,15 +239,53 @@ public final class Indexer: @unchecked Sendable {
                         let fid = nextFid; nextFid += 1
                         acc[fid] = (item.file, item.kind, pieces.count, [])
                         for (j, piece) in pieces.enumerated() { buf.append((fid, j, piece, self.snippet(piece))) }
-                        flushText(min: self.textBatchSize)
-                    case .images:
-                        storeChunks(path, self.embed(item))   // scanned PDF rendered to images
+                        if buf.count >= textStageWindow { flushText(drainAll: false) }
+                    case .images, .imagePatches:
+                        storeChunks(path, self.embed(item))   // scanned PDF / image pages (batched)
                     default:
                         p.skipped += 1
                     }
                 }
-                flushText(min: 1)                                   // drain the partial last batch
+                flushText(drainAll: true)                           // drain the remaining buffer
                 for (_, a) in acc { storeChunks(a.file.url.path, a.done) }   // any stragglers
+            } else if kind == .audio {
+                // Cross-file audio batching: stage decoded mels and embed up to
+                // audioMaxClipsPerBatch clips (bounded by audioFrameBudget total frames)
+                // in ONE tower + ONE backbone forward. Mel STFT already ran on background
+                // cores in the concurrent decode stage; this only batches the GPU forward.
+                var stage: [(file: CrawledFile, kind: String, mel: [Float], frames: Int)] = []
+                var stageFrames = 0
+                func flushAudio() {
+                    guard !stage.isEmpty else { return }
+                    let batch = stage; stage = []; stageFrames = 0
+                    let vecs = self.embedder.embedAudioMelBatch(batch.map { $0.mel }, frames: batch.map { $0.frames })
+                    for (k, b) in batch.enumerated() {
+                        let v = (vecs != nil && k < vecs!.count) ? vecs![k] : nil
+                        guard let vec = v else { storeChunks(b.file.url.path, []); continue }
+                        storeChunks(b.file.url.path, [IndexedChunk(
+                            path: b.file.url.path, modified: b.file.modified, size: b.file.size,
+                            kind: b.kind, chunkIndex: 0, snippet: b.file.url.lastPathComponent, embedding: vec)])
+                    }
+                    onProgress(p)
+                }
+                pipeline(files, force: force, known: known) { item in
+                    let path = item.file.url.path
+                    defer { tick(path) }
+                    if item.unchanged { p.unchanged += 1; return }
+                    guard case .audioMel(let mel, let frames) = item.payload else { p.skipped += 1; return }
+                    // Flush before adding if this clip would exceed the budget (but never
+                    // split a single clip; a clip larger than the budget embeds alone).
+                    if !stage.isEmpty && (stageFrames + frames > self.audioFrameBudget
+                                          || stage.count >= self.audioMaxClipsPerBatch) {
+                        flushAudio()
+                    }
+                    stage.append((item.file, item.kind, mel, frames))
+                    stageFrames += frames
+                    if stageFrames >= self.audioFrameBudget || stage.count >= self.audioMaxClipsPerBatch {
+                        flushAudio()
+                    }
+                }
+                flushAudio()   // drain the remaining staged clips
             } else {
                 pipeline(files, force: force, known: known) { item in
                     if item.unchanged { p.unchanged += 1 } else { storeChunks(item.file.url.path, self.embed(item)) }
@@ -239,7 +330,7 @@ public final class Indexer: @unchecked Sendable {
             // not its children. Crawl it so freshly added subtrees get indexed instead of
             // being silently skipped until the next full pass.
             if isDir.boolValue {
-                FileCrawler(roots: [url], enabledKinds: settings.enabledKinds)
+                FileCrawler(roots: [url], enabledKinds: settings.enabledKinds, disabledExtensions: settings.disabledExtensions)
                     .walk(shouldContinue: { true }) { self.indexFile($0.url, known: known, settings: settings) }
                 continue
             }
@@ -251,7 +342,7 @@ public final class Indexer: @unchecked Sendable {
     /// watcher update and the directory re-crawl above.
     private func indexFile(_ url: URL, known: [String: StoredFile], settings: IndexSettings) {
         let path = url.path
-        guard FileExtractor.isSupported(url, enabledKinds: settings.enabledKinds) else {
+        guard FileExtractor.isSupported(url, enabledKinds: settings.enabledKinds, disabledExtensions: settings.disabledExtensions) else {
             if known[path] != nil { store.deletePath(path) }   // now unsupported/disabled
             return
         }
@@ -342,7 +433,11 @@ public final class Indexer: @unchecked Sendable {
             if active.minTextChars > 0, text.count < active.minTextChars { return DecodedItem(file: file) }
             return DecodedItem(file: file, kind: kind, payload: .text(chunk(text)))
         case .images(let images):
-            return images.isEmpty ? DecodedItem(file: file) : DecodedItem(file: file, kind: kind, payload: .images(images))
+            if images.isEmpty { return DecodedItem(file: file) }
+            // Still images / PDF pages: run the CPU preprocess (resize + parallel patchify) HERE,
+            // in the concurrent decode stage, so the serialized GPU thread only does the tower.
+            let raws = images.map { OmniVisionPreprocess.preprocessRaw($0) }
+            return DecodedItem(file: file, kind: kind, payload: .imagePatches(raws))
         }
     }
 
@@ -371,11 +466,13 @@ public final class Indexer: @unchecked Sendable {
             return [IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
                                  chunkIndex: 0, snippet: file.url.lastPathComponent, embedding: vec)]
         case .images(let images):
+            // Only video frames reach here now (one temporal clip -> one embedding).
             if kind == FileKind.video.rawValue {
                 guard let vec = embedder.embedVideoFrames(images) else { return [] }
                 return [IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
                                      chunkIndex: 0, snippet: file.url.lastPathComponent, embedding: vec)]
             }
+            // Safety fallback (non-video CGImages, e.g. a conformer that didn't preprocess): serial.
             var out: [IndexedChunk] = []
             for (i, img) in images.enumerated() {
                 if isCancelled { break }
@@ -385,17 +482,33 @@ public final class Indexer: @unchecked Sendable {
                                         chunkIndex: i, snippet: "\(file.url.lastPathComponent) - \(label)", embedding: vec))
             }
             return out
+        case .imagePatches(let raws):
+            // Batch-N: ONE block-diagonal vision forward over all pages of this file (capped by the
+            // encoder's patch budget). Order is preserved, so chunkIndex i == page i.
+            guard let vecs = embedder.embedImages(raws) else {
+                // Vision path unavailable: nothing to index.
+                return []
+            }
+            var out: [IndexedChunk] = []
+            for (i, vec) in vecs.enumerated() {
+                if isCancelled { break }
+                let label = raws.count > 1 ? "page \(i + 1)" : file.url.lastPathComponent
+                out.append(IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
+                                        chunkIndex: i, snippet: "\(file.url.lastPathComponent) - \(label)", embedding: vec))
+            }
+            return out
         }
     }
 
     private func chunk(_ text: String) -> [String] {
+        let limit = max(200, active.maxCharsPerChunk)   // user-set; floor keeps chunks meaningful
         let scalars = Array(text)
-        if scalars.count <= maxCharsPerChunk { return [text] }
+        if scalars.count <= limit { return [text] }
         var chunks: [String] = []
         var start = 0
-        let step = max(1, maxCharsPerChunk - chunkOverlap)
+        let step = max(1, limit - chunkOverlap)
         while start < scalars.count && chunks.count < maxChunksPerFile {
-            let end = min(start + maxCharsPerChunk, scalars.count)
+            let end = min(start + limit, scalars.count)
             chunks.append(String(scalars[start ..< end]))
             if end == scalars.count { break }
             start += step

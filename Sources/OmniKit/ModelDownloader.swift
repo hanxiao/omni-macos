@@ -33,8 +33,27 @@ public final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unche
     }
 
     private var session: URLSession!
+    // `perFile` and `continuation` are written from the async download flow but read/cleared on
+    // URLSession's (separate) delegate queue, so every access goes through `lock`. This is what
+    // makes the @unchecked Sendable sound, and taking the continuation under the lock guarantees
+    // it is resumed at most once even if didFinish and didComplete both fire.
+    private let lock = NSLock()
     private var perFile: (@Sendable (Int64, Int64) -> Void)?
     private var continuation: CheckedContinuation<URL, Error>?
+
+    private func setProgressHandler(_ handler: (@Sendable (Int64, Int64) -> Void)?) {
+        lock.withLock { perFile = handler }
+    }
+    private func reportProgress(_ written: Int64, _ total: Int64) {
+        let handler = lock.withLock { perFile }
+        handler?(written, total)
+    }
+    private func setContinuation(_ cont: CheckedContinuation<URL, Error>) {
+        lock.withLock { continuation = cont }
+    }
+    private func takeContinuation() -> CheckedContinuation<URL, Error>? {
+        lock.withLock { let c = continuation; continuation = nil; return c }
+    }
 
     public override init() {
         super.init()
@@ -59,7 +78,7 @@ public final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unche
             guard let url = URL(string: "https://huggingface.co/\(repo)/resolve/main/\(rel)") else {
                 throw OmniError.model("bad URL for \(rel)")
             }
-            perFile = { received, total in
+            setProgressHandler { received, total in
                 onProgress(Progress(file: rel, fileIndex: idx, fileCount: Self.files.count, received: received, total: total))
             }
             let tmp = try await downloadOne(url)
@@ -70,7 +89,7 @@ public final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unche
 
     private func downloadOne(_ url: URL) async throws -> URL {
         try await withCheckedThrowingContinuation { cont in
-            self.continuation = cont
+            self.setContinuation(cont)
             session.downloadTask(with: url).resume()
         }
     }
@@ -79,25 +98,26 @@ public final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unche
 
     public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                            didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
-        perFile?(totalBytesWritten, totalBytesExpectedToWrite)
+        reportProgress(totalBytesWritten, totalBytesExpectedToWrite)
     }
 
     public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
         // `location` is deleted when this returns; move it to a stable temp we own.
         let staged = FileManager.default.temporaryDirectory.appendingPathComponent("omni-dl-\(UUID().uuidString)")
+        let cont = takeContinuation()
         do {
             try FileManager.default.moveItem(at: location, to: staged)
             // Reject HTML error pages (HF returns 200 + html for some failures).
             if let http = downloadTask.response as? HTTPURLResponse, http.statusCode != 200 {
                 throw OmniError.model("HTTP \(http.statusCode)")
             }
-            continuation?.resume(returning: staged); continuation = nil
+            cont?.resume(returning: staged)
         } catch {
-            continuation?.resume(throwing: error); continuation = nil
+            cont?.resume(throwing: error)
         }
     }
 
     public func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        if let error { continuation?.resume(throwing: error); continuation = nil }
+        if let error { takeContinuation()?.resume(throwing: error) }
     }
 }

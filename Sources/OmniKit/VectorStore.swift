@@ -215,6 +215,27 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
+    /// Drop all vectors for files with one of these extensions (the user turned an extension off
+    /// within an enabled kind). There is no extension column, so victims are matched by path.
+    public func deleteExtensions(_ exts: Set<String>) {
+        guard !exts.isEmpty else { return }
+        queue.sync {
+            let lower = Set(exts.map { $0.lowercased() })
+            func disabled(_ path: String) -> Bool { lower.contains((path as NSString).pathExtension.lowercased()) }
+            let victims = Set(rows.filter { disabled($0.path) }.map { $0.path })
+            guard !victims.isEmpty else { return }
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, "DELETE FROM chunks WHERE path = ?;", -1, &stmt, nil) == SQLITE_OK {
+                for path in victims {
+                    sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT)
+                    sqlite3_step(stmt); sqlite3_reset(stmt)
+                }
+            }
+            sqlite3_finalize(stmt)
+            removeRowsLocked { disabled($0.path) }
+        }
+    }
+
     /// Drop all vectors (e.g. before a forced full reindex into a new embedding space).
     public func wipeChunks() {
         queue.sync {
@@ -357,17 +378,43 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
-    public func sizeBytes() -> Int64 {
+    public func sizeBytes() -> Int64 { queue.sync { onDiskBytes() } }
+
+    /// Reclaim disk space after deletions. SQLite keeps pages freed by DELETE inside the file
+    /// (its high-water mark never drops on its own), so the on-disk size stays put until VACUUM
+    /// rewrites the file. Gated on the free-page ratio so calling it after any delete is cheap:
+    /// it only rewrites when enough is free to be worth it. VACUUM cost scales with LIVE data,
+    /// so a mostly-emptied DB compacts fast. Returns bytes reclaimed (0 if it skipped).
+    @discardableResult
+    public func compact(minFreeRatio: Double = 0.15) -> Int64 {
+        queue.sync {
+            let total = intPragma("page_count")
+            let free = intPragma("freelist_count")
+            guard total > 0, Double(free) / Double(total) >= minFreeRatio else { return 0 }
+            let before = onDiskBytes()
+            exec("VACUUM;")
+            exec("PRAGMA wal_checkpoint(TRUNCATE);")
+            return max(0, before - onDiskBytes())
+        }
+    }
+
+    // MARK: - Internals
+
+    private func onDiskBytes() -> Int64 {
         let fm = FileManager.default
         var total: Int64 = 0
         for suffix in ["", "-wal", "-shm"] {
-            let url = URL(fileURLWithPath: dbURL.path + suffix)
-            if let size = try? fm.attributesOfItem(atPath: url.path)[.size] as? Int64 { total += size }
+            if let s = try? fm.attributesOfItem(atPath: dbURL.path + suffix)[.size] as? Int64 { total += s }
         }
         return total
     }
 
-    // MARK: - Internals
+    private func intPragma(_ name: String) -> Int {
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, "PRAGMA \(name);", -1, &stmt, nil) == SQLITE_OK else { return 0 }
+        return sqlite3_step(stmt) == SQLITE_ROW ? Int(sqlite3_column_int64(stmt, 0)) : 0
+    }
 
     /// Drop rows (and their contiguous embedding slices) matching the predicate, compacting
     /// `flat` in one pass. Only runs on deletes, never on search.

@@ -24,6 +24,20 @@ public final class OmniVisionTower: @unchecked Sendable {
     private let gridSide: Int          // sqrt(num_position_embeddings) = 48
     private let ropeDim: Int           // (headDim / 2) -- VisionRotaryEmbedding.dim
     private let lnEps: Float = 1e-6
+    /// Run the WHOLE vision tower in fp32 (matmuls + SDPA). The small-mlx checkpoint stores
+    /// vision/merger weights in bf16. Two problems follow from bf16 tower compute:
+    ///   1. NaN: the attention softmax occasionally overflows to NaN on real photos (~7% drop).
+    ///   2. Packing noise: a bf16 matmul over the PACKED `[sum_i N_i, *]` tensor rounds each row
+    ///      slightly differently than over a single image's `[N_i, *]` tensor (different GPU
+    ///      tiling/accumulation per shape). That bf16-level noise is benign for the causal Small
+    ///      backbone but the bidirectional Nano backbone amplifies it near the pooled token, so
+    ///      batched vs single-image vectors drift to cos~0.97 (fails the >=0.99999 batch gate).
+    /// Upcasting tower compute to fp32 fixes BOTH: fp32 is shape-stable (single==packed to ~1e-7)
+    /// and NaN-free. It is parity-safe: fp32 is strictly more precise than the bf16 reference, and
+    /// image_ref.safetensors parity stays cos>=0.999. Default ON; OMNI_VISION_BF16_SDPA=1 forces
+    /// the legacy bf16 tower (bit-identical to pre-batch behavior, single-image only).
+    private let fp32Compute: Bool
+    private var matmulDtype: DType { fp32Compute ? .float32 : w["vision_tower.patch_embed.proj.weight"].dtype }
 
     public init(weights: WeightStore, config: OmniConfig) {
         self.w = weights
@@ -34,10 +48,38 @@ public final class OmniVisionTower: @unchecked Sendable {
         self.mergeSize = config.vision.spatialMergeSize
         self.gridSide = Int(Double(config.vision.numPositionEmbeddings).squareRoot().rounded())
         self.ropeDim = (config.vision.hiddenSize / config.vision.numHeads) / 2
+        self.fp32Compute = ProcessInfo.processInfo.environment["OMNI_VISION_BF16_SDPA"] != "1"
+    }
+
+    /// Weight cast to the tower compute dtype (fp32 by default). Hoisting the cast here keeps every
+    /// matmul in one dtype so packing is shape-invariant.
+    private func wc(_ key: String) -> MLXArray {
+        let a = w[key]
+        return fp32Compute && a.dtype != .float32 ? a.asType(.float32) : a
     }
 
     /// pixelValues [N, 1536], grid [(t, h, w)] -> merged vision features [N/merge^2, 1024].
+    /// Single-image / single-clip entry point (kept for the parity test + the merged-output
+    /// callers). Internally this is the batch-N path with one item; N=1 is bit-identical to the
+    /// pre-batch implementation (cu_seqlens=[0, h*w], one full-attention window, one merger call).
     public func forward(_ pixelValues: MLXArray, gridTHW: [(Int, Int, Int)]) -> MLXArray {
+        let perItem = forwardPerItem(pixelValues, gridTHW: gridTHW)
+        return perItem.count == 1 ? perItem[0] : MLX.concatenated(perItem, axis: 0)
+    }
+
+    /// Batch-N vision-tower forward. `pixelValues` is the row-wise concatenation of each item's
+    /// preprocessed patches; `gridTHW` has one (t,h,w) per item. Returns ONE merged feature block
+    /// per item: `[ [N_1/merge^2, 1024], [N_2/merge^2, 1024], ... ]`.
+    ///
+    /// Parity: the patch-embed / pos-embed / rope / 24 attention+mlp blocks all run on the packed
+    /// `[sum_i N_i, hidden]` tensor in a SINGLE forward, but attention is BLOCK-DIAGONAL over
+    /// cu_seqlens (each frame-window of each item attends only within itself - see `attention`),
+    /// so item i never sees item j. This is exactly model.py's VisionAttention.__call__
+    /// (split q/k/v along the sequence axis at cu_seqlens[1:-1], per-window SDPA, concat). The only
+    /// per-item operations are pos-embed / rope index construction (already per-item by grid) and
+    /// the merger reshape, which MUST be applied per-item so the `[-1, 4096]` spatial-merge never
+    /// groups 4 patches across an image boundary.
+    public func forwardPerItem(_ pixelValues: MLXArray, gridTHW: [(Int, Int, Int)]) -> [MLXArray] {
         // --- patch embed: conv3d (full-kernel stride) == linear over the 1536-vector.
         var hidden = patchEmbed(pixelValues)                 // [N, hidden]
 
@@ -52,8 +94,9 @@ public final class OmniVisionTower: @unchecked Sendable {
         let cos = MLX.tiled(MLX.cos(rotary), repetitions: [1, 2])  // [N, 64]
         let sin = MLX.tiled(MLX.sin(rotary), repetitions: [1, 2])  // [N, 64]
 
-        // --- cu_seqlens: per-frame attention windows. For a single image this is
-        // [0, N] (full attention over all N patches). General: one window per frame.
+        // --- cu_seqlens: per-frame attention windows over the PACKED sequence. One image (t=1)
+        // contributes [.., prev+h*w]; multiple images/frames extend the boundary list, giving
+        // model.py's block-diagonal mask without ever materializing an O(Ltotal^2) score matrix.
         let cuSeqlens = cumulativeSeqlens(gridTHW)           // [num_windows + 1]
 
         for i in 0 ..< cfg.vision.depth {
@@ -62,7 +105,18 @@ public final class OmniVisionTower: @unchecked Sendable {
             hidden = hidden + mlp(layerNorm(hidden, p + "norm2"), p)
         }
 
-        return merger(hidden)                                // [N/merge^2, 1024]
+        // Merge per item: slice each item's N_i patches and run the spatial-merge separately so the
+        // [-1, hidden*merge^2] reshape stays within one image (no cross-image patch grouping).
+        // `asContiguous` detaches each item's features from the shared packed buffer so downstream
+        // per-item backbone passes don't alias one another's memory.
+        var out: [MLXArray] = []
+        var offset = 0
+        for (t, h, w) in gridTHW {
+            let ni = t * h * w
+            out.append(MLX.contiguous(merger(hidden[offset ..< (offset + ni)])))   // [N_i/merge^2, dim]
+            offset += ni
+        }
+        return out
     }
 
     // MARK: - Patch embed
@@ -85,15 +139,16 @@ public final class OmniVisionTower: @unchecked Sendable {
         let p = cfg.vision.patchSize           // 16
 
         // [N, 1536] flat order is [c, t, h, w]; reshape then move c (axis1) to last.
-        let x = pixelValues
+        var x = pixelValues
             .reshaped([n, c, t, p, p])         // [N, c, t, h, w]
             .movedAxis(source: 1, destination: 4) // [N, t, h, w, c]
             .reshaped([n, t * p * p * c])       // flatten over (t, h, w, c)
+        if fp32Compute { x = x.asType(.float32) }
 
         // weight [out, t, h, w, c] -> [out, t*h*w*c]; matmul x @ W^T.
-        let weight = w["vision_tower.patch_embed.proj.weight"]
+        let weight = wc("vision_tower.patch_embed.proj.weight")
             .reshaped([visHidden, t * p * p * c])
-        let bias = w["vision_tower.patch_embed.proj.bias"]
+        let bias = wc("vision_tower.patch_embed.proj.bias")
         return matmul(x, weight.transposed(1, 0)) + bias    // [N, hidden]
     }
 
@@ -138,7 +193,7 @@ public final class OmniVisionTower: @unchecked Sendable {
         }
 
         let total = idx[0].count
-        let posWeight = w["vision_tower.pos_embed.weight"]    // [2304, hidden]
+        let posWeight = wc("vision_tower.pos_embed.weight")   // [2304, hidden] (fp32 by default)
         // Accumulate the four weighted gathers.
         var patchPos: MLXArray? = nil
         for k in 0 ..< 4 {
@@ -237,7 +292,7 @@ public final class OmniVisionTower: @unchecked Sendable {
         _ cuSeqlens: [Int]
     ) -> MLXArray {
         let n = x.dim(0)
-        let qkv = matmul(x, w[p + "attn.qkv.weight"].transposed(1, 0)) + w[p + "attn.qkv.bias"]
+        let qkv = matmul(x, wc(p + "attn.qkv.weight").transposed(1, 0)) + wc(p + "attn.qkv.bias")
         // [n, 3*hidden] -> [n, 3, heads, headDim] -> [3, n, heads, headDim]
         let split = qkv.reshaped([n, 3, numHeads, headDim]).transposed(1, 0, 2, 3)
         var q = split[0]   // [n, heads, headDim]
@@ -249,12 +304,19 @@ public final class OmniVisionTower: @unchecked Sendable {
         k = applyRotaryVision(k, cos, sin)
 
         // -> [heads, n, headDim] for SDPA windows.
-        let qh = q.transposed(1, 0, 2)
-        let kh = k.transposed(1, 0, 2)
-        let vh = v.transposed(1, 0, 2)
+        var qh = q.transposed(1, 0, 2)
+        var kh = k.transposed(1, 0, 2)
+        var vh = v.transposed(1, 0, 2)
+        // With fp32Compute (default) qh/kh/vh are already fp32 (whole tower runs fp32: NaN-free and
+        // packing-shape-invariant). The legacy bf16 path keeps them bf16 - still upcast just the
+        // attention product to fp32 to avoid the softmax NaN, then cast back for the proj matmul.
+        let attnDtype = qh.dtype
+        if attnDtype != .float32 {
+            qh = qh.asType(.float32); kh = kh.asType(.float32); vh = vh.asType(.float32)
+        }
         let scale = Float(pow(Double(headDim), -0.5))
 
-        let out: MLXArray
+        var out: MLXArray
         if cuSeqlens.count <= 2 {
             // Single full-attention window: add batch axis -> [1, heads, n, headDim].
             let o = MLXFast.scaledDotProductAttention(
@@ -277,7 +339,9 @@ public final class OmniVisionTower: @unchecked Sendable {
             let cat = MLX.concatenated(outs, axis: 1)   // [heads, n, headDim]
             out = cat.transposed(1, 0, 2).reshaped([n, numHeads * headDim])
         }
-        return matmul(out, w[p + "attn.proj.weight"].transposed(1, 0)) + w[p + "attn.proj.bias"]
+        // Cast the attention output back to the residual-stream dtype before the proj matmul.
+        if out.dtype != attnDtype { out = out.asType(attnDtype) }
+        return matmul(out, wc(p + "attn.proj.weight").transposed(1, 0)) + wc(p + "attn.proj.bias")
     }
 
     /// apply_rotary_pos_emb_vision on a [n, heads, headDim] tensor.
@@ -300,9 +364,9 @@ public final class OmniVisionTower: @unchecked Sendable {
     // MARK: - MLP
 
     private func mlp(_ x: MLXArray, _ p: String) -> MLXArray {
-        let h = matmul(x, w[p + "mlp.linear_fc1.weight"].transposed(1, 0)) + w[p + "mlp.linear_fc1.bias"]
+        let h = matmul(x, wc(p + "mlp.linear_fc1.weight").transposed(1, 0)) + wc(p + "mlp.linear_fc1.bias")
         let a = geluTanh(h)
-        return matmul(a, w[p + "mlp.linear_fc2.weight"].transposed(1, 0)) + w[p + "mlp.linear_fc2.bias"]
+        return matmul(a, wc(p + "mlp.linear_fc2.weight").transposed(1, 0)) + wc(p + "mlp.linear_fc2.bias")
     }
 
     // MARK: - Merger
@@ -313,9 +377,9 @@ public final class OmniVisionTower: @unchecked Sendable {
         let normed = layerNorm(x, "merger.norm")             // [N, hidden]
         let mergedDim = visHidden * mergeSize * mergeSize     // 4096
         let reshaped = normed.reshaped([-1, mergedDim])       // [N/merge^2, 4096]
-        let h1 = matmul(reshaped, w["merger.linear_fc1.weight"].transposed(1, 0)) + w["merger.linear_fc1.bias"]
+        let h1 = matmul(reshaped, wc("merger.linear_fc1.weight").transposed(1, 0)) + wc("merger.linear_fc1.bias")
         let a = geluErf(h1)
-        return matmul(a, w["merger.linear_fc2.weight"].transposed(1, 0)) + w["merger.linear_fc2.bias"]
+        return matmul(a, wc("merger.linear_fc2.weight").transposed(1, 0)) + wc("merger.linear_fc2.bias")
     }
 
     // MARK: - Helpers
@@ -327,7 +391,7 @@ public final class OmniVisionTower: @unchecked Sendable {
         let centered = xf - mean
         let variance = MLX.mean(centered * centered, axis: -1, keepDims: true)
         let normed = centered * MLX.rsqrt(variance + lnEps)
-        return normed * w[keyPrefix + ".weight"] + w[keyPrefix + ".bias"]
+        return normed * wc(keyPrefix + ".weight") + wc(keyPrefix + ".bias")
     }
 
     /// GELU tanh approximation (nn.GELU(approx="tanh")), used by the ViT MLP.

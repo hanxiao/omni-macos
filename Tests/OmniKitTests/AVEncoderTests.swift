@@ -98,4 +98,61 @@ final class AVEncoderTests: XCTestCase {
         print(String(format: "[audio] cosine vs og encode_audio = %.5f (frames=%d)", c, lens.reduce(0, +)))
         XCTAssertGreaterThanOrEqual(c, 0.999, "audio tower parity")
     }
+
+    /// Batch-N audio parity. Build N clips from the fixture mel (the reference clip plus
+    /// a couple of distinct truncations so the batch has mixed lengths -> mixed Lmax pad),
+    /// embed each ALONE and embed all in ONE encodeBatch call, and assert per-clip
+    /// single-vs-batched cosine >= 0.99999. Also re-checks the reference clip stays
+    /// >= 0.999 against the og embedding, so batching never regresses quality.
+    func testAudioBatchParity() async throws {
+        let (weights, config) = try loadWeights()
+        guard let enc = OmniAudioEncoder(weights: weights, config: config) else { throw XCTSkip("no audio") }
+        let f = try fixture("audio_ref")
+        let feats = f["input_features"]!                       // [128, totalFrames] mel-major
+        let melBins = config.audio.numMelBins
+        let totalFrames = feats.dim(1)
+        let ref = f["embedding"]!.reshaped([-1]).asArray(Float.self)
+        let pre = prefix(f, startToken: config.audioStartTokenId)
+
+        // Helper: extract a length-F prefix (first F time frames) of the fixture mel as a
+        // mel-major [melBins*F] flat buffer (row m = bin m's first F frames).
+        let flatAll = feats.asArray(Float.self)               // row-major [128, totalFrames]
+        func melPrefix(_ F: Int) -> [Float] {
+            var out = [Float](repeating: 0, count: melBins * F)
+            for m in 0 ..< melBins {
+                let src = m * totalFrames
+                for t in 0 ..< F { out[m * F + t] = flatAll[src + t] }
+            }
+            return out
+        }
+
+        // Mixed-length batch: full clip, ~2/3, ~1/3 (each >= 1 chunk so cu_seqlens varies).
+        let lensSet = [totalFrames, (totalFrames * 2) / 3, totalFrames / 3].filter { $0 > 0 }
+        let mels = lensSet.map { melPrefix($0) }
+
+        // Single-clip (batch-1) reference embeddings, the bit-identical baseline.
+        let singles = zip(mels, lensSet).map { (mel, F) in
+            enc.encode(mel: mel, frames: F, prefixIds: pre)
+        }
+        // One batched forward (tower once + backbone once, block-diagonal per clip).
+        let batched = enc.encodeBatch(mels: mels, frames: lensSet, prefixIds: pre)
+        XCTAssertEqual(batched.count, mels.count, "batched returns one vector per clip")
+
+        for i in 0 ..< mels.count {
+            let c = cosine(singles[i], batched[i])
+            print(String(format: "[audio batch] clip %d (frames=%d) single-vs-batched cosine = %.7f", i, lensSet[i], c))
+            XCTAssertGreaterThanOrEqual(c, 0.99999, "batch-N clip \(i) must match batch-1")
+        }
+        // The reference clip (index 0 = full length) must match the og embedding *to the same
+        // degree the batch-1 path does*. The audio_ref fixture is generated from the SMALL
+        // model; on nano the og embedding does not apply, so we only assert batch != regression
+        // when the batch-1 baseline itself matches the fixture (i.e. we're running the small
+        // model). The single-vs-batched check above is the model-agnostic batch parity gate.
+        let cSingleRef = cosine(singles[0], ref)
+        let cBatchRef = cosine(batched[0], ref)
+        print(String(format: "[audio batch] ref clip cosine vs og: single=%.5f batched=%.5f", cSingleRef, cBatchRef))
+        if cSingleRef >= 0.999 {
+            XCTAssertGreaterThanOrEqual(cBatchRef, 0.999, "batched ref clip vs og parity (small)")
+        }
+    }
 }
