@@ -86,7 +86,7 @@ struct OmniApp: App {
 
     private func showAbout() {
         let credits = NSAttributedString(
-            string: "Omni search over all kinds of files.\n\nPrivate by design: everything runs locally on your Mac's Apple silicon, so your files never leave the device. The model downloads once, then no internet is required.",
+            string: "On-device semantic search over all your files - private by design, nothing leaves your Mac.",
             attributes: [
                 .font: NSFont.systemFont(ofSize: 11),
                 .foregroundColor: NSColor.secondaryLabelColor,
