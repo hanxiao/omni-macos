@@ -47,10 +47,12 @@ struct ResultsList<Footer: View>: View {
                               expanded: expanded.contains(hit.path),
                               onToggle: { toggle(hit.path) })
                         .draggable(URL(fileURLWithPath: hit.path))
-                        // Make the whole row a uniform hit area and let double-click ride alongside
-                        // the List's own single-click selection (a plain .onTapGesture would swallow
-                        // single clicks on the text, so only the blank part selected).
+                        // Make the whole row a uniform hit area, then drive selection explicitly
+                        // (same as the gallery rows): the List's built-in click-to-select stops
+                        // firing once any gesture is attached, so a single tap sets the selection
+                        // and a double tap opens. Clicking the title/description now selects too.
                         .contentShape(Rectangle())
+                        .onTapGesture { model.selection = hit.path }
                         .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
                     if expanded.contains(hit.path) {
                         PassagesView(passages: passagesCache[hit.path] ?? [])
