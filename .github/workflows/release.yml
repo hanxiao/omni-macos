@@ -72,11 +72,13 @@ jobs:
             CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO \
             OTHER_CODE_SIGN_FLAGS=--timestamp
 
+      # The version IS MARKETING_VERSION (the same x.y.z the About panel shows) - no build suffix,
+      # so the GitHub release tag always matches the app version. Bump MARKETING_VERSION in
+      # project.yml to cut a new version; re-pushing the same version refreshes that one release.
       - name: Compute version
         id: ver
         run: |
-          BASE=$(grep -m1 'MARKETING_VERSION' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
-          VERSION="${BASE}-b${{ github.run_number }}"
+          VERSION=$(grep -m1 'MARKETING_VERSION' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
 
@@ -96,6 +98,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # One release per version: drop any existing release+tag for this version so the new
+          # notarized DMG replaces it (keeps the version's release pointing at the latest build).
+          gh release delete "${{ steps.ver.outputs.tag }}" --cleanup-tag --yes 2>/dev/null || true
           gh release create "${{ steps.ver.outputs.tag }}" \
             "dist/Omni-${{ steps.ver.outputs.version }}.dmg" \
             --target "${{ github.sha }}" \

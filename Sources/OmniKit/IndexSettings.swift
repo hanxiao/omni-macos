@@ -1,6 +1,6 @@
 import Foundation
 
-/// Which modalities to index. Default: media on, text off (audio pending support).
+/// Which modalities to index. Default: all four on (text, image, audio, video).
 public struct IndexSettings: Sendable, Equatable {
     public var enabledKinds: Set<FileKind>
     /// Cap the largest image/PDF-page side decoded for embedding. The vision model
@@ -25,7 +25,7 @@ public struct IndexSettings: Sendable, Equatable {
     public var minVideoSeconds: Double = 0
     public var minTextChars: Int = 0
 
-    public init(enabledKinds: Set<FileKind> = [.image, .video, .audio]) {
+    public init(enabledKinds: Set<FileKind> = [.text, .image, .video, .audio]) {
         self.enabledKinds = enabledKinds
     }
 

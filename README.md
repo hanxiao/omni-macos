@@ -16,8 +16,8 @@ No Python, no server, no network at query time.
 - Everything lands in one shared embedding space, so a text query finds images,
   video, audio, scanned PDFs, and documents together.
 - SQLite vector store with brute-force cosine search.
-- Indexes images, video, and audio by default; text/code/PDF/office is an opt-in
-  toggle (per-modality switches in the sidebar).
+- Indexes all modalities by default - text/code/PDF/office, images, audio, video
+  (per-modality switches in the sidebar to turn any off).
 - Finder-style results: List and Gallery views with real QuickLook thumbnails.
 - Search filters by file kind, folder, extension, and minimum score.
 
