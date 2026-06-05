@@ -25,6 +25,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Auto-bump the patch on every release: x.y.z -> x.y.(z+1). This runs before xcodegen so the
+      # build, the About panel, the DMG name, and the release tag all use the new version. The
+      # bumped project.yml is committed back to main later with [skip ci] so it does not re-trigger.
+      - name: Bump patch version
+        id: ver
+        run: |
+          CUR=$(grep -m1 'MARKETING_VERSION' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
+          MAJ=${CUR%%.*}; REST=${CUR#*.}; MIN=${REST%%.*}; PAT=${REST##*.}
+          NEW="${MAJ}.${MIN}.$((PAT+1))"
+          sed -i '' -E "s/(MARKETING_VERSION: *)\"[^\"]+\"/\1\"${NEW}\"/" project.yml
+          echo "bumped $CUR -> $NEW"
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+          echo "tag=v$NEW" >> "$GITHUB_OUTPUT"
+
       # The app needs Xcode 26 (Swift 6.2 + the swift-tokenizers SE-0482 artifact).
       - name: Select newest Xcode 26
         run: |
@@ -72,16 +86,6 @@ jobs:
             CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO \
             OTHER_CODE_SIGN_FLAGS=--timestamp
 
-      # The version IS MARKETING_VERSION (the same x.y.z the About panel shows) - no build suffix,
-      # so the GitHub release tag always matches the app version. Bump MARKETING_VERSION in
-      # project.yml to cut a new version; re-pushing the same version refreshes that one release.
-      - name: Compute version
-        id: ver
-        run: |
-          VERSION=$(grep -m1 'MARKETING_VERSION' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
-
       # Store notary credentials under the "omni-notary" profile, then notarize + staple the app
       # and the (signed) DMG via the same script used locally.
       - name: Notarize and package DMG
@@ -94,16 +98,23 @@ jobs:
           ./Scripts/notarize.sh omni-notary \
             .build/xcode-rel/Build/Products/Release/Omni.app "${{ steps.ver.outputs.version }}"
 
+      # Persist the bumped version back to main, so the next push bumps from here. [skip ci] keeps
+      # this commit from re-triggering the release workflow (no infinite loop).
+      - name: Commit version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add project.yml
+          git commit -m "chore: release v${{ steps.ver.outputs.version }} [skip ci]"
+          git push origin HEAD:main
+
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # One release per version: drop any existing release+tag for this version so the new
-          # notarized DMG replaces it (keeps the version's release pointing at the latest build).
-          gh release delete "${{ steps.ver.outputs.tag }}" --cleanup-tag --yes 2>/dev/null || true
           gh release create "${{ steps.ver.outputs.tag }}" \
             "dist/Omni-${{ steps.ver.outputs.version }}.dmg" \
-            --target "${{ github.sha }}" \
+            --target "$(git rev-parse HEAD)" \
             --title "Omni ${{ steps.ver.outputs.version }}" \
             --notes "Automated, Apple-notarized build from \`${{ github.sha }}\`.
 

@@ -38,6 +38,14 @@ struct OnboardingView: View {
             if model.downloadFailed {
                 Text(model.downloadLabel).font(.caption).foregroundStyle(.red).frame(maxWidth: 440)
             }
+
+            Spacer().frame(height: 2)
+            VStack(spacing: 5) {
+                Image(systemName: "lock.shield").foregroundStyle(.tertiary)
+                Text("Private by design. Indexing and search run on your Mac's Apple silicon, so your files never leave the device. The model downloads once - after that, no internet is required.")
+                    .font(.caption).foregroundStyle(.tertiary)
+                    .multilineTextAlignment(.center).frame(maxWidth: 420)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding()
