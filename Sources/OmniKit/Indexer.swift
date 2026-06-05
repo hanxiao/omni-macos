@@ -346,41 +346,47 @@ public final class Indexer: @unchecked Sendable {
         queue.sync { active = settings }
         let known = store.indexedFiles()
         let fm = FileManager.default
+        // Accumulate the batch's deletions and re-embeds, then apply each as ONE batched store
+        // call. Per-file deletePath/replace would each trigger a full O(N) in-memory rebuild, so a
+        // burst (bulk edit, git checkout, synced folder) would be O(N*batch). deletePaths +
+        // replaceMany do one transaction and one rebuild for the whole batch.
+        var toDelete = Set<String>()
+        var toReplace: [(path: String, chunks: [IndexedChunk])] = []
+        func classify(_ url: URL) {
+            let path = url.path
+            guard FileExtractor.isSupported(url, enabledKinds: settings.enabledKinds, disabledExtensions: settings.disabledExtensions) else {
+                if known[path] != nil { toDelete.insert(path) }   // now unsupported/disabled
+                return
+            }
+            guard let vals = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]) else { return }
+            let mtime = vals.contentModificationDate?.timeIntervalSince1970 ?? 0
+            let size = vals.fileSize ?? 0
+            if let prev = known[path], prev.modified == mtime, prev.size == size { return }  // unchanged
+            let file = CrawledFile(url: url, modified: mtime, size: size)
+            let chunks = embed(decode(file)).filter { Self.isFinite($0.embedding) }
+            if chunks.isEmpty { if known[path] != nil { toDelete.insert(path) } }
+            else { toReplace.append((path, chunks)) }
+        }
         for path in Set(paths) {
+            if isCancelled { break }
             let url = URL(fileURLWithPath: path)
             var isDir: ObjCBool = false
             if !fm.fileExists(atPath: path, isDirectory: &isDir) {
-                store.deletePath(path)               // deleted / moved away
+                if known[path] != nil { toDelete.insert(path) }   // deleted / moved away
                 continue
             }
-            // A directory event (new folder, bulk move-in) carries only the folder path,
-            // not its children. Crawl it so freshly added subtrees get indexed instead of
-            // being silently skipped until the next full pass.
+            // A directory event (new folder, bulk move-in) carries only the folder path, not its
+            // children. Crawl it so freshly added subtrees get indexed. The crawl honors
+            // isCancelled so a huge move-in can be interrupted instead of blocking the batch.
             if isDir.boolValue {
                 FileCrawler(roots: [url], enabledKinds: settings.enabledKinds, disabledExtensions: settings.disabledExtensions)
-                    .walk(shouldContinue: { true }) { self.indexFile($0.url, known: known, settings: settings) }
+                    .walk(shouldContinue: { !self.isCancelled }) { classify($0.url) }
                 continue
             }
-            indexFile(url, known: known, settings: settings)
+            classify(url)
         }
-    }
-
-    /// Embed (or remove) a single file, skipping it when unchanged. Shared by the targeted
-    /// watcher update and the directory re-crawl above.
-    private func indexFile(_ url: URL, known: [String: StoredFile], settings: IndexSettings) {
-        let path = url.path
-        guard FileExtractor.isSupported(url, enabledKinds: settings.enabledKinds, disabledExtensions: settings.disabledExtensions) else {
-            if known[path] != nil { store.deletePath(path) }   // now unsupported/disabled
-            return
-        }
-        guard let vals = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]) else { return }
-        let mtime = vals.contentModificationDate?.timeIntervalSince1970 ?? 0
-        let size = vals.fileSize ?? 0
-        if let prev = known[path], prev.modified == mtime, prev.size == size { return }  // unchanged
-        let file = CrawledFile(url: url, modified: mtime, size: size)
-        let chunks = embed(decode(file)).filter { Self.isFinite($0.embedding) }
-        if chunks.isEmpty { store.deletePath(path) }
-        else { try? store.replace(path: path, chunks: chunks) }
+        if !toDelete.isEmpty { store.deletePaths(toDelete) }
+        if !toReplace.isEmpty { try? store.replaceMany(toReplace) }
     }
 
     // MARK: - Pipeline

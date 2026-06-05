@@ -83,6 +83,10 @@ public final class VectorStore: @unchecked Sendable {
     // there is no second parallel [[Float]] copy (halves embedding residency).
     private var flat: [Float] = []
     private var dim = 0
+    // Membership index of the paths currently in `rows`. Lets replace() know in O(1) whether a
+    // path pre-exists, so a brand-new file skips removeRowsLocked entirely (no O(N) scan per file
+    // during a full index). Rebuilt from the surviving rows whenever removeRowsLocked compacts.
+    private var presentPaths: Set<String> = []
 
     public let dbURL: URL
 
@@ -171,11 +175,75 @@ public final class VectorStore: @unchecked Sendable {
                 }
             }
             exec("COMMIT;")
-            removeRowsLocked { $0.path == path }
-            flat.reserveCapacity(flat.count + chunks.count * dim)
+            // Only rebuild the in-memory buffer if this path already had rows. For a new file
+            // (the dominant indexing case) there is nothing to remove, so skip the O(N) scan and
+            // just append. `append` grows `flat`/`rows` geometrically (amortized O(1)); a per-file
+            // reserveCapacity to the exact running size would allocate exactly and recopy the whole
+            // buffer every file - O(N^2) over a full index.
+            if presentPaths.contains(path) { removeRowsLocked { $0.path == path } }
             for c in chunks {
                 rows.append(Row(path: c.path, snippet: c.snippet, kind: c.kind, chunkIndex: c.chunkIndex, modified: c.modified))
                 flat.append(contentsOf: c.embedding)
+            }
+            presentPaths.insert(path)
+        }
+    }
+
+    /// Replace many paths in one transaction and ONE in-memory rebuild, instead of one rebuild per
+    /// file. The file-watcher update path can touch many already-indexed files at once (bulk edit,
+    /// git checkout, synced folder); per-file replace() would be O(N) rebuild each = O(N*M). Result
+    /// is identical: each path's old rows are removed and its new chunks appended.
+    public func replaceMany(_ items: [(path: String, chunks: [IndexedChunk])]) throws {
+        let work = items.filter { !$0.chunks.isEmpty }
+        guard !work.isEmpty else { return }
+        try queue.sync {
+            for it in work {
+                for c in it.chunks {
+                    if dim == 0 { dim = c.embedding.count }
+                    guard c.embedding.count == dim else {
+                        throw OmniError.store("embedding dim \(c.embedding.count) != index dim \(dim)")
+                    }
+                }
+            }
+            exec("BEGIN;")
+            let sql = "INSERT INTO chunks(path, modified, size, kind, chunk_index, snippet, dim, vec) VALUES(?,?,?,?,?,?,?,?);"
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                exec("ROLLBACK;")
+                throw OmniError.store("prepare insert failed")
+            }
+            defer { sqlite3_finalize(stmt) }
+            for it in work {
+                deletePathLocked(it.path)
+                for c in it.chunks {
+                    sqlite3_reset(stmt)
+                    sqlite3_bind_text(stmt, 1, c.path, -1, SQLITE_TRANSIENT)
+                    sqlite3_bind_double(stmt, 2, c.modified)
+                    sqlite3_bind_int64(stmt, 3, Int64(c.size))
+                    sqlite3_bind_text(stmt, 4, c.kind, -1, SQLITE_TRANSIENT)
+                    sqlite3_bind_int(stmt, 5, Int32(c.chunkIndex))
+                    sqlite3_bind_text(stmt, 6, c.snippet, -1, SQLITE_TRANSIENT)
+                    sqlite3_bind_int(stmt, 7, Int32(c.embedding.count))
+                    c.embedding.withUnsafeBytes { raw in
+                        _ = sqlite3_bind_blob(stmt, 8, raw.baseAddress, Int32(raw.count), SQLITE_TRANSIENT)
+                    }
+                    guard sqlite3_step(stmt) == SQLITE_DONE else {
+                        exec("ROLLBACK;")
+                        throw OmniError.store("insert step failed")
+                    }
+                }
+            }
+            exec("COMMIT;")
+            let affected = Set(work.map { $0.path })
+            if affected.contains(where: { presentPaths.contains($0) }) {
+                removeRowsLocked { affected.contains($0.path) }   // one rebuild for the whole batch
+            }
+            for it in work {
+                for c in it.chunks {
+                    rows.append(Row(path: c.path, snippet: c.snippet, kind: c.kind, chunkIndex: c.chunkIndex, modified: c.modified))
+                    flat.append(contentsOf: c.embedding)
+                }
+                presentPaths.insert(it.path)
             }
         }
     }
@@ -212,6 +280,9 @@ public final class VectorStore: @unchecked Sendable {
 
     /// Delete every chunk whose path is under `folder` (path-boundary aware).
     public func deleteUnderFolder(_ folder: String) {
+        // Destructive-op guard: an empty (or root "/") folder would match every absolute path and
+        // silently wipe the whole index. A legitimate folder is never empty.
+        guard !folder.isEmpty, folder != "/" else { return }
         queue.sync {
             var stmt: OpaquePointer?
             if sqlite3_prepare_v2(db, "DELETE FROM chunks WHERE path = ? OR path LIKE ?;", -1, &stmt, nil) == SQLITE_OK {
@@ -262,7 +333,9 @@ public final class VectorStore: @unchecked Sendable {
     public func wipeChunks() {
         queue.sync {
             exec("DELETE FROM chunks;")
-            rows.removeAll(); flat.removeAll()
+            // Release the backing buffers (a wipe will not refill to the same size immediately),
+            // rather than removeAll which keeps the ~1.6GB capacity reserved.
+            rows = []; flat = []; presentPaths = []
             dim = 0
         }
     }
@@ -439,10 +512,18 @@ public final class VectorStore: @unchecked Sendable {
         return sqlite3_step(stmt) == SQLITE_ROW ? Int(sqlite3_column_int64(stmt, 0)) : 0
     }
 
+    /// First integer column of a single-row query (0 if none). Used for pre-sizing reads.
+    private func scalarQuery(_ sql: String) -> Int {
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return 0 }
+        return sqlite3_step(stmt) == SQLITE_ROW ? Int(sqlite3_column_int64(stmt, 0)) : 0
+    }
+
     /// Drop rows (and their contiguous embedding slices) matching the predicate, compacting
     /// `flat` in one pass. Only runs on deletes, never on search.
     private func removeRowsLocked(_ predicate: (Row) -> Bool) {
-        guard dim > 0 else { rows.removeAll(where: predicate); return }
+        guard dim > 0 else { rows.removeAll(where: predicate); presentPaths = Set(rows.map { $0.path }); return }
         // Fast path: if nothing matches, skip the full O(N) buffer rebuild. This is the common
         // case - replace() calls this before appending a NEW file's chunks, where there is no
         // prior row to remove. Without it, every stored file rebuilt the entire ~dim*rows.count
@@ -458,6 +539,9 @@ public final class VectorStore: @unchecked Sendable {
             }
         }
         rows = keptRows; flat = keptFlat
+        // Our delete predicates always remove ALL rows of a matched path, so survivors define the
+        // exact set of present paths after compaction.
+        presentPaths = Set(rows.map { $0.path })
     }
 
     private func deletePathLocked(_ path: String) {
@@ -470,7 +554,17 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     private func loadIntoMemory() {
-        rows.removeAll(); flat.removeAll(); dim = 0
+        rows.removeAll(); flat.removeAll(); presentPaths.removeAll(); dim = 0
+        // Pre-size the buffers to the final row/float count so the ~1.6GB flat buffer is filled in
+        // place rather than grown through ~log2(N) reallocations (each memmoving the grown-so-far
+        // buffer). One COUNT(*) + one dim read up front.
+        let total = scalarQuery("SELECT COUNT(*) FROM chunks")
+        let d0 = scalarQuery("SELECT dim FROM chunks LIMIT 1")
+        if total > 0 && d0 > 0 {
+            rows.reserveCapacity(total)
+            flat.reserveCapacity(total * d0)
+            presentPaths.reserveCapacity(total)
+        }
         var stmt: OpaquePointer?
         if sqlite3_prepare_v2(db, "SELECT path, snippet, kind, chunk_index, dim, vec, modified FROM chunks;", -1, &stmt, nil) == SQLITE_OK {
             while sqlite3_step(stmt) == SQLITE_ROW {
@@ -490,6 +584,7 @@ public final class VectorStore: @unchecked Sendable {
                 flat.append(contentsOf: UnsafeBufferPointer(start: blob.assumingMemoryBound(to: Float.self), count: count))
                 if count < d { flat.append(contentsOf: repeatElement(0, count: d - count)) }
                 rows.append(Row(path: path, snippet: snippet, kind: kind, chunkIndex: ci, modified: modified))
+                presentPaths.insert(path)
             }
         }
         sqlite3_finalize(stmt)
