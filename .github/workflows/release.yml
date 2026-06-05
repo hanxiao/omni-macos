@@ -124,3 +124,33 @@ jobs:
           ## Requirements
           - Apple Silicon Mac (M1 or later), macOS 14+.
           - First launch downloads the on-device search model (~1.9 GB), then runs offline."
+
+      # Refresh hanxiao.io/omni: copy the new DMG and stamp the version into the download buttons,
+      # on both the deployed Pages repo (live now) and the blog source (keeps it consistent).
+      # omni/ is a static page, so this is a direct file swap - no hexo build needed.
+      # Requires a SITE_TOKEN secret (PAT with contents:write on hanxiao.github.io + blog).
+      # Skips cleanly if the secret is absent, so a release never fails on this.
+      - name: Update hanxiao.io/omni download page
+        env:
+          SITE_TOKEN: ${{ secrets.SITE_TOKEN }}
+          VER: ${{ steps.ver.outputs.tag }}
+          DMG: dist/Omni-${{ steps.ver.outputs.version }}.dmg
+        run: |
+          if [ -z "$SITE_TOKEN" ]; then echo "no SITE_TOKEN secret; skipping site update"; exit 0; fi
+          git config --global user.email "omni-ci@users.noreply.github.com"
+          git config --global user.name "omni-ci"
+          stamp() { sed -i '' "s#<span class=\"dl-ver\">v[0-9.]*</span>#<span class=\"dl-ver\">${VER}</span>#g" "$1"; }
+          # live Pages repo (omni/ is the static deployed page)
+          git clone --depth 1 "https://x-access-token:${SITE_TOKEN}@github.com/hanxiao/hanxiao.github.io.git" /tmp/site
+          if [ -f /tmp/site/omni/index.html ]; then
+            cp "$DMG" /tmp/site/omni/Omni.dmg
+            stamp /tmp/site/omni/index.html
+            ( cd /tmp/site && git add omni && (git diff --cached --quiet || (git commit -m "omni: ${VER}" && git push)) )
+          fi
+          # blog source (DMG is gitignored there; just keep the version in sync)
+          git clone --depth 1 "https://x-access-token:${SITE_TOKEN}@github.com/hanxiao/blog.git" /tmp/blog
+          if [ -f /tmp/blog/source/omni/index.html ]; then
+            stamp /tmp/blog/source/omni/index.html
+            ( cd /tmp/blog && git add source/omni/index.html && (git diff --cached --quiet || (git commit -m "omni: stamp page version ${VER}" && git push)) )
+          fi
+          echo "updated hanxiao.io/omni to ${VER}"
