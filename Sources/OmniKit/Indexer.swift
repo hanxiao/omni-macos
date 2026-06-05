@@ -82,7 +82,7 @@ private final class ReadyBox: @unchecked Sendable { var items = [Int: DecodedIte
 
 /// Crawl -> extract -> chunk -> embed -> store, incrementally.
 public final class Indexer: @unchecked Sendable {
-    static let log = Logger(subsystem: "ai.jina.omni", category: "indexer")
+    static let log = Logger(subsystem: "io.hanxiao.omni", category: "indexer")
     static func isFinite(_ v: [Float]) -> Bool { v.allSatisfy { $0.isFinite } }
 
     private let store: VectorStore

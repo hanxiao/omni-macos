@@ -1,6 +1,6 @@
 name: Omni
 options:
-  bundleIdPrefix: ai.jina.omni
+  bundleIdPrefix: io.hanxiao
   deploymentTarget:
     macOS: "14.0"
   createIntermediateGroups: true
@@ -20,7 +20,7 @@ targets:
         product: OmniKit
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: ai.jina.omni
+        PRODUCT_BUNDLE_IDENTIFIER: io.hanxiao.omni
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
         GENERATE_INFOPLIST_FILE: YES
@@ -37,7 +37,7 @@ targets:
         ENABLE_HARDENED_RUNTIME: YES
         ENABLE_APP_SANDBOX: NO
         INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.productivity"
-        INFOPLIST_KEY_NSHumanReadableCopyright: ""
+        INFOPLIST_KEY_NSHumanReadableCopyright: "Copyright © 2026 Han Xiao"
         INFOPLIST_KEY_NSDocumentsFolderUsageDescription: "Omni indexes your Documents so you can search them by meaning."
         INFOPLIST_KEY_NSDownloadsFolderUsageDescription: "Omni indexes your Downloads so you can search them by meaning."
         INFOPLIST_KEY_NSDesktopFolderUsageDescription: "Omni indexes your Desktop so you can search them by meaning."

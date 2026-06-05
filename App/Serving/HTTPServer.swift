@@ -9,7 +9,7 @@ import os
 /// awaits the async handler; only the LogEntry callback crosses to the main actor (the
 /// controller coalesces it).
 final class HTTPServer: @unchecked Sendable {
-    static let log = Logger(subsystem: "ai.jina.omni", category: "serving")
+    static let log = Logger(subsystem: "io.hanxiao.omni", category: "serving")
 
     typealias Handler = @Sendable (HTTPRequest) async -> HTTPResponse
 

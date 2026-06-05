@@ -86,7 +86,7 @@ struct OmniApp: App {
 
     private func showAbout() {
         let credits = NSAttributedString(
-            string: "Semantic search over your local files.\nIn-process MLX-Swift port of jina-embeddings-v5-omni.",
+            string: "Omni search over all kinds of files.",
             attributes: [
                 .font: NSFont.systemFont(ofSize: 11),
                 .foregroundColor: NSColor.secondaryLabelColor,

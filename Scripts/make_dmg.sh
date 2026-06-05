@@ -24,7 +24,10 @@ trap 'rm -rf "$STAGE"' EXIT
 cp -R "$APP" "$STAGE/$NAME.app"
 ln -s /Applications "$STAGE/Applications"
 
-# First-launch help: the app is not notarized yet, so macOS warns once on a downloaded copy.
+# First-launch help: only for un-notarized builds (macOS warns once on a downloaded copy).
+# When NOTARIZED=1 the build is notarized + stapled, opens with no warning, and the note would
+# be misleading - skip it.
+if [ "${NOTARIZED:-0}" != "1" ]; then
 cat > "$STAGE/How to Open Omni.txt" <<'TXT'
 First launch on macOS
 
@@ -41,6 +44,7 @@ Or run this once in Terminal:
 
 After that Omni opens normally. On first run it downloads the search model.
 TXT
+fi
 
 # Compressed read-only DMG (UDZO) named "Omni <version>".
 hdiutil create -volname "$NAME $VERSION" -srcfolder "$STAGE" -fs HFS+ -format UDZO -ov "$DMG" >/dev/null
