@@ -44,6 +44,7 @@ public struct ChunkHit: Sendable, Identifiable {
 public struct StoredFile: Sendable {
     public let modified: Double
     public let size: Int
+    public let kind: String
 }
 
 /// Constraints applied to search results. Score thresholding is intentionally NOT
@@ -188,6 +189,27 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
+    /// Delete many paths at once. Critical for reconcile: deleting K paths via deletePath would
+    /// rebuild the in-memory vector buffer K times (O(N*K), multi-GB memmoves on a large index).
+    /// This deletes all rows in one transaction and rebuilds the buffer exactly once.
+    public func deletePaths(_ paths: Set<String>) {
+        guard !paths.isEmpty else { return }
+        queue.sync {
+            exec("BEGIN;")
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, "DELETE FROM chunks WHERE path = ?;", -1, &stmt, nil) == SQLITE_OK {
+                for p in paths {
+                    sqlite3_reset(stmt)
+                    sqlite3_bind_text(stmt, 1, p, -1, SQLITE_TRANSIENT)
+                    sqlite3_step(stmt)
+                }
+            }
+            sqlite3_finalize(stmt)
+            exec("COMMIT;")
+            removeRowsLocked { paths.contains($0.path) }   // one rebuild for the whole set
+        }
+    }
+
     /// Delete every chunk whose path is under `folder` (path-boundary aware).
     public func deleteUnderFolder(_ folder: String) {
         queue.sync {
@@ -250,10 +272,11 @@ public final class VectorStore: @unchecked Sendable {
         queue.sync {
             var out: [String: StoredFile] = [:]
             var stmt: OpaquePointer?
-            if sqlite3_prepare_v2(db, "SELECT path, MAX(modified), MAX(size) FROM chunks GROUP BY path;", -1, &stmt, nil) == SQLITE_OK {
+            if sqlite3_prepare_v2(db, "SELECT path, MAX(modified), MAX(size), MAX(kind) FROM chunks GROUP BY path;", -1, &stmt, nil) == SQLITE_OK {
                 while sqlite3_step(stmt) == SQLITE_ROW {
                     let p = String(cString: sqlite3_column_text(stmt, 0))
-                    out[p] = StoredFile(modified: sqlite3_column_double(stmt, 1), size: Int(sqlite3_column_int64(stmt, 2)))
+                    let kind = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? ""
+                    out[p] = StoredFile(modified: sqlite3_column_double(stmt, 1), size: Int(sqlite3_column_int64(stmt, 2)), kind: kind)
                 }
             }
             sqlite3_finalize(stmt)
@@ -420,6 +443,11 @@ public final class VectorStore: @unchecked Sendable {
     /// `flat` in one pass. Only runs on deletes, never on search.
     private func removeRowsLocked(_ predicate: (Row) -> Bool) {
         guard dim > 0 else { rows.removeAll(where: predicate); return }
+        // Fast path: if nothing matches, skip the full O(N) buffer rebuild. This is the common
+        // case - replace() calls this before appending a NEW file's chunks, where there is no
+        // prior row to remove. Without it, every stored file rebuilt the entire ~dim*rows.count
+        // float buffer (a multi-GB memmove on a large index), making indexing and reconcile O(N^2).
+        guard rows.contains(where: predicate) else { return }
         var keptRows: [Row] = []; keptRows.reserveCapacity(rows.count)
         var keptFlat: [Float] = []; keptFlat.reserveCapacity(flat.count)
         flat.withUnsafeBufferPointer { fb in

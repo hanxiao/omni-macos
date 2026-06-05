@@ -304,8 +304,35 @@ public final class Indexer: @unchecked Sendable {
         // corrupt the index and break resume.
         let wasCancelled = isCancelled
         if !wasCancelled {
-            for path in known.keys where !seen.contains(path) {
-                store.deletePath(path)
+            // Reconcile deletions, with two guards so we only remove files genuinely gone from
+            // disk - never files that were merely OUT OF SCOPE this pass:
+            //  1. In-scope only: a path whose modality is disabled (or whose extension is
+            //     excluded) is never crawled, so its absence from `seen` means "not maintained",
+            //     not "deleted". Removing it would purge a whole modality the instant its toggle
+            //     flips off - exactly what a settings reset (e.g. a bundle-id change clearing
+            //     UserDefaults) triggers. Toggling a kind/extension off already deletes its data
+            //     explicitly via deleteKind/deleteExtensions, so reconcile must stay out of it.
+            //  2. Blind root: a root that crawled zero files is almost certainly unreadable
+            //     (permission revoked, volume offline), not emptied. Skip its paths too.
+            let blindRoots = perRootFiles.filter { $0.files.isEmpty }.map { $0.key }
+            func inBlindRoot(_ path: String) -> Bool {
+                blindRoots.contains { path == $0 || path.hasPrefix($0 + "/") }
+            }
+            func inScope(_ path: String, _ kindRaw: String) -> Bool {
+                guard let k = FileKind(rawValue: kindRaw), settings.enabledKinds.contains(k) else { return false }
+                let ext = (path as NSString).pathExtension.lowercased()
+                return ext.isEmpty || !settings.disabledExtensions.contains(ext)
+            }
+            // Batch the deletion: one transaction + one in-memory rebuild, not one per path.
+            let stale = Set(known.compactMap { (path, sf) -> String? in
+                (!seen.contains(path) && !inBlindRoot(path) && inScope(path, sf.kind)) ? path : nil
+            })
+            if !stale.isEmpty {
+                Self.log.info("reconcile: removing \(stale.count, privacy: .public) stale paths")
+                store.deletePaths(stale)
+            }
+            if !blindRoots.isEmpty {
+                Self.log.error("reconcile: \(blindRoots.count, privacy: .public) root(s) crawled empty; skipped deletion (likely no file-access permission)")
             }
         }
         p.done = true
