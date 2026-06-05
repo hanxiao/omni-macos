@@ -26,6 +26,7 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         SWIFT_VERSION: "6.0"
         SWIFT_STRICT_CONCURRENCY: complete
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         # Sign with a stable Apple Development identity (not ad-hoc) so the code signature is
         # consistent across rebuilds. TCC then remembers the Documents/Downloads/Desktop grant
         # instead of re-prompting on every build.
