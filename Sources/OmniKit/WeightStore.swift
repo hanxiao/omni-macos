@@ -54,10 +54,11 @@ public struct WeightStore {
             }
         }
 
-        // Optional: run the backbone in bf16 for indexing throughput. The fp32 upcast above
-        // (and the fp32 LoRA merge) preserve fidelity during load; this only lowers the compute
-        // dtype, which is far faster on the GPU. Gated by env so parity runs stay fp32.
-        if ProcessInfo.processInfo.environment["OMNI_BACKBONE_BF16"] == "1" {
+        // Run the backbone weights in bf16 by default: the fp32 upcast above (and the fp32 LoRA
+        // merge) keep the merge exact, and this only lowers the runtime weight dtype - faster on the
+        // GPU and ~half the backbone VRAM. Set OMNI_BACKBONE_BF16=0 for the exact fp32 path (the
+        // parity test does this to match the fp32 reference fixtures).
+        if ProcessInfo.processInfo.environment["OMNI_BACKBONE_BF16"] != "0" {
             for key in Array(w.keys) where key.hasPrefix("language_model.") {
                 w[key] = w[key]!.asType(.bfloat16)
             }
