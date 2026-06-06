@@ -149,3 +149,19 @@ jobs:
           stamp /tmp/site/omni/index.html
           ( cd /tmp/site && git add omni && (git diff --cached --quiet || (git commit -m "omni: ${VER}" && git push)) )
           echo "updated hanxiao.io/omni to ${VER}"
+
+      - name: Purge Cloudflare cache for /omni
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+        run: |
+          if [ -z "$CF_API_TOKEN" ] || [ -z "$CF_ZONE_ID" ]; then
+            echo "no Cloudflare secrets; skipping purge (page is updated at origin, CF will catch up on TTL)"; exit 0
+          fi
+          # Surgical purge of just the /omni URLs (GitHub Pages origin is already updated above).
+          # Without this, Cloudflare serves the stale cached HTML/DMG until TTL expiry, making a
+          # release look like it never landed. Blog deploys purge_everything; this only touches omni.
+          curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" \
+            --data '{"files":["https://hanxiao.io/omni/","https://hanxiao.io/omni/index.html","https://hanxiao.io/omni/Omni.dmg"]}' \
+            && echo "purged Cloudflare cache for /omni" || echo "Cloudflare purge failed (non-fatal)"
