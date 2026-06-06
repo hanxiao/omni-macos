@@ -1,0 +1,12 @@
+{
+  "fill" : { "automatic-gradient" : "extended-srgb:0.498,0.804,0.776,1.000" },
+  "groups" : [
+    {
+      "layers" : [
+        { "image-name" : "foreground.png", "name" : "Mole", "glass" : false }
+      ],
+      "shadow" : { "kind" : "neutral", "opacity" : 0.4 }
+    }
+  ],
+  "supported-platforms" : { "circles" : ["watchOS"], "squares" : "shared" }
+}
