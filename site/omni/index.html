@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <title>Omni - local semantic search for your Mac</title>
+  <meta name="description" content="Omni searches your local files by meaning - text, code, PDFs, images, audio, and video in one vector space, in any language. Runs on-device on Apple silicon. Private, offline." />
+  <link rel="canonical" href="https://hanxiao.io/omni/" />
+  <meta name="theme-color" content="#f9fafc" />
+
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="Omni" />
+  <meta property="og:title" content="Omni - local semantic search for your Mac" />
+  <meta property="og:description" content="Search your files by meaning - text, code, PDFs, images, audio, and video in one vector space, in any language. On-device on Apple silicon. Private and offline." />
+  <meta property="og:url" content="https://hanxiao.io/omni/" />
+  <meta property="og:image" content="https://hanxiao.io/omni/assets/og-image.png" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Omni - local semantic search for your Mac" />
+  <meta name="twitter:description" content="Search your files by meaning - in any language, across every modality. On-device, private, offline." />
+  <meta name="twitter:image" content="https://hanxiao.io/omni/assets/og-image.png" />
+
+  <link rel="icon" href="assets/icon.png" />
+  <link rel="apple-touch-icon" href="assets/icon.png" />
+  <style>
+/* Omni - local semantic search for your Mac
+   Light theme, turbopuffer-inspired: cream background, near-black slate text,
+   system-font-first with a monospace accent, thin borders, small radii. */
+
+:root {
+  --bg: #f9fafc;
+  --fg: #111827;
+  --muted: #6b7280;
+  --border: #d1d5db;
+  --border-soft: #e5e7eb;
+  --panel: #ffffff;
+  --accent: #fdba74;          /* warm orange, used sparingly */
+  --accent-fg: #7c2d12;       /* burnt orange */
+  --selection: #fed7aa;
+  --selection-fg: #7c2d12;
+  --radius: 0.5rem;
+  --radius-sm: 6px;
+  --maxw: 1080px;
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro",
+    "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco,
+    Consolas, "Liberation Mono", monospace;
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background-color: var(--bg);
+  /* subtle graph-paper texture */
+  background-image:
+    linear-gradient(to right, rgba(17, 24, 39, 0.025) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(17, 24, 39, 0.025) 1px, transparent 1px);
+  background-size: 28px 28px;
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection { background: var(--selection); color: var(--selection-fg); }
+
+.mono { font-family: var(--font-mono); }
+
+.container {
+  width: 100%;
+  max-width: var(--maxw);
+  margin: 0 auto;
+  padding: 0 24px;
+}
+
+a { color: inherit; text-decoration: none; }
+
+img { max-width: 100%; display: block; }
+
+/* ---------- Section labels ---------- */
+.section-label {
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-size: 12px;
+  color: var(--muted);
+  margin: 0 0 20px;
+}
+
+/* ---------- Buttons ---------- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  padding: 9px 16px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: opacity 0.15s ease, transform 0.05s ease;
+  white-space: nowrap;
+}
+.btn:active { transform: translateY(1px); }
+
+.btn-primary {
+  background: var(--fg);
+  color: #f8fafc;
+  border-color: var(--fg);
+}
+.btn-primary:hover { opacity: 0.88; }
+
+.btn-lg {
+  font-size: 15px;
+  padding: 12px 22px;
+}
+
+/* ---------- Header ---------- */
+.site-header {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  background: rgba(249, 250, 252, 0.85);
+  backdrop-filter: saturate(180%) blur(10px);
+  border-bottom: 1px solid var(--border-soft);
+}
+.header-inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 60px;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.brand-icon { border-radius: 7px; }
+.brand-name {
+  font-weight: 600;
+  font-size: 17px;
+  letter-spacing: -0.02em;
+}
+.header-nav {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+}
+.nav-link {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--muted);
+  transition: color 0.15s ease;
+}
+.nav-link:hover { color: var(--fg); }
+
+/* ---------- Hero ---------- */
+.hero {
+  border-bottom: 1px solid var(--border-soft);
+}
+.hero-inner {
+  text-align: center;
+  padding: 72px 24px 80px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.hero-mascot {
+  width: 180px;
+  height: 180px;
+  object-fit: contain;
+  margin-bottom: 28px;
+}
+.hero-title {
+  font-size: clamp(2rem, 5vw, 3.25rem);
+  line-height: 1.05;
+  letter-spacing: -0.03em;
+  font-weight: 650;
+  margin: 0 0 18px;
+  max-width: 14ch;
+}
+.hero-sub {
+  font-size: clamp(1rem, 2vw, 1.15rem);
+  color: var(--muted);
+  margin: 0 0 30px;
+  max-width: 60ch;
+}
+.hero-actions {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+.hero-note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+}
+
+/* ---------- Intro ---------- */
+.intro {
+  border-bottom: 1px solid var(--border-soft);
+}
+.intro-inner {
+  padding: 56px 24px;
+}
+.intro-text {
+  margin: 0 auto;
+  max-width: 70ch;
+  font-size: clamp(1.05rem, 2vw, 1.3rem);
+  line-height: 1.6;
+  letter-spacing: -0.01em;
+}
+
+/* ---------- Features ---------- */
+.features {
+  padding: 64px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 1px;
+  background: var(--border-soft);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.feature-card {
+  background: var(--panel);
+  padding: 28px;
+}
+.feature-title {
+  margin: 0 0 10px;
+  font-size: 1.05rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+.feature-body {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.95rem;
+  line-height: 1.6;
+}
+
+/* ---------- Private band ---------- */
+.band {
+  padding: 72px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+.band-inner { max-width: 760px; margin: 0 auto; }
+.band-title {
+  margin: 0 0 18px;
+  font-size: clamp(1.6rem, 3.5vw, 2.25rem);
+  letter-spacing: -0.03em;
+  font-weight: 650;
+}
+.band-body {
+  margin: 0 0 24px;
+  font-size: 1.05rem;
+  color: var(--muted);
+  line-height: 1.6;
+}
+.band-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.band-list li {
+  font-size: 12px;
+  letter-spacing: 0.01em;
+  border: 1px solid var(--border);
+  border-radius: 9999px;
+  padding: 6px 14px;
+  background: var(--panel);
+  color: var(--fg);
+}
+
+/* ---------- Screenshots ---------- */
+.screenshots {
+  padding: 72px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+.shot { margin: 0; }
+.shot img {
+  width: 100%;
+  height: auto;
+  display: block;
+  /* captured by window id, so the macOS window corners are already transparent - just a soft
+     shadow that follows the rounded shape (drop-shadow respects the alpha). */
+  filter: drop-shadow(0 16px 38px rgba(17, 24, 39, 0.15));
+}
+.shot-caption {
+  margin: 18px 4px 0;
+  font-size: 0.9rem;
+  color: var(--muted);
+  text-align: center;
+}
+/* main UI shot - large, centered */
+.shot-hero { max-width: 920px; margin: 0 auto 72px; }
+
+/* ---------- Carousel (multimodal search) ---------- */
+.carousel-wrap { max-width: 920px; margin: 0 auto 72px; }
+.carousel {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1180 / 760;       /* matches the window-ID captures */
+}
+/* captured by window id, so corners are already transparent - no clipping, shadow follows shape */
+.cframe {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  opacity: 0;
+  filter: drop-shadow(0 16px 38px rgba(17, 24, 39, 0.15));
+  animation: cfade 24s infinite;
+}
+.cframe:nth-child(1) { animation-delay: 0s; }
+.cframe:nth-child(2) { animation-delay: 6s; }
+.cframe:nth-child(3) { animation-delay: 12s; }
+.cframe:nth-child(4) { animation-delay: 18s; }
+@keyframes cfade {
+  0%   { opacity: 0; }
+  3%   { opacity: 1; }
+  22%  { opacity: 1; }
+  28%  { opacity: 0; }
+  100% { opacity: 0; }
+}
+/* captions crossfade in sync with the frames */
+.carousel-cap { position: relative; height: 1.4em; }
+.carousel-cap > span {
+  position: absolute;
+  left: 0; right: 0;
+  opacity: 0;
+  animation: cfade 24s infinite;
+}
+.carousel-cap > span:nth-child(1) { animation-delay: 0s; }
+.carousel-cap > span:nth-child(2) { animation-delay: 6s; }
+.carousel-cap > span:nth-child(3) { animation-delay: 12s; }
+.carousel-cap > span:nth-child(4) { animation-delay: 18s; }
+@media (prefers-reduced-motion: reduce) {
+  .cframe, .carousel-cap > span { animation: none; }
+  .cframe:nth-child(1), .carousel-cap > span:nth-child(1) { opacity: 1; }
+}
+/* the two settings windows are small in reality, so show them small and side by side */
+.shot-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 48px;
+  max-width: 760px;
+  margin: 0 auto;
+  align-items: start;
+}
+.shot-sm { max-width: 320px; margin: 0 auto; }
+@media (max-width: 640px) {
+  .shot-row { grid-template-columns: 1fr; gap: 36px; max-width: 340px; }
+}
+
+/* ---------- Serving ---------- */
+.serving {
+  padding: 72px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+.serving-title {
+  margin: 0 0 18px;
+  font-size: clamp(1.6rem, 3.5vw, 2.25rem);
+  letter-spacing: -0.03em;
+  font-weight: 650;
+}
+.serving-body {
+  margin: 0 0 32px;
+  max-width: 70ch;
+  font-size: 1.05rem;
+  color: var(--muted);
+  line-height: 1.6;
+}
+.serving-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 1px;
+  background: var(--border-soft);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.serving-item {
+  background: var(--panel);
+  padding: 24px;
+}
+.serving-item-label {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 11px;
+  color: var(--muted);
+  margin: 0 0 10px;
+}
+.serving-item-body {
+  margin: 0;
+  font-size: 0.95rem;
+  line-height: 1.55;
+}
+.serving-item-body strong { font-weight: 600; }
+
+/* ---------- Download ---------- */
+.download {
+  padding: 80px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+.download-inner {
+  text-align: center;
+  max-width: 640px;
+  margin: 0 auto;
+}
+.download-title {
+  margin: 0 0 24px;
+  font-size: clamp(1.6rem, 3.5vw, 2.25rem);
+  letter-spacing: -0.03em;
+  font-weight: 650;
+}
+.download-note {
+  margin: 22px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+}
+/* version pill inside the download button */
+.dl-ver {
+  margin-left: 8px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: rgba(255, 255, 255, 0.16);
+  color: inherit;
+}
+
+/* ---------- Footer ---------- */
+.site-footer {
+  padding: 36px 0;
+}
+.footer-inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.footer-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+}
+.footer-brand .brand-icon { border-radius: 5px; }
+.footer-note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* ---------- Responsive ---------- */
+@media (max-width: 720px) {
+  .header-nav { gap: 14px; }
+  .nav-link { display: none; }
+  .feature-grid { grid-template-columns: 1fr; }
+  .serving-grid { grid-template-columns: 1fr; }
+  .req-row { grid-template-columns: 1fr; gap: 4px; }
+  .hero-inner { padding: 48px 20px 56px; }
+  .hero-mascot { width: 140px; height: 140px; }
+}
+
+</style>
+</head>
+<body>
+
+  <header class="site-header">
+    <div class="container header-inner">
+      <a class="brand" href="/omni">
+        <img class="brand-icon" src="assets/icon.png" alt="Omni app icon" width="26" height="26" />
+        <span class="brand-name">Omni</span>
+      </a>
+      <nav class="header-nav">
+        <a class="nav-link" href="#features">Features</a>
+        <a class="nav-link" href="#serving">Serving</a>
+        <a class="btn btn-primary" href="Omni.dmg">Download</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+
+    <!-- HERO -->
+    <section class="hero">
+      <div class="container hero-inner">
+        <img class="hero-mascot" src="assets/omni-mascot.png" alt="Omni mascot, a small 3D mole" width="160" height="148" />
+        <h1 class="hero-title">Search every file on your Mac by meaning.</h1>
+        <p class="hero-sub">Text, code, PDFs, images, audio, and video in one vector space - searched in any language, entirely on-device.</p>
+        <div class="hero-actions">
+          <a class="btn btn-primary btn-lg" href="Omni.dmg">Download for macOS <span class="dl-ver">v0.1.10</span></a>
+        </div>
+        <p class="hero-note mono">Apple silicon &middot; macOS 14+</p>
+      </div>
+    </section>
+
+    <!-- FEATURES -->
+    <section id="features" class="features">
+      <div class="container">
+        <p class="section-label mono">Features</p>
+        <div class="feature-grid">
+
+          <article class="feature-card">
+            <h3 class="feature-title">One space for every file</h3>
+            <p class="feature-body">Text, code, PDFs, images, audio, and video are embedded into a single vector space. A text query matches them all - including scanned pages.</p>
+          </article>
+
+          <article class="feature-card">
+            <h3 class="feature-title">Any language</h3>
+            <p class="feature-body">Languages share that same space, so a query in one finds files in another. Search in English, match notes in German, Chinese, or Japanese.</p>
+          </article>
+
+          <article class="feature-card">
+            <h3 class="feature-title">Local and private</h3>
+            <p class="feature-body">Indexing and search run on your Mac. Files never leave the device. No accounts, no telemetry, no network at query time.</p>
+          </article>
+
+          <article class="feature-card">
+            <h3 class="feature-title">Native to macOS</h3>
+            <p class="feature-body">List and Gallery views, real QuickLook thumbnails, drag and drop, and filters by kind, folder, and score.</p>
+          </article>
+
+        </div>
+      </div>
+    </section>
+
+    <!-- PRIVATE BAND -->
+    <section class="band">
+      <div class="container band-inner">
+        <p class="section-label mono">Private by design</p>
+        <h2 class="band-title">Everything stays on your Mac.</h2>
+        <p class="band-body">Omni runs a native MLX-Swift port of <span class="mono">jina-embeddings-v5-omni</span> in-process, on the Apple silicon GPU. The model downloads once; after that, Omni works offline.</p>
+        <ul class="band-list mono">
+          <li>On-device indexing and search</li>
+          <li>No accounts, no telemetry</li>
+          <li>Local SQLite vector store</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- SCREENSHOTS -->
+    <section id="screenshots" class="screenshots">
+      <div class="container">
+        <p class="section-label mono">A look inside</p>
+
+        <figure class="carousel-wrap">
+          <div class="carousel" aria-label="Searching across images, text, audio, and video">
+            <img class="cframe" src="assets/search-image.png" alt="Searching images - Porsche 911 photos" />
+            <img class="cframe" src="assets/search-text.png" alt="Searching text and code - jina omni embeddings" />
+            <img class="cframe" src="assets/search-audio.png" alt="Searching audio files" />
+            <img class="cframe" src="assets/search-video.png" alt="Searching video clips" />
+          </div>
+          <figcaption class="shot-caption carousel-cap">
+            <span><span class="mono">porsche 911</span> &middot; images</span>
+            <span><span class="mono">jina omni embeddings</span> &middot; text</span>
+            <span><span class="mono">podcast interview</span> &middot; audio</span>
+            <span><span class="mono">screen recording demo</span> &middot; video</span>
+          </figcaption>
+        </figure>
+
+        <div class="shot-row">
+          <figure class="shot shot-sm">
+            <img src="assets/shot-content.png" alt="Omni settings: which file types to index" loading="lazy" />
+            <figcaption class="shot-caption">Choose what to index.</figcaption>
+          </figure>
+          <figure class="shot shot-sm">
+            <img src="assets/shot-serving.png" alt="Omni settings: the local HTTP embedding server" loading="lazy" />
+            <figcaption class="shot-caption">Run a local embedding server.</figcaption>
+          </figure>
+        </div>
+      </div>
+    </section>
+
+    <!-- SERVING -->
+    <section id="serving" class="serving">
+      <div class="container">
+        <p class="section-label mono">Serving</p>
+        <h2 class="serving-title">Give your local agents search.</h2>
+        <p class="serving-body">Omni exposes its search over your indexed files as a local endpoint - loopback-only and token-guarded. Agents like <strong>Hermes</strong> and <strong>OpenClaw</strong> query your files by meaning, on your machine, with no cloud round-trip.</p>
+        <div class="serving-grid">
+          <div class="serving-item">
+            <p class="serving-item-label mono">Search endpoint</p>
+            <p class="serving-item-body">The same semantic search the app uses, over the index you already built - how agents actually reach your files.</p>
+          </div>
+          <div class="serving-item">
+            <p class="serving-item-label mono">Embeddings &middot; add-on</p>
+            <p class="serving-item-body">Raw vectors too, via OpenAI-, Jina-, Cohere-, and Gemini-compatible APIs.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- DOWNLOAD -->
+    <section id="download" class="download">
+      <div class="container download-inner">
+        <h2 class="download-title">Get Omni</h2>
+        <a class="btn btn-primary btn-lg" href="Omni.dmg">Download for macOS <span class="dl-ver">v0.1.10</span></a>
+        <p class="download-note mono">Apple silicon &middot; macOS 14+ &middot; the model downloads once, then works offline</p>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="site-footer">
+    <div class="container footer-inner">
+      <div class="footer-brand">
+        <img class="brand-icon" src="assets/icon.png" alt="" width="18" height="18" />
+        <span class="mono">Omni</span>
+      </div>
+      <p class="footer-note mono">On-device semantic search for macOS.</p>
+    </div>
+  </footer>
+
+</body>
+</html>
