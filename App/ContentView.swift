@@ -128,6 +128,17 @@ struct ContentView: View {
     // MARK: - Toolbar
 
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
+        // macOS 26 (Tahoe) shows the NavigationSplitView sidebar toggle automatically; macOS 15 and
+        // earlier don't, so add an explicit one there (toggleSidebar: travels the responder chain to
+        // the split view controller backing NavigationSplitView).
+        if #unavailable(macOS 26.0) {
+            ToolbarItem(placement: .navigation) {
+                Button { NSApp.sendAction(Selector(("toggleSidebar:")), to: nil, from: nil) } label: {
+                    Image(systemName: "sidebar.left")
+                }
+                .help("Show or hide the sidebar")
+            }
+        }
         // Progressive disclosure: the filter/sort/view chrome appears only once there are results
         // to act on - hidden, not greyed out, during onboarding and the idle/empty states.
         // Exception: keep the filter menu reachable whenever a filter is active, so a filter that

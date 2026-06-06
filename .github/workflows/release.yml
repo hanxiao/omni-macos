@@ -20,7 +20,9 @@ permissions:
 
 jobs:
   release:
-    runs-on: macos-15
+    # macOS 26: rendering the Liquid Glass AppIcon.icon requires the Tahoe runtime frameworks -
+    # actool crashes on macos-15 ("FigBaseCALayer missing from MediaToolbox") when compiling it.
+    runs-on: macos-26
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4

@@ -32,8 +32,11 @@ struct OmniApp: App {
                     .keyboardShortcut("r", modifiers: [.command, .shift])
                     .disabled(!model.hasSelection)
             }
-            // A View menu matching Finder: Cmd-1 gallery, Cmd-2 list, plus Sort By.
-            CommandMenu("View") {
+            // Add to the SYSTEM View menu (which NavigationSplitView already provides with Show
+            // Sidebar / Full Screen) instead of declaring a second "View" CommandMenu - otherwise
+            // the menu bar shows two "View" menus. Cmd-1 gallery, Cmd-2 list, plus Sort By.
+            CommandGroup(after: .sidebar) {
+                Divider()
                 // Inline Picker so the active mode gets a checkmark (Finder-style); the Cmd-1/Cmd-2
                 // shortcuts ride on the items.
                 Picker("View", selection: Binding(get: { model.viewMode }, set: { model.viewMode = $0 })) {
