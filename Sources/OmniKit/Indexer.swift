@@ -121,27 +121,16 @@ public final class Indexer: @unchecked Sendable {
         let known = store.indexedFiles()
         var seen = Set<String>()
 
-        // Pass 1: count supported files per root (stat-only, no reads) so each folder
-        // gets a determinate progress ring.
-        for root in roots {
-            if isCancelled { break }
-            var total = 0
-            FileCrawler(roots: [root], enabledKinds: settings.enabledKinds, disabledExtensions: settings.disabledExtensions)
-                .walk(shouldContinue: { !self.isCancelled }) { _ in total += 1 }
-            var rp = RootProgress(); rp.total = total
-            p.perRoot[root.path] = rp
-        }
-        onProgress(p)
-
-        // Pass 2: process roots through a concurrent-decode -> serial-embed pipeline
-        // so the GPU stays fed while CPU decode (image/video/audio + mel STFT) runs ahead
-        // on multiple cores. The consumer (embed + store) runs serially.
+        // Single crawl: walk each root ONCE, collecting its files and setting the determinate
+        // progress total as that root finishes. (Previously this was two full walks - a stat-only
+        // count pass followed by a collect pass - which doubled the directory traversal before the
+        // first embed and slowed cold start. The per-root total is now published as each root's
+        // walk completes; the ring is indeterminate for a root only until its own walk finishes.)
         //
-        // Files are interleaved round-robin across roots so every folder makes progress
-        // from the start. Embedding is one-at-a-time and slow, so draining a large first
-        // root (e.g. Documents with thousands of files) before touching the others would
-        // starve them for the whole run - a paused/interrupted index would then leave
-        // later folders (Downloads, Desktop) with nothing indexed at all.
+        // The pipeline below feeds a concurrent-decode -> serial-embed stage. Files are interleaved
+        // round-robin across roots so every folder makes progress from the start - draining a large
+        // first root (e.g. Documents) before the others would starve them, leaving a paused run with
+        // later folders (Downloads, Desktop) unindexed.
         var perRootFiles: [(key: String, files: [CrawledFile])] = []
         for root in roots {
             if isCancelled { break }
@@ -149,6 +138,9 @@ public final class Indexer: @unchecked Sendable {
             FileCrawler(roots: [root], enabledKinds: settings.enabledKinds, disabledExtensions: settings.disabledExtensions)
                 .walk(shouldContinue: { !self.isCancelled }) { files.append($0) }
             perRootFiles.append((root.path, files))
+            var rp = RootProgress(); rp.total = files.count
+            p.perRoot[root.path] = rp
+            onProgress(p)
         }
 
         var interleaved: [CrawledFile] = []

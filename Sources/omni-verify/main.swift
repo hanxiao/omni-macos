@@ -285,6 +285,27 @@ if args.count >= 2 && args[1] == "concbench2" {
     exit(0)
 }
 
+// Crawl benchmark: omni-verify crawlbench [folder]
+// Quantifies the single-pass-crawl win: OLD two-pass (count walk + collect walk) vs NEW one-pass
+// (collect only) on a real folder. Warm-cache, so it's a LOWER BOUND on the cold-start saving
+// (a cold FS cache makes each directory walk far costlier).
+if args.count >= 2 && args[1] == "crawlbench" {
+    let folder = URL(fileURLWithPath: args.count >= 3 ? args[2] : NSHomeDirectory() + "/Documents")
+    let kinds: Set<FileKind> = [.text, .image, .video, .audio]
+    func collectWalk() -> [CrawledFile] { var f: [CrawledFile] = []; FileCrawler(roots: [folder], enabledKinds: kinds).walk { f.append($0) }; return f }
+    _ = collectWalk()   // warm the FS cache (not timed)
+    let t0 = Date()
+    var c = 0; FileCrawler(roots: [folder], enabledKinds: kinds).walk { _ in c += 1 }   // OLD pass 1: count
+    let files = collectWalk()                                                            // OLD pass 2: collect
+    let twoPassMs = -t0.timeIntervalSinceNow * 1000
+    let t1 = Date(); let files2 = collectWalk(); let onePassMs = -t1.timeIntervalSinceNow * 1000   // NEW: one walk
+    print(String(format: "crawlbench %@  files=%d (count-pass saw %d, collect %d)", folder.path, files.count, c, files2.count))
+    print(String(format: "  OLD two-pass (count+collect): %.0f ms", twoPassMs))
+    print(String(format: "  NEW one-pass (collect):       %.0f ms", onePassMs))
+    print(String(format: "  saved per cold index:         %.0f ms (%.2fx fewer walks)  [warm-cache lower bound]", twoPassMs - onePassMs, twoPassMs / max(onePassMs, 1e-6)))
+    exit(0)
+}
+
 // Throughput benchmark: omni-verify bench [modelDir] [batch] [count]
 // Embeds a varied-length text corpus through the exact indexing path and reports tok/s.
 if args.count >= 2 && args[1] == "bench" {
