@@ -154,8 +154,11 @@ jobs:
           # and pushed in full every release, so a dropped asset or an outside clobber self-repairs.
           git clone --depth 1 "https://x-access-token:${SITE_TOKEN}@github.com/hanxiao/hanxiao.github.io.git" /tmp/site
           rsync -a --delete --exclude='*.dmg' site/omni/ /tmp/site/omni/
-          rm -f /tmp/site/omni/Omni*.dmg                 # drop the previous release's DMG (keep only latest)
           cp "$DMG" "/tmp/site/omni/Omni-${VERSION}.dmg"
+          # Keep the 2 most recent DMGs (current + previous). The page HTML is at the fixed /omni/
+          # URL and can be CF-cached (max-age=14400) briefly after a release; keeping the previous
+          # version's DMG means a momentarily-stale page still links a real file instead of 404ing.
+          ( cd /tmp/site/omni && ls -t Omni-*.dmg 2>/dev/null | tail -n +3 | xargs rm -f 2>/dev/null || true )
           stamp /tmp/site/omni/index.html
           ( cd /tmp/site && git add -A omni && (git diff --cached --quiet || (git commit -m "omni: ${VER} (md5 ${MD5})" && git push)) )
           echo "updated hanxiao.io/omni to ${VER}, dmg Omni-${VERSION}.dmg md5 ${MD5}"
