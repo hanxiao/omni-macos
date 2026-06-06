@@ -29,37 +29,51 @@ public struct WeightStore {
             }
         }
 
-        // Upcast the language backbone to fp32 (matches reference sanitize()).
+        let bf16Backbone = ProcessInfo.processInfo.environment["OMNI_BACKBONE_BF16"] != "0"
+
+        // Load the retrieval LoRA adapter and compute which backbone weights it modifies, so the
+        // fp32 round-trip is paid only where it matters.
+        let adapterURL = modelDir
+            .appendingPathComponent("adapters/retrieval/adapter_model.safetensors")
+        let adapter = FileManager.default.fileExists(atPath: adapterURL.path)
+            ? try loadArrays(url: adapterURL) : [:]
+        var loraTargets = Set<String>()
+        for key in adapter.keys where key.contains("lora_A") {
+            loraTargets.insert(key
+                .replacingOccurrences(of: "base_model.model.", with: "")
+                .replacingOccurrences(of: ".lora_A.weight", with: ".weight"))
+        }
+
+        // Upcast to fp32 for the merge (reference sanitize() upcasts the whole backbone). In the
+        // default bf16 path we only need fp32 on the LoRA-target linears - every other weight is
+        // bf16->fp32->bf16, which is the identity, so upcasting the whole backbone (incl. the large
+        // embed_tokens) is pure transient memory + time. The exact path (OMNI_BACKBONE_BF16=0, used
+        // by the fp32 parity fixtures) still upcasts everything so the result stays fp32.
         for key in Array(w.keys) where key.hasPrefix("language_model.") {
-            if w[key]!.dtype != .float32 {
+            let needsFP32 = !bf16Backbone || loraTargets.contains(key)
+            if needsFP32 && w[key]!.dtype != .float32 {
                 w[key] = w[key]!.asType(.float32)
             }
         }
 
-        // Merge the retrieval LoRA adapter into the backbone.
-        let adapterURL = modelDir
-            .appendingPathComponent("adapters/retrieval/adapter_model.safetensors")
-        if FileManager.default.fileExists(atPath: adapterURL.path) {
-            let adapter = try loadArrays(url: adapterURL)
-            for (key, aArr) in adapter where key.contains("lora_A") {
-                let baseKey = key
-                    .replacingOccurrences(of: "base_model.model.", with: "")
-                    .replacingOccurrences(of: ".lora_A.weight", with: ".weight")
-                let bKey = key.replacingOccurrences(of: "lora_A", with: "lora_B")
-                guard let bArr = adapter[bKey], let base = w[baseKey] else { continue }
-                let a = aArr.asType(.float32)        // [r, in]
-                let b = bArr.asType(.float32)         // [out, r]
-                let delta = matmul(b, a)              // [out, in]
-                w[baseKey] = base + (loraScale * delta)
-            }
+        // Merge the retrieval LoRA adapter into the backbone (in fp32).
+        for (key, aArr) in adapter where key.contains("lora_A") {
+            let baseKey = key
+                .replacingOccurrences(of: "base_model.model.", with: "")
+                .replacingOccurrences(of: ".lora_A.weight", with: ".weight")
+            let bKey = key.replacingOccurrences(of: "lora_A", with: "lora_B")
+            guard let bArr = adapter[bKey], let base = w[baseKey] else { continue }
+            let a = aArr.asType(.float32)        // [r, in]
+            let b = bArr.asType(.float32)         // [out, r]
+            let delta = matmul(b, a)              // [out, in]
+            w[baseKey] = base + (loraScale * delta)
         }
 
-        // Run the backbone weights in bf16 by default: the fp32 upcast above (and the fp32 LoRA
-        // merge) keep the merge exact, and this only lowers the runtime weight dtype - faster on the
-        // GPU and ~half the backbone VRAM. Set OMNI_BACKBONE_BF16=0 for the exact fp32 path (the
-        // parity test does this to match the fp32 reference fixtures).
-        if ProcessInfo.processInfo.environment["OMNI_BACKBONE_BF16"] != "0" {
-            for key in Array(w.keys) where key.hasPrefix("language_model.") {
+        // Cast the fp32-merged weights back to bf16. In the default path only the LoRA targets were
+        // upcast, so only they need casting back; non-target weights are already bf16. The result is
+        // byte-identical to upcasting + casting the whole backbone, at a fraction of the load memory.
+        if bf16Backbone {
+            for key in loraTargets where w[key] != nil {
                 w[key] = w[key]!.asType(.bfloat16)
             }
         }
