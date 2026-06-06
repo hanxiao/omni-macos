@@ -38,33 +38,55 @@ struct ResultsList<Footer: View>: View {
 
     // MARK: - List
 
+    // A plain scroll of rows (not a `List`), so selection, click, double-click, right-click, and
+    // arrow-key navigation behave EXACTLY like the gallery. `List(selection:)` showed the system
+    // grey highlight (only accent while focused) and would not take arrow keys once the rows had
+    // their own tap gestures - this drives all of it explicitly instead.
     private var listView: some View {
-        List(selection: Binding(get: { model.selection }, set: { model.selection = $0 })) {
-            ForEach(results, id: \.path) { hit in
-                VStack(spacing: 0) {
-                    ResultRow(hit: hit,
-                              expandable: hit.kind == FileKind.text.rawValue,
-                              expanded: expanded.contains(hit.path),
-                              onToggle: { toggle(hit.path) })
-                        .draggable(URL(fileURLWithPath: hit.path))
-                        // Make the whole row a uniform hit area, then drive selection explicitly
-                        // (same as the gallery rows): the List's built-in click-to-select stops
-                        // firing once any gesture is attached, so a single tap sets the selection
-                        // and a double tap opens. Clicking the title/description now selects too.
-                        .contentShape(Rectangle())
-                        .onTapGesture { model.selection = hit.path }
-                        .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
-                    if expanded.contains(hit.path) {
-                        PassagesView(passages: passagesCache[hit.path] ?? [])
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 2) {
+                    ForEach(results, id: \.path) { hit in
+                        VStack(spacing: 0) {
+                            ResultRow(hit: hit,
+                                      selected: model.selection == hit.path,
+                                      expandable: hit.kind == FileKind.text.rawValue,
+                                      expanded: expanded.contains(hit.path),
+                                      onToggle: { toggle(hit.path) })
+                                .draggable(URL(fileURLWithPath: hit.path))
+                                .contentShape(Rectangle())
+                                .onTapGesture { model.selection = hit.path }
+                                .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
+                                .contextMenu { menu(hit.path) }
+                            if expanded.contains(hit.path) {
+                                PassagesView(passages: passagesCache[hit.path] ?? [])
+                            }
+                        }
+                        .id(hit.path)
                     }
+                    footer
                 }
-                .tag(hit.path)
-                .contextMenu { menu(hit.path) }
+                .padding(.horizontal, Design.gapLarge)
+                .padding(.vertical, 8)
             }
-            footer.listRowSeparator(.hidden)
+            // Arrow keys move the selection up/down (Return/Space handled on the body). Same
+            // focusable + onMoveCommand wiring the gallery uses.
+            .focusable()
+            .focusEffectDisabled()
+            .onMoveCommand { direction in
+                switch direction {
+                case .up: model.moveSelection(rowDelta: -1)
+                case .down: model.moveSelection(rowDelta: 1)
+                default: break
+                }
+            }
+            // Keep the selected row on screen as it moves (so arrowing past the fold scrolls).
+            .onChange(of: model.selection) { _, sel in
+                guard let sel else { return }
+                withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(sel, anchor: .center) }
+            }
+            .onChange(of: results.map(\.path)) { _, _ in expanded = []; passagesCache = [:] }
         }
-        .listStyle(.inset)
-        .onChange(of: results.map(\.path)) { _, _ in expanded = []; passagesCache = [:] }
     }
 
     // MARK: - Gallery
@@ -130,6 +152,7 @@ struct ResultsList<Footer: View>: View {
 
 struct ResultRow: View {
     let hit: SearchHit
+    var selected: Bool = false
     var expandable: Bool = false
     var expanded: Bool = false
     var onToggle: (() -> Void)? = nil
@@ -166,7 +189,14 @@ struct ResultRow: View {
                 .help("Show matching passages")
             }
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 6)
+        .padding(.horizontal, 10)
+        // Same selection treatment as the gallery cell: a translucent accent fill (not the
+        // system grey, which only shows when the List has focus). Consistent across both views.
+        .background(
+            selected ? Color.accentColor.opacity(0.18) : .clear,
+            in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+        )
     }
 }
 
