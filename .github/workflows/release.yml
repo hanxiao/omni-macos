@@ -24,6 +24,8 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history + tags, so the release notes can diff against the previous tag
 
       # Auto-bump the patch on every release: x.y.z -> x.y.(z+1). This runs before xcodegen so the
       # build, the About panel, the DMG name, and the release tag all use the new version. The
@@ -112,18 +114,32 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Changelog = the commit subjects since the previous release tag (the new tag is created by
+          # this step, so the highest existing tag is the previous release). Drop the auto version-bump
+          # commit and merges. Written to a file so commit messages with quotes/backticks can't break
+          # the notes.
+          PREV=$(git tag -l 'v*' --sort=-version:refname | head -n1)
+          if [ -n "$PREV" ]; then
+            CHANGES=$(git log --no-merges --pretty='- %s' "${PREV}..HEAD" \
+              | grep -vE '\[skip ci\]|^- chore: release|^- Merge ' || true)
+          fi
+          [ -z "$CHANGES" ] && CHANGES="- Maintenance and internal improvements."
+          {
+            echo "## What's changed since ${PREV:-the previous release}"
+            echo "$CHANGES"
+            echo ""
+            echo "## Install"
+            echo "Open the DMG and drag **Omni** onto **Applications**. No Gatekeeper prompt - the build is notarized."
+            echo ""
+            echo "## Requirements"
+            echo "- Apple Silicon Mac (M1 or later), macOS 14+."
+            echo "- First launch downloads the on-device search model (~1.9 GB), then runs offline."
+          } > /tmp/release-notes.md
           gh release create "${{ steps.ver.outputs.tag }}" \
             "dist/Omni-${{ steps.ver.outputs.version }}.dmg" \
             --target "$(git rev-parse HEAD)" \
             --title "Omni ${{ steps.ver.outputs.version }}" \
-            --notes "Automated, Apple-notarized build from \`${{ github.sha }}\`.
-
-          ## Install
-          Open the DMG and drag **Omni** onto **Applications**. No Gatekeeper prompt - the build is notarized.
-
-          ## Requirements
-          - Apple Silicon Mac (M1 or later), macOS 14+.
-          - First launch downloads the on-device search model (~1.9 GB), then runs offline."
+            --notes-file /tmp/release-notes.md
 
       # Refresh hanxiao.io/omni: copy the new DMG and stamp the version into the download buttons,
       # on both the deployed Pages repo (live now) and the blog source (keeps it consistent).
@@ -159,6 +175,9 @@ jobs:
           # URL and can be CF-cached (max-age=14400) briefly after a release; keeping the previous
           # version's DMG means a momentarily-stale page still links a real file instead of 404ing.
           ( cd /tmp/site/omni && ls -t Omni-*.dmg 2>/dev/null | tail -n +3 | xargs rm -f 2>/dev/null || true )
+          # Manifest the in-app updater ("Check for Updates") reads to detect new versions.
+          printf '{"version":"%s","url":"https://hanxiao.io/omni/Omni-%s.dmg","md5":"%s"}\n' \
+            "$VERSION" "$VERSION" "$MD5" > /tmp/site/omni/latest.json
           stamp /tmp/site/omni/index.html
           ( cd /tmp/site && git add -A omni && (git diff --cached --quiet || (git commit -m "omni: ${VER} (md5 ${MD5})" && git push)) )
           echo "updated hanxiao.io/omni to ${VER}, dmg Omni-${VERSION}.dmg md5 ${MD5}"
