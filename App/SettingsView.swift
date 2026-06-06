@@ -112,7 +112,7 @@ private struct ActivityTab: View {
             } header: {
                 Text("Status")
             } footer: {
-                Text("Keeps itself current in the background as files change; Update catches up any changes now.")
+                Text("Stays current automatically as files change. Update checks now.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -169,7 +169,7 @@ private struct ContentTypesTab: View {
             } header: {
                 Text("What to Index")
             } footer: {
-                Text("Drag a type onto another to reorder how they are indexed.")
+                Text("Drag to set which types are indexed first.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -204,7 +204,7 @@ private struct ContentTypesTab: View {
             } header: {
                 Text("Skip Small Files")
             } footer: {
-                Text("Files below these thresholds are skipped on the next index - useful for icons, thumbnails, and very short clips.")
+                Text("Skips files below these sizes: icons, thumbnails, very short clips.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -295,7 +295,7 @@ private struct PerformanceTab: View {
             } header: {
                 Text("Throughput")
             } footer: {
-                Text("Smaller caps trade detail for faster indexing; images resize to about 1.3 MP anyway, so a lower image cap is free.")
+                Text("Smaller caps trade some detail for faster indexing.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
@@ -321,7 +321,7 @@ private struct PerformanceTab: View {
             } header: {
                 Text("Memory")
             } footer: {
-                Text("Hard cap on the model's memory. Keep it above ~4 GB so the model stays resident; 0 means unlimited.")
+                Text("Caps memory the model may use. Keep it above ~4 GB; 0 means unlimited.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -383,7 +383,7 @@ private struct IndexTab: View {
             } header: {
                 Text("Model")
             } footer: {
-                Text("Switching variant rebuilds the index. Both variants share one embedding space.")
+                Text("Switching the model rebuilds the index - the two models use different embeddings.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
