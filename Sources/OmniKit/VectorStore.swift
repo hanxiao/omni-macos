@@ -455,21 +455,24 @@ public final class VectorStore: @unchecked Sendable {
             let t0 = Self.searchTiming ? Date() : nil
             let qv = MLXArray(query, [dim, 1]).asType(.bfloat16)
             let baseScore = MLX.matmul(mlxBase!, qv)
-            MLX.eval(baseScore)
-            var scores = baseScore.reshaped([baseRows]).asType(.float32).asArray(Float.self)
+            var scores: [Float]
             // Delta: rows [baseRows, n) appended since the base was built (bounded by foldThreshold).
-            // flat16 is stable for this synchronous call, so a bytesNoCopy wrap into the matmul is safe.
+            // flat16 is stable for this synchronous call; MLXArray copies the bytes at construction so
+            // the delta array is owned and safe to eval after the closure returns.
             if n > baseRows {
                 let deltaCount = n - baseRows
-                flat16.withUnsafeBytes { raw in
+                let ds: MLXArray = flat16.withUnsafeBytes { raw in
                     let p = raw.baseAddress!.advanced(by: baseRows * dim * MemoryLayout<UInt16>.size)
                     let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: p),
                                     count: deltaCount * dim * MemoryLayout<UInt16>.size, deallocator: .none)
-                    let dm = MLXArray(data, [deltaCount, dim], dtype: .bfloat16)
-                    let ds = MLX.matmul(dm, qv)
-                    MLX.eval(ds)
-                    scores.append(contentsOf: ds.reshaped([deltaCount]).asType(.float32).asArray(Float.self))
+                    return MLX.matmul(MLXArray(data, [deltaCount, dim], dtype: .bfloat16), qv)
                 }
+                MLX.eval(baseScore, ds)   // one fused GPU sync for both matmuls (was two)
+                scores = baseScore.reshaped([baseRows]).asType(.float32).asArray(Float.self)
+                scores.append(contentsOf: ds.reshaped([deltaCount]).asType(.float32).asArray(Float.self))
+            } else {
+                MLX.eval(baseScore)
+                scores = baseScore.reshaped([baseRows]).asType(.float32).asArray(Float.self)
             }
             let t1 = Self.searchTiming ? Date() : nil
             let result = Self.reduceTopK(scores: scores, fileID: fileID, fileCount: fileIDCount,
