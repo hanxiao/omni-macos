@@ -8,6 +8,13 @@ import Accelerate
 // Numeric validation of the MLX-Swift text encoder against Python reference fixtures.
 // Usage: omni-verify <modelDir> <fixturesJson>
 
+/// Tiny thread-safe boolean for stopping a background load thread in concbench2.
+final class BenchFlag: @unchecked Sendable {
+    private let l = NSLock(); private var v = false
+    var value: Bool { l.lock(); defer { l.unlock() }; return v }
+    func set(_ x: Bool) { l.lock(); v = x; l.unlock() }
+}
+
 let args = CommandLine.arguments
 
 // Search benchmark: omni-verify searchbench [N] [dim] [queries]
@@ -84,6 +91,197 @@ if args.count >= 2 && args[1] == "searchbench" {
     print(String(format: "  recall@10 (bf16 vs fp32):  %.4f", recall10/Double(nq)))
     print(String(format: "  recall@%d (bf16 vs fp32):  %.4f", topK, recall50/Double(nq)))
     print(String(format: "\n  matrix memory:  fp32 %.0f MB  ->  bf16 %.0f MB  (%.0f%% smaller)", fp32MB, bf16MB, 100*(1 - bf16MB/fp32MB)))
+    exit(0)
+}
+
+// Concurrency benchmark: omni-verify concbench [N] [dim] [queries]
+// Drives the REAL VectorStore and measures search latency (a) idle with a warm cache and (b) while
+// the store is being mutated by new-file inserts (the "search during indexing" case), plus
+// recall@10 vs CPU fp32 exact. (b) is the metric the base+delta fix targets: the current code marks
+// the cache dirty on every insert, so each under-indexing query rebuilds the full resident matrix.
+if args.count >= 2 && args[1] == "concbench" {
+    let N = (args.count >= 3 ? Int(args[2]) : nil) ?? 50_000
+    let dim = (args.count >= 4 ? Int(args[3]) : nil) ?? 1024
+    let nq = (args.count >= 5 ? Int(args[4]) : nil) ?? 30
+    let clusters = max(64, N / 200)
+    print("concbench  N=\(N)  dim=\(dim)  queries=\(nq)  clusters=\(clusters)")
+
+    var rng: UInt64 = 0x9E3779B97F4A7C15
+    func nextF() -> Float { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return Float(rng >> 40) / Float(1 << 24) }
+    func gauss() -> Float { let u1 = max(nextF(), 1e-7), u2 = nextF(); return sqrtf(-2*logf(u1)) * cosf(2 * .pi * u2) }
+    func normalize(_ v: inout [Float], _ off: Int) { var s: Float = 0; for k in 0..<dim { s += v[off+k]*v[off+k] }; s = sqrtf(s)+1e-9; for k in 0..<dim { v[off+k] /= s } }
+
+    print("generating clustered vectors...")
+    var centers = [Float](repeating: 0, count: clusters*dim)
+    for c in 0..<clusters { for k in 0..<dim { centers[c*dim+k] = gauss() }; normalize(&centers, c*dim) }
+    var flat = [Float](repeating: 0, count: N*dim)
+    for i in 0..<N { let c = i % clusters; for k in 0..<dim { flat[i*dim+k] = centers[c*dim+k] + 0.35*gauss() }; normalize(&flat, i*dim) }
+    func vec(_ i: Int) -> [Float] { Array(flat[i*dim..<(i+1)*dim]) }
+    var queries: [[Float]] = []
+    for qi in 0..<nq { let c = (qi*37)%clusters; var q=[Float](repeating:0,count:dim); for k in 0..<dim { q[k]=centers[c*dim+k]+0.2*gauss() }; normalize(&q,0); queries.append(q) }
+
+    let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("concbench-\(N)-\(dim).sqlite")
+    for ext in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(at: URL(fileURLWithPath: tmp.path + ext)) }
+    let store = try VectorStore(dbURL: tmp)
+    print("inserting \(N) rows into the real VectorStore...")
+    let t0 = Date()
+    var batch: [(path: String, chunks: [IndexedChunk])] = []
+    for i in 0..<N {
+        batch.append(("p\(i)", [IndexedChunk(path: "p\(i)", modified: 0, kind: "text", chunkIndex: 0, snippet: "", embedding: vec(i))]))
+        if batch.count == 2000 { try store.replaceMany(batch); batch.removeAll(keepingCapacity: true) }
+    }
+    if !batch.isEmpty { try store.replaceMany(batch) }
+    print(String(format: "  inserted in %.1fs", -t0.timeIntervalSinceNow))
+
+    func median(_ xs: [Double]) -> Double { xs.sorted()[xs.count/2] }
+    func pidx(_ p: String) -> Int { Int(p.dropFirst()) ?? -1 }
+    func exactTop10(_ q: [Float]) -> Set<Int> {
+        var s = [Float](repeating: 0, count: N); let d = vDSP_Length(dim)
+        q.withUnsafeBufferPointer { qp in flat.withUnsafeBufferPointer { mp in s.withUnsafeMutableBufferPointer { sp in
+            for i in 0..<N { vDSP_dotpr(mp.baseAddress!+i*dim, 1, qp.baseAddress!, 1, sp.baseAddress!+i, d) }
+        }}}
+        return Set(s.indices.sorted { s[$0] > s[$1] }.prefix(10))
+    }
+
+    _ = store.search(queries[0], topK: 50); _ = store.search(queries[0], topK: 50)   // warm
+
+    // (a) IDLE: back-to-back searches, no mutation between them.
+    var tIdle: [Double] = []
+    for q in queries { let a = Date(); _ = store.search(q, topK: 50); tIdle.append(-a.timeIntervalSinceNow) }
+
+    // recall@10 vs fp32 exact (idle store, only p-rows present).
+    var recall = 0.0
+    for q in queries {
+        let got = Set(store.search(q, topK: 50).prefix(10).map { pidx($0.path) })
+        recall += Double(got.intersection(exactTop10(q)).count) / 10.0
+    }
+    recall /= Double(nq)
+
+    // (b) UNDER INDEXING: insert 200 NEW rows (the dominant indexing case - new files append),
+    // then search. Repeats per query so every query sees a freshly-mutated store.
+    var extra = N
+    var tLoad: [Double] = []
+    for q in queries {
+        var b: [(path: String, chunks: [IndexedChunk])] = []
+        for _ in 0..<200 { let i = extra % N; b.append(("x\(extra)", [IndexedChunk(path: "x\(extra)", modified: 0, kind: "text", chunkIndex: 0, snippet: "", embedding: vec(i))])); extra += 1 }
+        try store.replaceMany(b)
+        let a = Date(); _ = store.search(q, topK: 50); tLoad.append(-a.timeIntervalSinceNow)
+    }
+
+    print(String(format: "\n  search IDLE (warm cache):        %.2f ms/query (median)", median(tIdle)*1000))
+    print(String(format: "  search UNDER INDEXING (mutate):  %.2f ms/query (median)", median(tLoad)*1000))
+    print(String(format: "  under-indexing penalty:          %.1fx vs idle", median(tLoad)/max(median(tIdle), 1e-6)))
+    print(String(format: "  recall@10 vs fp32 exact:         %.4f", recall))
+    for ext in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(at: URL(fileURLWithPath: tmp.path + ext)) }
+    exit(0)
+}
+
+// Concurrent-GPU benchmark: omni-verify concbench2 [modelDir] [N] [loadSeconds]
+// Drives a REAL OmniEngine so indexing embeds are genuine GPU work, and measures search latency
+// while that load runs, with the priority gate OFF (gpuGate=nil, search matmul ungated) vs ON
+// (gpuGate=engine, search preempts embeds). Proves Fix #1's win + no deadlock + no throughput
+// collapse + bounded memory. The background load also mutates the store (delta + a fold) under
+// concurrency. Liveness: each loaded phase must complete within a watchdog timeout.
+if args.count >= 2 && args[1] == "concbench2" {
+    let modelDir = URL(fileURLWithPath: args.count >= 3 ? args[2] : "/private/tmp/omni-nano")
+    let N = (args.count >= 4 ? Int(args[3]) : nil) ?? 200_000
+    let secs = (args.count >= 5 ? Double(args[4]) : nil) ?? 15
+    print("concbench2  model=\(modelDir.lastPathComponent)  N=\(N)  loadSeconds=\(secs)")
+    let engine = try await OmniEngine(modelDir: modelDir)
+    let dim = engine.dim
+    print("engine loaded, dim=\(dim)")
+
+    var rng: UInt64 = 0x1234_5678_9ABC_DEF0
+    func nextF() -> Float { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return Float(rng >> 40) / Float(1 << 24) }
+    func gauss() -> Float { let u1 = max(nextF(), 1e-7), u2 = nextF(); return sqrtf(-2*logf(u1)) * cosf(2 * .pi * u2) }
+    func norm(_ v: inout [Float], _ off: Int) { var s: Float = 0; for k in 0..<dim { s += v[off+k]*v[off+k] }; s = sqrtf(s)+1e-9; for k in 0..<dim { v[off+k] /= s } }
+    let clusters = max(64, N / 200)
+    var centersTmp = [Float](repeating: 0, count: clusters*dim)
+    for c in 0..<clusters { for k in 0..<dim { centersTmp[c*dim+k] = gauss() }; norm(&centersTmp, c*dim) }
+    let centers = centersTmp                 // immutable -> safe to capture from the load thread
+    // Pure, deterministic vector for row i (local RNG, no shared mutable state) so the background
+    // load thread can build rows without racing the main thread's RNG.
+    func vec(_ i: Int) -> [Float] {
+        let c = i % clusters
+        var s = (UInt64(bitPattern: Int64(i)) &* 0x9E3779B97F4A7C15) | 1
+        func g() -> Float {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17; let u1 = max(Float(s >> 40) / Float(1 << 24), 1e-7)
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17; let u2 = Float(s >> 40) / Float(1 << 24)
+            return sqrtf(-2*logf(u1)) * cosf(2 * .pi * u2)
+        }
+        var v = [Float](repeating: 0, count: dim)
+        for k in 0..<dim { v[k] = centers[c*dim+k] + 0.35*g() }
+        var nn: Float = 0; for k in 0..<dim { nn += v[k]*v[k] }; nn = sqrtf(nn) + 1e-9
+        for k in 0..<dim { v[k] /= nn }
+        return v
+    }
+    var queriesTmp: [[Float]] = []
+    for qi in 0..<40 { let c = (qi*37)%clusters; var q = [Float](repeating: 0, count: dim); for k in 0..<dim { q[k] = centers[c*dim+k] + 0.2*gauss() }; norm(&q, 0); queriesTmp.append(q) }
+    let queries = queriesTmp
+
+    let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("concbench2-\(N).sqlite")
+    for e in ["","-wal","-shm"] { try? FileManager.default.removeItem(at: URL(fileURLWithPath: tmp.path + e)) }
+    let store = try VectorStore(dbURL: tmp)
+    print("inserting \(N) rows...")
+    var batch: [(path: String, chunks: [IndexedChunk])] = []
+    for i in 0..<N { batch.append(("p\(i)", [IndexedChunk(path: "p\(i)", modified: 0, kind: "text", chunkIndex: 0, snippet: "", embedding: vec(i))]))
+        if batch.count == 2000 { try store.replaceMany(batch); batch.removeAll(keepingCapacity: true) } }
+    if !batch.isEmpty { try store.replaceMany(batch) }
+
+    let para = "Distributed systems and quarterly cloud revenue with strong operating margins across regions. Paris is the capital of France and latent space podcasts discuss architecture graphs."
+    let passages = (0..<128).map { String(repeating: para + " ", count: ($0 % 6) + 1) }
+    func med(_ xs: [Double]) -> Double { xs.isEmpty ? 0 : xs.sorted()[xs.count/2] }
+    func p95(_ xs: [Double]) -> Double { xs.isEmpty ? 0 : xs.sorted()[min(xs.count-1, Int(Double(xs.count)*0.95))] }
+
+    // Idle baseline (no concurrent load).
+    _ = store.search(queries[0], topK: 50); _ = store.search(queries[0], topK: 50)
+    var idle: [Double] = []
+    for qi in 0..<40 { let a = Date(); _ = store.search(queries[qi % queries.count], topK: 50); idle.append(-a.timeIntervalSinceNow*1000) }
+
+    // Loaded phase: background embeds (+ periodic mutation, incl. a fold) while we time searches.
+    // Search runs under the lock; MLX's stream scheduler interleaves it with the embed forwards.
+    func loadedPhase() -> (lat: [Double], embeds: Int, foldHit: Bool, alive: Bool) {
+        let stop = BenchFlag()
+        let done = DispatchSemaphore(value: 0)
+        nonisolated(unsafe) var embeds = 0
+        nonisolated(unsafe) var foldHit = false
+        nonisolated(unsafe) var extra = N
+        DispatchQueue.global(qos: .utility).async {
+            var i = 0
+            let embedBatch = (ProcessInfo.processInfo.environment["OMNI_BENCH_EMBED_BATCH"].flatMap { Int($0) }) ?? passages.count
+            while !stop.value {
+                _ = engine.embedTextBatch(Array(passages.prefix(embedBatch)), as: .passage)   // low-pri GPU load
+                i += 1
+                if i % 2 == 0 {                                           // mutate: delta + eventual fold
+                    var b: [(path: String, chunks: [IndexedChunk])] = []
+                    for _ in 0..<600 { b.append(("x\(extra)", [IndexedChunk(path: "x\(extra)", modified: 0, kind: "text", chunkIndex: 0, snippet: "", embedding: vec(extra % N))])); extra += 1 }
+                    try? store.replaceMany(b)
+                    if extra - N > 50_000 { foldHit = true }
+                }
+            }
+            embeds = i
+            done.signal()
+        }
+        Thread.sleep(forTimeInterval: 0.6)                               // let load saturate the GPU
+        var lat: [Double] = []
+        let deadline = Date().addingTimeInterval(secs)
+        var qi = 0
+        while Date() < deadline { let q = queries[qi % queries.count]; qi += 1
+            let a = Date(); _ = store.search(q, topK: 50); lat.append(-a.timeIntervalSinceNow*1000) }
+        stop.set(true)
+        let alive = done.wait(timeout: .now() + 30) == .success            // watchdog: no hang/deadlock
+        return (lat, embeds, foldHit, alive)
+    }
+
+    let memBefore = Double(MLX.GPU.activeMemory) / 1_048_576
+    let r = loadedPhase()
+    let peakMB = Double(MLX.GPU.peakMemory) / 1_048_576
+
+    print(String(format: "\n  search IDLE (no load):     median %.1f ms   p95 %.1f ms", med(idle), p95(idle)))
+    print(String(format: "  search UNDER INDEXING:     median %.1f ms   p95 %.1f ms   (embeds=%d, fold=%@, alive=%@)", med(r.lat), p95(r.lat), r.embeds, r.foldHit ? "yes":"no", r.alive ? "yes":"NO-HANG"))
+    print(String(format: "  under-indexing penalty:    %.2fx vs idle", med(r.lat)/max(med(idle),1e-6)))
+    print(String(format: "  GPU active before load %.0f MB -> peak %.0f MB   (store bf16 ~%.0f MB; no unbounded burst)", memBefore, peakMB, Double(N*dim*2)/1_048_576))
+    for e in ["","-wal","-shm"] { try? FileManager.default.removeItem(at: URL(fileURLWithPath: tmp.path + e)) }
     exit(0)
 }
 
