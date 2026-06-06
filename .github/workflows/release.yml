@@ -140,17 +140,12 @@ jobs:
           git config --global user.email "omni-ci@users.noreply.github.com"
           git config --global user.name "omni-ci"
           stamp() { sed -i '' "s#<span class=\"dl-ver\">v[0-9.]*</span>#<span class=\"dl-ver\">${VER}</span>#g" "$1"; }
-          # live Pages repo (omni/ is the static deployed page)
+          # Self-healing deploy: the page (index.html + all assets) is owned by this repo's
+          # site/omni/ and pushed in full every release, so a dropped asset or an outside clobber
+          # is repaired on the next release. The DMG is the only thing CI adds on top.
           git clone --depth 1 "https://x-access-token:${SITE_TOKEN}@github.com/hanxiao/hanxiao.github.io.git" /tmp/site
-          if [ -f /tmp/site/omni/index.html ]; then
-            cp "$DMG" /tmp/site/omni/Omni.dmg
-            stamp /tmp/site/omni/index.html
-            ( cd /tmp/site && git add omni && (git diff --cached --quiet || (git commit -m "omni: ${VER}" && git push)) )
-          fi
-          # blog source (DMG is gitignored there; just keep the version in sync)
-          git clone --depth 1 "https://x-access-token:${SITE_TOKEN}@github.com/hanxiao/blog.git" /tmp/blog
-          if [ -f /tmp/blog/source/omni/index.html ]; then
-            stamp /tmp/blog/source/omni/index.html
-            ( cd /tmp/blog && git add source/omni/index.html && (git diff --cached --quiet || (git commit -m "omni: stamp page version ${VER}" && git push)) )
-          fi
+          rsync -a --delete --exclude='Omni.dmg' site/omni/ /tmp/site/omni/
+          cp "$DMG" /tmp/site/omni/Omni.dmg
+          stamp /tmp/site/omni/index.html
+          ( cd /tmp/site && git add omni && (git diff --cached --quiet || (git commit -m "omni: ${VER}" && git push)) )
           echo "updated hanxiao.io/omni to ${VER}"
