@@ -98,8 +98,10 @@ public final class OmniTextEncoder: @unchecked Sendable {
         return backbone.poolBatch(hidden, lengths: lengths)
     }
 
-    /// Whether the async double-buffer pipeline is enabled (OMNI_ASYNC_EVAL=1). Default OFF.
-    public static let asyncEvalEnabled = ProcessInfo.processInfo.environment["OMNI_ASYNC_EVAL"] == "1"
+    /// Whether the async double-buffer pipeline is enabled. Default ON (overlaps batch K+1's GPU
+    /// forward with batch K's host readout; measured +16-25% indexing throughput, cos 0.99995 vs the
+    /// single-encode reference). Set OMNI_ASYNC_EVAL=0 to disable.
+    public static let asyncEvalEnabled = ProcessInfo.processInfo.environment["OMNI_ASYNC_EVAL"] != "0"
 
     /// SAFE TEXT LEVER (a): encode many pre-tokenized batches with GPU/CPU double-buffering.
     ///
