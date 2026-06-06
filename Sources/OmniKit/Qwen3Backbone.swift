@@ -35,7 +35,9 @@ final class Qwen3Backbone: @unchecked Sendable {
         self.w = weights
         self.cfg = config
         self.rope = RoPE(dimensions: config.text.headDim, traditional: false, base: config.text.ropeTheta)
-        self.computeDType = ProcessInfo.processInfo.environment["OMNI_BF16_COMPUTE"] == "1" ? .bfloat16 : .float32
+        // bf16 compute by default (faster, half the backbone VRAM); set OMNI_BF16_COMPUTE=0 for the
+        // exact fp32 path (the parity test does this to match the fp32 reference fixtures).
+        self.computeDType = ProcessInfo.processInfo.environment["OMNI_BF16_COMPUTE"] == "0" ? .float32 : .bfloat16
         self.useCompiledBlock = ProcessInfo.processInfo.environment["OMNI_COMPILE_BLOCK"] == "1"
     }
 

@@ -14,6 +14,14 @@ final class TextEncoderTests: XCTestCase {
     }
     struct Fixtures: Decodable { let records: [Record] }
 
+    override func setUp() {
+        super.setUp()
+        // The app defaults to bf16, but parity is asserted against the fp32 reference fixtures, so
+        // pin the encoder to the exact fp32 path here (env is read when WeightStore/the backbone build).
+        setenv("OMNI_BF16_COMPUTE", "0", 1)
+        setenv("OMNI_BACKBONE_BF16", "0", 1)
+    }
+
     func cosine(_ a: [Float], _ b: [Float]) -> Float {
         var dot: Float = 0, na: Float = 0, nb: Float = 0
         for i in 0 ..< min(a.count, b.count) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i] }
