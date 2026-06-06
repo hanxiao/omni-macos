@@ -3,11 +3,89 @@ import OmniKit
 import ImageIO
 import CoreGraphics
 import MLX
+import Accelerate
 
 // Numeric validation of the MLX-Swift text encoder against Python reference fixtures.
 // Usage: omni-verify <modelDir> <fixturesJson>
 
 let args = CommandLine.arguments
+
+// Search benchmark: omni-verify searchbench [N] [dim] [queries]
+// Compares brute-force cosine scoring: CPU vDSP fp32 (current), CPU cblas_sgemv fp32 (the
+// doc-claimed-but-unwired path), and GPU MLX bf16 (resident bf16 matrix, one matmul/query).
+// Reports median per-query latency, bf16-vs-fp32 recall@k, and memory. Clustered synthetic
+// vectors so the recall number is meaningful (uniform-random would make every score ~0).
+if args.count >= 2 && args[1] == "searchbench" {
+    let N = (args.count >= 3 ? Int(args[2]) : nil) ?? 420_000
+    let dim = (args.count >= 4 ? Int(args[3]) : nil) ?? 1024
+    let nq = (args.count >= 5 ? Int(args[4]) : nil) ?? 40
+    let topK = 50
+    let clusters = max(64, N / 200)
+    print("searchbench  N=\(N)  dim=\(dim)  queries=\(nq)  topK=\(topK)  clusters=\(clusters)")
+
+    var rng: UInt64 = 0x9E3779B97F4A7C15
+    func nextF() -> Float { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return Float(rng >> 40) / Float(1 << 24) } // [0,1)
+    func gauss() -> Float { let u1 = max(nextF(), 1e-7), u2 = nextF(); return sqrtf(-2 * logf(u1)) * cosf(2 * .pi * u2) }
+    func normalize(_ v: inout [Float], _ off: Int) { var s: Float = 0; for k in 0..<dim { s += v[off+k]*v[off+k] }; s = sqrtf(s) + 1e-9; for k in 0..<dim { v[off+k] /= s } }
+
+    print("generating clustered vectors...")
+    var centers = [Float](repeating: 0, count: clusters * dim)
+    for c in 0..<clusters { for k in 0..<dim { centers[c*dim+k] = gauss() }; normalize(&centers, c*dim) }
+    var flat = [Float](repeating: 0, count: N * dim)
+    for i in 0..<N { let c = i % clusters; for k in 0..<dim { flat[i*dim+k] = centers[c*dim+k] + 0.35*gauss() }; normalize(&flat, i*dim) }
+    var queries: [[Float]] = []
+    for qi in 0..<nq { let c = (qi*37) % clusters; var q = [Float](repeating: 0, count: dim); for k in 0..<dim { q[k] = centers[c*dim+k] + 0.2*gauss() }; normalize(&q, 0); queries.append(q) }
+
+    func topKIdx(_ s: [Float], _ k: Int) -> Set<Int> { Set(s.indices.sorted { s[$0] > s[$1] }.prefix(k)) }
+    func median(_ xs: [Double]) -> Double { xs.sorted()[xs.count/2] }
+
+    // --- CPU fp32 vDSP (current impl) ---
+    func cpuVDSP(_ q: [Float]) -> [Float] {
+        var s = [Float](repeating: 0, count: N); let d = vDSP_Length(dim)
+        q.withUnsafeBufferPointer { qp in flat.withUnsafeBufferPointer { mp in s.withUnsafeMutableBufferPointer { sp in
+            for i in 0..<N { vDSP_dotpr(mp.baseAddress! + i*dim, 1, qp.baseAddress!, 1, sp.baseAddress! + i, d) }
+        }}}; return s
+    }
+    // --- CPU fp32 cblas_sgemv (matrix-vector) ---
+    func cpuGEMV(_ q: [Float]) -> [Float] {
+        var s = [Float](repeating: 0, count: N)
+        q.withUnsafeBufferPointer { qp in flat.withUnsafeBufferPointer { mp in s.withUnsafeMutableBufferPointer { sp in
+            cblas_sgemv(CblasRowMajor, CblasNoTrans, Int32(N), Int32(dim), 1, mp.baseAddress!, Int32(dim), qp.baseAddress!, 1, 0, sp.baseAddress!, 1)
+        }}}; return s
+    }
+    // --- GPU MLX bf16 (resident bf16 matrix, one matmul per query) ---
+    let Mbf = MLXArray(flat, [N, dim]).asType(.bfloat16); MLX.eval(Mbf)
+    func gpuBF16(_ q: [Float]) -> [Float] {
+        let qb = MLXArray(q, [dim, 1]).asType(.bfloat16)
+        let s = MLX.matmul(Mbf, qb)
+        MLX.eval(s)
+        return s.reshaped([N]).asType(.float32).asArray(Float.self)
+    }
+
+    // warm up
+    _ = cpuVDSP(queries[0]); _ = cpuGEMV(queries[0]); _ = gpuBF16(queries[0]); _ = gpuBF16(queries[0])
+
+    var tV: [Double] = [], tG: [Double] = [], tGpu: [Double] = []
+    var recall10 = 0.0, recall50 = 0.0
+    for q in queries {
+        let a = Date(); let sv = cpuVDSP(q); tV.append(-a.timeIntervalSinceNow)
+        let b = Date(); _ = cpuGEMV(q); tG.append(-b.timeIntervalSinceNow)
+        let c = Date(); let sg = gpuBF16(q); tGpu.append(-c.timeIntervalSinceNow)
+        let gt10 = topKIdx(sv, 10), gt50 = topKIdx(sv, topK)
+        let bf10 = topKIdx(sg, 10), bf50 = topKIdx(sg, topK)
+        recall10 += Double(gt10.intersection(bf10).count) / 10.0
+        recall50 += Double(gt50.intersection(bf50).count) / Double(topK)
+    }
+    let fp32MB = Double(N*dim*4) / 1_048_576, bf16MB = Double(N*dim*2) / 1_048_576
+    print(String(format: "\n  CPU vDSP fp32 (current):  %.2f ms/query (median)", median(tV)*1000))
+    print(String(format: "  CPU cblas_sgemv fp32:     %.2f ms/query (median)", median(tG)*1000))
+    print(String(format: "  GPU MLX bf16 (proposed):  %.2f ms/query (median)", median(tGpu)*1000))
+    print(String(format: "\n  speedup GPU-bf16 vs CPU-vDSP:  %.2fx", median(tV)/median(tGpu)))
+    print(String(format: "  recall@10 (bf16 vs fp32):  %.4f", recall10/Double(nq)))
+    print(String(format: "  recall@%d (bf16 vs fp32):  %.4f", topK, recall50/Double(nq)))
+    print(String(format: "\n  matrix memory:  fp32 %.0f MB  ->  bf16 %.0f MB  (%.0f%% smaller)", fp32MB, bf16MB, 100*(1 - bf16MB/fp32MB)))
+    exit(0)
+}
 
 // Throughput benchmark: omni-verify bench [modelDir] [batch] [count]
 // Embeds a varied-length text corpus through the exact indexing path and reports tok/s.
