@@ -10,12 +10,14 @@ struct OmniApp: App {
             ContentView()
                 .environment(model)
                 .frame(minWidth: 820, minHeight: 520)
+                .task { Updater.checkOnLaunchIfDue() }   // silent once-a-day check; prompts only if newer
         }
         .defaultSize(width: 1000, height: 660)
         .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(replacing: .appInfo) {
                 Button("About Omni") { showAbout() }
+                Button("Check for Updates\u{2026}") { Updater.check(userInitiated: true) }
             }
             // The primary actions on the selected result, reachable from the menu bar and keyboard
             // with visible shortcut hints (previously double-click / context-menu only).
@@ -91,8 +93,11 @@ struct OmniApp: App {
                 .font: NSFont.systemFont(ofSize: 11),
                 .foregroundColor: NSColor.secondaryLabelColor,
             ])
+        let marketingVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
         NSApplication.shared.orderFrontStandardAboutPanel(options: [
             .applicationName: "Omni",
+            .applicationVersion: marketingVersion,   // "Version 0.1.16"
+            .version: "",                            // suppress the build-number "(1)" in parens
             .credits: credits,
         ])
     }
