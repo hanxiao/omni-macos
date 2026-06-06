@@ -77,7 +77,7 @@ public final class VectorStore: @unchecked Sendable {
     private let queue = DispatchQueue(label: "omni.vectorstore")
     private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-    private struct Row { let path: String; let snippet: String; let kind: String; let chunkIndex: Int; let modified: Double }
+    struct Row { let path: String; let snippet: String; let kind: String; let chunkIndex: Int; let modified: Double }
     private var rows: [Row] = []
     // Single source of truth for embeddings: contiguous bf16 bits, [count*dim], row i = rows[i].
     // bf16 (2 bytes/dim) halves residency and disk vs fp32 with negligible recall loss on
@@ -85,9 +85,16 @@ public final class VectorStore: @unchecked Sendable {
     // matrix from these bytes (reinterpreted, not converted) and scores on the GPU in one matmul.
     private var flat16: [UInt16] = []
     private var dim = 0
-    // Cached resident GPU matrix for search, rebuilt lazily from flat16 after any mutation.
-    private var mlxMatrix: MLXArray?
-    private var mlxDirty = true
+    // Resident GPU score matrix, split so indexing inserts don't recopy it. `mlxBase` is an
+    // MLX-OWNED copy of rows [0, baseRows) (mlx_array_new_data copies, so it's independent of
+    // flat16's storage). Rows appended past baseRows are the "delta" - scored per query with one
+    // small matmul. An ordinary indexing append just grows the delta; the 0.8 GB base copy is
+    // rebuilt only on a structural change (delete/reload) or once the delta exceeds foldThreshold,
+    // instead of on every query as before. Result is identical (base+delta covers all rows).
+    private var mlxBase: MLXArray?
+    private var baseRows = 0
+    private var baseDirty = true
+    private static let foldThreshold = 50_000
 
     // fp32 <-> bf16 (round-to-nearest-even). Embeddings are L2-normalized and finite, so |x| <= ~1
     // and the rounding add never overflows.
@@ -97,11 +104,37 @@ public final class VectorStore: @unchecked Sendable {
     }
     @inline(__always) static func fromBF16(_ x: UInt16) -> Float { Float(bitPattern: UInt32(x) << 16) }
     private func bf16Row(_ v: [Float]) -> [UInt16] { v.map(Self.toBF16) }
-    private func invalidateSearchCache() { mlxDirty = true; mlxMatrix = nil }
+    // Force a full base rebuild on the next search. Used by structural changes (delete/compact/
+    // reload) that shift row indices; plain appends do NOT call this (they extend the delta).
+    private func invalidateBase() { baseDirty = true; mlxBase = nil; baseRows = 0 }
     // Membership index of the paths currently in `rows`. Lets replace() know in O(1) whether a
     // path pre-exists, so a brand-new file skips removeRowsLocked entirely (no O(N) scan per file
     // during a full index). Rebuilt from the surviving rows whenever removeRowsLocked compacts.
     private var presentPaths: Set<String> = []
+
+    // Dense per-row file id (row-aligned with `rows`), plus its path->id intern table. Search
+    // results are per FILE, but the index stores one vector per CHUNK; the reducer groups N chunk
+    // scores into the best chunk per file. Hashing the path STRING for every one of N rows was the
+    // dominant cost of search (the matmul is ~10ms; that loop was ~120ms at 420K). With a dense
+    // fileID, the reducer groups via a flat array indexed by id - no string hashing in the hot loop.
+    // INVARIANT: fileID.count == rows.count, and pathID.count == number of distinct present paths,
+    // with fileID[i] in [0, pathID.count). Kept in lockstep with `rows` at every mutation; any
+    // structural change to `rows` must call rebuildFileIDsLocked().
+    private var fileID: [Int32] = []
+    private var pathID: [String: Int32] = [:]
+    private var fileIDCount: Int { pathID.count }
+    @inline(__always) private func internPath(_ p: String) -> Int32 {
+        if let id = pathID[p] { return id }
+        let id = Int32(pathID.count); pathID[p] = id; return id
+    }
+    /// Rebuild the dense fileID/pathID tables from the current `rows`. Call after any structural
+    /// change that rewrites or reorders `rows` (compaction, reload, wipe).
+    private func rebuildFileIDsLocked() {
+        pathID.removeAll(keepingCapacity: true)
+        fileID.removeAll(keepingCapacity: true)
+        fileID.reserveCapacity(rows.count)
+        for r in rows { fileID.append(internPath(r.path)) }
+    }
 
     public let dbURL: URL
 
@@ -198,9 +231,11 @@ public final class VectorStore: @unchecked Sendable {
             for (i, c) in chunks.enumerated() {
                 rows.append(Row(path: c.path, snippet: c.snippet, kind: c.kind, chunkIndex: c.chunkIndex, modified: c.modified))
                 flat16.append(contentsOf: bfs[i])
+                fileID.append(internPath(c.path))
             }
             presentPaths.insert(path)
-            invalidateSearchCache()
+            // No invalidateBase(): a new path's rows append past baseRows and are scored as delta.
+            // A pre-existing path already triggered removeRowsLocked above, which invalidates.
         }
     }
 
@@ -258,10 +293,12 @@ public final class VectorStore: @unchecked Sendable {
                 for (ci, c) in it.chunks.enumerated() {
                     rows.append(Row(path: c.path, snippet: c.snippet, kind: c.kind, chunkIndex: c.chunkIndex, modified: c.modified))
                     flat16.append(contentsOf: bfs[wi][ci])
+                    fileID.append(internPath(c.path))
                 }
                 presentPaths.insert(it.path)
             }
-            invalidateSearchCache()
+            // No invalidateBase(): appended rows are scored as delta. Any pre-existing path in the
+            // batch already triggered removeRowsLocked above, which invalidates the base.
         }
     }
 
@@ -352,7 +389,7 @@ public final class VectorStore: @unchecked Sendable {
             exec("DELETE FROM chunks;")
             // Release the backing buffers (a wipe will not refill to the same size immediately),
             // rather than removeAll which keeps the ~1.6GB capacity reserved.
-            rows = []; flat16 = []; presentPaths = []; invalidateSearchCache()
+            rows = []; flat16 = []; presentPaths = []; fileID = []; pathID = [:]; invalidateBase()
             dim = 0
         }
     }
@@ -400,41 +437,109 @@ public final class VectorStore: @unchecked Sendable {
 
     // MARK: - Search (Accelerate GEMV)
 
-    /// Top-K cosine search. Scores every vector with one bf16 matmul on the GPU (resident bf16
-    /// matrix), then keeps the best-scoring chunk per file. Score thresholding is left to the caller.
+    /// Top-K cosine search over all indexed files. Scores via base matmul + delta matmul on the GPU,
+    /// then collapses to the best chunk per file. Runs under `queue` (the original locking model):
+    /// benchmarking showed routing the matmul through the engine's priority gate to "win" the GPU
+    /// during indexing actually HURT both search latency and indexing throughput (the gate forces a
+    /// coarse CPU-level serialization that MLX's stream scheduler already does better), and an
+    /// off-lock snapshot variant introduced a transient 2x-base memory burst for no real gain. So
+    /// search stays under the lock; the wins are the base+delta (no per-query rebuild) and the
+    /// numeric reduceTopK (no per-row path-string hashing).
     public func search(_ query: [Float], filter: SearchFilter = SearchFilter(), topK: Int = 40) -> [SearchHit] {
         queue.sync {
             let n = rows.count
             guard n > 0, dim > 0, query.count == dim, flat16.count == n * dim else { return [] }
-
-            // Resident bf16 matrix on the GPU, (re)built only after a mutation. flat16's bytes ARE
-            // the bf16 matrix - reinterpreted, not converted - so one matmul scores all N vectors.
-            if mlxDirty || mlxMatrix == nil {
-                flat16.withUnsafeBytes { raw in
-                    let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!),
-                                    count: raw.count, deallocator: .none)
-                    mlxMatrix = MLXArray(data, [n, dim], dtype: .bfloat16)
-                }
-                MLX.eval(mlxMatrix!)
-                mlxDirty = false
+            if baseDirty || mlxBase == nil || (n - baseRows) > Self.foldThreshold {
+                rebuildBaseLocked(rowCount: n)
             }
             let qv = MLXArray(query, [dim, 1]).asType(.bfloat16)
-            let scoreArr = MLX.matmul(mlxMatrix!, qv)
-            MLX.eval(scoreArr)
-            let scores = scoreArr.reshaped([n]).asType(.float32).asArray(Float.self)
-
-            var best: [String: SearchHit] = [:]
-            best.reserveCapacity(min(n, 512))
-            for i in 0 ..< n {
-                let r = rows[i]
-                if !filter.accepts(path: r.path, kind: r.kind, modified: r.modified) { continue }
-                let dot = scores[i]
-                if !dot.isFinite { continue }   // ignore any degenerate (NaN/inf) stored vector
-                if let e = best[r.path], e.score >= dot { continue }
-                best[r.path] = SearchHit(path: r.path, score: dot, snippet: r.snippet, kind: r.kind, chunkIndex: r.chunkIndex, modified: r.modified)
+            let baseScore = MLX.matmul(mlxBase!, qv)
+            MLX.eval(baseScore)
+            var scores = baseScore.reshaped([baseRows]).asType(.float32).asArray(Float.self)
+            // Delta: rows [baseRows, n) appended since the base was built (bounded by foldThreshold).
+            // flat16 is stable for this synchronous call, so a bytesNoCopy wrap into the matmul is safe.
+            if n > baseRows {
+                let deltaCount = n - baseRows
+                flat16.withUnsafeBytes { raw in
+                    let p = raw.baseAddress!.advanced(by: baseRows * dim * MemoryLayout<UInt16>.size)
+                    let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: p),
+                                    count: deltaCount * dim * MemoryLayout<UInt16>.size, deallocator: .none)
+                    let dm = MLXArray(data, [deltaCount, dim], dtype: .bfloat16)
+                    let ds = MLX.matmul(dm, qv)
+                    MLX.eval(ds)
+                    scores.append(contentsOf: ds.reshaped([deltaCount]).asType(.float32).asArray(Float.self))
+                }
             }
-            return Array(best.values).sorted { $0.score > $1.score }.prefix(topK).map { $0 }
+            return Self.reduceTopK(scores: scores, fileID: fileID, fileCount: fileIDCount,
+                                   rows: rows, filter: filter, topK: topK)
         }
+    }
+
+    /// Collapse N per-chunk `scores` into the top-K best-scoring FILES. Groups chunks by the dense
+    /// `fileID` (a flat-array lookup, not a path-string hash) and keeps the best chunk per file, then
+    /// returns the top-K files. Pure and lock-free so it can run off `queue` (used by the search
+    /// reducer and by the differential test against `reduceTopKReference`).
+    ///
+    /// Filter handling matches the per-row reference exactly: kind/`since` are applied per row in the
+    /// hot loop (they can in principle vary per chunk); `folderPrefix`/`ext` are path-based and so
+    /// identical for every chunk of a file, so applying them once to each file's winner is exact.
+    static func reduceTopK(scores: [Float], fileID: [Int32], fileCount: Int,
+                           rows: [Row], filter: SearchFilter, topK: Int) -> [SearchHit] {
+        let n = rows.count
+        guard n > 0, fileCount > 0, topK > 0, scores.count >= n, fileID.count >= n else { return [] }
+        var bestScore = [Float](repeating: -.infinity, count: fileCount)
+        var bestRow = [Int32](repeating: -1, count: fileCount)
+        let kinds = filter.kinds, hasKind = !filter.kinds.isEmpty, since = filter.since
+        for i in 0 ..< n {
+            let dot = scores[i]
+            if !dot.isFinite { continue }            // ignore degenerate (NaN/inf) stored vectors
+            let r = rows[i]
+            if hasKind && !kinds.contains(r.kind) { continue }
+            if let s = since, r.modified < s { continue }
+            let f = Int(fileID[i])
+            if dot > bestScore[f] { bestScore[f] = dot; bestRow[f] = Int32(i) }   // strict > keeps lowest row index on tie (== reference's `>=` skip)
+        }
+        var hits: [SearchHit] = []
+        hits.reserveCapacity(min(fileCount, max(topK, 16)))
+        for f in 0 ..< fileCount {
+            let ri = bestRow[f]
+            if ri < 0 { continue }
+            let r = rows[Int(ri)]
+            if !filter.accepts(path: r.path, kind: r.kind, modified: r.modified) { continue }
+            hits.append(SearchHit(path: r.path, score: bestScore[f], snippet: r.snippet, kind: r.kind, chunkIndex: r.chunkIndex, modified: r.modified))
+        }
+        return hits.sorted { $0.score > $1.score }.prefix(topK).map { $0 }
+    }
+
+    /// The original string-keyed best-per-path reducer, kept verbatim as the differential-test oracle
+    /// for `reduceTopK`. Not used in production. O(N) with a path-string hash per row.
+    static func reduceTopKReference(scores: [Float], rows: [Row], filter: SearchFilter, topK: Int) -> [SearchHit] {
+        var best: [String: SearchHit] = [:]
+        best.reserveCapacity(min(rows.count, 512))
+        for i in 0 ..< rows.count {
+            let r = rows[i]
+            if !filter.accepts(path: r.path, kind: r.kind, modified: r.modified) { continue }
+            let dot = scores[i]
+            if !dot.isFinite { continue }
+            if let e = best[r.path], e.score >= dot { continue }
+            best[r.path] = SearchHit(path: r.path, score: dot, snippet: r.snippet, kind: r.kind, chunkIndex: r.chunkIndex, modified: r.modified)
+        }
+        return Array(best.values).sorted { $0.score > $1.score }.prefix(topK).map { $0 }
+    }
+
+    /// Build the owned base score matrix over rows [0, rowCount). mlx_array_new_data copies, so the
+    /// result is independent of flat16 (which reallocates as indexing appends) - no aliasing. Called
+    /// only on a structural change or fold, not per query. Must run on `queue`.
+    private func rebuildBaseLocked(rowCount: Int) {
+        let byteCount = rowCount * dim * MemoryLayout<UInt16>.size
+        flat16.withUnsafeBytes { raw in
+            let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!),
+                            count: byteCount, deallocator: .none)
+            mlxBase = MLXArray(data, [rowCount, dim], dtype: .bfloat16)
+        }
+        MLX.eval(mlxBase!)
+        baseRows = rowCount
+        baseDirty = false
     }
 
     public func kinds() -> Set<String> { queue.sync { Set(rows.map { $0.kind }) } }
@@ -545,7 +650,17 @@ public final class VectorStore: @unchecked Sendable {
     /// Drop rows (and their contiguous embedding slices) matching the predicate, compacting
     /// `flat16` in one pass. Only runs on deletes, never on search.
     private func removeRowsLocked(_ predicate: (Row) -> Bool) {
-        guard dim > 0 else { rows.removeAll(where: predicate); presentPaths = Set(rows.map { $0.path }); return }
+        // dim==0 means no vectors stored yet, but `rows` may still hold metadata - keep fileID and
+        // the base in sync if anything is actually removed (the base was previously left stale here).
+        guard dim > 0 else {
+            if rows.contains(where: predicate) {
+                rows.removeAll(where: predicate)
+                presentPaths = Set(rows.map { $0.path })
+                rebuildFileIDsLocked()
+                invalidateBase()
+            }
+            return
+        }
         // Fast path: if nothing matches, skip the full O(N) buffer rebuild. This is the common
         // case - replace() calls this before appending a NEW file's chunks, where there is no
         // prior row to remove. Without it, every stored file rebuilt the entire ~dim*rows.count
@@ -564,7 +679,8 @@ public final class VectorStore: @unchecked Sendable {
         // Our delete predicates always remove ALL rows of a matched path, so survivors define the
         // exact set of present paths after compaction.
         presentPaths = Set(rows.map { $0.path })
-        invalidateSearchCache()
+        rebuildFileIDsLocked()   // rows were rewritten - re-densify fileID over the survivors
+        invalidateBase()
     }
 
     private func deletePathLocked(_ path: String) {
@@ -577,7 +693,7 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     private func loadIntoMemory() {
-        rows.removeAll(); flat16.removeAll(); presentPaths.removeAll(); dim = 0
+        rows.removeAll(); flat16.removeAll(); presentPaths.removeAll(); fileID.removeAll(); pathID.removeAll(); dim = 0
         // Pre-size the buffers to the final row/element count so the bf16 buffer is filled in place
         // rather than grown through ~log2(N) reallocations. One COUNT(*) + one dim read up front.
         let total = scalarQuery("SELECT COUNT(*) FROM chunks")
@@ -586,6 +702,7 @@ public final class VectorStore: @unchecked Sendable {
             rows.reserveCapacity(total)
             flat16.reserveCapacity(total * d0)
             presentPaths.reserveCapacity(total)
+            fileID.reserveCapacity(total)
         }
         var stmt: OpaquePointer?
         if sqlite3_prepare_v2(db, "SELECT path, snippet, kind, chunk_index, dim, vec, modified FROM chunks;", -1, &stmt, nil) == SQLITE_OK {
@@ -611,11 +728,12 @@ public final class VectorStore: @unchecked Sendable {
                     flat16.append(contentsOf: repeatElement(0, count: d))   // short/corrupt row
                 }
                 rows.append(Row(path: path, snippet: snippet, kind: kind, chunkIndex: ci, modified: modified))
+                fileID.append(internPath(path))
                 presentPaths.insert(path)
             }
         }
         sqlite3_finalize(stmt)
-        invalidateSearchCache()
+        invalidateBase()
     }
 
     private func userVersion() -> Int32 {
