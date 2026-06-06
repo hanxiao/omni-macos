@@ -438,6 +438,8 @@ img { max-width: 100%; display: block; }
   color: var(--muted);
   letter-spacing: 0.02em;
 }
+.download-note + .download-note { margin-top: 6px; }
+.dl-md5 { color: var(--fg); opacity: 0.7; user-select: all; word-break: break-all; }
 /* version pill inside the download button */
 .dl-ver {
   margin-left: 8px;
@@ -497,7 +499,7 @@ img { max-width: 100%; display: block; }
       <nav class="header-nav">
         <a class="nav-link" href="#features">Features</a>
         <a class="nav-link" href="#serving">Serving</a>
-        <a class="btn btn-primary" href="Omni.dmg">Download</a>
+        <a class="btn btn-primary" href="Omni-0.1.15.dmg">Download</a>
       </nav>
     </div>
   </header>
@@ -511,7 +513,7 @@ img { max-width: 100%; display: block; }
         <h1 class="hero-title">Search every file on your Mac by meaning.</h1>
         <p class="hero-sub">Text, code, PDFs, images, audio, and video in one vector space - searched in any language, entirely on-device.</p>
         <div class="hero-actions">
-          <a class="btn btn-primary btn-lg" href="Omni.dmg">Download for macOS <span class="dl-ver">v0.1.10</span></a>
+          <a class="btn btn-primary btn-lg" href="Omni-0.1.15.dmg">Download for macOS <span class="dl-ver">v0.1.10</span></a>
         </div>
         <p class="hero-note mono">Apple silicon &middot; macOS 14+</p>
       </div>
@@ -617,8 +619,9 @@ img { max-width: 100%; display: block; }
     <section id="download" class="download">
       <div class="container download-inner">
         <h2 class="download-title">Get Omni</h2>
-        <a class="btn btn-primary btn-lg" href="Omni.dmg">Download for macOS <span class="dl-ver">v0.1.10</span></a>
+        <a class="btn btn-primary btn-lg" href="Omni-0.1.15.dmg">Download for macOS <span class="dl-ver">v0.1.10</span></a>
         <p class="download-note mono">Apple silicon &middot; macOS 14+ &middot; the model downloads once, then works offline</p>
+        <p class="download-note mono">MD5 <span class="dl-md5">—</span></p>
       </div>
     </section>
 
