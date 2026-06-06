@@ -73,8 +73,9 @@ final class DecodedItem: @unchecked Sendable {
     let kind: String
     let payload: Payload
     let unchanged: Bool   // already indexed and not modified - not a "skip", just nothing to do
-    init(file: CrawledFile, kind: String = "", payload: Payload = .empty, unchanged: Bool = false) {
-        self.file = file; self.kind = kind; self.payload = payload; self.unchanged = unchanged
+    let abandoned: Bool   // produced after a pause/cancel - not consumed, not counted (re-indexed on resume)
+    init(file: CrawledFile, kind: String = "", payload: Payload = .empty, unchanged: Bool = false, abandoned: Bool = false) {
+        self.file = file; self.kind = kind; self.payload = payload; self.unchanged = unchanged; self.abandoned = abandoned
     }
 }
 
@@ -411,10 +412,13 @@ public final class Indexer: @unchecked Sendable {
                     $0.modified == file.modified && $0.size == file.size
                 } ?? false)
                 if self.isCancelled || unchanged {
-                    cond.lock(); ready.items[i] = DecodedItem(file: file, unchanged: unchanged); cond.signal(); cond.unlock()
+                    // On cancel, mark abandoned (unless genuinely unchanged) so the consumer skips it
+                    // instead of counting it as "skipped" - it just hasn't been processed yet.
+                    let item = DecodedItem(file: file, unchanged: unchanged, abandoned: self.isCancelled && !unchanged)
+                    cond.lock(); ready.items[i] = item; cond.signal(); cond.unlock()
                 } else {
                     decodeQ.async {
-                        let item = self.isCancelled ? DecodedItem(file: file) : self.decode(file)
+                        let item = self.isCancelled ? DecodedItem(file: file, abandoned: true) : self.decode(file)
                         cond.lock(); ready.items[i] = item; cond.signal(); cond.unlock()
                     }
                 }
@@ -427,6 +431,7 @@ public final class Indexer: @unchecked Sendable {
             let item = ready.items.removeValue(forKey: i)!
             cond.unlock()
             sem.signal()
+            if item.abandoned { continue }   // paused: don't consume/count files left unprocessed
             consume(item)
         }
     }
