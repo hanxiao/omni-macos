@@ -170,6 +170,7 @@ private struct ContentTypesTab: View {
                 Text("What to Index")
             } footer: {
                 Text("Drag a type onto another to reorder how they are indexed.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
 
             Section {
@@ -279,7 +280,12 @@ private struct PerformanceTab: View {
                     Text("1568 px \u{00B7} recommended").tag(1568)
                     Text("2048 px").tag(2048)
                 }
-                Stepper("Max video frames per clip: \(model.maxVideoFrames)", value: Binding(get: { model.maxVideoFrames }, set: { model.maxVideoFrames = $0 }), in: 1 ... 16)
+                Picker("Max frames per video", selection: Binding(get: { model.maxVideoFrames }, set: { model.maxVideoFrames = $0 })) {
+                    Text("3").tag(3)
+                    Text("6 \u{00B7} recommended").tag(6)
+                    Text("9").tag(9)
+                    Text("18").tag(18)
+                }
                 Picker("Max characters per chunk", selection: Binding(get: { model.maxTextChunkChars }, set: { model.maxTextChunkChars = $0 })) {
                     Text("1200").tag(1200)
                     Text("1800").tag(1800)
