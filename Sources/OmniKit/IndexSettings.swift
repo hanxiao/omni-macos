@@ -16,8 +16,9 @@ public struct IndexSettings: Sendable, Equatable {
     public var disabledExtensions: Set<String> = []
 
     /// Order the modalities are indexed in (user-reorderable). A uniform phase per kind lets text
-    /// chunks batch across files; the order sets which modality is embedded first.
-    public var kindOrder: [FileKind] = [.text, .image, .audio, .video]
+    /// chunks batch across files; the order sets which modality is embedded first. Text is last by
+    /// default: media is slower to index, so getting it done first surfaces those results sooner.
+    public var kindOrder: [FileKind] = [.image, .audio, .video, .text]
 
     // Index-time minimums: files below these are skipped (0 = no minimum).
     public var minImageDimension: Int = 0   // largest image side, px
