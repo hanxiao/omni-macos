@@ -1,6 +1,7 @@
 import Foundation
 import SQLite3
 import Accelerate
+import MLX
 
 /// A single indexed chunk: one file may produce several chunks.
 public struct IndexedChunk: Sendable {
@@ -78,11 +79,25 @@ public final class VectorStore: @unchecked Sendable {
 
     private struct Row { let path: String; let snippet: String; let kind: String; let chunkIndex: Int; let modified: Double }
     private var rows: [Row] = []
-    // Single source of truth for embeddings: contiguous [count*dim], row i = rows[i]. Kept in
-    // sync on every mutation so search never rebuilds it (no full re-scan during indexing), and
-    // there is no second parallel [[Float]] copy (halves embedding residency).
-    private var flat: [Float] = []
+    // Single source of truth for embeddings: contiguous bf16 bits, [count*dim], row i = rows[i].
+    // bf16 (2 bytes/dim) halves residency and disk vs fp32 with negligible recall loss on
+    // L2-normalized vectors. Kept in sync on every mutation; search builds a resident MLX bf16
+    // matrix from these bytes (reinterpreted, not converted) and scores on the GPU in one matmul.
+    private var flat16: [UInt16] = []
     private var dim = 0
+    // Cached resident GPU matrix for search, rebuilt lazily from flat16 after any mutation.
+    private var mlxMatrix: MLXArray?
+    private var mlxDirty = true
+
+    // fp32 <-> bf16 (round-to-nearest-even). Embeddings are L2-normalized and finite, so |x| <= ~1
+    // and the rounding add never overflows.
+    @inline(__always) static func toBF16(_ x: Float) -> UInt16 {
+        let b = x.bitPattern
+        return UInt16(truncatingIfNeeded: (b &+ 0x7FFF &+ ((b >> 16) & 1)) >> 16)
+    }
+    @inline(__always) static func fromBF16(_ x: UInt16) -> Float { Float(bitPattern: UInt32(x) << 16) }
+    private func bf16Row(_ v: [Float]) -> [UInt16] { v.map(Self.toBF16) }
+    private func invalidateSearchCache() { mlxDirty = true; mlxMatrix = nil }
     // Membership index of the paths currently in `rows`. Lets replace() know in O(1) whether a
     // path pre-exists, so a brand-new file skips removeRowsLocked entirely (no O(N) scan per file
     // during a full index). Rebuilt from the surviving rows whenever removeRowsLocked compacts.
@@ -150,6 +165,7 @@ public final class VectorStore: @unchecked Sendable {
             }
             exec("BEGIN;")
             deletePathLocked(path)
+            let bfs = chunks.map { bf16Row($0.embedding) }   // fp32 -> bf16 once, reused for blob + memory
             let sql = "INSERT INTO chunks(path, modified, size, kind, chunk_index, snippet, dim, vec) VALUES(?,?,?,?,?,?,?,?);"
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -157,7 +173,7 @@ public final class VectorStore: @unchecked Sendable {
                 throw OmniError.store("prepare insert failed")
             }
             defer { sqlite3_finalize(stmt) }
-            for c in chunks {
+            for (i, c) in chunks.enumerated() {
                 sqlite3_reset(stmt)
                 sqlite3_bind_text(stmt, 1, c.path, -1, SQLITE_TRANSIENT)
                 sqlite3_bind_double(stmt, 2, c.modified)
@@ -166,7 +182,7 @@ public final class VectorStore: @unchecked Sendable {
                 sqlite3_bind_int(stmt, 5, Int32(c.chunkIndex))
                 sqlite3_bind_text(stmt, 6, c.snippet, -1, SQLITE_TRANSIENT)
                 sqlite3_bind_int(stmt, 7, Int32(c.embedding.count))
-                c.embedding.withUnsafeBytes { raw in
+                bfs[i].withUnsafeBytes { raw in
                     _ = sqlite3_bind_blob(stmt, 8, raw.baseAddress, Int32(raw.count), SQLITE_TRANSIENT)
                 }
                 guard sqlite3_step(stmt) == SQLITE_DONE else {
@@ -177,15 +193,14 @@ public final class VectorStore: @unchecked Sendable {
             exec("COMMIT;")
             // Only rebuild the in-memory buffer if this path already had rows. For a new file
             // (the dominant indexing case) there is nothing to remove, so skip the O(N) scan and
-            // just append. `append` grows `flat`/`rows` geometrically (amortized O(1)); a per-file
-            // reserveCapacity to the exact running size would allocate exactly and recopy the whole
-            // buffer every file - O(N^2) over a full index.
+            // just append. `append` grows flat16/rows geometrically (amortized O(1)).
             if presentPaths.contains(path) { removeRowsLocked { $0.path == path } }
-            for c in chunks {
+            for (i, c) in chunks.enumerated() {
                 rows.append(Row(path: c.path, snippet: c.snippet, kind: c.kind, chunkIndex: c.chunkIndex, modified: c.modified))
-                flat.append(contentsOf: c.embedding)
+                flat16.append(contentsOf: bfs[i])
             }
             presentPaths.insert(path)
+            invalidateSearchCache()
         }
     }
 
@@ -205,6 +220,7 @@ public final class VectorStore: @unchecked Sendable {
                     }
                 }
             }
+            let bfs = work.map { $0.chunks.map { bf16Row($0.embedding) } }   // fp32 -> bf16 once
             exec("BEGIN;")
             let sql = "INSERT INTO chunks(path, modified, size, kind, chunk_index, snippet, dim, vec) VALUES(?,?,?,?,?,?,?,?);"
             var stmt: OpaquePointer?
@@ -213,9 +229,9 @@ public final class VectorStore: @unchecked Sendable {
                 throw OmniError.store("prepare insert failed")
             }
             defer { sqlite3_finalize(stmt) }
-            for it in work {
+            for (wi, it) in work.enumerated() {
                 deletePathLocked(it.path)
-                for c in it.chunks {
+                for (ci, c) in it.chunks.enumerated() {
                     sqlite3_reset(stmt)
                     sqlite3_bind_text(stmt, 1, c.path, -1, SQLITE_TRANSIENT)
                     sqlite3_bind_double(stmt, 2, c.modified)
@@ -224,7 +240,7 @@ public final class VectorStore: @unchecked Sendable {
                     sqlite3_bind_int(stmt, 5, Int32(c.chunkIndex))
                     sqlite3_bind_text(stmt, 6, c.snippet, -1, SQLITE_TRANSIENT)
                     sqlite3_bind_int(stmt, 7, Int32(c.embedding.count))
-                    c.embedding.withUnsafeBytes { raw in
+                    bfs[wi][ci].withUnsafeBytes { raw in
                         _ = sqlite3_bind_blob(stmt, 8, raw.baseAddress, Int32(raw.count), SQLITE_TRANSIENT)
                     }
                     guard sqlite3_step(stmt) == SQLITE_DONE else {
@@ -238,13 +254,14 @@ public final class VectorStore: @unchecked Sendable {
             if affected.contains(where: { presentPaths.contains($0) }) {
                 removeRowsLocked { affected.contains($0.path) }   // one rebuild for the whole batch
             }
-            for it in work {
-                for c in it.chunks {
+            for (wi, it) in work.enumerated() {
+                for (ci, c) in it.chunks.enumerated() {
                     rows.append(Row(path: c.path, snippet: c.snippet, kind: c.kind, chunkIndex: c.chunkIndex, modified: c.modified))
-                    flat.append(contentsOf: c.embedding)
+                    flat16.append(contentsOf: bfs[wi][ci])
                 }
                 presentPaths.insert(it.path)
             }
+            invalidateSearchCache()
         }
     }
 
@@ -335,7 +352,7 @@ public final class VectorStore: @unchecked Sendable {
             exec("DELETE FROM chunks;")
             // Release the backing buffers (a wipe will not refill to the same size immediately),
             // rather than removeAll which keeps the ~1.6GB capacity reserved.
-            rows = []; flat = []; presentPaths = []
+            rows = []; flat16 = []; presentPaths = []; invalidateSearchCache()
             dim = 0
         }
     }
@@ -383,25 +400,28 @@ public final class VectorStore: @unchecked Sendable {
 
     // MARK: - Search (Accelerate GEMV)
 
-    /// Top-K cosine search. Scores all vectors with one cblas_sgemv, then keeps the
-    /// best-scoring chunk per file. Score thresholding is left to the caller.
+    /// Top-K cosine search. Scores every vector with one bf16 matmul on the GPU (resident bf16
+    /// matrix), then keeps the best-scoring chunk per file. Score thresholding is left to the caller.
     public func search(_ query: [Float], filter: SearchFilter = SearchFilter(), topK: Int = 40) -> [SearchHit] {
         queue.sync {
             let n = rows.count
-            guard n > 0, dim > 0, query.count == dim else { return [] }
+            guard n > 0, dim > 0, query.count == dim, flat16.count == n * dim else { return [] }
 
-            var scores = [Float](repeating: 0, count: n)
-            let d = vDSP_Length(dim)
-            query.withUnsafeBufferPointer { qp in
-                flat.withUnsafeBufferPointer { mp in
-                    scores.withUnsafeMutableBufferPointer { sp in
-                        guard let q = qp.baseAddress, let m = mp.baseAddress, let s = sp.baseAddress else { return }
-                        for i in 0 ..< n {
-                            vDSP_dotpr(m + i * dim, 1, q, 1, s + i, d)
-                        }
-                    }
+            // Resident bf16 matrix on the GPU, (re)built only after a mutation. flat16's bytes ARE
+            // the bf16 matrix - reinterpreted, not converted - so one matmul scores all N vectors.
+            if mlxDirty || mlxMatrix == nil {
+                flat16.withUnsafeBytes { raw in
+                    let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!),
+                                    count: raw.count, deallocator: .none)
+                    mlxMatrix = MLXArray(data, [n, dim], dtype: .bfloat16)
                 }
+                MLX.eval(mlxMatrix!)
+                mlxDirty = false
             }
+            let qv = MLXArray(query, [dim, 1]).asType(.bfloat16)
+            let scoreArr = MLX.matmul(mlxMatrix!, qv)
+            MLX.eval(scoreArr)
+            let scores = scoreArr.reshaped([n]).asType(.float32).asArray(Float.self)
 
             var best: [String: SearchHit] = [:]
             best.reserveCapacity(min(n, 512))
@@ -425,12 +445,14 @@ public final class VectorStore: @unchecked Sendable {
             guard dim > 0, query.count == dim else { return [] }
             var hits: [ChunkHit] = []
             let d = vDSP_Length(dim)
+            var rowF = [Float](repeating: 0, count: dim)   // one row, bf16 -> fp32 for the dot
             query.withUnsafeBufferPointer { q in
-                flat.withUnsafeBufferPointer { fb in
+                flat16.withUnsafeBufferPointer { fb in
                     guard let qp = q.baseAddress, let mb = fb.baseAddress else { return }
                     for i in 0 ..< rows.count where rows[i].path == path {
+                        for k in 0 ..< dim { rowF[k] = Self.fromBF16(mb[i * dim + k]) }
                         var dot: Float = 0
-                        vDSP_dotpr(mb + i * dim, 1, qp, 1, &dot, d)
+                        rowF.withUnsafeBufferPointer { vDSP_dotpr($0.baseAddress!, 1, qp, 1, &dot, d) }
                         if dot.isFinite { hits.append(ChunkHit(chunkIndex: rows[i].chunkIndex, score: dot, snippet: rows[i].snippet)) }
                     }
                 }
@@ -521,27 +543,28 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     /// Drop rows (and their contiguous embedding slices) matching the predicate, compacting
-    /// `flat` in one pass. Only runs on deletes, never on search.
+    /// `flat16` in one pass. Only runs on deletes, never on search.
     private func removeRowsLocked(_ predicate: (Row) -> Bool) {
         guard dim > 0 else { rows.removeAll(where: predicate); presentPaths = Set(rows.map { $0.path }); return }
         // Fast path: if nothing matches, skip the full O(N) buffer rebuild. This is the common
         // case - replace() calls this before appending a NEW file's chunks, where there is no
         // prior row to remove. Without it, every stored file rebuilt the entire ~dim*rows.count
-        // float buffer (a multi-GB memmove on a large index), making indexing and reconcile O(N^2).
+        // buffer (a multi-GB memmove on a large index), making indexing and reconcile O(N^2).
         guard rows.contains(where: predicate) else { return }
         var keptRows: [Row] = []; keptRows.reserveCapacity(rows.count)
-        var keptFlat: [Float] = []; keptFlat.reserveCapacity(flat.count)
-        flat.withUnsafeBufferPointer { fb in
+        var keptFlat: [UInt16] = []; keptFlat.reserveCapacity(flat16.count)
+        flat16.withUnsafeBufferPointer { fb in
             guard let base = fb.baseAddress else { return }
             for i in 0 ..< rows.count where !predicate(rows[i]) {
                 keptRows.append(rows[i])
                 keptFlat.append(contentsOf: UnsafeBufferPointer(start: base + i * dim, count: dim))
             }
         }
-        rows = keptRows; flat = keptFlat
+        rows = keptRows; flat16 = keptFlat
         // Our delete predicates always remove ALL rows of a matched path, so survivors define the
         // exact set of present paths after compaction.
         presentPaths = Set(rows.map { $0.path })
+        invalidateSearchCache()
     }
 
     private func deletePathLocked(_ path: String) {
@@ -554,15 +577,14 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     private func loadIntoMemory() {
-        rows.removeAll(); flat.removeAll(); presentPaths.removeAll(); dim = 0
-        // Pre-size the buffers to the final row/float count so the ~1.6GB flat buffer is filled in
-        // place rather than grown through ~log2(N) reallocations (each memmoving the grown-so-far
-        // buffer). One COUNT(*) + one dim read up front.
+        rows.removeAll(); flat16.removeAll(); presentPaths.removeAll(); dim = 0
+        // Pre-size the buffers to the final row/element count so the bf16 buffer is filled in place
+        // rather than grown through ~log2(N) reallocations. One COUNT(*) + one dim read up front.
         let total = scalarQuery("SELECT COUNT(*) FROM chunks")
         let d0 = scalarQuery("SELECT dim FROM chunks LIMIT 1")
         if total > 0 && d0 > 0 {
             rows.reserveCapacity(total)
-            flat.reserveCapacity(total * d0)
+            flat16.reserveCapacity(total * d0)
             presentPaths.reserveCapacity(total)
         }
         var stmt: OpaquePointer?
@@ -578,16 +600,22 @@ public final class VectorStore: @unchecked Sendable {
                 if dim == 0 { dim = d }
                 guard d == dim else { continue }   // skip mismatched-dimension rows
                 let bytes = Int(sqlite3_column_bytes(stmt, 5))
-                let count = min(bytes / MemoryLayout<Float>.size, d)
-                // Append the row's embedding straight into the contiguous buffer - no per-row
-                // [Float] allocation and no later rebuild pass.
-                flat.append(contentsOf: UnsafeBufferPointer(start: blob.assumingMemoryBound(to: Float.self), count: count))
-                if count < d { flat.append(contentsOf: repeatElement(0, count: d - count)) }
+                if bytes == d * MemoryLayout<Float>.size {
+                    // Legacy fp32 blob: round to bf16 in memory. It is re-saved as bf16 the next
+                    // time its file is indexed, so the DB migrates lazily without a forced reindex.
+                    let fp = blob.assumingMemoryBound(to: Float.self)
+                    for k in 0 ..< d { flat16.append(Self.toBF16(fp[k])) }
+                } else if bytes >= d * MemoryLayout<UInt16>.size {
+                    flat16.append(contentsOf: UnsafeBufferPointer(start: blob.assumingMemoryBound(to: UInt16.self), count: d))
+                } else {
+                    flat16.append(contentsOf: repeatElement(0, count: d))   // short/corrupt row
+                }
                 rows.append(Row(path: path, snippet: snippet, kind: kind, chunkIndex: ci, modified: modified))
                 presentPaths.insert(path)
             }
         }
         sqlite3_finalize(stmt)
+        invalidateSearchCache()
     }
 
     private func userVersion() -> Int32 {
