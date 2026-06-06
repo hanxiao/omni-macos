@@ -31,6 +31,12 @@ private struct ActivityTab: View {
         return Double(rs.reduce(0) { $0 + $1.done }) / Double(total)
     }
 
+    /// Aggregate done/total across the roots being indexed (a full pass or one or more folder-adds).
+    private var activeCounts: (done: Int, total: Int) {
+        let rs = model.progress.perRoot.values
+        return (rs.reduce(0) { $0 + $1.done }, rs.reduce(0) { $0 + $1.total })
+    }
+
     /// "12.3 files/sec · 45k tok/s" during a full pass, or "45k tok/s" during a background reconcile
     /// where there is no per-file count. nil when nothing is being embedded.
     private var rateLabel: String? {
@@ -76,13 +82,21 @@ private struct ActivityTab: View {
                     }
                 case .idle:
                     if !model.activeRoots.isEmpty {
-                        // A background reconcile of file-system changes is embedding right now.
-                        HStack {
-                            ProgressView().controlSize(.small)
-                            Text("Updating\u{2026}").fontWeight(.medium)
-                            Spacer()
-                            if let rateLabel {
-                                Text(rateLabel).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                        // A newly added folder (or a background reconcile) is embedding right now.
+                        // It tracks per-root totals just like a full pass, so show the same progress.
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                ProgressView().controlSize(.small)
+                                Text("Updating\u{2026}").fontWeight(.medium)
+                                Spacer()
+                                if let rateLabel {
+                                    Text(rateLabel).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                                }
+                            }
+                            if activeCounts.total > 0 {
+                                ProgressView(value: overall)
+                                Text("\(activeCounts.done.formatted()) / \(activeCounts.total.formatted()) files")
+                                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                             }
                         }
                     } else {
@@ -109,7 +123,8 @@ private struct ActivityTab: View {
                         Image(systemName: "folder").foregroundStyle(.secondary)
                         Text(url.lastPathComponent).lineLimit(1).truncationMode(.middle)
                         Spacer()
-                        if model.isIndexing, let rp, rp.total > 0, rp.done < rp.total {
+                        if let rp, rp.total > 0, rp.done < rp.total,
+                           model.isIndexing || model.activeRoots.contains(url.path) {
                             Text("\(rp.done.formatted()) / \(rp.total.formatted())")
                                 .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                         } else if model.activeRoots.contains(url.path) {
