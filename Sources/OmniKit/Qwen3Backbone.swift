@@ -245,7 +245,9 @@ final class Qwen3Backbone: @unchecked Sendable {
         for b in 0 ..< B where lengths[b] < Lmax {
             for j in lengths[b] ..< Lmax { m[b * Lmax + j] = -1e9 }
         }
-        return .array(MLXArray(m, [B, 1, 1, Lmax]))
+        // The additive mask must share the query dtype: MLX fast SDPA rejects a fp32 mask against
+        // bf16 q/k/v (the default compute dtype), which crashed the batched text path.
+        return .array(MLXArray(m, [B, 1, 1, Lmax]).asType(computeDType))
     }
 
     /// Last-token pool of a [1, L, dim] hidden state -> L2-normalized [Float].
