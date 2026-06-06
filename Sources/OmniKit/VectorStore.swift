@@ -452,6 +452,7 @@ public final class VectorStore: @unchecked Sendable {
             if baseDirty || mlxBase == nil || (n - baseRows) > Self.foldThreshold {
                 rebuildBaseLocked(rowCount: n)
             }
+            let t0 = Self.searchTiming ? Date() : nil
             let qv = MLXArray(query, [dim, 1]).asType(.bfloat16)
             let baseScore = MLX.matmul(mlxBase!, qv)
             MLX.eval(baseScore)
@@ -470,10 +471,17 @@ public final class VectorStore: @unchecked Sendable {
                     scores.append(contentsOf: ds.reshaped([deltaCount]).asType(.float32).asArray(Float.self))
                 }
             }
-            return Self.reduceTopK(scores: scores, fileID: fileID, fileCount: fileIDCount,
-                                   rows: rows, filter: filter, topK: topK)
+            let t1 = Self.searchTiming ? Date() : nil
+            let result = Self.reduceTopK(scores: scores, fileID: fileID, fileCount: fileIDCount,
+                                         rows: rows, filter: filter, topK: topK)
+            if let t0, let t1 {
+                print(String(format: "[search] n=%d score(matmul+readout)=%.1fms reduce=%.1fms",
+                             n, t1.timeIntervalSince(t0) * 1000, -t1.timeIntervalSinceNow * 1000))
+            }
+            return result
         }
     }
+    static let searchTiming = ProcessInfo.processInfo.environment["OMNI_SEARCH_TIMING"] == "1"
 
     /// Collapse N per-chunk `scores` into the top-K best-scoring FILES. Groups chunks by the dense
     /// `fileID` (a flat-array lookup, not a path-string hash) and keeps the best chunk per file, then
@@ -487,6 +495,7 @@ public final class VectorStore: @unchecked Sendable {
                            rows: [Row], filter: SearchFilter, topK: Int) -> [SearchHit] {
         let n = rows.count
         guard n > 0, fileCount > 0, topK > 0, scores.count >= n, fileID.count >= n else { return [] }
+        let tA = searchTiming ? Date() : nil
         var bestScore = [Float](repeating: -.infinity, count: fileCount)
         var bestRow = [Int32](repeating: -1, count: fileCount)
         let kinds = filter.kinds, hasKind = !filter.kinds.isEmpty, since = filter.since
@@ -499,16 +508,50 @@ public final class VectorStore: @unchecked Sendable {
             let f = Int(fileID[i])
             if dot > bestScore[f] { bestScore[f] = dot; bestRow[f] = Int32(i) }   // strict > keeps lowest row index on tie (== reference's `>=` skip)
         }
-        var hits: [SearchHit] = []
-        hits.reserveCapacity(min(fileCount, max(topK, 16)))
+        let tB = searchTiming ? Date() : nil
+        // Bounded top-K over the per-file winners via a size-K min-heap, instead of building a
+        // SearchHit for all F files and sorting them (that full sort of F String-bearing structs was
+        // ~49ms of the ~57ms reduce at F=420K). O(F log K), and we materialize SearchHit only for the
+        // K survivors. Identical top-K to a full sort: with distinct scores the set+order match
+        // exactly; equal-score ties at the K-th boundary are pool-equivalent (same contract as before).
+        var heapScore = [Float](); heapScore.reserveCapacity(topK)   // parallel min-heaps keyed by score
+        var heapRow = [Int32]()    ; heapRow.reserveCapacity(topK)
+        func siftUp(_ start: Int) {
+            var i = start
+            while i > 0 { let p = (i - 1) >> 1; if heapScore[p] <= heapScore[i] { break }
+                heapScore.swapAt(p, i); heapRow.swapAt(p, i); i = p }
+        }
+        func siftDown(_ start: Int) {
+            var i = start; let c = heapScore.count
+            while true { let l = 2*i+1, r = 2*i+2; var m = i
+                if l < c && heapScore[l] < heapScore[m] { m = l }
+                if r < c && heapScore[r] < heapScore[m] { m = r }
+                if m == i { break }; heapScore.swapAt(i, m); heapRow.swapAt(i, m); i = m }
+        }
         for f in 0 ..< fileCount {
             let ri = bestRow[f]
             if ri < 0 { continue }
+            let s = bestScore[f]
+            if heapScore.count >= topK && s <= heapScore[0] { continue }   // can't beat the current K-th
             let r = rows[Int(ri)]
             if !filter.accepts(path: r.path, kind: r.kind, modified: r.modified) { continue }
-            hits.append(SearchHit(path: r.path, score: bestScore[f], snippet: r.snippet, kind: r.kind, chunkIndex: r.chunkIndex, modified: r.modified))
+            if heapScore.count < topK {
+                heapScore.append(s); heapRow.append(ri); siftUp(heapScore.count - 1)
+            } else if s > heapScore[0] {
+                heapScore[0] = s; heapRow[0] = ri; siftDown(0)
+            }
         }
-        return hits.sorted { $0.score > $1.score }.prefix(topK).map { $0 }
+        // Order the K survivors by descending score (K is small).
+        let order = (0 ..< heapScore.count).sorted { heapScore[$0] > heapScore[$1] }
+        let out = order.map { idx -> SearchHit in
+            let r = rows[Int(heapRow[idx])]
+            return SearchHit(path: r.path, score: heapScore[idx], snippet: r.snippet, kind: r.kind, chunkIndex: r.chunkIndex, modified: r.modified)
+        }
+        if let tA, let tB {
+            print(String(format: "  [reduce] hot=%.1fms topK=%.1fms (F=%d out=%d)",
+                         tB.timeIntervalSince(tA)*1000, -tB.timeIntervalSinceNow*1000, fileCount, out.count))
+        }
+        return out
     }
 
     /// The original string-keyed best-per-path reducer, kept verbatim as the differential-test oracle
