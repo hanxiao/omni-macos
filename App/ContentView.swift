@@ -188,23 +188,43 @@ struct ContentView: View {
             filterMenu.disabled(model.indexedFiles == 0)
         }
         }
-        // Result presentation - sort + view grouped together. Only meaningful with results.
+        // Result presentation - sort + view. Only meaningful with results.
         if model.phase == .ready, !model.rawResults.isEmpty {
         ToolbarItem(placement: .primaryAction) {
-            ControlGroup {
+            if #available(macOS 26.0, *) {
+                // Tahoe: the inline sort menu + segmented view toggle render and overflow cleanly.
+                ControlGroup {
+                    Menu {
+                        Picker("Sort By", selection: Binding(get: { model.sortOrder }, set: { model.sortOrder = $0 })) {
+                            ForEach(SortOrder.allCases) { Text($0.title).tag($0) }
+                        }
+                    } label: { Image(systemName: "arrow.up.arrow.down") }
+                    .help("Sort by \(model.sortOrder.title)")
+
+                    Picker("View", selection: Binding(get: { model.viewMode }, set: { model.viewMode = $0 })) {
+                        Image(systemName: "list.bullet").accessibilityLabel("List view").tag(ResultViewMode.list)
+                        Image(systemName: "square.grid.2x2").accessibilityLabel("Gallery view").tag(ResultViewMode.grid)
+                    }
+                    .pickerStyle(.segmented)
+                    .help("Switch between list and gallery")
+                }
+            } else {
+                // Sequoia and earlier: a ControlGroup of a menu + segmented picker overflows into an
+                // empty, icon-less toolbar dropdown. Use one compact labeled menu instead so it always
+                // shows its icon and survives overflow.
                 Menu {
+                    Picker("View", selection: Binding(get: { model.viewMode }, set: { model.viewMode = $0 })) {
+                        Label("as Gallery", systemImage: "square.grid.2x2").tag(ResultViewMode.grid)
+                        Label("as List", systemImage: "list.bullet").tag(ResultViewMode.list)
+                    }
+                    Divider()
                     Picker("Sort By", selection: Binding(get: { model.sortOrder }, set: { model.sortOrder = $0 })) {
                         ForEach(SortOrder.allCases) { Text($0.title).tag($0) }
                     }
-                } label: { Image(systemName: "arrow.up.arrow.down") }
-                .help("Sort by \(model.sortOrder.title)")
-
-                Picker("View", selection: Binding(get: { model.viewMode }, set: { model.viewMode = $0 })) {
-                    Image(systemName: "list.bullet").accessibilityLabel("List view").tag(ResultViewMode.list)
-                    Image(systemName: "square.grid.2x2").accessibilityLabel("Gallery view").tag(ResultViewMode.grid)
+                } label: {
+                    Label("View Options", systemImage: "slider.horizontal.3")
                 }
-                .pickerStyle(.segmented)
-                .help("Switch between list and gallery")
+                .help("Sort and view")
             }
         }
         }
