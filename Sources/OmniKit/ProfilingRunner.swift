@@ -19,14 +19,16 @@ public struct ProfilingReport: Sendable, Codable {
     public let runId: String
     public let appVersion: String
     public let datasetVersion: String
+    public let model: String            // model variant the run used ("nano" / "small"), to compare on the site
     public let hardware: HardwareProfile
     public let metrics: ProfilingMetrics
 
-    public init(runId: String, appVersion: String, datasetVersion: String,
+    public init(runId: String, appVersion: String, datasetVersion: String, model: String,
                 hardware: HardwareProfile, metrics: ProfilingMetrics) {
         self.runId = runId
         self.appVersion = appVersion
         self.datasetVersion = datasetVersion
+        self.model = model
         self.hardware = hardware
         self.metrics = metrics
     }

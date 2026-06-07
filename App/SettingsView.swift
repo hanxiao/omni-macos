@@ -367,12 +367,22 @@ private struct IndexTab: View {
                     HStack(alignment: .top, spacing: 8) {
                         Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
                         VStack(alignment: .leading, spacing: 6) {
-                            Text("Index is out of date").fontWeight(.medium)
-                            Text("It was built with an older embedding version. Reindex so results stay accurate.")
-                                .font(.caption).foregroundStyle(.secondary)
-                            Button("Reindex") { model.startIndexing() }
-                                .controlSize(.small)
-                                .disabled(model.isIndexing || !model.canIndex)
+                            Text("Index doesn't match the loaded model").fontWeight(.medium)
+                            if let v = model.indexBuiltVariant {
+                                Text("Built with \(v.title) (\(model.indexStoredDim)-dim); \(model.modelVariant.title) is loaded. Switch back to keep this index, or reindex with the current model.")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            } else {
+                                Text("It was built with an older embedding version. Reindex so results stay accurate.")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                            HStack {
+                                if let v = model.indexBuiltVariant {
+                                    Button("Switch to \(v.title)") { model.selectVariant(v) }.disabled(model.isDownloading)
+                                }
+                                Button("Reindex") { model.startIndexing() }
+                                    .disabled(model.isIndexing || !model.canIndex)
+                            }
+                            .controlSize(.small)
                         }
                     }
                 }
