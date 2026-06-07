@@ -26,6 +26,10 @@ struct ContentView: View {
         // macOS 15 .searchFocused API is unavailable on our 14 target, so focus the toolbar's
         // NSSearchField directly once it exists.
         .onChange(of: showsSearch, initial: true) { _, shows in if shows { focusSearchField() } }
+        // Profiling progress as a native sheet on the main window (not a stray floating panel).
+        .sheet(isPresented: Binding(get: { model.isProfilingRunning }, set: { _ in })) {
+            ProfilingSheet()
+        }
     }
 
     private func focusSearchField() {

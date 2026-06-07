@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 import AppKit
 import CryptoKit
 import OmniKit
@@ -31,7 +32,8 @@ enum ProfilingService {
 
     /// Ensure the dataset is present locally and return its folder + file count. Uses a cached copy
     /// when the manifest MD5 still matches; otherwise downloads the zip, verifies it, unzips to /tmp.
-    static func ensureDataset(progress: ProfilingProgressPanel) async throws -> (folder: URL, fileCount: Int) {
+    static func ensureDataset(onPhase: @escaping (String) -> Void) async throws -> (folder: URL, fileCount: Int) {
+        onPhase("Preparing dataset\u{2026}")
         let manifest = try await fetchManifest()
         let folder = datasetFolder
         let count = manifest.fileCount ?? 0
@@ -44,8 +46,7 @@ enum ProfilingService {
             return (folder, count)
         }
 
-        progress.phase("Downloading dataset...")
-        progress.indeterminate()
+        onPhase("Downloading dataset\u{2026}")
         guard let url = URL(string: zipURL) else { throw ProfilingError("Invalid dataset URL.") }
         let (tmpZip, response) = try await URLSession.shared.download(from: url)
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
@@ -56,7 +57,7 @@ enum ProfilingService {
             if got != want { throw ProfilingError("Dataset checksum did not match the manifest.") }
         }
 
-        progress.phase("Unzipping dataset...")
+        onPhase("Unzipping dataset\u{2026}")
         try? FileManager.default.removeItem(at: folder)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         try await unzip(tmpZip, into: folder)
@@ -146,42 +147,39 @@ enum ProfilingService {
     }
 }
 
-/// A small native progress panel for the profiling run. Determinate during indexing, indeterminate
-/// for the download/unzip/upload phases. Mirrors the updater's panel style.
-@MainActor
-final class ProfilingProgressPanel {
-    private var window: NSWindow?
-    private let label = NSTextField(labelWithString: "")
-    private let detail = NSTextField(labelWithString: "")
-    private let bar = NSProgressIndicator()
+/// Native progress sheet for a profiling run - slides down from the main window (vs a stray
+/// free-floating window). Determinate during indexing, indeterminate for download/unzip/upload.
+/// Presented while AppModel.isProfilingRunning is true and dismissed when it flips false.
+struct ProfilingSheet: View {
+    @Environment(AppModel.self) private var model: AppModel
 
-    func show() {
-        if window == nil {
-            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 132),
-                             styleMask: [.titled], backing: .buffered, defer: false)
-            w.isReleasedWhenClosed = false
-            w.title = "Profiling Omni"
-            let content = NSView(frame: w.contentRect(forFrameRect: w.frame))
-            label.frame = NSRect(x: 24, y: 80, width: 372, height: 20)
-            label.font = .systemFont(ofSize: 13, weight: .medium)
-            detail.frame = NSRect(x: 24, y: 58, width: 372, height: 18)
-            detail.font = .systemFont(ofSize: 11)
-            detail.textColor = .secondaryLabelColor
-            bar.frame = NSRect(x: 24, y: 32, width: 372, height: 18)
-            bar.style = .bar
-            bar.minValue = 0; bar.maxValue = 1; bar.isIndeterminate = false
-            content.addSubview(label); content.addSubview(detail); content.addSubview(bar)
-            w.contentView = content
-            w.center()
-            window = w
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 12) {
+                Image(systemName: "speedometer")
+                    .font(.system(size: 24))
+                    .foregroundStyle(.tint)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Profiling").font(.headline)
+                    Text(model.profilingPhase.isEmpty ? "Working\u{2026}" : model.profilingPhase)
+                        .font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+            if let f = model.profilingFraction {
+                ProgressView(value: f)
+            } else {
+                ProgressView().progressViewStyle(.linear)   // indeterminate barber-pole
+            }
+            if !model.profilingDetail.isEmpty {
+                Text(model.profilingDetail)
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.middle)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
-        window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        .padding(20)
+        .frame(width: 400)
+        .interactiveDismissDisabled()   // a run can't be dismissed midway; it closes itself when done
     }
-
-    func phase(_ s: String) { label.stringValue = s; detail.stringValue = "" }
-    func detail(_ s: String) { detail.stringValue = s }
-    func indeterminate() { bar.isIndeterminate = true; bar.startAnimation(nil) }
-    func fraction(_ f: Double) { bar.isIndeterminate = false; bar.doubleValue = max(0, min(1, f)) }
-    func close() { bar.stopAnimation(nil); window?.orderOut(nil) }
 }

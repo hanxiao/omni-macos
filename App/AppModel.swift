@@ -135,6 +135,8 @@ final class AppModel {
     // Profiling ("Run Profiling" menu): downloads a fixed dataset and times an isolated index pass.
     var isProfilingRunning = false
     var profilingPhase = ""
+    var profilingDetail = ""
+    var profilingFraction: Double? = nil   // nil = indeterminate (download/unzip/upload)
     var lastProfilingReport: ProfilingReport?
     /// Settings opt-in for uploading profiling results (mirrors ProfilingService's persisted flag).
     var shareProfilingResults: Bool = UserDefaults.standard.bool(forKey: "omni.profiling.uploadEnabled") {
@@ -1068,39 +1070,36 @@ final class AppModel {
     func runProfiling() async {
         guard !isProfilingRunning, let engine else { return }
         isProfilingRunning = true
-        let panel = ProfilingProgressPanel()
-        panel.show()
+        profilingPhase = ""; profilingDetail = ""; profilingFraction = nil
         let wasIndexing = (indexState == .indexing)
 
         // Pause any live pass and wait (bounded) for it to actually stop, so the measurement is not
         // skewed by a concurrent pass sharing the engine.
         if wasIndexing {
-            panel.phase("Pausing indexing\u{2026}")
-            panel.indeterminate()
+            profilingPhase = "Pausing indexing\u{2026}"
             pauseIndexing()
             for _ in 0 ..< 50 { if indexState != .indexing { break }; try? await Task.sleep(nanoseconds: 100_000_000) }
         }
 
         defer {
-            panel.close()
             isProfilingRunning = false
-            profilingPhase = ""
+            profilingPhase = ""; profilingDetail = ""; profilingFraction = nil
             if wasIndexing { startIndexing() }   // resume where it left off (incremental)
         }
 
         do {
-            profilingPhase = "Preparing dataset"
-            let (folder, count) = try await ProfilingService.ensureDataset(progress: panel)
+            profilingFraction = nil
+            let (folder, count) = try await ProfilingService.ensureDataset { self.profilingPhase = $0 }
 
-            profilingPhase = "Indexing"
             let total = count > 0 ? count : 1000
-            panel.phase("Indexing 0 / \(total)\u{2026}")
-            panel.fraction(0)
+            profilingPhase = "Indexing"
+            profilingDetail = "0 of \(total) files"
+            profilingFraction = 0
             let metrics = try await runProfilingPass(engine: engine, targetURL: folder, settings: effectiveSettings()) { p in
                 Task { @MainActor in
-                    panel.phase("Indexing \(p.scanned) / \(total)\u{2026}")
-                    panel.detail("\(p.embedded) embedded, \(p.failed) failed")
-                    panel.fraction(total > 0 ? Double(p.scanned) / Double(total) : 0)
+                    self.profilingFraction = total > 0 ? Double(p.scanned) / Double(total) : nil
+                    self.profilingDetail = "\(p.scanned) of \(total) files \u{00B7} \(p.embedded) embedded"
+                        + (p.failed > 0 ? " \u{00B7} \(p.failed) failed" : "")
                 }
             }
 
@@ -1113,19 +1112,20 @@ final class AppModel {
             lastProfilingReport = report
             writeProfilingReport(report)
 
-            panel.phase("Uploading results\u{2026}")
-            panel.indeterminate()
+            profilingPhase = "Uploading results\u{2026}"; profilingFraction = nil; profilingDetail = ""
             if ProfilingService.ensureConsent() { await ProfilingService.upload(report) }
             shareProfilingResults = ProfilingService.uploadsEnabled   // reflect the consent choice in Settings
 
-            panel.phase("Profiling complete")
-            panel.detail(String(format: "%.1f files/sec  \u{00B7}  %.0f tok/sec  \u{00B7}  %.1f GB peak VRAM",
-                                metrics.filesPerSec, metrics.tokensPerSec,
-                                Double(metrics.peakVramDeltaBytes) / 1_073_741_824))
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            profilingPhase = "Profiling complete"
+            profilingFraction = 1
+            profilingDetail = String(format: "%.1f files/sec  \u{00B7}  %.0f tok/sec  \u{00B7}  %.1f GB peak VRAM",
+                                     metrics.filesPerSec, metrics.tokensPerSec,
+                                     Double(metrics.peakVramDeltaBytes) / 1_073_741_824)
+            try? await Task.sleep(nanoseconds: 1_800_000_000)
         } catch {
-            panel.phase("Profiling failed")
-            panel.detail((error as? ProfilingService.ProfilingError)?.message ?? error.localizedDescription)
+            profilingPhase = "Profiling failed"
+            profilingFraction = nil
+            profilingDetail = (error as? ProfilingService.ProfilingError)?.message ?? error.localizedDescription
             try? await Task.sleep(nanoseconds: 2_500_000_000)
         }
     }
