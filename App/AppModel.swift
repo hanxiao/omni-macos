@@ -118,6 +118,10 @@ final class AppModel {
     var indexState: IndexState = .idle
     var isIndexing: Bool { indexState == .indexing }
     var isPaused: Bool { indexState == .paused }
+    /// Indexing has started but nothing has been processed yet - still crawling folders, or
+    /// compiling the model's GPU kernels on first run (slow on smaller Macs, instant on a Mac
+    /// Studio). The UI shows "Preparing" here so a 0-progress bar does not look stuck.
+    var isPreparing: Bool { indexState == .indexing && progress.scanned == 0 }
     /// Any embedding work in flight: a full index pass or a background FSEvents reconcile. The
     /// throughput readout follows this, not just the full pass.
     var isWorking: Bool { indexState == .indexing || !activeRoots.isEmpty }
