@@ -12,8 +12,14 @@ public struct IndexedChunk: Sendable {
     public var chunkIndex: Int
     public var snippet: String           // short preview for the UI
     public var embedding: [Float]        // L2-normalized
+    // Display metadata captured at index time so the UI never reads the file from disk to show it.
+    // Images: original pixel dimensions. Audio/video: duration in seconds. 0 = not applicable/unknown.
+    public var width: Int
+    public var height: Int
+    public var duration: Double
 
-    public init(path: String, modified: Double, size: Int = 0, kind: String, chunkIndex: Int, snippet: String, embedding: [Float]) {
+    public init(path: String, modified: Double, size: Int = 0, kind: String, chunkIndex: Int, snippet: String, embedding: [Float],
+                width: Int = 0, height: Int = 0, duration: Double = 0) {
         self.path = path
         self.modified = modified
         self.size = size
@@ -21,6 +27,9 @@ public struct IndexedChunk: Sendable {
         self.chunkIndex = chunkIndex
         self.snippet = snippet
         self.embedding = embedding
+        self.width = width
+        self.height = height
+        self.duration = duration
     }
 }
 
@@ -31,6 +40,11 @@ public struct SearchHit: Sendable {
     public let kind: String
     public let chunkIndex: Int
     public let modified: Double
+    // Index-time display metadata (see IndexedChunk). 0 = not applicable/unknown; the UI then
+    // falls back to reading it from disk once and caching it.
+    public var width: Int = 0
+    public var height: Int = 0
+    public var duration: Double = 0
 }
 
 /// One matching passage (chunk) within a file.
@@ -77,7 +91,8 @@ public final class VectorStore: @unchecked Sendable {
     private let queue = DispatchQueue(label: "omni.vectorstore")
     private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-    struct Row { let path: String; let snippet: String; let kind: String; let chunkIndex: Int; let modified: Double }
+    struct Row { let path: String; let snippet: String; let kind: String; let chunkIndex: Int; let modified: Double
+                 var width: Int = 0; var height: Int = 0; var duration: Double = 0 }
     private var rows: [Row] = []
     // Single source of truth for embeddings: contiguous bf16 bits, [count*dim], row i = rows[i].
     // bf16 (2 bytes/dim) halves residency and disk vs fp32 with negligible recall loss on
@@ -168,10 +183,21 @@ public final class VectorStore: @unchecked Sendable {
                 snippet TEXT NOT NULL,
                 dim INTEGER NOT NULL,
                 vec BLOB NOT NULL,
+                width INTEGER NOT NULL DEFAULT 0,
+                height INTEGER NOT NULL DEFAULT 0,
+                duration REAL NOT NULL DEFAULT 0,
                 PRIMARY KEY(path, chunk_index)
             );
         """)
         exec("CREATE INDEX IF NOT EXISTS idx_path ON chunks(path);")
+        // Additive, lazy migration for indexes created before the display-metadata columns existed:
+        // ADD COLUMN is an O(1) metadata change (no table rewrite, no forced reindex), and existing
+        // rows default to 0 so the UI just falls back to a one-time on-disk read for them. Done
+        // without bumping schemaVersion precisely so the existing index is NOT dropped. Mirrors the
+        // existing fp32 -> bf16 lazy migration: media rows pick up real dims/duration as they reindex.
+        addColumnIfMissing("width", "INTEGER NOT NULL DEFAULT 0")
+        addColumnIfMissing("height", "INTEGER NOT NULL DEFAULT 0")
+        addColumnIfMissing("duration", "REAL NOT NULL DEFAULT 0")
         setUserVersion(Self.schemaVersion)
         loadIntoMemory()
     }
@@ -199,7 +225,7 @@ public final class VectorStore: @unchecked Sendable {
             exec("BEGIN;")
             deletePathLocked(path)
             let bfs = chunks.map { bf16Row($0.embedding) }   // fp32 -> bf16 once, reused for blob + memory
-            let sql = "INSERT INTO chunks(path, modified, size, kind, chunk_index, snippet, dim, vec) VALUES(?,?,?,?,?,?,?,?);"
+            let sql = "INSERT INTO chunks(path, modified, size, kind, chunk_index, snippet, dim, vec, width, height, duration) VALUES(?,?,?,?,?,?,?,?,?,?,?);"
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                 exec("ROLLBACK;")
@@ -218,6 +244,9 @@ public final class VectorStore: @unchecked Sendable {
                 bfs[i].withUnsafeBytes { raw in
                     _ = sqlite3_bind_blob(stmt, 8, raw.baseAddress, Int32(raw.count), SQLITE_TRANSIENT)
                 }
+                sqlite3_bind_int(stmt, 9, Int32(c.width))
+                sqlite3_bind_int(stmt, 10, Int32(c.height))
+                sqlite3_bind_double(stmt, 11, c.duration)
                 guard sqlite3_step(stmt) == SQLITE_DONE else {
                     exec("ROLLBACK;")
                     throw OmniError.store("insert step failed")
@@ -229,7 +258,8 @@ public final class VectorStore: @unchecked Sendable {
             // just append. `append` grows flat16/rows geometrically (amortized O(1)).
             if presentPaths.contains(path) { removeRowsLocked { $0.path == path } }
             for (i, c) in chunks.enumerated() {
-                rows.append(Row(path: c.path, snippet: c.snippet, kind: c.kind, chunkIndex: c.chunkIndex, modified: c.modified))
+                rows.append(Row(path: c.path, snippet: c.snippet, kind: c.kind, chunkIndex: c.chunkIndex, modified: c.modified,
+                                width: c.width, height: c.height, duration: c.duration))
                 flat16.append(contentsOf: bfs[i])
                 fileID.append(internPath(c.path))
             }
@@ -257,7 +287,7 @@ public final class VectorStore: @unchecked Sendable {
             }
             let bfs = work.map { $0.chunks.map { bf16Row($0.embedding) } }   // fp32 -> bf16 once
             exec("BEGIN;")
-            let sql = "INSERT INTO chunks(path, modified, size, kind, chunk_index, snippet, dim, vec) VALUES(?,?,?,?,?,?,?,?);"
+            let sql = "INSERT INTO chunks(path, modified, size, kind, chunk_index, snippet, dim, vec, width, height, duration) VALUES(?,?,?,?,?,?,?,?,?,?,?);"
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                 exec("ROLLBACK;")
@@ -278,6 +308,9 @@ public final class VectorStore: @unchecked Sendable {
                     bfs[wi][ci].withUnsafeBytes { raw in
                         _ = sqlite3_bind_blob(stmt, 8, raw.baseAddress, Int32(raw.count), SQLITE_TRANSIENT)
                     }
+                    sqlite3_bind_int(stmt, 9, Int32(c.width))
+                    sqlite3_bind_int(stmt, 10, Int32(c.height))
+                    sqlite3_bind_double(stmt, 11, c.duration)
                     guard sqlite3_step(stmt) == SQLITE_DONE else {
                         exec("ROLLBACK;")
                         throw OmniError.store("insert step failed")
@@ -291,7 +324,8 @@ public final class VectorStore: @unchecked Sendable {
             }
             for (wi, it) in work.enumerated() {
                 for (ci, c) in it.chunks.enumerated() {
-                    rows.append(Row(path: c.path, snippet: c.snippet, kind: c.kind, chunkIndex: c.chunkIndex, modified: c.modified))
+                    rows.append(Row(path: c.path, snippet: c.snippet, kind: c.kind, chunkIndex: c.chunkIndex, modified: c.modified,
+                                    width: c.width, height: c.height, duration: c.duration))
                     flat16.append(contentsOf: bfs[wi][ci])
                     fileID.append(internPath(c.path))
                 }
@@ -548,7 +582,8 @@ public final class VectorStore: @unchecked Sendable {
         let order = (0 ..< heapScore.count).sorted { heapScore[$0] > heapScore[$1] }
         let out = order.map { idx -> SearchHit in
             let r = rows[Int(heapRow[idx])]
-            return SearchHit(path: r.path, score: heapScore[idx], snippet: r.snippet, kind: r.kind, chunkIndex: r.chunkIndex, modified: r.modified)
+            return SearchHit(path: r.path, score: heapScore[idx], snippet: r.snippet, kind: r.kind, chunkIndex: r.chunkIndex, modified: r.modified,
+                             width: r.width, height: r.height, duration: r.duration)
         }
         if let tA, let tB {
             print(String(format: "  [reduce] hot=%.1fms topK=%.1fms (F=%d out=%d)",
@@ -568,7 +603,8 @@ public final class VectorStore: @unchecked Sendable {
             let dot = scores[i]
             if !dot.isFinite { continue }
             if let e = best[r.path], e.score >= dot { continue }
-            best[r.path] = SearchHit(path: r.path, score: dot, snippet: r.snippet, kind: r.kind, chunkIndex: r.chunkIndex, modified: r.modified)
+            best[r.path] = SearchHit(path: r.path, score: dot, snippet: r.snippet, kind: r.kind, chunkIndex: r.chunkIndex, modified: r.modified,
+                                     width: r.width, height: r.height, duration: r.duration)
         }
         return Array(best.values).sorted { $0.score > $1.score }.prefix(topK).map { $0 }
     }
@@ -751,7 +787,7 @@ public final class VectorStore: @unchecked Sendable {
             fileID.reserveCapacity(total)
         }
         var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, "SELECT path, snippet, kind, chunk_index, dim, vec, modified FROM chunks;", -1, &stmt, nil) == SQLITE_OK {
+        if sqlite3_prepare_v2(db, "SELECT path, snippet, kind, chunk_index, dim, vec, modified, width, height, duration FROM chunks;", -1, &stmt, nil) == SQLITE_OK {
             while sqlite3_step(stmt) == SQLITE_ROW {
                 let path = String(cString: sqlite3_column_text(stmt, 0))
                 let snippet = String(cString: sqlite3_column_text(stmt, 1))
@@ -759,6 +795,9 @@ public final class VectorStore: @unchecked Sendable {
                 let ci = Int(sqlite3_column_int(stmt, 3))
                 let d = Int(sqlite3_column_int(stmt, 4))
                 let modified = sqlite3_column_double(stmt, 6)
+                let width = Int(sqlite3_column_int(stmt, 7))
+                let height = Int(sqlite3_column_int(stmt, 8))
+                let duration = sqlite3_column_double(stmt, 9)
                 guard d > 0, let blob = sqlite3_column_blob(stmt, 5) else { continue }
                 if dim == 0 { dim = d }
                 guard d == dim else { continue }   // skip mismatched-dimension rows
@@ -773,7 +812,8 @@ public final class VectorStore: @unchecked Sendable {
                 } else {
                     flat16.append(contentsOf: repeatElement(0, count: d))   // short/corrupt row
                 }
-                rows.append(Row(path: path, snippet: snippet, kind: kind, chunkIndex: ci, modified: modified))
+                rows.append(Row(path: path, snippet: snippet, kind: kind, chunkIndex: ci, modified: modified,
+                                width: width, height: height, duration: duration))
                 fileID.append(internPath(path))
                 presentPaths.insert(path)
             }
@@ -790,6 +830,20 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     private func setUserVersion(_ v: Int32) { exec("PRAGMA user_version = \(v);") }
+
+    /// Idempotently add a column to `chunks` if it is not already present (SQLite has no
+    /// ADD COLUMN IF NOT EXISTS). Used for additive, no-reindex schema migrations.
+    private func addColumnIfMissing(_ name: String, _ decl: String) {
+        var stmt: OpaquePointer?
+        var present = false
+        if sqlite3_prepare_v2(db, "PRAGMA table_info(chunks);", -1, &stmt, nil) == SQLITE_OK {
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                if let c = sqlite3_column_text(stmt, 1), String(cString: c) == name { present = true; break }
+            }
+        }
+        sqlite3_finalize(stmt)
+        if !present { exec("ALTER TABLE chunks ADD COLUMN \(name) \(decl);") }
+    }
 
     private func exec(_ sql: String) { sqlite3_exec(db, sql, nil, nil, nil) }
 }

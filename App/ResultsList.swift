@@ -168,7 +168,7 @@ struct ResultRow: View {
                 }
                 HStack(spacing: 5) {
                     KindGlyph(kind: hit.kind)
-                    MediaInfoLabel(path: hit.path, kind: hit.kind, separator: true)
+                    MediaInfoLabel(path: hit.path, kind: hit.kind, width: hit.width, height: hit.height, duration: hit.duration, separator: true)
                     Text(prettyDir(url)).lineLimit(1).truncationMode(.middle)
                     if hit.modified > 0 {
                         Text("·")
@@ -257,7 +257,7 @@ struct ResultGridItem: View {
                 .padding(.horizontal, 6).padding(.vertical, 1)
                 .background(selected ? Color.accentColor : .clear, in: Capsule())
                 .frame(maxWidth: 150)
-            MediaInfoLabel(path: hit.path, kind: hit.kind, separator: false)
+            MediaInfoLabel(path: hit.path, kind: hit.kind, width: hit.width, height: hit.height, duration: hit.duration, separator: false)
                 .font(.caption2).foregroundStyle(.tertiary)
         }
         .padding(8)
@@ -270,29 +270,54 @@ struct ResultGridItem: View {
     }
 }
 
-/// Original resolution (images) or duration (audio/video), loaded off the main thread.
+/// In-memory cache for the on-disk fallback below, so re-scrolling a result list never re-reads the
+/// same file's header. Only legacy indexes (created before metadata was stored) ever hit this.
+final class MediaInfoCache: @unchecked Sendable {
+    static let shared = MediaInfoCache()
+    private let cache = NSCache<NSString, NSString>()
+    init() { cache.countLimit = 4096 }
+    func get(_ key: String) -> String? { cache.object(forKey: key as NSString) as String? }
+    func set(_ key: String, _ value: String) { cache.setObject(value as NSString, forKey: key as NSString) }
+}
+
+/// Original resolution (images) or duration (audio/video). Prefers the value captured at index time
+/// (zero disk access); only older indexes that predate stored metadata fall back to reading the file
+/// once, off the main thread and cached, so scrolling stays smooth.
 struct MediaInfoLabel: View {
     let path: String
     let kind: String
+    var width: Int = 0
+    var height: Int = 0
+    var duration: Double = 0
     var separator: Bool
-    @State private var text: String?
+    @State private var loaded: String?
+
+    private var stored: String? {
+        switch FileKind(rawValue: kind) {
+        case .image: return (width > 0 && height > 0) ? "\(width)\u{00D7}\(height)" : nil
+        case .video, .audio: return duration > 0 ? formatDuration(duration) : nil
+        default: return nil
+        }
+    }
+    private var isMedia: Bool { FileKind(rawValue: kind).map { $0 != .text } ?? false }
 
     var body: some View {
-        if let text {
+        if let text = stored ?? loaded {
             HStack(spacing: 5) {
                 Text(text)
                 if separator { Text("\u{00B7}") }
             }
-        } else {
-            Color.clear.frame(width: 0, height: 0).task(id: path) { text = await load() }
+        } else if isMedia {
+            // Legacy row with no stored metadata: read the header once, cached.
+            Color.clear.frame(width: 0, height: 0).task(id: path) { loaded = await Self.load(path: path, kind: kind) }
         }
     }
 
-    private func load() async -> String? {
-        let p = path, k = kind
-        return await Task.detached(priority: .utility) { () -> String? in
-            let url = URL(fileURLWithPath: p)
-            switch FileKind(rawValue: k) {
+    private static func load(path: String, kind: String) async -> String? {
+        if let cached = MediaInfoCache.shared.get(path) { return cached }
+        let result = await Task.detached(priority: .utility) { () -> String? in
+            let url = URL(fileURLWithPath: path)
+            switch FileKind(rawValue: kind) {
             case .image:
                 if let s = FileExtractor.imagePixelSize(url) { return "\(s.width)\u{00D7}\(s.height)" }
             case .video, .audio:
@@ -302,6 +327,8 @@ struct MediaInfoLabel: View {
             }
             return nil
         }.value
+        if let result { MediaInfoCache.shared.set(path, result) }
+        return result
     }
 }
 
