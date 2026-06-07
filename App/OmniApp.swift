@@ -79,6 +79,8 @@ struct OmniApp: App {
     private func showShortcuts() {
         let rows = [
             ("Focus Search", "\u{2318}F"),
+            ("Search by a File", "\u{21E7}\u{2318}O"),
+            ("Find Similar", "\u{2325}\u{2318}F"),
             ("Open", "\u{2318}O  /  Return"),
             ("Quick Look", "\u{2318}Y  /  Space"),
             ("Reveal in Finder", "\u{21E7}\u{2318}R"),

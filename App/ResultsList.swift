@@ -101,39 +101,47 @@ struct ResultsList<Footer: View>: View {
     }
 
     private var gridView: some View {
-        ScrollView {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: gridMin, maximum: 220), spacing: Design.gapLarge)], spacing: Design.gapLarge) {
-                ForEach(results, id: \.path) { hit in
-                    ResultGridItem(hit: hit, selected: model.selection == hit.path)
-                        // Make the whole cell tappable, not just the opaque thumbnail/label - without
-                        // this, clicking the transparent padding around a small item did nothing.
-                        // (The list row already has this; the grid relied on .draggable's hit area,
-                        // which was removed.)
-                        .contentShape(Rectangle())
-                        .onTapGesture { model.selection = hit.path }
-                        .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
-                        .contextMenu { menu(hit.path) }
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: gridMin, maximum: 220), spacing: Design.gapLarge)], spacing: Design.gapLarge) {
+                    ForEach(results, id: \.path) { hit in
+                        ResultGridItem(hit: hit, selected: model.selection == hit.path)
+                            // Make the whole cell tappable, not just the opaque thumbnail/label - without
+                            // this, clicking the transparent padding around a small item did nothing.
+                            // (The list row already has this; the grid relied on .draggable's hit area,
+                            // which was removed.)
+                            .contentShape(Rectangle())
+                            .onTapGesture { model.selection = hit.path }
+                            .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
+                            .contextMenu { menu(hit.path) }
+                            .id(hit.path)
+                    }
+                }
+                .padding(Design.gapLarge)
+                footer
+            }
+            .background(GeometryReader { g in
+                Color.clear
+                    .onAppear { gridWidth = g.size.width }
+                    .onChange(of: g.size.width) { _, w in gridWidth = w }
+            })
+            // Make the gallery keyboard-navigable like the list: arrow keys move the selection by
+            // column/row, and Return/Space (handled on the body) then open/preview it.
+            .focusable()
+            .focusEffectDisabled()
+            .onMoveCommand { direction in
+                switch direction {
+                case .up: model.moveSelection(rowDelta: -gridColumns)
+                case .down: model.moveSelection(rowDelta: gridColumns)
+                case .left: model.moveSelection(rowDelta: -1)
+                case .right: model.moveSelection(rowDelta: 1)
+                @unknown default: break
                 }
             }
-            .padding(Design.gapLarge)
-            footer
-        }
-        .background(GeometryReader { g in
-            Color.clear
-                .onAppear { gridWidth = g.size.width }
-                .onChange(of: g.size.width) { _, w in gridWidth = w }
-        })
-        // Make the gallery keyboard-navigable like the list: arrow keys move the selection by
-        // column/row, and Return/Space (handled on the body) then open/preview it.
-        .focusable()
-        .focusEffectDisabled()
-        .onMoveCommand { direction in
-            switch direction {
-            case .up: model.moveSelection(rowDelta: -gridColumns)
-            case .down: model.moveSelection(rowDelta: gridColumns)
-            case .left: model.moveSelection(rowDelta: -1)
-            case .right: model.moveSelection(rowDelta: 1)
-            @unknown default: break
+            // Keep the selected cell on screen as arrow keys move it (matches the list view).
+            .onChange(of: model.selection) { _, sel in
+                guard let sel else { return }
+                withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(sel, anchor: .center) }
             }
         }
     }

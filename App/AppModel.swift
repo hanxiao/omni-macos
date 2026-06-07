@@ -23,7 +23,9 @@ struct HistoryItem: Codable, Sendable, Identifiable, Equatable {
     var filePath: String? = nil       // set when the query is a file
     var fileKind: String? = nil       // FileKind rawValue, for the row glyph
     var similar: Bool = false         // doc-vs-doc "find similar" vs query-by-file
-    var id: String { filePath ?? query }   // path-keyed dedup for files, query for text
+    // Namespaced so a file path can never collide with a text query of the same string. id is
+    // runtime-only (computed, not encoded), so changing the scheme is safe.
+    var id: String { filePath.map { "file:\($0)" } ?? "query:\(query)" }
     var isFile: Bool { filePath != nil }
     var displayLabel: String { isFile ? ((filePath! as NSString).lastPathComponent) : query }
 }
