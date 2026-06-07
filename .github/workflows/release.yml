@@ -89,15 +89,15 @@ jobs:
             CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO \
             OTHER_CODE_SIGN_FLAGS=--timestamp
 
-      # Store notary credentials under the "omni-notary" profile, then notarize + staple the app
-      # and the (signed) DMG via the same script used locally.
+      # Notarize + staple the app and the (signed) DMG. notarize.sh takes the App Store Connect
+      # creds directly from the env (no keychain profile) so it works on the self-hosted runner,
+      # whose login keychain isn't unlocked for the LaunchAgent.
       - name: Notarize and package DMG
         env:
           AC_APPLE_ID: ${{ secrets.AC_APPLE_ID }}
           AC_PASSWORD: ${{ secrets.AC_PASSWORD }}
+          AC_TEAM_ID: MTECXQ97E6
         run: |
-          xcrun notarytool store-credentials omni-notary \
-            --apple-id "$AC_APPLE_ID" --team-id MTECXQ97E6 --password "$AC_PASSWORD"
           ./Scripts/notarize.sh omni-notary \
             .build/xcode-rel/Build/Products/Release/Omni.app "${{ steps.ver.outputs.version }}"
 
