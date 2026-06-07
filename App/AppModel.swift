@@ -327,8 +327,11 @@ final class AppModel {
         guard q.count >= 2, q != lastHistoryRunQuery else { return }
         let ctx = currentSearchContext()
         let lower = q.lowercased()
-        searchHistory.removeAll { !$0.bookmarked && $0.query.count < q.count && lower.hasPrefix($0.query.lowercased()) }
-        if let i = searchHistory.firstIndex(where: { $0.query.caseInsensitiveCompare(q) == .orderedSame }) {
+        // Collapse live-typed TEXT prefixes only. File items have query == "" and "".isPrefix of
+        // everything, so without the !isFile guard this would wipe every file query from history.
+        searchHistory.removeAll { !$0.bookmarked && !$0.isFile && !$0.query.isEmpty
+            && $0.query.count < q.count && lower.hasPrefix($0.query.lowercased()) }
+        if let i = searchHistory.firstIndex(where: { !$0.isFile && $0.query.caseInsensitiveCompare(q) == .orderedSame }) {
             searchHistory[i].lastUsed = Date()
             searchHistory[i].query = q
             searchHistory[i].kinds = ctx.kinds; searchHistory[i].folder = ctx.folder
