@@ -2,10 +2,17 @@ import SwiftUI
 import AppKit
 import OmniKit
 
+/// One selectable row in the sidebar - a folder, or a history query - so both participate in the
+/// List's native selection (focus highlight, arrow keys, Delete).
+enum SidebarSelection: Hashable {
+    case folder(URL)
+    case history(String)
+}
+
 struct Sidebar: View {
     @Environment(AppModel.self) private var model: AppModel
     @State private var dropTargeted = false
-    @State private var selection: URL?
+    @State private var selection: SidebarSelection?
 
     var body: some View {
         List(selection: $selection) {
@@ -53,16 +60,18 @@ struct Sidebar: View {
                         Divider()
                         Button("Remove from Omni") { remove(url) }
                     }
+                    .tag(SidebarSelection.folder(url))
                 }
                 Button { pickFolder() } label: { Label("Add Folder\u{2026}", systemImage: "plus") }
                     .buttonStyle(.plain)
             }
 
-            // Past searches. Bookmarked queries are pinned to the top with a filled star; recent
-            // ones are auto-pruned. Click to re-run; right-click to bookmark or remove.
-            if !model.searchHistory.isEmpty {
-                Section("History") {
-                    ForEach(model.historyForDisplay) { item in
+            // Past searches, grouped by time (Bookmarks pinned first). Selecting a row re-runs that
+            // search with its saved filters; right-click to bookmark or remove. Native source-list
+            // selection gives the focus highlight + Delete-to-remove.
+            ForEach(model.historyGroups, id: \.title) { group in
+                Section(group.title) {
+                    ForEach(group.items) { item in
                         HStack(spacing: 7) {
                             Image(systemName: item.bookmarked ? "star.fill" : "magnifyingglass")
                                 .foregroundStyle(item.bookmarked ? Color.accentColor : Color.secondary)
@@ -70,20 +79,39 @@ struct Sidebar: View {
                             Text(item.query).lineLimit(1).truncationMode(.tail)
                             Spacer(minLength: 0)
                         }
-                        .contentShape(Rectangle())
-                        .onTapGesture { model.runHistoryQuery(item) }
                         .help(item.query)
                         .contextMenu {
                             Button(item.bookmarked ? "Remove Bookmark" : "Bookmark") { model.toggleHistoryBookmark(item) }
                             Divider()
                             Button("Remove") { model.removeHistory(item) }
                         }
+                        .tag(SidebarSelection.history(item.query))
                     }
                 }
             }
         }
         .listStyle(.sidebar)
-        .onDeleteCommand { if let s = selection { remove(s) } }
+        // Selecting a history row runs it (native "smart folder" behavior). Folder selection just
+        // highlights (folders are acted on via context menu / Delete).
+        .onChange(of: selection) { _, sel in
+            if case .history(let q) = sel, let item = model.searchHistory.first(where: { $0.query == q }) {
+                model.runHistoryQuery(item)
+            }
+        }
+        // Keep the highlight honest: once the query differs from the selected history item (the user
+        // typed a new search), drop the selection.
+        .onChange(of: model.query) { _, q in
+            if case .history(let sq) = selection, sq != q { selection = nil }
+        }
+        .onDeleteCommand {
+            switch selection {
+            case .folder(let url): remove(url)
+            case .history(let q):
+                if let item = model.searchHistory.first(where: { $0.query == q }) { model.removeHistory(item) }
+                selection = nil
+            case .none: break
+            }
+        }
         // Drag a folder in from Finder to add it as a search root - the most natural gesture on
         // macOS, alongside the existing Add Folder button.
         .dropDestination(for: URL.self) { urls, _ in
@@ -126,7 +154,7 @@ struct Sidebar: View {
     }
 
     private func remove(_ url: URL) {
-        if selection == url { selection = nil }
+        if selection == .folder(url) { selection = nil }
         model.removeRoot(url)
     }
 

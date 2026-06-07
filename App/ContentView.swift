@@ -5,6 +5,7 @@ import OmniKit
 struct ContentView: View {
     @Environment(AppModel.self) private var model: AppModel
     @State private var debounce: Task<Void, Never>?
+    @State private var historyDebounce: Task<Void, Never>?
 
     // Progressive disclosure: only offer search once there is something to search. During model
     // loading, onboarding, and the no-folders state the search field stays hidden (not dimmed).
@@ -15,7 +16,7 @@ struct ContentView: View {
             if showsSearch {
                 split
                     .searchable(text: Binding(get: { model.query }, set: { model.query = $0 }), placement: .toolbar, prompt: "Search your files by meaning")
-                    .onChange(of: model.query) { _, _ in scheduleSearch() }
+                    .onChange(of: model.query) { _, _ in scheduleSearch(); scheduleHistoryRecord() }
                     .onSubmit(of: .search) { model.search() }
             } else {
                 split
@@ -218,6 +219,16 @@ struct ContentView: View {
         debounce = Task {
             try? await Task.sleep(nanoseconds: 180_000_000)
             if !Task.isCancelled { model.search() }
+        }
+    }
+
+    // History records on a longer (2x) debounce than the search itself, so only a query the user
+    // actually settled on is stored - not every transient keystroke.
+    private func scheduleHistoryRecord() {
+        historyDebounce?.cancel()
+        historyDebounce = Task {
+            try? await Task.sleep(nanoseconds: 360_000_000)
+            if !Task.isCancelled { model.recordCurrentSearchToHistory() }
         }
     }
 
