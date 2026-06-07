@@ -908,16 +908,19 @@ final class AppModel {
             let url = fq.url, similar = fq.similar, maxImg = maxImageDimension, maxVid = maxVideoFrames
             Task.detached(priority: .userInitiated) {
                 let vec = engine.embedFileQuery(url, asDocument: similar, maxImageDimension: maxImg, maxVideoFrames: maxVid)
+                // Run the vector search OFF the main actor (matches the text path); doing it inside
+                // MainActor.run stalled the UI per file query, especially on a large index.
+                let hits = vec.map { store.search($0, filter: filter, topK: 60) }
                 await MainActor.run {
                     guard token == self.searchToken else { return }
                     self.searching = false
-                    guard let vec else {
+                    guard let vec, let hits else {
                         self.queryError = "Couldn't read \(url.lastPathComponent) as a query."
                         self.rawResults = []; self.resolvedQuery = self.fileToken(url)
                         return
                     }
                     self.lastQueryVector = vec
-                    self.rawResults = store.search(vec, filter: filter, topK: 60)
+                    self.rawResults = hits
                     self.resolvedQuery = self.fileToken(url)
                     if let sel = self.selection, !self.rawResults.contains(where: { $0.path == sel }) { self.selection = nil }
                     if !fq.fromHistory { self.recordFileQueryToHistory(fq) }   // re-running from history must not reorder it

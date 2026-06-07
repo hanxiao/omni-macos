@@ -168,7 +168,10 @@ struct Sidebar: View {
     private func reconcileSelection() {
         guard case .history(let id) = selection else { return }
         let q = model.query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let activeID = model.fileQuery?.url.path ?? (q.isEmpty ? nil : q)
+        // Must use the SAME namespaced scheme as HistoryItem.id ("file:<path>" / "query:<text>"),
+        // otherwise the active id never matches and the row is wrongly deselected on every change -
+        // which made a re-clicked file history item flip between showing and clearing its results.
+        let activeID: String? = model.fileQuery.map { "file:\($0.url.path)" } ?? (q.isEmpty ? nil : "query:\(q)")
         if id != activeID { selection = nil }
     }
 
