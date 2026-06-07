@@ -53,7 +53,10 @@ struct ResultsList<Footer: View>: View {
                                       expandable: hit.kind == FileKind.text.rawValue,
                                       expanded: expanded.contains(hit.path),
                                       onToggle: { toggle(hit.path) })
-                                .draggable(URL(fileURLWithPath: hit.path))
+                                // Result rows are intentionally NOT draggable: an in-app row drag was
+                                // easy to misclick onto the search drop target. Drag-to-search is for
+                                // files coming from OUTSIDE the app (Finder); use Find Similar / Reveal
+                                // in Finder for a result.
                                 .contentShape(Rectangle())
                                 .onTapGesture { model.selection = hit.path }
                                 .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
@@ -102,7 +105,6 @@ struct ResultsList<Footer: View>: View {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: gridMin, maximum: 220), spacing: Design.gapLarge)], spacing: Design.gapLarge) {
                 ForEach(results, id: \.path) { hit in
                     ResultGridItem(hit: hit, selected: model.selection == hit.path)
-                        .draggable(URL(fileURLWithPath: hit.path))
                         .onTapGesture { model.selection = hit.path }
                         .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
                         .contextMenu { menu(hit.path) }

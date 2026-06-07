@@ -107,14 +107,12 @@ struct Sidebar: View {
                 model.runHistoryQuery(item)
             }
         }
-        // Keep the highlight honest: once the user types a new text search, drop a selected TEXT
-        // history row. A file-query row stays selected (its query is the active file, not the text).
-        .onChange(of: model.query) { _, q in
-            if case .history(let id) = selection,
-               let item = model.searchHistory.first(where: { $0.id == id }), !item.isFile, item.query != q {
-                selection = nil
-            }
-        }
+        // Keep the highlight in sync with the ACTIVE query (text or file). When the active query no
+        // longer matches the selected history row, drop the selection - otherwise the row stays
+        // "stuck" selected and clicking it again is a no-op (no selection change = no re-run), which
+        // is why re-running a file history item sometimes did nothing.
+        .onChange(of: model.query) { _, _ in reconcileSelection() }
+        .onChange(of: model.fileQuery) { _, _ in reconcileSelection() }
         .onDeleteCommand {
             switch selection {
             case .folder(let url): remove(url)
@@ -163,6 +161,15 @@ struct Sidebar: View {
             return "Indexing \(rp.done.formatted()) / \(rp.total.formatted()) files"
         }
         return "Updating\u{2026}"
+    }
+
+    /// Drop the history selection when it no longer matches the active query (text or file), so the
+    /// row isn't left stuck-selected (which would make a re-click a no-op).
+    private func reconcileSelection() {
+        guard case .history(let id) = selection else { return }
+        let q = model.query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let activeID = model.fileQuery?.url.path ?? (q.isEmpty ? nil : q)
+        if id != activeID { selection = nil }
     }
 
     private func remove(_ url: URL) {

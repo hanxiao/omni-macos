@@ -78,7 +78,7 @@ final class AppModel {
     var query: String = ""
     /// A file used as the query (any modality - the embedding space is shared). When set, the active
     /// query is this file, not `query`. `similar` = doc-vs-doc "find similar" vs query-by-file.
-    struct FileQuery: Equatable { var url: URL; var kind: FileKind; var similar: Bool }
+    struct FileQuery: Equatable { var url: URL; var kind: FileKind; var similar: Bool; var fromHistory: Bool = false }
     var fileQuery: FileQuery? = nil
     var queryError: String? = nil   // a file query that couldn't be embedded (decode/missing)
     var rawResults: [SearchHit] = [] { didSet { recomputeResults() } }   // kind/folder/ext/date filtered, score-sorted
@@ -359,7 +359,7 @@ final class AppModel {
                 queryError = "\((path as NSString).lastPathComponent) no longer exists."
                 return   // keep current results; don't blow them away
             }
-            setFileQuery(URL(fileURLWithPath: path), similar: item.similar)
+            setFileQuery(URL(fileURLWithPath: path), similar: item.similar, fromHistory: true)
         } else {
             lastHistoryRunQuery = item.query
             fileQuery = nil
@@ -874,14 +874,14 @@ final class AppModel {
     private func fileToken(_ url: URL) -> String { "\u{0000}file:\(url.path)" }
 
     /// Use a file as the query (any supported modality). `similar` = doc-vs-doc "find similar".
-    func setFileQuery(_ url: URL, similar: Bool = false) {
+    func setFileQuery(_ url: URL, similar: Bool = false, fromHistory: Bool = false) {
         guard let kind = FileExtractor.kind(for: url) else {
             queryError = "\(url.lastPathComponent) isn't a searchable file type."
             fileQuery = nil; rawResults = []; resolvedQuery = fileToken(url)
             return
         }
         query = ""                       // the text field empties; the chip represents the query
-        fileQuery = FileQuery(url: url, kind: kind, similar: similar)
+        fileQuery = FileQuery(url: url, kind: kind, similar: similar, fromHistory: fromHistory)
         search()
     }
 
@@ -915,7 +915,7 @@ final class AppModel {
                     self.rawResults = store.search(vec, filter: filter, topK: 60)
                     self.resolvedQuery = self.fileToken(url)
                     if let sel = self.selection, !self.rawResults.contains(where: { $0.path == sel }) { self.selection = nil }
-                    self.recordFileQueryToHistory(fq)
+                    if !fq.fromHistory { self.recordFileQueryToHistory(fq) }   // re-running from history must not reorder it
                 }
             }
             return
