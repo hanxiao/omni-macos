@@ -285,6 +285,39 @@ if args.count >= 2 && args[1] == "concbench2" {
     exit(0)
 }
 
+// Store-memory benchmark: omni-verify storemem [N] [dim]
+// Builds an N-row store, folds (one search), and prints process phys_footprint - the real resident
+// memory of the vector store. Used to verify opt 4C removed the flat16/base duplication.
+if args.count >= 2 && args[1] == "storemem" {
+    let N = (args.count >= 3 ? Int(args[2]) : nil) ?? 420_000
+    let dim = (args.count >= 4 ? Int(args[3]) : nil) ?? 1024
+    func footprintMB() -> Double {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) { p in p.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count) } }
+        return kr == KERN_SUCCESS ? Double(info.phys_footprint) / 1_048_576 : -1
+    }
+    let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("storemem-\(N)-\(dim).sqlite")
+    for e in ["","-wal","-shm"] { try? FileManager.default.removeItem(at: URL(fileURLWithPath: tmp.path + e)) }
+    func unit(_ i: Int) -> [Float] { var v = [Float](repeating: 0, count: dim); v[i % dim] = 1; return v }
+    let interleave = ProcessInfo.processInfo.environment["OMNI_STOREMEM_INTERLEAVE"] == "1"
+    let base0 = footprintMB()
+    let store = try VectorStore(dbURL: tmp)
+    var batch: [(path: String, chunks: [IndexedChunk])] = []
+    for i in 0..<N { batch.append(("p\(i)", [IndexedChunk(path: "p\(i)", modified: 0, kind: "text", chunkIndex: 0, snippet: "", embedding: unit(i))]))
+        if batch.count == 2000 { try store.replaceMany(batch); batch.removeAll(keepingCapacity: true)
+            if interleave { _ = store.search(unit(0), topK: 10) } } }   // periodic search -> folds keep the delta small
+    if !batch.isEmpty { try store.replaceMany(batch) }
+    _ = store.search(unit(0), topK: 10)   // folds delta into base
+    MLX.GPU.clearCache()                   // reclaim freed fold buffers so we measure live residency
+    let after = footprintMB()
+    print(String(format: "storemem N=%d dim=%d  vectors=%.0f MB (bf16 single copy)  phys_footprint: base %.0f MB -> %.0f MB (store = %.0f MB)",
+                 N, dim, Double(N*dim*2)/1_048_576, base0, after, after - base0))
+    for e in ["","-wal","-shm"] { try? FileManager.default.removeItem(at: URL(fileURLWithPath: tmp.path + e)) }
+    exit(0)
+}
+
 // Load benchmark: omni-verify loadbench [N] [dim]
 // Times VectorStore(dbURL) reopening an existing N-row index (loadIntoMemory) - the store load that
 // bootstrap now overlaps with the engine load (opt 2A), i.e. the wall-clock 2A removes from launch.
