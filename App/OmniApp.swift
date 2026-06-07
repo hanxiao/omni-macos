@@ -18,6 +18,11 @@ struct OmniApp: App {
             CommandGroup(replacing: .appInfo) {
                 Button("About Omni") { showAbout() }
                 Button("Check for Updates\u{2026}") { Updater.check(userInitiated: true) }
+                Divider()
+                // Benchmarks this Mac on a fixed 5000-file dataset; results (hardware + timing only)
+                // can be shared to hanxiao.io/omni.
+                Button("Run Profiling\u{2026}") { Task { await model.runProfiling() } }
+                    .disabled(model.isProfilingRunning || !model.canIndex)
             }
             // The primary actions on the selected result, reachable from the menu bar and keyboard
             // with visible shortcut hints (previously double-click / context-menu only).
@@ -58,11 +63,6 @@ struct OmniApp: App {
                     .disabled(model.isIndexing || !model.canIndex)
                 Button("Pause Indexing") { model.pauseIndexing() }
                     .disabled(!model.isIndexing)
-                Divider()
-                // Downloads a fixed 5000-file dataset and times an isolated index pass to benchmark
-                // this Mac. Results (hardware + timing only) can be shared to hanxiao.io/omni.
-                Button("Run Profiling\u{2026}") { Task { await model.runProfiling() } }
-                    .disabled(model.isProfilingRunning || !model.canIndex)
             }
             CommandGroup(replacing: .help) {
                 Button("Omni Keyboard Shortcuts") { showShortcuts() }
