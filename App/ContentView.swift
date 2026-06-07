@@ -119,6 +119,11 @@ struct ContentView: View {
         } else if let err = model.queryError {
             CenteredStatus(symbol: "exclamationmark.triangle", title: "Couldn't search by that file",
                            subtitle: err, showSpinner: false)
+        } else if model.indexObsolete && model.hasQuery {
+            // A dim/model mismatch makes every search return nothing; say so instead of "No matches".
+            CenteredStatus(symbol: "arrow.triangle.2.circlepath", title: "Reindex to search",
+                           subtitle: "This index was built with a different model than the one loaded. Rebuild it (or switch back to the matching model in Settings) to search again.",
+                           showSpinner: false, action: ("Reindex", { model.startIndexing() }))
         } else if !model.hasQuery || model.isResolving {
             // Idle prompt, and the in-flight search state. They share one calm placeholder so a
             // pending search only fades a small spinner in under the same prompt - it never flashes

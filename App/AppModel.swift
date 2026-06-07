@@ -631,7 +631,12 @@ final class AppModel {
     private func resolvedModelDir() -> URL? {
         if let saved = UserDefaults.standard.string(forKey: "omni.modelDir") {
             let u = URL(fileURLWithPath: saved)
-            if FileManager.default.fileExists(atPath: u.appendingPathComponent("model.safetensors").path) { return u }
+            let fm = FileManager.default
+            // Require a COMPLETE model, not just weights, so a partial saved dir doesn't load and
+            // then fail with missingConfig.
+            let complete = ["model.safetensors", "config.json", "tokenizer.json"]
+                .allSatisfy { fm.fileExists(atPath: u.appendingPathComponent($0).path) }
+            if complete { return u }
         }
         return ModelLocator.resolve()
     }
@@ -764,6 +769,7 @@ final class AppModel {
             let path = store.dbURL.path
             let lastTs = store.metaGet("last_indexed").flatMap { Double($0) }
             let stampedVersion = store.metaGet("embedding_version")
+            let storedDim = store.vectorDim   // ACTUAL stored vector dim - ground truth
             await MainActor.run {
                 self.indexedFiles = stats.fileCount
                 self.indexedChunks = stats.chunkCount
@@ -775,17 +781,54 @@ final class AppModel {
                 if let lastTs { self.lastIndexed = Date(timeIntervalSince1970: lastTs) }
                 // Require engineDim > 0: before the engine reports its dimension the fingerprint is
                 // "...|dim0|model0-0", which would spuriously flag obsolete and wipe a valid index.
-                self.indexObsolete = dimReady && stats.fileCount > 0 && stampedVersion != fp
+                let hasIndex = dimReady && stats.fileCount > 0
+                // A dim mismatch between the loaded model and the stored vectors is AUTHORITATIVE: you
+                // cannot search a 768-dim index with a 1024-dim model (store.search returns nothing).
+                // This is immune to a stale/wrong meta fingerprint (which had recorded the wrong dim).
+                let dimMismatch = hasIndex && storedDim > 0 && storedDim != self.engineDim
+                // Only trust the string fingerprint for same-dim changes when its encoded dim agrees
+                // with reality - otherwise a stale "dim1024" stamp on a 768 index would wrongly flag a
+                // matching model obsolete and wipe the index.
+                let stringTrustworthy = stampedVersion?.contains("dim\(self.engineDim)") == true
+                let stringMismatch = hasIndex && stringTrustworthy && stampedVersion != fp
+                self.indexObsolete = dimMismatch || stringMismatch
             }
         }
     }
 
     static func indexURL() throws -> URL {
         let fm = FileManager.default
+        // User-chosen database folder wins, so the index can live on another volume.
+        if let custom = UserDefaults.standard.string(forKey: "omni.dbDir"), !custom.isEmpty {
+            let dir = URL(fileURLWithPath: custom)
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            return dir.appendingPathComponent("index.sqlite")
+        }
         let base = try fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
             .appendingPathComponent("Omni", isDirectory: true)
         try fm.createDirectory(at: base, withIntermediateDirectories: true)
         return base.appendingPathComponent("index.sqlite")
+    }
+
+    /// Move the index to a user-chosen folder (reloads the store from there).
+    func setDatabaseDir(_ url: URL) {
+        UserDefaults.standard.set(url.path, forKey: "omni.dbDir")
+        phase = .loadingModel
+        Task { await bootstrap() }
+    }
+
+    /// Storage-tab model picker action: switch if the variant is installed, otherwise confirm and
+    /// download it (no separate Download button - selecting the variant is the trigger).
+    func selectVariant(_ v: ModelVariant) {
+        if installedVariants[v] != nil {
+            switchVariant(v)
+        } else if !isDownloading {
+            let a = NSAlert()
+            a.messageText = "Download \(v.title)?"
+            a.informativeText = "\(v.detail). It downloads on-device, becomes the active model, and the index rebuilds for it (the two models use different embeddings)."
+            a.addButton(withTitle: "Download"); a.addButton(withTitle: "Cancel")
+            if a.runModal() == .alertFirstButtonReturn { downloadModel(v) }
+        }
     }
 
     // MARK: - Roots

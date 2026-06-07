@@ -386,33 +386,39 @@ private struct IndexTab: View {
                 }
             }
             Section {
-                Picker("Model Variant", selection: Binding(
+                // Selecting a variant switches to it if installed, or downloads it if not - no
+                // separate download button.
+                Picker("Model", selection: Binding(
                     get: { model.modelVariant },
-                    set: { model.switchVariant($0) }
+                    set: { model.selectVariant($0) }
                 )) {
                     ForEach(ModelVariant.allCases, id: \.self) { v in
-                        Text(model.installedVariants[v] != nil ? v.title : "\(v.title) \u{00B7} not installed")
+                        Text(model.installedVariants[v] != nil ? v.title : "\(v.title) \u{00B7} download")
                             .tag(v)
-                            .disabled(model.installedVariants[v] == nil)   // can't switch to an uninstalled variant
                     }
                 }
-                .disabled(model.isDownloading)
+                .disabled(model.isDownloading || model.isIndexing)
 
                 if model.isDownloading {
                     VStack(alignment: .leading, spacing: 4) {
                         ProgressView(value: model.downloadFraction)
                         Text(model.downloadLabel).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                     }
-                } else {
-                    ForEach(ModelVariant.allCases.filter { model.installedVariants[$0] == nil }, id: \.self) { v in
-                        Button("Download \(v.title)") { model.downloadModel(v) }
+                } else if !model.modelPath.isEmpty {
+                    Text(model.modelPath).font(.caption.monospaced()).foregroundStyle(.secondary)
+                        .lineLimit(3).truncationMode(.middle).textSelection(.enabled)
+                    HStack {
+                        Button("Change\u{2026}") { pickModel() }
+                        Button("Reveal in Finder") {
+                            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.modelPath)])
+                        }
                     }
-                    Button("Choose Model Folder\u{2026}") { pickModel() }
+                    .controlSize(.small)
                 }
             } header: {
                 Text("Model")
             } footer: {
-                Text("Switching the model rebuilds the index - the two models use different embeddings.")
+                Text("Pick a variant to switch to it or download it. Switching rebuilds the index - the two models use different embeddings.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
@@ -420,12 +426,19 @@ private struct IndexTab: View {
                     Text(model.dbPath).font(.caption.monospaced()).foregroundStyle(.secondary)
                         .lineLimit(3).truncationMode(.middle).textSelection(.enabled)
                 }
-                Button("Reveal in Finder") {
-                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.dbPath)])
+                HStack {
+                    Button("Change\u{2026}") { pickDatabase() }
+                    Button("Reveal in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.dbPath)])
+                    }
+                    .disabled(model.dbPath.isEmpty)
                 }
-                .disabled(model.dbPath.isEmpty)
+                .controlSize(.small)
             } header: {
                 Text("Database Location")
+            } footer: {
+                Text("Where the search index is stored. Changing the folder loads the index from there.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
@@ -433,6 +446,13 @@ private struct IndexTab: View {
     private func pickModel() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true; panel.canChooseFiles = false
+        panel.message = "Choose the model folder (model.safetensors, config.json, tokenizer.json)"
         if panel.runModal() == .OK, let url = panel.url { model.setModelDir(url) }
+    }
+    private func pickDatabase() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true; panel.canChooseFiles = false
+        panel.message = "Choose a folder to store the search index"
+        if panel.runModal() == .OK, let url = panel.url { model.setDatabaseDir(url) }
     }
 }

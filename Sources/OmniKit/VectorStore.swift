@@ -100,6 +100,9 @@ public final class VectorStore: @unchecked Sendable {
     // matrix from these bytes (reinterpreted, not converted) and scores on the GPU in one matmul.
     private var flat16: [UInt16] = []
     private var dim = 0
+    /// The actual dimension of the stored vectors (0 if empty). Ground truth for detecting an index
+    /// built with a different model than the one now loaded - the meta fingerprint can go stale.
+    public var vectorDim: Int { queue.sync { dim } }
     // Resident GPU score matrix, split so indexing inserts don't recopy it. `mlxBase` is an
     // MLX-OWNED copy of rows [0, baseRows) (mlx_array_new_data copies, so it's independent of
     // flat16's storage). Rows appended past baseRows are the "delta" - scored per query with one
