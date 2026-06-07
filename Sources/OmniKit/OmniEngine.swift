@@ -77,9 +77,16 @@ public enum ModelLocator {
         return out
     }
 
+    /// First directory that holds a COMPLETE model, not just weights. A partial dir (e.g. an
+    /// interrupted download or a /tmp leftover with only model.safetensors) must be skipped, or it
+    /// gets selected and the engine then fails with missingConfig. Require the files the loader
+    /// actually needs: weights + config + tokenizer.
     private static func firstWithWeights(_ dirs: [URL]) -> URL? {
         let fm = FileManager.default
-        return dirs.first { fm.fileExists(atPath: $0.appendingPathComponent("model.safetensors").path) }
+        let required = ["model.safetensors", "config.json", "tokenizer.json"]
+        return dirs.first { dir in
+            required.allSatisfy { fm.fileExists(atPath: dir.appendingPathComponent($0).path) }
+        }
     }
 }
 
