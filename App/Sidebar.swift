@@ -57,6 +57,30 @@ struct Sidebar: View {
                 Button { pickFolder() } label: { Label("Add Folder\u{2026}", systemImage: "plus") }
                     .buttonStyle(.plain)
             }
+
+            // Past searches. Bookmarked queries are pinned to the top with a filled star; recent
+            // ones are auto-pruned. Click to re-run; right-click to bookmark or remove.
+            if !model.searchHistory.isEmpty {
+                Section("History") {
+                    ForEach(model.historyForDisplay) { item in
+                        HStack(spacing: 7) {
+                            Image(systemName: item.bookmarked ? "star.fill" : "magnifyingglass")
+                                .foregroundStyle(item.bookmarked ? Color.accentColor : Color.secondary)
+                                .frame(width: 16)
+                            Text(item.query).lineLimit(1).truncationMode(.tail)
+                            Spacer(minLength: 0)
+                        }
+                        .contentShape(Rectangle())
+                        .onTapGesture { model.runHistoryQuery(item) }
+                        .help(item.query)
+                        .contextMenu {
+                            Button(item.bookmarked ? "Remove Bookmark" : "Bookmark") { model.toggleHistoryBookmark(item) }
+                            Divider()
+                            Button("Remove") { model.removeHistory(item) }
+                        }
+                    }
+                }
+            }
         }
         .listStyle(.sidebar)
         .onDeleteCommand { if let s = selection { remove(s) } }
