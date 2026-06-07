@@ -122,10 +122,12 @@ final class AppModel {
         selection = r[idx].path
     }
 
-    /// Matching passages (ranked chunks) of a file for the current query.
-    func passages(for path: String) -> [ChunkHit] {
+    /// Matching passages (ranked chunks) of a file for the current query. Runs off the main actor:
+    /// rankChunks does a queue.sync linear scan over all rows, which would stall the UI on a large
+    /// index when a row is expanded.
+    func passages(for path: String) async -> [ChunkHit] {
         guard let store, let v = lastQueryVector else { return [] }
-        return store.rankChunks(v, path: path)
+        return await Task.detached(priority: .userInitiated) { store.rankChunks(v, path: path) }.value
     }
 
     var indexState: IndexState = .idle
@@ -356,8 +358,14 @@ final class AppModel {
     }
 
     /// Re-run a history item: restore its filters + sort (without firing a search per change), set the
-    /// query, and search once. Marked so the debounced recorder won't re-record it.
-    func runHistoryQuery(_ item: HistoryItem) {
+    /// query, and search once. Marked so the debounced recorder won't re-record it. Returns false if
+    /// it couldn't run (e.g. a file query whose file is gone) so the caller can drop the selection.
+    @discardableResult
+    func runHistoryQuery(_ item: HistoryItem) -> Bool {
+        if item.isFile, let path = item.filePath, !FileManager.default.fileExists(atPath: path) {
+            queryError = "\((path as NSString).lastPathComponent) no longer exists."
+            return false   // keep current results; don't blow them away (caller clears the selection)
+        }
         // Restore the saved filter/sort context without firing a search per change.
         applyingHistoryContext = true
         filterKinds = Set(item.kinds.compactMap { FileKind(rawValue: $0) })
@@ -368,10 +376,6 @@ final class AppModel {
         applyingHistoryContext = false
 
         if item.isFile, let path = item.filePath {
-            guard FileManager.default.fileExists(atPath: path) else {
-                queryError = "\((path as NSString).lastPathComponent) no longer exists."
-                return   // keep current results; don't blow them away
-            }
             setFileQuery(URL(fileURLWithPath: path), similar: item.similar, fromHistory: true)
         } else {
             lastHistoryRunQuery = item.query
@@ -379,6 +383,7 @@ final class AppModel {
             query = item.query
             search()
         }
+        return true
     }
 
     /// Record a file query (path-keyed dedup), storing the active filter/sort context.
@@ -934,6 +939,13 @@ final class AppModel {
 
     /// Use a file as the query (any supported modality). `similar` = doc-vs-doc "find similar".
     func setFileQuery(_ url: URL, similar: Bool = false, fromHistory: Bool = false) {
+        if !FileManager.default.isReadableFile(atPath: url.path) {
+            queryError = FileManager.default.fileExists(atPath: url.path)
+                ? "\(url.lastPathComponent) can't be read (permission denied)."
+                : "\(url.lastPathComponent) no longer exists."
+            fileQuery = nil; rawResults = []; resolvedQuery = fileToken(url)
+            return
+        }
         guard let kind = FileExtractor.kind(for: url) else {
             queryError = "\(url.lastPathComponent) isn't a searchable file type."
             fileQuery = nil; rawResults = []; resolvedQuery = fileToken(url)
@@ -1084,13 +1096,15 @@ final class AppModel {
         let force = indexObsolete
         if force {
             store.wipeChunks()
-            // Reclaim the old index's disk space now (the DB is empty, so VACUUM is instant) - else
-            // the Storage tab keeps showing the old multi-GB size during the whole rebuild, since
-            // SQLite doesn't shrink the file on DELETE until it's vacuumed.
-            store.compact(minFreeRatio: 0)
             indexedFiles = 0; indexedChunks = 0; indexedKinds = []; rawResults = []
             indexStoredDim = 0
-            refreshIndexStats(store)   // push the now-small size to the UI immediately
+            refreshIndexStats(store)   // show 0 files immediately
+            // Reclaim the wiped index's disk space OFF the main actor - a VACUUM is a synchronous
+            // queue.sync; even though it rewrites only the (now ~empty) live data, never block the UI.
+            Task.detached(priority: .utility) {
+                store.compact(minFreeRatio: 0)
+                await MainActor.run { self.refreshIndexStats(store) }
+            }
         }
         // Stamp the fingerprint at the START so a paused/partial index is not later
         // mis-flagged obsolete - its content is already in the current space.

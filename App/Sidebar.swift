@@ -104,7 +104,9 @@ struct Sidebar: View {
         // highlights (folders are acted on via context menu / Delete).
         .onChange(of: selection) { _, sel in
             if case .history(let id) = sel, let item = model.searchHistory.first(where: { $0.id == id }) {
-                model.runHistoryQuery(item)
+                // If it couldn't run (e.g. a file query whose file is gone), drop the selection so the
+                // row isn't left stuck-highlighted and a re-click still fires.
+                if !model.runHistoryQuery(item) { selection = nil }
             }
         }
         // Keep the highlight in sync with the ACTIVE query (text or file). When the active query no
