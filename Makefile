@@ -1,9 +1,8 @@
 # Omni - common tasks.
-# The generated Omni.xcodeproj shadows the SwiftPM package for xcodebuild, so the
-# test target temporarily moves it aside.
 
 DEST = platform=macOS
 MODEL ?= /private/tmp/omni-model
+ONLY ?=
 
 .PHONY: app test fixtures clean
 
@@ -12,13 +11,12 @@ app:
 	xcodegen generate
 	xcodebuild -project Omni.xcodeproj -scheme Omni -destination '$(DEST)' build
 
-# Run the numeric parity + end-to-end search tests (compiles the Metal shaders).
+# Run the numeric parity + end-to-end search tests (compiles the Metal shaders). Delegated to
+# run-tests.sh, which applies the swift-tokenizers Rust-artifact overrides and ad-hoc signs the
+# bundle so xctest can load it (plain `xcodebuild test` fails on both counts in this project).
+# Filter a single class with: make test ONLY=OmniKitTests.VectorStoreTests
 test:
-	@if [ -d Omni.xcodeproj ]; then mv Omni.xcodeproj /tmp/Omni.xcodeproj.bak; fi
-	OMNI_MODEL_DIR='$(MODEL)' xcodebuild test -scheme Omni-Package -destination '$(DEST)' -only-testing:OmniKitTests; \
-	status=$$?; \
-	if [ -d /tmp/Omni.xcodeproj.bak ]; then mv /tmp/Omni.xcodeproj.bak Omni.xcodeproj; fi; \
-	exit $$status
+	OMNI_MODEL_DIR='$(MODEL)' ./Scripts/run-tests.sh $(ONLY)
 
 # Regenerate Python reference fixtures (run in an env with mlx + tokenizers).
 fixtures:
