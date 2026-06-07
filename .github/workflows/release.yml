@@ -1,15 +1,11 @@
 name: Release
 
-# Builds the app, packages a DMG, and publishes a GitHub release on every push to main.
-# Doc-only pushes are skipped. Rapid pushes collapse to the latest commit.
+# Builds the app, packages a DMG, and publishes a GitHub release. Runs ON DEMAND (not on every
+# push) on a SELF-HOSTED macOS runner - so routine commits cost nothing and macOS builds don't burn
+# GitHub's 10x-metered minutes on a private repo. Release with: gh workflow run release.yml
+# (or the Actions "Run workflow" button).
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'dist/**'
-      - '.gitignore'
-  workflow_dispatch: {}   # allow manual runs from the Actions tab
+  workflow_dispatch: {}
 
 concurrency:
   group: release
@@ -20,9 +16,10 @@ permissions:
 
 jobs:
   release:
-    # macOS 26: rendering the Liquid Glass AppIcon.icon requires the Tahoe runtime frameworks -
-    # actool crashes on macos-15 ("FigBaseCALayer missing from MediaToolbox") when compiling it.
-    runs-on: macos-26
+    # Self-hosted macOS runner (the M3 Ultra dev box, macOS 26). Free + fast, and macOS 26 is
+    # required anyway: rendering the Liquid Glass AppIcon.icon needs the Tahoe runtime frameworks
+    # (actool crashes on macOS 15 with "FigBaseCALayer missing from MediaToolbox").
+    runs-on: [self-hosted, macOS, arm64]
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -43,13 +40,15 @@ jobs:
           echo "version=$NEW" >> "$GITHUB_OUTPUT"
           echo "tag=v$NEW" >> "$GITHUB_OUTPUT"
 
-      # The app needs Xcode 26 (Swift 6.2 + the swift-tokenizers SE-0482 artifact).
-      - name: Select newest Xcode 26
+      # The app needs Xcode 26 (Swift 6.2 + the swift-tokenizers SE-0482 artifact). Select it via
+      # DEVELOPER_DIR (written to the job env) instead of `sudo xcode-select` - the self-hosted
+      # runner has no passwordless sudo. Falls back to the active toolchain if no Xcode_* is found
+      # (the dev box's default is already Xcode 26).
+      - name: Select Xcode 26
         run: |
           XC=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
-          [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
-          echo "Using $XC"
-          sudo xcode-select -s "$XC"
+          [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1 || true)
+          if [ -n "$XC" ]; then echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"; echo "Using $XC"; fi
           xcodebuild -version
 
       # MLX-Swift compiles Metal shaders; Xcode 26 needs the Metal toolchain component.
@@ -199,3 +198,11 @@ jobs:
             -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" \
             --data '{"files":["https://hanxiao.io/omni/","https://hanxiao.io/omni/index.html","https://hanxiao.io/omni/Omni.dmg"]}' \
             && echo "purged Cloudflare cache for /omni" || echo "Cloudflare purge failed (non-fatal)"
+
+      # Self-hosted hygiene: the cert import adds a temp build.keychain to the user search list -
+      # restore it and remove the temp keychain so repeated builds don't pollute the dev machine.
+      - name: Clean up keychain
+        if: always()
+        run: |
+          security list-keychains -d user -s login.keychain-db || true
+          security delete-keychain build.keychain 2>/dev/null || true
