@@ -55,23 +55,30 @@ private struct ActivityTab: View {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             ProgressView().controlSize(.small)
-                            Text("Indexing\u{2026}").fontWeight(.medium)
+                            Text(model.isPreparing ? "Preparing\u{2026}" : "Indexing\u{2026}").fontWeight(.medium)
                             Spacer()
-                            if let rateLabel {
+                            if !model.isPreparing, let rateLabel {
                                 Text(rateLabel).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                             }
                             Button("Pause") { model.pauseIndexing() }.controlSize(.small)
                         }
-                        ProgressView(value: overall)
-                        HStack {
-                            Text("\(model.progress.embedded) added")
-                            if model.progress.unchanged > 0 { Text("\u{00B7} \(model.progress.unchanged) up to date") }
-                            if model.progress.skipped > 0 { Text("\u{00B7} \(model.progress.skipped) skipped") }
-                            if model.progress.failed > 0 { Text("\u{00B7} \(model.progress.failed) failed") }
+                        if model.isPreparing {
+                            // No file processed yet: scanning folders / warming up the model. Show an
+                            // explanation rather than a 0% bar that looks frozen.
+                            Text("Scanning your folders and warming up the model\u{2026}")
+                                .font(.caption).foregroundStyle(.secondary)
+                        } else {
+                            ProgressView(value: overall)
+                            HStack {
+                                Text("\(model.progress.embedded) added")
+                                if model.progress.unchanged > 0 { Text("\u{00B7} \(model.progress.unchanged) up to date") }
+                                if model.progress.skipped > 0 { Text("\u{00B7} \(model.progress.skipped) skipped") }
+                                if model.progress.failed > 0 { Text("\u{00B7} \(model.progress.failed) failed") }
+                            }
+                            .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                            Text(URL(fileURLWithPath: model.progress.currentPath).lastPathComponent)
+                                .font(.caption2).foregroundStyle(.tertiary).lineLimit(1).truncationMode(.middle)
                         }
-                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                        Text(URL(fileURLWithPath: model.progress.currentPath).lastPathComponent)
-                            .font(.caption2).foregroundStyle(.tertiary).lineLimit(1).truncationMode(.middle)
                     }
                 case .paused:
                     HStack(spacing: 8) {
