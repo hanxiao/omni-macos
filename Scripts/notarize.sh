@@ -21,6 +21,14 @@ cd "$(dirname "$0")/.."
 
 PROFILE="${1:?usage: notarize.sh <notary-profile> [app] [version]}"
 APP="${2:-.build/xcode-rel/Build/Products/Release/Omni.app}"
+
+# notarytool auth: prefer direct App Store Connect credentials from the environment (AC_APPLE_ID +
+# AC_PASSWORD app-specific password + team id) so it works on a self-hosted runner with no unlocked
+# login keychain. Fall back to the named keychain profile (the local interactive setup).
+NOTARY_AUTH=(--keychain-profile "$PROFILE")
+if [ -n "${AC_APPLE_ID:-}" ] && [ -n "${AC_PASSWORD:-}" ]; then
+  NOTARY_AUTH=(--apple-id "$AC_APPLE_ID" --team-id "${AC_TEAM_ID:-MTECXQ97E6}" --password "$AC_PASSWORD")
+fi
 [ -d "$APP" ] || { echo "app not found: $APP"; exit 1; }
 VERSION="${3:-$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$APP/Contents/Info.plist")}"
 
@@ -42,7 +50,7 @@ codesign --verify --deep --strict --verbose=2 "$APP"
 echo "==> Notarizing the app"
 ZIP="$(mktemp -d)/Omni.zip"
 /usr/bin/ditto -c -k --keepParent "$APP" "$ZIP"
-xcrun notarytool submit "$ZIP" --keychain-profile "$PROFILE" --wait
+xcrun notarytool submit "$ZIP" "${NOTARY_AUTH[@]}" --wait
 echo "==> Stapling the app"
 xcrun stapler staple "$APP"
 xcrun stapler validate "$APP"
@@ -57,7 +65,7 @@ echo "==> Signing the DMG with Developer ID"
 codesign --force --sign "Developer ID Application" --timestamp "$DMG"
 
 echo "==> Notarizing and stapling the DMG"
-xcrun notarytool submit "$DMG" --keychain-profile "$PROFILE" --wait
+xcrun notarytool submit "$DMG" "${NOTARY_AUTH[@]}" --wait
 xcrun stapler staple "$DMG"
 
 echo "==> Final Gatekeeper verdict"
