@@ -285,6 +285,31 @@ if args.count >= 2 && args[1] == "concbench2" {
     exit(0)
 }
 
+// Load benchmark: omni-verify loadbench [N] [dim]
+// Times VectorStore(dbURL) reopening an existing N-row index (loadIntoMemory) - the store load that
+// bootstrap now overlaps with the engine load (opt 2A), i.e. the wall-clock 2A removes from launch.
+if args.count >= 2 && args[1] == "loadbench" {
+    let N = (args.count >= 3 ? Int(args[2]) : nil) ?? 420_000
+    let dim = (args.count >= 4 ? Int(args[3]) : nil) ?? 1024
+    let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("loadbench-\(N)-\(dim).sqlite")
+    for e in ["","-wal","-shm"] { try? FileManager.default.removeItem(at: URL(fileURLWithPath: tmp.path + e)) }
+    func unit(_ i: Int) -> [Float] { var v = [Float](repeating: 0, count: dim); v[i % dim] = 1; return v }
+    do {
+        let store = try VectorStore(dbURL: tmp)
+        var batch: [(path: String, chunks: [IndexedChunk])] = []
+        for i in 0..<N { batch.append(("p\(i)", [IndexedChunk(path: "p\(i)", modified: 0, kind: "text", chunkIndex: 0, snippet: "", embedding: unit(i))]))
+            if batch.count == 2000 { try store.replaceMany(batch); batch.removeAll(keepingCapacity: true) } }
+        if !batch.isEmpty { try store.replaceMany(batch) }
+    }   // store deinits here (WAL checkpoint), simulating a clean prior exit
+    var times: [Double] = []
+    for _ in 0..<5 { let t = Date(); _ = try VectorStore(dbURL: tmp); times.append(-t.timeIntervalSinceNow*1000) }
+    times.sort()
+    print(String(format: "loadbench N=%d dim=%d  VectorStore reopen (loadIntoMemory): median %.0f ms  min %.0f ms", N, dim, times[times.count/2], times.first ?? 0))
+    print("  -> opt 2A overlaps this with the engine load, removing it from launch wall-clock")
+    for e in ["","-wal","-shm"] { try? FileManager.default.removeItem(at: URL(fileURLWithPath: tmp.path + e)) }
+    exit(0)
+}
+
 // Crawl benchmark: omni-verify crawlbench [folder]
 // Quantifies the single-pass-crawl win: OLD two-pass (count walk + collect walk) vs NEW one-pass
 // (collect only) on a real folder. Warm-cache, so it's a LOWER BOUND on the cold-start saving

@@ -503,13 +503,20 @@ final class AppModel {
 
     private func bootstrap() async {
         applyMemoryLimit()
-        installedVariants = ModelLocator.installedVariants()
+        // installedVariants is Settings-only - compute it off the launch critical path (it walks
+        // every variant dir, slow on the external model volume).
+        Task.detached { let v = ModelLocator.installedVariants(); await MainActor.run { self.installedVariants = v } }
         guard let dir = resolvedModelDir() else { phase = .noModel; return }
         modelPath = dir.path
         modelVariant = dir.path.contains("nano") ? .nano : .small
         do {
-            let store = try VectorStore(dbURL: try Self.indexURL())
-            let engine = try await OmniEngine(modelDir: dir)
+            // Load the store (CPU: reads the index into memory) concurrently with the engine (IO/GPU:
+            // weights + tokenizer) - they're independent, so overlap removes the store load from the
+            // critical path. VectorStore/OmniEngine are Sendable; neither touches MainActor state here.
+            async let storeC = try VectorStore(dbURL: try Self.indexURL())
+            async let engineC = OmniEngine(modelDir: dir)
+            let store = try await storeC
+            let engine = try await engineC
             self.store = store
             self.engine = engine
             self.indexer = Indexer(store: store, embedder: engine)
