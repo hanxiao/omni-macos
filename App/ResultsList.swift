@@ -13,7 +13,7 @@ struct ResultsList<Footer: View>: View {
 
     private func toggle(_ path: String) {
         if expanded.contains(path) { expanded.remove(path) }
-        else { expanded.insert(path); passagesCache[path] = model.passages(for: path) }
+        else { expanded.insert(path); Task { passagesCache[path] = await model.passages(for: path) } }
     }
 
     var body: some View {
