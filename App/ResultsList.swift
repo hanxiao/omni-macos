@@ -105,6 +105,11 @@ struct ResultsList<Footer: View>: View {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: gridMin, maximum: 220), spacing: Design.gapLarge)], spacing: Design.gapLarge) {
                 ForEach(results, id: \.path) { hit in
                     ResultGridItem(hit: hit, selected: model.selection == hit.path)
+                        // Make the whole cell tappable, not just the opaque thumbnail/label - without
+                        // this, clicking the transparent padding around a small item did nothing.
+                        // (The list row already has this; the grid relied on .draggable's hit area,
+                        // which was removed.)
+                        .contentShape(Rectangle())
                         .onTapGesture { model.selection = hit.path }
                         .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
                         .contextMenu { menu(hit.path) }
