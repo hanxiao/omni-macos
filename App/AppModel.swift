@@ -1082,7 +1082,16 @@ final class AppModel {
         guard !activeRootsToIndex.isEmpty else { return }
         // An out-of-date index is in a different vector space: rebuild it, don't top up.
         let force = indexObsolete
-        if force { store.wipeChunks(); indexedFiles = 0; indexedChunks = 0; indexedKinds = []; rawResults = [] }
+        if force {
+            store.wipeChunks()
+            // Reclaim the old index's disk space now (the DB is empty, so VACUUM is instant) - else
+            // the Storage tab keeps showing the old multi-GB size during the whole rebuild, since
+            // SQLite doesn't shrink the file on DELETE until it's vacuumed.
+            store.compact(minFreeRatio: 0)
+            indexedFiles = 0; indexedChunks = 0; indexedKinds = []; rawResults = []
+            indexStoredDim = 0
+            refreshIndexStats(store)   // push the now-small size to the UI immediately
+        }
         // Stamp the fingerprint at the START so a paused/partial index is not later
         // mis-flagged obsolete - its content is already in the current space.
         store.metaSet("embedding_version", fingerprint)
