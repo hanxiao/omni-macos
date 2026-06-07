@@ -324,6 +324,20 @@ private struct PerformanceTab: View {
                 Text("Caps memory the model may use. Keep it above ~4 GB; 0 means unlimited.")
                     .font(.caption).foregroundStyle(.secondary)
             }
+            Section {
+                Toggle(isOn: Binding(get: { model.shareProfilingResults }, set: { model.shareProfilingResults = $0 })) {
+                    Text("Share profiling results")
+                }
+                if let r = model.lastProfilingReport {
+                    LabeledContent("Last run", value: String(format: "%.1f files/sec \u{00B7} %.0f tok/sec", r.metrics.filesPerSec, r.metrics.tokensPerSec))
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("Profiling")
+            } footer: {
+                Text("Run File \u{203A} Run Profiling to benchmark this Mac on a fixed dataset. Sharing sends hardware and timing only - never your files - to the public results on hanxiao.io/omni.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
     }

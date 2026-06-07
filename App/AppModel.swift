@@ -114,6 +114,14 @@ final class AppModel {
     /// tokens (backbone sequence positions) per second. Both exactly measured.
     var filesPerSec: Double = 0
     var tokensPerSec: Double = 0
+    // Profiling ("Run Profiling" menu): downloads a fixed dataset and times an isolated index pass.
+    var isProfilingRunning = false
+    var profilingPhase = ""
+    var lastProfilingReport: ProfilingReport?
+    /// Settings opt-in for uploading profiling results (mirrors ProfilingService's persisted flag).
+    var shareProfilingResults: Bool = UserDefaults.standard.bool(forKey: "omni.profiling.uploadEnabled") {
+        didSet { ProfilingService.setShareEnabled(shareProfilingResults) }
+    }
     private var rateLastEmbedded = 0
     private var rateLastTokens = 0
     private var rateLastTime: CFAbsoluteTime = 0
@@ -921,4 +929,85 @@ final class AppModel {
 
     /// Pause indexing. Files embedded so far are kept; resume continues from there.
     func pauseIndexing() { indexer?.cancel() }
+
+    // MARK: - Profiling
+
+    static var appVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+    }
+
+    /// Menu action: download the fixed profiling dataset, pause live indexing, run an ISOLATED timed
+    /// index pass over it (a throwaway temp store, so the real index is untouched), record hardware +
+    /// throughput + peak VRAM, write a local report, and - with one-time consent - upload it. Live
+    /// indexing is restored afterward no matter how the run ends.
+    func runProfiling() async {
+        guard !isProfilingRunning, let engine else { return }
+        isProfilingRunning = true
+        let panel = ProfilingProgressPanel()
+        panel.show()
+        let wasIndexing = (indexState == .indexing)
+
+        // Pause any live pass and wait (bounded) for it to actually stop, so the measurement is not
+        // skewed by a concurrent pass sharing the engine.
+        if wasIndexing {
+            panel.phase("Pausing indexing\u{2026}")
+            panel.indeterminate()
+            pauseIndexing()
+            for _ in 0 ..< 50 { if indexState != .indexing { break }; try? await Task.sleep(nanoseconds: 100_000_000) }
+        }
+
+        defer {
+            panel.close()
+            isProfilingRunning = false
+            profilingPhase = ""
+            if wasIndexing { startIndexing() }   // resume where it left off (incremental)
+        }
+
+        do {
+            profilingPhase = "Preparing dataset"
+            let folder = try await ProfilingService.ensureDataset(progress: panel)
+
+            profilingPhase = "Indexing"
+            let total = 5000
+            panel.phase("Indexing 0 / \(total)\u{2026}")
+            panel.fraction(0)
+            let metrics = try await runProfilingPass(engine: engine, targetURL: folder, settings: effectiveSettings()) { p in
+                Task { @MainActor in
+                    panel.phase("Indexing \(p.scanned) / \(total)\u{2026}")
+                    panel.detail("\(p.embedded) embedded, \(p.failed) failed")
+                    panel.fraction(total > 0 ? Double(p.scanned) / Double(total) : 0)
+                }
+            }
+
+            let report = ProfilingReport(
+                runId: UUID().uuidString,
+                appVersion: Self.appVersion,
+                datasetVersion: ProfilingService.datasetVersion,
+                hardware: HardwareProfile.collect(),
+                metrics: metrics)
+            lastProfilingReport = report
+            writeProfilingReport(report)
+
+            panel.phase("Uploading results\u{2026}")
+            panel.indeterminate()
+            if ProfilingService.ensureConsent() { await ProfilingService.upload(report) }
+            shareProfilingResults = ProfilingService.uploadsEnabled   // reflect the consent choice in Settings
+
+            panel.phase("Profiling complete")
+            panel.detail(String(format: "%.1f files/sec  \u{00B7}  %.0f tok/sec  \u{00B7}  %.1f GB peak VRAM",
+                                metrics.filesPerSec, metrics.tokensPerSec,
+                                Double(metrics.peakVramDeltaBytes) / 1_073_741_824))
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+        } catch {
+            panel.phase("Profiling failed")
+            panel.detail((error as? ProfilingService.ProfilingError)?.message ?? error.localizedDescription)
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+        }
+    }
+
+    private func writeProfilingReport(_ report: ProfilingReport) {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("omni-profiling-report.json")
+        let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        if let data = try? enc.encode(report) { try? data.write(to: url) }
+    }
 }
