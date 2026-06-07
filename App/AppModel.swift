@@ -11,7 +11,7 @@ enum IndexState { case idle, indexing, paused }
 /// A past search shown in the sidebar History. Bookmarked items are pinned and never auto-pruned.
 /// The filter/sort context is captured so re-running a history item restores exactly that search.
 struct HistoryItem: Codable, Sendable, Identifiable, Equatable {
-    var query: String
+    var query: String                 // text query, or "" for a file query
     var bookmarked: Bool
     var lastUsed: Date
     var kinds: [String] = []          // FileKind rawValues
@@ -19,7 +19,13 @@ struct HistoryItem: Codable, Sendable, Identifiable, Equatable {
     var ext: String = ""              // extension filter
     var dateRange: String = "any"     // DateRange rawValue
     var sortOrder: String = "relevance" // SortOrder rawValue
-    var id: String { query }
+    // File-query fields (all optional/defaulted so existing persisted JSON decodes unchanged).
+    var filePath: String? = nil       // set when the query is a file
+    var fileKind: String? = nil       // FileKind rawValue, for the row glyph
+    var similar: Bool = false         // doc-vs-doc "find similar" vs query-by-file
+    var id: String { filePath ?? query }   // path-keyed dedup for files, query for text
+    var isFile: Bool { filePath != nil }
+    var displayLabel: String { isFile ? ((filePath! as NSString).lastPathComponent) : query }
 }
 
 enum SortOrder: String, CaseIterable, Identifiable {
@@ -70,6 +76,11 @@ final class AppModel {
 
     var phase: Phase = .loadingModel
     var query: String = ""
+    /// A file used as the query (any modality - the embedding space is shared). When set, the active
+    /// query is this file, not `query`. `similar` = doc-vs-doc "find similar" vs query-by-file.
+    struct FileQuery: Equatable { var url: URL; var kind: FileKind; var similar: Bool }
+    var fileQuery: FileQuery? = nil
+    var queryError: String? = nil   // a file query that couldn't be embedded (decode/missing)
     var rawResults: [SearchHit] = [] { didSet { recomputeResults() } }   // kind/folder/ext/date filtered, score-sorted
     var searching = false
     /// The query text the currently displayed results actually correspond to. Lets the UI tell
@@ -334,7 +345,7 @@ final class AppModel {
     /// Re-run a history item: restore its filters + sort (without firing a search per change), set the
     /// query, and search once. Marked so the debounced recorder won't re-record it.
     func runHistoryQuery(_ item: HistoryItem) {
-        lastHistoryRunQuery = item.query
+        // Restore the saved filter/sort context without firing a search per change.
         applyingHistoryContext = true
         filterKinds = Set(item.kinds.compactMap { FileKind(rawValue: $0) })
         filterFolder = item.folder.map { URL(fileURLWithPath: $0) }
@@ -342,8 +353,39 @@ final class AppModel {
         dateRange = DateRange(rawValue: item.dateRange) ?? .any
         sortOrder = SortOrder(rawValue: item.sortOrder) ?? .relevance
         applyingHistoryContext = false
-        query = item.query
-        search()
+
+        if item.isFile, let path = item.filePath {
+            guard FileManager.default.fileExists(atPath: path) else {
+                queryError = "\((path as NSString).lastPathComponent) no longer exists."
+                return   // keep current results; don't blow them away
+            }
+            setFileQuery(URL(fileURLWithPath: path), similar: item.similar)
+        } else {
+            lastHistoryRunQuery = item.query
+            fileQuery = nil
+            query = item.query
+            search()
+        }
+    }
+
+    /// Record a file query (path-keyed dedup), storing the active filter/sort context.
+    private func recordFileQueryToHistory(_ fq: FileQuery) {
+        let ctx = currentSearchContext()
+        let path = fq.url.path
+        if let i = searchHistory.firstIndex(where: { $0.filePath == path }) {
+            searchHistory[i].lastUsed = Date()
+            searchHistory[i].similar = fq.similar
+            searchHistory[i].kinds = ctx.kinds; searchHistory[i].folder = ctx.folder
+            searchHistory[i].ext = ctx.ext; searchHistory[i].dateRange = ctx.dateRange; searchHistory[i].sortOrder = ctx.sort
+        } else {
+            var item = HistoryItem(query: "", bookmarked: false, lastUsed: Date(),
+                                   kinds: ctx.kinds, folder: ctx.folder, ext: ctx.ext,
+                                   dateRange: ctx.dateRange, sortOrder: ctx.sort)
+            item.filePath = path; item.fileKind = fq.kind.rawValue; item.similar = fq.similar
+            searchHistory.insert(item, at: 0)
+        }
+        pruneHistory()
+        persistHistory()
     }
 
     func toggleHistoryBookmark(_ item: HistoryItem) {
@@ -400,6 +442,7 @@ final class AppModel {
     /// True while a non-empty query's results are not yet ready (debouncing or searching). The UI
     /// shows a calm "Searching" state during this window instead of prematurely saying "No matches".
     var isResolving: Bool {
+        if let fq = fileQuery { return searching || resolvedQuery != fileToken(fq.url) }
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         return !q.isEmpty && (searching || resolvedQuery != q)
     }
@@ -825,14 +868,62 @@ final class AppModel {
 
     // MARK: - Search
 
+    /// A query is active if there's typed text OR a file subject.
+    var hasQuery: Bool { fileQuery != nil || !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    /// Stable resolvedQuery token for a file subject (distinct from any typed text).
+    private func fileToken(_ url: URL) -> String { "\u{0000}file:\(url.path)" }
+
+    /// Use a file as the query (any supported modality). `similar` = doc-vs-doc "find similar".
+    func setFileQuery(_ url: URL, similar: Bool = false) {
+        guard let kind = FileExtractor.kind(for: url) else {
+            queryError = "\(url.lastPathComponent) isn't a searchable file type."
+            fileQuery = nil; rawResults = []; resolvedQuery = fileToken(url)
+            return
+        }
+        query = ""                       // the text field empties; the chip represents the query
+        fileQuery = FileQuery(url: url, kind: kind, similar: similar)
+        search()
+    }
+
+    func clearFileQuery() {
+        fileQuery = nil; queryError = nil
+        rawResults = []; resolvedQuery = ""; selection = nil
+    }
+
     func search() {
         guard let engine, let store else { return }
-        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty else { rawResults = []; resolvedQuery = ""; return }
+        queryError = nil
+        let filter = currentFilter()
         searchToken += 1
         let token = searchToken
+
+        // File-as-query: embed the file off-thread (high priority inside the engine), then search.
+        if let fq = fileQuery {
+            searching = true
+            let url = fq.url, similar = fq.similar, maxImg = maxImageDimension, maxVid = maxVideoFrames
+            Task.detached(priority: .userInitiated) {
+                let vec = engine.embedFileQuery(url, asDocument: similar, maxImageDimension: maxImg, maxVideoFrames: maxVid)
+                await MainActor.run {
+                    guard token == self.searchToken else { return }
+                    self.searching = false
+                    guard let vec else {
+                        self.queryError = "Couldn't read \(url.lastPathComponent) as a query."
+                        self.rawResults = []; self.resolvedQuery = self.fileToken(url)
+                        return
+                    }
+                    self.lastQueryVector = vec
+                    self.rawResults = store.search(vec, filter: filter, topK: 60)
+                    self.resolvedQuery = self.fileToken(url)
+                    if let sel = self.selection, !self.rawResults.contains(where: { $0.path == sel }) { self.selection = nil }
+                    self.recordFileQueryToHistory(fq)
+                }
+            }
+            return
+        }
+
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { rawResults = []; resolvedQuery = ""; return }
         searching = true
-        let filter = currentFilter()
         Task.detached(priority: .userInitiated) {
             let vec = engine.embedQuery(q)   // high priority: jumps ahead of indexing
             let hits = store.search(vec, filter: filter, topK: 60)

@@ -6,6 +6,7 @@ struct ContentView: View {
     @Environment(AppModel.self) private var model: AppModel
     @State private var debounce: Task<Void, Never>?
     @State private var historyDebounce: Task<Void, Never>?
+    @State private var fileDropTargeted = false
 
     // Progressive disclosure: only offer search once there is something to search. During model
     // loading, onboarding, and the no-folders state the search field stays hidden (not dimmed).
@@ -16,7 +17,10 @@ struct ContentView: View {
             if showsSearch {
                 split
                     .searchable(text: Binding(get: { model.query }, set: { model.query = $0 }), placement: .toolbar, prompt: "Search your files by meaning")
-                    .onChange(of: model.query) { _, _ in scheduleSearch(); scheduleHistoryRecord() }
+                    .onChange(of: model.query) { _, q in
+                        if !q.isEmpty, model.fileQuery != nil { model.fileQuery = nil }   // typing replaces a file query
+                        scheduleSearch(); scheduleHistoryRecord()
+                    }
                     .onSubmit(of: .search) { model.search() }
             } else {
                 split
@@ -54,7 +58,7 @@ struct ContentView: View {
     }
 
     private var subtitle: String {
-        guard model.phase == .ready, !model.query.isEmpty, !model.isResolving else { return "" }
+        guard model.phase == .ready, model.hasQuery, !model.isResolving else { return "" }
         let n = model.results.count
         if n == 0 { return "" }
         return n >= 60 ? "Top \(n) results" : "\(n) result\(n == 1 ? "" : "s")"
@@ -80,10 +84,25 @@ struct ContentView: View {
     }
 
     @ViewBuilder private var content: some View {
-        if !model.results.isEmpty {
-            ResultsList(results: model.results) { belowThresholdFooter }
-        } else {
-            emptyState
+        VStack(spacing: 0) {
+            if let fq = model.fileQuery { FileQueryChip(fileQuery: fq) }
+            if !model.results.isEmpty {
+                ResultsList(results: model.results) { belowThresholdFooter }
+            } else {
+                emptyState
+            }
+        }
+        // Drop a supported file from Finder anywhere on the content to search by it.
+        .dropDestination(for: URL.self) { urls, _ in
+            guard let url = urls.first(where: { FileExtractor.kind(for: $0) != nil }) else { return false }
+            model.setFileQuery(url)
+            return true
+        } isTargeted: { fileDropTargeted = $0 }
+        .overlay {
+            if fileDropTargeted {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(Color.accentColor, lineWidth: 2).padding(6).allowsHitTesting(false)
+            }
         }
     }
 
@@ -94,7 +113,10 @@ struct ContentView: View {
             CenteredStatus(symbol: "folder.badge.plus", title: "Add a folder to search",
                            subtitle: "Choose the folders you want to search. Omni indexes them automatically and keeps them up to date.",
                            showSpinner: false, action: ("Add Folder\u{2026}", { pickFolder() }))
-        } else if model.query.isEmpty || model.isResolving {
+        } else if let err = model.queryError {
+            CenteredStatus(symbol: "exclamationmark.triangle", title: "Couldn't search by that file",
+                           subtitle: err, showSpinner: false)
+        } else if !model.hasQuery || model.isResolving {
             // Idle prompt, and the in-flight search state. They share one calm placeholder so a
             // pending search only fades a small spinner in under the same prompt - it never flashes
             // "No matches" while the debounce/search for what you just typed is still running.
@@ -142,6 +164,14 @@ struct ContentView: View {
                     Image(systemName: "sidebar.left")
                 }
                 .help("Show or hide the sidebar")
+            }
+        }
+        // Search by a file (any modality - the embedding space is shared). Available whenever the
+        // app can search, since it can start a query from the empty state too.
+        if model.phase == .ready {
+            ToolbarItem(placement: .automatic) {
+                Button { pickFile() } label: { Image(systemName: "photo.badge.magnifyingglass") }
+                    .help("Search by a file (image, audio, video, or text)")
             }
         }
         // Progressive disclosure: the filter/sort/view chrome appears only once there are results
@@ -242,6 +272,39 @@ struct ContentView: View {
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = true
         if panel.runModal() == .OK { for url in panel.urls { model.addRoot(url) } }
+    }
+
+    private func pickFile() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Search"
+        panel.message = "Choose an image, audio, video, or text file to search by"
+        if panel.runModal() == .OK, let url = panel.url { model.setFileQuery(url) }
+    }
+}
+
+/// A thin bar above the results showing the active file query (a file used as the search subject),
+/// with a clear button. Reuses Thumbnail and a native .bar material.
+private struct FileQueryChip: View {
+    @Environment(AppModel.self) private var model: AppModel
+    let fileQuery: AppModel.FileQuery
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: fileQuery.similar ? "square.on.square" : "photo.badge.magnifyingglass")
+                .foregroundStyle(.secondary)
+            Thumbnail(path: fileQuery.url.path, side: 18, corner: 4)
+            Text(fileQuery.similar ? "Similar to" : "Searching by").foregroundStyle(.secondary)
+            Text(fileQuery.url.lastPathComponent).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
+            Spacer(minLength: 8)
+            Button { model.clearFileQuery() } label: { Image(systemName: "xmark.circle.fill") }
+                .buttonStyle(.plain).foregroundStyle(.secondary).help("Clear file query")
+        }
+        .font(.callout)
+        .padding(.horizontal, 12).padding(.vertical, 7)
+        .background(.bar)
+        .overlay(alignment: .bottom) { Divider() }
     }
 }
 
