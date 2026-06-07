@@ -257,7 +257,8 @@ public final class Indexer: @unchecked Sendable {
                         guard let vec = v else { storeChunks(b.file.url.path, []); continue }
                         storeChunks(b.file.url.path, [IndexedChunk(
                             path: b.file.url.path, modified: b.file.modified, size: b.file.size,
-                            kind: b.kind, chunkIndex: 0, snippet: b.file.url.lastPathComponent, embedding: vec)])
+                            kind: b.kind, chunkIndex: 0, snippet: b.file.url.lastPathComponent, embedding: vec,
+                            duration: FileExtractor.mediaDuration(b.file.url) ?? 0)])
                     }
                     onProgress(p)
                 }
@@ -472,8 +473,23 @@ public final class Indexer: @unchecked Sendable {
     }
 
     /// GPU embed of decoded content. Runs serially in the consumer.
+    /// Index-time display metadata for a media file: original image dimensions, or audio/video
+    /// duration. Read once per file from the header (cheap next to embedding) so the UI never has to
+    /// touch the file at search time. 0 = not applicable/unknown (text, or a header that won't read).
+    static func mediaMeta(_ url: URL, kind: String) -> (width: Int, height: Int, duration: Double) {
+        switch FileKind(rawValue: kind) {
+        case .image:
+            if let s = FileExtractor.imagePixelSize(url) { return (s.width, s.height, 0) }
+        case .video, .audio:
+            if let d = FileExtractor.mediaDuration(url) { return (0, 0, d) }
+        default: break
+        }
+        return (0, 0, 0)
+    }
+
     private func embed(_ item: DecodedItem) -> [IndexedChunk] {
         let file = item.file, kind = item.kind
+        let meta = Self.mediaMeta(file.url, kind: kind)
         switch item.payload {
         case .empty:
             return []
@@ -494,13 +510,13 @@ public final class Indexer: @unchecked Sendable {
         case .audioMel(let mel, let frames):
             guard let vec = embedder.embedAudioMel(mel, frames: frames) else { return [] }
             return [IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
-                                 chunkIndex: 0, snippet: file.url.lastPathComponent, embedding: vec)]
+                                 chunkIndex: 0, snippet: file.url.lastPathComponent, embedding: vec, duration: meta.duration)]
         case .images(let images):
             // Only video frames reach here now (one temporal clip -> one embedding).
             if kind == FileKind.video.rawValue {
                 guard let vec = embedder.embedVideoFrames(images) else { return [] }
                 return [IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
-                                     chunkIndex: 0, snippet: file.url.lastPathComponent, embedding: vec)]
+                                     chunkIndex: 0, snippet: file.url.lastPathComponent, embedding: vec, duration: meta.duration)]
             }
             // Safety fallback (non-video CGImages, e.g. a conformer that didn't preprocess): serial.
             var out: [IndexedChunk] = []
@@ -509,7 +525,8 @@ public final class Indexer: @unchecked Sendable {
                 guard let vec = embedder.embedImage(img) else { continue }
                 let label = images.count > 1 ? "page \(i + 1)" : file.url.lastPathComponent
                 out.append(IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
-                                        chunkIndex: i, snippet: "\(file.url.lastPathComponent) - \(label)", embedding: vec))
+                                        chunkIndex: i, snippet: "\(file.url.lastPathComponent) - \(label)", embedding: vec,
+                                        width: meta.width, height: meta.height))
             }
             return out
         case .imagePatches(let raws):
@@ -523,8 +540,10 @@ public final class Indexer: @unchecked Sendable {
             for (i, vec) in vecs.enumerated() {
                 if isCancelled { break }
                 let label = raws.count > 1 ? "page \(i + 1)" : file.url.lastPathComponent
+                // Single images carry their original pixel size; multi-page (scanned PDF) leaves it 0.
                 out.append(IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
-                                        chunkIndex: i, snippet: "\(file.url.lastPathComponent) - \(label)", embedding: vec))
+                                        chunkIndex: i, snippet: "\(file.url.lastPathComponent) - \(label)", embedding: vec,
+                                        width: raws.count == 1 ? meta.width : 0, height: raws.count == 1 ? meta.height : 0))
             }
             return out
         }
