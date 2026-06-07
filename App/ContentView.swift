@@ -18,8 +18,11 @@ struct ContentView: View {
                 split
                     .searchable(text: Binding(get: { model.query }, set: { model.query = $0 }), placement: .toolbar, prompt: "Search your files by meaning")
                     .onChange(of: model.query) { _, q in
-                        if !q.isEmpty, model.fileQuery != nil { model.fileQuery = nil }   // typing replaces a file query
-                        scheduleSearch(); scheduleHistoryRecord()
+                        if !q.isEmpty, model.fileQuery != nil { model.fileQuery = nil; model.queryError = nil }   // typing replaces a file query
+                        // Don't re-search for the query="" that setFileQuery sets (it already searched);
+                        // only schedule a text search when no file query is active.
+                        if model.fileQuery == nil { scheduleSearch() }
+                        scheduleHistoryRecord()
                     }
                     .onSubmit(of: .search) { model.search() }
             } else {
@@ -171,7 +174,8 @@ struct ContentView: View {
         if model.phase == .ready {
             ToolbarItem(placement: .automatic) {
                 Button { pickFile() } label: { Image(systemName: "photo.badge.magnifyingglass") }
-                    .help("Search by a file (image, audio, video, or text)")
+                    .keyboardShortcut("o", modifiers: [.command, .shift])
+                    .help("Search by a file (image, audio, video, or text)  \u{21E7}\u{2318}O")
             }
         }
         // Progressive disclosure: the filter/sort/view chrome appears only once there are results
@@ -293,7 +297,7 @@ private struct FileQueryChip: View {
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: fileQuery.similar ? "square.on.square" : "photo.badge.magnifyingglass")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.secondary).frame(width: 18)
             Thumbnail(path: fileQuery.url.path, side: 18, corner: 4)
             Text(fileQuery.similar ? "Similar to" : "Searching by").foregroundStyle(.secondary)
             Text(fileQuery.url.lastPathComponent).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
@@ -302,7 +306,7 @@ private struct FileQueryChip: View {
                 .buttonStyle(.plain).foregroundStyle(.secondary).help("Clear file query")
         }
         .font(.callout)
-        .padding(.horizontal, 12).padding(.vertical, 7)
+        .padding(.horizontal, 16).padding(.vertical, 8)
         .background(.bar)
         .overlay(alignment: .bottom) { Divider() }
     }

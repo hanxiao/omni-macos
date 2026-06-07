@@ -157,7 +157,7 @@ struct ProfilingSheet: View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 12) {
                 Image(systemName: "speedometer")
-                    .font(.system(size: 24))
+                    .font(.system(size: 18))
                     .foregroundStyle(.tint)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Profiling").font(.headline)
@@ -179,7 +179,7 @@ struct ProfilingSheet: View {
             }
         }
         .padding(20)
-        .frame(width: 400)
+        .frame(maxWidth: 400)
         .interactiveDismissDisabled()   // a run can't be dismissed midway; it closes itself when done
     }
 }
