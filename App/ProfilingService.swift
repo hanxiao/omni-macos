@@ -9,8 +9,11 @@ import OmniKit
 @MainActor
 enum ProfilingService {
     static let datasetVersion = "profiling-v1"
-    static let manifestURL = "https://hanxiao.io/omni/profiling-v1.json"
-    static let zipURL = "https://hanxiao.io/omni/profiling-v1.zip"
+    // The dataset is hosted under a content-tagged filename (not plain "profiling-v1.zip") so a
+    // replaced dataset is a fresh URL the CDN has never cached - the same reason the DMG is versioned.
+    // Bump the "-1000" tag (and re-host) whenever the dataset content changes.
+    static let manifestURL = "https://hanxiao.io/omni/profiling-v1-1000.json"
+    static let zipURL = "https://hanxiao.io/omni/profiling-v1-1000.zip"
     static let uploadURL = "https://hanxiao.io/omni/profiling"
 
     private static let consentKey = "omni.profiling.consentGiven"
@@ -26,18 +29,19 @@ enum ProfilingService {
         URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("omni-\(datasetVersion)", isDirectory: true)
     }
 
-    /// Ensure the dataset is present locally and return its folder. Uses a cached copy when the
-    /// manifest MD5 still matches; otherwise downloads the zip, verifies it, and unzips to /tmp.
-    static func ensureDataset(progress: ProfilingProgressPanel) async throws -> URL {
+    /// Ensure the dataset is present locally and return its folder + file count. Uses a cached copy
+    /// when the manifest MD5 still matches; otherwise downloads the zip, verifies it, unzips to /tmp.
+    static func ensureDataset(progress: ProfilingProgressPanel) async throws -> (folder: URL, fileCount: Int) {
         let manifest = try await fetchManifest()
         let folder = datasetFolder
+        let count = manifest.fileCount ?? 0
 
         // Cache hit: folder exists and a stored stamp matches the manifest MD5.
         let stamp = folder.appendingPathComponent(".md5")
         if FileManager.default.fileExists(atPath: folder.path),
            let want = manifest.md5?.lowercased(),
            let have = try? String(contentsOf: stamp, encoding: .utf8), have == want {
-            return folder
+            return (folder, count)
         }
 
         progress.phase("Downloading dataset...")
@@ -57,7 +61,7 @@ enum ProfilingService {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         try await unzip(tmpZip, into: folder)
         if let want = manifest.md5?.lowercased() { try? want.write(to: stamp, atomically: true, encoding: .utf8) }
-        return folder
+        return (folder, count)
     }
 
     private static func fetchManifest() async throws -> Manifest {
