@@ -170,7 +170,7 @@ jobs:
           # Self-healing deploy: the page (index.html + all assets) is owned by this repo's site/omni/
           # and pushed in full every release, so a dropped asset or an outside clobber self-repairs.
           git clone --depth 1 "https://x-access-token:${SITE_TOKEN}@github.com/hanxiao/hanxiao.github.io.git" /tmp/site
-          rsync -a --delete --exclude='*.dmg' site/omni/ /tmp/site/omni/
+          rsync -a --delete --exclude='*.dmg' --exclude='profiling-v1.*' site/omni/ /tmp/site/omni/
           cp "$DMG" "/tmp/site/omni/Omni-${VERSION}.dmg"
           # Keep the 2 most recent DMGs (current + previous). The page HTML is at the fixed /omni/
           # URL and can be CF-cached (max-age=14400) briefly after a release; keeping the previous
