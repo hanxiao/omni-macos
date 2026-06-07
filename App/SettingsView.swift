@@ -332,17 +332,25 @@ private struct PerformanceTab: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
+                LabeledContent("Benchmark this Mac") {
+                    Button("Run Profiling\u{2026}") { Task { await model.runProfiling() } }
+                        .controlSize(.small)
+                        .disabled(model.isProfilingRunning || !model.canIndex)
+                }
                 Toggle(isOn: Binding(get: { model.shareProfilingResults }, set: { model.shareProfilingResults = $0 })) {
-                    Text("Share profiling results")
+                    Text("Share results")
                 }
                 if let r = model.lastProfilingReport {
-                    LabeledContent("Last run", value: String(format: "%.1f files/sec \u{00B7} %.0f tok/sec", r.metrics.filesPerSec, r.metrics.tokensPerSec))
-                        .foregroundStyle(.secondary)
+                    LabeledContent("Last run") {
+                        Text(String(format: "%.0f files/sec \u{00B7} %.1f GB peak VRAM",
+                                    r.metrics.filesPerSec, Double(r.metrics.peakVramDeltaBytes) / 1_073_741_824))
+                            .foregroundStyle(.secondary).monospacedDigit()
+                    }
                 }
             } header: {
                 Text("Profiling")
             } footer: {
-                Text("Run File \u{203A} Run Profiling to benchmark this Mac on a fixed dataset. Sharing sends hardware and timing only - never your files - to the public results on hanxiao.io/omni.")
+                Text("Benchmarks indexing on a fixed 1,000-file dataset. Sharing sends hardware and timing only - never your files - to the public results on hanxiao.io/omni.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }

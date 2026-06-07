@@ -74,7 +74,9 @@ struct Sidebar: View {
                     ForEach(group.items) { item in
                         HStack(spacing: 7) {
                             Image(systemName: item.bookmarked ? "star.fill" : "magnifyingglass")
-                                .foregroundStyle(item.bookmarked ? Color.accentColor : Color.secondary)
+                                // Yellow (not accent) so a bookmarked row stays legible even when it
+                                // is selected and sits on the accent-colored selection highlight.
+                                .foregroundStyle(item.bookmarked ? Color.yellow : Color.secondary)
                                 .frame(width: 16)
                             Text(item.query).lineLimit(1).truncationMode(.tail)
                             Spacer(minLength: 0)
