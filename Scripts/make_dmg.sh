@@ -1,10 +1,12 @@
 #!/bin/bash
-# Package a built Omni.app into a drag-to-install DMG.
+# Package a built Omni.app into a drag-to-install DMG with the classic installer layout
+# (app icon + arrow -> Applications, on a background image).
 #   ./Scripts/make_dmg.sh [path/to/Omni.app] [version]
 # Defaults: the Release build under .build, and the app's CFBundleShortVersionString.
 #
-# The DMG mounts to a volume containing Omni.app plus an /Applications symlink, so the
-# user drags the app onto Applications. No extra tooling required (uses hdiutil).
+# Uses dmgbuild (via uv), which writes the .DS_Store directly - no Finder/AppleScript automation, so
+# it works headless on the self-hosted CI runner. Set NOTARIZED=1 to skip the first-launch help note
+# (notarized builds open with no Gatekeeper warning).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -15,38 +17,37 @@ VERSION="${2:-$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$
 NAME="Omni"
 OUT="dist"
 DMG="$OUT/${NAME}-${VERSION}.dmg"
+BG="$PWD/Scripts/dmg/background.png"
 
 mkdir -p "$OUT"
 rm -f "$DMG"
 
-STAGE="$(mktemp -d)"
-trap 'rm -rf "$STAGE"' EXIT
-cp -R "$APP" "$STAGE/$NAME.app"
-ln -s /Applications "$STAGE/Applications"
-
-# First-launch help: only for un-notarized builds (macOS warns once on a downloaded copy).
-# When NOTARIZED=1 the build is notarized + stapled, opens with no warning, and the note would
-# be misleading - skip it.
+EXTRA_ARGS=()
+TMP_EXTRA=""
 if [ "${NOTARIZED:-0}" != "1" ]; then
-cat > "$STAGE/How to Open Omni.txt" <<'TXT'
+  TMP_EXTRA="$(mktemp -d)/How to Open Omni.txt"
+  cat > "$TMP_EXTRA" <<'TXT'
 First launch on macOS
 
-Omni is not yet notarized by Apple, so macOS shows a warning the first time
-you open a downloaded copy. To open it (you only do this once):
+This build is not notarized, so macOS warns the first time you open a downloaded
+copy. To open it (once):
 
   1. Drag Omni onto Applications.
-  2. Open System Settings - Privacy & Security.
-  3. Scroll down, click "Open Anyway" next to Omni, then confirm.
+  2. Open System Settings - Privacy & Security, scroll down, click "Open Anyway".
 
-Or run this once in Terminal:
+Or run once in Terminal:
 
   xattr -dr com.apple.quarantine /Applications/Omni.app
 
-After that Omni opens normally. On first run it downloads the search model.
+On first run Omni downloads the search model.
 TXT
+  EXTRA_ARGS=(-D "extra=$TMP_EXTRA")
 fi
+trap '[ -n "$TMP_EXTRA" ] && rm -rf "$(dirname "$TMP_EXTRA")" || true' EXIT
 
-# Compressed read-only DMG (UDZO) named "Omni <version>".
-hdiutil create -volname "$NAME $VERSION" -srcfolder "$STAGE" -fs HFS+ -format UDZO -ov "$DMG" >/dev/null
+uv run --with dmgbuild dmgbuild \
+  -s Scripts/dmg/settings.py \
+  -D "app=$APP" -D "bg=$BG" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
+  "$NAME $VERSION" "$DMG" >/dev/null
 
 echo "Created $DMG ($(du -h "$DMG" | cut -f1))"
