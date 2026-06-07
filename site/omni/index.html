@@ -311,6 +311,8 @@ img { max-width: 100%; display: block; }
 }
 /* main UI shot - large, centered */
 .shot-hero { max-width: 920px; margin: 0 auto 72px; }
+/* the any-file screenshot sits inside its own section, so tighten the margins */
+.anyfile-shot { margin: 28px auto 0; }
 
 /* ---------- Carousel (multimodal search) ---------- */
 .carousel-wrap { max-width: 920px; margin: 0 auto 72px; }
@@ -328,18 +330,17 @@ img { max-width: 100%; display: block; }
   object-fit: contain;
   opacity: 0;
   filter: drop-shadow(0 16px 38px rgba(17, 24, 39, 0.15));
-  animation: cfade 30s infinite;
+  animation: cfade 24s infinite;
 }
 .cframe:nth-child(1) { animation-delay: 0s; }
 .cframe:nth-child(2) { animation-delay: 6s; }
 .cframe:nth-child(3) { animation-delay: 12s; }
 .cframe:nth-child(4) { animation-delay: 18s; }
-.cframe:nth-child(5) { animation-delay: 24s; }
 @keyframes cfade {
   0%   { opacity: 0; }
-  2%   { opacity: 1; }
-  18%  { opacity: 1; }
-  22%  { opacity: 0; }
+  3%   { opacity: 1; }
+  22%  { opacity: 1; }
+  28%  { opacity: 0; }
   100% { opacity: 0; }
 }
 /* captions crossfade in sync with the frames */
@@ -348,13 +349,12 @@ img { max-width: 100%; display: block; }
   position: absolute;
   left: 0; right: 0;
   opacity: 0;
-  animation: cfade 30s infinite;
+  animation: cfade 24s infinite;
 }
 .carousel-cap > span:nth-child(1) { animation-delay: 0s; }
 .carousel-cap > span:nth-child(2) { animation-delay: 6s; }
 .carousel-cap > span:nth-child(3) { animation-delay: 12s; }
 .carousel-cap > span:nth-child(4) { animation-delay: 18s; }
-.carousel-cap > span:nth-child(5) { animation-delay: 24s; }
 @media (prefers-reduced-motion: reduce) {
   .cframe, .carousel-cap > span { animation: none; }
   .cframe:nth-child(1), .carousel-cap > span:nth-child(1) { opacity: 1; }
@@ -693,19 +693,17 @@ img { max-width: 100%; display: block; }
         <p class="section-label mono">A look inside</p>
 
         <figure class="carousel-wrap">
-          <div class="carousel" aria-label="Searching across images, text, audio, video, and by any file">
+          <div class="carousel" aria-label="Searching across images, text, audio, and video">
             <img class="cframe" src="assets/search-image.png" alt="Searching images - Porsche 911 photos" />
             <img class="cframe" src="assets/search-text.png" alt="Searching text and code - jina omni embeddings" />
             <img class="cframe" src="assets/search-audio.png" alt="Searching audio files" />
             <img class="cframe" src="assets/search-video.png" alt="Searching video clips" />
-            <img class="cframe" src="assets/search-anyfile.png" alt="Searching by an example file across all modalities" />
           </div>
           <figcaption class="shot-caption carousel-cap">
             <span><span class="mono">porsche 911</span> &middot; images</span>
             <span><span class="mono">jina omni embeddings</span> &middot; text</span>
             <span><span class="mono">podcast interview</span> &middot; audio</span>
             <span><span class="mono">screen recording demo</span> &middot; video</span>
-            <span><span class="mono">this file</span> &middot; any file as a query</span>
           </figcaption>
         </figure>
 
@@ -747,6 +745,10 @@ img { max-width: 100%; display: block; }
         <p class="section-label mono">Cross-modal</p>
         <h2 class="serving-title">Search with any file, find any file.</h2>
         <p class="serving-body">Every file - image, audio, video, text - lands in one shared vector space, so a query is just another file. Drop in a photo to find related screenshots, a voice memo to surface where it came from, a PDF to pull up everything near it. Right-click any result and choose <strong>Find Similar</strong>, or drop a file onto the search. One model, one space, any direction.</p>
+        <figure class="shot shot-hero anyfile-shot">
+          <img src="assets/search-anyfile.png" alt="Searching Omni by an example file, returning matches across modalities" loading="lazy" />
+          <figcaption class="shot-caption"><span class="mono">this file</span> &middot; results across every modality</figcaption>
+        </figure>
       </div>
     </section>
 
