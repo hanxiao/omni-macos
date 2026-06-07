@@ -9,10 +9,16 @@ enum ResultViewMode: String, CaseIterable { case list, grid }
 enum IndexState { case idle, indexing, paused }
 
 /// A past search shown in the sidebar History. Bookmarked items are pinned and never auto-pruned.
+/// The filter/sort context is captured so re-running a history item restores exactly that search.
 struct HistoryItem: Codable, Sendable, Identifiable, Equatable {
     var query: String
     var bookmarked: Bool
     var lastUsed: Date
+    var kinds: [String] = []          // FileKind rawValues
+    var folder: String? = nil         // restrict-to-folder path
+    var ext: String = ""              // extension filter
+    var dateRange: String = "any"     // DateRange rawValue
+    var sortOrder: String = "relevance" // SortOrder rawValue
     var id: String { query }
 }
 
@@ -134,6 +140,8 @@ final class AppModel {
     private(set) var searchHistory: [HistoryItem] = []
     private let historyKey = "omni.searchHistory"
     private let maxRecentHistory = 15
+    private var applyingHistoryContext = false   // suppress per-filter searches while restoring a history item
+    private var lastHistoryRunQuery: String?     // the query just launched from history (don't re-record it)
     private var rateLastEmbedded = 0
     private var rateLastTokens = 0
     private var rateLastTime: CFAbsoluteTime = 0
@@ -178,10 +186,10 @@ final class AppModel {
     }
 
     // Search filters + presentation. All persisted so the toolbar/view state survives relaunch.
-    var filterKinds: Set<FileKind> = [] { didSet { persistFilters(); search() } }
-    var filterFolder: URL? = nil { didSet { persistFilters(); search() } }
-    var filterExt: String = "" { didSet { persistFilters(); search() } }
-    var dateRange: DateRange = .any { didSet { persistFilters(); search() } }
+    var filterKinds: Set<FileKind> = [] { didSet { persistFilters(); if !applyingHistoryContext { search() } } }
+    var filterFolder: URL? = nil { didSet { persistFilters(); if !applyingHistoryContext { search() } } }
+    var filterExt: String = "" { didSet { persistFilters(); if !applyingHistoryContext { search() } } }
+    var dateRange: DateRange = .any { didSet { persistFilters(); if !applyingHistoryContext { search() } } }
     var minScore: Double = defaultMinScore { didSet { persistFilters(); recomputeResults() } }
     var sortOrder: SortOrder = .relevance { didSet { persistFilters(); recomputeResults() } }
 
@@ -267,31 +275,70 @@ final class AppModel {
 
     // MARK: - Search history
 
-    /// History sorted for display: bookmarks first (most-recent within each group).
-    var historyForDisplay: [HistoryItem] {
-        searchHistory.sorted {
-            $0.bookmarked != $1.bookmarked ? ($0.bookmarked && !$1.bookmarked) : $0.lastUsed > $1.lastUsed
+    /// History grouped for the sidebar: a pinned "Bookmarks" group, then recents bucketed by time
+    /// (Today / Yesterday / Previous 7 Days / Earlier). Only non-empty groups are returned, in order.
+    var historyGroups: [(title: String, items: [HistoryItem])] {
+        let cal = Calendar.current, now = Date()
+        let bookmarks = searchHistory.filter { $0.bookmarked }.sorted { $0.lastUsed > $1.lastUsed }
+        let recents = searchHistory.filter { !$0.bookmarked }.sorted { $0.lastUsed > $1.lastUsed }
+        func bucket(_ d: Date) -> Int {
+            if cal.isDateInToday(d) { return 0 }
+            if cal.isDateInYesterday(d) { return 1 }
+            let days = cal.dateComponents([.day], from: cal.startOfDay(for: d), to: cal.startOfDay(for: now)).day ?? 99
+            return days < 7 ? 2 : 3
         }
+        let names = ["Today", "Yesterday", "Previous 7 Days", "Earlier"]
+        var groups: [(String, [HistoryItem])] = []
+        if !bookmarks.isEmpty { groups.append(("Bookmarks", bookmarks)) }
+        for b in 0 ... 3 {
+            let items = recents.filter { bucket($0.lastUsed) == b }
+            if !items.isEmpty { groups.append((names[b], items)) }
+        }
+        return groups
     }
 
-    /// Record a search the user actually ran. Live-typed prefixes are collapsed (typing "ca" then
-    /// "cat" leaves only "cat") so the list holds whole searches, not every keystroke.
-    func recordSearch(_ raw: String) {
-        let q = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard q.count >= 2 else { return }
+    /// Snapshot of the active filters + sort, stored with a recorded query and restored on re-run.
+    private func currentSearchContext() -> (kinds: [String], folder: String?, ext: String, dateRange: String, sort: String) {
+        (filterKinds.map { $0.rawValue }, filterFolder?.path, filterExt, dateRange.rawValue, sortOrder.rawValue)
+    }
+
+    /// Debounced recorder (driven by ContentView at ~2x the search box's debounce, so only settled
+    /// queries land). Skips the query that was just launched from a history click (no re-record), and
+    /// collapses live-typed prefixes so "ca" -> "cat" leaves only "cat".
+    func recordCurrentSearchToHistory() {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard q.count >= 2, q != lastHistoryRunQuery else { return }
+        let ctx = currentSearchContext()
         let lower = q.lowercased()
         searchHistory.removeAll { !$0.bookmarked && $0.query.count < q.count && lower.hasPrefix($0.query.lowercased()) }
         if let i = searchHistory.firstIndex(where: { $0.query.caseInsensitiveCompare(q) == .orderedSame }) {
             searchHistory[i].lastUsed = Date()
-            searchHistory[i].query = q   // adopt the latest casing
+            searchHistory[i].query = q
+            searchHistory[i].kinds = ctx.kinds; searchHistory[i].folder = ctx.folder
+            searchHistory[i].ext = ctx.ext; searchHistory[i].dateRange = ctx.dateRange; searchHistory[i].sortOrder = ctx.sort
         } else {
-            searchHistory.insert(HistoryItem(query: q, bookmarked: false, lastUsed: Date()), at: 0)
+            searchHistory.insert(HistoryItem(query: q, bookmarked: false, lastUsed: Date(),
+                                             kinds: ctx.kinds, folder: ctx.folder, ext: ctx.ext,
+                                             dateRange: ctx.dateRange, sortOrder: ctx.sort), at: 0)
         }
         pruneHistory()
         persistHistory()
     }
 
-    func runHistoryQuery(_ item: HistoryItem) { query = item.query; search() }
+    /// Re-run a history item: restore its filters + sort (without firing a search per change), set the
+    /// query, and search once. Marked so the debounced recorder won't re-record it.
+    func runHistoryQuery(_ item: HistoryItem) {
+        lastHistoryRunQuery = item.query
+        applyingHistoryContext = true
+        filterKinds = Set(item.kinds.compactMap { FileKind(rawValue: $0) })
+        filterFolder = item.folder.map { URL(fileURLWithPath: $0) }
+        filterExt = item.ext
+        dateRange = DateRange(rawValue: item.dateRange) ?? .any
+        sortOrder = SortOrder(rawValue: item.sortOrder) ?? .relevance
+        applyingHistoryContext = false
+        query = item.query
+        search()
+    }
 
     func toggleHistoryBookmark(_ item: HistoryItem) {
         guard let i = searchHistory.firstIndex(where: { $0.id == item.id }) else { return }
@@ -788,7 +835,6 @@ final class AppModel {
                 self.lastQueryVector = vec
                 self.rawResults = hits
                 self.resolvedQuery = q
-                self.recordSearch(q)
                 if let sel = self.selection, !hits.contains(where: { $0.path == sel }) { self.selection = nil }
                 self.searching = false
             }
