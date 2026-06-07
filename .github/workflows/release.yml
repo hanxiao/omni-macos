@@ -171,7 +171,7 @@ jobs:
           # and pushed in full every release, so a dropped asset or an outside clobber self-repairs.
           rm -rf /tmp/site   # self-hosted runner reuses /tmp; a prior run's clone would block this one
           git clone --depth 1 "https://x-access-token:${SITE_TOKEN}@github.com/hanxiao/hanxiao.github.io.git" /tmp/site
-          rsync -a --delete --exclude='*.dmg' --exclude='profiling-v1.*' site/omni/ /tmp/site/omni/
+          rsync -a --delete --exclude='*.dmg' --exclude='profiling-v1*' site/omni/ /tmp/site/omni/
           cp "$DMG" "/tmp/site/omni/Omni-${VERSION}.dmg"
           # Keep the 2 most recent DMGs (current + previous). The page HTML is at the fixed /omni/
           # URL and can be CF-cached (max-age=14400) briefly after a release; keeping the previous

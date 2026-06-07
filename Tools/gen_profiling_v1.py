@@ -1,6 +1,6 @@
 """Generate the "profiling-v1" dataset used to benchmark Omni indexing speed.
 
-5000 files mixed across the four indexer kinds (text/image/audio/video). Content
+1000 files mixed across the four indexer kinds (text/image/audio/video). Content
 is PLACEHOLDER but metadata (resolution, duration, sample rate, byte size, file
 type, filename tokens) is real and varied so the indexer does real work.
 
@@ -31,8 +31,9 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-# Full-scale mix (must sum to 5000).
-FULL_MIX = {"text": 2000, "image": 1500, "audio": 800, "video": 700}
+# Canonical mix: 1000 files, 40/30/16/14 across the kinds. (Was 5000; trimmed so a profiling run is
+# quick on every Mac while keeping modality diversity and the same distribution.)
+FULL_MIX = {"text": 400, "image": 300, "audio": 160, "video": 140}
 TOTAL = sum(FULL_MIX.values())
 
 ZIP_FAIL_BYTES = 95 * 1024 * 1024  # fail loudly above this

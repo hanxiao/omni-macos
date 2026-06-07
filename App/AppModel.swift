@@ -1090,10 +1090,10 @@ final class AppModel {
 
         do {
             profilingPhase = "Preparing dataset"
-            let folder = try await ProfilingService.ensureDataset(progress: panel)
+            let (folder, count) = try await ProfilingService.ensureDataset(progress: panel)
 
             profilingPhase = "Indexing"
-            let total = 5000
+            let total = count > 0 ? count : 1000
             panel.phase("Indexing 0 / \(total)\u{2026}")
             panel.fraction(0)
             let metrics = try await runProfilingPass(engine: engine, targetURL: folder, settings: effectiveSettings()) { p in
