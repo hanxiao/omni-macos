@@ -259,6 +259,14 @@ final class AppModel {
     var dbSizeBytes: Int64 = 0
     var lastIndexed: Date?
     var indexObsolete = false
+    var indexStoredDim = 0                  // actual vector dim of the current index (0 if empty)
+    var indexModelVariantRaw: String?       // model variant recorded when the index was built
+    /// The model variant the current index was built with - recorded in meta, else inferred from the
+    /// stored vector dim (768 = Nano, 1024 = Small). Used to offer "switch back" vs "reindex".
+    var indexBuiltVariant: ModelVariant? {
+        if let raw = indexModelVariantRaw, let v = ModelVariant(rawValue: raw) { return v }
+        switch indexStoredDim { case 768: return .nano; case 1024: return .small; default: return nil }
+    }
     let embeddingVersion = omniEmbeddingVersion
     /// Engine vector dimension, captured at load; used to derive the fingerprint.
     private var engineDim = 0
@@ -770,7 +778,10 @@ final class AppModel {
             let lastTs = store.metaGet("last_indexed").flatMap { Double($0) }
             let stampedVersion = store.metaGet("embedding_version")
             let storedDim = store.vectorDim   // ACTUAL stored vector dim - ground truth
+            let builtVariant = store.metaGet("index_model_variant")
             await MainActor.run {
+                self.indexStoredDim = storedDim
+                self.indexModelVariantRaw = builtVariant
                 self.indexedFiles = stats.fileCount
                 self.indexedChunks = stats.chunkCount
                 self.indexedKinds = stats.kinds
@@ -1075,7 +1086,9 @@ final class AppModel {
         // Stamp the fingerprint at the START so a paused/partial index is not later
         // mis-flagged obsolete - its content is already in the current space.
         store.metaSet("embedding_version", fingerprint)
+        store.metaSet("index_model_variant", modelVariant.rawValue)   // for the "switch model vs reindex" prompt
         indexObsolete = false
+        indexModelVariantRaw = modelVariant.rawValue
         indexState = .indexing
         progress = IndexProgress()
         startRateSampler()
@@ -1249,6 +1262,7 @@ final class AppModel {
                 runId: UUID().uuidString,
                 appVersion: Self.appVersion,
                 datasetVersion: ProfilingService.datasetVersion,
+                model: modelVariant.rawValue,
                 hardware: HardwareProfile.collect(),
                 metrics: metrics)
             lastProfilingReport = report

@@ -120,10 +120,17 @@ struct ContentView: View {
             CenteredStatus(symbol: "exclamationmark.triangle", title: "Couldn't search by that file",
                            subtitle: err, showSpinner: false)
         } else if model.indexObsolete && model.hasQuery {
-            // A dim/model mismatch makes every search return nothing; say so instead of "No matches".
-            CenteredStatus(symbol: "arrow.triangle.2.circlepath", title: "Reindex to search",
-                           subtitle: "This index was built with a different model than the one loaded. Rebuild it (or switch back to the matching model in Settings) to search again.",
-                           showSpinner: false, action: ("Reindex", { model.startIndexing() }))
+            // A dim/model mismatch makes every search return nothing; explain it and offer both the
+            // cheap fix (switch back to the model the index was built with) and the rebuild.
+            let built = model.indexBuiltVariant
+            CenteredStatus(symbol: "arrow.triangle.2.circlepath",
+                           title: built != nil ? "Switch to \(built!.title) or reindex" : "Reindex to search",
+                           subtitle: built != nil
+                               ? "This index was built with \(built!.title) (\(model.indexStoredDim)-dim) but \(model.modelVariant.title) is loaded. Switch back to keep your index, or reindex with the current model."
+                               : "This index was built with a different model than the one loaded. Reindex to search again.",
+                           showSpinner: false,
+                           action: built.map { v in ("Switch to \(v.title)", { model.selectVariant(v) }) },
+                           secondary: ("Reindex", { model.startIndexing() }))
         } else if !model.hasQuery || model.isResolving {
             // Idle prompt, and the in-flight search state. They share one calm placeholder so a
             // pending search only fades a small spinner in under the same prompt - it never flashes
@@ -343,6 +350,7 @@ struct CenteredStatus: View {
     let subtitle: String
     var showSpinner: Bool = false
     var action: (String, () -> Void)? = nil
+    var secondary: (String, () -> Void)? = nil
 
     var body: some View {
         VStack(spacing: 12) {
@@ -351,8 +359,12 @@ struct CenteredStatus: View {
             Text(subtitle).font(.callout).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center).frame(maxWidth: 400)
             if showSpinner { ProgressView().controlSize(.small).padding(.top, 4) }
-            if let action {
-                Button(action.0, action: action.1).controlSize(.large).buttonStyle(.borderedProminent).padding(.top, 4)
+            if action != nil || secondary != nil {
+                HStack(spacing: 10) {
+                    if let action { Button(action.0, action: action.1).buttonStyle(.borderedProminent) }
+                    if let secondary { Button(secondary.0, action: secondary.1) }
+                }
+                .controlSize(.large).padding(.top, 4)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
