@@ -8,6 +8,14 @@ enum ResultViewMode: String, CaseIterable { case list, grid }
 /// The only indexing states the user sees: idle, indexing, paused.
 enum IndexState { case idle, indexing, paused }
 
+/// A past search shown in the sidebar History. Bookmarked items are pinned and never auto-pruned.
+struct HistoryItem: Codable, Sendable, Identifiable, Equatable {
+    var query: String
+    var bookmarked: Bool
+    var lastUsed: Date
+    var id: String { query }
+}
+
 enum SortOrder: String, CaseIterable, Identifiable {
     case relevance, name, dateModified
     var id: String { rawValue }
@@ -122,6 +130,10 @@ final class AppModel {
     var shareProfilingResults: Bool = UserDefaults.standard.bool(forKey: "omni.profiling.uploadEnabled") {
         didSet { ProfilingService.setShareEnabled(shareProfilingResults) }
     }
+    /// Past searches shown in the sidebar (recents auto-pruned; bookmarks pinned and kept).
+    private(set) var searchHistory: [HistoryItem] = []
+    private let historyKey = "omni.searchHistory"
+    private let maxRecentHistory = 15
     private var rateLastEmbedded = 0
     private var rateLastTokens = 0
     private var rateLastTime: CFAbsoluteTime = 0
@@ -248,8 +260,70 @@ final class AppModel {
         loadSettings()
         loadPerf()
         loadFilters()
+        loadHistory()
         if let raw = UserDefaults.standard.string(forKey: "omni.viewMode"), let m = ResultViewMode(rawValue: raw) { viewMode = m }
         Task { await bootstrap() }
+    }
+
+    // MARK: - Search history
+
+    /// History sorted for display: bookmarks first (most-recent within each group).
+    var historyForDisplay: [HistoryItem] {
+        searchHistory.sorted {
+            $0.bookmarked != $1.bookmarked ? ($0.bookmarked && !$1.bookmarked) : $0.lastUsed > $1.lastUsed
+        }
+    }
+
+    /// Record a search the user actually ran. Live-typed prefixes are collapsed (typing "ca" then
+    /// "cat" leaves only "cat") so the list holds whole searches, not every keystroke.
+    func recordSearch(_ raw: String) {
+        let q = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard q.count >= 2 else { return }
+        let lower = q.lowercased()
+        searchHistory.removeAll { !$0.bookmarked && $0.query.count < q.count && lower.hasPrefix($0.query.lowercased()) }
+        if let i = searchHistory.firstIndex(where: { $0.query.caseInsensitiveCompare(q) == .orderedSame }) {
+            searchHistory[i].lastUsed = Date()
+            searchHistory[i].query = q   // adopt the latest casing
+        } else {
+            searchHistory.insert(HistoryItem(query: q, bookmarked: false, lastUsed: Date()), at: 0)
+        }
+        pruneHistory()
+        persistHistory()
+    }
+
+    func runHistoryQuery(_ item: HistoryItem) { query = item.query; search() }
+
+    func toggleHistoryBookmark(_ item: HistoryItem) {
+        guard let i = searchHistory.firstIndex(where: { $0.id == item.id }) else { return }
+        searchHistory[i].bookmarked.toggle()
+        searchHistory[i].lastUsed = Date()
+        persistHistory()
+    }
+
+    func removeHistory(_ item: HistoryItem) {
+        searchHistory.removeAll { $0.id == item.id }
+        persistHistory()
+    }
+
+    /// Keep every bookmark; cap non-bookmarked recents to the most recent N.
+    private func pruneHistory() {
+        var recents = 0
+        searchHistory = searchHistory.sorted { $0.lastUsed > $1.lastUsed }.filter { item in
+            if item.bookmarked { return true }
+            recents += 1
+            return recents <= maxRecentHistory
+        }
+    }
+
+    private func persistHistory() {
+        if let data = try? JSONEncoder().encode(searchHistory) { UserDefaults.standard.set(data, forKey: historyKey) }
+    }
+
+    private func loadHistory() {
+        if let data = UserDefaults.standard.data(forKey: historyKey),
+           let items = try? JSONDecoder().decode([HistoryItem].self, from: data) {
+            searchHistory = items
+        }
     }
 
     // MARK: - Derived results
@@ -714,6 +788,7 @@ final class AppModel {
                 self.lastQueryVector = vec
                 self.rawResults = hits
                 self.resolvedQuery = q
+                self.recordSearch(q)
                 if let sel = self.selection, !hits.contains(where: { $0.path == sel }) { self.selection = nil }
                 self.searching = false
             }
