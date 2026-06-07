@@ -29,5 +29,11 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
 - Needs: `model.safetensors`, `adapters/retrieval/adapter_model.safetensors`, `tokenizer.json`, `config.json`.
 - Retrieval LoRA: alpha=32, r=32 -> scale 1.0, targets all 7 linear modules in `language_model`.
 
+## Signing (no Apple creds in the repo - it is public)
+- Local: `export OMNI_TEAM_ID=<10-char team>` before `xcodegen generate` (project.yml reads it).
+- CI: Team ID is the `APPLE_TEAM_ID` secret; cert/notary/deploy creds are GitHub Actions secrets
+  (DEVELOPER_ID_P12, DEVELOPER_ID_P12_PASSWORD, AC_APPLE_ID, AC_PASSWORD, SITE_TOKEN).
+- notarize.sh takes AC_* creds from env (no keychain profile) so the self-hosted runner works.
+
 ## Style
-- No emojis, no em dashes. Lean commits and docs.
+- No emojis, no em dashes. Lean commits and docs. License is Apache 2.0.

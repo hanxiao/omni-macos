@@ -32,7 +32,10 @@ targets:
         # instead of re-prompting on every build.
         CODE_SIGN_IDENTITY: "Apple Development"
         CODE_SIGN_STYLE: Manual
-        DEVELOPMENT_TEAM: MTECXQ97E6
+        # Team ID is read from the environment so no Apple account is baked into the repo.
+        # Set it before generating: `export OMNI_TEAM_ID=XXXXXXXXXX` (your 10-char Team ID).
+        # CI passes DEVELOPMENT_TEAM as a build override, so this can be empty there.
+        DEVELOPMENT_TEAM: ${OMNI_TEAM_ID}
         CODE_SIGNING_REQUIRED: YES
         ENABLE_HARDENED_RUNTIME: YES
         ENABLE_APP_SANDBOX: NO
