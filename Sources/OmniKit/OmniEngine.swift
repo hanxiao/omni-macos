@@ -116,6 +116,10 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     private var highWaiting = 0
     /// Media is indexed as documents -> the "Document: " prefix (official model card).
     private let docPrefix: [Int]
+    /// The "Query: " prefix. v5-omni applies the Query:/Document: distinction to EVERY modality
+    /// (model card), so a file used as a search query is embedded exactly like a document but with
+    /// this prefix instead of docPrefix.
+    private let queryPrefix: [Int]
     /// Trailing special tokens (e.g. Nano's end-of-text) appended after the media wrapper so
     /// image/audio/video pool at the same token the text path does - required for cross-modal.
     private let mediaSuffix: [Int]
@@ -138,6 +142,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         let text = OmniTextEncoder(weights: weights, config: config, tokenizer: tokenizer)
         self.textEncoder = text
         self.docPrefix = text.prefixTokenIds(.passage)
+        self.queryPrefix = text.prefixTokenIds(.query)
         self.mediaSuffix = text.suffixTokenIds
         self.imageEncoder = OmniImageEncoder(weights: weights, config: config)
         self.audioEncoder = OmniAudioEncoder(weights: weights, config: config)
@@ -255,6 +260,52 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             let v = enc.encodeBatch(mels: mels, frames: frames, prefixIds: docPrefix, suffixIds: mediaSuffix)
             addTokens(enc.lastSequenceLength)
             return v
+        }
+    }
+
+    // MARK: - File as a search query (HIGH priority - jumps ahead of indexing)
+    //
+    // v5-omni shares one space across modalities and applies the Query:/Document: distinction to
+    // EVERY modality (model card). So a file used as a query is embedded exactly like the indexing
+    // path, choosing the prefix by intent: queryPrefix for an asymmetric search ("search by this
+    // file"), docPrefix for symmetric "find similar" (document-vs-document neighbors). These run at
+    // high priority and skip addTokens() (queries are excluded from the indexing throughput counter).
+
+    public func embedImageQuery(_ image: CGImage, asDocument: Bool = false) -> [Float]? {
+        guard let enc = imageEncoder else { return nil }
+        let prefix = asDocument ? docPrefix : queryPrefix
+        return run(highPriority: true) { enc.encode(image, prefixIds: prefix, suffixIds: mediaSuffix) }
+    }
+
+    public func embedVideoQuery(_ frames: [CGImage], asDocument: Bool = false) -> [Float]? {
+        guard let enc = imageEncoder, !frames.isEmpty else { return nil }
+        let prefix = asDocument ? docPrefix : queryPrefix
+        return run(highPriority: true) { enc.encodeVideo(frames, prefixIds: prefix, suffixIds: mediaSuffix) }
+    }
+
+    public func embedAudioQuery(_ url: URL, asDocument: Bool = false) -> [Float]? {
+        guard let enc = audioEncoder else { return nil }
+        let prefix = asDocument ? docPrefix : queryPrefix
+        return run(highPriority: true) { enc.encode(url, prefixIds: prefix, suffixIds: mediaSuffix) }
+    }
+
+    /// Embed a file (by URL) as a search query, detecting modality and reusing the indexing-path
+    /// decoders so the vector lands in the same space as the index. `asDocument` picks doc-vs-doc
+    /// ("find similar") vs query-vs-doc ("search by this file"). Returns nil for text-kind files
+    /// (the caller embeds extracted text via embedQuery) and for unsupported/undecodable files.
+    public func embedFileQuery(_ url: URL, asDocument: Bool = false,
+                               maxImageDimension: Int = 1568, maxVideoFrames: Int = 6) -> [Float]? {
+        switch FileExtractor.kind(for: url) {
+        case .image:
+            guard let img = FileExtractor.loadImage(url, maxDimension: maxImageDimension) else { return nil }
+            return embedImageQuery(img, asDocument: asDocument)
+        case .video:
+            let frames = FileExtractor.videoFrames(url, maxFrames: maxVideoFrames, maxDimension: maxImageDimension)
+            return frames.isEmpty ? nil : embedVideoQuery(frames, asDocument: asDocument)
+        case .audio:
+            return embedAudioQuery(url, asDocument: asDocument)
+        case .text, .none:
+            return nil
         }
     }
 
