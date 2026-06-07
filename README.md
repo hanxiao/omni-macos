@@ -6,18 +6,23 @@
 
 <p align="center">Semantic search over your local files, running entirely on-device.</p>
 
+<p align="center">
+  <a href="https://hanxiao.io/omni"><b>Download for macOS &rarr;</b></a>
+</p>
+
 Omni indexes your files and lets you search them by meaning instead of filename. A
 text query finds matching documents, code, PDFs, images, audio, and video together,
 because everything is embedded into one shared vector space. The model runs in-process
-on Apple GPUs via a native MLX-Swift port of
-[`jinaai/jina-embeddings-v5-omni`](https://huggingface.co/jinaai/jina-embeddings-v5-omni-small-mlx).
-No Python, no server, no network at query time.
+on Apple GPUs via a native MLX-Swift port of `jina-embeddings-v5-omni`, in two sizes -
+[Nano](https://huggingface.co/jinaai/jina-embeddings-v5-omni-nano-mlx) (~1.9 GB) and
+[Small](https://huggingface.co/jinaai/jina-embeddings-v5-omni-small-mlx) (~3.1 GB). No
+Python, no server, no network at query time.
 
 ## Install
 
-Download the latest `Omni-*.dmg` from
-[Releases](https://github.com/hanxiao/omni-macos/releases), open it, and drag **Omni**
-onto **Applications**. Builds are notarized, so they open without a Gatekeeper prompt.
+Download the latest DMG from [**hanxiao.io/omni**](https://hanxiao.io/omni) (or from
+[GitHub Releases](https://github.com/hanxiao/omni-macos/releases)), open it, and drag
+**Omni** onto **Applications**. Builds are notarized, so they open without a Gatekeeper prompt.
 
 On first launch Omni downloads the model on-device (Nano ~1.9 GB or Small ~3.1 GB),
 then runs offline. Point it at folders to index (Documents, Downloads, Desktop, or any
