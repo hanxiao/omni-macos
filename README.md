@@ -16,7 +16,8 @@ because everything is embedded into one shared vector space. The model runs in-p
 on Apple GPUs via a native MLX-Swift port of `jina-embeddings-v5-omni`, in two sizes -
 [Nano](https://huggingface.co/jinaai/jina-embeddings-v5-omni-nano-mlx) (~1.9 GB) and
 [Small](https://huggingface.co/jinaai/jina-embeddings-v5-omni-small-mlx) (~3.1 GB). No
-Python, no server, no network at query time.
+Python, no server, no cloud: the model downloads once, then indexing and search run with
+no network at all. Airgap the Mac and Omni keeps working.
 
 ## Install
 
@@ -24,9 +25,10 @@ Download the latest DMG from [**hanxiao.io/omni**](https://hanxiao.io/omni) (or 
 [GitHub Releases](https://github.com/hanxiao/omni-macos/releases)), open it, and drag
 **Omni** onto **Applications**. Builds are notarized, so they open without a Gatekeeper prompt.
 
-On first launch Omni downloads the model on-device (Nano ~1.9 GB or Small ~3.1 GB),
-then runs offline. Point it at folders to index (Documents, Downloads, Desktop, or any
-folder you pick), press Index, then search.
+On first launch Omni downloads the model once (Nano ~1.9 GB or Small ~3.1 GB). That is the
+only time it touches the network: after that, both indexing and search run on-device with
+nothing leaving your Mac, so you can pull the plug and run it fully airgapped. Point it at
+folders to index (Documents, Downloads, Desktop, or any folder you pick), press Index, then search.
 
 Requires an Apple silicon Mac on macOS 14 or later.
 

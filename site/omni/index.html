@@ -645,7 +645,7 @@ img { max-width: 100%; display: block; }
       <div class="container hero-inner">
         <img class="hero-mascot" src="assets/omni-mascot.png" alt="Omni mascot, a small 3D mole" width="160" height="148" />
         <h1 class="hero-title">Search every file on your Mac by meaning.</h1>
-        <p class="hero-sub">Text, code, PDFs, images, audio, and video in one vector space - searched in any language, entirely on-device.</p>
+        <p class="hero-sub">Text, code, PDFs, images, audio, and video in one vector space - searched in any language, entirely on-device. Download the model once, then run fully offline.</p>
         <div class="hero-actions">
           <a class="btn btn-primary btn-lg" href="Omni-0.1.15.dmg">Download for macOS <span class="dl-ver">v0.1.10</span></a>
         </div>
@@ -670,8 +670,8 @@ img { max-width: 100%; display: block; }
           </article>
 
           <article class="feature-card">
-            <h3 class="feature-title">Local and private</h3>
-            <p class="feature-body">Indexing and search run on your Mac. Files never leave the device. No accounts, no telemetry, no network at query time.</p>
+            <h3 class="feature-title">Offline and private</h3>
+            <p class="feature-body">The model downloads once; after that both indexing and search run on your Mac with no network - airgap it and Omni still works. Files never leave the device. No accounts, no telemetry.</p>
           </article>
 
           <article class="feature-card">
@@ -688,9 +688,10 @@ img { max-width: 100%; display: block; }
       <div class="container band-inner">
         <p class="section-label mono">Private by design</p>
         <h2 class="band-title">Everything stays on your Mac.</h2>
-        <p class="band-body">Omni runs a native MLX-Swift port of <span class="mono">jina-embeddings-v5-omni</span> in-process, on the Apple silicon GPU. The model downloads once; after that, Omni works offline.</p>
+        <p class="band-body">Omni runs a native MLX-Swift port of <span class="mono">jina-embeddings-v5-omni</span> in-process, on the Apple silicon GPU. The model downloads once - the only time it uses the network. After that, indexing and search run with nothing leaving the device, so you can pull the plug and run it fully airgapped.</p>
         <ul class="band-list mono">
-          <li>On-device indexing and search</li>
+          <li>One model download, then fully offline</li>
+          <li>On-device indexing and search - no network</li>
           <li>No accounts, no telemetry</li>
           <li>Local SQLite vector store</li>
         </ul>
