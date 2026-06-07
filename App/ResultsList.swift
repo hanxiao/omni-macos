@@ -136,6 +136,11 @@ struct ResultsList<Footer: View>: View {
             .keyboardShortcut("o", modifiers: .command)
         Button("Quick Look") { model.previewURL = URL(fileURLWithPath: path) }
             .keyboardShortcut("y", modifiers: .command)
+        Divider()
+        // Use this file itself as the query - doc-vs-doc "more like this" across all modalities.
+        Button("Find Similar") { model.setFileQuery(URL(fileURLWithPath: path), similar: true) }
+            .keyboardShortcut("f", modifiers: [.command, .option])
+        Divider()
         Button("Reveal in Finder") { reveal(path) }
             .keyboardShortcut("r", modifiers: [.command, .shift])
         Divider()

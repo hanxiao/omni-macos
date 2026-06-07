@@ -73,21 +73,28 @@ struct Sidebar: View {
                 Section(group.title) {
                     ForEach(group.items) { item in
                         HStack(spacing: 7) {
-                            Image(systemName: item.bookmarked ? "star.fill" : "magnifyingglass")
-                                // Yellow (not accent) so a bookmarked row stays legible even when it
-                                // is selected and sits on the accent-colored selection highlight.
-                                .foregroundStyle(item.bookmarked ? Color.yellow : Color.secondary)
-                                .frame(width: 16)
-                            Text(item.query).lineLimit(1).truncationMode(.tail)
+                            if item.bookmarked {
+                                Image(systemName: "star.fill").foregroundStyle(Color.yellow).frame(width: 16)
+                            } else if item.isFile, let p = item.filePath {
+                                // A file query: show its thumbnail (falls back to a generic icon if the
+                                // file is gone, so deleted files degrade gracefully).
+                                Thumbnail(path: p, side: 16, corner: 3)
+                            } else {
+                                Image(systemName: "magnifyingglass").foregroundStyle(Color.secondary).frame(width: 16)
+                            }
+                            Text(item.displayLabel).lineLimit(1).truncationMode(item.isFile ? .middle : .tail)
                             Spacer(minLength: 0)
+                            if item.isFile, !item.bookmarked, let k = item.fileKind, let fk = FileKind(rawValue: k), fk != .text {
+                                Image(systemName: fk.symbol).font(.caption2).foregroundStyle(.tertiary)
+                            }
                         }
-                        .help(item.query)
+                        .help(item.isFile ? (item.filePath ?? item.displayLabel) : item.query)
                         .contextMenu {
                             Button(item.bookmarked ? "Remove Bookmark" : "Bookmark") { model.toggleHistoryBookmark(item) }
                             Divider()
                             Button("Remove") { model.removeHistory(item) }
                         }
-                        .tag(SidebarSelection.history(item.query))
+                        .tag(SidebarSelection.history(item.id))
                     }
                 }
             }
@@ -96,20 +103,23 @@ struct Sidebar: View {
         // Selecting a history row runs it (native "smart folder" behavior). Folder selection just
         // highlights (folders are acted on via context menu / Delete).
         .onChange(of: selection) { _, sel in
-            if case .history(let q) = sel, let item = model.searchHistory.first(where: { $0.query == q }) {
+            if case .history(let id) = sel, let item = model.searchHistory.first(where: { $0.id == id }) {
                 model.runHistoryQuery(item)
             }
         }
-        // Keep the highlight honest: once the query differs from the selected history item (the user
-        // typed a new search), drop the selection.
+        // Keep the highlight honest: once the user types a new text search, drop a selected TEXT
+        // history row. A file-query row stays selected (its query is the active file, not the text).
         .onChange(of: model.query) { _, q in
-            if case .history(let sq) = selection, sq != q { selection = nil }
+            if case .history(let id) = selection,
+               let item = model.searchHistory.first(where: { $0.id == id }), !item.isFile, item.query != q {
+                selection = nil
+            }
         }
         .onDeleteCommand {
             switch selection {
             case .folder(let url): remove(url)
-            case .history(let q):
-                if let item = model.searchHistory.first(where: { $0.query == q }) { model.removeHistory(item) }
+            case .history(let id):
+                if let item = model.searchHistory.first(where: { $0.id == id }) { model.removeHistory(item) }
                 selection = nil
             case .none: break
             }
