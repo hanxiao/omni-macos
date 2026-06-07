@@ -26,3 +26,8 @@ dist/
 
 # Icon authoring scratch (rembg venv, source render, variants)
 icon-work/
+
+# Profiling dataset (generated; hosted on /omni, not committed to git)
+out/
+Tools/out/
+profiling-v1.zip

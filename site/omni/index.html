@@ -416,6 +416,127 @@ img { max-width: 100%; display: block; }
 }
 .serving-item-body strong { font-weight: 600; }
 
+/* ---------- Profiling ---------- */
+.profiling {
+  padding: 72px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+.profiling-title {
+  margin: 0 0 18px;
+  font-size: clamp(1.6rem, 3.5vw, 2.25rem);
+  letter-spacing: -0.03em;
+  font-weight: 650;
+}
+.profiling-body {
+  margin: 0 0 14px;
+  max-width: 70ch;
+  font-size: 1.05rem;
+  color: var(--muted);
+  line-height: 1.6;
+}
+.profiling-meta {
+  margin: 0 0 32px;
+  font-size: 12px;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+}
+.profiling-meta .dot { margin: 0 8px; opacity: 0.5; }
+/* empty / error state card */
+.profiling-empty {
+  background: var(--panel);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  padding: 40px 28px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.98rem;
+}
+.profiling-empty strong { color: var(--fg); font-weight: 600; display: block; margin-bottom: 6px; }
+/* per-chip rows */
+.chip-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  background: var(--border-soft);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.chip-row {
+  background: var(--panel);
+  padding: 18px 22px;
+}
+.chip-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.chip-name {
+  font-weight: 600;
+  font-size: 1rem;
+  letter-spacing: -0.01em;
+}
+.chip-name .chip-year {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--muted);
+  margin-left: 8px;
+}
+.chip-runs {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+/* primary bar: median files/sec */
+.bar-track {
+  position: relative;
+  width: 100%;
+  height: 22px;
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.bar-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  height: 100%;
+  background: var(--accent);
+  border-radius: var(--radius-sm) 0 0 var(--radius-sm);
+  transition: width 0.6s ease;
+}
+.bar-value {
+  position: absolute;
+  top: 0; right: 8px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fg);
+}
+.bar-unit { color: var(--muted); font-size: 11px; margin-left: 4px; }
+/* secondary stats line */
+.chip-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 20px;
+  margin-top: 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--muted);
+}
+.chip-stats .stat strong { color: var(--fg); font-weight: 500; }
+@media (max-width: 720px) {
+  .chip-head { flex-direction: column; gap: 2px; }
+  .chip-stats { gap: 4px 16px; }
+}
+
 /* ---------- Download ---------- */
 .download {
   padding: 80px 0;
@@ -615,6 +736,21 @@ img { max-width: 100%; display: block; }
       </div>
     </section>
 
+    <!-- PROFILING -->
+    <section id="profiling" class="profiling">
+      <div class="container">
+        <p class="section-label mono">Profiling</p>
+        <h2 class="profiling-title">How fast is Omni on your Mac?</h2>
+        <p class="profiling-body">Real, community-submitted indexing benchmarks over a fixed 5,000-file dataset. Anyone can contribute by running <span class="mono">File &rarr; Run Profiling</span> in the app.</p>
+        <p class="profiling-meta mono" id="profiling-meta" hidden></p>
+        <div id="profiling-content">
+          <div class="profiling-empty" id="profiling-loading">
+            <span class="mono">Loading community benchmarks&hellip;</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- DOWNLOAD -->
     <section id="download" class="download">
       <div class="container download-inner">
@@ -636,6 +772,141 @@ img { max-width: 100%; display: block; }
       <p class="footer-note mono">On-device semantic search for macOS.</p>
     </div>
   </footer>
+
+  <!-- Profiling: fetch community benchmarks and render -->
+  <script>
+  (function () {
+    var ENDPOINT = "https://hanxiao.io/omni/profiling";
+
+    function esc(s) {
+      return String(s).replace(/[&<>"]/g, function (c) {
+        return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+      });
+    }
+    function fmt1(n) {
+      return (typeof n === "number" && isFinite(n)) ? n.toFixed(1) : "—";
+    }
+    function fmtInt(n) {
+      return (typeof n === "number" && isFinite(n))
+        ? Math.round(n).toLocaleString("en-US") : "—";
+    }
+    function gb(bytes) {
+      if (typeof bytes !== "number" || !isFinite(bytes)) return "—";
+      return (bytes / 1073741824).toFixed(1) + " GB";
+    }
+    function relTime(ms) {
+      if (typeof ms !== "number" || !isFinite(ms)) return "";
+      var diff = Date.now() - ms;
+      if (diff < 0) diff = 0;
+      var s = Math.floor(diff / 1000);
+      if (s < 60) return "just now";
+      var m = Math.floor(s / 60);
+      if (m < 60) return m + (m === 1 ? " minute ago" : " minutes ago");
+      var h = Math.floor(m / 60);
+      if (h < 24) return h + (h === 1 ? " hour ago" : " hours ago");
+      var d = Math.floor(h / 24);
+      if (d < 30) return d + (d === 1 ? " day ago" : " days ago");
+      var mo = Math.floor(d / 30);
+      if (mo < 12) return mo + (mo === 1 ? " month ago" : " months ago");
+      var y = Math.floor(d / 365);
+      return y + (y === 1 ? " year ago" : " years ago");
+    }
+
+    function showEmpty() {
+      var content = document.getElementById("profiling-content");
+      if (content) {
+        content.innerHTML =
+          '<div class="profiling-empty">' +
+          '<strong>No results yet</strong>' +
+          '<span class="mono">Be the first to run profiling - File &rarr; Run Profiling in the app.</span>' +
+          "</div>";
+      }
+    }
+
+    function render(data) {
+      var content = document.getElementById("profiling-content");
+      var meta = document.getElementById("profiling-meta");
+      if (!content) return;
+
+      var byChip = (data && Array.isArray(data.byChip)) ? data.byChip.slice() : [];
+      var total = (data && typeof data.totalRuns === "number") ? data.totalRuns : 0;
+
+      if (!total || byChip.length === 0) {
+        showEmpty();
+        if (meta) meta.hidden = true;
+        return;
+      }
+
+      // meta line: total runs + relative updated time
+      if (meta) {
+        var rel = relTime(data.updatedAt);
+        meta.innerHTML =
+          fmtInt(total) + (total === 1 ? " run" : " runs") +
+          (rel ? '<span class="dot">&middot;</span>updated ' + esc(rel) : "");
+        meta.hidden = false;
+      }
+
+      // sort by median files/sec desc; scale bars to the fastest chip
+      byChip.sort(function (a, b) {
+        return (b.medianFilesPerSec || 0) - (a.medianFilesPerSec || 0);
+      });
+      var maxFps = byChip.reduce(function (m, c) {
+        return Math.max(m, c.medianFilesPerSec || 0);
+      }, 0) || 1;
+
+      var rows = byChip.map(function (c) {
+        var fps = c.medianFilesPerSec || 0;
+        var pct = Math.max(2, Math.min(100, (fps / maxFps) * 100));
+        var year = (typeof c.releaseYear === "number")
+          ? '<span class="chip-year">' + c.releaseYear + "</span>" : "";
+        var runs = (typeof c.runs === "number")
+          ? c.runs + (c.runs === 1 ? " run" : " runs") : "";
+        return (
+          '<div class="chip-row">' +
+            '<div class="chip-head">' +
+              '<div class="chip-name">' + esc(c.chip || "Unknown") + year + "</div>" +
+              '<div class="chip-runs">' + esc(runs) + "</div>" +
+            "</div>" +
+            '<div class="bar-track" role="img" aria-label="' +
+              esc((c.chip || "Unknown") + ": " + fmt1(fps) + " files per second") + '">' +
+              '<div class="bar-fill" style="width:' + pct.toFixed(1) + '%"></div>' +
+              '<div class="bar-value">' + fmt1(fps) +
+                '<span class="bar-unit">files/s</span></div>' +
+            "</div>" +
+            '<div class="chip-stats">' +
+              '<span class="stat"><strong>' + fmtInt(c.medianTokensPerSec) +
+                "</strong> tokens/s</span>" +
+              '<span class="stat"><strong>' + gb(c.medianPeakVramDeltaBytes) +
+                "</strong> peak VRAM &Delta;</span>" +
+              '<span class="stat"><strong>' + fmt1(c.medianSeconds) +
+                "</strong> s median</span>" +
+            "</div>" +
+          "</div>"
+        );
+      }).join("");
+
+      content.innerHTML = '<div class="chip-list">' + rows + "</div>";
+    }
+
+    function load() {
+      fetch(ENDPOINT, { method: "GET" })
+        .then(function (r) {
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          return r.json();
+        })
+        .then(function (data) { render(data); })
+        .catch(function () { showEmpty(); });
+    }
+
+    // expose render for local testing; real load runs on DOM ready
+    window.__omniProfilingRender = render;
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", load);
+    } else {
+      load();
+    }
+  })();
+  </script>
 
 </body>
 </html>

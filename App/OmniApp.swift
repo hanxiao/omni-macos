@@ -58,6 +58,11 @@ struct OmniApp: App {
                     .disabled(model.isIndexing || !model.canIndex)
                 Button("Pause Indexing") { model.pauseIndexing() }
                     .disabled(!model.isIndexing)
+                Divider()
+                // Downloads a fixed 5000-file dataset and times an isolated index pass to benchmark
+                // this Mac. Results (hardware + timing only) can be shared to hanxiao.io/omni.
+                Button("Run Profiling\u{2026}") { Task { await model.runProfiling() } }
+                    .disabled(model.isProfilingRunning || !model.canIndex)
             }
             CommandGroup(replacing: .help) {
                 Button("Omni Keyboard Shortcuts") { showShortcuts() }
