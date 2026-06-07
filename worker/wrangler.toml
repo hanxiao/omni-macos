@@ -7,12 +7,12 @@ compatibility_date = "2025-05-01"
 [[d1_databases]]
 binding = "DB"
 database_name = "omni-profiling"
-database_id = "REPLACE_WITH_DATABASE_ID_FROM_WRANGLER_D1_CREATE"
+database_id = "27ee8e5e-6c69-4274-962b-b41bd40c629f"
 
 # Route: map hanxiao.io/omni/profiling* to this worker.
 # Configure this in the Cloudflare dashboard (Workers Routes) or uncomment below
 # and supply your real zone_id. The "*" suffix catches subpaths/query strings.
 #
-# [[routes]]
-# pattern = "hanxiao.io/omni/profiling*"
-# zone_id = "REPLACE_WITH_ZONE_ID_FOR_hanxiao.io"
+[[routes]]
+pattern = "hanxiao.io/omni/profiling*"
+zone_id = "095d0733042e0d76d9cd92ebd3425544"
