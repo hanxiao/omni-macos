@@ -11,7 +11,7 @@
 #          --key   AuthKey_XXXX.p8 \
 #          --key-id  <KEY_ID> \
 #          --issuer  <ISSUER_ID>
-#      (or the Apple-ID variant: --apple-id <id> --team-id MTECXQ97E6 --password <app-specific>)
+#      (or the Apple-ID variant: --apple-id <id> --team-id <TEAM_ID> --password <app-specific>)
 #
 # The app MUST already be signed with Developer ID + hardened runtime (build it with
 # ./Scripts/build-app.sh Release CODE_SIGN_IDENTITY="Developer ID Application" ...). This script
@@ -27,7 +27,8 @@ APP="${2:-.build/xcode-rel/Build/Products/Release/Omni.app}"
 # login keychain. Fall back to the named keychain profile (the local interactive setup).
 NOTARY_AUTH=(--keychain-profile "$PROFILE")
 if [ -n "${AC_APPLE_ID:-}" ] && [ -n "${AC_PASSWORD:-}" ]; then
-  NOTARY_AUTH=(--apple-id "$AC_APPLE_ID" --team-id "${AC_TEAM_ID:-MTECXQ97E6}" --password "$AC_PASSWORD")
+  : "${AC_TEAM_ID:?set AC_TEAM_ID (your 10-char Apple Team ID) when using AC_APPLE_ID/AC_PASSWORD}"
+  NOTARY_AUTH=(--apple-id "$AC_APPLE_ID" --team-id "$AC_TEAM_ID" --password "$AC_PASSWORD")
 fi
 [ -d "$APP" ] || { echo "app not found: $APP"; exit 1; }
 VERSION="${3:-$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$APP/Contents/Info.plist")}"
