@@ -141,7 +141,7 @@ public final class Indexer: @unchecked Sendable {
         for root in roots {
             if isCancelled { break }
             var files: [CrawledFile] = []
-            FileCrawler(roots: [root], enabledKinds: settings.enabledKinds, disabledExtensions: settings.disabledExtensions)
+            FileCrawler(roots: [root], ignore: settings.ignore)
                 .walk(shouldContinue: { !self.isCancelled }) { files.append($0) }
             perRootFiles.append((root.path, files))
             var rp = RootProgress(); rp.total = files.count
@@ -319,9 +319,10 @@ public final class Indexer: @unchecked Sendable {
                 blindRoots.contains { path == $0 || path.hasPrefix($0 + "/") }
             }
             func inScope(_ path: String, _ kindRaw: String) -> Bool {
-                guard let k = FileKind(rawValue: kindRaw), settings.enabledKinds.contains(k) else { return false }
-                let ext = (path as NSString).pathExtension.lowercased()
-                return ext.isEmpty || !settings.disabledExtensions.contains(ext)
+                // A known file is in scope (eligible for stale-deletion accounting) iff the current
+                // ignore policy would still index it. The kind is implied by FileExtractor; ignore is
+                // the single source of truth for exclusion.
+                return !settings.ignore.isIgnored(path, isDir: false)
             }
             // Batch the deletion: one transaction + one in-memory rebuild, not one per path.
             let stale = Set(known.compactMap { (path, sf) -> String? in
@@ -354,8 +355,8 @@ public final class Indexer: @unchecked Sendable {
         var toReplace: [(path: String, chunks: [IndexedChunk])] = []
         func classify(_ url: URL) {
             let path = url.path
-            guard FileExtractor.isSupported(url, enabledKinds: settings.enabledKinds, disabledExtensions: settings.disabledExtensions) else {
-                if known[path] != nil { toDelete.insert(path) }   // now unsupported/disabled
+            guard FileExtractor.kind(for: url) != nil, !settings.ignore.isIgnored(url.path, isDir: false) else {
+                if known[path] != nil { toDelete.insert(path) }   // now unsupported/excluded
                 return
             }
             guard let vals = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]) else { return }
@@ -379,7 +380,7 @@ public final class Indexer: @unchecked Sendable {
             // children. Crawl it so freshly added subtrees get indexed. The crawl honors
             // isCancelled so a huge move-in can be interrupted instead of blocking the batch.
             if isDir.boolValue {
-                FileCrawler(roots: [url], enabledKinds: settings.enabledKinds, disabledExtensions: settings.disabledExtensions)
+                FileCrawler(roots: [url], ignore: settings.ignore)
                     .walk(shouldContinue: { !self.isCancelled }) { classify($0.url) }
                 continue
             }

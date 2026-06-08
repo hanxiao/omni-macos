@@ -150,23 +150,18 @@ private struct ActivityTab: View {
 
 private struct ContentTypesTab: View {
     @Environment(AppModel.self) private var model: AppModel
-    @State private var selectedKind: FileKind = .image
-    @State private var extFilter = ""
+    @State private var draft = ""
+    @State private var loaded = false
+    @State private var showSamples = false
+    @State private var previewTask: Task<Void, Never>?
 
-    private var visibleExtensions: [String] {
-        let all = FileExtractor.extensions(for: selectedKind)
-        let q = extFilter.trimmingCharacters(in: .whitespaces).lowercased()
-        return q.isEmpty ? all : all.filter { $0.contains(q) }
-    }
+    private var dirty: Bool { model.ignoreTextIsDirty(draft) }
 
     var body: some View {
-        // Same grouped Form as every other Settings tab (bold section titles, rounded inset cards),
-        // height-capped so the long Text extension set scrolls inside the pane instead of growing it.
-        let kindOff = !model.settings.contains(selectedKind)
         Form {
             Section {
                 ForEach(model.kindOrder, id: \.self) { kind in
-                    kindToggle(kind, kind.title)
+                    orderRow(kind)
                         .draggable(kind.rawValue)
                         .dropDestination(for: String.self) { items, _ in
                             guard let raw = items.first, let dragged = FileKind(rawValue: raw) else { return false }
@@ -175,9 +170,9 @@ private struct ContentTypesTab: View {
                         }
                 }
             } header: {
-                Text("What to Index")
+                Text("Indexing Priority")
             } footer: {
-                Text("Drag to set which types are indexed first.")
+                Text("Drag to set which types are indexed first. To stop indexing a type, exclude it in the rules below.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -217,62 +212,149 @@ private struct ContentTypesTab: View {
             }
 
             Section {
-                Picker("Type", selection: $selectedKind) {
-                    Text("Images").tag(FileKind.image)
-                    Text("Video").tag(FileKind.video)
-                    Text("Audio").tag(FileKind.audio)
-                    Text("Text").tag(FileKind.text)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
+                IgnoreEditor(text: $draft)
+                    .frame(minHeight: 180)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(.separator))
 
-                HStack(spacing: 6) {
-                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                    TextField("Filter", text: $extFilter).textFieldStyle(.plain)
-                    if !extFilter.isEmpty {
-                        Button { extFilter = "" } label: { Image(systemName: "xmark.circle.fill") }
-                            .buttonStyle(.plain).foregroundStyle(.tertiary)
-                    }
-                    // Scoped to the selected type only, so it lives with that type's list.
-                    let allOn = !visibleExtensions.isEmpty && visibleExtensions.allSatisfy { model.isExtensionEnabled($0) }
-                    Button(allOn ? "Disable All" : "Enable All") {
-                        model.setExtensionsEnabled(visibleExtensions, !allOn)
-                    }
-                    .buttonStyle(.link)
-                    .disabled(kindOff || visibleExtensions.isEmpty)
-                }
-
-                ForEach(visibleExtensions, id: \.self) { ext in
-                    Toggle(isOn: Binding(
-                        get: { model.isExtensionEnabled(ext) },
-                        set: { model.setExtensionEnabled(ext, $0) }
-                    )) {
-                        Text(".\(ext)").font(.body.monospaced())
-                    }
-                    .toggleStyle(.checkbox)
-                    .disabled(kindOff)
-                }
+                previewBar
             } header: {
-                Text("Extensions")
+                Text("Ignore Rules")
             } footer: {
-                Text("Turning an extension off removes those files from the index.")
+                Text("One pattern per line, .gitignore syntax. Files matching any pattern are not indexed. A leading ! re-includes; a trailing / matches directories.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
         .frame(height: 520)   // matches the Serving tab so switching tall tabs doesn't jump
+        .onAppear { if !loaded { draft = model.ignoreText; loaded = true } }
+        .onChange(of: draft) { _, newValue in schedulePreview(newValue) }
     }
 
-    @ViewBuilder private func kindToggle(_ k: FileKind, _ label: String) -> some View {
-        let off = (k == .audio && !model.audioSupported)
-        Toggle(isOn: Binding(get: { model.settings.contains(k) }, set: { model.setIndexKind(k, $0) })) {
-            HStack(spacing: 8) {
-                // Drag-handle affordance: signals the row can be dragged to reorder.
-                Image(systemName: "line.3.horizontal").foregroundStyle(.tertiary).font(.callout)
-                Label(label, systemImage: k.symbol)
+    /// Drag-to-reorder row (priority only; exclusion is handled in the rules editor).
+    @ViewBuilder private func orderRow(_ k: FileKind) -> some View {
+        // Reflects the APPLIED policy: a kind is "excluded" when every one of its extensions is ignored.
+        let excluded = FileExtractor.extensions(for: k).allSatisfy { model.ignore.isIgnored("/x.\($0)", isDir: false) }
+        HStack(spacing: 8) {
+            Image(systemName: "line.3.horizontal").foregroundStyle(.tertiary).font(.callout)
+            Label(k.title, systemImage: k.symbol)
+            Spacer()
+            if excluded {
+                Text("excluded").font(.caption).foregroundStyle(.secondary)
             }
         }
-        .toggleStyle(.switch)
-        .disabled(off)
+        .opacity(excluded ? 0.5 : 1)
+    }
+
+    @ViewBuilder private var previewBar: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let d = model.ignorePreview?.danger {
+                Label(d, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack(spacing: 12) {
+                if let p = model.ignorePreview {
+                    Text("\(p.kept.formatted()) kept")
+                        .foregroundStyle(.secondary)
+                    Text("\(p.removed.formatted()) removed")
+                        .foregroundStyle(p.removed > 0 ? .orange : .secondary)
+                    if !p.samples.isEmpty {
+                        Button("Show samples") { showSamples = true }
+                            .buttonStyle(.link)
+                            .popover(isPresented: $showSamples, arrowEdge: .bottom) { samplePopover(p.samples) }
+                    }
+                } else if dirty {
+                    Text("Calculating...").foregroundStyle(.secondary)
+                } else {
+                    Text("These rules are applied.").foregroundStyle(.secondary)
+                }
+                Spacer()
+                if model.ignoreHasBackup {
+                    Button("Revert") {
+                        model.revertIgnore()
+                        draft = model.ignoreText
+                    }
+                    .help("Undo the last applied change.")
+                }
+                Button("Apply") {
+                    previewTask?.cancel()
+                    model.applyIgnoreText(draft)
+                }
+                .keyboardShortcut("s", modifiers: .command)
+                .buttonStyle(.borderedProminent)
+                .disabled(!dirty)
+            }
+            .font(.callout)
+        }
+    }
+
+    @ViewBuilder private func samplePopover(_ samples: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Files this removes (sample)")
+                .font(.caption.bold()).foregroundStyle(.secondary)
+            ForEach(samples, id: \.self) { path in
+                Text((path as NSString).abbreviatingWithTildeInPath)
+                    .font(.system(.caption, design: .monospaced))
+                    .lineLimit(1).truncationMode(.middle)
+            }
+        }
+        .padding(12)
+        .frame(width: 360, alignment: .leading)
+    }
+
+    /// Debounce the dry-run so we don't query the index on every keystroke.
+    private func schedulePreview(_ text: String) {
+        previewTask?.cancel()
+        previewTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !Task.isCancelled else { return }
+            model.previewIgnore(text)
+        }
+    }
+}
+
+/// Plain-text editor (NSTextView) for the .omniignore: monospaced, with every smart substitution
+/// disabled so glob patterns are typed literally (no curly quotes, em-dashes, or autocorrect).
+private struct IgnoreEditor: NSViewRepresentable {
+    @Binding var text: String
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scroll = NSTextView.scrollableTextView()
+        scroll.borderType = .noBorder
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        guard let tv = scroll.documentView as? NSTextView else { return scroll }
+        tv.delegate = context.coordinator
+        tv.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        tv.isRichText = false
+        tv.isAutomaticQuoteSubstitutionEnabled = false
+        tv.isAutomaticDashSubstitutionEnabled = false
+        tv.isAutomaticTextReplacementEnabled = false
+        tv.isAutomaticSpellingCorrectionEnabled = false
+        tv.isContinuousSpellCheckingEnabled = false
+        tv.isGrammarCheckingEnabled = false
+        tv.allowsUndo = true
+        tv.textContainerInset = NSSize(width: 6, height: 8)
+        tv.drawsBackground = false
+        tv.string = text
+        return scroll
+    }
+
+    func updateNSView(_ nsView: NSScrollView, context: Context) {
+        guard let tv = nsView.documentView as? NSTextView, tv.string != text else { return }
+        tv.string = text
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        let parent: IgnoreEditor
+        init(_ parent: IgnoreEditor) { self.parent = parent }
+        func textDidChange(_ notification: Notification) {
+            guard let tv = notification.object as? NSTextView else { return }
+            parent.text = tv.string
+        }
     }
 }
 

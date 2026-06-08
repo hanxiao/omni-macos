@@ -223,8 +223,14 @@ struct ContentView: View {
         if model.phase == .ready, model.hasActiveSearch {
             ToolbarItem(placement: .automatic) {
                 Button { model.toggleBookmarkCurrentSearch() } label: {
-                    Image(systemName: model.currentSearchIsBookmarked ? "star.fill" : "star")
-                        .foregroundStyle(model.currentSearchIsBookmarked ? Color.yellow : Color.primary)
+                    // No explicit color in the unbookmarked state, so the toolbar can dim it like every
+                    // other button when the window resigns key (e.g. while Settings is open). Yellow is
+                    // applied only when bookmarked, where the lit status color is intentional.
+                    if model.currentSearchIsBookmarked {
+                        Image(systemName: "star.fill").foregroundStyle(.yellow)
+                    } else {
+                        Image(systemName: "star")
+                    }
                 }
                 // Cmd-D is owned by the File-menu "Bookmark Search" command (single owner, avoids a
                 // duplicate-shortcut conflict); the tooltip names it, and accessibilityLabel is what
