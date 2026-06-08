@@ -37,4 +37,20 @@ public struct IndexSettings: Sendable, Equatable {
     }
 
     public static let `default` = IndexSettings()
+
+    /// Fixed workload for a profiling run, so every machine indexes the IDENTICAL set of files with
+    /// the IDENTICAL per-file work - the only variables left are the hardware and the app version's
+    /// efficiency. All kinds on, no min thresholds (every file in the curated dataset is indexed,
+    /// disregarding the user's own settings), no per-extension exclusions, and standard caps. Frozen
+    /// on purpose: changing any of these moves the benchmark baseline and breaks comparability.
+    public static let profiling: IndexSettings = {
+        var s = IndexSettings(enabledKinds: [.text, .image, .video, .audio])
+        s.maxImageDimension = 1568
+        s.maxVideoFrames = 6
+        s.maxCharsPerChunk = 1800
+        s.minImageDimension = 0; s.minAudioSeconds = 0; s.minVideoSeconds = 0; s.minTextChars = 0
+        s.disabledExtensions = []
+        s.kindOrder = [.image, .audio, .video, .text]
+        return s
+    }()
 }

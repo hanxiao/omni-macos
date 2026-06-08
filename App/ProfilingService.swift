@@ -161,8 +161,18 @@ struct ProfilingSheet: View {
                     .foregroundStyle(.tint)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Profiling").font(.headline)
-                    Text(model.profilingPhase.isEmpty ? "Working\u{2026}" : model.profilingPhase)
-                        .font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                    // During the indexing pass, show live elapsed + ETA (ticking every second) instead
+                    // of the static "Indexing" label; other phases keep their name.
+                    if model.profilingPhase == "Indexing", let start = model.profilingStartedAt {
+                        TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                            Text(Self.timingLine(elapsed: ctx.date.timeIntervalSince(start),
+                                                 fraction: model.profilingFraction ?? 0))
+                                .font(.subheadline.monospacedDigit()).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                    } else {
+                        Text(model.profilingPhase.isEmpty ? "Working\u{2026}" : model.profilingPhase)
+                            .font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                    }
                 }
                 Spacer(minLength: 0)
             }
@@ -181,5 +191,19 @@ struct ProfilingSheet: View {
         .padding(20)
         .frame(maxWidth: 400)
         .interactiveDismissDisabled()   // a run can't be dismissed midway; it closes itself when done
+    }
+
+    /// "1:05 elapsed  ·  ~48s left" - ETA from the linear progress fraction, suppressed until there's
+    /// enough progress (>2%) for a stable estimate.
+    private static func timingLine(elapsed: Double, fraction: Double) -> String {
+        let el = fmtDur(elapsed) + " elapsed"
+        if fraction > 0.02, fraction < 1 {
+            return el + "  \u{00B7}  ~" + fmtDur(elapsed * (1 - fraction) / fraction) + " left"
+        }
+        return el
+    }
+    private static func fmtDur(_ s: Double) -> String {
+        let t = max(0, Int(s.rounded()))
+        return t < 60 ? "\(t)s" : String(format: "%d:%02d", t / 60, t % 60)
     }
 }

@@ -184,6 +184,7 @@ final class AppModel {
     var profilingPhase = ""
     var profilingDetail = ""
     var profilingFraction: Double? = nil   // nil = indeterminate (download/unzip/upload)
+    var profilingStartedAt: Date? = nil    // start of the indexing pass, for live elapsed/ETA
     var lastProfilingReport: ProfilingReport?
     /// Settings opt-in for uploading profiling results (mirrors ProfilingService's persisted flag).
     var shareProfilingResults: Bool = UserDefaults.standard.bool(forKey: "omni.profiling.uploadEnabled") {
@@ -1566,7 +1567,7 @@ final class AppModel {
 
         defer {
             isProfilingRunning = false
-            profilingPhase = ""; profilingDetail = ""; profilingFraction = nil
+            profilingPhase = ""; profilingDetail = ""; profilingFraction = nil; profilingStartedAt = nil
             if wasIndexing { startIndexing() }   // resume where it left off (incremental)
         }
 
@@ -1578,10 +1579,14 @@ final class AppModel {
             profilingPhase = "Indexing"
             profilingDetail = "0 of \(total) files"
             profilingFraction = 0
-            let metrics = try await runProfilingPass(engine: engine, targetURL: folder, settings: effectiveSettings()) { p in
+            profilingStartedAt = Date()   // anchor for the live elapsed/ETA readout
+            // Fixed canonical settings (NOT the user's) so every machine indexes the same workload -
+            // that is what makes the crowdsourced numbers comparable.
+            let metrics = try await runProfilingPass(engine: engine, targetURL: folder, settings: .profiling) { p in
                 Task { @MainActor in
                     self.profilingFraction = total > 0 ? Double(p.scanned) / Double(total) : nil
                     self.profilingDetail = "\(p.scanned) of \(total) files \u{00B7} \(p.embedded) embedded"
+                        + (p.skipped > 0 ? " \u{00B7} \(p.skipped) skipped" : "")
                         + (p.failed > 0 ? " \u{00B7} \(p.failed) failed" : "")
                 }
             }
