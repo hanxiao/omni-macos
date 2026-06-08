@@ -195,9 +195,11 @@ jobs:
           # Surgical purge of just the /omni URLs (GitHub Pages origin is already updated above).
           # Without this, Cloudflare serves the stale cached HTML/DMG until TTL expiry, making a
           # release look like it never landed. Blog deploys purge_everything; this only touches omni.
+          # Include the long-TTL assets (icon/favicon, og-image, latest.json): they change rarely, but
+          # when they do CF would otherwise serve the stale copy for the full max-age (4h).
           curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
             -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" \
-            --data '{"files":["https://hanxiao.io/omni/","https://hanxiao.io/omni/index.html","https://hanxiao.io/omni/Omni.dmg"]}' \
+            --data '{"files":["https://hanxiao.io/omni/","https://hanxiao.io/omni/index.html","https://hanxiao.io/omni/Omni.dmg","https://hanxiao.io/omni/latest.json","https://hanxiao.io/omni/assets/icon.png","https://hanxiao.io/omni/assets/og-image.png"]}' \
             && echo "purged Cloudflare cache for /omni" || echo "Cloudflare purge failed (non-fatal)"
 
       # Self-hosted hygiene: the cert import adds a temp build.keychain to the user search list -
