@@ -17,6 +17,7 @@ struct ContentView: View {
     /// box binds to the RAW typed string; `set` (user edits only) routes here.
     private func handleQueryEdit(_ raw: String) {
         model.applyParsedQuery(raw)
+        model.suggestionsAllowed = true   // this fires only on real keystrokes (the .searchable set:), so arm the dropdown
         if !model.query.isEmpty, model.fileQuery != nil { model.fileQuery = nil; model.queryError = nil }
         if model.fileQuery == nil { scheduleSearch() }
         scheduleHistoryRecord()
@@ -29,8 +30,10 @@ struct ContentView: View {
                     .searchable(text: Binding(get: { model.rawQuery }, set: { handleQueryEdit($0) }),
                                 placement: .toolbar, prompt: "Search by meaning") {
                         // Typeahead: keys (ty -> type:), values (type: -> image/...), and matching past
-                        // queries as instant (cached) shortcuts. Navigate with arrows + Return.
-                        ForEach(searchSuggestions(model.rawQuery), id: \.completion) { sug in
+                        // queries as instant (cached) shortcuts. Navigate with arrows + Return. Only while
+                        // the user is typing - a programmatic box change (history replay, filter menu) keeps
+                        // the dropdown closed (suggestionsAllowed is false unless handleQueryEdit armed it).
+                        ForEach(model.suggestionsAllowed ? searchSuggestions(model.rawQuery) : [], id: \.completion) { sug in
                             Label(sug.label, systemImage: sug.icon).searchCompletion(sug.completion)
                         }
                     }
