@@ -570,28 +570,58 @@ img { max-width: 100%; display: block; }
 }
 
 /* ---------- Download ---------- */
-.download {
-  padding: 80px 0;
-  border-bottom: 1px solid var(--border-soft);
-}
-.download-inner {
-  text-align: center;
-  max-width: 640px;
-  margin: 0 auto;
-}
-.download-title {
-  margin: 0 0 24px;
+.faq { padding: 72px 0; border-bottom: 1px solid var(--border-soft); }
+.faq-title {
+  margin: 0 0 8px;
   font-size: clamp(1.6rem, 3.5vw, 2.25rem);
   letter-spacing: -0.03em;
   font-weight: 650;
 }
-.download-note {
-  margin: 22px 0 0;
+.faq-sub { margin: 0 0 28px; color: var(--muted); font-size: 15px; }
+.faq-loading { color: var(--muted); font-size: 13px; }
+.faq-cat { margin-top: 30px; }
+.faq-cat:first-child { margin-top: 0; }
+.faq-cat-title {
+  margin: 0 0 6px;
   font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
   color: var(--muted);
-  letter-spacing: 0.02em;
+  font-weight: 600;
 }
-.download-note + .download-note { margin-top: 6px; }
+.faq-item { border-bottom: 1px solid var(--border-soft); }
+.faq-item > summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 13px 30px 13px 0;
+  position: relative;
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--fg);
+}
+.faq-item > summary::-webkit-details-marker { display: none; }
+.faq-item > summary::after {
+  content: "+";
+  position: absolute;
+  right: 4px;
+  top: 11px;
+  color: var(--muted);
+  font-size: 17px;
+  font-weight: 400;
+}
+.faq-item[open] > summary::after { content: "\2212"; }
+.faq-a { padding: 0 30px 16px 0; color: var(--muted); font-size: 14px; line-height: 1.6; }
+.faq-kbd {
+  margin-left: 8px;
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: var(--border-soft);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--fg);
+  white-space: nowrap;
+}
 .dl-md5 { color: var(--fg); opacity: 0.7; user-select: all; word-break: break-all; }
 /* version pill inside the download button */
 .dl-ver {
@@ -653,6 +683,7 @@ img { max-width: 100%; display: block; }
         <a class="nav-link" href="#features">Features</a>
         <a class="nav-link" href="#serving">Serving</a>
         <a class="nav-link" href="#profiling">Benchmark</a>
+        <a class="nav-link" href="#faq">FAQ</a>
         <a class="gh-link" href="https://github.com/hanxiao/omni-macos" target="_blank" rel="noopener" aria-label="View source on GitHub" title="View source on GitHub">
           <svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.02-1.49-2.01.44-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
         </a>
@@ -672,7 +703,7 @@ img { max-width: 100%; display: block; }
         <div class="hero-actions">
           <a class="btn btn-primary btn-lg" href="Omni-0.1.15.dmg">Download for macOS <span class="dl-ver">v0.1.10</span></a>
         </div>
-        <p class="hero-note mono">Apple silicon &middot; macOS 14+</p>
+        <p class="hero-note mono">Apple silicon &middot; macOS 14+ &middot; MD5 <span class="dl-md5">&hellip;</span></p>
       </div>
     </section>
 
@@ -802,12 +833,14 @@ img { max-width: 100%; display: block; }
     </section>
 
     <!-- DOWNLOAD -->
-    <section id="download" class="download">
-      <div class="container download-inner">
-        <h2 class="download-title">Get Omni</h2>
-        <a class="btn btn-primary btn-lg" href="Omni-0.1.15.dmg">Download for macOS <span class="dl-ver">v0.1.10</span></a>
-        <p class="download-note mono">Apple silicon &middot; macOS 14+ &middot; the model downloads once, then works offline</p>
-        <p class="download-note mono">MD5 <span class="dl-md5">—</span></p>
+    <!-- FAQ (content is faq.json; rendered + structured-data emitted by the script below) -->
+    <section id="faq" class="faq">
+      <div class="container">
+        <h2 class="faq-title">Questions &amp; how-to</h2>
+        <p class="faq-sub">Everything Omni does, and how. Click a question to expand.</p>
+        <div id="faq-content" class="faq-content">
+          <p class="faq-loading mono">Loading&hellip;</p>
+        </div>
       </div>
     </section>
 
@@ -981,6 +1014,49 @@ img { max-width: 100%; display: block; }
     } else {
       load();
     }
+  })();
+  </script>
+
+  <!-- FAQ: content lives in faq.json; render collapsible items + emit schema.org FAQPage -->
+  <script>
+  (function () {
+    function esc(s) {
+      return String(s).replace(/[&<>"]/g, function (c) {
+        return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+      });
+    }
+    fetch("faq.json", { cache: "no-cache" })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function (data) {
+        var content = document.getElementById("faq-content");
+        if (!content || !data || !Array.isArray(data.categories)) return;
+        content.innerHTML = data.categories.map(function (cat) {
+          var items = (cat.items || []).map(function (it) {
+            var sc = it.shortcut ? ' <kbd class="faq-kbd">' + esc(it.shortcut) + "</kbd>" : "";
+            return '<details class="faq-item"><summary>' + esc(it.q) + sc +
+                   '</summary><div class="faq-a">' + esc(it.a) + "</div></details>";
+          }).join("");
+          return '<div class="faq-cat"><h3 class="faq-cat-title">' + esc(cat.title) +
+                 "</h3>" + items + "</div>";
+        }).join("");
+
+        // Structured data so the FAQ is eligible for rich results despite JS rendering.
+        var qa = [];
+        data.categories.forEach(function (c) {
+          (c.items || []).forEach(function (it) {
+            qa.push({ "@type": "Question", name: it.q,
+                      acceptedAnswer: { "@type": "Answer", text: it.a } });
+          });
+        });
+        var ld = document.createElement("script");
+        ld.type = "application/ld+json";
+        ld.textContent = JSON.stringify({ "@context": "https://schema.org", "@type": "FAQPage", mainEntity: qa });
+        document.head.appendChild(ld);
+      })
+      .catch(function () {
+        var content = document.getElementById("faq-content");
+        if (content) content.innerHTML = '<p class="faq-loading mono">Couldn’t load the FAQ.</p>';
+      });
   })();
   </script>
 

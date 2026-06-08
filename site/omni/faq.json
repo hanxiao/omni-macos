@@ -1,0 +1,364 @@
+{
+  "categories": [
+    {
+      "title": "Getting started",
+      "items": [
+        {
+          "q": "What is Omni?",
+          "a": "Omni is a native macOS app that searches your files by meaning instead of keywords. It runs an on-device embedding model to index images, video, audio, and text, then ranks results by semantic similarity to your query.",
+          "shortcut": ""
+        },
+        {
+          "q": "How does the first-launch model download work?",
+          "a": "On first launch Omni prompts you to download one of two models: Nano (about 1.9 GB) or Small (about 3.1 GB). It fetches model.safetensors, tokenizer.json, and config.json into Application Support (or a folder you choose), then loads the model and starts indexing automatically.",
+          "shortcut": ""
+        },
+        {
+          "q": "How do I start indexing my files?",
+          "a": "Add folders in Settings, then click the Index button or press ⇧⌘I. Indexing runs in the background and search works immediately on files that are already indexed.",
+          "shortcut": "⇧⌘I"
+        },
+        {
+          "q": "Where do I find all the keyboard shortcuts?",
+          "a": "Press ⌘/ to open the Keyboard Shortcuts window, which lists every shortcut for search, navigation, result actions, indexing, bookmarking, and view modes. Close it with Escape.",
+          "shortcut": "⌘/"
+        }
+      ]
+    },
+    {
+      "title": "Searching",
+      "items": [
+        {
+          "q": "What does semantic search mean in Omni?",
+          "a": "Semantic search finds files by meaning rather than exact keywords. Omni embeds your query with its on-device model, compares it against the embeddings of your indexed files, and ranks results so the closest matches appear first.",
+          "shortcut": ""
+        },
+        {
+          "q": "How do I focus the search box?",
+          "a": "Press ⌘F to jump to the search box, then type any phrase to run a search.",
+          "shortcut": "⌘F"
+        },
+        {
+          "q": "How does autocomplete in the search box work?",
+          "a": "As you type, Omni suggests partial qualifier keys (typing ty offers type:), qualifier values (type: offers image, video, audio, text), and past searches from your history. Use the arrow keys to highlight a suggestion and press ↩ to apply it; Tab is not a completer in this version.",
+          "shortcut": ""
+        },
+        {
+          "q": "How do I search using a file as the query instead of text?",
+          "a": "Press ⇧⌘O to pick a file, or drag any image, video, audio, or text file from Finder onto the results area. Omni embeds that file and finds semantically similar files, showing the source in a chip at the top of results that you can clear with its X button.",
+          "shortcut": "⇧⌘O"
+        },
+        {
+          "q": "What is the difference between the 'Searching by' and 'Similar to' chips?",
+          "a": "'Searching by' means you supplied a file as the query yourself, while 'Similar to' appears when you used Find Similar on an existing result. Both use the same modality-agnostic embedding space.",
+          "shortcut": ""
+        },
+        {
+          "q": "Why do repeated searches feel instant?",
+          "a": "Omni caches query embeddings, so re-running a search from history, a bookmark, or by retyping the same text skips the GPU embedding step entirely. The search runs instantly without consuming GPU power or competing with indexing.",
+          "shortcut": ""
+        }
+      ]
+    },
+    {
+      "title": "Query language",
+      "items": [
+        {
+          "q": "How do I filter results with key:value qualifiers?",
+          "a": "Type qualifiers like type:image, ext:pdf, in:~/Documents, date:month, after:7d, score:50%, or sort:name directly in the search box, and any plain text becomes the semantic query. Use a colon with no surrounding spaces (type:image, not type: image), and separate multiple values with commas (type:image,video).",
+          "shortcut": ""
+        },
+        {
+          "q": "What qualifier keys are available?",
+          "a": "type (image/video/audio/text, plus aliases like photo, movie, music), ext (a file extension such as pdf or jpg), in (a folder path with tilde expansion), date (any/week/month/year), after (a relative duration like 7d, 30d, or 1y), score (a relevance threshold like 25%, 50%, 70%, or 0.0-1.0), and sort (relevance/name/date).",
+          "shortcut": ""
+        },
+        {
+          "q": "Can I exclude file types or folders from results?",
+          "a": "Yes, prefix a qualifier with a minus to negate it: -type:audio excludes audio files, -ext:mp4 excludes MP4s, and -in:~/Library excludes a folder. You can combine negations, for example -type:audio -ext:mp4.",
+          "shortcut": ""
+        },
+        {
+          "q": "Can I use quoted text in qualifiers?",
+          "a": "Yes, wrap values containing spaces in quotes, such as in:\"~/My Documents\". You can escape quotes and backslashes inside the value, so any non-whitespace text works as a qualifier value.",
+          "shortcut": ""
+        },
+        {
+          "q": "What happens when I type a colon that is not a qualifier?",
+          "a": "Omni only treats a colon as a qualifier when the key before it is on the whitelist and the value follows immediately with no spaces. So http://example.com, 12:30, and 'notes about type: theory' stay as free text for embedding, which keeps URLs and times from being misparsed.",
+          "shortcut": ""
+        },
+        {
+          "q": "How do I search text literally without parsing qualifiers?",
+          "a": "Click the Plain text button in the qualifier bar below the search box to enter literal mode, which embeds your text exactly as typed and ignores all key:value qualifiers. A bar reading 'Literal search - qualifiers ignored' confirms it is on; click again to return to parsing.",
+          "shortcut": ""
+        },
+        {
+          "q": "When should I use literal search?",
+          "a": "Use it when your phrase contains colons or looks like a qualifier but should be searched as-is, for example 'web: design tips' or 'ratio 3:1'. Literal mode keeps the exact text intact for embedding.",
+          "shortcut": ""
+        }
+      ]
+    },
+    {
+      "title": "Working with results",
+      "items": [
+        {
+          "q": "How do I open a result?",
+          "a": "Select a result and press ⌘O or ↩, or double-click it, to open the file in its default app.",
+          "shortcut": "⌘O"
+        },
+        {
+          "q": "How do I preview a file without opening it?",
+          "a": "Select a result and press ⌘Y or Space to open Quick Look, then press Space again or Escape to close it. While Quick Look is open, the arrow keys move to adjacent results and the preview updates live.",
+          "shortcut": "⌘Y"
+        },
+        {
+          "q": "How do I navigate results with the keyboard?",
+          "a": "Use Up and Down to move the selection in list view, plus Left and Right in gallery view. Press ↩ to open the selected result and Space or ⌘Y for Quick Look.",
+          "shortcut": ""
+        },
+        {
+          "q": "How do I switch between gallery and list view?",
+          "a": "Press ⌘1 for gallery view with thumbnails or ⌘2 for list view with text rows. A view switcher is also in the toolbar on macOS 26+ or in the View menu on earlier versions.",
+          "shortcut": "⌘1 / ⌘2"
+        },
+        {
+          "q": "How do I reveal a result in Finder?",
+          "a": "Select a result and press ⇧⌘R, or right-click and choose Reveal in Finder, to open Finder with the file highlighted.",
+          "shortcut": "⇧⌘R"
+        },
+        {
+          "q": "How do I find files similar to a result?",
+          "a": "Select a result and press ⌥⌘F, or right-click and choose Find Similar. Omni searches by that file across all modalities (text, image, video, audio).",
+          "shortcut": "⌥⌘F"
+        },
+        {
+          "q": "How do I copy a result's file path?",
+          "a": "Right-click a result and choose Copy Path, or press ⌥⌘C, to copy the full path to the clipboard.",
+          "shortcut": "⌥⌘C"
+        },
+        {
+          "q": "What does the percentage badge on a result mean?",
+          "a": "The badge is the relevance score, computed as cosine similarity between your query and the file (0-100%). Higher means a closer semantic match.",
+          "shortcut": ""
+        },
+        {
+          "q": "How do I see thumbnails for results?",
+          "a": "List view shows a small 40x40 thumbnail beside each filename, and gallery view shows larger 128x128 thumbnails with the score overlaid. Press ⌘1 for gallery view to get the bigger previews.",
+          "shortcut": "⌘1"
+        },
+        {
+          "q": "How do I sort results?",
+          "a": "Use the sort control in the toolbar (or View > Sort By) and choose Relevance (default), Name, or Date Modified. The choice persists across searches and launches.",
+          "shortcut": ""
+        },
+        {
+          "q": "How do I filter results from the toolbar?",
+          "a": "Open the filter menu (funnel icon) in the toolbar to toggle file kinds (image, video, audio, text), pick a folder, choose an extension, set a date range (Any, Last Week, Last Month, Last Year), or set a minimum relevance threshold. On earlier macOS these live under View > Filter Results.",
+          "shortcut": ""
+        },
+        {
+          "q": "Why are some results hidden, and how do I show them?",
+          "a": "Results below the active relevance threshold are hidden; for example, with score:70% anything under 70% similarity is suppressed. A footer button such as 'Show All Matches' reports the count of hidden results and reveals them, or you can lower the Relevance filter back to Any.",
+          "shortcut": ""
+        },
+        {
+          "q": "How do I clear all active filters?",
+          "a": "Open the filter menu and click Clear Filters. If filters hide every result, the empty state shows a Clear Filters button in the center.",
+          "shortcut": ""
+        },
+        {
+          "q": "How do I see the passages that matched a text file?",
+          "a": "In list view, text results show a chevron on the right; click it (or use the context menu) to expand the matching passages that contributed to the result.",
+          "shortcut": ""
+        },
+        {
+          "q": "Can I drag a result into another app?",
+          "a": "No, results are intentionally not draggable since drag-to-search is reserved for files coming from Finder. Use Reveal in Finder to drag the file from there, or Find Similar to keep searching by it.",
+          "shortcut": ""
+        }
+      ]
+    },
+    {
+      "title": "Folders & indexing",
+      "items": [
+        {
+          "q": "What does indexing actually do?",
+          "a": "Indexing crawls your configured folders, extracts text and metadata, chunks text, encodes everything into the shared vector space with the local embedding model, and stores the vectors in a local SQLite database. This is what powers semantic search.",
+          "shortcut": ""
+        },
+        {
+          "q": "How do I add or remove folders?",
+          "a": "Click the + button next to the Folders section (or drag a folder from Finder into the sidebar) to add one, and select a folder then press Delete or right-click and choose Remove from Omni to remove it. Added folders are indexed automatically; removed folders have their vectors deleted and the disk space reclaimed.",
+          "shortcut": ""
+        },
+        {
+          "q": "How do I start or pause indexing?",
+          "a": "Click the Index button or press ⇧⌘I to start; click or press again to pause. Pausing stops the current pass and already-indexed files stay searchable, and resuming picks up exactly where it left off.",
+          "shortcut": "⇧⌘I"
+        },
+        {
+          "q": "Is indexing incremental?",
+          "a": "Yes, Omni skips already-embedded files by checking their modification time and size, so re-indexing is fast when nothing has changed. Only new or modified files are embedded.",
+          "shortcut": ""
+        },
+        {
+          "q": "Does Omni keep the index up to date automatically?",
+          "a": "Yes, it watches your indexed folders with FSEvents and updates the index in the background. Files you add, modify, or delete are reflected without any action from you.",
+          "shortcut": ""
+        },
+        {
+          "q": "What does pausing or excluding a single folder do?",
+          "a": "Pausing a folder (right-click it, or toggle it off in Settings > Content) excludes it from all indexing passes and live updates, while files already indexed from it stay searchable. When you resume the folder, it is re-indexed to catch up on changes.",
+          "shortcut": ""
+        },
+        {
+          "q": "How do I see how many files are indexed per folder, and track progress?",
+          "a": "Each folder shows its indexed file count beside it, with a pause icon on paused folders and a grayed-out 0 when empty. A progress pie fills clockwise as a folder is indexed, and hovering it shows exact progress like 1,234 / 5,678 files; a small spinner appears instead during background reconciliation.",
+          "shortcut": ""
+        }
+      ]
+    },
+    {
+      "title": "History & bookmarks",
+      "items": [
+        {
+          "q": "How does search history work?",
+          "a": "By default, every search you settle on for at least 3 seconds is recorded and grouped in the sidebar as Today, Yesterday, Previous 7 Days, and Earlier. Bookmarked searches are pinned in a separate group at the top, and history persists across app restarts.",
+          "shortcut": ""
+        },
+        {
+          "q": "How do I re-run a past search?",
+          "a": "Click a search in the History or Bookmarks section of the sidebar. Omni restores the saved query text along with all filters, date range, file types, extension, relevance threshold, and sort order, then re-runs it; if a file query's source file is gone, it shows an error.",
+          "shortcut": ""
+        },
+        {
+          "q": "How do I bookmark a search?",
+          "a": "With a search active, click the star in the toolbar or press ⌘D (or right-click the search in the sidebar and choose Bookmark). The star fills in, and bookmarks are pinned at the top of the sidebar and never auto-pruned; click the filled star again to remove it.",
+          "shortcut": "⌘D"
+        },
+        {
+          "q": "What are the three history recording modes?",
+          "a": "In Settings > History you can pick Automatically (every settled search is recorded), When I press Return (only searches you submit with ↩, though Find Similar still records), or Only when I bookmark (nothing saves automatically). Changes apply to future searches immediately.",
+          "shortcut": ""
+        },
+        {
+          "q": "How long are searches kept in history?",
+          "a": "Bookmarked searches are kept indefinitely, while non-bookmarked recents are kept for a retention window you choose in Settings > History (3, 7, 14, or 31 days; default 7). Older recents are pruned on launch, and history is capped at 200 recent entries.",
+          "shortcut": ""
+        },
+        {
+          "q": "Why does a history entry show a file thumbnail?",
+          "a": "A thumbnail means that entry was a file query made with Find Similar or Search by File, and it shows the file's preview or icon. If the source file is missing, the thumbnail falls back to a generic icon.",
+          "shortcut": ""
+        },
+        {
+          "q": "How do I remove a search or clear my history?",
+          "a": "Right-click a search and choose Remove (or select it and press Delete); removing a bookmark just reverts it to a regular recent entry. To clear everything at once, open Settings > History and click Clear Search History, which removes all non-bookmarked searches and keeps bookmarks.",
+          "shortcut": ""
+        }
+      ]
+    },
+    {
+      "title": "Settings & the model",
+      "items": [
+        {
+          "q": "Where are Omni's settings, and how are they organized?",
+          "a": "Open Settings with ⌘, (or via the app menu). They are split into tabs: Indexing (status and controls), Content (what to index), Performance (speed vs quality), Storage (models and database), History (search recording), and Serving (HTTP server).",
+          "shortcut": "⌘,"
+        },
+        {
+          "q": "How do I choose which file types and extensions get indexed?",
+          "a": "In Settings > Content, toggle image, video, audio, and text under What to Index, and drag to reorder indexing priority. Below that, select a type and toggle individual extensions (like .jpg or .mp4) on or off, with a filter box and Enable All / Disable All shortcuts.",
+          "shortcut": ""
+        },
+        {
+          "q": "What do the Skip Small Files options do?",
+          "a": "They set minimum thresholds (image pixels, audio and video length in seconds, text length in characters) below which files are skipped during indexing. This avoids wasting time and space on icons, thumbnails, and very short clips, and takes effect on the next index pass.",
+          "shortcut": ""
+        },
+        {
+          "q": "How do I tune indexing speed versus quality?",
+          "a": "In Settings > Performance, Max image size (1024-2048px), Max frames per video (3-18), and Max characters per chunk (1200-3600) trade detail for speed. Recommended starting points are about 1568px and 6 frames; lower them for faster indexing on older Macs.",
+          "shortcut": ""
+        },
+        {
+          "q": "How do I limit how much memory indexing uses?",
+          "a": "The Maximum memory slider in Settings > Performance caps the RAM the embedding model can use, where 0 means unlimited. When the limit is reached, the model pauses and resumes in smaller batches; keep it above roughly 4 GB for reasonable performance.",
+          "shortcut": ""
+        },
+        {
+          "q": "How do I switch between the Small and Nano models?",
+          "a": "In Settings > Storage, use the Model picker to choose Omni Small (about 1.7B, higher quality, the default) or Omni Nano (smaller and faster). If the variant is not installed yet, selecting it triggers a download first.",
+          "shortcut": ""
+        },
+        {
+          "q": "What happens to my index when I switch models?",
+          "a": "Switching forces a full rebuild because Small uses 1024-dimensional vectors and Nano uses 768, so the two live in different embedding spaces. Your configured folders stay the same and only the vectors are rebuilt, incrementally by modification time where possible.",
+          "shortcut": ""
+        },
+        {
+          "q": "What does the 'Index doesn't match the loaded model' banner mean?",
+          "a": "It appears when the index was built with a different model variant than the one currently loaded, which prevents accurate search because vector dimensions differ. The banner offers Switch (go back to the old model and keep the index) or Reindex (wipe and rebuild for the current model).",
+          "shortcut": ""
+        },
+        {
+          "q": "How do I move the index or change the model location?",
+          "a": "In Settings > Storage, the Database Location section shows the index path (default ~/Library/Application Support/Omni) with a Change button to move it, useful for external drives. The Model section similarly lets you point at a custom folder containing model.safetensors, config.json, and tokenizer.json.",
+          "shortcut": ""
+        },
+        {
+          "q": "How much disk space does the index use, and where can I see its stats?",
+          "a": "The index is a SQLite database storing bf16 vectors (2 bytes per dimension), so roughly 2-3 GB per million files. Settings > Storage shows the indexed file and embedding counts, the database size on disk, and the last indexing timestamp, all updating as indexing runs.",
+          "shortcut": ""
+        },
+        {
+          "q": "What is the Serving tab for?",
+          "a": "It controls Omni's optional HTTP server, which lets other apps query the index through a REST API compatible with OpenAI's /v1/embeddings format. The tab shows server status and listening address, and you can disable it if you do not need programmatic access.",
+          "shortcut": ""
+        }
+      ]
+    },
+    {
+      "title": "Privacy & offline",
+      "items": [
+        {
+          "q": "Is Omni private? Does anything leave my Mac?",
+          "a": "Yes, it is fully private. The embedding model runs in-process on your Mac's GPU via MLX-Swift, and after the initial model download all indexing and searching happen locally with no further network calls.",
+          "shortcut": ""
+        },
+        {
+          "q": "Does Omni work offline or air-gapped?",
+          "a": "Yes. Once the model is downloaded on first launch (Nano about 1.9 GB or Small about 3.1 GB), indexing and search run entirely offline. You can disconnect the network and Omni keeps working with no degradation.",
+          "shortcut": ""
+        }
+      ]
+    },
+    {
+      "title": "Benchmarking",
+      "items": [
+        {
+          "q": "What does Run Profiling do?",
+          "a": "It benchmarks your Mac on a fixed 1,000-file dataset with canonical settings: it downloads the dataset once, pauses live indexing, runs an isolated timed pass on temporary storage (your real index is untouched), and measures throughput (files/sec and tokens/sec) and peak GPU memory. A local report is written and your indexing resumes automatically when it finishes.",
+          "shortcut": ""
+        },
+        {
+          "q": "What does profiling share, and is my consent required?",
+          "a": "Profiling can upload only hardware facts (chip, memory, macOS version) and timing numbers (files/sec, tokens/sec, peak VRAM); it never sends file contents, paths, or personal data. A one-time consent dialog appears on the first run, and you can toggle sharing anytime in Settings, which affects future uploads but not local reports.",
+          "shortcut": ""
+        }
+      ]
+    },
+    {
+      "title": "Updates",
+      "items": [
+        {
+          "q": "How does Check for Updates work?",
+          "a": "Omni checks silently once per day on launch and prompts you with a dialog if a newer version is available, then downloads, installs, and relaunches. You can also check manually from the app menu, which always prompts when an update is found.",
+          "shortcut": ""
+        }
+      ]
+    }
+  ]
+}

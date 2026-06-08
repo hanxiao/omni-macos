@@ -62,5 +62,5 @@ jobs:
           fi
           curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
             -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" \
-            --data '{"files":["https://hanxiao.io/omni/","https://hanxiao.io/omni/index.html","https://hanxiao.io/omni/assets/icon.png","https://hanxiao.io/omni/assets/og-image.png"]}' \
+            --data '{"files":["https://hanxiao.io/omni/","https://hanxiao.io/omni/index.html","https://hanxiao.io/omni/faq.json","https://hanxiao.io/omni/assets/icon.png","https://hanxiao.io/omni/assets/og-image.png"]}' \
             && echo "purged Cloudflare cache for /omni" || echo "Cloudflare purge failed (non-fatal)"
