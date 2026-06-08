@@ -11,7 +11,7 @@ enum IndexState { case idle, indexing, paused }
 /// A past search shown in the sidebar History. Bookmarked items are pinned and never auto-pruned.
 /// The filter/sort context is captured so re-running a history item restores exactly that search.
 struct HistoryItem: Codable, Sendable, Identifiable, Equatable {
-    var query: String                 // text query, or "" for a file query
+    var query: String                 // semantic (embedding) text, or "" for a file query
     var bookmarked: Bool
     var lastUsed: Date
     var kinds: [String] = []          // FileKind rawValues
@@ -19,15 +19,20 @@ struct HistoryItem: Codable, Sendable, Identifiable, Equatable {
     var ext: String = ""              // extension filter
     var dateRange: String = "any"     // DateRange rawValue
     var sortOrder: String = "relevance" // SortOrder rawValue
+    // The literal search-box text the user typed, including any `key:value` qualifiers. Optional so
+    // history saved before the query language decodes unchanged (it falls back to `query`).
+    var rawQuery: String? = nil
     // File-query fields (all optional/defaulted so existing persisted JSON decodes unchanged).
     var filePath: String? = nil       // set when the query is a file
     var fileKind: String? = nil       // FileKind rawValue, for the row glyph
     var similar: Bool = false         // doc-vs-doc "find similar" vs query-by-file
+    // The string the user actually typed/sees (with qualifiers) drives display, identity, and dedup.
+    var displayText: String { rawQuery ?? query }
     // Namespaced so a file path can never collide with a text query of the same string. id is
     // runtime-only (computed, not encoded), so changing the scheme is safe.
-    var id: String { filePath.map { "file:\($0)" } ?? "query:\(query)" }
+    var id: String { filePath.map { "file:\($0)" } ?? "query:\(displayText)" }
     var isFile: Bool { filePath != nil }
-    var displayLabel: String { isFile ? ((filePath! as NSString).lastPathComponent) : query }
+    var displayLabel: String { isFile ? ((filePath! as NSString).lastPathComponent) : displayText }
 }
 
 /// When a search enters History. Mirrors how macOS apps treat recents - automatic, on explicit
@@ -98,7 +103,13 @@ final class AppModel {
     static func relevance(_ score: Float) -> Double { Double(max(0, min(1, score))) }
 
     var phase: Phase = .loadingModel
+    /// The semantic (embedding) query - the free-text remainder after `key:value` qualifiers are
+    /// stripped out by `applyParsedQuery`. This is what actually gets embedded and searched.
     var query: String = ""
+    /// The literal search-box text (what the user typed, qualifiers and all). `.searchable` binds to
+    /// this; `query` is derived from it. Programmatic changes here are reflected in the field but do
+    /// NOT re-parse (only user edits, routed through `applyParsedQuery`, do).
+    var rawQuery: String = ""
     /// A file used as the query (any modality - the embedding space is shared). When set, the active
     /// query is this file, not `query`. `similar` = doc-vs-doc "find similar" vs query-by-file.
     struct FileQuery: Equatable { var url: URL; var kind: FileKind; var similar: Bool; var fromHistory: Bool = false }
@@ -194,6 +205,19 @@ final class AppModel {
         }
     }
     private var applyingHistoryContext = false   // suppress per-filter searches while restoring a history item
+    private var applyingParsedQuery = false      // suppress per-filter searches while applying a parsed query string
+    private var stringOwnedFilters: Set<String> = []   // filters the search-box string currently sets (vs the menu)
+    /// Treat the box text literally: embed the whole raw string (qualifiers included) and apply no
+    /// box-derived filters. Toggled from the qualifier bar; resets when the box is emptied.
+    var literalQuery: Bool = false
+    /// Qualifiers parsed from the current box text, for the feedback bar. Empty in literal mode.
+    private(set) var activeQualifiers: [ParsedQuery.Qualifier] = []
+    /// Query-side embedding cache. A query vector depends only on the text + model, never on the
+    /// (changing) document index, so caching lets a repeated / history / bookmark search skip the GPU
+    /// embed entirely - instant, and crucially GPU-free while indexing runs. Cleared on model reload.
+    private var queryEmbedCache: [String: [Float]] = [:]
+    private var queryEmbedOrder: [String] = []          // insertion order for a small LRU cap
+    private let queryEmbedCap = 256
     private var lastHistoryRunQuery: String?     // the query just launched from history (don't re-record it)
     private var rateLastEmbedded = 0
     private var rateLastTokens = 0
@@ -239,12 +263,17 @@ final class AppModel {
     }
 
     // Search filters + presentation. All persisted so the toolbar/view state survives relaunch.
-    var filterKinds: Set<FileKind> = [] { didSet { persistFilters(); if !applyingHistoryContext { search() } } }
-    var filterFolder: URL? = nil { didSet { persistFilters(); if !applyingHistoryContext { search() } } }
-    var filterExt: String = "" { didSet { persistFilters(); if !applyingHistoryContext { search() } } }
-    var dateRange: DateRange = .any { didSet { persistFilters(); if !applyingHistoryContext { search() } } }
-    var minScore: Double = defaultMinScore { didSet { persistFilters(); recomputeResults() } }
-    var sortOrder: SortOrder = .relevance { didSet { persistFilters(); recomputeResults() } }
+    // didSets fire a search/recompute, EXCEPT while restoring a history item or applying a parsed
+    // query string (both set several filters at once, then run a single search themselves).
+    // When suppressed (applying a parsed query / restoring history), skip the per-property persist +
+    // search; the batch operation persists once and searches once at the end.
+    var filterKinds: Set<FileKind> = [] { didSet { if !suppressFilterSearch { persistFilters(); search() } } }
+    var filterFolder: URL? = nil { didSet { if !suppressFilterSearch { persistFilters(); search() } } }
+    var filterExt: String = "" { didSet { if !suppressFilterSearch { persistFilters(); search() } } }
+    var dateRange: DateRange = .any { didSet { if !suppressFilterSearch { persistFilters(); search() } } }
+    var minScore: Double = defaultMinScore { didSet { if !suppressFilterSearch { persistFilters(); recomputeResults() } } }
+    var sortOrder: SortOrder = .relevance { didSet { if !suppressFilterSearch { persistFilters(); recomputeResults() } } }
+    private var suppressFilterSearch: Bool { applyingHistoryContext || applyingParsedQuery }
 
     var viewMode: ResultViewMode = .list {
         didSet { UserDefaults.standard.set(viewMode.rawValue, forKey: "omni.viewMode") }
@@ -380,22 +409,27 @@ final class AppModel {
         case .manual: return
         }
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard q.count >= 2, q != lastHistoryRunQuery else { return }
+        let raw = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Need semantic text to embed (q), and skip the item just launched from a history click.
+        guard q.count >= 2, raw != lastHistoryRunQuery else { return }
         let ctx = currentSearchContext()
-        let lower = q.lowercased()
-        // Collapse live-typed TEXT prefixes only. File items have query == "" and "".isPrefix of
-        // everything, so without the !isFile guard this would wipe every file query from history.
-        searchHistory.removeAll { !$0.bookmarked && !$0.isFile && !$0.query.isEmpty
-            && $0.query.count < q.count && lower.hasPrefix($0.query.lowercased()) }
-        if let i = searchHistory.firstIndex(where: { !$0.isFile && $0.query.caseInsensitiveCompare(q) == .orderedSame }) {
+        let lower = raw.lowercased()
+        // Identity/dedup/prefix-collapse use the full typed string (qualifiers included), so
+        // "type:pdf budget" and "budget" are distinct entries and live-typed prefixes still collapse.
+        searchHistory.removeAll { !$0.bookmarked && !$0.isFile && !$0.displayText.isEmpty
+            && $0.displayText.count < raw.count && lower.hasPrefix($0.displayText.lowercased()) }
+        if let i = searchHistory.firstIndex(where: { !$0.isFile && $0.displayText.caseInsensitiveCompare(raw) == .orderedSame }) {
             searchHistory[i].lastUsed = Date()
             searchHistory[i].query = q
+            searchHistory[i].rawQuery = raw
             searchHistory[i].kinds = ctx.kinds; searchHistory[i].folder = ctx.folder
             searchHistory[i].ext = ctx.ext; searchHistory[i].dateRange = ctx.dateRange; searchHistory[i].sortOrder = ctx.sort
         } else {
-            searchHistory.insert(HistoryItem(query: q, bookmarked: false, lastUsed: Date(),
-                                             kinds: ctx.kinds, folder: ctx.folder, ext: ctx.ext,
-                                             dateRange: ctx.dateRange, sortOrder: ctx.sort), at: 0)
+            var item = HistoryItem(query: q, bookmarked: false, lastUsed: Date(),
+                                   kinds: ctx.kinds, folder: ctx.folder, ext: ctx.ext,
+                                   dateRange: ctx.dateRange, sortOrder: ctx.sort)
+            item.rawQuery = raw
+            searchHistory.insert(item, at: 0)
         }
         pruneHistory()
         persistHistory()
@@ -418,13 +452,21 @@ final class AppModel {
         dateRange = DateRange(rawValue: item.dateRange) ?? .any
         sortOrder = SortOrder(rawValue: item.sortOrder) ?? .relevance
         applyingHistoryContext = false
+        persistFilters()
 
         if item.isFile, let path = item.filePath {
             setFileQuery(URL(fileURLWithPath: path), similar: item.similar, fromHistory: true)
         } else {
-            lastHistoryRunQuery = item.query
+            let raw = item.rawQuery ?? item.query
+            lastHistoryRunQuery = raw
             fileQuery = nil
-            query = item.query
+            literalQuery = false                                  // replay always starts in parse mode
+            activeQualifiers = SearchQueryParser.parse(raw).qualifiers   // keep the qualifier bar in sync
+            // The restored filters come from the saved fields, not from re-parsing; reset ownership so
+            // a later box edit re-establishes it and never wrongly clears a restored (menu-set) filter.
+            stringOwnedFilters = []
+            rawQuery = raw           // box shows the full typed string (qualifiers included)
+            query = item.query       // the semantic text that gets embedded
             search()
         }
         return true
@@ -468,14 +510,14 @@ final class AppModel {
     /// Is the search currently shown already saved as a bookmark?
     var currentSearchIsBookmarked: Bool {
         if let fq = fileQuery { return searchHistory.contains { $0.filePath == fq.url.path && $0.bookmarked } }
-        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty else { return false }
-        return searchHistory.contains { !$0.isFile && $0.query.caseInsensitiveCompare(q) == .orderedSame && $0.bookmarked }
+        let raw = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return false }
+        return searchHistory.contains { !$0.isFile && $0.displayText.caseInsensitiveCompare(raw) == .orderedSame && $0.bookmarked }
     }
 
     /// Is there a search to act on (text typed or a file query active)?
     var hasActiveSearch: Bool {
-        fileQuery != nil || !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        fileQuery != nil || !rawQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     var recentHistoryCount: Int { searchHistory.lazy.filter { !$0.bookmarked }.count }
@@ -498,14 +540,17 @@ final class AppModel {
             }
             persistHistory(); return
         }
+        let raw = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty else { return }
-        if let i = searchHistory.firstIndex(where: { !$0.isFile && $0.query.caseInsensitiveCompare(q) == .orderedSame }) {
+        guard !raw.isEmpty else { return }
+        if let i = searchHistory.firstIndex(where: { !$0.isFile && $0.displayText.caseInsensitiveCompare(raw) == .orderedSame }) {
             searchHistory[i].bookmarked.toggle(); searchHistory[i].lastUsed = Date()
         } else {
-            searchHistory.insert(HistoryItem(query: q, bookmarked: true, lastUsed: Date(),
-                                             kinds: ctx.kinds, folder: ctx.folder, ext: ctx.ext,
-                                             dateRange: ctx.dateRange, sortOrder: ctx.sort), at: 0)
+            var item = HistoryItem(query: q, bookmarked: true, lastUsed: Date(),
+                                   kinds: ctx.kinds, folder: ctx.folder, ext: ctx.ext,
+                                   dateRange: ctx.dateRange, sortOrder: ctx.sort)
+            item.rawQuery = raw
+            searchHistory.insert(item, at: 0)
         }
         persistHistory()
     }
@@ -724,6 +769,147 @@ final class AppModel {
     }
     func showAllBelowThreshold() { minScore = 0 }
 
+    // MARK: - Query language
+
+    /// Parse the raw search-box text into the semantic (embedding) query plus `key:value` qualifiers,
+    /// and apply the qualifiers to the existing filters. Sets state only - the caller runs the
+    /// (debounced) search. The box "owns only what it mentions": a filter the box previously set but
+    /// no longer names is cleared, while a filter set via the toolbar menu is left untouched.
+    func applyParsedQuery(_ raw: String) {
+        rawQuery = raw
+        if raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { literalQuery = false }
+        applyingParsedQuery = true
+        var owned: Set<String> = []
+        // Literal mode: no qualifier extraction - embed the whole string and release box-owned filters.
+        guard !literalQuery else {
+            activeQualifiers = []
+            for key in stringOwnedFilters { resetFilter(key) }
+            stringOwnedFilters = []
+            query = raw
+            applyingParsedQuery = false
+            persistFilters()
+            return
+        }
+        let parsed = SearchQueryParser.parse(raw)
+        activeQualifiers = parsed.qualifiers
+        var includeKinds: Set<FileKind> = []
+        var excludeKinds: Set<FileKind> = []
+        var sawType = false
+        for qual in parsed.qualifiers {
+            switch qual.key {
+            case "type":
+                sawType = true
+                let kinds = qual.value.split(separator: ",").compactMap { Self.mapKind(String($0)) }
+                if qual.negated { excludeKinds.formUnion(kinds) } else { includeKinds.formUnion(kinds) }
+            case "ext":
+                filterExt = qual.value.hasPrefix(".") ? String(qual.value.dropFirst()) : qual.value
+                owned.insert("ext")
+            case "in":
+                if let url = Self.resolveFolder(qual.value) { filterFolder = url; owned.insert("in") }
+            case "date":
+                if let d = DateRange(rawValue: qual.value.lowercased()) { dateRange = d; owned.insert("date") }
+            case "after":
+                if let d = Self.mapAfter(qual.value) { dateRange = d; owned.insert("date") }
+            case "score":
+                if let s = Self.mapScore(qual.value) { minScore = s; owned.insert("score") }
+            case "sort":
+                if let so = Self.mapSort(qual.value) { sortOrder = so; owned.insert("sort") }
+            default: break
+            }
+        }
+        if sawType {
+            if !includeKinds.isEmpty {
+                filterKinds = includeKinds.subtracting(excludeKinds); owned.insert("type")
+            } else if !excludeKinds.isEmpty {                       // -type:x means "everything but x"
+                filterKinds = Set(FileKind.allCases).subtracting(excludeKinds); owned.insert("type")
+            }   // else: only invalid kinds named -> leave the current filter, don't own it
+        }
+        // Clear only filters the box previously owned and no longer mentions; leave menu-set ones.
+        for key in stringOwnedFilters.subtracting(owned) { resetFilter(key) }
+        stringOwnedFilters = owned
+        query = parsed.semanticText
+        applyingParsedQuery = false
+        persistFilters()
+    }
+
+    /// Reset one filter dimension to its default. Caller is responsible for the applyingParsedQuery guard.
+    private func resetFilter(_ key: String) {
+        switch key {
+        case "type": filterKinds = []
+        case "ext": filterExt = ""
+        case "in": filterFolder = nil
+        case "date": dateRange = .any
+        case "score": minScore = Self.defaultMinScore
+        case "sort": sortOrder = .relevance
+        default: break
+        }
+    }
+
+    /// Toggle literal mode: embed the box text as-is (ignoring qualifiers) vs parse it as a query
+    /// language. Re-applies and searches. No-op for a file query.
+    func toggleLiteralQuery() {
+        guard fileQuery == nil, hasActiveSearch else { return }
+        literalQuery.toggle()
+        applyParsedQuery(rawQuery)
+        search()
+    }
+
+    // MARK: - Query-side embedding cache
+
+    private func cacheQueryVector(_ q: String, _ v: [Float]) {
+        if queryEmbedCache[q] == nil {
+            queryEmbedOrder.append(q)
+            if queryEmbedOrder.count > queryEmbedCap { queryEmbedCache[queryEmbedOrder.removeFirst()] = nil }
+        }
+        queryEmbedCache[q] = v
+    }
+    /// Cleared whenever the model is (re)loaded, since the vectors are model-specific.
+    func clearQueryEmbedCache() { queryEmbedCache.removeAll(); queryEmbedOrder.removeAll() }
+
+    private static func mapKind(_ s: String) -> FileKind? {
+        switch s.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "image", "images", "img", "photo", "photos", "picture", "pictures": return .image
+        case "video", "videos", "movie", "movies", "clip", "clips": return .video
+        case "audio", "sound", "music", "song", "songs": return .audio
+        case "text", "txt", "doc", "docs", "document", "documents": return .text
+        default: return nil
+        }
+    }
+
+    /// `after:` accepts the named buckets or a relative duration (`7d`, `2w`, `3m`, `1y`), snapped to
+    /// the nearest DateRange bucket since `SearchFilter.since` only exposes week/month/year.
+    private static func mapAfter(_ s: String) -> DateRange? {
+        let v = s.trimmingCharacters(in: .whitespaces).lowercased()
+        if let d = DateRange(rawValue: v) { return d }
+        guard let unit = v.last, "dwmy".contains(unit), let num = Int(v.dropLast()), num > 0 else { return nil }
+        let days: Int
+        switch unit { case "d": days = num; case "w": days = num * 7; case "m": days = num * 30; default: days = num * 365 }
+        if days <= 7 { return .week } else if days <= 31 { return .month } else if days <= 366 { return .year } else { return .any }
+    }
+
+    private static func mapScore(_ s: String) -> Double? {
+        var v = s.trimmingCharacters(in: .whitespaces)
+        if v.hasSuffix("%") { v.removeLast(); guard let p = Double(v) else { return nil }; return max(0, min(1, p / 100)) }
+        guard let d = Double(v) else { return nil }
+        return max(0, min(1, d))
+    }
+
+    private static func mapSort(_ s: String) -> SortOrder? {
+        switch s.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "relevance", "score", "best": return .relevance
+        case "name", "title", "alpha": return .name
+        case "date", "datemodified", "modified", "recent", "newest": return .dateModified
+        default: return nil
+        }
+    }
+
+    private static func resolveFolder(_ s: String) -> URL? {
+        var p = s.trimmingCharacters(in: .whitespaces)
+        guard !p.isEmpty else { return nil }
+        if p == "~" || p.hasPrefix("~/") { p = (p as NSString).expandingTildeInPath }
+        return URL(fileURLWithPath: p)
+    }
+
     private func currentFilter() -> SearchFilter {
         var f = SearchFilter()
         f.kinds = Set(filterKinds.map { $0.rawValue })
@@ -821,6 +1007,7 @@ final class AppModel {
             let engine = try await engineC
             self.store = store
             self.engine = engine
+            self.clearQueryEmbedCache()   // cached query vectors are model-specific
             self.indexer = Indexer(store: store, embedder: engine)
             // Hand the live engine and store to the serving layer. attach() swaps in the new
             // backend and reconciles: it auto-starts the server if serving was enabled last
@@ -1052,7 +1239,8 @@ final class AppModel {
             fileQuery = nil; rawResults = []; resolvedQuery = fileToken(url)
             return
         }
-        query = ""                       // the text field empties; the chip represents the query
+        query = ""; rawQuery = ""        // the text field empties; the chip represents the query
+        stringOwnedFilters = []
         fileQuery = FileQuery(url: url, kind: kind, similar: similar, fromHistory: fromHistory)
         search()
     }
@@ -1097,13 +1285,29 @@ final class AppModel {
         }
 
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty else { rawResults = []; resolvedQuery = ""; return }
+        guard !q.isEmpty else { rawResults = []; resolvedQuery = ""; searching = false; return }
         searching = true
+        // Cached query vector: skip the GPU embed entirely (instant, and no contention with indexing).
+        if let cached = queryEmbedCache[q] {
+            Task.detached(priority: .userInitiated) {
+                let hits = store.search(cached, filter: filter, topK: 60)
+                await MainActor.run {
+                    guard token == self.searchToken else { return }
+                    self.lastQueryVector = cached
+                    self.rawResults = hits
+                    self.resolvedQuery = q
+                    if let sel = self.selection, !hits.contains(where: { $0.path == sel }) { self.selection = nil }
+                    self.searching = false
+                }
+            }
+            return
+        }
         Task.detached(priority: .userInitiated) {
             let vec = engine.embedQuery(q)   // high priority: jumps ahead of indexing
             let hits = store.search(vec, filter: filter, topK: 60)
             await MainActor.run {
                 guard token == self.searchToken else { return }
+                self.cacheQueryVector(q, vec)
                 self.lastQueryVector = vec
                 self.rawResults = hits
                 self.resolvedQuery = q
