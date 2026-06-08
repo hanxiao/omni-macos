@@ -1,0 +1,66 @@
+name: Deploy site
+
+# Deploy ONLY the static hanxiao.io/omni page (index.html + assets) - no app build, no version bump.
+# Use after editing site/omni/ (homepage copy, benchmark viz, icon, og-image). The full release
+# workflow also deploys the site; this is the lightweight path for site-only changes.
+#
+#   gh workflow run deploy-site.yml
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-site
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    # Self-hosted (the dev Mac) - free, and BSD sed matches the release workflow's stamp.
+    runs-on: [self-hosted, macOS, arm64]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy site/omni
+        env:
+          SITE_TOKEN: ${{ secrets.SITE_TOKEN }}
+        run: |
+          if [ -z "$SITE_TOKEN" ]; then echo "no SITE_TOKEN secret; cannot deploy"; exit 1; fi
+          git config --global user.email "omni-ci@users.noreply.github.com"
+          git config --global user.name "omni-ci"
+          rm -rf /tmp/site-only   # self-hosted runner reuses /tmp; a prior clone would block this one
+          git clone --depth 1 "https://x-access-token:${SITE_TOKEN}@github.com/hanxiao/hanxiao.github.io.git" /tmp/site-only
+          # Sync the page + assets, but PRESERVE the release-managed files: the DMGs, the in-app
+          # updater manifest (latest.json), and the profiling dataset. --delete still prunes stale
+          # page assets that were removed from the repo.
+          rsync -a --delete --exclude='*.dmg' --exclude='profiling-v1*' --exclude='latest.json' \
+            site/omni/ /tmp/site-only/omni/
+          # The repo's index.html carries placeholder download metadata; re-stamp it to the currently
+          # released DMG using the live manifest, so a site-only deploy never regresses the version pill.
+          MANIFEST=/tmp/site-only/omni/latest.json
+          if [ -f "$MANIFEST" ]; then
+            VERSION=$(python3 -c "import json;print(json.load(open('$MANIFEST'))['version'])")
+            MD5=$(python3 -c "import json;print(json.load(open('$MANIFEST'))['md5'])")
+            sed -i '' "s#<span class=\"dl-ver\">v[0-9.]*</span>#<span class=\"dl-ver\">v${VERSION}</span>#g" /tmp/site-only/omni/index.html
+            sed -i '' "s#href=\"Omni[^\"]*\.dmg\"#href=\"Omni-${VERSION}.dmg\"#g" /tmp/site-only/omni/index.html
+            sed -i '' "s#<span class=\"dl-md5\">[^<]*</span>#<span class=\"dl-md5\">${MD5}</span>#g" /tmp/site-only/omni/index.html
+            echo "stamped download to v${VERSION} (md5 ${MD5})"
+          else
+            echo "WARNING: no latest.json on target; deploying page with placeholder download metadata"
+          fi
+          ( cd /tmp/site-only && git add -A omni && (git diff --cached --quiet && echo "no site changes" || (git commit -m "omni site: deploy ${GITHUB_SHA::7}" && git push)) )
+
+      - name: Purge Cloudflare cache for /omni
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+        run: |
+          if [ -z "$CF_API_TOKEN" ] || [ -z "$CF_ZONE_ID" ]; then
+            echo "no Cloudflare secrets; skipping purge (origin updated; CF catches up on TTL)"; exit 0
+          fi
+          curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" \
+            --data '{"files":["https://hanxiao.io/omni/","https://hanxiao.io/omni/index.html","https://hanxiao.io/omni/assets/icon.png","https://hanxiao.io/omni/assets/og-image.png"]}' \
+            && echo "purged Cloudflare cache for /omni" || echo "Cloudflare purge failed (non-fatal)"
