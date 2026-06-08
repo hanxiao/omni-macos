@@ -168,9 +168,9 @@ public final class VectorStore: @unchecked Sendable {
         // bounded page cache cut read syscalls on load; temp_store=MEMORY keeps sorts off disk.
         exec("PRAGMA synchronous=NORMAL;")
         exec("PRAGMA mmap_size=268435456;")     // 256MB memory-mapped IO (virtual, demand-paged)
-        exec("PRAGMA cache_size=-65536;")        // 64MB page cache
+        exec("PRAGMA cache_size=-262144;")       // 256MB page cache (bulk insert keeps more dirty pages hot)
         exec("PRAGMA temp_store=MEMORY;")
-        exec("PRAGMA wal_autocheckpoint=2000;")
+        exec("PRAGMA wal_autocheckpoint=8000;")  // ~32MB WAL between checkpoints: fewer checkpoint stalls mid-reindex
         exec("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);")
         // The index is a rebuildable cache: on a schema change, drop and recreate.
         if userVersion() != Self.schemaVersion {
@@ -539,15 +539,33 @@ public final class VectorStore: @unchecked Sendable {
         var bestScore = [Float](repeating: -.infinity, count: fileCount)
         var bestRow = [Int32](repeating: -1, count: fileCount)
         let kinds = filter.kinds, hasKind = !filter.kinds.isEmpty, since = filter.since
-        for i in 0 ..< n {
-            let dot = scores[i]
-            if !dot.isFinite { continue }            // ignore degenerate (NaN/inf) stored vectors
-            let r = rows[i]
-            if hasKind && !kinds.contains(r.kind) { continue }
-            if let s = since, r.modified < s { continue }
-            let f = Int(fileID[i])
-            if dot > bestScore[f] { bestScore[f] = dot; bestRow[f] = Int32(i) }   // strict > keeps lowest row index on tie (== reference's `>=` skip)
-        }
+        // Per-file max over all N chunks. The hot case (a plain query, no kind/since filter) must NOT
+        // touch `rows[i]`: copying that struct retains/releases its three Strings ~N times, and that
+        // ARC traffic - not the arithmetic - was the bulk of this loop. So split into a filter-free
+        // fast path over primitive buffers (no ARC, no bounds checks via unsafe pointers) and a
+        // filtered path that reads only the two fields it needs. Both produce identical winners.
+        scores.withUnsafeBufferPointer { sp in
+        fileID.withUnsafeBufferPointer { fp in
+        bestScore.withUnsafeMutableBufferPointer { bs in
+        bestRow.withUnsafeMutableBufferPointer { br in
+            if hasKind || since != nil {
+                for i in 0 ..< n {
+                    let dot = sp[i]
+                    if !dot.isFinite { continue }        // ignore degenerate (NaN/inf) stored vectors
+                    if hasKind && !kinds.contains(rows[i].kind) { continue }
+                    if let s = since, rows[i].modified < s { continue }
+                    let f = Int(fp[i])
+                    if dot > bs[f] { bs[f] = dot; br[f] = Int32(i) }
+                }
+            } else {
+                for i in 0 ..< n {
+                    let dot = sp[i]
+                    if !dot.isFinite { continue }
+                    let f = Int(fp[i])
+                    if dot > bs[f] { bs[f] = dot; br[f] = Int32(i) }   // strict > keeps lowest row index on tie (== reference's `>=` skip)
+                }
+            }
+        }}}}
         let tB = searchTiming ? Date() : nil
         // Bounded top-K over the per-file winners via a size-K min-heap, instead of building a
         // SearchHit for all F files and sorting them (that full sort of F String-bearing structs was
@@ -568,10 +586,12 @@ public final class VectorStore: @unchecked Sendable {
                 if r < c && heapScore[r] < heapScore[m] { m = r }
                 if m == i { break }; heapScore.swapAt(i, m); heapRow.swapAt(i, m); i = m }
         }
+        bestScore.withUnsafeBufferPointer { bsp in
+        bestRow.withUnsafeBufferPointer { brp in
         for f in 0 ..< fileCount {
-            let ri = bestRow[f]
+            let ri = brp[f]
             if ri < 0 { continue }
-            let s = bestScore[f]
+            let s = bsp[f]
             if heapScore.count >= topK && s <= heapScore[0] { continue }   // can't beat the current K-th
             let r = rows[Int(ri)]
             if !filter.accepts(path: r.path, kind: r.kind, modified: r.modified) { continue }
@@ -581,6 +601,7 @@ public final class VectorStore: @unchecked Sendable {
                 heapScore[0] = s; heapRow[0] = ri; siftDown(0)
             }
         }
+        }}
         // Order the K survivors by descending score (K is small).
         let order = (0 ..< heapScore.count).sorted { heapScore[$0] > heapScore[$1] }
         let out = order.map { idx -> SearchHit in

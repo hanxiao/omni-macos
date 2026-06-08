@@ -31,3 +31,5 @@ icon-work/
 out/
 Tools/out/
 profiling-v1.zip
+bench/
+*.profraw

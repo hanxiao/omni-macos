@@ -9,6 +9,7 @@ struct SettingsView: View {
             ContentTypesTab().tabItem { Label("Content", systemImage: "square.grid.2x2") }
             PerformanceTab().tabItem { Label("Performance", systemImage: "speedometer") }
             IndexTab().tabItem { Label("Storage", systemImage: "externaldrive") }
+            HistoryTab().tabItem { Label("History", systemImage: "clock.arrow.circlepath") }
             ServingTab().tabItem { Label("Serving", systemImage: "network") }
         }
         // Size to the selected tab rather than forcing one height across five differently sized
@@ -355,6 +356,57 @@ private struct PerformanceTab: View {
             }
         }
         .formStyle(.grouped)
+    }
+}
+
+/// Search History preferences - what gets remembered, for how long, and a way to clear it.
+/// Mirrors how macOS surfaces recents/Smart Folders: an explicit recording mode, a time window,
+/// and a destructive clear that spares the user's explicit bookmarks.
+private struct HistoryTab: View {
+    @Environment(AppModel.self) private var model: AppModel
+    @State private var confirmClear = false
+    var body: some View {
+        Form {
+            Section {
+                Picker("Add searches to History", selection: Binding(get: { model.historyMode }, set: { model.historyMode = $0 })) {
+                    ForEach(HistoryMode.allCases) { Text($0.title).tag($0) }
+                }
+                .help("Choose when a search is remembered in the sidebar")
+            } footer: {
+                Text(model.historyMode.detail).font(.caption).foregroundStyle(.secondary)
+            }
+            Section {
+                Picker("Keep history for", selection: Binding(get: { model.historyRetentionDays }, set: { model.historyRetentionDays = $0 })) {
+                    Text("3 days").tag(3)
+                    Text("7 days").tag(7)
+                    Text("14 days").tag(14)
+                    Text("31 days").tag(31)
+                }
+                .help("How long recent searches are kept before they are removed")
+            } footer: {
+                Text("Recent searches older than this are removed automatically. Bookmarked searches are always kept.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section {
+                LabeledContent("Saved searches") {
+                    Text("\(model.recentHistoryCount) recent \u{00B7} \(model.bookmarkCount) bookmarked")
+                        .foregroundStyle(.secondary).monospacedDigit()
+                }
+                Button("Clear Search History\u{2026}", role: .destructive) { confirmClear = true }
+                    .disabled(model.recentHistoryCount == 0)
+                    .help("Remove all recent searches. Your bookmarks are kept.")
+            } footer: {
+                Text("Clearing removes recent searches from the sidebar. Your bookmarks stay.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .confirmationDialog("Clear all recent searches?", isPresented: $confirmClear) {
+            Button("Clear Search History", role: .destructive) { model.clearSearchHistory() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Your bookmarked searches will be kept.")
+        }
     }
 }
 
