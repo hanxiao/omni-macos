@@ -173,7 +173,7 @@ struct FolderEmbeddingVisualization: View {
         // lands, so this blanks the old map under the "Mapping..." spinner instead of leaving it
         // stale). The GPU buffer then rebuilds when a new layout lands (keyed on the generation, since
         // two folders can share a file count) or the appearance flips.
-        .onChange(of: model.selectedFolderForViz) { selectedIndex = nil; resetView(); rebuildPoints() }
+        .onChange(of: model.selectedFolderForViz) { hovered = nil; selectedIndex = nil; resetView(); rebuildPoints() }
         .onChange(of: model.projectionGeneration) { rebuildPoints() }
         .onChange(of: colorScheme) { rebuildPoints() }
         .onAppear { rebuildPoints() }

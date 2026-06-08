@@ -231,6 +231,40 @@
       ]
     },
     {
+      "title": "Folder map",
+      "items": [
+        {
+          "q": "How do I see a folder as a map?",
+          "a": "With the search box empty, click a folder in the sidebar. Omni lays out every indexed file under it as a 2D map, placing semantically similar files near each other and coloring them by type."
+        },
+        {
+          "q": "What do the colors and clusters mean?",
+          "a": "Each dot is one indexed file. Its position comes from the file's embedding, so files that mean similar things cluster together. Color is the file type: blue for images, green for text, purple for video, orange for audio."
+        },
+        {
+          "q": "How do I zoom and pan the map?",
+          "a": "Scroll or two-finger pinch to zoom (anchored at the cursor), or use the minus / reset / plus controls at the bottom-left. Drag anywhere to pan.",
+          "shortcut": "Cmd-Plus / Cmd-Minus / Cmd-0"
+        },
+        {
+          "q": "What happens when I click a file in the map?",
+          "a": "It spotlights that file plus its 10 nearest neighbors in embedding space - showing each one's thumbnail with connecting lines, and dimming the rest. Click a neighbor's thumbnail to re-center on it and walk the similarity graph. Click empty space to clear."
+        },
+        {
+          "q": "What can I do by right-clicking a file in the map?",
+          "a": "The same actions as a search result: Open, Quick Look, Find Similar (run that file as a query), Reveal in Finder, and Copy Path."
+        },
+        {
+          "q": "Does opening the folder map re-index or embed anything?",
+          "a": "No. The map only reads embeddings already in your index, so it appears in seconds and never re-reads or embeds your files. Files that aren't indexed yet simply don't appear, and the layout runs on the GPU at low priority so it never slows down search or indexing."
+        },
+        {
+          "q": "Hovering a dot shows a thumbnail - where does it come from?",
+          "a": "It's the same QuickLook thumbnail Omni shows in the results list, cached, so hovering is instant after the first look."
+        }
+      ]
+    },
+    {
       "title": "History & bookmarks",
       "items": [
         {
