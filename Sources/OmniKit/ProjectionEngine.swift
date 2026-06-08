@@ -56,7 +56,8 @@ public final class ProjectionEngine: @unchecked Sendable {
     /// gate (so a search preempts within a batch) and checks cancellation between slices, but the
     /// host readback happens once at the end. The UI shows the final result, not a bloom.
     public func project(_ data: FolderVectors,
-                        k: Int = 15, epochs: Int = 300, negRate: Int = 5, seed: UInt64 = 42) async -> ProjectionResult {
+                        k: Int = 15, epochs: Int = 300, negRate: Int = 5, seed: UInt64 = 42,
+                        refine: Bool = true) async -> ProjectionResult {
         let n = data.count
         guard n > 0, data.dim > 0, data.vectors.count == n * data.dim else { return ProjectionResult(points: [], knn: [], k: k) }
         let d = data.dim
@@ -71,6 +72,12 @@ public final class ProjectionEngine: @unchecked Sendable {
             return (X, Y0)
         }
         let pcaPoints = Self.makePoints(Y0host, data)
+
+        // PCA-only (default, light): stop here. The kNN step materializes hundreds of MB of GPU
+        // distance tiles for a large folder, and the 300-epoch force layout adds more - enough to
+        // exhaust unified memory and freeze a low-RAM Mac. UMAP refinement (better cluster separation
+        // + the neighbor graph for click-to-spotlight) is opt-in via Settings. PCA is N-light + instant.
+        if !refine { return ProjectionResult(points: pcaPoints, knn: [], k: 0) }
 
         // kNN graph (embedding space), computed ONCE: it both seeds the force layout and is returned
         // for the click-to-highlight-neighbors UI. Skipped only when there are too few files (<= k).
@@ -190,7 +197,7 @@ public final class ProjectionEngine: @unchecked Sendable {
         let n = X.dim(0)
         let sqNorms = MLX.sum(X * X, axis: 1)                 // [n]
         eval(sqNorms)
-        let chunk = min(n, max(1000, 500_000_000 / (n * 4)))
+        let chunk = min(n, max(1000, 200_000_000 / (n * 4)))   // cap the distance-tile VRAM (~smaller tiles, more iters)
         var idxChunks = [MLXArray]()
         var start = 0
         let xT = X.transposed()
