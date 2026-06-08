@@ -483,6 +483,28 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
+    /// Distinct indexed files under EACH folder, computed in ONE pass under ONE lock - vs one full
+    /// row scan (and lock) per folder via `fileCount(underFolder:)`. On a large index this is what
+    /// `refreshIndexStats` calls every progress tick, so the per-folder fan-out (O(folders * rows),
+    /// folders+1 lock acquisitions) was a serial-queue hog that starved search and the folder map
+    /// during indexing. A row is counted for every folder it falls under, so overlapping/nested
+    /// inputs stay correct.
+    public func fileCounts(underFolders folders: [String]) -> [String: Int] {
+        queue.sync {
+            guard !folders.isEmpty else { return [:] }
+            let prefixes = folders.map { $0 + "/" }
+            var seen = [Set<String>](repeating: [], count: folders.count)
+            for r in rows {
+                for i in folders.indices where r.path == folders[i] || r.path.hasPrefix(prefixes[i]) {
+                    seen[i].insert(r.path)
+                }
+            }
+            var out: [String: Int] = [:]
+            for i in folders.indices { out[folders[i]] = seen[i].count }
+            return out
+        }
+    }
+
     /// Per-FILE mean-pooled, L2-normalized fp32 vectors for files under `folder` (path-boundary
     /// aware), capped at `cap` files in row order. Additive read-only helper for the folder
     /// visualization; does NOT touch search state. Runs under `queue` like every other reader.

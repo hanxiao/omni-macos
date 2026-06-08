@@ -256,6 +256,12 @@ final class AppModel {
 
     var roots: [URL] = []
     var settings = IndexSettings.default
+    /// In-memory text of the central `.omniignore` (gitignore syntax) - the single source of truth for
+    /// the crawl's EXCLUDE policy. Migrated on first launch from the legacy kind/extension settings plus
+    /// the well-known noise dirs (see `synthesizeIgnoreText`). Handed to the indexer via effectiveSettings.
+    private(set) var ignoreText: String = ""
+    /// Compiled form of `ignoreText`.
+    private(set) var ignore = OmniIgnore(text: "")
     var indexedKinds: Set<String> = []
     var indexedExts: [String] = []
     var folderFileCounts: [String: Int] = [:]
@@ -289,19 +295,20 @@ final class AppModel {
         roots.first { path == $0.path || path.hasPrefix($0.path + "/") }?.path
     }
 
-    // Search filters + presentation. All persisted so the toolbar/view state survives relaunch.
-    // didSets fire a search/recompute, EXCEPT while restoring a history item or applying a parsed
-    // query string (both set several filters at once, then run a single search themselves).
-    // When suppressed (applying a parsed query / restoring history), skip the per-property persist +
-    // search; the batch operation persists once and searches once at the end.
+    // Search filters + presentation. NOT persisted across launches: a filter is a refinement of a live
+    // query, and restoring a bare filter (e.g. "type:image") into an otherwise-empty box on launch
+    // pre-fills the search and pops the suggestions dropdown for no query - a confusing cold start. A
+    // past filtered search is still re-runnable from History, which is where cross-launch recall lives.
+    // didSets fire a search/recompute, EXCEPT while restoring a history item or applying a parsed query
+    // string (both set several filters at once, then run a single search themselves).
     // A menu change writes the filter into the box string (syncBoxFromFilters) so the box stays the
     // single source of truth. score/sort are client-side post-filters -> reshape results, don't re-search.
-    var filterKinds: Set<FileKind> = [] { didSet { if !suppressFilterSearch { persistFilters(); syncBoxFromFilters(reSearch: true) } } }
-    var filterFolder: URL? = nil { didSet { if !suppressFilterSearch { persistFilters(); syncBoxFromFilters(reSearch: true) } } }
-    var filterExt: String = "" { didSet { if !suppressFilterSearch { persistFilters(); syncBoxFromFilters(reSearch: true) } } }
-    var dateRange: DateRange = .any { didSet { if !suppressFilterSearch { persistFilters(); syncBoxFromFilters(reSearch: true) } } }
-    var minScore: Double = defaultMinScore { didSet { if !suppressFilterSearch { persistFilters(); syncBoxFromFilters(reSearch: false) } } }
-    var sortOrder: SortOrder = .relevance { didSet { if !suppressFilterSearch { persistFilters(); syncBoxFromFilters(reSearch: false) } } }
+    var filterKinds: Set<FileKind> = [] { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
+    var filterFolder: URL? = nil { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
+    var filterExt: String = "" { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
+    var dateRange: DateRange = .any { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
+    var minScore: Double = defaultMinScore { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: false) } } }
+    var sortOrder: SortOrder = .relevance { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: false) } } }
     private var suppressFilterEffects = false   // set while bulk-clearing filters for the folder map
     private var suppressFilterSearch: Bool { applyingParsedQuery || suppressFilterEffects }
 
@@ -386,8 +393,8 @@ final class AppModel {
     init() {
         loadRoots()
         loadSettings()
+        loadIgnore()
         loadPerf()
-        loadFilters()
         loadHistory()
         if let raw = UserDefaults.standard.string(forKey: "omni.historyMode"), let m = HistoryMode(rawValue: raw) { historyMode = m }
         // Setting historyRetentionDays runs the day-based prune via didSet, so stale recents are
@@ -486,7 +493,7 @@ final class AppModel {
             fileQuery = nil
             literalQuery = false                  // replay always starts in parse mode
             applyParsedQuery(raw)                  // sets rawQuery + all filters + semantic query + qualifier bar
-            search()
+            scheduleSearch()                       // debounced: rapid history click-through coalesces to one search
         }
         return true
     }
@@ -636,30 +643,6 @@ final class AppModel {
             || minScore != Self.defaultMinScore
     }
 
-    private func persistFilters() {
-        let d = UserDefaults.standard
-        d.set(filterKinds.map { $0.rawValue }, forKey: "omni.filterKinds")
-        d.set(filterFolder?.path ?? "", forKey: "omni.filterFolder")
-        d.set(filterExt, forKey: "omni.filterExt")
-        d.set(dateRange.rawValue, forKey: "omni.dateRange")
-        d.set(minScore, forKey: "omni.minScore")
-        d.set(sortOrder.rawValue, forKey: "omni.sortOrder")
-    }
-    private func loadFilters() {
-        let d = UserDefaults.standard
-        if let raw = d.array(forKey: "omni.filterKinds") as? [String] {
-            filterKinds = Set(raw.compactMap { FileKind(rawValue: $0) })
-        }
-        if let p = d.string(forKey: "omni.filterFolder"), !p.isEmpty {
-            let u = URL(fileURLWithPath: p)
-            if roots.contains(u) { filterFolder = u }   // ignore a folder no longer configured
-        }
-        if let e = d.string(forKey: "omni.filterExt") { filterExt = e }
-        if let dr = d.string(forKey: "omni.dateRange").flatMap(DateRange.init(rawValue:)) { dateRange = dr }
-        if d.object(forKey: "omni.minScore") != nil { minScore = d.double(forKey: "omni.minScore") }
-        if let so = d.string(forKey: "omni.sortOrder").flatMap(SortOrder.init(rawValue:)) { sortOrder = so }
-    }
-
     // MARK: - Settings persistence
 
     private func loadSettings() {
@@ -677,6 +660,130 @@ final class AppModel {
         if let raw = UserDefaults.standard.array(forKey: "omni.pausedRoots") as? [String] {
             pausedRoots = Set(raw)
         }
+    }
+
+    // MARK: - Ignore policy (.omniignore)
+
+    /// The central policy file, in the fixed app-support dir (NOT the custom db volume - the exclude
+    /// policy is app-level, not tied to where the vectors live).
+    static func ignoreFileURL() -> URL? {
+        let fm = FileManager.default
+        guard let base = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+            .appendingPathComponent("Omni", isDirectory: true) else { return nil }
+        try? fm.createDirectory(at: base, withIntermediateDirectories: true)
+        return base.appendingPathComponent(".omniignore")
+    }
+
+    /// Load the policy file at launch. If absent, migrate: synthesize it from the legacy
+    /// kind/extension settings (+ seeded noise dirs) and write it. The synthesized policy excludes
+    /// exactly what the old crawl excluded, so the first pass after upgrade prunes/indexes nothing new.
+    private func loadIgnore() {
+        if let url = Self.ignoreFileURL(), let text = try? String(contentsOf: url, encoding: .utf8) {
+            ignoreText = text
+        } else {
+            ignoreText = OmniIgnore.synthesize(enabledKinds: settings.enabledKinds, disabledExtensions: settings.disabledExtensions)
+            saveIgnoreText()
+        }
+        ignore = OmniIgnore(text: ignoreText)
+    }
+
+    private func saveIgnoreText() {
+        guard let url = Self.ignoreFileURL() else { return }
+        try? ignoreText.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    /// Live dry-run of an in-progress edit in Settings > Content, computed over the CURRENT index
+    /// (an honest "of your indexed files, this many will be removed"). `nil` when no edit is pending.
+    struct IgnorePreview: Sendable, Equatable {
+        var kept: Int
+        var removed: Int
+        var samples: [String]   // a handful of currently-indexed paths the edit would exclude
+        var danger: String?     // set when the edit looks destructive (removes most of the index / a whole root)
+    }
+    private(set) var ignorePreview: IgnorePreview?
+    private var ignorePreviewSeq = 0
+
+    /// Whether the editor text differs from the applied policy (drives the Apply button's enabled state).
+    func ignoreTextIsDirty(_ text: String) -> Bool { text != ignoreText }
+
+    /// Recompute the preview for a candidate policy against the current index. Sequenced so only the
+    /// latest keystroke's result is published; runs off the main actor (the index can hold 100k+ paths).
+    func previewIgnore(_ text: String) {
+        guard text != ignoreText else { ignorePreview = nil; return }
+        ignorePreviewSeq += 1
+        let seq = ignorePreviewSeq
+        guard let store else { ignorePreview = nil; return }
+        let candidate = OmniIgnore(text: text)
+        let rootPaths = roots.map { $0.path }
+        Task.detached(priority: .userInitiated) {
+            let files = store.indexedFiles()
+            var kept = 0, removed = 0, samples: [String] = []
+            for path in files.keys {
+                if candidate.isIgnored(path, isDir: false) {
+                    removed += 1
+                    if samples.count < 12 { samples.append(path) }
+                } else { kept += 1 }
+            }
+            let danger = Self.ignoreDanger(removed: removed, total: kept + removed, roots: rootPaths, candidate: candidate)
+            let preview = IgnorePreview(kept: kept, removed: removed, samples: samples.sorted(), danger: danger)
+            await MainActor.run {
+                guard seq == self.ignorePreviewSeq else { return }   // a newer edit superseded this
+                self.ignorePreview = preview
+            }
+        }
+    }
+
+    /// Heuristic danger flags: removing most of the index, or excluding a whole indexed root.
+    private nonisolated static func ignoreDanger(removed: Int, total: Int, roots: [String], candidate: OmniIgnore) -> String? {
+        if total > 0 && removed >= total { return "This removes every indexed file." }
+        for r in roots where candidate.isIgnored(r, isDir: true) {
+            return "This excludes an entire indexed folder: \((r as NSString).lastPathComponent)."
+        }
+        if total > 0 {
+            let pct = Int((Double(removed) / Double(total)) * 100)
+            if pct >= 50 { return "This removes \(pct)% of indexed files (\(removed) of \(total))." }
+        }
+        return nil
+    }
+
+    /// Apply an edited policy: back up the old file (one-step Revert), prune now-excluded files from the
+    /// index, persist the new text, then kick an incremental pass to index anything the policy now allows.
+    func applyIgnoreText(_ newText: String) {
+        if let url = Self.ignoreFileURL(), FileManager.default.fileExists(atPath: url.path) {
+            let bak = url.appendingPathExtension("bak")
+            try? FileManager.default.removeItem(at: bak)
+            try? FileManager.default.copyItem(at: url, to: bak)
+        }
+        let new = OmniIgnore(text: newText)
+        let changed = new != ignore
+        ignoreText = newText
+        ignore = new
+        saveIgnoreText()
+        ignorePreview = nil
+        guard changed, let store else { return }
+        Task.detached(priority: .utility) {
+            let files = store.indexedFiles()
+            let drop = Set(files.keys.filter { new.isIgnored($0, isDir: false) })
+            if !drop.isEmpty { store.deletePaths(drop); store.compact() }
+            await MainActor.run {
+                self.refreshIndexStats(store)
+                if !self.query.isEmpty { self.search() }
+                self.startIndexing()   // pick up files the new policy now allows
+            }
+        }
+    }
+
+    /// True when a `.bak` from the last Apply exists (drives the Revert button).
+    var ignoreHasBackup: Bool {
+        guard let url = Self.ignoreFileURL() else { return false }
+        return FileManager.default.fileExists(atPath: url.appendingPathExtension("bak").path)
+    }
+
+    /// Restore the policy from the `.bak` written by the last Apply, and re-apply it.
+    func revertIgnore() {
+        guard let url = Self.ignoreFileURL(),
+              let text = try? String(contentsOf: url.appendingPathExtension("bak"), encoding: .utf8) else { return }
+        applyIgnoreText(text)
     }
 
     /// The modality order shown (and dragged) in the Content tab; drives indexing order.
@@ -701,58 +808,6 @@ final class AppModel {
         UserDefaults.standard.set(settings.kindOrder.map { $0.rawValue }, forKey: "omni.kindOrder")
     }
 
-    func isExtensionEnabled(_ ext: String) -> Bool { !settings.disabledExtensions.contains(ext) }
-
-    /// Turn a single extension on/off within its (enabled) kind. Like setIndexKind: disabling drops
-    /// those files from the index right away; enabling re-indexes the previously-skipped ones. No
-    /// wipe - the vector space is unchanged, only which files are included.
-    func setExtensionEnabled(_ ext: String, _ on: Bool) { setExtensionsEnabled([ext], on) }
-
-    /// Batch version (used by Enable/Disable All over the filtered set) so it costs one reconcile,
-    /// not one per extension.
-    func setExtensionsEnabled(_ exts: [String], _ on: Bool) {
-        guard !exts.isEmpty else { return }
-        if on { exts.forEach { settings.disabledExtensions.remove($0) } }
-        else { exts.forEach { settings.disabledExtensions.insert($0) } }
-        UserDefaults.standard.set(Array(settings.disabledExtensions), forKey: "omni.disabledExtensions")
-        if !on {
-            if let store {
-                Task.detached {
-                    store.deleteExtensions(Set(exts))
-                    store.compact()
-                    await MainActor.run {
-                        self.refreshIndexStats(store)
-                        if !self.query.isEmpty { self.search() }
-                    }
-                }
-            }
-        } else {
-            startIndexing()
-        }
-    }
-    func setIndexKind(_ k: FileKind, _ on: Bool) {
-        settings.set(k, on)
-        UserDefaults.standard.set(settings.enabledKinds.map { $0.rawValue }, forKey: "omni.indexKinds")
-        if !on {
-            // Disabling a kind immediately removes its vectors so search/filters stay truthful.
-            if let store {
-                filterKinds.remove(k)
-                Task.detached {
-                    store.deleteKind(k.rawValue)
-                    store.compact()
-                    await MainActor.run {
-                        self.refreshIndexStats(store)
-                        if !self.query.isEmpty { self.search() }
-                    }
-                }
-            }
-        } else {
-            // Enabling a previously-skipped kind: incrementally index so its pre-existing
-            // files get embedded (already-indexed files are skipped by mtime). No wipe - the
-            // vector space is unchanged.
-            startIndexing()
-        }
-    }
     private func loadPerf() {
         let d = UserDefaults.standard
         if d.object(forKey: "omni.maxImageDim") != nil { maxImageDimension = max(512, d.integer(forKey: "omni.maxImageDim")) }
@@ -799,7 +854,7 @@ final class AppModel {
         rawQuery = raw
         if raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { literalQuery = false }
         applyingParsedQuery = true
-        defer { applyingParsedQuery = false; persistFilters() }
+        defer { applyingParsedQuery = false }
 
         // The box string is the SINGLE source of truth for filters: reset to a clean slate every time,
         // then set exactly what the string names. (No menu-vs-box ownership - a menu change rewrites
@@ -1101,7 +1156,7 @@ final class AppModel {
         let dimReady = engineDim > 0
         Task.detached(priority: .utility) {
             let stats = store.allIndexStats()
-            let folders = Dictionary(uniqueKeysWithValues: rootPaths.map { ($0, store.fileCount(underFolder: $0)) })
+            let folders = store.fileCounts(underFolders: rootPaths)   // one pass + one lock, not one scan per root
             let size = store.sizeBytes()
             let path = store.dbURL.path
             let lastTs = store.metaGet("last_indexed").flatMap { Double($0) }
@@ -1317,6 +1372,13 @@ final class AppModel {
         projectionTask = Task { [weak self] in
             let stream = AsyncStream<ProjectionResult> { continuation in
                 let worker = Task.detached(priority: .utility) {
+                    // Settle briefly first: clicking folders back-and-forth cancels this task before the
+                    // scan starts, so we don't enqueue an uncancellable full vectorsUnderFolder scan per
+                    // click on the shared serial store queue. Short enough to feel instant for a single
+                    // click (the scan+PCA itself is ~100-290ms in Release), long enough to coalesce a
+                    // machine-gun click-through to just the folder the selection lands on.
+                    try? await Task.sleep(for: .milliseconds(120))
+                    if Task.isCancelled { continuation.finish(); return }
                     let data = store.vectorsUnderFolder(folder)
                     if Task.isCancelled { continuation.finish(); return }
                     continuation.yield(await proj.project(data, refine: refine))   // PCA (default) or UMAP
@@ -1372,7 +1434,21 @@ final class AppModel {
         }
     }
 
+    private var searchDebounce: Task<Void, Never>?
+
+    /// Debounced search: clicking through history items (or any rapid trigger) coalesces to a single
+    /// search instead of enqueuing a full `store.search` scan per click on the shared serial store queue.
+    func scheduleSearch(after ms: Int = 180) {
+        searchDebounce?.cancel()
+        searchDebounce = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(ms))
+            guard !Task.isCancelled, let self else { return }
+            self.search()
+        }
+    }
+
     func search() {
+        searchDebounce?.cancel()   // a direct search supersedes any pending debounced one
         guard let engine, let store else { return }
         // A real query is taking the GPU: cancel any in-flight folder-map fit so it doesn't compete
         // with the embed/search. The folder stays selected; clearing the query returns to the map.
@@ -1453,6 +1529,7 @@ final class AppModel {
     /// All settings the indexer needs (modalities + perf + thresholds).
     private func effectiveSettings() -> IndexSettings {
         var s = settings
+        s.ignore = ignore   // single source of truth for what the crawl excludes
         s.maxImageDimension = maxImageDimension
         s.maxVideoFrames = maxVideoFrames
         s.maxCharsPerChunk = maxTextChunkChars

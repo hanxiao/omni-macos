@@ -357,11 +357,10 @@ if args.count >= 2 && args[1] == "loadbench" {
 // (a cold FS cache makes each directory walk far costlier).
 if args.count >= 2 && args[1] == "crawlbench" {
     let folder = URL(fileURLWithPath: args.count >= 3 ? args[2] : NSHomeDirectory() + "/Documents")
-    let kinds: Set<FileKind> = [.text, .image, .video, .audio]
-    func collectWalk() -> [CrawledFile] { var f: [CrawledFile] = []; FileCrawler(roots: [folder], enabledKinds: kinds).walk { f.append($0) }; return f }
+    func collectWalk() -> [CrawledFile] { var f: [CrawledFile] = []; FileCrawler(roots: [folder], ignore: OmniIgnore(text: "")).walk { f.append($0) }; return f }
     _ = collectWalk()   // warm the FS cache (not timed)
     let t0 = Date()
-    var c = 0; FileCrawler(roots: [folder], enabledKinds: kinds).walk { _ in c += 1 }   // OLD pass 1: count
+    var c = 0; FileCrawler(roots: [folder], ignore: OmniIgnore(text: "")).walk { _ in c += 1 }   // OLD pass 1: count
     let files = collectWalk()                                                            // OLD pass 2: collect
     let twoPassMs = -t0.timeIntervalSinceNow * 1000
     let t1 = Date(); let files2 = collectWalk(); let onePassMs = -t1.timeIntervalSinceNow * 1000   // NEW: one walk
@@ -555,9 +554,13 @@ if args.count >= 4 && args[1] == "indexbench" {
     let idx = Indexer(store: store, embedder: engine)
     let tok0 = engine.tokensProcessed
     let t0 = Date()
+    // Text-only workload, noise dirs pruned - matches the pre-OmniIgnore crawl for this bench.
+    var benchSettings = IndexSettings(enabledKinds: [.text])
+    let nonText = FileExtractor.imageExtensions.union(FileExtractor.videoExtensions).union(FileExtractor.audioExtensions)
+    benchSettings.ignore = OmniIgnore(text: (FileCrawler.skipDirNames.map { "\($0)/" } + nonText.sorted().map { "*.\($0)" }).joined(separator: "\n"))
     let result: (emb: Int, sec: Double) = await withCheckedContinuation { cont in
         let done = NSLock(); var fired = false
-        idx.index(roots: [target], settings: IndexSettings(enabledKinds: [.text]), force: true) { p in
+        idx.index(roots: [target], settings: benchSettings, force: true) { p in
             if p.done {
                 done.lock(); let go = !fired; fired = true; done.unlock()
                 if go { cont.resume(returning: (p.embedded, Date().timeIntervalSince(t0))) }

@@ -35,6 +35,24 @@ final class VectorStoreTests: XCTestCase {
         XCTAssertEqual(store.count, 3)
     }
 
+    func testFolderFileCountsSinglePassMatchesPerFolder() throws {
+        let url = tempDB()
+        let store = try VectorStore(dbURL: url)
+        // Two roots; a "Documents2" sibling guards the path-boundary (prefix must not leak across it).
+        for p in ["/Users/me/Documents/a.txt", "/Users/me/Documents/sub/b.txt",
+                  "/Users/me/Documents2/c.txt", "/Users/me/Downloads/d.txt"] {
+            try store.replace(path: p, chunks: [chunk(p, 0, "text", basis(0)), chunk(p, 1, "text", basis(1))])
+        }
+        let docs = "/Users/me/Documents", dl = "/Users/me/Downloads"
+        let counts = store.fileCounts(underFolders: [docs, dl])
+        // Single-pass result must equal the per-folder method, and stay boundary-aware (Documents2 excluded).
+        XCTAssertEqual(counts[docs], 2)                       // a.txt + sub/b.txt, NOT Documents2/c.txt
+        XCTAssertEqual(counts[dl], 1)
+        XCTAssertEqual(counts[docs], store.fileCount(underFolder: docs))
+        XCTAssertEqual(counts[dl], store.fileCount(underFolder: dl))
+        XCTAssertEqual(store.fileCounts(underFolders: []), [:])
+    }
+
     func testRankChunksReadsFlat() throws {
         let url = tempDB()
         let store = try VectorStore(dbURL: url)

@@ -13,7 +13,14 @@ public struct IndexSettings: Sendable, Equatable {
 
     /// File extensions (lowercased, no dot) the user has turned off within an enabled kind, e.g.
     /// "gif" while Images stays on. Excluded from the crawl like a disabled kind.
+    /// DEPRECATED as crawl policy - kept only as a migration source for `ignore` (see OmniIgnore).
     public var disabledExtensions: Set<String> = []
+
+    /// The single source of truth for what is EXCLUDED from indexing (gitignore semantics). The crawl
+    /// indexes a file iff `FileExtractor.kind(for:) != nil` and `!ignore.isIgnored(path)`. Built by
+    /// AppModel from the user's .omniignore file (which migration seeds from the legacy kind/extension
+    /// settings). `.default`/`.profiling` leave it empty = index everything extractable.
+    public var ignore: OmniIgnore = OmniIgnore(text: "")
 
     /// Order the modalities are indexed in (user-reorderable). A uniform phase per kind lets text
     /// chunks batch across files; the order sets which modality is embedded first. Text is last by
@@ -50,6 +57,9 @@ public struct IndexSettings: Sendable, Equatable {
         s.maxCharsPerChunk = 1800
         s.minImageDimension = 0; s.minAudioSeconds = 0; s.minVideoSeconds = 0; s.minTextChars = 0
         s.disabledExtensions = []
+        // Seed the well-known noise dirs the old crawl always skipped, so the workload stays identical
+        // to pre-OmniIgnore profiling runs (no per-extension/kind exclusion, but noise dirs still pruned).
+        s.ignore = OmniIgnore(text: FileCrawler.skipDirNames.map { "\($0)/" }.joined(separator: "\n"))
         s.kindOrder = [.image, .audio, .video, .text]
         return s
     }()
