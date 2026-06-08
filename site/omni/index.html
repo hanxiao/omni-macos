@@ -337,18 +337,19 @@ img { max-width: 100%; display: block; }
   object-fit: contain;
   opacity: 0;
   filter: drop-shadow(0 16px 38px rgba(17, 24, 39, 0.15));
-  animation: cfade 24s infinite;
+  animation: cfade 30s infinite;
 }
 .cframe:nth-child(1) { animation-delay: 0s; }
 .cframe:nth-child(2) { animation-delay: 6s; }
 .cframe:nth-child(3) { animation-delay: 12s; }
 .cframe:nth-child(4) { animation-delay: 18s; }
-@keyframes cfade {
-  0%   { opacity: 0; }
-  3%   { opacity: 1; }
-  22%  { opacity: 1; }
-  28%  { opacity: 0; }
-  100% { opacity: 0; }
+.cframe:nth-child(5) { animation-delay: 24s; }
+@keyframes cfade {     /* 30s cycle, 5 frames at 6s each: ~5s visible + a short crossfade */
+  0%    { opacity: 0; }
+  2.4%  { opacity: 1; }
+  17.6% { opacity: 1; }
+  22.4% { opacity: 0; }
+  100%  { opacity: 0; }
 }
 /* captions crossfade in sync with the frames */
 .carousel-cap { position: relative; height: 1.4em; }
@@ -356,34 +357,16 @@ img { max-width: 100%; display: block; }
   position: absolute;
   left: 0; right: 0;
   opacity: 0;
-  animation: cfade 24s infinite;
+  animation: cfade 30s infinite;
 }
 .carousel-cap > span:nth-child(1) { animation-delay: 0s; }
 .carousel-cap > span:nth-child(2) { animation-delay: 6s; }
 .carousel-cap > span:nth-child(3) { animation-delay: 12s; }
 .carousel-cap > span:nth-child(4) { animation-delay: 18s; }
+.carousel-cap > span:nth-child(5) { animation-delay: 24s; }
 @media (prefers-reduced-motion: reduce) {
   .cframe, .carousel-cap > span { animation: none; }
   .cframe:nth-child(1), .carousel-cap > span:nth-child(1) { opacity: 1; }
-}
-/* ---------- Folder map cross-fade (the whole folder, then zoomed in) ---------- */
-.mapfade-wrap { max-width: 920px; margin: 0 auto 16px; }
-.mapfade { position: relative; width: 100%; aspect-ratio: 1012 / 820; }
-.mframe {
-  position: absolute; inset: 0; width: 100%; height: 100%;
-  object-fit: contain; opacity: 0;
-  border-radius: 12px;
-  filter: drop-shadow(0 16px 38px rgba(17, 24, 39, 0.15));
-  animation: mfade 11s infinite;
-}
-.mframe:nth-child(1) { animation-delay: 0s; }
-.mframe:nth-child(2) { animation-delay: 5.5s; }
-@keyframes mfade {
-  0% { opacity: 0; } 4% { opacity: 1; } 46% { opacity: 1; } 50% { opacity: 0; } 100% { opacity: 0; }
-}
-@media (prefers-reduced-motion: reduce) {
-  .mframe { animation: none; }
-  .mframe:nth-child(1) { opacity: 1; }
 }
 /* the two settings windows are small in reality, so show them small and side by side */
 .shot-row {
@@ -782,26 +765,20 @@ img { max-width: 100%; display: block; }
         <p class="section-label mono">A look inside</p>
 
         <figure class="carousel-wrap">
-          <div class="carousel" aria-label="Searching across images, text, audio, and video">
+          <div class="carousel" aria-label="Searching across images, text, audio, and video, plus a folder mapped by similarity">
             <img class="cframe" src="assets/search-image.png" alt="Searching images - Porsche 911 photos" />
             <img class="cframe" src="assets/search-text.png" alt="Searching text and code - jina omni embeddings" />
             <img class="cframe" src="assets/search-audio.png" alt="Searching audio files" />
             <img class="cframe" src="assets/search-video.png" alt="Searching video clips" />
+            <img class="cframe" src="assets/map.png" alt="Folder embedding map: 55,953 files clustered by similarity and colored by type" />
           </div>
           <figcaption class="shot-caption carousel-cap">
             <span><span class="mono">porsche 911</span> &middot; images</span>
             <span><span class="mono">jina omni embeddings</span> &middot; text</span>
             <span><span class="mono">podcast interview</span> &middot; audio</span>
             <span><span class="mono">screen recording demo</span> &middot; video</span>
+            <span><span class="mono">Documents</span> &middot; mapped by similarity</span>
           </figcaption>
-        </figure>
-
-        <figure class="mapfade-wrap">
-          <div class="mapfade" aria-label="A folder shown as a map of its files arranged by similarity">
-            <img class="mframe" src="assets/map-cloud.png" alt="Folder embedding map: 55,953 files clustered by similarity and colored by type" />
-            <img class="mframe" src="assets/map-zoom.png" alt="Zoomed into the folder map to explore a cluster up close" />
-          </div>
-          <figcaption class="shot-caption">Click a folder to see it as a map - every indexed file placed by meaning, colored by type. Hover for a thumbnail, click a file to spotlight its nearest neighbors, scroll to zoom.</figcaption>
         </figure>
 
         <div class="shot-row">
