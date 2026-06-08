@@ -127,11 +127,15 @@ struct FolderEmbeddingVisualization: View {
                     .updating($dragOffset) { v, s, _ in s = v.translation }
                     .onEnded { v in
                         if hypot(v.translation.width, v.translation.height) < 4 {
-                            let idx = nearestIndex(to: v.location, in: geo.size)
-                            withAnimation(.easeOut(duration: 0.16)) {
-                                selectedIndex = (idx != nil && idx == selectedIndex) ? nil : idx
+                            // The spotlight needs the embedding-space neighbor graph, which only the
+                            // UMAP layout computes. In PCA mode (no kNN) a click does nothing.
+                            if model.folderKNNk > 0 {
+                                let idx = nearestIndex(to: v.location, in: geo.size)
+                                withAnimation(.easeOut(duration: 0.16)) {
+                                    selectedIndex = (idx != nil && idx == selectedIndex) ? nil : idx
+                                }
+                                applyHighlight()
                             }
-                            applyHighlight()
                         } else {
                             pan.width += v.translation.width; pan.height += v.translation.height
                         }

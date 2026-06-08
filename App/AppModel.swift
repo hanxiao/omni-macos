@@ -148,6 +148,16 @@ final class AppModel {
     var folderProjectionFitting = false
     private var projectionTask: Task<Void, Never>?
     private var projectionCache: [URL: ProjectionResult] = [:]   // final layout + kNN per folder URL
+    /// Folder-map layout. false = PCA (fast, N-light, instant - the default, safe on low-RAM Macs);
+    /// true = UMAP (richer clusters + the click-to-spotlight neighbor graph, but the kNN step builds
+    /// large GPU distance tiles + a 300-epoch force layout that can freeze a low-memory Mac).
+    var mapUsesUMAP: Bool = UserDefaults.standard.bool(forKey: "omni.mapUsesUMAP") {
+        didSet {
+            UserDefaults.standard.set(mapUsesUMAP, forKey: "omni.mapUsesUMAP")
+            projectionCache.removeAll()   // cached layouts belong to the other mode
+            if let url = selectedFolderForViz { selectFolderForVisualization(url) }   // re-fit in the new mode
+        }
+    }
 
     var canIndex: Bool { phase == .ready && !roots.isEmpty }
 
@@ -1296,6 +1306,7 @@ final class AppModel {
         if let cached = projectionCache[url] { applyProjection(cached); return }   // instant
         folderProjectionFitting = true
         let folder = url.path
+        let refine = mapUsesUMAP   // captured on the main actor; the detached worker reads only this Bool
         let proj = ProjectionEngine(engine: engine)
         // The fit runs on a detached utility worker (off the main actor), bridged through a one-shot
         // AsyncStream so cancelling this @MainActor task terminates the stream and cancels the worker
@@ -1308,7 +1319,7 @@ final class AppModel {
                 let worker = Task.detached(priority: .utility) {
                     let data = store.vectorsUnderFolder(folder)
                     if Task.isCancelled { continuation.finish(); return }
-                    continuation.yield(await proj.project(data))   // settled layout + kNN graph
+                    continuation.yield(await proj.project(data, refine: refine))   // PCA (default) or UMAP
                     continuation.finish()
                 }
                 continuation.onTermination = { _ in worker.cancel() }

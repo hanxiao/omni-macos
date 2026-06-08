@@ -307,6 +307,17 @@ private struct PerformanceTab: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
+                Picker("Folder map layout", selection: Binding(get: { model.mapUsesUMAP }, set: { model.mapUsesUMAP = $0 })) {
+                    Text("Fast \u{00B7} PCA").tag(false)
+                    Text("Detailed \u{00B7} UMAP").tag(true)
+                }
+            } header: {
+                Text("Folder map")
+            } footer: {
+                Text("PCA is instant and uses little memory - the safe default. UMAP separates clusters better and enables click-to-spotlight of nearest neighbors, but builds large GPU buffers; on a Mac with limited memory it can be slow or unresponsive on big folders.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
                         Text("Maximum memory")
