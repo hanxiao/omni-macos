@@ -862,7 +862,13 @@ final class AppModel {
         return parts.joined(separator: " ")
     }
     private static func quoteIfNeeded(_ s: String) -> String {
-        s.contains(where: { $0.isWhitespace }) ? "\"\(s)\"" : s
+        // A value without whitespace is read verbatim by the parser's bare branch, so leave it as-is.
+        // A value WITH whitespace must be quoted - and then any inner quote/backslash must be escaped,
+        // because the parser unescapes inside quotes (\" and \\). Otherwise the round-trip is asymmetric
+        // and a folder path like /Users/me/My "Project"/x is silently truncated on history replay.
+        guard s.contains(where: { $0.isWhitespace }) else { return s }
+        let escaped = s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        return "\"\(escaped)\""
     }
 
     /// Toggle literal mode: embed the box text as-is (ignoring qualifiers) vs parse it as a query

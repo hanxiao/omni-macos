@@ -366,6 +366,25 @@ img { max-width: 100%; display: block; }
   .cframe, .carousel-cap > span { animation: none; }
   .cframe:nth-child(1), .carousel-cap > span:nth-child(1) { opacity: 1; }
 }
+/* ---------- Folder map cross-fade (the whole folder, then zoomed in) ---------- */
+.mapfade-wrap { max-width: 920px; margin: 0 auto 16px; }
+.mapfade { position: relative; width: 100%; aspect-ratio: 1012 / 820; }
+.mframe {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  object-fit: contain; opacity: 0;
+  border-radius: 12px;
+  filter: drop-shadow(0 16px 38px rgba(17, 24, 39, 0.15));
+  animation: mfade 11s infinite;
+}
+.mframe:nth-child(1) { animation-delay: 0s; }
+.mframe:nth-child(2) { animation-delay: 5.5s; }
+@keyframes mfade {
+  0% { opacity: 0; } 4% { opacity: 1; } 46% { opacity: 1; } 50% { opacity: 0; } 100% { opacity: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mframe { animation: none; }
+  .mframe:nth-child(1) { opacity: 1; }
+}
 /* the two settings windows are small in reality, so show them small and side by side */
 .shot-row {
   display: grid;
@@ -719,6 +738,11 @@ img { max-width: 100%; display: block; }
           </article>
 
           <article class="feature-card">
+            <h3 class="feature-title">See a folder, not a list</h3>
+            <p class="feature-body">Click any folder to map every indexed file by meaning - similar files cluster together, colored by type. Hover for a thumbnail, click one to spotlight its nearest neighbors. GPU-rendered, smooth at 50k+ files.</p>
+          </article>
+
+          <article class="feature-card">
             <h3 class="feature-title">Any language</h3>
             <p class="feature-body">Languages share that same space, so a query in one finds files in another. Search in English, match notes in German, Chinese, or Japanese.</p>
           </article>
@@ -770,6 +794,14 @@ img { max-width: 100%; display: block; }
             <span><span class="mono">podcast interview</span> &middot; audio</span>
             <span><span class="mono">screen recording demo</span> &middot; video</span>
           </figcaption>
+        </figure>
+
+        <figure class="mapfade-wrap">
+          <div class="mapfade" aria-label="A folder shown as a map of its files arranged by similarity">
+            <img class="mframe" src="assets/map-cloud.png" alt="Folder embedding map: 55,953 files clustered by similarity and colored by type" />
+            <img class="mframe" src="assets/map-zoom.png" alt="Zoomed into the folder map to explore a cluster up close" />
+          </div>
+          <figcaption class="shot-caption">Click a folder to see it as a map - every indexed file placed by meaning, colored by type. Hover for a thumbnail, click a file to spotlight its nearest neighbors, scroll to zoom.</figcaption>
         </figure>
 
         <div class="shot-row">

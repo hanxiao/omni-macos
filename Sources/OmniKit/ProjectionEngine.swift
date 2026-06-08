@@ -84,7 +84,9 @@ public final class ProjectionEngine: @unchecked Sendable {
         }
 
         // Tiny N: force layout is meaningless; PCA-2D is the answer (with the graph if we have one).
-        if n <= Self.smallN || n <= 2 { return ProjectionResult(points: pcaPoints, knn: knnHost, k: k) }
+        // PCA-only when there's no usable kNN graph: too few files (smallN), or n <= k so each file
+        // can't have k distinct neighbors (the force layout would reshape an empty graph against n*k edges).
+        if n <= Self.smallN || n <= 2 || !haveKNN { return ProjectionResult(points: pcaPoints, knn: knnHost, k: k) }
         if Task.isCancelled { return ProjectionResult(points: [], knn: [], k: k) }
         await Task.yield()
 
@@ -145,7 +147,7 @@ public final class ProjectionEngine: @unchecked Sendable {
         eval(Y0)
         let Y0host = Y0.asArray(Float.self)
         let pcaPoints = makePoints(Y0host, data)
-        if n <= smallN || n <= 2 { return pcaPoints }
+        if n <= smallN || n <= 2 || n <= k { return pcaPoints }   // n <= k: can't build a k-NN graph
 
         let knnIdx = knn(X, k: k)
         let edgeFrom = MLXArray((0 ..< n).flatMap { Array(repeating: Int32($0), count: k) })
