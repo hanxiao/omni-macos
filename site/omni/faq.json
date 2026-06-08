@@ -104,6 +104,11 @@
       "title": "Working with results",
       "items": [
         {
+          "q": "What can I do by right-clicking a result?",
+          "a": "Right-click (or Control-click) any result for its full menu: Open (⌘O), Quick Look (⌘Y), Find Similar (⌥⌘F), Reveal in Finder (⇧⌘R), and Copy Path (⌥⌘C). These actions are also on the main menu bar and via the shortcuts shown.",
+          "shortcut": ""
+        },
+        {
           "q": "How do I open a result?",
           "a": "Select a result and press ⌘O or ↩, or double-click it, to open the file in its default app.",
           "shortcut": "⌘O"
@@ -184,6 +189,11 @@
       "title": "Folders & indexing",
       "items": [
         {
+          "q": "What can I do by right-clicking a folder in the sidebar?",
+          "a": "Right-click a folder in the Folders list for: Pause This Folder (or Resume This Folder if it's paused) to exclude or re-include it from indexing, Reveal in Finder, and Remove from Omni. Selecting a folder and pressing Delete also removes it.",
+          "shortcut": ""
+        },
+        {
           "q": "What does indexing actually do?",
           "a": "Indexing crawls your configured folders, extracts text and metadata, chunks text, encodes everything into the shared vector space with the local embedding model, and stores the vectors in a local SQLite database. This is what powers semantic search.",
           "shortcut": ""
@@ -223,6 +233,11 @@
     {
       "title": "History & bookmarks",
       "items": [
+        {
+          "q": "What can I do by right-clicking a search in the sidebar?",
+          "a": "Right-click a past search or bookmark for: Bookmark (or Remove Bookmark to unpin it back to a recent), and Remove. Selecting an entry and pressing Delete also removes it.",
+          "shortcut": ""
+        },
         {
           "q": "How does search history work?",
           "a": "By default, every search you settle on for at least 3 seconds is recorded and grouped in the sidebar as Today, Yesterday, Previous 7 Days, and Earlier. Bookmarked searches are pinned in a separate group at the top, and history persists across app restarts.",
