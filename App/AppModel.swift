@@ -110,6 +110,11 @@ final class AppModel {
     /// this; `query` is derived from it. Programmatic changes here are reflected in the field but do
     /// NOT re-parse (only user edits, routed through `applyParsedQuery`, do).
     var rawQuery: String = ""
+    /// Whether the typeahead/autocomplete dropdown may open. True only while the user is editing the
+    /// box directly; cleared on any PROGRAMMATIC box change (history replay, filter-menu sync, folder
+    /// map) so restoring a query's text doesn't pop the suggestions. The `.searchable` suggestions
+    /// closure reads this and returns nothing when false.
+    var suggestionsAllowed = false
     /// A file used as the query (any modality - the embedding space is shared). When set, the active
     /// query is this file, not `query`. `similar` = doc-vs-doc "find similar" vs query-by-file.
     struct FileQuery: Equatable { var url: URL; var kind: FileKind; var similar: Bool; var fromHistory: Bool = false }
@@ -852,6 +857,7 @@ final class AppModel {
     /// no longer names is cleared, while a filter set via the toolbar menu is left untouched.
     func applyParsedQuery(_ raw: String) {
         rawQuery = raw
+        suggestionsAllowed = false   // programmatic box write by default; handleQueryEdit re-arms it for real typing
         if raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { literalQuery = false }
         applyingParsedQuery = true
         defer { applyingParsedQuery = false }
@@ -908,6 +914,7 @@ final class AppModel {
     private func syncBoxFromFilters(reSearch: Bool) {
         literalQuery = false
         rawQuery = serializeSearch(semantic: query)
+        suggestionsAllowed = false   // a filter-menu change rewrites the box; don't pop the dropdown for it
         activeQualifiers = SearchQueryParser.parse(rawQuery).qualifiers
         if reSearch { search() } else { recomputeResults() }
     }
