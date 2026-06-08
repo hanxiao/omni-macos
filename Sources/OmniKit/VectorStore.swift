@@ -55,6 +55,17 @@ public struct ChunkHit: Sendable, Identifiable {
     public var id: Int { chunkIndex }
 }
 
+/// Per-FILE mean-pooled, L2-normalized fp32 vectors for a folder, used by the folder embedding
+/// visualization. Returned as a plain [Float] (not MLXArray, which is non-Sendable) so it can
+/// cross a Task boundary; ProjectionEngine rebuilds the MLXArray on the GPU thread.
+public struct FolderVectors: Sendable {
+    public let paths: [String]      // one entry per FILE, row-aligned with vectors
+    public let kinds: [String]      // FileKind rawValue per file, row-aligned
+    public let vectors: [Float]     // row-major [count*dim], fp32, L2-normalized, mean-pooled per file
+    public let dim: Int
+    public var count: Int { paths.count }
+}
+
 /// Signature used for incremental change detection.
 public struct StoredFile: Sendable {
     public let modified: Double
@@ -469,6 +480,68 @@ public final class VectorStore: @unchecked Sendable {
             var seen = Set<String>()
             for r in rows where r.path == folder || r.path.hasPrefix(folder + "/") { seen.insert(r.path) }
             return seen.count
+        }
+    }
+
+    /// Per-FILE mean-pooled, L2-normalized fp32 vectors for files under `folder` (path-boundary
+    /// aware), capped at `cap` files in row order. Additive read-only helper for the folder
+    /// visualization; does NOT touch search state. Runs under `queue` like every other reader.
+    public func vectorsUnderFolder(_ folder: String, cap: Int = .max) -> FolderVectors {
+        queue.sync {
+            guard dim > 0, !folder.isEmpty, folder != "/" else { return FolderVectors(paths: [], kinds: [], vectors: [], dim: dim) }
+            let empty = FolderVectors(paths: [], kinds: [], vectors: [], dim: dim)
+            let prefix = folder + "/"
+            @inline(__always) func underFolder(_ p: String) -> Bool { p == folder || p.hasPrefix(prefix) }
+
+            // Mean-pool each file's chunk vectors WITHOUT string-keyed dictionaries in the hot loop:
+            // group by the store's dense per-row `fileID` (path -> Int32, already maintained) via a
+            // flat global->local table, and accumulate into a contiguous [Float] indexed by local file
+            // index. (The old [String:[Float]] version hashed the path and COW'd a 768-float array on
+            // every chunk - ~26s for a 42k-file folder; this is sub-second.)
+            let nGlobal = max(1, fileIDCount)
+            var globalToLocal = [Int32](repeating: -1, count: nGlobal)
+            var order: [String] = []
+            var kinds: [String] = []
+            for i in 0 ..< rows.count {
+                let p = rows[i].path
+                guard underFolder(p) else { continue }
+                let gid = Int(fileID[i])
+                if globalToLocal[gid] < 0 {
+                    if order.count >= cap { continue }       // cap reached: ignore further new files
+                    globalToLocal[gid] = Int32(order.count)
+                    order.append(p); kinds.append(rows[i].kind)
+                }
+            }
+            let nFiles = order.count
+            guard nFiles > 0 else { return empty }
+
+            var sums = [Float](repeating: 0, count: nFiles * dim)
+            var counts = [Int](repeating: 0, count: nFiles)
+            flat16.withUnsafeBufferPointer { fb in
+                guard let base = fb.baseAddress else { return }
+                sums.withUnsafeMutableBufferPointer { s in
+                    for i in 0 ..< rows.count {
+                        guard underFolder(rows[i].path) else { continue }
+                        let li = globalToLocal[Int(fileID[i])]
+                        guard li >= 0 else { continue }       // file beyond cap
+                        let so = Int(li) * dim, off = i * dim
+                        for k in 0 ..< dim { s[so + k] += Self.fromBF16(base[off + k]) }
+                        counts[Int(li)] += 1
+                    }
+                }
+            }
+
+            // Mean then L2-normalize, in place.
+            sums.withUnsafeMutableBufferPointer { s in
+                for f in 0 ..< nFiles {
+                    let so = f * dim, c = Float(max(1, counts[f]))
+                    var norm: Float = 0
+                    for k in 0 ..< dim { let v = s[so + k] / c; s[so + k] = v; norm += v * v }
+                    let inv = norm > 0 ? 1.0 / norm.squareRoot() : 0
+                    for k in 0 ..< dim { s[so + k] *= inv }
+                }
+            }
+            return FolderVectors(paths: order, kinds: kinds, vectors: sums, dim: dim)
         }
     }
 

@@ -179,6 +179,11 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         return result
     }
 
+    /// Run low-priority GPU work behind the same gate as indexing, so an interactive query
+    /// (high priority) preempts between calls. Used by the folder-projection animation, one
+    /// ~10-epoch batch at a time. Internal: same-module callers only (ProjectionEngine).
+    func runLowPriorityGPU<T>(_ work: () -> T) -> T { run(highPriority: false, work) }
+
     /// Embed a query for interactive search - runs at high priority.
     public func embedQuery(_ text: String) -> [Float] {
         run(highPriority: true) { textEncoder.encode(text, as: .query) }

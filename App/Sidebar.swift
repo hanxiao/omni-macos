@@ -108,6 +108,10 @@ struct Sidebar: View {
                 // row isn't left stuck-highlighted and a re-click still fires.
                 if !model.runHistoryQuery(item) { selection = nil }
             }
+            // Folder selection shows that folder's embedding map (precedence-gated in ContentView so
+            // an active query/results always win); any other selection clears the viz.
+            if case .folder(let url) = sel { model.selectFolderForVisualization(url) }
+            else { model.selectFolderForVisualization(nil) }
         }
         // Keep the highlight in sync with the ACTIVE query (text or file). When the active query no
         // longer matches the selected history row, drop the selection - otherwise the row stays
