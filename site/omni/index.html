@@ -541,6 +541,29 @@ img { max-width: 100%; display: block; }
   color: var(--muted);
 }
 .chip-stats .stat strong { color: var(--fg); font-weight: 500; }
+/* the ± standard-deviation, kept visually quiet next to the median */
+.pm { color: var(--muted); font-weight: 400; font-size: 0.85em; }
+.bar-value .pm { opacity: 0.75; }
+/* per-app-version throughput trend (newest first) - the "is it improving?" signal */
+.chip-versions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  margin-top: 9px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.chip-versions .ver {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--card-2, rgba(127,127,127,0.10));
+  color: var(--muted);
+}
+.chip-versions .ver-tag { color: var(--fg); font-weight: 600; }
+.chip-versions .ver-runs { color: var(--muted); opacity: 0.7; }
 @media (max-width: 720px) {
   .chip-head { flex-direction: column; gap: 2px; }
   .chip-stats { gap: 4px 16px; }
@@ -869,6 +892,7 @@ img { max-width: 100%; display: block; }
         var rel = relTime(data.updatedAt);
         meta.innerHTML =
           fmtInt(total) + (total === 1 ? " run" : " runs") +
+          (data.latestVersion ? '<span class="dot">&middot;</span>latest v' + esc(data.latestVersion) : "") +
           (rel ? '<span class="dot">&middot;</span>updated ' + esc(rel) : "");
         meta.hidden = false;
       }
@@ -888,8 +912,30 @@ img { max-width: 100%; display: block; }
           ? '<span class="chip-year">' + c.releaseYear + "</span>" : "";
         var runs = (typeof c.runs === "number")
           ? c.runs + (c.runs === 1 ? " run" : " runs") : "";
+        // ± std (only when >1 run, so there's spread to report)
+        var fpsStd = (typeof c.filesPerSecStd === "number" && c.filesPerSecStd > 0)
+          ? '<span class="pm"> &plusmn;' + fmt1(c.filesPerSecStd) + "</span>" : "";
+        var tpsStd = (typeof c.tokensPerSecStd === "number" && c.tokensPerSecStd > 0)
+          ? '<span class="pm"> &plusmn;' + fmtInt(c.tokensPerSecStd) + "</span>" : "";
+        // Per-app-version trend within this chip - the key "is it improving?" signal, hardware-controlled.
+        var vers = Array.isArray(c.versions) ? c.versions : [];
+        var verLine = vers.length
+          ? '<div class="chip-versions">' + vers.map(function (v) {
+              return '<span class="ver"><span class="ver-tag">v' + esc(v.version) + "</span>" +
+                fmtInt(v.medianTokensPerSec) + " tok/s" +
+                (v.runs > 1 ? '<span class="ver-runs">&times;' + v.runs + "</span>" : "") + "</span>";
+            }).join("") + "</div>"
+          : "";
+        // Hover detail: device memory, GPU VRAM, OS spread.
+        var oses = Array.isArray(c.macosVersions) ? c.macosVersions.filter(Boolean) : [];
+        var tip = [
+          "Memory: " + gb(c.memoryBytes),
+          "GPU VRAM: " + gb(c.vramBytes),
+          oses.length ? "macOS " + oses.join(", ") : "",
+          (c.runs || 0) + ((c.runs === 1) ? " run" : " runs"),
+        ].filter(Boolean).join("  ·  ");
         return (
-          '<div class="chip-row">' +
+          '<div class="chip-row" title="' + esc(tip) + '">' +
             '<div class="chip-head">' +
               '<div class="chip-name">' + esc(c.chip || "Unknown") + year + "</div>" +
               '<div class="chip-runs">' + esc(runs) + "</div>" +
@@ -897,17 +943,20 @@ img { max-width: 100%; display: block; }
             '<div class="bar-track" role="img" aria-label="' +
               esc((c.chip || "Unknown") + ": " + fmt1(fps) + " files per second") + '">' +
               '<div class="bar-fill" style="width:' + pct.toFixed(1) + '%"></div>' +
-              '<div class="bar-value">' + fmt1(fps) +
+              '<div class="bar-value">' + fmt1(fps) + fpsStd +
                 '<span class="bar-unit">files/s</span></div>' +
             "</div>" +
             '<div class="chip-stats">' +
-              '<span class="stat"><strong>' + fmtInt(c.medianTokensPerSec) +
+              '<span class="stat"><strong>' + fmtInt(c.medianTokensPerSec) + tpsStd +
                 "</strong> tokens/s</span>" +
               '<span class="stat"><strong>' + gb(c.medianPeakVramDeltaBytes) +
                 "</strong> peak VRAM &Delta;</span>" +
+              '<span class="stat"><strong>' + gb(c.vramBytes) +
+                "</strong> GPU VRAM</span>" +
               '<span class="stat"><strong>' + fmt1(c.medianSeconds) +
                 "</strong> s median</span>" +
             "</div>" +
+            verLine +
           "</div>"
         );
       }).join("");
