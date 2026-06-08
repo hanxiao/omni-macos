@@ -113,7 +113,7 @@ struct Sidebar: View {
         // longer matches the selected history row, drop the selection - otherwise the row stays
         // "stuck" selected and clicking it again is a no-op (no selection change = no re-run), which
         // is why re-running a file history item sometimes did nothing.
-        .onChange(of: model.query) { _, _ in reconcileSelection() }
+        .onChange(of: model.rawQuery) { _, _ in reconcileSelection() }
         .onChange(of: model.fileQuery) { _, _ in reconcileSelection() }
         .onDeleteCommand {
             switch selection {
@@ -169,10 +169,11 @@ struct Sidebar: View {
     /// row isn't left stuck-selected (which would make a re-click a no-op).
     private func reconcileSelection() {
         guard case .history(let id) = selection else { return }
-        let q = model.query.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Match HistoryItem.id, which keys text items on the full typed string (rawQuery), not the
+        // semantic remainder - otherwise a query with qualifiers would never match its own row.
+        let q = model.rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         // Must use the SAME namespaced scheme as HistoryItem.id ("file:<path>" / "query:<text>"),
-        // otherwise the active id never matches and the row is wrongly deselected on every change -
-        // which made a re-clicked file history item flip between showing and clearing its results.
+        // otherwise the active id never matches and the row is wrongly deselected on every change.
         let activeID: String? = model.fileQuery.map { "file:\($0.url.path)" } ?? (q.isEmpty ? nil : "query:\(q)")
         if id != activeID { selection = nil }
     }

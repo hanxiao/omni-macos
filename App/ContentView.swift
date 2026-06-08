@@ -12,26 +12,34 @@ struct ContentView: View {
     // loading, onboarding, and the no-folders state the search field stays hidden (not dimmed).
     private var showsSearch: Bool { model.phase == .ready && !model.roots.isEmpty }
 
+    /// Apply a user edit of the search box: parse it into the semantic query + qualifiers, apply the
+    /// filters, clear a file query if real text was typed, and schedule the (debounced) search. The
+    /// box binds to the RAW typed string; `set` (user edits only) routes here.
+    private func handleQueryEdit(_ raw: String) {
+        model.applyParsedQuery(raw)
+        if !model.query.isEmpty, model.fileQuery != nil { model.fileQuery = nil; model.queryError = nil }
+        if model.fileQuery == nil { scheduleSearch() }
+        scheduleHistoryRecord()
+    }
+
     var body: some View {
         Group {
             if showsSearch {
                 split
-                    .searchable(text: Binding(get: { model.query }, set: { model.query = $0 }), placement: .toolbar, prompt: "Search your files by meaning")
-                    .onChange(of: model.query) { _, q in
-                        if !q.isEmpty, model.fileQuery != nil { model.fileQuery = nil; model.queryError = nil }   // typing replaces a file query
-                        // Don't re-search for the query="" that setFileQuery sets (it already searched);
-                        // only schedule a text search when no file query is active.
-                        if model.fileQuery == nil { scheduleSearch() }
-                        scheduleHistoryRecord()
+                    .searchable(text: Binding(get: { model.rawQuery }, set: { handleQueryEdit($0) }),
+                                placement: .toolbar, prompt: "Search by meaning") {
+                        // Typeahead: keys (ty -> type:), values (type: -> image/...), and matching past
+                        // queries as instant (cached) shortcuts. Navigate with arrows + Return.
+                        ForEach(searchSuggestions(model.rawQuery), id: \.completion) { sug in
+                            Label(sug.label, systemImage: sug.icon).searchCompletion(sug.completion)
+                        }
                     }
                     .onSubmit(of: .search) { model.search(); model.recordCurrentSearchToHistory(viaSubmit: true) }
             } else {
                 split
             }
         }
-        // Spotlight-style: put the caret in the search field as soon as the app can search. The
-        // macOS 15 .searchFocused API is unavailable on our 14 target, so focus the toolbar's
-        // NSSearchField directly once it exists.
+        // Spotlight-style: put the caret in the search field as soon as the app can search.
         .onChange(of: showsSearch, initial: true) { _, shows in if shows { focusSearchField() } }
         // Profiling progress as a native sheet on the main window (not a stray floating panel).
         .sheet(isPresented: Binding(get: { model.isProfilingRunning }, set: { _ in })) {
@@ -89,6 +97,7 @@ struct ContentView: View {
     @ViewBuilder private var content: some View {
         VStack(spacing: 0) {
             if let fq = model.fileQuery { FileQueryChip(fileQuery: fq) }
+            else if !model.activeQualifiers.isEmpty || model.literalQuery { QualifierBar() }
             if !model.results.isEmpty {
                 ResultsList(results: model.results) { belowThresholdFooter }
             } else {
@@ -328,6 +337,69 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - Query-language autocomplete
+
+    struct Suggestion: Hashable { let label: String; let completion: String; let icon: String }
+
+    /// Typeahead for the search box: complete a partial qualifier key (`ty` -> `type:`) or a key's
+    /// values (`type:` -> image/video/...). Returns full-string completions - the text before the
+    /// active token is preserved, so selecting one keeps the rest of the query intact.
+    private func searchSuggestions(_ raw: String) -> [Suggestion] {
+        guard !model.literalQuery else { return [] }
+        var out: [Suggestion] = []
+        let prefix: String, tok: String
+        if let sp = raw.lastIndex(of: " ") {
+            prefix = String(raw[...sp]); tok = String(raw[raw.index(after: sp)...])
+        } else {
+            prefix = ""; tok = raw
+        }
+        if !tok.isEmpty {
+            if let colon = tok.firstIndex(of: ":") {                   // value completion: key:partial
+                let keyTyped = String(tok[..<colon])
+                if let canon = SearchQueryParser.canonicalKey(keyTyped.lowercased()) {
+                    let partial = String(tok[tok.index(after: colon)...]).lowercased()
+                    out += valueSuggestions(canon).filter { $0.lowercased().hasPrefix(partial) }.prefix(8).map {
+                        let v = $0.contains(" ") ? "\"\($0)\"" : $0
+                        return Suggestion(label: "\(keyTyped):\($0)", completion: "\(prefix)\(keyTyped):\(v)", icon: "tag")
+                    }
+                }
+            } else {                                                   // key completion: bare prefix
+                let neg = tok.hasPrefix("-") ? "-" : ""
+                let low = (neg.isEmpty ? tok : String(tok.dropFirst())).lowercased()
+                if !low.isEmpty {
+                    for k in ["type:", "ext:", "in:", "date:", "after:", "score:", "sort:"] where k.hasPrefix(low) {
+                        out.append(Suggestion(label: neg + k, completion: "\(prefix)\(neg)\(k)", icon: "line.3.horizontal.decrease.circle"))
+                    }
+                }
+            }
+        }
+        // Past queries as quick shortcuts: already query-side embedded (cached), so picking one
+        // searches instantly without a trip to the sidebar.
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        if trimmed.count >= 1 {
+            let needle = trimmed.lowercased()
+            let hist = model.searchHistory
+                .filter { !$0.isFile && $0.displayText.lowercased().contains(needle) && $0.displayText.lowercased() != needle }
+                .sorted { a, b in a.bookmarked != b.bookmarked ? a.bookmarked : a.lastUsed > b.lastUsed }
+                .prefix(5)
+            out += hist.map { Suggestion(label: $0.displayText, completion: $0.displayText, icon: $0.bookmarked ? "star.fill" : "clock") }
+        }
+        return Array(out.prefix(10))
+    }
+
+    private func valueSuggestions(_ key: String) -> [String] {
+        switch key {
+        case "type": return ["image", "video", "audio", "text"]
+        case "date": return ["any", "week", "month", "year"]
+        case "after": return ["week", "month", "year", "7d", "30d", "1y"]
+        case "score": return ["25%", "50%", "70%"]
+        case "sort": return ["relevance", "name", "date"]
+        case "ext": return model.indexedExts
+        case "in": return model.roots.map { ($0.path as NSString).abbreviatingWithTildeInPath }
+        default: return []
+        }
+    }
+
     private func pickFolder() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
@@ -344,6 +416,46 @@ struct ContentView: View {
         panel.prompt = "Search"
         panel.message = "Choose an image, audio, video, or text file to search by"
         if panel.runModal() == .OK, let url = panel.url { model.setFileQuery(url) }
+    }
+}
+
+/// A thin bar under the search field showing the qualifiers Omni parsed from the box (or the
+/// literal-mode state), with a one-click toggle to treat the box as plain text instead of filters.
+private struct QualifierBar: View {
+    @Environment(AppModel.self) private var model: AppModel
+    var body: some View {
+        HStack(spacing: 6) {
+            if model.literalQuery {
+                Image(systemName: "textformat").foregroundStyle(.secondary).frame(width: 18)
+                Text("Literal search").foregroundStyle(.secondary)
+                Text("- qualifiers ignored").font(.caption).foregroundStyle(.tertiary)
+            } else {
+                Image(systemName: "line.3.horizontal.decrease.circle").foregroundStyle(.secondary).frame(width: 18)
+                ForEach(Array(model.activeQualifiers.enumerated()), id: \.offset) { _, q in
+                    HStack(spacing: 3) {
+                        if q.negated { Text("not").font(.caption2).foregroundStyle(.tertiary) }
+                        Text(q.key).fontWeight(.medium).foregroundStyle(.tint)
+                        Text(q.value).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    }
+                    .font(.caption)
+                    .padding(.horizontal, 7).padding(.vertical, 2)
+                    .background(.quaternary, in: Capsule())
+                }
+            }
+            Spacer(minLength: 8)
+            Button { model.toggleLiteralQuery() } label: {
+                Label(model.literalQuery ? "Use as query" : "Plain text",
+                      systemImage: model.literalQuery ? "line.3.horizontal.decrease.circle" : "textformat")
+            }
+            .buttonStyle(.bordered).controlSize(.small)
+            .help(model.literalQuery
+                  ? "Interpret key:value as filters again"
+                  : "Embed the box text as-is, ignoring key:value qualifiers")
+        }
+        .font(.callout)
+        .padding(.horizontal, 16).padding(.vertical, 6)
+        .background(.bar)
+        .overlay(alignment: .bottom) { Divider() }
     }
 }
 

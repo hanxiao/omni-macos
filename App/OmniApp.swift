@@ -73,6 +73,15 @@ struct OmniApp: App {
                 Button("Pause Indexing") { model.pauseIndexing() }
                     .disabled(!model.isIndexing)
             }
+            // Focus the toolbar search field (.searchable doesn't bind ⌘F on its own).
+            CommandGroup(after: .textEditing) {
+                Button("Find") {
+                    guard let w = NSApp.keyWindow ?? NSApp.mainWindow,
+                          let item = w.toolbar?.items.compactMap({ $0 as? NSSearchToolbarItem }).first else { return }
+                    w.makeFirstResponder(item.searchField)
+                }
+                .keyboardShortcut("f", modifiers: .command)
+            }
             CommandGroup(replacing: .help) {
                 Button("Omni Keyboard Shortcuts") { showShortcuts() }
                     .keyboardShortcut("/", modifiers: .command)
