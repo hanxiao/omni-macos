@@ -36,4 +36,5 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
 - notarize.sh takes AC_* creds from env (no keychain profile) so the self-hosted runner works.
 
 ## Style
+- Site (site/omni): keep the homepage Features section lean - exactly 4 cards.
 - No emojis, no em dashes. Lean commits and docs. License is Apache 2.0.
