@@ -94,12 +94,24 @@ struct ContentView: View {
         content
     }
 
+    /// The folder embedding map is shown ONLY in the empty-result region and ONLY when nothing
+    /// search-related is active: a folder is selected, the query box is empty (typed AND file), no
+    /// raw results, no query error, and nothing resolving. Active queries/results always win - this
+    /// flips false the instant the user types, hiding the viz purely by precedence (the selected
+    /// folder is not cleared, so clearing the query brings the cached map back instantly).
+    private var showsFolderViz: Bool {
+        model.selectedFolderForViz != nil && !model.hasQuery && model.fileQuery == nil
+            && model.rawResults.isEmpty && model.queryError == nil && !model.isResolving
+    }
+
     @ViewBuilder private var content: some View {
         VStack(spacing: 0) {
             if let fq = model.fileQuery { FileQueryChip(fileQuery: fq) }
             else if !model.activeQualifiers.isEmpty || model.literalQuery { QualifierBar() }
             if !model.results.isEmpty {
                 ResultsList(results: model.results) { belowThresholdFooter }
+            } else if showsFolderViz {
+                FolderEmbeddingVisualization(folderName: model.selectedFolderForViz!.lastPathComponent)
             } else {
                 emptyState
             }

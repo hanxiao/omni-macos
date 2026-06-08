@@ -131,6 +131,24 @@ final class AppModel {
     var previewURL: URL?               // drives Quick Look; set from the Space key and the menu
     private var lastQueryVector: [Float]?
 
+    // MARK: - Folder embedding visualization (additive; never touches search/index state)
+    /// The folder whose embedding map is being shown (sidebar selection). nil = no viz.
+    var selectedFolderForViz: URL? = nil
+    /// The settled 2D projection (raw coords); carries the per-point path/kind for hover + legend.
+    /// Set once when the fit finishes (the UI shows the final layout, not an animation).
+    private(set) var folderProjection: [ProjectionPoint] = []
+    /// Embedding-space kNN graph for the current projection (row-major [count*k], nearest first) and
+    /// its k. Reused by the click-to-highlight-neighbors UI - no recompute. Empty for tiny folders.
+    private(set) var folderKNN: [Int32] = []
+    private(set) var folderKNNk: Int = 0
+    /// Bumped every time a new layout lands in `folderProjection`. The view keys its GPU buffer
+    /// rebuild on this (file count alone is ambiguous - two folders can have the same count).
+    private(set) var projectionGeneration = 0
+    /// True while a projection fit is running (drives the spinner). False once the final layout lands.
+    var folderProjectionFitting = false
+    private var projectionTask: Task<Void, Never>?
+    private var projectionCache: [URL: ProjectionResult] = [:]   // final layout + kNN per folder URL
+
     var canIndex: Bool { phase == .ready && !roots.isEmpty }
 
     // MARK: - Selected-result actions (shared by the context menu, the File menu, and key handlers)
@@ -205,9 +223,7 @@ final class AppModel {
             pruneHistory(); persistHistory()
         }
     }
-    private var applyingHistoryContext = false   // suppress per-filter searches while restoring a history item
     private var applyingParsedQuery = false      // suppress per-filter searches while applying a parsed query string
-    private var stringOwnedFilters: Set<String> = []   // filters the search-box string currently sets (vs the menu)
     /// Treat the box text literally: embed the whole raw string (qualifiers included) and apply no
     /// box-derived filters. Toggled from the qualifier bar; resets when the box is emptied.
     var literalQuery: Bool = false
@@ -268,13 +284,16 @@ final class AppModel {
     // query string (both set several filters at once, then run a single search themselves).
     // When suppressed (applying a parsed query / restoring history), skip the per-property persist +
     // search; the batch operation persists once and searches once at the end.
-    var filterKinds: Set<FileKind> = [] { didSet { if !suppressFilterSearch { persistFilters(); search() } } }
-    var filterFolder: URL? = nil { didSet { if !suppressFilterSearch { persistFilters(); search() } } }
-    var filterExt: String = "" { didSet { if !suppressFilterSearch { persistFilters(); search() } } }
-    var dateRange: DateRange = .any { didSet { if !suppressFilterSearch { persistFilters(); search() } } }
-    var minScore: Double = defaultMinScore { didSet { if !suppressFilterSearch { persistFilters(); recomputeResults() } } }
-    var sortOrder: SortOrder = .relevance { didSet { if !suppressFilterSearch { persistFilters(); recomputeResults() } } }
-    private var suppressFilterSearch: Bool { applyingHistoryContext || applyingParsedQuery }
+    // A menu change writes the filter into the box string (syncBoxFromFilters) so the box stays the
+    // single source of truth. score/sort are client-side post-filters -> reshape results, don't re-search.
+    var filterKinds: Set<FileKind> = [] { didSet { if !suppressFilterSearch { persistFilters(); syncBoxFromFilters(reSearch: true) } } }
+    var filterFolder: URL? = nil { didSet { if !suppressFilterSearch { persistFilters(); syncBoxFromFilters(reSearch: true) } } }
+    var filterExt: String = "" { didSet { if !suppressFilterSearch { persistFilters(); syncBoxFromFilters(reSearch: true) } } }
+    var dateRange: DateRange = .any { didSet { if !suppressFilterSearch { persistFilters(); syncBoxFromFilters(reSearch: true) } } }
+    var minScore: Double = defaultMinScore { didSet { if !suppressFilterSearch { persistFilters(); syncBoxFromFilters(reSearch: false) } } }
+    var sortOrder: SortOrder = .relevance { didSet { if !suppressFilterSearch { persistFilters(); syncBoxFromFilters(reSearch: false) } } }
+    private var suppressFilterEffects = false   // set while bulk-clearing filters for the folder map
+    private var suppressFilterSearch: Bool { applyingParsedQuery || suppressFilterEffects }
 
     var viewMode: ResultViewMode = .list {
         didSet { UserDefaults.standard.set(viewMode.rawValue, forKey: "omni.viewMode") }
@@ -445,29 +464,18 @@ final class AppModel {
             queryError = "\((path as NSString).lastPathComponent) no longer exists."
             return false   // keep current results; don't blow them away (caller clears the selection)
         }
-        // Restore the saved filter/sort context without firing a search per change.
-        applyingHistoryContext = true
-        filterKinds = Set(item.kinds.compactMap { FileKind(rawValue: $0) })
-        filterFolder = item.folder.map { URL(fileURLWithPath: $0) }
-        filterExt = item.ext
-        dateRange = DateRange(rawValue: item.dateRange) ?? .any
-        sortOrder = SortOrder(rawValue: item.sortOrder) ?? .relevance
-        applyingHistoryContext = false
-        persistFilters()
-
         if item.isFile, let path = item.filePath {
             setFileQuery(URL(fileURLWithPath: path), similar: item.similar, fromHistory: true)
         } else {
-            let raw = item.rawQuery ?? item.query
+            // The item's canonical query string IS its full state (query + every filter as a qualifier),
+            // so a single parse restores the search AND the UI selectors - no separate filter fields,
+            // no leak. (Old items predating the query language fall back to their plain text; any filter
+            // they had only via the menu is dropped, which is the intended cleanup.)
+            let raw = item.displayText   // rawQuery ?? query - the full query-language string
             lastHistoryRunQuery = raw
             fileQuery = nil
-            literalQuery = false                                  // replay always starts in parse mode
-            activeQualifiers = SearchQueryParser.parse(raw).qualifiers   // keep the qualifier bar in sync
-            // The restored filters come from the saved fields, not from re-parsing; reset ownership so
-            // a later box edit re-establishes it and never wrongly clears a restored (menu-set) filter.
-            stringOwnedFilters = []
-            rawQuery = raw           // box shows the full typed string (qualifiers included)
-            query = item.query       // the semantic text that gets embedded
+            literalQuery = false                  // replay always starts in parse mode
+            applyParsedQuery(raw)                  // sets rawQuery + all filters + semantic query + qualifier bar
             search()
         }
         return true
@@ -764,9 +772,10 @@ final class AppModel {
         if filterKinds.contains(k) { filterKinds.remove(k) } else { filterKinds.insert(k) }
     }
     func clearFilters() {
-        filterKinds = []; filterFolder = nil; filterExt = ""; dateRange = .any
-        minScore = Self.defaultMinScore
-        search()
+        suppressFilterEffects = true
+        resetAllFilters()
+        suppressFilterEffects = false
+        syncBoxFromFilters(reSearch: true)   // drop all qualifiers from the box, then search once
     }
     func showAllBelowThreshold() { minScore = 0 }
 
@@ -780,15 +789,18 @@ final class AppModel {
         rawQuery = raw
         if raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { literalQuery = false }
         applyingParsedQuery = true
-        var owned: Set<String> = []
-        // Literal mode: no qualifier extraction - embed the whole string and release box-owned filters.
+        defer { applyingParsedQuery = false; persistFilters() }
+
+        // The box string is the SINGLE source of truth for filters: reset to a clean slate every time,
+        // then set exactly what the string names. (No menu-vs-box ownership - a menu change rewrites
+        // the string via syncBoxFromFilters, so a filter only ever exists if the string spells it out.
+        // This is what makes each history item self-contained and kills cross-query filter leaks.)
+        resetAllFilters()
+
+        // Literal mode: embed the whole string verbatim, no qualifiers, no filters.
         guard !literalQuery else {
             activeQualifiers = []
-            for key in stringOwnedFilters { resetFilter(key) }
-            stringOwnedFilters = []
             query = raw
-            applyingParsedQuery = false
-            persistFilters()
             return
         }
         let parsed = SearchQueryParser.parse(raw)
@@ -802,48 +814,55 @@ final class AppModel {
                 sawType = true
                 let kinds = qual.value.split(separator: ",").compactMap { Self.mapKind(String($0)) }
                 if qual.negated { excludeKinds.formUnion(kinds) } else { includeKinds.formUnion(kinds) }
-            case "ext":
-                filterExt = qual.value.hasPrefix(".") ? String(qual.value.dropFirst()) : qual.value
-                owned.insert("ext")
-            case "in":
-                if let url = Self.resolveFolder(qual.value) { filterFolder = url; owned.insert("in") }
-            case "date":
-                if let d = DateRange(rawValue: qual.value.lowercased()) { dateRange = d; owned.insert("date") }
-            case "after":
-                if let d = Self.mapAfter(qual.value) { dateRange = d; owned.insert("date") }
-            case "score":
-                if let s = Self.mapScore(qual.value) { minScore = s; owned.insert("score") }
-            case "sort":
-                if let so = Self.mapSort(qual.value) { sortOrder = so; owned.insert("sort") }
+            case "ext": filterExt = qual.value.hasPrefix(".") ? String(qual.value.dropFirst()) : qual.value
+            case "in":  if let url = Self.resolveFolder(qual.value) { filterFolder = url }
+            case "date": if let d = DateRange(rawValue: qual.value.lowercased()) { dateRange = d }
+            case "after": if let d = Self.mapAfter(qual.value) { dateRange = d }
+            case "score": if let s = Self.mapScore(qual.value) { minScore = s }
+            case "sort": if let so = Self.mapSort(qual.value) { sortOrder = so }
             default: break
             }
         }
         if sawType {
-            if !includeKinds.isEmpty {
-                filterKinds = includeKinds.subtracting(excludeKinds); owned.insert("type")
-            } else if !excludeKinds.isEmpty {                       // -type:x means "everything but x"
-                filterKinds = Set(FileKind.allCases).subtracting(excludeKinds); owned.insert("type")
-            }   // else: only invalid kinds named -> leave the current filter, don't own it
+            if !includeKinds.isEmpty { filterKinds = includeKinds.subtracting(excludeKinds) }
+            else if !excludeKinds.isEmpty { filterKinds = Set(FileKind.allCases).subtracting(excludeKinds) }  // -type:x = all but x
         }
-        // Clear only filters the box previously owned and no longer mentions; leave menu-set ones.
-        for key in stringOwnedFilters.subtracting(owned) { resetFilter(key) }
-        stringOwnedFilters = owned
         query = parsed.semanticText
-        applyingParsedQuery = false
-        persistFilters()
     }
 
-    /// Reset one filter dimension to its default. Caller is responsible for the applyingParsedQuery guard.
-    private func resetFilter(_ key: String) {
-        switch key {
-        case "type": filterKinds = []
-        case "ext": filterExt = ""
-        case "in": filterFolder = nil
-        case "date": dateRange = .any
-        case "score": minScore = Self.defaultMinScore
-        case "sort": sortOrder = .relevance
-        default: break
-        }
+    /// Reset every filter dimension to its default (caller holds the applyingParsedQuery guard).
+    private func resetAllFilters() {
+        filterKinds = []; filterExt = ""; filterFolder = nil
+        dateRange = .any; minScore = Self.defaultMinScore; sortOrder = .relevance
+    }
+
+    /// A filter changed via the toolbar menu: rewrite the search box from the current semantic query +
+    /// the full filter state, so the box stays the single source of truth (and history captures it),
+    /// then run. `reSearch` false for the client-side post-filters (score/sort), which only reshape the
+    /// already-fetched results - keeping the query-embedding cache and avoiding a needless re-search.
+    private func syncBoxFromFilters(reSearch: Bool) {
+        literalQuery = false
+        rawQuery = serializeSearch(semantic: query)
+        activeQualifiers = SearchQueryParser.parse(rawQuery).qualifiers
+        if reSearch { search() } else { recomputeResults() }
+    }
+
+    /// Render the current semantic query + filter state as a canonical query-language string. The
+    /// inverse of `applyParsedQuery`: `parse(serializeSearch(q)))` restores the same filters.
+    private func serializeSearch(semantic: String) -> String {
+        var parts: [String] = []
+        let s = semantic.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !s.isEmpty { parts.append(s) }
+        if !filterKinds.isEmpty { parts.append("type:" + filterKinds.map { $0.rawValue }.sorted().joined(separator: ",")) }
+        if !filterExt.isEmpty { parts.append("ext:" + filterExt) }
+        if let f = filterFolder { parts.append("in:" + Self.quoteIfNeeded(f.path)) }
+        if dateRange != .any { parts.append("date:" + dateRange.rawValue) }
+        if minScore != Self.defaultMinScore { parts.append("score:\(Int((minScore * 100).rounded()))%") }
+        if sortOrder != .relevance { parts.append("sort:" + (sortOrder == .name ? "name" : "date")) }
+        return parts.joined(separator: " ")
+    }
+    private static func quoteIfNeeded(_ s: String) -> String {
+        s.contains(where: { $0.isWhitespace }) ? "\"\(s)\"" : s
     }
 
     /// Toggle literal mode: embed the box text as-is (ignoring qualifiers) vs parse it as a query
@@ -1080,6 +1099,14 @@ final class AppModel {
                 self.indexedChunks = stats.chunkCount
                 self.indexedKinds = stats.kinds
                 self.indexedExts = stats.exts.sorted()
+                // Invalidate any cached embedding-map layout for a folder whose indexed file count
+                // changed (its vectors moved), so the next selection refits instead of showing stale.
+                for (path, count) in folders where self.folderFileCounts[path] != count {
+                    self.projectionCache[URL(fileURLWithPath: path)] = nil
+                    if self.selectedFolderForViz?.path == path, !self.folderProjectionFitting {
+                        self.selectFolderForVisualization(self.selectedFolderForViz)
+                    }
+                }
                 self.folderFileCounts = folders
                 self.dbPath = path
                 self.dbSizeBytes = size
@@ -1241,7 +1268,6 @@ final class AppModel {
             return
         }
         query = ""; rawQuery = ""        // the text field empties; the chip represents the query
-        stringOwnedFilters = []
         fileQuery = FileQuery(url: url, kind: kind, similar: similar, fromHistory: fromHistory)
         search()
     }
@@ -1251,8 +1277,91 @@ final class AppModel {
         rawResults = []; resolvedQuery = ""; selection = nil
     }
 
+    /// Show the embedding map for `url` (or clear it when nil). Pulls per-file vectors off-thread,
+    /// then runs ProjectionEngine through the low-priority GPU gate, streaming animation snapshots
+    /// into `folderProjection` on the main actor. Cancels any in-flight fit (cancel-on-change) and
+    /// reuses a cached final layout instantly. Purely additive: never embeds, scores, or indexes.
+    func selectFolderForVisualization(_ url: URL?) {
+        projectionTask?.cancel(); projectionTask = nil
+        selectedFolderForViz = url
+        folderProjection = []; folderKNN = []; folderKNNk = 0; folderProjectionFitting = false
+        guard let url, let engine, let store else { return }
+        clearSearchForFolderMap()   // a folder map replaces the search: clear query, results, filters
+        if let cached = projectionCache[url] { applyProjection(cached); return }   // instant
+        folderProjectionFitting = true
+        let folder = url.path
+        let proj = ProjectionEngine(engine: engine)
+        // The fit runs on a detached utility worker (off the main actor), bridged through a one-shot
+        // AsyncStream so cancelling this @MainActor task terminates the stream and cancels the worker
+        // (onTermination) - preserving cancel-on-change. The worker captures only Sendable values
+        // (store/proj/folder), never self, so it satisfies Swift 6 strict concurrency.
+        // store.vectorsUnderFolder is the read-only data pull (never embeds); proj.project does the
+        // gated GPU work and yields only the settled layout.
+        projectionTask = Task { [weak self] in
+            let stream = AsyncStream<ProjectionResult> { continuation in
+                let worker = Task.detached(priority: .utility) {
+                    let data = store.vectorsUnderFolder(folder)
+                    if Task.isCancelled { continuation.finish(); return }
+                    continuation.yield(await proj.project(data))   // settled layout + kNN graph
+                    continuation.finish()
+                }
+                continuation.onTermination = { _ in worker.cancel() }
+            }
+            var result = ProjectionResult(points: [], knn: [], k: 0)
+            for await snap in stream { if Task.isCancelled { break }; result = snap }
+            guard let self, self.selectedFolderForViz?.path == folder else { return }   // folder changed: drop
+            if !result.points.isEmpty { self.projectionCache[url] = result; self.applyProjection(result) }
+            self.folderProjectionFitting = false
+        }
+    }
+
+    /// Clear any active search (query, file-query, results) and filters so a freshly selected folder
+    /// shows its clean map. Suppresses the per-field filter didSet so it doesn't kick off a search,
+    /// and bumps the search token so any in-flight search can't repopulate the list afterwards.
+    private func clearSearchForFolderMap() {
+        suppressFilterEffects = true
+        defer { suppressFilterEffects = false }
+        query = ""; rawQuery = ""; fileQuery = nil; queryError = nil
+        rawResults = []; resolvedQuery = ""; searching = false
+        activeQualifiers = []
+        if selection != nil { selection = nil }
+        filterKinds = []; filterFolder = nil; filterExt = ""
+        dateRange = .any; minScore = Self.defaultMinScore; sortOrder = .relevance
+        searchToken += 1
+    }
+
+    /// Publish a finished projection (points + kNN graph) and bump the generation so the view rebuilds.
+    private func applyProjection(_ r: ProjectionResult) {
+        folderProjection = r.points
+        folderKNN = r.knn
+        folderKNNk = r.k
+        projectionGeneration &+= 1
+    }
+
+    /// Cancel an in-flight folder-map fit so its low-priority GPU work stops competing with search and
+    /// indexing. The folder stays selected (and any cached layout is kept), so clearing the query
+    /// returns to the map - refitting only if the fit was interrupted before it finished.
+    func cancelFolderVizFit() {
+        guard folderProjectionFitting else { return }   // nothing running (already cached/done/idle)
+        projectionTask?.cancel(); projectionTask = nil
+        folderProjectionFitting = false
+    }
+
+    /// Re-run the folder map when returning from a search to a still-selected folder whose fit was
+    /// cancelled mid-flight (a completed/cached layout is reused instantly inside the call).
+    func refitFolderVizIfNeeded() {
+        if let url = selectedFolderForViz, folderProjection.isEmpty, !folderProjectionFitting {
+            selectFolderForVisualization(url)
+        }
+    }
+
     func search() {
         guard let engine, let store else { return }
+        // A real query is taking the GPU: cancel any in-flight folder-map fit so it doesn't compete
+        // with the embed/search. The folder stays selected; clearing the query returns to the map.
+        if fileQuery != nil || !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            cancelFolderVizFit()
+        }
         queryError = nil
         let filter = currentFilter()
         searchToken += 1
@@ -1286,7 +1395,11 @@ final class AppModel {
         }
 
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty else { rawResults = []; resolvedQuery = ""; searching = false; return }
+        guard !q.isEmpty else {
+            rawResults = []; resolvedQuery = ""; searching = false
+            refitFolderVizIfNeeded()   // empty box + a folder still selected -> back to its map
+            return
+        }
         searching = true
         // Cached query vector: skip the GPU embed entirely (instant, and no contention with indexing).
         if let cached = queryEmbedCache[q] {
