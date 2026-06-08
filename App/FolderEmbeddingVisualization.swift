@@ -236,7 +236,7 @@ struct FolderEmbeddingVisualization: View {
             } else {
                 Image(systemName: "circle.grid.cross").foregroundStyle(.secondary)
                 Text(folderName).fontWeight(.medium)
-                    .lineLimit(1).truncationMode(.middle).frame(maxWidth: 220)   // cap only the name, not the chip
+                    .lineLimit(1).truncationMode(.middle)   // hug the name; .frame(maxWidth:) would expand it greedily
                 if count > 0 {
                     Text("\(count) file\(count == 1 ? "" : "s")").foregroundStyle(.secondary).lineLimit(1)
                 }
