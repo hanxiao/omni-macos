@@ -24,7 +24,7 @@ struct ContentView: View {
                         if model.fileQuery == nil { scheduleSearch() }
                         scheduleHistoryRecord()
                     }
-                    .onSubmit(of: .search) { model.search() }
+                    .onSubmit(of: .search) { model.search(); model.recordCurrentSearchToHistory(viaSubmit: true) }
             } else {
                 split
             }
@@ -169,6 +169,12 @@ struct ContentView: View {
 
     // MARK: - Toolbar
 
+    // On Tahoe, place the filter with sort/view (trailing) so the three result controls share one
+    // Liquid Glass pill; on earlier macOS keep it leading so the existing toolbar layout is untouched.
+    private var filterPlacement: ToolbarItemPlacement {
+        if #available(macOS 26.0, *) { return .primaryAction } else { return .automatic }
+    }
+
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
         // macOS 26 (Tahoe) shows the NavigationSplitView sidebar toggle automatically; macOS 15 and
         // earlier don't, so add an explicit one there (toggleSidebar: travels the responder chain to
@@ -188,6 +194,22 @@ struct ContentView: View {
                 Button { pickFile() } label: { Image(systemName: "photo.badge.magnifyingglass") }
                     .keyboardShortcut("o", modifiers: [.command, .shift])
                     .help("Search by a file (image, audio, video, or text)  \u{21E7}\u{2318}O")
+                    .accessibilityLabel("Search by a File")
+            }
+        }
+        // Bookmark the current search. The only way into History when recording is set to "Only when
+        // I bookmark", and a quick save otherwise. Appears once there's a search to keep.
+        if model.phase == .ready, model.hasActiveSearch {
+            ToolbarItem(placement: .automatic) {
+                Button { model.toggleBookmarkCurrentSearch() } label: {
+                    Image(systemName: model.currentSearchIsBookmarked ? "star.fill" : "star")
+                        .foregroundStyle(model.currentSearchIsBookmarked ? Color.yellow : Color.primary)
+                }
+                // Cmd-D is owned by the File-menu "Bookmark Search" command (single owner, avoids a
+                // duplicate-shortcut conflict); the tooltip names it, and accessibilityLabel is what
+                // VoiceOver reads and what the toolbar-overflow menu shows for this icon-only button.
+                .help(model.currentSearchIsBookmarked ? "Remove bookmark  \u{2318}D" : "Bookmark this search  \u{2318}D")
+                .accessibilityLabel(model.currentSearchIsBookmarked ? "Remove Bookmark" : "Bookmark Search")
             }
         }
         // Progressive disclosure: the filter/sort/view chrome appears only once there are results
@@ -195,8 +217,10 @@ struct ContentView: View {
         // Exception: keep the filter menu reachable whenever a filter is active, so a filter that
         // hides every result can still be cleared (otherwise the menu vanishes with the results).
         if model.phase == .ready, !model.rawResults.isEmpty || model.filtersActive {
-        // Filtering - one home.
-        ToolbarItem(placement: .automatic) {
+        // Filter joins sort/view in the trailing placement so on Tahoe the three result controls
+        // share ONE Liquid Glass pill (search-by-file + bookmark form the other). filterPlacement
+        // keeps filter leading on pre-26 so the Sequoia toolbar layout is unchanged.
+        ToolbarItem(placement: filterPlacement) {
             filterMenu.disabled(model.indexedFiles == 0)
         }
         }
@@ -292,12 +316,14 @@ struct ContentView: View {
         }
     }
 
-    // History records on a longer (2x) debounce than the search itself, so only a query the user
-    // actually settled on is stored - not every transient keystroke.
+    // Auto-record (history mode .auto) only after the query has been settled for 3s, so a search has
+    // to be one the user actually dwelled on - quick type-and-click-through queries aren't stored.
+    // Cancelled on every keystroke, so it only fires once typing stops. (No effect in .onSubmit /
+    // .manual modes, which record on Return / the bookmark button instead.)
     private func scheduleHistoryRecord() {
         historyDebounce?.cancel()
         historyDebounce = Task {
-            try? await Task.sleep(nanoseconds: 360_000_000)
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
             if !Task.isCancelled { model.recordCurrentSearchToHistory() }
         }
     }

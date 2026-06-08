@@ -36,6 +36,15 @@ struct OmniApp: App {
                 Button("Reveal in Finder") { model.revealSelected() }
                     .keyboardShortcut("r", modifiers: [.command, .shift])
                     .disabled(!model.hasSelection)
+                Divider()
+                // Bookmark the current search. The menu bar owns the Cmd-D shortcut (always present,
+                // just disabled when there's nothing to save) so it works even when the toolbar star
+                // is hidden; the toolbar button is a click target that names the same shortcut.
+                Button(model.currentSearchIsBookmarked ? "Remove Bookmark" : "Bookmark Search") {
+                    model.toggleBookmarkCurrentSearch()
+                }
+                .keyboardShortcut("d", modifiers: .command)
+                .disabled(!model.hasActiveSearch)
             }
             // Add to the SYSTEM View menu (which NavigationSplitView already provides with Show
             // Sidebar / Full Screen) instead of declaring a second "View" CommandMenu - otherwise
@@ -75,25 +84,21 @@ struct OmniApp: App {
         }
     }
 
-    /// Lightweight discoverability surface for the keyboard-only interactions (Help > Cmd-/).
+    /// Discoverability surface for the keyboard interactions (Help > Cmd-/). A small native SwiftUI
+    /// window with an aligned action/keycap grid - reused (not re-created) on repeat invocations.
+    private static var shortcutsWindow: NSWindow?
     private func showShortcuts() {
-        let rows = [
-            ("Focus Search", "\u{2318}F"),
-            ("Search by a File", "\u{21E7}\u{2318}O"),
-            ("Find Similar", "\u{2325}\u{2318}F"),
-            ("Open", "\u{2318}O  /  Return"),
-            ("Quick Look", "\u{2318}Y  /  Space"),
-            ("Reveal in Finder", "\u{21E7}\u{2318}R"),
-            ("Gallery / List", "\u{2318}1  /  \u{2318}2"),
-            ("Index / Update / Resume", "\u{21E7}\u{2318}I"),
-            ("Move Selection", "Arrow Keys"),
-        ]
-        let body = rows.map { "\($0.0)\t\($0.1)" }.joined(separator: "\n")
-        let alert = NSAlert()
-        alert.messageText = "Keyboard Shortcuts"
-        alert.informativeText = body
-        alert.addButton(withTitle: "Done")
-        alert.runModal()
+        if let w = OmniApp.shortcutsWindow {
+            w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return
+        }
+        let win = NSWindow(contentViewController: NSHostingController(rootView: ShortcutsView()))
+        win.title = "Keyboard Shortcuts"
+        win.styleMask = [.titled, .closable]
+        win.isReleasedWhenClosed = false      // keep the retained instance so reopening is instant
+        win.center()
+        OmniApp.shortcutsWindow = win
+        win.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     private func showAbout() {
@@ -110,5 +115,45 @@ struct OmniApp: App {
             .version: "",                            // suppress the build-number "(1)" in parens
             .credits: credits,
         ])
+    }
+}
+
+/// The keyboard-shortcuts reference (Help > Omni Keyboard Shortcuts, Cmd-/). Two aligned columns:
+/// the action, and its keys rendered as monospaced key-caps - the native macOS reference style,
+/// replacing the old tab-aligned NSAlert text.
+private struct ShortcutsView: View {
+    private let rows: [(action: String, keys: [String])] = [
+        ("Focus Search", ["\u{2318}F"]),
+        ("Search by a File", ["\u{21E7}\u{2318}O"]),
+        ("Find Similar", ["\u{2325}\u{2318}F"]),
+        ("Bookmark Search", ["\u{2318}D"]),
+        ("Open", ["\u{2318}O", "\u{21A9}"]),
+        ("Quick Look", ["\u{2318}Y", "Space"]),
+        ("Reveal in Finder", ["\u{21E7}\u{2318}R"]),
+        ("Gallery / List", ["\u{2318}1", "\u{2318}2"]),
+        ("Index / Update / Resume", ["\u{21E7}\u{2318}I"]),
+        ("Move Selection", ["\u{2191}\u{2193}\u{2190}\u{2192}"]),
+    ]
+    var body: some View {
+        Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 10) {
+            ForEach(rows, id: \.action) { row in
+                GridRow {
+                    Text(row.action).foregroundStyle(.primary)
+                    HStack(spacing: 6) {
+                        ForEach(Array(row.keys.enumerated()), id: \.offset) { _, key in
+                            Text(key)
+                                .font(.system(.callout, design: .rounded).weight(.medium))
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 7).padding(.vertical, 3)
+                                .background(.quaternary, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        }
+                    }
+                    .gridColumnAlignment(.trailing)
+                }
+            }
+        }
+        .padding(24)
+        .frame(width: 340)
     }
 }

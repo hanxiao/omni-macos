@@ -95,7 +95,13 @@ public final class Indexer: @unchecked Sendable {
     public var chunkOverlap = 200
     public var maxChunksPerFile = 40
     public var snippetLength = 220
-    public var textBatchSize = 48   // chunks embedded per batched forward pass (GPU-efficient)
+    // Chunks per batched text forward. Larger = a longer single GPU forward, which is exactly how
+    // long an interactive query can wait mid-indexing (the query's eval queues behind the in-flight
+    // forward on the MLX stream). Measured: 48 -> ~385ms p95 search tail under load, 16 -> ~164ms,
+    // while index throughput stays flat-to-better in 16..48 (long files even index faster at 16,
+    // less padding). 16 is the responsiveness sweet spot; vectors are identical (length-bucketing
+    // reassembles each file's chunks the same regardless of batch). OMNI_TEXT_BATCH overrides.
+    public var textBatchSize = (ProcessInfo.processInfo.environment["OMNI_TEXT_BATCH"].flatMap { Int($0) }) ?? 16
 
     // Audio batch-N: cap clips per tower+backbone forward by a TOTAL-FRAME budget so peak
     // VRAM is bounded (the backbone forward is O(B*Lmax^2); Lmax grows ~frames/4). A clip

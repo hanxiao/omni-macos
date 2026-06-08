@@ -249,8 +249,16 @@ if args.count >= 2 && args[1] == "concbench2" {
         DispatchQueue.global(qos: .utility).async {
             var i = 0
             let embedBatch = (ProcessInfo.processInfo.environment["OMNI_BENCH_EMBED_BATCH"].flatMap { Int($0) }) ?? passages.count
+            // OMNI_BENCH_BATCHES=B drives the real indexer path: one embedTextBatches() flush of B
+            // batches of `embedBatch` chunks each (vs the default single embedTextBatch forward), so
+            // the per-batch gate-release fix is exercised exactly as the indexer hits it.
+            let nBatches = ProcessInfo.processInfo.environment["OMNI_BENCH_BATCHES"].flatMap { Int($0) }
+            let flush: [[String]]? = nBatches.map { b in
+                (0..<b).map { bi in (0..<embedBatch).map { passages[($0 + bi*embedBatch) % passages.count] } }
+            }
             while !stop.value {
-                _ = engine.embedTextBatch(Array(passages.prefix(embedBatch)), as: .passage)   // low-pri GPU load
+                if let flush { _ = engine.embedTextBatches(flush, as: .passage) }
+                else { _ = engine.embedTextBatch(Array(passages.prefix(embedBatch)), as: .passage) }   // low-pri GPU load
                 i += 1
                 if i % 2 == 0 {                                           // mutate: delta + eventual fold
                     var b: [(path: String, chunks: [IndexedChunk])] = []

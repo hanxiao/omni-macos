@@ -30,6 +30,27 @@ struct HistoryItem: Codable, Sendable, Identifiable, Equatable {
     var displayLabel: String { isFile ? ((filePath! as NSString).lastPathComponent) : query }
 }
 
+/// When a search enters History. Mirrors how macOS apps treat recents - automatic, on explicit
+/// submit, or only when the user deliberately saves one (Smart-Folder style).
+enum HistoryMode: String, CaseIterable, Identifiable {
+    case auto, onSubmit, manual
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .auto: return "Automatically"
+        case .onSubmit: return "When I press Return"
+        case .manual: return "Only when I bookmark"
+        }
+    }
+    var detail: String {
+        switch self {
+        case .auto: return "Every search you settle on is added to History."
+        case .onSubmit: return "Only searches you submit with Return are added. Find Similar still records."
+        case .manual: return "Nothing is added on its own. Use the Bookmark button to keep a search."
+        }
+    }
+}
+
 enum SortOrder: String, CaseIterable, Identifiable {
     case relevance, name, dateModified
     var id: String { rawValue }
@@ -160,7 +181,18 @@ final class AppModel {
     /// Past searches shown in the sidebar (recents auto-pruned; bookmarks pinned and kept).
     private(set) var searchHistory: [HistoryItem] = []
     private let historyKey = "omni.searchHistory"
-    private let maxRecentHistory = 15
+    private let maxRecentHistory = 200   // hard ceiling on recents; the day window is the real control
+    /// When searches enter History (Settings > History). Default: automatic, as before.
+    var historyMode: HistoryMode = .auto {
+        didSet { UserDefaults.standard.set(historyMode.rawValue, forKey: "omni.historyMode") }
+    }
+    /// Recent (non-bookmarked) searches older than this many days are pruned. Default 7.
+    var historyRetentionDays: Int = 7 {
+        didSet {
+            UserDefaults.standard.set(historyRetentionDays, forKey: "omni.historyRetentionDays")
+            pruneHistory(); persistHistory()
+        }
+    }
     private var applyingHistoryContext = false   // suppress per-filter searches while restoring a history item
     private var lastHistoryRunQuery: String?     // the query just launched from history (don't re-record it)
     private var rateLastEmbedded = 0
@@ -298,6 +330,11 @@ final class AppModel {
         loadPerf()
         loadFilters()
         loadHistory()
+        if let raw = UserDefaults.standard.string(forKey: "omni.historyMode"), let m = HistoryMode(rawValue: raw) { historyMode = m }
+        // Setting historyRetentionDays runs the day-based prune via didSet, so stale recents are
+        // cleaned up at launch. integer(forKey:) returns 0 when unset -> keep the 7-day default.
+        let retain = UserDefaults.standard.integer(forKey: "omni.historyRetentionDays")
+        if retain > 0 { historyRetentionDays = retain } else { pruneHistory(); persistHistory() }
         if let raw = UserDefaults.standard.string(forKey: "omni.viewMode"), let m = ResultViewMode(rawValue: raw) { viewMode = m }
         Task { await bootstrap() }
     }
@@ -334,7 +371,14 @@ final class AppModel {
     /// Debounced recorder (driven by ContentView at ~2x the search box's debounce, so only settled
     /// queries land). Skips the query that was just launched from a history click (no re-record), and
     /// collapses live-typed prefixes so "ca" -> "cat" leaves only "cat".
-    func recordCurrentSearchToHistory() {
+    func recordCurrentSearchToHistory(viaSubmit: Bool = false) {
+        // Honor the History recording mode: auto records on the typing debounce or on submit;
+        // onSubmit records only when the user pressed Return; manual records nothing automatically.
+        switch historyMode {
+        case .auto: break
+        case .onSubmit: if !viaSubmit { return }
+        case .manual: return
+        }
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard q.count >= 2, q != lastHistoryRunQuery else { return }
         let ctx = currentSearchContext()
@@ -388,6 +432,7 @@ final class AppModel {
 
     /// Record a file query (path-keyed dedup), storing the active filter/sort context.
     private func recordFileQueryToHistory(_ fq: FileQuery) {
+        if historyMode == .manual { return }   // manual: only explicit bookmarks enter History
         let ctx = currentSearchContext()
         let path = fq.url.path
         if let i = searchHistory.firstIndex(where: { $0.filePath == path }) {
@@ -418,11 +463,67 @@ final class AppModel {
         persistHistory()
     }
 
-    /// Keep every bookmark; cap non-bookmarked recents to the most recent N.
+    // MARK: - Bookmark / clear (the explicit, mode-independent entry points)
+
+    /// Is the search currently shown already saved as a bookmark?
+    var currentSearchIsBookmarked: Bool {
+        if let fq = fileQuery { return searchHistory.contains { $0.filePath == fq.url.path && $0.bookmarked } }
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return false }
+        return searchHistory.contains { !$0.isFile && $0.query.caseInsensitiveCompare(q) == .orderedSame && $0.bookmarked }
+    }
+
+    /// Is there a search to act on (text typed or a file query active)?
+    var hasActiveSearch: Bool {
+        fileQuery != nil || !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var recentHistoryCount: Int { searchHistory.lazy.filter { !$0.bookmarked }.count }
+    var bookmarkCount: Int { searchHistory.lazy.filter { $0.bookmarked }.count }
+
+    /// Toolbar action: bookmark the current search, or remove the bookmark if it already is one.
+    /// The single entry point into History when the mode is `.manual`; a quick "save this" otherwise.
+    func toggleBookmarkCurrentSearch() {
+        let ctx = currentSearchContext()
+        if let fq = fileQuery {
+            let path = fq.url.path
+            if let i = searchHistory.firstIndex(where: { $0.filePath == path }) {
+                searchHistory[i].bookmarked.toggle(); searchHistory[i].lastUsed = Date()
+            } else {
+                var item = HistoryItem(query: "", bookmarked: true, lastUsed: Date(),
+                                       kinds: ctx.kinds, folder: ctx.folder, ext: ctx.ext,
+                                       dateRange: ctx.dateRange, sortOrder: ctx.sort)
+                item.filePath = path; item.fileKind = fq.kind.rawValue; item.similar = fq.similar
+                searchHistory.insert(item, at: 0)
+            }
+            persistHistory(); return
+        }
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return }
+        if let i = searchHistory.firstIndex(where: { !$0.isFile && $0.query.caseInsensitiveCompare(q) == .orderedSame }) {
+            searchHistory[i].bookmarked.toggle(); searchHistory[i].lastUsed = Date()
+        } else {
+            searchHistory.insert(HistoryItem(query: q, bookmarked: true, lastUsed: Date(),
+                                             kinds: ctx.kinds, folder: ctx.folder, ext: ctx.ext,
+                                             dateRange: ctx.dateRange, sortOrder: ctx.sort), at: 0)
+        }
+        persistHistory()
+    }
+
+    /// Clear recent searches. Bookmarks are explicit saves, not history, so they are kept.
+    func clearSearchHistory() {
+        searchHistory.removeAll { !$0.bookmarked }
+        persistHistory()
+    }
+
+    /// Keep every bookmark; drop non-bookmarked recents older than the retention window, then cap to
+    /// the most recent N as a hard ceiling.
     private func pruneHistory() {
+        let cutoff = Date().addingTimeInterval(-Double(historyRetentionDays) * 86_400)
         var recents = 0
         searchHistory = searchHistory.sorted { $0.lastUsed > $1.lastUsed }.filter { item in
             if item.bookmarked { return true }
+            if item.lastUsed < cutoff { return false }
             recents += 1
             return recents <= maxRecentHistory
         }
