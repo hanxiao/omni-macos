@@ -295,6 +295,7 @@ async function sha256Hex(input: string): Promise<string> {
 
 interface RunRow {
   chip: string | null;
+  app_version: string | null;
   release_year: number | null;
   macos_version: string | null;
   mem_bytes: number | null;
@@ -310,7 +311,7 @@ async function handleGet(env: Env): Promise<Response> {
   const now = Date.now();
 
   const { results } = await env.DB.prepare(
-    `SELECT chip, release_year, macos_version, mem_bytes, vram_bytes,
+    `SELECT chip, app_version, release_year, macos_version, mem_bytes, vram_bytes,
             files_per_sec, tokens_per_sec, seconds, peak_vram_delta, created_at
        FROM profiling_runs
       ORDER BY created_at DESC`
@@ -318,7 +319,7 @@ async function handleGet(env: Env): Promise<Response> {
 
   const rows = results ?? [];
 
-  // ---- byChip: group + medians ----
+  // ---- byChip: group + median/std (+ per-version breakdown) ----
   const groups = new Map<string, RunRow[]>();
   for (const r of rows) {
     const key = r.chip ?? "Unknown";
@@ -329,26 +330,63 @@ async function handleGet(env: Env): Promise<Response> {
 
   const byChip = [...groups.entries()]
     .map(([chip, list]) => {
-      // Representative hardware values: most common non-null (fall back to first).
       const rep = list[0];
+      const fps = nums(list.map((r) => r.files_per_sec));
+      const tps = nums(list.map((r) => r.tokens_per_sec));
+      // Version breakdown WITHIN this chip - so version-over-version is hardware-controlled and
+      // actually comparable (throughput is dominated by the Mac, not the app version).
+      const vMap = new Map<string, RunRow[]>();
+      for (const r of list) {
+        const v = r.app_version ?? "?";
+        (vMap.get(v) ?? vMap.set(v, []).get(v)!).push(r);
+      }
+      const versions = [...vMap.entries()]
+        .map(([version, vl]) => ({
+          version,
+          runs: vl.length,
+          medianTokensPerSec: roundInt(median(nums(vl.map((r) => r.tokens_per_sec)))),
+          medianFilesPerSec: round1(median(nums(vl.map((r) => r.files_per_sec)))),
+        }))
+        .sort((a, b) => cmpVersion(b.version, a.version)); // newest first
       return {
         chip,
         releaseYear: firstNonNull(list.map((r) => r.release_year)),
         runs: list.length,
-        medianFilesPerSec: round1(median(nums(list.map((r) => r.files_per_sec)))),
-        medianTokensPerSec: roundInt(median(nums(list.map((r) => r.tokens_per_sec)))),
+        medianFilesPerSec: round1(median(fps)),
+        filesPerSecStd: round1(stddev(fps)),
+        medianTokensPerSec: roundInt(median(tps)),
+        tokensPerSecStd: roundInt(stddev(tps)),
         medianSeconds: round1(median(nums(list.map((r) => r.seconds)))),
         medianPeakVramDeltaBytes: roundInt(median(nums(list.map((r) => r.peak_vram_delta)))),
         memoryBytes: firstNonNull(list.map((r) => r.mem_bytes)) ?? rep.mem_bytes,
         vramBytes: firstNonNull(list.map((r) => r.vram_bytes)),
+        macosVersions: uniq(list.map((r) => r.macos_version)),
+        versions,
       };
     })
     .sort((a, b) => b.runs - a.runs);
 
+  // ---- byVersion: overall throughput per app version (across all chips - directional only) ----
+  const vGroups = new Map<string, RunRow[]>();
+  for (const r of rows) {
+    const v = r.app_version ?? "?";
+    (vGroups.get(v) ?? vGroups.set(v, []).get(v)!).push(r);
+  }
+  const byVersion = [...vGroups.entries()]
+    .map(([version, list]) => ({
+      version,
+      runs: list.length,
+      medianTokensPerSec: roundInt(median(nums(list.map((r) => r.tokens_per_sec)))),
+      medianFilesPerSec: round1(median(nums(list.map((r) => r.files_per_sec)))),
+    }))
+    .sort((a, b) => cmpVersion(b.version, a.version));
+
   // ---- recent: last 25 anonymized rows ----
   const recent = rows.slice(0, 25).map((r: RunRow) => ({
     chip: r.chip,
+    appVersion: r.app_version,
     macosVersion: r.macos_version,
+    memoryBytes: r.mem_bytes,
     filesPerSec: round1(r.files_per_sec),
     tokensPerSec: roundInt(r.tokens_per_sec),
     seconds: round1(r.seconds),
@@ -360,7 +398,9 @@ async function handleGet(env: Env): Promise<Response> {
     datasetVersion: DATASET_VERSION,
     updatedAt: now,
     totalRuns: rows.length,
+    latestVersion: byVersion.length ? byVersion[0].version : null,
     byChip,
+    byVersion,
     recent,
   };
 
@@ -388,6 +428,36 @@ function median(xs: number[]): number | null {
   const s = [...xs].sort((a, b) => a - b);
   const mid = Math.floor(s.length / 2);
   return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+
+/** Sample standard deviation; null for <2 points (no spread to report). */
+function stddev(xs: number[]): number | null {
+  if (xs.length < 2) return null;
+  const mean = xs.reduce((a, b) => a + b, 0) / xs.length;
+  const v = xs.reduce((a, b) => a + (b - mean) * (b - mean), 0) / (xs.length - 1);
+  return Math.sqrt(v);
+}
+
+/** Distinct, non-null values in first-seen order. */
+function uniq<T>(xs: (T | null)[]): T[] {
+  const out: T[] = [];
+  const seen = new Set<T>();
+  for (const x of xs) if (x !== null && x !== undefined && !seen.has(x)) { seen.add(x); out.push(x); }
+  return out;
+}
+
+/** Compare dotted versions numerically ("0.1.29" > "0.1.9"); non-numeric sort last. */
+function cmpVersion(a: string, b: string): number {
+  const pa = a.split(".").map((n) => parseInt(n, 10));
+  const pb = b.split(".").map((n) => parseInt(n, 10));
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = pa[i], y = pb[i];
+    if (Number.isNaN(x) && Number.isNaN(y)) return 0;
+    if (Number.isNaN(x)) return -1;
+    if (Number.isNaN(y)) return 1;
+    if (x !== y) return x - y;
+  }
+  return 0;
 }
 
 function firstNonNull<T>(xs: (T | null)[]): T | null {
