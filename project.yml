@@ -21,7 +21,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.hanxiao.omni
-        MARKETING_VERSION: "0.1.31"
+        MARKETING_VERSION: "0.1.32"
         CURRENT_PROJECT_VERSION: "1"
         GENERATE_INFOPLIST_FILE: YES
         SWIFT_VERSION: "6.0"
