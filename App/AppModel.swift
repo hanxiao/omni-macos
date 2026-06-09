@@ -1590,7 +1590,12 @@ final class AppModel {
             let url = fq.url, similar = fq.similar, maxImg = maxImageDimension, maxVid = maxVideoFrames
             searchWorkTask = Task.detached(priority: .userInitiated) {
                 if Task.isCancelled { return }
-                let vec = engine.embedFileQuery(url, asDocument: similar, maxImageDimension: maxImg, maxVideoFrames: maxVid)
+                // "Find similar" on an indexed file (every search result is one) reuses its STORED
+                // vector - the exact indexed representation - so it always finds the file itself and
+                // cannot diverge from how the indexer parsed it. Falls back to re-embedding (with the
+                // index-matching extractor) for an external, not-yet-indexed file.
+                let vec = (similar ? store.fileVector(url.path) : nil)
+                    ?? engine.embedFileQuery(url, asDocument: similar, maxImageDimension: maxImg, maxVideoFrames: maxVid)
                 if Task.isCancelled { return }   // superseded while embedding: don't run the store scan
                 // Run the vector search OFF the main actor (matches the text path); doing it inside
                 // MainActor.run stalled the UI per file query, especially on a large index.

@@ -53,6 +53,29 @@ final class VectorStoreTests: XCTestCase {
         XCTAssertEqual(store.fileCounts(underFolders: []), [:])
     }
 
+    func testFileVectorFindsItselfAcrossModalities() throws {
+        let url = tempDB()
+        let store = try VectorStore(dbURL: url)
+        // A multi-chunk text/PDF file, plus single-chunk media files (image/audio) - the "find similar"
+        // path is modality-agnostic, so each must resolve to its own stored vector.
+        try store.replace(path: "/a.pdf", chunks: [chunk("/a.pdf", 0, "text", basis(0)), chunk("/a.pdf", 1, "text", basis(1))])
+        try store.replace(path: "/b.png", chunks: [chunk("/b.png", 0, "image", basis(3))])
+        try store.replace(path: "/c.mp3", chunks: [chunk("/c.mp3", 0, "audio", basis(5))])
+
+        // fileVector = L2-normalized mean of the file's chunk vectors. A: mean(basis0, basis1) -> (1,1,0..)/sqrt2.
+        let va = try XCTUnwrap(store.fileVector("/a.pdf"))
+        XCTAssertEqual(va.count, 8)
+        XCTAssertEqual(va[0], 1 / Float(2).squareRoot(), accuracy: 1e-4)
+        XCTAssertEqual(va[1], 1 / Float(2).squareRoot(), accuracy: 1e-4)
+        XCTAssertEqual(va[2], 0, accuracy: 1e-4)
+
+        // "Find similar" on each file (search with its own stored vector) returns that file as top hit.
+        XCTAssertEqual(store.search(va, topK: 10).first?.path, "/a.pdf")
+        XCTAssertEqual(store.search(try XCTUnwrap(store.fileVector("/b.png")), topK: 10).first?.path, "/b.png")
+        XCTAssertEqual(store.search(try XCTUnwrap(store.fileVector("/c.mp3")), topK: 10).first?.path, "/c.mp3")
+        XCTAssertNil(store.fileVector("/not-indexed"))
+    }
+
     func testRankChunksReadsFlat() throws {
         let url = tempDB()
         let store = try VectorStore(dbURL: url)
