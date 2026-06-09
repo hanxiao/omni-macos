@@ -252,15 +252,20 @@ final class Qwen3Backbone: @unchecked Sendable {
 
     /// Last-token pool of a [1, L, dim] hidden state -> L2-normalized [Float].
     func pool(_ hidden: MLXArray, length L: Int, truncateDim: Int? = nil) -> [Float] {
-        var pooled = hidden[0, L - 1].asType(.float32)
-        pooled = pooled / MLX.sqrt((pooled * pooled).sum())
+        var pooled = poolGraph(hidden, length: L)
         if let d = truncateDim, d < cfg.text.hiddenSize {
             pooled = pooled[0 ..< d]
             pooled = pooled / MLX.sqrt((pooled * pooled).sum())
         }
-        pooled = pooled.asType(.float32)
         eval(pooled)
         return pooled.asArray(Float.self)
+    }
+
+    /// Graph-only last-token pool (fp32, L2-normalized, UNEVALUATED). Lets a caller build several
+    /// sequences' pools and evaluate them in ONE eval instead of one GPU drain per sequence.
+    func poolGraph(_ hidden: MLXArray, length L: Int) -> MLXArray {
+        let pooled = hidden[0, L - 1].asType(.float32)
+        return pooled / MLX.sqrt((pooled * pooled).sum())
     }
 
     // MARK: - Layers
