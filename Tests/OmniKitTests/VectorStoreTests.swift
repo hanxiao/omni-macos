@@ -135,13 +135,25 @@ final class VectorStoreTests: XCTestCase {
         try store.replace(path: "/d/img.png", chunks: [chunk("/d/img.png", 0, "image", basis(0))])
         try store.replace(path: "/d/sub/a.txt", chunks: [chunk("/d/sub/a.txt", 0, "text", basis(1))])
         try store.replace(path: "/e/b.txt", chunks: [chunk("/e/b.txt", 0, "text", basis(2))])
+        // Path-boundary sibling: shares the "/d" prefix but is NOT under the folder. Must survive
+        // the delete both in memory AND in SQLite (the index-driven range form
+        // `path >= '/d/' AND path < '/d0'` must not over-match).
+        try store.replace(path: "/dz/c.txt", chunks: [chunk("/dz/c.txt", 0, "text", basis(3))])
 
         store.deleteKind("image")
-        XCTAssertEqual(store.fileCount, 2)
+        XCTAssertEqual(store.fileCount, 3)
         XCTAssertTrue(store.search(basis(0), topK: 10).allSatisfy { $0.kind != "image" })
 
         store.deleteUnderFolder("/d")
-        XCTAssertEqual(store.fileCount, 1)
+        XCTAssertEqual(store.fileCount, 2)
         XCTAssertEqual(store.search(basis(2), topK: 1).first?.path, "/e/b.txt")
+        XCTAssertEqual(store.search(basis(3), topK: 1).first?.path, "/dz/c.txt")
+
+        // Reload from disk: proves the SQL delete (not just the in-memory predicate) removed
+        // exactly the right rows.
+        store.close()
+        let reloaded = try VectorStore(dbURL: url)
+        XCTAssertEqual(reloaded.fileCount, 2)
+        XCTAssertEqual(Set(reloaded.indexedFiles().keys), ["/e/b.txt", "/dz/c.txt"])
     }
 }
