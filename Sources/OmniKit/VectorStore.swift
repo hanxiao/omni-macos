@@ -565,6 +565,33 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
+    /// The L2-normalized mean of a file's stored chunk vectors (the same per-file representation the
+    /// folder map uses), or nil if the path is not indexed. "Find similar" uses this so the query
+    /// vector IS the indexed representation - it lands exactly in the index space, always finds the
+    /// file itself, and never re-parses the file (so it can't diverge from how the indexer parsed it).
+    public func fileVector(_ path: String) -> [Float]? {
+        queue.sync {
+            guard dim > 0 else { return nil }
+            var sum = [Float](repeating: 0, count: dim)
+            var count = 0
+            flat16.withUnsafeBufferPointer { fb in
+                guard let base = fb.baseAddress else { return }
+                for i in 0 ..< rows.count where rows[i].path == path {
+                    let off = i * dim
+                    for k in 0 ..< dim { sum[k] += Self.fromBF16(base[off + k]) }
+                    count += 1
+                }
+            }
+            guard count > 0 else { return nil }
+            var norm: Float = 0
+            for k in 0 ..< dim { sum[k] /= Float(count); norm += sum[k] * sum[k] }
+            norm = norm.squareRoot()
+            guard norm > 0 else { return nil }
+            for k in 0 ..< dim { sum[k] /= norm }
+            return sum
+        }
+    }
+
     /// Per-FILE mean-pooled, L2-normalized fp32 vectors for files under `folder` (path-boundary
     /// aware), capped at `cap` files in row order. Additive read-only helper for the folder
     /// visualization; does NOT touch search state. Runs under `queue` like every other reader.

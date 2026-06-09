@@ -339,7 +339,22 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             return frames.isEmpty ? nil : embedVideoQuery(frames, asDocument: asDocument)
         case .audio:
             return embedAudioQuery(url, asDocument: asDocument)
-        case .text, .none:
+        case .text:
+            // Parser PARITY with the index path: a text-kind file (txt/code/PDF/office) is embedded the
+            // SAME way the indexer decodes it - FileExtractor.extract - so its query vector lands in the
+            // index space. A text PDF yields text (text tower); a SCANNED PDF rasterizes to page images
+            // (vision tower), exactly as the indexer treats it. (Previously this returned nil, so "find
+            // similar"/file-query on a PDF or text file silently failed.)
+            switch (try? FileExtractor.extract(url, maxImageDimension: maxImageDimension, maxVideoFrames: maxVideoFrames)) ?? .empty {
+            case .text(let s):
+                let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+                return t.isEmpty ? nil : embedText(t, as: asDocument ? .passage : .query)
+            case .images(let pages):
+                return pages.isEmpty ? nil : embedVideoQuery(pages, asDocument: asDocument)
+            case .empty:
+                return nil
+            }
+        case .none:
             return nil
         }
     }
