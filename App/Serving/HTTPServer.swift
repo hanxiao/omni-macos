@@ -24,6 +24,11 @@ final class HTTPServer: @unchecked Sendable {
     private let receiveChunk = 64 * 1024
 
     private var listener: NWListener?
+    /// Accepted live connections (queue-owned), so stop() can close keep-alive sockets instead of
+    /// leaking their fds; and a cancelled flag so a stranded read loop stops re-arming work that would
+    /// keep driving the GPU gate after the UI shows the server stopped.
+    private var conns: [ObjectIdentifier: NWConnection] = [:]
+    private var cancelled = false
     /// When bound for local scope we accept the listener on all interfaces (the reliable
     /// NWListener path) but drop any connection whose peer is not loopback - functionally
     /// local-only without the fragile requiredLocalEndpoint bind.
@@ -86,23 +91,33 @@ final class HTTPServer: @unchecked Sendable {
     }
 
     func stop() {
-        listener?.cancel()
-        listener = nil
+        // Tear down on the serving queue (which owns listener/conns): cancel the listener AND every
+        // accepted connection (idle keep-alives leak fds otherwise), and flag cancellation so any
+        // in-flight read loop stops re-arming and stops feeding the GPU gate after "Stopped".
+        queue.async {
+            self.cancelled = true
+            self.listener?.cancel()
+            self.listener = nil
+            for c in self.conns.values { c.cancel() }
+            self.conns.removeAll()
+        }
     }
 
     // MARK: - Connection handling
 
     private func accept(_ conn: NWConnection) {
-        // Local scope: refuse anything not coming from loopback.
-        if loopbackOnly && !isLoopback(conn) {
+        // Refuse new connections once stopped, or non-loopback peers in local scope.
+        if cancelled || (loopbackOnly && !isLoopback(conn)) {
             conn.cancel()
             return
         }
+        conns[ObjectIdentifier(conn)] = conn   // track for teardown (accept runs on `queue`)
         conn.stateUpdateHandler = { [weak self] state in
             switch state {
             case .ready:
                 self?.readRequest(on: conn, buffer: Data())
             case .failed, .cancelled:
+                self?.conns[ObjectIdentifier(conn)] = nil
                 conn.cancel()
             default:
                 break
@@ -114,6 +129,7 @@ final class HTTPServer: @unchecked Sendable {
     /// Accumulate bytes until a full request is buffered, then service it. Drains
     /// pipelined requests already sitting in `buffer` before reading more.
     private func readRequest(on conn: NWConnection, buffer: Data) {
+        if cancelled { conn.cancel(); return }   // server stopped: stop the read loop / GPU feed
         // First, try to satisfy from what we already have (handles pipelining and the
         // case where the head+body arrived in one receive).
         if drain(on: conn, buffer: buffer) { return }

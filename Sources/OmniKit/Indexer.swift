@@ -121,7 +121,7 @@ public final class Indexer: @unchecked Sendable {
     }
 
     public func cancel() { queue.sync { cancelled = true } }
-    private var isCancelled: Bool { queue.sync { cancelled } }
+    public var isCancelled: Bool { queue.sync { cancelled } }
 
     /// Full incremental pass over `roots`. `onProgress` is called on a background
     /// thread; marshal to the main actor in the UI.
