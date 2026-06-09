@@ -191,6 +191,21 @@ final class AppModel {
         }
     }
 
+    /// Files projected into the folder map, bounded by the memory cap. The projection builds an
+    /// `N x dim` fp32 matrix on the GPU (plus a centered copy, and for UMAP kNN tiles + a force
+    /// layout); leaving N unbounded is what lets a big folder burst past the cap and lag the machine.
+    /// The map is a visual overview, so larger folders are subsampled to this many representative
+    /// points. UMAP carries the extra kNN/force cost, so its ceiling is lower than PCA's for speed.
+    var mapPointBudget: Int {
+        let capGB = maxMemoryGB > 0 ? maxMemoryGB : physicalMemoryGB
+        let bytesPerPoint = Double(max(256, engineDim) * 4 * 5)   // X + centered copy + transient temps
+        let n = Int(capGB * 0.12 * 1_073_741_824 / bytesPerPoint) // give the map ~12% of the cap
+        // Ceilings keep the map responsive even with memory to spare: UMAP runs kNN + a 300-epoch force
+        // layout (~0.4s at 15k here, multiseconds on a low-end GPU), so cap it well below PCA, which is
+        // an N-light SVD. The memory budget above pulls both lower on a low-RAM Mac.
+        return max(2_000, min(n, mapUsesUMAP ? 15_000 : 60_000))
+    }
+
     var canIndex: Bool { phase == .ready && !roots.isEmpty }
 
     // MARK: - Selected-result actions (shared by the context menu, the File menu, and key handlers)
@@ -851,6 +866,64 @@ final class AppModel {
         UserDefaults.standard.set(settings.kindOrder.map { $0.rawValue }, forKey: "omni.kindOrder")
     }
 
+    // MARK: - Modality on/off (coarse filter; ignore rules apply after)
+
+    /// Towers the loaded engine must keep for the enabled modalities. Vision serves BOTH image and
+    /// video; audio is its own tower. A turned-off tower is dropped at load so it never sits in VRAM.
+    private var enabledKindTowers: (vision: Bool, audio: Bool) {
+        (vision: settings.enabledKinds.contains(.image) || settings.enabledKinds.contains(.video),
+         audio: settings.enabledKinds.contains(.audio))
+    }
+
+    func kindEnabled(_ k: FileKind) -> Bool { settings.enabledKinds.contains(k) }
+
+    /// Pending modality turn-off awaiting the user's purge/keep choice (drives the Content dialog).
+    var pendingDisable: PendingDisable?
+    struct PendingDisable: Identifiable, Equatable {
+        let kind: FileKind; let count: Int
+        var id: String { kind.rawValue }
+    }
+
+    /// Entry point for the Content tab toggle. Turning a kind OFF while it has indexed files asks
+    /// first (purge vs keep); turning ON applies immediately and indexes the newly included files.
+    func toggleKind(_ k: FileKind, on: Bool) {
+        if on { applyKind(k, on: true, purge: false); return }
+        let count = store?.fileCount(kind: k.rawValue) ?? 0
+        if count > 0 { pendingDisable = PendingDisable(kind: k, count: count) }   // ask; dialog calls applyKind
+        else { applyKind(k, on: false, purge: false) }
+    }
+
+    /// Commit a modality change: update the set, optionally purge its embeddings, reload the engine
+    /// only when the tower requirement changed (to free/load VRAM), and reindex when turning one on.
+    func applyKind(_ k: FileKind, on: Bool, purge: Bool) {
+        pendingDisable = nil
+        let oldTowers = enabledKindTowers
+        settings.set(k, on)
+        UserDefaults.standard.set(settings.enabledKinds.map { $0.rawValue }, forKey: "omni.indexKinds")
+        if on { clearKindExcludesFromIgnore(k) }       // make the toggle authoritative over legacy excludes
+        if !on, purge, let store { store.deleteKind(k.rawValue); refreshIndexStats(store) }
+        if enabledKindTowers != oldTowers {
+            // Reload so the dropped tower leaves VRAM (or the newly needed one loads). bootstrap is the
+            // tested engine-swap path and ends with an incremental pass, which picks up a newly enabled
+            // kind's files on its own.
+            phase = .loadingModel
+            Task { await bootstrap() }
+        } else if on {
+            startIndexing()   // tower already resident; just crawl the now-included files
+        }
+    }
+
+    /// Re-enabling a modality should fully include it again, so drop any leftover `*.ext` excludes a
+    /// prior version synthesized for this kind when it was off (the toggle is now the source of truth).
+    private func clearKindExcludesFromIgnore(_ k: FileKind) {
+        let globs = Set(FileExtractor.extensions(for: k).map { "*.\($0)" })
+        guard !globs.isEmpty else { return }
+        let kept = ignoreText.components(separatedBy: "\n")
+            .filter { !globs.contains($0.trimmingCharacters(in: .whitespaces)) }
+            .joined(separator: "\n")
+        if kept != ignoreText { applyIgnoreText(kept) }
+    }
+
     private func loadPerf() {
         let d = UserDefaults.standard
         if d.object(forKey: "omni.maxImageDim") != nil { maxImageDimension = max(512, d.integer(forKey: "omni.maxImageDim")) }
@@ -1148,8 +1221,10 @@ final class AppModel {
             // critical path. VectorStore/OmniEngine are Sendable; neither touches MainActor state here.
             async let storeC = try VectorStore(dbURL: try Self.indexURL())
             // loadValidated self-tests the media embedding path and reloads weights if the first
-            // (cold) load hit the MLX uninitialized-memory NaN, so media indexes reliably.
-            async let engineC = OmniEngine.loadValidated(modelDir: dir)
+            // (cold) load hit the MLX uninitialized-memory NaN, so media indexes reliably. Only load
+            // the towers for enabled modalities so a turned-off kind never occupies VRAM.
+            let towers = enabledKindTowers
+            async let engineC = OmniEngine.loadValidated(modelDir: dir, keepVision: towers.vision, keepAudio: towers.audio)
             let store = try await storeC
             let engine = try await engineC
             // On a model/db switch, close the PREVIOUS store off the main actor: dropping its last ref
@@ -1478,10 +1553,11 @@ final class AppModel {
         folderProjectionFitting = true
         let folder = url.path
         let refine = mapUsesUMAP   // captured on the main actor; the detached worker reads only this Bool
-        // Cap the points pulled for the map so a pathological (200k+) folder degrades to a sampled cloud
-        // rather than peaking the host [Float] + GPU X + centered matrix into OOM on a low-RAM Mac. High
-        // on 16GB+ (folders never sample); the map is a visual overview, so sampling only shifts dots.
-        let mapCap = physicalMemoryGB >= 16 ? 200_000 : 60_000
+        // Bound the points pulled for the map by the memory cap (mapPointBudget) so a big folder is
+        // subsampled to a representative cloud instead of peaking the host [Float] + GPU X + centered
+        // matrix past the cap and freezing the machine. The map is a visual overview, so this only
+        // shifts dots, never search results (which always use the full index).
+        let mapCap = mapPointBudget
         let proj = ProjectionEngine(engine: engine)
         // The fit runs on a detached utility worker (off the main actor), bridged through a one-shot
         // AsyncStream so cancelling this @MainActor task terminates the stream and cancels the worker

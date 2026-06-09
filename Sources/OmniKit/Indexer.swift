@@ -145,7 +145,7 @@ public final class Indexer: @unchecked Sendable {
         for root in roots {
             if isCancelled { break }
             var files: [CrawledFile] = []
-            FileCrawler(roots: [root], ignore: settings.ignore)
+            FileCrawler(roots: [root], ignore: settings.ignore, enabledKinds: settings.enabledKinds)
                 .walk(shouldContinue: { !self.isCancelled }) { files.append($0) }
             perRootFiles.append((root.path, files))
             var rp = RootProgress(); rp.total = files.count
@@ -323,9 +323,11 @@ public final class Indexer: @unchecked Sendable {
                 blindRoots.contains { path == $0 || path.hasPrefix($0 + "/") }
             }
             func inScope(_ path: String, _ kindRaw: String) -> Bool {
-                // A known file is in scope (eligible for stale-deletion accounting) iff the current
-                // ignore policy would still index it. The kind is implied by FileExtractor; ignore is
-                // the single source of truth for exclusion.
+                // A known file is in scope (eligible for stale-deletion accounting) iff we still index
+                // its kind AND the ignore policy still keeps it. A DISABLED modality is intentionally
+                // not crawled, so its known files being absent from `seen` is not a disk deletion -
+                // hold them out of scope so reconcile never auto-purges them (purge is explicit).
+                if let k = FileKind(rawValue: kindRaw), !settings.enabledKinds.contains(k) { return false }
                 return !settings.ignore.isIgnored(path, isDir: false)
             }
             // Batch the deletion: one transaction + one in-memory rebuild, not one per path.
@@ -363,7 +365,7 @@ public final class Indexer: @unchecked Sendable {
             var isDir: ObjCBool = false
             if !fm.fileExists(atPath: path, isDirectory: &isDir) { deletedTop.insert(path); continue }
             if isDir.boolValue {
-                FileCrawler(roots: [url], ignore: settings.ignore)
+                FileCrawler(roots: [url], ignore: settings.ignore, enabledKinds: settings.enabledKinds)
                     .walk(shouldContinue: { !self.isCancelled }) { files.append($0.url) }
             } else {
                 files.append(url)
@@ -381,10 +383,14 @@ public final class Indexer: @unchecked Sendable {
         for url in files {
             if isCancelled { break }
             let path = url.path
-            guard FileExtractor.kind(for: url) != nil, !settings.ignore.isIgnored(path, isDir: false) else {
-                if known[path] != nil { toDelete.insert(path) }   // now unsupported/excluded
+            let kind = FileExtractor.kind(for: url)
+            if kind == nil || settings.ignore.isIgnored(path, isDir: false) {
+                if known[path] != nil { toDelete.insert(path) }   // now unsupported/excluded -> remove
                 continue
             }
+            // Modality turned off: don't index new files of this kind, but DON'T delete ones already
+            // indexed (the user picks purge/keep explicitly when toggling it off).
+            if let kind, !settings.enabledKinds.contains(kind) { continue }
             guard let vals = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]) else { continue }
             let mtime = vals.contentModificationDate?.timeIntervalSince1970 ?? 0
             let size = vals.fileSize ?? 0

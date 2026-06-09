@@ -140,19 +140,25 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
 
     /// - Parameter gpuCacheBytes: cap on MLX's buffer cache (0 = library default).
     ///   Bounds memory growth during long indexing runs on unified memory.
-    public init(modelDir: URL, gpuCacheBytes: Int = 0) async throws {
+    /// - Parameters keepVision/keepAudio: load the vision / audio tower weights. Pass false for a
+    ///   modality the user has turned off so its tower never occupies VRAM (the matching encoder is
+    ///   then nil and `supportsImages`/`supportsVideo`/`supportsAudio` report false). `keepVision`
+    ///   covers BOTH image and video (they share the vision tower).
+    public init(modelDir: URL, gpuCacheBytes: Int = 0, keepVision: Bool = true, keepAudio: Bool = true) async throws {
         if gpuCacheBytes > 0 { MLX.Memory.cacheLimit = gpuCacheBytes }
         self.modelDir = modelDir
         let config = try OmniConfig(modelDir: modelDir)
         // Parse the BPE tokenizer concurrently with the (synchronous) weight load.
         async let tokenizerTask = AutoTokenizer.from(directory: modelDir)
-        let weights = try WeightStore(modelDir: modelDir, loraScale: config.loraScale, keepVision: true, keepAudio: true)
+        let weights = try WeightStore(modelDir: modelDir, loraScale: config.loraScale, keepVision: keepVision, keepAudio: keepAudio)
         let tokenizer = try await tokenizerTask
         let text = OmniTextEncoder(weights: weights, config: config, tokenizer: tokenizer)
         self.textEncoder = text
         self.docPrefix = text.prefixTokenIds(.passage)
         self.queryPrefix = text.prefixTokenIds(.query)
         self.mediaSuffix = text.suffixTokenIds
+        // The encoders fail-init to nil when their tower weights were dropped, so a disabled
+        // modality is simply unavailable (and unloaded) rather than special-cased everywhere.
         self.imageEncoder = OmniImageEncoder(weights: weights, config: config)
         self.audioEncoder = OmniAudioEncoder(weights: weights, config: config)
         self.dim = config.text.hiddenSize
@@ -168,12 +174,12 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     /// the media path on a synthetic input and rebuild until it is finite. One retry is virtually
     /// always enough; we cap attempts and, in the (unobserved) event they all fail, return the last
     /// engine so the app still runs (media files just skip, as before) rather than failing to launch.
-    public static func loadValidated(modelDir: URL, gpuCacheBytes: Int = 0, maxAttempts: Int = 4) async throws -> OmniEngine {
-        var engine = try await OmniEngine(modelDir: modelDir, gpuCacheBytes: gpuCacheBytes)
+    public static func loadValidated(modelDir: URL, gpuCacheBytes: Int = 0, keepVision: Bool = true, keepAudio: Bool = true, maxAttempts: Int = 4) async throws -> OmniEngine {
+        var engine = try await OmniEngine(modelDir: modelDir, gpuCacheBytes: gpuCacheBytes, keepVision: keepVision, keepAudio: keepAudio)
         var attempt = 1
         while attempt < maxAttempts && !engine.mediaPathFinite() {
             FileHandle.standardError.write(Data("OmniEngine: media self-test produced NaN on load attempt \(attempt); reloading weights\n".utf8))
-            engine = try await OmniEngine(modelDir: modelDir, gpuCacheBytes: gpuCacheBytes)
+            engine = try await OmniEngine(modelDir: modelDir, gpuCacheBytes: gpuCacheBytes, keepVision: keepVision, keepAudio: keepAudio)
             attempt += 1
         }
         return engine
