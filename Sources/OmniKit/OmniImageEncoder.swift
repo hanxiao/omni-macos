@@ -28,7 +28,10 @@ public final class OmniImageEncoder: @unchecked Sendable {
         if let s = ProcessInfo.processInfo.environment["OMNI_IMAGE_PATCH_BUDGET"], let v = Int(s), v > 0 {
             return v
         }
-        return 8192
+        // Scale the default to RAM: the packed-patch count is the vision tower's main VRAM driver, and a
+        // smaller budget only packs fewer images per forward - per-image vectors are unchanged (B=1 is
+        // block-diagonal), so retrieval is identical. Lower on 8GB to leave headroom for the resident model.
+        return ProcessInfo.processInfo.physicalMemory >= 16_000_000_000 ? 8192 : 4096
     }()
 
     public init?(weights: WeightStore, config: OmniConfig) {

@@ -79,7 +79,11 @@ final class DecodedItem: @unchecked Sendable {
     }
 }
 
-private final class ReadyBox: @unchecked Sendable { var items = [Int: DecodedItem]() }
+private final class ReadyBox: @unchecked Sendable {
+    var items = [Int: DecodedItem]()
+    var estimates = [Int: Int]()   // admitted-but-not-consumed decoded-byte estimate, per index
+    var outstandingBytes = 0       // sum of the above; gates the producer (guarded by `cond`)
+}
 
 /// Crawl -> extract -> chunk -> embed -> store, incrementally.
 public final class Indexer: @unchecked Sendable {
@@ -345,46 +349,57 @@ public final class Indexer: @unchecked Sendable {
     /// changed/added supported files and removes deleted/unsupported ones. No crawl.
     public func update(paths: [String], settings: IndexSettings) {
         queue.sync { active = settings }
-        let known = store.indexedFiles()
         let fm = FileManager.default
-        // Accumulate the batch's deletions and re-embeds, then apply each as ONE batched store
-        // call. Per-file deletePath/replace would each trigger a full O(N) in-memory rebuild, so a
-        // burst (bulk edit, git checkout, synced folder) would be O(N*batch). deletePaths +
-        // replaceMany do one transaction and one rebuild for the whole batch.
-        var toDelete = Set<String>()
-        var toReplace: [(path: String, chunks: [IndexedChunk])] = []
-        func classify(_ url: URL) {
-            let path = url.path
-            guard FileExtractor.kind(for: url) != nil, !settings.ignore.isIgnored(url.path, isDir: false) else {
-                if known[path] != nil { toDelete.insert(path) }   // now unsupported/excluded
-                return
-            }
-            guard let vals = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]) else { return }
-            let mtime = vals.contentModificationDate?.timeIntervalSince1970 ?? 0
-            let size = vals.fileSize ?? 0
-            if let prev = known[path], prev.modified == mtime, prev.size == size { return }  // unchanged
-            let file = CrawledFile(url: url, modified: mtime, size: size)
-            let chunks = embed(decode(file)).filter { Self.isFinite($0.embedding) }
-            if chunks.isEmpty { if known[path] != nil { toDelete.insert(path) } }
-            else { toReplace.append((path, chunks)) }
-        }
+        // Resolve the concrete files first: the explicit events, plus a crawl of any directory event
+        // (a new folder / bulk move-in carries only the folder path). Then look up the PRIOR stored
+        // state for just these paths - an index-backed query (storedFiles) instead of a full
+        // `GROUP BY path` scan over the entire index, which a few touched files do not justify and
+        // which would stall any concurrent search behind it on the store's serial queue.
+        var files: [URL] = []
+        var deletedTop = Set<String>()
         for path in Set(paths) {
             if isCancelled { break }
             let url = URL(fileURLWithPath: path)
             var isDir: ObjCBool = false
-            if !fm.fileExists(atPath: path, isDirectory: &isDir) {
-                if known[path] != nil { toDelete.insert(path) }   // deleted / moved away
-                continue
-            }
-            // A directory event (new folder, bulk move-in) carries only the folder path, not its
-            // children. Crawl it so freshly added subtrees get indexed. The crawl honors
-            // isCancelled so a huge move-in can be interrupted instead of blocking the batch.
+            if !fm.fileExists(atPath: path, isDirectory: &isDir) { deletedTop.insert(path); continue }
             if isDir.boolValue {
                 FileCrawler(roots: [url], ignore: settings.ignore)
-                    .walk(shouldContinue: { !self.isCancelled }) { classify($0.url) }
+                    .walk(shouldContinue: { !self.isCancelled }) { files.append($0.url) }
+            } else {
+                files.append(url)
+            }
+        }
+        var lookup = Set(files.map { $0.path }); lookup.formUnion(deletedTop)
+        let known = store.storedFiles(paths: lookup)
+
+        // Accumulate the batch's deletions and re-embeds, then apply each as ONE batched store call.
+        // Per-file deletePath/replace would each trigger a full O(N) in-memory rebuild, so a burst
+        // would be O(N*batch); deletePaths + replaceMany do one transaction + one rebuild for the batch.
+        var toDelete = Set<String>()
+        var toReplace: [(path: String, chunks: [IndexedChunk])] = []
+        for path in deletedTop where known[path] != nil { toDelete.insert(path) }   // deleted / moved away
+        for url in files {
+            if isCancelled { break }
+            let path = url.path
+            guard FileExtractor.kind(for: url) != nil, !settings.ignore.isIgnored(path, isDir: false) else {
+                if known[path] != nil { toDelete.insert(path) }   // now unsupported/excluded
                 continue
             }
-            classify(url)
+            guard let vals = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]) else { continue }
+            let mtime = vals.contentModificationDate?.timeIntervalSince1970 ?? 0
+            let size = vals.fileSize ?? 0
+            if let prev = known[path], prev.modified == mtime, prev.size == size { continue }  // unchanged
+            let chunks = embed(decode(CrawledFile(url: url, modified: mtime, size: size))).filter { Self.isFinite($0.embedding) }
+            if chunks.isEmpty { if known[path] != nil { toDelete.insert(path) } }
+            else {
+                toReplace.append((path, chunks))
+                // A directory event (folder rename / big drag-in) can crawl thousands of files; flush
+                // periodically so the accumulated embeddings do not peak unbounded in memory, and so
+                // progress survives a crash mid-reconcile. The store batches each flush as one txn.
+                if toReplace.count >= 256 {
+                    try? store.replaceMany(toReplace); toReplace.removeAll(keepingCapacity: true)
+                }
+            }
         }
         if !toDelete.isEmpty { store.deletePaths(toDelete) }
         if !toReplace.isEmpty { try? store.replaceMany(toReplace) }
@@ -399,15 +414,28 @@ public final class Indexer: @unchecked Sendable {
                           consume: (DecodedItem) -> Void) {
         if files.isEmpty { return }
         let maxInFlight = max(2, ProcessInfo.processInfo.activeProcessorCount)
+        // Second gate, by BYTES not item count: a scanned PDF / video decodes into a big pixel buffer
+        // (~tens to a few hundred MB), so `maxInFlight` of them outstanding can be GBs while a slow GPU
+        // drains one at a time - enough to swap/OOM an 8GB Mac. The byte budget throttles the producer
+        // only when big items pile up; small text/image work stays count-limited as before. On a
+        // high-RAM machine the cap is large enough that the count semaphore always dominates (no
+        // throughput change). Estimated from extension (no extra IO); the `outstandingBytes == 0` guard
+        // always admits at least one item, so a single oversized file never deadlocks.
+        let byteCap = max(384_000_000, Int(ProcessInfo.processInfo.physicalMemory) / 8)
         let decodeQ = DispatchQueue(label: "omni.decode", attributes: .concurrent)
         let producerQ = DispatchQueue(label: "omni.producer")
         let cond = NSCondition()
-        let ready = ReadyBox()            // shared mailbox, guarded by `cond`
+        let ready = ReadyBox()            // shared mailbox + byte accounting, guarded by `cond`
         let sem = DispatchSemaphore(value: maxInFlight)
 
         producerQ.async {
             for (i, file) in files.enumerated() {
-                sem.wait()   // bound outstanding (decoding + decoded-not-consumed)
+                sem.wait()   // bound outstanding ITEM COUNT (decoding + decoded-not-consumed)
+                let est = self.estimatedDecodedBytes(file)
+                cond.lock()
+                while ready.outstandingBytes > 0 && ready.outstandingBytes + est > byteCap { cond.wait() }
+                ready.outstandingBytes += est; ready.estimates[i] = est
+                cond.unlock()
                 let unchanged = !force && (known[file.url.path].map {
                     $0.modified == file.modified && $0.size == file.size
                 } ?? false)
@@ -415,11 +443,14 @@ public final class Indexer: @unchecked Sendable {
                     // On cancel, mark abandoned (unless genuinely unchanged) so the consumer skips it
                     // instead of counting it as "skipped" - it just hasn't been processed yet.
                     let item = DecodedItem(file: file, unchanged: unchanged, abandoned: self.isCancelled && !unchanged)
-                    cond.lock(); ready.items[i] = item; cond.signal(); cond.unlock()
+                    // broadcast (not signal): the cond now has two wait predicates - the consumer waiting
+                    // for an item AND the producer waiting for byte budget - so wake all to avoid a lost
+                    // wakeup landing on the wrong waiter.
+                    cond.lock(); ready.items[i] = item; cond.broadcast(); cond.unlock()
                 } else {
                     decodeQ.async {
                         let item = self.isCancelled ? DecodedItem(file: file, abandoned: true) : self.decode(file)
-                        cond.lock(); ready.items[i] = item; cond.signal(); cond.unlock()
+                        cond.lock(); ready.items[i] = item; cond.broadcast(); cond.unlock()
                     }
                 }
             }
@@ -429,11 +460,28 @@ public final class Indexer: @unchecked Sendable {
             cond.lock()
             while ready.items[i] == nil { cond.wait() }
             let item = ready.items.removeValue(forKey: i)!
+            ready.outstandingBytes -= ready.estimates.removeValue(forKey: i) ?? 0   // release the byte budget
+            cond.broadcast()                                                        // wake a byte-blocked producer
             cond.unlock()
             sem.signal()
             if item.abandoned { continue }   // paused: don't consume/count files left unprocessed
             consume(item)
         }
+    }
+
+    /// Cheap (extension-only, no IO) upper estimate of a file's decoded resident bytes, for the
+    /// pipeline's byte budget. Media decode to fp32 pixel/mel buffers; text is tiny.
+    private func estimatedDecodedBytes(_ file: CrawledFile) -> Int {
+        let dim = max(256, active.maxImageDimension)
+        let oneImage = dim * dim * 12   // ~fp32 RGB after the vision preprocess
+        let ext = file.url.pathExtension.lowercased()
+        if FileExtractor.imageExtensions.contains(ext) { return oneImage }
+        if FileExtractor.videoExtensions.contains(ext) { return max(1, active.maxVideoFrames) * oneImage }
+        if FileExtractor.audioExtensions.contains(ext) { return 64_000_000 }   // mel + frame stack, rough
+        if FileExtractor.pdfExtensions.contains(ext) || FileExtractor.officeExtensions.contains(ext) {
+            return FileExtractor.maxScanPages * oneImage   // may rasterize as a scan -> conservative
+        }
+        return 1_000_000   // plain text / code: cheap
     }
 
     /// CPU-only decode: extraction, thresholds, frame sampling, audio mel. No GPU/MLX.

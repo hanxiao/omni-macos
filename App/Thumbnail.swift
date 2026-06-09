@@ -2,13 +2,35 @@ import SwiftUI
 import AppKit
 import QuickLookThumbnailing
 
-/// In-memory thumbnail cache keyed by path + pixel size.
+extension NSWorkspace {
+    /// Open a file without blocking the caller. The plain `open(URL)` is the deprecated SYNCHRONOUS
+    /// variant (LaunchServices IPC on the main thread); the configuration form returns immediately.
+    func openAsync(_ url: URL) { open(url, configuration: NSWorkspace.OpenConfiguration(), completionHandler: nil) }
+    /// Reveal a file in Finder off the main actor (there is no async API; the sync call does
+    /// LaunchServices/Finder IPC that can stutter on a cold LS database or a slow volume).
+    func revealAsync(_ url: URL) { Task.detached { NSWorkspace.shared.activateFileViewerSelecting([url]) } }
+}
+
+/// In-memory thumbnail cache keyed by path + pixel size, plus a small file-type icon cache.
 final class ThumbnailCache: @unchecked Sendable {
     static let shared = ThumbnailCache()
     private let cache = NSCache<NSString, NSImage>()
-    init() { cache.countLimit = 1024 }
+    private let icons = NSCache<NSString, NSImage>()
+    init() { cache.countLimit = 1024; icons.countLimit = 256 }
     func image(_ key: String) -> NSImage? { cache.object(forKey: key as NSString) }
     func store(_ image: NSImage, _ key: String) { cache.setObject(image, forKey: key as NSString) }
+
+    /// The system fallback icon for a file, cached by extension so all files of a type share one
+    /// `NSWorkspace.icon(forFile:)` (a synchronous Launch Services call) instead of re-fetching it on
+    /// every view-body eval while the QuickLook thumbnail is still loading.
+    func fallbackIcon(for path: String) -> NSImage {
+        let ext = (path as NSString).pathExtension.lowercased()
+        let key = (ext.isEmpty ? "\u{1}none" : ext) as NSString
+        if let cached = icons.object(forKey: key) { return cached }
+        let img = NSWorkspace.shared.icon(forFile: path)
+        icons.setObject(img, forKey: key)
+        return img
+    }
 }
 
 /// Finder-style thumbnail for any file via QuickLook, falling back to the system
@@ -26,7 +48,7 @@ struct Thumbnail: View {
                     .resizable()
                     .aspectRatio(contentMode: .fill)
             } else {
-                Image(nsImage: NSWorkspace.shared.icon(forFile: path))
+                Image(nsImage: ThumbnailCache.shared.fallbackIcon(for: path))
                     .resizable()
                     .aspectRatio(contentMode: .fit)
                     .padding(side * 0.12)

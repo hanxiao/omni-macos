@@ -221,6 +221,29 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         // Tokenize every batch across cores BEFORE taking the serial gate, so the GPU pipeline
         // inside run() is never stalled waiting on the (single-threaded per call) BPE tokenizer.
         let tokenized = batches.map { textEncoder.tokenizeParallel($0, type) }
+        // The gate only yields to a waiting high-priority query BETWEEN run() calls. On a low-RAM/
+        // few-core Mac, running a whole multi-batch indexing flush as ONE run() makes an interactive
+        // search wait behind every batch. Split the flush into two gated halves there so a query can
+        // preempt mid-window. Per-batch vectors are independent, so the result is bit-identical; only
+        // the cross-half double-buffering is lost (acceptable on low-end). High-RAM keeps the single
+        // full-window call - no throughput change.
+        let lowEnd = ProcessInfo.processInfo.environment["OMNI_FORCE_LOWEND"] != nil
+            || ProcessInfo.processInfo.physicalMemory < 16_000_000_000
+        if type != .query, lowEnd, tokenized.count > 2 {
+            var out: [[[Float]]] = []; out.reserveCapacity(tokenized.count)
+            let groupSize = (tokenized.count + 1) / 2
+            var i = 0
+            while i < tokenized.count {
+                let group = Array(tokenized[i ..< min(i + groupSize, tokenized.count)])
+                out.append(contentsOf: run(highPriority: false) {
+                    let r = textEncoder.encodeTokenBatchesPipelined(group)
+                    addTokens(textEncoder.lastSequenceLength)
+                    return r
+                })
+                i += groupSize
+            }
+            return out
+        }
         return run(highPriority: type == .query) {
             let v = textEncoder.encodeTokenBatchesPipelined(tokenized)
             if type != .query { addTokens(textEncoder.lastSequenceLength) }
