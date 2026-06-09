@@ -197,7 +197,11 @@ public final class ProjectionEngine: @unchecked Sendable {
         let n = X.dim(0)
         let sqNorms = MLX.sum(X * X, axis: 1)                 // [n]
         eval(sqNorms)
-        let chunk = min(n, max(1000, 200_000_000 / (n * 4)))   // cap the distance-tile VRAM (~smaller tiles, more iters)
+        // Cap the distance-tile VRAM at ~200MB. No lower floor on the chunk: a floor (e.g. 1000) would
+        // override the byte cap for large n - at n=200k a [1000,n] fp32 tile is ~800MB and the argSort
+        // index array doubles it, enough to OOM an 8GB Mac in UMAP mode. Total FLOPs are chunk-invariant,
+        // so smaller tiles just mean more kernel launches (negligible on any GPU).
+        let chunk = min(n, max(1, 200_000_000 / max(1, n * 4)))
         var idxChunks = [MLXArray]()
         var start = 0
         let xT = X.transposed()

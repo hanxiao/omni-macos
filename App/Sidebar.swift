@@ -56,7 +56,7 @@ struct Sidebar: View {
                         } else {
                             Button("Pause This Folder") { model.setFolderPaused(url, true) }
                         }
-                        Button("Reveal in Finder") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+                        Button("Reveal in Finder") { NSWorkspace.shared.revealAsync(url) }
                         Divider()
                         Button("Remove from Omni") { remove(url) }
                     }
@@ -66,38 +66,10 @@ struct Sidebar: View {
                     .buttonStyle(.plain)
             }
 
-            // Past searches, grouped by time (Bookmarks pinned first). Selecting a row re-runs that
-            // search with its saved filters; right-click to bookmark or remove. Native source-list
-            // selection gives the focus highlight + Delete-to-remove.
-            ForEach(model.historyGroups, id: \.title) { group in
-                Section(group.title) {
-                    ForEach(group.items) { item in
-                        HStack(spacing: 7) {
-                            if item.bookmarked {
-                                Image(systemName: "star.fill").foregroundStyle(Color.yellow).frame(width: 16)
-                            } else if item.isFile, let p = item.filePath {
-                                // A file query: show its thumbnail (falls back to a generic icon if the
-                                // file is gone, so deleted files degrade gracefully).
-                                Thumbnail(path: p, side: 16, corner: 3)
-                            } else {
-                                Image(systemName: "magnifyingglass").foregroundStyle(Color.secondary).frame(width: 16)
-                            }
-                            Text(item.displayLabel).lineLimit(1).truncationMode(item.isFile ? .middle : .tail)
-                            Spacer(minLength: 0)
-                            if item.isFile, !item.bookmarked, let k = item.fileKind, let fk = FileKind(rawValue: k), fk != .text {
-                                Image(systemName: fk.symbol).font(.caption2).foregroundStyle(.tertiary)
-                            }
-                        }
-                        .help(item.isFile ? (item.filePath ?? item.displayLabel) : item.query)
-                        .contextMenu {
-                            Button(item.bookmarked ? "Remove Bookmark" : "Bookmark") { model.toggleHistoryBookmark(item) }
-                            Divider()
-                            Button("Remove") { model.removeHistory(item) }
-                        }
-                        .tag(SidebarSelection.history(item.id))
-                    }
-                }
-            }
+            // Past searches, grouped by time. Extracted into its own view so it re-renders only when
+            // searchHistory changes - NOT on every indexing-progress publish (~12x/sec), which would
+            // otherwise re-run the historyGroups date-bucketing on the main thread and jank the sidebar.
+            HistorySections()
         }
         .listStyle(.sidebar)
         // Selecting a history row runs it (native "smart folder" behavior). Folder selection just
@@ -193,6 +165,44 @@ struct Sidebar: View {
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = true
         if panel.runModal() == .OK { for url in panel.urls { model.addRoot(url) } }
+    }
+}
+
+/// The past-searches sections of the sidebar. A separate view so SwiftUI Observation re-renders it only
+/// when `searchHistory` changes (via `historyGroups`), not on every indexing-progress publish the parent
+/// Folders section reads - keeping the date-bucketing off the 12x/sec progress path.
+private struct HistorySections: View {
+    @Environment(AppModel.self) private var model: AppModel
+    var body: some View {
+        ForEach(model.historyGroups, id: \.title) { group in
+            Section(group.title) {
+                ForEach(group.items) { item in
+                    HStack(spacing: 7) {
+                        if item.bookmarked {
+                            Image(systemName: "star.fill").foregroundStyle(Color.yellow).frame(width: 16)
+                        } else if item.isFile, let p = item.filePath {
+                            // A file query: show its thumbnail (falls back to a generic icon if the
+                            // file is gone, so deleted files degrade gracefully).
+                            Thumbnail(path: p, side: 16, corner: 3)
+                        } else {
+                            Image(systemName: "magnifyingglass").foregroundStyle(Color.secondary).frame(width: 16)
+                        }
+                        Text(item.displayLabel).lineLimit(1).truncationMode(item.isFile ? .middle : .tail)
+                        Spacer(minLength: 0)
+                        if item.isFile, !item.bookmarked, let k = item.fileKind, let fk = FileKind(rawValue: k), fk != .text {
+                            Image(systemName: fk.symbol).font(.caption2).foregroundStyle(.tertiary)
+                        }
+                    }
+                    .help(item.isFile ? (item.filePath ?? item.displayLabel) : item.query)
+                    .contextMenu {
+                        Button(item.bookmarked ? "Remove Bookmark" : "Bookmark") { model.toggleHistoryBookmark(item) }
+                        Divider()
+                        Button("Remove") { model.removeHistory(item) }
+                    }
+                    .tag(SidebarSelection.history(item.id))
+                }
+            }
+        }
     }
 }
 

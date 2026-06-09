@@ -216,11 +216,27 @@ public final class VectorStore: @unchecked Sendable {
         loadIntoMemory()
     }
 
+    private var closed = false
+
+    /// Fold the WAL into the main db and close the connection, ON the serial queue (so it cannot race a
+    /// reader/writer or a new same-path connection). Idempotent. Call this when switching model/db so the
+    /// synchronous checkpoint + close runs off the main actor instead of at the @MainActor ref-drop site.
+    public func close() {
+        queue.sync {
+            guard !closed, let h = db else { closed = true; return }
+            sqlite3_exec(h, "PRAGMA wal_checkpoint(TRUNCATE);", nil, nil, nil)
+            sqlite3_close(h)
+            db = nil
+            closed = true
+        }
+    }
+
     deinit {
-        // Fold the WAL back into the main db on the way out so the next launch opens a compact
-        // file and no -wal/-shm lingers. deinit runs after all queued work, so this is safe.
-        exec("PRAGMA wal_checkpoint(TRUNCATE);")
-        sqlite3_close(db)
+        // Safety net if close() was not called explicitly. deinit runs after all queued work and at
+        // refcount 0 (no concurrent access), so the raw checkpoint + close is safe without the queue.
+        guard !closed, let h = db else { return }
+        sqlite3_exec(h, "PRAGMA wal_checkpoint(TRUNCATE);", nil, nil, nil)
+        sqlite3_close(h)
         db = nil
     }
 
@@ -459,6 +475,28 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
+    /// Prior stored state for ONLY the given paths - the FSEvents reconcile touches a handful of files,
+    /// so this avoids the full `GROUP BY path` scan over the whole index that `indexedFiles()` does.
+    /// `presentPaths` short-circuits brand-new files (no SQL); the rest are O(log N) lookups via `idx_path`.
+    public func storedFiles(paths: Set<String>) -> [String: StoredFile] {
+        guard !paths.isEmpty else { return [:] }
+        return queue.sync {
+            var out: [String: StoredFile] = [:]
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "SELECT MAX(modified), MAX(size), MAX(kind) FROM chunks WHERE path = ?;", -1, &stmt, nil) == SQLITE_OK else { return out }
+            defer { sqlite3_finalize(stmt) }
+            for p in paths where presentPaths.contains(p) {   // not present -> definitely not stored, skip the query
+                sqlite3_reset(stmt); sqlite3_clear_bindings(stmt)
+                sqlite3_bind_text(stmt, 1, p, -1, SQLITE_TRANSIENT)
+                if sqlite3_step(stmt) == SQLITE_ROW, sqlite3_column_type(stmt, 0) != SQLITE_NULL {
+                    let kind = sqlite3_column_text(stmt, 2).map { String(cString: $0) } ?? ""
+                    out[p] = StoredFile(modified: sqlite3_column_double(stmt, 0), size: Int(sqlite3_column_int64(stmt, 1)), kind: kind)
+                }
+            }
+            return out
+        }
+    }
+
     public var count: Int { queue.sync { rows.count } }
     public var fileCount: Int { queue.sync { Set(rows.map { $0.path }).count } }
 
@@ -480,6 +518,28 @@ public final class VectorStore: @unchecked Sendable {
             var seen = Set<String>()
             for r in rows where r.path == folder || r.path.hasPrefix(folder + "/") { seen.insert(r.path) }
             return seen.count
+        }
+    }
+
+    /// All summary stats AND per-folder distinct-file counts in a SINGLE lock + SINGLE pass over rows.
+    /// refreshIndexStats calls this every progress tick on a large index, so folding the two scans
+    /// (allIndexStats + fileCounts) into one pass halves the queue time it steals from concurrent inserts.
+    public func indexSummary(folders: [String])
+        -> (fileCount: Int, chunkCount: Int, kinds: Set<String>, exts: Set<String>, folderCounts: [String: Int]) {
+        queue.sync {
+            var paths = Set<String>(), k = Set<String>(), e = Set<String>()
+            let prefixes = folders.map { $0 + "/" }
+            var seen = [Set<String>](repeating: [], count: folders.count)
+            for r in rows {
+                paths.insert(r.path); k.insert(r.kind)
+                let x = (r.path as NSString).pathExtension.lowercased(); if !x.isEmpty { e.insert(x) }
+                for i in folders.indices where r.path == folders[i] || r.path.hasPrefix(prefixes[i]) {
+                    seen[i].insert(r.path)
+                }
+            }
+            var fc: [String: Int] = [:]
+            for i in folders.indices { fc[folders[i]] = seen[i].count }
+            return (paths.count, rows.count, k, e, fc)
         }
     }
 
@@ -867,16 +927,22 @@ public final class VectorStore: @unchecked Sendable {
         // prior row to remove. Without it, every stored file rebuilt the entire ~dim*rows.count
         // buffer (a multi-GB memmove on a large index), making indexing and reconcile O(N^2).
         guard rows.contains(where: predicate) else { return }
+        // Compact `flat16` IN PLACE with a write cursor instead of building a second full-size `keptFlat`
+        // copy (which doubled bf16 peak - ~1.3GB transient on a 420k*768 index, enough to swap an 8GB
+        // Mac on a reconcile delete). Survivors only ever move toward the front (w <= i), so the forward
+        // dim-slice move is non-overlapping and the surviving layout/order is byte-identical.
         var keptRows: [Row] = []; keptRows.reserveCapacity(rows.count)
-        var keptFlat: [UInt16] = []; keptFlat.reserveCapacity(flat16.count)
-        flat16.withUnsafeBufferPointer { fb in
+        var w = 0   // write cursor, in dim-slice units
+        flat16.withUnsafeMutableBufferPointer { fb in
             guard let base = fb.baseAddress else { return }
             for i in 0 ..< rows.count where !predicate(rows[i]) {
+                if w != i { (base + w * dim).update(from: base + i * dim, count: dim) }
                 keptRows.append(rows[i])
-                keptFlat.append(contentsOf: UnsafeBufferPointer(start: base + i * dim, count: dim))
+                w += 1
             }
         }
-        rows = keptRows; flat16 = keptFlat
+        flat16.removeLast((rows.count - w) * dim)
+        rows = keptRows
         // Our delete predicates always remove ALL rows of a matched path, so survivors define the
         // exact set of present paths after compaction.
         presentPaths = Set(rows.map { $0.path })

@@ -153,13 +153,30 @@ final class AppModel {
     var folderProjectionFitting = false
     private var projectionTask: Task<Void, Never>?
     private var projectionCache: [URL: ProjectionResult] = [:]   // final layout + kNN per folder URL
+    private var projectionCacheOrder: [URL] = []                 // LRU order, oldest first
+    private let projectionCacheCap = 6                           // bound: each entry is N points + N*k kNN
+
+    /// Insert a fitted layout, evicting the least-recently-used folder over the cap. Browsing many large
+    /// folders otherwise retained every one's full point cloud + kNN graph for the whole session.
+    private func cacheProjection(_ url: URL, _ result: ProjectionResult) {
+        if projectionCache[url] == nil { projectionCacheOrder.append(url) }
+        else { touchProjection(url) }
+        projectionCache[url] = result
+        while projectionCacheOrder.count > projectionCacheCap {
+            let evict = projectionCacheOrder.removeFirst()
+            projectionCache[evict] = nil   // re-fit on return is debounced + GPU-gated; map only, never retrieval
+        }
+    }
+    private func touchProjection(_ url: URL) {
+        if let i = projectionCacheOrder.firstIndex(of: url) { projectionCacheOrder.append(projectionCacheOrder.remove(at: i)) }
+    }
     /// Folder-map layout. false = PCA (fast, N-light, instant - the default, safe on low-RAM Macs);
     /// true = UMAP (richer clusters + the click-to-spotlight neighbor graph, but the kNN step builds
     /// large GPU distance tiles + a 300-epoch force layout that can freeze a low-memory Mac).
     var mapUsesUMAP: Bool = UserDefaults.standard.bool(forKey: "omni.mapUsesUMAP") {
         didSet {
             UserDefaults.standard.set(mapUsesUMAP, forKey: "omni.mapUsesUMAP")
-            projectionCache.removeAll()   // cached layouts belong to the other mode
+            projectionCache.removeAll(); projectionCacheOrder.removeAll()   // cached layouts belong to the other mode
             if let url = selectedFolderForViz { selectFolderForVisualization(url) }   // re-fit in the new mode
         }
     }
@@ -171,8 +188,8 @@ final class AppModel {
     var selectedURL: URL? { selection.map { URL(fileURLWithPath: $0) } }
     var hasSelection: Bool { selection != nil }
 
-    func openSelected() { if let u = selectedURL { NSWorkspace.shared.open(u) } }
-    func revealSelected() { if let u = selectedURL { NSWorkspace.shared.activateFileViewerSelecting([u]) } }
+    func openSelected() { if let u = selectedURL { NSWorkspace.shared.openAsync(u) } }
+    func revealSelected() { if let u = selectedURL { NSWorkspace.shared.revealAsync(u) } }
     /// Finder-style toggle: dismiss the preview if open, else preview the current selection.
     func toggleQuickLook() { previewURL = previewURL != nil ? nil : selectedURL }
 
@@ -267,6 +284,9 @@ final class AppModel {
     private(set) var ignoreText: String = ""
     /// Compiled form of `ignoreText`.
     private(set) var ignore = OmniIgnore(text: "")
+    /// Whether a `.bak` from the last Apply exists (drives the Revert button). Cached so the Settings
+    /// preview - re-rendered every keystroke - doesn't do FileManager IO (a mkdir + stat) per character.
+    private(set) var ignoreHasBackup = false
     var indexedKinds: Set<String> = []
     var indexedExts: [String] = []
     var folderFileCounts: [String: Int] = [:]
@@ -348,6 +368,10 @@ final class AppModel {
     // past unprocessed work).
     private var pendingFSPaths = Set<String>()
     private var pendingFSEventId: UInt64 = 0
+    /// A background FSEvents reconcile is running. New file events buffer into pendingFSPaths instead of
+    /// spawning a second overlapping update() - during a write storm (git checkout, npm install, sync)
+    /// that otherwise stacks N reconciles all fighting the GPU gate on a slow Mac.
+    private var fsReconcileInFlight = false
 
     // Folders removed while a full pass is running. The pass holds an old roots snapshot and
     // keeps re-inserting these files, so we defer the vector delete until it stops, then restart.
@@ -690,6 +714,7 @@ final class AppModel {
             saveIgnoreText()
         }
         ignore = OmniIgnore(text: ignoreText)
+        ignoreHasBackup = Self.ignoreFileURL().map { FileManager.default.fileExists(atPath: $0.appendingPathExtension("bak").path) } ?? false   // one stat at launch, then cached
     }
 
     private func saveIgnoreText() {
@@ -758,6 +783,7 @@ final class AppModel {
             let bak = url.appendingPathExtension("bak")
             try? FileManager.default.removeItem(at: bak)
             try? FileManager.default.copyItem(at: url, to: bak)
+            ignoreHasBackup = true
         }
         let new = OmniIgnore(text: newText)
         let changed = new != ignore
@@ -772,17 +798,12 @@ final class AppModel {
             if !drop.isEmpty { store.deletePaths(drop); store.compact() }
             await MainActor.run {
                 self.refreshIndexStats(store)
-                if !self.query.isEmpty { self.search() }
+                if !self.query.isEmpty { self.scheduleSearch() }
                 self.startIndexing()   // pick up files the new policy now allows
             }
         }
     }
 
-    /// True when a `.bak` from the last Apply exists (drives the Revert button).
-    var ignoreHasBackup: Bool {
-        guard let url = Self.ignoreFileURL() else { return false }
-        return FileManager.default.fileExists(atPath: url.appendingPathExtension("bak").path)
-    }
 
     /// Restore the policy from the `.bak` written by the last Apply, and re-apply it.
     func revertIgnore() {
@@ -819,6 +840,7 @@ final class AppModel {
         if d.object(forKey: "omni.maxVideoFrames") != nil { maxVideoFrames = max(1, d.integer(forKey: "omni.maxVideoFrames")) }
         if d.object(forKey: "omni.maxTextChunkChars") != nil { maxTextChunkChars = max(200, d.integer(forKey: "omni.maxTextChunkChars")) }
         if d.object(forKey: "omni.maxMemoryGB") != nil { maxMemoryGB = max(0, d.double(forKey: "omni.maxMemoryGB")) }
+        else { maxMemoryGB = min(6, max(2, (physicalMemoryGB * 0.4).rounded())) }   // first launch: ~3GB on 8GB RAM, 6GB on 16GB+ (unchanged)
         if d.object(forKey: "omni.minImageDim") != nil { minImageDimension = max(0, d.integer(forKey: "omni.minImageDim")) }
         if d.object(forKey: "omni.minAudioSec") != nil { minAudioSeconds = max(0, d.double(forKey: "omni.minAudioSec")) }
         if d.object(forKey: "omni.minVideoSec") != nil { minVideoSeconds = max(0, d.double(forKey: "omni.minVideoSec")) }
@@ -1026,7 +1048,7 @@ final class AppModel {
     }
     func retryBootstrap() { phase = .loadingModel; Task { await bootstrap() } }
 
-    private func resolvedModelDir() -> URL? {
+    private nonisolated static func resolvedModelDir() -> URL? {
         if let saved = UserDefaults.standard.string(forKey: "omni.modelDir") {
             let u = URL(fileURLWithPath: saved)
             let fm = FileManager.default
@@ -1048,9 +1070,14 @@ final class AppModel {
     /// Switch model variant (small/nano). Reloads the engine; the index is flagged
     /// out-of-date and can be rebuilt.
     func switchVariant(_ v: ModelVariant) {
-        guard v != modelVariant, let dir = ModelLocator.resolve(variant: v) else { return }
-        modelVariant = v
-        setModelDir(dir)
+        guard v != modelVariant else { return }
+        // resolve(variant:) walks model dirs (incl. the external volume) - off the main actor so a slow
+        // volume can't beachball the Settings click.
+        Task { @MainActor in
+            guard let dir = await Task.detached(priority: .userInitiated, operation: { ModelLocator.resolve(variant: v) }).value else { return }
+            modelVariant = v
+            setModelDir(dir)
+        }
     }
 
     /// Download a model variant from HuggingFace and load it when finished.
@@ -1092,7 +1119,10 @@ final class AppModel {
         // installedVariants is Settings-only - compute it off the launch critical path (it walks
         // every variant dir, slow on the external model volume).
         Task.detached { let v = ModelLocator.installedVariants(); await MainActor.run { self.installedVariants = v } }
-        guard let dir = resolvedModelDir() else { phase = .noModel; return }
+        // Resolve the model dir off the main actor: it stats candidate dirs including the hardcoded
+        // external model volume, which blocks for seconds if that USB volume is mounted-but-spun-down.
+        guard let dir = await Task.detached(priority: .userInitiated, operation: { Self.resolvedModelDir() }).value
+        else { phase = .noModel; return }
         modelPath = dir.path
         modelVariant = dir.path.contains("nano") ? .nano : .small
         do {
@@ -1103,6 +1133,12 @@ final class AppModel {
             async let engineC = OmniEngine(modelDir: dir)
             let store = try await storeC
             let engine = try await engineC
+            // On a model/db switch, close the PREVIOUS store off the main actor: dropping its last ref
+            // here would run a synchronous WAL checkpoint(TRUNCATE) + sqlite_close in deinit on @MainActor
+            // (disk IO, worse on a slow/external volume). oldIndexer is kept alive in the task so its
+            // store ref does not drop the old store before close() runs on the store's own serial queue.
+            let oldStore = self.store
+            let oldIndexer = self.indexer
             self.store = store
             self.engine = engine
             self.clearQueryEmbedCache()   // cached query vectors are model-specific
@@ -1112,6 +1148,7 @@ final class AppModel {
             // session, and on a variant switch (bootstrap reruns) it replaces the backend under
             // any in-flight server. modelName is reported by /health and /v1/models.
             self.serving.attach(engine: engine, store: store, modelName: "omni-\(modelVariant.rawValue)")
+            if let oldStore { Task.detached(priority: .utility) { _ = oldIndexer; oldStore.close() } }
             self.supportsImages = engine.supportsImages
             self.audioSupported = engine.supportsAudio
             self.engineDim = engine.dim
@@ -1162,8 +1199,9 @@ final class AppModel {
         let fp = fingerprint
         let dimReady = engineDim > 0
         Task.detached(priority: .utility) {
-            let stats = store.allIndexStats()
-            let folders = store.fileCounts(underFolders: rootPaths)   // one pass + one lock, not one scan per root
+            let summary = store.indexSummary(folders: rootPaths)   // one pass + one lock for stats AND per-folder counts
+            let stats = (fileCount: summary.fileCount, chunkCount: summary.chunkCount, kinds: summary.kinds, exts: summary.exts)
+            let folders = summary.folderCounts
             let size = store.sizeBytes()
             let path = store.dbURL.path
             let lastTs = store.metaGet("last_indexed").flatMap { Double($0) }
@@ -1180,7 +1218,9 @@ final class AppModel {
                 // Invalidate any cached embedding-map layout for a folder whose indexed file count
                 // changed (its vectors moved), so the next selection refits instead of showing stale.
                 for (path, count) in folders where self.folderFileCounts[path] != count {
-                    self.projectionCache[URL(fileURLWithPath: path)] = nil
+                    let u = URL(fileURLWithPath: path)
+                    self.projectionCache[u] = nil
+                    self.projectionCacheOrder.removeAll { $0 == u }
                     if self.selectedFolderForViz?.path == path, !self.folderProjectionFitting {
                         self.selectFolderForVisualization(self.selectedFolderForViz)
                     }
@@ -1289,7 +1329,7 @@ final class AppModel {
                         self.activeRoots.remove(key)
                         self.progress.perRoot[key] = nil
                         self.refreshIndexStats(store)
-                        if !self.query.isEmpty { self.search() }
+                        if !self.query.isEmpty { self.scheduleSearch() }
                     }
                 }
             }
@@ -1318,7 +1358,7 @@ final class AppModel {
                 store.compact()
                 await MainActor.run {
                     self.refreshIndexStats(store)
-                    if !self.query.isEmpty { self.search() }
+                    if !self.query.isEmpty { self.scheduleSearch() }
                 }
             }
         }
@@ -1365,10 +1405,14 @@ final class AppModel {
         folderProjection = []; folderKNN = []; folderKNNk = 0; folderProjectionFitting = false
         guard let url, let engine, let store else { return }
         clearSearchForFolderMap()   // a folder map replaces the search: clear query, results, filters
-        if let cached = projectionCache[url] { applyProjection(cached); return }   // instant
+        if let cached = projectionCache[url] { touchProjection(url); applyProjection(cached); return }   // instant (LRU touch)
         folderProjectionFitting = true
         let folder = url.path
         let refine = mapUsesUMAP   // captured on the main actor; the detached worker reads only this Bool
+        // Cap the points pulled for the map so a pathological (200k+) folder degrades to a sampled cloud
+        // rather than peaking the host [Float] + GPU X + centered matrix into OOM on a low-RAM Mac. High
+        // on 16GB+ (folders never sample); the map is a visual overview, so sampling only shifts dots.
+        let mapCap = physicalMemoryGB >= 16 ? 200_000 : 60_000
         let proj = ProjectionEngine(engine: engine)
         // The fit runs on a detached utility worker (off the main actor), bridged through a one-shot
         // AsyncStream so cancelling this @MainActor task terminates the stream and cancels the worker
@@ -1386,7 +1430,7 @@ final class AppModel {
                     // machine-gun click-through to just the folder the selection lands on.
                     try? await Task.sleep(for: .milliseconds(120))
                     if Task.isCancelled { continuation.finish(); return }
-                    let data = store.vectorsUnderFolder(folder)
+                    let data = store.vectorsUnderFolder(folder, cap: mapCap)
                     if Task.isCancelled { continuation.finish(); return }
                     continuation.yield(await proj.project(data, refine: refine))   // PCA (default) or UMAP
                     continuation.finish()
@@ -1396,7 +1440,7 @@ final class AppModel {
             var result = ProjectionResult(points: [], knn: [], k: 0)
             for await snap in stream { if Task.isCancelled { break }; result = snap }
             guard let self, self.selectedFolderForViz?.path == folder else { return }   // folder changed: drop
-            if !result.points.isEmpty { self.projectionCache[url] = result; self.applyProjection(result) }
+            if !result.points.isEmpty { self.cacheProjection(url, result); self.applyProjection(result) }
             self.folderProjectionFitting = false
         }
     }
@@ -1442,6 +1486,11 @@ final class AppModel {
     }
 
     private var searchDebounce: Task<Void, Never>?
+    /// The in-flight search's worker. Cancelled when a newer search starts so a superseded query
+    /// (rapid history/folder/typing switching) skips its remaining embed + store scan instead of
+    /// running to completion and only having its result dropped. Without this, fast switching on a
+    /// slow Mac queues N embeds + N scans and the wanted search waits behind all the stale ones.
+    private var searchWorkTask: Task<Void, Never>?
 
     /// Debounced search: clicking through history items (or any rapid trigger) coalesces to a single
     /// search instead of enqueuing a full `store.search` scan per click on the shared serial store queue.
@@ -1456,6 +1505,7 @@ final class AppModel {
 
     func search() {
         searchDebounce?.cancel()   // a direct search supersedes any pending debounced one
+        searchWorkTask?.cancel()   // and supersedes the previous in-flight search's embed + store scan
         guard let engine, let store else { return }
         // A real query is taking the GPU: cancel any in-flight folder-map fit so it doesn't compete
         // with the embed/search. The folder stays selected; clearing the query returns to the map.
@@ -1471,8 +1521,10 @@ final class AppModel {
         if let fq = fileQuery {
             searching = true
             let url = fq.url, similar = fq.similar, maxImg = maxImageDimension, maxVid = maxVideoFrames
-            Task.detached(priority: .userInitiated) {
+            searchWorkTask = Task.detached(priority: .userInitiated) {
+                if Task.isCancelled { return }
                 let vec = engine.embedFileQuery(url, asDocument: similar, maxImageDimension: maxImg, maxVideoFrames: maxVid)
+                if Task.isCancelled { return }   // superseded while embedding: don't run the store scan
                 // Run the vector search OFF the main actor (matches the text path); doing it inside
                 // MainActor.run stalled the UI per file query, especially on a large index.
                 let hits = vec.map { store.search($0, filter: filter, topK: 60) }
@@ -1503,7 +1555,8 @@ final class AppModel {
         searching = true
         // Cached query vector: skip the GPU embed entirely (instant, and no contention with indexing).
         if let cached = queryEmbedCache[q] {
-            Task.detached(priority: .userInitiated) {
+            searchWorkTask = Task.detached(priority: .userInitiated) {
+                if Task.isCancelled { return }   // superseded before the scan started: skip it
                 let hits = store.search(cached, filter: filter, topK: 60)
                 await MainActor.run {
                     guard token == self.searchToken else { return }
@@ -1516,8 +1569,10 @@ final class AppModel {
             }
             return
         }
-        Task.detached(priority: .userInitiated) {
+        searchWorkTask = Task.detached(priority: .userInitiated) {
+            if Task.isCancelled { return }
             let vec = engine.embedQuery(q)   // high priority: jumps ahead of indexing
+            if Task.isCancelled { return }   // superseded while embedding: don't run the store scan
             let hits = store.search(vec, filter: filter, topK: 60)
             await MainActor.run {
                 guard token == self.searchToken else { return }
@@ -1570,28 +1625,12 @@ final class AppModel {
         let paths = pausedRoots.isEmpty ? rawPaths
             : rawPaths.filter { p in !pausedRoots.contains(where: { p == $0 || p.hasPrefix($0 + "/") }) }
         guard !paths.isEmpty else { return }
-        // During a full index, buffer changes instead of dropping them; startIndexing drains
-        // the buffer on completion.
-        if indexState == .indexing {
-            pendingFSPaths.formUnion(paths)
-            if let eid = watcher?.latestEventId() { pendingFSEventId = max(pendingFSEventId, eid) }
-            return
-        }
-        let settings = effectiveSettings()
-        let eid = watcher?.latestEventId()
-        let touched = Set(paths.compactMap { rootKey(for: $0) })
-        activeRoots.formUnion(touched)
-        startRateSampler()   // show throughput during the background reconcile too, not only full passes
-        Task.detached(priority: .utility) {
-            indexer.update(paths: paths, settings: settings)
-            await MainActor.run {
-                if let eid { UserDefaults.standard.set(String(eid), forKey: "omni.fsEventId") }
-                self.activeRoots.subtract(touched)
-                self.markIndexed(store)   // a reconcile brought the index current just now
-                self.refreshIndexStats(store)
-                if !self.query.isEmpty { self.search() }
-            }
-        }
+        // Always buffer, then kick a reconcile only if none is running. A full index drains the buffer
+        // when it finishes (startIndexing); an in-flight reconcile re-drains when it finishes. This
+        // coalesces a storm into back-to-back single batches instead of overlapping update() tasks.
+        pendingFSPaths.formUnion(paths)
+        if let eid = watcher?.latestEventId() { pendingFSEventId = max(pendingFSEventId, eid) }
+        if indexState != .indexing && !fsReconcileInFlight { drainPendingFSChanges() }
     }
 
     /// Stamp "now" as the last time the index was brought current - persisted and reflected live.
@@ -1600,8 +1639,11 @@ final class AppModel {
     /// background reconciles run.
     private func markIndexed(_ store: VectorStore) {
         let now = Date()
-        lastIndexed = now
-        store.metaSet("last_indexed", "\(now.timeIntervalSince1970)")
+        lastIndexed = now   // reflect in the UI immediately
+        // Persist OFF the main actor: metaSet is queue.sync on the shared serial store queue, and this
+        // fires from every pass/reconcile completion - on @MainActor it stalls the UI behind any
+        // in-flight search/scan. last_indexed is display-only, so deferred ordering is harmless.
+        Task.detached(priority: .utility) { store.metaSet("last_indexed", "\(now.timeIntervalSince1970)") }
     }
 
     /// Start or resume indexing. Indexing is incremental - already-embedded files are
@@ -1614,30 +1656,34 @@ final class AppModel {
         guard !activeRootsToIndex.isEmpty else { return }
         // An out-of-date index is in a different vector space: rebuild it, don't top up.
         let force = indexObsolete
+        let fp = fingerprint
+        let variant = modelVariant.rawValue
         if force {
-            store.wipeChunks()
+            // Reset the visible counts to 0 directly; the actual wipe runs off the main actor below.
             indexedFiles = 0; indexedChunks = 0; indexedKinds = []; rawResults = []
             indexStoredDim = 0
-            refreshIndexStats(store)   // show 0 files immediately
-            // Reclaim the wiped index's disk space OFF the main actor - a VACUUM is a synchronous
-            // queue.sync; even though it rewrites only the (now ~empty) live data, never block the UI.
-            Task.detached(priority: .utility) {
-                store.compact(minFreeRatio: 0)
-                await MainActor.run { self.refreshIndexStats(store) }
-            }
         }
-        // Stamp the fingerprint at the START so a paused/partial index is not later
-        // mis-flagged obsolete - its content is already in the current space.
-        store.metaSet("embedding_version", fingerprint)
-        store.metaSet("index_model_variant", modelVariant.rawValue)   // for the "switch model vs reindex" prompt
+        // Stamp the fingerprint at the START so a paused/partial index is not later mis-flagged obsolete.
         indexObsolete = false
-        indexModelVariantRaw = modelVariant.rawValue
+        indexModelVariantRaw = variant
         indexState = .indexing
         progress = IndexProgress()
         startRateSampler()
         let roots = activeRootsToIndex
         let settings = effectiveSettings()
         Task.detached(priority: .utility) {
+            // Index-lifecycle store writes OFF the main actor: wipeChunks (a multi-GB buffer free + a
+            // 100k-400k-key path-set clear), the force-path VACUUM, and the two metaSet stamps are all
+            // queue.sync on the single serial store queue - on @MainActor they blocked the UI behind any
+            // in-flight search/scan/VACUUM. Sequenced at the head of this task, before index(), so the
+            // FIFO order vs the index's own writes is unchanged. Vectors/recall identical.
+            if force {
+                store.wipeChunks()
+                store.compact(minFreeRatio: 0)   // reclaim the wiped index's pages
+                await MainActor.run { self.refreshIndexStats(store) }   // now reads the empty store -> 0
+            }
+            store.metaSet("embedding_version", fp)
+            store.metaSet("index_model_variant", variant)
             // Coalesce UI updates by wall-clock time. onProgress fires per ~10 scanned files;
             // on a fast crawl of a large index that floods the main actor (thousands of @Published
             // writes + O(n) stats), which hangs the app and kills the Pause button. Publish the
@@ -1672,7 +1718,7 @@ final class AppModel {
                                 store.compact()
                                 await MainActor.run {
                                     self.refreshIndexStats(store)
-                                    if !self.query.isEmpty { self.search() }
+                                    if !self.query.isEmpty { self.scheduleSearch() }
                                     if !self.roots.isEmpty { self.startIndexing() }
                                 }
                             }
@@ -1689,7 +1735,7 @@ final class AppModel {
                         }
                         self.indexState = p.cancelled ? .paused : .idle
                         self.refreshIndexStats(store)
-                        if !self.query.isEmpty { self.search() }
+                        if !self.query.isEmpty { self.scheduleSearch() }
                         if !p.cancelled { self.drainPendingFSChanges() }
                     }
                 }
@@ -1735,19 +1781,26 @@ final class AppModel {
     /// only after a completed (non-cancelled) pass, so a paused index never advances
     /// omni.fsEventId past work it has not processed.
     private func drainPendingFSChanges() {
-        guard !pendingFSPaths.isEmpty, let indexer, let store else { return }
+        guard !pendingFSPaths.isEmpty, !fsReconcileInFlight, let indexer, let store else { return }
         let drained = Array(pendingFSPaths); pendingFSPaths.removeAll()
         let eid = pendingFSEventId; pendingFSEventId = 0
         let settings = effectiveSettings()
         let touched = Set(drained.compactMap { rootKey(for: $0) })
         activeRoots.formUnion(touched)
+        fsReconcileInFlight = true
+        startRateSampler()   // show throughput during the background reconcile too, not only full passes
         Task.detached(priority: .utility) {
             indexer.update(paths: drained, settings: settings)
             await MainActor.run {
                 if eid > 0 { UserDefaults.standard.set(String(eid), forKey: "omni.fsEventId") }
                 self.activeRoots.subtract(touched)
+                self.markIndexed(store)   // a reconcile brought the index current just now
                 self.refreshIndexStats(store)
-                if !self.query.isEmpty { self.search() }
+                if !self.query.isEmpty { self.scheduleSearch() }
+                self.fsReconcileInFlight = false
+                // Events that arrived during this reconcile are buffered: drain them in one more batch
+                // (no-op while a full index is running - that path drains on its own completion).
+                if self.indexState != .indexing { self.drainPendingFSChanges() }
             }
         }
     }

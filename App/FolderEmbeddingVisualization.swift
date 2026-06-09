@@ -20,12 +20,15 @@ struct FolderEmbeddingVisualization: View {
 
     @State private var hovered: ProjectionPoint?
     @State private var hoverLocation: CGPoint = .zero
+    @State private var lastHoverResolveLoc: CGPoint = .zero   // last cursor pos we ran the hit-test for (movement gate)
+    @State private var rebuildTask: Task<Void, Never>?        // off-main point-cloud build, cancelled on rapid re-fit
     @State private var selectedIndex: Int?                // clicked point; its kNN stay lit, rest dimmed
     @State private var litNeighbors: [Int] = []           // the selected point's kNN row (for the overlay)
     @State private var positions: [SIMD2<Float>] = []     // model-space, row-aligned with colors/folderProjection
     @State private var baseColors: [SIMD4<Float>] = []    // full per-point RGBA (pre-dimming)
     @State private var colors: [SIMD4<Float>] = []        // displayed RGBA (dimmed when a point is selected)
     @State private var bbox = SIMD4<Float>(0, 0, 1, 1)    // cached (cx, cy, extX, extY) for O(1) hit-test + ring
+    @State private var presentKinds: [FileKind] = []      // legend entries, computed once per projection (not per frame)
     @State private var dataVersion = 0
     @State private var zoom: CGFloat = 1
     @State private var pan: CGSize = .zero
@@ -151,7 +154,13 @@ struct FolderEmbeddingVisualization: View {
                 switch phase {
                 case .active(let loc):
                     hoverLocation = loc
-                    hovered = nearestIndex(to: loc, in: geo.size).map { model.folderProjection[$0] }
+                    // Only run the O(N) nearest-point scan when the cursor actually moved a few px.
+                    // onContinuousHover fires on every mouse sample, so a fast sweep otherwise piles
+                    // many 60k-element scans per second onto the main thread; tiny jitters reuse the hit.
+                    if hypot(loc.x - lastHoverResolveLoc.x, loc.y - lastHoverResolveLoc.y) >= 3 {
+                        lastHoverResolveLoc = loc
+                        hovered = nearestIndex(to: loc, in: geo.size).map { model.folderProjection[$0] }
+                    }
                 case .ended:
                     hovered = nil
                 }
@@ -252,12 +261,9 @@ struct FolderEmbeddingVisualization: View {
     }
 
     @ViewBuilder private var legend: some View {
-        let present = FileKind.allCases.filter { kind in
-            model.folderProjection.contains { $0.kind == kind.rawValue }
-        }
-        if !present.isEmpty {
+        if !presentKinds.isEmpty {
             HStack(spacing: 12) {
-                ForEach(present, id: \.self) { kind in
+                ForEach(presentKinds, id: \.self) { kind in
                     HStack(spacing: 4) {
                         Circle().fill(kind.vizColor).frame(width: 8, height: 8)
                         Text(kind.title).font(.caption)
@@ -277,6 +283,8 @@ struct FolderEmbeddingVisualization: View {
     /// inline - no per-point NSColor/Color allocation, so it stays cheap for 50k+ files.
     private func rebuildPoints() {
         let pts = model.folderProjection
+        // Resolve the kind->HSB palette on the main actor: performAsCurrentDrawingAppearance is what
+        // makes it adapt to light/dark, and it is only ~8 FileKinds, so it stays on @MainActor.
         var baseHSB: [String: (h: CGFloat, s: CGFloat, b: CGFloat)] = [:]
         let resolve = {
             for k in FileKind.allCases {
@@ -290,29 +298,45 @@ struct FolderEmbeddingVisualization: View {
         } else {
             resolve()
         }
-
-        var pos = [SIMD2<Float>](); pos.reserveCapacity(pts.count)
-        var col = [SIMD4<Float>](); col.reserveCapacity(pts.count)
-        var mn = SIMD2<Float>(.greatestFiniteMagnitude, .greatestFiniteMagnitude)
-        var mx = SIMD2<Float>(-.greatestFiniteMagnitude, -.greatestFiniteMagnitude)
-        let fallback = SIMD4<Float>(0.5, 0.5, 0.5, Self.dotAlpha)
-        for p in pts {
-            pos.append(p.position)
-            if p.position.x.isFinite, p.position.y.isFinite {
-                mn = pointwiseMin(mn, p.position); mx = pointwiseMax(mx, p.position)
-            }
-            if let base = baseHSB[p.kind] {
-                col.append(FileKind.vizShadeRGBA(base: base, ext: (p.path as NSString).pathExtension, alpha: Self.dotAlpha))
-            } else {
-                col.append(fallback)
-            }
+        let alpha = Self.dotAlpha
+        // The per-point loop (positions + per-ext shading + bbox over up to 60k points, each with an
+        // NSString ext alloc + FNV hash + HSB->RGB) is tens of ms - run it OFF the main actor and hop the
+        // finished arrays back. Cancel any in-flight build so rapid folder switches / light-dark flips
+        // (which can fire selectedFolderForViz AND projectionGeneration in one tick) don't stack loops.
+        rebuildTask?.cancel()
+        rebuildTask = Task { @MainActor in
+            let built = await Task.detached(priority: .userInitiated) { () -> (pos: [SIMD2<Float>], col: [SIMD4<Float>], bbox: SIMD4<Float>, kinds: [FileKind])? in
+                if Task.isCancelled { return nil }
+                var pos = [SIMD2<Float>](); pos.reserveCapacity(pts.count)
+                var col = [SIMD4<Float>](); col.reserveCapacity(pts.count)
+                var mn = SIMD2<Float>(.greatestFiniteMagnitude, .greatestFiniteMagnitude)
+                var mx = SIMD2<Float>(-.greatestFiniteMagnitude, -.greatestFiniteMagnitude)
+                let fallback = SIMD4<Float>(0.5, 0.5, 0.5, alpha)
+                var kindsSeen = Set<String>()
+                for p in pts {
+                    pos.append(p.position)
+                    kindsSeen.insert(p.kind)
+                    if p.position.x.isFinite, p.position.y.isFinite {
+                        mn = pointwiseMin(mn, p.position); mx = pointwiseMax(mx, p.position)
+                    }
+                    if let base = baseHSB[p.kind] {
+                        col.append(FileKind.vizShadeRGBA(base: base, ext: (p.path as NSString).pathExtension, alpha: alpha))
+                    } else {
+                        col.append(fallback)
+                    }
+                }
+                if pts.isEmpty { mn = .zero; mx = .zero }
+                let ext = pointwiseMax(mx - mn, SIMD2<Float>(1e-5, 1e-5))
+                let present = FileKind.allCases.filter { kindsSeen.contains($0.rawValue) }
+                return (pos, col, SIMD4<Float>((mn.x + mx.x) / 2, (mn.y + mx.y) / 2, ext.x, ext.y), present)
+            }.value
+            guard !Task.isCancelled, let built else { return }
+            positions = built.pos
+            baseColors = built.col
+            bbox = built.bbox
+            presentKinds = built.kinds
+            applyHighlight()
         }
-        if pts.isEmpty { mn = .zero; mx = .zero }
-        let ext = pointwiseMax(mx - mn, SIMD2<Float>(1e-5, 1e-5))
-        positions = pos
-        baseColors = col
-        bbox = SIMD4<Float>((mn.x + mx.x) / 2, (mn.y + mx.y) / 2, ext.x, ext.y)
-        applyHighlight()
     }
 
     /// Produce the displayed colors from `baseColors`: with no selection, show them as-is; with a
@@ -342,7 +366,7 @@ struct FolderEmbeddingVisualization: View {
     /// "Find Similar" reuses `setFileQuery`, which runs a file-as-query search: that activates a query,
     /// so ContentView precedence swaps the map out for the live results (clearing it returns to the map).
     @ViewBuilder private func dotMenu(_ path: String) -> some View {
-        Button("Open") { NSWorkspace.shared.open(URL(fileURLWithPath: path)) }
+        Button("Open") { NSWorkspace.shared.openAsync(URL(fileURLWithPath: path)) }
             .keyboardShortcut("o", modifiers: .command)
         Button("Quick Look") { model.previewURL = URL(fileURLWithPath: path) }
             .keyboardShortcut("y", modifiers: .command)
@@ -350,7 +374,7 @@ struct FolderEmbeddingVisualization: View {
         Button("Find Similar") { model.setFileQuery(URL(fileURLWithPath: path), similar: true) }
             .keyboardShortcut("f", modifiers: [.command, .option])
         Divider()
-        Button("Reveal in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)]) }
+        Button("Reveal in Finder") { NSWorkspace.shared.revealAsync(URL(fileURLWithPath: path)) }
             .keyboardShortcut("r", modifiers: [.command, .shift])
         Divider()
         Button("Copy Path") {

@@ -166,8 +166,8 @@ struct ResultsList<Footer: View>: View {
         .keyboardShortcut("c", modifiers: [.command, .option])
     }
 
-    private func open(_ path: String) { NSWorkspace.shared.open(URL(fileURLWithPath: path)) }
-    private func reveal(_ path: String) { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)]) }
+    private func open(_ path: String) { NSWorkspace.shared.openAsync(URL(fileURLWithPath: path)) }
+    private func reveal(_ path: String) { NSWorkspace.shared.revealAsync(URL(fileURLWithPath: path)) }
 }
 
 struct ResultRow: View {
