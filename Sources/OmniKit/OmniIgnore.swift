@@ -21,9 +21,21 @@ import CryptoKit
 public struct OmniIgnore: Sendable, Equatable {
     private struct Rule: Sendable, Equatable {
         let segments: [String]   // pattern split on '/'; the last may be "" only via dirOnly (stripped)
+        // Lowercased character arrays of `segments`, precomputed once at parse time: fnmatch runs per
+        // file/dir per rule on the crawl hot path, and re-lowercasing + re-materializing the pattern
+        // there allocated rules x files arrays per crawl.
+        let segChars: [[Character]]
         let negated: Bool
         let dirOnly: Bool
         let anchored: Bool       // contains a non-trailing '/' -> match the whole path; else basename at any depth
+
+        init(segments: [String], negated: Bool, dirOnly: Bool, anchored: Bool) {
+            self.segments = segments
+            self.segChars = segments.map { Array($0.lowercased()) }
+            self.negated = negated
+            self.dirOnly = dirOnly
+            self.anchored = anchored
+        }
     }
     private let rules: [Rule]
     /// Stable hash of the source text - the applied-state key persisted in the store for change detection.
@@ -90,7 +102,10 @@ public struct OmniIgnore: Sendable, Equatable {
 
     /// Whether `path` (absolute) is excluded. `isDir` gates directory-only rules. Last match wins.
     public func isIgnored(_ path: String, isDir: Bool) -> Bool {
-        let segs = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        guard !rules.isEmpty else { return false }
+        // Lowercase each path segment ONCE per call (not once per rule x call); fnmatch then compares
+        // pre-lowered character arrays with zero allocation per rule.
+        let segs = path.split(separator: "/", omittingEmptySubsequences: true).map { Array($0.lowercased()) }
         guard !segs.isEmpty else { return false }
         var decision = false
         for r in rules where !(r.dirOnly && !isDir) {
@@ -101,41 +116,40 @@ public struct OmniIgnore: Sendable, Equatable {
 
     // MARK: - Matching
 
-    private static func matches(_ r: Rule, _ path: [String]) -> Bool {
+    private static func matches(_ r: Rule, _ path: [[Character]]) -> Bool {
         if r.anchored {
-            return matchSegments(r.segments, 0, path, 0)
+            return matchSegments(r, 0, path, 0)
         }
         // Slashless pattern: match the basename at any depth. Since the crawl evaluates every directory
         // and file along a path, matching the last component is sufficient (a `node_modules/` dir is
         // caught when we reach it and its subtree is pruned).
-        return fnmatch(r.segments[0], path[path.count - 1])
+        return fnmatch(r.segChars[0], path[path.count - 1])
     }
 
     /// Match pattern segments against path segments from a given start, anchored. Pattern fully
     /// consumed -> true (prefix match: everything under it is covered). `**` matches zero+ segments.
-    private static func matchSegments(_ pat: [String], _ pi: Int, _ path: [String], _ si: Int) -> Bool {
+    private static func matchSegments(_ r: Rule, _ pi: Int, _ path: [[Character]], _ si: Int) -> Bool {
         var pi = pi, si = si
-        while pi < pat.count {
-            if pat[pi] == "**" {
-                if pi + 1 == pat.count { return true }                 // trailing ** matches the rest
+        while pi < r.segments.count {
+            if r.segments[pi] == "**" {
+                if pi + 1 == r.segments.count { return true }          // trailing ** matches the rest
                 var k = si
                 while k <= path.count {
-                    if matchSegments(pat, pi + 1, path, k) { return true }
+                    if matchSegments(r, pi + 1, path, k) { return true }
                     k += 1
                 }
                 return false
             }
             if si >= path.count { return false }
-            if !fnmatch(pat[pi], path[si]) { return false }
+            if !fnmatch(r.segChars[pi], path[si]) { return false }
             pi += 1; si += 1
         }
         return true   // pattern consumed; remaining path (if any) is "under" the match -> ignored
     }
 
     /// Glob match within a single path segment: `*` (zero+ non-`/`), `?` (one), `[...]` set, literals.
-    /// Case-insensitive (APFS default). No `/` ever matches here.
-    private static func fnmatch(_ pattern: String, _ name: String) -> Bool {
-        let p = Array(pattern.lowercased()), s = Array(name.lowercased())
+    /// Case-insensitive (APFS default). No `/` ever matches here. Both sides arrive pre-lowercased.
+    private static func fnmatch(_ p: [Character], _ s: [Character]) -> Bool {
         // Iterative wildcard match with backtracking for `*`.
         var pi = 0, si = 0, star = -1, mark = 0
         while si < s.count {

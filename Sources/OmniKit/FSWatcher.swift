@@ -18,10 +18,25 @@ public final class FSWatcher: @unchecked Sendable {
 
     public func start() {
         guard stream == nil, !paths.isEmpty else { return }
+        // The stream must RETAIN the watcher: FSEventStreamInvalidate does not wait for a callback
+        // already executing on the dispatch queue, so an unretained `info` could be used after the
+        // owner drops the watcher mid-burst (add/remove folder while files are changing). With
+        // retain/release callbacks the stream holds +1 until it is invalidated AND the last in-flight
+        // callback returns; stop() must therefore always be called explicitly (restartWatcher does),
+        // or the stream would keep the watcher alive.
         var context = FSEventStreamContext(
             version: 0,
             info: Unmanaged.passUnretained(self).toOpaque(),
-            retain: nil, release: nil, copyDescription: nil)
+            retain: { ptr in
+                guard let ptr else { return nil }
+                _ = Unmanaged<FSWatcher>.fromOpaque(ptr).retain()
+                return UnsafeRawPointer(ptr)
+            },
+            release: { ptr in
+                guard let ptr else { return }
+                Unmanaged<FSWatcher>.fromOpaque(ptr).release()
+            },
+            copyDescription: nil)
         let flags = UInt32(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer | kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagWatchRoot)
         guard let s = FSEventStreamCreate(
             kCFAllocatorDefault, fsEventsCallback, &context,

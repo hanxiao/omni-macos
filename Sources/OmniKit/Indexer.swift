@@ -74,8 +74,14 @@ final class DecodedItem: @unchecked Sendable {
     let payload: Payload
     let unchanged: Bool   // already indexed and not modified - not a "skip", just nothing to do
     let abandoned: Bool   // produced after a pause/cancel - not consumed, not counted (re-indexed on resume)
-    init(file: CrawledFile, kind: String = "", payload: Payload = .empty, unchanged: Bool = false, abandoned: Bool = false) {
+    // Display metadata (image pixel size / media duration) captured DURING decode, where the file
+    // header is often already being read for the threshold checks - the serial embed stage must not
+    // re-open the file (an AVURLAsset header parse per audio file was a measurable stall there).
+    let meta: (width: Int, height: Int, duration: Double)
+    init(file: CrawledFile, kind: String = "", payload: Payload = .empty, unchanged: Bool = false, abandoned: Bool = false,
+         meta: (width: Int, height: Int, duration: Double) = (0, 0, 0)) {
         self.file = file; self.kind = kind; self.payload = payload; self.unchanged = unchanged; self.abandoned = abandoned
+        self.meta = meta
     }
 }
 
@@ -113,7 +119,10 @@ public final class Indexer: @unchecked Sendable {
     public var audioFrameBudget = 24000
     public var audioMaxClipsPerBatch = 16
 
-    private var active: IndexSettings = .default
+    // NOTE: pass settings are deliberately NOT stored on self: decode workers run on concurrent
+    // queues, and a second pass starting on another thread (rapid toggle/ignore-edit flows) would
+    // reassign a shared var mid-read - a torn read of the Sets/arrays inside IndexSettings. Settings
+    // flow by value through pipeline/decode/chunk instead, so each pass is self-contained.
 
     public init(store: VectorStore, embedder: Embedder) {
         self.store = store
@@ -126,7 +135,7 @@ public final class Indexer: @unchecked Sendable {
     /// Full incremental pass over `roots`. `onProgress` is called on a background
     /// thread; marshal to the main actor in the UI.
     public func index(roots: [URL], settings: IndexSettings = .default, force: Bool = false, onProgress: @escaping (IndexProgress) -> Void) {
-        queue.sync { cancelled = false; active = settings }
+        queue.sync { cancelled = false }
         var p = IndexProgress()
         let known = store.indexedFiles()
         var seen = Set<String>()
@@ -233,7 +242,7 @@ public final class Indexer: @unchecked Sendable {
                         onProgress(p)
                     }
                 }
-                pipeline(files, force: force, known: known) { item in
+                pipeline(files, force: force, known: known, settings: settings) { item in
                     let path = item.file.url.path
                     defer { tick(path) }
                     if item.unchanged { p.unchanged += 1; return }
@@ -256,7 +265,7 @@ public final class Indexer: @unchecked Sendable {
                 // audioMaxClipsPerBatch clips (bounded by audioFrameBudget total frames)
                 // in ONE tower + ONE backbone forward. Mel STFT already ran on background
                 // cores in the concurrent decode stage; this only batches the GPU forward.
-                var stage: [(file: CrawledFile, kind: String, mel: [Float], frames: Int)] = []
+                var stage: [(file: CrawledFile, kind: String, mel: [Float], frames: Int, duration: Double)] = []
                 var stageFrames = 0
                 func flushAudio() {
                     guard !stage.isEmpty else { return }
@@ -268,11 +277,11 @@ public final class Indexer: @unchecked Sendable {
                         storeChunks(b.file.url.path, [IndexedChunk(
                             path: b.file.url.path, modified: b.file.modified, size: b.file.size,
                             kind: b.kind, chunkIndex: 0, snippet: b.file.url.lastPathComponent, embedding: vec,
-                            duration: FileExtractor.mediaDuration(b.file.url) ?? 0)])
+                            duration: b.duration)])
                     }
                     onProgress(p)
                 }
-                pipeline(files, force: force, known: known) { item in
+                pipeline(files, force: force, known: known, settings: settings) { item in
                     let path = item.file.url.path
                     defer { tick(path) }
                     if item.unchanged { p.unchanged += 1; return }
@@ -283,7 +292,7 @@ public final class Indexer: @unchecked Sendable {
                                           || stage.count >= self.audioMaxClipsPerBatch) {
                         flushAudio()
                     }
-                    stage.append((item.file, item.kind, mel, frames))
+                    stage.append((item.file, item.kind, mel, frames, item.meta.duration))
                     stageFrames += frames
                     if stageFrames >= self.audioFrameBudget || stage.count >= self.audioMaxClipsPerBatch {
                         flushAudio()
@@ -291,7 +300,7 @@ public final class Indexer: @unchecked Sendable {
                 }
                 flushAudio()   // drain the remaining staged clips
             } else {
-                pipeline(files, force: force, known: known) { item in
+                pipeline(files, force: force, known: known, settings: settings) { item in
                     if item.unchanged { p.unchanged += 1 } else { storeChunks(item.file.url.path, self.embed(item)) }
                     tick(item.file.url.path)
                 }
@@ -350,7 +359,6 @@ public final class Indexer: @unchecked Sendable {
     /// Targeted update for a set of changed paths (from the file watcher). Re-embeds
     /// changed/added supported files and removes deleted/unsupported ones. No crawl.
     public func update(paths: [String], settings: IndexSettings) {
-        queue.sync { active = settings }
         let fm = FileManager.default
         // Resolve the concrete files first: the explicit events, plus a crawl of any directory event
         // (a new folder / bulk move-in carries only the folder path). Then look up the PRIOR stored
@@ -379,7 +387,20 @@ public final class Indexer: @unchecked Sendable {
         // would be O(N*batch); deletePaths + replaceMany do one transaction + one rebuild for the batch.
         var toDelete = Set<String>()
         var toReplace: [(path: String, chunks: [IndexedChunk])] = []
+        // A directory event (folder rename / big drag-in) can crawl thousands of files; flush
+        // periodically so the accumulated embeddings do not peak unbounded in memory, and so
+        // progress survives a crash mid-reconcile. The store batches each flush as one txn.
+        // Failures must not be silent: a dimension mismatch after a model switch would otherwise
+        // "succeed" while storing nothing.
+        func flushReplace() {
+            guard !toReplace.isEmpty else { return }
+            do { try store.replaceMany(toReplace) }
+            catch { Self.log.error("update: replaceMany(\(toReplace.count, privacy: .public)) failed: \(String(describing: error), privacy: .public)") }
+            toReplace.removeAll(keepingCapacity: true)
+        }
         for path in deletedTop where known[path] != nil { toDelete.insert(path) }   // deleted / moved away
+        // Resolve which files actually need (re)embedding - stat-level checks only, no decode.
+        var work: [CrawledFile] = []
         for url in files {
             if isCancelled { break }
             let path = url.path
@@ -395,20 +416,22 @@ public final class Indexer: @unchecked Sendable {
             let mtime = vals.contentModificationDate?.timeIntervalSince1970 ?? 0
             let size = vals.fileSize ?? 0
             if let prev = known[path], prev.modified == mtime, prev.size == size { continue }  // unchanged
-            let chunks = embed(decode(CrawledFile(url: url, modified: mtime, size: size))).filter { Self.isFinite($0.embedding) }
+            work.append(CrawledFile(url: url, modified: mtime, size: size))
+        }
+        // Decode through the same bounded concurrent pipeline as a full pass (PDF raster, mel STFT,
+        // patchify run on background cores instead of serially on this thread); embed serially in
+        // file order. force: true because change detection already happened above.
+        pipeline(work, force: true, known: [:], settings: settings) { item in
+            let path = item.file.url.path
+            let chunks = self.embed(item).filter { Self.isFinite($0.embedding) }
             if chunks.isEmpty { if known[path] != nil { toDelete.insert(path) } }
             else {
                 toReplace.append((path, chunks))
-                // A directory event (folder rename / big drag-in) can crawl thousands of files; flush
-                // periodically so the accumulated embeddings do not peak unbounded in memory, and so
-                // progress survives a crash mid-reconcile. The store batches each flush as one txn.
-                if toReplace.count >= 256 {
-                    try? store.replaceMany(toReplace); toReplace.removeAll(keepingCapacity: true)
-                }
+                if toReplace.count >= 256 { flushReplace() }
             }
         }
         if !toDelete.isEmpty { store.deletePaths(toDelete) }
-        if !toReplace.isEmpty { try? store.replaceMany(toReplace) }
+        flushReplace()
     }
 
     // MARK: - Pipeline
@@ -417,7 +440,7 @@ public final class Indexer: @unchecked Sendable {
     /// serially, on the calling thread; decode runs on up to `activeProcessorCount`
     /// background cores. At most that many items are outstanding (bounds memory).
     private func pipeline(_ files: [CrawledFile], force: Bool, known: [String: StoredFile],
-                          consume: (DecodedItem) -> Void) {
+                          settings: IndexSettings, consume: (DecodedItem) -> Void) {
         if files.isEmpty { return }
         let maxInFlight = max(2, ProcessInfo.processInfo.activeProcessorCount)
         // Second gate, by BYTES not item count: a scanned PDF / video decodes into a big pixel buffer
@@ -437,7 +460,7 @@ public final class Indexer: @unchecked Sendable {
         producerQ.async {
             for (i, file) in files.enumerated() {
                 sem.wait()   // bound outstanding ITEM COUNT (decoding + decoded-not-consumed)
-                let est = self.estimatedDecodedBytes(file)
+                let est = self.estimatedDecodedBytes(file, settings: settings)
                 cond.lock()
                 while ready.outstandingBytes > 0 && ready.outstandingBytes + est > byteCap { cond.wait() }
                 ready.outstandingBytes += est; ready.estimates[i] = est
@@ -455,7 +478,9 @@ public final class Indexer: @unchecked Sendable {
                     cond.lock(); ready.items[i] = item; cond.broadcast(); cond.unlock()
                 } else {
                     decodeQ.async {
-                        let item = self.isCancelled ? DecodedItem(file: file, abandoned: true) : self.decode(file)
+                        let item = self.isCancelled
+                            ? DecodedItem(file: file, abandoned: true)
+                            : self.decode(file, settings: settings)
                         cond.lock(); ready.items[i] = item; cond.broadcast(); cond.unlock()
                     }
                 }
@@ -477,12 +502,12 @@ public final class Indexer: @unchecked Sendable {
 
     /// Cheap (extension-only, no IO) upper estimate of a file's decoded resident bytes, for the
     /// pipeline's byte budget. Media decode to fp32 pixel/mel buffers; text is tiny.
-    private func estimatedDecodedBytes(_ file: CrawledFile) -> Int {
-        let dim = max(256, active.maxImageDimension)
+    private func estimatedDecodedBytes(_ file: CrawledFile, settings: IndexSettings) -> Int {
+        let dim = max(256, settings.maxImageDimension)
         let oneImage = dim * dim * 12   // ~fp32 RGB after the vision preprocess
         let ext = file.url.pathExtension.lowercased()
         if FileExtractor.imageExtensions.contains(ext) { return oneImage }
-        if FileExtractor.videoExtensions.contains(ext) { return max(1, active.maxVideoFrames) * oneImage }
+        if FileExtractor.videoExtensions.contains(ext) { return max(1, settings.maxVideoFrames) * oneImage }
         if FileExtractor.audioExtensions.contains(ext) { return 64_000_000 }   // mel + frame stack, rough
         if FileExtractor.pdfExtensions.contains(ext) || FileExtractor.officeExtensions.contains(ext) {
             return FileExtractor.maxScanPages * oneImage   // may rasterize as a scan -> conservative
@@ -491,66 +516,59 @@ public final class Indexer: @unchecked Sendable {
     }
 
     /// CPU-only decode: extraction, thresholds, frame sampling, audio mel. No GPU/MLX.
-    private func decode(_ file: CrawledFile) -> DecodedItem {
+    /// Also captures display metadata (pixel size / duration) here, on the concurrent stage, so the
+    /// serial embed stage never re-opens the file header.
+    private func decode(_ file: CrawledFile, settings: IndexSettings) -> DecodedItem {
         let category = FileExtractor.kind(for: file.url) ?? .text
         let kind = category.rawValue
+        var meta: (width: Int, height: Int, duration: Double) = (0, 0, 0)
 
         switch category {
         case .image:
-            if active.minImageDimension > 0, let s = FileExtractor.imagePixelSize(file.url),
-               max(s.width, s.height) < active.minImageDimension { return DecodedItem(file: file) }
-        case .video:
-            if active.minVideoSeconds > 0, let d = FileExtractor.mediaDuration(file.url),
-               d < active.minVideoSeconds { return DecodedItem(file: file) }
-        case .audio:
-            if active.minAudioSeconds > 0, let d = FileExtractor.mediaDuration(file.url),
-               d < active.minAudioSeconds { return DecodedItem(file: file) }
+            if let s = FileExtractor.imagePixelSize(file.url) {
+                meta = (s.width, s.height, 0)
+                if settings.minImageDimension > 0, max(s.width, s.height) < settings.minImageDimension {
+                    return DecodedItem(file: file)
+                }
+            }
+        case .video, .audio:
+            if let d = FileExtractor.mediaDuration(file.url) {
+                meta = (0, 0, d)
+                let minS = category == .video ? settings.minVideoSeconds : settings.minAudioSeconds
+                if minS > 0, d < minS { return DecodedItem(file: file) }
+            }
         case .text:
             break
         }
 
         if category == .video {
-            let frames = FileExtractor.videoFrames(file.url, maxFrames: active.maxVideoFrames, maxDimension: active.maxImageDimension)
-            return frames.isEmpty ? DecodedItem(file: file) : DecodedItem(file: file, kind: kind, payload: .images(frames))
+            let frames = FileExtractor.videoFrames(file.url, maxFrames: settings.maxVideoFrames, maxDimension: settings.maxImageDimension)
+            return frames.isEmpty ? DecodedItem(file: file) : DecodedItem(file: file, kind: kind, payload: .images(frames), meta: meta)
         }
         if category == .audio {
             guard let (mel, frames) = OmniAudioPreprocess.melFeatures(url: file.url) else { return DecodedItem(file: file) }
-            return DecodedItem(file: file, kind: kind, payload: .audioMel(mel, frames))
+            return DecodedItem(file: file, kind: kind, payload: .audioMel(mel, frames), meta: meta)
         }
-        let content = (try? FileExtractor.extract(file.url, maxImageDimension: active.maxImageDimension, maxVideoFrames: active.maxVideoFrames)) ?? .empty
+        let content = (try? FileExtractor.extract(file.url, maxImageDimension: settings.maxImageDimension, maxVideoFrames: settings.maxVideoFrames)) ?? .empty
         switch content {
         case .empty:
             return DecodedItem(file: file)
         case .text(let text):
-            if active.minTextChars > 0, text.count < active.minTextChars { return DecodedItem(file: file) }
-            return DecodedItem(file: file, kind: kind, payload: .text(chunk(text)))
+            if settings.minTextChars > 0, text.count < settings.minTextChars { return DecodedItem(file: file) }
+            return DecodedItem(file: file, kind: kind, payload: .text(chunk(text, settings: settings)))
         case .images(let images):
             if images.isEmpty { return DecodedItem(file: file) }
             // Still images / PDF pages: run the CPU preprocess (resize + parallel patchify) HERE,
             // in the concurrent decode stage, so the serialized GPU thread only does the tower.
             let raws = images.map { OmniVisionPreprocess.preprocessRaw($0) }
-            return DecodedItem(file: file, kind: kind, payload: .imagePatches(raws))
+            return DecodedItem(file: file, kind: kind, payload: .imagePatches(raws), meta: meta)
         }
     }
 
     /// GPU embed of decoded content. Runs serially in the consumer.
-    /// Index-time display metadata for a media file: original image dimensions, or audio/video
-    /// duration. Read once per file from the header (cheap next to embedding) so the UI never has to
-    /// touch the file at search time. 0 = not applicable/unknown (text, or a header that won't read).
-    static func mediaMeta(_ url: URL, kind: String) -> (width: Int, height: Int, duration: Double) {
-        switch FileKind(rawValue: kind) {
-        case .image:
-            if let s = FileExtractor.imagePixelSize(url) { return (s.width, s.height, 0) }
-        case .video, .audio:
-            if let d = FileExtractor.mediaDuration(url) { return (0, 0, d) }
-        default: break
-        }
-        return (0, 0, 0)
-    }
-
     private func embed(_ item: DecodedItem) -> [IndexedChunk] {
         let file = item.file, kind = item.kind
-        let meta = Self.mediaMeta(file.url, kind: kind)
+        let meta = item.meta   // captured during decode; never re-open the file header here
         switch item.payload {
         case .empty:
             return []
@@ -610,10 +628,15 @@ public final class Indexer: @unchecked Sendable {
         }
     }
 
-    private func chunk(_ text: String) -> [String] {
-        let limit = max(200, active.maxCharsPerChunk)   // user-set; floor keeps chunks meaningful
-        let scalars = Array(text)
-        if scalars.count <= limit { return [text] }
+    private func chunk(_ text: String, settings: IndexSettings) -> [String] {
+        let limit = max(200, settings.maxCharsPerChunk)   // user-set; floor keeps chunks meaningful
+        // Only the first maxChunksPerFile chunks are ever produced, so cap BEFORE materializing the
+        // Character array (16B/Character: a 2MB extract would otherwise cost ~32MB transient in the
+        // concurrent decode stage, blowing past the pipeline's byte estimate for the file).
+        let needed = max(1, limit - chunkOverlap) * (maxChunksPerFile - 1) + limit
+        let totalCount = text.count
+        if totalCount <= limit { return [text] }
+        let scalars = totalCount > needed ? Array(text.prefix(needed)) : Array(text)
         var chunks: [String] = []
         var start = 0
         let step = max(1, limit - chunkOverlap)
