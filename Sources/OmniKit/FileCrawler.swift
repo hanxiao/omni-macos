@@ -10,7 +10,10 @@ public struct CrawledFile: Sendable {
 /// dirs, package bundles, and well-known noise (node_modules, .git, caches).
 public struct FileCrawler: Sendable {
     public var roots: [URL]
-    public var ignore: OmniIgnore   // the exclude policy; index iff kind(for:) != nil && !ignored
+    public var ignore: OmniIgnore   // the fine exclude policy; index iff kind enabled && !ignored
+    /// Modalities the user has turned on. The coarse filter applied BEFORE `ignore`: a file is
+    /// indexed iff its kind is in this set AND it is not ignored. Default: all four kinds on.
+    public var enabledKinds: Set<FileKind>
     public var maxFileSize: Int
 
     /// Well-known noise directories. No longer special-cased in the crawl - migration SEEDS these as
@@ -21,9 +24,11 @@ public struct FileCrawler: Sendable {
         "Caches", ".Trash", "vendor", "dist", "build", ".next", "target",
     ]
 
-    public init(roots: [URL], ignore: OmniIgnore = OmniIgnore(text: ""), maxFileSize: Int = 200_000_000) {
+    public init(roots: [URL], ignore: OmniIgnore = OmniIgnore(text: ""),
+                enabledKinds: Set<FileKind> = [.text, .image, .video, .audio], maxFileSize: Int = 200_000_000) {
         self.roots = roots
         self.ignore = ignore
+        self.enabledKinds = enabledKinds
         self.maxFileSize = maxFileSize
     }
 
@@ -53,7 +58,7 @@ public struct FileCrawler: Sendable {
                     continue
                 }
                 guard vals.isRegularFile == true,
-                      FileExtractor.kind(for: url) != nil,
+                      let kind = FileExtractor.kind(for: url), enabledKinds.contains(kind),
                       !ignore.isIgnored(url.path, isDir: false) else { continue }
                 let size = vals.fileSize ?? 0
                 if size > maxFileSize { continue }
