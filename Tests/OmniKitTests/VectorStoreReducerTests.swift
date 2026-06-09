@@ -75,6 +75,17 @@ final class VectorStoreReducerTests: XCTestCase {
             let got = VectorStore.reduceTopK(scores: scores, fileID: fileID, fileCount: fc, rows: rows, filter: filter, topK: topK)
             let want = VectorStore.reduceTopKReference(scores: scores, rows: rows, filter: filter, topK: topK)
 
+            // The kind-code fast path (dense per-row UInt8 + intern table, used by the store for
+            // `type:` filters) must produce the identical result as the string-compare fallback.
+            var kindID: [String: UInt8] = [:]
+            let kindCode: [UInt8] = rows.map { r in
+                if let id = kindID[r.kind] { return id }
+                let id = UInt8(kindID.count); kindID[r.kind] = id; return id
+            }
+            let gotKC = VectorStore.reduceTopK(scores: scores, fileID: fileID, fileCount: fc, rows: rows,
+                                               filter: filter, topK: topK, kindCode: kindCode, kindID: kindID)
+            XCTAssertEqual(gotKC.map(key), want.map(key), "trial \(trial): kind-code path")
+
             XCTAssertEqual(got.count, want.count, "trial \(trial): count")
             XCTAssertEqual(got.map(key), want.map(key), "trial \(trial): F=\(F) n=\(n) topK=\(topK) filter kinds=\(filter.kinds) prefix=\(String(describing: filter.folderPrefix)) ext=\(String(describing: filter.ext)) since=\(String(describing: filter.since))")
             // invariants
