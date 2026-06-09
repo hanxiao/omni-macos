@@ -22,6 +22,155 @@ let args = CommandLine.arguments
 // doc-claimed-but-unwired path), and GPU MLX bf16 (resident bf16 matrix, one matmul/query).
 // Reports median per-query latency, bf16-vs-fp32 recall@k, and memory. Clustered synthetic
 // vectors so the recall number is meaningful (uniform-random would make every score ~0).
+// Q8/Q4 vs bf16 matmul micro-bench at the nano MLP up-proj shape, across batch sizes. Answers
+// "does quantizing the model speed up inference on THIS hardware?" empirically (no native int8 pre-M5).
+if args.count >= 2 && args[1] == "quantbench" {
+    let d = 768, dff = 3072, gs = 64
+    func randn(_ shape: [Int]) -> MLXArray {   // deterministic pseudo-random; values irrelevant for timing
+        let n = shape.reduce(1, *); var v = [Float](repeating: 0, count: n); var s: UInt64 = 0x9E3779B97F4A7C15
+        for i in 0 ..< n { s = s &* 6364136223846793005 &+ 1442695040888963407; v[i] = Float(Int32(truncatingIfNeeded: s >> 33)) / Float(Int32.max) }
+        return MLXArray(v, shape)
+    }
+    let W = randn([dff, d]).asType(.bfloat16); eval(W)
+    let (wq8, s8, b8) = quantized(W, groupSize: gs, bits: 8)
+    let (wq4, s4, b4) = quantized(W, groupSize: gs, bits: 4)
+    eval(wq8, s8, wq4, s4)
+    let bf16Bytes = dff * d * 2
+    func arrBytes(_ a: MLXArray) -> Int { a.size * a.dtype.size }
+    print("quantbench: x[B,768] @ W[3072,768].T  (nano MLP up-proj), groupSize=64")
+    print(String(format: "  weight bytes:  bf16=%.2fMB  q8=%.2fMB  q4=%.2fMB",
+                 Double(bf16Bytes) / 1e6,
+                 Double(arrBytes(wq8) + arrBytes(s8) + arrBytes(b8 ?? MLXArray([Float]()))) / 1e6,
+                 Double(arrBytes(wq4) + arrBytes(s4) + arrBytes(b4 ?? MLXArray([Float]()))) / 1e6))
+    for batch in [1, 8, 48, 512] {
+        let x = randn([batch, d]).asType(.bfloat16); eval(x)
+        func timeIt(_ name: String, _ f: () -> MLXArray) -> Double {
+            for _ in 0 ..< 5 { eval(f()) }   // warmup
+            let iters = 300; let t0 = Date()
+            for _ in 0 ..< iters { eval(f()) }
+            return -t0.timeIntervalSinceNow * 1e6 / Double(iters)   // microseconds/call
+        }
+        let tb = timeIt("bf16") { MLX.matmul(x, W.transposed()) }
+        let t8 = timeIt("q8") { quantizedMM(x, wq8, scales: s8, biases: b8, transpose: true, groupSize: gs, bits: 8) }
+        let t4 = timeIt("q4") { quantizedMM(x, wq4, scales: s4, biases: b4, transpose: true, groupSize: gs, bits: 4) }
+        print(String(format: "  batch=%4d   bf16=%6.1fus   q8=%6.1fus (%.2fx)   q4=%6.1fus (%.2fx)",
+                     batch, tb, t8, tb / t8, t4, tb / t4))
+    }
+    exit(0)
+}
+
+// Rapid-interaction memory stress: omni-verify stressbench <modelDir> [iters] [capGB]
+// Simulates the UI stress flow (switch history-query <-> map <-> type/delete/retype) at the GPU
+// level: each iteration does a VARIABLE-shape query embed + a VARIABLE-size folder-map projection +
+// a search, the variable-shape mix that grows MLX's buffer cache. Real cancellation only stops work
+// EARLIER, so running full work every iteration is the worst case for memory. Asserts GPU memory
+// returns to ~baseline (no leak) and peak stays bounded by the cap. Serial, GPU, run in Release.
+if args.count >= 4 && args[1] == "stressbench" {
+    let capGB = Double(args[3]) ?? 6.0
+    omniSetMemoryLimit(Int(capGB * 1_073_741_824))
+    let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[2]))
+    let iters = (args.count >= 5 ? Int(args[4]) : nil) ?? 40
+    let dim = engine.dim
+    func mb(_ b: Int) -> Double { Double(b) / 1_048_576 }
+
+    // A synthetic store to search over (like a real index).
+    var rng: UInt64 = 0x243F6A8885A308D3
+    func nextF() -> Float { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return Float(rng >> 40) / Float(1 << 24) }
+    func gauss() -> Float { let u1 = max(nextF(), 1e-7), u2 = nextF(); return sqrtf(-2 * logf(u1)) * cosf(2 * .pi * u2) }
+    func unit(_ n: Int) -> FolderVectors {
+        var v = [Float](repeating: 0, count: n * dim); var paths: [String] = []; var kinds: [String] = []
+        let kn = ["text", "image", "audio", "video"]
+        for i in 0 ..< n {
+            var s: Float = 0; for k in 0 ..< dim { let x = gauss(); v[i * dim + k] = x; s += x * x }
+            let inv = s > 0 ? 1 / s.squareRoot() : 0; for k in 0 ..< dim { v[i * dim + k] *= inv }
+            paths.append("/f\(i)"); kinds.append(kn[i % 4])
+        }
+        return FolderVectors(paths: paths, kinds: kinds, vectors: v, dim: dim)
+    }
+    let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("stress-\(dim).sqlite")
+    for e in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(at: URL(fileURLWithPath: tmp.path + e)) }
+    let store = try VectorStore(dbURL: tmp)
+    let seed = unit(120_000)
+    var batch: [(path: String, chunks: [IndexedChunk])] = []
+    for i in 0 ..< seed.count {
+        batch.append(("p\(i)", [IndexedChunk(path: "p\(i)", modified: 0, kind: seed.kinds[i], chunkIndex: 0, snippet: "",
+                                             embedding: Array(seed.vectors[i * dim ..< (i + 1) * dim]))]))
+        if batch.count == 4000 { try store.replaceMany(batch); batch.removeAll(keepingCapacity: true) }
+    }
+    if !batch.isEmpty { try store.replaceMany(batch) }
+    _ = store.search(Array(seed.vectors[0 ..< dim]), topK: 50)   // warm the resident base matrix
+
+    let queries = ["tax", "where is the lease agreement pdf scan from last year",
+                   "quarterly earnings report 2024 q3 revenue", "photo of the whiteboard", "a"]
+    let mapSizes = [4_000, 11_000, 7_000, 14_000, 9_000]   // varying shape per iter -> cache churn
+
+    MLX.GPU.clearCache(); MLX.GPU.resetPeakMemory()
+    let base = MLX.GPU.activeMemory
+    print(String(format: "stressbench dim=%d cap=%.0fGB store=%d iters=%d  baseline active=%.0fMB cacheLimit=%.0fMB",
+                 dim, capGB, store.count, iters, mb(base), mb(MLX.Memory.cacheLimit)))
+    var maxActive = base, maxPeak = 0
+    for it in 0 ..< iters {
+        // 1. variable-length query embed (history-query switch / typing)
+        let qv = engine.embedText(queries[it % queries.count], as: .query)
+        // 2. variable-size folder map projection (the variable-shape GPU work)
+        _ = ProjectionEngine.layout(unit(mapSizes[it % mapSizes.count]), k: 15, epochs: 60)
+        // 3. search over the resident index
+        _ = store.search(qv, topK: 50)
+        let a = MLX.GPU.activeMemory, p = MLX.GPU.peakMemory
+        maxActive = max(maxActive, a); maxPeak = max(maxPeak, p)
+        if it % 8 == 0 || it == iters - 1 {
+            print(String(format: "  iter %2d  active=%.0fMB  peak=%.0fMB  cache=%.0fMB", it, mb(a), mb(p), mb(MLX.GPU.cacheMemory)))
+        }
+    }
+    MLX.GPU.clearCache()
+    let endActive = MLX.GPU.activeMemory
+    print(String(format: "RESULT base=%.0fMB  maxActive=%.0fMB  maxPeak=%.0fMB  endActive(after clearCache)=%.0fMB  growth=%.0fMB",
+                 mb(base), mb(maxActive), mb(maxPeak), mb(endActive), mb(endActive - base)))
+    let leaked = mb(endActive - base) > 200   // resident model + base matrix only; >200MB extra = leak
+    let oom = mb(maxPeak) > capGB * 1024 * 1.5
+    print("VERDICT \(leaked ? "LEAK SUSPECTED" : "no leak") \(oom ? "PEAK OVER CAP" : "peak bounded")")
+    for e in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(at: URL(fileURLWithPath: tmp.path + e)) }
+    exit(0)
+}
+
+// Folder-map projection timing: omni-verify projbench [dim] [Ns...]
+// Times the full ProjectionEngine UMAP layout (PCA-2D + kNN + 300 force epochs) at a few point
+// counts, to verify the memory-budgeted map cap (mapPointBudget) keeps the map fast. Serial, GPU.
+if args.count >= 2 && args[1] == "projbench" {
+    let dim = (args.count >= 3 ? Int(args[2]) : nil) ?? 1024
+    var rng: UInt64 = 0x9E3779B97F4A7C15
+    func nextF() -> Float { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return Float(rng >> 40) / Float(1 << 24) }
+    func gauss() -> Float { let u1 = max(nextF(), 1e-7), u2 = nextF(); return sqrtf(-2 * logf(u1)) * cosf(2 * .pi * u2) }
+    func makeData(_ n: Int) -> FolderVectors {
+        let clusters = max(8, n / 500)
+        var centers = [Float](repeating: 0, count: clusters * dim)
+        for i in 0 ..< centers.count { centers[i] = gauss() }
+        var v = [Float](repeating: 0, count: n * dim)
+        var paths: [String] = []; var kinds: [String] = []
+        let kindNames = ["text", "image", "audio", "video"]
+        for i in 0 ..< n {
+            let c = i % clusters; var nrm: Float = 0
+            for k in 0 ..< dim { let x = centers[c * dim + k] + 0.4 * gauss(); v[i * dim + k] = x; nrm += x * x }
+            let inv = nrm > 0 ? 1 / nrm.squareRoot() : 0
+            for k in 0 ..< dim { v[i * dim + k] *= inv }
+            paths.append("/f\(i)"); kinds.append(kindNames[c % 4])
+        }
+        return FolderVectors(paths: paths, kinds: kinds, vectors: v, dim: dim)
+    }
+    let Ns = args.count >= 4 ? args[3...].compactMap { Int($0) } : [5_000, 15_000, 30_000, 60_000]
+    print("projbench dim=\(dim)")
+    for n in Ns {
+        let data = makeData(n)
+        _ = ProjectionEngine.layout(data, k: 15, epochs: 2)   // warm GPU kernels
+        let t = Date()
+        let pts = ProjectionEngine.layout(data, k: 15, epochs: 300)
+        let finite = pts.allSatisfy { $0.position.x.isFinite && $0.position.y.isFinite }
+        print(String(format: "  n=%-6d  UMAP full layout = %.3fs   (%d pts, finite=%@)",
+                     n, -t.timeIntervalSinceNow, pts.count, finite ? "yes" : "NO"))
+    }
+    exit(0)
+}
+
 if args.count >= 2 && args[1] == "searchbench" {
     let N = (args.count >= 3 ? Int(args[2]) : nil) ?? 420_000
     let dim = (args.count >= 4 ? Int(args[3]) : nil) ?? 1024
@@ -575,6 +724,28 @@ if args.count >= 4 && args[1] == "indexbench" {
     exit(0)
 }
 
+// Skip diagnostic: omni-verify idxstat <modelDir> <folder> - index with .profiling settings (force),
+// print scanned/embedded/skipped/unchanged/failed so we can see which workload is being skipped.
+if args.count >= 4 && args[1] == "idxstat" {
+    let engine = ProcessInfo.processInfo.environment["OMNI_VALIDATED"] == "1"
+        ? try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[2]))
+        : try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    let target = URL(fileURLWithPath: args[3])
+    let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("idxs-\(UUID().uuidString).sqlite")
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    let store = try VectorStore(dbURL: tmp)
+    let idx = Indexer(store: store, embedder: engine)
+    let final: IndexProgress = await withCheckedContinuation { cont in
+        let done = NSLock(); var fired = false
+        idx.index(roots: [target], settings: .profiling, force: true) { p in
+            if p.done { done.lock(); let go = !fired; fired = true; done.unlock(); if go { cont.resume(returning: p) } }
+        }
+    }
+    print(String(format: "IDXSTAT scanned=%d embedded=%d skipped=%d unchanged=%d failed=%d",
+                 final.scanned, final.embedded, final.skipped, final.unchanged, final.failed))
+    exit(0)
+}
+
 // Media throughput: omni-verify mediabench <modelDir> <imageDir> [count]
 // Times image embedding batch-1 (current path), splitting CPU preprocess vs GPU tower+backbone,
 // so we can see the media bottleneck and the ceiling a batch-N tower would lift.
@@ -731,6 +902,55 @@ if args.count >= 4 && args[1] == "audiocheck" {
     exit(0)
 }
 
+// NaN localization: omni-verify audionan <modelDir> <clip> [iters]
+// Computes the mel ONCE (CPU), checks it for non-finite, then runs the GPU embed N times in
+// ONE process on that SAME mel. Distinguishes (a) CPU mel race, (b) a per-call GPU race
+// (flips within a process), (c) process-start state (consistent within a process, varies
+// across processes). Prints finite + norm + first 3 components each iter.
+if args.count >= 4 && args[1] == "audionan" {
+    let engine = ProcessInfo.processInfo.environment["OMNI_VALIDATED"] == "1"
+        ? try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[2]))
+        : try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    guard engine.supportsAudio else { print("audio not supported"); exit(1) }
+    let iters = (args.count >= 5 ? Int(args[4]) : nil) ?? 8
+    guard let (mel, frames) = OmniAudioPreprocess.melFeatures(url: URL(fileURLWithPath: args[3])) else {
+        print("AUDIONAN decode/skip (too short or undecodable)"); exit(1)
+    }
+    let melFinite = mel.allSatisfy { $0.isFinite }
+    let melMin = mel.min() ?? 0, melMax = mel.max() ?? 0
+    print(String(format: "AUDIONAN mel: frames=%d  count=%d  finite=%@  range=[%.3f, %.3f]",
+                 frames, mel.count, melFinite ? "yes" : "NO", melMin, melMax))
+    // Experiment: OMNI_WARMUP=1 forces a real GPU compute + eval before the first media embed,
+    // to test whether a process-start uninitialized-memory NaN clears after the device is warm.
+    if ProcessInfo.processInfo.environment["OMNI_WARMUP"] == "1" {
+        var acc = MLXArray.zeros([512, 512], dtype: .float32)
+        for _ in 0 ..< 4 { acc = MLX.matmul(acc, acc) + 1; MLX.eval(acc) }
+        let s = acc.sum().item(Float.self)
+        FileHandle.standardError.write(Data("  WARMUP done (sum=\(s))\n".utf8))
+    }
+    var nNaN = 0
+    for i in 0 ..< iters {
+        guard let v = engine.embedAudioMel(mel, frames: frames) else { print("  iter \(i): nil"); continue }
+        let fin = v.allSatisfy { $0.isFinite }
+        if !fin { nNaN += 1 }
+        let norm = v.reduce(0) { $0 + $1 * $1 }.squareRoot()
+        print(String(format: "  iter %d: finite=%@ norm=%.4f  v[0..3]=[%.4f %.4f %.4f]",
+                     i, fin ? "yes" : "NO", norm, v[0], v.count > 1 ? v[1] : 0, v.count > 2 ? v[2] : 0))
+    }
+    // Experiment: OMNI_RELOAD=1 builds FRESH engines in the same process and re-embeds, to test
+    // whether a bad (NaN) process can recover within-session by reloading (vs being stuck bad).
+    if ProcessInfo.processInfo.environment["OMNI_RELOAD"] == "1" {
+        for r in 0 ..< 3 {
+            let e2 = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+            let v = e2.embedAudioMel(mel, frames: frames) ?? []
+            let fin = v.allSatisfy { $0.isFinite } && !v.isEmpty
+            FileHandle.standardError.write(Data("  RELOAD engine #\(r): finite=\(fin ? "yes" : "NO")\n".utf8))
+        }
+    }
+    print("AUDIONAN result: \(nNaN)/\(iters) NaN  (mel finite=\(melFinite))")
+    exit(0)
+}
+
 // Audio batch-N bench: omni-verify audiobench <modelDir> <audioDir> [budgetFrames]
 // Compares serial batch-1 embedding (one tower+backbone forward per clip) against
 // batch-N (one tower + one backbone forward for a frame-budgeted group of clips), and
@@ -875,6 +1095,524 @@ if args.count >= 3 && args[1] == "levercheck" {
     print(String(format: "  pipelined-vs-single  worst cos=%.6f  %@", worst, worst >= 0.999 ? "OK" : "FAIL"))
     exit(worst >= 0.999 ? 0 : 1)
 }
+
+
+// ===== benchmark harness: compilebench (auto-integrated) =====
+// Compile-lever bench: omni-verify compilebench <modelDir> [nIters]
+// Settles whether mx.compile of the per-layer backbone block (OMNI_COMPILE_BLOCK=1, read once at
+// engine init in Qwen3Backbone) actually pays off. It times the two paths the lever can touch:
+//   (1) BATCH-1 query latency via engine.embedQuery  - high-priority interactive path, where
+//       per-op MLX dispatch overhead dominates and a fused compiled graph should help MOST.
+//   (2) BATCH-48 passage embedding via engine.embedTextBatch(.passage) - the indexing path, which
+//       is far more compute-bound, so any compile win there is expected to be small.
+// The flag is read at init, so ONE process can only measure ONE setting. The maintainer runs this
+// twice: once with the flag OFF, once with OMNI_COMPILE_BLOCK=1, then diffs batch1_ms / batch48_ms.
+// levercheck already proves bit-identical output across the flag, so this command only times.
+if args.count >= 3 && args[1] == "compilebench" {
+    let dir = URL(fileURLWithPath: args[2])
+    let nIters = (args.count >= 4 ? Int(args[3]) : nil) ?? 60
+    let compileOn = ProcessInfo.processInfo.environment["OMNI_COMPILE_BLOCK"] == "1"
+    let engine = try await OmniEngine(modelDir: dir)
+
+    print("compilebench \(dir.lastPathComponent)  OMNI_COMPILE_BLOCK=\(compileOn ? "1(ON)" : "unset(OFF)")  dim=\(engine.dim)  nIters=\(nIters)")
+    print("  NOTE: comparison needs TWO runs - once with the flag OFF, once with OMNI_COMPILE_BLOCK=1 - then diff batch1_ms / batch48_ms / tok_s.")
+
+    func pct(_ sorted: [Double], _ p: Double) -> Double {
+        if sorted.isEmpty { return 0 }
+        let idx = Swift.min(sorted.count - 1, Swift.max(0, Int((Double(sorted.count) * p).rounded(.down))))
+        return sorted[idx]
+    }
+
+    // --- Path 1: BATCH-1 query latency (engine.embedQuery, query prefix, high priority). ---
+    // A single short interactive query - the worst case for dispatch overhead, best case for compile.
+    let query = "quarterly cloud revenue growth across european regions"
+    // Warm up: the first forward of each shape bucket triggers the compile (when the flag is on) and
+    // the lazy MLX kernel build (always), so it must be excluded from the timed window.
+    for _ in 0 ..< 12 { _ = engine.embedQuery(query) }
+    var b1: [Double] = []; b1.reserveCapacity(nIters)
+    for _ in 0 ..< nIters {
+        let t = Date()
+        _ = engine.embedQuery(query)
+        b1.append(-t.timeIntervalSinceNow * 1000.0)   // ms
+    }
+    b1.sort()
+    let b1med = pct(b1, 0.50), b1p99 = pct(b1, 0.99)
+
+    // --- Path 2: BATCH-48 passage embedding (engine.embedTextBatch(.passage), indexing path). ---
+    // Varied-length chunks (1..8 paragraphs) to mimic a real folder, padded to the batch Lmax.
+    let para = "The quarterly revenue report shows strong cloud growth this year, with operating margins improving across every region as distributed systems work paid off. Paris remains the capital of France."
+    var corpus: [String] = []
+    for i in 0 ..< 48 { corpus.append(String(repeating: para + " ", count: (i % 8) + 1)) }
+    _ = engine.embedTextBatch(corpus, as: .passage)   // warm (compile + kernels for this batch shape)
+    // tokensProcessed counts backbone sequence positions for non-query embeds, so its delta over the
+    // timed window is the exact token count - used for an honest tok/s on the indexing path.
+    var b48: [Double] = []; b48.reserveCapacity(nIters)
+    let tok0 = engine.tokensProcessed
+    for _ in 0 ..< nIters {
+        let t = Date()
+        _ = engine.embedTextBatch(corpus, as: .passage)
+        b48.append(-t.timeIntervalSinceNow * 1000.0)   // ms
+    }
+    let tokTotal = engine.tokensProcessed - tok0
+    b48.sort()
+    let b48med = pct(b48, 0.50), b48p99 = pct(b48, 0.99)
+    // tok/s from the median batch latency (steady-state), tokens/batch from the measured delta.
+    let tokPerBatch = Double(tokTotal) / Double(nIters)
+    let tokS = b48med > 0 ? tokPerBatch / (b48med / 1000.0) : 0
+
+    print(String(format: "  batch1  query latency  median=%.3f ms  p99=%.3f ms", b1med, b1p99))
+    print(String(format: "  batch48 passage embed  median=%.2f ms  p99=%.2f ms  (%.0f tok/batch)", b48med, b48p99, tokPerBatch))
+    // Single grep-able result line.
+    print(String(format: "COMPILEBENCH compile=%@ batch1_ms=%.3f batch48_ms=%.2f tok_s=%.0f (b1_p99=%.3f b48_p99=%.2f n=%d)",
+                 compileOn ? "1" : "0", b1med, b48med, tokS, b1p99, b48p99, nIters))
+    exit(0)
+}
+
+
+// ===== benchmark harness: querybreak (auto-integrated) =====
+// Query-latency breakdown: omni-verify querybreak <modelDir> [nIters] [N] [topK]
+// Splits END-TO-END query latency into its stages at the REAL store size and reports where the time
+// goes. Builds a synthetic clustered store of N x dim bf16 vectors once (same clustered-random recipe
+// as searchbench so the GEMV/reduce behaviour is realistic), then over many warm iterations measures:
+//   (a) EMBED  = engine.embedQuery(text)        - the model forward at batch 1 (tokenize + encode)
+//   (b) SEARCH = store.search(precomputedVec)    - the whole search call (resident bf16 GEMV + reduceTopK)
+//   (c) GEMV   = raw MLX bf16 matmul on a resident copy of the matrix - the bandwidth-bound core of (b)
+// reduceTopK is then attributed as SEARCH - GEMV (it is the small remainder inside store.search).
+// COLD path = EMBED + SEARCH (typed a fresh query); CACHED-query path = SEARCH alone (vector already known).
+// Prints one grep-able line per stage with median + p99 ms and the % of the cold end-to-end total.
+if args.count >= 3 && args[1] == "querybreak" {
+    let nIters = (args.count >= 4 ? Int(args[3]) : nil) ?? 120
+    let N = (args.count >= 5 ? Int(args[4]) : nil) ?? 420_000
+    let topK = (args.count >= 6 ? Int(args[5]) : nil) ?? 50
+
+    let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    let dim = engine.dim
+    let clusters = max(64, N / 200)
+    print("querybreak  model=\(args[2])  N=\(N)  dim=\(dim)  topK=\(topK)  iters=\(nIters)  clusters=\(clusters)")
+
+    // --- clustered synthetic vectors (searchbench recipe; Swift RNG, no MLXRandom) ---
+    var rng: UInt64 = 0x9E3779B97F4A7C15
+    func nextF() -> Float { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return Float(rng >> 40) / Float(1 << 24) }
+    func gauss() -> Float { let u1 = max(nextF(), 1e-7), u2 = nextF(); return sqrtf(-2 * logf(u1)) * cosf(2 * .pi * u2) }
+    func normalize(_ v: inout [Float], _ off: Int) { var s: Float = 0; for k in 0..<dim { s += v[off+k]*v[off+k] }; s = sqrtf(s) + 1e-9; for k in 0..<dim { v[off+k] /= s } }
+
+    print("generating \(N) clustered vectors...")
+    var centers = [Float](repeating: 0, count: clusters * dim)
+    for c in 0..<clusters { for k in 0..<dim { centers[c*dim+k] = gauss() }; normalize(&centers, c*dim) }
+    var flat = [Float](repeating: 0, count: N * dim)
+    for i in 0..<N { let c = i % clusters; for k in 0..<dim { flat[i*dim+k] = centers[c*dim+k] + 0.35*gauss() }; normalize(&flat, i*dim) }
+    func vec(_ i: Int) -> [Float] { Array(flat[i*dim..<(i+1)*dim]) }
+
+    // --- load the REAL VectorStore once ---
+    let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("querybreak-\(N)-\(dim).sqlite")
+    for ext in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(at: URL(fileURLWithPath: tmp.path + ext)) }
+    let store = try VectorStore(dbURL: tmp)
+    print("inserting \(N) rows into the real VectorStore...")
+    let tIns = Date()
+    var batch: [(path: String, chunks: [IndexedChunk])] = []
+    for i in 0..<N {
+        batch.append(("p\(i)", [IndexedChunk(path: "p\(i)", modified: 0, kind: "text", chunkIndex: 0, snippet: "", embedding: vec(i))]))
+        if batch.count == 2000 { try store.replaceMany(batch); batch.removeAll(keepingCapacity: true) }
+    }
+    if !batch.isEmpty { try store.replaceMany(batch) }
+    print(String(format: "  inserted in %.1fs  (store.count=%d files=%d)", -tIns.timeIntervalSinceNow, store.count, store.fileCount))
+
+    // --- resident bf16 matrix for the pure-GEMV attribution (mirrors store's internal mlxBase) ---
+    let Mbf = MLXArray(flat, [N, dim]).asType(.bfloat16); MLX.eval(Mbf)
+    func gpuGEMV(_ q: [Float]) -> [Float] {
+        let qb = MLXArray(q, [dim, 1]).asType(.bfloat16)
+        let s = MLX.matmul(Mbf, qb); MLX.eval(s)
+        return s.reshaped([N]).asType(.float32).asArray(Float.self)
+    }
+
+    // --- ~20 varied realistic queries (short + medium) ---
+    let queries = [
+        "tax return",
+        "quarterly earnings report 2024",
+        "where is the lease agreement pdf",
+        "photos from the trip to japan last spring",
+        "machine learning lecture notes",
+        "invoice from the plumber",
+        "resume",
+        "screenshot of the error message",
+        "how do I reset my router password",
+        "wedding guest list spreadsheet",
+        "annual performance review feedback",
+        "recipe for sourdough bread",
+        "meeting notes about the product launch",
+        "scanned passport copy",
+        "budget planning for next year",
+        "the song I recorded on my phone",
+        "contract with the freelance designer",
+        "diagram of the database schema",
+        "vacation request email to my manager",
+        "presentation slides on climate change",
+    ]
+
+    // --- warmup: build the store's resident base, warm the model, prime GEMV path ---
+    let q0 = engine.embedQuery(queries[0])
+    _ = store.search(q0, topK: topK); _ = store.search(q0, topK: topK)
+    _ = gpuGEMV(q0); _ = gpuGEMV(q0)
+    for s in queries { _ = engine.embedQuery(s) }   // warm tokenizer/encoder across all strings
+
+    // precompute one vector per query (the "cached-query" case: vector already known)
+    let qVecs = queries.map { engine.embedQuery($0) }
+
+    func median(_ xs: [Double]) -> Double { xs.sorted()[xs.count/2] }
+    func p99(_ xs: [Double]) -> Double { let s = xs.sorted(); return s[min(s.count-1, Int(Double(s.count)*0.99))] }
+
+    var tEmbed: [Double] = [], tSearch: [Double] = [], tGemv: [Double] = [], tCold: [Double] = []
+    for it in 0..<nIters {
+        let qi = it % queries.count
+        let qStr = queries[qi]
+        let qVec = qVecs[qi]
+        // cold end-to-end: embed a freshly-typed query, then search with that vector
+        let a = Date(); let fresh = engine.embedQuery(qStr); let tE = -a.timeIntervalSinceNow
+        let b = Date(); _ = store.search(fresh, topK: topK); let tEnd = -a.timeIntervalSinceNow
+        _ = b
+        tEmbed.append(tE)
+        tCold.append(tEnd)
+        // cached-query search alone (vector already known) - same matrix, isolates the search call
+        let c = Date(); _ = store.search(qVec, topK: topK); tSearch.append(-c.timeIntervalSinceNow)
+        // pure GEMV core (resident bf16 matmul, no reduceTopK)
+        let d = Date(); _ = gpuGEMV(qVec); tGemv.append(-d.timeIntervalSinceNow)
+    }
+
+    let mE = median(tEmbed)*1000, mS = median(tSearch)*1000, mG = median(tGemv)*1000, mC = median(tCold)*1000
+    let mReduce = max(0, mS - mG)
+    let e2e = mE + mS    // cold end-to-end as the sum of stage medians (== measured cold within noise)
+    func pct(_ x: Double) -> Double { 100 * x / e2e }
+    let bf16MB = Double(N*dim*2) / 1_048_576
+
+    print("")
+    print(String(format: "querybreak STAGE embed          median=%7.3f ms  p99=%7.3f ms   %5.1f%% of e2e", mE, p99(tEmbed)*1000, pct(mE)))
+    print(String(format: "querybreak STAGE search(total)  median=%7.3f ms  p99=%7.3f ms   %5.1f%% of e2e   (GEMV + reduceTopK)", mS, p99(tSearch)*1000, pct(mS)))
+    print(String(format: "querybreak STAGE   gemv         median=%7.3f ms  p99=%7.3f ms   %5.1f%% of e2e   (resident bf16 matmul, %.0f MB streamed)", mG, p99(tGemv)*1000, pct(mG), bf16MB))
+    print(String(format: "querybreak STAGE   reduceTopK   median=%7.3f ms                 %5.1f%% of e2e   (search - gemv)", mReduce, pct(mReduce)))
+    print(String(format: "querybreak PATH  cached-query   median=%7.3f ms  p99=%7.3f ms   (search alone, vector known)", mS, p99(tSearch)*1000))
+    print(String(format: "querybreak PATH  cold          median=%7.3f ms  p99=%7.3f ms   (embed + search, measured)", mC, p99(tCold)*1000))
+    print(String(format: "querybreak E2E   total          median=%7.3f ms   embed %.1f%%  search %.1f%%   embed/search ratio = %.2fx",
+                 e2e, pct(mE), pct(mS), mE / max(mS, 1e-6)))
+    let dominant = mE >= mS ? "EMBED" : "SEARCH"
+    print(String(format: "querybreak VERDICT dominant=%@  embed=%.2f ms  search=%.2f ms  (search is %.0f%% GEMV)", dominant, mE, mS, 100*mG/max(mS,1e-6)))
+    exit(0)
+}
+
+
+// ===== benchmark harness: mrlbench (auto-integrated) =====
+// Matryoshka lever: omni-verify mrlbench <modelDir> <corpusFolder> [nDocs] [nQueries]
+// jina-embeddings-v5-omni is a Matryoshka model: a K-dim embedding is just the first K
+// components of the full L2-normalized vector, RE-NORMALIZED. This bench quantifies exactly
+// what retrieval recall you pay to shrink the stored + query vectors (and thus search GEMV
+// bandwidth and store RAM) by truncating to K dims.
+//
+// Method: embed nDocs real .txt/.md files (as .passage) and nQueries query strings (first
+// line of docs spread across the corpus, as .query) at FULL dim. The exact fp32 full-dim
+// cosine ranking is the GROUND TRUTH (per-FILE, since search pools chunks->files). For each
+// K in [full, 512, 256, 128, 64] we truncate every doc+query vector to the first K comps,
+// re-L2-normalize, build a fresh K-dim VectorStore, run store.search per query, and report
+// recall@10 / recall@40 vs the full-dim ground truth, median (+p99) search latency, and the
+// K-dim bf16 store residency. One grep-able row per K.
+if args.count >= 4 && args[1] == "mrlbench" {
+    let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    let corpus = URL(fileURLWithPath: args[3])
+    let nDocsReq = (args.count >= 5 ? Int(args[4]) : nil) ?? 800
+    let nQueriesReq = (args.count >= 6 ? Int(args[5]) : nil) ?? 40
+    let fullDim = engine.dim
+
+    // --- gather corpus files (recursive, .txt/.md), deterministic order ---
+    let textExts: Set<String> = ["txt", "md", "markdown", "text"]
+    var files: [URL] = []
+    if let en = FileManager.default.enumerator(at: corpus, includingPropertiesForKeys: nil) {
+        for case let u as URL in en.allObjects where textExts.contains(u.pathExtension.lowercased()) { files.append(u) }
+    }
+    files.sort { $0.path < $1.path }
+
+    func readText(_ u: URL) -> String? {
+        if let s = try? String(contentsOf: u, encoding: .utf8) { return s }
+        if let d = try? Data(contentsOf: u), let s = String(data: d, encoding: .utf8) { return s }
+        return nil
+    }
+    // Read + cap content; drop empties.
+    var docPaths: [String] = []
+    var docTexts: [String] = []
+    for u in files {
+        if docPaths.count >= nDocsReq { break }
+        guard let raw = readText(u) else { continue }
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.count < 16 { continue }
+        docPaths.append(u.path)
+        docTexts.append(String(t.prefix(4000)))   // cap for bounded embed time
+    }
+    let nDocs = docPaths.count
+    guard nDocs >= 20 else {
+        FileHandle.standardError.write(Data("mrlbench: need >=20 text docs in \(corpus.path), found \(nDocs)\n".utf8)); exit(1)
+    }
+
+    // --- queries: first meaningful line of docs spread across the corpus ---
+    func firstLine(_ s: String) -> String {
+        for raw in s.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
+            let t = raw.trimmingCharacters(in: .whitespaces)
+            if t.count >= 12 { return String(t.prefix(160)) }
+        }
+        return String(s.prefix(120))
+    }
+    let nQueries = min(nQueriesReq, nDocs)
+    let qStride = max(1, nDocs / nQueries)
+    var qTexts: [String] = []
+    var di = 0
+    while qTexts.count < nQueries && di < nDocs { qTexts.append(firstLine(docTexts[di])); di += qStride }
+
+    print("mrlbench  model=\(URL(fileURLWithPath: args[2]).lastPathComponent)  fullDim=\(fullDim)  nDocs=\(nDocs)  nQueries=\(qTexts.count)")
+
+    // --- embed at full dim (chunked batches) ---
+    func embedAll(_ texts: [String], as t: OmniInputType) -> [[Float]] {
+        var out: [[Float]] = []; out.reserveCapacity(texts.count)
+        let bs = 64; var i = 0
+        while i < texts.count {
+            let j = min(i + bs, texts.count)
+            out.append(contentsOf: engine.embedTextBatch(Array(texts[i..<j]), as: t))
+            i = j
+        }
+        return out
+    }
+    print("embedding \(nDocs) docs (.passage) + \(qTexts.count) queries (.query) at full dim ...")
+    let tEmb = Date()
+    let docFull = embedAll(docTexts, as: .passage)
+    let queryFull = embedAll(qTexts, as: .query)
+    print(String(format: "  embed done in %.1fs", -tEmb.timeIntervalSinceNow))
+
+    // --- ground truth: exact fp32 full-dim cosine ranking, per FILE (path) ---
+    let k10 = min(10, nDocs), k40 = min(40, nDocs)
+    var gt10: [Set<String>] = [], gt40: [Set<String>] = []
+    for qv in queryFull {
+        var scores = [Float](repeating: 0, count: nDocs)
+        for d in 0..<nDocs { scores[d] = cosine(qv, docFull[d]) }
+        let order = scores.indices.sorted { scores[$0] > scores[$1] }
+        gt10.append(Set(order.prefix(k10).map { docPaths[$0] }))
+        gt40.append(Set(order.prefix(k40).map { docPaths[$0] }))
+    }
+
+    // --- truncate-to-K + re-L2-normalize (Matryoshka) ---
+    func truncNorm(_ v: [Float], _ k: Int) -> [Float] {
+        var out = Array(v.prefix(k))
+        var s: Float = 0; for x in out { s += x * x }; s = sqrtf(s) + 1e-9
+        for i in out.indices { out[i] /= s }
+        return out
+    }
+    func median(_ xs: [Double]) -> Double { let s = xs.sorted(); return s.isEmpty ? 0 : s[s.count / 2] }
+    func p99(_ xs: [Double]) -> Double { let s = xs.sorted(); return s.isEmpty ? 0 : s[Swift.min(s.count - 1, Int((0.99 * Double(s.count)).rounded(.up)) - 1)] }
+
+    // K list: full, then standard matryoshka cuts below full.
+    var Ks: [Int] = [fullDim]
+    for k in [512, 256, 128, 64] where k < fullDim { Ks.append(k) }
+
+    let fullBytes = Double(nDocs * fullDim * 2)
+    print("\n  dim   recall@10  recall@40   search_ms (p99)   store_MB   bytes-vs-full")
+    for K in Ks {
+        // Build a fresh K-dim store; one chunk == one file.
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("mrl-\(K)-\(UUID().uuidString).sqlite")
+        let store = try VectorStore(dbURL: tmp)
+        let items: [(path: String, chunks: [IndexedChunk])] = (0..<nDocs).map { i in
+            (path: docPaths[i],
+             chunks: [IndexedChunk(path: docPaths[i], modified: 0, size: 0, kind: "text",
+                                   chunkIndex: 0, snippet: "", embedding: truncNorm(docFull[i], K))])
+        }
+        try store.replaceMany(items)
+
+        // Pre-truncate queries.
+        let qK = queryFull.map { truncNorm($0, K) }
+        // Warmup (builds resident GPU base matrix).
+        _ = store.search(qK[0], filter: SearchFilter(), topK: k40)
+        _ = store.search(qK[0], filter: SearchFilter(), topK: k40)
+
+        var lat: [Double] = []
+        var r10 = 0.0, r40 = 0.0
+        for qi in 0..<qK.count {
+            let t = Date()
+            let hits = store.search(qK[qi], filter: SearchFilter(), topK: k40)
+            lat.append(-t.timeIntervalSinceNow * 1000)
+            let paths = hits.map { $0.path }
+            let top10 = Set(paths.prefix(k10)), top40 = Set(paths.prefix(k40))
+            r10 += Double(gt10[qi].intersection(top10).count) / Double(k10)
+            r40 += Double(gt40[qi].intersection(top40).count) / Double(k40)
+        }
+        let nq = Double(qK.count)
+        let storeMB = Double(nDocs * K * 2) / 1_048_576
+        let pct = 100.0 * Double(K) / Double(fullDim)
+        print(String(format: "  %4d   %.4f     %.4f      %.3f (%.3f)     %.2f      %.0f%%%@",
+                     K, r10 / nq, r40 / nq, median(lat), p99(lat), storeMB, pct,
+                     K == fullDim ? "  <- full (ground truth)" : ""))
+        _ = fullBytes
+        store.close()
+        try? FileManager.default.removeItem(at: tmp)
+    }
+    exit(0)
+}
+
+
+// ===== benchmark harness: idxbreak (auto-integrated) =====
+// Indexing breakdown by modality + stage: omni-verify idxbreak <modelDir> <folder>
+// Phase 1 runs the REAL Indexer once (.profiling, force:true) for the true end-to-end wall, overall
+// files/s, tok/s, store row count, and PEAK phys_footprint (sampled in the progress callback).
+// Phase 2 replays each modality SERIALLY as a decode-only pass then an embed-only pass (mirroring
+// Indexer.decode / Indexer.embed) to attribute that modality's time to CPU decode vs GPU embed -
+// the Indexer fuses the two behind a concurrent-decode -> serial-embed pipeline and exposes no split,
+// so this is the documented way to see it. decode_ms is SERIAL CPU work (the real pipeline overlaps
+// it across `cores`, so effective wall ~ decode_ms/cores); embed_ms is GPU-serialized (the indexer
+// embeds on one MLX stream), so embed_ms is the throughput floor a modality cannot beat. The replay
+// uses batch-1 image/audio/video embeds and OMNI_TEXT_BATCH-wide text batches (no length bucketing),
+// which matches the indexer's per-file granularity closely enough for stage attribution.
+// Serial, single GPU. Run in Release.
+if args.count >= 4 && args[1] == "idxbreak" {
+    func footprintMB() -> Double {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) { p in p.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count) } }
+        return kr == KERN_SUCCESS ? Double(info.phys_footprint) / 1_048_576 : -1
+    }
+    let modelDir = URL(fileURLWithPath: args[2])
+    let target = URL(fileURLWithPath: args[3])
+    let cores = ProcessInfo.processInfo.activeProcessorCount
+    let textB = ProcessInfo.processInfo.environment["OMNI_TEXT_BATCH"].flatMap { Int($0) } ?? 16
+    let settings = IndexSettings.profiling
+    let engine = try await OmniEngine(modelDir: modelDir)
+    print(String(format: "IDXBREAK model=%@ dim=%d  folder=%@  cores=%d textBatch=%d  (img=%@ aud=%@ vid=%@)",
+                 modelDir.lastPathComponent, engine.dim, target.path, cores, textB,
+                 engine.supportsImages ? "y":"n", engine.supportsAudio ? "y":"n", engine.supportsVideo ? "y":"n"))
+
+    // ---- Phase 1: real end-to-end index (.profiling, force:true) ----
+    let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("idxbreak-\(UUID().uuidString).sqlite")
+    defer { for e in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(at: URL(fileURLWithPath: tmp.path + e)) } }
+    let store = try VectorStore(dbURL: tmp)
+    let idx = Indexer(store: store, embedder: engine)
+    let baseRSS = footprintMB()
+    let peakLock = NSLock(); var peakRSS = baseRSS
+    let tok0 = engine.tokensProcessed
+    let t0 = Date()
+    let final: IndexProgress = await withCheckedContinuation { cont in
+        let done = NSLock(); var fired = false
+        idx.index(roots: [target], settings: settings, force: true) { p in
+            let f = footprintMB(); peakLock.lock(); if f > peakRSS { peakRSS = f }; peakLock.unlock()
+            if p.done { done.lock(); let go = !fired; fired = true; done.unlock(); if go { cont.resume(returning: p) } }
+        }
+    }
+    let wall = -t0.timeIntervalSinceNow
+    let toks = engine.tokensProcessed - tok0
+    let fp = footprintMB()
+    print(String(format: "ENDTOEND  embedded=%d (scanned=%d skipped=%d unchanged=%d failed=%d)  rows=%d  %d tok  in %.2fs",
+                 final.embedded, final.scanned, final.skipped, final.unchanged, final.failed, store.count, toks, wall))
+    print(String(format: "OVERALL   %.1f files/s  %.0f tok/s  |  RSS base %.0f -> peak %.0f -> end %.0f MB (peak +%.0f MB)",
+                 Double(final.embedded) / max(wall, 1e-9), Double(toks) / max(wall, 1e-9), baseRSS, peakRSS, fp, peakRSS - baseRSS))
+
+    // ---- Phase 2: per-modality decode-only vs embed-only replay ----
+    var byKind: [FileKind: [CrawledFile]] = [:]
+    FileCrawler(roots: [target], ignore: settings.ignore).walk { f in
+        if let k = FileExtractor.kind(for: f.url) { byKind[k, default: []].append(f) }
+    }
+    // Mirror Indexer.chunk: limit = maxCharsPerChunk (floor 200), overlap 200, cap 40 chunks/file.
+    func chunkText(_ text: String) -> [String] {
+        let limit = max(200, settings.maxCharsPerChunk)
+        let scalars = Array(text)
+        if scalars.count <= limit { return [text] }
+        var chunks: [String] = []; var start = 0; let step = max(1, limit - 200)
+        while start < scalars.count && chunks.count < 40 {
+            let end = min(start + limit, scalars.count)
+            chunks.append(String(scalars[start ..< end]))
+            if end == scalars.count { break }
+            start += step
+        }
+        return chunks
+    }
+
+    print("--- per-modality (decode = serial CPU work, embed = GPU-serial) ---")
+    for kind in [FileKind.text, .image, .audio, .video] {
+        guard let files = byKind[kind], !files.isEmpty else { continue }
+        var decMs = 0.0, embMs = 0.0, embeddedFiles = 0, unitN = 0, tokDelta = 0
+        var note = ""
+        switch kind {
+        case .text:
+            // decode: extract text + chunk (CPU). embed: textB-wide batches over all chunks (GPU).
+            var allChunks: [String] = []
+            let td = Date()
+            for f in files {
+                guard case .text(let s) = (try? FileExtractor.extract(f.url, maxImageDimension: settings.maxImageDimension, maxVideoFrames: settings.maxVideoFrames)) ?? .empty else { continue }
+                let cs = chunkText(s)
+                if !cs.isEmpty { embeddedFiles += 1; allChunks.append(contentsOf: cs) }
+            }
+            decMs = -td.timeIntervalSinceNow * 1000
+            unitN = allChunks.count
+            if !allChunks.isEmpty {
+                _ = engine.embedTextBatch(Array(allChunks.prefix(min(textB, allChunks.count))), as: .passage)   // warm
+                let tk0 = engine.tokensProcessed
+                let te = Date()
+                var i = 0
+                while i < allChunks.count { _ = engine.embedTextBatch(Array(allChunks[i ..< min(i + textB, allChunks.count)]), as: .passage); i += textB }
+                embMs = -te.timeIntervalSinceNow * 1000
+                tokDelta = engine.tokensProcessed - tk0
+            }
+            note = String(format: "%d chunks  %d tok  %.0f tok/s", unitN, tokDelta, embMs > 0 ? Double(tokDelta) / (embMs / 1000) : 0)
+        case .image:
+            // decode: load + preprocessRaw patchify (CPU). embed: embedImages batch-1 per file (GPU).
+            var raws: [OmniVisionPreprocess.RawPatches] = []
+            let td = Date()
+            for f in files {
+                guard case .images(let imgs) = (try? FileExtractor.extract(f.url, maxImageDimension: settings.maxImageDimension)) ?? .empty, let img = imgs.first else { continue }
+                raws.append(OmniVisionPreprocess.preprocessRaw(img))
+            }
+            decMs = -td.timeIntervalSinceNow * 1000
+            embeddedFiles = raws.count; unitN = raws.count
+            if !raws.isEmpty {
+                _ = engine.embedImages([raws[0]])   // warm
+                let te = Date()
+                for r in raws { _ = engine.embedImages([r]) }
+                embMs = -te.timeIntervalSinceNow * 1000
+            }
+            note = String(format: "%d imgs  batch-1 embed", unitN)
+        case .audio:
+            // decode: mel STFT (CPU). embed: embedAudioMel batch-1 per file (GPU).
+            var mels: [(mel: [Float], frames: Int)] = []
+            let td = Date()
+            for f in files { if let m = OmniAudioPreprocess.melFeatures(url: f.url) { mels.append(m) } }
+            decMs = -td.timeIntervalSinceNow * 1000
+            embeddedFiles = mels.count; unitN = mels.count
+            if !mels.isEmpty {
+                _ = engine.embedAudioMel(mels[0].mel, frames: mels[0].frames)   // warm
+                let te = Date()
+                for m in mels { _ = engine.embedAudioMel(m.mel, frames: m.frames) }
+                embMs = -te.timeIntervalSinceNow * 1000
+            }
+            let totFrames = mels.reduce(0) { $0 + $1.frames }
+            note = String(format: "%d clips  %d mel-frames", unitN, totFrames)
+        case .video:
+            // decode: key-frame sample + downscale (CPU). embed: embedVideoFrames per clip (GPU).
+            var clips: [[CGImage]] = []
+            let td = Date()
+            for f in files {
+                if case .images(let frames) = (try? FileExtractor.extract(f.url, maxImageDimension: settings.maxImageDimension, maxVideoFrames: settings.maxVideoFrames)) ?? .empty, !frames.isEmpty { clips.append(frames) }
+            }
+            decMs = -td.timeIntervalSinceNow * 1000
+            embeddedFiles = clips.count; unitN = clips.count
+            if !clips.isEmpty {
+                _ = engine.embedVideoFrames(clips[0])   // warm
+                let te = Date()
+                for c in clips { _ = engine.embedVideoFrames(c) }
+                embMs = -te.timeIntervalSinceNow * 1000
+            }
+            let totF = clips.reduce(0) { $0 + $1.count }
+            note = String(format: "%d clips  %.1f frames/clip", unitN, clips.isEmpty ? 0 : Double(totF) / Double(clips.count))
+        }
+        let total = decMs + embMs
+        let effDec = decMs / Double(max(1, cores))   // decode wall after the pipeline's concurrent decode
+        let bound = effDec > embMs ? "DECODE" : "EMBED"   // which stage gates this modality once overlapped
+        let fps = total > 0 ? Double(embeddedFiles) / (total / 1000) : 0
+        print(String(format: "MOD %-6@ files=%-4d decode=%7.0fms (eff %6.0fms/%dc)  embed=%7.0fms  tot=%7.0fms  %5.1f files/s  bound=%@  | %@",
+                     String(describing: kind), embeddedFiles, decMs, effDec, cores, embMs, total, fps, bound, note))
+    }
+    exit(0)
+}
+
 
 guard args.count >= 3 else {
     FileHandle.standardError.write(Data("usage: omni-verify <modelDir> <text_fixtures.json>\n".utf8))
