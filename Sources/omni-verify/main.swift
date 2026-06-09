@@ -59,6 +59,63 @@ if args.count >= 2 && args[1] == "quantbench" {
     exit(0)
 }
 
+// Tower load/unload + cross-modal query efficiency: omni-verify towerbench <modelDir> <mediaDir>
+// For each keepVision/keepAudio config: engine load time, resident VRAM after load (backbone) and
+// after materializing the towers (one embed per supported modality). The full-vs-text-only gap is
+// the VRAM a disabled modality frees. Also times each modality's query embed + find-similar.
+// Serial, GPU, run in Release.
+if args.count >= 4 && args[1] == "towerbench" {
+    let modelDir = URL(fileURLWithPath: args[2])
+    let mediaDir = URL(fileURLWithPath: args[3])
+    func firstFile(_ exts: [String]) -> URL? {
+        ((try? FileManager.default.contentsOfDirectory(at: mediaDir, includingPropertiesForKeys: nil)) ?? [])
+            .filter { exts.contains($0.pathExtension.lowercased()) }.sorted { $0.path < $1.path }.first
+    }
+    let img = firstFile(["png", "jpg", "jpeg"]), aud = firstFile(["mp3", "m4a", "wav"]), vid = firstFile(["mp4", "mov"])
+    func mb(_ b: Int) -> Double { Double(b) / 1_048_576 }
+    print("towerbench model=\(modelDir.lastPathComponent)  img=\(img?.lastPathComponent ?? "-") aud=\(aud?.lastPathComponent ?? "-") vid=\(vid?.lastPathComponent ?? "-")")
+    print("config                    loadMs   afterLoadMB   afterUseMB   peakMB   towers")
+
+    let configs: [(String, Bool, Bool)] = [("full", true, true), ("text-only", false, false),
+                                           ("vision-only(img+vid)", true, false), ("audio-only", false, true)]
+    var hold: OmniEngine? = nil
+    for (label, kv, ka) in configs {
+        hold = nil                       // release the prior engine before measuring a clean baseline
+        MLX.GPU.clearCache(); MLX.GPU.resetPeakMemory()
+        let base = MLX.GPU.activeMemory
+        let t0 = Date()
+        let e = try await OmniEngine(modelDir: modelDir, keepVision: kv, keepAudio: ka)
+        let loadMs = -t0.timeIntervalSinceNow * 1000
+        let afterLoad = MLX.GPU.activeMemory - base
+        _ = e.embedText("a quick search query about quarterly reports", as: .query)
+        if kv, let img { _ = e.embedFileQuery(img) }
+        if kv, let vid { _ = e.embedFileQuery(vid) }
+        if ka, let aud { _ = e.embedFileQuery(aud) }
+        let afterUse = MLX.GPU.activeMemory - base
+        let peak = MLX.GPU.peakMemory - base
+        print(String(format: "%-24@  %6.0f   %10.0f   %10.0f   %6.0f   img=%@ aud=%@",
+                     label, loadMs, mb(afterLoad), mb(afterUse), mb(peak),
+                     e.supportsImages ? "y" : "n", e.supportsAudio ? "y" : "n"))
+        hold = e
+    }
+
+    // Cross-modal query + find-similar latency on the FULL engine (warm).
+    guard let e = hold else { exit(0) }
+    func timeN(_ n: Int, _ f: () -> Void) -> Double {
+        f(); let t = Date(); for _ in 0 ..< n { f() }; return -t.timeIntervalSinceNow / Double(n) * 1000
+    }
+    print("\nquery embed latency (median of 8, ms):")
+    print(String(format: "  text  : %.2f", timeN(8) { _ = e.embedText("where is the lease agreement", as: .query) }))
+    if let img { print(String(format: "  image : %.2f", timeN(8) { _ = e.embedFileQuery(img) })) }
+    if let aud { print(String(format: "  audio : %.2f", timeN(8) { _ = e.embedFileQuery(aud) })) }
+    if let vid { print(String(format: "  video : %.2f", timeN(8) { _ = e.embedFileQuery(vid) })) }
+    print("find-similar (asDocument:true) re-embed latency (ms):")
+    if let img { print(String(format: "  image : %.2f", timeN(8) { _ = e.embedFileQuery(img, asDocument: true) })) }
+    if let aud { print(String(format: "  audio : %.2f", timeN(8) { _ = e.embedFileQuery(aud, asDocument: true) })) }
+    print("(note: find-similar on an INDEXED file reuses store.fileVector - an O(dim) host read, no GPU embed at all)")
+    exit(0)
+}
+
 // Rapid-interaction memory stress: omni-verify stressbench <modelDir> [iters] [capGB]
 // Simulates the UI stress flow (switch history-query <-> map <-> type/delete/retype) at the GPU
 // level: each iteration does a VARIABLE-shape query embed + a VARIABLE-size folder-map projection +
