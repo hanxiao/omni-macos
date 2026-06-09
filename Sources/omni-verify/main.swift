@@ -1018,7 +1018,7 @@ if args.count >= 4 && args[1] == "audionan" {
     exit(0)
 }
 
-// Audio batch-N bench: omni-verify audiobench <modelDir> <audioDir> [budgetFrames]
+// Audio batch-N bench: omni-verify audiobench <modelDir> <audioDir> [budgetFrames] [maxClips]
 // Compares serial batch-1 embedding (one tower+backbone forward per clip) against
 // batch-N (one tower + one backbone forward for a frame-budgeted group of clips), and
 // splits the mel STFT preprocess (now parallelized) from the GPU forward.
@@ -1027,6 +1027,7 @@ if args.count >= 4 && args[1] == "audiobench" {
     guard engine.supportsAudio else { print("audio not supported by this model"); exit(1) }
     let dir = URL(fileURLWithPath: args[3])
     let budget = args.count >= 5 ? (Int(args[4]) ?? 24000) : 24000
+    let maxClips = args.count >= 6 ? (Int(args[5]) ?? 16) : 16
     let exts: Set<String> = ["wav", "mp3", "m4a", "aac", "flac", "aif", "aiff", "caf"]
     let urls = ((try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [])
         .filter { exts.contains($0.pathExtension.lowercased()) }.sorted { $0.path < $1.path }
@@ -1059,7 +1060,7 @@ if args.count >= 4 && args[1] == "audiobench" {
         var groupMels: [[Float]] = []
         var groupFrames: [Int] = []
         var acc = 0
-        while i < mels.count && (groupMels.isEmpty || acc + mels[i].frames <= budget) && groupMels.count < 16 {
+        while i < mels.count && (groupMels.isEmpty || acc + mels[i].frames <= budget) && groupMels.count < maxClips {
             groupMels.append(mels[i].mel); groupFrames.append(mels[i].frames); acc += mels[i].frames; i += 1
         }
         done += (engine.embedAudioMelBatch(groupMels, frames: groupFrames)?.count ?? 0)

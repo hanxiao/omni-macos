@@ -99,9 +99,26 @@ public enum ModelLocator {
 /// same position as text, fixing cross-modal alignment (Nano's image vectors were orthogonal).
 public let omniEmbeddingVersion = "omni-2-mediasuffix"
 
+/// The user's effective memory cap (the Settings cap; physical RAM when Unlimited). OmniKit's
+/// batching budgets (image patch packing, audio batch sizing, the decode-pipeline byte gate)
+/// derive from THIS, not from physical RAM: the cap is the contract the user set in a public app,
+/// the machine underneath is incidental. Written from the main actor when the setting changes and
+/// read lock-free from worker threads - an Int store is atomic on arm64, and a momentarily stale
+/// value only shifts a batch boundary.
+public enum OmniMemoryBudget {
+    nonisolated(unsafe) public internal(set) static var capBytes: Int = Int(ProcessInfo.processInfo.physicalMemory)
+    public static var capGB: Double { Double(capBytes) / 1_073_741_824 }
+    /// Linear scale anchored so the DEFAULT 6GB cap reproduces the historical tuned value - users
+    /// who never touch Settings see byte-identical batching; raising the cap scales budgets up.
+    public static func scaled(anchor6GB: Int, floor: Int, ceiling: Int) -> Int {
+        max(floor, min(ceiling, Int(capGB / 6.0 * Double(anchor6GB))))
+    }
+}
+
 /// Hard-cap MLX memory usage (bytes). 0 = library default (no explicit cap). The
 /// buffer cache is set to half the limit. Takes effect immediately and globally.
 public func omniSetMemoryLimit(_ bytes: Int) {
+    OmniMemoryBudget.capBytes = bytes > 0 ? bytes : Int(ProcessInfo.processInfo.physicalMemory)
     if bytes > 0 {
         MLX.Memory.memoryLimit = bytes
         MLX.Memory.cacheLimit = max(bytes / 2, 256 * 1024 * 1024)

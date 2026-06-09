@@ -116,6 +116,9 @@ public final class Indexer: @unchecked Sendable {
     // Audio batch-N: cap clips per tower+backbone forward by a TOTAL-FRAME budget so peak
     // VRAM is bounded (the backbone forward is O(B*Lmax^2); Lmax grows ~frames/4). A clip
     // longer than the budget on its own is embedded alone. 24000 frames ~= 4 min of audio.
+    // Deliberately NOT scaled with the memory cap: measured on a mixed-length corpus (48 clips),
+    // batch-N at 4x budget was SLOWER than this (0.86x vs 0.92x of batch-1 - right-padding to a
+    // long clip's Lmax wastes quadratic backbone work), so a bigger cap buys nothing here.
     public var audioFrameBudget = 24000
     public var audioMaxClipsPerBatch = 16
 
@@ -467,7 +470,10 @@ public final class Indexer: @unchecked Sendable {
         // high-RAM machine the cap is large enough that the count semaphore always dominates (no
         // throughput change). Estimated from extension (no extra IO); the `outstandingBytes == 0` guard
         // always admits at least one item, so a single oversized file never deadlocks.
-        let byteCap = max(384_000_000, Int(ProcessInfo.processInfo.physicalMemory) / 8)
+        // Derived from the USER'S memory cap (unified memory: decoded pixel/mel buffers compete
+        // with the GPU budget), not from physical RAM - phys/8 on a big machine was a 64GB gate,
+        // i.e. no gate at all, regardless of how tight the user set the cap.
+        let byteCap = max(384_000_000, OmniMemoryBudget.capBytes / 6)
         let decodeQ = DispatchQueue(label: "omni.decode", attributes: .concurrent)
         let producerQ = DispatchQueue(label: "omni.producer")
         let cond = NSCondition()

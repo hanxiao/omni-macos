@@ -205,10 +205,14 @@ final class AppModel {
         let capGB = maxMemoryGB > 0 ? maxMemoryGB : physicalMemoryGB
         let bytesPerPoint = Double(max(256, engineDim) * 4 * 5)   // X + centered copy + transient temps
         let n = Int(capGB * 0.12 * 1_073_741_824 / bytesPerPoint) // give the map ~12% of the cap
-        // Ceilings keep the map responsive even with memory to spare: UMAP runs kNN + a 300-epoch force
-        // layout (~0.3s at 15k / 2s at 60k on an M3 Ultra, ~10x that on a base M-series GPU), so cap
-        // it below PCA, which is an N-light SVD. The memory budget above pulls both lower on low RAM.
-        return max(2_000, min(n, mapUsesUMAP ? 15_000 : 60_000))
+        // Ceilings scale with the USER'S cap (anchored so the default 6GB cap keeps the tuned
+        // 15k/60k), since the kNN tiles + force buffers are what the cap is bounding. UMAP stays
+        // below PCA: its layout is quadratic in landmarks (~0.3s at 15k / 2s at 60k on an M3 Ultra,
+        // ~10x that on a base M-series GPU), while PCA is an N-light SVD.
+        let ceiling = mapUsesUMAP
+            ? max(5_000, min(60_000, Int(capGB / 6.0 * 15_000)))
+            : max(20_000, min(250_000, Int(capGB / 6.0 * 60_000)))
+        return max(2_000, min(n, ceiling))
     }
 
     /// Ceiling on TOTAL dots in the map (landmarks + placed rest). Placement cost is linear and its
