@@ -143,10 +143,14 @@ struct HTTPResponse {
     /// Build a JSON response from a JSONSerialization-compatible object.
     static func json(_ obj: Any, status: Int = 200) -> HTTPResponse {
         let data: Data
+        var status = status
         if let d = try? JSONSerialization.data(withJSONObject: obj, options: []) {
             data = d
         } else {
+            // e.g. a NaN Float slipped into a vector: the payload is garbage, so the status must
+            // say failure - a 200 here would make clients ingest the error object as a result.
             data = Data("{\"error\":\"serialization failure\"}".utf8)
+            status = 500
         }
         return HTTPResponse(
             status: status,

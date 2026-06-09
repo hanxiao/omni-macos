@@ -266,6 +266,7 @@ struct ContentView: View {
                         }
                     } label: { Image(systemName: "arrow.up.arrow.down") }
                     .help("Sort by \(model.sortOrder.title)")
+                    .accessibilityLabel("Sort Results")
 
                     Picker("View", selection: Binding(get: { model.viewMode }, set: { model.viewMode = $0 })) {
                         Image(systemName: "list.bullet").accessibilityLabel("List view").tag(ResultViewMode.list)
@@ -336,6 +337,7 @@ struct ContentView: View {
             Image(systemName: model.filtersActive ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
         }
         .help("Filter results")
+        .accessibilityLabel("Filter Results")
     }
 
     private func scheduleSearch() {

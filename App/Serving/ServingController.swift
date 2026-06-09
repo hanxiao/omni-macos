@@ -1,6 +1,7 @@
 import Foundation
 import OmniKit
 import Observation
+import Security
 
 /// The single serving controller AppModel owns. The SwiftUI tab binds only to the members
 /// documented here; AppModel wires the engine/store via attach(). @MainActor so all
@@ -16,7 +17,10 @@ final class ServingController {
     var enabled: Bool = false { didSet { persist(); reconcile() } }
     var scope: ServingScope = .local { didSet { persist(); if isRunning { restart() } } }
     var port: Int = 51234 { didSet { persist(); if isRunning { restart() } } }
-    var bearerToken: String = "" { didSet { persist() } } // empty = none; applied on next start
+    // The auth closure snapshots the token at start, so a running server MUST restart to apply a
+    // change - otherwise "switch to LAN, then generate a token" leaves the listener unauthenticated
+    // while the UI shows a token set.
+    var bearerToken: String = "" { didSet { persist(); if isRunning { restart() } } }
 
     // MARK: Published runtime state (read-only for the view)
 
@@ -97,10 +101,15 @@ final class ServingController {
         stopServer()   // cancel any prior/orphan server before binding a new listener (avoids EADDRINUSE)
 
         // Snapshot settings into a Sendable auth closure: localhost never requires a token;
-        // a token set on a public bind is enforced.
+        // a public (LAN) bind ALWAYS requires one. Anyone on the network could otherwise call
+        // /v1/search and enumerate file paths + snippets, so an empty token on public scope is
+        // filled with a generated one rather than served open.
         let isPublic = (scope == .public)
+        if isPublic && bearerToken.isEmpty {
+            bearerToken = Self.generateToken()   // didSet persists; restart guard below is no-op while starting
+        }
         let token = bearerToken
-        let requireToken = isPublic && !token.isEmpty
+        let requireToken = isPublic
         let auth: @Sendable (HTTPRequest) -> Bool = { req in
             guard requireToken else { return true }
             if req.bearer == token { return true }
@@ -186,6 +195,16 @@ final class ServingController {
         defaults.set(scope.rawValue, forKey: "omni.serving.scope")
         defaults.set(port, forKey: "omni.serving.port")
         defaults.set(bearerToken, forKey: "omni.serving.token")
+    }
+
+    /// URL-safe 192-bit random token (shared by the Generate button and the public-scope autofill).
+    static func generateToken() -> String {
+        var bytes = [UInt8](repeating: 0, count: 24)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        return Data(bytes).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
     }
 
     /// Best-effort LAN IPv4 for display when bound publicly. Falls back to 0.0.0.0.

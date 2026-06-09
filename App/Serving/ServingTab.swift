@@ -126,7 +126,7 @@ struct ServingTab: View {
                 .buttonStyle(.borderless).foregroundStyle(.secondary)
                 .help("Copy").disabled(model.serving.bearerToken.isEmpty)
                 Button("Generate New") {
-                    model.serving.bearerToken = Self.newToken()
+                    model.serving.bearerToken = ServingController.generateToken()
                     revealToken = true   // show it so it can be copied
                 }
                 .buttonStyle(.link)
@@ -134,18 +134,9 @@ struct ServingTab: View {
         } header: {
             Text("Access")
         } footer: {
-            Text("Local network reaches other devices, so set a token to require it. Port or scope changes restart the server.")
+            Text("Local network always requires a token (one is generated if empty). Token, port, or scope changes restart the server.")
                 .font(.caption).foregroundStyle(.secondary)
         }
-    }
-
-    private static func newToken() -> String {
-        var bytes = [UInt8](repeating: 0, count: 24)
-        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
-        return Data(bytes).base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
     }
 
     // MARK: - Example

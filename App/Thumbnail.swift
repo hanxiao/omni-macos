@@ -83,7 +83,20 @@ struct Thumbnail: View {
             scale: scale,
             representationTypes: .thumbnail
         )
-        guard let rep = try? await QLThumbnailGenerator.shared.generateBestRepresentation(for: request) else { return }
+        // The async overlay of generateBestRepresentation does NOT forward Swift cancellation to
+        // QuickLook, so a fast scroll through a grid queued a full disk+decode generation for every
+        // row that ever appeared, all running to completion AHEAD of the rows now visible. Bridge
+        // the completion API and cancel the QuickLook request when the row's .task is cancelled.
+        let rep: QLThumbnailRepresentation? = await withTaskCancellationHandler {
+            await withCheckedContinuation { (cont: CheckedContinuation<QLThumbnailRepresentation?, Never>) in
+                QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { rep, _ in
+                    cont.resume(returning: rep)
+                }
+            }
+        } onCancel: {
+            QLThumbnailGenerator.shared.cancel(request)
+        }
+        guard let rep, !Task.isCancelled else { return }
         let img = rep.nsImage
         ThumbnailCache.shared.store(img, key)
         image = img
