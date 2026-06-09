@@ -1147,7 +1147,9 @@ final class AppModel {
             // weights + tokenizer) - they're independent, so overlap removes the store load from the
             // critical path. VectorStore/OmniEngine are Sendable; neither touches MainActor state here.
             async let storeC = try VectorStore(dbURL: try Self.indexURL())
-            async let engineC = OmniEngine(modelDir: dir)
+            // loadValidated self-tests the media embedding path and reloads weights if the first
+            // (cold) load hit the MLX uninitialized-memory NaN, so media indexes reliably.
+            async let engineC = OmniEngine.loadValidated(modelDir: dir)
             let store = try await storeC
             let engine = try await engineC
             // On a model/db switch, close the PREVIOUS store off the main actor: dropping its last ref

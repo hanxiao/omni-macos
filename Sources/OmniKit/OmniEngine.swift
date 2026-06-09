@@ -132,6 +132,8 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     private let mediaSuffix: [Int]
     public let dim: Int
     public let modelDir: URL
+    /// Mel-bin count for the audio path, kept so `loadValidated` can build a synthetic self-test input.
+    private let audioMelBins: Int
     public var supportsImages: Bool { imageEncoder != nil }
     public var supportsVideo: Bool { imageEncoder != nil }
     public var supportsAudio: Bool { audioEncoder != nil }
@@ -154,6 +156,62 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         self.imageEncoder = OmniImageEncoder(weights: weights, config: config)
         self.audioEncoder = OmniAudioEncoder(weights: weights, config: config)
         self.dim = config.text.hiddenSize
+        self.audioMelBins = config.audio.numMelBins
+    }
+
+    /// Build an engine whose media (image/audio/video) embedding path is verified NaN-free.
+    ///
+    /// The FIRST weight load in a process intermittently reads uninitialized GPU memory, which
+    /// corrupts the loaded weights and makes every media embedding come out NaN. It is per-process
+    /// (a launch is either all-good or all-NaN for media), hits ~60% of cold loads, and leaves the
+    /// text path unaffected. A freshly reconstructed engine reloads clean weights, so we self-test
+    /// the media path on a synthetic input and rebuild until it is finite. One retry is virtually
+    /// always enough; we cap attempts and, in the (unobserved) event they all fail, return the last
+    /// engine so the app still runs (media files just skip, as before) rather than failing to launch.
+    public static func loadValidated(modelDir: URL, gpuCacheBytes: Int = 0, maxAttempts: Int = 4) async throws -> OmniEngine {
+        var engine = try await OmniEngine(modelDir: modelDir, gpuCacheBytes: gpuCacheBytes)
+        var attempt = 1
+        while attempt < maxAttempts && !engine.mediaPathFinite() {
+            FileHandle.standardError.write(Data("OmniEngine: media self-test produced NaN on load attempt \(attempt); reloading weights\n".utf8))
+            engine = try await OmniEngine(modelDir: modelDir, gpuCacheBytes: gpuCacheBytes)
+            attempt += 1
+        }
+        return engine
+    }
+
+    /// Self-test the media (injected-embeddings) backbone path that the cold-load NaN corrupts,
+    /// using a synthetic finite input. Returns true if the embedding is finite, or if the model has
+    /// no media path (a text-only model never exhibits the issue). Audio and image share the same
+    /// backbone weights, so an audio probe also covers the image/video path.
+    /// `probes`: a corrupted load NaNs most but not all media embeds (a bad process has a high,
+    /// not 100%, per-embed NaN rate), so probe several times and require every one finite - one
+    /// probe would let a grossly-bad engine slip through (and then mostly NaN real files).
+    private func mediaPathFinite(probes: Int = 3) -> Bool {
+        for _ in 0 ..< probes {
+            if supportsAudio {
+                let frames = 8   // >= 3 mel frames so the audio tower pool is well-defined
+                let mel = [Float](repeating: 0, count: audioMelBins * frames)
+                guard let v = embedAudioMel(mel, frames: frames), !v.isEmpty else { return true }
+                if !v.allSatisfy({ $0.isFinite }) { return false }
+            } else if supportsImages {
+                let raw = OmniVisionPreprocess.preprocessRaw(Self.solidTestImage())
+                guard let vs = embedImages([raw]), let v = vs.first else { return true }
+                if !v.allSatisfy({ $0.isFinite }) { return false }
+            } else {
+                return true   // text-only model: never exhibits the issue
+            }
+        }
+        return true
+    }
+
+    /// A tiny solid-gray CGImage for the image self-test (CoreGraphics only, no AppKit).
+    private static func solidTestImage(side: Int = 56) -> CGImage {
+        let cs = CGColorSpaceCreateDeviceRGB()
+        let ctx = CGContext(data: nil, width: side, height: side, bitsPerComponent: 8, bytesPerRow: 0,
+                            space: cs, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        ctx.setFillColor(CGColor(red: 0.5, green: 0.5, blue: 0.5, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: side, height: side))
+        return ctx.makeImage()!
     }
 
     /// Convenience initializer that locates the model automatically.
@@ -161,7 +219,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         guard let dir = ModelLocator.resolve() else {
             throw OmniError.model("no model found. Set OMNI_MODEL_DIR or install to ~/Library/Application Support/Omni/model")
         }
-        return try await OmniEngine(modelDir: dir)
+        return try await OmniEngine.loadValidated(modelDir: dir)
     }
 
     /// Serialize MLX work. `highPriority` calls run before any waiting low-priority
