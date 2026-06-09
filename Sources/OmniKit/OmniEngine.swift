@@ -105,6 +105,11 @@ public func omniSetMemoryLimit(_ bytes: Int) {
     if bytes > 0 {
         MLX.Memory.memoryLimit = bytes
         MLX.Memory.cacheLimit = max(bytes / 2, 256 * 1024 * 1024)
+    } else {
+        // "Unlimited" = no compute cap, but STILL bound the reclaimable buffer cache. Otherwise
+        // sustained variable-shape work (folder maps + query embeds of changing sizes) lets MLX's
+        // buffer cache creep toward physical RAM, which reads as the app slowly eating memory.
+        MLX.Memory.cacheLimit = max(Int(ProcessInfo.processInfo.physicalMemory) / 3, 512 * 1024 * 1024)
     }
 }
 
