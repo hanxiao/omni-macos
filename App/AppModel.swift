@@ -153,9 +153,12 @@ final class AppModel {
     var folderProjectionFitting = false
     private var projectionTask: Task<Void, Never>?
     private var projectionCache: [URL: ProjectionResult] = [:]   // final layout + kNN per folder URL
+    private var projectionTotals: [URL: Int] = [:]               // total files under each cached folder (for "N of M")
     private var projectionCacheOrder: [URL] = []                 // LRU order, oldest first
     private let projectionCacheCap = 6                           // bound: each entry is N points + N*k kNN
     private var folderMapRefitPending = false                    // map refit deferred until the folder stops indexing
+    /// Files under the currently shown folder before map subsampling (caption shows "N of M" when M > N).
+    private(set) var folderProjectionTotal = 0
 
     /// Refit the embedding map for the selected folder if a refit was deferred while it indexed, now
     /// that no pass touches it. Called from index/reconcile completions.
@@ -168,13 +171,15 @@ final class AppModel {
 
     /// Insert a fitted layout, evicting the least-recently-used folder over the cap. Browsing many large
     /// folders otherwise retained every one's full point cloud + kNN graph for the whole session.
-    private func cacheProjection(_ url: URL, _ result: ProjectionResult) {
+    private func cacheProjection(_ url: URL, _ result: ProjectionResult, total: Int) {
         if projectionCache[url] == nil { projectionCacheOrder.append(url) }
         else { touchProjection(url) }
         projectionCache[url] = result
+        projectionTotals[url] = total
         while projectionCacheOrder.count > projectionCacheCap {
             let evict = projectionCacheOrder.removeFirst()
             projectionCache[evict] = nil   // re-fit on return is debounced + GPU-gated; map only, never retrieval
+            projectionTotals[evict] = nil
         }
     }
     private func touchProjection(_ url: URL) {
@@ -186,7 +191,7 @@ final class AppModel {
     var mapUsesUMAP: Bool = UserDefaults.standard.bool(forKey: "omni.mapUsesUMAP") {
         didSet {
             UserDefaults.standard.set(mapUsesUMAP, forKey: "omni.mapUsesUMAP")
-            projectionCache.removeAll(); projectionCacheOrder.removeAll()   // cached layouts belong to the other mode
+            projectionCache.removeAll(); projectionCacheOrder.removeAll(); projectionTotals.removeAll()   // cached layouts belong to the other mode
             if let url = selectedFolderForViz { selectFolderForVisualization(url) }   // re-fit in the new mode
         }
     }
@@ -886,12 +891,17 @@ final class AppModel {
 
     /// Entry point for the Content tab toggle. Turning a kind OFF while it has indexed files asks
     /// first (purge vs keep); turning ON applies immediately and indexes the newly included files.
-    func toggleKind(_ k: FileKind, on: Bool) {
+    func toggleKind(_ k: FileKind, on: Bool) async {
         if on { applyKind(k, on: true, purge: false); return }
-        let count = store?.fileCount(kind: k.rawValue) ?? 0
+        // Count this kind's indexed files OFF the main actor: fileCount(kind:) is a queue.sync linear
+        // scan over the whole in-memory row set, which would stall the UI on a large index.
+        let store = self.store
+        let count = await Task.detached { store?.fileCount(kind: k.rawValue) ?? 0 }.value
         if count > 0 { pendingDisable = PendingDisable(kind: k, count: count) }   // ask; dialog calls applyKind
         else { applyKind(k, on: false, purge: false) }
     }
+
+    private var modalityReloadTask: Task<Void, Never>?
 
     /// Commit a modality change: update the set, optionally purge its embeddings, reload the engine
     /// only when the tower requirement changed (to free/load VRAM), and reindex when turning one on.
@@ -901,23 +911,38 @@ final class AppModel {
         settings.set(k, on)
         UserDefaults.standard.set(settings.enabledKinds.map { $0.rawValue }, forKey: "omni.indexKinds")
         if on { clearKindExcludesFromIgnore(k) }       // make the toggle authoritative over legacy excludes
-        if !on, purge, let store { store.deleteKind(k.rawValue); refreshIndexStats(store) }
+        if !on, purge, let store {
+            // deleteKind is a SQL DELETE + O(N) in-place row compaction; run it off the main actor like
+            // every other index mutation, then refresh stats back on the main actor.
+            Task.detached(priority: .utility) { store.deleteKind(k.rawValue); await MainActor.run { self.refreshIndexStats(store) } }
+        }
         if enabledKindTowers != oldTowers {
-            // Reload so the dropped tower leaves VRAM (or the newly needed one loads). bootstrap is the
-            // tested engine-swap path and ends with an incremental pass, which picks up a newly enabled
-            // kind's files on its own.
+            // Reload so the dropped tower leaves VRAM (or the newly needed one loads). Debounce so a
+            // burst of toggles coalesces into ONE bootstrap that reads the FINAL modality set - two
+            // concurrent bootstraps would each load an engine and race the swap, possibly leaving the
+            // engine out of sync with the towers. bootstrap ends with an incremental pass that picks up
+            // newly enabled files.
             phase = .loadingModel
-            Task { await bootstrap() }
+            modalityReloadTask?.cancel()
+            modalityReloadTask = Task { [weak self] in
+                try? await Task.sleep(for: .milliseconds(250))
+                guard !Task.isCancelled else { return }
+                await self?.bootstrap()
+            }
         } else if on {
             startIndexing()   // tower already resident; just crawl the now-included files
         }
     }
 
-    /// Re-enabling a modality should fully include it again, so drop any leftover `*.ext` excludes a
-    /// prior version synthesized for this kind when it was off (the toggle is now the source of truth).
+    /// Re-enabling a modality should fully include it again, so drop a leftover `*.ext` exclude block a
+    /// prior version synthesized for this kind when it was off. Strip ONLY when EVERY one of the kind's
+    /// extensions is present as a bare glob (the synthesized signature); a user's hand-typed subset
+    /// (e.g. a single `*.gif`) is left intact, so we never delete an intentional rule.
     private func clearKindExcludesFromIgnore(_ k: FileKind) {
         let globs = Set(FileExtractor.extensions(for: k).map { "*.\($0)" })
         guard !globs.isEmpty else { return }
+        let present = Set(ignoreText.components(separatedBy: "\n").map { $0.trimmingCharacters(in: .whitespaces) })
+        guard globs.isSubset(of: present) else { return }   // not the full synthesized block: leave user rules alone
         let kept = ignoreText.components(separatedBy: "\n")
             .filter { !globs.contains($0.trimmingCharacters(in: .whitespaces)) }
             .joined(separator: "\n")
@@ -1549,7 +1574,9 @@ final class AppModel {
         folderProjection = []; folderKNN = []; folderKNNk = 0; folderProjectionFitting = false
         guard let url, let engine, let store else { return }
         clearSearchForFolderMap()   // a folder map replaces the search: clear query, results, filters
-        if let cached = projectionCache[url] { touchProjection(url); applyProjection(cached); return }   // instant (LRU touch)
+        if let cached = projectionCache[url] {   // instant (LRU touch)
+            touchProjection(url); applyProjection(cached); folderProjectionTotal = projectionTotals[url] ?? cached.points.count; return
+        }
         folderProjectionFitting = true
         let folder = url.path
         let refine = mapUsesUMAP   // captured on the main actor; the detached worker reads only this Bool
@@ -1566,7 +1593,9 @@ final class AppModel {
         // store.vectorsUnderFolder is the read-only data pull (never embeds); proj.project does the
         // gated GPU work and yields only the settled layout.
         projectionTask = Task { [weak self] in
-            let stream = AsyncStream<ProjectionResult> { continuation in
+            // Stream carries (layout, total-files-under-folder) so the caption can say "N of M" when the
+            // folder was subsampled to the memory budget - total is the pre-sample distinct count.
+            let stream = AsyncStream<(ProjectionResult, Int)> { continuation in
                 let worker = Task.detached(priority: .utility) {
                     // Settle briefly first: clicking folders back-and-forth cancels this task before the
                     // scan starts, so we don't enqueue an uncancellable full vectorsUnderFolder scan per
@@ -1577,15 +1606,16 @@ final class AppModel {
                     if Task.isCancelled { continuation.finish(); return }
                     let data = store.vectorsUnderFolder(folder, cap: mapCap)
                     if Task.isCancelled { continuation.finish(); return }
-                    continuation.yield(await proj.project(data, refine: refine))   // PCA (default) or UMAP
+                    continuation.yield((await proj.project(data, refine: refine), data.total))   // PCA / UMAP
                     continuation.finish()
                 }
                 continuation.onTermination = { _ in worker.cancel() }
             }
             var result = ProjectionResult(points: [], knn: [], k: 0)
-            for await snap in stream { if Task.isCancelled { break }; result = snap }
+            var total = 0
+            for await (snap, t) in stream { if Task.isCancelled { break }; result = snap; total = t }
             guard let self, self.selectedFolderForViz?.path == folder else { return }   // folder changed: drop
-            if !result.points.isEmpty { self.cacheProjection(url, result); self.applyProjection(result) }
+            if !result.points.isEmpty { self.cacheProjection(url, result, total: total); self.applyProjection(result); self.folderProjectionTotal = total }
             self.folderProjectionFitting = false
         }
     }
