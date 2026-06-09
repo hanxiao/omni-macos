@@ -58,6 +58,15 @@ struct Sidebar: View {
                         }
                         Button("Reveal in Finder") { NSWorkspace.shared.revealAsync(url) }
                         Divider()
+                        // Swap the folder map to the OTHER projection (the same app-wide setting as
+                        // Settings > Folder map layout), mirroring the Pause/Resume idiom above.
+                        // Selecting the folder first makes the map visible in the new layout right
+                        // away; the mode's didSet clears the layout cache and re-fits it.
+                        Button(model.mapUsesUMAP ? "View as PCA" : "View as UMAP") {
+                            selection = .folder(url)
+                            model.mapUsesUMAP.toggle()
+                        }
+                        Divider()
                         Button("Remove from Omni") { remove(url) }
                     }
                     .tag(SidebarSelection.folder(url))
