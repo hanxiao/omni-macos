@@ -86,7 +86,9 @@ struct ResultsList<Footer: View>: View {
             // Keep the selected row on screen as it moves (so arrowing past the fold scrolls).
             .onChange(of: model.selection) { _, sel in
                 guard let sel else { return }
-                withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(sel, anchor: .center) }
+                // anchor nil = minimal scroll to visible (Finder/Mail behavior); centering on every
+                // arrow press made keyboard navigation jumpy.
+                withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(sel, anchor: nil) }
             }
             .onChange(of: results.map(\.path)) { _, _ in expanded = []; passagesCache = [:] }
         }
@@ -141,7 +143,9 @@ struct ResultsList<Footer: View>: View {
             // Keep the selected cell on screen as arrow keys move it (matches the list view).
             .onChange(of: model.selection) { _, sel in
                 guard let sel else { return }
-                withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(sel, anchor: .center) }
+                // anchor nil = minimal scroll to visible (Finder/Mail behavior); centering on every
+                // arrow press made keyboard navigation jumpy.
+                withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(sel, anchor: nil) }
             }
         }
     }

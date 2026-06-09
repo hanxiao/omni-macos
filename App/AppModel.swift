@@ -297,6 +297,13 @@ final class AppModel {
     private var queryEmbedCache: [String: [Float]] = [:]
     private var queryEmbedOrder: [String] = []          // insertion order for a small LRU cap
     private let queryEmbedCap = 256
+    /// File-as-query embed cache (path + mtime + mode keyed). A re-run file query (history click,
+    /// re-pick of the same file) otherwise re-decodes and re-embeds the file every time - up to
+    /// seconds for a video/PDF. The mtime in the key makes edits invalidate naturally. Small cap:
+    /// file queries are rare next to text queries. Cleared on model reload with the text cache.
+    private var fileQueryEmbedCache: [String: [Float]] = [:]
+    private var fileQueryEmbedOrder: [String] = []
+    private let fileQueryEmbedCap = 32
     private var lastHistoryRunQuery: String?     // the query just launched from history (don't re-record it)
     private var rateLastEmbedded = 0
     private var rateLastTokens = 0
@@ -559,7 +566,11 @@ final class AppModel {
             fileQuery = nil
             literalQuery = false                  // replay always starts in parse mode
             applyParsedQuery(raw)                  // sets rawQuery + all filters + semantic query + qualifier bar
-            scheduleSearch()                       // debounced: rapid history click-through coalesces to one search
+            // A click is a single deliberate action - don't make it eat the typing debounce (180ms
+            // of dead time before an often-cached, ~20ms search). Rapid click-through still
+            // coalesces: search() cancels the previous in-flight work and the searchToken guard
+            // drops any superseded result.
+            search()
         }
         return true
     }
@@ -1098,8 +1109,29 @@ final class AppModel {
         }
         queryEmbedCache[q] = v
     }
+    /// LRU touch: a re-run query (history click, re-typed search) moves to the back of the eviction
+    /// order so hot queries survive 256 one-off searches. Without this the cache was FIFO.
+    private func touchQueryVector(_ q: String) {
+        if let i = queryEmbedOrder.lastIndex(of: q), i != queryEmbedOrder.count - 1 {
+            queryEmbedOrder.remove(at: i)
+            queryEmbedOrder.append(q)
+        }
+    }
     /// Cleared whenever the model is (re)loaded, since the vectors are model-specific.
-    func clearQueryEmbedCache() { queryEmbedCache.removeAll(); queryEmbedOrder.removeAll() }
+    func clearQueryEmbedCache() {
+        queryEmbedCache.removeAll(); queryEmbedOrder.removeAll()
+        fileQueryEmbedCache.removeAll(); fileQueryEmbedOrder.removeAll()
+    }
+
+    private func cacheFileQueryVector(_ key: String, _ v: [Float]) {
+        if fileQueryEmbedCache[key] == nil {
+            fileQueryEmbedOrder.append(key)
+            if fileQueryEmbedOrder.count > fileQueryEmbedCap {
+                fileQueryEmbedCache[fileQueryEmbedOrder.removeFirst()] = nil
+            }
+        }
+        fileQueryEmbedCache[key] = v
+    }
 
     private static func mapKind(_ s: String) -> FileKind? {
         switch s.trimmingCharacters(in: .whitespaces).lowercased() {
@@ -1328,6 +1360,10 @@ final class AppModel {
     /// thread; only the small result assignment hops back to the main actor. Doing it on the main
     /// thread is what hung the app during a fast crawl of a large index.
     private func refreshIndexStats(_ store: VectorStore) {
+        // A search in flight is about to queue on the store's serial queue; indexSummary's full row
+        // scan in front of it would add tens of ms to that query's tail on a large index. Stats are
+        // a progress nicety - skip this tick, the next one (1.5s) catches up.
+        if searching { return }
         let rootPaths = roots.map(\.path)
         let fp = fingerprint
         let dimReady = engineDim > 0
@@ -1696,13 +1732,22 @@ final class AppModel {
         if let fq = fileQuery {
             searching = true
             let url = fq.url, similar = fq.similar, maxImg = maxImageDimension, maxVid = maxVideoFrames
+            // Re-embed cache: a re-run file query (history click, same file re-picked) otherwise
+            // decodes + embeds the file again - up to seconds for a video/PDF. Keyed on mtime so an
+            // edited file re-embeds. The stored-vector path (`similar` on an indexed file) is already
+            // instant and stays uncached.
+            let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate?.timeIntervalSince1970 ?? 0
+            let cacheKey = "\(url.path)|\(mtime)|\(similar)|\(maxImg)|\(maxVid)"
+            let cachedVec = fileQueryEmbedCache[cacheKey]
             searchWorkTask = Task.detached(priority: .userInitiated) {
                 if Task.isCancelled { return }
                 // "Find similar" on an indexed file (every search result is one) reuses its STORED
                 // vector - the exact indexed representation - so it always finds the file itself and
                 // cannot diverge from how the indexer parsed it. Falls back to re-embedding (with the
                 // index-matching extractor) for an external, not-yet-indexed file.
-                let vec = (similar ? store.fileVector(url.path) : nil)
+                let stored = similar ? store.fileVector(url.path) : nil
+                let vec = stored ?? cachedVec
                     ?? engine.embedFileQuery(url, asDocument: similar, maxImageDimension: maxImg, maxVideoFrames: maxVid)
                 if Task.isCancelled { return }   // superseded while embedding: don't run the store scan
                 // Run the vector search OFF the main actor (matches the text path); doing it inside
@@ -1716,6 +1761,7 @@ final class AppModel {
                         self.rawResults = []; self.resolvedQuery = self.fileToken(url)
                         return
                     }
+                    if stored == nil { self.cacheFileQueryVector(cacheKey, vec) }
                     self.lastQueryVector = vec
                     self.rawResults = hits
                     self.resolvedQuery = self.fileToken(url)
@@ -1735,6 +1781,7 @@ final class AppModel {
         searching = true
         // Cached query vector: skip the GPU embed entirely (instant, and no contention with indexing).
         if let cached = queryEmbedCache[q] {
+            touchQueryVector(q)   // LRU: a re-run query shouldn't be first in line for eviction
             searchWorkTask = Task.detached(priority: .userInitiated) {
                 if Task.isCancelled { return }   // superseded before the scan started: skip it
                 let hits = store.search(cached, filter: filter, topK: 60)

@@ -46,8 +46,18 @@ enum OpenAIJinaAdapter {
         guard let body = JSONBody.object(req) else { return badRequest("invalid JSON body") }
 
         let model = (body["model"] as? String) ?? backend.modelName
-        let texts = flattenInput(body["input"])
+        guard let texts = flattenInput(body["input"]) else {
+            // Silently dropping unrecognized items (token-id arrays, numbers, nulls) would return
+            // fewer `data` entries than inputs with shifted indexes - corrupt for the caller.
+            return badRequest("unsupported 'input' element: expected a string or {\"text\": ...}")
+        }
         if texts.isEmpty { return badRequest("'input' is required") }
+
+        // The model serves exactly one dimension; a client asking for another (OpenAI `dimensions`)
+        // must hear "no" here, not discover a mismatch downstream in its vector store.
+        if let want = body["dimensions"] as? Int, want != backend.dim {
+            return badRequest("'dimensions' must equal \(backend.dim) for \(backend.modelName)")
+        }
 
         // task suffix ".query" or == "query" -> query path. Field is "task" (Jina).
         let task = (body["task"] as? String)?.lowercased() ?? ""
@@ -80,7 +90,9 @@ enum OpenAIJinaAdapter {
     }
 
     /// Accepts String, [String], [{"text": ...}], or a mix; flattens to [String].
-    private static func flattenInput(_ raw: Any?) -> [String] {
+    /// Returns nil if the array contains an unrecognized element (the caller responds 400) so the
+    /// response `data` always has one entry per input, indexes aligned.
+    private static func flattenInput(_ raw: Any?) -> [String]? {
         if let s = raw as? String { return [s] }
         if let arr = raw as? [Any] {
             var out: [String] = []
@@ -89,6 +101,8 @@ enum OpenAIJinaAdapter {
                     out.append(s)
                 } else if let obj = item as? [String: Any], let t = obj["text"] as? String {
                     out.append(t)
+                } else {
+                    return nil
                 }
             }
             return out
