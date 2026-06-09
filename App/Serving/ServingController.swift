@@ -94,6 +94,7 @@ final class ServingController {
 
     private func startServer() {
         guard let backend else { return }
+        stopServer()   // cancel any prior/orphan server before binding a new listener (avoids EADDRINUSE)
 
         // Snapshot settings into a Sendable auth closure: localhost never requires a token;
         // a token set on a public bind is enforced.
@@ -114,9 +115,12 @@ final class ServingController {
         }
 
         let srv = HTTPServer(handler: { req in await router.handle(req) }, onLog: sink)
-        srv.onFailure = { [weak self] msg in
+        srv.onFailure = { [weak self, weak srv] msg in
             Task { @MainActor in
-                guard let self else { return }
+                // Ignore a late failure from a DISCARDED server (rapid toggle / port edit): it must not
+                // clobber the live server's state, or reconcile would show Stopped while the real
+                // listener keeps serving, and the next toggle binds over the orphan -> EADDRINUSE wedge.
+                guard let self, let srv, self.server === srv else { return }
                 self.state = msg == "port in use" ? .portInUse : .failed(msg)
                 self.isRunning = false
                 self.boundAddress = ""

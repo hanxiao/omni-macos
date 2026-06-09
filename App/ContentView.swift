@@ -426,7 +426,7 @@ struct ContentView: View {
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = true
-        if panel.runModal() == .OK { for url in panel.urls { model.addRoot(url) } }
+        if panel.runModal() == .OK { model.addRoots(panel.urls) }
     }
 
     private func pickFile() {

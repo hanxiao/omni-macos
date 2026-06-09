@@ -104,7 +104,7 @@ struct Sidebar: View {
         // macOS, alongside the existing Add Folder button.
         .dropDestination(for: URL.self) { urls, _ in
             let dirs = urls.filter { $0.hasDirectoryPath }
-            dirs.forEach { model.addRoot($0) }
+            model.addRoots(dirs)
             return !dirs.isEmpty
         } isTargeted: { dropTargeted = $0 }
         .overlay {
@@ -164,7 +164,7 @@ struct Sidebar: View {
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = true
-        if panel.runModal() == .OK { for url in panel.urls { model.addRoot(url) } }
+        if panel.runModal() == .OK { model.addRoots(panel.urls) }
     }
 }
 

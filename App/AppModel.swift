@@ -155,6 +155,16 @@ final class AppModel {
     private var projectionCache: [URL: ProjectionResult] = [:]   // final layout + kNN per folder URL
     private var projectionCacheOrder: [URL] = []                 // LRU order, oldest first
     private let projectionCacheCap = 6                           // bound: each entry is N points + N*k kNN
+    private var folderMapRefitPending = false                    // map refit deferred until the folder stops indexing
+
+    /// Refit the embedding map for the selected folder if a refit was deferred while it indexed, now
+    /// that no pass touches it. Called from index/reconcile completions.
+    private func refitFolderMapIfPending() {
+        guard folderMapRefitPending, let url = selectedFolderForViz,
+              indexState != .indexing, !activeRoots.contains(url.path), !folderProjectionFitting else { return }
+        folderMapRefitPending = false
+        selectFolderForVisualization(url)
+    }
 
     /// Insert a fitted layout, evicting the least-recently-used folder over the cap. Browsing many large
     /// folders otherwise retained every one's full point cloud + kNN graph for the whole session.
@@ -299,6 +309,13 @@ final class AppModel {
     var pausedRoots: Set<String> = []
     /// When a folder is paused/resumed mid-pass, cancel and restart re-scoped to the unpaused roots.
     private var restartAfterPause = false
+    /// Monotonic index-pass token. Bumped whenever a pass starts or is superseded (model/db switch). A
+    /// pass's progress/completion callback bails when its captured token != indexGen, so an orphaned pass
+    /// (e.g. switched model mid-index) cannot clobber the live pass's state, stats, or store.
+    private var indexGen = 0
+    /// Roots added while a pass was already running; the running pass's completion catches them up, so
+    /// we never run a second concurrent index() on the same Indexer.
+    private var pendingCatchUpRoots: [URL] = []
 
     func isFolderPaused(_ url: URL) -> Bool { pausedRoots.contains(url.path) }
 
@@ -1139,6 +1156,20 @@ final class AppModel {
             // store ref does not drop the old store before close() runs on the store's own serial queue.
             let oldStore = self.store
             let oldIndexer = self.indexer
+            // Model/db SWITCH while a pass may be running: cancel the old pass and supersede it (bump
+            // indexGen so its completion callback bails) BEFORE swapping, and reset the index state
+            // machine. Otherwise the orphaned pass keeps embedding on the old engine, writes into the
+            // just-closed old store, and its lingering .indexing state makes the post-swap rebuild a
+            // no-op. (First bootstrap: indexer is nil, so this is a no-op.)
+            if oldIndexer != nil {
+                oldIndexer?.cancel()
+                indexGen += 1
+                indexState = .idle
+                restartAfterPause = false
+                pendingRootRemovals.removeAll()
+                pendingCatchUpRoots.removeAll()
+                activeRoots.removeAll()
+            }
             self.store = store
             self.engine = engine
             self.clearQueryEmbedCache()   // cached query vectors are model-specific
@@ -1221,8 +1252,16 @@ final class AppModel {
                     let u = URL(fileURLWithPath: path)
                     self.projectionCache[u] = nil
                     self.projectionCacheOrder.removeAll { $0 == u }
+                    // Don't eager-refit a folder whose count keeps changing because it is actively
+                    // indexing/reconciling - the fit could never settle (120ms + full scan + GPU PCA
+                    // every 1.5s). Mark it stale; it refits once when that folder's pass completes (and
+                    // an idle folder still refits immediately).
                     if self.selectedFolderForViz?.path == path, !self.folderProjectionFitting {
-                        self.selectFolderForVisualization(self.selectedFolderForViz)
+                        if self.indexState == .indexing || self.activeRoots.contains(path) {
+                            self.folderMapRefitPending = true
+                        } else {
+                            self.selectFolderForVisualization(self.selectedFolderForViz)
+                        }
                     }
                 }
                 self.folderFileCounts = folders
@@ -1303,33 +1342,61 @@ final class AppModel {
         return canonical
     }
 
-    func addRoot(_ url: URL) {
-        guard !roots.contains(url) else { return }
-        roots = canonicalizeRoots(roots + [url])
+    func addRoot(_ url: URL) { addRoots([url]) }
+
+    /// Add one or more roots. Dropping several folders at once (or the file panel returning many)
+    /// canonicalizes + persists + rebuilds the FSEvents watcher ONCE for the whole batch, then queues
+    /// them for a single serialized catch-up - instead of N watcher rebuilds and N concurrent crawls.
+    func addRoots(_ urls: [URL]) {
+        let new = urls.filter { !roots.contains($0) }
+        guard !new.isEmpty else { return }
+        roots = canonicalizeRoots(roots + new)
         saveRoots()
-        restartWatcher()
-        // FSEvents only sees future changes, so the folder's pre-existing files would never
-        // be indexed without a manual reindex. Index just this new root now (incremental:
-        // already-known files are skipped by mtime, so it is cheap if it overlapped).
-        // Skip the per-root catch-up when the index is obsolete (wrong vector space) or mid
-        // full index - the pending full reindex will cover the new folder cleanly.
-        guard indexState != .indexing, !indexObsolete, let indexer, let store, roots.contains(url) else { return }
+        restartWatcher()   // once
+        // FSEvents only sees future changes, so pre-existing files would never be indexed without a
+        // manual reindex. Queue the new roots and kick the catch-up, which runs ONE pass at a time so
+        // we never start concurrent index() calls racing the same Indexer.
+        pendingCatchUpRoots.append(contentsOf: new)
+        catchUpPendingRoots()
+    }
+
+    /// Index the roots queued by addRoot, one incremental catch-up pass at a time. Runs only when no
+    /// other index pass (full, catch-up, or reconcile) is in flight - the in-flight one's completion
+    /// re-invokes this, so passes serialize on the single Indexer. Obsolete index skips it (the pending
+    /// full reindex covers the new folders).
+    private func catchUpPendingRoots() {
+        guard !indexObsolete, indexState != .indexing, activeRoots.isEmpty,
+              let indexer, let store, !pendingCatchUpRoots.isEmpty else { return }
+        let batch = pendingCatchUpRoots.filter { roots.contains($0) }
+        pendingCatchUpRoots.removeAll()
+        guard !batch.isEmpty else { return }
         let settings = effectiveSettings()
-        let key = url.path
-        activeRoots.insert(key)
-        progress.perRoot[key] = RootProgress()   // drives the clock pie from 0
+        let keys = batch.map { $0.path }
+        let gen = indexGen
+        for k in keys { activeRoots.insert(k); progress.perRoot[k] = RootProgress() }   // drive the pies from 0
         Task.detached(priority: .utility) {
-            indexer.index(roots: [url], settings: settings, force: false) { p in
+            var statsClock = 0.0
+            indexer.index(roots: batch, settings: settings, force: false) { p in
+                let now = CFAbsoluteTimeGetCurrent()
+                // Time-gate the stats refresh (was every 24 scanned files = dozens of full-store scans/sec
+                // on a fast crawl of a large index), matching the main pass's 1.5s cadence.
+                let doStats = p.done || now - statsClock >= 1.5
+                if doStats { statsClock = now }
                 Task { @MainActor in
-                    if let rp = p.perRoot[key] { self.progress.perRoot[key] = rp }   // live progress -> pie fill
-                    // Tick the visible counts while this background index runs (isIndexing is
-                    // false here, so nothing else would update them until it finished).
-                    if p.scanned % 24 == 0 { self.refreshIndexStats(store) }
+                    let live = (gen == self.indexGen)   // superseded by a full reindex / model switch?
+                    if live {
+                        for k in keys { if let rp = p.perRoot[k] { self.progress.perRoot[k] = rp } }
+                        if doStats { self.refreshIndexStats(store) }
+                    }
                     if p.done {
-                        self.activeRoots.remove(key)
-                        self.progress.perRoot[key] = nil
+                        // Always release this pass's activeRoots keys, even when superseded - else they
+                        // leak and catchUpPendingRoots (gated on activeRoots.isEmpty) wedges forever.
+                        for k in keys { self.activeRoots.remove(k); self.progress.perRoot[k] = nil }
+                        guard live else { return }   // a newer pass owns state/stats now
                         self.refreshIndexStats(store)
                         if !self.query.isEmpty { self.scheduleSearch() }
+                        self.catchUpPendingRoots()   // pick up any roots added while this pass ran
+                        self.refitFolderMapIfPending()
                     }
                 }
             }
@@ -1667,6 +1734,7 @@ final class AppModel {
         indexObsolete = false
         indexModelVariantRaw = variant
         indexState = .indexing
+        indexGen += 1; let gen = indexGen
         progress = IndexProgress()
         startRateSampler()
         let roots = activeRootsToIndex
@@ -1681,6 +1749,17 @@ final class AppModel {
                 store.wipeChunks()
                 store.compact(minFreeRatio: 0)   // reclaim the wiped index's pages
                 await MainActor.run { self.refreshIndexStats(store) }   // now reads the empty store -> 0
+            }
+            // Pause/supersede during the (possibly long) force-wipe prelude, before any embed: index()
+            // would otherwise reset cancelled=false and run the whole pass ignoring the Pause.
+            let liveGen = await MainActor.run { self.indexGen }
+            if indexer.isCancelled || gen != liveGen {
+                await MainActor.run {
+                    guard gen == self.indexGen else { return }
+                    self.indexState = indexer.isCancelled ? .paused : .idle
+                    self.refreshIndexStats(store)
+                }
+                return
             }
             store.metaSet("embedding_version", fp)
             store.metaSet("index_model_variant", variant)
@@ -1697,6 +1776,9 @@ final class AppModel {
                 let doStats = p.done || now - statsClock >= 1.5
                 if doStats { statsClock = now }
                 Task { @MainActor in
+                    // A superseded pass (model/db switch, or a newer startIndexing) must not touch live
+                    // state, stats, or the now-swapped store. Its token is stale -> drop everything.
+                    guard gen == self.indexGen else { return }
                     self.progress = p
                     // Refresh the visible stats periodically so the file count, embeddings,
                     // and per-folder counts tick up live in the sidebar and Settings.
@@ -1706,12 +1788,15 @@ final class AppModel {
                         // folder-removal restart - updated the index just now; a clean finish with
                         // nothing left to do also confirms it is current as of now.
                         if p.embedded > 0 || !p.cancelled { self.markIndexed(store) }
-                        if p.cancelled, !self.pendingRootRemovals.isEmpty {
-                            // Cancelled to apply folder removals: now that the pass has stopped
-                            // re-inserting, drop those vectors, reclaim their disk space, then
-                            // resume indexing the remaining roots.
-                            let removed = self.pendingRootRemovals; self.pendingRootRemovals.removeAll()
-                            self.restartAfterPause = false
+                        // Deferred-recovery is keyed on WHAT was queued (removals / a paused-folder
+                        // restart / added roots), NOT on p.cancelled: a folder removed or paused in the
+                        // exact instant the pass finished naturally would otherwise strand its request.
+                        let removed = self.pendingRootRemovals; self.pendingRootRemovals.removeAll()
+                        let wantRestart = self.restartAfterPause; self.restartAfterPause = false
+                        let caughtUp = self.pendingCatchUpRoots; self.pendingCatchUpRoots.removeAll()
+                        if !removed.isEmpty {
+                            // Drop the removed folders' vectors now the pass stopped re-inserting them,
+                            // reclaim disk, then resume indexing the remaining roots.
                             self.indexState = .idle
                             Task.detached {
                                 for path in removed { store.deleteUnderFolder(path) }
@@ -1724,19 +1809,19 @@ final class AppModel {
                             }
                             return
                         }
-                        if p.cancelled, self.restartAfterPause {
-                            // A folder was paused/resumed mid-pass: restart re-scoped to the
-                            // current unpaused roots (incremental, so the rest resume in place).
-                            self.restartAfterPause = false
+                        if wantRestart || !caughtUp.isEmpty {
+                            // A folder was paused/resumed, or roots were added, mid-pass: restart
+                            // re-scoped to the current unpaused roots (incremental, so the rest resume).
                             self.indexState = .idle
                             self.refreshIndexStats(store)
-                            self.startIndexing()   // no-op if every folder is now paused
+                            self.startIndexing()   // covers any added roots; no-op if all folders paused
                             return
                         }
                         self.indexState = p.cancelled ? .paused : .idle
                         self.refreshIndexStats(store)
                         if !self.query.isEmpty { self.scheduleSearch() }
                         if !p.cancelled { self.drainPendingFSChanges() }
+                        self.refitFolderMapIfPending()
                     }
                 }
             }
@@ -1801,6 +1886,8 @@ final class AppModel {
                 // Events that arrived during this reconcile are buffered: drain them in one more batch
                 // (no-op while a full index is running - that path drains on its own completion).
                 if self.indexState != .indexing { self.drainPendingFSChanges() }
+                self.catchUpPendingRoots()   // a folder added while this reconcile ran can now index
+                self.refitFolderMapIfPending()
             }
         }
     }
