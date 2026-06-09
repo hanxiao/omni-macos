@@ -114,6 +114,23 @@ public struct OmniIgnore: Sendable, Equatable {
         return decision
     }
 
+    /// Single-shot variant for EXPLICIT file paths (the FSEvents reconcile): also honors directory
+    /// rules on every ancestor - gitignore's "an ignored directory ignores all its contents". The
+    /// crawl never needs this (it evaluates each directory and prunes the subtree), but a file event
+    /// like `.../.build/foo/bar.json` arrives without its ancestors ever being tested, so a dirOnly
+    /// rule (`.build/`) would never match and build churn leaked into the index.
+    public func isIgnoredIncludingAncestors(_ path: String, isDir: Bool) -> Bool {
+        guard !rules.isEmpty else { return false }
+        let comps = path.split(separator: "/", omittingEmptySubsequences: true)
+        guard !comps.isEmpty else { return false }
+        var prefix = ""
+        for i in 0 ..< comps.count - 1 {
+            prefix += "/" + comps[i]
+            if isIgnored(prefix, isDir: true) { return true }   // excluded dir -> contents excluded
+        }
+        return isIgnored(path, isDir: isDir)
+    }
+
     // MARK: - Matching
 
     private static func matches(_ r: Rule, _ path: [[Character]]) -> Bool {
