@@ -188,13 +188,26 @@ public final class OmniAudioTower: @unchecked Sendable {
         for totalAfter in perAudioAfter {
             var seg = hidden[offset ..< (offset + totalAfter), 0...]   // [totalAfter, d]
             offset += totalAfter
-            let tEven = (seg.dim(0) / 2) * 2
-            seg = seg[0 ..< tEven, 0...]
-                .reshaped([tEven / 2, 2, dModel])
-                .mean(axis: 1)                                          // [tEven/2, d]
+            let t = seg.dim(0)
+            // Factor-2 pool over frame pairs. Guard the degenerate case (t < 2): a clip with
+            // 0 or 1 post-conv frames would reduce over a zero-size axis and abort the GPU
+            // stream (issue #3). Pool whatever frames exist into a single row (zeros if none)
+            // instead. The preprocessing min-length pad makes this branch unreachable for real
+            // audio, so every clip that already embedded is bit-identical; this is insurance.
+            if t < 2 {
+                seg = t == 0
+                    ? MLXArray.zeros([1, dModel], dtype: seg.dtype)
+                    : seg.mean(axis: 0, keepDims: true)                 // [1, d]
+                perAudioN.append(1)
+            } else {
+                let tEven = (t / 2) * 2
+                seg = seg[0 ..< tEven, 0...]
+                    .reshaped([tEven / 2, 2, dModel])
+                    .mean(axis: 1)                                      // [tEven/2, d]
+                perAudioN.append(tEven / 2)
+            }
             seg = layerNorm(seg, "audio_tower.ln_post")
             perAudio.append(seg)
-            perAudioN.append(tEven / 2)
         }
         let audioHidden = perAudio.count == 1 ? perAudio[0] : MLX.concatenated(perAudio, axis: 0)
 

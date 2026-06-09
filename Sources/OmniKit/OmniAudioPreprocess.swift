@@ -28,6 +28,15 @@ public enum OmniAudioPreprocess {
     private static let melFMin: Float = 0.0
     private static let melFMax: Float = 8000.0
 
+    /// Smallest mel-frame count a clip may have and still survive the audio tower. The conv
+    /// frontend halves frames (conv2 stride 2) and the per-audio pool then averages frame
+    /// PAIRS; a clip with 1-2 mel frames collapses to a single post-conv frame, whose pair-pool
+    /// reduces over a zero-size axis -> MLX `reduce` abort (SIGABRT), killing the whole indexing
+    /// scan (issue #3). 3 mel frames is the smallest count that survives (verified). Clips below
+    /// it (< ~30 ms of audio) carry no searchable content, so we skip them at the source -
+    /// deterministically, without feeding a degenerate tensor to the GPU.
+    private static let minMelFrames = 3
+
     /// Decode + log-mel as a plain Float buffer (mel-major `[128*frames]`) + frame count.
     /// CPU-only and Sendable, so it can run in the concurrent decode stage of indexing.
     public static func melFeatures(url: URL) -> (mel: [Float], frames: Int)? {
@@ -36,7 +45,9 @@ public enum OmniAudioPreprocess {
         let nBins = nFFT / 2 + 1   // 201
         let power = stftPower(samples)                  // [nBins, frames] row-major
         let frames = power.count / nBins
-        if frames == 0 { return nil }
+        // Skip clips too short to survive the tower's conv + pair-pool (issue #3): < 3 mel
+        // frames would otherwise reduce over an empty axis and abort the scan.
+        if frames < minMelFrames { return nil }
 
         let melFB = melFilterbank()                      // [nMel, nBins] row-major
 
