@@ -251,9 +251,9 @@ struct FolderEmbeddingVisualization: View {
                 Text(folderName).fontWeight(.medium)
                     .lineLimit(1).truncationMode(.middle)   // hug the name; .frame(maxWidth:) would expand it greedily
                 if count > 0 {
-                    // Show "N of M" when the folder was subsampled to fit the memory cap (the map is a
-                    // representative sample, not every file). M comes from the cached per-folder count.
-                    let total = model.selectedFolderForViz.flatMap { model.folderFileCounts[$0.path] } ?? count
+                    // "N of M" when the folder was subsampled to fit the memory cap (the map is a
+                    // representative sample, not every file). M is the pre-sample total for THIS folder.
+                    let total = model.folderProjectionTotal
                     Text(total > count ? "\(count) of \(total) files"
                                        : "\(count) file\(count == 1 ? "" : "s")")
                         .foregroundStyle(.secondary).lineLimit(1)

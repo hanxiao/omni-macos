@@ -244,12 +244,14 @@ private struct ContentTypesTab: View {
     /// One modality: drag handle (reorder = index priority) + an on/off switch. Off skips the kind
     /// AND unloads its model from memory; the ignore rules below filter further within what stays on.
     @ViewBuilder private func orderRow(_ k: FileKind) -> some View {
-        let on = model.kindEnabled(k)
+        // While a disable is awaiting the purge/keep dialog the kind is still in enabledKinds, so reflect
+        // the pending-off state so the switch doesn't snap back to ON under the dialog.
+        let on = model.kindEnabled(k) && model.pendingDisable?.kind != k
         HStack(spacing: 8) {
             Image(systemName: "line.3.horizontal").foregroundStyle(.tertiary).font(.callout)
             Label(k.title, systemImage: k.symbol)
             Spacer()
-            Toggle("", isOn: Binding(get: { model.kindEnabled(k) }, set: { model.toggleKind(k, on: $0) }))
+            Toggle("", isOn: Binding(get: { on }, set: { v in Task { await model.toggleKind(k, on: v) } }))
                 .labelsHidden().toggleStyle(.switch).controlSize(.mini)
         }
         .opacity(on ? 1 : 0.55)

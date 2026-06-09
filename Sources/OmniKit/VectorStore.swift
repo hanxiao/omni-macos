@@ -63,9 +63,12 @@ public struct FolderVectors: Sendable {
     public let kinds: [String]      // FileKind rawValue per file, row-aligned
     public let vectors: [Float]     // row-major [count*dim], fp32, L2-normalized, mean-pooled per file
     public let dim: Int
+    /// Distinct files under the folder BEFORE map subsampling (== count when not sampled). Lets the
+    /// folder-map caption show "N of M" for any folder, including non-root subfolders.
+    public let total: Int
     public var count: Int { paths.count }
-    public init(paths: [String], kinds: [String], vectors: [Float], dim: Int) {
-        self.paths = paths; self.kinds = kinds; self.vectors = vectors; self.dim = dim
+    public init(paths: [String], kinds: [String], vectors: [Float], dim: Int, total: Int? = nil) {
+        self.paths = paths; self.kinds = kinds; self.vectors = vectors; self.dim = dim; self.total = total ?? paths.count
     }
 }
 
@@ -676,7 +679,7 @@ public final class VectorStore: @unchecked Sendable {
                     for k in 0 ..< dim { s[so + k] *= inv }
                 }
             }
-            return FolderVectors(paths: order, kinds: kinds, vectors: sums, dim: dim)
+            return FolderVectors(paths: order, kinds: kinds, vectors: sums, dim: dim, total: total)
         }
     }
 
