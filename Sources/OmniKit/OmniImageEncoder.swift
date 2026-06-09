@@ -110,15 +110,36 @@ public final class OmniImageEncoder: @unchecked Sendable {
         // unstable on this GPU (intermittent cos~0.97 vs single), so we deliberately do NOT batch
         // it: every returned vector is exactly what the single-image path produces. Small (causal)
         // is stable batched, but keeping ONE code path keeps N=1 bit-identical for both variants.
-        var vecs: [[Float]] = []
-        vecs.reserveCapacity(perImage.count)
+        //
+        // Two chunk-level cheapenings that do NOT change any graph:
+        //  - the wrapper embeds (prefix / vision_start / vision_end / suffix) are identical for
+        //    every image, so they are built once per chunk instead of once per image;
+        //  - each image's pooled vector is built as a GRAPH and all of them evaluate in ONE eval,
+        //    instead of a full GPU drain + host readback per image (the graphs are independent, so
+        //    peak memory matches the largest single forward, as before).
+        let dim = cfg.text.hiddenSize
+        let preEmbed: MLXArray? = prefixIds.isEmpty ? nil : backbone.embed(prefixIds)
+        let startEmbed = backbone.embed([cfg.visionStartTokenId])
+        let endEmbed = backbone.embed([cfg.visionEndTokenId])
+        let sufEmbed: MLXArray? = suffixIds.isEmpty ? nil : backbone.embed(suffixIds)
+        var pooled: [MLXArray] = []
+        pooled.reserveCapacity(perImage.count)
         var seqTotal = 0
         for feats in perImage {
-            let r = injectAndPool(feats, prefixIds: prefixIds, suffixIds: suffixIds)
-            vecs.append(r.vec)
-            seqTotal += r.length
+            let n = feats.dim(0)
+            var parts: [MLXArray] = []
+            if let preEmbed { parts.append(preEmbed) }
+            parts.append(startEmbed)
+            parts.append(feats.asType(.float32).reshaped([1, n, dim]))
+            parts.append(endEmbed)
+            if let sufEmbed { parts.append(sufEmbed) }
+            let length = prefixIds.count + n + 2 + suffixIds.count
+            let hidden = backbone.forward(inputsEmbeds: MLX.concatenated(parts, axis: 1), length: length)
+            pooled.append(backbone.poolGraph(hidden, length: length))
+            seqTotal += length
         }
-        return (vecs, seqTotal)
+        eval(pooled)
+        return (pooled.map { $0.asArray(Float.self) }, seqTotal)
     }
 
     /// Single-sequence inject + forward + last-token pool (the original scalar path).

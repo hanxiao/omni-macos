@@ -214,7 +214,13 @@ public final class ProjectionEngine: @unchecked Sendable {
             let rowsIdx = MLX.arange(start, end)[0..., .newAxis]   // [c,1] int32
             let colsIdx = MLX.arange(0, n)[.newAxis, 0...]         // [1,n] int32
             D = D + (rowsIdx .== colsIdx).asType(.float32) * 1e30  // mask self
-            let idx = MLX.argSort(D, axis: 1)[0..., 0 ..< k]  // [c, k] nearest
+            // Select the k nearest via argPartition (O(n) per row) + a small [c,k] sort to restore
+            // the nearest-first order the UI relies on, instead of fully sorting every [c,n] row
+            // (O(n log n) per row - the dominant kNN cost at n in the tens of thousands). Identical
+            // output for distinct distances; exact-tie sets at the k-th boundary are pool-equivalent.
+            let part = MLX.argPartition(D, kth: k, axis: 1)[0..., 0 ..< k]   // [c,k] smallest, unordered
+            let dk = MLX.takeAlong(D, part, axis: 1)                          // [c,k] their distances
+            let idx = MLX.takeAlong(part, MLX.argSort(dk, axis: 1), axis: 1) // [c,k] nearest first
             eval(idx)
             idxChunks.append(idx)
             start = end
@@ -228,7 +234,11 @@ public final class ProjectionEngine: @unchecked Sendable {
     static func forceEpochs(_ Y0: MLXArray, edgeFrom: MLXArray, edgeTo: MLXArray, negHeads: MLXArray,
                             n: Int, negRate: Int, epochStart: Int, epochEnd: Int, totalEpochs: Int) -> MLXArray {
         var Y = Y0
-        let a: Float = 1.0, b: Float = 1.0, lr: Float = 1.0
+        // UMAP a=1, b=1 (the spike's tuned constants) folded in algebraically: pow(d2, b-1) is
+        // pow(x, 0) == 1 and pow(d2, b) is the identity, so the three pow kernels per epoch were
+        // pure dispatch waste. The folded forms are bit-identical for finite d2 >= 1e-6
+        // (IEEE pow(x, 1) == x, pow(x, 0) == 1, and -2.0 * 1 * 1 == -2.0 exactly).
+        let lr: Float = 1.0
         let nEdges = edgeFrom.dim(0)
         let nNeg = nEdges * negRate
         for epoch in epochStart ..< epochEnd {
@@ -236,7 +246,7 @@ public final class ProjectionEngine: @unchecked Sendable {
             // attractive (neighbors)
             let diff = Y[edgeFrom] - Y[edgeTo]
             let d2 = MLX.maximum(MLX.sum(diff * diff, axis: 1, keepDims: true), MLXArray(Float(1e-6)))
-            let posCoeff = (-2.0 * a * b) * MLX.pow(d2, b - 1.0) / (1.0 + a * MLX.pow(d2, b))
+            let posCoeff = -2.0 / (1.0 + d2)
             let posGrad = MLX.clip(posCoeff * diff, min: Float(-4), max: Float(4)) * alpha
             Y = Y.at[edgeFrom].add(posGrad)
             Y = Y.at[edgeTo].subtract(posGrad)
@@ -244,7 +254,7 @@ public final class ProjectionEngine: @unchecked Sendable {
             let negTo = MLX.randInt(0 ..< n, [nNeg]).asType(.int32)
             let nd = Y[negHeads] - Y[negTo]
             let nd2 = MLX.maximum(MLX.sum(nd * nd, axis: 1, keepDims: true), MLXArray(Float(1e-6)))
-            let negCoeff = (2.0 * b) / ((0.001 + nd2) * (1.0 + a * MLX.pow(nd2, b)))
+            let negCoeff = 2.0 / ((0.001 + nd2) * (1.0 + nd2))
             let negGrad = MLX.clip(negCoeff * nd, min: Float(-4), max: Float(4)) * alpha
             Y = Y.at[negHeads].add(negGrad)
             if (epoch + 1) % 16 == 0 { eval(Y) }              // throttle graph eval to bound memory

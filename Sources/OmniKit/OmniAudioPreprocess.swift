@@ -37,6 +37,39 @@ public enum OmniAudioPreprocess {
     /// deterministically, without feeding a degenerate tensor to the GPU.
     private static let minMelFrames = 3
 
+    // Tables that depend only on the constants above, built once (static let is lazy and
+    // thread-safe). Previously rebuilt per audio FILE: the DFT cos/sin matrices alone are
+    // 2 x 201 x 400 trig evaluations, and the filterbank another 128 x 201 pass - pure waste
+    // in the concurrent decode stage when indexing a large audio folder.
+    /// Hann periodic window length nFFT: w[n] = 0.5 - 0.5*cos(2*pi*n/N).
+    private static let hannWindow: [Float] = {
+        var window = [Float](repeating: 0, count: nFFT)
+        let twoPiOverN = 2.0 * Float.pi / Float(nFFT)
+        for n in 0 ..< nFFT { window[n] = 0.5 - 0.5 * cosf(twoPiOverN * Float(n)) }
+        return window
+    }()
+    /// Direct-DFT basis matrices [nBins x nFFT] (nFFT=400 is not a vDSP DFT length).
+    private static let dftCos: [Float] = {
+        let nBins = nFFT / 2 + 1
+        var cosM = [Float](repeating: 0, count: nBins * nFFT)
+        for b in 0 ..< nBins {
+            for n in 0 ..< nFFT {
+                cosM[b * nFFT + n] = cosf(-2.0 * Float.pi * Float(b) * Float(n) / Float(nFFT))
+            }
+        }
+        return cosM
+    }()
+    private static let dftSin: [Float] = {
+        let nBins = nFFT / 2 + 1
+        var sinM = [Float](repeating: 0, count: nBins * nFFT)
+        for b in 0 ..< nBins {
+            for n in 0 ..< nFFT {
+                sinM[b * nFFT + n] = sinf(-2.0 * Float.pi * Float(b) * Float(n) / Float(nFFT))
+            }
+        }
+        return sinM
+    }()
+
     /// Decode + log-mel as a plain Float buffer (mel-major `[128*frames]`) + frame count.
     /// CPU-only and Sendable, so it can run in the concurrent decode stage of indexing.
     public static func melFeatures(url: URL) -> (mel: [Float], frames: Int)? {
@@ -49,7 +82,7 @@ public enum OmniAudioPreprocess {
         // frames would otherwise reduce over an empty axis and abort the scan.
         if frames < minMelFrames { return nil }
 
-        let melFB = melFilterbank()                      // [nMel, nBins] row-major
+        let melFB = Self.melFB                           // [nMel, nBins] row-major, cached
 
         // Mel projection + log10, parallelized across mel bins (rows are independent;
         // the max reduction is deferred to a second pass). This is CPU-bound matmul work
@@ -170,23 +203,12 @@ public enum OmniAudioPreprocess {
         let frames = Swift.max(fullFrames - 1, 0)
         if frames == 0 { return [] }
 
-        // Hann periodic window length nFFT: w[n] = 0.5 - 0.5*cos(2*pi*n/N).
-        var window = [Float](repeating: 0, count: nFFT)
-        let twoPiOverN = 2.0 * Float.pi / Float(nFFT)
-        for n in 0 ..< nFFT { window[n] = 0.5 - 0.5 * cosf(twoPiOverN * Float(n)) }
-
         // nFFT=400 is not a vDSP-supported DFT length (vDSP needs f*2^n, f in {1,3,5,15};
-        // 400 = 2^4 * 25). Use a direct DFT via precomputed [nBins x nFFT] cos/sin
+        // 400 = 2^4 * 25). Use a direct DFT via the precomputed [nBins x nFFT] cos/sin
         // matrices + vDSP_mmul, preserving the exact 201-bin grid (no zero-padding).
-        var cosM = [Float](repeating: 0, count: nBins * nFFT)
-        var sinM = [Float](repeating: 0, count: nBins * nFFT)
-        for b in 0 ..< nBins {
-            for n in 0 ..< nFFT {
-                let ang = -2.0 * Float.pi * Float(b) * Float(n) / Float(nFFT)
-                cosM[b * nFFT + n] = cosf(ang)
-                sinM[b * nFFT + n] = sinf(ang)
-            }
-        }
+        let window = hannWindow
+        let cosM = dftCos
+        let sinM = dftSin
 
         // Per-frame DFT is independent across frames -> parallelize the outer loop.
         // Each worker owns thread-local scratch (frame/re/im) and writes disjoint
@@ -227,6 +249,9 @@ public enum OmniAudioPreprocess {
     /// 128 triangular mel filters over 201 FFT bins (0..8000 Hz), Slaney mel scale +
     /// Slaney area normalization. Row-major `[nMel, nBins]`. Built from scratch to
     /// match `transformers.audio_utils.mel_filter_bank(norm='slaney', mel_scale='slaney')`.
+    /// Built once (constants-only); previously recomputed per audio file.
+    private static let melFB: [Float] = melFilterbank()
+
     private static func melFilterbank() -> [Float] {
         let nBins = nFFT / 2 + 1
         // FFT bin center frequencies (Hz).
