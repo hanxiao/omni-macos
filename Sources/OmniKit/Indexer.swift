@@ -131,6 +131,11 @@ public final class Indexer: @unchecked Sendable {
 
     public func cancel() { queue.sync { cancelled = true } }
     public var isCancelled: Bool { queue.sync { cancelled } }
+    /// Clear a STALE cancel before starting a new pass. `cancel()` outlives the pass it stopped
+    /// (only `index()`'s own start resets it), so a caller that cancels-and-reschedules (folder
+    /// removal, deferred restart) must reset at the moment the new pass is committed - otherwise
+    /// pre-pass checks read the old cancel and abort the new pass as if the user paused it.
+    public func resetCancelled() { queue.sync { cancelled = false } }
 
     /// Full incremental pass over `roots`. `onProgress` is called on a background
     /// thread; marshal to the main actor in the UI.
@@ -317,16 +322,26 @@ public final class Indexer: @unchecked Sendable {
         // corrupt the index and break resume.
         let wasCancelled = isCancelled
         if !wasCancelled {
-            // Reconcile deletions, with two guards so we only remove files genuinely gone from
+            // Reconcile deletions, with three guards so we only remove files genuinely gone from
             // disk - never files that were merely OUT OF SCOPE this pass:
-            //  1. In-scope only: a path whose modality is disabled (or whose extension is
+            //  1. Under THIS pass's roots only: `known` is the WHOLE store, but a pass may be given
+            //     a SUBSET of the user's roots - the add-folder catch-up pass indexes just the new
+            //     root, and a full pass excludes paused roots. Files of roots this pass never
+            //     crawled are absent from `seen` because nobody looked, not because they are gone;
+            //     deleting them wiped every other folder's index the moment a new folder was added
+            //     from the sidebar. A pass may only reconcile what it was asked to crawl.
+            //  2. In-scope only: a path whose modality is disabled (or whose extension is
             //     excluded) is never crawled, so its absence from `seen` means "not maintained",
             //     not "deleted". Removing it would purge a whole modality the instant its toggle
             //     flips off - exactly what a settings reset (e.g. a bundle-id change clearing
             //     UserDefaults) triggers. Toggling a kind/extension off already deletes its data
             //     explicitly via deleteKind/deleteExtensions, so reconcile must stay out of it.
-            //  2. Blind root: a root that crawled zero files is almost certainly unreadable
+            //  3. Blind root: a root that crawled zero files is almost certainly unreadable
             //     (permission revoked, volume offline), not emptied. Skip its paths too.
+            let passRoots = roots.map { $0.path }
+            func underPassRoots(_ path: String) -> Bool {
+                passRoots.contains { path == $0 || path.hasPrefix($0 + "/") }
+            }
             let blindRoots = perRootFiles.filter { $0.files.isEmpty }.map { $0.key }
             func inBlindRoot(_ path: String) -> Bool {
                 blindRoots.contains { path == $0 || path.hasPrefix($0 + "/") }
@@ -341,7 +356,7 @@ public final class Indexer: @unchecked Sendable {
             }
             // Batch the deletion: one transaction + one in-memory rebuild, not one per path.
             let stale = Set(known.compactMap { (path, sf) -> String? in
-                (!seen.contains(path) && !inBlindRoot(path) && inScope(path, sf.kind)) ? path : nil
+                (!seen.contains(path) && underPassRoots(path) && !inBlindRoot(path) && inScope(path, sf.kind)) ? path : nil
             })
             if !stale.isEmpty {
                 Self.log.info("reconcile: removing \(stale.count, privacy: .public) stale paths")
@@ -405,7 +420,9 @@ public final class Indexer: @unchecked Sendable {
             if isCancelled { break }
             let path = url.path
             let kind = FileExtractor.kind(for: url)
-            if kind == nil || settings.ignore.isIgnored(path, isDir: false) {
+            // Ancestor-aware: an explicit file event for `.../.build/x/y.json` must honor the
+            // dirOnly rule on `.build/` - the crawl prunes at the directory, this path never sees it.
+            if kind == nil || settings.ignore.isIgnoredIncludingAncestors(path, isDir: false) {
                 if known[path] != nil { toDelete.insert(path) }   // now unsupported/excluded -> remove
                 continue
             }

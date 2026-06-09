@@ -134,4 +134,22 @@ final class OmniIgnoreTests: XCTestCase {
         XCTAssertTrue(g.isIgnored("/a/b/__pycache__", isDir: true))
         XCTAssertFalse(g.isIgnored("/proj/src", isDir: true))
     }
+
+    /// FSEvents hands the reconcile EXPLICIT file paths, never their ancestors - so a directory-only
+    /// rule (`.build/`) must still exclude a file deep inside via the ancestor-aware check. This is
+    /// how build churn (.build/...json) leaked into the index through the watcher path while the
+    /// crawl correctly pruned it.
+    func testAncestorAwareCheckHonorsDirOnlyRules() {
+        let g = OmniIgnore(text: OmniIgnore.synthesize(enabledKinds: [.text, .image, .video, .audio], disabledExtensions: []))
+        let leaked = "/Users/x/Documents/proj/.build/arm64/debug/output-file-map.json"
+        XCTAssertFalse(g.isIgnored(leaked, isDir: false),
+                       "plain file check can't see the dirOnly rule (crawl prunes at the dir instead)")
+        XCTAssertTrue(g.isIgnoredIncludingAncestors(leaked, isDir: false),
+                      "ancestor-aware check must exclude contents of an ignored directory")
+        XCTAssertFalse(g.isIgnoredIncludingAncestors("/Users/x/Documents/proj/src/main.swift", isDir: false))
+        // Negation behaves like the plain check for non-dir rules.
+        let g2 = OmniIgnore(text: "*.log\n!keep.log\n")
+        XCTAssertFalse(g2.isIgnoredIncludingAncestors("/a/b/keep.log", isDir: false))
+        XCTAssertTrue(g2.isIgnoredIncludingAncestors("/a/b/other.log", isDir: false))
+    }
 }

@@ -1531,9 +1531,15 @@ final class AppModel {
                         // leak and catchUpPendingRoots (gated on activeRoots.isEmpty) wedges forever.
                         for k in keys { self.activeRoots.remove(k); self.progress.perRoot[k] = nil }
                         guard live else { return }   // a newer pass owns state/stats now
+                        if p.cancelled {
+                            // The cancel came from a deferred removal or a queued full pass, and this
+                            // pass may have stopped before finishing its roots. Re-queue the survivors
+                            // (incremental, so already-embedded files are skipped on the re-run).
+                            self.pendingCatchUpRoots.append(contentsOf: batch.filter { self.roots.contains($0) })
+                        }
                         self.refreshIndexStats(store)
                         if !self.query.isEmpty { self.scheduleSearch() }
-                        self.catchUpPendingRoots()   // pick up any roots added while this pass ran
+                        self.drainDeferredAfterPass(store)   // removals/restart/catch-ups/FS queued mid-pass
                         self.refitFolderMapIfPending()
                     }
                 }
@@ -1549,10 +1555,10 @@ final class AppModel {
         saveRoots()
         restartWatcher()
         guard let store else { return }
-        if indexState == .indexing {
-            // A pass is mid-flight with the old root set; deleting now just races its
-            // re-insertion. Defer the delete and cancel - the completion handler drops the
-            // vectors once the pass has stopped, then resumes indexing the remaining roots.
+        if indexState == .indexing || !activeRoots.isEmpty || fsReconcileInFlight {
+            // A pass is mid-flight with the old root set (full, catch-up, OR fs-reconcile - all
+            // re-insert vectors); deleting now just races its re-insertion. Defer the delete and
+            // cancel - the pass's completion drops the vectors once it has stopped, then resumes.
             pendingRootRemovals.insert(url.path)
             indexer?.cancel()
         } else {
@@ -1857,7 +1863,9 @@ final class AppModel {
         // coalesces a storm into back-to-back single batches instead of overlapping update() tasks.
         pendingFSPaths.formUnion(paths)
         if let eid = watcher?.latestEventId() { pendingFSEventId = max(pendingFSEventId, eid) }
-        if indexState != .indexing && !fsReconcileInFlight { drainPendingFSChanges() }
+        // activeRoots covers the catch-up pass too: kicking update() while a catch-up index() runs
+        // would overlap two pipelines on the same Indexer. The catch-up's completion re-drains.
+        if indexState != .indexing && activeRoots.isEmpty && !fsReconcileInFlight { drainPendingFSChanges() }
     }
 
     /// Stamp "now" as the last time the index was brought current - persisted and reflected live.
@@ -1877,6 +1885,14 @@ final class AppModel {
     /// skipped by modification time, so resuming simply continues where it left off.
     func startIndexing() {
         guard let indexer, let store, indexState != .indexing else { return }
+        // A catch-up pass (added folders) or FS reconcile is mid-flight on the SAME Indexer: starting
+        // a full pass now would run two passes concurrently (shared `cancelled` flag, double
+        // embedding, racing reconciles). Cancel it and defer; its completion drains the flag.
+        guard activeRoots.isEmpty, !fsReconcileInFlight else {
+            restartAfterPause = true
+            indexer.cancel()
+            return
+        }
         // Paused folders are excluded from the pass; if every folder is paused (or there are
         // none), there is nothing to index.
         let activeRootsToIndex = roots.filter { !pausedRoots.contains($0.path) }
@@ -1897,6 +1913,11 @@ final class AppModel {
         indexGen += 1; let gen = indexGen
         progress = IndexProgress()
         startRateSampler()
+        // The pass is committed: clear any STALE cancel left by a deferred removal/restart chain.
+        // Without this, the pre-flight isCancelled check below reads the old cancel and aborts this
+        // pass as ".paused" - the app then sits idle with roots queued forever. From here on, a
+        // cancel means "pause/supersede THIS pass", which that check exists to honor.
+        indexer.resetCancelled()
         let roots = activeRootsToIndex
         let settings = effectiveSettings()
         Task.detached(priority: .utility) {
@@ -2025,8 +2046,43 @@ final class AppModel {
     /// Apply file-system changes that were buffered while a full index was running. Called
     /// only after a completed (non-cancelled) pass, so a paused index never advances
     /// omni.fsEventId past work it has not processed.
+    /// Drain work that was deferred while a catch-up pass or FS reconcile ran, in fixed priority:
+    /// folder removals first (the pass that re-inserted their vectors has stopped), then a deferred
+    /// full pass (modality/ignore change or resume queued via restartAfterPause), then queued
+    /// catch-up roots, then buffered FS events. Each step that starts a new pass owns the rest of
+    /// the chain through its own completion handler, so passes never overlap.
+    private func drainDeferredAfterPass(_ store: VectorStore) {
+        let removed = pendingRootRemovals
+        pendingRootRemovals.removeAll()
+        if !removed.isEmpty {
+            Task.detached {
+                for path in removed { store.deleteUnderFolder(path) }
+                store.compact()
+                await MainActor.run {
+                    self.refreshIndexStats(store)
+                    if !self.query.isEmpty { self.scheduleSearch() }
+                    self.drainDeferredAfterPass(store)   // removals drained; continue the chain
+                }
+            }
+            return
+        }
+        if restartAfterPause {
+            restartAfterPause = false
+            startIndexing()
+            return
+        }
+        catchUpPendingRoots()
+        if indexState != .indexing && activeRoots.isEmpty && !fsReconcileInFlight {
+            drainPendingFSChanges()
+        }
+    }
+
     private func drainPendingFSChanges() {
         guard !pendingFSPaths.isEmpty, !fsReconcileInFlight, let indexer, let store else { return }
+        // Globally paused: keep the events buffered (resume's pass completion re-drains them).
+        // Running update() now would also hit the stale cancel and silently DROP the batch.
+        guard indexState != .paused else { return }
+        indexer.resetCancelled()   // a stale cancel from a removal/restart chain must not kill this batch
         let drained = Array(pendingFSPaths); pendingFSPaths.removeAll()
         let eid = pendingFSEventId; pendingFSEventId = 0
         let settings = effectiveSettings()
@@ -2043,10 +2099,9 @@ final class AppModel {
                 self.refreshIndexStats(store)
                 if !self.query.isEmpty { self.scheduleSearch() }
                 self.fsReconcileInFlight = false
-                // Events that arrived during this reconcile are buffered: drain them in one more batch
-                // (no-op while a full index is running - that path drains on its own completion).
-                if self.indexState != .indexing { self.drainPendingFSChanges() }
-                self.catchUpPendingRoots()   // a folder added while this reconcile ran can now index
+                // Work queued while this reconcile ran (folder removals, a deferred full pass,
+                // added roots, more FS events) drains in one place, in fixed priority.
+                self.drainDeferredAfterPass(store)
                 self.refitFolderMapIfPending()
             }
         }
