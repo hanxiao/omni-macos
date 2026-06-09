@@ -64,6 +64,9 @@ public struct FolderVectors: Sendable {
     public let vectors: [Float]     // row-major [count*dim], fp32, L2-normalized, mean-pooled per file
     public let dim: Int
     public var count: Int { paths.count }
+    public init(paths: [String], kinds: [String], vectors: [Float], dim: Int) {
+        self.paths = paths; self.kinds = kinds; self.vectors = vectors; self.dim = dim
+    }
 }
 
 /// Signature used for incremental change detection.
@@ -414,6 +417,12 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     /// Delete every chunk of a given file kind (used when a content type is disabled).
+    /// Distinct indexed files of one kind (rawValue). Drives the "remove N image files?" purge prompt
+    /// shown when a modality is turned off.
+    public func fileCount(kind: String) -> Int {
+        queue.sync { Set(rows.filter { $0.kind == kind }.map { $0.path }).count }
+    }
+
     public func deleteKind(_ kind: String) {
         queue.sync {
             var stmt: OpaquePointer?
@@ -608,21 +617,38 @@ public final class VectorStore: @unchecked Sendable {
             // index. (The old [String:[Float]] version hashed the path and COW'd a 768-float array on
             // every chunk - ~26s for a 42k-file folder; this is sub-second.)
             let nGlobal = max(1, fileIDCount)
-            var globalToLocal = [Int32](repeating: -1, count: nGlobal)
-            var order: [String] = []
-            var kinds: [String] = []
+            // First pass: every distinct file under the folder, in row order.
+            var seen = [Bool](repeating: false, count: nGlobal)
+            var allGids: [Int] = []; var allPaths: [String] = []; var allKinds: [String] = []
             for i in 0 ..< rows.count {
                 let p = rows[i].path
                 guard underFolder(p) else { continue }
                 let gid = Int(fileID[i])
-                if globalToLocal[gid] < 0 {
-                    if order.count >= cap { continue }       // cap reached: ignore further new files
-                    globalToLocal[gid] = Int32(order.count)
-                    order.append(p); kinds.append(rows[i].kind)
+                if !seen[gid] { seen[gid] = true; allGids.append(gid); allPaths.append(p); allKinds.append(rows[i].kind) }
+            }
+            let total = allPaths.count
+            guard total > 0 else { return empty }
+
+            // Subsample to `cap` with an even stride so the map is a representative overview rather than
+            // the first `cap` files (index order biases toward whichever kind was embedded first).
+            // Deterministic: the same folder yields the same sample.
+            var globalToLocal = [Int32](repeating: -1, count: nGlobal)
+            var order: [String] = []; var kinds: [String] = []
+            if total <= cap {
+                order = allPaths; kinds = allKinds
+                for (li, gid) in allGids.enumerated() { globalToLocal[gid] = Int32(li) }
+            } else {
+                order.reserveCapacity(cap); kinds.reserveCapacity(cap)
+                let stride = Double(total) / Double(cap)
+                var t = 0.0
+                while order.count < cap {
+                    let idx = min(total - 1, Int(t))
+                    globalToLocal[allGids[idx]] = Int32(order.count)
+                    order.append(allPaths[idx]); kinds.append(allKinds[idx])
+                    t += stride
                 }
             }
             let nFiles = order.count
-            guard nFiles > 0 else { return empty }
 
             var sums = [Float](repeating: 0, count: nFiles * dim)
             var counts = [Int](repeating: 0, count: nFiles)

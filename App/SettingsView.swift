@@ -170,9 +170,9 @@ private struct ContentTypesTab: View {
                         }
                 }
             } header: {
-                Text("Indexing Priority")
+                Text("File Types")
             } footer: {
-                Text("Drag to set which types are indexed first. To stop indexing a type, exclude it in the rules below.")
+                Text("Turn a type off to stop indexing it and free its model from memory. Drag to set which types index first.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -207,7 +207,7 @@ private struct ContentTypesTab: View {
             } header: {
                 Text("Skip Small Files")
             } footer: {
-                Text("Skips files below these sizes: icons, thumbnails, very short clips.")
+                Text("Skips files below these sizes, like icons, thumbnails, and very short clips.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -221,29 +221,38 @@ private struct ContentTypesTab: View {
             } header: {
                 Text("Ignore Rules")
             } footer: {
-                Text("One pattern per line, .gitignore syntax. Files matching any pattern are not indexed. A leading ! re-includes; a trailing / matches directories.")
+                Text("Applied after the file-type switches above. One .gitignore pattern per line: a leading ! re-includes, a trailing / matches folders.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
-        .frame(height: 520)   // matches the Serving tab so switching tall tabs doesn't jump
         .onAppear { if !loaded { draft = model.ignoreText; loaded = true } }
         .onChange(of: draft) { _, newValue in schedulePreview(newValue) }
+        .confirmationDialog(
+            model.pendingDisable.map { "Stop indexing \($0.kind.title.lowercased())?" } ?? "",
+            isPresented: Binding(get: { model.pendingDisable != nil }, set: { if !$0 { model.pendingDisable = nil } }),
+            presenting: model.pendingDisable
+        ) { pd in
+            Button("Remove \(pd.count) from index", role: .destructive) { model.applyKind(pd.kind, on: false, purge: true) }
+            Button("Keep in index") { model.applyKind(pd.kind, on: false, purge: false) }
+            Button("Cancel", role: .cancel) { model.pendingDisable = nil }
+        } message: { pd in
+            Text("\(pd.count) \(pd.kind.title.lowercased()) \(pd.count == 1 ? "file is" : "files are") already indexed. Remove them now, or keep them searchable and just stop indexing new ones.")
+        }
     }
 
-    /// Drag-to-reorder row (priority only; exclusion is handled in the rules editor).
+    /// One modality: drag handle (reorder = index priority) + an on/off switch. Off skips the kind
+    /// AND unloads its model from memory; the ignore rules below filter further within what stays on.
     @ViewBuilder private func orderRow(_ k: FileKind) -> some View {
-        // Reflects the APPLIED policy: a kind is "excluded" when every one of its extensions is ignored.
-        let excluded = FileExtractor.extensions(for: k).allSatisfy { model.ignore.isIgnored("/x.\($0)", isDir: false) }
+        let on = model.kindEnabled(k)
         HStack(spacing: 8) {
             Image(systemName: "line.3.horizontal").foregroundStyle(.tertiary).font(.callout)
             Label(k.title, systemImage: k.symbol)
             Spacer()
-            if excluded {
-                Text("excluded").font(.caption).foregroundStyle(.secondary)
-            }
+            Toggle("", isOn: Binding(get: { model.kindEnabled(k) }, set: { model.toggleKind(k, on: $0) }))
+                .labelsHidden().toggleStyle(.switch).controlSize(.mini)
         }
-        .opacity(excluded ? 0.5 : 1)
+        .opacity(on ? 1 : 0.55)
     }
 
     @ViewBuilder private var previewBar: some View {
@@ -270,6 +279,8 @@ private struct ContentTypesTab: View {
                     Text("These rules are applied.").foregroundStyle(.secondary)
                 }
                 Spacer()
+                Button("Import\u{2026}") { importIgnoreFile() }
+                    .help("Load patterns from a file on disk into the editor.")
                 if model.ignoreHasBackup {
                     Button("Revert") {
                         model.revertIgnore()
@@ -301,6 +312,16 @@ private struct ContentTypesTab: View {
         }
         .padding(12)
         .frame(width: 360, alignment: .leading)
+    }
+
+    /// Load an ignore file from disk into the editor draft (Apply still commits it).
+    private func importIgnoreFile() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true; panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
+        panel.message = "Choose a .omniignore or text file of ignore patterns"
+        if panel.runModal() == .OK, let url = panel.url, let text = try? String(contentsOf: url, encoding: .utf8) {
+            draft = text
+        }
     }
 
     /// Debounce the dry-run so we don't query the index on every keystroke.
@@ -396,7 +417,7 @@ private struct PerformanceTab: View {
             } header: {
                 Text("Folder map")
             } footer: {
-                Text("PCA is instant and uses little memory - the safe default. UMAP separates clusters better and enables click-to-spotlight of nearest neighbors, but builds large GPU buffers; on a Mac with limited memory it can be slow or unresponsive on big folders.")
+                Text("PCA is instant and light, the safe default. UMAP separates clusters better and enables click-to-spotlight of nearest neighbors. Large folders are sampled to stay within the memory cap below.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
@@ -422,7 +443,7 @@ private struct PerformanceTab: View {
             } header: {
                 Text("Memory")
             } footer: {
-                Text("Caps memory the model may use. Keep it above ~4 GB; 0 means unlimited.")
+                Text("Caps memory for the model and the folder map. Keep it above ~4 GB; 0 means unlimited.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
