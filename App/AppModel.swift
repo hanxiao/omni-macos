@@ -196,19 +196,29 @@ final class AppModel {
         }
     }
 
-    /// Files projected into the folder map, bounded by the memory cap. The projection builds an
-    /// `N x dim` fp32 matrix on the GPU (plus a centered copy, and for UMAP kNN tiles + a force
-    /// layout); leaving N unbounded is what lets a big folder burst past the cap and lag the machine.
-    /// The map is a visual overview, so larger folders are subsampled to this many representative
-    /// points. UMAP carries the extra kNN/force cost, so its ceiling is lower than PCA's for speed.
+    /// LANDMARK budget for the folder map: the rows the quadratic layout work (UMAP kNN + force,
+    /// PCA SVD) runs on. The kNN GEMM is O(L^2 * dim) and builds large distance tiles, so leaving L
+    /// unbounded is what lets a big folder lag or freeze a low-RAM Mac. Files beyond the budget are
+    /// no longer dropped - they are PLACED relative to the landmark layout (linear, memory-bounded
+    /// tiles), so every file still gets a dot (up to mapTotalPointCap).
     var mapPointBudget: Int {
         let capGB = maxMemoryGB > 0 ? maxMemoryGB : physicalMemoryGB
         let bytesPerPoint = Double(max(256, engineDim) * 4 * 5)   // X + centered copy + transient temps
         let n = Int(capGB * 0.12 * 1_073_741_824 / bytesPerPoint) // give the map ~12% of the cap
         // Ceilings keep the map responsive even with memory to spare: UMAP runs kNN + a 300-epoch force
-        // layout (~0.4s at 15k here, multiseconds on a low-end GPU), so cap it well below PCA, which is
-        // an N-light SVD. The memory budget above pulls both lower on a low-RAM Mac.
+        // layout (~0.3s at 15k / 2s at 60k on an M3 Ultra, ~10x that on a base M-series GPU), so cap
+        // it below PCA, which is an N-light SVD. The memory budget above pulls both lower on low RAM.
         return max(2_000, min(n, mapUsesUMAP ? 15_000 : 60_000))
+    }
+
+    /// Ceiling on TOTAL dots in the map (landmarks + placed rest). Placement cost is linear and its
+    /// GEMM is tiled, so this bound is about the host vector buffer pulled from the store and the
+    /// render/hover cost of the scatter itself, not the layout math.
+    var mapTotalPointCap: Int {
+        let capGB = maxMemoryGB > 0 ? maxMemoryGB : physicalMemoryGB
+        let bytesPerPoint = Double(max(256, engineDim) * 4 * 2)   // host [Float] + tile headroom
+        let n = Int(capGB * 0.12 * 1_073_741_824 / bytesPerPoint)
+        return max(mapPointBudget, min(n, 250_000))
     }
 
     var canIndex: Bool { phase == .ready && !roots.isEmpty }
@@ -1622,11 +1632,12 @@ final class AppModel {
         folderProjectionFitting = true
         let folder = url.path
         let refine = mapUsesUMAP   // captured on the main actor; the detached worker reads only this Bool
-        // Bound the points pulled for the map by the memory cap (mapPointBudget) so a big folder is
-        // subsampled to a representative cloud instead of peaking the host [Float] + GPU X + centered
-        // matrix past the cap and freezing the machine. The map is a visual overview, so this only
-        // shifts dots, never search results (which always use the full index).
+        // The quadratic layout runs on a memory-budgeted LANDMARK sample (mapPointBudget); the rest
+        // of the files are placed relative to it in linear, tiled passes, so every file gets a dot
+        // up to mapTotalPointCap. Neither bound ever shifts search results (which always use the
+        // full index).
         let mapCap = mapPointBudget
+        let totalCap = mapTotalPointCap
         let proj = ProjectionEngine(engine: engine)
         // The fit runs on a detached utility worker (off the main actor), bridged through a one-shot
         // AsyncStream so cancelling this @MainActor task terminates the stream and cancels the worker
@@ -1646,7 +1657,7 @@ final class AppModel {
                     // machine-gun click-through to just the folder the selection lands on.
                     try? await Task.sleep(for: .milliseconds(120))
                     if Task.isCancelled { continuation.finish(); return }
-                    let data = store.vectorsUnderFolder(folder, cap: mapCap)
+                    let data = store.vectorsUnderFolder(folder, cap: totalCap, landmarkCap: mapCap)
                     if Task.isCancelled { continuation.finish(); return }
                     continuation.yield((await proj.project(data, refine: refine), data.total))   // PCA / UMAP
                     continuation.finish()

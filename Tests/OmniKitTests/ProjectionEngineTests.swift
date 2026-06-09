@@ -90,6 +90,54 @@ final class ProjectionEngineTests: XCTestCase {
                              "PCA blobs not separated: mean inter \(inter) <= mean intra \(intra)")
     }
 
+    /// Reorder blob data so the first L rows are an even-stride sample (what vectorsUnderFolder
+    /// returns with a landmark cap) and the rest follow in row order.
+    private func landmarkFirst(_ data: FolderVectors, _ label: [Int], landmarks L: Int) -> (FolderVectors, [Int]) {
+        let n = data.count, d = data.dim
+        var isLandmark = [Bool](repeating: false, count: n)
+        var order = [Int]()
+        let stride = Double(n) / Double(L)
+        var t = 0.0
+        while order.count < L { let i = min(n - 1, Int(t)); isLandmark[i] = true; order.append(i); t += stride }
+        for i in 0 ..< n where !isLandmark[i] { order.append(i) }
+        var vectors = [Float](); vectors.reserveCapacity(n * d)
+        var paths = [String](); var kinds = [String](); var lab = [Int]()
+        for i in order {
+            vectors.append(contentsOf: data.vectors[(i * d) ..< ((i + 1) * d)])
+            paths.append(data.paths[i]); kinds.append(data.kinds[i]); lab.append(label[i])
+        }
+        return (FolderVectors(paths: paths, kinds: kinds, vectors: vectors, dim: d, landmarkCount: L), lab)
+    }
+
+    /// Landmark mode: the force layout runs on the first L rows only; every other row is PLACED via
+    /// IDW over its nearest landmarks. All n points must come back finite, blobs must still
+    /// separate, and the landmarks' own coordinates must be exactly what a landmark-only layout
+    /// produces (placement must not disturb the layout).
+    func testLandmarkLayoutPlacesAllPoints() {
+        let dim = 256, L = 120
+        let (data0, label0) = makeBlobs(blobs: 4, perBlob: 150, dim: dim, seed: 4242)   // n = 600
+        let (data, label) = landmarkFirst(data0, label0, landmarks: L)
+        let pts = ProjectionEngine.layout(data, k: 10, epochs: 80, seed: 7)
+        XCTAssertEqual(pts.count, 600, "every file gets a dot, not just the landmarks")
+        XCTAssertTrue(pts.allSatisfy { $0.position.x.isFinite && $0.position.y.isFinite })
+        XCTAssertEqual(pts.map(\.path), data.paths, "points stay row-aligned with the input")
+        let (intra, inter) = meanIntraInter(pts, label)
+        XCTAssertGreaterThan(inter, intra,
+                             "placed points broke blob separation: inter \(inter) <= intra \(intra)")
+
+        // Landmark coordinates must equal a landmark-only layout. Compared at epochs: 0 (the
+        // deterministic PCA-init stage): the force loop's scatter-add is order-nondeterministic on
+        // the GPU, so full force layouts are not bit-reproducible across runs (pre-existing).
+        let pts0 = ProjectionEngine.layout(data, k: 10, epochs: 0, seed: 7)
+        let lmOnly = FolderVectors(paths: Array(data.paths[0 ..< L]), kinds: Array(data.kinds[0 ..< L]),
+                                   vectors: Array(data.vectors[0 ..< (L * dim)]), dim: dim)
+        let lmPts = ProjectionEngine.layout(lmOnly, k: 10, epochs: 0, seed: 7)
+        for i in 0 ..< L {
+            XCTAssertEqual(pts0[i].position.x, lmPts[i].position.x, accuracy: 1e-4, "landmark \(i) moved")
+            XCTAssertEqual(pts0[i].position.y, lmPts[i].position.y, accuracy: 1e-4, "landmark \(i) moved")
+        }
+    }
+
     /// Degenerate inputs must not crash or emit NaN.
     func testEmptyAndTinyInputs() {
         XCTAssertTrue(ProjectionEngine.layout(FolderVectors(paths: [], kinds: [], vectors: [], dim: 1024)).isEmpty)
