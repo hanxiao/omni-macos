@@ -66,9 +66,16 @@ public struct FolderVectors: Sendable {
     /// Distinct files under the folder BEFORE map subsampling (== count when not sampled). Lets the
     /// folder-map caption show "N of M" for any folder, including non-root subfolders.
     public let total: Int
+    /// The FIRST `landmarkCount` rows are the deterministic stride sample (the "landmarks"): the
+    /// expensive layout (UMAP kNN + force, PCA SVD) runs on them, and the remaining rows are placed
+    /// relative to them, so every file gets a dot at near-sample cost. == count when not sampled.
+    public let landmarkCount: Int
     public var count: Int { paths.count }
-    public init(paths: [String], kinds: [String], vectors: [Float], dim: Int, total: Int? = nil) {
-        self.paths = paths; self.kinds = kinds; self.vectors = vectors; self.dim = dim; self.total = total ?? paths.count
+    public init(paths: [String], kinds: [String], vectors: [Float], dim: Int, total: Int? = nil,
+                landmarkCount: Int? = nil) {
+        self.paths = paths; self.kinds = kinds; self.vectors = vectors; self.dim = dim
+        self.total = total ?? paths.count
+        self.landmarkCount = landmarkCount ?? paths.count
     }
 }
 
@@ -643,9 +650,16 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     /// Per-FILE mean-pooled, L2-normalized fp32 vectors for files under `folder` (path-boundary
-    /// aware), capped at `cap` files in row order. Additive read-only helper for the folder
-    /// visualization; does NOT touch search state. Runs under `queue` like every other reader.
-    public func vectorsUnderFolder(_ folder: String, cap: Int = .max) -> FolderVectors {
+    /// aware). Additive read-only helper for the folder visualization; does NOT touch search state.
+    /// Runs under `queue` like every other reader.
+    ///
+    /// `landmarkCap` bounds the LANDMARK sample (the rows the expensive layout runs on); `cap`
+    /// bounds the total rows returned. The first `landmarkCount` rows of the result are the
+    /// deterministic even-stride sample over all files (representative, not index-order biased);
+    /// the remaining rows are every other file, in row order, up to `cap`. With cap == .max every
+    /// file under the folder gets a row, so the map can place ALL files while only the landmarks
+    /// pay the quadratic layout cost.
+    public func vectorsUnderFolder(_ folder: String, cap: Int = .max, landmarkCap: Int = .max) -> FolderVectors {
         queue.sync {
             guard dim > 0, !folder.isEmpty, folder != "/" else { return FolderVectors(paths: [], kinds: [], vectors: [], dim: dim) }
             let empty = FolderVectors(paths: [], kinds: [], vectors: [], dim: dim)
@@ -670,25 +684,36 @@ public final class VectorStore: @unchecked Sendable {
             let total = allPaths.count
             guard total > 0 else { return empty }
 
-            // Subsample to `cap` with an even stride so the map is a representative overview rather than
-            // the first `cap` files (index order biases toward whichever kind was embedded first).
-            // Deterministic: the same folder yields the same sample.
+            // Landmarks: an even-stride sample so the layout sees a representative overview rather
+            // than the first `landmarkCap` files (index order biases toward whichever kind was
+            // embedded first). Deterministic: the same folder yields the same sample.
+            let lCap = min(landmarkCap, cap)
             var globalToLocal = [Int32](repeating: -1, count: nGlobal)
             var order: [String] = []; var kinds: [String] = []
-            if total <= cap {
+            if total <= lCap {
                 order = allPaths; kinds = allKinds
                 for (li, gid) in allGids.enumerated() { globalToLocal[gid] = Int32(li) }
             } else {
-                order.reserveCapacity(cap); kinds.reserveCapacity(cap)
-                let stride = Double(total) / Double(cap)
+                order.reserveCapacity(min(total, cap)); kinds.reserveCapacity(min(total, cap))
+                let stride = Double(total) / Double(lCap)
                 var t = 0.0
-                while order.count < cap {
+                while order.count < lCap {
                     let idx = min(total - 1, Int(t))
                     globalToLocal[allGids[idx]] = Int32(order.count)
                     order.append(allPaths[idx]); kinds.append(allKinds[idx])
                     t += stride
                 }
+                // Rest: every remaining file, row order, until the total cap. These rows are PLACED
+                // relative to the landmark layout (no quadratic cost), so every file gets a dot.
+                if order.count < cap {
+                    for i in 0 ..< total where globalToLocal[allGids[i]] < 0 {
+                        globalToLocal[allGids[i]] = Int32(order.count)
+                        order.append(allPaths[i]); kinds.append(allKinds[i])
+                        if order.count >= cap { break }
+                    }
+                }
             }
+            let landmarkCount = min(total, lCap)
             let nFiles = order.count
 
             var sums = [Float](repeating: 0, count: nFiles * dim)
@@ -717,7 +742,8 @@ public final class VectorStore: @unchecked Sendable {
                     for k in 0 ..< dim { s[so + k] *= inv }
                 }
             }
-            return FolderVectors(paths: order, kinds: kinds, vectors: sums, dim: dim, total: total)
+            return FolderVectors(paths: order, kinds: kinds, vectors: sums, dim: dim, total: total,
+                                 landmarkCount: landmarkCount)
         }
     }
 

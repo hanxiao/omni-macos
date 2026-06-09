@@ -129,6 +129,37 @@ final class VectorStoreTests: XCTestCase {
         XCTAssertEqual(hits.first?.score ?? 0, 1.0, accuracy: 1e-6)
     }
 
+    /// Landmark-first ordering: the first landmarkCount rows are the even-stride sample over ALL
+    /// files; the remaining rows are every other file (row order) up to the total cap, so the map
+    /// can place every file while only the landmarks pay the quadratic layout cost.
+    func testVectorsUnderFolderLandmarkOrdering() throws {
+        let url = tempDB()
+        let store = try VectorStore(dbURL: url)
+        let dim = 16
+        func unit(_ i: Int) -> [Float] { var v = [Float](repeating: 0, count: dim); v[i] = 1; return v }
+        for i in 0 ..< 10 {
+            let path = "/d/f\(i).txt"
+            try store.replace(path: path, chunks: [IndexedChunk(path: path, modified: 1, size: 1, kind: "text",
+                                                                chunkIndex: 0, snippet: "s", embedding: unit(i))])
+        }
+        let fv = store.vectorsUnderFolder("/d", cap: 8, landmarkCap: 4)
+        XCTAssertEqual(fv.total, 10)
+        XCTAssertEqual(fv.count, 8)
+        XCTAssertEqual(fv.landmarkCount, 4)
+        // stride 10/4 = 2.5 -> rows 0, 2, 5, 7; the rest fills 1, 3, 4, 6 in row order up to cap 8.
+        XCTAssertEqual(fv.paths, ["/d/f0.txt", "/d/f2.txt", "/d/f5.txt", "/d/f7.txt",
+                                  "/d/f1.txt", "/d/f3.txt", "/d/f4.txt", "/d/f6.txt"])
+        // vectors stay row-aligned: each file's mean-pooled vector is its own basis vector.
+        for (row, path) in fv.paths.enumerated() {
+            let i = Int(path.dropFirst("/d/f".count).dropLast(".txt".count))!
+            XCTAssertEqual(fv.vectors[row * dim + i], 1.0, accuracy: 1e-5, "row \(row) misaligned")
+        }
+        // No caps: everything is a landmark (the pre-landmark behavior).
+        let full = store.vectorsUnderFolder("/d")
+        XCTAssertEqual(full.count, 10)
+        XCTAssertEqual(full.landmarkCount, 10)
+    }
+
     func testDeleteKindAndUnderFolder() throws {
         let url = tempDB()
         let store = try VectorStore(dbURL: url)

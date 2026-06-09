@@ -224,6 +224,16 @@ if args.count >= 2 && args[1] == "projbench" {
         let finite = pts.allSatisfy { $0.position.x.isFinite && $0.position.y.isFinite }
         print(String(format: "  n=%-6d  UMAP full layout = %.3fs   (%d pts, finite=%@)",
                      n, -t.timeIntervalSinceNow, pts.count, finite ? "yes" : "NO"))
+        // Landmark mode: quadratic layout on 15k landmarks, every other point placed via IDW.
+        if n > 15_000 {
+            let lm = FolderVectors(paths: data.paths, kinds: data.kinds, vectors: data.vectors,
+                                   dim: dim, landmarkCount: 15_000)
+            let tl = Date()
+            let lpts = ProjectionEngine.layout(lm, k: 15, epochs: 300)
+            let lfinite = lpts.allSatisfy { $0.position.x.isFinite && $0.position.y.isFinite }
+            print(String(format: "  n=%-6d  UMAP landmark(15k) = %.3fs   (%d pts, finite=%@)",
+                         n, -tl.timeIntervalSinceNow, lpts.count, lfinite ? "yes" : "NO"))
+        }
     }
     exit(0)
 }
