@@ -17,9 +17,12 @@ public struct IndexedChunk: Sendable {
     public var width: Int
     public var height: Int
     public var duration: Double
+    /// Where this chunk sits inside its file, human-readable ("Page 3", "Line 1240").
+    /// Empty when the file has a single chunk or no meaningful position.
+    public var locator: String
 
     public init(path: String, modified: Double, size: Int = 0, kind: String, chunkIndex: Int, snippet: String, embedding: [Float],
-                width: Int = 0, height: Int = 0, duration: Double = 0) {
+                width: Int = 0, height: Int = 0, duration: Double = 0, locator: String = "") {
         self.path = path
         self.modified = modified
         self.size = size
@@ -30,6 +33,7 @@ public struct IndexedChunk: Sendable {
         self.width = width
         self.height = height
         self.duration = duration
+        self.locator = locator
     }
 }
 
@@ -45,6 +49,8 @@ public struct SearchHit: Sendable {
     public var width: Int = 0
     public var height: Int = 0
     public var duration: Double = 0
+    /// Position of the best-matching chunk inside the file ("Page 3", "Line 1240"); "" if n/a.
+    public var locator: String = ""
 }
 
 /// One matching passage (chunk) within a file.
@@ -52,6 +58,7 @@ public struct ChunkHit: Sendable, Identifiable {
     public let chunkIndex: Int
     public let score: Float
     public let snippet: String
+    public let locator: String
     public var id: Int { chunkIndex }
 }
 
@@ -116,7 +123,7 @@ public final class VectorStore: @unchecked Sendable {
     private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
     struct Row { let path: String; let snippet: String; let kind: String; let chunkIndex: Int; let modified: Double
-                 var width: Int = 0; var height: Int = 0; var duration: Double = 0 }
+                 var width: Int = 0; var height: Int = 0; var duration: Double = 0; var locator: String = "" }
     private var rows: [Row] = []
     // Single source of truth for embeddings: contiguous bf16 bits, [count*dim], row i = rows[i].
     // bf16 (2 bytes/dim) halves residency and disk vs fp32 with negligible recall loss on
@@ -240,6 +247,7 @@ public final class VectorStore: @unchecked Sendable {
         addColumnIfMissing("width", "INTEGER NOT NULL DEFAULT 0")
         addColumnIfMissing("height", "INTEGER NOT NULL DEFAULT 0")
         addColumnIfMissing("duration", "REAL NOT NULL DEFAULT 0")
+        addColumnIfMissing("locator", "TEXT NOT NULL DEFAULT ''")
         setUserVersion(Self.schemaVersion)
         loadIntoMemory()
     }
@@ -289,7 +297,7 @@ public final class VectorStore: @unchecked Sendable {
             exec("BEGIN;")
             deletePathLocked(path)
             let bfs = chunks.map { bf16Row($0.embedding) }   // fp32 -> bf16 once, reused for blob + memory
-            let sql = "INSERT INTO chunks(path, modified, size, kind, chunk_index, snippet, dim, vec, width, height, duration) VALUES(?,?,?,?,?,?,?,?,?,?,?);"
+            let sql = "INSERT INTO chunks(path, modified, size, kind, chunk_index, snippet, dim, vec, width, height, duration, locator) VALUES(?,?,?,?,?,?,?,?,?,?,?,?);"
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                 exec("ROLLBACK;")
@@ -311,6 +319,7 @@ public final class VectorStore: @unchecked Sendable {
                 sqlite3_bind_int(stmt, 9, Int32(c.width))
                 sqlite3_bind_int(stmt, 10, Int32(c.height))
                 sqlite3_bind_double(stmt, 11, c.duration)
+                sqlite3_bind_text(stmt, 12, c.locator, -1, SQLITE_TRANSIENT)
                 guard sqlite3_step(stmt) == SQLITE_DONE else {
                     exec("ROLLBACK;")
                     throw OmniError.store("insert step failed")
@@ -323,7 +332,7 @@ public final class VectorStore: @unchecked Sendable {
             if presentPaths.contains(path) { removeRowsLocked { $0.path == path } }
             for (i, c) in chunks.enumerated() {
                 rows.append(Row(path: c.path, snippet: c.snippet, kind: c.kind, chunkIndex: c.chunkIndex, modified: c.modified,
-                                width: c.width, height: c.height, duration: c.duration))
+                                width: c.width, height: c.height, duration: c.duration, locator: c.locator))
                 flat16.append(contentsOf: bfs[i])
                 fileID.append(internPath(c.path))
                 kindCode.append(internKind(c.kind))
@@ -353,7 +362,7 @@ public final class VectorStore: @unchecked Sendable {
             }
             let bfs = work.map { $0.chunks.map { bf16Row($0.embedding) } }   // fp32 -> bf16 once
             exec("BEGIN;")
-            let sql = "INSERT INTO chunks(path, modified, size, kind, chunk_index, snippet, dim, vec, width, height, duration) VALUES(?,?,?,?,?,?,?,?,?,?,?);"
+            let sql = "INSERT INTO chunks(path, modified, size, kind, chunk_index, snippet, dim, vec, width, height, duration, locator) VALUES(?,?,?,?,?,?,?,?,?,?,?,?);"
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                 exec("ROLLBACK;")
@@ -377,6 +386,7 @@ public final class VectorStore: @unchecked Sendable {
                     sqlite3_bind_int(stmt, 9, Int32(c.width))
                     sqlite3_bind_int(stmt, 10, Int32(c.height))
                     sqlite3_bind_double(stmt, 11, c.duration)
+                    sqlite3_bind_text(stmt, 12, c.locator, -1, SQLITE_TRANSIENT)
                     guard sqlite3_step(stmt) == SQLITE_DONE else {
                         exec("ROLLBACK;")
                         throw OmniError.store("insert step failed")
@@ -391,7 +401,7 @@ public final class VectorStore: @unchecked Sendable {
             for (wi, it) in work.enumerated() {
                 for (ci, c) in it.chunks.enumerated() {
                     rows.append(Row(path: c.path, snippet: c.snippet, kind: c.kind, chunkIndex: c.chunkIndex, modified: c.modified,
-                                    width: c.width, height: c.height, duration: c.duration))
+                                    width: c.width, height: c.height, duration: c.duration, locator: c.locator))
                     flat16.append(contentsOf: bfs[wi][ci])
                     fileID.append(internPath(c.path))
                     kindCode.append(internKind(c.kind))
@@ -898,7 +908,7 @@ public final class VectorStore: @unchecked Sendable {
         let out = order.map { idx -> SearchHit in
             let r = rows[Int(heapRow[idx])]
             return SearchHit(path: r.path, score: heapScore[idx], snippet: r.snippet, kind: r.kind, chunkIndex: r.chunkIndex, modified: r.modified,
-                             width: r.width, height: r.height, duration: r.duration)
+                             width: r.width, height: r.height, duration: r.duration, locator: r.locator)
         }
         if let tA, let tB {
             print(String(format: "  [reduce] hot=%.1fms topK=%.1fms (F=%d out=%d)",
@@ -919,7 +929,7 @@ public final class VectorStore: @unchecked Sendable {
             if !dot.isFinite { continue }
             if let e = best[r.path], e.score >= dot { continue }
             best[r.path] = SearchHit(path: r.path, score: dot, snippet: r.snippet, kind: r.kind, chunkIndex: r.chunkIndex, modified: r.modified,
-                                     width: r.width, height: r.height, duration: r.duration)
+                                     width: r.width, height: r.height, duration: r.duration, locator: r.locator)
         }
         return Array(best.values).sorted { $0.score > $1.score }.prefix(topK).map { $0 }
     }
@@ -955,7 +965,7 @@ public final class VectorStore: @unchecked Sendable {
                         for k in 0 ..< dim { rowF[k] = Self.fromBF16(mb[i * dim + k]) }
                         var dot: Float = 0
                         rowF.withUnsafeBufferPointer { vDSP_dotpr($0.baseAddress!, 1, qp, 1, &dot, d) }
-                        if dot.isFinite { hits.append(ChunkHit(chunkIndex: rows[i].chunkIndex, score: dot, snippet: rows[i].snippet)) }
+                        if dot.isFinite { hits.append(ChunkHit(chunkIndex: rows[i].chunkIndex, score: dot, snippet: rows[i].snippet, locator: rows[i].locator)) }
                     }
                 }
             }
@@ -1118,7 +1128,7 @@ public final class VectorStore: @unchecked Sendable {
             kindCode.reserveCapacity(total)
         }
         var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, "SELECT path, snippet, kind, chunk_index, dim, vec, modified, width, height, duration FROM chunks;", -1, &stmt, nil) == SQLITE_OK {
+        if sqlite3_prepare_v2(db, "SELECT path, snippet, kind, chunk_index, dim, vec, modified, width, height, duration, locator FROM chunks;", -1, &stmt, nil) == SQLITE_OK {
             while sqlite3_step(stmt) == SQLITE_ROW {
                 let path = String(cString: sqlite3_column_text(stmt, 0))
                 let snippet = String(cString: sqlite3_column_text(stmt, 1))
@@ -1129,6 +1139,7 @@ public final class VectorStore: @unchecked Sendable {
                 let width = Int(sqlite3_column_int(stmt, 7))
                 let height = Int(sqlite3_column_int(stmt, 8))
                 let duration = sqlite3_column_double(stmt, 9)
+                let locator = sqlite3_column_text(stmt, 10).map { String(cString: $0) } ?? ""
                 guard d > 0, let blob = sqlite3_column_blob(stmt, 5) else { continue }
                 if dim == 0 { dim = d }
                 guard d == dim else { continue }   // skip mismatched-dimension rows
@@ -1144,7 +1155,7 @@ public final class VectorStore: @unchecked Sendable {
                     flat16.append(contentsOf: repeatElement(0, count: d))   // short/corrupt row
                 }
                 rows.append(Row(path: path, snippet: snippet, kind: kind, chunkIndex: ci, modified: modified,
-                                width: width, height: height, duration: duration))
+                                width: width, height: height, duration: duration, locator: locator))
                 fileID.append(internPath(path))
                 kindCode.append(internKind(kind))
                 presentPaths.insert(path)

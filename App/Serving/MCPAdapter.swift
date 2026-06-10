@@ -129,15 +129,18 @@ enum MCPAdapter {
             ? ["No results for \"\(query)\"."]
             : hits.enumerated().map { i, h in
                 let score = Int((max(0, min(1, h.score)) * 100).rounded())
+                let loc = h.locator.isEmpty ? "" : ", \(h.locator)"
                 let snippet = h.snippet.replacingOccurrences(of: "\n", with: " ")
                 let snip = h.kind == "text" && !snippet.isEmpty ? "\n   \(String(snippet.prefix(160)))" : ""
-                return "\(i + 1). \(h.path)  (\(h.kind), \(score)%)\(snip)"
+                return "\(i + 1). \(h.path)  (\(h.kind), \(score)%\(loc))\(snip)"
             }
         let structured: [[String: Any]] = hits.map { h in
             ["path": h.path,
              "score": Double(max(0, min(1, h.score))),
              "kind": h.kind,
              "snippet": h.snippet,
+             // Where the best-matching chunk sits inside the file ("Page 3", "Line 1240"); "" if n/a.
+             "locator": h.locator,
              "modified": h.modified]
         }
         return result(id: id, [

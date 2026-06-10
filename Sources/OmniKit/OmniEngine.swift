@@ -1,6 +1,7 @@
 import Foundation
 import CoreGraphics
 import MLX
+import PDFKit
 import Tokenizers
 
 /// The jina-embeddings-v5-omni model variants the app can run.
@@ -432,9 +433,20 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             // (vision tower), exactly as the indexer treats it. (Previously this returned nil, so "find
             // similar"/file-query on a PDF or text file silently failed.)
             switch (try? FileExtractor.extract(url, maxImageDimension: maxImageDimension, maxVideoFrames: maxVideoFrames)) ?? .empty {
-            case .text(let s):
+            case .text(let s), .pagedText(let s, _):
                 let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
                 return t.isEmpty ? nil : embedText(t, as: asDocument ? .passage : .query)
+            case .scannedPDF(let pageCount):
+                // Query context: a handful of leading pages is plenty to characterize the document
+                // (the INDEX covers every page; this is just the query vector).
+                guard let doc = PDFDocument(url: url) else { return nil }
+                var pages: [CGImage] = []
+                for i in 0 ..< min(pageCount, 8) {
+                    autoreleasepool {
+                        if let img = FileExtractor.renderPDFPage(doc, index: i, maxDimension: maxImageDimension) { pages.append(img) }
+                    }
+                }
+                return pages.isEmpty ? nil : embedVideoQuery(pages, asDocument: asDocument)
             case .images(let pages):
                 return pages.isEmpty ? nil : embedVideoQuery(pages, asDocument: asDocument)
             case .empty:

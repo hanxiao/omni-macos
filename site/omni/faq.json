@@ -182,6 +182,10 @@
           "q": "Can I drag a result into another app?",
           "a": "No, results are intentionally not draggable since drag-to-search is reserved for files coming from Finder. Use Reveal in Finder to drag the file from there, or Find Similar to keep searching by it.",
           "shortcut": ""
+        },
+        {
+          "q": "Why do some results show \"Page 3\" or \"Line 1240\"?",
+          "a": "That is where the best-matching passage sits inside the file: page numbers for PDFs, line numbers for text and code. In list view it appears in the result's info line (expand a text result to see all matching passages); in grid view it is a small badge on the thumbnail. Agents get the same field as \"locator\" in API and MCP results."
         }
       ]
     },
@@ -227,6 +231,10 @@
           "q": "How do I see how many files are indexed per folder, and track progress?",
           "a": "Each folder shows its indexed file count beside it, with a pause icon on paused folders and a grayed-out 0 when empty. A progress pie fills clockwise as a folder is indexed, and hovering it shows exact progress like 1,234 / 5,678 files; a small spinner appears instead during background reconciliation.",
           "shortcut": ""
+        },
+        {
+          "q": "How are long documents and multi-page PDFs handled?",
+          "a": "Long text files are split into overlapping chunks and every chunk is indexed - there is no length cap beyond the 2MB extraction limit. A PDF with a text layer is indexed as text with page tracking; a scanned (image-only) PDF has every page rasterized and embedded individually, whatever the page count. Search ranks each file by its best-matching chunk, so long documents compete fairly with short ones."
         }
       ]
     },

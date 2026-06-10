@@ -34,7 +34,14 @@ public enum FileKind: String, Sendable, CaseIterable {
 /// Content pulled from a file, ready to embed.
 public enum ExtractedContent {
     case text(String)         // embed with the text tower
-    case images([CGImage])    // embed with the vision tower (images, scanned PDFs, video frames)
+    /// Text with page boundaries (text-layer PDFs): `pageStarts[i]` is the CHARACTER offset of
+    /// page i in the string, so chunk positions can be mapped back to page numbers.
+    case pagedText(String, pageStarts: [Int])
+    case images([CGImage])    // embed with the vision tower (images, video frames)
+    /// A scanned (image-only) PDF. Pages are NOT rasterized here: the indexer streams them in
+    /// small groups (render -> patchify -> embed -> free), so a 500-page scan never holds more
+    /// than a group of pages in memory. Use `renderPDFPage` to rasterize one page.
+    case scannedPDF(pageCount: Int)
     case empty
 }
 
@@ -58,7 +65,6 @@ public enum FileExtractor {
     public static let audioExtensions: Set<String> = ["mp3", "wav", "m4a", "aac", "flac", "ogg", "oga", "aiff", "aif", "caf", "wma"]
 
     public static let maxTextBytes = 2_000_000
-    public static let maxScanPages = 8
     public static let minCharsPerPage = 8
     public static let maxVideoFrames = 6
 
@@ -121,21 +127,34 @@ public enum FileExtractor {
     private static func extractPDF(_ url: URL, maxImageDimension: Int) throws -> ExtractedContent {
         guard let doc = PDFDocument(url: url) else { throw OmniError.extraction("cannot open PDF \(url.lastPathComponent)") }
         let pageCount = doc.pageCount
-        let text = doc.string ?? ""
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if pageCount > 0, trimmed.count >= minCharsPerPage * pageCount {
-            return .text(trimmed)
+        guard pageCount > 0 else { return .empty }
+        // Per-page text (not doc.string) so chunk offsets map back to page numbers exactly.
+        var pageStarts: [Int] = []
+        var text = ""
+        var totalChars = 0
+        for i in 0 ..< pageCount {
+            pageStarts.append(text.count)
+            let s = doc.page(at: i)?.string ?? ""
+            text += s
+            if !s.hasSuffix("\n") { text += "\n" }
+            // Trimmed: a whitespace-only "text layer" must still classify as a scan.
+            totalChars += s.trimmingCharacters(in: .whitespacesAndNewlines).count
         }
-        var images: [CGImage] = []
-        for i in 0 ..< min(pageCount, maxScanPages) {
-            // Pool each page render so transient CGContext/backing buffers are freed between
-            // pages instead of accumulating across a long PDF.
-            autoreleasepool {
-                if let page = doc.page(at: i), let img = render(page: page, maxDimension: maxImageDimension) { images.append(img) }
-            }
+        // Same scan heuristic as always: a real text layer averages >= minCharsPerPage chars per
+        // page; below that the "text" is OCR junk or absent, so treat the PDF as a scan and let
+        // the indexer stream-render its pages (every page, no cap).
+        if totalChars >= minCharsPerPage * pageCount {
+            return .pagedText(text, pageStarts: pageStarts)
         }
-        if images.isEmpty { return trimmed.isEmpty ? .empty : .text(trimmed) }
-        return .images(images)
+        return .scannedPDF(pageCount: pageCount)
+    }
+
+    /// Rasterize one PDF page (white background, capped at 2x scale / `maxDimension` on the long
+    /// side). Public so the indexer can stream scanned-PDF pages without holding the whole
+    /// document's bitmaps; wrap calls in autoreleasepool to free CG buffers between pages.
+    public static func renderPDFPage(_ doc: PDFDocument, index: Int, maxDimension: Int) -> CGImage? {
+        guard let page = doc.page(at: index) else { return nil }
+        return render(page: page, maxDimension: maxDimension)
     }
 
     private static func render(page: PDFPage, maxDimension: Int) -> CGImage? {

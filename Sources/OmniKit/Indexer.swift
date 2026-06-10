@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import PDFKit
 import os
 
 /// What the indexer needs from the embedding engine. OmniEngine conforms.
@@ -62,13 +63,38 @@ public struct IndexProgress: Sendable {
     public init() {}
 }
 
+/// One text chunk plus its human-readable position in the file ("Page 3" / "Line 1240"; "" if n/a).
+struct TextPiece {
+    let text: String
+    let locator: String
+}
+
+/// What kind of position a text extract's chunks can be mapped back to.
+enum TextOrigin {
+    case plain          // real text file: chunk start -> "Line N"
+    case paged([Int])   // text-layer PDF: page-start character offsets -> "Page N"
+    case opaque         // converted office doc: offsets don't map to anything the user can see
+}
+
+/// Crosses the embed thread -> prefetch queue boundary for streamed scanned-PDF groups.
+/// @unchecked Sendable: the loop in embedScannedPDF waits on the DispatchGroup before reading
+/// `result`, and PDFDocument is only rendered from by one thread at a time (calls are sequenced).
+private final class ScanPrefetchBox: @unchecked Sendable {
+    let doc: PDFDocument
+    var result: [(page: Int, raw: OmniVisionPreprocess.RawPatches)] = []
+    init(doc: PDFDocument) { self.doc = doc }
+}
+
 /// Decoded, embed-ready content for one file. @unchecked Sendable so it can cross the
 /// concurrent-decode -> serial-embed boundary (it may hold CGImages).
 final class DecodedItem: @unchecked Sendable {
-    // .images stays for VIDEO frames (one temporal clip). Still images / PDF pages are
-    // preprocessed in the decode stage to .imagePatches so the heavy CPU patchify runs off the
-    // serialized GPU thread and the vision tower can batch them.
-    enum Payload { case empty, text([String]), images([CGImage]), imagePatches([OmniVisionPreprocess.RawPatches]), audioMel([Float], Int) }
+    // .images stays for VIDEO frames (one temporal clip). Still images are preprocessed in the
+    // decode stage to .imagePatches so the heavy CPU patchify runs off the serialized GPU thread
+    // and the vision tower can batch them. Scanned PDFs are .pdfScan: pages are NOT rasterized at
+    // decode (a long scan's bitmaps would blow the pipeline's byte budget); the embed stage
+    // streams them in small groups instead, so every page of any-length scan gets indexed.
+    enum Payload { case empty, text([TextPiece]), images([CGImage]), imagePatches([OmniVisionPreprocess.RawPatches]), audioMel([Float], Int),
+                   pdfScan(pageCount: Int, maxDimension: Int) }
     let file: CrawledFile
     let kind: String
     let payload: Payload
@@ -102,9 +128,16 @@ public final class Indexer: @unchecked Sendable {
     private var cancelled = false
 
     // Text chunking. maxCharsPerChunk now comes per-pass from IndexSettings (user-set).
+    // There is deliberately NO per-file chunk-count cap: the only bound on text coverage is
+    // FileExtractor.maxTextBytes (the extraction read itself). A 40-chunk cap here used to
+    // silently truncate long documents to ~64KB while claiming a 2MB read limit.
     public var chunkOverlap = 200
-    public var maxChunksPerFile = 40
     public var snippetLength = 220
+    // Pages of a scanned PDF rasterized + patchified per streamed group in the embed stage.
+    // Bounds host RAM (a page's raw patches are ~40MB at the default 1568px), NOT total pages -
+    // any page count gets indexed, group by group, with the next group prefetched off-thread.
+    // Cap-scaled like the other budgets: ~2 groups resident, so 6GB cap = ~320MB peak.
+    public var scanPageGroup: Int { OmniMemoryBudget.scaled(anchor6GB: 4, floor: 2, ceiling: 8) }
     // Chunks per batched text forward. Larger = a longer single GPU forward, which is exactly how
     // long an interactive query can wait mid-indexing (the query's eval queues behind the in-flight
     // forward on the MLX stream). Measured: 48 -> ~385ms p95 search tail under load, 16 -> ~164ms,
@@ -193,8 +226,16 @@ public final class Indexer: @unchecked Sendable {
             if p.scanned % 10 == 0 { onProgress(p) }
         }
         func storeChunks(_ path: String, _ raw: [IndexedChunk]) {
+            // A non-finite vector is a transient GPU fault (memory pressure, cross-process
+            // contention). Storing the finite SUBSET would persist a silently truncated file
+            // under its current mtime - never repaired because later passes see it "unchanged".
+            // Fail the whole file instead; the next pass redoes it from scratch.
             let chunks = raw.filter { Self.isFinite($0.embedding) }
-            if chunks.count < raw.count { Self.log.error("non-finite embedding dropped: \(path, privacy: .public)") }
+            if chunks.count < raw.count {
+                Self.log.error("non-finite embedding, file deferred to next pass: \(path, privacy: .public)")
+                p.failed += 1
+                return
+            }
             if chunks.isEmpty {
                 p.skipped += 1
                 if raw.isEmpty { Self.log.info("skip \(path, privacy: .public)") }
@@ -214,7 +255,7 @@ public final class Indexer: @unchecked Sendable {
                 // Cross-file text batching: buffer chunks from many files and embed them in
                 // batches of textBatchSize (one GPU forward). A file is stored once all of its
                 // chunks have come back, so per-file atomicity is preserved.
-                var buf: [(fid: Int, idx: Int, text: String, snippet: String)] = []
+                var buf: [(fid: Int, idx: Int, text: String, snippet: String, locator: String)] = []
                 var acc: [Int: (file: CrawledFile, kind: String, total: Int, done: [IndexedChunk])] = [:]
                 var nextFid = 0
                 // Buffer several batches before draining so we can LENGTH-BUCKET them: sorting the
@@ -231,7 +272,7 @@ public final class Indexer: @unchecked Sendable {
                     // embedTextBatches in one serialized call. With OMNI_ASYNC_EVAL=1 that double-
                     // buffers batch K+1's GPU forward over batch K's host readout; otherwise it is a
                     // plain per-batch loop. Same vectors either way (just scheduling).
-                    var groups: [[(fid: Int, idx: Int, text: String, snippet: String)]] = []
+                    var groups: [[(fid: Int, idx: Int, text: String, snippet: String, locator: String)]] = []
                     while buf.count > floor {
                         let take = Swift.min(textBatchSize, buf.count)
                         groups.append(Array(buf.prefix(take))); buf.removeFirst(take)
@@ -243,7 +284,8 @@ public final class Indexer: @unchecked Sendable {
                         for (k, b) in batch.enumerated() {
                             guard var a = acc[b.fid] else { continue }
                             a.done.append(IndexedChunk(path: a.file.url.path, modified: a.file.modified, size: a.file.size,
-                                                       kind: a.kind, chunkIndex: b.idx, snippet: b.snippet, embedding: vecs[k]))
+                                                       kind: a.kind, chunkIndex: b.idx, snippet: b.snippet, embedding: vecs[k],
+                                                       locator: b.locator))
                             acc[b.fid] = a
                             if a.done.count == a.total { storeChunks(a.file.url.path, a.done); acc[b.fid] = nil }
                         }
@@ -258,16 +300,20 @@ public final class Indexer: @unchecked Sendable {
                     case .text(let pieces) where !pieces.isEmpty:
                         let fid = nextFid; nextFid += 1
                         acc[fid] = (item.file, item.kind, pieces.count, [])
-                        for (j, piece) in pieces.enumerated() { buf.append((fid, j, piece, self.snippet(piece))) }
+                        for (j, piece) in pieces.enumerated() { buf.append((fid, j, piece.text, self.snippet(piece.text), piece.locator)) }
                         if buf.count >= textStageWindow { flushText(drainAll: false) }
-                    case .images, .imagePatches:
-                        storeChunks(path, self.embed(item))   // scanned PDF / image pages (batched)
+                    case .images, .imagePatches, .pdfScan:
+                        storeChunks(path, self.embed(item))   // scanned PDF (streamed) / image pages (batched)
                     default:
                         p.skipped += 1
                     }
                 }
                 flushText(drainAll: true)                           // drain the remaining buffer
-                for (_, a) in acc { storeChunks(a.file.url.path, a.done) }   // any stragglers
+                // Stragglers can only be INCOMPLETE files (a complete file is stored the moment its
+                // last chunk lands, and the drain above embeds everything buffered) - i.e. a cancel
+                // interrupted them. Storing a partial chunk set would mark the file's mtime as fully
+                // indexed and permanently truncate it, so only ever store complete sets.
+                for (_, a) in acc where a.done.count == a.total { storeChunks(a.file.url.path, a.done) }
             } else if kind == .audio {
                 // Cross-file audio batching: stage decoded mels and embed up to
                 // audioMaxClipsPerBatch clips (bounded by audioFrameBudget total frames)
@@ -443,8 +489,18 @@ public final class Indexer: @unchecked Sendable {
         // file order. force: true because change detection already happened above.
         pipeline(work, force: true, known: [:], settings: settings) { item in
             let path = item.file.url.path
-            let chunks = self.embed(item).filter { Self.isFinite($0.embedding) }
-            if chunks.isEmpty { if known[path] != nil { toDelete.insert(path) } }
+            let raw = self.embed(item)
+            let chunks = raw.filter { Self.isFinite($0.embedding) }
+            // Transient GPU fault (some vectors non-finite): keep whatever is currently indexed
+            // and let a later pass redo the file - storing/deleting now would persist the fault.
+            if chunks.count < raw.count {
+                Self.log.error("non-finite embedding, update skipped: \(path, privacy: .public)")
+                return
+            }
+            // The cancel guard matters: embed() returns [] when a pause interrupts it, and that
+            // must NOT be read as "file has no content" - deleting here would drop a file from
+            // the index just because the user paused mid-update.
+            if chunks.isEmpty { if !self.isCancelled, known[path] != nil { toDelete.insert(path) } }
             else {
                 toReplace.append((path, chunks))
                 if toReplace.count >= 256 { flushReplace() }
@@ -533,9 +589,14 @@ public final class Indexer: @unchecked Sendable {
         if FileExtractor.videoExtensions.contains(ext) { return max(1, settings.maxVideoFrames) * oneImage }
         if FileExtractor.audioExtensions.contains(ext) { return 64_000_000 }   // mel + frame stack, rough
         if FileExtractor.pdfExtensions.contains(ext) || FileExtractor.officeExtensions.contains(ext) {
-            return FileExtractor.maxScanPages * oneImage   // may rasterize as a scan -> conservative
+            // Page-text buffers / attributed-string conversion. Scans no longer rasterize at
+            // decode (the embed stage streams pages in bounded groups), so no per-page term.
+            return 64_000_000
         }
-        return 1_000_000   // plain text / code: cheap
+        // Plain text / code: chunking materializes a Character array (~16B/Character) for the
+        // whole extract, which is no longer chunk-capped - account for it so a burst of large
+        // files in the concurrent decode stage stays under the byte budget.
+        return max(1_000_000, min(file.size, FileExtractor.maxTextBytes) * 18)
     }
 
     /// CPU-only decode: extraction, thresholds, frame sampling, audio mel. No GPU/MLX.
@@ -578,17 +639,32 @@ public final class Indexer: @unchecked Sendable {
             return DecodedItem(file: file)
         case .text(let text):
             if settings.minTextChars > 0, text.count < settings.minTextChars { return DecodedItem(file: file) }
-            return DecodedItem(file: file, kind: kind, payload: .text(chunk(text, settings: settings)))
+            // Line locators only for REAL text files (code, markdown, logs) - line numbers of an
+            // office doc's converted string are meaningless to the user.
+            let ext = file.url.pathExtension.lowercased()
+            let origin: TextOrigin = FileExtractor.textExtensions.contains(ext) ? .plain : .opaque
+            return DecodedItem(file: file, kind: kind, payload: .text(chunk(text, settings: settings, origin: origin)))
+        case .pagedText(let text, let pageStarts):
+            if settings.minTextChars > 0, text.count < settings.minTextChars { return DecodedItem(file: file) }
+            return DecodedItem(file: file, kind: kind, payload: .text(chunk(text, settings: settings, origin: .paged(pageStarts))))
+        case .scannedPDF(let pageCount):
+            return DecodedItem(file: file, kind: kind,
+                               payload: .pdfScan(pageCount: pageCount, maxDimension: settings.maxImageDimension), meta: meta)
         case .images(let images):
             if images.isEmpty { return DecodedItem(file: file) }
-            // Still images / PDF pages: run the CPU preprocess (resize + parallel patchify) HERE,
-            // in the concurrent decode stage, so the serialized GPU thread only does the tower.
+            // Still images: run the CPU preprocess (resize + parallel patchify) HERE, in the
+            // concurrent decode stage, so the serialized GPU thread only does the tower.
             let raws = images.map { OmniVisionPreprocess.preprocessRaw($0) }
             return DecodedItem(file: file, kind: kind, payload: .imagePatches(raws), meta: meta)
         }
     }
 
     /// GPU embed of decoded content. Runs serially in the consumer.
+    ///
+    /// Cancel contract: on a mid-file cancel this returns [] - NEVER a partial chunk set. A
+    /// partial set would be stored under the file's current mtime, making the next pass skip it
+    /// as "unchanged" and silently truncating the file in the index forever. An empty return
+    /// leaves the file unindexed, and the next pass redoes it from scratch.
     private func embed(_ item: DecodedItem) -> [IndexedChunk] {
         let file = item.file, kind = item.kind
         let meta = item.meta   // captured during decode; never re-open the file header here
@@ -599,12 +675,13 @@ public final class Indexer: @unchecked Sendable {
             var out: [IndexedChunk] = []
             var i = 0
             while i < pieces.count {
-                if isCancelled { break }
+                if isCancelled { return [] }
                 let group = Array(pieces[i ..< min(i + textBatchSize, pieces.count)])
-                let vecs = embedder.embedTextBatch(group, as: .passage)
+                let vecs = embedder.embedTextBatch(group.map { $0.text }, as: .passage)
                 for (j, vec) in vecs.enumerated() {
                     out.append(IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
-                                            chunkIndex: i + j, snippet: snippet(group[j]), embedding: vec))
+                                            chunkIndex: i + j, snippet: snippet(group[j].text), embedding: vec,
+                                            locator: group[j].locator))
                 }
                 i += textBatchSize
             }
@@ -623,53 +700,121 @@ public final class Indexer: @unchecked Sendable {
             // Safety fallback (non-video CGImages, e.g. a conformer that didn't preprocess): serial.
             var out: [IndexedChunk] = []
             for (i, img) in images.enumerated() {
-                if isCancelled { break }
+                if isCancelled { return [] }
                 guard let vec = embedder.embedImage(img) else { continue }
-                let label = images.count > 1 ? "page \(i + 1)" : file.url.lastPathComponent
                 out.append(IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
-                                        chunkIndex: i, snippet: "\(file.url.lastPathComponent) - \(label)", embedding: vec,
-                                        width: meta.width, height: meta.height))
+                                        chunkIndex: i, snippet: file.url.lastPathComponent, embedding: vec,
+                                        width: meta.width, height: meta.height,
+                                        locator: images.count > 1 ? "Page \(i + 1)" : ""))
             }
             return out
         case .imagePatches(let raws):
-            // Batch-N: ONE block-diagonal vision forward over all pages of this file (capped by the
-            // encoder's patch budget). Order is preserved, so chunkIndex i == page i.
+            // Batch-N: ONE block-diagonal vision forward over all images (capped by the encoder's
+            // patch budget). Order is preserved.
             guard let vecs = embedder.embedImages(raws) else {
                 // Vision path unavailable: nothing to index.
                 return []
             }
+            if isCancelled { return [] }
             var out: [IndexedChunk] = []
             for (i, vec) in vecs.enumerated() {
-                if isCancelled { break }
-                let label = raws.count > 1 ? "page \(i + 1)" : file.url.lastPathComponent
-                // Single images carry their original pixel size; multi-page (scanned PDF) leaves it 0.
                 out.append(IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
-                                        chunkIndex: i, snippet: "\(file.url.lastPathComponent) - \(label)", embedding: vec,
-                                        width: raws.count == 1 ? meta.width : 0, height: raws.count == 1 ? meta.height : 0))
+                                        chunkIndex: i, snippet: file.url.lastPathComponent, embedding: vec,
+                                        width: raws.count == 1 ? meta.width : 0, height: raws.count == 1 ? meta.height : 0,
+                                        locator: raws.count > 1 ? "Page \(i + 1)" : ""))
             }
             return out
+        case .pdfScan(let pageCount, let maxDimension):
+            return embedScannedPDF(file: file, kind: kind, pageCount: pageCount, maxDimension: maxDimension)
         }
     }
 
-    private func chunk(_ text: String, settings: IndexSettings) -> [String] {
+    /// Stream-embed a scanned PDF of ANY length: rasterize + patchify `scanPageGroup` pages at a
+    /// time, embed the group, free it, repeat - while the NEXT group renders on a background
+    /// queue so the GPU is not idle during PDFKit rasterization. Peak memory is two groups
+    /// (~8 pages at the default cap) regardless of page count; the old design materialized every
+    /// page up front, which is why it was capped at 8 pages.
+    func embedScannedPDF(file: CrawledFile, kind: String, pageCount: Int, maxDimension: Int) -> [IndexedChunk] {   // internal for tests
+        guard let doc = PDFDocument(url: file.url) else { return [] }
+        let group = scanPageGroup
+        // PDFKit rendering is not concurrency-safe per document: prep() calls are sequenced (the
+        // loop waits for the prefetch before starting the next one), so `doc` is only ever
+        // rendered from by one thread at a time.
+        func prep(_ range: Range<Int>) -> [(page: Int, raw: OmniVisionPreprocess.RawPatches)] {
+            var result: [(Int, OmniVisionPreprocess.RawPatches)] = []
+            for i in range {
+                if isCancelled { break }
+                autoreleasepool {
+                    if let img = FileExtractor.renderPDFPage(doc, index: i, maxDimension: maxDimension) {
+                        result.append((i, OmniVisionPreprocess.preprocessRaw(img)))
+                    }
+                }
+            }
+            return result
+        }
+        var out: [IndexedChunk] = []
+        var nextStart = min(group, pageCount)
+        var current = prep(0 ..< nextStart)
+        let prefetchQ = DispatchQueue(label: "omni.indexer.scan-prefetch")
+        while !current.isEmpty || nextStart < pageCount {
+            if isCancelled { return [] }
+            // Kick off the next group's render+patchify while the GPU embeds the current one.
+            let box = ScanPrefetchBox(doc: doc)
+            let sync = DispatchGroup()
+            if nextStart < pageCount {
+                let range = nextStart ..< min(nextStart + group, pageCount)
+                nextStart = range.upperBound
+                sync.enter()
+                prefetchQ.async { box.result = prep(range); sync.leave() }
+            }
+            if !current.isEmpty, let vecs = embedder.embedImages(current.map { $0.raw }) {
+                for (k, vec) in vecs.enumerated() where k < current.count {
+                    let page = current[k].page
+                    out.append(IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
+                                            chunkIndex: page, snippet: file.url.lastPathComponent, embedding: vec,
+                                            locator: "Page \(page + 1)"))
+                }
+            }
+            sync.wait()
+            current = box.result
+        }
+        return isCancelled ? [] : out
+    }
+
+    func chunk(_ text: String, settings: IndexSettings, origin: TextOrigin) -> [TextPiece] {   // internal for tests
         let limit = max(200, settings.maxCharsPerChunk)   // user-set; floor keeps chunks meaningful
-        // Only the first maxChunksPerFile chunks are ever produced, so cap BEFORE materializing the
-        // Character array (16B/Character: a 2MB extract would otherwise cost ~32MB transient in the
-        // concurrent decode stage, blowing past the pipeline's byte estimate for the file).
-        let needed = max(1, limit - chunkOverlap) * (maxChunksPerFile - 1) + limit
         let totalCount = text.count
-        if totalCount <= limit { return [text] }
-        let scalars = totalCount > needed ? Array(text.prefix(needed)) : Array(text)
-        var chunks: [String] = []
+        if totalCount <= limit { return [TextPiece(text: text, locator: "")] }   // single chunk: position is trivial
+        // No chunk-count cap: coverage is bounded only by FileExtractor.maxTextBytes at extraction.
+        // The Character array is ~16B/Character; estimatedDecodedBytes accounts for it so the
+        // pipeline's byte budget throttles concurrent large files instead of a silent truncation.
+        let scalars = Array(text)
+        var pieces: [TextPiece] = []
         var start = 0
         let step = max(1, limit - chunkOverlap)
-        while start < scalars.count && chunks.count < maxChunksPerFile {
+        var line = 1          // running line number at `lineMark` (plain origin; one forward pass total)
+        var lineMark = 0
+        func locatorFor(_ start: Int) -> String {
+            switch origin {
+            case .plain:
+                while lineMark < start { if scalars[lineMark].isNewline { line += 1 }; lineMark += 1 }
+                return "Line \(line)"
+            case .paged(let starts):
+                guard !starts.isEmpty else { return "" }
+                var lo = 0, hi = starts.count - 1   // last page whose start offset <= chunk start
+                while lo < hi { let mid = (lo + hi + 1) / 2; if starts[mid] <= start { lo = mid } else { hi = mid - 1 } }
+                return "Page \(lo + 1)"
+            case .opaque:
+                return ""
+            }
+        }
+        while start < scalars.count {
             let end = min(start + limit, scalars.count)
-            chunks.append(String(scalars[start ..< end]))
+            pieces.append(TextPiece(text: String(scalars[start ..< end]), locator: locatorFor(start)))
             if end == scalars.count { break }
             start += step
         }
-        return chunks
+        return pieces
     }
 
     private func snippet(_ text: String) -> String {
