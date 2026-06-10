@@ -200,7 +200,9 @@ struct ServingTab: View {
         Section {
             HStack(spacing: 10) {
                 Button("MCP\u{2026}") { showMCPSheet = true }
+                    .help("Connection config for MCP clients (Claude Code, Cursor, VS Code)")
                 Button("SKILL.md\u{2026}") { showSkillSheet = true }
+                    .help("A ready skill file for instruction-following agents")
                 Spacer()
             }
         } header: {
@@ -420,6 +422,7 @@ private struct AgentConfigSheet: View {
                     pb.clearContents()
                     pb.setString(text, forType: .string)
                     copied = true
+                    Task { try? await Task.sleep(for: .seconds(1.5)); copied = false }
                 }
                 if let saveAs {
                     Button("Save\u{2026}") {
@@ -436,5 +439,6 @@ private struct AgentConfigSheet: View {
         }
         .padding(20)
         .frame(width: 640, height: 460)
+        .onExitCommand { dismiss() }   // Esc closes, matching the native sheet expectation
     }
 }
