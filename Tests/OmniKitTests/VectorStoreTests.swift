@@ -20,6 +20,10 @@ final class VectorStoreTests: XCTestCase {
         IndexedChunk(path: path, modified: 1, size: 1, kind: kind, chunkIndex: idx, snippet: "\(path)#\(idx)", embedding: emb)
     }
 
+    private func chunk(_ path: String, _ idx: Int, _ kind: String, _ emb: [Float], modified: Double, size: Int) -> IndexedChunk {
+        IndexedChunk(path: path, modified: modified, size: size, kind: kind, chunkIndex: idx, snippet: "\(path)#\(idx)", embedding: emb)
+    }
+
     func testSearchRankingAndScores() throws {
         let url = tempDB()
         let store = try VectorStore(dbURL: url)
@@ -51,6 +55,70 @@ final class VectorStoreTests: XCTestCase {
         XCTAssertEqual(counts[docs], store.fileCount(underFolder: docs))
         XCTAssertEqual(counts[dl], store.fileCount(underFolder: dl))
         XCTAssertEqual(store.fileCounts(underFolders: []), [:])
+    }
+
+    func testFolderSignatureChangesWhenFileMetadataChanges() throws {
+        let url = tempDB()
+        let store = try VectorStore(dbURL: url)
+        let folder = "/Users/me/Documents"
+        try store.replace(path: "\(folder)/a.txt", chunks: [chunk("\(folder)/a.txt", 0, "text", basis(0), modified: 1, size: 10)])
+        try store.replace(path: "\(folder)/b.txt", chunks: [chunk("\(folder)/b.txt", 0, "text", basis(1), modified: 1, size: 20)])
+        try store.replace(path: "/Users/me/Documents2/c.txt", chunks: [chunk("/Users/me/Documents2/c.txt", 0, "text", basis(2), modified: 1, size: 30)])
+
+        let s1 = store.folderSignature(folder)
+        XCTAssertEqual(s1.fileCount, 2)
+        XCTAssertEqual(s1.chunkCount, 2)
+        XCTAssertEqual(s1.dim, 8)
+
+        // Same folder file count, but one file was re-embedded with different metadata.
+        try store.replace(path: "\(folder)/b.txt", chunks: [chunk("\(folder)/b.txt", 0, "text", basis(3), modified: 2, size: 20)])
+        let s2 = store.folderSignature(folder)
+        XCTAssertEqual(s2.fileCount, 2)
+        XCTAssertEqual(s2.chunkCount, 2)
+        XCTAssertNotEqual(s2.hash, s1.hash)
+
+        // A sibling with the same prefix must not affect the folder signature.
+        try store.replace(path: "/Users/me/Documents2/c.txt", chunks: [chunk("/Users/me/Documents2/c.txt", 0, "text", basis(4), modified: 2, size: 30)])
+        XCTAssertEqual(store.folderSignature(folder), s2)
+    }
+
+    func testProjectionCacheRoundTripAndRejectsStaleSignature() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omni-proj-cache-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let sig = FolderVectorSignature(dim: 8, fileCount: 2, chunkCount: 2, hash: "a")
+        let result = ProjectionResult(points: [
+            ProjectionPoint(position: SIMD2(1, 2), path: "/d/a.txt", kind: "text"),
+            ProjectionPoint(position: SIMD2(3, 4), path: "/d/b.png", kind: "image"),
+        ], knn: [1, 0], k: 1)
+
+        ProjectionCache.savePCA(result, directory: dir, folder: "/d", fingerprint: "fp",
+                                mapCap: 100, totalCap: 1_000, signature: sig, total: 2)
+        let loaded = try XCTUnwrap(ProjectionCache.loadPCA(directory: dir, folder: "/d", fingerprint: "fp",
+                                                           mapCap: 100, totalCap: 1_000, signature: sig))
+        XCTAssertEqual(loaded.total, 2)
+        XCTAssertEqual(loaded.result.points.count, 2)
+        XCTAssertEqual(loaded.result.points[0].path, "/d/a.txt")
+        XCTAssertEqual(loaded.result.points[0].position.x, 1)
+        XCTAssertEqual(loaded.result.points[1].kind, "image")
+        XCTAssertTrue(loaded.result.knn.isEmpty)
+
+        let stale = FolderVectorSignature(dim: 8, fileCount: 2, chunkCount: 2, hash: "b")
+        XCTAssertNil(ProjectionCache.loadPCA(directory: dir, folder: "/d", fingerprint: "fp",
+                                             mapCap: 100, totalCap: 1_000, signature: stale))
+        XCTAssertNil(ProjectionCache.loadPCA(directory: dir, folder: "/d", fingerprint: "fp",
+                                             mapCap: 100, totalCap: 500, signature: sig))
+
+        ProjectionCache.saveUMAP(result, directory: dir, folder: "/d", fingerprint: "fp",
+                                 mapCap: 100, totalCap: 1_000, signature: sig, total: 2)
+        let loadedUMAP = try XCTUnwrap(ProjectionCache.loadUMAP(directory: dir, folder: "/d", fingerprint: "fp",
+                                                                mapCap: 100, totalCap: 1_000, signature: sig))
+        XCTAssertEqual(loadedUMAP.total, 2)
+        XCTAssertEqual(loadedUMAP.result.points.count, 2)
+        XCTAssertEqual(loadedUMAP.result.knn, [1, 0])
+        XCTAssertEqual(loadedUMAP.result.k, 1)
+        XCTAssertNil(ProjectionCache.loadUMAP(directory: dir, folder: "/d", fingerprint: "fp",
+                                              mapCap: 100, totalCap: 1_000, signature: stale))
     }
 
     func testFileVectorFindsItselfAcrossModalities() throws {
