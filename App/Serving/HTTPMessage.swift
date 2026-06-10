@@ -24,8 +24,14 @@ struct HTTPRequest {
 
     var contentLength: Int { Int(headers["content-length"] ?? "") ?? 0 }
 
-    /// HTTP/1.1 defaults to keep-alive unless Connection: close is sent.
-    var wantsKeepAlive: Bool { (headers["connection"]?.lowercased() ?? "") != "close" }
+    /// HTTP/1.1 defaults to keep-alive unless Connection: close; HTTP/1.0 is the inverse.
+    var wantsKeepAlive: Bool {
+        let conn = headers["connection"]?.lowercased() ?? ""
+        if httpVersion == "HTTP/1.0" { return conn == "keep-alive" }
+        return conn != "close"
+    }
+    /// Version token from the request line ("HTTP/1.1" when absent).
+    var httpVersion: String = "HTTP/1.1"
 
     /// Bearer token from Authorization header, case-insensitive scheme match.
     var bearer: String? {
@@ -43,6 +49,9 @@ struct HTTPRequest {
 }
 
 enum HTTPParse {
+    /// Body cap shared by the parser (head-time refusal) and the server (buffer-time refusal).
+    static let maxBody = 8 * 1024 * 1024
+
     /// Try to parse one full request from the head of `buf`.
     /// Returns (request, bytesConsumed) once the head and the Content-Length body are
     /// fully buffered; returns nil to signal "read more bytes"; throws HTTPError.badRequest
@@ -64,6 +73,7 @@ enum HTTPParse {
         guard parts.count >= 2 else { throw HTTPError.badRequest }
         let method = parts[0].uppercased()
         let target = parts[1]
+        let version = parts.count >= 3 ? parts[2].uppercased() : "HTTP/1.1"
 
         // Headers: everything after the request line, first ":" splits name/value.
         var headers: [String: String] = [:]
@@ -81,8 +91,17 @@ enum HTTPParse {
             throw HTTPError.badRequest
         }
 
-        let contentLength = Int(headers["content-length"] ?? "") ?? 0
-        if contentLength < 0 { throw HTTPError.badRequest }
+        // Strict Content-Length: a non-numeric value parsed as 0 would re-parse the body bytes as
+        // a pipelined "next request" (garbage 400s at best); an oversized declaration gets refused
+        // at the head instead of after buffering megabytes.
+        var contentLength = 0
+        if let raw = headers["content-length"] {
+            guard let cl = Int(raw.trimmingCharacters(in: .whitespaces)), cl >= 0 else {
+                throw HTTPError.badRequest
+            }
+            contentLength = cl
+        }
+        if contentLength > maxBody { throw HTTPError.payloadTooLarge }
 
         let bodyStart = headerEnd.upperBound
         let available = buf.distance(from: bodyStart, to: buf.endIndex)
@@ -99,7 +118,8 @@ enum HTTPParse {
             routePath: routePath,
             query: query,
             headers: headers,
-            body: body
+            body: body,
+            httpVersion: version
         )
         return (req, consumed)
     }

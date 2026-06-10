@@ -118,7 +118,7 @@ final class ServingController {
             return false
         }
 
-        let router = Router(backend: backend, auth: auth)
+        let router = Router(backend: backend, auth: auth, appVersion: AppModel.appVersion)
         let sink: @Sendable (LogEntry) -> Void = { [weak self] entry in
             Task { @MainActor in self?.ingest(entry) }
         }

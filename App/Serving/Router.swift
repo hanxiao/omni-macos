@@ -7,6 +7,8 @@ struct Router: Sendable {
     /// Returns true if the request is authorized to proceed. Built by the controller as a
     /// snapshot of the current scope/token so it carries no main-actor state.
     let auth: @Sendable (HTTPRequest) -> Bool
+    /// Reported by the MCP initialize handshake as serverInfo.version.
+    var appVersion: String = ""
 
     func handle(_ req: HTTPRequest) async -> HTTPResponse {
         let route = req.routePath
@@ -19,6 +21,12 @@ struct Router: Sendable {
         // Auth gate. The 401 envelope is shaped per provider by path prefix.
         guard auth(req) else {
             return unauthorized(for: route)
+        }
+
+        // MCP: JSON-RPC over streamable HTTP. Auth-gated like everything else (loopback scope
+        // never requires a token; LAN scope always does, sent as a normal Authorization header).
+        if route == "/mcp" {
+            return MCPAdapter.handle(req, backend, appVersion: appVersion)
         }
 
         switch (req.method, route) {
