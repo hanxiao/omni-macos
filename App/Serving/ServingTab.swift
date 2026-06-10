@@ -270,7 +270,8 @@ struct ServingTab: View {
         ```
 
         Optional `filters`: `{"kinds": ["text"|"image"|"audio"|"video"], "folder": "/abs/path", "since": <epoch seconds>}`.
-        Response: `{"results": [{"path", "score" (0..1), "snippet", "kind", "modified"}]}`.
+        Response: `{"results": [{"path", "score" (0..1), "snippet", "kind", "modified", "locator"}]}`.
+        `locator` is where the best match sits inside the file ("Page 3", "Line 1240"; "" if n/a).
         Scores above ~0.45 are usually relevant; below ~0.3 usually noise.
 
         ## Health check

@@ -282,7 +282,9 @@ enum SearchAdapter {
                 "score": Double(max(0, min(1, hit.score))),
                 "snippet": hit.snippet,
                 "kind": hit.kind,
-                "modified": hit.modified
+                "modified": hit.modified,
+                // Best-matching chunk's position inside the file ("Page 3", "Line 1240"); "" if n/a.
+                "locator": hit.locator
             ]
         }
         return HTTPResponse.json(["query": query, "results": results])

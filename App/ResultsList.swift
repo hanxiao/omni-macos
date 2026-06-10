@@ -62,7 +62,8 @@ struct ResultsList<Footer: View>: View {
                                 .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
                                 .contextMenu { menu(hit.path) }
                             if expanded.contains(hit.path) {
-                                PassagesView(passages: passagesCache[hit.path] ?? [])
+                                PassagesView(passages: passagesCache[hit.path] ?? [],
+                                             fileName: URL(fileURLWithPath: hit.path).lastPathComponent)
                             }
                         }
                         .id(hit.path)
@@ -193,6 +194,11 @@ struct ResultRow: View {
                 HStack(spacing: 5) {
                     KindGlyph(kind: hit.kind)
                     MediaInfoLabel(path: hit.path, kind: hit.kind, width: hit.width, height: hit.height, duration: hit.duration, separator: true)
+                    if !hit.locator.isEmpty {
+                        // Where in the file the best-matching chunk sits ("Page 3", "Line 1240").
+                        Text(hit.locator)
+                        Text("\u{00B7}")
+                    }
                     Text(prettyDir(url)).lineLimit(1).truncationMode(.middle)
                     if hit.modified > 0 {
                         Text("·")
@@ -225,26 +231,38 @@ struct ResultRow: View {
 }
 
 /// The matching passages (chunks) of a file, each shown as an excerpt with a top/bottom
-/// alpha fade to signal there is more text before and after it in the file.
+/// alpha fade to signal there is more text before and after it in the file. A chunk's
+/// locator ("Page 3", "Line 1240") leads the excerpt; for scanned-PDF pages the snippet is
+/// just the file name, so the locator + score carry the row alone.
 struct PassagesView: View {
     let passages: [ChunkHit]
+    var fileName: String = ""
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(passages) { p in
                 HStack(alignment: .top, spacing: 8) {
                     RoundedRectangle(cornerRadius: 1.5).fill(.quaternary).frame(width: 3)
-                    Text(p.snippet)
-                        .font(.body).foregroundStyle(.secondary)
-                        .lineLimit(3)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    VStack(alignment: .leading, spacing: 2) {
+                        if !p.locator.isEmpty {
+                            Text(p.locator).font(.caption2.weight(.medium)).foregroundStyle(.tertiary)
+                        }
+                        if !p.snippet.isEmpty, p.snippet != fileName {
+                            Text(p.snippet)
+                                .font(.body).foregroundStyle(.secondary)
+                                .lineLimit(3)
+                                // The fade signals there is more text before/after the excerpt -
+                                // applied to the excerpt only so the locator stays crisp.
+                                .mask(LinearGradient(stops: [
+                                    .init(color: .clear, location: 0),
+                                    .init(color: .black, location: 0.22),
+                                    .init(color: .black, location: 0.78),
+                                    .init(color: .clear, location: 1),
+                                ], startPoint: .top, endPoint: .bottom))
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     Text(scoreText(p.score)).font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
                 }
-                .mask(LinearGradient(stops: [
-                    .init(color: .clear, location: 0),
-                    .init(color: .black, location: 0.22),
-                    .init(color: .black, location: 0.78),
-                    .init(color: .clear, location: 1),
-                ], startPoint: .top, endPoint: .bottom))
             }
             if passages.isEmpty {
                 Text("No passages").font(.caption).foregroundStyle(.tertiary)
@@ -274,6 +292,14 @@ struct ResultGridItem: View {
                     Text(scoreText(hit.score)).font(.caption2.monospacedDigit()).foregroundStyle(.primary)
                         .padding(.horizontal, 5).padding(.vertical, 2)
                         .glassChip().padding(5)
+                }
+                .overlay(alignment: .bottomLeading) {
+                    // Match position inside the file (page/line), mirroring the score chip.
+                    if !hit.locator.isEmpty {
+                        Text(hit.locator).font(.caption2.monospacedDigit()).foregroundStyle(.primary)
+                            .padding(.horizontal, 5).padding(.vertical, 2)
+                            .glassChip().padding(5)
+                    }
                 }
             Text(url.lastPathComponent).font(.caption).lineLimit(2)
                 .multilineTextAlignment(.center)
