@@ -152,8 +152,21 @@ final class AppModel {
     /// True while a projection fit is running (drives the spinner). False once the final layout lands.
     var folderProjectionFitting = false
     private var projectionTask: Task<Void, Never>?
-    private var projectionCache: [URL: ProjectionResult] = [:]   // final layout + kNN per folder URL
-    private var projectionTotals: [URL: Int] = [:]               // total files under each cached folder (for "N of M")
+    private struct ProjectionCacheEntry {
+        let result: ProjectionResult
+        let signature: FolderVectorSignature?
+        let usesUMAP: Bool
+        let mapCap: Int
+        let totalCap: Int
+        let fingerprint: String
+    }
+    private struct ProjectionLoad: Sendable {
+        let result: ProjectionResult
+        let signature: FolderVectorSignature?
+        let total: Int
+    }
+    private var projectionCache: [URL: ProjectionCacheEntry] = [:]   // final layout + optional signature per folder URL
+    private var projectionTotals: [URL: Int] = [:]                   // total files under each cached folder (for "N of M")
     private var projectionCacheOrder: [URL] = []                 // LRU order, oldest first
     private let projectionCacheCap = 6                           // bound: each entry is N points + N*k kNN
     private var folderMapRefitPending = false                    // map refit deferred until the folder stops indexing
@@ -171,10 +184,15 @@ final class AppModel {
 
     /// Insert a fitted layout, evicting the least-recently-used folder over the cap. Browsing many large
     /// folders otherwise retained every one's full point cloud + kNN graph for the whole session.
-    private func cacheProjection(_ url: URL, _ result: ProjectionResult, total: Int) {
+    private func cacheProjection(_ url: URL, _ result: ProjectionResult,
+                                 signature: FolderVectorSignature?,
+                                 usesUMAP: Bool, mapCap: Int, totalCap: Int,
+                                 fingerprint: String, total: Int) {
         if projectionCache[url] == nil { projectionCacheOrder.append(url) }
         else { touchProjection(url) }
-        projectionCache[url] = result
+        projectionCache[url] = ProjectionCacheEntry(result: result, signature: signature,
+                                                    usesUMAP: usesUMAP, mapCap: mapCap, totalCap: totalCap,
+                                                    fingerprint: fingerprint)
         projectionTotals[url] = total
         while projectionCacheOrder.count > projectionCacheCap {
             let evict = projectionCacheOrder.removeFirst()
@@ -763,6 +781,17 @@ final class AppModel {
             .appendingPathComponent("Omni", isDirectory: true) else { return nil }
         try? fm.createDirectory(at: base, withIntermediateDirectories: true)
         return base.appendingPathComponent(".omniignore")
+    }
+
+    /// Rebuildable, disk-backed folder-map cache. Stored with the app-level policy/state rather than
+    /// beside the vector DB, because cache entries are validated against the current index fingerprint.
+    static func projectionCacheDirectoryURL() -> URL? {
+        let fm = FileManager.default
+        guard let base = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+            .appendingPathComponent("Omni", isDirectory: true) else { return nil }
+        let dir = base.appendingPathComponent("ProjectionCache", isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
     }
 
     /// Load the policy file at launch. If absent, migrate: synthesize it from the legacy
@@ -1627,13 +1656,9 @@ final class AppModel {
     func selectFolderForVisualization(_ url: URL?) {
         projectionTask?.cancel(); projectionTask = nil
         selectedFolderForViz = url
-        folderProjection = []; folderKNN = []; folderKNNk = 0; folderProjectionFitting = false
+        folderProjection = []; folderKNN = []; folderKNNk = 0; folderProjectionTotal = 0; folderProjectionFitting = false
         guard let url, let engine, let store else { return }
         clearSearchForFolderMap()   // a folder map replaces the search: clear query, results, filters
-        if let cached = projectionCache[url] {   // instant (LRU touch)
-            touchProjection(url); applyProjection(cached); folderProjectionTotal = projectionTotals[url] ?? cached.points.count; return
-        }
-        folderProjectionFitting = true
         let folder = url.path
         let refine = mapUsesUMAP   // captured on the main actor; the detached worker reads only this Bool
         // The quadratic layout runs on a memory-budgeted LANDMARK sample (mapPointBudget); the rest
@@ -1642,7 +1667,42 @@ final class AppModel {
         // full index).
         let mapCap = mapPointBudget
         let totalCap = mapTotalPointCap
+        let fp = fingerprint
+
+        // Instant revisit: serve a matching in-memory layout immediately - no spinner, no 120ms
+        // settle, no store scan. The fit then validates the folder signature in the BACKGROUND and
+        // only refits if the content actually changed (a same-file-count re-embed, which the
+        // file-count invalidation misses). The user sees the prior layout meanwhile; one file's
+        // vector moving barely shifts a global PCA/UMAP, so the momentary staleness is invisible.
+        if let hit = projectionCache[url], hit.usesUMAP == refine, hit.mapCap == mapCap,
+           hit.totalCap == totalCap, hit.fingerprint == fp {
+            touchProjection(url)
+            applyProjection(hit.result)
+            folderProjectionTotal = projectionTotals[url] ?? hit.result.points.count
+            folderProjectionFitting = false
+            let cachedSig = hit.signature
+            // Detached (not main-actor) so the signature scan runs off the main thread and `store`
+            // is captured cleanly; `self` is touched only inside the MainActor hop (capturing self
+            // in the detached body would "send" a main-actor reference into concurrent code).
+            projectionTask = Task.detached(priority: .utility) {
+                try? await Task.sleep(for: .milliseconds(120))   // coalesce machine-gun click-through
+                if Task.isCancelled { return }
+                let stale = store.folderSignature(folder) != cachedSig
+                if Task.isCancelled { return }
+                await MainActor.run { [weak self] in
+                    guard let self, self.selectedFolderForViz?.path == folder, stale else { return }
+                    // Content changed under the same file count: drop the stale entry and refit.
+                    self.projectionCache[url] = nil
+                    self.projectionCacheOrder.removeAll { $0 == url }
+                    self.selectFolderForVisualization(url)
+                }
+            }
+            return
+        }
+
+        folderProjectionFitting = true
         let proj = ProjectionEngine(engine: engine)
+        let cacheDir = Self.projectionCacheDirectoryURL()
         // The fit runs on a detached utility worker (off the main actor), bridged through a one-shot
         // AsyncStream so cancelling this @MainActor task terminates the stream and cancels the worker
         // (onTermination) - preserving cancel-on-change. The worker captures only Sendable values
@@ -1650,9 +1710,7 @@ final class AppModel {
         // store.vectorsUnderFolder is the read-only data pull (never embeds); proj.project does the
         // gated GPU work and yields only the settled layout.
         projectionTask = Task { [weak self] in
-            // Stream carries (layout, total-files-under-folder) so the caption can say "N of M" when the
-            // folder was subsampled to the memory budget - total is the pre-sample distinct count.
-            let stream = AsyncStream<(ProjectionResult, Int)> { continuation in
+            let stream = AsyncStream<ProjectionLoad> { continuation in
                 let worker = Task.detached(priority: .utility) {
                     // Settle briefly first: clicking folders back-and-forth cancels this task before the
                     // scan starts, so we don't enqueue an uncancellable full vectorsUnderFolder scan per
@@ -1661,18 +1719,57 @@ final class AppModel {
                     // machine-gun click-through to just the folder the selection lands on.
                     try? await Task.sleep(for: .milliseconds(120))
                     if Task.isCancelled { continuation.finish(); return }
+
+                    // In-memory hits are served synchronously up front (the fast path above), so this
+                    // worker only runs on a miss - it never needs to touch `self`, keeping the detached
+                    // body free of main-actor captures (Swift 6 strict concurrency).
+                    let signature = store.folderSignature(folder)
+                    if Task.isCancelled { continuation.finish(); return }
+                    if let cacheDir {
+                        let cached = refine
+                            ? ProjectionCache.loadUMAP(directory: cacheDir, folder: folder, fingerprint: fp,
+                                                       mapCap: mapCap, totalCap: totalCap, signature: signature)
+                            : ProjectionCache.loadPCA(directory: cacheDir, folder: folder, fingerprint: fp,
+                                                      mapCap: mapCap, totalCap: totalCap, signature: signature)
+                        if let cached {
+                            continuation.yield(ProjectionLoad(result: cached.result, signature: signature,
+                                                              total: cached.total))
+                            continuation.finish()
+                            return
+                        }
+                    }
+
                     let data = store.vectorsUnderFolder(folder, cap: totalCap, landmarkCap: mapCap)
                     if Task.isCancelled { continuation.finish(); return }
-                    continuation.yield((await proj.project(data, refine: refine), data.total))   // PCA / UMAP
+                    let result = await proj.project(data, refine: refine)   // PCA (default) or UMAP
+                    let total = data.total
+                    if let cacheDir, !result.points.isEmpty {
+                        if refine {
+                            ProjectionCache.saveUMAP(result, directory: cacheDir, folder: folder,
+                                                     fingerprint: fp, mapCap: mapCap, totalCap: totalCap,
+                                                     signature: signature, total: total)
+                        } else {
+                            ProjectionCache.savePCA(result, directory: cacheDir, folder: folder,
+                                                    fingerprint: fp, mapCap: mapCap, totalCap: totalCap,
+                                                    signature: signature, total: total)
+                        }
+                    }
+                    continuation.yield(ProjectionLoad(result: result, signature: signature, total: total))
                     continuation.finish()
                 }
                 continuation.onTermination = { _ in worker.cancel() }
             }
-            var result = ProjectionResult(points: [], knn: [], k: 0)
-            var total = 0
-            for await (snap, t) in stream { if Task.isCancelled { break }; result = snap; total = t }
+            var load = ProjectionLoad(result: ProjectionResult(points: [], knn: [], k: 0),
+                                      signature: nil, total: 0)
+            for await snap in stream { if Task.isCancelled { break }; load = snap }
             guard let self, self.selectedFolderForViz?.path == folder else { return }   // folder changed: drop
-            if !result.points.isEmpty { self.cacheProjection(url, result, total: total); self.applyProjection(result); self.folderProjectionTotal = total }
+            if !load.result.points.isEmpty {
+                self.cacheProjection(url, load.result, signature: load.signature,
+                                     usesUMAP: refine, mapCap: mapCap, totalCap: totalCap,
+                                     fingerprint: fp, total: load.total)
+                self.applyProjection(load.result)
+                self.folderProjectionTotal = load.total
+            }
             self.folderProjectionFitting = false
         }
     }

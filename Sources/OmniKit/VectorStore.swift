@@ -2,6 +2,7 @@ import Foundation
 import SQLite3
 import Accelerate
 import MLX
+import CryptoKit
 
 /// A single indexed chunk: one file may produce several chunks.
 public struct IndexedChunk: Sendable {
@@ -89,6 +90,22 @@ public struct FolderVectors: Sendable {
     }
 }
 
+/// Stable metadata signature for a folder's indexed files. Used to decide whether a cached
+/// visualization layout still matches the vectors currently in the store.
+public struct FolderVectorSignature: Sendable, Codable, Equatable {
+    public let dim: Int
+    public let fileCount: Int
+    public let chunkCount: Int
+    public let hash: String
+
+    public init(dim: Int, fileCount: Int, chunkCount: Int, hash: String) {
+        self.dim = dim
+        self.fileCount = fileCount
+        self.chunkCount = chunkCount
+        self.hash = hash
+    }
+}
+
 /// Signature used for incremental change detection.
 public struct StoredFile: Sendable {
     public let modified: Double
@@ -126,7 +143,7 @@ public final class VectorStore: @unchecked Sendable {
     private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
     struct Row { let path: String; let snippet: String; let kind: String; let chunkIndex: Int; let modified: Double
-                 var width: Int = 0; var height: Int = 0; var duration: Double = 0; var locator: String = "" }
+                 var size: Int = 0; var width: Int = 0; var height: Int = 0; var duration: Double = 0; var locator: String = "" }
     private var rows: [Row] = []
     // Single source of truth for embeddings: contiguous bf16 bits, [count*dim], row i = rows[i].
     // bf16 (2 bytes/dim) halves residency and disk vs fp32 with negligible recall loss on
@@ -334,7 +351,7 @@ public final class VectorStore: @unchecked Sendable {
             // just append. `append` grows flat16/rows geometrically (amortized O(1)).
             if presentPaths.contains(path) { removeRowsLocked { $0.path == path } }
             for (i, c) in chunks.enumerated() {
-                rows.append(Row(path: c.path, snippet: c.snippet, kind: c.kind, chunkIndex: c.chunkIndex, modified: c.modified,
+                rows.append(Row(path: c.path, snippet: c.snippet, kind: c.kind, chunkIndex: c.chunkIndex, modified: c.modified, size: c.size,
                                 width: c.width, height: c.height, duration: c.duration, locator: c.locator))
                 flat16.append(contentsOf: bfs[i])
                 fileID.append(internPath(c.path))
@@ -403,7 +420,7 @@ public final class VectorStore: @unchecked Sendable {
             }
             for (wi, it) in work.enumerated() {
                 for (ci, c) in it.chunks.enumerated() {
-                    rows.append(Row(path: c.path, snippet: c.snippet, kind: c.kind, chunkIndex: c.chunkIndex, modified: c.modified,
+                    rows.append(Row(path: c.path, snippet: c.snippet, kind: c.kind, chunkIndex: c.chunkIndex, modified: c.modified, size: c.size,
                                     width: c.width, height: c.height, duration: c.duration, locator: c.locator))
                     flat16.append(contentsOf: bfs[wi][ci])
                     fileID.append(internPath(c.path))
@@ -629,6 +646,59 @@ public final class VectorStore: @unchecked Sendable {
             var out: [String: Int] = [:]
             for i in folders.indices { out[folders[i]] = seen[i].count }
             return out
+        }
+    }
+
+    /// Metadata-only signature for all indexed rows under `folder`. This is much cheaper than
+    /// `vectorsUnderFolder` on a cache hit because it avoids bf16 -> fp32 vector expansion and PCA.
+    public func folderSignature(_ folder: String) -> FolderVectorSignature {
+        queue.sync {
+            guard dim > 0, !folder.isEmpty, folder != "/" else {
+                return FolderVectorSignature(dim: dim, fileCount: 0, chunkCount: 0, hash: "")
+            }
+            let prefix = folder + "/"
+            @inline(__always) func underFolder(_ p: String) -> Bool { p == folder || p.hasPrefix(prefix) }
+
+            struct Acc {
+                var modified: Double
+                var size: Int
+                var kind: String
+                var chunks: Int
+            }
+
+            var files: [String: Acc] = [:]
+            var chunkCount = 0
+            for r in rows where underFolder(r.path) {
+                chunkCount += 1
+                var a = files[r.path] ?? Acc(modified: r.modified, size: r.size, kind: r.kind, chunks: 0)
+                a.modified = max(a.modified, r.modified)
+                a.size = max(a.size, r.size)
+                if a.kind.isEmpty { a.kind = r.kind }
+                a.chunks += 1
+                files[r.path] = a
+            }
+            guard !files.isEmpty else {
+                return FolderVectorSignature(dim: dim, fileCount: 0, chunkCount: 0, hash: "")
+            }
+
+            var hasher = SHA256()
+            func feed(_ s: String) {
+                hasher.update(data: Data(s.utf8))
+                hasher.update(data: Data([0]))
+            }
+            feed("\(dim)")
+            feed("\(files.count)")
+            feed("\(chunkCount)")
+            for path in files.keys.sorted() {
+                guard let a = files[path] else { continue }
+                feed(path)
+                feed(a.kind)
+                feed("\(a.modified.bitPattern)")
+                feed("\(a.size)")
+                feed("\(a.chunks)")
+            }
+            let hash = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+            return FolderVectorSignature(dim: dim, fileCount: files.count, chunkCount: chunkCount, hash: hash)
         }
     }
 
@@ -1139,7 +1209,7 @@ public final class VectorStore: @unchecked Sendable {
             kindCode.reserveCapacity(total)
         }
         var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, "SELECT path, snippet, kind, chunk_index, dim, vec, modified, width, height, duration, locator FROM chunks;", -1, &stmt, nil) == SQLITE_OK {
+        if sqlite3_prepare_v2(db, "SELECT path, snippet, kind, chunk_index, dim, vec, modified, size, width, height, duration, locator FROM chunks;", -1, &stmt, nil) == SQLITE_OK {
             while sqlite3_step(stmt) == SQLITE_ROW {
                 let path = String(cString: sqlite3_column_text(stmt, 0))
                 let snippet = String(cString: sqlite3_column_text(stmt, 1))
@@ -1147,10 +1217,11 @@ public final class VectorStore: @unchecked Sendable {
                 let ci = Int(sqlite3_column_int(stmt, 3))
                 let d = Int(sqlite3_column_int(stmt, 4))
                 let modified = sqlite3_column_double(stmt, 6)
-                let width = Int(sqlite3_column_int(stmt, 7))
-                let height = Int(sqlite3_column_int(stmt, 8))
-                let duration = sqlite3_column_double(stmt, 9)
-                let locator = sqlite3_column_text(stmt, 10).map { String(cString: $0) } ?? ""
+                let size = Int(sqlite3_column_int64(stmt, 7))
+                let width = Int(sqlite3_column_int(stmt, 8))
+                let height = Int(sqlite3_column_int(stmt, 9))
+                let duration = sqlite3_column_double(stmt, 10)
+                let locator = sqlite3_column_text(stmt, 11).map { String(cString: $0) } ?? ""
                 guard d > 0, let blob = sqlite3_column_blob(stmt, 5) else { continue }
                 if dim == 0 { dim = d }
                 guard d == dim else { continue }   // skip mismatched-dimension rows
@@ -1165,7 +1236,7 @@ public final class VectorStore: @unchecked Sendable {
                 } else {
                     flat16.append(contentsOf: repeatElement(0, count: d))   // short/corrupt row
                 }
-                rows.append(Row(path: path, snippet: snippet, kind: kind, chunkIndex: ci, modified: modified,
+                rows.append(Row(path: path, snippet: snippet, kind: kind, chunkIndex: ci, modified: modified, size: size,
                                 width: width, height: height, duration: duration, locator: locator))
                 fileID.append(internPath(path))
                 kindCode.append(internKind(kind))
