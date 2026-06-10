@@ -1,6 +1,6 @@
-"""Generate the "profiling-v1" dataset used to benchmark Omni indexing speed.
+"""Generate the "profiling-v2" dataset used to benchmark Omni indexing speed.
 
-1000 files mixed across the four indexer kinds (text/image/audio/video). Content
+300 files mixed across the four indexer kinds (text/image/audio/video). Content
 is PLACEHOLDER but metadata (resolution, duration, sample rate, byte size, file
 type, filename tokens) is real and varied so the indexer does real work.
 
@@ -9,13 +9,13 @@ zips to well under GitHub Pages' 100MB limit. The script measures the final zip
 and exits non-zero if it exceeds 95MB.
 
 Run with uv (Pillow + ffmpeg required):
-    uv run --with pillow python Tools/gen_profiling_v1.py
-    uv run --with pillow python Tools/gen_profiling_v1.py --count 200 --out /tmp/prof
+    uv run --with pillow python Tools/gen_profiling_v2.py
+    uv run --with pillow python Tools/gen_profiling_v2.py --count 200 --out /tmp/prof
 
 Outputs (under --out, default ./out):
-    profiling-v1/        the generated files
-    profiling-v1.zip     the packaged dataset (< 100MB)
-    profiling-v1.json    manifest with counts, zipBytes, md5
+    profiling-v2/        the generated files
+    profiling-v2.zip     the packaged dataset (< 100MB)
+    profiling-v2.json    manifest with counts, zipBytes, md5
 """
 
 import argparse
@@ -31,9 +31,10 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-# Canonical mix: 1000 files, 40/30/16/14 across the kinds. (Was 5000; trimmed so a profiling run is
-# quick on every Mac while keeping modality diversity and the same distribution.)
-FULL_MIX = {"text": 400, "image": 300, "audio": 160, "video": 140}
+# Canonical mix: 300 files, 40/30/16/14 across the kinds. (v1 was 1000; trimmed again so a run
+# finishes in minutes even on a base M-series Mac while keeping modality diversity and the same
+# distribution. Every file passes the canonical profiling thresholds - nothing is skipped.)
+FULL_MIX = {"text": 120, "image": 90, "audio": 48, "video": 42}
 TOTAL = sum(FULL_MIX.values())
 
 ZIP_FAIL_BYTES = 95 * 1024 * 1024  # fail loudly above this
@@ -240,13 +241,13 @@ def main():
     args = ap.parse_args()
 
     out_root = Path(args.out).resolve()
-    data_dir = out_root / "profiling-v1"
+    data_dir = out_root / "profiling-v2"
     if data_dir.exists():
         shutil.rmtree(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
 
     mix = scaled_mix(args.count)
-    print(f"[profiling-v1] generating {sum(mix.values())} files: {mix}", flush=True)
+    print(f"[profiling-v2] generating {sum(mix.values())} files: {mix}", flush=True)
 
     sizes = {}
 
@@ -267,7 +268,7 @@ def main():
     file_count = sum(len(v) for v in sizes.values())
 
     # Build the zip.
-    zip_path = out_root / "profiling-v1.zip"
+    zip_path = out_root / "profiling-v2.zip"
     if zip_path.exists():
         zip_path.unlink()
     # report compressed bytes per modality by zipping in passes
@@ -290,7 +291,7 @@ def main():
 
     # Manifest.
     manifest = {
-        "version": "profiling-v1",
+        "version": "profiling-v2",
         "fileCount": file_count,
         "modalityCounts": {k: len(v) for k, v in sizes.items()},
         "zipBytes": zip_bytes,
@@ -299,11 +300,11 @@ def main():
     }
     import json
 
-    manifest_path = out_root / "profiling-v1.json"
+    manifest_path = out_root / "profiling-v2.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 
     # Report.
-    print("\n[profiling-v1] summary", flush=True)
+    print("\n[profiling-v2] summary", flush=True)
     print(f"  files: {file_count}", flush=True)
     for mod in ("text", "image", "audio", "video"):
         n = len(sizes[mod])

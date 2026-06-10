@@ -463,112 +463,76 @@ img { max-width: 100%; display: block; }
   font-size: 0.98rem;
 }
 .profiling-empty strong { color: var(--fg); font-weight: 600; display: block; margin-bottom: 6px; }
-/* per-chip rows */
-.chip-list {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  background: var(--border-soft);
+/* version-vs-throughput scatter: one colored line per chip */
+.bench-panel {
+  background: var(--panel);
   border: 1px solid var(--border-soft);
   border-radius: var(--radius);
-  overflow: hidden;
+  padding: 18px 16px 6px;
 }
-.chip-row {
-  background: var(--panel);
-  padding: 18px 22px;
-}
-.chip-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 10px;
-}
-.chip-name {
-  font-weight: 600;
-  font-size: 1rem;
-  letter-spacing: -0.01em;
-}
-.chip-name .chip-year {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  font-weight: 400;
-  color: var(--muted);
-  margin-left: 8px;
-}
-.chip-runs {
+.bench-svg { width: 100%; height: auto; display: block; }
+.bench-grid line { stroke: var(--border-soft); }
+.bench-axis text {
+  fill: var(--muted);
   font-family: var(--font-mono);
   font-size: 11px;
-  color: var(--muted);
-  white-space: nowrap;
 }
-/* primary bar: median files/sec */
-.bar-track {
-  position: relative;
-  width: 100%;
-  height: 22px;
-  background: var(--bg);
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-sm);
-  overflow: hidden;
+.bench-axis .axis-name { font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; }
+.bench-series polyline {
+  fill: none;
+  stroke-width: 2;
+  opacity: 0.85;
+  transition: opacity 0.15s ease;
 }
-.bar-fill {
-  position: absolute;
-  inset: 0 auto 0 0;
-  height: 100%;
-  background: var(--accent);
-  border-radius: var(--radius-sm) 0 0 var(--radius-sm);
-  transition: width 0.6s ease;
+.bench-series circle {
+  stroke: var(--panel);
+  stroke-width: 1.5;
+  cursor: pointer;
+  transition: opacity 0.15s ease;
 }
-.bar-value {
-  position: absolute;
-  top: 0; right: 8px;
-  height: 22px;
+/* hovering a dot spotlights its chip's line, dims the rest */
+.bench-svg.focusing .bench-series { opacity: 0.15; }
+.bench-svg.focusing .bench-series.focus { opacity: 1; }
+.bench-legend {
   display: flex;
-  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  margin: 12px 6px 10px;
   font-family: var(--font-mono);
   font-size: 12px;
-  font-weight: 500;
   color: var(--fg);
 }
-.bar-unit { color: var(--muted); font-size: 11px; margin-left: 4px; }
-/* secondary stats line */
-.chip-stats {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px 20px;
-  margin-top: 10px;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  color: var(--muted);
+.bench-legend .sw {
+  width: 10px; height: 10px;
+  border-radius: 3px;
+  display: inline-block;
+  margin-right: 7px;
+  vertical-align: -1px;
 }
-.chip-stats .stat strong { color: var(--fg); font-weight: 500; }
-/* the ± standard-deviation, kept visually quiet next to the median */
-.pm { color: var(--muted); font-weight: 400; font-size: 0.85em; }
-.bar-value .pm { opacity: 0.75; }
-/* per-app-version throughput trend (newest first) - the "is it improving?" signal */
-.chip-versions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px 8px;
-  margin-top: 9px;
-  font-family: var(--font-mono);
+.bench-legend .chip-year {
+  color: var(--muted);
   font-size: 11px;
+  margin-left: 6px;
 }
-.chip-versions .ver {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 5px;
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: var(--card-2, rgba(127,127,127,0.10));
+#bench-tip {
+  position: fixed;
+  z-index: 50;
+  pointer-events: none;
+  background: var(--panel);
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.55;
   color: var(--muted);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  max-width: 280px;
 }
-.chip-versions .ver-tag { color: var(--fg); font-weight: 600; }
-.chip-versions .ver-runs { color: var(--muted); opacity: 0.7; }
+#bench-tip .t { color: var(--fg); font-weight: 600; font-size: 12px; margin-bottom: 4px; }
+#bench-tip strong { color: var(--fg); font-weight: 500; }
 @media (max-width: 720px) {
-  .chip-head { flex-direction: column; gap: 2px; }
-  .chip-stats { gap: 4px 16px; }
+  .bench-legend { gap: 4px 14px; font-size: 11px; }
 }
 
 /* ---------- Download ---------- */
@@ -826,7 +790,7 @@ img { max-width: 100%; display: block; }
       <div class="container">
         <p class="section-label mono">Profiling</p>
         <h2 class="profiling-title">How fast is Omni on your Mac?</h2>
-        <p class="profiling-body">Real, community-submitted indexing benchmarks over a fixed 1,000-file dataset. Anyone can contribute by running <span class="mono">File &rarr; Run Profiling</span> in the app.</p>
+        <p class="profiling-body">Real, community-submitted indexing benchmarks over a fixed 300-file dataset (text, images, audio, and video). Each line is one chip across Omni versions - higher is faster. Hover a dot for details, and contribute your own Mac by running <span class="mono">File &rarr; Run Profiling</span> in the app.</p>
         <p class="profiling-meta mono" id="profiling-meta" hidden></p>
         <div id="profiling-content">
           <div class="profiling-empty" id="profiling-loading">
@@ -860,10 +824,13 @@ img { max-width: 100%; display: block; }
     </div>
   </footer>
 
-  <!-- Profiling: fetch community benchmarks and render -->
+  <!-- Profiling: fetch community benchmarks, render the version-vs-throughput scatter -->
   <script>
   (function () {
     var ENDPOINT = "https://hanxiao.io/omni/profiling";
+    // Chip line colors - mid-saturation hues readable on both light and dark panels.
+    var PALETTE = ["#4f8ef7", "#34c08b", "#f2a33c", "#e0566e", "#9a6cf2",
+                   "#2ab7c9", "#c08a3e", "#7d9c4a", "#d164b6", "#8aa0b4"];
 
     function esc(s) {
       return String(s).replace(/[&<>"]/g, function (c) {
@@ -871,20 +838,19 @@ img { max-width: 100%; display: block; }
       });
     }
     function fmt1(n) {
-      return (typeof n === "number" && isFinite(n)) ? n.toFixed(1) : "—";
+      return (typeof n === "number" && isFinite(n)) ? n.toFixed(1) : "\u2014";
     }
     function fmtInt(n) {
       return (typeof n === "number" && isFinite(n))
-        ? Math.round(n).toLocaleString("en-US") : "—";
+        ? Math.round(n).toLocaleString("en-US") : "\u2014";
     }
     function gb(bytes) {
-      if (typeof bytes !== "number" || !isFinite(bytes)) return "—";
-      return (bytes / 1073741824).toFixed(1) + " GB";
+      if (typeof bytes !== "number" || !isFinite(bytes)) return "\u2014";
+      return (bytes / 1073741824).toFixed(0) + " GB";
     }
     function relTime(ms) {
       if (typeof ms !== "number" || !isFinite(ms)) return "";
-      var diff = Date.now() - ms;
-      if (diff < 0) diff = 0;
+      var diff = Math.max(0, Date.now() - ms);
       var s = Math.floor(diff / 1000);
       if (s < 60) return "just now";
       var m = Math.floor(s / 60);
@@ -897,6 +863,20 @@ img { max-width: 100%; display: block; }
       if (mo < 12) return mo + (mo === 1 ? " month ago" : " months ago");
       var y = Math.floor(d / 365);
       return y + (y === 1 ? " year ago" : " years ago");
+    }
+    function cmpVer(a, b) {
+      var A = String(a).split("."), B = String(b).split(".");
+      for (var i = 0; i < Math.max(A.length, B.length); i++) {
+        var d = (parseInt(A[i], 10) || 0) - (parseInt(B[i], 10) || 0);
+        if (d) return d;
+      }
+      return 0;
+    }
+    function niceStep(maxV) {
+      var raw = maxV / 4;
+      var mag = Math.pow(10, Math.floor(Math.log(raw) / Math.LN10));
+      var n = raw / mag;
+      return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * mag;
     }
 
     function showEmpty() {
@@ -917,88 +897,165 @@ img { max-width: 100%; display: block; }
 
       var byChip = (data && Array.isArray(data.byChip)) ? data.byChip.slice() : [];
       var total = (data && typeof data.totalRuns === "number") ? data.totalRuns : 0;
+      // Only chips that carry a per-version series can be plotted.
+      var chips = byChip.filter(function (c) {
+        return Array.isArray(c.versions) && c.versions.length > 0;
+      });
 
-      if (!total || byChip.length === 0) {
+      if (!total || chips.length === 0) {
         showEmpty();
         if (meta) meta.hidden = true;
         return;
       }
 
-      // meta line: total runs + relative updated time
       if (meta) {
         var rel = relTime(data.updatedAt);
         meta.innerHTML =
           fmtInt(total) + (total === 1 ? " run" : " runs") +
+          '<span class="dot">&middot;</span>' + chips.length + (chips.length === 1 ? " chip" : " chips") +
           (data.latestVersion ? '<span class="dot">&middot;</span>latest v' + esc(data.latestVersion) : "") +
           (rel ? '<span class="dot">&middot;</span>updated ' + esc(rel) : "");
         meta.hidden = false;
       }
 
-      // sort by median files/sec desc; scale bars to the fastest chip
-      byChip.sort(function (a, b) {
-        return (b.medianFilesPerSec || 0) - (a.medianFilesPerSec || 0);
+      // Legend/color order: fastest chip (by overall median tok/s) first.
+      chips.sort(function (a, b) {
+        return (b.medianTokensPerSec || 0) - (a.medianTokensPerSec || 0);
       });
-      var maxFps = byChip.reduce(function (m, c) {
-        return Math.max(m, c.medianFilesPerSec || 0);
-      }, 0) || 1;
 
-      var rows = byChip.map(function (c) {
-        var fps = c.medianFilesPerSec || 0;
-        var pct = Math.max(2, Math.min(100, (fps / maxFps) * 100));
-        var year = (typeof c.releaseYear === "number")
-          ? '<span class="chip-year">' + c.releaseYear + "</span>" : "";
-        var runs = (typeof c.runs === "number")
-          ? c.runs + (c.runs === 1 ? " run" : " runs") : "";
-        // ± std (only when >1 run, so there's spread to report)
-        var fpsStd = (typeof c.filesPerSecStd === "number" && c.filesPerSecStd > 0)
-          ? '<span class="pm"> &plusmn;' + fmt1(c.filesPerSecStd) + "</span>" : "";
-        var tpsStd = (typeof c.tokensPerSecStd === "number" && c.tokensPerSecStd > 0)
-          ? '<span class="pm"> &plusmn;' + fmtInt(c.tokensPerSecStd) + "</span>" : "";
-        // Per-app-version trend within this chip - the key "is it improving?" signal, hardware-controlled.
-        var vers = Array.isArray(c.versions) ? c.versions : [];
-        var verLine = vers.length
-          ? '<div class="chip-versions">' + vers.map(function (v) {
-              return '<span class="ver"><span class="ver-tag">v' + esc(v.version) + "</span>" +
-                fmtInt(v.medianTokensPerSec) + " tok/s" +
-                (v.runs > 1 ? '<span class="ver-runs">&times;' + v.runs + "</span>" : "") + "</span>";
-            }).join("") + "</div>"
-          : "";
-        // Hover detail: device memory, GPU VRAM, OS spread.
-        var oses = Array.isArray(c.macosVersions) ? c.macosVersions.filter(Boolean) : [];
-        var tip = [
-          "Memory: " + gb(c.memoryBytes),
-          "GPU VRAM: " + gb(c.vramBytes),
-          oses.length ? "macOS " + oses.join(", ") : "",
-          (c.runs || 0) + ((c.runs === 1) ? " run" : " runs"),
-        ].filter(Boolean).join("  ·  ");
-        return (
-          '<div class="chip-row" title="' + esc(tip) + '">' +
-            '<div class="chip-head">' +
-              '<div class="chip-name">' + esc(c.chip || "Unknown") + year + "</div>" +
-              '<div class="chip-runs">' + esc(runs) + "</div>" +
-            "</div>" +
-            '<div class="bar-track" role="img" aria-label="' +
-              esc((c.chip || "Unknown") + ": " + fmt1(fps) + " files per second") + '">' +
-              '<div class="bar-fill" style="width:' + pct.toFixed(1) + '%"></div>' +
-              '<div class="bar-value">' + fmt1(fps) + fpsStd +
-                '<span class="bar-unit">files/s</span></div>' +
-            "</div>" +
-            '<div class="chip-stats">' +
-              '<span class="stat"><strong>' + fmtInt(c.medianTokensPerSec) + tpsStd +
-                "</strong> tokens/s</span>" +
-              '<span class="stat"><strong>' + gb(c.medianPeakVramDeltaBytes) +
-                "</strong> peak VRAM &Delta;</span>" +
-              '<span class="stat"><strong>' + gb(c.vramBytes) +
-                "</strong> GPU VRAM</span>" +
-              '<span class="stat"><strong>' + fmt1(c.medianSeconds) +
-                "</strong> s median</span>" +
-            "</div>" +
-            verLine +
-          "</div>"
-        );
+      // X domain: every app version seen on any chip, semver order.
+      var verSet = {};
+      chips.forEach(function (c) {
+        c.versions.forEach(function (v) { if (v && v.version) verSet[v.version] = true; });
+      });
+      var versions = Object.keys(verSet).sort(cmpVer);
+      var vIndex = {};
+      versions.forEach(function (v, i) { vIndex[v] = i; });
+
+      // Y domain: 0 .. max tok/s with headroom.
+      var yMax = 1;
+      chips.forEach(function (c) {
+        c.versions.forEach(function (v) {
+          if (typeof v.medianTokensPerSec === "number") yMax = Math.max(yMax, v.medianTokensPerSec);
+        });
+      });
+      yMax *= 1.1;
+
+      var W = 920, H = 380;
+      var m = { t: 14, r: 44, b: 48, l: 64 };   // right margin fits the last centered x-label
+      var pw = W - m.l - m.r, ph = H - m.t - m.b;
+      function x(ver) {
+        var i = vIndex[ver] || 0;
+        return m.l + (versions.length <= 1 ? pw / 2 : pw * i / (versions.length - 1));
+      }
+      function y(v) { return m.t + ph * (1 - v / yMax); }
+
+      // Grid + Y ticks.
+      var step = niceStep(yMax);
+      var grid = "", yTicks = "";
+      for (var t = 0; t <= yMax; t += step) {
+        var yy = y(t).toFixed(1);
+        grid += '<line x1="' + m.l + '" x2="' + (W - m.r) + '" y1="' + yy + '" y2="' + yy + '"/>';
+        yTicks += '<text x="' + (m.l - 10) + '" y="' + yy + '" text-anchor="end" dominant-baseline="middle">' +
+          (t >= 1000 ? (t / 1000) + "k" : t) + "</text>";
+      }
+
+      // X labels: at most ~8, always including the first and last version.
+      var every = Math.max(1, Math.ceil(versions.length / 8));
+      var xTicks = versions.map(function (v, i) {
+        if (i % every !== 0 && i !== versions.length - 1) return "";
+        return '<text x="' + x(v).toFixed(1) + '" y="' + (H - m.b + 20) + '" text-anchor="middle">v' + esc(v) + "</text>";
       }).join("");
 
-      content.innerHTML = '<div class="chip-list">' + rows + "</div>";
+      // Series: a polyline + dots per chip. Dots carry their tooltip payload in data- attrs.
+      var series = chips.map(function (c, ci) {
+        var color = PALETTE[ci % PALETTE.length];
+        var pts = c.versions.slice().sort(function (a, b) { return cmpVer(a.version, b.version); });
+        var line = pts.length > 1
+          ? '<polyline stroke="' + color + '" points="' +
+            pts.map(function (v) {
+              return x(v.version).toFixed(1) + "," + y(v.medianTokensPerSec || 0).toFixed(1);
+            }).join(" ") + '"/>'
+          : "";
+        var dots = pts.map(function (v) {
+          var tip = [
+            "<div class=\"t\">" + esc(c.chip || "Unknown") +
+              (typeof c.releaseYear === "number" ? " (" + c.releaseYear + ")" : "") +
+              " \u00B7 v" + esc(v.version) + "</div>",
+            "<div><strong>" + fmtInt(v.medianTokensPerSec) + "</strong> tokens/s" +
+              (typeof v.medianFilesPerSec === "number" ? " \u00B7 <strong>" + fmt1(v.medianFilesPerSec) + "</strong> files/s" : "") + "</div>",
+            "<div>" + (v.runs || 1) + ((v.runs || 1) === 1 ? " run" : " runs") +
+              " \u00B7 " + gb(c.memoryBytes) + " memory \u00B7 " + gb(c.vramBytes) + " GPU</div>",
+            (Array.isArray(c.macosVersions) && c.macosVersions.length
+              ? "<div>macOS " + esc(c.macosVersions.filter(Boolean).join(", ")) + "</div>" : ""),
+          ].join("");
+          return '<circle class="bench-dot" r="4.5" fill="' + color + '" cx="' + x(v.version).toFixed(1) +
+            '" cy="' + y(v.medianTokensPerSec || 0).toFixed(1) + '" data-tip="' + esc(tip) + '" data-series="' + ci + '"/>';
+        }).join("");
+        return '<g class="bench-series" data-series="' + ci + '">' + line + dots + "</g>";
+      }).join("");
+
+      var legend = chips.map(function (c, ci) {
+        var color = PALETTE[ci % PALETTE.length];
+        return '<span><span class="sw" style="background:' + color + '"></span>' + esc(c.chip || "Unknown") +
+          (typeof c.releaseYear === "number" ? '<span class="chip-year">' + c.releaseYear + "</span>" : "") + "</span>";
+      }).join("");
+
+      content.innerHTML =
+        '<div class="bench-panel">' +
+          '<svg class="bench-svg" id="bench-svg" viewBox="0 0 ' + W + " " + H + '" role="img" ' +
+            'aria-label="Indexing throughput in tokens per second by Omni version, one line per Apple chip">' +
+            '<g class="bench-grid">' + grid + "</g>" +
+            '<g class="bench-axis">' + yTicks + xTicks +
+              '<text class="axis-name" x="' + (m.l + pw / 2) + '" y="' + (H - 6) + '" text-anchor="middle">Omni version</text>' +
+              '<text class="axis-name" transform="translate(14 ' + (m.t + ph / 2) + ') rotate(-90)" text-anchor="middle">tokens / s</text>' +
+            "</g>" + series +
+          "</svg>" +
+          '<div class="bench-legend">' + legend + "</div>" +
+        "</div>";
+
+      // Tooltip + line spotlight (event delegation; dots carry their payload).
+      var svg = document.getElementById("bench-svg");
+      var tip = document.getElementById("bench-tip");
+      if (!tip) {
+        tip = document.createElement("div");
+        tip.id = "bench-tip";
+        tip.hidden = true;
+        document.body.appendChild(tip);
+      }
+      function moveTip(e) {
+        var pad = 14;
+        var tw = tip.offsetWidth, th = tip.offsetHeight;
+        var px = e.clientX + pad, py = e.clientY + pad;
+        if (px + tw > window.innerWidth - 8) px = e.clientX - tw - pad;
+        if (py + th > window.innerHeight - 8) py = e.clientY - th - pad;
+        tip.style.left = px + "px";
+        tip.style.top = py + "px";
+      }
+      svg.addEventListener("mouseover", function (e) {
+        var dot = e.target.closest ? e.target.closest(".bench-dot") : null;
+        if (!dot) return;
+        tip.innerHTML = dot.getAttribute("data-tip") || "";
+        tip.hidden = false;
+        dot.setAttribute("r", "6.5");
+        svg.classList.add("focusing");
+        var si = dot.getAttribute("data-series");
+        var groups = svg.querySelectorAll(".bench-series");
+        for (var i = 0; i < groups.length; i++) {
+          groups[i].classList.toggle("focus", groups[i].getAttribute("data-series") === si);
+        }
+        moveTip(e);
+      });
+      svg.addEventListener("mousemove", function (e) {
+        if (!tip.hidden) moveTip(e);
+      });
+      svg.addEventListener("mouseout", function (e) {
+        var dot = e.target.closest ? e.target.closest(".bench-dot") : null;
+        if (!dot) return;
+        dot.setAttribute("r", "4.5");
+        tip.hidden = true;
+        svg.classList.remove("focusing");
+      });
     }
 
     function load() {

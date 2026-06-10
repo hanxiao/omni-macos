@@ -35,7 +35,7 @@ jobs:
           # Sync the page + assets, but PRESERVE the release-managed files: the DMGs, the in-app
           # updater manifest (latest.json), and the profiling dataset. --delete still prunes stale
           # page assets that were removed from the repo.
-          rsync -a --delete --exclude='*.dmg' --exclude='profiling-v1*' --exclude='latest.json' \
+          rsync -a --delete --exclude='*.dmg' --exclude='profiling-v*' --exclude='latest.json' \
             site/omni/ /tmp/site-only/omni/
           # The repo's index.html carries placeholder download metadata; re-stamp it to the currently
           # released DMG using the live manifest, so a site-only deploy never regresses the version pill.

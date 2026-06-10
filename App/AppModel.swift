@@ -2159,7 +2159,7 @@ final class AppModel {
             profilingFraction = nil
             let (folder, count) = try await ProfilingService.ensureDataset { self.profilingPhase = $0 }
 
-            let total = count > 0 ? count : 1000
+            let total = count > 0 ? count : 300
             profilingPhase = "Indexing"
             profilingDetail = "0 of \(total) files"
             profilingFraction = 0
