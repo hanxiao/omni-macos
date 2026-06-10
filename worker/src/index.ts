@@ -16,7 +16,11 @@ export interface Env {
   RATE_SALT?: string;
 }
 
-const DATASET_VERSION = "profiling-v1";
+// Current dataset (reported in GET). Uploads are accepted for every KNOWN dataset and stored with
+// the version they ran on: v1 (1000 files) and v2 (300 files, same modality mix) have comparable
+// files/s and tokens/s RATES, so the per-chip trend keeps its history across the dataset change.
+const DATASET_VERSION = "profiling-v2";
+const ACCEPTED_DATASETS = new Set(["profiling-v1", "profiling-v2"]);
 const MAX_BODY_BYTES = 8 * 1024; // 8KB
 const RATE_LIMIT_PER_HOUR = 20;
 const ALLOWED_ORIGIN = "https://hanxiao.io";
@@ -157,7 +161,7 @@ async function handlePost(request: Request, env: Env): Promise<Response> {
       body.runId,
       now,
       str(body.appVersion),
-      DATASET_VERSION,
+      str(body.datasetVersion),
       str(h.chip),
       str(h.hwModel),
       intOrNull(h.releaseYear),
@@ -199,7 +203,7 @@ function validate(b: ProfilingReport): Validation {
   if (typeof b?.runId !== "string" || b.runId.length < 8 || b.runId.length > 64) {
     return { ok: false, error: "invalid runId" };
   }
-  if (b.datasetVersion !== DATASET_VERSION) {
+  if (!ACCEPTED_DATASETS.has(b.datasetVersion)) {
     return { ok: false, error: "unsupported datasetVersion" };
   }
   if (typeof b.hardware !== "object" || b.hardware === null) {

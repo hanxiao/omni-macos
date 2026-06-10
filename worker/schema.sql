@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS profiling_runs (
   id              TEXT PRIMARY KEY,      -- runId (uuid v4), used for dedup via INSERT OR IGNORE
   created_at      INTEGER NOT NULL,      -- server-set epoch ms (worker runtime clock; client time ignored)
   app_version     TEXT,
-  dataset_ver     TEXT NOT NULL,         -- must equal "profiling-v1"
+  dataset_ver     TEXT NOT NULL,         -- the dataset the run used (profiling-v1 or profiling-v2)
   -- hardware
   chip            TEXT,
   hw_model        TEXT,
