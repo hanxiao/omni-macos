@@ -500,6 +500,26 @@ img { max-width: 100%; display: block; }
 /* hovering a dot spotlights its chip's line, dims the rest */
 .bench-svg.focusing .bench-series { opacity: 0.15; }
 .bench-svg.focusing .bench-series.focus { opacity: 1; }
+.bench-toggle {
+  display: inline-flex;
+  gap: 0;
+  margin: 0 0 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.bench-toggle button {
+  appearance: none;
+  border: 0;
+  background: var(--panel);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+.bench-toggle button + button { border-left: 1px solid var(--border-soft); }
+.bench-toggle button.on { background: var(--accent); color: var(--accent-fg); }
 .bench-legend {
   display: flex;
   flex-wrap: wrap;
@@ -539,7 +559,27 @@ img { max-width: 100%; display: block; }
 #bench-tip .t { color: var(--fg); font-weight: 600; font-size: 12px; margin-bottom: 4px; }
 #bench-tip strong { color: var(--fg); font-weight: 500; }
 @media (max-width: 720px) {
-  .bench-legend { gap: 4px 14px; font-size: 11px; }
+  .bench-toggle {
+  display: inline-flex;
+  gap: 0;
+  margin: 0 0 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.bench-toggle button {
+  appearance: none;
+  border: 0;
+  background: var(--panel);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+.bench-toggle button + button { border-left: 1px solid var(--border-soft); }
+.bench-toggle button.on { background: var(--accent); color: var(--accent-fg); }
+.bench-legend { gap: 4px 14px; font-size: 11px; }
 }
 
 /* ---------- Download ---------- */
@@ -946,12 +986,17 @@ img { max-width: 100%; display: block; }
       var vIndex = {};
       versions.forEach(function (v, i) { vIndex[v] = i; });
 
-      // Y domain: 0 .. max tok/s with headroom.
-      var yMax = 1;
+      // Metric accessor: tokens/s (throughput of the model) or files/s (end-to-end indexing rate).
+      var isTPS = metric === "tps";
+      function yVal(v) {
+        var n = isTPS ? v.medianTokensPerSec : v.medianFilesPerSec;
+        return (typeof n === "number" && isFinite(n)) ? n : 0;
+      }
+
+      // Y domain: 0 .. max with headroom.
+      var yMax = isTPS ? 1 : 0.1;
       chips.forEach(function (c) {
-        c.versions.forEach(function (v) {
-          if (typeof v.medianTokensPerSec === "number") yMax = Math.max(yMax, v.medianTokensPerSec);
-        });
+        c.versions.forEach(function (v) { yMax = Math.max(yMax, yVal(v)); });
       });
       yMax *= 1.1;
 
@@ -964,14 +1009,19 @@ img { max-width: 100%; display: block; }
       }
       function y(v) { return m.t + ph * (1 - v / yMax); }
 
-      // Grid + Y ticks.
+      // Grid + Y ticks (k-format for big tokens/s values, one decimal for small files/s values).
       var step = niceStep(yMax);
+      function tickLabel(t) {
+        if (t >= 1000) return (t / 1000) + "k";
+        if (step < 1) return t.toFixed(1);
+        return String(Math.round(t));
+      }
       var grid = "", yTicks = "";
       for (var t = 0; t <= yMax; t += step) {
         var yy = y(t).toFixed(1);
         grid += '<line x1="' + m.l + '" x2="' + (W - m.r) + '" y1="' + yy + '" y2="' + yy + '"/>';
         yTicks += '<text x="' + (m.l - 10) + '" y="' + yy + '" text-anchor="end" dominant-baseline="middle">' +
-          (t >= 1000 ? (t / 1000) + "k" : t) + "</text>";
+          tickLabel(t) + "</text>";
       }
 
       // X labels: at most ~8, always including the first and last version.
@@ -988,7 +1038,7 @@ img { max-width: 100%; display: block; }
         var line = pts.length > 1
           ? '<polyline stroke="' + color + '" points="' +
             pts.map(function (v) {
-              return x(v.version).toFixed(1) + "," + y(v.medianTokensPerSec || 0).toFixed(1);
+              return x(v.version).toFixed(1) + "," + y(yVal(v)).toFixed(1);
             }).join(" ") + '"/>'
           : "";
         var dots = pts.map(function (v) {
@@ -1004,7 +1054,7 @@ img { max-width: 100%; display: block; }
               ? "<div>macOS " + esc(c.macosVersions.filter(Boolean).join(", ")) + "</div>" : ""),
           ].join("");
           return '<circle class="bench-dot" r="4.5" fill="' + color + '" cx="' + x(v.version).toFixed(1) +
-            '" cy="' + y(v.medianTokensPerSec || 0).toFixed(1) + '" data-tip="' + esc(tip) + '" data-series="' + ci + '"/>';
+            '" cy="' + y(yVal(v)).toFixed(1) + '" data-tip="' + esc(tip) + '" data-series="' + ci + '"/>';
         }).join("");
         return '<g class="bench-series" data-series="' + ci + '">' + line + dots + "</g>";
       }).join("");
@@ -1015,14 +1065,24 @@ img { max-width: 100%; display: block; }
           (typeof c.releaseYear === "number" ? '<span class="chip-year">' + c.releaseYear + "</span>" : "") + "</span>";
       }).join("");
 
+      var toggle =
+        '<div class="bench-toggle mono" role="tablist" aria-label="Chart metric">' +
+          '<button role="tab" aria-selected="' + (isTPS ? "true" : "false") + '" data-metric="tps"' +
+            (isTPS ? ' class="on"' : "") + '>tokens/s</button>' +
+          '<button role="tab" aria-selected="' + (!isTPS ? "true" : "false") + '" data-metric="fps"' +
+            (!isTPS ? ' class="on"' : "") + '>files/s</button>' +
+        "</div>";
+
       content.innerHTML =
+        toggle +
         '<div class="bench-panel">' +
           '<svg class="bench-svg" id="bench-svg" viewBox="0 0 ' + W + " " + H + '" role="img" ' +
             'aria-label="Indexing throughput in tokens per second by Omni version, one line per Apple chip">' +
             '<g class="bench-grid">' + grid + "</g>" +
             '<g class="bench-axis">' + yTicks + xTicks +
               '<text class="axis-name" x="' + (m.l + pw / 2) + '" y="' + (H - 6) + '" text-anchor="middle">Omni version</text>' +
-              '<text class="axis-name" transform="translate(14 ' + (m.t + ph / 2) + ') rotate(-90)" text-anchor="middle">tokens / s</text>' +
+              '<text class="axis-name" transform="translate(14 ' + (m.t + ph / 2) + ') rotate(-90)" text-anchor="middle">' +
+                (isTPS ? "tokens / s" : "files / s") + "</text>" +
             "</g>" + series +
           "</svg>" +
           '<div class="bench-legend">' + legend + "</div>" +
@@ -1070,7 +1130,21 @@ img { max-width: 100%; display: block; }
         tip.hidden = true;
         svg.classList.remove("focusing");
       });
+
+      var buttons = content.querySelectorAll(".bench-toggle button");
+      for (var bi = 0; bi < buttons.length; bi++) {
+        buttons[bi].addEventListener("click", function () {
+          var m2 = this.getAttribute("data-metric");
+          if (m2 && m2 !== metric && lastData) {
+            metric = m2;
+            render(lastData);
+          }
+        });
+      }
     }
+
+    var lastData = null;
+    var metric = "tps";   // "tps" (tokens/s) | "fps" (files/s)
 
     function load() {
       fetch(ENDPOINT, { method: "GET" })
@@ -1078,7 +1152,7 @@ img { max-width: 100%; display: block; }
           if (!r.ok) throw new Error("HTTP " + r.status);
           return r.json();
         })
-        .then(function (data) { render(data); })
+        .then(function (data) { lastData = data; render(data); })
         .catch(function () { showEmpty(); });
     }
 
