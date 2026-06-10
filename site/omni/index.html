@@ -317,9 +317,7 @@ img { max-width: 100%; display: block; }
   text-align: center;
 }
 /* main UI shot - large, centered */
-.shot-hero { max-width: 920px; margin: 0 auto 72px; }
 /* the any-file screenshot sits inside its own section, so tighten the margins */
-.anyfile-shot { margin: 28px auto 0; }
 
 /* ---------- Carousel (multimodal search) ---------- */
 .carousel-wrap { max-width: 920px; margin: 0 auto 72px; }
@@ -337,18 +335,19 @@ img { max-width: 100%; display: block; }
   object-fit: contain;
   opacity: 0;
   filter: drop-shadow(0 16px 38px rgba(17, 24, 39, 0.15));
-  animation: cfade 30s infinite;
+  animation: cfade 36s infinite;
 }
 .cframe:nth-child(1) { animation-delay: 0s; }
 .cframe:nth-child(2) { animation-delay: 6s; }
 .cframe:nth-child(3) { animation-delay: 12s; }
 .cframe:nth-child(4) { animation-delay: 18s; }
 .cframe:nth-child(5) { animation-delay: 24s; }
-@keyframes cfade {     /* 30s cycle, 5 frames at 6s each: ~5s visible + a short crossfade */
+.cframe:nth-child(6) { animation-delay: 30s; }
+@keyframes cfade {     /* 36s cycle, 6 frames at 6s each: ~5s visible + a short crossfade */
   0%    { opacity: 0; }
-  2.4%  { opacity: 1; }
-  17.6% { opacity: 1; }
-  22.4% { opacity: 0; }
+  2%    { opacity: 1; }
+  14.7% { opacity: 1; }
+  18.7% { opacity: 0; }
   100%  { opacity: 0; }
 }
 /* captions crossfade in sync with the frames */
@@ -357,30 +356,33 @@ img { max-width: 100%; display: block; }
   position: absolute;
   left: 0; right: 0;
   opacity: 0;
-  animation: cfade 30s infinite;
+  animation: cfade 36s infinite;
 }
 .carousel-cap > span:nth-child(1) { animation-delay: 0s; }
 .carousel-cap > span:nth-child(2) { animation-delay: 6s; }
 .carousel-cap > span:nth-child(3) { animation-delay: 12s; }
 .carousel-cap > span:nth-child(4) { animation-delay: 18s; }
 .carousel-cap > span:nth-child(5) { animation-delay: 24s; }
+.carousel-cap > span:nth-child(6) { animation-delay: 30s; }
 @media (prefers-reduced-motion: reduce) {
   .cframe, .carousel-cap > span { animation: none; }
   .cframe:nth-child(1), .carousel-cap > span:nth-child(1) { opacity: 1; }
 }
-/* the two settings windows are small in reality, so show them small and side by side */
-.shot-row {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 48px;
-  max-width: 760px;
+/* every Settings tab: a waterfall (masonry) of the small settings windows. CSS columns keep it
+   dependency-free; break-inside guards each card from splitting across columns. */
+.waterfall {
+  columns: 3;
+  column-gap: 28px;
+  max-width: 980px;
   margin: 0 auto;
-  align-items: start;
 }
-.shot-sm { max-width: 320px; margin: 0 auto; }
-@media (max-width: 640px) {
-  .shot-row { grid-template-columns: 1fr; gap: 36px; max-width: 340px; }
+.wf-item {
+  break-inside: avoid;
+  margin: 0 0 28px;
 }
+.wf-item img { width: 100%; height: auto; display: block; }
+@media (max-width: 900px) { .waterfall { columns: 2; } }
+@media (max-width: 560px) { .waterfall { columns: 1; max-width: 340px; } }
 
 /* ---------- Serving ---------- */
 .serving {
@@ -722,13 +724,16 @@ img { max-width: 100%; display: block; }
     <section id="screenshots" class="screenshots">
       <div class="container">
         <p class="section-label mono">A look inside</p>
+        <h2 class="serving-title">Search with any file, find any file.</h2>
+        <p class="serving-body">Every file - image, audio, video, text - lands in one shared vector space, so a query is just another file. Drop in a photo to find related screenshots, a voice memo to surface where it came from, a PDF to pull up everything near it. Right-click any result and choose <strong>Find Similar</strong>, or drop a file onto the search. One model, one space, any direction.</p>
 
         <figure class="carousel-wrap">
-          <div class="carousel" aria-label="Searching across images, text, audio, and video, plus a folder mapped by similarity">
+          <div class="carousel" aria-label="Searching across images, text, audio, video, by an example file, plus a folder mapped by similarity">
             <img class="cframe" src="assets/search-image.png" alt="Searching images - Porsche 911 photos" />
             <img class="cframe" src="assets/search-text.png" alt="Searching text and code - jina omni embeddings" />
             <img class="cframe" src="assets/search-audio.png" alt="Searching audio files" />
             <img class="cframe" src="assets/search-video.png" alt="Searching video clips" />
+            <img class="cframe" src="assets/search-anyfile.png" alt="Searching Omni by an example file, returning matches across modalities" />
             <img class="cframe" src="assets/map.png" alt="Folder embedding map: 55,953 files clustered by similarity and colored by type" />
           </div>
           <figcaption class="shot-caption carousel-cap">
@@ -736,18 +741,36 @@ img { max-width: 100%; display: block; }
             <span><span class="mono">jina omni embeddings</span> &middot; text</span>
             <span><span class="mono">podcast interview</span> &middot; audio</span>
             <span><span class="mono">screen recording demo</span> &middot; video</span>
+            <span><span class="mono">this file</span> &middot; results across every modality</span>
             <span><span class="mono">Documents</span> &middot; mapped by similarity</span>
           </figcaption>
         </figure>
 
-        <div class="shot-row">
-          <figure class="shot shot-sm">
-            <img src="assets/shot-content.png" alt="Omni settings: which file types to index" loading="lazy" />
+        <!-- every Settings tab, waterfall layout -->
+        <div class="waterfall" aria-label="Every Settings tab">
+          <figure class="shot wf-item">
+            <img src="assets/settings-content.png" alt="Settings - Content: file types to index, size thresholds, ignore rules" loading="lazy" />
             <figcaption class="shot-caption">Choose what to index.</figcaption>
           </figure>
-          <figure class="shot shot-sm">
-            <img src="assets/shot-serving.png" alt="Omni settings: the local HTTP embedding server" loading="lazy" />
+          <figure class="shot wf-item">
+            <img src="assets/settings-performance.png" alt="Settings - Performance: model choice, memory cap, folder map layout" loading="lazy" />
+            <figcaption class="shot-caption">Tune memory and speed.</figcaption>
+          </figure>
+          <figure class="shot wf-item">
+            <img src="assets/settings-serving.png" alt="Settings - Serving: the local HTTP embedding server" loading="lazy" />
             <figcaption class="shot-caption">Run a local embedding server.</figcaption>
+          </figure>
+          <figure class="shot wf-item">
+            <img src="assets/settings-indexing.png" alt="Settings - Indexing: live activity and throughput" loading="lazy" />
+            <figcaption class="shot-caption">Watch indexing live.</figcaption>
+          </figure>
+          <figure class="shot wf-item">
+            <img src="assets/settings-storage.png" alt="Settings - Storage: where the index lives and how big it is" loading="lazy" />
+            <figcaption class="shot-caption">One index, on your disk.</figcaption>
+          </figure>
+          <figure class="shot wf-item">
+            <img src="assets/settings-history.png" alt="Settings - History: search history retention" loading="lazy" />
+            <figcaption class="shot-caption">History on your terms.</figcaption>
           </figure>
         </div>
       </div>
@@ -769,19 +792,6 @@ img { max-width: 100%; display: block; }
             <p class="serving-item-body">Raw vectors too, via OpenAI-, Jina-, Cohere-, and Gemini-compatible APIs.</p>
           </div>
         </div>
-      </div>
-    </section>
-
-    <!-- ANY-TO-ANY -->
-    <section id="anytoany" class="serving">
-      <div class="container">
-        <p class="section-label mono">Cross-modal</p>
-        <h2 class="serving-title">Search with any file, find any file.</h2>
-        <p class="serving-body">Every file - image, audio, video, text - lands in one shared vector space, so a query is just another file. Drop in a photo to find related screenshots, a voice memo to surface where it came from, a PDF to pull up everything near it. Right-click any result and choose <strong>Find Similar</strong>, or drop a file onto the search. One model, one space, any direction.</p>
-        <figure class="shot shot-hero anyfile-shot">
-          <img src="assets/search-anyfile.png" alt="Searching Omni by an example file, returning matches across modalities" loading="lazy" />
-          <figcaption class="shot-caption"><span class="mono">this file</span> &middot; results across every modality</figcaption>
-        </figure>
       </div>
     </section>
 
