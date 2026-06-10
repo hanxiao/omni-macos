@@ -259,6 +259,11 @@ img { max-width: 100%; display: block; }
   font-size: 0.95rem;
   line-height: 1.6;
 }
+.feature-body a {
+  color: var(--fg);
+  border-bottom: 1px solid var(--accent);
+}
+.feature-body a:hover { background: var(--accent); color: var(--accent-fg); }
 
 /* ---------- Private band ---------- */
 .band {
@@ -667,7 +672,7 @@ img { max-width: 100%; display: block; }
       <div class="container hero-inner">
         <img class="hero-mascot" src="assets/omni-mascot.png" alt="Omni mascot, a small 3D mole" width="160" height="148" />
         <h1 class="hero-title">Search every file on your Mac by meaning.</h1>
-        <p class="hero-sub">Text, code, PDFs, images, audio, and video in one vector space - searched in any language, entirely on-device. Download the model once, then run fully offline.</p>
+        <p class="hero-sub">Text, code, PDFs, images, audio, and video - in any language, entirely on-device. Download the model once, then run fully offline.</p>
         <div class="hero-actions">
           <a class="btn btn-primary btn-lg" href="Omni-0.1.15.dmg">Download for macOS <span class="dl-ver">v0.1.10</span></a>
         </div>
@@ -682,25 +687,24 @@ img { max-width: 100%; display: block; }
         <div class="feature-grid">
 
           <article class="feature-card">
-            <h3 class="feature-title">One space for every file</h3>
-            <p class="feature-body">Text, code, PDFs, images, audio, and video are embedded into a single vector space. A text query matches them all - including scanned pages.</p>
-          </article>
-
-          <article class="feature-card">
             <h3 class="feature-title">Any language</h3>
-            <p class="feature-body">Languages share that same space, so a query in one finds files in another. Search in English, match notes in German, Chinese, or Japanese.</p>
+            <p class="feature-body">Search in English, match notes in German, Chinese, or Japanese - queries and files meet by meaning, not by keyword, scanned pages included.</p>
           </article>
 
           <article class="feature-card">
-            <h3 class="feature-title">Offline and private</h3>
-            <p class="feature-body">The model downloads once; after that both indexing and search run on your Mac with no network - airgap it and Omni still works. Files never leave the device. No accounts, no telemetry.</p>
+            <h3 class="feature-title">See a folder as a map</h3>
+            <p class="feature-body">Every file becomes a dot, clustered by similarity and colored by type. Click a dot to spotlight its nearest neighbors - duplicates, drafts, and forgotten corners stand out at a glance.</p>
+          </article>
+
+          <article class="feature-card">
+            <h3 class="feature-title">Fast on Apple silicon</h3>
+            <p class="feature-body">A native MLX-Swift port of <span class="mono">jina-embeddings-v5-omni</span> runs in-process on the GPU - tens of thousands of tokens per second on recent chips, <a href="#profiling">measured in the open</a> rather than claimed.</p>
           </article>
 
           <article class="feature-card">
             <h3 class="feature-title">Native to macOS</h3>
-            <p class="feature-body">List and Gallery views, real QuickLook thumbnails, drag and drop, and filters by kind, folder, and score.</p>
+            <p class="feature-body">List and Gallery views, real QuickLook thumbnails, drag and drop, keyboard-first navigation, and filters by kind, folder, date, and score.</p>
           </article>
-
         </div>
       </div>
     </section>
@@ -710,12 +714,12 @@ img { max-width: 100%; display: block; }
       <div class="container band-inner">
         <p class="section-label mono">Private by design</p>
         <h2 class="band-title">Everything stays on your Mac.</h2>
-        <p class="band-body">Omni runs a native MLX-Swift port of <span class="mono">jina-embeddings-v5-omni</span> in-process, on the Apple silicon GPU. The model downloads once - the only time it uses the network. After that, indexing and search run with nothing leaving the device, so you can pull the plug and run it fully airgapped.</p>
+        <p class="band-body">The model download is the only time Omni touches the network. From then on your files, their embeddings, and every query stay on this Mac - pull the plug and search still works.</p>
         <ul class="band-list mono">
           <li>One model download, then fully offline</li>
-          <li>On-device indexing and search - no network</li>
           <li>No accounts, no telemetry</li>
-          <li>Local SQLite vector store</li>
+          <li>Local SQLite vector store you can inspect or delete</li>
+          <li>Open source on GitHub</li>
         </ul>
       </div>
     </section>
@@ -781,11 +785,11 @@ img { max-width: 100%; display: block; }
       <div class="container">
         <p class="section-label mono">Serving</p>
         <h2 class="serving-title">Give your local agents search.</h2>
-        <p class="serving-body">Omni exposes its search over your indexed files as a local endpoint - loopback-only and token-guarded. Agents like <strong>Hermes</strong> and <strong>OpenClaw</strong> query your files by meaning, on your machine, with no cloud round-trip.</p>
+        <p class="serving-body">Omni exposes its search over your indexed files as a local endpoint - loopback-only and token-guarded. Agents like <strong>Hermes</strong> and <strong>OpenClaw</strong> search the index you already built - on your machine, with no cloud round-trip.</p>
         <div class="serving-grid">
           <div class="serving-item">
             <p class="serving-item-label mono">Search endpoint</p>
-            <p class="serving-item-body">The same semantic search the app uses, over the index you already built - how agents actually reach your files.</p>
+            <p class="serving-item-body">The same semantic search the app uses - how agents actually reach your files.</p>
           </div>
           <div class="serving-item">
             <p class="serving-item-label mono">Embeddings &middot; add-on</p>
@@ -798,9 +802,9 @@ img { max-width: 100%; display: block; }
     <!-- PROFILING -->
     <section id="profiling" class="profiling">
       <div class="container">
-        <p class="section-label mono">Profiling</p>
+        <p class="section-label mono">Benchmark</p>
         <h2 class="profiling-title">How fast is Omni on your Mac?</h2>
-        <p class="profiling-body">Real, community-submitted indexing benchmarks over a fixed 300-file dataset (text, images, audio, and video). Each line is one chip across Omni versions - higher is faster. Hover a dot for details, and contribute your own Mac by running <span class="mono">File &rarr; Run Profiling</span> in the app.</p>
+        <p class="profiling-body">Speed claims are cheap, so Omni ships its benchmark: a fixed 300-file dataset (text, images, audio, and video) indexed with canonical settings, submitted by the community. Each line is one chip across Omni versions - higher is faster, and a rising line means the same hardware got faster with an update. Hover a dot for the details, and add your own Mac with <span class="mono">File &rarr; Run Profiling</span> in the app.</p>
         <p class="profiling-meta mono" id="profiling-meta" hidden></p>
         <div id="profiling-content">
           <div class="profiling-empty" id="profiling-loading">
