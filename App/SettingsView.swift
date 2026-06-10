@@ -467,7 +467,7 @@ private struct PerformanceTab: View {
             } header: {
                 Text("Profiling")
             } footer: {
-                Text("Benchmarks indexing on a fixed 1,000-file dataset. Sharing sends hardware and timing only - never your files - to the public results on hanxiao.io/omni.")
+                Text("Benchmarks indexing on a fixed 300-file dataset. Sharing sends hardware and timing only - never your files - to the public results on hanxiao.io/omni.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }

@@ -389,7 +389,7 @@
       "items": [
         {
           "q": "What does Run Profiling do?",
-          "a": "It benchmarks your Mac on a fixed 1,000-file dataset with canonical settings: it downloads the dataset once, pauses live indexing, runs an isolated timed pass on temporary storage (your real index is untouched), and measures throughput (files/sec and tokens/sec) and peak GPU memory. A local report is written and your indexing resumes automatically when it finishes.",
+          "a": "It benchmarks your Mac on a fixed 300-file dataset (text, images, audio, and video) with canonical settings: it downloads the dataset once, pauses live indexing, runs an isolated timed pass on temporary storage (your real index is untouched), and measures throughput (files/sec and tokens/sec) and peak GPU memory. A local report is written and your indexing resumes automatically when it finishes.",
           "shortcut": ""
         },
         {

@@ -9,12 +9,12 @@ import OmniKit
 /// only - no file contents, paths, or identity are sent.
 @MainActor
 enum ProfilingService {
-    static let datasetVersion = "profiling-v1"
-    // The dataset is hosted under a content-tagged filename (not plain "profiling-v1.zip") so a
+    static let datasetVersion = "profiling-v2"
+    // The dataset is hosted under a content-tagged filename (not plain "profiling-v2.zip") so a
     // replaced dataset is a fresh URL the CDN has never cached - the same reason the DMG is versioned.
-    // Bump the "-1000" tag (and re-host) whenever the dataset content changes.
-    static let manifestURL = "https://hanxiao.io/omni/profiling-v1-1000.json"
-    static let zipURL = "https://hanxiao.io/omni/profiling-v1-1000.zip"
+    // Bump the "-300" tag (and re-host) whenever the dataset content changes.
+    static let manifestURL = "https://hanxiao.io/omni/profiling-v2-300.json"
+    static let zipURL = "https://hanxiao.io/omni/profiling-v2-300.zip"
     static let uploadURL = "https://hanxiao.io/omni/profiling"
 
     private static let consentKey = "omni.profiling.consentGiven"
