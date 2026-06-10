@@ -19,6 +19,14 @@ on Apple GPUs via a native MLX-Swift port of `jina-embeddings-v5-omni`, in two s
 Python, no server, no cloud: the model downloads once, then indexing and search run with
 no network at all. Airgap the Mac and Omni keeps working.
 
+<p align="center">
+  <a href="https://hanxiao.io/omni/assets/omni-intro.mp4" title="Watch the Omni demo (37 seconds)">
+    <img src="site/omni/assets/omni-poster-play.jpg" alt="Watch the Omni demo: search by meaning, any file to any file, deep PDF search, folder maps, and the on-device MLX architecture" width="720">
+  </a>
+  <br>
+  <a href="https://hanxiao.io/omni/assets/omni-intro.mp4"><b>&#9654;&#65039; Watch the 37-second demo</b></a>
+</p>
+
 ## Install
 
 Download the latest DMG from [**hanxiao.io/omni**](https://hanxiao.io/omni) (or from

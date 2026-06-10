@@ -23,6 +23,35 @@
   <meta name="twitter:description" content="Search your files by meaning - in any language, across every modality. On-device, private, offline." />
   <meta name="twitter:image" content="https://hanxiao.io/omni/assets/og-image.png" />
 
+  <!-- Product video (Open Graph + Twitter player) -->
+  <meta property="og:video" content="https://hanxiao.io/omni/assets/omni-intro.mp4" />
+  <meta property="og:video:secure_url" content="https://hanxiao.io/omni/assets/omni-intro.mp4" />
+  <meta property="og:video:type" content="video/mp4" />
+  <meta property="og:video:width" content="1920" />
+  <meta property="og:video:height" content="1080" />
+  <meta name="twitter:player:stream" content="https://hanxiao.io/omni/assets/omni-intro.mp4" />
+  <meta name="twitter:player:stream:content_type" content="video/mp4" />
+
+  <!-- VideoObject structured data, so the demo is eligible for video rich results -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "VideoObject",
+    "name": "Omni - search every file on your Mac by meaning",
+    "description": "A 37-second tour of Omni: type what you mean and it finds the file; any file type searches any other in one shared embedding space; deep PDF search jumps to the matching page; folders become a similarity map; and an MLX model runs entirely on the Apple silicon GPU with a single-matmul search. Free, open source, Apache 2.0.",
+    "thumbnailUrl": "https://hanxiao.io/omni/assets/omni-poster.jpg",
+    "uploadDate": "2026-06-10",
+    "duration": "PT37S",
+    "contentUrl": "https://hanxiao.io/omni/assets/omni-intro.mp4",
+    "embedUrl": "https://hanxiao.io/omni/",
+    "publisher": {
+      "@type": "Organization",
+      "name": "Omni",
+      "url": "https://hanxiao.io/omni/"
+    }
+  }
+  </script>
+
   <link rel="icon" href="assets/icon.png" />
   <link rel="apple-touch-icon" href="assets/icon.png" />
   <style>
@@ -227,6 +256,35 @@ img { max-width: 100%; display: block; }
   font-size: clamp(1.05rem, 2vw, 1.3rem);
   line-height: 1.6;
   letter-spacing: -0.01em;
+}
+
+/* ---------- Hero video ---------- */
+.hero-video {
+  padding: 8px 0 64px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.hero-video-inner {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 0 24px;
+}
+.hero-video figure { margin: 0; }
+.hero-video video {
+  width: 100%;
+  display: block;
+  aspect-ratio: 1920 / 1080;
+  border-radius: 14px;
+  border: 1px solid var(--border-soft);
+  /* deep, soft elevation so the dark film sits above the cream page */
+  box-shadow: 0 24px 60px rgba(17, 24, 39, 0.20), 0 2px 8px rgba(17, 24, 39, 0.08);
+  background: #0a0b0e;            /* matches the film's gradient before load/poster */
+  outline: none;
+}
+.hero-video figcaption {
+  margin: 14px 0 0;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.9rem;
 }
 
 /* ---------- Features ---------- */
@@ -717,6 +775,24 @@ img { max-width: 100%; display: block; }
           <a class="btn btn-primary btn-lg" href="Omni-0.1.15.dmg">Download for macOS <span class="dl-ver">v0.1.10</span></a>
         </div>
         <p class="hero-note mono">Apple silicon &middot; macOS 14+ &middot; MD5 <span class="dl-md5">&hellip;</span></p>
+      </div>
+    </section>
+
+    <!-- VIDEO -->
+    <section class="hero-video" aria-label="Omni product demo">
+      <div class="hero-video-inner">
+        <figure>
+          <video
+            controls playsinline loop preload="none"
+            width="1920" height="1080"
+            poster="assets/omni-poster.jpg"
+            aria-label="Omni demo: search every file on your Mac by meaning - cross-modal search, deep PDF search, folder maps, and an on-device MLX architecture">
+            <source src="assets/omni-intro.mp4" type="video/mp4" />
+            Your browser cannot play this video.
+            <a href="assets/omni-intro.mp4">Download the Omni intro (MP4)</a>.
+          </video>
+          <figcaption>37 seconds: search by meaning, any file to any file, deep PDF search, folder maps, and the on-device architecture.</figcaption>
+        </figure>
       </div>
     </section>
 
