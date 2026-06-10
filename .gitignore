@@ -33,3 +33,6 @@ Tools/out/
 profiling-v1.zip
 bench/
 *.profraw
+
+# scratch screenshots used while producing site/omni/assets - not repo material
+site-assets/
