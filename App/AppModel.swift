@@ -203,19 +203,6 @@ final class AppModel {
     private func touchProjection(_ url: URL) {
         if let i = projectionCacheOrder.firstIndex(of: url) { projectionCacheOrder.append(projectionCacheOrder.remove(at: i)) }
     }
-    private func cachedProjection(_ url: URL, signature: FolderVectorSignature?,
-                                  usesUMAP: Bool, mapCap: Int, totalCap: Int,
-                                  fingerprint: String) -> ProjectionLoad? {
-        guard let cached = projectionCache[url],
-              cached.usesUMAP == usesUMAP,
-              cached.mapCap == mapCap,
-              cached.totalCap == totalCap,
-              cached.fingerprint == fingerprint else { return nil }
-        if cached.signature != signature { return nil }
-        touchProjection(url)
-        return ProjectionLoad(result: cached.result, signature: cached.signature,
-                              total: projectionTotals[url] ?? cached.result.points.count)
-    }
     /// Folder-map layout. false = PCA (fast, N-light, instant - the default, safe on low-RAM Macs);
     /// true = UMAP (richer clusters + the click-to-spotlight neighbor graph, but the kNN step builds
     /// large GPU distance tiles + a 300-epoch force layout that can freeze a low-memory Mac).
@@ -1681,6 +1668,38 @@ final class AppModel {
         let mapCap = mapPointBudget
         let totalCap = mapTotalPointCap
         let fp = fingerprint
+
+        // Instant revisit: serve a matching in-memory layout immediately - no spinner, no 120ms
+        // settle, no store scan. The fit then validates the folder signature in the BACKGROUND and
+        // only refits if the content actually changed (a same-file-count re-embed, which the
+        // file-count invalidation misses). The user sees the prior layout meanwhile; one file's
+        // vector moving barely shifts a global PCA/UMAP, so the momentary staleness is invisible.
+        if let hit = projectionCache[url], hit.usesUMAP == refine, hit.mapCap == mapCap,
+           hit.totalCap == totalCap, hit.fingerprint == fp {
+            touchProjection(url)
+            applyProjection(hit.result)
+            folderProjectionTotal = projectionTotals[url] ?? hit.result.points.count
+            folderProjectionFitting = false
+            let cachedSig = hit.signature
+            // Detached (not main-actor) so the signature scan runs off the main thread and `store`
+            // is captured cleanly; `self` is touched only inside the MainActor hop (capturing self
+            // in the detached body would "send" a main-actor reference into concurrent code).
+            projectionTask = Task.detached(priority: .utility) {
+                try? await Task.sleep(for: .milliseconds(120))   // coalesce machine-gun click-through
+                if Task.isCancelled { return }
+                let stale = store.folderSignature(folder) != cachedSig
+                if Task.isCancelled { return }
+                await MainActor.run { [weak self] in
+                    guard let self, self.selectedFolderForViz?.path == folder, stale else { return }
+                    // Content changed under the same file count: drop the stale entry and refit.
+                    self.projectionCache[url] = nil
+                    self.projectionCacheOrder.removeAll { $0 == url }
+                    self.selectFolderForVisualization(url)
+                }
+            }
+            return
+        }
+
         folderProjectionFitting = true
         let proj = ProjectionEngine(engine: engine)
         let cacheDir = Self.projectionCacheDirectoryURL()
@@ -1701,16 +1720,11 @@ final class AppModel {
                     try? await Task.sleep(for: .milliseconds(120))
                     if Task.isCancelled { continuation.finish(); return }
 
+                    // In-memory hits are served synchronously up front (the fast path above), so this
+                    // worker only runs on a miss - it never needs to touch `self`, keeping the detached
+                    // body free of main-actor captures (Swift 6 strict concurrency).
                     let signature = store.folderSignature(folder)
                     if Task.isCancelled { continuation.finish(); return }
-                    if let cached = await MainActor.run(body: { [weak self] in
-                        self?.cachedProjection(url, signature: signature, usesUMAP: refine,
-                                               mapCap: mapCap, totalCap: totalCap, fingerprint: fp)
-                    }) {
-                        continuation.yield(cached)
-                        continuation.finish()
-                        return
-                    }
                     if let cacheDir {
                         let cached = refine
                             ? ProjectionCache.loadUMAP(directory: cacheDir, folder: folder, fingerprint: fp,

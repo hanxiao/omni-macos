@@ -121,6 +121,26 @@ final class VectorStoreTests: XCTestCase {
                                               mapCap: 100, totalCap: 1_000, signature: stale))
     }
 
+    func testProjectionCacheBoundsDiskEntries() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omni-proj-prune-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let sig = FolderVectorSignature(dim: 8, fileCount: 1, chunkCount: 1, hash: "h")
+        let result = ProjectionResult(points: [ProjectionPoint(position: SIMD2(0, 0), path: "/p", kind: "text")],
+                                      knn: [], k: 0)
+        let n = ProjectionCache.maxDiskEntries + 8
+        for i in 0 ..< n {
+            ProjectionCache.savePCA(result, directory: dir, folder: "/folder\(i)", fingerprint: "fp",
+                                    mapCap: 100, totalCap: 1_000, signature: sig, total: 1)
+        }
+        let files = try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension == "json" }
+        XCTAssertLessThanOrEqual(files.count, ProjectionCache.maxDiskEntries, "disk cache must stay bounded")
+        // The most recently written folder must survive eviction.
+        XCTAssertNotNil(ProjectionCache.loadPCA(directory: dir, folder: "/folder\(n - 1)", fingerprint: "fp",
+                                                mapCap: 100, totalCap: 1_000, signature: sig))
+    }
+
     func testFileVectorFindsItselfAcrossModalities() throws {
         let url = tempDB()
         let store = try VectorStore(dbURL: url)

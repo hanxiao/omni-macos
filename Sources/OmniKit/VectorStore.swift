@@ -142,8 +142,8 @@ public final class VectorStore: @unchecked Sendable {
     private let queue = DispatchQueue(label: "omni.vectorstore")
     private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-    struct Row { let path: String; let snippet: String; let kind: String; let chunkIndex: Int; let modified: Double; let size: Int
-                 var width: Int = 0; var height: Int = 0; var duration: Double = 0; var locator: String = "" }
+    struct Row { let path: String; let snippet: String; let kind: String; let chunkIndex: Int; let modified: Double
+                 var size: Int = 0; var width: Int = 0; var height: Int = 0; var duration: Double = 0; var locator: String = "" }
     private var rows: [Row] = []
     // Single source of truth for embeddings: contiguous bf16 bits, [count*dim], row i = rows[i].
     // bf16 (2 bytes/dim) halves residency and disk vs fp32 with negligible recall loss on

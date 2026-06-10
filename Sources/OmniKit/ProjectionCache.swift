@@ -5,6 +5,11 @@ import CryptoKit
 /// the kNN graph used by click-to-highlight, so they can be much larger for big folders.
 public enum ProjectionCache {
     public static let schemaVersion = 1
+    /// Bound the on-disk cache: each entry holds a folder's full point cloud (and a UMAP kNN graph),
+    /// so a few large folders across model/cap changes could otherwise grow without limit. LRU by
+    /// file mtime, pruned after every save. The in-memory LRU (AppModel, cap 6) is the hot tier; this
+    /// only has to survive restarts for the handful of folders a user actually maps.
+    public static let maxDiskEntries = 16
 
     public struct Loaded: Sendable {
         public let result: ProjectionResult
@@ -102,8 +107,25 @@ public enum ProjectionCache {
             try data.write(to: cacheURL(directory: directory, mode: mode, folder: folder,
                                         fingerprint: fingerprint, mapCap: mapCap, totalCap: totalCap),
                            options: .atomic)
+            prune(directory: directory)
         } catch {
             // Rebuildable cache: ignore write failures.
+        }
+    }
+
+    /// Keep at most `maxDiskEntries` cache files, evicting the oldest by modification time. Best-effort.
+    private static func prune(directory: URL) {
+        let fm = FileManager.default
+        guard let urls = try? fm.contentsOfDirectory(at: directory,
+                                                     includingPropertiesForKeys: [.contentModificationDateKey],
+                                                     options: [.skipsHiddenFiles]) else { return }
+        let entries = urls.filter { $0.pathExtension == "json" }
+        guard entries.count > maxDiskEntries else { return }
+        func mtime(_ u: URL) -> Date {
+            (try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+        }
+        for u in entries.sorted(by: { mtime($0) < mtime($1) }).prefix(entries.count - maxDiskEntries) {
+            try? fm.removeItem(at: u)
         }
     }
 
