@@ -190,7 +190,7 @@
       "items": [
         {
           "q": "What can I do by right-clicking a folder in the sidebar?",
-          "a": "Right-click a folder in the Folders list for: Pause This Folder (or Resume This Folder if it's paused) to exclude or re-include it from indexing, Reveal in Finder, and Remove from Omni. Selecting a folder and pressing Delete also removes it.",
+          "a": "Right-click a folder in the Folders list for: Pause This Folder (or Resume This Folder if it's paused) to exclude or re-include it from indexing, Reveal in Finder, View as UMAP or View as PCA to swap the folder map's layout, and Remove from Omni. Selecting a folder and pressing Delete also removes it.",
           "shortcut": ""
         },
         {
@@ -235,7 +235,7 @@
       "items": [
         {
           "q": "How do I see a folder as a map?",
-          "a": "With the search box empty, click a folder in the sidebar. Omni lays out every indexed file under it as a 2D map, placing semantically similar files near each other and coloring them by type."
+          "a": "With the search box empty, click a folder in the sidebar. Omni lays out every indexed file under it as a 2D map, placing semantically similar files near each other and coloring them by type. Large folders stay fast: the expensive layout runs on a representative sample of landmark files and every other file is placed relative to them, so all files appear regardless of folder size. Right-click the folder to swap between the UMAP layout (richer clusters, click-to-spotlight neighbors) and PCA (instant)."
         },
         {
           "q": "What do the colors and clusters mean?",
@@ -334,7 +334,7 @@
         },
         {
           "q": "How do I limit how much memory indexing uses?",
-          "a": "The Maximum memory slider in Settings > Performance caps the RAM the embedding model can use, where 0 means unlimited. When the limit is reached, the model pauses and resumes in smaller batches; keep it above roughly 4 GB for reasonable performance.",
+          "a": "The Maximum memory slider in Settings > Performance caps the memory the embedding model can use on the GPU, where 0 means unlimited. The cap is also the budget the rest of Omni scales itself by: indexing batch sizes, the decode pipeline's buffer gate, and how many landmark files the folder map lays out all derive from it. Keep it above roughly 4 GB for reasonable performance; raising it on a big Mac buys a more detailed folder map.",
           "shortcut": ""
         },
         {
@@ -364,7 +364,7 @@
         },
         {
           "q": "What is the Serving tab for?",
-          "a": "It controls Omni's optional HTTP server, which lets other apps query the index through a REST API compatible with OpenAI's /v1/embeddings format. The tab shows server status and listening address, and you can disable it if you do not need programmatic access.",
+          "a": "It turns on Omni's local HTTP server so other software can use your index: a /v1/search endpoint, embedding endpoints compatible with the OpenAI, Jina, Cohere, and Gemini APIs, and an MCP endpoint at /mcp for AI agents. The tab shows status and address, controls the port, scope (this Mac only, or local network with a required bearer token), and has an Agents section that generates ready-to-paste MCP configs and a SKILL.md.",
           "shortcut": ""
         }
       ]
@@ -381,6 +381,27 @@
           "q": "Does Omni work offline or air-gapped?",
           "a": "Yes. Once the model is downloaded on first launch (Nano about 1.9 GB or Small about 3.1 GB), indexing and search run entirely offline. You can disconnect the network and Omni keeps working with no degradation.",
           "shortcut": ""
+        }
+      ]
+    },
+    {
+      "title": "Agents & serving",
+      "items": [
+        {
+          "q": "How do I let Claude Code or another AI agent search my files?",
+          "a": "Turn on Settings > Serving, then click MCP in the Agents section. Copy the one-line command for Claude Code (claude mcp add --transport http omni http://127.0.0.1:51234/mcp) or the mcpServers JSON block for Cursor, VS Code, or Claude Desktop. The agent gets a 'search' tool that queries the same index the app uses - by meaning, across text, images, audio, and video."
+        },
+        {
+          "q": "What is the SKILL.md button for?",
+          "a": "It generates a complete skill file for agents that follow written instructions rather than speaking MCP. The file documents the search endpoint, filters, response shape, score interpretation, and auth, with your actual port baked in. Save it where your agent reads skills (for Claude Code: ~/.claude/skills/omni-local-search/SKILL.md) or paste it into the agent's instructions."
+        },
+        {
+          "q": "What exactly can an agent do through the MCP endpoint?",
+          "a": "One tool: search. It takes a natural-language query plus optional top_k, file-kind, and folder filters, and returns file paths with relevance scores and text snippets. Agents read the files themselves with their own tools - Omni never sends file contents. Raw vectors are available separately via the /v1/embeddings endpoint."
+        },
+        {
+          "q": "Is the agent endpoint safe to expose?",
+          "a": "By default the server binds to this Mac only (loopback), so nothing else on the network can reach it. Switching to local network always requires a bearer token (one is generated automatically if empty). Requests are size-capped, idle connections time out, and search results contain paths and snippets - never whole files."
         }
       ]
     },
