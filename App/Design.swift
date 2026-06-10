@@ -25,6 +25,23 @@ extension View {
     }
 }
 
+/// Groups sibling Liquid Glass surfaces into one `GlassEffectContainer` on macOS 26 - Apple's
+/// requirement when several glass elements coexist: the container renders them in a single
+/// effect pass (cheaper than N independent passes) and lets effects that approach each other
+/// blend instead of stacking. On macOS 14-15 (material fallback chips) it is a no-op wrapper.
+/// `spacing` is the effect-merge distance, not layout spacing.
+struct GlassGroup<Content: View>: View {
+    var spacing: CGFloat = 12
+    @ViewBuilder var content: Content
+    var body: some View {
+        if #available(macOS 26, *) {
+            GlassEffectContainer(spacing: spacing) { content }
+        } else {
+            content
+        }
+    }
+}
+
 extension FileKind {
     /// The dynamic system color for this kind. NSColor's system colors ship distinct light and dark
     /// variants (blue #007AFF/#0A84FF, purple #AF52DE/#BF5AF2, etc.) and adapt to the active

@@ -94,28 +94,38 @@ struct FolderEmbeddingVisualization: View {
                     .transition(.opacity)
                 }
 
-                // Hover overlay: a ring on the dot + a thumbnail-and-name chip near the cursor.
-                if let h = hovered {
-                    let s = screenPoint(h.position, in: geo.size)
-                    let d = max(Self.radius(for: positions.count), 3) * 2 + 5
-                    Circle().stroke(.primary, lineWidth: 1.5)
-                        .frame(width: d, height: d).position(s).allowsHitTesting(false)
-                    hoverChip(for: h, in: geo.size)
+                // The floating glass layer: hover chip + caption + zoom cluster + legend share ONE
+                // GlassEffectContainer on macOS 26, so the up-to-four glass surfaces over the Metal
+                // map render in a single effect pass per frame (the hover chip tracks the cursor at
+                // event rate - per-element passes would be the expensive way). They sit in corners,
+                // so the merge distance never triggers; the container is purely the batching.
+                GlassGroup {
+                    ZStack {
+                        // Hover: a ring on the dot (plain stroke, not glass) + a thumbnail-and-name
+                        // chip near the cursor.
+                        if let h = hovered {
+                            let s = screenPoint(h.position, in: geo.size)
+                            let d = max(Self.radius(for: positions.count), 3) * 2 + 5
+                            Circle().stroke(.primary, lineWidth: 1.5)
+                                .frame(width: d, height: d).position(s).allowsHitTesting(false)
+                            hoverChip(for: h, in: geo.size)
+                        }
+
+                        caption
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                            .padding(Design.gapLarge)
+                            .allowsHitTesting(false)
+
+                        zoomControls
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                            .padding(Design.gapLarge)
+
+                        legend
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                            .padding(Design.gapLarge)
+                            .allowsHitTesting(false)
+                    }
                 }
-
-                caption
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                    .padding(Design.gapLarge)
-                    .allowsHitTesting(false)
-
-                zoomControls
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
-                    .padding(Design.gapLarge)
-
-                legend
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
-                    .padding(Design.gapLarge)
-                    .allowsHitTesting(false)
             }
             // Interaction on the ZStack itself (the Metal view is hit-testing-disabled): drag pans,
             // pinch zooms, hover picks the nearest point. This is the structure the Canvas version

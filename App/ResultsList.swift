@@ -358,19 +358,26 @@ struct ResultGridItem: View {
     var body: some View {
         VStack(spacing: 6) {
             Thumbnail(path: hit.path, side: 128, corner: Design.corner)
-                .overlay(alignment: .topTrailing) {
-                    // A material chip over imagery (the one legitimate in-content use of vibrancy):
-                    // stays legible over both bright and dark thumbnails, adapts to light/dark mode.
-                    Text(scoreText(hit.score)).font(.caption2.monospacedDigit()).foregroundStyle(.primary)
-                        .padding(.horizontal, 5).padding(.vertical, 2)
-                        .glassChip().padding(5)
-                }
-                .overlay(alignment: .bottomLeading) {
-                    // Match position inside the file (page/line), mirroring the score chip.
-                    if !hit.locator.isEmpty {
-                        Text(hit.locator).font(.caption2.monospacedDigit()).foregroundStyle(.primary)
-                            .padding(.horizontal, 5).padding(.vertical, 2)
-                            .glassChip().padding(5)
+                .overlay {
+                    // Glass chips over imagery (the one legitimate in-content use of vibrancy):
+                    // legible over bright and dark thumbnails, appearance-adaptive. The pair shares
+                    // one GlassEffectContainer per cell, so a visible grid renders one glass pass
+                    // per cell instead of two - and on a narrow cell where a long locator nears the
+                    // score, the effects blend instead of seaming.
+                    GlassGroup(spacing: 10) {
+                        ZStack {
+                            Text(scoreText(hit.score)).font(.caption2.monospacedDigit()).foregroundStyle(.primary)
+                                .padding(.horizontal, 5).padding(.vertical, 2)
+                                .glassChip().padding(5)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                            // Match position inside the file (page/line), mirroring the score chip.
+                            if !hit.locator.isEmpty {
+                                Text(hit.locator).font(.caption2.monospacedDigit()).foregroundStyle(.primary)
+                                    .padding(.horizontal, 5).padding(.vertical, 2)
+                                    .glassChip().padding(5)
+                                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                            }
+                        }
                     }
                 }
             Text(url.lastPathComponent).font(.caption).lineLimit(2)
