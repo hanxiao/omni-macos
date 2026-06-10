@@ -202,7 +202,7 @@ img { max-width: 100%; display: block; }
 
 /* ---------- Hero ---------- */
 .hero {
-  border-bottom: 1px solid var(--border-soft);
+  padding-bottom: 4px;
 }
 .hero-inner {
   text-align: center;
@@ -260,8 +260,7 @@ img { max-width: 100%; display: block; }
 
 /* ---------- Hero video ---------- */
 .hero-video {
-  padding: 8px 0 64px;
-  border-bottom: 1px solid var(--border-soft);
+  padding: 4px 0 56px;           /* no divider lines - just breathing room */
 }
 .hero-video-inner {
   max-width: 960px;
@@ -270,11 +269,12 @@ img { max-width: 100%; display: block; }
 }
 .hero-video figure { margin: 0; }
 .hero-video video {
-  width: 100%;
   display: block;
-  aspect-ratio: 1920 / 1080;
+  width: 100%;
+  height: auto;                  /* derive height from the true 16:9 source - no square box */
+  aspect-ratio: 16 / 9;          /* hold the shape before the poster loads (no layout shift) */
+  object-fit: cover;             /* fill the frame; source is already 16:9 so nothing is cropped */
   border-radius: 14px;
-  border: 1px solid var(--border-soft);
   /* deep, soft elevation so the dark film sits above the cream page */
   box-shadow: 0 24px 60px rgba(17, 24, 39, 0.20), 0 2px 8px rgba(17, 24, 39, 0.08);
   background: #0a0b0e;            /* matches the film's gradient before load/poster */
@@ -784,7 +784,6 @@ img { max-width: 100%; display: block; }
         <figure>
           <video
             controls playsinline loop preload="none"
-            width="1920" height="1080"
             poster="assets/omni-poster.jpg"
             aria-label="Omni demo: search every file on your Mac by meaning - cross-modal search, deep PDF search, folder maps, and an on-device MLX architecture">
             <source src="assets/omni-intro.mp4" type="video/mp4" />
