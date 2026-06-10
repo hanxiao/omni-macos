@@ -50,7 +50,9 @@ struct ResultsList<Footer: View>: View {
                         VStack(spacing: 0) {
                             ResultRow(hit: hit,
                                       selected: model.selection == hit.path,
-                                      expandable: hit.kind == FileKind.text.rawValue,
+                                      // Only multi-chunk files (long docs, multi-page PDFs) have a
+                                      // per-chunk breakdown; a single-embedding file gets no chevron.
+                                      expandable: hit.chunkCount > 1,
                                       expanded: expanded.contains(hit.path),
                                       onToggle: { toggle(hit.path) })
                                 // Result rows are intentionally NOT draggable: an in-app row drag was
@@ -60,8 +62,11 @@ struct ResultsList<Footer: View>: View {
                                 .contentShape(Rectangle())
                                 .onTapGesture { model.selection = hit.path }
                                 .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
-                                .contextMenu { menu(hit.path) }
-                            if expanded.contains(hit.path) {
+                                .contextMenu { menu(hit) }
+                            // chunkCount guard: if a reindex turned the file single-chunk while its
+                            // path sat in `expanded` (same result set, so the reset below does not
+                            // fire), the chevron is gone - don't strand an open expansion either.
+                            if expanded.contains(hit.path), hit.chunkCount > 1 {
                                 PassagesView(passages: passagesCache[hit.path] ?? [],
                                              fileName: URL(fileURLWithPath: hit.path).lastPathComponent)
                             }
@@ -116,7 +121,7 @@ struct ResultsList<Footer: View>: View {
                             .contentShape(Rectangle())
                             .onTapGesture { model.selection = hit.path }
                             .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
-                            .contextMenu { menu(hit.path) }
+                            .contextMenu { menu(hit) }
                             .id(hit.path)
                     }
                 }
@@ -151,11 +156,19 @@ struct ResultsList<Footer: View>: View {
         }
     }
 
-    @ViewBuilder private func menu(_ path: String) -> some View {
+    @ViewBuilder private func menu(_ hit: SearchHit) -> some View {
+        let path = hit.path
         Button("Open") { open(path) }
             .keyboardShortcut("o", modifiers: .command)
         Button("Quick Look") { model.previewURL = URL(fileURLWithPath: path) }
             .keyboardShortcut("y", modifiers: .command)
+        // Per-chunk breakdown (pages of a PDF, passages of a long doc). List view only - the
+        // gallery has no expansion surface - and only for files that actually have several chunks.
+        if model.viewMode == .list, hit.chunkCount > 1 {
+            Button(expanded.contains(path) ? "Hide Matching Passages" : "Show Matching Passages") {
+                toggle(path)
+            }
+        }
         Divider()
         // Use this file itself as the query - doc-vs-doc "more like this" across all modalities.
         Button("Find Similar") { model.setFileQuery(URL(fileURLWithPath: path), similar: true) }

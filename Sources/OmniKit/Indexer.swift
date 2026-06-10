@@ -772,7 +772,7 @@ public final class Indexer: @unchecked Sendable {
                     let page = current[k].page
                     out.append(IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
                                             chunkIndex: page, snippet: file.url.lastPathComponent, embedding: vec,
-                                            locator: "Page \(page + 1)"))
+                                            locator: pageCount > 1 ? "Page \(page + 1)" : ""))
                 }
             }
             sync.wait()

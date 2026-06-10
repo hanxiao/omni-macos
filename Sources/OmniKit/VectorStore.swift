@@ -51,6 +51,9 @@ public struct SearchHit: Sendable {
     public var duration: Double = 0
     /// Position of the best-matching chunk inside the file ("Page 3", "Line 1240"); "" if n/a.
     public var locator: String = ""
+    /// Total indexed chunks of this FILE (pages/passages), regardless of filters. 1 = single
+    /// embedding; > 1 means the UI can offer a per-chunk breakdown (rankChunks).
+    public var chunkCount: Int = 1
 }
 
 /// One matching passage (chunk) within a file.
@@ -825,6 +828,9 @@ public final class VectorStore: @unchecked Sendable {
         let tA = searchTiming ? Date() : nil
         var bestScore = [Float](repeating: -.infinity, count: fileCount)
         var bestRow = [Int32](repeating: -1, count: fileCount)
+        // Total rows per file (counted before any filter/finite check: it is the FILE's chunk
+        // count, not the count of matching chunks). One extra write per row in the pass below.
+        var rowCount = [Int32](repeating: 0, count: fileCount)
         let kinds = filter.kinds, hasKind = !filter.kinds.isEmpty, since = filter.since
         // `type:` filters compare the dense per-row kind code against a 256-slot mask instead of
         // hashing the kind String per row, when the caller maintains kindCode in lockstep (the
@@ -843,10 +849,13 @@ public final class VectorStore: @unchecked Sendable {
         fileID.withUnsafeBufferPointer { fp in
         bestScore.withUnsafeMutableBufferPointer { bs in
         bestRow.withUnsafeMutableBufferPointer { br in
+        rowCount.withUnsafeMutableBufferPointer { rc in
             if hasKind || since != nil {
                 kindCode.withUnsafeBufferPointer { kc in
                 kindAllowed.withUnsafeBufferPointer { ka in
                 for i in 0 ..< n {
+                    let f = Int(fp[i])
+                    rc[f] += 1
                     let dot = sp[i]
                     if !dot.isFinite { continue }        // ignore degenerate (NaN/inf) stored vectors
                     if hasKind {
@@ -854,19 +863,19 @@ public final class VectorStore: @unchecked Sendable {
                         else if !kinds.contains(rows[i].kind) { continue }
                     }
                     if let s = since, rows[i].modified < s { continue }
-                    let f = Int(fp[i])
                     if dot > bs[f] { bs[f] = dot; br[f] = Int32(i) }
                 }
                 }}
             } else {
                 for i in 0 ..< n {
+                    let f = Int(fp[i])
+                    rc[f] += 1
                     let dot = sp[i]
                     if !dot.isFinite { continue }
-                    let f = Int(fp[i])
                     if dot > bs[f] { bs[f] = dot; br[f] = Int32(i) }   // strict > keeps lowest row index on tie (== reference's `>=` skip)
                 }
             }
-        }}}}
+        }}}}}
         let tB = searchTiming ? Date() : nil
         // Bounded top-K over the per-file winners via a size-K min-heap, instead of building a
         // SearchHit for all F files and sorting them (that full sort of F String-bearing structs was
@@ -906,9 +915,11 @@ public final class VectorStore: @unchecked Sendable {
         // Order the K survivors by descending score (K is small).
         let order = (0 ..< heapScore.count).sorted { heapScore[$0] > heapScore[$1] }
         let out = order.map { idx -> SearchHit in
-            let r = rows[Int(heapRow[idx])]
+            let ri = Int(heapRow[idx])
+            let r = rows[ri]
             return SearchHit(path: r.path, score: heapScore[idx], snippet: r.snippet, kind: r.kind, chunkIndex: r.chunkIndex, modified: r.modified,
-                             width: r.width, height: r.height, duration: r.duration, locator: r.locator)
+                             width: r.width, height: r.height, duration: r.duration, locator: r.locator,
+                             chunkCount: Int(rowCount[Int(fileID[ri])]))
         }
         if let tA, let tB {
             print(String(format: "  [reduce] hot=%.1fms topK=%.1fms (F=%d out=%d)",

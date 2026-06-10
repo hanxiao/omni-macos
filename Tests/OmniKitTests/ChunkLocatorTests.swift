@@ -104,8 +104,21 @@ final class ChunkLocatorTests: XCTestCase {
         try store.replace(path: "/tmp/doc.pdf", chunks: chunks)
         let hits = store.search([0, 1, 0, 0], topK: 1)
         XCTAssertEqual(hits.first?.locator, "Page 2", "best chunk's locator must ride the SearchHit")
+        XCTAssertEqual(hits.first?.chunkCount, 2, "file chunk count rides the hit (drives the expand UI)")
         let ranked = store.rankChunks([1, 0, 0, 0], path: "/tmp/doc.pdf")
         XCTAssertEqual(ranked.first?.locator, "Page 1")
+        // multi -> single transition: a re-embed that collapses the file to one chunk must drop
+        // the count (and locator) so the UI stops offering the expansion.
+        try store.replace(path: "/tmp/doc.pdf", chunks: [
+            IndexedChunk(path: "/tmp/doc.pdf", modified: 2, size: 10, kind: "text", chunkIndex: 0,
+                         snippet: "doc.pdf", embedding: [1, 0, 0, 0], locator: ""),
+        ])
+        let single = store.search([1, 0, 0, 0], topK: 1).first
+        XCTAssertEqual(single?.chunkCount, 1)
+        XCTAssertEqual(single?.locator, "")
+        // and single -> multi again (the other direction of the same edge)
+        try store.replace(path: "/tmp/doc.pdf", chunks: chunks)
+        XCTAssertEqual(store.search([1, 0, 0, 0], topK: 1).first?.chunkCount, 2)
         store.close()
         // Reload from disk: the locator column must survive loadIntoMemory.
         let store2 = try VectorStore(dbURL: dbURL)
