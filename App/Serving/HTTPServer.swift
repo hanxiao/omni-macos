@@ -20,14 +20,20 @@ final class HTTPServer: @unchecked Sendable {
     private let handler: Handler
     private let onLog: @Sendable (LogEntry) -> Void
     private let queue = DispatchQueue(label: "omni.serving.http")
-    private let maxBody = 8 * 1024 * 1024 // 8 MB hard cap -> 413
+    private let maxBody = HTTPParse.maxBody // 8 MB hard cap -> 413
     private let receiveChunk = 64 * 1024
+    /// A client that connects and trickles (or sends nothing) must not hold an fd forever.
+    private let idleTimeout: TimeInterval = 60
+    /// Accept cap: each connection can hold up to an 8MB buffer, so unbounded accepts are a
+    /// memory/fd DoS on the LAN scope. Excess connections are refused at accept.
+    private let maxConnections = 64
 
     private var listener: NWListener?
     /// Accepted live connections (queue-owned), so stop() can close keep-alive sockets instead of
     /// leaking their fds; and a cancelled flag so a stranded read loop stops re-arming work that would
     /// keep driving the GPU gate after the UI shows the server stopped.
     private var conns: [ObjectIdentifier: NWConnection] = [:]
+    private var idleTimers: [ObjectIdentifier: DispatchSourceTimer] = [:]
     private var cancelled = false
     /// When bound for local scope we accept the listener on all interfaces (the reliable
     /// NWListener path) but drop any connection whose peer is not loopback - functionally
@@ -98,6 +104,8 @@ final class HTTPServer: @unchecked Sendable {
             self.cancelled = true
             self.listener?.cancel()
             self.listener = nil
+            for t in self.idleTimers.values { t.cancel() }
+            self.idleTimers.removeAll()
             for c in self.conns.values { c.cancel() }
             self.conns.removeAll()
         }
@@ -106,8 +114,8 @@ final class HTTPServer: @unchecked Sendable {
     // MARK: - Connection handling
 
     private func accept(_ conn: NWConnection) {
-        // Refuse new connections once stopped, or non-loopback peers in local scope.
-        if cancelled || (loopbackOnly && !isLoopback(conn)) {
+        // Refuse new connections once stopped, over the cap, or non-loopback peers in local scope.
+        if cancelled || conns.count >= maxConnections || (loopbackOnly && !isLoopback(conn)) {
             conn.cancel()
             return
         }
@@ -115,8 +123,10 @@ final class HTTPServer: @unchecked Sendable {
         conn.stateUpdateHandler = { [weak self] state in
             switch state {
             case .ready:
+                self?.touchIdle(conn)
                 self?.readRequest(on: conn, buffer: Data())
             case .failed, .cancelled:
+                self?.idleTimers.removeValue(forKey: ObjectIdentifier(conn))?.cancel()
                 self?.conns[ObjectIdentifier(conn)] = nil
                 conn.cancel()
             default:
@@ -124,6 +134,23 @@ final class HTTPServer: @unchecked Sendable {
             }
         }
         conn.start(queue: queue)
+    }
+
+    /// (Re)arm the per-connection idle deadline. Fires on `queue`; a connection that has not
+    /// received bytes for `idleTimeout` is closed (slowloris / abandoned keep-alive protection).
+    private func touchIdle(_ conn: NWConnection) {
+        let key = ObjectIdentifier(conn)
+        idleTimers.removeValue(forKey: key)?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + idleTimeout)
+        timer.setEventHandler { [weak self, weak conn] in
+            guard let self, let conn else { return }
+            self.idleTimers.removeValue(forKey: key)?.cancel()
+            self.conns[key] = nil
+            conn.cancel()
+        }
+        timer.resume()
+        idleTimers[key] = timer
     }
 
     /// Accumulate bytes until a full request is buffered, then service it. Drains
@@ -136,6 +163,7 @@ final class HTTPServer: @unchecked Sendable {
 
         conn.receive(minimumIncompleteLength: 1, maximumLength: receiveChunk) { [weak self] data, _, isComplete, error in
             guard let self else { return }
+            self.touchIdle(conn)
             var buf = buffer
             if let data, !data.isEmpty { buf.append(data) }
 
@@ -171,6 +199,11 @@ final class HTTPServer: @unchecked Sendable {
         let parsed: (HTTPRequest, Int)?
         do {
             parsed = try HTTPParse.tryParse(buffer)
+        } catch HTTPError.payloadTooLarge {
+            write(HTTPResponse.json(["error": "payload too large"], status: 413), to: conn, keepAlive: false) {
+                conn.cancel()
+            }
+            return true
         } catch {
             write(HTTPResponse.json(["error": "bad request"], status: 400), to: conn, keepAlive: false) {
                 conn.cancel()

@@ -41,6 +41,10 @@ private func badRequest(_ message: String, type: String = "invalid_request_error
 
 // MARK: - OpenAI + Jina (one OpenAI-shaped emitter)
 
+/// One request must not occupy the engine for minutes: cap the batch like hosted APIs do
+/// (Jina caps at 2048 inputs). Callers get an explicit 400, not a silent truncation.
+let servingMaxInputs = 2048
+
 enum OpenAIJinaAdapter {
     static func handle(_ req: HTTPRequest, _ backend: any ServingBackend) -> HTTPResponse {
         guard let body = JSONBody.object(req) else { return badRequest("invalid JSON body") }
@@ -52,6 +56,7 @@ enum OpenAIJinaAdapter {
             return badRequest("unsupported 'input' element: expected a string or {\"text\": ...}")
         }
         if texts.isEmpty { return badRequest("'input' is required") }
+        if texts.count > servingMaxInputs { return badRequest("'input' exceeds \(servingMaxInputs) items") }
 
         // The model serves exactly one dimension; a client asking for another (OpenAI `dimensions`)
         // must hear "no" here, not discover a mismatch downstream in its vector store.
@@ -124,6 +129,7 @@ enum CohereAdapter {
         guard let body = JSONBody.object(req) else { return cohereError("invalid JSON body") }
 
         let texts = parseTexts(body)
+        if texts.count > servingMaxInputs { return badRequest("'texts' exceeds \(servingMaxInputs) items") }
         if texts.isEmpty { return cohereError("'texts' is required") }
 
         let inputType = (body["input_type"] as? String)?.lowercased()
@@ -196,6 +202,7 @@ enum GeminiAdapter {
             guard let requests = body["requests"] as? [Any] else {
                 return geminiError("'requests' is required")
             }
+            if requests.count > servingMaxInputs { return geminiError("'requests' exceeds \(servingMaxInputs) items") }
             var texts: [String] = []
             var anyQuery = false
             for item in requests {

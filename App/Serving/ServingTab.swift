@@ -11,6 +11,8 @@ struct ServingTab: View {
     @State private var revealToken = false
     @State private var exampleKind: ExampleKind = .search
     @State private var embedSchema: EmbedSchema = .openai
+    @State private var showMCPSheet = false
+    @State private var showSkillSheet = false
 
     /// Top-level example category: the search endpoint, or an embedding endpoint.
     private enum ExampleKind: String, CaseIterable, Identifiable {
@@ -27,11 +29,22 @@ struct ServingTab: View {
         Form {
             serverSection
             accessSection
+            agentsSection
             exampleSection
             requestsSection
         }
         .formStyle(.grouped)
         .frame(height: 520)   // matches the Content tab so switching tall tabs doesn't jump
+        .sheet(isPresented: $showMCPSheet) {
+            AgentConfigSheet(title: "Connect agents over MCP",
+                             subtitle: "Works with every MCP client that speaks the HTTP transport (Claude Code, Cursor, VS Code, ...). One tool is exposed: search.",
+                             text: mcpConfigText, saveAs: nil)
+        }
+        .sheet(isPresented: $showSkillSheet) {
+            AgentConfigSheet(title: "SKILL.md for instruction-following agents",
+                             subtitle: "Drop this file where your agent reads skills (e.g. ~/.claude/skills/omni-search/SKILL.md) or paste it into its instructions.",
+                             text: skillMarkdown, saveAs: "SKILL.md")
+        }
     }
 
     // MARK: - Server
@@ -181,6 +194,100 @@ struct ServingTab: View {
         }
     }
 
+    // MARK: - Agents
+
+    @ViewBuilder private var agentsSection: some View {
+        Section {
+            HStack(spacing: 10) {
+                Button("MCP\u{2026}") { showMCPSheet = true }
+                Button("SKILL.md\u{2026}") { showSkillSheet = true }
+                Spacer()
+            }
+        } header: {
+            Text("Agents")
+        } footer: {
+            Text("Two ways to hand Omni to a local agent: MCP for clients that speak the protocol, SKILL.md for agents that follow written instructions.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    /// MCP connection snippets, generated from the live port/scope/token.
+    private var mcpConfigText: String {
+        let base = exampleBase
+        let token = model.serving.bearerToken
+        let isLAN = model.serving.scope == .public
+        var out = """
+        # Claude Code (one line)
+        claude mcp add --transport http omni \(base)/mcp
+
+        # .mcp.json / mcpServers config (Cursor, VS Code, claude_desktop_config.json, ...)
+        {
+          "mcpServers": {
+            "omni": {
+              "type": "http",
+              "url": "\(base)/mcp"\(isLAN && !token.isEmpty ? ",\n      \"headers\": { \"Authorization\": \"Bearer \(token)\" }" : "")
+            }
+          }
+        }
+        """
+        if !model.serving.isRunning {
+            out += "\n\n# Note: the server is currently stopped - turn on \"Serve Omni over HTTP\" above."
+        }
+        return out
+    }
+
+    /// A complete SKILL.md an instruction-following agent can use to call the HTTP API.
+    private var skillMarkdown: String {
+        let base = exampleBase
+        let token = model.serving.bearerToken
+        let isLAN = model.serving.scope == .public
+        let authNote = isLAN && !token.isEmpty
+            ? "All requests need the header `Authorization: Bearer \(token)`."
+            : "No auth needed from this Mac (loopback)."
+        let authFlag = isLAN && !token.isEmpty ? " -H 'Authorization: Bearer \(token)'" : ""
+        return """
+        ---
+        name: omni-local-search
+        description: Search the user's local files by MEANING (semantic search over text, code, PDFs, images, audio, and video) via the Omni app's local HTTP API. Use when the user asks to find, locate, or recall their own files by content ("find my notes about X", "that invoice from February", "photos of the beach").
+        ---
+
+        # Omni - local semantic file search
+
+        Omni indexes the user's files into one embedding space, so describe the CONTENT you want
+        in natural language (any language); keywords are not required. Results are absolute file
+        paths - read the files yourself if you need their contents.
+
+        Base URL: \(base)
+        \(authNote)
+
+        ## Search (the main call)
+
+        ```bash
+        curl -s \(base)/v1/search\(authFlag) -H 'Content-Type: application/json' \\
+          -d '{"query": "invoice from Anthropic in February", "top_k": 10}'
+        ```
+
+        Optional `filters`: `{"kinds": ["text"|"image"|"audio"|"video"], "folder": "/abs/path", "since": <epoch seconds>}`.
+        Response: `{"results": [{"path", "score" (0..1), "snippet", "kind", "modified"}]}`.
+        Scores above ~0.45 are usually relevant; below ~0.3 usually noise.
+
+        ## Health check
+
+        `curl -s \(base)/health` -> `{"status":"ok", ...}`. If the connection is refused, the
+        server is off - ask the user to enable Settings -> Serving in the Omni app.
+
+        ## Embeddings (optional)
+
+        `POST \(base)/v1/embeddings` accepts OpenAI/Jina-style bodies (`{"model":"omni","input":[...]}`)
+        and returns L2-normalized vectors - useful for building your own similarity logic.
+
+        ## MCP
+
+        The same search is exposed as an MCP tool at `\(base)/mcp` (streamable HTTP) if you
+        prefer the protocol over raw HTTP.
+        """
+    }
+
     /// Base URL for examples: the live bound address, or the configured local address when stopped.
     private var exampleBase: String {
         model.serving.boundAddress.isEmpty ? "http://127.0.0.1:\(model.serving.port)" : model.serving.boundAddress
@@ -278,5 +385,56 @@ private struct LogRow: View {
         .font(.caption.monospaced())
         .monospacedDigit()
         .padding(.vertical, 1)
+    }
+}
+
+/// Modal sheet showing a generated agent-config blob: selectable monospaced text with Copy
+/// (and optionally Save as a file). Used by the MCP and SKILL.md buttons in the Serving tab.
+private struct AgentConfigSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let title: String
+    let subtitle: String
+    let text: String
+    /// Suggested filename to enable the Save button (nil = copy-only).
+    let saveAs: String?
+    @State private var copied = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(title).font(.headline)
+            Text(subtitle).font(.subheadline).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            ScrollView {
+                Text(text)
+                    .font(.callout.monospaced())
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10)
+            }
+            .background(Color(nsColor: .textBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.primary.opacity(0.1)))
+            HStack {
+                Button(copied ? "Copied" : "Copy") {
+                    let pb = NSPasteboard.general
+                    pb.clearContents()
+                    pb.setString(text, forType: .string)
+                    copied = true
+                }
+                if let saveAs {
+                    Button("Save\u{2026}") {
+                        let panel = NSSavePanel()
+                        panel.nameFieldStringValue = saveAs
+                        if panel.runModal() == .OK, let url = panel.url {
+                            try? text.write(to: url, atomically: true, encoding: .utf8)
+                        }
+                    }
+                }
+                Spacer()
+                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 640, height: 460)
     }
 }
