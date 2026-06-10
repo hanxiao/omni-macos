@@ -10,10 +10,20 @@ struct ResultsList<Footer: View>: View {
     @State private var expanded: Set<String> = []
     @State private var passagesCache: [String: [ChunkHit]] = [:]
     @State private var gridWidth: CGFloat = 0
+    /// Grid counterpart of the list's inline expansion: the path whose passages popover is open.
+    @State private var passagesPopover: String?
 
     private func toggle(_ path: String) {
-        if expanded.contains(path) { expanded.remove(path) }
-        else { expanded.insert(path); Task { passagesCache[path] = await model.passages(for: path) } }
+        // Animated: the chevron rotation and the panel's insertion/removal track this mutation.
+        withAnimation(.easeOut(duration: 0.18)) {
+            if expanded.contains(path) { expanded.remove(path) }
+            else { expanded.insert(path); fetchPassages(path) }
+        }
+    }
+
+    private func fetchPassages(_ path: String) {
+        guard passagesCache[path] == nil else { return }
+        Task { passagesCache[path] = await model.passages(for: path) }
     }
 
     var body: some View {
@@ -34,6 +44,13 @@ struct ResultsList<Footer: View>: View {
             return true
         }))
         .onKeyPress(.return) { if model.hasSelection { model.openSelected(); return .handled }; return .ignored }
+        // Passages are ranked against the CURRENT query vector - a new result set invalidates
+        // them (and any open expansion/popover) in both views, so this lives here, not per-view.
+        .onChange(of: results.map(\.path)) { _, _ in
+            expanded = []
+            passagesCache = [:]
+            passagesPopover = nil
+        }
     }
 
     // MARK: - List
@@ -69,6 +86,15 @@ struct ResultsList<Footer: View>: View {
                             if expanded.contains(hit.path), hit.chunkCount > 1 {
                                 PassagesView(passages: passagesCache[hit.path] ?? [],
                                              fileName: URL(fileURLWithPath: hit.path).lastPathComponent)
+                                    .padding(10)
+                                    // A flat elevated fill, not vibrancy: blur belongs on sidebars and
+                                    // popovers; this excerpt card sits inside the opaque scrolling
+                                    // content where text must stay crisp and high-contrast.
+                                    .background(Color(.controlBackgroundColor), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                                    .padding(.leading, 52)
+                                    .padding(.trailing, 12)
+                                    .padding(.bottom, 8)
+                                    .transition(.opacity)
                             }
                         }
                         .id(hit.path)
@@ -79,14 +105,20 @@ struct ResultsList<Footer: View>: View {
                 .padding(.vertical, 8)
             }
             // Arrow keys move the selection up/down (Return/Space handled on the body). Same
-            // focusable + onMoveCommand wiring the gallery uses.
+            // focusable + onMoveCommand wiring the gallery uses. Right/left disclose/collapse the
+            // selected row's passages - the Finder list-view convention for expandable rows.
             .focusable()
             .focusEffectDisabled()
             .onMoveCommand { direction in
                 switch direction {
                 case .up: model.moveSelection(rowDelta: -1)
                 case .down: model.moveSelection(rowDelta: 1)
-                default: break
+                case .right:
+                    if let sel = model.selection, !expanded.contains(sel),
+                       results.first(where: { $0.path == sel })?.chunkCount ?? 0 > 1 { toggle(sel) }
+                case .left:
+                    if let sel = model.selection, expanded.contains(sel) { toggle(sel) }
+                @unknown default: break
                 }
             }
             // Keep the selected row on screen as it moves (so arrowing past the fold scrolls).
@@ -96,7 +128,6 @@ struct ResultsList<Footer: View>: View {
                 // arrow press made keyboard navigation jumpy.
                 withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(sel, anchor: nil) }
             }
-            .onChange(of: results.map(\.path)) { _, _ in expanded = []; passagesCache = [:] }
         }
     }
 
@@ -122,6 +153,24 @@ struct ResultsList<Footer: View>: View {
                             .onTapGesture { model.selection = hit.path }
                             .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
                             .contextMenu { menu(hit) }
+                            // The grid's counterpart of the list's inline expansion: a popover
+                            // anchored to the cell (the Photos/Finder info pattern - cells stay
+                            // uniform, the breakdown floats with system vibrancy). Passages are
+                            // fetched BEFORE presenting (see the menu action): swapping a loading
+                            // placeholder for the loaded view would animate an NSPopover window
+                            // resize mid-presentation, which crashes AppKit (NSMoveHelper SEGV).
+                            .popover(isPresented: Binding(
+                                get: { passagesPopover == hit.path },
+                                set: { if !$0 { passagesPopover = nil } }
+                            ), arrowEdge: .bottom) {
+                                ScrollView {
+                                    PassagesView(passages: passagesCache[hit.path] ?? [],
+                                                 fileName: URL(fileURLWithPath: hit.path).lastPathComponent)
+                                        .padding(12)
+                                }
+                                .frame(width: 380)
+                                .frame(maxHeight: 320)
+                            }
                             .id(hit.path)
                     }
                 }
@@ -162,11 +211,23 @@ struct ResultsList<Footer: View>: View {
             .keyboardShortcut("o", modifiers: .command)
         Button("Quick Look") { model.previewURL = URL(fileURLWithPath: path) }
             .keyboardShortcut("y", modifiers: .command)
-        // Per-chunk breakdown (pages of a PDF, passages of a long doc). List view only - the
-        // gallery has no expansion surface - and only for files that actually have several chunks.
-        if model.viewMode == .list, hit.chunkCount > 1 {
-            Button(expanded.contains(path) ? "Hide Matching Passages" : "Show Matching Passages") {
-                toggle(path)
+        // Per-chunk breakdown (pages of a PDF, passages of a long doc) - only for files that
+        // actually have several chunks. The list expands inline; the grid opens a popover.
+        if hit.chunkCount > 1 {
+            switch model.viewMode {
+            case .list:
+                Button(expanded.contains(path) ? "Hide Matching Passages" : "Show Matching Passages") {
+                    toggle(path)
+                }
+            case .grid:
+                Button("Show Matching Passages") {
+                    // Load first, present after: the popover must mount at its final size
+                    // (see the crash note at the .popover site).
+                    Task {
+                        if passagesCache[path] == nil { passagesCache[path] = await model.passages(for: path) }
+                        passagesPopover = path
+                    }
+                }
             }
         }
         Divider()
@@ -227,9 +288,13 @@ struct ResultRow: View {
                     Image(systemName: "chevron.right")
                         .rotationEffect(.degrees(expanded ? 90 : 0))
                         .foregroundStyle(.tertiary)
+                        // A bare glyph is a ~16px target; give it a comfortable hit area.
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .help("Show matching passages")
+                .help("Show matching passages (right arrow)")
+                .accessibilityLabel(expanded ? "Hide matching passages" : "Show matching passages")
             }
         }
         .padding(.vertical, 6)
@@ -247,6 +312,7 @@ struct ResultRow: View {
 /// alpha fade to signal there is more text before and after it in the file. A chunk's
 /// locator ("Page 3", "Line 1240") leads the excerpt; for scanned-PDF pages the snippet is
 /// just the file name, so the locator + score carry the row alone.
+/// Chrome-free (rows only): the list wraps it in an inline card, the grid in a popover.
 struct PassagesView: View {
     let passages: [ChunkHit]
     var fileName: String = ""
@@ -281,13 +347,6 @@ struct PassagesView: View {
                 Text("No passages").font(.caption).foregroundStyle(.tertiary)
             }
         }
-        .padding(10)
-        // A flat elevated fill, not vibrancy: blur belongs on sidebars/toolbars, but this excerpt
-        // card sits inside the opaque scrolling content where text must stay crisp and high-contrast.
-        .background(Color(.controlBackgroundColor), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-        .padding(.leading, 52)
-        .padding(.trailing, 12)
-        .padding(.bottom, 8)
     }
 }
 
