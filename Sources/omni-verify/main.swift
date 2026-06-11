@@ -548,6 +548,60 @@ if args.count >= 3 && args[1] == "qcachebench" {
     exit(0)
 }
 
+
+// SDPA isolation: omni-verify sdpabench [n] [heads] [dim]
+// Times MLXFast.scaledDotProductAttention at the vision tower's exact shape (one full-attention
+// window, [1, heads, n, dim]) in fp32 vs bf16-io, and the unfused composite, reporting achieved
+// TFLOPS vs the ~28 TFLOPS M3-Ultra fp32 peak. Decides whether a custom Metal kernel has a prize.
+if args.count >= 2 && args[1] == "sdpabench" {
+    let n = (args.count >= 3 ? Int(args[2]) : nil) ?? 4888
+    let heads = (args.count >= 4 ? Int(args[3]) : nil) ?? 12
+    let d = (args.count >= 5 ? Int(args[4]) : nil) ?? 64
+    let flops = 4.0 * Double(n) * Double(n) * Double(heads * d)   // QK^T + AV
+    func bench(_ name: String, _ make: () -> MLXArray) {
+        _ = make().sum().item(Float.self)   // warm
+        let iters = 20
+        let t0 = Date()
+        for _ in 0 ..< iters { let o = make(); MLX.eval(o) }
+        let dt = -t0.timeIntervalSinceNow / Double(iters)
+        print("  " + name.padding(toLength: 22, withPad: " ", startingAt: 0) + String(format: "%7.2f ms   %5.1f TFLOPS", dt * 1000, flops / dt / 1e12))
+    }
+    let scale = Float(pow(Double(d), -0.5))
+    for (dt, label) in [(DType.float32, "fp32"), (DType.bfloat16, "bf16")] {
+        let q = MLXRandom.normal([1, heads, n, d]).asType(dt)
+        let k = MLXRandom.normal([1, heads, n, d]).asType(dt)
+        let v = MLXRandom.normal([1, heads, n, d]).asType(dt)
+        MLX.eval(q, k, v)
+        bench("steel-\(label)") { MLXFast.scaledDotProductAttention(queries: q, keys: k, values: v, scale: scale, mask: .none) }
+        bench("composite-\(label)") {
+            let s = MLX.matmul(q, k.transposed(0, 1, 3, 2)) * scale
+            return MLX.matmul(MLX.softmax(s, axis: -1, precise: true), v)
+        }
+        bench("comp4head-\(label)") {
+            // head-chunked composite: bounded transient (4 heads of scores at a time)
+            var outs: [MLXArray] = []
+            var h = 0
+            while h < heads {
+                let hi = Swift.min(h + 4, heads)
+                let qh = q[0..., h ..< hi], kh = k[0..., h ..< hi], vh = v[0..., h ..< hi]
+                let sc = MLX.matmul(qh, kh.transposed(0, 1, 3, 2)) * scale
+                outs.append(MLX.matmul(MLX.softmax(sc, axis: -1, precise: true), vh))
+                h = hi
+            }
+            return MLX.concatenated(outs, axis: 1)
+        }
+        if dt == .float32 {
+            // numeric equivalence: composite vs steel (same math, different schedule)
+            let a = MLXFast.scaledDotProductAttention(queries: q, keys: k, values: v, scale: scale, mask: .none)
+            let sscore = MLX.matmul(q, k.transposed(0, 1, 3, 2)) * scale
+            let b = MLX.matmul(MLX.softmax(sscore, axis: -1, precise: true), v)
+            let maxDiff = MLX.abs(a - b).max().item(Float.self)
+            print(String(format: "  fp32 steel-vs-composite max|diff| = %.3e", maxDiff))
+        }
+    }
+    exit(0)
+}
+
 // Indexing-throughput benchmark: omni-verify embbench <modelDir> [seconds] [batchSize]
 // Mirrors the indexer's text hot path EXACTLY: length-sorted carve into batchSize buckets, ONE
 // embedTextBatches call per 6-batch staging window (tokenize-parallel + async double-buffering

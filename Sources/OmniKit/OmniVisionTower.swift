@@ -51,9 +51,14 @@ public final class OmniVisionTower: @unchecked Sendable {
         self.fp32Compute = ProcessInfo.processInfo.environment["OMNI_VISION_BF16_SDPA"] != "1"
     }
 
-    /// Experiment lever: run the vision SDPA itself in bf16 (no fp32 upcast). Requires
-    /// OMNI_VISION_BF16_SDPA=1 to have any effect (otherwise inputs are already fp32).
-    static let trueBF16Attn = ProcessInfo.processInfo.environment["OMNI_VISION_TRUE_BF16_ATTN"] == "1"
+    /// SDPA i/o precision. The steel flash kernel accumulates in fp32 internally regardless of the
+    /// i/o dtype, and measured at the tower's shape ([1, heads, ~4.9k, 64]) the bf16-i/o variant is
+    /// ~18% faster (3.68 vs 4.50 ms; the win is bandwidth/registers - Apple GPUs run fp32 and half
+    /// ALUs at the same rate). Casting q/k/v per element is packing-shape-INVARIANT (unlike bf16
+    /// matmuls, whose tiling noise broke the batched-vs-single gate), so the strict batch-parity
+    /// gates still hold. Everything around the SDPA stays fp32 (reference-faithful).
+    /// OMNI_VISION_SDPA_FP32=1 restores full-fp32 SDPA i/o.
+    static let sdpaBF16IO = ProcessInfo.processInfo.environment["OMNI_VISION_SDPA_FP32"] != "1"
 
     /// Weight cast to the tower compute dtype (fp32 by default). Hoisting the cast here keeps every
     /// matmul in one dtype so packing is shape-invariant.
@@ -335,13 +340,15 @@ public final class OmniVisionTower: @unchecked Sendable {
         var qh = q.transposed(1, 0, 2)
         var kh = k.transposed(1, 0, 2)
         var vh = v.transposed(1, 0, 2)
-        // With fp32Compute (default) qh/kh/vh are already fp32 (whole tower runs fp32: NaN-free and
-        // packing-shape-invariant). The legacy bf16 path keeps them bf16 - still upcast just the
-        // attention product to fp32 to avoid the softmax NaN, then cast back for the proj matmul.
-        // OMNI_VISION_TRUE_BF16_ATTN=1 (experiment): skip the upcast and run SDPA in bf16.
+        // The residual stream is fp32 (reference-faithful). For the SDPA call itself, bf16 i/o is
+        // ~18% faster with identical fp32 accumulation inside the steel kernel (see sdpaBF16IO);
+        // the output is cast straight back to fp32 below.
         let attnDtype = qh.dtype
-        if attnDtype != .float32, !Self.trueBF16Attn {
+        if attnDtype != .float32 {
             qh = qh.asType(.float32); kh = kh.asType(.float32); vh = vh.asType(.float32)
+        }
+        if Self.sdpaBF16IO {
+            qh = qh.asType(.bfloat16); kh = kh.asType(.bfloat16); vh = vh.asType(.bfloat16)
         }
         let scale = Float(pow(Double(headDim), -0.5))
 
