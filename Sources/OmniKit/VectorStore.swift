@@ -149,6 +149,23 @@ public final class VectorStore: @unchecked Sendable {
     // rebuilt only on a structural change (delete/reload) or once the delta exceeds foldThreshold,
     // instead of on every query as before. Result is identical (base+delta covers all rows).
     private var mlxBase: MLXArray?
+    // QUANTIZED BASE (the low-end scaling mode): when the full bf16 base would claim too much of the
+    // user's memory budget, the GPU-resident scan matrix is a 4-bit group-quantized replica instead
+    // (MLX quantizedMM - the heavily-optimized LLM-weights kernel; ~4x less resident and ~4x less
+    // bandwidth per scan). flat16 stays the EXACT bf16 source of truth in host memory - compaction,
+    // rankChunks, fileVector, the folder map, and the delta matmul are all unchanged - and search
+    // becomes a funnel: coarse top-C on the quantized replica (with resident kind/since/path
+    // prefilters), then an EXACT bf16 rerank of just those C candidates gathered from flat16, then
+    // the normal reducer over exact scores. Quality is gated by concbench's recall-vs-fp32-exact.
+    private var quantBase: (wq: MLXArray, scales: MLXArray, biases: MLXArray?)? = nil
+    private var quantBits = 0          // active bits of quantBase (0 = full bf16 base)
+    private static let quantGroup = 64
+    /// Policy: OMNI_QUANT_BASE forces (0=off, 4, 8); unset = auto-on at 4 bits when the full base
+    /// would exceed a quarter of the user's memory cap (Settings > Performance).
+    static func quantBitsFor(baseBytes: Int) -> Int {
+        if let s = ProcessInfo.processInfo.environment["OMNI_QUANT_BASE"], let v = Int(s) { return v }
+        return baseBytes > OmniMemoryBudget.capBytes / 4 ? 4 : 0
+    }
     private var baseRows = 0
     private var baseDirty = true
     private static let foldThreshold = 50_000
@@ -172,7 +189,7 @@ public final class VectorStore: @unchecked Sendable {
     private func bf16Row(_ v: [Float]) -> [UInt16] { v.map(Self.toBF16) }
     // Force a full base rebuild on the next search. Used by structural changes (delete/compact/
     // reload) that shift row indices; plain appends do NOT call this (they extend the delta).
-    private func invalidateBase() { baseDirty = true; mlxBase = nil; baseRows = 0 }
+    private func invalidateBase() { baseDirty = true; mlxBase = nil; quantBase = nil; baseRows = 0 }
     // Membership index of the paths currently in `rows`. Lets replace() know in O(1) whether a
     // path pre-exists, so a brand-new file skips removeRowsLocked entirely (no O(N) scan per file
     // during a full index). Rebuilt from the surviving rows whenever removeRowsLocked compacts.
@@ -828,12 +845,21 @@ public final class VectorStore: @unchecked Sendable {
             lastSearchAt = Date()   // mark the store "actively searched" so writes proactively refold the base
             let n = rows.count
             guard n > 0, dim > 0, query.count == dim, flat16.count == n * dim else { return [] }
-            if baseDirty || mlxBase == nil || (n - baseRows) > Self.foldThreshold {
+            if baseDirty || (mlxBase == nil && quantBase == nil) || (n - baseRows) > Self.foldThreshold {
                 rebuildBaseLocked(rowCount: n)
             }
             let t0 = Self.searchTiming ? Date() : nil
             let qv = MLXArray(query, [dim, 1]).asType(.bfloat16)
-            let baseScore = MLX.matmul(mlxBase!, qv)
+            // Full mode: exact bf16 scores. Quant mode: COARSE scores from the 4-bit replica
+            // (x @ w.T via quantizedMM wants x as [1, dim]); exact rerank happens below.
+            let baseScore: MLXArray
+            if let qb = quantBase {
+                baseScore = MLX.quantizedMM(qv.transposed(1, 0), qb.wq, scales: qb.scales, biases: qb.biases,
+                                            transpose: true, groupSize: Self.quantGroup, bits: quantBits)
+                    .transposed(1, 0)
+            } else {
+                baseScore = MLX.matmul(mlxBase!, qv)
+            }
             var scores: [Float]
             // Delta: rows [baseRows, n) appended since the base was built (bounded by foldThreshold).
             // flat16 is stable for this synchronous call; MLXArray copies the bytes at construction so
@@ -853,6 +879,16 @@ public final class VectorStore: @unchecked Sendable {
                 MLX.eval(baseScore)
                 scores = baseScore.reshaped([baseRows]).asType(.float32).asArray(Float.self)
             }
+            // FUNNEL RERANK (quant mode only): the base scores above are coarse. Select the top-C
+            // candidate rows (delta rows [baseRows, n) are already EXACT - they always qualify),
+            // gather their bf16 vectors from flat16, rescore exactly in one small matmul, and hand
+            // the reducer a dense score array where non-candidates are -inf (skipped by its
+            // isFinite check; per-file chunk counts are unaffected). Candidate selection applies
+            // the kind/since/path prefilters from RESIDENT data so a filtered query cannot lose
+            // its matches outside the coarse top-C.
+            if quantBase != nil {
+                scores = rerankLocked(coarse: scores, n: n, query: query, filter: filter, topK: topK)
+            }
             let t1 = Self.searchTiming ? Date() : nil
             let result = fillSnippetsLocked(Self.reduceTopK(scores: scores, fileID: fileID, fileCount: fileIDCount,
                                                             rows: rows, filter: filter, topK: topK,
@@ -864,6 +900,80 @@ public final class VectorStore: @unchecked Sendable {
             return result
         }
     }
+
+    /// Quant-mode second stage: exact bf16 rescore of the coarse top-C candidates.
+    ///
+    /// Selects the C highest COARSE-scoring base rows that pass the filter (kind/since via the
+    /// resident codes; folder/ext via the canonical paths - only walked when those filters are
+    /// set), gathers their exact bf16 vectors from flat16 (host memcpy, ~C*dim*2 bytes), rescores
+    /// them in ONE small matmul, and returns a dense score array where non-candidates are -inf
+    /// (the reducer's isFinite check skips them; its per-file chunk counts still see every row).
+    /// Delta rows [baseRows, n) were scored exactly by the delta matmul and pass through as-is.
+    /// C scales with topK and never exceeds 4096; when the base has <= C rows every row is a
+    /// candidate and the result is exactly the full bf16 search.
+    private func rerankLocked(coarse: [Float], n: Int, query: [Float], filter: SearchFilter, topK: Int) -> [Float] {
+        let C = min(baseRows, min(4096, max(1024, topK * 32)))
+        let kinds = filter.kinds, hasKind = !kinds.isEmpty, since = filter.since
+        let pathFiltered = filter.folderPrefix != nil || (filter.ext?.isEmpty == false)
+        var kindAllowed = [Bool](repeating: false, count: 256)
+        if hasKind { for k in kinds { if let id = kindID[k] { kindAllowed[Int(id)] = true } } }
+
+        // Size-C min-heap over (coarse score, row index) of the FILTER-PASSING base rows.
+        var hScore = [Float](); hScore.reserveCapacity(C)
+        var hIdx = [Int32](); hIdx.reserveCapacity(C)
+        func siftUp(_ start: Int) {
+            var i = start
+            while i > 0 { let p = (i - 1) >> 1; if hScore[p] <= hScore[i] { break }
+                hScore.swapAt(p, i); hIdx.swapAt(p, i); i = p }
+        }
+        func siftDown(_ start: Int) {
+            var i = start; let c = hScore.count
+            while true { let l = 2*i+1, r = 2*i+2; var m = i
+                if l < c && hScore[l] < hScore[m] { m = l }
+                if r < c && hScore[r] < hScore[m] { m = r }
+                if m == i { break }; hScore.swapAt(i, m); hIdx.swapAt(i, m); i = m }
+        }
+        coarse.withUnsafeBufferPointer { sp in
+            kindCode.withUnsafeBufferPointer { kc in
+                for i in 0 ..< baseRows {
+                    let sc = sp[i]
+                    if !sc.isFinite { continue }
+                    if hScore.count >= C && sc <= hScore[0] { continue }
+                    if hasKind && !kindAllowed[Int(kc[i])] { continue }
+                    if let since, rows[i].modified < since { continue }
+                    if pathFiltered, !filter.accepts(path: rows[i].path, kind: rows[i].kind, modified: rows[i].modified) { continue }
+                    if hScore.count < C { hScore.append(sc); hIdx.append(Int32(i)); siftUp(hScore.count - 1) }
+                    else { hScore[0] = sc; hIdx[0] = Int32(i); siftDown(0) }
+                }
+            }
+        }
+
+        var out = [Float](repeating: -.infinity, count: n)
+        for i in baseRows ..< n { out[i] = coarse[i] }   // delta rows: already exact
+        guard !hIdx.isEmpty else { return out }
+
+        // Gather candidates' exact bf16 rows and rescore in one [C, dim] x [dim, 1] matmul.
+        var packed = [UInt16](repeating: 0, count: hIdx.count * dim)
+        flat16.withUnsafeBufferPointer { fb in
+            packed.withUnsafeMutableBufferPointer { pb in
+                guard let src = fb.baseAddress, let dst = pb.baseAddress else { return }
+                for (j, ri) in hIdx.enumerated() {
+                    (dst + j * dim).update(from: src + Int(ri) * dim, count: dim)
+                }
+            }
+        }
+        let exact: MLXArray = packed.withUnsafeBytes { raw in
+            let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!),
+                            count: hIdx.count * dim * MemoryLayout<UInt16>.size, deallocator: .none)
+            return MLX.matmul(MLXArray(data, [hIdx.count, dim], dtype: .bfloat16),
+                              MLXArray(query, [dim, 1]).asType(.bfloat16))
+        }
+        MLX.eval(exact)
+        let exScores = exact.reshaped([hIdx.count]).asType(.float32).asArray(Float.self)
+        for (j, ri) in hIdx.enumerated() { out[Int(ri)] = exScores[j] }
+        return out
+    }
+
     static let searchTiming = ProcessInfo.processInfo.environment["OMNI_SEARCH_TIMING"] == "1"
 
     /// Fill the lazily-loaded snippets for a search's winners: <=topK primary-key point lookups
@@ -1032,13 +1142,50 @@ public final class VectorStore: @unchecked Sendable {
         // before returning, so no in-flight graph references the old array here. The freed buffer
         // returns to MLX's cache and is often reused by the new allocation outright.
         mlxBase = nil
+        quantBase = nil
         let byteCount = rowCount * dim * MemoryLayout<UInt16>.size
-        flat16.withUnsafeBytes { raw in
-            let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!),
-                            count: byteCount, deallocator: .none)
-            mlxBase = MLXArray(data, [rowCount, dim], dtype: .bfloat16)
+        let bits = Self.quantBitsFor(baseBytes: byteCount)
+        if bits > 0, dim % Self.quantGroup == 0 {
+            // Group-quantize the scan replica in SLABS: converting through one full bf16 MLXArray
+            // would leave a base-sized transient in MLX's buffer cache (measured: it ERASED the
+            // quantization's memory win) and would spike an 8GB machine at exactly the moment it
+            // is memory-tight. 128k-row slabs bound the transient to ~200MB, and each slab reuses
+            // the previous one's cached buffer. The packed outputs concat along axis 0 (wq rows
+            // are independently packed), so the result is identical to a one-shot quantize.
+            let slab = 131_072
+            var wqs: [MLXArray] = [], scs: [MLXArray] = [], bss: [MLXArray] = []
+            var off = 0
+            flat16.withUnsafeBytes { raw in
+                while off < rowCount {
+                    let count = Swift.min(slab, rowCount - off)
+                    let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!.advanced(by: off * dim * MemoryLayout<UInt16>.size)),
+                                    count: count * dim * MemoryLayout<UInt16>.size, deallocator: .none)
+                    let part = MLXArray(data, [count, dim], dtype: .bfloat16)
+                    let q = MLX.quantized(part, groupSize: Self.quantGroup, bits: bits)
+                    var toEval = [q.wq, q.scales]
+                    if let b = q.biases { toEval.append(b) }
+                    MLX.eval(toEval)
+                    wqs.append(q.wq); scs.append(q.scales); if let b = q.biases { bss.append(b) }
+                    off += count
+                }
+            }
+            let wq = wqs.count == 1 ? wqs[0] : MLX.concatenated(wqs, axis: 0)
+            let sc = scs.count == 1 ? scs[0] : MLX.concatenated(scs, axis: 0)
+            let bi: MLXArray? = bss.isEmpty ? nil : (bss.count == 1 ? bss[0] : MLX.concatenated(bss, axis: 0))
+            var toEval = [wq, sc]
+            if let bi { toEval.append(bi) }
+            MLX.eval(toEval)
+            quantBase = (wq, sc, bi)
+            quantBits = bits
+        } else {
+            flat16.withUnsafeBytes { raw in
+                let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!),
+                                count: byteCount, deallocator: .none)
+                mlxBase = MLXArray(data, [rowCount, dim], dtype: .bfloat16)
+            }
+            MLX.eval(mlxBase!)
+            quantBits = 0
         }
-        MLX.eval(mlxBase!)
         baseRows = rowCount
         baseDirty = false
     }
