@@ -189,6 +189,17 @@ func churnbenchRun(_ nFiles: Int, _ secs: Double) throws -> Int32 {
                  m1, peakMB, Double(indexed.count * 64 * 2) / 1_048_576, peakMB / max(m1, 1)))
     print(String(format: "  consistency: onDisk=%d indexed=%d  missing=%d orphan=%d", onDisk.count, indexed.count, missing.count, orphan.count))
 
+    // Search correctness: after the chaos converges, NO query may return a path that is not on disk.
+    // This is the check a deferred-compaction/tombstone scheme must never break - a stale (deleted or
+    // pre-modify) row leaking into results. Probe with several query vectors and intersect the hits
+    // against the live filesystem set.
+    var ghost = 0, probed = 0
+    for k in 0 ..< 20 {
+        let qv2 = FastEmbedder().vec("seed \(k * 137 % max(1, nFiles))")
+        for h in store.search(qv2, topK: 50) { probed += 1; if !onDisk.contains(h.path) { ghost += 1 } }
+    }
+    print(String(format: "  search correctness: probed=%d hits, ghost(non-existent)=%d", probed, ghost))
+
     // Clean teardown: close (checkpoint+close on the serial queue) must not hang or crash, and the WAL
     // must fold back into the main db (no growing -wal left behind).
     let closeDone = DispatchSemaphore(value: 0)
@@ -198,7 +209,7 @@ func churnbenchRun(_ nFiles: Int, _ secs: Double) throws -> Int32 {
     print("  teardown: close \(cleanClose ? "clean" : "HUNG")  residual WAL \(walSize) bytes")
 
     try? FileManager.default.removeItem(at: root)
-    let ok = !hung && missing.count == 0 && orphan.count == 0 && cleanClose
+    let ok = !hung && missing.count == 0 && orphan.count == 0 && ghost == 0 && cleanClose
     print("  RESULT: \(ok ? "PASS" : "FAIL")")
     return ok ? 0 : 1
 }
