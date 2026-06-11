@@ -163,12 +163,17 @@ struct FolderEmbeddingVisualization: View {
             .onContinuousHover { phase in
                 switch phase {
                 case .active(let loc):
-                    hoverLocation = loc
-                    // Only run the O(N) nearest-point scan when the cursor actually moved a few px.
-                    // onContinuousHover fires on every mouse sample, so a fast sweep otherwise piles
-                    // many 60k-element scans per second onto the main thread; tiny jitters reuse the hit.
+                    // onContinuousHover fires on every mouse sample. Publishing hoverLocation each
+                    // time recomputes the whole body AND recomposites the Liquid Glass overlays
+                    // (caption/legend/zoom/hover-chip share one GlassEffectContainer) at event rate -
+                    // 60-120 glass passes/sec on a fast sweep over the live Metal cloud. Gate BOTH the
+                    // chip-position publish and the O(N) nearest-point scan to ~3px of movement: the
+                    // chip following in 3px steps is imperceptible, and body/glass passes drop to
+                    // roughly sweep-distance/3px. (The hover chip only renders when `hovered != nil`,
+                    // so a position update finer than the hit-test would not even be visible.)
                     if hypot(loc.x - lastHoverResolveLoc.x, loc.y - lastHoverResolveLoc.y) >= 3 {
                         lastHoverResolveLoc = loc
+                        hoverLocation = loc
                         hovered = nearestIndex(to: loc, in: geo.size).map { model.folderProjection[$0] }
                     }
                 case .ended:
