@@ -1364,6 +1364,126 @@ if args.count >= 4 && args[1] == "dedupbench" {
     exit(0)
 }
 
+// Per-process NaN sweep: omni-verify nansweep <modelDir> [imageDir] [reps]
+// Measures THIS process's non-finite embedding rate per modality. The cold-load weight-corruption
+// hypothesis predicts a bimodal distribution ACROSS processes (most runs 0, an occasional run
+// with a persistent low rate), while transient GPU faults predict uniform low rates everywhere.
+// Drive it in a shell loop (one process per sample). OMNI_VALIDATED=1 uses loadValidated.
+// Also embeds one fixed input twice and reports max |diff| (nondeterminism probe).
+if args.count >= 3 && args[1] == "nansweep" {
+    let engine = ProcessInfo.processInfo.environment["OMNI_VALIDATED"] == "1"
+        ? try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[2]))
+        : try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    let reps = (args.count >= 5 ? Int(args[4]) : nil) ?? 150
+    // Real images when a dir is given (cycled), else the synthetic probe path only.
+    var raws: [OmniVisionPreprocess.RawPatches] = []
+    if args.count >= 4, let names = try? FileManager.default.contentsOfDirectory(atPath: args[3]) {
+        for n in names.sorted().prefix(8) {
+            let u = URL(fileURLWithPath: args[3]).appendingPathComponent(n)
+            guard let src = CGImageSourceCreateWithURL(u as CFURL, nil),
+                  let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { continue }
+            raws.append(OmniVisionPreprocess.preprocessRaw(img))
+        }
+    }
+    let sentence = "The quarterly revenue report shows strong cloud growth across European regions. "
+    var melBuf = [Float](repeating: 0, count: 128 * 60)
+    for i in 0 ..< melBuf.count { melBuf[i] = Float((i * 2654435761) % 1000) / 1000 - 0.5 }  // deterministic, finite
+    var badImg = 0, badTxt = 0, badAud = 0, imgN = 0, txtN = 0, audN = 0
+    for k in 0 ..< reps {
+        if !raws.isEmpty, let vs = engine.embedImages([raws[k % raws.count]]) {
+            imgN += 1; if !(vs.first?.allSatisfy { $0.isFinite } ?? true) { badImg += 1 }
+        }
+        let tv = engine.embedText(sentence + "rep \(k)", as: .passage)
+        txtN += 1; if !tv.allSatisfy({ $0.isFinite }) { badTxt += 1 }
+        if engine.supportsAudio, let av = engine.embedAudioMel(melBuf, frames: 60) {
+            audN += 1; if !av.allSatisfy({ $0.isFinite }) { badAud += 1 }
+        }
+    }
+    var maxDiff: Float = 0
+    if !raws.isEmpty, let a = engine.embedImages([raws[0]])?.first, let b = engine.embedImages([raws[0]])?.first {
+        for i in 0 ..< min(a.count, b.count) { maxDiff = max(maxDiff, abs(a[i] - b[i])) }
+    }
+    print(String(format: "NANSWEEP img %d/%d  text %d/%d  audio %d/%d  redo-maxdiff %.2e  validated=%@",
+                 badImg, imgN, badTxt, txtN, badAud, audN, maxDiff,
+                 ProcessInfo.processInfo.environment["OMNI_VALIDATED"] == "1" ? "1" : "0"))
+    // Corrupted process caught in the act: this is the only place the recovery reload can be
+    // validated end to end (corruption cannot be injected on demand). Recover, re-measure.
+    if badImg + badTxt + badAud > 0 {
+        let recovered = engine.recoverMediaPath()
+        var rBadImg = 0, rBadAud = 0, rImgN = 0, rAudN = 0
+        for k in 0 ..< reps {
+            if !raws.isEmpty, let vs = engine.embedImages([raws[k % raws.count]]) {
+                rImgN += 1; if !(vs.first?.allSatisfy { $0.isFinite } ?? true) { rBadImg += 1 }
+            }
+            if engine.supportsAudio, let av = engine.embedAudioMel(melBuf, frames: 60) {
+                rAudN += 1; if !av.allSatisfy({ $0.isFinite }) { rBadAud += 1 }
+            }
+        }
+        print(String(format: "NANSWEEP-RECOVERED probe=%@  img %d/%d  audio %d/%d",
+                     recovered ? "pass" : "FAIL", rBadImg, rImgN, rBadAud, rAudN))
+        exit(rBadImg + rBadAud > 0 ? 1 : 0)
+    }
+    exit(0)
+}
+
+// Indexer recover-and-retry wiring: omni-verify nanretrycheck
+// A flaky embedder NaNs every text embed until recoverMediaPath() is called, then is clean -
+// the deterministic stand-in for the measured per-process weight corruption. One index pass
+// must end with failed=0, all files stored, and the engine recovery invoked exactly once.
+final class FlakyEmbedder: Embedder, @unchecked Sendable {
+    let dim = 64
+    private let inner = FastEmbedder()
+    private let lock = NSLock()
+    private var corrupted = true
+    private var recoveries = 0
+    var recoverCount: Int { lock.withLock { recoveries } }
+    func recoverMediaPath() -> Bool { lock.withLock { recoveries += 1; corrupted = false; return true } }
+    private func maybeNaN(_ v: [Float]) -> [Float] {
+        lock.withLock { corrupted } ? v.enumerated().map { $0.offset == 0 ? Float.nan : $0.element } : v
+    }
+    func embedText(_ t: String, as type: OmniInputType) -> [Float] { maybeNaN(inner.vec(t)) }
+    func embedTextBatch(_ ts: [String], as type: OmniInputType) -> [[Float]] { ts.map { maybeNaN(inner.vec($0)) } }
+    func embedImage(_ i: CGImage) -> [Float]? { nil }
+    func embedImages(_ r: [OmniVisionPreprocess.RawPatches]) -> [[Float]]? { nil }
+    func embedVideoFrames(_ f: [CGImage]) -> [Float]? { nil }
+    func embedAudio(_ u: URL) -> [Float]? { nil }
+    func embedAudioMel(_ m: [Float], frames: Int) -> [Float]? { nil }
+    func embedAudioMelBatch(_ m: [[Float]], frames: [Int]) -> [[Float]]? { nil }
+}
+func nanretrycheckRun() throws -> Int32 {
+    var fails = 0
+    func check(_ cond: Bool, _ msg: String) { print("  \(cond ? "ok  " : "FAIL") \(msg)"); if !cond { fails += 1 } }
+    var root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("omni-nanretry-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+    try? FileManager.default.removeItem(at: root)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    if let rp = realpath(root.path, nil) { root = URL(fileURLWithPath: String(cString: rp), isDirectory: true); free(rp) }
+    for i in 0 ..< 6 {
+        try "Document number \(i) about distributed search indexes, embeddings, and folder layouts.".write(
+            to: root.appendingPathComponent("f\(i).txt"), atomically: true, encoding: .utf8)
+    }
+    let store = try VectorStore(dbURL: root.appendingPathComponent("index.sqlite"))
+    let emb = FlakyEmbedder()
+    let indexer = Indexer(store: store, embedder: emb)
+    let done = DispatchSemaphore(value: 0)
+    nonisolated(unsafe) var final = IndexProgress()
+    DispatchQueue.global().async {
+        indexer.index(roots: [root], settings: IndexSettings()) { p in if p.done { final = p; done.signal() } }
+    }
+    guard done.wait(timeout: .now() + 60) == .success else { print("  FAIL pass hung"); return 1 }
+    check(final.failed == 0, "no files failed after recovery (failed=\(final.failed))")
+    check(final.embedded == 6, "all files stored (embedded=\(final.embedded))")
+    // Every file embedded pre-recovery trips its own gate; the real engine throttles the
+    // repeat recover calls, the test double just counts them.
+    check(emb.recoverCount >= 1, "engine recovery invoked (\(emb.recoverCount)x)")
+    check(store.fileCount == 6, "store holds all files (\(store.fileCount))")
+    try? FileManager.default.removeItem(at: root)
+    print("  RESULT: \(fails == 0 ? "PASS" : "FAIL (\(fails))")")
+    return fails == 0 ? 0 : 1
+}
+if args.count >= 2 && args[1] == "nanretrycheck" {
+    exit(try nanretrycheckRun())
+}
+
 // Idle-trim check: omni-verify trimcheck <modelDir>
 // Verifies the debounced GPU buffer-cache trim end to end in-process: run an embed burst, arm
 // indexingIdle() (OMNI_IDLE_TRIM seconds, set it small, e.g. 2), and watch MLX cache memory drop

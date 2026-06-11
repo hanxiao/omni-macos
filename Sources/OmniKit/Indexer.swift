@@ -34,6 +34,10 @@ public protocol Embedder: AnyObject {
     /// Indexing finished a pass / reconcile batch. The engine may use this to reclaim GPU
     /// resources (buffer-cache trim) once the machine goes quiet. Default: no-op.
     func indexingIdle()
+    /// A real embed came back non-finite (NaN/Inf). The engine may attempt recovery (reload
+    /// weights - the cold-load corruption is per-process and otherwise persists until relaunch).
+    /// Returns true if the media path probes healthy afterwards. Default: false (no recovery).
+    func recoverMediaPath() -> Bool
 }
 
 public extension Embedder {
@@ -42,6 +46,9 @@ public extension Embedder {
 
     /// Default: nothing to reclaim. OmniEngine overrides with a debounced buffer-cache trim.
     func indexingIdle() {}
+
+    /// Default: no recovery available (test doubles). OmniEngine overrides with a weight reload.
+    func recoverMediaPath() -> Bool { false }
 
     /// Default: no pipelining, just embed each batch in turn. Conformances that support the
     /// async double-buffer (OmniEngine) override this.
@@ -147,6 +154,46 @@ public final class Indexer: @unchecked Sendable {
 
     // Content dedup: identical bytes never embed twice. OMNI_CONTENT_DEDUP=0 disables (A/B).
     public static let contentDedup = ProcessInfo.processInfo.environment["OMNI_CONTENT_DEDUP"] != "0"
+
+    // OMNI_NAN_DEBUG=1: dump non-finite embedding details to stderr (os.Logger from an unbundled
+    // CLI never reaches `log show` on some systems, so benches need a direct channel).
+    static let nanDebug = ProcessInfo.processInfo.environment["OMNI_NAN_DEBUG"] == "1"
+    static func nanReport(_ path: String, _ raw: [IndexedChunk]) {
+        guard nanDebug else { return }
+        for c in raw where !isFinite(c.embedding) {
+            let nans = c.embedding.filter { $0.isNaN }.count
+            let infs = c.embedding.filter { $0.isInfinite }.count
+            FileHandle.standardError.write(Data(
+                "NANDEBUG kind=\(c.kind) chunk=\(c.chunkIndex) nan=\(nans) inf=\(infs) of \(c.embedding.count) path=\(path)\n".utf8))
+        }
+    }
+
+    // OMNI_NAN_RETRY=0 disables the recover-and-retry on non-finite embeddings (A/B, tests).
+    static let nanRetry = ProcessInfo.processInfo.environment["OMNI_NAN_RETRY"] != "0"
+
+    /// One-shot recovery for a file whose embedding came back non-finite. The dominant cause is
+    /// per-process cold-load weight corruption (measured: deterministic per input, media-only,
+    /// 2-37% per-embed NaN rate, survives the load-time probes at the low rates), so a plain
+    /// re-embed reproduces the same NaN - the engine must reload its weights first
+    /// (recoverMediaPath, throttled engine-side so a pass with many bad files pays one reload).
+    /// Then re-decode from disk and re-embed the whole file: decode inputs are no longer in scope
+    /// at the gate sites, and the full re-decode also covers transients cleanly. Returns finite
+    /// chunks on success, nil to fail the file exactly as before (deferred to the next pass).
+    private func retryNonFinite(_ path: String, settings: IndexSettings) -> [IndexedChunk]? {
+        guard Self.nanRetry, !isCancelled else { return nil }
+        _ = embedder.recoverMediaPath()   // false = throttled or unavailable; retry regardless (covers transients)
+        guard !isCancelled else { return nil }
+        let url = URL(fileURLWithPath: path)
+        guard let vals = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]) else { return nil }
+        let file = CrawledFile(url: url,
+                               modified: vals.contentModificationDate?.timeIntervalSince1970 ?? 0,
+                               size: vals.fileSize ?? 0)
+        let again = embed(decode(file, settings: settings))
+        guard !again.isEmpty, again.allSatisfy({ Self.isFinite($0.embedding) }) else { return nil }
+        Self.log.info("recovered after non-finite embedding: \(path, privacy: .public)")
+        if Self.nanDebug { FileHandle.standardError.write(Data("NANDEBUG recovered path=\(path)\n".utf8)) }
+        return again
+    }
     private let dedupLock = NSLock()
     private var _dedupHits = 0
     private func noteDedupHit() { dedupLock.withLock { _dedupHits += 1 } }
@@ -255,10 +302,16 @@ public final class Indexer: @unchecked Sendable {
             if p.scanned % 10 == 0 { onProgress(p) }
         }
         func storeChunks(_ path: String, _ raw: [IndexedChunk]) {
-            // A non-finite vector is a transient GPU fault (memory pressure, cross-process
-            // contention). Storing the finite SUBSET would persist a silently truncated file
-            // under its current mtime - never repaired because later passes see it "unchanged".
-            // Fail the whole file instead; the next pass redoes it from scratch.
+            // A non-finite vector means corrupted resident weights (per-process cold-load fault)
+            // or a transient GPU fault. Storing the finite SUBSET would persist a silently
+            // truncated file under its current mtime - never repaired because later passes see it
+            // "unchanged". Recover the engine and retry the file once; if still bad, fail the
+            // whole file and let the next pass redo it from scratch.
+            var raw = raw
+            if raw.contains(where: { !Self.isFinite($0.embedding) }) {
+                Self.nanReport(path, raw)
+                if let again = retryNonFinite(path, settings: settings) { raw = again }
+            }
             let chunks = raw.filter { Self.isFinite($0.embedding) }
             if chunks.count < raw.count {
                 Self.log.error("non-finite embedding, file deferred to next pass: \(path, privacy: .public)")
@@ -306,8 +359,13 @@ public final class Indexer: @unchecked Sendable {
                 // flush window - the same durability granularity reconcile already has.
                 var stagedStores: [(path: String, chunks: [IndexedChunk])] = []
                 func stageStore(_ path: String, _ raw: [IndexedChunk]) {
-                    // Mirrors storeChunks' guards: fail whole files with any non-finite vector
-                    // (transient GPU fault - next pass redoes them), skip empties.
+                    // Mirrors storeChunks' guards: recover + retry once on any non-finite vector,
+                    // then fail whole files that are still bad (next pass redoes them), skip empties.
+                    var raw = raw
+                    if raw.contains(where: { !Self.isFinite($0.embedding) }) {
+                        Self.nanReport(path, raw)
+                        if let again = retryNonFinite(path, settings: settings) { raw = again }
+                    }
                     let chunks = raw.filter { Self.isFinite($0.embedding) }
                     if chunks.count < raw.count {
                         Self.log.error("non-finite embedding, file deferred to next pass: \(path, privacy: .public)")
@@ -631,9 +689,14 @@ public final class Indexer: @unchecked Sendable {
         var tNextFid = 0
         let tWindow = textBatchSize * 6
         func acceptCompleted(_ path: String, _ raw: [IndexedChunk]) {
+            var raw = raw
+            if raw.contains(where: { !Self.isFinite($0.embedding) }) {
+                Self.nanReport(path, raw)
+                if let again = retryNonFinite(path, settings: settings) { raw = again }
+            }
             let chunks = raw.filter { Self.isFinite($0.embedding) }
-            // Transient GPU fault (some vectors non-finite): keep whatever is currently indexed
-            // and let a later pass redo the file - storing/deleting now would persist the fault.
+            // Still non-finite after recovery: keep whatever is currently indexed and let a
+            // later pass redo the file - storing/deleting now would persist the fault.
             if chunks.count < raw.count {
                 Self.log.error("non-finite embedding, update skipped: \(path, privacy: .public)")
                 return

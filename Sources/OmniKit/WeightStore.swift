@@ -78,10 +78,17 @@ public struct WeightStore {
             }
         }
 
-        // Force-evaluate only the language backbone (it was merged + upcast). The
-        // vision/audio tower weights stay lazily memory-mapped until their first
-        // image/audio embed, so launch doesn't pay for towers a text query never uses.
-        eval(w.compactMap { $0.key.hasPrefix("language_model.") ? $0.value : nil })
+        // Force-evaluate EVERY loaded tensor before any forward runs. Upstream norm (mlx-lm
+        // loads with lazy=False and evals all parameters; mlx-swift-lm ends loadWeights with
+        // eval(model)): MLX's lazy Load buffers are recycled-never-zeroed MTLBuffers filled by
+        // pread on background thread pools, and a GPU consumer racing those reads sees garbage
+        // (ml-explore/mlx#3329 is the crash-flavored sibling). Measured here: with only the
+        // language backbone force-evaluated, 4 of 12 cold processes had persistent media-tower
+        // corruption (2-37% per-embed NaN rates); the towers were exactly the tensors left to
+        // materialize lazily mid-flight. Launch pays the tower read it previously deferred to
+        // the first media embed; loadValidated's probes and recoverMediaPath() remain as the
+        // behavioral backstops.
+        eval(Array(w.values))
         self.weights = w
     }
 }

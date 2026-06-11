@@ -719,6 +719,10 @@ public final class VectorStore: @unchecked Sendable {
             } else {
                 return nil   // short/corrupt row - not a usable source
             }
+            // Never resurrect a degenerate row (e.g. a legacy fp32 row stored before the
+            // indexer's finite gates existed): rejecting here makes the caller fall through
+            // to a fresh embed instead of copying a poisoned vector forever.
+            guard vec.allSatisfy({ $0.isFinite }) else { return nil }
             out.append(IndexedChunk(path: path, modified: modified, size: Int(sqlite3_column_int64(stmt, 1)),
                                     kind: String(cString: sqlite3_column_text(stmt, 2)),
                                     chunkIndex: Int(sqlite3_column_int(stmt, 3)),
