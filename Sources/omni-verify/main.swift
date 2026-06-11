@@ -219,6 +219,103 @@ if args.count >= 2 && args[1] == "churnbench" {
     exit(try churnbenchRun(nFiles, secs))
 }
 
+// Content-dedup correctness: omni-verify dedupcheck
+// Exercises the content_keys machinery end to end with a counting embedder (no GPU): a byte-
+// identical copy indexed in a later pass must reuse stored rows (zero new embeds), a touched-but-
+// unmodified file must reuse its own rows, a real edit must re-embed, a deleted source must not
+// poison lookups (lockstep verification), and the key table must survive a store close/reopen.
+// Duplicates are introduced ACROSS passes deliberately: within one pass adjacent copies decode
+// concurrently and may both miss the table (opportunistic, not guaranteed - by design).
+final class CountingEmbedder: Embedder, @unchecked Sendable {
+    let dim = 64
+    private let inner = FastEmbedder()
+    private let lock = NSLock()
+    private var n = 0
+    var textEmbeds: Int { lock.withLock { n } }
+    func embedText(_ t: String, as type: OmniInputType) -> [Float] { lock.withLock { n += 1 }; return inner.vec(t) }
+    func embedTextBatch(_ ts: [String], as type: OmniInputType) -> [[Float]] { lock.withLock { n += ts.count }; return ts.map(inner.vec) }
+    func embedImage(_ i: CGImage) -> [Float]? { nil }
+    func embedImages(_ r: [OmniVisionPreprocess.RawPatches]) -> [[Float]]? { nil }
+    func embedVideoFrames(_ f: [CGImage]) -> [Float]? { nil }
+    func embedAudio(_ u: URL) -> [Float]? { nil }
+    func embedAudioMel(_ m: [Float], frames: Int) -> [Float]? { nil }
+    func embedAudioMelBatch(_ m: [[Float]], frames: [Int]) -> [[Float]]? { nil }
+}
+func dedupcheckRun() throws -> Int32 {
+    var fails = 0
+    func check(_ cond: Bool, _ msg: String) { print("  \(cond ? "ok  " : "FAIL") \(msg)"); if !cond { fails += 1 } }
+    var root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("omni-dedup-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+    try? FileManager.default.removeItem(at: root)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    if let rp = realpath(root.path, nil) { root = URL(fileURLWithPath: String(cString: rp), isDirectory: true); free(rp) }
+    // Long enough for multiple chunks (checks per-chunk copy: chunkIndex, locator, snippet).
+    let contentX = (0 ..< 60).map { "Line \($0): the distributed search index keeps embeddings current across folders and machines." }.joined(separator: "\n")
+    let contentY = "A completely different document about quarterly revenue and cloud growth."
+    func write(_ name: String, _ s: String) throws { try s.write(to: root.appendingPathComponent(name), atomically: true, encoding: .utf8) }
+    let dbURL = root.appendingPathComponent("index.sqlite")
+    var store = try VectorStore(dbURL: dbURL)
+    let emb = CountingEmbedder()
+    var indexer = Indexer(store: store, embedder: emb)
+    func pass() -> Bool {
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async { indexer.index(roots: [root], settings: IndexSettings()) { p in if p.done { done.signal() } } }
+        return done.wait(timeout: .now() + 60) == .success
+    }
+    print("dedupcheck  root=\(root.lastPathComponent)")
+
+    try write("a.txt", contentX); try write("c.txt", contentY)
+    guard pass() else { print("  FAIL pass1 hung"); return 1 }
+    let e1 = emb.textEmbeds
+    check(e1 > 0 && store.fileCount == 2, "pass1: baseline indexed (embeds=\(e1), files=\(store.fileCount))")
+
+    try write("b.txt", contentX)                                   // byte-identical copy, new path
+    guard pass() else { print("  FAIL pass2 hung"); return 1 }
+    check(emb.textEmbeds == e1, "copy reused stored rows, zero new embeds (\(emb.textEmbeds) vs \(e1))")
+    check(store.fileCount == 3, "copy is searchable as its own file (files=\(store.fileCount))")
+    let qv = FastEmbedder().vec(String(contentX.prefix(1800)))
+    let hitPaths = Set(store.search(qv, topK: 10).map { $0.path })
+    check(hitPaths.contains(root.appendingPathComponent("b.txt").path), "copy surfaces in search results")
+
+    // Touch: same bytes, new mtime - must reuse its OWN rows (the git-checkout/re-save case).
+    try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(30)],
+                                          ofItemAtPath: root.appendingPathComponent("b.txt").path)
+    guard pass() else { print("  FAIL pass3 hung"); return 1 }
+    check(emb.textEmbeds == e1, "touched-but-identical file reused own rows (\(emb.textEmbeds) vs \(e1))")
+
+    // Real edit must re-embed (no false dedup).
+    try write("c.txt", contentY + " Updated with a fresh paragraph that changes the content hash.")
+    guard pass() else { print("  FAIL pass4 hung"); return 1 }
+    check(emb.textEmbeds > e1, "edited file re-embedded (\(emb.textEmbeds) vs \(e1))")
+    let e2 = emb.textEmbeds
+
+    // Deleted source must not poison the table: a's chunks and key rows go; a NEW copy of the
+    // same content must hit b's row instead (or at worst re-embed - never produce bad rows).
+    try FileManager.default.removeItem(at: root.appendingPathComponent("a.txt"))
+    guard pass() else { print("  FAIL pass5 hung"); return 1 }   // reconcile removes a
+    check(store.fileCount == 2, "reconcile removed the deleted source (files=\(store.fileCount))")
+    try write("d.txt", contentX)
+    guard pass() else { print("  FAIL pass6 hung"); return 1 }
+    check(emb.textEmbeds == e2, "new copy hit the surviving duplicate's rows (\(emb.textEmbeds) vs \(e2))")
+
+    // Keys persist across sessions: reopen the store, another copy must still dedup.
+    let closeDone = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async { store.close(); closeDone.signal() }
+    check(closeDone.wait(timeout: .now() + 30) == .success, "store closed cleanly")
+    store = try VectorStore(dbURL: dbURL)
+    indexer = Indexer(store: store, embedder: emb)
+    try write("e.txt", contentX)
+    guard pass() else { print("  FAIL pass7 hung"); return 1 }
+    check(emb.textEmbeds == e2, "dedup works across store sessions (\(emb.textEmbeds) vs \(e2))")
+    check(store.fileCount == 4, "all files present after reopen (files=\(store.fileCount))")
+
+    try? FileManager.default.removeItem(at: root)
+    print("  RESULT: \(fails == 0 ? "PASS" : "FAIL (\(fails))")")
+    return fails == 0 ? 0 : 1
+}
+if args.count >= 2 && args[1] == "dedupcheck" {
+    exit(try dedupcheckRun())
+}
+
 // Search benchmark: omni-verify searchbench [N] [dim] [queries]
 // Compares brute-force cosine scoring: CPU vDSP fp32 (current), CPU cblas_sgemv fp32 (the
 // doc-claimed-but-unwired path), and GPU MLX bf16 (resident bf16 matrix, one matmul/query).
@@ -1219,6 +1316,75 @@ if args.count >= 4 && args[1] == "indexbench" {
     print(String(format: "INDEXBENCH  %d files (%d stored)  %d tok  in %.2fs  =>  %.0f files/s  %.0f tok/s",
                  emb, chunks, toks, sec, Double(emb) / sec, Double(toks) / sec))
     exit(0)
+}
+
+// Content-dedup A/B: omni-verify dedupbench <modelDir> <root>
+// Indexes <root> (all kinds, default settings) into a FRESH store and times the pass, then
+// touches every file (mtime bump, bytes unchanged - the git-checkout/re-save storm) and times a
+// second non-forced pass. Run with OMNI_CONTENT_DEDUP=0 and =1 to A/B. Pass 1 measures the
+// first-index benefit (scattered byte-duplicates hit opportunistically once their original
+// lands); pass 2 measures the touch-storm benefit (self-hits, ~every file).
+if args.count >= 4 && args[1] == "dedupbench" {
+    // loadValidated, like the app: the raw init's cold-load NaN mode would surface as spurious
+    // "failed" files (non-finite filter) and pollute the A/B.
+    let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[2]))
+    let target = URL(fileURLWithPath: args[3])
+    let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("ddb-\(UUID().uuidString).sqlite")
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    let store = try VectorStore(dbURL: tmp)
+    let idx = Indexer(store: store, embedder: engine)
+    func pass(_ label: String, force: Bool) async {
+        let t0 = Date()
+        let tok0 = engine.tokensProcessed
+        let final: IndexProgress = await withCheckedContinuation { cont in
+            let done = NSLock(); var fired = false
+            idx.index(roots: [target], settings: IndexSettings(), force: force) { p in
+                if p.done { done.lock(); let go = !fired; fired = true; done.unlock(); if go { cont.resume(returning: p) } }
+            }
+        }
+        print(String(format: "DEDUPBENCH %@  %.2fs  embedded=%d skipped=%d unchanged=%d failed=%d  gpuTokens=%d  (dedup=%@)",
+                     label, -t0.timeIntervalSinceNow, final.embedded, final.skipped, final.unchanged, final.failed,
+                     engine.tokensProcessed - tok0, Indexer.contentDedup ? "on" : "off"))
+    }
+    await pass("fresh ", force: true)
+    // Touch storm: bump every file's mtime without changing a byte (sync helper: enumerator
+    // iteration is unavailable in async contexts).
+    func touchAll(_ target: URL) -> Int {
+        let fm = FileManager.default
+        var touched = 0
+        guard let en = fm.enumerator(at: target, includingPropertiesForKeys: nil) else { return 0 }
+        for case let u as URL in en where (try? u.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
+            try? fm.setAttributes([.modificationDate: Date()], ofItemAtPath: u.path)
+            touched += 1
+        }
+        return touched
+    }
+    print("touched \(touchAll(target)) files (mtime bump, content unchanged)")
+    await pass("touch ", force: false)
+    exit(0)
+}
+
+// Idle-trim check: omni-verify trimcheck <modelDir>
+// Verifies the debounced GPU buffer-cache trim end to end in-process: run an embed burst, arm
+// indexingIdle() (OMNI_IDLE_TRIM seconds, set it small, e.g. 2), and watch MLX cache memory drop
+// once the machine goes quiet. Prints cache/active bytes before and after.
+if args.count >= 3 && args[1] == "trimcheck" {
+    let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    let sentence = "The quarterly revenue report shows strong cloud growth across European regions. "
+    let batches = (0 ..< 12).map { k in (0 ..< 16).map { String(repeating: sentence, count: ($0 + k) % 10 + 1) } }
+    _ = engine.embedTextBatches(batches, as: .passage)
+    let cacheBefore = MLX.Memory.cacheMemory
+    print(String(format: "post-burst:  cache %.0f MB  active %.0f MB", Double(cacheBefore) / 1_048_576, Double(MLX.GPU.activeMemory) / 1_048_576))
+    engine.indexingIdle()
+    let delay = ProcessInfo.processInfo.environment["OMNI_IDLE_TRIM"].flatMap { Double($0) } ?? 60
+    let deadline = Date().addingTimeInterval(delay * 3 + 5)
+    while MLX.Memory.cacheMemory == cacheBefore && Date() < deadline {
+        try await Task.sleep(nanoseconds: 200_000_000)
+    }
+    let cacheAfter = MLX.Memory.cacheMemory
+    print(String(format: "after trim:  cache %.0f MB  active %.0f MB", Double(cacheAfter) / 1_048_576, Double(MLX.GPU.activeMemory) / 1_048_576))
+    print("RESULT: \(cacheAfter < cacheBefore ? "PASS (trim fired)" : "FAIL (no trim within window)")")
+    exit(cacheAfter < cacheBefore ? 0 : 1)
 }
 
 // Skip diagnostic: omni-verify idxstat <modelDir> <folder> - index with .profiling settings (force),

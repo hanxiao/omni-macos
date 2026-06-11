@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import CryptoKit
 import PDFKit
 import os
 
@@ -30,11 +31,17 @@ public protocol Embedder: AnyObject {
     /// Batch-N audio: embed several precomputed mels in one tower + backbone forward
     /// (output order matches input). Nil if the audio path is unavailable.
     func embedAudioMelBatch(_ mels: [[Float]], frames: [Int]) -> [[Float]]?
+    /// Indexing finished a pass / reconcile batch. The engine may use this to reclaim GPU
+    /// resources (buffer-cache trim) once the machine goes quiet. Default: no-op.
+    func indexingIdle()
 }
 
 public extension Embedder {
     /// Default: not search-aware (test doubles, simple conformances). OmniEngine overrides.
     var interactiveQueryActive: Bool { false }
+
+    /// Default: nothing to reclaim. OmniEngine overrides with a debounced buffer-cache trim.
+    func indexingIdle() {}
 
     /// Default: no pipelining, just embed each batch in turn. Conformances that support the
     /// async double-buffer (OmniEngine) override this.
@@ -100,7 +107,8 @@ final class DecodedItem: @unchecked Sendable {
     // decode (a long scan's bitmaps would blow the pipeline's byte budget); the embed stage
     // streams them in small groups instead, so every page of any-length scan gets indexed.
     enum Payload { case empty, text([TextPiece]), images([CGImage]), imagePatches([OmniVisionPreprocess.RawPatches]), audioMel([Float], Int),
-                   pdfScan(pageCount: Int, maxDimension: Int) }
+                   pdfScan(pageCount: Int, maxDimension: Int),
+                   duplicate([IndexedChunk]) }   // content-dedup hit: rows ready to store, no embed needed
     let file: CrawledFile
     let kind: String
     let payload: Payload
@@ -110,10 +118,14 @@ final class DecodedItem: @unchecked Sendable {
     // header is often already being read for the threshold checks - the serial embed stage must not
     // re-open the file (an AVURLAsset header parse per audio file was a measurable stall there).
     let meta: (width: Int, height: Int, duration: Double)
+    /// Content key (hash of embedding-relevant bytes + preprocess settings), computed during
+    /// decode. Recorded in the store once the file's chunks land, so identical content found
+    /// later (a copy, a move, a touched-but-unmodified file) reuses them instead of re-embedding.
+    let contentKey: String?
     init(file: CrawledFile, kind: String = "", payload: Payload = .empty, unchanged: Bool = false, abandoned: Bool = false,
-         meta: (width: Int, height: Int, duration: Double) = (0, 0, 0)) {
+         meta: (width: Int, height: Int, duration: Double) = (0, 0, 0), contentKey: String? = nil) {
         self.file = file; self.kind = kind; self.payload = payload; self.unchanged = unchanged; self.abandoned = abandoned
-        self.meta = meta
+        self.meta = meta; self.contentKey = contentKey
     }
 }
 
@@ -132,6 +144,14 @@ public final class Indexer: @unchecked Sendable {
     private let embedder: Embedder
     private let queue = DispatchQueue(label: "omni.indexer")
     private var cancelled = false
+
+    // Content dedup: identical bytes never embed twice. OMNI_CONTENT_DEDUP=0 disables (A/B).
+    public static let contentDedup = ProcessInfo.processInfo.environment["OMNI_CONTENT_DEDUP"] != "0"
+    private let dedupLock = NSLock()
+    private var _dedupHits = 0
+    private func noteDedupHit() { dedupLock.withLock { _dedupHits += 1 } }
+    /// Dedup hits since the last call (concurrent decode threads increment).
+    private func takeDedupHits() -> Int { dedupLock.withLock { let n = _dedupHits; _dedupHits = 0; return n } }
 
     // Text chunking. maxCharsPerChunk now comes per-pass from IndexSettings (user-set).
     // There is deliberately NO per-file chunk-count cap: the only bound on text coverage is
@@ -351,6 +371,10 @@ public final class Indexer: @unchecked Sendable {
                         acc[fid] = (item.file, item.kind, pieces.count, [])
                         for (j, piece) in pieces.enumerated() { buf.append((fid, j, piece.text, self.snippet(piece.text), piece.locator)) }
                         if buf.count >= textStageWindow { flushText(drainAll: false) }
+                    case .duplicate(let chunks):
+                        // Content-dedup hit: rows are ready, join the batched store directly.
+                        stageStore(path, chunks)
+                        if stagedStores.count >= 256 { flushStagedStores() }
                     case .images, .imagePatches, .pdfScan:
                         storeChunks(path, self.embed(item))   // scanned PDF (streamed) / image pages (batched)
                     default:
@@ -389,6 +413,7 @@ public final class Indexer: @unchecked Sendable {
                     let path = item.file.url.path
                     defer { tick(path) }
                     if item.unchanged { p.unchanged += 1; return }
+                    if case .duplicate(let chunks) = item.payload { storeChunks(path, chunks); return }
                     guard case .audioMel(let mel, let frames) = item.payload else { p.skipped += 1; return }
                     // Flush before adding if this clip would exceed the budget (but never
                     // split a single clip; a clip larger than the budget embeds alone).
@@ -514,6 +539,9 @@ public final class Indexer: @unchecked Sendable {
                 Self.log.error("reconcile: \(blindRoots.count, privacy: .public) root(s) crawled empty; skipped deletion (likely no file-access permission)")
             }
         }
+        let dedupHits = takeDedupHits()
+        if dedupHits > 0 { Self.log.info("content dedup: \(dedupHits, privacy: .public) file(s) reused stored vectors") }
+        embedder.indexingIdle()   // arm the debounced GPU buffer-cache trim
         p.done = true
         p.cancelled = wasCancelled
         onProgress(p)
@@ -695,6 +723,9 @@ public final class Indexer: @unchecked Sendable {
         for (_, a) in tAcc where a.done.count == a.total { acceptCompleted(a.path, a.done) }
         if !toDelete.isEmpty { store.deletePaths(toDelete) }
         flushReplace()
+        let dedupHits = takeDedupHits()
+        if dedupHits > 0 { Self.log.info("content dedup (update): \(dedupHits, privacy: .public) file(s) reused stored vectors") }
+        embedder.indexingIdle()   // arm the debounced GPU buffer-cache trim
     }
 
     // MARK: - Pipeline
@@ -753,6 +784,11 @@ public final class Indexer: @unchecked Sendable {
             }
         }
 
+        // Content keys recorded for every consumed item, batched into one txn per flush. Recording
+        // is decoupled from store success on purpose: a key row whose chunks never landed (or
+        // landed under a different mtime) fails duplicateChunks' lockstep check, so over-recording
+        // can never leak wrong vectors - it is just an unused row until the file re-embeds.
+        var keyBuf: [(path: String, key: String, modified: Double, size: Int)] = []
         for i in 0 ..< files.count {
             cond.lock()
             while ready.items[i] == nil { cond.wait() }
@@ -763,7 +799,16 @@ public final class Indexer: @unchecked Sendable {
             sem.signal()
             if item.abandoned { continue }   // paused: don't consume/count files left unprocessed
             consume(item)
+            if let ck = item.contentKey {
+                keyBuf.append((item.file.url.path, ck, item.file.modified, item.file.size))
+                // Flush eagerly (small rows, one txn): keys must be VISIBLE for later files in the
+                // same pass to dedup against - a media phase is often well under a few hundred
+                // items, so a lazy flush would publish keys only after every duplicate already
+                // decoded, forfeiting all within-pass hits.
+                if keyBuf.count >= 64 { store.recordContentKeys(keyBuf); keyBuf.removeAll(keepingCapacity: true) }
+            }
         }
+        store.recordContentKeys(keyBuf)
     }
 
     /// Cheap (extension-only, no IO) upper estimate of a file's decoded resident bytes, for the
@@ -819,13 +864,31 @@ public final class Indexer: @unchecked Sendable {
             break
         }
 
+        // Content dedup: if the store already holds the chunks for these exact bytes (same
+        // preprocess settings, same model), reuse them - no decode, no GPU forward. Measured on
+        // a real home-folder corpus: 16% of images, 9% of audio, 8% of video and 6% of text
+        // files are byte-level duplicates of an already-indexed file; a touched-but-identical
+        // file (git checkout, re-save without changes) otherwise re-embeds for nothing. The key
+        // is recorded once the file's chunks land (see pipeline()), and reuse is exact by
+        // construction: same input bytes + same settings produce the same vectors, so copying
+        // the stored rows is the embedding, minus the work.
+        var contentKey: String? = nil
+        if Self.contentDedup {
+            contentKey = self.contentKey(file, category: category, settings: settings)
+            if let ck = contentKey, let src = store.duplicateChunks(key: ck) {
+                noteDedupHit()
+                return DecodedItem(file: file, kind: kind, payload: .duplicate(Self.rewrite(src, to: file)),
+                                   meta: meta, contentKey: ck)
+            }
+        }
+
         if category == .video {
             let frames = FileExtractor.videoFrames(file.url, maxFrames: settings.maxVideoFrames, maxDimension: settings.maxImageDimension)
-            return frames.isEmpty ? DecodedItem(file: file) : DecodedItem(file: file, kind: kind, payload: .images(frames), meta: meta)
+            return frames.isEmpty ? DecodedItem(file: file) : DecodedItem(file: file, kind: kind, payload: .images(frames), meta: meta, contentKey: contentKey)
         }
         if category == .audio {
             guard let (mel, frames) = OmniAudioPreprocess.melFeatures(url: file.url) else { return DecodedItem(file: file) }
-            return DecodedItem(file: file, kind: kind, payload: .audioMel(mel, frames), meta: meta)
+            return DecodedItem(file: file, kind: kind, payload: .audioMel(mel, frames), meta: meta, contentKey: contentKey)
         }
         let content = (try? FileExtractor.extract(file.url, maxImageDimension: settings.maxImageDimension, maxVideoFrames: settings.maxVideoFrames)) ?? .empty
         switch content {
@@ -837,19 +900,67 @@ public final class Indexer: @unchecked Sendable {
             // office doc's converted string are meaningless to the user.
             let ext = file.url.pathExtension.lowercased()
             let origin: TextOrigin = FileExtractor.textExtensions.contains(ext) ? .plain : .opaque
-            return DecodedItem(file: file, kind: kind, payload: .text(chunk(text, settings: settings, origin: origin)))
+            return DecodedItem(file: file, kind: kind, payload: .text(chunk(text, settings: settings, origin: origin)), contentKey: contentKey)
         case .pagedText(let text, let pageStarts):
             if settings.minTextChars > 0, text.count < settings.minTextChars { return DecodedItem(file: file) }
-            return DecodedItem(file: file, kind: kind, payload: .text(chunk(text, settings: settings, origin: .paged(pageStarts))))
+            return DecodedItem(file: file, kind: kind, payload: .text(chunk(text, settings: settings, origin: .paged(pageStarts))), contentKey: contentKey)
         case .scannedPDF(let pageCount):
             return DecodedItem(file: file, kind: kind,
-                               payload: .pdfScan(pageCount: pageCount, maxDimension: settings.maxImageDimension), meta: meta)
+                               payload: .pdfScan(pageCount: pageCount, maxDimension: settings.maxImageDimension), meta: meta, contentKey: contentKey)
         case .images(let images):
             if images.isEmpty { return DecodedItem(file: file) }
             // Still images: run the CPU preprocess (resize + parallel patchify) HERE, in the
             // concurrent decode stage, so the serialized GPU thread only does the tower.
             let raws = images.map { OmniVisionPreprocess.preprocessRaw($0) }
-            return DecodedItem(file: file, kind: kind, payload: .imagePatches(raws), meta: meta)
+            return DecodedItem(file: file, kind: kind, payload: .imagePatches(raws), meta: meta, contentKey: contentKey)
+        }
+    }
+
+    /// Content key of a file: SHA-256 over the bytes that determine its embedding, qualified by
+    /// every setting that changes the vectors for those bytes (and the model dimension). Plain
+    /// text extraction truncates at FileExtractor.maxTextBytes, so the hash caps there for those
+    /// extensions - exact, because chunks can only depend on bytes extract() actually reads.
+    /// The extension is included so equal bytes under different parsers never alias. Nil on read
+    /// failure (no dedup; the normal path decides what to do with the file).
+    private func contentKey(_ file: CrawledFile, category: FileKind, settings: IndexSettings) -> String? {
+        let ext = file.url.pathExtension.lowercased()
+        let cap = (category == .text && FileExtractor.textExtensions.contains(ext)) ? FileExtractor.maxTextBytes : Int.max
+        guard let digest = Self.sha256(file.url, cap: cap) else { return nil }
+        let fp: String
+        switch category {
+        case .text:  fp = "c\(settings.maxCharsPerChunk)|o\(chunkOverlap)|d\(settings.maxImageDimension)"   // d: scanned-PDF render size
+        case .image: fp = "d\(settings.maxImageDimension)"
+        case .video: fp = "d\(settings.maxImageDimension)|f\(settings.maxVideoFrames)"
+        case .audio: fp = ""
+        }
+        return "1|\(category.rawValue)|\(ext)|m\(embedder.dim)|\(fp)|\(digest)"
+    }
+
+    /// Streaming SHA-256 of a file's first `cap` bytes (whole file when cap covers it).
+    private static func sha256(_ url: URL, cap: Int) -> String? {
+        guard let h = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? h.close() }
+        var hasher = SHA256()
+        var remaining = cap
+        while remaining > 0 {
+            let want = Swift.min(1 << 20, remaining)
+            guard let data = try? h.read(upToCount: want), !data.isEmpty else { break }
+            hasher.update(data: data)
+            remaining -= data.count
+            if data.count < want { break }
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Rewrite a duplicate source's rows for this file: same vectors, snippets and locators, new
+    /// path/mtime/size. Media rows use the filename as their snippet - swap in ours.
+    private static func rewrite(_ src: [IndexedChunk], to file: CrawledFile) -> [IndexedChunk] {
+        let srcName = (src.first?.path as NSString?)?.lastPathComponent
+        return src.map { c in
+            var n = c
+            n.path = file.url.path; n.modified = file.modified; n.size = file.size
+            if c.snippet == srcName { n.snippet = file.url.lastPathComponent }
+            return n
         }
     }
 
@@ -865,6 +976,8 @@ public final class Indexer: @unchecked Sendable {
         switch item.payload {
         case .empty:
             return []
+        case .duplicate(let chunks):
+            return chunks   // content-dedup hit: source rows already rewritten for this file
         case .text(let pieces):
             var out: [IndexedChunk] = []
             var i = 0

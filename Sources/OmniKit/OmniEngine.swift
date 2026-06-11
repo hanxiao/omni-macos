@@ -205,6 +205,9 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             engine = try await OmniEngine(modelDir: modelDir, gpuCacheBytes: gpuCacheBytes, keepVision: keepVision, keepAudio: keepAudio)
             attempt += 1
         }
+        // Flush load-time temporaries (dequant scratch, self-test activations, and on a retry the
+        // discarded first engine's buffers) from the buffer cache before steady state.
+        MLX.GPU.clearCache()
         return engine
     }
 
@@ -262,8 +265,47 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         if highPriority { highWaiting -= 1 }
         cond.unlock()
         let result = work()
+        trimLock.withLock { lastGPUWork = Date() }
         cond.lock(); busy = false; cond.broadcast(); cond.unlock()
         return result
+    }
+
+    // MARK: - GPU buffer-cache trim at idle
+
+    // MLX's buffer cache keeps freed Metal buffers for reuse, up to cacheLimit (half the user's
+    // memory cap). That is right for sustained indexing, but between passes those buffers are
+    // dead weight in the app's footprint while it sits idle in the menu bar. The indexer signals
+    // end-of-pass via indexingIdle(); after a debounce with no further GPU work the cache is
+    // returned to the OS. The next burst re-allocates from Metal, which is invisible against a
+    // pass. OMNI_IDLE_TRIM=0 disables; a numeric value overrides the delay (seconds).
+    private let trimLock = NSLock()
+    private var trimGen: UInt64 = 0
+    private var lastGPUWork = Date.distantPast   // stamped at every run() exit
+    private static let idleTrimDelay: TimeInterval? = {
+        let env = ProcessInfo.processInfo.environment["OMNI_IDLE_TRIM"]
+        if env == "0" { return nil }
+        return env.flatMap { Double($0) } ?? 60
+    }()
+
+    public func indexingIdle() {
+        guard let delay = Self.idleTrimDelay else { return }
+        let gen: UInt64 = trimLock.withLock { trimGen += 1; return trimGen }
+        scheduleTrim(gen: gen, delay: delay)
+    }
+
+    private func scheduleTrim(gen: UInt64, delay: TimeInterval) {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            guard self.trimLock.withLock({ self.trimGen == gen }) else { return }   // superseded by newer signal
+            let idle = self.trimLock.withLock { -self.lastGPUWork.timeIntervalSinceNow }
+            if idle >= delay * 0.5 {
+                // Only frees FREE (cached) buffers - a concurrent forward's live arrays are
+                // untouched; its next allocations just miss the cache once.
+                MLX.GPU.clearCache()
+            } else {
+                self.scheduleTrim(gen: gen, delay: delay)   // GPU active again - check back later
+            }
+        }
     }
 
     /// Run low-priority GPU work behind the same gate as indexing, so an interactive query

@@ -124,6 +124,11 @@ clips under a frame budget. Live updates from the file watcher go through the sa
 batched path as a full pass. MLX calls are serialized through a priority gate and the
 batch size adapts while you type, so search stays responsive during indexing.
 
+Identical bytes never embed twice: a content hash maps copies, moves, and
+touched-but-unmodified files (a git checkout, a re-save) to their already-stored
+vectors. A touch storm that used to re-embed everything now completes in well under
+a second.
+
 ### Storing
 
 SQLite is the durable store: file metadata plus bf16 vectors (2 bytes per dimension,
