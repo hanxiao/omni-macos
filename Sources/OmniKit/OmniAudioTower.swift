@@ -108,22 +108,31 @@ public final class OmniAudioTower: @unchecked Sendable {
 
         // --- Build the padded [numChunks, windowSize, C] tensor + pad mask.
         // features_tc = input_features.T -> [total_frames, C] (frame-major).
-        let featuresTC = inputFeatures.transposed(1, 0)   // [total_frames, C]
-        var padded = MLXArray.zeros([numChunks, windowSize, C], dtype: featuresTC.dtype)
-        var maskRows: [MLXArray] = []
+        // Build the padded windows and the pad mask as SINGLE host buffers + one MLXArray each,
+        // instead of numChunks GPU scatter-assignments plus numChunks tiny mask arrays + a concat
+        // (~2 kernels per chunk; a minute of audio is ~30 chunks). The mel features are already
+        // host-resident [Float] upstream, so this also skips the GPU-side transpose + slicing:
+        // featuresTC[r][c] = inputFeatures[c * totalFrames + r] read directly during the copy.
+        // Identical layout and values.
+        let totalFrames = inputFeatures.dim(1)
+        let mel = inputFeatures.asArray(Float.self)            // [C, total_frames] flattened
+        var padBuf = [Float](repeating: 0, count: numChunks * windowSize * C)
+        var maskBuf = [Float](repeating: 0, count: numChunks * windowSize)
         var offset = 0
-        for (i, L) in chunkLengths.enumerated() {
-            if L > 0 {
-                let seg = featuresTC[offset ..< (offset + L), 0...]   // [L, C]
-                padded[i, 0 ..< L, 0...] = seg
+        padBuf.withUnsafeMutableBufferPointer { pb in
+            for (i, L) in chunkLengths.enumerated() {
+                let chunkBase = i * windowSize * C
+                for r in 0 ..< L {
+                    let frame = offset + r
+                    let rowBase = chunkBase + r * C
+                    for c in 0 ..< C { pb[rowBase + c] = mel[c * totalFrames + frame] }
+                }
+                for j in 0 ..< L { maskBuf[i * windowSize + j] = 1 }
+                offset += L
             }
-            // Pad mask row: 1 for valid frames, 0 for padding, length windowSize.
-            var row = [Float](repeating: 0, count: windowSize)
-            for j in 0 ..< L { row[j] = 1 }
-            maskRows.append(MLXArray(row).reshaped([1, windowSize]))
-            offset += L
         }
-        let padMask = MLX.concatenated(maskRows, axis: 0)   // [numChunks, windowSize]
+        let padded = MLXArray(padBuf, [numChunks, windowSize, C])
+        let padMask = MLXArray(maskBuf, [numChunks, windowSize])   // [numChunks, windowSize]
 
         // --- Conv frontend (channels-last [N, H, C_in], weights [C_out, kernel, C_in]).
         // conv1: mel(128) -> d_model(1280), k3 s1 p1 ; GELU ; zero out padded frames.
