@@ -6,6 +6,9 @@ import os
 /// What the indexer needs from the embedding engine. OmniEngine conforms.
 public protocol Embedder: AnyObject {
     var dim: Int { get }
+    /// True while the user is actively running interactive searches. The indexer shrinks its
+    /// per-forward batch so a query's GPU work waits behind a short command buffer, not a full one.
+    var interactiveQueryActive: Bool { get }
     func embedText(_ text: String, as type: OmniInputType) -> [Float]
     /// Embed several texts in one batched forward pass (output order matches input).
     func embedTextBatch(_ texts: [String], as type: OmniInputType) -> [[Float]]
@@ -30,6 +33,9 @@ public protocol Embedder: AnyObject {
 }
 
 public extension Embedder {
+    /// Default: not search-aware (test doubles, simple conformances). OmniEngine overrides.
+    var interactiveQueryActive: Bool { false }
+
     /// Default: no pipelining, just embed each batch in turn. Conformances that support the
     /// async double-buffer (OmniEngine) override this.
     func embedTextBatches(_ batches: [[String]], as type: OmniInputType) -> [[[Float]]] {
@@ -145,6 +151,9 @@ public final class Indexer: @unchecked Sendable {
     // less padding). 16 is the responsiveness sweet spot; vectors are identical (length-bucketing
     // reassembles each file's chunks the same regardless of batch). OMNI_TEXT_BATCH overrides.
     public var textBatchSize = (ProcessInfo.processInfo.environment["OMNI_TEXT_BATCH"].flatMap { Int($0) }) ?? 16
+    /// Per-forward bucket size used while an interactive query is active (see flushText). Small =
+    /// short GPU command buffers = low query latency during typing.
+    static let searchCarve = (ProcessInfo.processInfo.environment["OMNI_SEARCH_CARVE"].flatMap { Int($0) }) ?? 4
 
     // Audio batch-N: cap clips per tower+backbone forward by a TOTAL-FRAME budget so peak
     // VRAM is bounded (the backbone forward is O(B*Lmax^2); Lmax grows ~frames/4). A clip
@@ -272,9 +281,15 @@ public final class Indexer: @unchecked Sendable {
                     // embedTextBatches in one serialized call. With OMNI_ASYNC_EVAL=1 that double-
                     // buffers batch K+1's GPU forward over batch K's host readout; otherwise it is a
                     // plain per-batch loop. Same vectors either way (just scheduling).
+                    // While the user is actively searching, carve into smaller buckets so each GPU
+                    // forward is a short command buffer an interactive query's matmul can slip behind
+                    // quickly (per the latency/throughput sweep, ~4/forward cuts query wait ~4x at a
+                    // throughput cost that only applies during the ~2s of active typing). Full
+                    // textBatchSize buckets otherwise, for peak indexing throughput.
+                    let carve = embedder.interactiveQueryActive ? Swift.min(textBatchSize, Self.searchCarve) : textBatchSize
                     var groups: [[(fid: Int, idx: Int, text: String, snippet: String, locator: String)]] = []
                     while buf.count > floor {
-                        let take = Swift.min(textBatchSize, buf.count)
+                        let take = Swift.min(carve, buf.count)
                         groups.append(Array(buf.prefix(take))); buf.removeFirst(take)
                     }
                     if groups.isEmpty { return }

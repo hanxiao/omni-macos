@@ -771,7 +771,9 @@ public final class VectorStore: @unchecked Sendable {
     /// search stays under the lock; the wins are the base+delta (no per-query rebuild) and the
     /// numeric reduceTopK (no per-row path-string hashing).
     public func search(_ query: [Float], filter: SearchFilter = SearchFilter(), topK: Int = 40) -> [SearchHit] {
-        queue.sync {
+        let tCall = Self.searchTiming ? Date() : nil
+        return queue.sync {
+            if let tCall { print(String(format: "[search] lockwait=%.1fms", -tCall.timeIntervalSinceNow * 1000)) }
             let n = rows.count
             guard n > 0, dim > 0, query.count == dim, flat16.count == n * dim else { return [] }
             if baseDirty || mlxBase == nil || (n - baseRows) > Self.foldThreshold {
