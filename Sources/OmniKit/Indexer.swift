@@ -403,6 +403,55 @@ public final class Indexer: @unchecked Sendable {
                     }
                 }
                 flushAudio()   // drain the remaining staged clips
+            } else if kind == .image {
+                // Cross-file IMAGE batching: still images decode to ONE RawPatches each, so the
+                // per-file embed() path fed the block-diagonal batch-N tower a single image at a
+                // time (~batch-1 throughput). Stage raws across files and embed a group in ONE
+                // embedImages call (the encoder still chunks internally by its patch budget, so
+                // peak VRAM is bounded exactly as before). Vectors come back in input order and
+                // scatter back per file; per-image values are identical (the tower is block-
+                // diagonal per image regardless of grouping - the imgbatchparity gate proves it).
+                var stage: [(file: CrawledFile, kind: String, raws: [OmniVisionPreprocess.RawPatches],
+                             meta: (width: Int, height: Int, duration: Double))] = []
+                var stagedRaws = 0
+                func flushImages() {
+                    guard !stage.isEmpty else { return }
+                    let batch = stage; stage = []; stagedRaws = 0
+                    let allRaws = batch.flatMap { $0.raws }
+                    guard let vecs = self.embedder.embedImages(allRaws), vecs.count == allRaws.count else {
+                        for b in batch { storeChunks(b.file.url.path, []) }   // vision unavailable/fault
+                        return
+                    }
+                    if self.isCancelled { return }   // mid-batch pause: nothing stored, files redo next pass
+                    var off = 0
+                    for b in batch {
+                        var out: [IndexedChunk] = []
+                        for (i, vec) in vecs[off ..< (off + b.raws.count)].enumerated() {
+                            out.append(IndexedChunk(path: b.file.url.path, modified: b.file.modified, size: b.file.size,
+                                                    kind: b.kind, chunkIndex: i, snippet: b.file.url.lastPathComponent,
+                                                    embedding: vec,
+                                                    width: b.raws.count == 1 ? b.meta.width : 0,
+                                                    height: b.raws.count == 1 ? b.meta.height : 0,
+                                                    locator: b.raws.count > 1 ? "Page \(i + 1)" : ""))
+                        }
+                        storeChunks(b.file.url.path, out)
+                        off += b.raws.count
+                    }
+                    onProgress(p)
+                }
+                pipeline(files, force: force, known: known, settings: settings) { item in
+                    let path = item.file.url.path
+                    defer { tick(path) }
+                    if item.unchanged { p.unchanged += 1; return }
+                    guard case .imagePatches(let raws) = item.payload, !raws.isEmpty else {
+                        // Anything that did not decode to patches keeps the per-file path.
+                        storeChunks(path, self.embed(item)); return
+                    }
+                    stage.append((item.file, item.kind, raws, item.meta))
+                    stagedRaws += raws.count
+                    if stagedRaws >= 16 { flushImages() }
+                }
+                flushImages()
             } else {
                 pipeline(files, force: force, known: known, settings: settings) { item in
                     if item.unchanged { p.unchanged += 1 } else { storeChunks(item.file.url.path, self.embed(item)) }
@@ -593,6 +642,34 @@ public final class Indexer: @unchecked Sendable {
                 }
             }
         }
+        // Cross-file IMAGE staging for live updates, mirroring the full pass: still images are one
+        // RawPatches each, so per-file embedding fed the batch-N tower one image at a time.
+        var iStage: [(file: CrawledFile, kind: String, raws: [OmniVisionPreprocess.RawPatches],
+                      meta: (width: Int, height: Int, duration: Double))] = []
+        var iStagedRaws = 0
+        func flushImagesU() {
+            guard !iStage.isEmpty else { return }
+            let batch = iStage; iStage = []; iStagedRaws = 0
+            let allRaws = batch.flatMap { $0.raws }
+            guard let vecs = self.embedder.embedImages(allRaws), vecs.count == allRaws.count else {
+                for b in batch { acceptCompleted(b.file.url.path, []) }
+                return
+            }
+            var off = 0
+            for b in batch {
+                var out: [IndexedChunk] = []
+                for (i, vec) in vecs[off ..< (off + b.raws.count)].enumerated() {
+                    out.append(IndexedChunk(path: b.file.url.path, modified: b.file.modified, size: b.file.size,
+                                            kind: b.kind, chunkIndex: i, snippet: b.file.url.lastPathComponent,
+                                            embedding: vec,
+                                            width: b.raws.count == 1 ? b.meta.width : 0,
+                                            height: b.raws.count == 1 ? b.meta.height : 0,
+                                            locator: b.raws.count > 1 ? "Page \(i + 1)" : ""))
+                }
+                acceptCompleted(b.file.url.path, out)
+                off += b.raws.count
+            }
+        }
         pipeline(work, force: true, known: [:], settings: settings) { item in
             let path = item.file.url.path
             switch item.payload {
@@ -603,11 +680,16 @@ public final class Indexer: @unchecked Sendable {
                     tBuf.append((fid, j, piece.text, self.snippet(piece.text), piece.locator))
                 }
                 if tBuf.count >= tWindow { flushTextU(drainAll: false) }
+            case .imagePatches(let raws) where !raws.isEmpty:
+                iStage.append((item.file, item.kind, raws, item.meta))
+                iStagedRaws += raws.count
+                if iStagedRaws >= 16 { flushImagesU() }
             default:
                 acceptCompleted(path, self.embed(item))
             }
         }
         flushTextU(drainAll: true)
+        flushImagesU()
         // Stragglers are INCOMPLETE files (a cancel interrupted their window) - storing a partial
         // chunk set would permanently truncate the file under its current mtime, so never store them.
         for (_, a) in tAcc where a.done.count == a.total { acceptCompleted(a.path, a.done) }
