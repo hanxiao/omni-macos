@@ -117,6 +117,128 @@ public struct SearchFilter: Sendable {
 
 /// SQLite-backed store of L2-normalized embeddings with brute-force cosine search.
 /// Vectors are mirrored in one contiguous Float buffer and scored with a single
+
+/// The store's bf16 vector bytes: a heap Array by default, or - in the quantized low-end mode - a
+/// PAGEABLE region backed by an UNLINKED scratch file. Anonymous (heap) memory under pressure must
+/// be compressed or swapped; clean file-backed pages are simply dropped and re-read (the OS pages
+/// the cold base out for free on an 8GB machine, and the hot subset - rerank gathers, one file's
+/// chunks - stays resident). The scratch file is created, mapped MAP_SHARED, and immediately
+/// unlinked: no persistence semantics, no stale-file management, disk space auto-reclaimed by the
+/// kernel even on a crash. The mapping reserves extra virtual space so appends land in the
+/// anonymous tail after the file region and IN-PLACE COMPACTION (the forward memmove) works through
+/// the mapping unchanged - all existing correctness invariants hold byte-for-byte. If the
+/// reservation is ever exhausted (or anything fails), it falls back to heap mode - heap is always
+/// correct, mapped is an optimization.
+final class Vec16Buffer {
+    private var heap: [UInt16] = []
+    private var base: UnsafeMutableRawPointer? = nil   // reservation start (mmap mode)
+    private var reserveBytes = 0
+    private(set) var count = 0                          // logical UInt16 element count
+    var isMapped: Bool { base != nil }
+
+    var capacityElements: Int { isMapped ? reserveBytes / 2 : heap.capacity }
+
+    func reserveCapacity(_ n: Int) { if !isMapped { heap.reserveCapacity(n) } }
+
+    func append(contentsOf src: [UInt16]) {
+        if let base {
+            if (count + src.count) * 2 > reserveBytes { fallbackToHeap() ; heap.append(contentsOf: src); count = heap.count; return }
+            src.withUnsafeBufferPointer { sp in
+                guard let s = sp.baseAddress else { return }
+                memcpy(base.advanced(by: count * 2), s, src.count * 2)
+            }
+            count += src.count
+        } else {
+            heap.append(contentsOf: src); count = heap.count
+        }
+    }
+
+    func append<S: Sequence>(contentsOf src: S) where S.Element == UInt16 {
+        append(contentsOf: Array(src))
+    }
+
+    func removeLast(_ k: Int) {
+        if isMapped { count -= k } else { heap.removeLast(k); count = heap.count }
+    }
+
+    func removeAll() {
+        if let base { munmap(base, reserveBytes); self.base = nil; reserveBytes = 0 }
+        heap.removeAll(); count = 0
+    }
+    /// Release capacity too (the wipe path).
+    func releaseAll() {
+        if let base { munmap(base, reserveBytes); self.base = nil; reserveBytes = 0 }
+        heap = []; count = 0
+    }
+
+    func withUnsafeBufferPointer<R>(_ body: (UnsafeBufferPointer<UInt16>) throws -> R) rethrows -> R {
+        if let base {
+            return try body(UnsafeBufferPointer(start: base.assumingMemoryBound(to: UInt16.self), count: count))
+        }
+        return try heap.withUnsafeBufferPointer(body)
+    }
+
+    func withUnsafeMutableBufferPointer<R>(_ body: (inout UnsafeMutableBufferPointer<UInt16>) throws -> R) rethrows -> R {
+        if let base {
+            var bp = UnsafeMutableBufferPointer(start: base.assumingMemoryBound(to: UInt16.self), count: count)
+            return try body(&bp)
+        }
+        return try heap.withUnsafeMutableBufferPointer(body)
+    }
+
+    func withUnsafeBytes<R>(_ body: (UnsafeRawBufferPointer) throws -> R) rethrows -> R {
+        if let base {
+            return try body(UnsafeRawBufferPointer(start: base, count: count * 2))
+        }
+        return try heap.withUnsafeBytes(body)
+    }
+
+    /// Move the CURRENT bytes into a fresh unlinked scratch file mapping (or rewrite the existing
+    /// one - called at quant-mode activation and at each fold, when the logical bytes are settled).
+    /// `tailSlackElements` sizes the anonymous append tail (the delta between folds). Any failure
+    /// leaves the buffer in (correct) heap mode.
+    func mapToScratch(dir: URL, tailSlackElements: Int) {
+        let pageSize = Int(getpagesize())
+        let dataBytes = count * 2
+        let fileBytes = max(pageSize, (dataBytes + pageSize - 1) / pageSize * pageSize)
+        let newReserve = fileBytes + max(64 << 20, tailSlackElements * 2)
+        let path = dir.appendingPathComponent(".omni-vec-scratch-\(getpid())-\(UInt32.random(in: 0...UInt32.max))").path
+        let fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0o600)
+        guard fd >= 0 else { return }
+        unlink(path)                                      // ephemeral: kernel reclaims on last close
+        guard ftruncate(fd, off_t(fileBytes)) == 0 else { close(fd); return }
+        // One contiguous reservation: anonymous RW everywhere, then the file mapped FIXED over the front.
+        guard let resv = mmap(nil, newReserve, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0),
+              resv != MAP_FAILED else { close(fd); return }
+        guard let fmap = mmap(resv, fileBytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0),
+              fmap != MAP_FAILED else { munmap(resv, newReserve); close(fd); return }
+        close(fd)                                          // mapping keeps the (unlinked) vnode alive
+        // Copy the logical bytes in, then release the old storage.
+        withUnsafeBytes { src in
+            if let s = src.baseAddress, src.count > 0 { memcpy(resv, s, src.count) }
+        }
+        let logical = count
+        if let old = base { munmap(old, reserveBytes) }
+        heap = []
+        base = resv
+        reserveBytes = newReserve
+        count = logical
+    }
+
+    private func fallbackToHeap() {
+        guard let b = base else { return }
+        var arr = [UInt16](repeating: 0, count: count)
+        arr.withUnsafeMutableBufferPointer { dst in
+            if let d = dst.baseAddress { memcpy(d, b, count * 2) }
+        }
+        munmap(b, reserveBytes)
+        base = nil; reserveBytes = 0
+        heap = arr
+    }
+
+    deinit { if let b = base { munmap(b, reserveBytes) } }
+}
+
 /// Accelerate GEMV (cblas_sgemv) per query; SQLite is the durable source of truth.
 public final class VectorStore: @unchecked Sendable {
     private static let schemaVersion: Int32 = 2
@@ -137,7 +259,7 @@ public final class VectorStore: @unchecked Sendable {
     // bf16 (2 bytes/dim) halves residency and disk vs fp32 with negligible recall loss on
     // L2-normalized vectors. Kept in sync on every mutation; search builds a resident MLX bf16
     // matrix from these bytes (reinterpreted, not converted) and scores on the GPU in one matmul.
-    private var flat16: [UInt16] = []
+    private var flat16 = Vec16Buffer()
     private var dim = 0
     /// The actual dimension of the stored vectors (0 if empty). Ground truth for detecting an index
     /// built with a different model than the one now loaded - the meta fingerprint can go stale.
@@ -261,7 +383,9 @@ public final class VectorStore: @unchecked Sendable {
         // bounded page cache cut read syscalls on load; temp_store=MEMORY keeps sorts off disk.
         exec("PRAGMA synchronous=NORMAL;")
         exec("PRAGMA mmap_size=268435456;")     // 256MB memory-mapped IO (virtual, demand-paged)
-        exec("PRAGMA cache_size=-262144;")       // 256MB page cache (bulk insert keeps more dirty pages hot)
+        // Page cache scaled to the user's memory budget: 256MB at the default 6GB cap (the historical
+        // value - bulk insert keeps more dirty pages hot), down to 64MB under tight low-end caps.
+        exec("PRAGMA cache_size=-\(OmniMemoryBudget.scaled(anchor6GB: 262_144, floor: 65_536, ceiling: 262_144));")
         exec("PRAGMA temp_store=MEMORY;")
         // SQLite's automatic checkpoint fires inside whatever write txn crosses the page threshold -
         // measured 40-70ms stalls on the serial queue every ~32MB of WAL, landing directly in a
@@ -585,7 +709,7 @@ public final class VectorStore: @unchecked Sendable {
             exec("DELETE FROM chunks;")
             // Release the backing buffers (a wipe will not refill to the same size immediately),
             // rather than removeAll which keeps the ~1.6GB capacity reserved.
-            rows = []; flat16 = []; presentPaths = []; fileID = []; pathID = [:]; idPath = []
+            rows = []; flat16.releaseAll(); presentPaths = []; fileID = []; pathID = [:]; idPath = []
             kindCode = []; kindID = [:]; idKind = []; invalidateBase()
             dim = 0
         }
@@ -1177,6 +1301,13 @@ public final class VectorStore: @unchecked Sendable {
             MLX.eval(toEval)
             quantBase = (wq, sc, bi)
             quantBits = bits
+            // Pageable host copy: with the GPU scanning the quantized replica, the exact bf16 bytes
+            // are only touched by rerank gathers, rankChunks/fileVector, the folder map, and
+            // compaction - move them to the unlinked scratch mapping so the OS can evict the cold
+            // bulk on memory-tight machines. Rewritten at each fold so the absorbed delta becomes
+            // file-backed too. Heap mode resumes automatically if the mapping ever fails.
+            flat16.mapToScratch(dir: dbURL.deletingLastPathComponent(),
+                                tailSlackElements: Self.foldThreshold * dim)
         } else {
             flat16.withUnsafeBytes { raw in
                 let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!),
@@ -1498,7 +1629,7 @@ public final class VectorStore: @unchecked Sendable {
                     // Legacy fp32 blob: round to bf16 in memory. It is re-saved as bf16 the next
                     // time its file is indexed, so the DB migrates lazily without a forced reindex.
                     let fp = blob.assumingMemoryBound(to: Float.self)
-                    for k in 0 ..< d { flat16.append(Self.toBF16(fp[k])) }
+                    flat16.append(contentsOf: (0 ..< d).map { Self.toBF16(fp[$0]) })
                 } else if bytes >= d * MemoryLayout<UInt16>.size {
                     flat16.append(contentsOf: UnsafeBufferPointer(start: blob.assumingMemoryBound(to: UInt16.self), count: d))
                 } else {
