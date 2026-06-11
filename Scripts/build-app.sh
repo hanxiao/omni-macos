@@ -21,7 +21,14 @@ ART="$PWD/$DD/SourcePackages/artifacts/swift-tokenizers/TokenizersRust/Tokenizer
 # version string (code is current, the About/crash-report version lies). Regenerate when outdated.
 if command -v xcodegen >/dev/null 2>&1; then
   if [ ! -f Omni.xcodeproj/project.pbxproj ] || [ project.yml -nt Omni.xcodeproj/project.pbxproj ]; then
-    echo "project.yml newer than Omni.xcodeproj - regenerating (xcodegen)"
+    # project.yml reads OMNI_TEAM_ID at generation time; regenerating without it would drop the
+    # development team and fail signing. Preserve the team from the existing project if the env
+    # is not set (the public repo never contains it - this stays local-only).
+    if [ -z "${OMNI_TEAM_ID:-}" ] && [ -f Omni.xcodeproj/project.pbxproj ]; then
+      OMNI_TEAM_ID=$(grep -m1 'DEVELOPMENT_TEAM = ' Omni.xcodeproj/project.pbxproj | sed -E 's/.*= ([A-Z0-9]*);/\1/')
+      export OMNI_TEAM_ID
+    fi
+    echo "project.yml newer than Omni.xcodeproj - regenerating (xcodegen, team: ${OMNI_TEAM_ID:-none})"
     xcodegen generate
   fi
 fi
