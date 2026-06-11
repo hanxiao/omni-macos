@@ -276,7 +276,7 @@ private struct ContentTypesTab: View {
                             .popover(isPresented: $showSamples, arrowEdge: .bottom) { samplePopover(p.samples) }
                     }
                 } else if dirty {
-                    Text("Calculating...").foregroundStyle(.secondary)
+                    Text("Calculating\u{2026}").foregroundStyle(.secondary)
                 } else {
                     Text("These rules are applied.").foregroundStyle(.secondary)
                 }
