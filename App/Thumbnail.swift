@@ -101,7 +101,12 @@ struct Thumbnail: View {
         // are faster (no thumbnail-daemon IPC), and the work is pure synchronous decode in a detached
         // task (no actor-isolation hazard). QuickLook still covers video/audio/docs below. Returning nil
         // here (unreadable/odd file) falls through to the QuickLook path.
-        if Self.imageExts.contains(ext) || ext == "pdf" {
+        // Dataless files (iCloud Optimize Mac Storage / FileProvider evictions) are skipped: ImageIO
+        // and CGPDF read the file body, which IMPLICITLY MATERIALIZES it - a scroll over an evicted
+        // photo library would queue real downloads into the 4 decode slots (or stall them offline).
+        // QuickLook below serves its cached thumbnail for evicted files without materializing,
+        // exactly like Finder. stat is exempt from materialization (TN3150), so the check is free.
+        if (Self.imageExts.contains(ext) || ext == "pdf") && !Self.isDataless(path) {
             let isPDF = ext == "pdf"
             let cg = await Self.decodeBounded {
                 isPDF ? Self.pdfThumbnail(url, maxPixel: maxPixel) : Self.imageThumbnail(url, maxPixel: maxPixel)
@@ -190,9 +195,18 @@ struct Thumbnail: View {
 
     /// File extensions decoded directly by ImageIO (CGImageSource handles all of these natively).
     static let imageExts: Set<String> = [
-        "png", "jpg", "jpeg", "gif", "heic", "heif", "tiff", "tif", "bmp", "webp",
+        "png", "jpg", "jpeg", "gif", "heic", "heif", "tiff", "tif", "bmp", "webp", "avif",
         "jp2", "ico", "icns", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2",
     ]
+
+    /// True if the file is dataless - its content lives on a remote server (iCloud/FileProvider) and
+    /// any body read triggers a download. Per TN3150 the canonical check is SF_DATALESS in st_flags,
+    /// and stat itself never materializes.
+    nonisolated static func isDataless(_ path: String) -> Bool {
+        var st = stat()
+        guard lstat(path, &st) == 0 else { return false }
+        return st.st_flags & UInt32(SF_DATALESS) != 0
+    }
 
     /// Downsample an image file to <= maxPixel on its long edge via ImageIO. Reads only what it needs
     /// and never returns the type-icon placeholder for a valid image (the QuickLook in-app failure mode
