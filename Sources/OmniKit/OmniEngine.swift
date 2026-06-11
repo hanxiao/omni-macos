@@ -303,8 +303,11 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     static let adaptiveBatch = ProcessInfo.processInfo.environment["OMNI_ADAPTIVE_BATCH"] != "0"
 
     // Embedder conformance - used by the indexer, so these run at low (indexing) priority.
+    // Query-typed calls also stamp markQuery(): the serving endpoints (/v1/embeddings task=query)
+    // come through here, not embedQuery, and must engage adaptive batching the same way.
     public func embedText(_ text: String, as type: OmniInputType) -> [Float] {
-        run(highPriority: type == .query) {
+        if type == .query { markQuery() }
+        return run(highPriority: type == .query) {
             let v = textEncoder.encode(text, as: type)
             if type != .query { addTokens(textEncoder.lastSequenceLength) }
             return v
@@ -312,7 +315,8 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     }
 
     public func embedTextBatch(_ texts: [String], as type: OmniInputType) -> [[Float]] {
-        run(highPriority: type == .query) {
+        if type == .query { markQuery() }
+        return run(highPriority: type == .query) {
             let v = textEncoder.encodeBatch(texts, as: type)
             if type != .query { addTokens(textEncoder.lastSequenceLength) }
             return v
