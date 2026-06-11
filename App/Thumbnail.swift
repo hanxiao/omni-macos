@@ -75,33 +75,53 @@ struct Thumbnail: View {
     private func load() async {
         let key = "\(path)@\(Int(side))"
         if let cached = ThumbnailCache.shared.image(key) { image = cached; return }
+        // This view is reused for a new path on scroll (the cell is the same struct, `path` changes);
+        // drop the prior file's thumbnail so a cache miss shows the fallback icon, not a stale image.
+        if image != nil { image = nil }
         let url = URL(fileURLWithPath: path)
         let scale = NSScreen.main?.backingScaleFactor ?? 2
+        // `.all` (icon + low-quality + full thumbnail), not `.thumbnail` alone: the bulk of an index is
+        // text/source/data files that have no CONTENT thumbnail, where `.thumbnail` returns nil and we
+        // fell back to NSWorkspace's generic icon. `.all` returns QuickLook's faithful, Finder-matching
+        // type icon for those, and the real content thumbnail for media. Generated and disk-cached by
+        // the same iconservicesd/QuickLook daemon Finder uses, so a file Finder has shown is ~free.
         let request = QLThumbnailGenerator.Request(
             fileAt: url,
             size: CGSize(width: side, height: side),
             scale: scale,
-            representationTypes: .thumbnail
+            representationTypes: .all
         )
-        // The async overlay of generateBestRepresentation does NOT forward Swift cancellation to
-        // QuickLook, so a fast scroll through a grid queued a full disk+decode generation for every
-        // row that ever appeared, all running to completion AHEAD of the rows now visible. Bridge
-        // the completion API and cancel the QuickLook request when the row's .task is cancelled.
-        // The continuation carries the CGImage (Sendable), not the QLThumbnailRepresentation,
-        // which may not cross out of QuickLook's callback queue.
-        let cg: CGImage? = await withTaskCancellationHandler {
-            await withCheckedContinuation { (cont: CheckedContinuation<CGImage?, Never>) in
-                QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { rep, _ in
-                    cont.resume(returning: rep?.cgImage)
-                }
+        // Progressive: generateRepresentations calls back lowest -> highest quality, so we paint the
+        // instant cache icon, then upgrade to the full thumbnail when it is ready (Apple's recommended
+        // pattern for snappy grids), instead of blocking on the single best representation. The handler
+        // can fire several times, so bridge it through an AsyncStream rather than a one-shot
+        // continuation. cgImage is Sendable; the QLThumbnailRepresentation must not leave QL's queue.
+        // Cancellation (row scrolled away) cancels the QuickLook request - both via the stream's
+        // termination and the task-cancellation handler - so a fast scroll does not run every row's
+        // generation to completion behind the rows now on screen.
+        let frames = AsyncStream<(CGImage, Bool)> { cont in
+            QLThumbnailGenerator.shared.generateRepresentations(for: request) { rep, type, err in
+                if let cg = rep?.cgImage { cont.yield((cg, type == .thumbnail)) }
+                if type == .thumbnail || err != nil { cont.finish() }
+            }
+            cont.onTermination = { _ in QLThumbnailGenerator.shared.cancel(request) }
+        }
+        var best: NSImage?
+        await withTaskCancellationHandler {
+            for await (cg, isFinal) in frames {
+                if Task.isCancelled { break }
+                let img = NSImage(cgImage: cg, size: NSSize(width: CGFloat(cg.width) / scale,
+                                                            height: CGFloat(cg.height) / scale))
+                best = img
+                image = img                 // progressive paint: icon first, thumbnail when ready
+                if isFinal { break }
             }
         } onCancel: {
             QLThumbnailGenerator.shared.cancel(request)
         }
-        guard let cg, !Task.isCancelled else { return }
-        let img = NSImage(cgImage: cg, size: NSSize(width: CGFloat(cg.width) / scale,
-                                                    height: CGFloat(cg.height) / scale))
-        ThumbnailCache.shared.store(img, key)
-        image = img
+        // Cache the best representation we reached so a revisit is instant (and never regenerates a
+        // file whose only representation is its type icon). A total failure leaves `image` nil -> the
+        // body keeps showing the NSWorkspace fallback icon, exactly as before.
+        if let best, !Task.isCancelled { ThumbnailCache.shared.store(best, key) }
     }
 }
