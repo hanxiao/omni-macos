@@ -526,11 +526,23 @@ if args.count >= 3 && args[1] == "qcachebench" {
     _ = engine.embedQuery(query(3))   // warm general kernels
     let m0 = mb()
     print(String(format: "qcachebench %@  GPU active after warmup: %.0f MB", dir.lastPathComponent, m0))
+    // Round 1 = COLD per length (first encounter pays any compile); round 3 = warm. The cold-vs-warm
+    // delta is the one-time per-length cost the B==1 compile default adds to a never-seen query
+    // length - i.e. what a user's FIRST query of a given token count feels.
+    var roundMs: [[Double]] = []
     for round in 1 ... 3 {
-        for n in 1 ... 60 { _ = engine.embedQuery(query(n)) }
+        var ms: [Double] = []
+        for n in 1 ... 60 { let t = Date(); _ = engine.embedQuery(query(n)); ms.append(-t.timeIntervalSinceNow * 1000) }
+        roundMs.append(ms)
         print(String(format: "  after round %d (60 distinct lengths x %d): GPU active %.0f MB  (delta %+.0f MB)",
                      round, round, mb(), mb() - m0))
     }
+    func stats(_ xs: [Double]) -> String {
+        let s = xs.sorted()
+        return String(format: "median %.1fms  p90 %.1fms  max %.1fms", s[s.count/2], s[Int(Double(s.count)*0.9)], s.last ?? 0)
+    }
+    print("  COLD (round 1, first per length): \(stats(roundMs[0]))")
+    print("  WARM (round 3, cached):           \(stats(roundMs[2]))")
     print("  NOTE: if active memory climbs each round, distinct-length compiled graphs accumulate (leak).")
     print("        if it plateaus after round 1, the cache is one-graph-per-length and bounded by length range.")
     exit(0)
