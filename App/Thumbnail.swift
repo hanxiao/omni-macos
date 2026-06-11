@@ -17,9 +17,19 @@ final class ThumbnailCache: @unchecked Sendable {
     static let shared = ThumbnailCache()
     private let cache = NSCache<NSString, NSImage>()
     private let icons = NSCache<NSString, NSImage>()
-    init() { cache.countLimit = 1024; icons.countLimit = 256 }
+    init() {
+        cache.countLimit = 1024
+        // Byte cap on top of the count cap: 1024 grid-size content thumbnails (~256KB each at 128pt@2x)
+        // is ~256MB - fine on a big Mac, a real bite out of an 8GB one. NSCache also evicts under
+        // system memory pressure, but the explicit cost limit keeps the steady-state bounded.
+        cache.totalCostLimit = ProcessInfo.processInfo.physicalMemory < 16_000_000_000
+            ? 96_000_000 : 256_000_000
+        icons.countLimit = 256
+    }
     func image(_ key: String) -> NSImage? { cache.object(forKey: key as NSString) }
-    func store(_ image: NSImage, _ key: String) { cache.setObject(image, forKey: key as NSString) }
+    func store(_ image: NSImage, _ key: String, cost: Int = 0) {
+        cache.setObject(image, forKey: key as NSString, cost: cost)
+    }
 
     /// The system fallback icon for a file, cached by extension so all files of a type share one
     /// `NSWorkspace.icon(forFile:)` (a synchronous Launch Services call) instead of re-fetching it on
@@ -93,14 +103,14 @@ struct Thumbnail: View {
         // here (unreadable/odd file) falls through to the QuickLook path.
         if Self.imageExts.contains(ext) || ext == "pdf" {
             let isPDF = ext == "pdf"
-            let cg = await Task.detached(priority: .userInitiated) {
+            let cg = await Self.decodeBounded {
                 isPDF ? Self.pdfThumbnail(url, maxPixel: maxPixel) : Self.imageThumbnail(url, maxPixel: maxPixel)
-            }.value
+            }
             if Task.isCancelled { return }
             if let cg {
                 let img = NSImage(cgImage: cg, size: NSSize(width: CGFloat(cg.width) / scale,
                                                             height: CGFloat(cg.height) / scale))
-                ThumbnailCache.shared.store(img, key)
+                ThumbnailCache.shared.store(img, key, cost: cg.bytesPerRow * cg.height)
                 image = img
                 return
             }
@@ -140,8 +150,42 @@ struct Thumbnail: View {
         guard let cg, !Task.isCancelled else { return }
         let img = NSImage(cgImage: cg, size: NSSize(width: CGFloat(cg.width) / scale,
                                                     height: CGFloat(cg.height) / scale))
-        ThumbnailCache.shared.store(img, key)
+        ThumbnailCache.shared.store(img, key, cost: cg.bytesPerRow * cg.height)
         image = img
+    }
+
+    /// Async width gate for direct decodes. A `Task.detached` sync decode would (a) occupy one of
+    /// Swift's cooperative-pool threads - the SAME small pool the app's search tasks run on, so a
+    /// scroll burst of decodes could starve a search dispatch for hundreds of ms on a low-core Mac -
+    /// and (b) admit cores-many concurrent full-image decodes, each holding a multi-megapixel decode
+    /// buffer (a transient memory burst on 8GB machines). Acquire one of `width` slots (suspending,
+    /// not blocking), then run the decode on a dedicated GCD queue bridged through a continuation:
+    /// the cooperative pool is never occupied, at most `width` decode buffers exist at once, and at
+    /// most `width` GCD threads are in flight (no thread explosion from queued blocked blocks).
+    private actor DecodeGate {
+        private var available: Int
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+        init(width: Int) { available = width }
+        func acquire() async {
+            if available > 0 { available -= 1; return }
+            await withCheckedContinuation { waiters.append($0) }
+        }
+        func release() {
+            if waiters.isEmpty { available += 1 } else { waiters.removeFirst().resume() }
+        }
+    }
+    private static let decodeGate = DecodeGate(width: 4)
+    private static let decodeQueue = DispatchQueue(label: "omni.thumbnail.decode",
+                                                   qos: .userInitiated, attributes: .concurrent)
+    nonisolated static func decodeBounded(_ work: @escaping @Sendable () -> CGImage?) async -> CGImage? {
+        await decodeGate.acquire()
+        // A cell that scrolled away while queued for a slot skips its decode (the slot still cycles).
+        if Task.isCancelled { await decodeGate.release(); return nil }
+        let result: CGImage? = await withCheckedContinuation { cont in
+            decodeQueue.async { cont.resume(returning: work()) }
+        }
+        await decodeGate.release()
+        return result
     }
 
     /// File extensions decoded directly by ImageIO (CGImageSource handles all of these natively).
