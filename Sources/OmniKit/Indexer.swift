@@ -273,6 +273,39 @@ public final class Indexer: @unchecked Sendable {
                 // Reordering is output-neutral: vectors are scattered back by (fid,idx), so each
                 // file's chunks reassemble identically regardless of batch composition.
                 let textStageWindow = textBatchSize * 6
+                // Completed files stage here and are stored as ONE replaceMany per flushText drain,
+                // instead of one replace() per file. Per-file stores made the full pass the store's
+                // highest-rate writer: each modified file's replace invalidates the resident base
+                // score matrix, so a concurrent interactive search either pays a full base rebuild
+                // (lazy) or the write side rebuilds per file (proactive refold) - measured ~25
+                // rebuilds/s during active search, ~100% of the queue. One batched write per drain
+                // = one invalidation + at most one refold per ~window, the same coarseness as the
+                // FSEvents reconcile path (256/batch), AND one SQL txn instead of ~tens. Vectors,
+                // per-file atomicity, and progress counts are unchanged; a cancel loses only the
+                // staged-but-unflushed files' embed work (they re-embed next pass), bounded by one
+                // flush window - the same durability granularity reconcile already has.
+                var stagedStores: [(path: String, chunks: [IndexedChunk])] = []
+                func stageStore(_ path: String, _ raw: [IndexedChunk]) {
+                    // Mirrors storeChunks' guards: fail whole files with any non-finite vector
+                    // (transient GPU fault - next pass redoes them), skip empties.
+                    let chunks = raw.filter { Self.isFinite($0.embedding) }
+                    if chunks.count < raw.count {
+                        Self.log.error("non-finite embedding, file deferred to next pass: \(path, privacy: .public)")
+                        p.failed += 1
+                        return
+                    }
+                    if chunks.isEmpty { p.skipped += 1; if raw.isEmpty { Self.log.info("skip \(path, privacy: .public)") } }
+                    else { stagedStores.append((path, chunks)) }
+                }
+                func flushStagedStores() {
+                    guard !stagedStores.isEmpty else { return }
+                    do { try store.replaceMany(stagedStores); p.embedded += stagedStores.count }
+                    catch {
+                        p.failed += stagedStores.count
+                        Self.log.error("fail batch(\(stagedStores.count, privacy: .public)): \(String(describing: error), privacy: .public)")
+                    }
+                    stagedStores.removeAll(keepingCapacity: true)
+                }
                 func flushText(drainAll: Bool) {
                     let floor = drainAll ? 0 : textBatchSize    // keep up to one partial batch between flushes
                     guard buf.count > floor else { return }
@@ -302,10 +335,11 @@ public final class Indexer: @unchecked Sendable {
                                                        kind: a.kind, chunkIndex: b.idx, snippet: b.snippet, embedding: vecs[k],
                                                        locator: b.locator))
                             acc[b.fid] = a
-                            if a.done.count == a.total { storeChunks(a.file.url.path, a.done); acc[b.fid] = nil }
+                            if a.done.count == a.total { stageStore(a.file.url.path, a.done); acc[b.fid] = nil }
                         }
                         onProgress(p)
                     }
+                    flushStagedStores()   // one batched store (replaceMany) per drain
                 }
                 pipeline(files, force: force, known: known, settings: settings) { item in
                     let path = item.file.url.path
@@ -324,11 +358,12 @@ public final class Indexer: @unchecked Sendable {
                     }
                 }
                 flushText(drainAll: true)                           // drain the remaining buffer
-                // Stragglers can only be INCOMPLETE files (a complete file is stored the moment its
+                // Stragglers can only be INCOMPLETE files (a complete file is staged the moment its
                 // last chunk lands, and the drain above embeds everything buffered) - i.e. a cancel
                 // interrupted them. Storing a partial chunk set would mark the file's mtime as fully
                 // indexed and permanently truncate it, so only ever store complete sets.
-                for (_, a) in acc where a.done.count == a.total { storeChunks(a.file.url.path, a.done) }
+                for (_, a) in acc where a.done.count == a.total { stageStore(a.file.url.path, a.done) }
+                flushStagedStores()
             } else if kind == .audio {
                 // Cross-file audio batching: stage decoded mels and embed up to
                 // audioMaxClipsPerBatch clips (bounded by audioFrameBudget total frames)
