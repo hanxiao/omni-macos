@@ -374,6 +374,7 @@ public final class VectorStore: @unchecked Sendable {
                 }
             }
             let bfs = work.map { $0.chunks.map { bf16Row($0.embedding) } }   // fp32 -> bf16 once
+            let tSql = Self.searchTiming ? Date() : nil
             exec("BEGIN;")
             let sql = "INSERT INTO chunks(path, modified, size, kind, chunk_index, snippet, dim, vec, width, height, duration, locator) VALUES(?,?,?,?,?,?,?,?,?,?,?,?);"
             var stmt: OpaquePointer?
@@ -407,6 +408,7 @@ public final class VectorStore: @unchecked Sendable {
                 }
             }
             exec("COMMIT;")
+            let tRm = Self.searchTiming ? Date() : nil
             let affected = Set(work.map { $0.path })
             if affected.contains(where: { presentPaths.contains($0) }) {
                 removeRowsLocked { affected.contains($0.path) }   // one rebuild for the whole batch
@@ -423,7 +425,13 @@ public final class VectorStore: @unchecked Sendable {
             }
             // No invalidateBase(): appended rows are scored as delta. Any pre-existing path in the
             // batch already triggered removeRowsLocked above, which invalidates the base.
+            let tBeforeFold = Self.searchTiming ? Date() : nil
             proactiveRefoldLocked()   // refold now if a search is active, off the search's latency path
+            if let tSql, let tRm, let tBeforeFold {
+                print(String(format: "[replaceMany] paths=%d sql=%.1fms rebuildRows=%.1fms append+fold=%.1fms",
+                             work.count, tRm.timeIntervalSince(tSql) * 1000, tBeforeFold.timeIntervalSince(tRm) * 1000,
+                             -tBeforeFold.timeIntervalSinceNow * 1000))
+            }
         }
     }
 
@@ -1131,22 +1139,34 @@ public final class VectorStore: @unchecked Sendable {
         // copy (which doubled bf16 peak - ~1.3GB transient on a 420k*768 index, enough to swap an 8GB
         // Mac on a reconcile delete). Survivors only ever move toward the front (w <= i), so the forward
         // dim-slice move is non-overlapping and the surviving layout/order is byte-identical.
-        var keptRows: [Row] = []; keptRows.reserveCapacity(rows.count)
-        var w = 0   // write cursor, in dim-slice units
+        //
+        // Compact rows/fileID/kindCode IN LOCKSTEP in the SAME pass, and update presentPaths only by the
+        // gone paths. The old code rebuilt all three from scratch afterward (Set(rows.map{path}) +
+        // rebuildFileIDsLocked re-interning every survivor) - that hashed every survivor path TWICE more,
+        // ~2x the cost of this loop on a large index, on the serial queue a concurrent search waits on.
+        // pathID/kindID intern tables are intentionally NOT rebuilt: surviving fileID values stay valid
+        // (ids are never reused), a re-added path reuses its existing id, and a fully-removed path's id
+        // just goes unreferenced - leaving fileIDCount an upper bound (the reducer's per-file array is
+        // then merely oversized, never wrong). loadIntoMemory rebuilds them densely on the next launch.
+        var removedPaths = Set<String>()
+        var w = 0   // write cursor, in dim-slice / row units
         flat16.withUnsafeMutableBufferPointer { fb in
             guard let base = fb.baseAddress else { return }
-            for i in 0 ..< rows.count where !predicate(rows[i]) {
-                if w != i { (base + w * dim).update(from: base + i * dim, count: dim) }
-                keptRows.append(rows[i])
+            for i in 0 ..< rows.count {
+                if predicate(rows[i]) { removedPaths.insert(rows[i].path); continue }
+                if w != i {
+                    (base + w * dim).update(from: base + i * dim, count: dim)
+                    rows[w] = rows[i]; fileID[w] = fileID[i]; kindCode[w] = kindCode[i]
+                }
                 w += 1
             }
         }
-        flat16.removeLast((rows.count - w) * dim)
-        rows = keptRows
-        // Our delete predicates always remove ALL rows of a matched path, so survivors define the
-        // exact set of present paths after compaction.
-        presentPaths = Set(rows.map { $0.path })
-        rebuildFileIDsLocked()   // rows were rewritten - re-densify fileID over the survivors
+        let removed = rows.count - w
+        flat16.removeLast(removed * dim)
+        rows.removeLast(removed); fileID.removeLast(removed); kindCode.removeLast(removed)
+        // Our delete predicates always remove ALL rows of a matched path, so the gone paths are exactly
+        // `removedPaths` and none survive - subtract them rather than rebuild the whole present set.
+        presentPaths.subtract(removedPaths)
         invalidateBase()
     }
 
