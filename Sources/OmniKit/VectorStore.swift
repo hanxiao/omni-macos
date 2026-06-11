@@ -147,6 +147,15 @@ public final class VectorStore: @unchecked Sendable {
     private var baseRows = 0
     private var baseDirty = true
     private static let foldThreshold = 50_000
+    // Last interactive search time (queue-guarded). When a write invalidates the base WHILE the user is
+    // actively searching, the write rebuilds the base in place (it already holds the queue, and runs
+    // right after its own embed so the rebuild's GPU eval does not wait behind in-flight indexing
+    // kernels) - so the NEXT search finds a fresh base instead of paying a ~65ms (worse under GPU load)
+    // rebuild on its own latency-critical path. Idle indexing leaves the rebuild lazy (no one waiting).
+    private var lastSearchAt = Date.distantPast
+    private static let searchActiveWindow: TimeInterval = 2.0
+    private func searchRecentlyActiveLocked() -> Bool { -lastSearchAt.timeIntervalSinceNow < Self.searchActiveWindow }
+    static let proactiveFold = ProcessInfo.processInfo.environment["OMNI_PROACTIVE_FOLD"] != "0"
 
     // fp32 <-> bf16 (round-to-nearest-even). Embeddings are L2-normalized and finite, so |x| <= ~1
     // and the rounding add never overflows.
@@ -343,6 +352,7 @@ public final class VectorStore: @unchecked Sendable {
             presentPaths.insert(path)
             // No invalidateBase(): a new path's rows append past baseRows and are scored as delta.
             // A pre-existing path already triggered removeRowsLocked above, which invalidates.
+            proactiveRefoldLocked()
         }
     }
 
@@ -413,6 +423,7 @@ public final class VectorStore: @unchecked Sendable {
             }
             // No invalidateBase(): appended rows are scored as delta. Any pre-existing path in the
             // batch already triggered removeRowsLocked above, which invalidates the base.
+            proactiveRefoldLocked()   // refold now if a search is active, off the search's latency path
         }
     }
 
@@ -423,6 +434,7 @@ public final class VectorStore: @unchecked Sendable {
             deletePathLocked(path)
             exec("COMMIT;")
             removeRowsLocked { $0.path == path }
+            proactiveRefoldLocked()
         }
     }
 
@@ -445,6 +457,7 @@ public final class VectorStore: @unchecked Sendable {
             sqlite3_finalize(stmt)
             exec("COMMIT;")
             removeRowsLocked { paths.contains($0.path) }   // one rebuild for the whole set
+            proactiveRefoldLocked()
         }
     }
 
@@ -465,6 +478,7 @@ public final class VectorStore: @unchecked Sendable {
             }
             sqlite3_finalize(stmt)
             removeRowsLocked { $0.path == folder || $0.path.hasPrefix(folder + "/") }
+            proactiveRefoldLocked()
         }
     }
 
@@ -774,6 +788,7 @@ public final class VectorStore: @unchecked Sendable {
         let tCall = Self.searchTiming ? Date() : nil
         return queue.sync {
             if let tCall { print(String(format: "[search] lockwait=%.1fms", -tCall.timeIntervalSinceNow * 1000)) }
+            lastSearchAt = Date()   // mark the store "actively searched" so writes proactively refold the base
             let n = rows.count
             guard n > 0, dim > 0, query.count == dim, flat16.count == n * dim else { return [] }
             if baseDirty || mlxBase == nil || (n - baseRows) > Self.foldThreshold {
@@ -951,6 +966,8 @@ public final class VectorStore: @unchecked Sendable {
     /// result is independent of flat16 (which reallocates as indexing appends) - no aliasing. Called
     /// only on a structural change or fold, not per query. Must run on `queue`.
     private func rebuildBaseLocked(rowCount: Int) {
+        let tR = Self.searchTiming ? Date() : nil
+        defer { if let tR { print(String(format: "[search] REBUILD base rows=%d %.1fms", rowCount, -tR.timeIntervalSinceNow * 1000)) } }
         let byteCount = rowCount * dim * MemoryLayout<UInt16>.size
         flat16.withUnsafeBytes { raw in
             let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!),
@@ -960,6 +977,22 @@ public final class VectorStore: @unchecked Sendable {
         MLX.eval(mlxBase!)
         baseRows = rowCount
         baseDirty = false
+    }
+
+    /// Called at the tail of every write (under `queue`). If the user is actively searching AND the
+    /// base now needs a rebuild (a modify/delete dirtied it, or the delta outgrew the fold threshold),
+    /// rebuild it HERE - off the search's latency path. The write runs right after the indexer's own
+    /// embed, so the rebuild's GPU eval is not stuck behind in-flight indexing kernels (which is what
+    /// turns a ~65ms rebuild into a multi-hundred-ms search stall). Idle indexing skips this (the lazy
+    /// search-path rebuild is fine when no query is waiting). Mirrors search()'s rebuild condition, so
+    /// the next search finds baseDirty == false and a delta within threshold. Output is identical.
+    private func proactiveRefoldLocked() {
+        guard Self.proactiveFold, searchRecentlyActiveLocked() else { return }
+        let n = rows.count
+        guard n > 0, dim > 0, flat16.count == n * dim else { return }
+        if baseDirty || mlxBase == nil || (n - baseRows) > Self.foldThreshold {
+            rebuildBaseLocked(rowCount: n)
+        }
     }
 
     public func kinds() -> Set<String> { queue.sync { Set(rows.map { $0.kind }) } }
