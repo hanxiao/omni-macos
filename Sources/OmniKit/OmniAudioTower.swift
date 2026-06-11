@@ -270,8 +270,15 @@ public final class OmniAudioTower: @unchecked Sendable {
     // MARK: - Helpers
 
     /// Explicit LayerNorm over the last axis (mean/var, eps, affine weight+bias). fp32 for stability.
+    /// Fused via MLXFast.layerNorm (one kernel vs ~9 dispatches); the fp32 input cast is kept so the
+    /// output dtype (fp32) and the tower's residual precision are unchanged - the swap only fuses the
+    /// schedule. Gate: the audio parity tests. OMNI_FUSED_NORM=0 reverts to the hand-rolled chain.
     private func layerNorm(_ x: MLXArray, _ keyPrefix: String) -> MLXArray {
         let xf = x.asType(.float32)
+        if Qwen3Backbone.fusedNorm {
+            return MLXFast.layerNorm(xf, weight: w[keyPrefix + ".weight"].asType(.float32),
+                                     bias: w[keyPrefix + ".bias"].asType(.float32), eps: lnEps)
+        }
         let mean = MLX.mean(xf, axis: -1, keepDims: true)
         let centered = xf - mean
         let variance = MLX.mean(centered * centered, axis: -1, keepDims: true)

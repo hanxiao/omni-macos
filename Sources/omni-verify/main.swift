@@ -548,6 +548,81 @@ if args.count >= 3 && args[1] == "qcachebench" {
     exit(0)
 }
 
+// Indexing-throughput benchmark: omni-verify embbench <modelDir> [seconds] [batchSize]
+// Mirrors the indexer's text hot path EXACTLY: length-sorted carve into batchSize buckets, ONE
+// embedTextBatches call per 6-batch staging window (tokenize-parallel + async double-buffering
+// inside, same as flushText). Reports tokens/s, chunks/s, GPU peak. Levers:
+//   OMNI_BENCH_QOS=utility|userInitiated|default|background  driver-thread QoS. The APP indexes from
+//       a .utility task (E-core biased) - benches that run on the main thread overstate the app.
+//   OMNI_BENCH_WIRED=1   wire the model's weights for the run (MLX wired-limit ticket)
+//   MLX_MAX_OPS_PER_BUFFER / MLX_MAX_MB_PER_BUFFER   MLX command-buffer batching (read by MLX at init)
+func embbenchRun(_ engine: OmniEngine, _ corpus: [String], _ secs: Double, _ batchSize: Int,
+                 _ qos: DispatchQoS.QoSClass) -> (chunks: Int, toks: Int, wall: Double) {
+    let done = DispatchSemaphore(value: 0)
+    nonisolated(unsafe) var chunks = 0
+    nonisolated(unsafe) var toks = 0
+    nonisolated(unsafe) var wall = 0.0
+    DispatchQueue.global(qos: qos).async {
+        let windowSize = batchSize * 6
+        func window(_ off: Int) -> [[String]] {
+            var w: [String] = []; w.reserveCapacity(windowSize)
+            for k in 0 ..< windowSize { w.append(corpus[(off + k) % corpus.count]) }
+            w.sort { $0.count < $1.count }                       // the indexer's length bucketing
+            var groups: [[String]] = []
+            var i = 0
+            while i < w.count { groups.append(Array(w[i ..< min(i + batchSize, w.count)])); i += batchSize }
+            return groups
+        }
+        _ = engine.embedTextBatches(window(0), as: .passage)     // warm kernels for these shapes
+        let tok0 = engine.tokensProcessed
+        let t0 = Date()
+        var off = 0
+        let deadline = t0.addingTimeInterval(secs)
+        while Date() < deadline {
+            _ = engine.embedTextBatches(window(off), as: .passage)
+            off += windowSize
+            chunks += windowSize
+        }
+        wall = -t0.timeIntervalSinceNow
+        toks = engine.tokensProcessed - tok0
+        done.signal()
+    }
+    done.wait()
+    return (chunks, toks, wall)
+}
+if args.count >= 3 && args[1] == "embbench" {
+    let dir = URL(fileURLWithPath: args[2])
+    let secs = (args.count >= 4 ? Double(args[3]) : nil) ?? 12
+    let batchSize = (args.count >= 5 ? Int(args[4]) : nil) ?? 16
+    let engine = try await OmniEngine(modelDir: dir)
+    // Realistic varied lengths: 1..14 sentences (~60..1700 chars), the chunker's working range.
+    let sentence = "The quarterly revenue report shows strong cloud growth across European regions while distributed systems engineering paid down latency debt and the search index stayed current. "
+    var corpus: [String] = []
+    for i in 0 ..< 192 { corpus.append(String(repeating: sentence, count: (i % 14) + 1)) }
+    let qosName = ProcessInfo.processInfo.environment["OMNI_BENCH_QOS"] ?? "userInitiated"
+    let qos: DispatchQoS.QoSClass = switch qosName {
+    case "utility": .utility
+    case "background": .background
+    case "default": .default
+    default: .userInitiated
+    }
+    var ticket: WiredMemoryTicket? = nil
+    if ProcessInfo.processInfo.environment["OMNI_BENCH_WIRED"] == "1" {
+        let bytes = MLX.GPU.activeMemory           // post-load = weights + tokenizer residency
+        ticket = WiredSumPolicy().ticket(size: bytes)
+        _ = await ticket!.start()
+        print("  wired \(bytes >> 20) MB")
+    }
+    let r = embbenchRun(engine, corpus, secs, batchSize, qos)
+    if let ticket { _ = await ticket.end() }
+    let opsBuf = ProcessInfo.processInfo.environment["MLX_MAX_OPS_PER_BUFFER"] ?? "default"
+    print(String(format: "embbench batch=%d qos=%@ wired=%@ opsbuf=%@  %.0f tok/s  %.1f chunks/s  (%d chunks in %.1fs)  GPU peak %.0f MB",
+                 batchSize, qosName, ticket != nil ? "1" : "0", opsBuf,
+                 Double(r.toks) / r.wall, Double(r.chunks) / r.wall, r.chunks, r.wall,
+                 Double(MLX.GPU.peakMemory) / 1_048_576))
+    exit(0)
+}
+
 // Concurrency benchmark: omni-verify concbench [N] [dim] [queries]
 // Drives the REAL VectorStore and measures search latency (a) idle with a warm cache and (b) while
 // the store is being mutated by new-file inserts (the "search during indexing" case), plus

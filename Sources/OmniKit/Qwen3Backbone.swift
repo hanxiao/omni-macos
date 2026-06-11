@@ -197,7 +197,9 @@ final class Qwen3Backbone: @unchecked Sendable {
         let hasHeadNorm = w.has("language_model.layers.0.self_attn.q_norm.weight")
         let scale = Float(pow(Double(t.headDim), -0.5))
 
+        let fused = Self.fusedNorm
         func rms(_ x: MLXArray, _ wt: MLXArray) -> MLXArray {
+            if fused { return MLXFast.rmsNorm(x, weight: wt, eps: eps) }
             let xf = x.asType(.float32)
             let v = MLX.mean(xf * xf, axis: -1, keepDims: true)
             return (xf * MLX.rsqrt(v + eps) * wt.asType(.float32)).asType(cdt)
@@ -283,7 +285,16 @@ final class Qwen3Backbone: @unchecked Sendable {
         matmul(x, w[key].transposed(1, 0))
     }
 
+    /// Fused RMSNorm (MLXFast.rmsNorm, one kernel) vs the hand-rolled chain (cast + square + mean +
+    /// rsqrt + 2 muls + cast = ~6 dispatches and intermediates, x3 norms x28 layers per forward).
+    /// The fused kernel accumulates the variance in fp32 internally - the same numeric intent as the
+    /// hand-rolled fp32 path - and it is what the Python reference itself runs (mlx nn.RMSNorm wraps
+    /// mx.fast.rms_norm), so the fixture parity gate validates the swap directly. OMNI_FUSED_NORM=0
+    /// restores the hand-rolled chain for A/B.
+    static let fusedNorm = ProcessInfo.processInfo.environment["OMNI_FUSED_NORM"] != "0"
+
     private func rmsNorm(_ x: MLXArray, _ key: String) -> MLXArray {
+        if Self.fusedNorm { return MLXFast.rmsNorm(x, weight: w[key], eps: cfg.text.rmsNormEps) }
         let xf = x.asType(.float32)
         let v = MLX.mean(xf * xf, axis: -1, keepDims: true)
         return (xf * MLX.rsqrt(v + cfg.text.rmsNormEps) * w[key].asType(.float32)).asType(computeDType)
@@ -308,6 +319,7 @@ final class Qwen3Backbone: @unchecked Sendable {
     }
 
     private func headNorm(_ x: MLXArray, _ key: String) -> MLXArray {
+        if Self.fusedNorm { return MLXFast.rmsNorm(x, weight: w[key], eps: cfg.text.rmsNormEps) }
         let xf = x.asType(.float32)
         let v = MLX.mean(xf * xf, axis: -1, keepDims: true)
         return (xf * MLX.rsqrt(v + cfg.text.rmsNormEps) * w[key].asType(.float32)).asType(computeDType)

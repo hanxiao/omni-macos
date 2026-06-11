@@ -385,8 +385,17 @@ public final class OmniVisionTower: @unchecked Sendable {
     // MARK: - Helpers
 
     /// Explicit LayerNorm over the last axis (mean/var, eps 1e-6, affine weight+bias).
+    /// Fused (MLXFast.layerNorm, one kernel) vs the hand-rolled chain (~9 dispatches and
+    /// intermediates, x2 norms per ViT block). The fp32 input cast is kept ON PURPOSE: the
+    /// hand-rolled version returned fp32 (stability), and the fused kernel returns its input
+    /// dtype - casting in preserves the tower's existing fp32 residual flow exactly, so the swap
+    /// only fuses the schedule. Gate: the vision tower/e2e cosine tests. OMNI_FUSED_NORM=0 reverts.
     private func layerNorm(_ x: MLXArray, _ keyPrefix: String) -> MLXArray {
         let xf = x.asType(.float32)
+        if Qwen3Backbone.fusedNorm {
+            return MLXFast.layerNorm(xf, weight: wc(keyPrefix + ".weight").asType(.float32),
+                                     bias: wc(keyPrefix + ".bias").asType(.float32), eps: lnEps)
+        }
         let mean = MLX.mean(xf, axis: -1, keepDims: true)
         let centered = xf - mean
         let variance = MLX.mean(centered * centered, axis: -1, keepDims: true)
