@@ -273,7 +273,8 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
 
     /// Embed a query for interactive search - runs at high priority.
     public func embedQuery(_ text: String) -> [Float] {
-        run(highPriority: true) { textEncoder.encode(text, as: .query) }
+        markQuery()   // signal the indexer to shrink/split its forwards while the user is searching
+        return run(highPriority: true) { textEncoder.encode(text, as: .query) }
     }
 
     // Cumulative backbone sequence positions (tokens) processed by INDEXING embeds (queries
@@ -282,6 +283,24 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     private var _tokensProcessed = 0
     public var tokensProcessed: Int { tokenLock.withLock { _tokensProcessed } }
     private func addTokens(_ n: Int) { tokenLock.withLock { _tokensProcessed += n } }
+
+    // Interactive-query activity stamp. embedQuery refreshes it; the indexer reads
+    // `interactiveQueryActive` to shrink its per-forward batch and split the flush into per-batch gate
+    // windows WHILE the user is actively searching - so an interactive query's embed + matmul wait
+    // behind a short GPU command buffer instead of a full 96-chunk indexing forward. Reverts to full
+    // batch + double-buffered flush (max indexing throughput) ~2s after the last keystroke.
+    private let queryStampLock = NSLock()
+    private var _lastQueryAt = Date.distantPast
+    private func markQuery() { queryStampLock.withLock { _lastQueryAt = Date() } }
+    private static let queryActiveWindow: TimeInterval =
+        (ProcessInfo.processInfo.environment["OMNI_QUERY_ACTIVE_WINDOW"].flatMap { Double($0) }) ?? 2.0
+    /// True if an interactive query ran within the active window (default 2s). Off by env
+    /// OMNI_ADAPTIVE_BATCH=0 (A/B baseline).
+    public var interactiveQueryActive: Bool {
+        guard Self.adaptiveBatch else { return false }
+        return queryStampLock.withLock { -_lastQueryAt.timeIntervalSinceNow < Self.queryActiveWindow }
+    }
+    static let adaptiveBatch = ProcessInfo.processInfo.environment["OMNI_ADAPTIVE_BATCH"] != "0"
 
     // Embedder conformance - used by the indexer, so these run at low (indexing) priority.
     public func embedText(_ text: String, as type: OmniInputType) -> [Float] {
@@ -314,6 +333,23 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         // preempt mid-window. Per-batch vectors are independent, so the result is bit-identical; only
         // the cross-half double-buffering is lost (acceptable on low-end). High-RAM keeps the single
         // full-window call - no throughput change.
+        // While the user is actively searching, run each batch as its OWN gate window so an
+        // interactive query (high priority) preempts after one short forward instead of after the
+        // whole multi-batch staging flush. Combined with the indexer's shrunk per-forward batch, this
+        // collapses the query's gate wait from ~one full flush to ~one small forward. Sacrifices
+        // cross-batch double-buffering for the ~2s the user is typing; reverts to the full
+        // double-buffered single-call flush (max throughput) once typing stops.
+        if type != .query, interactiveQueryActive, tokenized.count > 1 {
+            var out: [[[Float]]] = []; out.reserveCapacity(tokenized.count)
+            for b in tokenized {
+                out.append(contentsOf: run(highPriority: false) {
+                    let r = textEncoder.encodeTokenBatchesPipelined([b])
+                    addTokens(textEncoder.lastSequenceLength)
+                    return r
+                })
+            }
+            return out
+        }
         let lowEnd = ProcessInfo.processInfo.environment["OMNI_FORCE_LOWEND"] != nil
             || ProcessInfo.processInfo.physicalMemory < 16_000_000_000
         if type != .query, lowEnd, tokenized.count > 2 {

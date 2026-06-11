@@ -449,10 +449,21 @@ if args.count >= 2 && args[1] == "concbench2" {
     func med(_ xs: [Double]) -> Double { xs.isEmpty ? 0 : xs.sorted()[xs.count/2] }
     func p95(_ xs: [Double]) -> Double { xs.isEmpty ? 0 : xs.sorted()[min(xs.count-1, Int(Double(xs.count)*0.95))] }
 
+    // Full-path option: time engine.embedQuery (gate, high priority) + store.search (matmul), the
+    // REAL interactive latency a user sees. Default (off) times only the matmul, as before.
+    let fullQuery = ProcessInfo.processInfo.environment["OMNI_BENCH_FULL_QUERY"] == "1"
+    let queryTexts = ["quarterly cloud revenue margins", "capital of france", "architecture graph podcast",
+                      "distributed systems operating", "latent space discussion regions"]
+    func oneSearch(_ qi: Int) {
+        if fullQuery { let v = engine.embedQuery(queryTexts[qi % queryTexts.count]); _ = store.search(v, topK: 50) }
+        else { _ = store.search(queries[qi % queries.count], topK: 50) }
+    }
+    if fullQuery { print("  (timing FULL path: embedQuery + search)") }
+
     // Idle baseline (no concurrent load).
-    _ = store.search(queries[0], topK: 50); _ = store.search(queries[0], topK: 50)
+    oneSearch(0); oneSearch(0)
     var idle: [Double] = []
-    for qi in 0..<40 { let a = Date(); _ = store.search(queries[qi % queries.count], topK: 50); idle.append(-a.timeIntervalSinceNow*1000) }
+    for qi in 0..<40 { let a = Date(); oneSearch(qi); idle.append(-a.timeIntervalSinceNow*1000) }
 
     // Loaded phase: background embeds (+ periodic mutation, incl. a fold) while we time searches.
     // Search runs under the lock; MLX's stream scheduler interleaves it with the embed forwards.
@@ -490,8 +501,9 @@ if args.count >= 2 && args[1] == "concbench2" {
         var lat: [Double] = []
         let deadline = Date().addingTimeInterval(secs)
         var qi = 0
-        while Date() < deadline { let q = queries[qi % queries.count]; qi += 1
-            let a = Date(); _ = store.search(q, topK: 50); lat.append(-a.timeIntervalSinceNow*1000) }
+        while Date() < deadline { qi += 1
+            let a = Date(); oneSearch(qi); lat.append(-a.timeIntervalSinceNow*1000)
+            if fullQuery { Thread.sleep(forTimeInterval: 0.12) } }   // ~debounced typing cadence
         stop.set(true)
         let alive = done.wait(timeout: .now() + 30) == .success            // watchdog: no hang/deadlock
         return (lat, embeds, foldHit, alive)
