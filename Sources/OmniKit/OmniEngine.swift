@@ -135,9 +135,11 @@ public func omniSetMemoryLimit(_ bytes: Int) {
 public func omniPhysicalMemory() -> Int { Int(ProcessInfo.processInfo.physicalMemory) }
 
 public final class OmniEngine: Embedder, @unchecked Sendable {
-    private let textEncoder: OmniTextEncoder
-    private let imageEncoder: OmniImageEncoder?
-    private let audioEncoder: OmniAudioEncoder?
+    // var, not let: recoverMediaPath() swaps in freshly loaded encoders when a cold-load weight
+    // corruption is detected at runtime. All reads/writes happen inside the run() gate.
+    private var textEncoder: OmniTextEncoder
+    private var imageEncoder: OmniImageEncoder?
+    private var audioEncoder: OmniAudioEncoder?
     // Priority-aware serializer: MLX work runs one at a time, but a high-priority
     // query (interactive search) jumps ahead of pending low-priority indexing work,
     // so search stays responsive while indexing runs.
@@ -157,6 +159,11 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     public let modelDir: URL
     /// Mel-bin count for the audio path, kept so `loadValidated` can build a synthetic self-test input.
     private let audioMelBins: Int
+    // Retained for recoverMediaPath(): a runtime weight reload reuses the parsed tokenizer and
+    // must honor the same tower selection the engine was built with.
+    private let tokenizer: Tokenizer
+    private let keepVision: Bool
+    private let keepAudio: Bool
     public var supportsImages: Bool { imageEncoder != nil }
     public var supportsVideo: Bool { imageEncoder != nil }
     public var supportsAudio: Bool { audioEncoder != nil }
@@ -175,6 +182,9 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         async let tokenizerTask = AutoTokenizer.from(directory: modelDir)
         let weights = try WeightStore(modelDir: modelDir, loraScale: config.loraScale, keepVision: keepVision, keepAudio: keepAudio)
         let tokenizer = try await tokenizerTask
+        self.tokenizer = tokenizer
+        self.keepVision = keepVision
+        self.keepAudio = keepAudio
         let text = OmniTextEncoder(weights: weights, config: config, tokenizer: tokenizer)
         self.textEncoder = text
         self.docPrefix = text.prefixTokenIds(.passage)
@@ -190,12 +200,14 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
 
     /// Build an engine whose media (image/audio/video) embedding path is verified NaN-free.
     ///
-    /// The FIRST weight load in a process intermittently reads uninitialized GPU memory, which
-    /// corrupts the loaded weights and makes every media embedding come out NaN. It is per-process
-    /// (a launch is either all-good or all-NaN for media), hits ~60% of cold loads, and leaves the
-    /// text path unaffected. A freshly reconstructed engine reloads clean weights, so we self-test
-    /// the media path on a synthetic input and rebuild until it is finite. One retry is virtually
-    /// always enough; we cap attempts and, in the (unobserved) event they all fail, return the last
+    /// Weight loads intermittently read uninitialized GPU memory, corrupting the materialized
+    /// copies so media embeddings come out NaN. It is per-process and persistent (measured over
+    /// 12 cold processes: 4 corrupted, at per-embed NaN rates from 2% to 37%, deterministic per
+    /// input), media-only (the text path is force-evaluated and exercised at load). A freshly
+    /// reconstructed engine reloads clean weights, so we self-test the media paths on synthetic
+    /// inputs and rebuild until they are finite. Low-rate corruption can pass these probes; the
+    /// runtime backstop is recoverMediaPath(). We cap attempts and, in the event they all fail,
+    /// return the last
     /// engine so the app still runs (media files just skip, as before) rather than failing to launch.
     public static func loadValidated(modelDir: URL, gpuCacheBytes: Int = 0, keepVision: Bool = true, keepAudio: Bool = true, maxAttempts: Int = 4) async throws -> OmniEngine {
         var engine = try await OmniEngine(modelDir: modelDir, gpuCacheBytes: gpuCacheBytes, keepVision: keepVision, keepAudio: keepAudio)
@@ -211,30 +223,81 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         return engine
     }
 
-    /// Self-test the media (injected-embeddings) backbone path that the cold-load NaN corrupts,
-    /// using a synthetic finite input. Returns true if the embedding is finite, or if the model has
-    /// no media path (a text-only model never exhibits the issue). Audio and image share the same
-    /// backbone weights, so an audio probe also covers the image/video path.
-    /// `probes`: a corrupted load NaNs most but not all media embeds (a bad process has a high,
-    /// not 100%, per-embed NaN rate), so probe several times and require every one finite - one
-    /// probe would let a grossly-bad engine slip through (and then mostly NaN real files).
+    /// Self-test the media (injected-embeddings) paths that the cold-load NaN corrupts, using
+    /// synthetic finite inputs. Returns true if every probe is finite, or if the model has no
+    /// media path (a text-only model never exhibits the issue). BOTH towers are probed: an audio
+    /// probe covers the shared backbone but reads zero bytes of the vision tower's weights, so
+    /// vision-only corruption is invisible to it (measured: a corrupted process can NaN 2-37% of
+    /// image embeds while audio stays clean, and vice versa).
+    /// `probes`: a corrupted load NaNs some but not all media embeds (per-embed NaN rates of
+    /// 2-37% measured across corrupted processes), so probe several times and require every one
+    /// finite. Low-rate corruption can still slip through - the runtime backstop is
+    /// recoverMediaPath(), triggered by the indexer when a real embed comes back non-finite.
     private func mediaPathFinite(probes: Int = 3) -> Bool {
         for _ in 0 ..< probes {
             if supportsAudio {
                 let frames = 8   // >= 3 mel frames so the audio tower pool is well-defined
                 let mel = [Float](repeating: 0, count: audioMelBins * frames)
-                guard let v = embedAudioMel(mel, frames: frames), !v.isEmpty else { return true }
-                if !v.allSatisfy({ $0.isFinite }) { return false }
-            } else if supportsImages {
+                if let v = embedAudioMel(mel, frames: frames), !v.isEmpty,
+                   !v.allSatisfy({ $0.isFinite }) { return false }
+            }
+            if supportsImages {
                 let raw = OmniVisionPreprocess.preprocessRaw(Self.solidTestImage())
-                guard let vs = embedImages([raw]), let v = vs.first else { return true }
-                if !v.allSatisfy({ $0.isFinite }) { return false }
-            } else {
-                return true   // text-only model: never exhibits the issue
+                if let vs = embedImages([raw]), let v = vs.first,
+                   !v.allSatisfy({ $0.isFinite }) { return false }
             }
         }
         return true
     }
+
+    /// Runtime backstop for the cold-load weight corruption that slips past the load-time probes.
+    ///
+    /// Measured (nansweep, 12 cold processes): 4 had per-process media corruption at per-embed
+    /// NaN rates of 2-37%, deterministic per input (re-embedding the same input reproduces the
+    /// same NaN), media-only (text is force-evaluated and exercised at load), persisting for the
+    /// process lifetime. Three identical load-time probes pass 78-91% of the time at the low
+    /// rates, so a corrupted process can reach indexing - where, without this, the same files
+    /// fail every pass until the app relaunches.
+    ///
+    /// Recovery = reload ALL weights from disk and swap in fresh encoders (the corruption is in
+    /// the materialized GPU copies, not the files), then re-probe both towers; up to two reload
+    /// attempts. Throttled to one recovery per 120s so a pass with many bad files pays it once.
+    /// Returns true if the media path probes finite afterwards. Thread-safe: the swap runs inside
+    /// the run() gate, serialized with every embed.
+    public func recoverMediaPath() -> Bool {
+        let now = Date()
+        let admitted: Bool = recoverLock.withLock {
+            guard now.timeIntervalSince(lastRecoverAt) > 120 else { return false }
+            lastRecoverAt = now
+            return true
+        }
+        guard admitted else { return false }
+        for attempt in 1 ... 2 {
+            let rebuilt: Bool = run(highPriority: false) {
+                do {
+                    let config = try OmniConfig(modelDir: modelDir)
+                    let weights = try WeightStore(modelDir: modelDir, loraScale: config.loraScale,
+                                                  keepVision: keepVision, keepAudio: keepAudio)
+                    textEncoder = OmniTextEncoder(weights: weights, config: config, tokenizer: tokenizer)
+                    imageEncoder = OmniImageEncoder(weights: weights, config: config)
+                    audioEncoder = OmniAudioEncoder(weights: weights, config: config)
+                    return true
+                } catch {
+                    FileHandle.standardError.write(Data("OmniEngine: media-path recovery reload failed: \(error)\n".utf8))
+                    return false
+                }
+            }
+            guard rebuilt else { return false }
+            MLX.GPU.clearCache()   // drop the corrupted copies' buffers
+            if mediaPathFinite(probes: 5) {
+                FileHandle.standardError.write(Data("OmniEngine: media path recovered after weight reload (attempt \(attempt))\n".utf8))
+                return true
+            }
+        }
+        return false
+    }
+    private let recoverLock = NSLock()
+    private var lastRecoverAt = Date.distantPast
 
     /// A tiny solid-gray CGImage for the image self-test (CoreGraphics only, no AppKit).
     private static func solidTestImage(side: Int = 56) -> CGImage {
