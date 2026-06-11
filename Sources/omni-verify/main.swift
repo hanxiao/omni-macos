@@ -898,8 +898,14 @@ if args.count >= 2 && args[1] == "storemem" {
     let interleave = ProcessInfo.processInfo.environment["OMNI_STOREMEM_INTERLEAVE"] == "1"
     let base0 = footprintMB()
     let store = try VectorStore(dbURL: tmp)
+    // Realistic rows: ~110-char paths and 220-char snippets (the indexer's snippetLength cap), 2
+    // chunks per file - the resident-metadata cost is real Strings, not empty placeholders.
+    let snip = String(repeating: "The quarterly revenue report shows strong cloud growth across all regions this year. ", count: 3).prefix(220)
     var batch: [(path: String, chunks: [IndexedChunk])] = []
-    for i in 0..<N { batch.append(("p\(i)", [IndexedChunk(path: "p\(i)", modified: 0, kind: "text", chunkIndex: 0, snippet: "", embedding: unit(i))]))
+    for i in 0..<(N / 2) {
+        let p = "/Users/someone/Documents/projects/area-\(i % 97)/subfolder-with-a-name-\(i % 31)/document-file-number-\(i).md"
+        batch.append((p, [IndexedChunk(path: p, modified: 0, kind: "text", chunkIndex: 0, snippet: String(snip), embedding: unit(i)),
+                          IndexedChunk(path: p, modified: 0, kind: "text", chunkIndex: 1, snippet: String(snip), embedding: unit(i + 1))]))
         if batch.count == 2000 { try store.replaceMany(batch); batch.removeAll(keepingCapacity: true)
             if interleave { _ = store.search(unit(0), topK: 10) } } }   // periodic search -> folds keep the delta small
     if !batch.isEmpty { try store.replaceMany(batch) }
