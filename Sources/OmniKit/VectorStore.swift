@@ -341,7 +341,7 @@ public final class VectorStore: @unchecked Sendable {
             // Only rebuild the in-memory buffer if this path already had rows. For a new file
             // (the dominant indexing case) there is nothing to remove, so skip the O(N) scan and
             // just append. `append` grows flat16/rows geometrically (amortized O(1)).
-            if presentPaths.contains(path) { removeRowsLocked { $0.path == path } }
+            if presentPaths.contains(path) { removeRowsByPathsLocked([path]) }
             for (i, c) in chunks.enumerated() {
                 rows.append(Row(path: c.path, snippet: c.snippet, kind: c.kind, chunkIndex: c.chunkIndex, modified: c.modified,
                                 width: c.width, height: c.height, duration: c.duration, locator: c.locator))
@@ -411,7 +411,7 @@ public final class VectorStore: @unchecked Sendable {
             let tRm = Self.searchTiming ? Date() : nil
             let affected = Set(work.map { $0.path })
             if affected.contains(where: { presentPaths.contains($0) }) {
-                removeRowsLocked { affected.contains($0.path) }   // one rebuild for the whole batch
+                removeRowsByPathsLocked(affected)   // one rebuild for the whole batch (id-mask, no path hashing)
             }
             for (wi, it) in work.enumerated() {
                 for (ci, c) in it.chunks.enumerated() {
@@ -441,7 +441,7 @@ public final class VectorStore: @unchecked Sendable {
             exec("BEGIN;")
             deletePathLocked(path)
             exec("COMMIT;")
-            removeRowsLocked { $0.path == path }
+            removeRowsByPathsLocked([path])
             proactiveRefoldLocked()
         }
     }
@@ -464,7 +464,7 @@ public final class VectorStore: @unchecked Sendable {
             }
             sqlite3_finalize(stmt)
             exec("COMMIT;")
-            removeRowsLocked { paths.contains($0.path) }   // one rebuild for the whole set
+            removeRowsByPathsLocked(paths)   // one rebuild for the whole set (id-mask, no path hashing)
             proactiveRefoldLocked()
         }
     }
@@ -1118,6 +1118,30 @@ public final class VectorStore: @unchecked Sendable {
 
     /// Drop rows (and their contiguous embedding slices) matching the predicate, compacting
     /// `flat16` in one pass. Only runs on deletes, never on search.
+    /// Remove every row whose PATH is in `paths` (the reconcile/replace/delete-set case). Builds an
+    /// O(1) file-id mask and compacts via that, instead of hashing every survivor's path string
+    /// against the set: the per-row `Set<String>.contains` was ~45ms of the compaction at 627k rows
+    /// (the in-place memmove is only ~5ms), and that whole window holds the serial queue a concurrent
+    /// search waits on. A path maps to exactly one dense file-id covering all its rows, so the mask is
+    /// exact. Folder/kind removals (prefix / kind predicates) keep the generic `removeRowsLocked`.
+    private func removeRowsByPathsLocked(_ paths: Set<String>) {
+        guard dim > 0 else { removeRowsLocked { paths.contains($0.path) }; return }
+        // Map the (small) removed set to file-ids -> a bool mask indexed by id. Only currently-present
+        // paths have an id and any rows; new paths in the set (a reconcile batch mixes add+modify) are
+        // simply absent from the mask.
+        guard fileIDCount > 0 else { return }
+        var idMask = [Bool](repeating: false, count: fileIDCount)
+        var any = false
+        for p in paths { if let id = pathID[p] { let idx = Int(id); if idx < idMask.count { idMask[idx] = true; any = true } } }
+        guard any else { return }
+        let removed = idMask.withUnsafeBufferPointer { m in
+            fileID.withUnsafeBufferPointer { fid in
+                compactRowsLocked { m[Int(fid[$0])] }
+            }
+        }
+        presentPaths.subtract(removed.isEmpty ? paths : removed)
+    }
+
     private func removeRowsLocked(_ predicate: (Row) -> Bool) {
         // dim==0 means no vectors stored yet, but `rows` may still hold metadata - keep fileID and
         // the base in sync if anything is actually removed (the base was previously left stale here).
@@ -1135,25 +1159,26 @@ public final class VectorStore: @unchecked Sendable {
         // prior row to remove. Without it, every stored file rebuilt the entire ~dim*rows.count
         // buffer (a multi-GB memmove on a large index), making indexing and reconcile O(N^2).
         guard rows.contains(where: predicate) else { return }
-        // Compact `flat16` IN PLACE with a write cursor instead of building a second full-size `keptFlat`
-        // copy (which doubled bf16 peak - ~1.3GB transient on a 420k*768 index, enough to swap an 8GB
-        // Mac on a reconcile delete). Survivors only ever move toward the front (w <= i), so the forward
-        // dim-slice move is non-overlapping and the surviving layout/order is byte-identical.
-        //
-        // Compact rows/fileID/kindCode IN LOCKSTEP in the SAME pass, and update presentPaths only by the
-        // gone paths. The old code rebuilt all three from scratch afterward (Set(rows.map{path}) +
-        // rebuildFileIDsLocked re-interning every survivor) - that hashed every survivor path TWICE more,
-        // ~2x the cost of this loop on a large index, on the serial queue a concurrent search waits on.
-        // pathID/kindID intern tables are intentionally NOT rebuilt: surviving fileID values stay valid
-        // (ids are never reused), a re-added path reuses its existing id, and a fully-removed path's id
-        // just goes unreferenced - leaving fileIDCount an upper bound (the reducer's per-file array is
-        // then merely oversized, never wrong). loadIntoMemory rebuilds them densely on the next launch.
+        let removed = compactRowsLocked { predicate(rows[$0]) }
+        presentPaths.subtract(removed)
+    }
+
+    /// Shared in-place compaction: drop every row index for which `shouldRemove` is true, keeping the
+    /// survivors' layout/order byte-identical. Compacts flat16 with a forward write cursor (no second
+    /// full-size buffer - that doubled bf16 peak, ~1.3GB transient at 420k*768, enough to swap an 8GB
+    /// Mac) and rows/fileID/kindCode in LOCKSTEP in the same pass. pathID/kindID are intentionally NOT
+    /// re-densified: surviving file-ids stay valid (ids are never reused), a re-added path reuses its
+    /// id, a fully-removed id just goes unreferenced (fileIDCount becomes an upper bound -> the
+    /// reducer's per-file array is merely oversized, never wrong); loadIntoMemory rebuilds them densely
+    /// next launch. Returns the set of removed paths (for presentPaths maintenance). Invalidates base.
+    private func compactRowsLocked(_ shouldRemove: (Int) -> Bool) -> Set<String> {
         var removedPaths = Set<String>()
+        var firstRemoved = Int.max
         var w = 0   // write cursor, in dim-slice / row units
         flat16.withUnsafeMutableBufferPointer { fb in
             guard let base = fb.baseAddress else { return }
             for i in 0 ..< rows.count {
-                if predicate(rows[i]) { removedPaths.insert(rows[i].path); continue }
+                if shouldRemove(i) { removedPaths.insert(rows[i].path); if i < firstRemoved { firstRemoved = i }; continue }
                 if w != i {
                     (base + w * dim).update(from: base + i * dim, count: dim)
                     rows[w] = rows[i]; fileID[w] = fileID[i]; kindCode[w] = kindCode[i]
@@ -1162,12 +1187,16 @@ public final class VectorStore: @unchecked Sendable {
             }
         }
         let removed = rows.count - w
+        guard removed > 0 else { return removedPaths }
         flat16.removeLast(removed * dim)
         rows.removeLast(removed); fileID.removeLast(removed); kindCode.removeLast(removed)
-        // Our delete predicates always remove ALL rows of a matched path, so the gone paths are exactly
-        // `removedPaths` and none survive - subtract them rather than rebuild the whole present set.
-        presentPaths.subtract(removedPaths)
-        invalidateBase()
+        // The base is the resident copy of rows [0, baseRows). It only goes stale if a removed row was
+        // INSIDE that region (everything after it shifts forward). If every removed row was in the delta
+        // [baseRows, n) - the common "re-edit a recently indexed file" case - rows [0, baseRows) are
+        // byte-untouched (the write cursor never diverged before `firstRemoved`), so the base stays
+        // valid and we skip the ~65ms rebuild entirely. Delta-only shrink keeps baseRows correct.
+        if firstRemoved < baseRows { invalidateBase() }
+        return removedPaths
     }
 
     private func deletePathLocked(_ path: String) {
