@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import QuickLookThumbnailing
+import ImageIO
 
 extension NSWorkspace {
     /// Open a file without blocking the caller. The plain `open(URL)` is the deprecated SYNCHRONOUS
@@ -80,6 +81,31 @@ struct Thumbnail: View {
         if image != nil { image = nil }
         let url = URL(fileURLWithPath: path)
         let scale = NSScreen.main?.backingScaleFactor ?? 2
+        let maxPixel = Swift.max(32, Int((side * scale).rounded()))
+        let ext = (path as NSString).pathExtension.lowercased()
+
+        // Images and PDFs: decode DIRECTLY off the main thread (ImageIO / PDFKit), not via QuickLook.
+        // QLThumbnailGenerator returns only the type-icon placeholder for large files (multi-megapixel
+        // PNGs, big PDFs) under its in-app budget - exactly the photos/diagrams that most want a real
+        // preview - even though qlmanage can render them. ImageIO/PDFKit reliably downsample any size,
+        // are faster (no thumbnail-daemon IPC), and the work is pure synchronous decode in a detached
+        // task (no actor-isolation hazard). QuickLook still covers video/audio/docs below. Returning nil
+        // here (unreadable/odd file) falls through to the QuickLook path.
+        if Self.imageExts.contains(ext) || ext == "pdf" {
+            let isPDF = ext == "pdf"
+            let cg = await Task.detached(priority: .userInitiated) {
+                isPDF ? Self.pdfThumbnail(url, maxPixel: maxPixel) : Self.imageThumbnail(url, maxPixel: maxPixel)
+            }.value
+            if Task.isCancelled { return }
+            if let cg {
+                let img = NSImage(cgImage: cg, size: NSSize(width: CGFloat(cg.width) / scale,
+                                                            height: CGFloat(cg.height) / scale))
+                ThumbnailCache.shared.store(img, key)
+                image = img
+                return
+            }
+        }
+
         // `.all` (icon + low-quality + full thumbnail), not `.thumbnail` alone: the bulk of an index is
         // text/source/data files that have no CONTENT thumbnail, where `.thumbnail` returns nil and we
         // fell back to NSWorkspace's generic icon. generateBestRepresentation with `.all` returns the
@@ -116,5 +142,44 @@ struct Thumbnail: View {
                                                     height: CGFloat(cg.height) / scale))
         ThumbnailCache.shared.store(img, key)
         image = img
+    }
+
+    /// File extensions decoded directly by ImageIO (CGImageSource handles all of these natively).
+    static let imageExts: Set<String> = [
+        "png", "jpg", "jpeg", "gif", "heic", "heif", "tiff", "tif", "bmp", "webp",
+        "jp2", "ico", "icns", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2",
+    ]
+
+    /// Downsample an image file to <= maxPixel on its long edge via ImageIO. Reads only what it needs
+    /// and never returns the type-icon placeholder for a valid image (the QuickLook in-app failure mode
+    /// for multi-megapixel files). `WithTransform` honors EXIF orientation. Synchronous CPU decode -
+    /// call off the main thread.
+    nonisolated static func imageThumbnail(_ url: URL, maxPixel: Int) -> CGImage? {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+        ]
+        return CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary)
+    }
+
+    /// Render page 1 of a PDF to <= maxPixel on its long edge via pure CoreGraphics. Reliable where
+    /// QuickLook returns the icon for a large PDF. CGPDFDocument + CGContext.drawPDFPage is thread-safe
+    /// and has no AppKit/@MainActor dependency, so it runs in the detached decode task. CGPDF pages are
+    /// 1-indexed. White backing so a transparent PDF does not render as black on the dark detail pane.
+    nonisolated static func pdfThumbnail(_ url: URL, maxPixel: Int) -> CGImage? {
+        guard let doc = CGPDFDocument(url as CFURL), let page = doc.page(at: 1) else { return nil }
+        let box = page.getBoxRect(.cropBox)
+        guard box.width > 0, box.height > 0 else { return nil }
+        let s = CGFloat(maxPixel) / Swift.max(box.width, box.height)
+        let w = Swift.max(1, Int((box.width * s).rounded())), h = Swift.max(1, Int((box.height * s).rounded()))
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1)); ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        ctx.translateBy(x: -box.minX * s, y: -box.minY * s); ctx.scaleBy(x: s, y: s)
+        ctx.drawPDFPage(page)
+        return ctx.makeImage()
     }
 }
