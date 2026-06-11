@@ -105,9 +105,13 @@ final class Qwen3Backbone: @unchecked Sendable {
     func forward(inputsEmbeds: MLXArray, length L: Int, lengths: [Int]? = nil) -> MLXArray {
         let mask = attentionMask(inputsEmbeds, lengths: lengths)
         var h = inputsEmbeds.asType(computeDType)
-        // Compile policy: B==1 (interactive query) by default; env can force all/none. See `compileEnv`.
+        // Compile policy: B==1 SHORT forwards (interactive queries, <=512 tokens) by default; env can
+        // force all/none. The L cap keeps MEDIA off the compiled path: image/audio injections are
+        // B==1 too but ~1.2k tokens with near-unique lengths, so each image would cold-compile a new
+        // (1, L) graph (~1ms on a ~19ms backbone pass) and grow the cache without reuse. Queries
+        // cluster in a handful of short lengths and reuse their graphs (measured 8 keys, 15-17% win).
         let B = inputsEmbeds.dim(0)
-        let useCompiled = compileEnv == "1" || (compileEnv != "0" && B == 1)
+        let useCompiled = compileEnv == "1" || (compileEnv != "0" && B == 1 && inputsEmbeds.dim(1) <= 512)
         if useCompiled {
             h = forwardCompiled(h, mask: mask)
         } else {

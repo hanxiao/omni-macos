@@ -51,6 +51,10 @@ public final class OmniVisionTower: @unchecked Sendable {
         self.fp32Compute = ProcessInfo.processInfo.environment["OMNI_VISION_BF16_SDPA"] != "1"
     }
 
+    /// Experiment lever: run the vision SDPA itself in bf16 (no fp32 upcast). Requires
+    /// OMNI_VISION_BF16_SDPA=1 to have any effect (otherwise inputs are already fp32).
+    static let trueBF16Attn = ProcessInfo.processInfo.environment["OMNI_VISION_TRUE_BF16_ATTN"] == "1"
+
     /// Weight cast to the tower compute dtype (fp32 by default). Hoisting the cast here keeps every
     /// matmul in one dtype so packing is shape-invariant.
     private func wc(_ key: String) -> MLXArray {
@@ -99,10 +103,15 @@ public final class OmniVisionTower: @unchecked Sendable {
         // model.py's block-diagonal mask without ever materializing an O(Ltotal^2) score matrix.
         let cuSeqlens = cumulativeSeqlens(gridTHW)           // [num_windows + 1]
 
+        // OMNI_VIZ_ABLATE=attn|mlp|blocks: measurement-only ablation to attribute the tower's GPU
+        // time (output is garbage; never set outside benchmarking).
+        let ablate = ProcessInfo.processInfo.environment["OMNI_VIZ_ABLATE"]
         for i in 0 ..< cfg.vision.depth {
             let p = "vision_tower.blocks.\(i)."
-            hidden = hidden + attention(layerNorm(hidden, p + "norm1"), p, cos, sin, cuSeqlens)
-            hidden = hidden + mlp(layerNorm(hidden, p + "norm2"), p)
+            if ablate != "blocks" {
+                if ablate != "attn" { hidden = hidden + attention(layerNorm(hidden, p + "norm1"), p, cos, sin, cuSeqlens) }
+                if ablate != "mlp" { hidden = hidden + mlp(layerNorm(hidden, p + "norm2"), p) }
+            }
         }
 
         // Merge per item: slice each item's N_i patches and run the spatial-merge separately so the
@@ -310,8 +319,9 @@ public final class OmniVisionTower: @unchecked Sendable {
         // With fp32Compute (default) qh/kh/vh are already fp32 (whole tower runs fp32: NaN-free and
         // packing-shape-invariant). The legacy bf16 path keeps them bf16 - still upcast just the
         // attention product to fp32 to avoid the softmax NaN, then cast back for the proj matmul.
+        // OMNI_VISION_TRUE_BF16_ATTN=1 (experiment): skip the upcast and run SDPA in bf16.
         let attnDtype = qh.dtype
-        if attnDtype != .float32 {
+        if attnDtype != .float32, !Self.trueBF16Attn {
             qh = qh.asType(.float32); kh = kh.asType(.float32); vh = vh.asType(.float32)
         }
         let scale = Float(pow(Double(headDim), -0.5))
@@ -347,10 +357,26 @@ public final class OmniVisionTower: @unchecked Sendable {
     /// apply_rotary_pos_emb_vision on a [n, heads, headDim] tensor.
     /// cos/sin arrive pre-tiled to [n, headDim] (the x2 tile from model.py is
     /// done by the caller), so they broadcast over the heads axis directly.
+    /// Rope apply is ~6 elementwise/slice kernels eagerly, twice (q,k) per block. The compiled form
+    /// fuses the elementwise tail (neg, concat, two muls, add) into one kernel. Slices stay OUTSIDE
+    /// the compiled body: MLX's shapeless compile cannot shape-infer Slice (it traps), so x1/x2 are
+    /// passed in as inputs. The cos/sin rank-expansion also happens outside (a reshape with concrete
+    /// dims would bake n). Same expression tree as eager - gated by the vision parity tests.
+    private static let ropeApplyCompiled: @Sendable ([MLXArray]) -> [MLXArray] = compile(shapeless: true) { xs in
+        let (t, c, s, x1, x2) = (xs[0], xs[1], xs[2], xs[3], xs[4])
+        return [(t * c) + (MLX.concatenated([-x2, x1], axis: -1) * s)]
+    }
+
     private func applyRotaryVision(_ t: MLXArray, _ cos: MLXArray, _ sin: MLXArray) -> MLXArray {
         // cos/sin: [n, headDim] -> broadcast to [n, 1, headDim].
-        let c = cos.reshaped([cos.dim(0), 1, cos.dim(1)])
-        let s = sin.reshaped([sin.dim(0), 1, sin.dim(1)])
+        let c = cos.expandedDimensions(axis: 1)
+        let s = sin.expandedDimensions(axis: 1)
+        if Qwen3Backbone.fusedNorm {
+            let d = t.dim(-1)
+            let x1 = t[.ellipsis, 0 ..< (d / 2)]
+            let x2 = t[.ellipsis, (d / 2) ..< d]
+            return Self.ropeApplyCompiled([t, c, s, x1, x2])[0]
+        }
         return (t * c) + (rotateHalf(t) * s)
     }
 
@@ -404,14 +430,34 @@ public final class OmniVisionTower: @unchecked Sendable {
     }
 
     /// GELU tanh approximation (nn.GELU(approx="tanh")), used by the ViT MLP.
+    /// The tanh-GELU expression is ~9 elementwise kernels eagerly - on [N, 4*hidden] fp32 that is
+    /// ~9 round-trips of a ~60MB intermediate per block, pure memory traffic. compile(shapeless:)
+    /// fuses the whole expression into ONE kernel, shape-independently (no per-N recompile; the
+    /// expression is purely elementwise, the shapeless-safe case). Same expression tree, same
+    /// per-element order - gated by the vision parity tests. OMNI_FUSED_NORM=0 restores eager.
+    private static let geluTanhCompiled: @Sendable ([MLXArray]) -> [MLXArray] = compile(shapeless: true) { xs in
+        let x = xs[0]
+        let c: Float = 0.7978845608028654   // sqrt(2/pi)
+        let inner = c * (x + 0.044715 * x * x * x)
+        return [0.5 * x * (1 + MLX.tanh(inner))]
+    }
+
     private func geluTanh(_ x: MLXArray) -> MLXArray {
+        if Qwen3Backbone.fusedNorm { return Self.geluTanhCompiled([x])[0] }
         let c: Float = 0.7978845608028654   // sqrt(2/pi)
         let inner = c * (x + 0.044715 * x * x * x)
         return 0.5 * x * (1 + MLX.tanh(inner))
     }
 
-    /// Exact GELU (nn.GELU() default, erf-based), used by the merger.
+    /// Exact GELU (nn.GELU() default, erf-based), used by the merger. Fused like geluTanh.
+    private static let geluErfCompiled: @Sendable ([MLXArray]) -> [MLXArray] = compile(shapeless: true) { xs in
+        let x = xs[0]
+        let invSqrt2: Float = 0.7071067811865476
+        return [x * 0.5 * (1 + MLX.erf(x * invSqrt2))]
+    }
+
     private func geluErf(_ x: MLXArray) -> MLXArray {
+        if Qwen3Backbone.fusedNorm { return Self.geluErfCompiled([x])[0] }
         let invSqrt2: Float = 0.7071067811865476
         return x * 0.5 * (1 + MLX.erf(x * invSqrt2))
     }

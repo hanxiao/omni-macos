@@ -102,10 +102,17 @@ public final class OmniImageEncoder: @unchecked Sendable {
         let packedPixels = inputs.count == 1 ? inputs[0].pixelValues
             : MLX.concatenated(inputs.map { $0.pixelValues }, axis: 0)
         let packedGrid = inputs.flatMap { $0.gridTHW }
+        let tT = Self.mediaTiming ? Date() : nil
         let perImage = tower.forwardPerItem(packedPixels, gridTHW: packedGrid)  // [[N_i/merge^2, dim]]
+        let tBuilt = Self.mediaTiming ? Date() : nil
         // Realize the (packed) tower features before the backbone runs. This frees the tower's large
         // packed activations before the backbone allocates its own - bounding peak memory per chunk.
         eval(perImage)
+        if let tT, let tBuilt {
+            let toks = perImage.reduce(0) { $0 + $1.dim(0) }
+            print(String(format: "[media] tower(%d imgs, %d toks) build=%.1fms eval=%.1fms", inputs.count, toks,
+                         tBuilt.timeIntervalSince(tT) * 1000, -tBuilt.timeIntervalSinceNow * 1000))
+        }
 
         // Backbone injection is kept at B=1 PER IMAGE (the proven, bit-identical scalar path).
         // The vision tower - the media bottleneck per the profile (~163ms nano / 418ms small,
@@ -122,6 +129,7 @@ public final class OmniImageEncoder: @unchecked Sendable {
         //  - each image's pooled vector is built as a GRAPH and all of them evaluate in ONE eval,
         //    instead of a full GPU drain + host readback per image (the graphs are independent, so
         //    peak memory matches the largest single forward, as before).
+        let tLoop = Self.mediaTiming ? Date() : nil
         let dim = cfg.text.hiddenSize
         let preEmbed: MLXArray? = prefixIds.isEmpty ? nil : backbone.embed(prefixIds)
         let startEmbed = backbone.embed([cfg.visionStartTokenId])
@@ -143,9 +151,14 @@ public final class OmniImageEncoder: @unchecked Sendable {
             pooled.append(backbone.poolGraph(hidden, length: length))
             seqTotal += length
         }
+        let tB = Self.mediaTiming ? Date() : nil
+        if let tLoop, let tB { print(String(format: "[media] bb-graph-build(%d imgs) %.1fms", perImage.count, tB.timeIntervalSince(tLoop) * 1000)) }
         eval(pooled)
+        if let tB { print(String(format: "[media] bb-eval(%d imgs, %d toks) %.1fms", perImage.count, seqTotal, -tB.timeIntervalSinceNow * 1000)) }
         return (pooled.map { $0.asArray(Float.self) }, seqTotal)
     }
+
+    static let mediaTiming = ProcessInfo.processInfo.environment["OMNI_MEDIA_TIMING"] == "1"
 
     /// Single-sequence inject + forward + last-token pool (the original scalar path).
     private func injectAndPool(_ features: MLXArray, prefixIds: [Int], suffixIds: [Int]) -> (vec: [Float], length: Int) {

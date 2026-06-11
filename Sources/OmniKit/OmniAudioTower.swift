@@ -287,7 +287,17 @@ public final class OmniAudioTower: @unchecked Sendable {
     }
 
     /// Exact GELU (nn.GELU() default, erf-based) — matches the audio tower's act_fn.
+    /// Fused via compile(shapeless:) - one kernel instead of ~5 elementwise passes over the
+    /// activation (pure elementwise, the shapeless-safe case). Same expression tree as eager;
+    /// gated by the audio parity tests. OMNI_FUSED_NORM=0 restores eager.
+    private static let geluErfCompiled: @Sendable ([MLXArray]) -> [MLXArray] = compile(shapeless: true) { xs in
+        let x = xs[0]
+        let invSqrt2: Float = 0.7071067811865476
+        return [x * 0.5 * (1 + MLX.erf(x * invSqrt2))]
+    }
+
     private func gelu(_ x: MLXArray) -> MLXArray {
+        if Qwen3Backbone.fusedNorm { return Self.geluErfCompiled([x])[0] }
         let invSqrt2: Float = 0.7071067811865476
         return x * 0.5 * (1 + MLX.erf(x * invSqrt2))
     }
