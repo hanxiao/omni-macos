@@ -399,14 +399,28 @@ struct ResultGridItem: View {
                         }
                     }
                 }
-            Text(url.lastPathComponent).font(.caption).lineLimit(2)
-                .multilineTextAlignment(.center)
-                .foregroundStyle(selected ? .white : .primary)
-                .padding(.horizontal, 6).padding(.vertical, 1)
-                .background(selected ? Color.accentColor : .clear, in: Capsule())
-                .frame(maxWidth: 150)
-            MediaInfoLabel(path: hit.path, kind: hit.kind, width: hit.width, height: hit.height, duration: hit.duration, separator: false)
-                .font(.caption2).foregroundStyle(.tertiary)
+            // STRICT GRID ALIGNMENT (Finder convention): every cell reserves the same label
+            // footprint - exactly two caption lines for the name and one caption2 line for the info -
+            // whether or not the content fills it. Without this, 1-line names and caption-less text
+            // files made cells shorter, and LazyVGrid centers short cells in the row slot, so
+            // thumbnails floated at different heights across a row. The hidden template sets the slot
+            // height (layout-robust, no hardcoded points) while the visible name keeps hugging its
+            // selection capsule - reservesSpace on the Text itself would stretch the capsule over the
+            // empty reserved line. Top-aligned, like Finder: the name starts right under the icon.
+            ZStack(alignment: .top) {
+                Text(verbatim: "X\nX").font(.caption).padding(.vertical, 1).hidden()
+                Text(url.lastPathComponent).font(.caption).lineLimit(2)
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(selected ? .white : .primary)
+                    .padding(.horizontal, 6).padding(.vertical, 1)
+                    .background(selected ? Color.accentColor : .clear, in: Capsule())
+                    .frame(maxWidth: 150)
+            }
+            ZStack {
+                Text(verbatim: "0").font(.caption2).hidden()
+                MediaInfoLabel(path: hit.path, kind: hit.kind, width: hit.width, height: hit.height, duration: hit.duration, separator: false)
+                    .font(.caption2).foregroundStyle(.tertiary)
+            }
         }
         .padding(8)
         // Native selection: a translucent accent fill behind the whole cell (thumbnail + label),
