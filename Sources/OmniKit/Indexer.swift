@@ -542,9 +542,18 @@ public final class Indexer: @unchecked Sendable {
         // Decode through the same bounded concurrent pipeline as a full pass (PDF raster, mel STFT,
         // patchify run on background cores instead of serially on this thread); embed serially in
         // file order. force: true because change detection already happened above.
-        pipeline(work, force: true, known: [:], settings: settings) { item in
-            let path = item.file.url.path
-            let raw = self.embed(item)
+        // CROSS-FILE TEXT BATCHING for the reconcile path, mirroring the full pass's flushText.
+        // update() previously embedded each file by itself - ONE un-pipelined forward per file (its
+        // own gate window, asyncEval, and readout sync), forfeiting both the cross-file batch shape
+        // and the double-buffered pipeline that make the full pass fast. Live updates are the most
+        // user-visible indexing there is (files appear as you save them), so they now stage text
+        // chunks across files and embed per length-bucketed window exactly like index(). Media
+        // items keep the per-file path (their batching lives in the encoders).
+        var tBuf: [(fid: Int, idx: Int, text: String, snippet: String, locator: String)] = []
+        var tAcc: [Int: (path: String, file: CrawledFile, kind: String, total: Int, done: [IndexedChunk])] = [:]
+        var tNextFid = 0
+        let tWindow = textBatchSize * 6
+        func acceptCompleted(_ path: String, _ raw: [IndexedChunk]) {
             let chunks = raw.filter { Self.isFinite($0.embedding) }
             // Transient GPU fault (some vectors non-finite): keep whatever is currently indexed
             // and let a later pass redo the file - storing/deleting now would persist the fault.
@@ -552,15 +561,56 @@ public final class Indexer: @unchecked Sendable {
                 Self.log.error("non-finite embedding, update skipped: \(path, privacy: .public)")
                 return
             }
-            // The cancel guard matters: embed() returns [] when a pause interrupts it, and that
-            // must NOT be read as "file has no content" - deleting here would drop a file from
-            // the index just because the user paused mid-update.
+            // The cancel guard matters: an interrupted embed must NOT read as "file has no
+            // content" - deleting here would drop a file just because the user paused mid-update.
             if chunks.isEmpty { if !self.isCancelled, known[path] != nil { toDelete.insert(path) } }
             else {
                 toReplace.append((path, chunks))
                 if toReplace.count >= 256 { flushReplace() }
             }
         }
+        func flushTextU(drainAll: Bool) {
+            let floor = drainAll ? 0 : textBatchSize
+            guard tBuf.count > floor else { return }
+            tBuf.sort { $0.text.count < $1.text.count }
+            let carve = embedder.interactiveQueryActive ? Swift.min(textBatchSize, Self.searchCarve) : textBatchSize
+            var groups: [[(fid: Int, idx: Int, text: String, snippet: String, locator: String)]] = []
+            while tBuf.count > floor {
+                let take = Swift.min(carve, tBuf.count)
+                groups.append(Array(tBuf.prefix(take))); tBuf.removeFirst(take)
+            }
+            if groups.isEmpty { return }
+            let vecBatches = self.embedder.embedTextBatches(groups.map { $0.map { $0.text } }, as: .passage)
+            for (gi, batch) in groups.enumerated() {
+                let vecs = vecBatches[gi]
+                for (k, b) in batch.enumerated() {
+                    guard var a = tAcc[b.fid] else { continue }
+                    a.done.append(IndexedChunk(path: a.path, modified: a.file.modified, size: a.file.size,
+                                               kind: a.kind, chunkIndex: b.idx, snippet: b.snippet, embedding: vecs[k],
+                                               locator: b.locator))
+                    tAcc[b.fid] = a
+                    if a.done.count == a.total { acceptCompleted(a.path, a.done); tAcc[b.fid] = nil }
+                }
+            }
+        }
+        pipeline(work, force: true, known: [:], settings: settings) { item in
+            let path = item.file.url.path
+            switch item.payload {
+            case .text(let pieces) where !pieces.isEmpty:
+                let fid = tNextFid; tNextFid += 1
+                tAcc[fid] = (path, item.file, item.kind, pieces.count, [])
+                for (j, piece) in pieces.enumerated() {
+                    tBuf.append((fid, j, piece.text, self.snippet(piece.text), piece.locator))
+                }
+                if tBuf.count >= tWindow { flushTextU(drainAll: false) }
+            default:
+                acceptCompleted(path, self.embed(item))
+            }
+        }
+        flushTextU(drainAll: true)
+        // Stragglers are INCOMPLETE files (a cancel interrupted their window) - storing a partial
+        // chunk set would permanently truncate the file under its current mtime, so never store them.
+        for (_, a) in tAcc where a.done.count == a.total { acceptCompleted(a.path, a.done) }
         if !toDelete.isEmpty { store.deletePaths(toDelete) }
         flushReplace()
     }

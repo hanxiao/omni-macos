@@ -214,7 +214,7 @@ public final class OmniAudioTower: @unchecked Sendable {
         // --- audio_projector: Linear 1280 -> 1024.
         let projW = w["audio_projector.weight"]
         let projB = w["audio_projector.bias"]
-        let out = matmul(audioHidden, projW.transposed(1, 0)) + projB   // [N_audio, 1024]
+        let out = MLX.addMM(projB, audioHidden, projW.transposed(1, 0))   // fused, [N_audio, 1024]
         return (out, perAudioN)
     }
 
@@ -223,11 +223,11 @@ public final class OmniAudioTower: @unchecked Sendable {
     private func selfAttn(_ x: MLXArray, _ p: String, _ cuSeqlens: [Int]) -> MLXArray {
         let n = x.dim(0)
         // q/v/o carry bias; k_proj has no bias (Qwen2_5OmniAudioAttention).
-        let q = (matmul(x, w[p + "self_attn.q_proj.weight"].transposed(1, 0)) + w[p + "self_attn.q_proj.bias"])
+        let q = MLX.addMM(w[p + "self_attn.q_proj.bias"], x, w[p + "self_attn.q_proj.weight"].transposed(1, 0))
             .reshaped([n, numHeads, headDim]).transposed(1, 0, 2)   // [heads, n, headDim]
         let k = matmul(x, w[p + "self_attn.k_proj.weight"].transposed(1, 0))
             .reshaped([n, numHeads, headDim]).transposed(1, 0, 2)
-        let v = (matmul(x, w[p + "self_attn.v_proj.weight"].transposed(1, 0)) + w[p + "self_attn.v_proj.bias"])
+        let v = MLX.addMM(w[p + "self_attn.v_proj.bias"], x, w[p + "self_attn.v_proj.weight"].transposed(1, 0))
             .reshaped([n, numHeads, headDim]).transposed(1, 0, 2)
 
         let scale = Float(pow(Double(headDim), -0.5))
@@ -256,15 +256,15 @@ public final class OmniAudioTower: @unchecked Sendable {
             let cat = MLX.concatenated(outs, axis: 1)   // [heads, n, headDim]
             out = cat.transposed(1, 0, 2).reshaped([n, numHeads * headDim])
         }
-        return matmul(out, w[p + "self_attn.out_proj.weight"].transposed(1, 0)) + w[p + "self_attn.out_proj.bias"]
+        return MLX.addMM(w[p + "self_attn.out_proj.bias"], out, w[p + "self_attn.out_proj.weight"].transposed(1, 0))
     }
 
     // MARK: - Feed-forward (fc1 -> GELU -> fc2)
 
     private func feedForward(_ x: MLXArray, _ p: String) -> MLXArray {
-        let h1 = matmul(x, w[p + "fc1.weight"].transposed(1, 0)) + w[p + "fc1.bias"]
+        let h1 = MLX.addMM(w[p + "fc1.bias"], x, w[p + "fc1.weight"].transposed(1, 0))
         let a = gelu(h1)
-        return matmul(a, w[p + "fc2.weight"].transposed(1, 0)) + w[p + "fc2.bias"]
+        return MLX.addMM(w[p + "fc2.bias"], a, w[p + "fc2.weight"].transposed(1, 0))
     }
 
     // MARK: - Helpers

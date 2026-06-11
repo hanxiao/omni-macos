@@ -158,13 +158,18 @@ final class Qwen3Backbone: @unchecked Sendable {
                 // q_norm / k_norm are absent on Nano. Feed a 1x1 sentinel so the input arity is
                 // fixed; the compiled body skips it when the model has no head-norm (cfg-constant).
                 let key = p + name
-                args.append(w.has(key) ? w[key] : MLXArray([Float(1)]))
+                args.append(w.has(key) ? w[key] : oneSentinel)
             }
             if let m = maskArray { args.append(m) }
             h = block(args)[0]
         }
         return h
     }
+
+    /// Shared placeholder for absent optional weights (nano has no q/k head-norms) - previously a
+    /// fresh tiny host array per missing weight per layer per compiled forward (56 allocs/forward).
+    /// Instance-held (the class is @unchecked Sendable; forwards are engine-serialized).
+    private lazy var oneSentinel = MLXArray([Float(1)])
 
     /// Weight tensor names consumed by one transformer block, in the order `forwardCompiled` packs
     /// them and `buildBlock` unpacks them. Must stay in sync between the two.
