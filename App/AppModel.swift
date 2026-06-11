@@ -440,6 +440,16 @@ final class AppModel {
     var minAudioSeconds: Double = 0 { didSet { persistPerf() } }
     var minVideoSeconds: Double = 0 { didSet { persistPerf() } }
     var minTextChars: Int = 0 { didSet { persistPerf() } }
+    /// Dataless (iCloud/FileProvider-evicted) files: skip (default - no surprise downloads; they
+    /// index when materialized) or download-and-index. Switching TO download kicks an incremental
+    /// pass so previously skipped files get picked up without waiting for the next reconcile.
+    var skipDatalessFiles: Bool = true {
+        didSet {
+            guard oldValue != skipDatalessFiles else { return }
+            persistPerf()
+            if !skipDatalessFiles { startIndexing() }
+        }
+    }
 
     // Index storage info (for the Settings > Model tab).
     var dbPath = ""
@@ -867,6 +877,30 @@ final class AppModel {
     }
 
 
+    /// Whether a result's enclosing folder can be one-click ignored. False when the folder IS an
+    /// indexed root: excluding a whole root is "remove the folder" (a sidebar action with its own
+    /// confirmation), not a quiet ignore rule from a context menu.
+    func canIgnoreEnclosingFolder(ofPath path: String) -> Bool {
+        let folder = (path as NSString).deletingLastPathComponent
+        return !roots.contains { $0.path == folder }
+    }
+
+    /// Context-menu action: exclude a search result's ENCLOSING FOLDER from indexing. Appends an
+    /// absolute, directory-only pattern (`/abs/path/`) to .omniignore and routes it through
+    /// applyIgnoreText - the same path as the Settings editor - so it is backed up (one-step
+    /// Revert), pruned from the index, persisted, visible in Settings > Content, and followed by an
+    /// incremental pass. No-op if the pattern is already present or the folder is an indexed root.
+    func ignoreEnclosingFolder(ofPath path: String) {
+        guard canIgnoreEnclosingFolder(ofPath: path) else { return }
+        let pattern = (path as NSString).deletingLastPathComponent + "/"
+        let present = ignoreText.split(separator: "\n", omittingEmptySubsequences: true)
+            .contains { $0.trimmingCharacters(in: .whitespaces) == pattern }
+        guard !present else { return }
+        var text = ignoreText
+        if !text.isEmpty, !text.hasSuffix("\n") { text += "\n" }
+        applyIgnoreText(text + pattern + "\n")
+    }
+
     /// Restore the policy from the `.bak` written by the last Apply, and re-apply it.
     func revertIgnore() {
         guard let url = Self.ignoreFileURL(),
@@ -985,6 +1019,7 @@ final class AppModel {
         if d.object(forKey: "omni.minAudioSec") != nil { minAudioSeconds = max(0, d.double(forKey: "omni.minAudioSec")) }
         if d.object(forKey: "omni.minVideoSec") != nil { minVideoSeconds = max(0, d.double(forKey: "omni.minVideoSec")) }
         if d.object(forKey: "omni.minTextChars") != nil { minTextChars = max(0, d.integer(forKey: "omni.minTextChars")) }
+        if d.object(forKey: "omni.skipDataless") != nil { skipDatalessFiles = d.bool(forKey: "omni.skipDataless") }
     }
     private func persistPerf() {
         let d = UserDefaults.standard
@@ -996,6 +1031,7 @@ final class AppModel {
         d.set(minAudioSeconds, forKey: "omni.minAudioSec")
         d.set(minVideoSeconds, forKey: "omni.minVideoSec")
         d.set(minTextChars, forKey: "omni.minTextChars")
+        d.set(skipDatalessFiles, forKey: "omni.skipDataless")
     }
 
     // MARK: - Filters
@@ -1847,6 +1883,7 @@ final class AppModel {
         s.minAudioSeconds = minAudioSeconds
         s.minVideoSeconds = minVideoSeconds
         s.minTextChars = minTextChars
+        s.skipDataless = skipDatalessFiles
         return s
     }
 

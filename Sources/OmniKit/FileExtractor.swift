@@ -68,6 +68,17 @@ public enum FileExtractor {
     public static let minCharsPerPage = 8
     public static let maxVideoFrames = 6
 
+    /// True if the file is dataless - its content lives on a remote server (iCloud Optimize Mac
+    /// Storage / FileProvider eviction) and any body read implicitly DOWNLOADS it. Per TN3150 the
+    /// canonical check is SF_DATALESS in st_flags, and stat itself never materializes - so callers
+    /// can use this to decide whether to read at all (the indexer's skip policy, the thumbnailer's
+    /// direct-decode bypass).
+    public static func isDataless(_ path: String) -> Bool {
+        var st = stat()
+        guard lstat(path, &st) == 0 else { return false }
+        return st.st_flags & UInt32(SF_DATALESS) != 0
+    }
+
     /// File category from extension, or nil if unknown.
     public static func kind(for url: URL) -> FileKind? {
         let ext = url.pathExtension.lowercased()

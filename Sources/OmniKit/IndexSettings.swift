@@ -33,6 +33,14 @@ public struct IndexSettings: Sendable, Equatable {
     public var minVideoSeconds: Double = 0
     public var minTextChars: Int = 0
 
+    /// Dataless (cloud-evicted) files: their content lives remotely, and reading it for embedding
+    /// implicitly DOWNLOADS the file (iCloud Optimize Mac Storage / FileProvider). `true` (default)
+    /// skips them - no surprise downloads, no disk refill, no offline stalls; they index when the
+    /// user materializes them (the FSEvents reconcile picks the download up). An already-indexed
+    /// file that later gets evicted KEEPS its index entry (eviction does not change content), so it
+    /// stays searchable. `false` restores read-through behavior: indexing downloads as it goes.
+    public var skipDataless: Bool = true
+
     public init(enabledKinds: Set<FileKind> = [.text, .image, .video, .audio]) {
         self.enabledKinds = enabledKinds
     }

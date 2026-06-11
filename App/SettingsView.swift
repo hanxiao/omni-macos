@@ -212,6 +212,18 @@ private struct ContentTypesTab: View {
             }
 
             Section {
+                Picker("Files in iCloud", selection: Binding(get: { model.skipDatalessFiles }, set: { model.skipDatalessFiles = $0 })) {
+                    Text("Skip until downloaded").tag(true)
+                    Text("Download to index").tag(false)
+                }
+            } header: {
+                Text("Cloud Files")
+            } footer: {
+                Text("Files whose content is in iCloud or another cloud service but not on this Mac. Skipping indexes them when they download; the other option downloads each file to index it.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            Section {
                 IgnoreEditor(text: $draft)
                     .frame(minHeight: 180)
                     .clipShape(RoundedRectangle(cornerRadius: 6))

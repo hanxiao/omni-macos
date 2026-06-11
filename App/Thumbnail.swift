@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import QuickLookThumbnailing
 import ImageIO
+import OmniKit
 
 extension NSWorkspace {
     /// Open a file without blocking the caller. The plain `open(URL)` is the deprecated SYNCHRONOUS
@@ -106,7 +107,7 @@ struct Thumbnail: View {
         // photo library would queue real downloads into the 4 decode slots (or stall them offline).
         // QuickLook below serves its cached thumbnail for evicted files without materializing,
         // exactly like Finder. stat is exempt from materialization (TN3150), so the check is free.
-        if (Self.imageExts.contains(ext) || ext == "pdf") && !Self.isDataless(path) {
+        if (Self.imageExts.contains(ext) || ext == "pdf") && !FileExtractor.isDataless(path) {
             let isPDF = ext == "pdf"
             let cg = await Self.decodeBounded {
                 isPDF ? Self.pdfThumbnail(url, maxPixel: maxPixel) : Self.imageThumbnail(url, maxPixel: maxPixel)
@@ -198,15 +199,6 @@ struct Thumbnail: View {
         "png", "jpg", "jpeg", "gif", "heic", "heif", "tiff", "tif", "bmp", "webp", "avif",
         "jp2", "ico", "icns", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2",
     ]
-
-    /// True if the file is dataless - its content lives on a remote server (iCloud/FileProvider) and
-    /// any body read triggers a download. Per TN3150 the canonical check is SF_DATALESS in st_flags,
-    /// and stat itself never materializes.
-    nonisolated static func isDataless(_ path: String) -> Bool {
-        var st = stat()
-        guard lstat(path, &st) == 0 else { return false }
-        return st.st_flags & UInt32(SF_DATALESS) != 0
-    }
 
     /// Downsample an image file to <= maxPixel on its long edge via ImageIO. Reads only what it needs
     /// and never returns the type-icon placeholder for a valid image (the QuickLook in-app failure mode

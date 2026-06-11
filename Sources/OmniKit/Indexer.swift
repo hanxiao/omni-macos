@@ -532,6 +532,11 @@ public final class Indexer: @unchecked Sendable {
             let mtime = vals.contentModificationDate?.timeIntervalSince1970 ?? 0
             let size = vals.fileSize ?? 0
             if let prev = known[path], prev.modified == mtime, prev.size == size { continue }  // unchanged
+            // Dataless under the skip policy: do NOT queue it for embedding (the read would download
+            // it) and do NOT delete any existing entry (a remotely-modified evicted file keeps its
+            // old vectors - stale beats invisible; relying on the embed stage's empty result instead
+            // would hit the chunks.isEmpty branch below and DROP the file from the index).
+            if settings.skipDataless, FileExtractor.isDataless(path) { continue }
             work.append(CrawledFile(url: url, modified: mtime, size: size))
         }
         // Decode through the same bounded concurrent pipeline as a full pass (PDF raster, mel STFT,
@@ -653,6 +658,13 @@ public final class Indexer: @unchecked Sendable {
     /// Also captures display metadata (pixel size / duration) here, on the concurrent stage, so the
     /// serial embed stage never re-opens the file header.
     private func decode(_ file: CrawledFile, settings: IndexSettings) -> DecodedItem {
+        // Dataless (cloud-evicted) file under the skip policy: reading its body would implicitly
+        // DOWNLOAD it. Return an empty item BEFORE any content read - the consume stage counts it
+        // skipped, and tick() still marks it `seen`, so reconcile never mistakes it for deleted. An
+        // already-indexed file that got evicted does not even reach here (eviction keeps mtime/size,
+        // so the unchanged check holds it); when the user materializes the file, the FSEvents
+        // reconcile (or the next pass) indexes it normally.
+        if settings.skipDataless, FileExtractor.isDataless(file.url.path) { return DecodedItem(file: file) }
         let category = FileExtractor.kind(for: file.url) ?? .text
         let kind = category.rawValue
         var meta: (width: Int, height: Int, duration: Double) = (0, 0, 0)
