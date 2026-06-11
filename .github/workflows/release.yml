@@ -5,7 +5,12 @@ name: Release
 # GitHub's 10x-metered minutes on a private repo. Release with: gh workflow run release.yml
 # (or the Actions "Run workflow" button).
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Explicit version to release (e.g. 0.2.0). Empty = auto-bump patch.'
+        required: false
+        default: 
 
 concurrency:
   group: release
@@ -33,8 +38,12 @@ jobs:
         id: ver
         run: |
           CUR=$(grep -m1 'MARKETING_VERSION' project.yml | sed -E 's/.*"([^"]+)".*/\1/')
-          MAJ=${CUR%%.*}; REST=${CUR#*.}; MIN=${REST%%.*}; PAT=${REST##*.}
-          NEW="${MAJ}.${MIN}.$((PAT+1))"
+          if [ -n "${{ inputs.version }}" ]; then
+            NEW="${{ inputs.version }}"
+          else
+            MAJ=${CUR%%.*}; REST=${CUR#*.}; MIN=${REST%%.*}; PAT=${REST##*.}
+            NEW="${MAJ}.${MIN}.$((PAT+1))"
+          fi
           sed -i '' -E "s/(MARKETING_VERSION: *)\"[^\"]+\"/\1\"${NEW}\"/" project.yml
           echo "bumped $CUR -> $NEW"
           echo "version=$NEW" >> "$GITHUB_OUTPUT"
