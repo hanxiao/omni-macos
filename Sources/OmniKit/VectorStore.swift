@@ -1026,6 +1026,12 @@ public final class VectorStore: @unchecked Sendable {
     private func rebuildBaseLocked(rowCount: Int) {
         let tR = Self.searchTiming ? Date() : nil
         defer { if let tR { print(String(format: "[search] REBUILD base rows=%d %.1fms", rowCount, -tR.timeIntervalSinceNow * 1000)) } }
+        // Release the OLD base before allocating the new one: holding both across the copy doubled
+        // the transient GPU footprint (2x ~1GB at 627k rows, linearly worse at scale) - the burst
+        // that hurts most on 8GB machines. Safe under `queue`: search reads scores out synchronously
+        // before returning, so no in-flight graph references the old array here. The freed buffer
+        // returns to MLX's cache and is often reused by the new allocation outright.
+        mlxBase = nil
         let byteCount = rowCount * dim * MemoryLayout<UInt16>.size
         flat16.withUnsafeBytes { raw in
             let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!),
