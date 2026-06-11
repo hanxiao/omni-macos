@@ -714,17 +714,25 @@ if args.count >= 2 && args[1] == "concbench2" {
                 else { _ = engine.embedTextBatch(Array(passages.prefix(embedBatch)), as: .passage) }   // low-pri GPU load
                 i += 1
                 if i % 2 == 0 {                                           // mutate: delta + eventual fold
-                    // OMNI_BENCH_MODIFY=1 rewrites EXISTING paths (p0..p599) instead of appending new
-                    // ones: replacing an indexed path invalidates the base, so the next search pays a
-                    // full base rebuild - the real app's modify-reconcile p95 tail. Default appends new.
-                    let modify = ProcessInfo.processInfo.environment["OMNI_BENCH_MODIFY"] == "1"
-                    var b: [(path: String, chunks: [IndexedChunk])] = []
-                    if modify {
+                    // OMNI_BENCH_MODIFY=1 rewrites EXISTING paths (p0..p599) via ONE replaceMany batch
+                    // (the FSEvents-reconcile path): replacing an indexed path invalidates the base, so
+                    // searches pay rebuilds - the modify-reconcile tail. =2 rewrites the same paths via
+                    // 600 SINGLE-FILE replace() calls - the FULL-PASS storeChunks path, which stresses
+                    // per-write proactive refolds (the refold rate limit). Default appends new paths.
+                    let modify = ProcessInfo.processInfo.environment["OMNI_BENCH_MODIFY"]
+                    if modify == "2" {
+                        for k in 0..<600 {
+                            try? store.replace(path: "p\(k)", chunks: [IndexedChunk(path: "p\(k)", modified: Double(i), kind: "text", chunkIndex: 0, snippet: "", embedding: vec((i*600+k) % N))])
+                        }
+                    } else if modify == "1" {
+                        var b: [(path: String, chunks: [IndexedChunk])] = []
                         for k in 0..<600 { b.append(("p\(k)", [IndexedChunk(path: "p\(k)", modified: Double(i), kind: "text", chunkIndex: 0, snippet: "", embedding: vec((i*600+k) % N))])) }
+                        try? store.replaceMany(b)
                     } else {
+                        var b: [(path: String, chunks: [IndexedChunk])] = []
                         for _ in 0..<600 { b.append(("x\(extra)", [IndexedChunk(path: "x\(extra)", modified: 0, kind: "text", chunkIndex: 0, snippet: "", embedding: vec(extra % N))])); extra += 1 }
+                        try? store.replaceMany(b)
                     }
-                    try? store.replaceMany(b)
                     if extra - N > 50_000 { foldHit = true }
                 }
             }
