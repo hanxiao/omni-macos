@@ -407,6 +407,7 @@ public final class VectorStore: @unchecked Sendable {
         // The index is a rebuildable cache: on a schema change, drop and recreate.
         if userVersion() != Self.schemaVersion {
             exec("DROP TABLE IF EXISTS chunks;")
+            exec("DROP TABLE IF EXISTS content_keys;")
         }
         exec("""
             CREATE TABLE IF NOT EXISTS chunks(
@@ -434,6 +435,21 @@ public final class VectorStore: @unchecked Sendable {
         addColumnIfMissing("height", "INTEGER NOT NULL DEFAULT 0")
         addColumnIfMissing("duration", "REAL NOT NULL DEFAULT 0")
         addColumnIfMissing("locator", "TEXT NOT NULL DEFAULT ''")
+        // Content-dedup sidecar: one row per indexed file, mapping a content key (hash of the
+        // embedding-relevant bytes + the preprocess settings) to the path whose chunks realized it.
+        // ADDITIVE and self-healing, so index compatibility holds in BOTH directions: an old app
+        // version ignores the table; a new app on an old index starts with it empty; an old app
+        // modifying chunks leaves stale rows behind, which the lockstep check in
+        // duplicateChunks(key:) (chunks.modified must equal content_keys.modified) rejects.
+        exec("""
+            CREATE TABLE IF NOT EXISTS content_keys(
+                path TEXT PRIMARY KEY,
+                key TEXT NOT NULL,
+                modified REAL NOT NULL,
+                size INTEGER NOT NULL
+            );
+        """)
+        exec("CREATE INDEX IF NOT EXISTS idx_content_key ON content_keys(key);")
         setUserVersion(Self.schemaVersion)
         loadIntoMemory()
     }
@@ -627,6 +643,94 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
+    // MARK: - Content dedup (identical bytes never embed twice)
+
+    /// Record content keys for freshly stored files, batched (one txn). Over-recording is safe:
+    /// a key row whose path has no chunks, or whose modified does not match its chunks rows, is
+    /// simply never used as a duplicate source (duplicateChunks verifies lockstep before reuse).
+    public func recordContentKeys(_ entries: [(path: String, key: String, modified: Double, size: Int)]) {
+        guard !entries.isEmpty else { return }
+        queue.sync {
+            guard dbOpen() else { return }
+            exec("BEGIN;")
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO content_keys(path, key, modified, size) VALUES(?,?,?,?);", -1, &stmt, nil) == SQLITE_OK {
+                for e in entries {
+                    sqlite3_reset(stmt)
+                    sqlite3_bind_text(stmt, 1, e.path, -1, SQLITE_TRANSIENT)
+                    sqlite3_bind_text(stmt, 2, e.key, -1, SQLITE_TRANSIENT)
+                    sqlite3_bind_double(stmt, 3, e.modified)
+                    sqlite3_bind_int64(stmt, 4, Int64(e.size))
+                    sqlite3_step(stmt)
+                }
+            }
+            sqlite3_finalize(stmt)
+            exec("COMMIT;")
+        }
+    }
+
+    /// Stored chunks of a CURRENT file whose content key matches, for reuse instead of a fresh
+    /// decode + embed. Returns the source rows as-is (the caller rewrites path/mtime/size).
+    /// "Current" = the candidate's chunks rows still carry the same `modified` that was recorded
+    /// with its key (lockstep), so a stale key row - the path re-embedded by an old app version,
+    /// deleted, or mid-replace - can never leak wrong vectors. The file's OWN row is a valid
+    /// source: a touched-but-identical file (git checkout, re-save) reuses its own chunks.
+    public func duplicateChunks(key: String) -> [IndexedChunk]? {
+        queue.sync {
+            guard dbOpen() else { return nil }
+            var cand: [(path: String, modified: Double)] = []
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, "SELECT path, modified FROM content_keys WHERE key = ? LIMIT 4;", -1, &stmt, nil) == SQLITE_OK {
+                sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT)
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    cand.append((String(cString: sqlite3_column_text(stmt, 0)), sqlite3_column_double(stmt, 1)))
+                }
+            }
+            sqlite3_finalize(stmt)
+            for c in cand {
+                if let chunks = chunksForCurrentPathLocked(c.path, modified: c.modified) { return chunks }
+            }
+            return nil
+        }
+    }
+
+    /// All chunks of `path` iff every row still carries `modified` (else nil). On `queue`.
+    private func chunksForCurrentPathLocked(_ path: String, modified: Double) -> [IndexedChunk]? {
+        var out: [IndexedChunk] = []
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, """
+            SELECT modified, size, kind, chunk_index, snippet, dim, vec, width, height, duration, locator
+            FROM chunks WHERE path = ? ORDER BY chunk_index;
+            """, -1, &stmt, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT)
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard sqlite3_column_double(stmt, 0) == modified else { return nil }   // stale key row
+            let d = Int(sqlite3_column_int(stmt, 5))
+            guard d > 0, d == (dim == 0 ? d : dim), let blob = sqlite3_column_blob(stmt, 6) else { return nil }
+            let bytes = Int(sqlite3_column_bytes(stmt, 6))
+            var vec = [Float](repeating: 0, count: d)
+            if bytes == d * MemoryLayout<Float>.size {
+                let fp = blob.assumingMemoryBound(to: Float.self)
+                for k in 0 ..< d { vec[k] = fp[k] }
+            } else if bytes >= d * MemoryLayout<UInt16>.size {
+                let bf = blob.assumingMemoryBound(to: UInt16.self)
+                for k in 0 ..< d { vec[k] = Self.fromBF16(bf[k]) }
+            } else {
+                return nil   // short/corrupt row - not a usable source
+            }
+            out.append(IndexedChunk(path: path, modified: modified, size: Int(sqlite3_column_int64(stmt, 1)),
+                                    kind: String(cString: sqlite3_column_text(stmt, 2)),
+                                    chunkIndex: Int(sqlite3_column_int(stmt, 3)),
+                                    snippet: sqlite3_column_text(stmt, 4).map { String(cString: $0) } ?? "",
+                                    embedding: vec,
+                                    width: Int(sqlite3_column_int(stmt, 7)), height: Int(sqlite3_column_int(stmt, 8)),
+                                    duration: sqlite3_column_double(stmt, 9),
+                                    locator: sqlite3_column_text(stmt, 10).map { String(cString: $0) } ?? ""))
+        }
+        return out.isEmpty ? nil : out
+    }
+
     /// Delete many paths at once. Critical for reconcile: deleting K paths via deletePath would
     /// rebuild the in-memory vector buffer K times (O(N*K), multi-GB memmoves on a large index).
     /// This deletes all rows in one transaction and rebuilds the buffer exactly once.
@@ -644,6 +748,15 @@ public final class VectorStore: @unchecked Sendable {
                 }
             }
             sqlite3_finalize(stmt)
+            var kstmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, "DELETE FROM content_keys WHERE path = ?;", -1, &kstmt, nil) == SQLITE_OK {
+                for p in paths {
+                    sqlite3_reset(kstmt)
+                    sqlite3_bind_text(kstmt, 1, p, -1, SQLITE_TRANSIENT)
+                    sqlite3_step(kstmt)
+                }
+            }
+            sqlite3_finalize(kstmt)
             exec("COMMIT;")
             removeRowsByPathsLocked(paths)   // one rebuild for the whole set (id-mask, no path hashing)
             proactiveRefoldLocked()
@@ -667,6 +780,12 @@ public final class VectorStore: @unchecked Sendable {
                 sqlite3_step(stmt)
             }
             sqlite3_finalize(stmt)
+            var kstmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, "DELETE FROM content_keys WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0');", -1, &kstmt, nil) == SQLITE_OK {
+                sqlite3_bind_text(kstmt, 1, folder, -1, SQLITE_TRANSIENT)
+                sqlite3_step(kstmt)
+            }
+            sqlite3_finalize(kstmt)
             removeRowsLocked { $0.path == folder || $0.path.hasPrefix(folder + "/") }
             proactiveRefoldLocked()
             checkpointIfDueLocked()
@@ -684,6 +803,13 @@ public final class VectorStore: @unchecked Sendable {
         queue.sync {
             guard dbOpen() else { return }
             var stmt: OpaquePointer?
+            // Key rows first (the subquery needs the chunks rows still present).
+            if sqlite3_prepare_v2(db, "DELETE FROM content_keys WHERE path IN (SELECT DISTINCT path FROM chunks WHERE kind = ?);", -1, &stmt, nil) == SQLITE_OK {
+                sqlite3_bind_text(stmt, 1, kind, -1, SQLITE_TRANSIENT)
+                sqlite3_step(stmt)
+            }
+            sqlite3_finalize(stmt)
+            stmt = nil
             if sqlite3_prepare_v2(db, "DELETE FROM chunks WHERE kind = ?;", -1, &stmt, nil) == SQLITE_OK {
                 sqlite3_bind_text(stmt, 1, kind, -1, SQLITE_TRANSIENT)
                 sqlite3_step(stmt)
@@ -711,6 +837,14 @@ public final class VectorStore: @unchecked Sendable {
                 }
             }
             sqlite3_finalize(stmt)
+            var kstmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, "DELETE FROM content_keys WHERE path = ?;", -1, &kstmt, nil) == SQLITE_OK {
+                for path in victims {
+                    sqlite3_bind_text(kstmt, 1, path, -1, SQLITE_TRANSIENT)
+                    sqlite3_step(kstmt); sqlite3_reset(kstmt)
+                }
+            }
+            sqlite3_finalize(kstmt)
             removeRowsLocked { disabled($0.path) }
         }
     }
@@ -720,6 +854,7 @@ public final class VectorStore: @unchecked Sendable {
         queue.sync {
             guard dbOpen() else { return }
             exec("DELETE FROM chunks;")
+            exec("DELETE FROM content_keys;")
             // Release the backing buffers (a wipe will not refill to the same size immediately),
             // rather than removeAll which keeps the ~1.6GB capacity reserved.
             rows = []; flat16.releaseAll(); presentPaths = []; fileID = []; pathID = [:]; idPath = []; fileChunkCount = []
