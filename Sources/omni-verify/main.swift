@@ -310,6 +310,30 @@ if args.count >= 2 && args[1] == "searchbench" {
     exit(0)
 }
 
+// Query-compile-cache growth: omni-verify qcachebench <modelDir>
+// Issues queries of MANY distinct token lengths through the real high-priority embedQuery path (the
+// default-compiled B==1 forward) and reports GPU active memory + how it grows. Quantifies whether the
+// per-length compiled-block cache is a VRAM leak on a long interactive session.
+if args.count >= 3 && args[1] == "qcachebench" {
+    let dir = URL(fileURLWithPath: args[2])
+    let engine = try await OmniEngine(modelDir: dir)
+    func mb() -> Double { Double(MLX.GPU.activeMemory) / 1_048_576 }
+    let word = "revenue"
+    // 1..60 words -> ~60 distinct query token lengths -> up to 60 distinct compiled graphs.
+    func query(_ n: Int) -> String { Array(repeating: word, count: n).joined(separator: " ") }
+    _ = engine.embedQuery(query(3))   // warm general kernels
+    let m0 = mb()
+    print(String(format: "qcachebench %@  GPU active after warmup: %.0f MB", dir.lastPathComponent, m0))
+    for round in 1 ... 3 {
+        for n in 1 ... 60 { _ = engine.embedQuery(query(n)) }
+        print(String(format: "  after round %d (60 distinct lengths x %d): GPU active %.0f MB  (delta %+.0f MB)",
+                     round, round, mb(), mb() - m0))
+    }
+    print("  NOTE: if active memory climbs each round, distinct-length compiled graphs accumulate (leak).")
+    print("        if it plateaus after round 1, the cache is one-graph-per-length and bounded by length range.")
+    exit(0)
+}
+
 // Concurrency benchmark: omni-verify concbench [N] [dim] [queries]
 // Drives the REAL VectorStore and measures search latency (a) idle with a warm cache and (b) while
 // the store is being mutated by new-file inserts (the "search during indexing" case), plus
