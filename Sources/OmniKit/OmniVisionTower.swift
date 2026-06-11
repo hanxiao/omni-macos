@@ -57,9 +57,28 @@ public final class OmniVisionTower: @unchecked Sendable {
 
     /// Weight cast to the tower compute dtype (fp32 by default). Hoisting the cast here keeps every
     /// matmul in one dtype so packing is shape-invariant.
+    ///
+    /// BUDGET-GATED CACHE: in fp32 mode every weight access otherwise builds a fresh bf16->fp32
+    /// cast node - 147 cast kernels and ~352MB of fp32 temporaries PER packed forward (the single
+    /// biggest per-forward overhead found by the dtype audit). When the user's memory cap affords
+    /// it, cache the fp32 copies once (~352MB resident for the nano vision tower) and never cast
+    /// again; under tight low-end caps keep the per-forward casts (traffic, not residency). The
+    /// audio tower deliberately does NOT get this treatment: its fp32 copy would be ~2.5GB resident
+    /// for the rarest modality. Tower forwards are serialized by the engine gate, so the lazy
+    /// dictionary needs no lock.
+    private var fp32WeightCache: [String: MLXArray] = [:]
+    private lazy var cacheFP32Weights: Bool = fp32Compute && OmniMemoryBudget.capBytes >= 4 << 30
     private func wc(_ key: String) -> MLXArray {
         let a = w[key]
-        return fp32Compute && a.dtype != .float32 ? a.asType(.float32) : a
+        guard fp32Compute, a.dtype != .float32 else { return a }
+        if cacheFP32Weights {
+            if let c = fp32WeightCache[key] { return c }
+            let c = a.asType(.float32)
+            MLX.eval(c)
+            fp32WeightCache[key] = c
+            return c
+        }
+        return a.asType(.float32)
     }
 
     /// pixelValues [N, 1536], grid [(t, h, w)] -> merged vision features [N/merge^2, 1024].
@@ -158,7 +177,7 @@ public final class OmniVisionTower: @unchecked Sendable {
         let weight = wc("vision_tower.patch_embed.proj.weight")
             .reshaped([visHidden, t * p * p * c])
         let bias = wc("vision_tower.patch_embed.proj.bias")
-        return matmul(x, weight.transposed(1, 0)) + bias    // [N, hidden]
+        return MLX.addMM(bias, x, weight.transposed(1, 0))    // fused matmul+bias, [N, hidden]
     }
 
     // MARK: - Positional embedding (bilinear interpolation of the 48x48 grid)
@@ -203,15 +222,15 @@ public final class OmniVisionTower: @unchecked Sendable {
 
         let total = idx[0].count
         let posWeight = wc("vision_tower.pos_embed.weight")   // [2304, hidden] (fp32 by default)
-        // Accumulate the four weighted gathers.
-        var patchPos: MLXArray? = nil
-        for k in 0 ..< 4 {
-            let gathered = posWeight[MLXArray(idx[k])]        // [total, hidden]
-            let weights = MLXArray(wgt[k]).reshaped([total, 1]).asType(gathered.dtype)
-            let term = gathered * weights
-            patchPos = patchPos == nil ? term : patchPos! + term
-        }
-        let patch = patchPos!                                 // [total, hidden]
+        // One fused bilinear blend: gather all four corner sets in a single take (indices
+        // concatenated host-side), multiply by the [4, total, 1] weights, and sum the corner axis -
+        // 3 kernels instead of the 11 (4 gathers + 4 muls + 3 adds) the per-corner loop dispatched.
+        // Same corners, same weights, same order of accumulation per element.
+        let allIdx = MLXArray(idx[0] + idx[1] + idx[2] + idx[3])              // [4*total]
+        let allWgt = MLXArray(wgt[0] + wgt[1] + wgt[2] + wgt[3])              // [4*total]
+        let gathered = posWeight[allIdx].reshaped([4, total, visHidden])      // [4, total, hidden]
+        let weights = allWgt.reshaped([4, total, 1]).asType(gathered.dtype)
+        let patch = (gathered * weights).sum(axis: 0)                         // [total, hidden]
 
         // Spatial-merge reshape per image (model.py: t-tile then merge interleave).
         let fd = visHidden
@@ -301,7 +320,7 @@ public final class OmniVisionTower: @unchecked Sendable {
         _ cuSeqlens: [Int]
     ) -> MLXArray {
         let n = x.dim(0)
-        let qkv = matmul(x, wc(p + "attn.qkv.weight").transposed(1, 0)) + wc(p + "attn.qkv.bias")
+        let qkv = MLX.addMM(wc(p + "attn.qkv.bias"), x, wc(p + "attn.qkv.weight").transposed(1, 0))
         // [n, 3*hidden] -> [n, 3, heads, headDim] -> [3, n, heads, headDim]
         let split = qkv.reshaped([n, 3, numHeads, headDim]).transposed(1, 0, 2, 3)
         var q = split[0]   // [n, heads, headDim]
@@ -351,7 +370,7 @@ public final class OmniVisionTower: @unchecked Sendable {
         }
         // Cast the attention output back to the residual-stream dtype before the proj matmul.
         if out.dtype != attnDtype { out = out.asType(attnDtype) }
-        return matmul(out, wc(p + "attn.proj.weight").transposed(1, 0)) + wc(p + "attn.proj.bias")
+        return MLX.addMM(wc(p + "attn.proj.bias"), out, wc(p + "attn.proj.weight").transposed(1, 0))
     }
 
     /// apply_rotary_pos_emb_vision on a [n, heads, headDim] tensor.
@@ -390,9 +409,9 @@ public final class OmniVisionTower: @unchecked Sendable {
     // MARK: - MLP
 
     private func mlp(_ x: MLXArray, _ p: String) -> MLXArray {
-        let h = matmul(x, wc(p + "mlp.linear_fc1.weight").transposed(1, 0)) + wc(p + "mlp.linear_fc1.bias")
+        let h = MLX.addMM(wc(p + "mlp.linear_fc1.bias"), x, wc(p + "mlp.linear_fc1.weight").transposed(1, 0))
         let a = geluTanh(h)
-        return matmul(a, wc(p + "mlp.linear_fc2.weight").transposed(1, 0)) + wc(p + "mlp.linear_fc2.bias")
+        return MLX.addMM(wc(p + "mlp.linear_fc2.bias"), a, wc(p + "mlp.linear_fc2.weight").transposed(1, 0))
     }
 
     // MARK: - Merger
@@ -403,9 +422,9 @@ public final class OmniVisionTower: @unchecked Sendable {
         let normed = layerNorm(x, "merger.norm")             // [N, hidden]
         let mergedDim = visHidden * mergeSize * mergeSize     // 4096
         let reshaped = normed.reshaped([-1, mergedDim])       // [N/merge^2, 4096]
-        let h1 = matmul(reshaped, wc("merger.linear_fc1.weight").transposed(1, 0)) + wc("merger.linear_fc1.bias")
+        let h1 = MLX.addMM(wc("merger.linear_fc1.bias"), reshaped, wc("merger.linear_fc1.weight").transposed(1, 0))
         let a = geluErf(h1)
-        return matmul(a, wc("merger.linear_fc2.weight").transposed(1, 0)) + wc("merger.linear_fc2.bias")
+        return MLX.addMM(wc("merger.linear_fc2.bias"), a, wc("merger.linear_fc2.weight").transposed(1, 0))
     }
 
     // MARK: - Helpers
