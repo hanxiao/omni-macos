@@ -17,6 +17,197 @@ final class BenchFlag: @unchecked Sendable {
 
 let args = CommandLine.arguments
 
+// Fast deterministic embedder for concurrency stress (no GPU): isolates the FS/store/pipeline/cancel
+// locking from the embed compute, so churnbench can drive a high op rate and surface a real deadlock.
+final class FastEmbedder: Embedder, @unchecked Sendable {
+    let dim = 64
+    func vec(_ s: String) -> [Float] {
+        var h: UInt64 = 14695981039346656037
+        for b in s.utf8 { h = (h ^ UInt64(b)) &* 1099511628211 }
+        var x = h | 1
+        var v = [Float](repeating: 0, count: 64); var n: Float = 0
+        for k in 0 ..< 64 { x ^= x << 13; x ^= x >> 7; x ^= x << 17; let f = Float(x >> 40) / Float(1 << 24) - 0.5; v[k] = f; n += f * f }
+        n = n.squareRoot() + 1e-9; for k in 0 ..< 64 { v[k] /= n }; return v
+    }
+    func embedText(_ t: String, as type: OmniInputType) -> [Float] { vec(t) }
+    func embedTextBatch(_ ts: [String], as type: OmniInputType) -> [[Float]] { ts.map(vec) }
+    func embedImage(_ i: CGImage) -> [Float]? { nil }
+    func embedImages(_ r: [OmniVisionPreprocess.RawPatches]) -> [[Float]]? { nil }
+    func embedVideoFrames(_ f: [CGImage]) -> [Float]? { nil }
+    func embedAudio(_ u: URL) -> [Float]? { nil }
+    func embedAudioMel(_ m: [Float], frames: Int) -> [Float]? { nil }
+    func embedAudioMelBatch(_ m: [[Float]], frames: [Int]) -> [[Float]]? { nil }
+}
+
+// Resident memory (phys_footprint) in MB - the real burst detector.
+func churnFootprintMB() -> Double {
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+    let kr = withUnsafeMutablePointer(to: &info) { p in p.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+        task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count) } }
+    return kr == KERN_SUCCESS ? Double(info.phys_footprint) / 1_048_576 : -1
+}
+
+// Concurrency chaos: omni-verify churnbench [files] [seconds]
+// Drives a REAL Indexer + VectorStore (FastEmbedder, no GPU) over a churning temp tree while searching
+// concurrently. The indexer driver thread serially does fs-churn + update()/index()/cancel-restart
+// (one pipeline at a time, mirroring the app's state machine); the searcher thread reads concurrently
+// and occasionally cancels mid-pass (the real "pause while indexing" cross-thread race). A heartbeat
+// monitor flags a HANG if either thread stalls; phys_footprint is sampled for a memory burst; the final
+// index is reconciled against the filesystem to prove no corruption; then a clean close is verified.
+// Body lives in a SYNC function: top-level main is async, where blocking wait/sleep/lock are illegal.
+func churnbenchRun(_ nFiles: Int, _ secs: Double) throws -> Int32 {
+    let nFolders = 12
+    var root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("omni-churn-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+    try? FileManager.default.removeItem(at: root)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    // The crawler stores the enumerator's CANONICAL paths (/private/var/...); resolve root the same
+    // way (realpath) so the paths the harness writes/updates/deletes match what the index stores -
+    // otherwise /var vs /private/var mismatch fabricates phantom orphans (a test bug, not a product one).
+    if let rp = realpath(root.path, nil) { root = URL(fileURLWithPath: String(cString: rp), isDirectory: true); free(rp) }
+    for f in 0 ..< nFolders { try? FileManager.default.createDirectory(at: root.appendingPathComponent("d\(f)"), withIntermediateDirectories: true) }
+    func filePath(_ i: Int) -> URL { root.appendingPathComponent("d\(i % nFolders)/f\(i).txt") }
+    func writeFile(_ i: Int, rev: Int) { try? "document \(i) rev \(rev) about distributed search indexes folders and embeddings".write(to: filePath(i), atomically: true, encoding: .utf8) }
+    for i in 0 ..< nFiles { writeFile(i, rev: 0) }
+
+    let dbURL = root.appendingPathComponent("index.sqlite")
+    let store = try VectorStore(dbURL: dbURL)
+    let indexer = Indexer(store: store, embedder: FastEmbedder())
+    print("churnbench  files=\(nFiles) folders=\(nFolders) seconds=\(secs)  root=\(root.lastPathComponent)")
+
+    // Initial full index (watchdog 120s).
+    let m0 = churnFootprintMB()
+    let initDone = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async { indexer.index(roots: [root], settings: IndexSettings()) { p in if p.done { initDone.signal() } } }
+    if initDone.wait(timeout: .now() + 120) != .success { print("  FAIL: initial index HUNG"); return 1 }
+    print(String(format: "  initial index: %d files indexed, mem %.0f->%.0f MB", store.fileCount, m0, churnFootprintMB()))
+
+    // Heartbeats: each worker stamps a monotonically increasing counter; the monitor flags a stall.
+    let hbLock = NSLock()
+    nonisolated(unsafe) var hbDriver = 0, hbSearch = 0
+    nonisolated(unsafe) var liveRev = 1
+    nonisolated(unsafe) var peakMB = churnFootprintMB()
+    nonisolated(unsafe) var searchOps = 0, churnOps = 0, cancels = 0, passes = 0
+    nonisolated(unsafe) var hung = false
+    let stop = BenchFlag()
+    func bump(_ which: Int) { hbLock.lock(); if which == 0 { hbDriver += 1 } else { hbSearch += 1 }; hbLock.unlock() }
+
+    // A query vector deterministically derived like the store's contents, so searches return hits.
+    let qvec = FastEmbedder().vec("document 1 rev 0 about distributed search indexes folders and embeddings")
+
+    // Searcher: continuous concurrent reads + occasional mid-pass cancel (the pause-while-indexing race).
+    let searcher = Thread {
+        var i = 0
+        while !stop.value {
+            _ = store.search(qvec, topK: 40)
+            _ = store.indexedFiles().count          // the heavy scan the UI runs for stats, concurrent with writes
+            searchOps += 1; i += 1
+            if i % 50 == 0 { indexer.cancel(); cancels += 1 }   // cross-thread cancel mid-pipeline
+            bump(1)
+        }
+    }
+    searcher.stackSize = 1 << 20
+    // Warm MLX (first store.search initializes the Metal device ~400MB) so the memory baseline below
+    // measures the CHURN footprint, not framework init. Then m1 is the post-init resident floor.
+    _ = store.search(qvec, topK: 40)
+    let m1 = churnFootprintMB(); peakMB = m1
+    searcher.start()
+
+    // Indexer driver: serial fs-churn + reconcile/full-pass, ONE pipeline at a time (the app invariant
+    // enforced by its state machine). Signals driverDone so the final converge runs in isolation -
+    // two concurrent passes would share `cancelled` and is exactly what the app must never do.
+    let driverDone = DispatchSemaphore(value: 0)
+    let driver = Thread {
+        var seqDeleted = Set<Int>()
+        let deadline = Date().addingTimeInterval(secs)
+        var iter = 0
+        while Date() < deadline {
+            iter += 1
+            indexer.resetCancelled()   // clear any cancel the searcher raised before this pass
+            var changed: [String] = []
+            // Modify a band of files (new content -> new mtime), create some, delete some, and every
+            // few iters nuke or spawn a whole subfolder.
+            let base = (iter * 137) % nFiles
+            liveRev += 1
+            for j in 0 ..< 120 { let i = (base + j) % nFiles
+                if seqDeleted.contains(i) { continue }
+                writeFile(i, rev: liveRev); changed.append(filePath(i).path) }
+            for j in 0 ..< 30 { let i = nFiles + iter * 30 + j; writeFile(i, rev: liveRev); changed.append(filePath(i).path) }
+            for j in 0 ..< 20 { let i = (base + 500 + j) % nFiles
+                if seqDeleted.insert(i).inserted { try? FileManager.default.removeItem(at: filePath(i)); changed.append(filePath(i).path) } }
+            if iter % 7 == 0 {                          // whole-folder delete + recreate (folder churn)
+                let fd = root.appendingPathComponent("d\(iter % nFolders)")
+                changed.append(fd.path)
+                try? FileManager.default.removeItem(at: fd)
+                try? FileManager.default.createDirectory(at: fd, withIntermediateDirectories: true)
+            }
+            if iter % 5 == 0 { indexer.index(roots: [root], settings: IndexSettings()) { _ in }; passes += 1 }
+            else { indexer.update(paths: changed, settings: IndexSettings()) }
+            peakMB = max(peakMB, churnFootprintMB())
+            churnOps += 1
+            bump(0)
+        }
+        driverDone.signal()
+    }
+    driver.stackSize = 1 << 20
+    driver.start()
+
+    // Heartbeat monitor while the driver runs: a stall of > 25s (no GPU in the loop) means a deadlock.
+    let monStart = Date()
+    var lastD = 0, lastS = 0, stallD = 0.0, stallS = 0.0
+    while driverDone.wait(timeout: .now() + 1.0) != .success {
+        hbLock.lock(); let d = hbDriver, s = hbSearch; hbLock.unlock()
+        stallD = d == lastD ? stallD + 1 : 0; lastD = d
+        stallS = s == lastS ? stallS + 1 : 0; lastS = s
+        peakMB = max(peakMB, churnFootprintMB())
+        if stallD > 25 || stallS > 25 { hung = true; break }
+        if Date().timeIntervalSince(monStart) > secs + 130 { hung = true; break }   // backstop
+    }
+    if hung { print(String(format: "  FAIL: HANG detected (driver stall %.0fs, search stall %.0fs)", stallD, stallS)); stop.set(true); return 1 }
+
+    // Stop the searcher and JOIN both workers before converging, so the final pass is the only pipeline
+    // running (no shared-cancel race with an in-flight driver pass).
+    stop.set(true)
+    while searcher.isExecuting || driver.isExecuting { Thread.sleep(forTimeInterval: 0.02) }
+
+    // Converge: one final clean pass so the index reflects the final filesystem, then reconcile.
+    indexer.resetCancelled()
+    let finalDone = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async { indexer.index(roots: [root], settings: IndexSettings(), force: false) { p in if p.done { finalDone.signal() } } }
+    if finalDone.wait(timeout: .now() + 120) != .success { print("  FAIL: final converge index HUNG"); return 1 }
+
+    // Filesystem truth: every .txt actually on disk now.
+    var onDisk = Set<String>()
+    if let en = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil) {
+        for case let u as URL in en where u.pathExtension == "txt" { onDisk.insert(u.path) }
+    }
+    let indexed = Set(store.indexedFiles().keys)
+    let missing = onDisk.subtracting(indexed)      // on disk but not indexed
+    let orphan = indexed.subtracting(onDisk)        // indexed but gone from disk
+    print(String(format: "  chaos done: churnOps=%d searchOps=%d cancels=%d fullPasses=%d", churnOps, searchOps, cancels, passes))
+    print(String(format: "  memory: post-init floor %.0f MB -> peak %.0f MB (store bf16 ~%.1f MB; burst over floor %.2fx)",
+                 m1, peakMB, Double(indexed.count * 64 * 2) / 1_048_576, peakMB / max(m1, 1)))
+    print(String(format: "  consistency: onDisk=%d indexed=%d  missing=%d orphan=%d", onDisk.count, indexed.count, missing.count, orphan.count))
+
+    // Clean teardown: close (checkpoint+close on the serial queue) must not hang or crash, and the WAL
+    // must fold back into the main db (no growing -wal left behind).
+    let closeDone = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async { store.close(); closeDone.signal() }
+    let cleanClose = closeDone.wait(timeout: .now() + 30) == .success
+    let walSize = (try? FileManager.default.attributesOfItem(atPath: dbURL.path + "-wal")[.size] as? Int ?? 0) ?? 0
+    print("  teardown: close \(cleanClose ? "clean" : "HUNG")  residual WAL \(walSize) bytes")
+
+    try? FileManager.default.removeItem(at: root)
+    let ok = !hung && missing.count == 0 && orphan.count == 0 && cleanClose
+    print("  RESULT: \(ok ? "PASS" : "FAIL")")
+    return ok ? 0 : 1
+}
+if args.count >= 2 && args[1] == "churnbench" {
+    let nFiles = (args.count >= 3 ? Int(args[2]) : nil) ?? 3000
+    let secs = (args.count >= 4 ? Double(args[3]) : nil) ?? 12
+    exit(try churnbenchRun(nFiles, secs))
+}
+
 // Search benchmark: omni-verify searchbench [N] [dim] [queries]
 // Compares brute-force cosine scoring: CPU vDSP fp32 (current), CPU cblas_sgemv fp32 (the
 // doc-claimed-but-unwired path), and GPU MLX bf16 (resident bf16 matrix, one matmul/query).
