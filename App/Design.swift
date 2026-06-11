@@ -10,18 +10,31 @@ enum Design {
     static let gapLarge: CGFloat = 16
 }
 
+/// Applies a Liquid Glass capsule, but honors Reduce Transparency: when the user has it on (an
+/// accessibility preference, also common on low-power/older Macs), it drops the live vibrancy sample
+/// for a flat material capsule. That is the HIG-correct behavior AND removes a per-chip glass pass -
+/// material on the same grid of N visible cells (or the map's overlays over the live Metal cloud)
+/// costs far less GPU than N live `glassEffect` recomposites per frame.
+private struct GlassChip: ViewModifier {
+    var interactive: Bool
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    func body(content: Content) -> some View {
+        if #available(macOS 26, *), !reduceTransparency {
+            content.glassEffect(interactive ? .regular.interactive() : .regular, in: .capsule)
+        } else {
+            content.background(.ultraThinMaterial, in: Capsule())
+        }
+    }
+}
+
 extension View {
     /// A small translucent chip for content floating over imagery. Uses native Liquid Glass on
     /// macOS 26 - Apple's guidance is to prefer the `glassEffect` API over a hand-rolled blur - and
-    /// falls back to a material capsule on 14-15. Pass `interactive: true` for a chip that hosts
-    /// controls (e.g. the map's zoom cluster) so the glass responds to the pointer; leave it false for
-    /// passive labels/badges.
-    @ViewBuilder func glassChip(interactive: Bool = false) -> some View {
-        if #available(macOS 26, *) {
-            self.glassEffect(interactive ? .regular.interactive() : .regular, in: .capsule)
-        } else {
-            self.background(.ultraThinMaterial, in: Capsule())
-        }
+    /// falls back to a material capsule on 14-15 or when Reduce Transparency is on. Pass
+    /// `interactive: true` for a chip that hosts controls (e.g. the map's zoom cluster) so the glass
+    /// responds to the pointer; leave it false for passive labels/badges.
+    func glassChip(interactive: Bool = false) -> some View {
+        modifier(GlassChip(interactive: interactive))
     }
 }
 
