@@ -105,42 +105,42 @@ Tests/             numeric parity + end-to-end search tests
 
 `jina-embeddings-v5-omni` ported to MLX-Swift: a Qwen3 text tower, a Qwen3-VL vision
 tower (also used for video frames and scanned-PDF pages), and a Whisper-style audio
-tower. `WeightStore` loads the HF safetensors, merges the retrieval LoRA into the
-backbone (upcast to fp32, merge, cast back to bf16), and the encoders pool the last
-token and L2-normalize. All modalities land in one shared space, with media wrapped in
-a `Document:` prefix and an end-of-text suffix so cross-modal vectors align. MLX calls
-are serialized through a priority gate: an interactive query jumps ahead of in-flight
-indexing work, so search stays responsive while indexing runs.
+tower. `WeightStore` loads the HF safetensors and merges the retrieval LoRA into the
+backbone; encoders pool the last token and L2-normalize. All modalities land in one
+shared space, so text finds images and audio finds text.
+
+This is not a stock checkpoint runner. The towers are reworked for throughput - fused
+norm/activation/rope kernels, fused bias matmuls, shape-aware compile policy, tuned
+attention I/O precision, cross-file GPU batching with double-buffered readout - while
+staying parity-gated against the Python reference (cosine >= 0.999, exact token match).
+Expect the same vectors as the original model, not the same speed.
 
 ### Indexing
 
-A crawl -> extract -> chunk -> embed -> store pipeline, incremental via file mtime and
-size so re-indexing only touches what changed. A concurrent decode stage (text
-extraction, image patchify, audio mel) feeds a single serialized GPU embed stage.
-Throughput comes from batching the GPU forward: text is chunked (~1800 chars, 200
-overlap) and embedded in cross-file batches; images run one block-diagonal vision
-forward per batch; audio batches clips under a frame budget; video samples a few frames
-into one temporal embedding. Batches double-buffer - the next batch's GPU forward
-overlaps the previous batch's host readout.
+Crawl -> extract -> chunk -> embed -> store, incremental by file mtime and size. A
+concurrent decode stage (text extraction, image patchify, audio mel) feeds one
+serialized GPU embed stage; text chunks and images batch across files, audio batches
+clips under a frame budget. Live updates from the file watcher go through the same
+batched path as a full pass. MLX calls are serialized through a priority gate and the
+batch size adapts while you type, so search stays responsive during indexing.
 
 ### Storing
 
-Embeddings are stored as **bf16** (2 bytes per dimension): half the size of fp32 on
-disk and in memory, with negligible recall loss on L2-normalized vectors. SQLite holds
-file metadata and the persisted vectors; the live search index is a single contiguous
-bf16 matrix kept in sync on every insert, update, and delete.
+SQLite is the durable store: file metadata plus bf16 vectors (2 bytes per dimension,
+negligible recall loss on normalized embeddings). The resident form adapts to the
+memory budget in Settings > Performance: a full bf16 matrix when it fits, and past
+that a 4-bit quantized scan replica with the exact bf16 copy kept in a file-backed
+mapping the OS can page out. Old indexes load unchanged in either mode.
 
 ### Search
 
-Exact brute-force cosine: one MLX matmul of the query against the resident bf16 matrix
-on the GPU - no approximate index, no recall tradeoff. The matrix is split into a
-GPU-resident **base** prefix plus a small **delta** of rows added since the base was
-built, scored by a second matmul fused into one evaluation, so an indexing insert never
-forces the whole matrix to be recopied per query. The base is rebuilt only on a
-structural change (delete or reload) or once the delta grows past a threshold. Top-K
-comes from a bounded min-heap over per-file winners rather than a full sort, and the
-result is filtered by kind, folder, extension, and recency. Idle search is a few
-milliseconds.
+Exact cosine when the index fits the budget: one GPU matmul of the query against the
+resident matrix (a base prefix plus a small delta of recent rows, scored in one
+evaluation). At scale, a two-stage funnel: a coarse scan over the quantized replica
+selects top candidates on the GPU, which are rescored exactly in bf16 before ranking -
+final scores are exact either way, and recall is gated against the full-precision
+baseline. Results reduce to the best chunk per file, filtered by kind, folder,
+extension, and recency. Idle search is a few milliseconds.
 
 ## License
 
