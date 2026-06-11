@@ -104,6 +104,9 @@ public struct SearchFilter: Sendable {
     public var ext: String? = nil             // restrict to a file extension (no dot)
     public var since: Double? = nil           // modified >= since (epoch seconds)
 
+    /// No constraints set - the common plain-query case (enables the GPU candidate fast path).
+    var isEmpty: Bool { kinds.isEmpty && folderPrefix == nil && (ext?.isEmpty ?? true) && since == nil }
+
     public init() {}
 
     func accepts(path: String, kind: String, modified: Double) -> Bool {
@@ -331,9 +334,12 @@ public final class VectorStore: @unchecked Sendable {
     /// id -> canonical path String, parallel to pathID. Rows reference THESE instances so all
     /// chunks of a file share one heap allocation (and reloads/appends never re-copy the path).
     private var idPath: [String] = []
+    /// Per-file LIVE chunk count, indexed by file id (lockstep with idPath). Lets the candidate
+    /// fast path build SearchHit.chunkCount without an O(N) row scan.
+    private var fileChunkCount: [Int32] = []
     @inline(__always) private func internPath(_ p: String) -> Int32 {
         if let id = pathID[p] { return id }
-        let id = Int32(pathID.count); pathID[p] = id; idPath.append(p); return id
+        let id = Int32(pathID.count); pathID[p] = id; idPath.append(p); fileChunkCount.append(0); return id
     }
     @inline(__always) private func canonicalPath(_ p: String) -> String {
         idPath[Int(internPath(p))]
@@ -359,12 +365,15 @@ public final class VectorStore: @unchecked Sendable {
     private func rebuildFileIDsLocked() {
         pathID.removeAll(keepingCapacity: true)
         idPath.removeAll(keepingCapacity: true)
+        fileChunkCount.removeAll(keepingCapacity: true)
         fileID.removeAll(keepingCapacity: true)
         fileID.reserveCapacity(rows.count)
         kindCode.removeAll(keepingCapacity: true)
         kindCode.reserveCapacity(rows.count)
         for r in rows {
-            fileID.append(internPath(r.path))
+            let fid = internPath(r.path)
+            fileID.append(fid)
+            fileChunkCount[Int(fid)] += 1
             kindCode.append(internKind(r.kind))
         }
     }
@@ -511,7 +520,9 @@ public final class VectorStore: @unchecked Sendable {
                 rows.append(Row(path: canonicalPath(c.path), kind: canonicalKind(c.kind), chunkIndex: c.chunkIndex, modified: c.modified,
                                 width: c.width, height: c.height, duration: c.duration, locator: c.locator))
                 flat16.append(contentsOf: bfs[i])
-                fileID.append(internPath(c.path))
+                let fid = internPath(c.path)
+                fileID.append(fid)
+                fileChunkCount[Int(fid)] += 1
                 kindCode.append(internKind(c.kind))
             }
             presentPaths.insert(path)
@@ -584,7 +595,9 @@ public final class VectorStore: @unchecked Sendable {
                     rows.append(Row(path: canonicalPath(c.path), kind: canonicalKind(c.kind), chunkIndex: c.chunkIndex, modified: c.modified,
                                     width: c.width, height: c.height, duration: c.duration, locator: c.locator))
                     flat16.append(contentsOf: bfs[wi][ci])
-                    fileID.append(internPath(c.path))
+                    let fid = internPath(c.path)
+                    fileID.append(fid)
+                    fileChunkCount[Int(fid)] += 1
                     kindCode.append(internKind(c.kind))
                 }
                 presentPaths.insert(it.path)
@@ -709,7 +722,7 @@ public final class VectorStore: @unchecked Sendable {
             exec("DELETE FROM chunks;")
             // Release the backing buffers (a wipe will not refill to the same size immediately),
             // rather than removeAll which keeps the ~1.6GB capacity reserved.
-            rows = []; flat16.releaseAll(); presentPaths = []; fileID = []; pathID = [:]; idPath = []
+            rows = []; flat16.releaseAll(); presentPaths = []; fileID = []; pathID = [:]; idPath = []; fileChunkCount = []
             kindCode = []; kindID = [:]; idKind = []; invalidateBase()
             dim = 0
         }
@@ -981,6 +994,20 @@ public final class VectorStore: @unchecked Sendable {
                 baseScore = MLX.quantizedMM(qv.transposed(1, 0), qb.wq, scales: qb.scales, biases: qb.biases,
                                             transpose: true, groupSize: Self.quantGroup, bits: quantBits)
                     .transposed(1, 0)
+                // PLAIN-QUERY FAST PATH: select the top-C candidates ON THE GPU (argPartition) so the
+                // host never reads back or scans all N coarse scores, then exact-rescore just the
+                // candidates and reduce over candidates + delta only - O(C + delta) host work after
+                // the scan instead of O(N). Filtered queries keep the host path below (its candidate
+                // selection applies the filter prefilters).
+                let C = min(baseRows, min(4096, max(1024, topK * 32)))
+                if filter.isEmpty, baseRows > C {
+                    let result = fillSnippetsLocked(searchCandidatesLocked(
+                        coarse: baseScore, qv: qv, n: n, candidateCount: C, query: query, topK: topK))
+                    if let t0 {
+                        print(String(format: "[search] n=%d gpu-candidate path total=%.1fms", n, -t0.timeIntervalSinceNow * 1000))
+                    }
+                    return result
+                }
             } else {
                 baseScore = MLX.matmul(mlxBase!, qv)
             }
@@ -1022,6 +1049,73 @@ public final class VectorStore: @unchecked Sendable {
                              n, t1.timeIntervalSince(t0) * 1000, -t1.timeIntervalSinceNow * 1000))
             }
             return result
+        }
+    }
+
+
+    /// The plain-query fast path for quant mode. GPU: argPartition the coarse scores for the top-C
+    /// row indices (no full readback). Host: gather those C rows' exact bf16 vectors from flat16,
+    /// rescore in one [C, dim] matmul, then reduce best-chunk-per-file over ONLY the C candidates
+    /// plus the (already exact) delta rows. chunkCount comes from the lockstep fileChunkCount, so
+    /// nothing here touches all N rows. Unfiltered only - the caller guarantees filter.isEmpty.
+    private func searchCandidatesLocked(coarse: MLXArray, qv: MLXArray, n: Int,
+                                        candidateCount C: Int, query: [Float], topK: Int) -> [SearchHit] {
+        // Top-C base candidates on the GPU; delta rows are exact and all enter the reduce.
+        let flat = coarse.reshaped([baseRows])
+        let kth = baseRows - C
+        let topIdx = MLX.argPartition(flat, kth: kth)[kth...]
+        var deltaScores: [Float] = []
+        if n > baseRows {
+            let deltaCount = n - baseRows
+            let ds: MLXArray = flat16.withUnsafeBytes { raw in
+                let p = raw.baseAddress!.advanced(by: baseRows * dim * MemoryLayout<UInt16>.size)
+                let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: p),
+                                count: deltaCount * dim * MemoryLayout<UInt16>.size, deallocator: .none)
+                return MLX.matmul(MLXArray(data, [deltaCount, dim], dtype: .bfloat16), qv)
+            }
+            MLX.eval(topIdx, ds)
+            deltaScores = ds.reshaped([deltaCount]).asType(.float32).asArray(Float.self)
+        } else {
+            MLX.eval(topIdx)
+        }
+        let cand = topIdx.asType(.int32).asArray(Int32.self)
+
+        // Exact rescore of the C candidates (host gather + one small matmul).
+        var packed = [UInt16](repeating: 0, count: cand.count * dim)
+        flat16.withUnsafeBufferPointer { fb in
+            packed.withUnsafeMutableBufferPointer { pb in
+                guard let src = fb.baseAddress, let dst = pb.baseAddress else { return }
+                for (j, ri) in cand.enumerated() { (dst + j * dim).update(from: src + Int(ri) * dim, count: dim) }
+            }
+        }
+        let exact: MLXArray = packed.withUnsafeBytes { raw in
+            let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!),
+                            count: cand.count * dim * MemoryLayout<UInt16>.size, deallocator: .none)
+            return MLX.matmul(MLXArray(data, [cand.count, dim], dtype: .bfloat16), qv)
+        }
+        MLX.eval(exact)
+        let exScores = exact.reshaped([cand.count]).asType(.float32).asArray(Float.self)
+
+        // Best chunk per file over candidates + delta (small dictionary - C + delta entries max).
+        var best: [Int32: (score: Float, row: Int32)] = [:]
+        best.reserveCapacity(cand.count + deltaScores.count)
+        func offer(_ row: Int32, _ score: Float) {
+            guard score.isFinite else { return }
+            let f = fileID[Int(row)]
+            if let cur = best[f], cur.score >= score { return }
+            best[f] = (score, row)
+        }
+        for (j, ri) in cand.enumerated() { offer(ri, exScores[j]) }
+        for (j, sc) in deltaScores.enumerated() { offer(Int32(baseRows + j), sc) }
+
+        // Top-K files by best-chunk score.
+        let winners = best.values.sorted { $0.score > $1.score }.prefix(topK)
+        return winners.map { w in
+            let r = rows[Int(w.row)]
+            return SearchHit(path: r.path, score: w.score, snippet: "", kind: r.kind,
+                             chunkIndex: r.chunkIndex, modified: r.modified,
+                             width: r.width, height: r.height, duration: r.duration, locator: r.locator,
+                             chunkCount: Int(fileChunkCount[Int(fileID[Int(w.row)])]))
         }
     }
 
@@ -1565,7 +1659,12 @@ public final class VectorStore: @unchecked Sendable {
         flat16.withUnsafeMutableBufferPointer { fb in
             guard let base = fb.baseAddress else { return }
             for i in 0 ..< rows.count {
-                if shouldRemove(i) { removedPaths.insert(rows[i].path); if i < firstRemoved { firstRemoved = i }; continue }
+                if shouldRemove(i) {
+                    removedPaths.insert(rows[i].path)
+                    fileChunkCount[Int(fileID[i])] -= 1
+                    if i < firstRemoved { firstRemoved = i }
+                    continue
+                }
                 if w != i {
                     (base + w * dim).update(from: base + i * dim, count: dim)
                     rows[w] = rows[i]; fileID[w] = fileID[i]; kindCode[w] = kindCode[i]
@@ -1597,7 +1696,7 @@ public final class VectorStore: @unchecked Sendable {
 
     private func loadIntoMemory() {
         rows.removeAll(); flat16.removeAll(); presentPaths.removeAll(); fileID.removeAll(); pathID.removeAll()
-        idPath.removeAll(); kindCode.removeAll(); kindID.removeAll(); idKind.removeAll(); dim = 0
+        idPath.removeAll(); fileChunkCount.removeAll(); kindCode.removeAll(); kindID.removeAll(); idKind.removeAll(); dim = 0
         // Pre-size the buffers to the final row/element count so the bf16 buffer is filled in place
         // rather than grown through ~log2(N) reallocations. One COUNT(*) + one dim read up front.
         let total = scalarQuery("SELECT COUNT(*) FROM chunks")
@@ -1637,7 +1736,9 @@ public final class VectorStore: @unchecked Sendable {
                 }
                 rows.append(Row(path: path, kind: kind, chunkIndex: ci, modified: modified,
                                 width: width, height: height, duration: duration, locator: locator))
-                fileID.append(internPath(path))
+                let fid = internPath(path)
+                fileID.append(fid)
+                fileChunkCount[Int(fid)] += 1
                 kindCode.append(internKind(kind))
                 presentPaths.insert(path)
             }
