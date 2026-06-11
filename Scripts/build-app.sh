@@ -16,6 +16,16 @@ CONFIG="${1:-Release}"
 DD=".build/xcode-rel"
 ART="$PWD/$DD/SourcePackages/artifacts/swift-tokenizers/TokenizersRust/TokenizersRust.artifactbundle"
 
+# The .xcodeproj is GENERATED from project.yml and gitignored. If project.yml is newer (e.g. the
+# release CI bumped MARKETING_VERSION), a stale project silently stamps local builds with an old
+# version string (code is current, the About/crash-report version lies). Regenerate when outdated.
+if command -v xcodegen >/dev/null 2>&1; then
+  if [ ! -f Omni.xcodeproj/project.pbxproj ] || [ project.yml -nt Omni.xcodeproj/project.pbxproj ]; then
+    echo "project.yml newer than Omni.xcodeproj - regenerating (xcodegen)"
+    xcodegen generate
+  fi
+fi
+
 # Resolve packages first so the artifact (module map + .a) exists before compile.
 xcodebuild -resolvePackageDependencies -project Omni.xcodeproj -scheme Omni -derivedDataPath "$DD" >/dev/null
 
