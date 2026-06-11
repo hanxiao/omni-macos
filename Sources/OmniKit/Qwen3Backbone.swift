@@ -17,11 +17,17 @@ final class Qwen3Backbone: @unchecked Sendable {
     /// Requires bf16 weights (OMNI_BACKBONE_BF16) for the matmul to actually run in bf16.
     private let computeDType: DType
 
-    /// SAFE TEXT LEVER (b): mx.compile of the fixed-shape per-layer transformer block.
-    /// Default OFF. OMNI_COMPILE_BLOCK=1 fuses the per-layer (rmsNorm+attn+rmsNorm+mlp+residuals)
-    /// subgraph into one kernel to cut per-op dispatch. Output is bit-identical to the eager path
-    /// (same ops, same order); compile only changes the execution schedule. See `compiledBlock`.
-    let useCompiledBlock: Bool
+    /// mx.compile of the fixed-shape per-layer transformer block - fuses the per-layer
+    /// (rmsNorm+attn+rmsNorm+mlp+residuals) subgraph into one kernel to cut per-op dispatch. Output
+    /// is bit-identical to the eager path (same ops, same order); compile only changes the schedule.
+    ///
+    /// POLICY (measured): compile ONLY the B==1 interactive query forward by default. There the fused
+    /// dispatch is a ~15-17% latency win - larger on dispatch-bound low-end GPUs - and the (B,Lmax)
+    /// cache is naturally bounded to ~one key per distinct query length (measured 8 keys for 8 queries).
+    /// Batched INDEXING (B>1) stays EAGER: its (B,Lmax) space explodes (measured 45+ keys for 60 files),
+    /// so recompile churn + per-graph memory outweigh the ~4% throughput gain. nil = this default;
+    /// OMNI_COMPILE_BLOCK="1" forces compile for ALL batches (bench), "0" forces eager everywhere.
+    private let compileEnv: String?
     /// Compiled block cache keyed by the shape variant `(B, Lmax, hasArrayMask)`. Bucketing keeps
     /// the number of distinct keys small (a handful of near-uniform Lmax), so compile cost amortizes.
     /// If this map grows without bound on a workload, compile is recompiling too much -> turn the
@@ -38,7 +44,7 @@ final class Qwen3Backbone: @unchecked Sendable {
         // bf16 compute by default (faster, half the backbone VRAM); set OMNI_BF16_COMPUTE=0 for the
         // exact fp32 path (the parity test does this to match the fp32 reference fixtures).
         self.computeDType = ProcessInfo.processInfo.environment["OMNI_BF16_COMPUTE"] == "0" ? .float32 : .bfloat16
-        self.useCompiledBlock = ProcessInfo.processInfo.environment["OMNI_COMPILE_BLOCK"] == "1"
+        self.compileEnv = ProcessInfo.processInfo.environment["OMNI_COMPILE_BLOCK"]
     }
 
     /// Embed token ids -> [1, L, dim] (fp32, batch 1).
@@ -99,7 +105,10 @@ final class Qwen3Backbone: @unchecked Sendable {
     func forward(inputsEmbeds: MLXArray, length L: Int, lengths: [Int]? = nil) -> MLXArray {
         let mask = attentionMask(inputsEmbeds, lengths: lengths)
         var h = inputsEmbeds.asType(computeDType)
-        if useCompiledBlock {
+        // Compile policy: B==1 (interactive query) by default; env can force all/none. See `compileEnv`.
+        let B = inputsEmbeds.dim(0)
+        let useCompiled = compileEnv == "1" || (compileEnv != "0" && B == 1)
+        if useCompiled {
             h = forwardCompiled(h, mask: mask)
         } else {
             for i in 0 ..< cfg.text.numLayers {
