@@ -83,8 +83,11 @@ final class Qwen3Backbone: @unchecked Sendable {
     /// drives `asyncEval` and reads it later, so the GPU forward of the next batch can overlap
     /// the CPU readout of this one. Identical math to `poolBatch` - only the eval is deferred.
     func poolBatchGraph(_ hidden: MLXArray, lengths: [Int]) -> MLXArray {
-        let rows = lengths.enumerated().map { hidden[$0.offset, $0.element - 1] }   // each [dim]
-        var stacked = MLX.stacked(rows, axis: 0).asType(.float32)                   // [B, dim], norm in fp32
+        // One gather instead of B row-slices + a stack (B+1 kernels -> 1): take each row's
+        // last-real-token hidden state via takeAlongAxis on the L axis. Identical rows.
+        let idx = MLXArray(lengths.map { Int32($0 - 1) }, [lengths.count, 1, 1])     // [B, 1, 1]
+        let picked = MLX.takeAlong(hidden, idx, axis: 1)                             // [B, 1, dim]
+        var stacked = picked.reshaped([lengths.count, cfg.text.hiddenSize]).asType(.float32)
         stacked = stacked / MLX.sqrt((stacked * stacked).sum(axis: 1, keepDims: true))
         return stacked
     }
@@ -334,9 +337,20 @@ final class Qwen3Backbone: @unchecked Sendable {
         return (xf * MLX.rsqrt(v + cfg.text.rmsNormEps) * w[key].asType(.float32)).asType(computeDType)
     }
 
+    /// silu(g) * u is 3 elementwise kernels eagerly (sigmoid, mul, mul) over the [B*L, inter]
+    /// activation per layer; one fused shapeless-compiled kernel instead (purely elementwise, the
+    /// shapeless-safe case; same expression tree). The compiled B==1 query path already fuses this
+    /// inside its block graph - this covers the EAGER batched indexing path. OMNI_FUSED_NORM=0
+    /// restores eager.
+    private static let siluGateCompiled: @Sendable ([MLXArray]) -> [MLXArray] = compile(shapeless: true) { xs in
+        let (g, u) = (xs[0], xs[1])
+        return [(g * MLX.sigmoid(g)) * u]
+    }
+
     private func mlp(_ x: MLXArray, _ p: String) -> MLXArray {
-        let gate = MLXNN.silu(linear(x, p + "mlp.gate_proj.weight"))
+        let g = linear(x, p + "mlp.gate_proj.weight")
         let up = linear(x, p + "mlp.up_proj.weight")
-        return linear(gate * up, p + "mlp.down_proj.weight")
+        let a = Self.fusedNorm ? Self.siluGateCompiled([g, up])[0] : MLXNN.silu(g) * up
+        return linear(a, p + "mlp.down_proj.weight")
     }
 }
