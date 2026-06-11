@@ -564,13 +564,30 @@ func embbenchRun(_ engine: OmniEngine, _ corpus: [String], _ secs: Double, _ bat
     nonisolated(unsafe) var wall = 0.0
     DispatchQueue.global(qos: qos).async {
         let windowSize = batchSize * 6
+        // OMNI_BENCH_PACK=tokens: pack the sorted window into groups by PADDED-token budget (group
+        // cost = count * longest-in-group, the right-padded forward's true cost) instead of fixed
+        // count. Short texts then share one big forward instead of many tiny ones. Budget =
+        // batchSize * 360 est tokens (chars/4) ~= the work of one full-length fixed batch; count
+        // capped at 64 to bound activation VRAM.
+        let packTokens = ProcessInfo.processInfo.environment["OMNI_BENCH_PACK"] == "tokens"
+        let tokenBudget = batchSize * 360
         func window(_ off: Int) -> [[String]] {
             var w: [String] = []; w.reserveCapacity(windowSize)
             for k in 0 ..< windowSize { w.append(corpus[(off + k) % corpus.count]) }
             w.sort { $0.count < $1.count }                       // the indexer's length bucketing
             var groups: [[String]] = []
-            var i = 0
-            while i < w.count { groups.append(Array(w[i ..< min(i + batchSize, w.count)])); i += batchSize }
+            if packTokens {
+                var g: [String] = []
+                for t in w {
+                    let est = max(1, t.count / 4)
+                    if !g.isEmpty && ((g.count + 1) * est > tokenBudget || g.count >= 64) { groups.append(g); g = [] }
+                    g.append(t)
+                }
+                if !g.isEmpty { groups.append(g) }
+            } else {
+                var i = 0
+                while i < w.count { groups.append(Array(w[i ..< min(i + batchSize, w.count)])); i += batchSize }
+            }
             return groups
         }
         _ = engine.embedTextBatches(window(0), as: .passage)     // warm kernels for these shapes
@@ -596,15 +613,27 @@ if args.count >= 3 && args[1] == "embbench" {
     let batchSize = (args.count >= 5 ? Int(args[4]) : nil) ?? 16
     let engine = try await OmniEngine(modelDir: dir)
     // Realistic varied lengths: 1..14 sentences (~60..1700 chars), the chunker's working range.
+    // OMNI_BENCH_CORPUS=short skews to 1-2 sentences (a code-heavy corpus: many files chunk small).
     let sentence = "The quarterly revenue report shows strong cloud growth across European regions while distributed systems engineering paid down latency debt and the search index stayed current. "
     var corpus: [String] = []
-    for i in 0 ..< 192 { corpus.append(String(repeating: sentence, count: (i % 14) + 1)) }
+    if ProcessInfo.processInfo.environment["OMNI_BENCH_CORPUS"] == "short" {
+        for i in 0 ..< 192 { corpus.append(String(repeating: sentence, count: (i % 8 == 7) ? 6 : (i % 2) + 1)) }
+    } else {
+        for i in 0 ..< 192 { corpus.append(String(repeating: sentence, count: (i % 14) + 1)) }
+    }
     let qosName = ProcessInfo.processInfo.environment["OMNI_BENCH_QOS"] ?? "userInitiated"
     let qos: DispatchQoS.QoSClass = switch qosName {
     case "utility": .utility
     case "background": .background
     case "default": .default
     default: .userInitiated
+    }
+    // OMNI_BENCH_CACHE_MB: clamp MLX's buffer cache to emulate a low-end machine's memory budget
+    // (the app sets cacheLimit = userCap/2, ~1.5GB at the 8GB-Mac default cap; tighter = more
+    // allocation churn if the working set does not fit).
+    if let mb = ProcessInfo.processInfo.environment["OMNI_BENCH_CACHE_MB"].flatMap({ Int($0) }) {
+        MLX.Memory.cacheLimit = mb * 1_048_576
+        print("  cacheLimit clamped to \(mb) MB")
     }
     var ticket: WiredMemoryTicket? = nil
     if ProcessInfo.processInfo.environment["OMNI_BENCH_WIRED"] == "1" {
