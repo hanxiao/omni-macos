@@ -228,7 +228,13 @@ public final class VectorStore: @unchecked Sendable {
         exec("PRAGMA mmap_size=268435456;")     // 256MB memory-mapped IO (virtual, demand-paged)
         exec("PRAGMA cache_size=-262144;")       // 256MB page cache (bulk insert keeps more dirty pages hot)
         exec("PRAGMA temp_store=MEMORY;")
-        exec("PRAGMA wal_autocheckpoint=8000;")  // ~32MB WAL between checkpoints: fewer checkpoint stalls mid-reindex
+        // SQLite's automatic checkpoint fires inside whatever write txn crosses the page threshold -
+        // measured 40-70ms stalls on the serial queue every ~32MB of WAL, landing directly in a
+        // concurrent search's lockwait tail. Disable it (0) and checkpoint via checkpointIfDueLocked
+        // instead: same cadence, but scheduled AWAY from active-search windows. OMNI_WAL_AUTOCKPT
+        // restores the automatic mode for A/B.
+        let autoCkpt = ProcessInfo.processInfo.environment["OMNI_WAL_AUTOCKPT"].flatMap { Int($0) } ?? 0
+        exec("PRAGMA wal_autocheckpoint=\(autoCkpt);")
         exec("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);")
         // The index is a rebuildable cache: on a schema change, drop and recreate.
         if userVersion() != Self.schemaVersion {
@@ -353,6 +359,7 @@ public final class VectorStore: @unchecked Sendable {
             // No invalidateBase(): a new path's rows append past baseRows and are scored as delta.
             // A pre-existing path already triggered removeRowsLocked above, which invalidates.
             proactiveRefoldLocked()
+            checkpointIfDueLocked()
         }
     }
 
@@ -427,6 +434,7 @@ public final class VectorStore: @unchecked Sendable {
             // batch already triggered removeRowsLocked above, which invalidates the base.
             let tBeforeFold = Self.searchTiming ? Date() : nil
             proactiveRefoldLocked()   // refold now if a search is active, off the search's latency path
+            checkpointIfDueLocked()
             if let tSql, let tRm, let tBeforeFold {
                 print(String(format: "[replaceMany] paths=%d sql=%.1fms rebuildRows=%.1fms append+fold=%.1fms",
                              work.count, tRm.timeIntervalSince(tSql) * 1000, tBeforeFold.timeIntervalSince(tRm) * 1000,
@@ -443,6 +451,7 @@ public final class VectorStore: @unchecked Sendable {
             exec("COMMIT;")
             removeRowsByPathsLocked([path])
             proactiveRefoldLocked()
+            checkpointIfDueLocked()
         }
     }
 
@@ -466,6 +475,7 @@ public final class VectorStore: @unchecked Sendable {
             exec("COMMIT;")
             removeRowsByPathsLocked(paths)   // one rebuild for the whole set (id-mask, no path hashing)
             proactiveRefoldLocked()
+            checkpointIfDueLocked()
         }
     }
 
@@ -487,6 +497,7 @@ public final class VectorStore: @unchecked Sendable {
             sqlite3_finalize(stmt)
             removeRowsLocked { $0.path == folder || $0.path.hasPrefix(folder + "/") }
             proactiveRefoldLocked()
+            checkpointIfDueLocked()
         }
     }
 
@@ -998,10 +1009,41 @@ public final class VectorStore: @unchecked Sendable {
         guard Self.proactiveFold, searchRecentlyActiveLocked() else { return }
         let n = rows.count
         guard n > 0, dim > 0, flat16.count == n * dim else { return }
-        if baseDirty || mlxBase == nil || (n - baseRows) > Self.foldThreshold {
-            rebuildBaseLocked(rowCount: n)
-        }
+        guard baseDirty || mlxBase == nil || (n - baseRows) > Self.foldThreshold else { return }
+        // Rate limit: the high-rate writers (text full pass, reconcile) batch many files per write, so
+        // in practice this fires at most ~once per flush window. The floor only matters for residual
+        // PER-FILE writers (media stores) - without it, ~10 stores/s during active search would spend
+        // ~40% of the queue on ~40ms rebuilds; with it, refolds cap at 4/s (~16%) and a search landing
+        // on a still-dirty base pays the lazy rebuild itself once, the pre-proactive behavior. Measured
+        // both extremes with the per-file storm bench (OMNI_BENCH_MODIFY=2): unlimited = search p50
+        // 17ms but 25 rebuilds/s of write burn; searches-pay-lazily = p50 52ms; batching the text pass
+        // (the real fix) makes production writes coarse so this floor is a pathological-case guard.
+        guard -lastProactiveRefoldAt.timeIntervalSinceNow >= Self.refoldMinInterval else { return }
+        lastProactiveRefoldAt = Date()
+        rebuildBaseLocked(rowCount: n)
     }
+    private var lastProactiveRefoldAt = Date.distantPast
+    /// Floor between proactive refolds. 0 restores the unlimited (per-write) behavior for A/B.
+    static let refoldMinInterval: TimeInterval =
+        (ProcessInfo.processInfo.environment["OMNI_REFOLD_MIN_INTERVAL"].flatMap { Double($0) }) ?? 0.25
+
+    /// Scheduled WAL maintenance (autocheckpoint is off - see init). After a write, fold the WAL back
+    /// into the db once it exceeds the soft cap, but only when no search ran recently - the checkpoint
+    /// is the same 40-70ms it always was, it just no longer fires in the middle of a write txn that a
+    /// live search is queued behind. The hard cap bounds WAL growth if the user searches continuously
+    /// (a checkpoint then runs anyway; one bounded stall beats unbounded disk). Single-connection
+    /// store: TRUNCATE never waits on other readers. Crash-durability is unchanged in kind - the index
+    /// is a rebuildable cache, and a lost WAL tail just means the next pass re-embeds those files.
+    private func checkpointIfDueLocked() {
+        let wal = ((try? FileManager.default.attributesOfItem(atPath: dbURL.path + "-wal")[.size]) as? Int) ?? 0
+        guard wal > Self.walSoftCapBytes else { return }
+        if searchRecentlyActiveLocked() && wal < Self.walHardCapBytes { return }
+        let t = Self.searchTiming ? Date() : nil
+        exec("PRAGMA wal_checkpoint(TRUNCATE);")
+        if let t { print(String(format: "[ckpt] wal=%dMB %.1fms", wal >> 20, -t.timeIntervalSinceNow * 1000)) }
+    }
+    private static let walSoftCapBytes = 32 << 20
+    private static let walHardCapBytes = 256 << 20
 
     public func kinds() -> Set<String> { queue.sync { Set(rows.map { $0.kind }) } }
 
@@ -1134,10 +1176,19 @@ public final class VectorStore: @unchecked Sendable {
         var any = false
         for p in paths { if let id = pathID[p] { let idx = Int(id); if idx < idMask.count { idMask[idx] = true; any = true } } }
         guard any else { return }
-        let removed = idMask.withUnsafeBufferPointer { m in
+        // Resolve the id mask to per-ROW flags BEFORE compacting. compactRowsLocked mutates fileID
+        // in lockstep with rows/flat16, so the predicate must not read fileID through a live buffer
+        // pointer (mutating an array inside its own withUnsafeBufferPointer closure is an exclusivity
+        // violation - it happened to work, but it is undefined behavior). A standalone flags array
+        // costs one O(N) integer pass and is immune to the compaction's writes.
+        var removeRow = [Bool](repeating: false, count: rows.count)
+        idMask.withUnsafeBufferPointer { m in
             fileID.withUnsafeBufferPointer { fid in
-                compactRowsLocked { m[Int(fid[$0])] }
+                for i in 0 ..< removeRow.count { removeRow[i] = m[Int(fid[i])] }
             }
+        }
+        let removed = removeRow.withUnsafeBufferPointer { rm in
+            compactRowsLocked { rm[$0] }
         }
         presentPaths.subtract(removed.isEmpty ? paths : removed)
     }
