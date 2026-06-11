@@ -84,7 +84,7 @@ struct ResultsList<Footer: View>: View {
                             // path sat in `expanded` (same result set, so the reset below does not
                             // fire), the chevron is gone - don't strand an open expansion either.
                             if expanded.contains(hit.path), hit.chunkCount > 1 {
-                                PassagesView(passages: passagesCache[hit.path] ?? [],
+                                PassagesView(passages: passagesCache[hit.path],
                                              fileName: URL(fileURLWithPath: hit.path).lastPathComponent)
                                     .padding(10)
                                     // A flat elevated fill, not vibrancy: blur belongs on sidebars and
@@ -164,7 +164,7 @@ struct ResultsList<Footer: View>: View {
                                 set: { if !$0 { passagesPopover = nil } }
                             ), arrowEdge: .bottom) {
                                 ScrollView {
-                                    PassagesView(passages: passagesCache[hit.path] ?? [],
+                                    PassagesView(passages: passagesCache[hit.path],
                                                  fileName: URL(fileURLWithPath: hit.path).lastPathComponent)
                                         .padding(12)
                                 }
@@ -243,6 +243,16 @@ struct ResultsList<Footer: View>: View {
             NSPasteboard.general.setString(path, forType: .string)
         }
         .keyboardShortcut("c", modifiers: [.command, .option])
+        // Exclude this result's folder from indexing - the "stop showing me this build/cache noise"
+        // action. Routes through the same apply path as the Settings ignore editor (backed up,
+        // pruned, persisted, visible there). Hidden when the folder is an indexed root: removing a
+        // whole root belongs to the sidebar, with its confirmation - not a one-click menu item.
+        if model.canIgnoreEnclosingFolder(ofPath: path) {
+            Divider()
+            Button("Ignore Folder \u{201C}\((path as NSString).deletingLastPathComponent.components(separatedBy: "/").last ?? "")\u{201D}") {
+                model.ignoreEnclosingFolder(ofPath: path)
+            }
+        }
     }
 
     private func open(_ path: String) { NSWorkspace.shared.openAsync(URL(fileURLWithPath: path)) }
@@ -313,12 +323,15 @@ struct ResultRow: View {
 /// locator ("Page 3", "Line 1240") leads the excerpt; for scanned-PDF pages the snippet is
 /// just the file name, so the locator + score carry the row alone.
 /// Chrome-free (rows only): the list wraps it in an inline card, the grid in a popover.
+/// `passages == nil` means STILL LOADING (the rank runs async on the store queue) - render a quiet
+/// placeholder, never "No passages": conflating the two flashed the empty state for the fetch's
+/// duration before the real rows swapped in.
 struct PassagesView: View {
-    let passages: [ChunkHit]
+    let passages: [ChunkHit]?
     var fileName: String = ""
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            ForEach(passages) { p in
+            ForEach(passages ?? []) { p in
                 HStack(alignment: .top, spacing: 8) {
                     RoundedRectangle(cornerRadius: 1.5).fill(.quaternary).frame(width: 3)
                     VStack(alignment: .leading, spacing: 2) {
@@ -343,8 +356,14 @@ struct PassagesView: View {
                     Text(scoreText(p.score)).font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
                 }
             }
-            if passages.isEmpty {
+            if let passages, passages.isEmpty {
                 Text("No passages").font(.caption).foregroundStyle(.tertiary)
+            } else if passages == nil {
+                // Loading: keep the card's footprint stable with a quiet placeholder row.
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Ranking passages\u{2026}").font(.caption).foregroundStyle(.tertiary)
+                }
             }
         }
     }
