@@ -30,7 +30,7 @@ final class VectorStoreReducerTests: XCTestCase {
             let modified = Double(rng.int(1000))
             let chunks = 1 + rng.int(maxChunks)
             for c in 0 ..< chunks {
-                rows.append(VectorStore.Row(path: path, snippet: "s\(f)_\(c)", kind: kind, chunkIndex: c, modified: modified))
+                rows.append(VectorStore.Row(path: path, kind: kind, chunkIndex: c, modified: modified))
                 fileID.append(Int32(f))
             }
         }
@@ -100,7 +100,7 @@ final class VectorStoreReducerTests: XCTestCase {
         // 6 single-chunk files, scores: three at 0.9, three at 0.5. topK=2 straddles the 0.9 tie.
         var rows: [VectorStore.Row] = []; var fileID: [Int32] = []
         let s: [Float] = [0.9, 0.9, 0.9, 0.5, 0.5, 0.5]
-        for f in 0 ..< 6 { rows.append(.init(path: "/p\(f).txt", snippet: "x", kind: "text", chunkIndex: 0, modified: 0)); fileID.append(Int32(f)) }
+        for f in 0 ..< 6 { rows.append(.init(path: "/p\(f).txt", kind: "text", chunkIndex: 0, modified: 0)); fileID.append(Int32(f)) }
         for topK in 1 ... 6 {
             let got = VectorStore.reduceTopK(scores: s, fileID: fileID, fileCount: 6, rows: rows, filter: .init(), topK: topK)
             let want = VectorStore.reduceTopKReference(scores: s, rows: rows, filter: .init(), topK: topK)
@@ -114,7 +114,7 @@ final class VectorStoreReducerTests: XCTestCase {
     /// matching the reference's first-seen semantics.
     func testReducerTieWithinFilePicksLowestChunk() {
         var rows: [VectorStore.Row] = []; var fileID: [Int32] = []
-        for c in 0 ..< 5 { rows.append(.init(path: "/only.txt", snippet: "c\(c)", kind: "text", chunkIndex: c, modified: 0)); fileID.append(0) }
+        for c in 0 ..< 5 { rows.append(.init(path: "/only.txt", kind: "text", chunkIndex: c, modified: 0)); fileID.append(0) }
         let s: [Float] = [0.3, 0.9, 0.9, 0.9, 0.2]   // max 0.9 first at chunk index 1
         let got = VectorStore.reduceTopK(scores: s, fileID: fileID, fileCount: 1, rows: rows, filter: .init(), topK: 10)
         let want = VectorStore.reduceTopKReference(scores: s, rows: rows, filter: .init(), topK: 10)
@@ -126,7 +126,7 @@ final class VectorStoreReducerTests: XCTestCase {
     /// NaN/inf scores are skipped identically; a file whose only chunks are NaN is absent.
     func testReducerSkipsNonFinite() {
         var rows: [VectorStore.Row] = []; var fileID: [Int32] = []
-        for f in 0 ..< 3 { for c in 0 ..< 2 { rows.append(.init(path: "/f\(f).txt", snippet: "x", kind: "text", chunkIndex: c, modified: 0)); fileID.append(Int32(f)) } }
+        for f in 0 ..< 3 { for c in 0 ..< 2 { rows.append(.init(path: "/f\(f).txt", kind: "text", chunkIndex: c, modified: 0)); fileID.append(Int32(f)) } }
         let s: [Float] = [.nan, .infinity, 0.7, 0.6, .nan, .nan]   // f0: NaN/inf, f1: 0.7/0.6, f2: NaN/NaN
         let got = VectorStore.reduceTopK(scores: s, fileID: fileID, fileCount: 3, rows: rows, filter: .init(), topK: 10)
         let want = VectorStore.reduceTopKReference(scores: s, rows: rows, filter: .init(), topK: 10)
@@ -140,19 +140,21 @@ final class VectorStoreReducerTests: XCTestCase {
     func testReducerSinceFilterMixedModifiedWithinFile() {
         var rows: [VectorStore.Row] = []; var fileID: [Int32] = []
         // one file, two chunks: high score but old, low score but new
-        rows.append(.init(path: "/f.txt", snippet: "old", kind: "text", chunkIndex: 0, modified: 100)); fileID.append(0)
-        rows.append(.init(path: "/f.txt", snippet: "new", kind: "text", chunkIndex: 1, modified: 200)); fileID.append(0)
+        rows.append(.init(path: "/f.txt", kind: "text", chunkIndex: 0, modified: 100)); fileID.append(0)
+        rows.append(.init(path: "/f.txt", kind: "text", chunkIndex: 1, modified: 200)); fileID.append(0)
         var filter = SearchFilter(); filter.since = 150
         let s: [Float] = [0.9, 0.8]   // chunk0 higher but modified 100 < 150 -> excluded; chunk1 wins
         let got = VectorStore.reduceTopK(scores: s, fileID: fileID, fileCount: 1, rows: rows, filter: filter, topK: 10)
         let want = VectorStore.reduceTopKReference(scores: s, rows: rows, filter: filter, topK: 10)
         XCTAssertEqual(got.map(key), want.map(key))
-        XCTAssertEqual(got.first?.snippet, "new", "the since-passing chunk wins even though it scores lower")
+        // Witness which chunk won by index (snippets are no longer resident in Row; the store fills
+        // them lazily from SQLite for real searches, and this pure-reducer test has no db).
+        XCTAssertEqual(got.first?.chunkIndex, 1, "the since-passing chunk wins even though it scores lower")
     }
 
     func testReducerEmptyAndSingle() {
         XCTAssertTrue(VectorStore.reduceTopK(scores: [], fileID: [], fileCount: 0, rows: [], filter: .init(), topK: 10).isEmpty)
-        let rows: [VectorStore.Row] = [.init(path: "/a.txt", snippet: "x", kind: "text", chunkIndex: 0, modified: 0)]
+        let rows: [VectorStore.Row] = [.init(path: "/a.txt", kind: "text", chunkIndex: 0, modified: 0)]
         let got = VectorStore.reduceTopK(scores: [0.5], fileID: [0], fileCount: 1, rows: rows, filter: .init(), topK: 10)
         XCTAssertEqual(got.count, 1); XCTAssertEqual(got.first?.score, 0.5)
         // topK <= 0 yields nothing

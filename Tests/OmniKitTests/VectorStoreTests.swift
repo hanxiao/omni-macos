@@ -31,6 +31,8 @@ final class VectorStoreTests: XCTestCase {
         let hits = store.search(basis(1), topK: 10)
         XCTAssertEqual(hits.first?.path, "/b.txt")
         XCTAssertEqual(hits.first?.score ?? 0, 1.0, accuracy: 1e-6)
+        // Snippets are not resident - search must fill the winners' snippets lazily from SQLite.
+        XCTAssertEqual(hits.first?.snippet, "/b.txt#0")
         XCTAssertEqual(store.fileCount, 3)
         XCTAssertEqual(store.count, 3)
     }

@@ -40,7 +40,7 @@ public struct IndexedChunk: Sendable {
 public struct SearchHit: Sendable {
     public let path: String
     public let score: Float
-    public let snippet: String
+    public var snippet: String   // filled lazily from SQLite for the winners (not resident per row)
     public let kind: String
     public let chunkIndex: Int
     public let modified: Double
@@ -125,7 +125,12 @@ public final class VectorStore: @unchecked Sendable {
     private let queue = DispatchQueue(label: "omni.vectorstore")
     private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-    struct Row { let path: String; let snippet: String; let kind: String; let chunkIndex: Int; let modified: Double
+    // RESIDENT-SLIM: `path`/`kind` hold the CANONICAL shared String instance from the intern tables
+    // (one heap allocation per distinct file/kind, 16-byte refs per row - NOT a per-row copy), and
+    // the snippet is NOT resident at all: at ~220 chars x N chunks it dominated resident metadata
+    // (~800B/chunk measured at 2M realistic rows), yet it is only read for a search's <=60 winners
+    // and one file's chunks in rankChunks - both fetched lazily from SQLite by primary key.
+    struct Row { let path: String; let kind: String; let chunkIndex: Int; let modified: Double
                  var width: Int = 0; var height: Int = 0; var duration: Double = 0; var locator: String = "" }
     private var rows: [Row] = []
     // Single source of truth for embeddings: contiguous bf16 bits, [count*dim], row i = rows[i].
@@ -184,9 +189,15 @@ public final class VectorStore: @unchecked Sendable {
     private var fileID: [Int32] = []
     private var pathID: [String: Int32] = [:]
     private var fileIDCount: Int { pathID.count }
+    /// id -> canonical path String, parallel to pathID. Rows reference THESE instances so all
+    /// chunks of a file share one heap allocation (and reloads/appends never re-copy the path).
+    private var idPath: [String] = []
     @inline(__always) private func internPath(_ p: String) -> Int32 {
         if let id = pathID[p] { return id }
-        let id = Int32(pathID.count); pathID[p] = id; return id
+        let id = Int32(pathID.count); pathID[p] = id; idPath.append(p); return id
+    }
+    @inline(__always) private func canonicalPath(_ p: String) -> String {
+        idPath[Int(internPath(p))]
     }
     // Dense per-row kind code (row-aligned with `rows`), same idea as fileID: kinds are a tiny
     // closed set (image/video/audio/text/...), so a `type:` filtered search compares a UInt8
@@ -194,14 +205,21 @@ public final class VectorStore: @unchecked Sendable {
     // fileID: every mutation that appends to `rows` appends here; structural rewrites rebuild.
     private var kindCode: [UInt8] = []
     private var kindID: [String: UInt8] = [:]
+    private var idKind: [String] = []
     @inline(__always) private func internKind(_ k: String) -> UInt8 {
         if let id = kindID[k] { return id }
-        let id = UInt8(truncatingIfNeeded: min(kindID.count, 255)); kindID[k] = id; return id
+        let id = UInt8(truncatingIfNeeded: min(kindID.count, 255)); kindID[k] = id
+        if Int(id) == idKind.count { idKind.append(k) }
+        return id
+    }
+    @inline(__always) private func canonicalKind(_ k: String) -> String {
+        idKind[Int(internKind(k))]
     }
     /// Rebuild the dense fileID/pathID/kindCode tables from the current `rows`. Call after any
     /// structural change that rewrites or reorders `rows` (compaction, reload, wipe).
     private func rebuildFileIDsLocked() {
         pathID.removeAll(keepingCapacity: true)
+        idPath.removeAll(keepingCapacity: true)
         fileID.removeAll(keepingCapacity: true)
         fileID.reserveCapacity(rows.count)
         kindCode.removeAll(keepingCapacity: true)
@@ -349,7 +367,7 @@ public final class VectorStore: @unchecked Sendable {
             // just append. `append` grows flat16/rows geometrically (amortized O(1)).
             if presentPaths.contains(path) { removeRowsByPathsLocked([path]) }
             for (i, c) in chunks.enumerated() {
-                rows.append(Row(path: c.path, snippet: c.snippet, kind: c.kind, chunkIndex: c.chunkIndex, modified: c.modified,
+                rows.append(Row(path: canonicalPath(c.path), kind: canonicalKind(c.kind), chunkIndex: c.chunkIndex, modified: c.modified,
                                 width: c.width, height: c.height, duration: c.duration, locator: c.locator))
                 flat16.append(contentsOf: bfs[i])
                 fileID.append(internPath(c.path))
@@ -422,7 +440,7 @@ public final class VectorStore: @unchecked Sendable {
             }
             for (wi, it) in work.enumerated() {
                 for (ci, c) in it.chunks.enumerated() {
-                    rows.append(Row(path: c.path, snippet: c.snippet, kind: c.kind, chunkIndex: c.chunkIndex, modified: c.modified,
+                    rows.append(Row(path: canonicalPath(c.path), kind: canonicalKind(c.kind), chunkIndex: c.chunkIndex, modified: c.modified,
                                     width: c.width, height: c.height, duration: c.duration, locator: c.locator))
                     flat16.append(contentsOf: bfs[wi][ci])
                     fileID.append(internPath(c.path))
@@ -550,8 +568,8 @@ public final class VectorStore: @unchecked Sendable {
             exec("DELETE FROM chunks;")
             // Release the backing buffers (a wipe will not refill to the same size immediately),
             // rather than removeAll which keeps the ~1.6GB capacity reserved.
-            rows = []; flat16 = []; presentPaths = []; fileID = []; pathID = [:]
-            kindCode = []; kindID = [:]; invalidateBase()
+            rows = []; flat16 = []; presentPaths = []; fileID = []; pathID = [:]; idPath = []
+            kindCode = []; kindID = [:]; idKind = []; invalidateBase()
             dim = 0
         }
     }
@@ -836,9 +854,9 @@ public final class VectorStore: @unchecked Sendable {
                 scores = baseScore.reshaped([baseRows]).asType(.float32).asArray(Float.self)
             }
             let t1 = Self.searchTiming ? Date() : nil
-            let result = Self.reduceTopK(scores: scores, fileID: fileID, fileCount: fileIDCount,
-                                         rows: rows, filter: filter, topK: topK,
-                                         kindCode: kindCode, kindID: kindID)
+            let result = fillSnippetsLocked(Self.reduceTopK(scores: scores, fileID: fileID, fileCount: fileIDCount,
+                                                            rows: rows, filter: filter, topK: topK,
+                                                            kindCode: kindCode, kindID: kindID))
             if let t0, let t1 {
                 print(String(format: "[search] n=%d score(matmul+readout)=%.1fms reduce=%.1fms",
                              n, t1.timeIntervalSince(t0) * 1000, -t1.timeIntervalSinceNow * 1000))
@@ -847,6 +865,27 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
     static let searchTiming = ProcessInfo.processInfo.environment["OMNI_SEARCH_TIMING"] == "1"
+
+    /// Fill the lazily-loaded snippets for a search's winners: <=topK primary-key point lookups
+    /// (PRIMARY KEY(path, chunk_index) is the table's btree, so each is O(log N) with hot pages).
+    /// Snippets are NOT resident (see Row); this is the only read path that needs them at search
+    /// time. Must run on `queue`. A closed db (shutdown race) just leaves snippets empty.
+    private func fillSnippetsLocked(_ hits: [SearchHit]) -> [SearchHit] {
+        guard !hits.isEmpty, dbOpen() else { return hits }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT snippet FROM chunks WHERE path = ? AND chunk_index = ?;", -1, &stmt, nil) == SQLITE_OK else { return hits }
+        defer { sqlite3_finalize(stmt) }
+        var out = hits
+        for i in 0 ..< out.count {
+            sqlite3_reset(stmt)
+            sqlite3_bind_text(stmt, 1, out[i].path, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_int(stmt, 2, Int32(out[i].chunkIndex))
+            if sqlite3_step(stmt) == SQLITE_ROW, let c = sqlite3_column_text(stmt, 0) {
+                out[i].snippet = String(cString: c)
+            }
+        }
+        return out
+    }
 
     /// Collapse N per-chunk `scores` into the top-K best-scoring FILES. Groups chunks by the dense
     /// `fileID` (a flat-array lookup, not a path-string hash) and keeps the best chunk per file, then
@@ -953,7 +992,7 @@ public final class VectorStore: @unchecked Sendable {
         let out = order.map { idx -> SearchHit in
             let ri = Int(heapRow[idx])
             let r = rows[ri]
-            return SearchHit(path: r.path, score: heapScore[idx], snippet: r.snippet, kind: r.kind, chunkIndex: r.chunkIndex, modified: r.modified,
+            return SearchHit(path: r.path, score: heapScore[idx], snippet: "", kind: r.kind, chunkIndex: r.chunkIndex, modified: r.modified,
                              width: r.width, height: r.height, duration: r.duration, locator: r.locator,
                              chunkCount: Int(rowCount[Int(fileID[ri])]))
         }
@@ -975,7 +1014,7 @@ public final class VectorStore: @unchecked Sendable {
             let dot = scores[i]
             if !dot.isFinite { continue }
             if let e = best[r.path], e.score >= dot { continue }
-            best[r.path] = SearchHit(path: r.path, score: dot, snippet: r.snippet, kind: r.kind, chunkIndex: r.chunkIndex, modified: r.modified,
+            best[r.path] = SearchHit(path: r.path, score: dot, snippet: "", kind: r.kind, chunkIndex: r.chunkIndex, modified: r.modified,
                                      width: r.width, height: r.height, duration: r.duration, locator: r.locator)
         }
         return Array(best.values).sorted { $0.score > $1.score }.prefix(topK).map { $0 }
@@ -1051,6 +1090,19 @@ public final class VectorStore: @unchecked Sendable {
     public func rankChunks(_ query: [Float], path: String, topK: Int = 6) -> [ChunkHit] {
         queue.sync {
             guard dim > 0, query.count == dim, let id = pathID[path] else { return [] }
+            // Snippets are not resident (see Row): fetch this one file's chunk snippets in a single
+            // indexed SELECT, keyed by chunk index.
+            var snippets: [Int: String] = [:]
+            if dbOpen() {
+                var sStmt: OpaquePointer?
+                if sqlite3_prepare_v2(db, "SELECT chunk_index, snippet FROM chunks WHERE path = ?;", -1, &sStmt, nil) == SQLITE_OK {
+                    sqlite3_bind_text(sStmt, 1, path, -1, SQLITE_TRANSIENT)
+                    while sqlite3_step(sStmt) == SQLITE_ROW {
+                        if let c = sqlite3_column_text(sStmt, 1) { snippets[Int(sqlite3_column_int(sStmt, 0))] = String(cString: c) }
+                    }
+                }
+                sqlite3_finalize(sStmt)
+            }
             var hits: [ChunkHit] = []
             let d = vDSP_Length(dim)
             var rowF = [Float](repeating: 0, count: dim)   // one row, bf16 -> fp32 for the dot
@@ -1061,7 +1113,7 @@ public final class VectorStore: @unchecked Sendable {
                         for k in 0 ..< dim { rowF[k] = Self.fromBF16(mb[i * dim + k]) }
                         var dot: Float = 0
                         rowF.withUnsafeBufferPointer { vDSP_dotpr($0.baseAddress!, 1, qp, 1, &dot, d) }
-                        if dot.isFinite { hits.append(ChunkHit(chunkIndex: rows[i].chunkIndex, score: dot, snippet: rows[i].snippet, locator: rows[i].locator)) }
+                        if dot.isFinite { hits.append(ChunkHit(chunkIndex: rows[i].chunkIndex, score: dot, snippet: snippets[rows[i].chunkIndex] ?? "", locator: rows[i].locator)) }
                     }
                 }
             }
@@ -1261,7 +1313,7 @@ public final class VectorStore: @unchecked Sendable {
 
     private func loadIntoMemory() {
         rows.removeAll(); flat16.removeAll(); presentPaths.removeAll(); fileID.removeAll(); pathID.removeAll()
-        kindCode.removeAll(); kindID.removeAll(); dim = 0
+        idPath.removeAll(); kindCode.removeAll(); kindID.removeAll(); idKind.removeAll(); dim = 0
         // Pre-size the buffers to the final row/element count so the bf16 buffer is filled in place
         // rather than grown through ~log2(N) reallocations. One COUNT(*) + one dim read up front.
         let total = scalarQuery("SELECT COUNT(*) FROM chunks")
@@ -1274,22 +1326,21 @@ public final class VectorStore: @unchecked Sendable {
             kindCode.reserveCapacity(total)
         }
         var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, "SELECT path, snippet, kind, chunk_index, dim, vec, modified, width, height, duration, locator FROM chunks;", -1, &stmt, nil) == SQLITE_OK {
+        if sqlite3_prepare_v2(db, "SELECT path, kind, chunk_index, dim, vec, modified, width, height, duration, locator FROM chunks;", -1, &stmt, nil) == SQLITE_OK {
             while sqlite3_step(stmt) == SQLITE_ROW {
-                let path = String(cString: sqlite3_column_text(stmt, 0))
-                let snippet = String(cString: sqlite3_column_text(stmt, 1))
-                let kind = String(cString: sqlite3_column_text(stmt, 2))
-                let ci = Int(sqlite3_column_int(stmt, 3))
-                let d = Int(sqlite3_column_int(stmt, 4))
-                let modified = sqlite3_column_double(stmt, 6)
-                let width = Int(sqlite3_column_int(stmt, 7))
-                let height = Int(sqlite3_column_int(stmt, 8))
-                let duration = sqlite3_column_double(stmt, 9)
-                let locator = sqlite3_column_text(stmt, 10).map { String(cString: $0) } ?? ""
-                guard d > 0, let blob = sqlite3_column_blob(stmt, 5) else { continue }
+                let path = canonicalPath(String(cString: sqlite3_column_text(stmt, 0)))
+                let kind = canonicalKind(String(cString: sqlite3_column_text(stmt, 1)))
+                let ci = Int(sqlite3_column_int(stmt, 2))
+                let d = Int(sqlite3_column_int(stmt, 3))
+                let modified = sqlite3_column_double(stmt, 5)
+                let width = Int(sqlite3_column_int(stmt, 6))
+                let height = Int(sqlite3_column_int(stmt, 7))
+                let duration = sqlite3_column_double(stmt, 8)
+                let locator = sqlite3_column_text(stmt, 9).map { String(cString: $0) } ?? ""
+                guard d > 0, let blob = sqlite3_column_blob(stmt, 4) else { continue }
                 if dim == 0 { dim = d }
                 guard d == dim else { continue }   // skip mismatched-dimension rows
-                let bytes = Int(sqlite3_column_bytes(stmt, 5))
+                let bytes = Int(sqlite3_column_bytes(stmt, 4))
                 if bytes == d * MemoryLayout<Float>.size {
                     // Legacy fp32 blob: round to bf16 in memory. It is re-saved as bf16 the next
                     // time its file is indexed, so the DB migrates lazily without a forced reindex.
@@ -1300,7 +1351,7 @@ public final class VectorStore: @unchecked Sendable {
                 } else {
                     flat16.append(contentsOf: repeatElement(0, count: d))   // short/corrupt row
                 }
-                rows.append(Row(path: path, snippet: snippet, kind: kind, chunkIndex: ci, modified: modified,
+                rows.append(Row(path: path, kind: kind, chunkIndex: ci, modified: modified,
                                 width: width, height: height, duration: duration, locator: locator))
                 fileID.append(internPath(path))
                 kindCode.append(internKind(kind))
