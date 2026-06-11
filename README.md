@@ -113,7 +113,7 @@ This is not a stock checkpoint runner. The towers are reworked for throughput - 
 norm/activation/rope kernels, fused bias matmuls, shape-aware compile policy, tuned
 attention I/O precision, cross-file GPU batching with double-buffered readout - while
 staying parity-gated against the Python reference (cosine >= 0.999, exact token match).
-Expect the same vectors as the original model, not the same speed.
+Same vectors as the original model, much faster than running it stock.
 
 ### Indexing
 
