@@ -95,9 +95,15 @@ final class VectorStoreCornerTests: XCTestCase {
         let hits = store.search(basis(6), topK: 5)
         XCTAssertEqual(hits.first?.path, "/p0.txt")
         XCTAssertEqual(hits.first?.score ?? 0, 1.0, accuracy: 2e-2)
-        // basis(0) now has no exact match
+        // basis(0) now matches nothing: /p0 holds only basis(6), and basis(6)*basis(0) == 0, as do
+        // all the orthogonal leftovers. The stale-vector symptom would be /p0 scoring ~1.0 here, so
+        // assert on the SCORE - not which file wins the all-zero tie, which is arbitrary and depends
+        // only on file-id ordering. If /p0 surfaces at all, its score must be ~0 (its old basis(0)
+        // vector was removed), proving the replace rebuilt the base rather than serving the stale row.
         let h0 = store.search(basis(0), topK: 5)
-        XCTAssertNotEqual(h0.first?.path, "/p0.txt")
+        if let top = h0.first, top.path == "/p0.txt" {
+            XCTAssertLessThan(top.score, 0.5, "stale basis(0) vector for /p0 survived the in-place replace")
+        }
     }
 
     /// Concurrent searches while inserting must not deadlock, crash, or return non-finite scores.
