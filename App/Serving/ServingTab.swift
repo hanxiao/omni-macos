@@ -56,28 +56,28 @@ struct ServingTab: View {
             ))
             .toggleStyle(.switch)
 
-            HStack(spacing: 10) {
-                Button("MCP") { showMCPSheet = true }
-                    .help("Connection config for MCP clients (Claude Code, Cursor, VS Code)")
-                Button("SKILL.md") { showSkillSheet = true }
-                    .help("A ready skill file for instruction-following agents")
-                Spacer()
-            }
-            .disabled(!model.serving.enabled)
-
-            HStack {
+            // One row: live status on the left, the agent hand-off buttons on the right
+            // (enabled only while serving - they configure clients for a running server).
+            HStack(spacing: 8) {
                 Circle()
                     .fill(statusColor)
                     .frame(width: 8, height: 8)
                 Text(statusText)
-                Spacer()
                 if !model.serving.boundAddress.isEmpty {
                     Text(model.serving.boundAddress)
                         .font(.callout.monospaced())
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
+                        .lineLimit(1).truncationMode(.middle)
                 }
+                Spacer()
+                Button("MCP") { showMCPSheet = true }
+                    .help("Connection config for MCP clients (Claude Code, Cursor, VS Code)")
+                Button("SKILL.md") { showSkillSheet = true }
+                    .help("A ready skill file for instruction-following agents")
             }
+            .buttonStyle(.bordered).controlSize(.small)
+            .disabled(!model.serving.enabled)
         } header: {
             Text("Server")
         } footer: {

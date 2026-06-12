@@ -67,7 +67,6 @@ struct Sidebar: View {
                             Button("Pause This Folder") { model.setFolderPaused(url, true) }
                         }
                         Button("Reveal in Finder") { NSWorkspace.shared.revealAsync(url) }
-                        Divider()
                         // Swap the folder map to the OTHER projection (the same app-wide setting as
                         // Settings > Folder map layout), mirroring the Pause/Resume idiom above.
                         // Selecting the folder first makes the map visible in the new layout right
