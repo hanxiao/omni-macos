@@ -1,6 +1,5 @@
 import SwiftUI
 import AppKit
-import QuickLookUI
 
 /// Invisible helper that installs a local key monitor so the space bar triggers Quick Look
 /// for the selected result - in both list and gallery views, regardless of which subview
@@ -15,17 +14,23 @@ struct QuickLookKeyMonitor: NSViewRepresentable {
     /// panel is the key window while open and a single-item preview ignores arrows, so the app
     /// must drive them; the axis lets the gallery move by visual row, not linearly.
     let onPreviewArrow: (_ vertical: Bool, _ forward: Bool) -> Bool
+    /// Whether the app considers a Quick Look preview open (model.previewURL != nil). The scope
+    /// check below cannot rely on the key window's class: SwiftUI's preview panel is the key
+    /// window while open and is not reliably a QLPreviewPanel subclass.
+    let isPreviewOpen: () -> Bool
 
     func makeNSView(context: Context) -> NSView {
         let v = NSView(frame: .zero)
         context.coordinator.onSpace = onSpace
         context.coordinator.onPreviewArrow = onPreviewArrow
+        context.coordinator.isPreviewOpen = isPreviewOpen
         context.coordinator.install()
         return v
     }
     func updateNSView(_ nsView: NSView, context: Context) {
         context.coordinator.onSpace = onSpace
         context.coordinator.onPreviewArrow = onPreviewArrow
+        context.coordinator.isPreviewOpen = isPreviewOpen
     }
     static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
         coordinator.uninstall()
@@ -35,6 +40,7 @@ struct QuickLookKeyMonitor: NSViewRepresentable {
     final class Coordinator {
         var onSpace: (() -> Void)?
         var onPreviewArrow: ((_ vertical: Bool, _ forward: Bool) -> Bool)?
+        var isPreviewOpen: (() -> Bool)?
         private var monitor: Any?
 
         func install() {
@@ -46,12 +52,12 @@ struct QuickLookKeyMonitor: NSViewRepresentable {
                 // Scope to the main window (and the Quick Look panel, which becomes key while
                 // open and whose arrows/space this monitor drives): a global monitor swallowed
                 // Space in Settings and any other window, breaking keyboard control there.
-                let inScope = MainActor.assumeIsolated {
-                    guard let kw = NSApp.keyWindow else { return false }
-                    // SwiftUI scene windows get generated identifiers ("main-AppWindow-1").
-                    return (kw.identifier?.rawValue.hasPrefix("main") ?? false) || kw is QLPreviewPanel
+                let inMainWindow = MainActor.assumeIsolated {
+                    NSApp.keyWindow?.identifier?.rawValue.hasPrefix("main") ?? false
                 }
-                guard inScope else { return event }
+                // While a preview is open the PANEL is the key window (and its class is an
+                // implementation detail) - the app's own preview state is the reliable signal.
+                guard inMainWindow || self.isPreviewOpen?() == true else { return event }
                 let editingText = MainActor.assumeIsolated { NSApp.keyWindow?.firstResponder is NSText }
                 if editingText { return event }
                 switch event.keyCode {

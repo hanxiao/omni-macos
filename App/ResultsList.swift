@@ -47,7 +47,8 @@ struct ResultsList<Footer: View>: View {
                 let step = (vertical && grid) ? gridColumns : 1
                 model.moveSelection(rowDelta: forward ? step : -step, gridColumns: grid ? gridColumns : nil)
                 return true
-            }))
+            },
+            isPreviewOpen: { model.previewURL != nil }))
         .onKeyPress(.return) { if model.hasSelection { model.openSelected(); return .handled }; return .ignored }
         // Passages are ranked against the CURRENT query vector - a new result set invalidates
         // them (and any open expansion/popover) in both views, so this lives here, not per-view.
