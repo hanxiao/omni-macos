@@ -49,7 +49,7 @@ struct Sidebar: View {
                             Text(c.formatted())
                                 .font(.caption.monospacedDigit())
                                 .foregroundStyle(c == 0 ? .tertiary : .secondary)
-                                .help(c == 0 ? "No files indexed in this folder yet" : "\(c) files indexed")
+                                .help(c == 0 ? "No files indexed in this folder yet" : "\(c) file\(c == 1 ? "" : "s") indexed")
                         }
                     }
                     // While this folder indexes, the row tooltip shows live progress;

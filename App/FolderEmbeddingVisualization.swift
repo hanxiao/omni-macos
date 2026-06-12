@@ -194,7 +194,7 @@ struct FolderEmbeddingVisualization: View {
             // The cloud itself isn't individually navigable, but expose a container summary + the
             // interaction model so VoiceOver users aren't met with an opaque canvas.
             .accessibilityElement(children: .contain)
-            .accessibilityLabel("Folder map for \(folderName). \(model.folderProjection.count) files laid out by similarity.")
+            .accessibilityLabel("Folder map for \(folderName). \(model.folderProjection.count) file\(model.folderProjection.count == 1 ? "" : "s") laid out by similarity.")
             .accessibilityHint("Drag to pan, scroll or pinch to zoom, click a file to highlight its nearest neighbors.")
         }
         // A new folder resets the view and clears the cloud (folderProjection is empty until the fit
