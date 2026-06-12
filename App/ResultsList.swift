@@ -135,6 +135,11 @@ struct ResultsList<Footer: View>: View {
                 // arrow press made keyboard navigation jumpy.
                 withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(sel, anchor: nil) }
             }
+            // A NEW query reads top-down: jump back to the best hit. Keyed on resolvedQuery, not
+            // the result paths - a same-query refresh (live index updates) must keep the position.
+            .onChange(of: model.resolvedQuery) { _, _ in
+                if let first = results.first?.path { proxy.scrollTo(first, anchor: .top) }
+            }
         }
     }
 
@@ -209,6 +214,10 @@ struct ResultsList<Footer: View>: View {
                 // anchor nil = minimal scroll to visible (Finder/Mail behavior); centering on every
                 // arrow press made keyboard navigation jumpy.
                 withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(sel, anchor: nil) }
+            }
+            // A NEW query reads top-down: jump back to the best hit (same rule as the list view).
+            .onChange(of: model.resolvedQuery) { _, _ in
+                if let first = results.first?.path { proxy.scrollTo(first, anchor: .top) }
             }
         }
     }

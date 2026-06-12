@@ -1870,6 +1870,18 @@ final class AppModel {
         }
     }
 
+    /// Search-completion bookkeeping shared by the text and file-query paths. A genuinely NEW
+    /// query starts clean - the selection clears so the list reads top-down from the best hit -
+    /// while a refresh of the SAME query (live re-runs while indexing) keeps the selection if
+    /// its row survived, so a watcher tick never yanks the user's focus.
+    private func applyResults(_ hits: [SearchHit], resolved: String) {
+        let isNewQuery = resolvedQuery != resolved
+        rawResults = hits
+        resolvedQuery = resolved
+        if isNewQuery { selection = nil }
+        else if let sel = selection, !hits.contains(where: { $0.path == sel }) { selection = nil }
+    }
+
     func search() {
         searchDebounce?.cancel()   // a direct search supersedes any pending debounced one
         searchWorkTask?.cancel()   // and supersedes the previous in-flight search's embed + store scan
@@ -1919,9 +1931,7 @@ final class AppModel {
                     }
                     if stored == nil { self.cacheFileQueryVector(cacheKey, vec) }
                     self.lastQueryVector = vec
-                    self.rawResults = hits
-                    self.resolvedQuery = self.fileToken(url)
-                    if let sel = self.selection, !self.rawResults.contains(where: { $0.path == sel }) { self.selection = nil }
+                    self.applyResults(hits, resolved: self.fileToken(url))
                     if !fq.fromHistory { self.recordFileQueryToHistory(fq) }   // re-running from history must not reorder it
                 }
             }
@@ -1944,9 +1954,7 @@ final class AppModel {
                 await MainActor.run {
                     guard token == self.searchToken else { return }
                     self.lastQueryVector = cached
-                    self.rawResults = hits
-                    self.resolvedQuery = q
-                    if let sel = self.selection, !hits.contains(where: { $0.path == sel }) { self.selection = nil }
+                    self.applyResults(hits, resolved: q)
                     self.searching = false
                 }
             }
@@ -1970,9 +1978,7 @@ final class AppModel {
                 guard token == self.searchToken else { return }
                 self.cacheQueryVector(q, vec)
                 self.lastQueryVector = vec
-                self.rawResults = hits
-                self.resolvedQuery = q
-                if let sel = self.selection, !hits.contains(where: { $0.path == sel }) { self.selection = nil }
+                self.applyResults(hits, resolved: q)
                 self.searching = false
             }
         }
