@@ -48,10 +48,11 @@ struct OmniApp: App {
                     .keyboardShortcut("c", modifiers: [.command, .option])
                     .disabled(!model.hasSelection)
                 Divider()
+                // Search-level actions in one group: start a search from a file, save the
+                // current one. (A lone item between two separators reads as over-separation.)
                 Button("Search by a File\u{2026}") { model.searchByFilePanel() }
                     .keyboardShortcut("o", modifiers: [.command, .shift])
                     .disabled(model.phase != .ready)
-                Divider()
                 // Bookmark the current search. The menu bar owns the Cmd-D shortcut (always present,
                 // just disabled when there's nothing to save) so it works even when the toolbar star
                 // is hidden; the toolbar button is a click target that names the same shortcut.

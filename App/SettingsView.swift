@@ -574,6 +574,21 @@ private struct IndexTab: View {
                 if let last = model.lastIndexed {
                     LabeledContent("Last indexed", value: last.formatted(.relative(presentation: .named)))
                 }
+                LabeledContent("Database location") {
+                    HStack(spacing: 8) {
+                        if !model.dbPath.isEmpty {
+                            Text(model.dbPath).font(.caption.monospaced()).foregroundStyle(.secondary)
+                                .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                        }
+                        Button("Change\u{2026}") { pickDatabase() }
+                            .help("Where the search index is stored. Changing the folder loads the index from there.")
+                        Button("Reveal in Finder") {
+                            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.dbPath)])
+                        }
+                        .disabled(model.dbPath.isEmpty)
+                    }
+                    .controlSize(.small)
+                }
             }
             Section {
                 // Selecting a variant switches to it if installed, or downloads it if not - no
@@ -613,25 +628,6 @@ private struct IndexTab: View {
                 Text("Model")
             } footer: {
                 Text("Pick a variant to switch to it or download it. Switching rebuilds the index - the two models use different embeddings.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            Section {
-                if !model.dbPath.isEmpty {
-                    Text(model.dbPath).font(.caption.monospaced()).foregroundStyle(.secondary)
-                        .lineLimit(3).truncationMode(.middle).textSelection(.enabled)
-                }
-                HStack {
-                    Button("Change\u{2026}") { pickDatabase() }
-                    Button("Reveal in Finder") {
-                        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.dbPath)])
-                    }
-                    .disabled(model.dbPath.isEmpty)
-                }
-                .controlSize(.small)
-            } header: {
-                Text("Database Location")
-            } footer: {
-                Text("Where the search index is stored. Changing the folder loads the index from there.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
