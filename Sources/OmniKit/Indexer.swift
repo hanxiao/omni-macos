@@ -239,8 +239,9 @@ public final class Indexer: @unchecked Sendable {
     public var audioMaxClipsPerBatch = 16
 
     /// Seconds per long-media segment chunk (audio derives the same 240 s from its mel-frame
-    /// budget; video shares the window so audio and video locators line up).
-    static let mediaSegmentSeconds: Double = 240
+    /// budget; video shares the window so audio and video locators line up). Public so the UI
+    /// can seek a segment's midpoint when previewing a matched chunk.
+    public static let mediaSegmentSeconds: Double = 240
 
     /// Start-of-segment timestamp locator: "4:00", "1:20:00".
     static func timeLocator(_ seconds: Double) -> String {
