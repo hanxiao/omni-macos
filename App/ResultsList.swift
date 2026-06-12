@@ -12,9 +12,6 @@ struct ResultsList<Footer: View>: View {
     @State private var gridWidth: CGFloat = 0
     /// Grid counterpart of the list's inline expansion: the path whose passages popover is open.
     @State private var passagesPopover: String?
-    /// Keyboard focus on the results container (list or gallery - one is mounted at a time),
-    /// settable programmatically for the search-field Down-arrow hand-off.
-    @FocusState private var resultsFocused: Bool
 
     private func toggle(_ path: String) {
         // Animated: the chevron rotation and the panel's insertion/removal track this mutation.
@@ -49,18 +46,6 @@ struct ResultsList<Footer: View>: View {
                 let grid = model.viewMode == .grid
                 let step = (vertical && grid) ? gridColumns : 1
                 model.moveSelection(rowDelta: forward ? step : -step, gridColumns: grid ? gridColumns : nil)
-                return true
-            },
-            onSearchDown: {
-                // The Spotlight flow: Down in the search field selects the first result (or keeps
-                // a still-visible selection) and hands keyboard focus to the results, so the next
-                // Return/Space/arrows act on them.
-                guard !results.isEmpty else { return false }
-                if model.selection == nil || !results.contains(where: { $0.path == model.selection }) {
-                    model.selection = results.first?.path
-                }
-                NSApp.keyWindow?.makeFirstResponder(nil)
-                resultsFocused = true
                 return true
             }))
         .onKeyPress(.return) { if model.hasSelection { model.openSelected(); return .handled }; return .ignored }
@@ -129,7 +114,6 @@ struct ResultsList<Footer: View>: View {
             // focusable + onMoveCommand wiring the gallery uses. Right/left disclose/collapse the
             // selected row's passages - the Finder list-view convention for expandable rows.
             .focusable()
-            .focused($resultsFocused)
             .focusEffectDisabled()
             .onMoveCommand { direction in
                 switch direction {
@@ -208,7 +192,6 @@ struct ResultsList<Footer: View>: View {
             // Make the gallery keyboard-navigable like the list: arrow keys move the selection by
             // column/row, and Return/Space (handled on the body) then open/preview it.
             .focusable()
-            .focused($resultsFocused)
             .focusEffectDisabled()
             .onMoveCommand { direction in
                 switch direction {
