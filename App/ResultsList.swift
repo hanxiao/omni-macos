@@ -230,14 +230,14 @@ struct ResultsList<Footer: View>: View {
     }
 
     @ViewBuilder private func menu(_ hit: SearchHit) -> some View {
-        // The menu acts on the row under the cursor: select it as the menu opens, so the
-        // shortcut hints shown beside the items and a live Quick Look follow the same item the
-        // user right-clicked (previously they acted on the prior selection).
-        let _ = { if model.selection != hit.path { DispatchQueue.main.async { model.selection = hit.path } } }()
+        // NOTE: no side effects in this builder - macOS evaluates context-menu builders eagerly
+        // during row rendering, so a "select on menu open" hack here thrashed the selection on
+        // every results render. Instead each ACTION selects the row it acts on, so the menu-bar
+        // shortcut hints and a live Quick Look follow the item the user actually invoked.
         let path = hit.path
-        Button("Open") { open(path) }
+        Button("Open") { model.selection = path; open(path) }
             .keyboardShortcut("o", modifiers: .command)
-        Button("Quick Look") { model.previewURL = URL(fileURLWithPath: path) }
+        Button("Quick Look") { model.selection = path; model.previewURL = URL(fileURLWithPath: path) }
             .keyboardShortcut("y", modifiers: .command)
         // Per-chunk breakdown (pages of a PDF, passages of a long doc) - only for files that
         // actually have several chunks. The list expands inline; the grid opens a popover.
