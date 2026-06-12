@@ -273,6 +273,74 @@ final class Qwen3Backbone: @unchecked Sendable {
         return .array(MLXArray(m, [B, 1, 1, Lmax]).asType(computeDType))
     }
 
+    // MARK: - Whole-forward compiled query path
+
+    /// Bucket lengths for the padded B==1 whole-forward graphs.
+    private static let queryBuckets = [16, 32, 64, 128, 256, 512]
+    /// One compiled graph per bucket spanning embed-gather -> all layers -> final norm ->
+    /// last-real-token pool -> L2 normalize. qbench measured the warm single-query embed at a
+    /// FLAT 2.5ms regardless of query length, vs 0.55ms/query amortized inside a batch - i.e.
+    /// ~2ms of per-call dispatch (graph build + per-block submission). Padding to a handful of
+    /// fixed bucket lengths makes the whole forward one pre-traced graph. Parity: padded columns
+    /// are masked exactly like the batched right-padded path (whose equality to per-string
+    /// encode is an existing test gate); pads sit AFTER the real tokens so absolute rope
+    /// positions of real tokens are unchanged, and the pool reads index n-1. Weights are
+    /// trace-time constants; the cache is per-instance, and weight recovery swaps instances.
+    private var queryWholeCache: [Int: ([MLXArray]) -> [MLXArray]] = [:]
+
+    /// The pooled, L2-normalized query vector as an UNEVALUATED graph - the caller can fuse its
+    /// evaluation into downstream work (the store's scan), paying ONE GPU round-trip for
+    /// embed + search instead of two. nil when the ids exceed the largest bucket or compilation
+    /// is disabled. OMNI_QUERY_WHOLE=0 disables (A/B + safety).
+    func pooledQueryGraph(ids: [Int]) -> MLXArray? {
+        guard Self.queryWholeEnabled, compileEnv != "0", !ids.isEmpty,
+              let L = Self.queryBuckets.first(where: { $0 >= ids.count }) else { return nil }
+        let n = ids.count
+        let f = cachedQueryWhole(L)
+        var padded = ids.map(Int32.init)
+        padded.append(contentsOf: repeatElement(0, count: L - n))
+        var inputs: [MLXArray] = [MLXArray(padded, [1, L]), MLXArray([Int32(n - 1)], [1, 1, 1])]
+        if !cfg.text.isCausal {
+            // Padding-column additive mask, the B==1 row of attentionMask's batched formula
+            // (which skips B==1 - unpadded single sequences never needed one). Causal models
+            // need none: real rows can never attend forward into the pad tail under .causal.
+            var m = [Float](repeating: 0, count: L)
+            for j in n ..< L { m[j] = -1e9 }
+            inputs.append(MLXArray(m, [1, 1, 1, L]).asType(computeDType))
+        }
+        return f(inputs)[0]
+    }
+
+    /// nil when the ids exceed the largest bucket or compilation is disabled - the caller falls
+    /// back to the layered path.
+    func encodePooledBucketed(ids: [Int]) -> [Float]? {
+        guard let out = pooledQueryGraph(ids: ids) else { return nil }
+        eval(out)
+        return out.asArray(Float.self)
+    }
+    static let queryWholeEnabled = ProcessInfo.processInfo.environment["OMNI_QUERY_WHOLE"] != "0"
+
+    private func cachedQueryWhole(_ L: Int) -> ([MLXArray]) -> [MLXArray] {
+        if let f = queryWholeCache[L] { return f }
+        let causal = cfg.text.isCausal
+        let f: ([MLXArray]) -> [MLXArray] = compile(shapeless: false) { [unowned self] xs in
+            let mask: MLXFast.ScaledDotProductAttentionMaskMode = causal ? .causal : .array(xs[2])
+            var h = w["language_model.embed_tokens.weight"][xs[0]].asType(computeDType)   // [1, L, dim]
+            for i in 0 ..< cfg.text.numLayers {
+                let p = "language_model.layers.\(i)."
+                h = h + attention(rmsNorm(h, p + "input_layernorm.weight"), p, mask: mask)
+                h = h + mlp(rmsNorm(h, p + "post_attention_layernorm.weight"), p)
+            }
+            h = rmsNorm(h, "language_model.norm.weight")
+            let picked = MLX.takeAlong(h, xs[1], axis: 1)                                  // [1, 1, dim]
+            var v = picked.reshaped([cfg.text.hiddenSize]).asType(.float32)
+            v = v / MLX.sqrt((v * v).sum())
+            return [v]
+        }
+        queryWholeCache[L] = f
+        return f
+    }
+
     /// Last-token pool of a [1, L, dim] hidden state -> L2-normalized [Float].
     func pool(_ hidden: MLXArray, length L: Int, truncateDim: Int? = nil) -> [Float] {
         var pooled = poolGraph(hidden, length: L)
