@@ -40,58 +40,6 @@ folders to index (Documents, Downloads, Desktop, or any folder you pick), press 
 
 Requires an Apple silicon Mac on macOS 14 or later.
 
-## Build from source
-
-```
-brew install xcodegen
-export OMNI_TEAM_ID=XXXXXXXXXX   # your 10-char Apple Team ID (see below)
-xcodegen generate
-open Omni.xcodeproj              # then Cmd+R
-```
-
-You need:
-
-- **Apple silicon Mac, macOS 14+.**
-- **Xcode 26 with the Metal Toolchain** (`xcodebuild -downloadComponent MetalToolchain`).
-  MLX-Swift compiles Metal shaders; a plain SwiftPM command-line build cannot, so build
-  through Xcode or `xcodebuild`.
-- **The model directory** (`model.safetensors`, `tokenizer.json`, `config.json`,
-  `adapters/retrieval/`) from
-  [`jinaai/jina-embeddings-v5-omni-small-mlx`](https://huggingface.co/jinaai/jina-embeddings-v5-omni-small-mlx)
-  (or the `-nano-` variant). The app finds it via `$OMNI_MODEL_DIR`,
-  `~/Library/Application Support/Omni/`, or the HuggingFace cache, and otherwise asks
-  you to pick the folder.
-
-### Why an Apple Developer account is needed
-
-Omni reads files in your Documents, Downloads, and Desktop, which macOS gates behind
-TCC permission. The app is code-signed (not ad-hoc) so the system ties that permission
-to a stable signature and remembers your grant across rebuilds instead of re-prompting
-every time. Signing requires a Team ID, which is why `OMNI_TEAM_ID` is set above.
-
-- **Build and run locally:** a **free** Apple ID is enough. Add it in Xcode (Settings -
-  Accounts), use the personal team it creates, and put that team's ID in `OMNI_TEAM_ID`.
-- **Distribute a notarized DMG** like the Releases here: this needs the **paid Apple
-  Developer Program** ($99/yr) for a *Developer ID Application* certificate and Apple's
-  notary service. The release pipeline (`.github/workflows/release.yml`) uses it; you
-  don't need it just to run Omni yourself.
-
-The repository contains no Apple credentials. The Team ID comes from `OMNI_TEAM_ID`
-locally and from the `APPLE_TEAM_ID` GitHub secret in CI; the signing certificate,
-notary password, and deploy tokens are all GitHub Actions secrets.
-
-## Verify the engine
-
-The MLX-Swift encoder is checked numerically against Python reference fixtures: text
-must match to cosine >= 0.999 with identical token ids; image, video, and audio towers
-match the upstream `model.py` to cosine ~1.0 on identical preprocessed inputs.
-
-```
-uv run python Tools/gen_fixtures.py          # regenerate fixtures (needs mlx + tokenizers)
-cp -R <model snapshot> /private/tmp/omni-model
-make test                                    # compiles shaders, asserts the cosines
-```
-
 ## Architecture
 
 ```
@@ -146,6 +94,58 @@ selects top candidates on the GPU, which are rescored exactly in bf16 before ran
 final scores are exact either way, and recall is gated against the full-precision
 baseline. Results reduce to the best chunk per file, filtered by kind, folder,
 extension, and recency. Idle search is a few milliseconds.
+
+## Build from source
+
+```
+brew install xcodegen
+export OMNI_TEAM_ID=XXXXXXXXXX   # your 10-char Apple Team ID (see below)
+xcodegen generate
+open Omni.xcodeproj              # then Cmd+R
+```
+
+You need:
+
+- **Apple silicon Mac, macOS 14+.**
+- **Xcode 26 with the Metal Toolchain** (`xcodebuild -downloadComponent MetalToolchain`).
+  MLX-Swift compiles Metal shaders; a plain SwiftPM command-line build cannot, so build
+  through Xcode or `xcodebuild`.
+- **The model directory** (`model.safetensors`, `tokenizer.json`, `config.json`,
+  `adapters/retrieval/`) from
+  [`jinaai/jina-embeddings-v5-omni-small-mlx`](https://huggingface.co/jinaai/jina-embeddings-v5-omni-small-mlx)
+  (or the `-nano-` variant). The app finds it via `$OMNI_MODEL_DIR`,
+  `~/Library/Application Support/Omni/`, or the HuggingFace cache, and otherwise asks
+  you to pick the folder.
+
+### Why an Apple Developer account is needed
+
+Omni reads files in your Documents, Downloads, and Desktop, which macOS gates behind
+TCC permission. The app is code-signed (not ad-hoc) so the system ties that permission
+to a stable signature and remembers your grant across rebuilds instead of re-prompting
+every time. Signing requires a Team ID, which is why `OMNI_TEAM_ID` is set above.
+
+- **Build and run locally:** a **free** Apple ID is enough. Add it in Xcode (Settings -
+  Accounts), use the personal team it creates, and put that team's ID in `OMNI_TEAM_ID`.
+- **Distribute a notarized DMG** like the Releases here: this needs the **paid Apple
+  Developer Program** ($99/yr) for a *Developer ID Application* certificate and Apple's
+  notary service. The release pipeline (`.github/workflows/release.yml`) uses it; you
+  don't need it just to run Omni yourself.
+
+The repository contains no Apple credentials. The Team ID comes from `OMNI_TEAM_ID`
+locally and from the `APPLE_TEAM_ID` GitHub secret in CI; the signing certificate,
+notary password, and deploy tokens are all GitHub Actions secrets.
+
+### Verify the engine
+
+The MLX-Swift encoder is checked numerically against Python reference fixtures: text
+must match to cosine >= 0.999 with identical token ids; image, video, and audio towers
+match the upstream `model.py` to cosine ~1.0 on identical preprocessed inputs.
+
+```
+uv run python Tools/gen_fixtures.py          # regenerate fixtures (needs mlx + tokenizers)
+cp -R <model snapshot> /private/tmp/omni-model
+make test                                    # compiles shaders, asserts the cosines
+```
 
 ## License
 
