@@ -262,7 +262,7 @@ struct ResultsList<Footer: View>: View {
         // Use this file itself as the query - doc-vs-doc "more like this" across all modalities.
         Button("Find Similar") { model.setFileQuery(URL(fileURLWithPath: path), similar: true) }
             .keyboardShortcut("f", modifiers: [.command, .option])
-        Button("Reveal in Finder") { reveal(path) }
+        Button("Reveal in Finder") { model.selection = path; reveal(path) }
             .keyboardShortcut("r", modifiers: [.command, .shift])
         Button("Copy Path") {
             NSPasteboard.general.clearContents()
