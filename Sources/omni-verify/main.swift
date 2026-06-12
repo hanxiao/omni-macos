@@ -317,6 +317,85 @@ if args.count >= 2 && args[1] == "dedupcheck" {
     exit(try dedupcheckRun())
 }
 
+// GPU-reduce parity: omni-verify reducecheck [N] [dim]
+// Deterministic store with engineered exact score ties (duplicated vectors) and multi-chunk
+// files; searches before and after un-folded delta inserts and prints a digest of every hit
+// (path|score-bits|chunkIndex). Run twice - OMNI_GPU_REDUCE=0 vs 1 - and diff the digests:
+// they must be IDENTICAL (the GPU reducer's winner-and-tie contract matches the host's).
+if args.count >= 2 && args[1] == "reducecheck" {
+    let n = (args.count >= 3 ? Int(args[2]) : nil) ?? 30_000
+    let dim = (args.count >= 4 ? Int(args[3]) : nil) ?? 64
+    let dbURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("omni-reducecheck-\(ProcessInfo.processInfo.processIdentifier).sqlite")
+    defer { try? FileManager.default.removeItem(at: dbURL) }
+    let store = try VectorStore(dbURL: dbURL)
+    var rng: UInt64 = 0x1234_5678_9ABC_DEF0
+    func nextF() -> Float { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return Float(rng >> 40) / Float(1 << 24) - 0.5 }
+    func vec(_ seedRow: Int) -> [Float] {
+        var v = [Float](repeating: 0, count: dim); var nrm: Float = 0
+        for k in 0 ..< dim { let x = nextF(); v[k] = x; nrm += x * x }
+        let inv = nrm > 0 ? 1 / nrm.squareRoot() : 0
+        for k in 0 ..< dim { v[k] *= inv }
+        return v
+    }
+    // Base: n files; every 7th file has 3 chunks; every 100th file DUPLICATES the previous
+    // file's vector exactly (engineered cross-file tie). Chunk 1 of multi-chunk files
+    // duplicates chunk 0 (engineered within-file tie -> lowest row index must win).
+    var batch: [(path: String, chunks: [IndexedChunk])] = []
+    var lastVec = vec(0)
+    for i in 0 ..< n {
+        let v = (i % 100 == 99) ? lastVec : vec(i)
+        lastVec = v
+        var chunks = [IndexedChunk(path: "/r/f\(i)", modified: 1, size: 1, kind: "text", chunkIndex: 0, snippet: "s", embedding: v)]
+        if i % 7 == 0 {
+            chunks.append(IndexedChunk(path: "/r/f\(i)", modified: 1, size: 1, kind: "text", chunkIndex: 1, snippet: "s", embedding: v))
+            chunks.append(IndexedChunk(path: "/r/f\(i)", modified: 1, size: 1, kind: "text", chunkIndex: 2, snippet: "s", embedding: vec(i + 1_000_000)))
+        }
+        batch.append(("/r/f\(i)", chunks))
+        if batch.count >= 4096 { try store.replaceMany(batch); batch.removeAll(keepingCapacity: true) }
+    }
+    try store.replaceMany(batch)
+    func digest(_ phase: String) {
+        var rng2: UInt64 = 42
+        func qf() -> Float { rng2 ^= rng2 << 13; rng2 ^= rng2 >> 7; rng2 ^= rng2 << 17; return Float(rng2 >> 40) / Float(1 << 24) - 0.5 }
+        var all = ""
+        for _ in 0 ..< 25 {
+            var q = [Float](repeating: 0, count: dim); for k in 0 ..< dim { q[k] = qf() }
+            let hits = store.search(q, topK: 40)
+            // The reducer contract (documented on reduceTopK) is exact winners with tie POOLS:
+            // order within an equal-score run, and membership at the K-th boundary's pool, are
+            // pool-equivalent. Canonicalize per query: above the boundary score, sort by
+            // (score desc, path) and require byte equality (incl. the chosen chunkIndex - the
+            // lowest-row tie rule); at the boundary, check the pool's size and score only.
+            guard let minScore = hits.map(\.score).min() else { continue }
+            let aboveBoundary = hits.filter { $0.score.bitPattern != minScore.bitPattern }
+                .sorted { $0.score != $1.score ? $0.score > $1.score : $0.path < $1.path }
+            for h in aboveBoundary {
+                all += h.path + "|" + String(h.score.bitPattern, radix: 16) + "|\(h.chunkIndex)|\(h.chunkCount)\n"
+            }
+            let pool = hits.filter { $0.score.bitPattern == minScore.bitPattern }
+            all += "boundary|\(String(minScore.bitPattern, radix: 16))|count=\(pool.count)\n"
+        }
+        if ProcessInfo.processInfo.environment["OMNI_REDUCE_DUMP"] == "1" { print("DUMP-\(phase)-BEGIN\n" + all + "DUMP-\(phase)-END") }
+        print("\(phase) digest=\(all.hashValue) lines=\(all.split(separator: "\n").count)")
+        // hashValue is per-process-seeded; print a stable FNV instead.
+        var h: UInt64 = 0xcbf29ce484222325
+        for b in all.utf8 { h = (h ^ UInt64(b)) &* 0x100000001b3 }
+        print("\(phase) fnv=\(String(h, radix: 16))")
+    }
+    digest("base")   // first search builds the base
+    // Delta: 500 more files (below foldThreshold - they stay unfolded), incl. a tie against an
+    // EXISTING base file's vector (cross base/delta tie -> base row must win).
+    var delta: [(path: String, chunks: [IndexedChunk])] = []
+    for i in 0 ..< 500 {
+        let v = (i % 50 == 0) ? lastVec : vec(2_000_000 + i)
+        delta.append(("/r/d\(i)", [IndexedChunk(path: "/r/d\(i)", modified: 2, size: 1, kind: "text", chunkIndex: 0, snippet: "s", embedding: v)]))
+    }
+    try store.replaceMany(delta)
+    digest("delta")
+    store.close()
+    exit(0)
+}
+
 // Search benchmark: omni-verify searchbench [N] [dim] [queries]
 // Compares brute-force cosine scoring: CPU vDSP fp32 (current), CPU cblas_sgemv fp32 (the
 // doc-claimed-but-unwired path), and GPU MLX bf16 (resident bf16 matrix, one matmul/query).
@@ -516,6 +595,27 @@ if args.count >= 2 && args[1] == "projbench" {
     }
     let Ns = args.count >= 4 ? args[3...].compactMap { Int($0) } : [5_000, 15_000, 30_000, 60_000]
     print("projbench dim=\(dim)")
+    // Phase attribution on the first N: PCA basis (SVD), kNN, and the 300-epoch force loop.
+    if let n0 = Ns.first {
+        let data = makeData(n0)
+        _ = ProjectionEngine.layout(data, k: 15, epochs: 2)   // warm
+        let X = MLXArray(data.vectors, [n0, dim]).asType(.float32); eval(X)
+        var t = Date()
+        let basis = ProjectionEngine.pca2DBasis(X)
+        print(String(format: "  [breakdown n=%d] pca2DBasis(SVD) = %.0f ms", n0, -t.timeIntervalSinceNow * 1000))
+        t = Date()
+        let knnIdx = ProjectionEngine.knn(X, k: 15); eval(knnIdx)
+        print(String(format: "  [breakdown n=%d] knn             = %.0f ms", n0, -t.timeIntervalSinceNow * 1000))
+        let edgeFrom = MLXArray((0 ..< n0).flatMap { Array(repeating: Int32($0), count: 15) })
+        let edgeTo = knnIdx.reshaped([-1]).asType(.int32)
+        let negHeads = MLX.concatenated(Array(repeating: edgeFrom, count: 5), axis: 0)
+        var Y = basis.Y * 1.0; eval(Y, edgeFrom, edgeTo, negHeads)
+        t = Date()
+        Y = ProjectionEngine.forceEpochs(Y, edgeFrom: edgeFrom, edgeTo: edgeTo, negHeads: negHeads,
+                                         n: n0, negRate: 5, epochStart: 0, epochEnd: 300, totalEpochs: 300)
+        eval(Y)
+        print(String(format: "  [breakdown n=%d] force x300      = %.0f ms", n0, -t.timeIntervalSinceNow * 1000))
+    }
     for n in Ns {
         let data = makeData(n)
         _ = ProjectionEngine.layout(data, k: 15, epochs: 2)   // warm GPU kernels
