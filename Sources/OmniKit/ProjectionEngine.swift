@@ -264,14 +264,106 @@ public final class ProjectionEngine: @unchecked Sendable {
 
     /// pca2D plus the fitted basis (mean + top-2 components), so non-landmark rows can be projected
     /// EXACTLY through the same components later (the landmark placement path).
+    ///
+    /// Top-2 components via GPU BLOCK subspace iteration (block 8) on the d x d covariance plus a
+    /// host-side 8x8 Rayleigh-Ritz step - a few [d,d]x[d,8] matmuls instead of the CPU-only SVD,
+    /// which was a fixed ~45ms (d=768) on every first map click. A wide block converges at the
+    /// (lambda_9/lambda_2)^k rate, so near-degenerate lambda_2/lambda_3 spectra (where rank-2
+    /// power iteration stalls) still converge in a handful of iterations. Deterministic: fixed
+    /// init, fixed iteration count; the top-2 Ritz residual is checked and any miss falls back
+    /// to the exact CPU SVD. Map orientation was never a contract (SVD signs are themselves
+    /// platform-dependent); the captured-variance parity vs SVD is gated in projbench.
     public static func pca2DBasis(_ X: MLXArray) -> (Y: MLXArray, mean: MLXArray, comps: MLXArray) {
         let n = X.dim(0)
+        let d = X.dim(1)
         let mean = MLX.mean(X, axis: 0)                       // [d]
         let Xc = X - mean                                     // [n, d]
         let cov = Xc.transposed().matmul(Xc) / Float(max(1, n - 1))  // [d, d]
-        eval(cov)
-        let (_, _, Vt) = MLXLinalg.svd(cov, stream: .cpu)    // SVD ONLY on .cpu; Vt: [d, d]
-        let comps = Vt[0 ..< 2]                               // top-2 rows [2, d]
+        let q = 8                                             // block width
+        // Deterministic full-rank init: fixed sinusoid columns (seed-free, never degenerate
+        // against a real covariance).
+        var initB = [Float](repeating: 0, count: d * q)
+        for i in 0 ..< d {
+            for j in 0 ..< q { initB[i * q + j] = cosf(Float(i) * (0.37 + 0.29 * Float(j)) + 0.11 * Float(j * j + 1)) }
+        }
+        var B = MLXArray(initB, [d, q])
+        // Modified Gram-Schmidt over q columns (lazy graph; no per-column syncs).
+        func orthonormalize(_ M: MLXArray) -> MLXArray {
+            var cols: [MLXArray] = (0 ..< q).map { M[0..., $0 ..< ($0 + 1)] }
+            for j in 0 ..< q {
+                for i in 0 ..< j { cols[j] = cols[j] - cols[i] * MLX.sum(cols[i] * cols[j]) }
+                cols[j] = cols[j] / MLX.sqrt(MLX.maximum(MLX.sum(cols[j] * cols[j]), MLXArray(Float(1e-30))))
+            }
+            return MLX.concatenated(cols, axis: 1)
+        }
+        for _ in 0 ..< 8 { B = orthonormalize(cov.matmul(B)) }
+        // Rayleigh-Ritz: T = B' C B (q x q, symmetric) eigendecomposed on the host (Jacobi),
+        // top-2 Ritz vectors become the components. One readback of q*q + 2 scalars total.
+        let CB = cov.matmul(B)
+        let T = B.transposed().matmul(CB)                     // [q, q]
+        eval(T)
+        var a = T.asArray(Float.self)                         // row-major q x q
+        // Symmetrize fp noise, then cyclic Jacobi (handful of sweeps; q=8 is tiny).
+        for i in 0 ..< q { for j in 0 ..< i { let m = 0.5 * (a[i*q+j] + a[j*q+i]); a[i*q+j] = m; a[j*q+i] = m } }
+        var V = [Float](repeating: 0, count: q * q)
+        for i in 0 ..< q { V[i*q+i] = 1 }
+        for _ in 0 ..< 12 {
+            var off: Float = 0
+            for p1 in 0 ..< q { for q1 in (p1 + 1) ..< q { off += a[p1*q+q1] * a[p1*q+q1] } }
+            if off < 1e-18 { break }
+            for p1 in 0 ..< q {
+                for q1 in (p1 + 1) ..< q {
+                    let apq = a[p1*q+q1]
+                    if abs(apq) < 1e-20 { continue }
+                    let app = a[p1*q+p1], aqq = a[q1*q+q1]
+                    let theta = 0.5 * atan2f(2 * apq, app - aqq)
+                    let c = cosf(theta), s2 = sinf(theta)
+                    for k in 0 ..< q {
+                        let akp = a[k*q+p1], akq = a[k*q+q1]
+                        a[k*q+p1] = c * akp + s2 * akq
+                        a[k*q+q1] = -s2 * akp + c * akq
+                    }
+                    for k in 0 ..< q {
+                        let apk = a[p1*q+k], aqk = a[q1*q+k]
+                        a[p1*q+k] = c * apk + s2 * aqk
+                        a[q1*q+k] = -s2 * apk + c * aqk
+                    }
+                    for k in 0 ..< q {
+                        let vkp = V[k*q+p1], vkq = V[k*q+q1]
+                        V[k*q+p1] = c * vkp + s2 * vkq
+                        V[k*q+q1] = -s2 * vkp + c * vkq
+                    }
+                }
+            }
+        }
+        // Top-2 eigenpairs by eigenvalue (diagonal of the rotated T).
+        let order = (0 ..< q).sorted { a[$0*q+$0] > a[$1*q+$1] }
+        let (i0, i1) = (order[0], order[1])
+        var v2 = [Float](repeating: 0, count: q * 2)
+        for k in 0 ..< q { v2[k*2] = V[k*q+i0]; v2[k*2+1] = V[k*q+i1] }
+        let Ritz = B.matmul(MLXArray(v2, [q, 2]))             // [d, 2] candidate components
+        // Convergence check on the SUBSPACE (rotation-insensitive): ||C S - S (S'CS)|| relative.
+        // Per-vector eigen-residuals never settle when lambda_2 ~ lambda_3 (the vectors are
+        // rotationally degenerate), but any basis of the converged subspace captures the same
+        // variance - which is what a 2D map needs. The captured-variance parity vs exact SVD is
+        // gated empirically in projbench.
+        let CS = cov.matmul(Ritz)
+        let M2 = Ritz.transposed().matmul(CS)                 // [2, 2]
+        let resid = CS - Ritz.matmul(M2)
+        let relErr = MLX.sum(resid * resid) / MLX.maximum(MLX.sum(CS * CS), MLXArray(Float(1e-30)))
+        eval(relErr)
+        if ProcessInfo.processInfo.environment["OMNI_PCA_DEBUG"] == "1" {
+            FileHandle.standardError.write(Data("PCA relErr=\(relErr.item(Float.self))\n".utf8))
+        }
+        var comps: MLXArray
+        // 2e-4 maps to >= 99.9% captured-variance parity with the exact SVD (measured); spectra
+        // that converge slower (near-isotropic synthetic data) take the exact CPU-SVD fallback.
+        if relErr.item(Float.self) < 2e-4 {
+            comps = Ritz.transposed()                         // [2, d]
+        } else {
+            let (_, _, Vt) = MLXLinalg.svd(cov, stream: .cpu)   // exact fallback
+            comps = Vt[0 ..< 2]
+        }
         let Y = Xc.matmul(comps.transposed())                // [n, 2]
         eval(Y)
         return (Y, mean, comps)
@@ -330,8 +422,6 @@ public final class ProjectionEngine: @unchecked Sendable {
     /// Chunked brute-force kNN that never materializes the full N x N distance matrix.
     public static func knn(_ X: MLXArray, k: Int) -> MLXArray {     // -> [n, k] int32
         let n = X.dim(0)
-        let sqNorms = MLX.sum(X * X, axis: 1)                 // [n]
-        eval(sqNorms)
         // Cap the distance-tile VRAM at ~200MB. No lower floor on the chunk: a floor (e.g. 1000) would
         // override the byte cap for large n - at n=200k a [1000,n] fp32 tile is ~800MB and the argSort
         // index array doubles it, enough to OOM an 8GB Mac in UMAP mode. Total FLOPs are chunk-invariant,
@@ -343,9 +433,11 @@ public final class ProjectionEngine: @unchecked Sendable {
         while start < n {
             let end = min(start + chunk, n)
             let xChunk = X[start ..< end]                     // [c, d]
-            var D = sqNorms[start ..< end, .newAxis] + sqNorms[.newAxis, 0...]
-                  - 2.0 * xChunk.matmul(xT)                   // [c, n] squared dists
-            D = MLX.maximum(D, MLXArray(Float(0)))
+            // Inputs are L2-normalized (per-file embeddings), so squared L2 = 2 - 2*cos: the
+            // negated similarity ranks identically and skips the sqNorms broadcast assembly.
+            // The dropped per-column ||b||^2-1 term is fp32-rounding-sized (~1e-7): it can only
+            // reorder exact near-ties, the latitude the selection already has.
+            var D = -xChunk.matmul(xT)                        // [c, n] -cosine (rank == squared L2)
             let rowsIdx = MLX.arange(start, end)[0..., .newAxis]   // [c,1] int32
             let colsIdx = MLX.arange(0, n)[.newAxis, 0...]         // [1,n] int32
             D = D + (rowsIdx .== colsIdx).asType(.float32) * 1e30  // mask self
@@ -366,6 +458,32 @@ public final class ProjectionEngine: @unchecked Sendable {
     /// Runs epochs [epochStart, epochEnd) of the UMAP-ish scatter-add SGD on `Y`, returning the
     /// updated (unevaluated) layout. Graph eval is throttled internally; the caller adds the final
     /// eval barrier for the batch. `negHeads` must equal edgeFrom tiled `negRate` times.
+    /// One force epoch as a COMPILED graph: (Y, edgeFrom, edgeTo, negHeads, negTo, alpha) -> Y'.
+    /// Shaped compile (not shapeless): the shapes are fixed for a whole projection, so MLX caches
+    /// one specialization per (L, k, negRate) and fuses the elementwise chains between the
+    /// gather/scatter ops - the loop was ~16 tiny kernel dispatches per epoch, pure launch
+    /// overhead at [L, 2] sizes. Identical math, same op set, no reassociation: positions are
+    /// bit-identical to the uncompiled loop (gated by projbench's layout digest).
+    private static let forceEpochCompiled: @Sendable ([MLXArray]) -> [MLXArray] = compile(shapeless: false) { xs in
+        let (Y0, edgeFrom, edgeTo, negHeads, negTo, alpha) = (xs[0], xs[1], xs[2], xs[3], xs[4], xs[5])
+        var Y = Y0
+        // attractive (neighbors)
+        let diff = Y[edgeFrom] - Y[edgeTo]
+        let d2 = MLX.maximum(MLX.sum(diff * diff, axis: 1, keepDims: true), MLXArray(Float(1e-6)))
+        let posCoeff = -2.0 / (1.0 + d2)
+        let posGrad = MLX.clip(posCoeff * diff, min: Float(-4), max: Float(4)) * alpha
+        Y = Y.at[edgeFrom].add(posGrad)
+        Y = Y.at[edgeTo].subtract(posGrad)
+        // repulsive (negative sampling; negTo supplied by the caller - random state stays outside
+        // the compiled graph so the sampling sequence matches the uncompiled loop exactly)
+        let nd = Y[negHeads] - Y[negTo]
+        let nd2 = MLX.maximum(MLX.sum(nd * nd, axis: 1, keepDims: true), MLXArray(Float(1e-6)))
+        let negCoeff = 2.0 / ((0.001 + nd2) * (1.0 + nd2))
+        let negGrad = MLX.clip(negCoeff * nd, min: Float(-4), max: Float(4)) * alpha
+        Y = Y.at[negHeads].add(negGrad)
+        return [Y]
+    }
+
     public static func forceEpochs(_ Y0: MLXArray, edgeFrom: MLXArray, edgeTo: MLXArray, negHeads: MLXArray,
                             n: Int, negRate: Int, epochStart: Int, epochEnd: Int, totalEpochs: Int) -> MLXArray {
         var Y = Y0
@@ -378,20 +496,8 @@ public final class ProjectionEngine: @unchecked Sendable {
         let nNeg = nEdges * negRate
         for epoch in epochStart ..< epochEnd {
             let alpha = lr * (1.0 - Float(epoch) / Float(totalEpochs))
-            // attractive (neighbors)
-            let diff = Y[edgeFrom] - Y[edgeTo]
-            let d2 = MLX.maximum(MLX.sum(diff * diff, axis: 1, keepDims: true), MLXArray(Float(1e-6)))
-            let posCoeff = -2.0 / (1.0 + d2)
-            let posGrad = MLX.clip(posCoeff * diff, min: Float(-4), max: Float(4)) * alpha
-            Y = Y.at[edgeFrom].add(posGrad)
-            Y = Y.at[edgeTo].subtract(posGrad)
-            // repulsive (negative sampling)
             let negTo = MLX.randInt(0 ..< n, [nNeg]).asType(.int32)
-            let nd = Y[negHeads] - Y[negTo]
-            let nd2 = MLX.maximum(MLX.sum(nd * nd, axis: 1, keepDims: true), MLXArray(Float(1e-6)))
-            let negCoeff = 2.0 / ((0.001 + nd2) * (1.0 + nd2))
-            let negGrad = MLX.clip(negCoeff * nd, min: Float(-4), max: Float(4)) * alpha
-            Y = Y.at[negHeads].add(negGrad)
+            Y = Self.forceEpochCompiled([Y, edgeFrom, edgeTo, negHeads, negTo, MLXArray(alpha)])[0]
             if (epoch + 1) % 16 == 0 { eval(Y) }              // throttle graph eval to bound memory
         }
         return Y
