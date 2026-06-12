@@ -264,7 +264,7 @@ public final class ProjectionEngine: @unchecked Sendable {
 
     /// pca2D plus the fitted basis (mean + top-2 components), so non-landmark rows can be projected
     /// EXACTLY through the same components later (the landmark placement path).
-    static func pca2DBasis(_ X: MLXArray) -> (Y: MLXArray, mean: MLXArray, comps: MLXArray) {
+    public static func pca2DBasis(_ X: MLXArray) -> (Y: MLXArray, mean: MLXArray, comps: MLXArray) {
         let n = X.dim(0)
         let mean = MLX.mean(X, axis: 0)                       // [d]
         let Xc = X - mean                                     // [n, d]
@@ -328,7 +328,7 @@ public final class ProjectionEngine: @unchecked Sendable {
     }
 
     /// Chunked brute-force kNN that never materializes the full N x N distance matrix.
-    static func knn(_ X: MLXArray, k: Int) -> MLXArray {     // -> [n, k] int32
+    public static func knn(_ X: MLXArray, k: Int) -> MLXArray {     // -> [n, k] int32
         let n = X.dim(0)
         let sqNorms = MLX.sum(X * X, axis: 1)                 // [n]
         eval(sqNorms)
@@ -366,7 +366,7 @@ public final class ProjectionEngine: @unchecked Sendable {
     /// Runs epochs [epochStart, epochEnd) of the UMAP-ish scatter-add SGD on `Y`, returning the
     /// updated (unevaluated) layout. Graph eval is throttled internally; the caller adds the final
     /// eval barrier for the batch. `negHeads` must equal edgeFrom tiled `negRate` times.
-    static func forceEpochs(_ Y0: MLXArray, edgeFrom: MLXArray, edgeTo: MLXArray, negHeads: MLXArray,
+    public static func forceEpochs(_ Y0: MLXArray, edgeFrom: MLXArray, edgeTo: MLXArray, negHeads: MLXArray,
                             n: Int, negRate: Int, epochStart: Int, epochEnd: Int, totalEpochs: Int) -> MLXArray {
         var Y = Y0
         // UMAP a=1, b=1 (the spike's tuned constants) folded in algebraically: pow(d2, b-1) is

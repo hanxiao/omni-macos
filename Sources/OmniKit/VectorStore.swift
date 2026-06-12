@@ -274,6 +274,9 @@ public final class VectorStore: @unchecked Sendable {
     // rebuilt only on a structural change (delete/reload) or once the delta exceeds foldThreshold,
     // instead of on every query as before. Result is identical (base+delta covers all rows).
     private var mlxBase: MLXArray?
+    /// [baseRows] int32 fileID copy on the GPU, rebuilt with mlxBase (full mode only): lets the
+    /// plain-query reduce run as GPU scatter ops instead of an O(N) host scan of all scores.
+    private var mlxFileID: MLXArray?
     // QUANTIZED BASE (the low-end scaling mode): when the full bf16 base would claim too much of the
     // user's memory budget, the GPU-resident scan matrix is a 4-bit group-quantized replica instead
     // (MLX quantizedMM - the heavily-optimized LLM-weights kernel; ~4x less resident and ~4x less
@@ -1149,6 +1152,30 @@ public final class VectorStore: @unchecked Sendable {
                 }
             } else {
                 baseScore = MLX.matmul(mlxBase!, qv)
+                // PLAIN-QUERY FAST PATH (full mode): best-chunk-per-file reduction ON the GPU.
+                // The scores are already resident post-matmul; reading all N back and scanning
+                // them on the host was ~4ms of a ~9.5ms query at 2M rows. Delta rows (bounded by
+                // foldThreshold) are scored and merged on the host. Filtered queries keep the
+                // host path (its reducer applies the filters).
+                if filter.isEmpty, Self.gpuReduce, let fid = mlxFileID, baseRows > 0 {
+                    var deltaScores: [Float] = []
+                    if n > baseRows {
+                        let deltaCount = n - baseRows
+                        let ds: MLXArray = flat16.withUnsafeBytes { raw in
+                            let p = raw.baseAddress!.advanced(by: baseRows * dim * MemoryLayout<UInt16>.size)
+                            let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: p),
+                                            count: deltaCount * dim * MemoryLayout<UInt16>.size, deallocator: .none)
+                            return MLX.matmul(MLXArray(data, [deltaCount, dim], dtype: .bfloat16), qv)
+                        }
+                        deltaScores = ds.reshaped([deltaCount]).asType(.float32).asArray(Float.self)
+                    }
+                    let result = fillSnippetsLocked(reduceTopKGPULocked(
+                        baseScore: baseScore, fid: fid, deltaScores: deltaScores, topK: topK))
+                    if let t0 {
+                        print(String(format: "[search] n=%d gpu-reduce path total=%.1fms", n, -t0.timeIntervalSinceNow * 1000))
+                    }
+                    return result
+                }
             }
             var scores: [Float]
             // Delta: rows [baseRows, n) appended since the base was built (bounded by foldThreshold).
@@ -1362,6 +1389,84 @@ public final class VectorStore: @unchecked Sendable {
     /// Filter handling matches the per-row reference exactly: kind/`since` are applied per row in the
     /// hot loop (they can in principle vary per chunk); `folderPrefix`/`ext` are path-based and so
     /// identical for every chunk of a file, so applying them once to each file's winner is exact.
+    /// OMNI_GPU_REDUCE=0 falls back to the host reducer (A/B + safety).
+    static let gpuReduce = ProcessInfo.processInfo.environment["OMNI_GPU_REDUCE"] != "0"
+
+    /// Best-chunk-per-file + top-K on the GPU for the full-mode plain-query path. Winner parity
+    /// with reduceTopK is EXACT, including ties: per file, the max score wins and the LOWEST row
+    /// index breaks ties (host uses a strict `>` over ascending rows); across base and delta the
+    /// base row wins an equal score (host scans base first). All ops are 32-bit:
+    ///   A) bestScore[F]  = scatter-max(scores by fileID)              (NaN forced to -inf first)
+    ///   B) bestRow[F]    = scatter-min(rowIdx where score == best)    (lowest row on ties)
+    ///   C) top-K files   = argPartition(bestScore)                    (read back 2*K scalars)
+    /// Host work after the matmul is O(K + delta), never O(N).
+    private func reduceTopKGPULocked(baseScore: MLXArray, fid: MLXArray, deltaScores: [Float], topK: Int) -> [SearchHit] {
+        let F = fileIDCount
+        guard F > 0, topK > 0 else { return [] }
+        let s32 = baseScore.reshaped([baseRows]).asType(.float32)
+        let sClean = MLX.which(s32 .== s32, s32, MLXArray(-Float.infinity))   // NaN rows lose
+        var bestScore = MLX.full([F], values: MLXArray(-Float.infinity))
+        bestScore = bestScore.at[fid].maximum(sClean)
+        let rowBest = bestScore[fid]                                          // [N] each row's file-best
+        let rowIdx = MLX.arange(0, baseRows, dtype: .int32)
+        let cand = MLX.which(sClean .== rowBest, rowIdx, MLXArray(Int32.max))
+        var bestRow = MLX.full([F], values: MLXArray(Int32.max), type: Int32.self)
+        bestRow = bestRow.at[fid].minimum(cand)
+        let K = Swift.min(topK, F)
+        let kth = F - K
+        // Selection keys are UNIQUE: monotone(score) in the high 32 bits, inverted fileID low -
+        // equal scores break to the LOWEST fileID, the same member the host heap keeps (it scans
+        // files in ascending order with a strict >). argPartition therefore never chooses among
+        // equal keys, which made the boundary pool member run- and permutation-dependent
+        // (caught by testFoldCrossingMatchesReload: folded vs reloaded picked different members
+        // of an exact-tie pool).
+        let bits = bestScore.view(dtype: .uint32)
+        let topBit = MLXArray(UInt32(0x8000_0000))
+        let mono = MLX.which(bits .>= topBit, MLXArray(UInt32.max) - bits, bits + topBit).asType(.uint64)
+        let invFid = (MLXArray(UInt32.max) - MLX.arange(0, F, dtype: .uint32)).asType(.uint64)
+        let keyF = (mono * MLXArray(UInt64(4_294_967_296))) + invFid   // mono << 32 | invFid
+        let topIdx = kth > 0 ? MLX.argPartition(keyF, kth: kth)[kth...] : MLX.arange(0, F, dtype: .int32)
+        let topScores = bestScore[topIdx]
+        let topRows = bestRow[topIdx]
+        MLX.eval(topScores, topRows)
+        let scoresHost = topScores.asArray(Float.self)
+        let rowsHost = topRows.asArray(Int32.self)
+
+        // Candidate map: the K best base files. Delta rows can only improve a file or add one
+        // (see merge proof in the call-site comment), so candidates = GPU top-K + delta files.
+        var candScore = [Int32: Float]()   // fid -> best score
+        var candRow = [Int32: Int32]()     // fid -> winning row
+        candScore.reserveCapacity(K + deltaScores.count)
+        let idxHost = topIdx.asType(.int32).asArray(Int32.self)
+        for j in 0 ..< scoresHost.count {
+            let r = rowsHost[j]
+            guard r != Int32.max, scoresHost[j].isFinite else { continue }    // file absent from base
+            candScore[idxHost[j]] = scoresHost[j]
+            candRow[idxHost[j]] = r
+        }
+        for (i, dot) in deltaScores.enumerated() {
+            guard dot.isFinite else { continue }
+            let ri = baseRows + i
+            let f = fileID[ri]
+            if let cur = candScore[f] {
+                if dot > cur { candScore[f] = dot; candRow[f] = Int32(ri) }   // strict >: base wins ties
+            } else {
+                candScore[f] = dot; candRow[f] = Int32(ri)
+            }
+        }
+        // Order and materialize the K survivors (candidate set is small: K + delta files).
+        // Equal scores tie-break on ascending fileID: Dictionary iteration order is RANDOMIZED,
+        // so without a deterministic secondary key, tied files reordered between calls - and
+        // between a folded and a freshly-reloaded base (caught by testFoldCrossingMatchesReload).
+        let order = candScore.sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }.prefix(topK)
+        return order.map { (f, score) -> SearchHit in
+            let r = rows[Int(candRow[f]!)]
+            return SearchHit(path: r.path, score: score, snippet: "", kind: r.kind, chunkIndex: r.chunkIndex, modified: r.modified,
+                             width: r.width, height: r.height, duration: r.duration, locator: r.locator,
+                             chunkCount: Int(fileChunkCount[Int(f)]))
+        }
+    }
+
     static func reduceTopK(scores: [Float], fileID: [Int32], fileCount: Int,
                            rows: [Row], filter: SearchFilter, topK: Int,
                            kindCode: [UInt8] = [], kindID: [String: UInt8] = [:]) -> [SearchHit] {
@@ -1499,6 +1604,7 @@ public final class VectorStore: @unchecked Sendable {
         // before returning, so no in-flight graph references the old array here. The freed buffer
         // returns to MLX's cache and is often reused by the new allocation outright.
         mlxBase = nil
+        mlxFileID = nil
         quantBase = nil
         let byteCount = rowCount * dim * MemoryLayout<UInt16>.size
         let bits = Self.quantBitsFor(baseBytes: byteCount)
@@ -1547,7 +1653,12 @@ public final class VectorStore: @unchecked Sendable {
                                 count: byteCount, deallocator: .none)
                 mlxBase = MLXArray(data, [rowCount, dim], dtype: .bfloat16)
             }
-            MLX.eval(mlxBase!)
+            // GPU fileID in lockstep (~4 bytes/row - trivial next to the bf16 base).
+            let fid = fileID.withUnsafeBufferPointer { fp in
+                MLXArray(Array(UnsafeBufferPointer(rebasing: fp[0 ..< rowCount])))
+            }
+            mlxFileID = fid
+            MLX.eval(mlxBase!, fid)
             quantBits = 0
         }
         baseRows = rowCount
