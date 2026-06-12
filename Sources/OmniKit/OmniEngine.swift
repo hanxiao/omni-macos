@@ -327,11 +327,21 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         busy = true
         if highPriority { highWaiting -= 1 }
         cond.unlock()
+        let t0 = Date()
         let result = work()
-        trimLock.withLock { lastGPUWork = Date() }
+        trimLock.withLock {
+            lastGPUWork = Date()
+            gpuBusyAccum += lastGPUWork.timeIntervalSince(t0)
+        }
         cond.lock(); busy = false; cond.broadcast(); cond.unlock()
         return result
     }
+
+    /// Cumulative wall time spent inside the serialized GPU gate (embeds, probes, projections).
+    /// wall-time-of-pass minus this = time the GPU pipeline sat idle waiting on host work
+    /// (decode, store writes, scheduling) - the occupancy measurement for indexing passes.
+    private var gpuBusyAccum: TimeInterval = 0
+    public var gpuBusySeconds: TimeInterval { trimLock.withLock { gpuBusyAccum } }
 
     // MARK: - GPU buffer-cache trim at idle
 
