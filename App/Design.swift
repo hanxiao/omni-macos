@@ -66,6 +66,7 @@ extension FileKind {
         case .video: return .systemPurple
         case .audio: return .systemOrange
         case .text:  return .systemGreen
+        case .scan:  return .systemBrown   // manila-paper hue, distinct from the four above
         }
     }
 

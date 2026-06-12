@@ -590,7 +590,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             return frames.isEmpty ? nil : embedVideoQuery(frames, asDocument: asDocument)
         case .audio:
             return embedAudioQuery(url, asDocument: asDocument)
-        case .text:
+        case .text, .scan:   // .scan never comes from detection (extraction-time only)
             // Parser PARITY with the index path: a text-kind file (txt/code/PDF/office) is embedded the
             // SAME way the indexer decodes it - FileExtractor.extract - so its query vector lands in the
             // index space. A text PDF yields text (text tower); a SCANNED PDF rasterizes to page images

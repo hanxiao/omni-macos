@@ -301,8 +301,10 @@ struct ContentView: View {
     private var filterKinds: [FileKind] {
         // Show indexed kinds, plus any kind currently being filtered on - otherwise a filter for a
         // kind that is not (yet) in the index would be invisible and impossible to untoggle.
-        let present = FileKind.allCases.filter { model.indexedKinds.contains($0.rawValue) || model.filterKinds.contains($0) }
-        return present.isEmpty ? [.image, .video, .audio] : present
+        let present = FileKind.indexable.filter { model.indexedKinds.contains($0.rawValue) || model.filterKinds.contains($0) }
+        // Scanned is ALWAYS offered (unlike the four detection kinds): it is an extraction-time
+        // sub-kind users may not know they have until they filter for it.
+        return (present.isEmpty ? [.image, .video, .audio] : present) + [.scan]
     }
 
     private var filterMenu: some View {
@@ -311,7 +313,18 @@ struct ContentView: View {
                 ForEach(filterKinds, id: \.self) { kind in
                     Toggle(isOn: Binding(
                         get: { model.filterKinds.contains(kind) },
-                        set: { on in if on { model.filterKinds.insert(kind) } else { model.filterKinds.remove(kind) } }
+                        // Text carries its sub-kind along (scanned PDFs are documents too), so
+                        // toggling Text never silently drops scans from the results. The Scanned
+                        // PDFs toggle stays independent for narrowing within text.
+                        set: { on in
+                            if on {
+                                model.filterKinds.insert(kind)
+                                if kind == .text { model.filterKinds.insert(.scan) }
+                            } else {
+                                model.filterKinds.remove(kind)
+                                if kind == .text { model.filterKinds.remove(.scan) }
+                            }
+                        }
                     )) { Label(kind.title, systemImage: kind.symbol) }
                 }
             }
@@ -413,7 +426,7 @@ struct ContentView: View {
 
     private func valueSuggestions(_ key: String) -> [String] {
         switch key {
-        case "type": return ["image", "video", "audio", "text"]
+        case "type": return ["image", "video", "audio", "text", "scanned"]
         case "date": return ["any", "week", "month", "year"]
         case "after": return ["week", "month", "year", "7d", "30d", "1y"]
         case "score": return ["25%", "50%", "70%"]
