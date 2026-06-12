@@ -234,18 +234,58 @@ final class AppModel {
 
     func openSelected() { if let u = selectedURL { NSWorkspace.shared.openAsync(u) } }
     func revealSelected() { if let u = selectedURL { NSWorkspace.shared.revealAsync(u) } }
+    func findSimilarSelected() { if let u = selectedURL { setFileQuery(u, similar: true) } }
+    func copySelectedPath() {
+        guard let u = selectedURL else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(u.path, forType: .string)
+    }
+    /// Search by a file (any modality - the embedding space is shared). Owned by the model so the
+    /// File menu and the toolbar button trigger the same panel.
+    func searchByFilePanel() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Search"
+        panel.message = "Choose an image, audio, video, or text file to search by"
+        if panel.runModal() == .OK, let url = panel.url { setFileQuery(url) }
+    }
     /// Finder-style toggle: dismiss the preview if open, else preview the current selection.
     func toggleQuickLook() { previewURL = previewURL != nil ? nil : selectedURL }
 
     /// Move the selection by `rowDelta` positions through the visible (filtered, sorted) results.
     /// `rowDelta == ±1` is left/right in the gallery or up/down in the list; `±columns` is a grid
     /// row. Lets the gallery share the list's arrow-key navigation instead of being click-only.
-    func moveSelection(rowDelta: Int) {
+    func moveSelection(rowDelta: Int, gridColumns: Int? = nil) {
         let r = results
         guard !r.isEmpty else { return }
-        let current = selection.flatMap { sel in r.firstIndex { $0.path == sel } }
-        let idx = current.map { max(0, min(r.count - 1, $0 + rowDelta)) } ?? (rowDelta >= 0 ? 0 : r.count - 1)
-        selection = r[idx].path
+        guard let cur = selection.flatMap({ sel in r.firstIndex { $0.path == sel } }) else {
+            selection = r[rowDelta >= 0 ? 0 : r.count - 1].path
+            return
+        }
+        let target = cur + rowDelta
+        guard let cols = gridColumns else {
+            // List: clamp to the ends, Finder-style.
+            selection = r[max(0, min(r.count - 1, target))].path
+            return
+        }
+        // Gallery, Finder rules: horizontal steps stay within their visual row (no wrapping to
+        // the next row's first cell), vertical steps stay in bounds (no clamping that silently
+        // changes column - Up from the top row previously jumped to item 0).
+        if abs(rowDelta) == 1 {
+            guard target >= 0, target < r.count, target / cols == cur / cols else { return }
+            selection = r[target].path
+        } else {
+            if target < 0 { return }
+            if target >= r.count {
+                // Down into a shorter last row lands on its last item (Finder behavior).
+                guard cur / cols < (r.count - 1) / cols else { return }
+                selection = r[r.count - 1].path
+                return
+            }
+            selection = r[target].path
+        }
     }
 
     /// Matching passages (ranked chunks) of a file for the current query. Runs off the main actor:
@@ -275,6 +315,13 @@ final class AppModel {
     var tokensPerSec: Double = 0
     // Profiling ("Run Profiling" menu): downloads a fixed dataset and times an isolated index pass.
     var isProfilingRunning = false
+    /// Set while a benchmark runs; the sheet's Cancel button flips it (cooperative - the pass
+    /// checks it at every progress tick and between phases).
+    var profilingCancel: CancelFlag?
+    func cancelProfiling() {
+        profilingCancel?.on = true
+        profilingPhase = "Cancelling\u{2026}"
+    }
     var profilingPhase = ""
     var profilingDetail = ""
     var profilingFraction: Double? = nil   // nil = indeterminate (download/unzip/upload)
@@ -1309,12 +1356,22 @@ final class AppModel {
             } catch {
                 await MainActor.run {
                     self.isDownloading = false
-                    self.downloadFailed = true
-                    self.downloadLabel = "Download failed: \(error.localizedDescription)"
+                    if (error as? URLError)?.code == .cancelled {
+                        // User-cancelled from onboarding: back to the variant picker, quietly.
+                        self.downloadFailed = false
+                        self.downloadLabel = ""
+                    } else {
+                        self.downloadFailed = true
+                        self.downloadLabel = "Download failed: \(error.localizedDescription)"
+                    }
                 }
             }
         }
     }
+
+    /// Cancel the in-flight model download (the onboarding Cancel button). Partial files stay on
+    /// disk and are resumed/skipped by the next attempt.
+    func cancelDownload() { downloader?.cancel() }
 
     private func bootstrap() async {
         applyMemoryLimit()
@@ -1458,6 +1515,7 @@ final class AppModel {
                     }
                 }
                 self.folderFileCounts = folders
+                self.refreshDeniedRoots()
                 self.dbPath = path
                 self.dbSizeBytes = size
                 if let lastTs { self.lastIndexed = Date(timeIntervalSince1970: lastTs) }
@@ -1502,18 +1560,45 @@ final class AppModel {
     /// Storage-tab model picker action: switch if the variant is installed, otherwise confirm and
     /// download it (no separate Download button - selecting the variant is the trigger).
     func selectVariant(_ v: ModelVariant) {
+        let rebuildNote = "Your search index will be rebuilt, because the two models store results differently."
         if installedVariants[v] != nil {
-            switchVariant(v)
+            guard v != modelVariant else { return }
+            // Switching wipes and rebuilds the whole index - never do that on a bare menu click.
+            let a = NSAlert()
+            a.messageText = "Switch to \(v.title)?"
+            a.informativeText = "\(rebuildNote) Files will reindex from scratch, which can take a while on a large library."
+            a.addButton(withTitle: "Switch and Rebuild Index"); a.addButton(withTitle: "Cancel")
+            if a.runModal() == .alertFirstButtonReturn { switchVariant(v) }
         } else if !isDownloading {
             let a = NSAlert()
             a.messageText = "Download \(v.title)?"
-            a.informativeText = "\(v.detail). It downloads on-device, becomes the active model, and the index rebuilds for it (the two models use different embeddings)."
+            let character = v == .small ? "\(v.title) is larger and gives higher-quality results."
+                                        : "\(v.title) is smaller and faster."
+            a.informativeText = "\(character) It downloads once to your Mac and becomes the active model. \(rebuildNote)"
             a.addButton(withTitle: "Download"); a.addButton(withTitle: "Cancel")
             if a.runModal() == .alertFirstButtonReturn { downloadModel(v) }
         }
     }
 
     // MARK: - Roots
+
+    /// Roots macOS denied Omni access to (TCC). A denied folder enumerates as empty, which the
+    /// crawler's error handler hides - previously it just showed "0 files" forever. Detected by a
+    /// direct directory read: denial surfaces as NSCocoaErrorDomain 257 (permission).
+    var deniedRoots: Set<String> = []
+    private func refreshDeniedRoots() {
+        let candidates = roots.filter { (folderFileCounts[$0.path] ?? 0) == 0 }.map(\.path)
+        guard !candidates.isEmpty || !deniedRoots.isEmpty else { return }
+        Task.detached(priority: .utility) {
+            var denied: Set<String> = []
+            for path in candidates {
+                do { _ = try FileManager.default.contentsOfDirectory(atPath: path) }
+                catch let e as NSError where e.domain == NSCocoaErrorDomain && e.code == 257 { denied.insert(path) }
+                catch {}
+            }
+            await MainActor.run { self.deniedRoots = denied }
+        }
+    }
 
     private func loadRoots() {
         if let saved = UserDefaults.standard.array(forKey: "omni.roots") as? [String], !saved.isEmpty {
@@ -1670,7 +1755,10 @@ final class AppModel {
         selectedFolderForViz = url
         folderProjection = []; folderKNN = []; folderKNNk = 0; folderProjectionFitting = false
         guard let url, let engine, let store else { return }
-        clearSearchForFolderMap()   // a folder map replaces the search: clear query, results, filters
+        // Deliberately does NOT clear the query or filters: sidebar selection must never destroy
+        // typed search state (no native sidebar does). The map surfaces via precedence the moment
+        // the search is cleared (see showsFolderViz) - which is also what the comment there
+        // already promised.
         if let cached = projectionCache[url] {   // instant (LRU touch)
             touchProjection(url); applyProjection(cached); folderProjectionTotal = projectionTotals[url] ?? cached.points.count; return
         }
@@ -1721,18 +1809,6 @@ final class AppModel {
     /// Clear any active search (query, file-query, results) and filters so a freshly selected folder
     /// shows its clean map. Suppresses the per-field filter didSet so it doesn't kick off a search,
     /// and bumps the search token so any in-flight search can't repopulate the list afterwards.
-    private func clearSearchForFolderMap() {
-        suppressFilterEffects = true
-        defer { suppressFilterEffects = false }
-        query = ""; rawQuery = ""; fileQuery = nil; queryError = nil
-        rawResults = []; resolvedQuery = ""; searching = false
-        activeQualifiers = []
-        if selection != nil { selection = nil }
-        filterKinds = []; filterFolder = nil; filterExt = ""
-        dateRange = .any; minScore = Self.defaultMinScore; sortOrder = .relevance
-        searchToken += 1
-    }
-
     /// Publish a finished projection (points + kNN graph) and bump the generation so the view rebuilds.
     private func applyProjection(_ r: ProjectionResult) {
         folderProjection = r.points
@@ -2180,6 +2256,8 @@ final class AppModel {
     func runProfiling() async {
         guard !isProfilingRunning, let engine else { return }
         isProfilingRunning = true
+        let cancelFlag = CancelFlag()
+        profilingCancel = cancelFlag
         profilingPhase = ""; profilingDetail = ""; profilingFraction = nil
         let wasIndexing = (indexState == .indexing)
 
@@ -2193,6 +2271,7 @@ final class AppModel {
 
         defer {
             isProfilingRunning = false
+            profilingCancel = nil
             profilingPhase = ""; profilingDetail = ""; profilingFraction = nil; profilingStartedAt = nil
             if wasIndexing { startIndexing() }   // resume where it left off (incremental)
         }
@@ -2200,6 +2279,7 @@ final class AppModel {
         do {
             profilingFraction = nil
             let (folder, count) = try await ProfilingService.ensureDataset { self.profilingPhase = $0 }
+            if cancelFlag.on { throw CancellationError() }
 
             let total = count > 0 ? count : 300
             profilingPhase = "Indexing"
@@ -2208,7 +2288,8 @@ final class AppModel {
             profilingStartedAt = Date()   // anchor for the live elapsed/ETA readout
             // Fixed canonical settings (NOT the user's) so every machine indexes the same workload -
             // that is what makes the crowdsourced numbers comparable.
-            let metrics = try await runProfilingPass(engine: engine, targetURL: folder, settings: .profiling) { p in
+            let metrics = try await runProfilingPass(engine: engine, targetURL: folder, settings: .profiling,
+                                                     shouldCancel: { cancelFlag.on }) { p in
                 Task { @MainActor in
                     self.profilingFraction = total > 0 ? Double(p.scanned) / Double(total) : nil
                     self.profilingDetail = "\(p.scanned) of \(total) files \u{00B7} \(p.embedded) embedded"
@@ -2227,18 +2308,21 @@ final class AppModel {
             lastProfilingReport = report
             writeProfilingReport(report)
 
+            if cancelFlag.on { throw CancellationError() }
             profilingPhase = "Uploading results\u{2026}"; profilingFraction = nil; profilingDetail = ""
             if ProfilingService.ensureConsent() { await ProfilingService.upload(report) }
             shareProfilingResults = ProfilingService.uploadsEnabled   // reflect the consent choice in Settings
 
-            profilingPhase = "Profiling complete"
+            profilingPhase = "Benchmark complete"
             profilingFraction = 1
-            profilingDetail = String(format: "%.1f files/sec  \u{00B7}  %.0f tok/sec  \u{00B7}  %.1f GB peak VRAM",
+            profilingDetail = String(format: "%.1f files/sec  \u{00B7}  %.0f tokens/sec  \u{00B7}  %.1f GB peak memory",
                                      metrics.filesPerSec, metrics.tokensPerSec,
                                      Double(metrics.peakVramDeltaBytes) / 1_073_741_824)
             try? await Task.sleep(nanoseconds: 1_800_000_000)
+        } catch is CancellationError {
+            // User-cancelled: close quietly, no failure banner.
         } catch {
-            profilingPhase = "Profiling failed"
+            profilingPhase = "Benchmark failed"
             profilingFraction = nil
             profilingDetail = (error as? ProfilingService.ProfilingError)?.message ?? error.localizedDescription
             try? await Task.sleep(nanoseconds: 2_500_000_000)

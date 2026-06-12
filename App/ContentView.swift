@@ -215,8 +215,9 @@ struct ContentView: View {
         // app can search, since it can start a query from the empty state too.
         if model.phase == .ready {
             ToolbarItem(placement: .automatic) {
-                Button { pickFile() } label: { Image(systemName: "photo.badge.magnifyingglass") }
-                    .keyboardShortcut("o", modifiers: [.command, .shift])
+                // The File menu owns the Shift-Cmd-O shortcut (always present); this is the
+                // click target naming the same chord.
+                Button { model.searchByFilePanel() } label: { Image(systemName: "photo.badge.magnifyingglass") }
                     .help("Search by a file (image, audio, video, or text)  \u{21E7}\u{2318}O")
                     .accessibilityLabel("Search by a File")
             }
@@ -431,15 +432,6 @@ struct ContentView: View {
         if panel.runModal() == .OK { model.addRoots(panel.urls) }
     }
 
-    private func pickFile() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Search"
-        panel.message = "Choose an image, audio, video, or text file to search by"
-        if panel.runModal() == .OK, let url = panel.url { model.setFileQuery(url) }
-    }
 }
 
 /// A thin bar under the search field showing the qualifiers Omni parsed from the box (or the

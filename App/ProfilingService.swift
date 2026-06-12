@@ -150,6 +150,13 @@ enum ProfilingService {
 /// Native progress sheet for a profiling run - slides down from the main window (vs a stray
 /// free-floating window). Determinate during indexing, indeterminate for download/unzip/upload.
 /// Presented while AppModel.isProfilingRunning is true and dismissed when it flips false.
+/// Cross-actor cancellation token: written by the sheet's Cancel button on the main actor, read
+/// from the benchmark's progress callbacks on background threads. A torn read is impossible for
+/// a Bool flag that only ever flips false -> true.
+final class CancelFlag: @unchecked Sendable {
+    var on = false
+}
+
 struct ProfilingSheet: View {
     @Environment(AppModel.self) private var model: AppModel
 
@@ -160,7 +167,7 @@ struct ProfilingSheet: View {
                     .font(.system(size: 18))
                     .foregroundStyle(.tint)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Profiling").font(.headline)
+                    Text("Benchmark").font(.headline)
                     // During the indexing pass, show live elapsed + ETA (ticking every second) instead
                     // of the static "Indexing" label; other phases keep their name.
                     if model.profilingPhase == "Indexing", let start = model.profilingStartedAt {
@@ -187,10 +194,17 @@ struct ProfilingSheet: View {
                     .lineLimit(1).truncationMode(.middle)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
+            HStack {
+                Spacer()
+                // HIG: every lengthy operation needs a cancel affordance - this one downloads a
+                // dataset and runs minutes of GPU work while blocking the window.
+                Button("Cancel") { model.cancelProfiling() }
+                    .disabled(model.profilingCancel?.on ?? true)
+            }
         }
         .padding(20)
         .frame(maxWidth: 400)
-        .interactiveDismissDisabled()   // a run can't be dismissed midway; it closes itself when done
+        .interactiveDismissDisabled()   // closes itself when done or cancelled; Cancel is the way out
     }
 
     /// "1:05 elapsed  ·  ~48s left" - ETA from the linear progress fraction, suppressed until there's

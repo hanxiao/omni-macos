@@ -133,7 +133,10 @@ final class ServingController {
                 self.state = msg == "port in use" ? .portInUse : .failed(msg)
                 self.isRunning = false
                 self.boundAddress = ""
-                self.enabled = false
+                // Deliberately do NOT flip `enabled` (it persists to defaults): a transient bind
+                // failure at launch was silently disabling the feature forever, breaking the
+                // agents whose SKILL.md points at this server. The toggle stays on, the status
+                // dot shows the failure, and the next launch (or port edit) retries.
             }
         }
 
@@ -148,8 +151,8 @@ final class ServingController {
             state = .portInUse
             isRunning = false
             boundAddress = ""
-            enabled = false
             server = nil
+            // `enabled` stays as the user set it - see onFailure above.
         }
     }
 
