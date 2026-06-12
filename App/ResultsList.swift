@@ -85,7 +85,8 @@ struct ResultsList<Footer: View>: View {
                             // fire), the chevron is gone - don't strand an open expansion either.
                             if expanded.contains(hit.path), hit.chunkCount > 1 {
                                 PassagesView(passages: passagesCache[hit.path],
-                                             fileName: URL(fileURLWithPath: hit.path).lastPathComponent)
+                                             fileName: URL(fileURLWithPath: hit.path).lastPathComponent,
+                                             path: hit.path, kind: hit.kind)
                                     .padding(10)
                                     // A flat elevated fill, not vibrancy: blur belongs on sidebars and
                                     // popovers; this excerpt card sits inside the opaque scrolling
@@ -165,7 +166,8 @@ struct ResultsList<Footer: View>: View {
                             ), arrowEdge: .bottom) {
                                 ScrollView {
                                     PassagesView(passages: passagesCache[hit.path],
-                                                 fileName: URL(fileURLWithPath: hit.path).lastPathComponent)
+                                                 fileName: URL(fileURLWithPath: hit.path).lastPathComponent,
+                                                 path: hit.path, kind: hit.kind)
                                         .padding(12)
                                 }
                                 .frame(width: 380)
@@ -329,11 +331,18 @@ struct ResultRow: View {
 struct PassagesView: View {
     let passages: [ChunkHit]?
     var fileName: String = ""
+    var path: String = ""
+    var kind: String = ""
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(passages ?? []) { p in
                 HStack(alignment: .top, spacing: 8) {
                     RoundedRectangle(cornerRadius: 1.5).fill(.quaternary).frame(width: 3)
+                    // Visual match evidence where the file has it: the video frame at the
+                    // segment's stored timestamp, the rendered page for a PDF chunk.
+                    if !path.isEmpty, ChunkPreview.expects(path: path, kind: kind, locator: p.locator) {
+                        ChunkThumb(path: path, kind: kind, locator: p.locator)
+                    }
                     VStack(alignment: .leading, spacing: 2) {
                         if !p.locator.isEmpty {
                             Text(p.locator).font(.caption2.weight(.medium)).foregroundStyle(.tertiary)
