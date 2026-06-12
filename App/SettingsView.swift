@@ -406,10 +406,9 @@ private struct PerformanceTab: View {
                     Text("2048 px").tag(2048)
                 }
                 Picker("Max frames per video", selection: Binding(get: { model.maxVideoFrames }, set: { model.maxVideoFrames = $0 })) {
-                    Text("3").tag(3)
-                    Text("6 \u{00B7} recommended").tag(6)
-                    Text("9").tag(9)
-                    Text("18").tag(18)
+                    Text("6").tag(6)
+                    Text("16").tag(16)
+                    Text("32 \u{00B7} recommended").tag(32)
                 }
                 Picker("Max characters per chunk", selection: Binding(get: { model.maxTextChunkChars }, set: { model.maxTextChunkChars = $0 })) {
                     Text("1200").tag(1200)

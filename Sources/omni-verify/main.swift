@@ -1504,6 +1504,120 @@ if args.count >= 2 && args[1] == "audiosegcheck" {
     exit(try await audiosegcheckRun(args.count >= 3 ? args[2] : nil))
 }
 
+// Long-video segmentation check: omni-verify videosegcheck [modelDir]
+// Layer 1+2 of the video revamp: videos longer than one 240 s segment stream one embedding per
+// segment with timestamp locators (like long audio / scanned PDFs), and frames are sampled
+// UNIFORMLY per window (the reference policy) instead of keep-first-N-distinct (start-biased).
+// Synthesizes H.264 clips with AVAssetWriter; with modelDir, indexes them end to end and runs
+// a frames-per-segment cost sweep (6/16/32) to ground the default in measured tokens/latency.
+func videosegcheckRun(_ modelDir: String?) async throws -> Int32 {
+    var fails = 0
+    func check(_ cond: Bool, _ msg: String) { print("  \(cond ? "ok  " : "FAIL") \(msg)"); if !cond { fails += 1 } }
+    var root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("omni-videoseg-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+    try? FileManager.default.removeItem(at: root)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    if let rp = realpath(root.path, nil) { root = URL(fileURLWithPath: String(cString: rp), isDirectory: true); free(rp) }
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    // Synthesize an H.264 MP4: distinct frames (shifting hue + moving square) so dedup keeps them.
+    func writeMP4(_ name: String, seconds: Double, fps: Double, width: Int, height: Int) async throws -> URL {
+        let url = root.appendingPathComponent(name)
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: width, AVVideoHeightKey: height])
+        input.expectsMediaDataInRealTime = false
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32ARGB,
+            kCVPixelBufferWidthKey as String: width, kCVPixelBufferHeightKey as String: height])
+        writer.add(input)
+        writer.startWriting()
+        writer.startSession(atSourceTime: .zero)
+        let n = Int(seconds * fps)
+        for i in 0 ..< n {
+            while !input.isReadyForMoreMediaData { usleep(2000) }
+            var pb: CVPixelBuffer?
+            CVPixelBufferPoolCreatePixelBuffer(nil, adaptor.pixelBufferPool!, &pb)
+            guard let pb else { throw OmniError.store("pixel buffer alloc failed") }
+            CVPixelBufferLockBaseAddress(pb, [])
+            let ctx = CGContext(data: CVPixelBufferGetBaseAddress(pb), width: width, height: height,
+                                bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
+                                space: CGColorSpaceCreateDeviceRGB(),
+                                bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue)!
+            ctx.setFillColor(CGColor(red: Double(i % 12) / 12.0, green: 0.45, blue: 0.7, alpha: 1))
+            ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+            ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+            ctx.fill(CGRect(x: (i * 37) % max(1, width - 80), y: (i * 23) % max(1, height - 80), width: 80, height: 80))
+            CVPixelBufferUnlockBaseAddress(pb, [])
+            adaptor.append(pb, withPresentationTime: CMTime(seconds: Double(i) / fps, preferredTimescale: 600))
+        }
+        input.markAsFinished()
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in writer.finishWriting { c.resume() } }
+        guard writer.status == .completed else { throw OmniError.store("writer failed: \(String(describing: writer.error))") }
+        return url
+    }
+
+    print("videosegcheck  root=\(root.lastPathComponent)")
+    let short = try await writeMP4("short.mp4", seconds: 30, fps: 1, width: 640, height: 360)
+    let long = try await writeMP4("long.mp4", seconds: 600, fps: 0.1, width: 320, height: 240)
+    func fileKB(_ u: URL) -> Int { (((try? FileManager.default.attributesOfItem(atPath: u.path)[.size] as? Int) ?? 0) ?? 0) / 1000 }
+    check(fileKB(short) > 0 && fileKB(long) > 0, "clips synthesized (short \(fileKB(short)) KB, long \(fileKB(long)) KB)")
+
+    guard let modelDir else {
+        print("  (no modelDir given - skipping the GPU e2e + sweep steps)")
+        print("  RESULT: \(fails == 0 ? "PASS" : "FAIL (\(fails))")")
+        return fails == 0 ? 0 : 1
+    }
+    let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: modelDir))
+    let store = try VectorStore(dbURL: root.appendingPathComponent("index.sqlite"))
+    let indexer = Indexer(store: store, embedder: engine)
+    let final: IndexProgress = await withCheckedContinuation { cont in
+        let once = NSLock(); var fired = false
+        indexer.index(roots: [root], settings: IndexSettings()) { p in
+            if p.done { once.lock(); let go = !fired; fired = true; once.unlock(); if go { cont.resume(returning: p) } }
+        }
+    }
+    check(final.failed == 0, "e2e pass clean (failed=\(final.failed))")
+    let qv = engine.embedText("a white square moving over a colored background", as: .query)
+    let hits = store.search(qv, topK: 8)
+    let longHit = hits.first { $0.path == long.path }
+    check(longHit != nil, "10-minute video is searchable")
+    check(longHit?.chunkCount == 3, "10-minute video has 3 segment chunks (\(longHit?.chunkCount ?? -1))")
+    let locators = Set(store.rankChunks(qv, path: long.path).map { $0.locator })
+    check(locators == ["0:00", "4:00", "8:00"], "timestamp locators per segment (\(locators.sorted()))")
+    let shortHit = hits.first { $0.path == short.path }
+    check(shortHit != nil && shortHit?.chunkCount == 1, "short video stays a single chunk (\(shortHit?.chunkCount ?? -1))")
+
+    // Frames-per-segment cost sweep on a 720p clip: tokens + latency at 6/16/32. The shared
+    // smart_resize pixel budget means cost should grow sublinearly once frames push per-frame
+    // resolution down; this grounds the maxVideoFrames default in data.
+    let sweep = try await writeMP4("sweep.mp4", seconds: 60, fps: 2, width: 1280, height: 720)
+    let asset = AVURLAsset(url: sweep)
+    let gen = AVAssetImageGenerator(asset: asset)
+    gen.appliesPreferredTrackTransform = true
+    gen.requestedTimeToleranceBefore = .positiveInfinity
+    gen.requestedTimeToleranceAfter = .positiveInfinity
+    gen.maximumSize = CGSize(width: 1568, height: 1568)
+    for n in [6, 16, 32] {
+        var frames: [CGImage] = []
+        for i in 0 ..< n {
+            let t = 60.0 * (Double(i) + 0.5) / Double(n)
+            if let img = try? gen.copyCGImage(at: CMTime(seconds: t, preferredTimescale: 600), actualTime: nil) { frames.append(img) }
+        }
+        _ = engine.embedVideoFrames(frames)   // warm the shapes
+        let tok0 = engine.tokensProcessed
+        let t0 = Date()
+        for _ in 0 ..< 3 { _ = engine.embedVideoFrames(frames) }
+        let ms = -t0.timeIntervalSinceNow * 1000 / 3
+        print(String(format: "  SWEEP frames=%-3d  %.0f ms/video  %d tokens", n, ms, (engine.tokensProcessed - tok0) / 3))
+    }
+    store.close()
+    print("  RESULT: \(fails == 0 ? "PASS" : "FAIL (\(fails))")")
+    return fails == 0 ? 0 : 1
+}
+if args.count >= 2 && args[1] == "videosegcheck" {
+    exit(try await videosegcheckRun(args.count >= 3 ? args[2] : nil))
+}
+
 // Per-process NaN sweep: omni-verify nansweep <modelDir> [imageDir] [reps]
 // Measures THIS process's non-finite embedding rate per modality. The cold-load weight-corruption
 // hypothesis predicts a bimodal distribution ACROSS processes (most runs 0, an occasional run

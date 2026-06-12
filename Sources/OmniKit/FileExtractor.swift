@@ -229,29 +229,36 @@ public enum FileExtractor {
 
     // MARK: - Video
 
-    /// Extract up to `maxFrames` visually-distinct ("key") frames. Samples densely,
-    /// then keeps only frames that differ perceptually (average-hash dedup), so a
-    /// static clip yields one frame and a dynamic one spreads across scene changes.
-    static func videoFrames(_ url: URL, maxFrames: Int = 6, maxDimension: Int = 1568) -> [CGImage] {
+    /// Sample up to `maxFrames` UNIFORMLY spaced frames from `[start, end)` of the video.
+    /// Uniform spacing is the reference policy (the official jina-v5-omni pipeline
+    /// linspace-samples 32 frames over a clip, no dedup) - the model was benchmarked on that
+    /// distribution. The old policy scanned 4x candidates in order and kept the FIRST N
+    /// visually distinct ones, which biased a long video's embedding toward its beginning.
+    /// The average-hash dedup is kept purely as a token saver for static content (screen
+    /// recordings, slideshows): it collapses near-identical frames, never re-searches for
+    /// replacements, so kept frames stay uniformly placed.
+    static func videoFrames(_ url: URL, maxFrames: Int = 6, maxDimension: Int = 1568,
+                            start: Double = 0, end: Double = .infinity) -> [CGImage] {
         let asset = AVURLAsset(url: url)
         let durationSec = CMTimeGetSeconds(asset.duration)
         guard durationSec.isFinite, durationSec > 0 else { return [] }
+        let lo = max(0, start)
+        let hi = min(end, durationSec)
+        guard hi > lo else { return [] }
         let gen = AVAssetImageGenerator(asset: asset)
         gen.appliesPreferredTrackTransform = true
         gen.requestedTimeToleranceBefore = .positiveInfinity
         gen.requestedTimeToleranceAfter = .positiveInfinity
         gen.maximumSize = CGSize(width: maxDimension, height: maxDimension)
 
-        let candidates = max(maxFrames, min(maxFrames * 4, Int(durationSec) + 1))
         var kept: [CGImage] = []
         var hashes: [UInt64] = []
-        for i in 0 ..< candidates {
-            if kept.count >= maxFrames { break }
-            // Pool each candidate so discarded frames (the majority - dedup keeps few) are
-            // freed immediately rather than piling up for the whole clip. Kept frames live in
-            // `kept` and survive the drain.
+        let n = max(1, maxFrames)
+        for i in 0 ..< n {
+            // Pool each sample so dedup-discarded frames are freed immediately rather than
+            // piling up for the whole clip. Kept frames live in `kept` and survive the drain.
             autoreleasepool {
-                let t = durationSec * (Double(i) + 0.5) / Double(candidates)
+                let t = lo + (hi - lo) * (Double(i) + 0.5) / Double(n)
                 guard let img = try? gen.copyCGImage(at: CMTime(seconds: t, preferredTimescale: 600), actualTime: nil) else { return }
                 let h = averageHash(img)
                 if hashes.allSatisfy({ hammingDistance($0, h) >= 8 }) {   // distinct from every kept frame
@@ -260,7 +267,7 @@ public enum FileExtractor {
             }
         }
         if kept.isEmpty,
-           let img = try? gen.copyCGImage(at: CMTime(seconds: durationSec * 0.5, preferredTimescale: 600), actualTime: nil) {
+           let img = try? gen.copyCGImage(at: CMTime(seconds: (lo + hi) * 0.5, preferredTimescale: 600), actualTime: nil) {
             kept.append(img)
         }
         return kept

@@ -401,7 +401,7 @@ final class AppModel {
 
     // Indexing performance settings.
     var maxImageDimension: Int = 1568 { didSet { persistPerf() } }
-    var maxVideoFrames: Int = 6 { didSet { persistPerf() } }
+    var maxVideoFrames: Int = 32 { didSet { persistPerf() } }
     /// Longest text slice (characters) embedded as one chunk.
     var maxTextChunkChars: Int = 1800 { didSet { persistPerf() } }
     /// Hard memory cap in GB (0 = unlimited). Applied to MLX immediately.
@@ -1011,7 +1011,12 @@ final class AppModel {
     private func loadPerf() {
         let d = UserDefaults.standard
         if d.object(forKey: "omni.maxImageDim") != nil { maxImageDimension = max(512, d.integer(forKey: "omni.maxImageDim")) }
-        if d.object(forKey: "omni.maxVideoFrames") != nil { maxVideoFrames = max(1, d.integer(forKey: "omni.maxVideoFrames")) }
+        if d.object(forKey: "omni.maxVideoFrames") != nil {
+            // Snap legacy picker values (3/9/18) to the nearest current option so the picker
+            // never shows an empty selection.
+            let stored = max(1, d.integer(forKey: "omni.maxVideoFrames"))
+            maxVideoFrames = [6, 16, 32].min(by: { abs($0 - stored) < abs($1 - stored) }) ?? 32
+        }
         if d.object(forKey: "omni.maxTextChunkChars") != nil { maxTextChunkChars = max(200, d.integer(forKey: "omni.maxTextChunkChars")) }
         if d.object(forKey: "omni.maxMemoryGB") != nil { maxMemoryGB = max(0, d.double(forKey: "omni.maxMemoryGB")) }
         else { maxMemoryGB = min(6, max(2, (physicalMemoryGB * 0.4).rounded())) }   // first launch: ~3GB on 8GB RAM, 6GB on 16GB+ (unchanged)
