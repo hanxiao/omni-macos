@@ -41,6 +41,7 @@ public final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unche
     private var perFile: (@Sendable (Int64, Int64) -> Void)?
     private var continuation: CheckedContinuation<URL, Error>?
     private var currentTask: URLSessionDownloadTask?
+    private var isCancelled = false
 
     private func setProgressHandler(_ handler: (@Sendable (Int64, Int64) -> Void)?) {
         lock.withLock { perFile = handler }
@@ -70,6 +71,9 @@ public final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unche
         try fm.createDirectory(at: dest, withIntermediateDirectories: true)
 
         for (idx, rel) in Self.files.enumerated() {
+            // A cancel that landed between two files (no live task to kill) must still stop the
+            // loop, or the next file would start downloading as if nothing happened.
+            if lock.withLock({ isCancelled }) { throw URLError(.cancelled) }
             let fileURL = dest.appendingPathComponent(rel)
             try fm.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             if let size = try? fm.attributesOfItem(atPath: fileURL.path)[.size] as? Int64, size > 0 {
@@ -97,11 +101,11 @@ public final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unche
         }
     }
 
-    /// Cancel the in-flight file download. The task errors with URLError.cancelled, which
-    /// surfaces from download(variant:to:) - partial completed files remain and are skipped
-    /// (resumed) by the next attempt.
+    /// Cancel the download. The in-flight file's task errors with URLError.cancelled, which
+    /// surfaces from download(variant:to:). Files that already completed are kept and skipped
+    /// by the next attempt; the interrupted file restarts from scratch.
     public func cancel() {
-        let task = lock.withLock { currentTask }
+        let task = lock.withLock { isCancelled = true; return currentTask }
         task?.cancel()
     }
 

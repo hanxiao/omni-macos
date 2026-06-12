@@ -150,7 +150,7 @@ struct ContentView: View {
             CenteredStatus(symbol: "arrow.triangle.2.circlepath",
                            title: built != nil ? "Switch to \(built!.title) or reindex" : "Reindex to search",
                            subtitle: built != nil
-                               ? "This index was built with \(built!.title) (\(model.indexStoredDim)-dim) but \(model.modelVariant.title) is loaded. Switch back to keep your index, or reindex with the current model."
+                               ? "This index was built with \(built!.title), but \(model.modelVariant.title) is loaded. Switch back to keep your index, or reindex with the current model."
                                : "This index was built with a different model than the one loaded. Reindex to search again.",
                            showSpinner: false,
                            action: built.map { v in ("Switch to \(v.title)", { model.selectVariant(v) }) },
@@ -442,7 +442,7 @@ private struct QualifierBar: View {
         HStack(spacing: 6) {
             if model.literalQuery {
                 Image(systemName: "textformat").foregroundStyle(.secondary).frame(width: 18)
-                Text("Literal search").foregroundStyle(.secondary)
+                Text("Plain-text search").foregroundStyle(.secondary)
                 Text("- qualifiers ignored").font(.caption).foregroundStyle(.tertiary)
             } else {
                 Image(systemName: "line.3.horizontal.decrease.circle").foregroundStyle(.secondary).frame(width: 18)
@@ -459,7 +459,7 @@ private struct QualifierBar: View {
             }
             Spacer(minLength: 8)
             Button { model.toggleLiteralQuery() } label: {
-                Label(model.literalQuery ? "Use as query" : "Plain text",
+                Label(model.literalQuery ? "Use as Query" : "Plain Text",
                       systemImage: model.literalQuery ? "line.3.horizontal.decrease.circle" : "textformat")
             }
             .buttonStyle(.bordered).controlSize(.small)
@@ -530,8 +530,8 @@ struct EngineFailedView: View {
     let message: String
     var body: some View {
         VStack(spacing: 12) {
-            Image(systemName: "exclamationmark.triangle").font(.system(size: 40, weight: .light)).foregroundStyle(.tertiary)
-            Text("Engine failed to load").font(.title2).fontWeight(.semibold)
+            Image(systemName: "exclamationmark.triangle").font(.system(size: 44, weight: .light)).foregroundStyle(.tertiary)
+            Text("Omni can't load its model").font(.title)
             HStack {
                 Button("Retry") { model.retryBootstrap() }.buttonStyle(.borderedProminent)
                 Button("Choose Model Folder\u{2026}") { pickModel() }

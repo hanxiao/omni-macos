@@ -265,7 +265,7 @@ final class AppModel {
             return
         }
         let target = cur + rowDelta
-        guard let cols = gridColumns else {
+        guard let cols = gridColumns, cols > 1 else {
             // List: clamp to the ends, Finder-style.
             selection = r[max(0, min(r.count - 1, target))].path
             return
@@ -318,8 +318,10 @@ final class AppModel {
     /// Set while a benchmark runs; the sheet's Cancel button flips it (cooperative - the pass
     /// checks it at every progress tick and between phases).
     var profilingCancel: CancelFlag?
+    private var profilingDatasetTask: Task<(folder: URL, fileCount: Int), Error>?
     func cancelProfiling() {
         profilingCancel?.on = true
+        profilingDatasetTask?.cancel()
         profilingPhase = "Cancelling\u{2026}"
     }
     var profilingPhase = ""
@@ -1375,6 +1377,7 @@ final class AppModel {
 
     private func bootstrap() async {
         applyMemoryLimit()
+        watchActivationForDeniedRoots()
         // installedVariants is Settings-only - compute it off the launch critical path (it walks
         // every variant dir, slow on the external model volume).
         Task.detached { let v = ModelLocator.installedVariants(); await MainActor.run { self.installedVariants = v } }
@@ -1563,7 +1566,12 @@ final class AppModel {
         let rebuildNote = "Your search index will be rebuilt, because the two models store results differently."
         if installedVariants[v] != nil {
             guard v != modelVariant else { return }
-            // Switching wipes and rebuilds the whole index - never do that on a bare menu click.
+            // Switching back to the variant the index was built with is the RECOVERY action for a
+            // model/index mismatch: it keeps the index (bootstrap re-checks the fingerprint), so
+            // no destructive confirmation - the banner that sent the user here promises exactly
+            // "switch back to keep your index".
+            if indexObsolete, v == indexBuiltVariant { switchVariant(v); return }
+            // Any other switch wipes and rebuilds the whole index - never on a bare menu click.
             let a = NSAlert()
             a.messageText = "Switch to \(v.title)?"
             a.informativeText = "\(rebuildNote) Files will reindex from scratch, which can take a while on a large library."
@@ -1586,6 +1594,16 @@ final class AppModel {
     /// crawler's error handler hides - previously it just showed "0 files" forever. Detected by a
     /// direct directory read: denial surfaces as NSCocoaErrorDomain 257 (permission).
     var deniedRoots: Set<String> = []
+    private var deniedRootsObserver: NSObjectProtocol?
+    /// Installed once at bootstrap: the badge's help text sends users to System Settings, so
+    /// re-probe when they come back instead of waiting for the next stats refresh.
+    func watchActivationForDeniedRoots() {
+        guard deniedRootsObserver == nil else { return }
+        deniedRootsObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
+            Task { @MainActor in self.refreshDeniedRoots() }
+        }
+    }
     private func refreshDeniedRoots() {
         let candidates = roots.filter { (folderFileCounts[$0.path] ?? 0) == 0 }.map(\.path)
         guard !candidates.isEmpty || !deniedRoots.isEmpty else { return }
@@ -1809,7 +1827,7 @@ final class AppModel {
     /// Clear any active search (query, file-query, results) and filters so a freshly selected folder
     /// shows its clean map. Suppresses the per-field filter didSet so it doesn't kick off a search,
     /// and bumps the search token so any in-flight search can't repopulate the list afterwards.
-    /// Publish a finished projection (points + kNN graph) and bump the generation so the view rebuilds.
+    /// Publish a finished projection (points + kNN graph) so the view rebuilds.
     private func applyProjection(_ r: ProjectionResult) {
         folderProjection = r.points
         folderKNN = r.knn
@@ -2278,7 +2296,15 @@ final class AppModel {
 
         do {
             profilingFraction = nil
-            let (folder, count) = try await ProfilingService.ensureDataset { self.profilingPhase = $0 }
+            // A child task so Cancel can abort the dataset download mid-flight (URLSession's
+            // async download honors task cancellation); the phase label stays "Cancelling..."
+            // once the flag is set instead of being overwritten by later phases.
+            let datasetTask = Task { try await ProfilingService.ensureDataset { phase in
+                Task { @MainActor in if !cancelFlag.on { self.profilingPhase = phase } }
+            } }
+            profilingDatasetTask = datasetTask
+            defer { profilingDatasetTask = nil }
+            let (folder, count) = try await datasetTask.value
             if cancelFlag.on { throw CancellationError() }
 
             let total = count > 0 ? count : 300

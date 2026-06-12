@@ -72,7 +72,7 @@ struct Sidebar: View {
                         // Settings > Folder map layout), mirroring the Pause/Resume idiom above.
                         // Selecting the folder first makes the map visible in the new layout right
                         // away; the mode's didSet clears the layout cache and re-fits it.
-                        Button(model.mapUsesUMAP ? "View as PCA" : "View as UMAP") {
+                        Button(model.mapUsesUMAP ? "Use Fast Map Layout" : "Use Detailed Map Layout") {
                             selection = .folder(url)
                             model.mapUsesUMAP.toggle()
                         }

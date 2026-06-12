@@ -57,12 +57,12 @@ struct FolderEmbeddingVisualization: View {
 
                 // Empty state: folder selected but nothing under it is indexed (and not mid-fit).
                 if positions.isEmpty && !model.folderProjectionFitting {
-                    ContentUnavailableView {
-                        Label("No files to map", systemImage: "circle.grid.cross")
-                    } description: {
-                        Text("Nothing under \(folderName) is indexed yet.")
-                    }
-                    .allowsHitTesting(false)
+                    // Same empty-state treatment as every search state in this pane
+                    // (CenteredStatus) - the system ContentUnavailableView used different
+                    // typography, so the pane's empty states visibly changed style.
+                    CenteredStatus(symbol: "circle.grid.cross", title: "No Files to Map",
+                                   subtitle: "Nothing under \(folderName) is indexed yet.")
+                        .allowsHitTesting(false)
                 }
 
                 // Spotlight overlay over the grey cloud: thin lines from the selected file to each of
@@ -259,7 +259,7 @@ struct FolderEmbeddingVisualization: View {
         let count = model.folderProjection.count
         HStack(spacing: 6) {
             if model.folderProjectionFitting {
-                ProgressView().controlSize(.small).scaleEffect(0.7)
+                ProgressView().controlSize(.mini)   // .mini renders crisp; scaleEffect rasterized fuzzy
                 Text("Mapping \(folderName)\u{2026}")
             } else {
                 Image(systemName: "circle.grid.cross").foregroundStyle(.secondary)

@@ -38,14 +38,14 @@ private struct ActivityTab: View {
         return (rs.reduce(0) { $0 + $1.done }, rs.reduce(0) { $0 + $1.total })
     }
 
-    /// "12.3 files/sec · 45k tok/s" during a full pass, or "45k tok/s" during a background reconcile
+    /// "12.3 files/sec · 45k tokens/sec" during a full pass, or "45k tokens/sec" during a background reconcile
     /// where there is no per-file count. nil when nothing is being embedded.
     private var rateLabel: String? {
         guard model.tokensPerSec > 0 else { return nil }
         let tok = model.tokensPerSec >= 1000 ? String(format: "%.1fk", model.tokensPerSec / 1000) : String(format: "%.0f", model.tokensPerSec)
         return model.filesPerSec > 0
-            ? String(format: "%.1f files/sec \u{00B7} %@ tok/s", model.filesPerSec, tok)
-            : "\(tok) tok/s"
+            ? String(format: "%.1f files/sec \u{00B7} %@ tokens/sec", model.filesPerSec, tok)
+            : "\(tok) tokens/sec"
     }
 
     var body: some View {
@@ -120,7 +120,7 @@ private struct ActivityTab: View {
             } header: {
                 Text("Status")
             } footer: {
-                Text("Stays current automatically as files change. Update checks now.")
+                Text("Omni keeps the index up to date automatically as files change. Click Update to check immediately.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -245,8 +245,8 @@ private struct ContentTypesTab: View {
             isPresented: Binding(get: { model.pendingDisable != nil }, set: { if !$0 { model.pendingDisable = nil } }),
             presenting: model.pendingDisable
         ) { pd in
-            Button("Remove \(pd.count) from index", role: .destructive) { model.applyKind(pd.kind, on: false, purge: true) }
-            Button("Keep in index") { model.applyKind(pd.kind, on: false, purge: false) }
+            Button("Remove \(pd.count) from Index", role: .destructive) { model.applyKind(pd.kind, on: false, purge: true) }
+            Button("Keep in Index") { model.applyKind(pd.kind, on: false, purge: false) }
             Button("Cancel", role: .cancel) { model.pendingDisable = nil }
         } message: { pd in
             Text("\(pd.count) \(pd.kind.title.lowercased()) \(pd.count == 1 ? "file is" : "files are") already indexed. Remove them now, or keep them searchable and just stop indexing new ones.")
@@ -283,14 +283,14 @@ private struct ContentTypesTab: View {
                     Text("\(p.removed.formatted()) removed")
                         .foregroundStyle(p.removed > 0 ? .orange : .secondary)
                     if !p.samples.isEmpty {
-                        Button("Show samples") { showSamples = true }
+                        Button("Show Samples") { showSamples = true }
                             .buttonStyle(.link)
                             .popover(isPresented: $showSamples, arrowEdge: .bottom) { samplePopover(p.samples) }
                     }
                 } else if dirty {
                     Text("Calculating\u{2026}").foregroundStyle(.secondary)
                 } else {
-                    Text("These rules are applied.").foregroundStyle(.secondary)
+                    Text("Rules active.").foregroundStyle(.secondary)
                 }
                 Spacer()
                 Button("Import\u{2026}") { importIgnoreFile() }
@@ -460,8 +460,8 @@ private struct PerformanceTab: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
-                LabeledContent("Benchmark this Mac") {
-                    Button("Run Profiling\u{2026}") { Task { await model.runProfiling() } }
+                LabeledContent("Benchmark This Mac") {
+                    Button("Run Benchmark") { Task { await model.runProfiling() } }
                         .controlSize(.small)
                         .disabled(model.isProfilingRunning || !model.canIndex)
                 }
@@ -470,7 +470,7 @@ private struct PerformanceTab: View {
                 }
                 if let r = model.lastProfilingReport {
                     LabeledContent("Last run") {
-                        Text(String(format: "%.0f files/sec \u{00B7} %.1f GB peak VRAM",
+                        Text(String(format: "%.0f files/sec \u{00B7} %.1f GB peak memory",
                                     r.metrics.filesPerSec, Double(r.metrics.peakVramDeltaBytes) / 1_073_741_824))
                             .foregroundStyle(.secondary).monospacedDigit()
                     }
@@ -548,7 +548,7 @@ private struct IndexTab: View {
                         VStack(alignment: .leading, spacing: 6) {
                             Text("Index doesn't match the loaded model").fontWeight(.medium)
                             if let v = model.indexBuiltVariant {
-                                Text("Built with \(v.title) (\(model.indexStoredDim)-dim); \(model.modelVariant.title) is loaded. Switch back to keep this index, or reindex with the current model.")
+                                Text("Built with \(v.title); \(model.modelVariant.title) is loaded. Switch back to keep this index, or reindex with the current model.")
                                     .font(.caption).foregroundStyle(.secondary)
                             } else {
                                 Text("It was built with an older embedding version. Reindex so results stay accurate.")
@@ -568,7 +568,7 @@ private struct IndexTab: View {
             }
             Section("Index") {
                 LabeledContent("Indexed files", value: "\(model.indexedFiles)")
-                LabeledContent("Embeddings", value: "\(model.indexedChunks)")
+                LabeledContent("Indexed Sections", value: "\(model.indexedChunks)")
                 LabeledContent("Size", value: ByteCountFormatter.string(fromByteCount: model.dbSizeBytes, countStyle: .file))
                 if let last = model.lastIndexed {
                     LabeledContent("Last indexed", value: last.formatted(.relative(presentation: .named)))
@@ -582,7 +582,7 @@ private struct IndexTab: View {
                     set: { model.selectVariant($0) }
                 )) {
                     ForEach(ModelVariant.allCases, id: \.self) { v in
-                        Text(model.installedVariants[v] != nil ? v.title : "\(v.title) \u{00B7} download")
+                        Text(model.installedVariants[v] != nil ? v.title : "Download \(v.title)\u{2026}")
                             .tag(v)
                     }
                 }
@@ -591,7 +591,11 @@ private struct IndexTab: View {
                 if model.isDownloading {
                     VStack(alignment: .leading, spacing: 4) {
                         ProgressView(value: model.downloadFraction)
-                        Text(model.downloadLabel).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                        HStack {
+                            Text(model.downloadLabel).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Cancel") { model.cancelDownload() }.controlSize(.small)
+                        }
                     }
                 } else if !model.modelPath.isEmpty {
                     Text(model.modelPath).font(.caption.monospaced()).foregroundStyle(.secondary)
