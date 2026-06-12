@@ -15,23 +15,17 @@ struct QuickLookKeyMonitor: NSViewRepresentable {
     /// panel is the key window while open and a single-item preview ignores arrows, so the app
     /// must drive them; the axis lets the gallery move by visual row, not linearly.
     let onPreviewArrow: (_ vertical: Bool, _ forward: Bool) -> Bool
-    /// Invoked when Down is pressed while the toolbar search field is being edited - the
-    /// Spotlight flow's hand-off from typing into the results. Return true to consume the key
-    /// (the callback selects the first result and moves focus to the list/gallery).
-    let onSearchDown: () -> Bool
 
     func makeNSView(context: Context) -> NSView {
         let v = NSView(frame: .zero)
         context.coordinator.onSpace = onSpace
         context.coordinator.onPreviewArrow = onPreviewArrow
-        context.coordinator.onSearchDown = onSearchDown
         context.coordinator.install()
         return v
     }
     func updateNSView(_ nsView: NSView, context: Context) {
         context.coordinator.onSpace = onSpace
         context.coordinator.onPreviewArrow = onPreviewArrow
-        context.coordinator.onSearchDown = onSearchDown
     }
     static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
         coordinator.uninstall()
@@ -41,7 +35,6 @@ struct QuickLookKeyMonitor: NSViewRepresentable {
     final class Coordinator {
         var onSpace: (() -> Void)?
         var onPreviewArrow: ((_ vertical: Bool, _ forward: Bool) -> Bool)?
-        var onSearchDown: (() -> Bool)?
         private var monitor: Any?
 
         func install() {
@@ -60,17 +53,7 @@ struct QuickLookKeyMonitor: NSViewRepresentable {
                 }
                 guard inScope else { return event }
                 let editingText = MainActor.assumeIsolated { NSApp.keyWindow?.firstResponder is NSText }
-                if editingText {
-                    // Down in the search field hands off to the results (the Spotlight flow:
-                    // type, Down, Return). Everything else stays with the field editor.
-                    if event.keyCode == 125 {
-                        let inSearchField = MainActor.assumeIsolated {
-                            ((NSApp.keyWindow?.firstResponder as? NSText)?.delegate) is NSSearchField
-                        }
-                        if inSearchField, self.onSearchDown?() == true { return nil }
-                    }
-                    return event
-                }
+                if editingText { return event }
                 switch event.keyCode {
                 case 49:                          // space: toggle Quick Look
                     self.onSpace?()
