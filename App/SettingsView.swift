@@ -625,15 +625,26 @@ private struct IndexTab: View {
                         }
                     }
                 } else if !model.modelPath.isEmpty {
-                    Text(model.modelPath).font(.caption.monospaced()).foregroundStyle(.secondary)
-                        .lineLimit(3).truncationMode(.middle).textSelection(.enabled)
-                    HStack {
-                        Button("Change\u{2026}") { pickModel() }
-                        Button("Reveal in Finder") {
-                            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.modelPath)])
+                    // Same layout as the Index section's Location row: the path gets the whole
+                    // value side of the label line, the buttons drop to a second line.
+                    VStack(spacing: 6) {
+                        HStack(spacing: 8) {
+                            Text("Location")
+                            Spacer()
+                            Text((model.modelPath as NSString).abbreviatingWithTildeInPath)
+                                .font(.caption.monospaced()).foregroundStyle(.secondary)
+                                .lineLimit(1).truncationMode(.middle)
+                                .help(model.modelPath)
                         }
+                        HStack(spacing: 8) {
+                            Spacer()
+                            Button("Change\u{2026}") { pickModel() }
+                            Button("Reveal in Finder") {
+                                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.modelPath)])
+                            }
+                        }
+                        .controlSize(.small)
                     }
-                    .controlSize(.small)
                 }
             } header: {
                 Text("Model")
