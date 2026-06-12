@@ -46,8 +46,11 @@ enum ProfilingService {
             return (folder, count)
         }
 
+        try Task.checkCancellation()
         onPhase("Downloading dataset\u{2026}")
         guard let url = URL(string: zipURL) else { throw ProfilingError("Invalid dataset URL.") }
+        // URLSession's async download honors Swift task cancellation - the sheet's Cancel
+        // cancels the wrapping task, which aborts the transfer mid-flight.
         let (tmpZip, response) = try await URLSession.shared.download(from: url)
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
             throw ProfilingError("Dataset download failed (HTTP \(http.statusCode)). The dataset may not be published yet.")
@@ -57,6 +60,7 @@ enum ProfilingService {
             if got != want { throw ProfilingError("Dataset checksum did not match the manifest.") }
         }
 
+        try Task.checkCancellation()
         onPhase("Unzipping dataset\u{2026}")
         try? FileManager.default.removeItem(at: folder)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -112,7 +116,7 @@ enum ProfilingService {
     static func ensureConsent() -> Bool {
         if UserDefaults.standard.bool(forKey: consentKey) { return uploadsEnabled }
         let a = NSAlert()
-        a.messageText = "Share your profiling results?"
+        a.messageText = "Share your benchmark results?"
         a.informativeText = """
         Omni can submit this benchmark to the public results on hanxiao.io/omni so you can compare \
         Macs. It sends only hardware facts (chip, memory, macOS version) and timing numbers - never \
@@ -151,10 +155,15 @@ enum ProfilingService {
 /// free-floating window). Determinate during indexing, indeterminate for download/unzip/upload.
 /// Presented while AppModel.isProfilingRunning is true and dismissed when it flips false.
 /// Cross-actor cancellation token: written by the sheet's Cancel button on the main actor, read
-/// from the benchmark's progress callbacks on background threads. A torn read is impossible for
-/// a Bool flag that only ever flips false -> true.
+/// from the benchmark's progress callbacks on background threads. Lock-guarded so the cross-
+/// thread reads are well-defined under the Swift memory model.
 final class CancelFlag: @unchecked Sendable {
-    var on = false
+    private let lock = NSLock()
+    private var flag = false
+    var on: Bool {
+        get { lock.withLock { flag } }
+        set { lock.withLock { flag = newValue } }
+    }
 }
 
 struct ProfilingSheet: View {

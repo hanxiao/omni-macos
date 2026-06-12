@@ -21,7 +21,8 @@ struct OmniApp: App {
                 Divider()
                 // Benchmarks this Mac on a fixed 5000-file dataset; results (hardware + timing only)
                 // can be shared to hanxiao.io/omni.
-                Button("Run Profiling\u{2026}") { Task { await model.runProfiling() } }
+                // No ellipsis: the command runs immediately, with no further input (HIG).
+                Button("Run Benchmark") { Task { await model.runProfiling() } }
                     .disabled(model.isProfilingRunning || !model.canIndex)
             }
             // The primary actions on the selected result, reachable from the menu bar and keyboard
@@ -49,6 +50,7 @@ struct OmniApp: App {
                 Divider()
                 Button("Search by a File\u{2026}") { model.searchByFilePanel() }
                     .keyboardShortcut("o", modifiers: [.command, .shift])
+                    .disabled(model.phase != .ready)
                 Divider()
                 // Bookmark the current search. The menu bar owns the Cmd-D shortcut (always present,
                 // just disabled when there's nothing to save) so it works even when the toolbar star
@@ -96,6 +98,7 @@ struct OmniApp: App {
                 .keyboardShortcut("f", modifiers: .command)
             }
             CommandGroup(replacing: .help) {
+                Button("Omni Website") { NSWorkspace.shared.open(URL(string: "https://hanxiao.io/omni")!) }
                 Button("Omni Keyboard Shortcuts") { showShortcuts() }
                     .keyboardShortcut("/", modifiers: .command)
             }
