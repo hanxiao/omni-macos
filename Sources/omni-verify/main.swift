@@ -4,6 +4,7 @@ import ImageIO
 import CoreGraphics
 import MLX
 import Accelerate
+@preconcurrency import AVFoundation
 
 // Numeric validation of the MLX-Swift text encoder against Python reference fixtures.
 // Usage: omni-verify <modelDir> <fixturesJson>
@@ -1362,6 +1363,145 @@ if args.count >= 4 && args[1] == "dedupbench" {
     print("touched \(touchAll(target)) files (mtime bump, content unchanged)")
     await pass("touch ", force: false)
     exit(0)
+}
+
+// Long-audio segmentation check: omni-verify audiosegcheck [modelDir]
+// Issue #7: a whole-file AVAudioPCMBuffer overflows AudioToolbox's 32-bit byte count for
+// >= ~3 h 23 m stereo 44.1 kHz (frames x channels x 4 >= 2^32), aborting the scan. Verifies the
+// streamed AudioSegmentReader: (1) byte-identical decode vs a one-shot whole-file read for a
+// short file; (2) correct 240 s segmentation of a 10-minute file; (3) a synthesized
+// OVER-THRESHOLD file (~3 h 23 m stereo 44.1 kHz, ~2.2 GB WAV) decodes segment by segment where
+// the old path died. With modelDir: also embeds the 10-minute file end to end through the
+// indexer's streaming path and checks per-segment chunks + timestamp locators.
+func audiosegcheckRun(_ modelDir: String?) async throws -> Int32 {
+    var fails = 0
+    func check(_ cond: Bool, _ msg: String) { print("  \(cond ? "ok  " : "FAIL") \(msg)"); if !cond { fails += 1 } }
+    var root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("omni-audioseg-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+    try? FileManager.default.removeItem(at: root)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    // The crawler stores canonical paths (/private/var/...); resolve the temp root the same way
+    // or every stored-path comparison below fabricates a mismatch (same trap as churnbench).
+    if let rp = realpath(root.path, nil) { root = URL(fileURLWithPath: String(cString: rp), isDirectory: true); free(rp) }
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    // Synthesize a WAV: `seconds` of a quiet sine at `rate`/`channels` (int16 on disk).
+    func writeWAV(_ name: String, seconds: Double, rate: Double, channels: AVAudioChannelCount) throws -> URL {
+        let url = root.appendingPathComponent(name)
+        let settings: [String: Any] = [AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: rate,
+                                       AVNumberOfChannelsKey: channels, AVLinearPCMBitDepthKey: 16,
+                                       AVLinearPCMIsFloatKey: false, AVLinearPCMIsBigEndianKey: false]
+        let file = try AVAudioFile(forWriting: url, settings: settings)
+        let fmt = file.processingFormat
+        let sliceFrames = AVAudioFrameCount(min(60.0 * rate, 4_000_000))
+        guard let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: sliceFrames) else {
+            throw OmniError.store("buffer alloc failed")
+        }
+        var written = 0
+        let total = Int(seconds * rate)
+        var phase: Float = 0
+        let step = Float(2.0 * Double.pi * 220.0 / rate)
+        while written < total {
+            let n = min(Int(sliceFrames), total - written)
+            buf.frameLength = AVAudioFrameCount(n)
+            if let ch = buf.floatChannelData {
+                for i in 0 ..< n { ch[0][i] = 0.05 * sinf(phase); phase += step }
+                for c in 1 ..< Int(fmt.channelCount) { memcpy(ch[c], ch[0], n * 4) }
+            }
+            try file.write(from: buf)
+            written += n
+        }
+        return url
+    }
+
+    print("audiosegcheck  root=\(root.lastPathComponent)")
+
+    // (1) Short stereo 44.1 kHz file: streamed decode must equal a one-shot whole-file read.
+    let short = try writeWAV("short.wav", seconds: 30, rate: 44100, channels: 2)
+    let reader1 = OmniAudioPreprocess.AudioSegmentReader(url: short)
+    let streamed = reader1?.nextSegment()
+    check(reader1?.nextSegment() == nil, "30s file is exactly one segment")
+    // One-shot reference decode (the old path, safe at this size).
+    var reference: [Float]? = nil
+    if let f = try? AVAudioFile(forReading: short),
+       let b = AVAudioPCMBuffer(pcmFormat: f.processingFormat, frameCapacity: AVAudioFrameCount(f.length)) {
+        try? f.read(into: b)
+        let n = Int(b.frameLength)
+        if let ch = b.floatChannelData {
+            var mono = [Float](repeating: 0, count: n)
+            for c in 0 ..< Int(f.processingFormat.channelCount) { for i in 0 ..< n { mono[i] += ch[c][i] } }
+            for i in 0 ..< n { mono[i] *= 0.5 }
+            // Same resample the production path applies (44.1 kHz -> 16 kHz).
+            let outN = Int((Double(n) * 16000.0 / 44100.0).rounded())
+            var out = [Float](repeating: 0, count: outN)
+            let stepR = 44100.0 / 16000.0
+            for i in 0 ..< outN {
+                let pos = Double(i) * stepR
+                let i0 = Int(pos), frac = Float(pos - Double(i0))
+                let a = mono[min(i0, n - 1)], bb = mono[min(i0 + 1, n - 1)]
+                out[i] = a + (bb - a) * frac
+            }
+            reference = out
+        }
+    }
+    check(streamed != nil && reference != nil && streamed! == reference!,
+          "streamed decode is byte-identical to the one-shot whole-file path (\(streamed?.count ?? -1) samples)")
+
+    // (2) 10-minute mono 16 kHz file: 240+240+120 second segments.
+    let tenMin = try writeWAV("tenmin.wav", seconds: 600, rate: 16000, channels: 1)
+    guard let reader2 = OmniAudioPreprocess.AudioSegmentReader(url: tenMin) else { print("  FAIL reader nil"); return 1 }
+    var segFrames: [Int] = []
+    while let seg = reader2.nextMelSegment() { segFrames.append(seg.frames) }
+    check(segFrames.count == 3, "10-minute file yields 3 segments (\(segFrames.count))")
+    check(segFrames.prefix(2).allSatisfy { $0 == OmniAudioPreprocess.segmentMelFrames },
+          "full segments carry \(OmniAudioPreprocess.segmentMelFrames) mel frames (\(segFrames))")
+    check(segFrames.last.map { $0 > 11_000 && $0 <= 12_000 } ?? false, "tail segment ~120s (\(segFrames.last ?? -1))")
+
+    // (3) Over the UInt32 threshold: stereo 44.1 kHz needs frames*2ch*4B >= 2^32, i.e.
+    // >= 536,870,912 frames = 12,174 s. The old whole-file alloc died here; streaming must not.
+    print("  writing ~2.2 GB over-threshold WAV (3h24m stereo 44.1kHz)...")
+    let long = try writeWAV("long.wav", seconds: 12_240, rate: 44100, channels: 2)
+    let sz = (try? FileManager.default.attributesOfItem(atPath: long.path)[.size] as? Int ?? 0) ?? 0
+    check(sz > 2_100_000_000, "over-threshold file written (\(sz / 1_000_000) MB)")
+    guard let reader3 = OmniAudioPreprocess.AudioSegmentReader(url: long) else {
+        print("  FAIL reader nil on over-threshold file"); return 1
+    }
+    var nSeg = 0
+    while reader3.nextSegment() != nil { nSeg += 1 }   // decode-only sweep over all 3.4 h
+    check(nSeg == 51, "over-threshold file decodes fully in segments (\(nSeg) of 51 expected)")
+
+    // (4) End-to-end with the real engine: stream-embed the 10-minute file, check locators.
+    if let modelDir {
+        let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: modelDir))
+        if let probe = OmniAudioPreprocess.melFeatures(url: tenMin) {
+            let v = engine.embedAudioMel(probe.mel, frames: probe.frames)
+            check(v != nil && v!.allSatisfy { $0.isFinite }, "engine embeds one full \(probe.frames)-frame segment directly")
+        } else { check(false, "probe mel nil") }
+        let store = try VectorStore(dbURL: root.appendingPathComponent("index.sqlite"))
+        let indexer = Indexer(store: store, embedder: engine)
+        try? FileManager.default.removeItem(at: long)    // keep the e2e pass to the short files
+        let final: IndexProgress = await withCheckedContinuation { cont in
+            let once = NSLock(); var fired = false
+            indexer.index(roots: [root], settings: IndexSettings()) { p in
+                if p.done { once.lock(); let go = !fired; fired = true; once.unlock(); if go { cont.resume(returning: p) } }
+            }
+        }
+        check(final.failed == 0, "e2e pass clean (failed=\(final.failed))")
+        let hits = store.search(engine.embedText("a low quiet tone", as: .query), topK: 8)
+        let tenHit = hits.first { $0.path == tenMin.path }
+        check(tenHit != nil, "10-minute file is searchable")
+        check(tenHit?.chunkCount == 3, "10-minute file has 3 segment chunks (\(tenHit?.chunkCount ?? -1))")
+        let locators = Set(store.rankChunks(engine.embedText("tone", as: .query), path: tenMin.path).map { $0.locator })
+        check(locators == ["0:00", "4:00", "8:00"], "timestamp locators per segment (\(locators.sorted()))")
+        store.close()
+    } else {
+        print("  (no modelDir given - skipping the GPU e2e step)")
+    }
+
+    print("  RESULT: \(fails == 0 ? "PASS" : "FAIL (\(fails))")")
+    return fails == 0 ? 0 : 1
+}
+if args.count >= 2 && args[1] == "audiosegcheck" {
+    exit(try await audiosegcheckRun(args.count >= 3 ? args[2] : nil))
 }
 
 // Per-process NaN sweep: omni-verify nansweep <modelDir> [imageDir] [reps]

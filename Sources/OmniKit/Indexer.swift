@@ -115,6 +115,9 @@ final class DecodedItem: @unchecked Sendable {
     // streams them in small groups instead, so every page of any-length scan gets indexed.
     enum Payload { case empty, text([TextPiece]), images([CGImage]), imagePatches([OmniVisionPreprocess.RawPatches]), audioMel([Float], Int),
                    pdfScan(pageCount: Int, maxDimension: Int),
+                   // Long audio (> one 240 s segment): the first segment's mel plus the open
+                   // reader; the embed stage streams the rest with a prefetch, like .pdfScan.
+                   audioSegments(mel: [Float], frames: Int, reader: OmniAudioPreprocess.AudioSegmentReader),
                    duplicate([IndexedChunk]) }   // content-dedup hit: rows ready to store, no embed needed
     let file: CrawledFile
     let kind: String
@@ -472,6 +475,11 @@ public final class Indexer: @unchecked Sendable {
                     defer { tick(path) }
                     if item.unchanged { p.unchanged += 1; return }
                     if case .duplicate(let chunks) = item.payload { storeChunks(path, chunks); return }
+                    if case .audioSegments = item.payload {
+                        // Long audio streams per-file (one embedding per 240 s segment); the
+                        // cross-file mel staging below is for clips within one frame budget.
+                        storeChunks(path, self.embed(item)); return
+                    }
                     guard case .audioMel(let mel, let frames) = item.payload else { p.skipped += 1; return }
                     // Flush before adding if this clip would exceed the budget (but never
                     // split a single clip; a clip larger than the budget embeds alone).
@@ -950,8 +958,20 @@ public final class Indexer: @unchecked Sendable {
             return frames.isEmpty ? DecodedItem(file: file) : DecodedItem(file: file, kind: kind, payload: .images(frames), meta: meta, contentKey: contentKey)
         }
         if category == .audio {
-            guard let (mel, frames) = OmniAudioPreprocess.melFeatures(url: file.url) else { return DecodedItem(file: file) }
-            return DecodedItem(file: file, kind: kind, payload: .audioMel(mel, frames), meta: meta, contentKey: contentKey)
+            // Stream-decode in bounded segments (issue #7: a whole-file PCM buffer for a
+            // multi-hour file overflows AudioToolbox's 32-bit byte count and killed the scan).
+            // One segment (the overwhelmingly common case, <= 240 s) keeps the exact old
+            // .audioMel path - byte-identical mel, cross-file batching preserved. Longer files
+            // carry the open reader to the embed stage, which streams one embedding per segment.
+            guard let reader = OmniAudioPreprocess.AudioSegmentReader(url: file.url),
+                  let first = reader.nextMelSegment(), first.frames > 0 else { return DecodedItem(file: file) }
+            guard let second = reader.nextMelSegment() else {
+                return DecodedItem(file: file, kind: kind, payload: .audioMel(first.mel, first.frames), meta: meta, contentKey: contentKey)
+            }
+            reader.pushBack(second)
+            return DecodedItem(file: file, kind: kind,
+                               payload: .audioSegments(mel: first.mel, frames: first.frames, reader: reader),
+                               meta: meta, contentKey: contentKey)
         }
         let content = (try? FileExtractor.extract(file.url, maxImageDimension: settings.maxImageDimension, maxVideoFrames: settings.maxVideoFrames)) ?? .empty
         switch content {
@@ -994,7 +1014,7 @@ public final class Indexer: @unchecked Sendable {
         case .text:  fp = "c\(settings.maxCharsPerChunk)|o\(chunkOverlap)|d\(settings.maxImageDimension)"   // d: scanned-PDF render size
         case .image: fp = "d\(settings.maxImageDimension)"
         case .video: fp = "d\(settings.maxImageDimension)|f\(settings.maxVideoFrames)"
-        case .audio: fp = ""
+        case .audio: fp = "s\(OmniAudioPreprocess.segmentMelFrames)"   // segmenting changes long-audio chunking
         }
         return "1|\(category.rawValue)|\(ext)|m\(embedder.dim)|\(fp)|\(digest)"
     }
@@ -1096,7 +1116,58 @@ public final class Indexer: @unchecked Sendable {
             return out
         case .pdfScan(let pageCount, let maxDimension):
             return embedScannedPDF(file: file, kind: kind, pageCount: pageCount, maxDimension: maxDimension)
+        case .audioSegments(let mel, let frames, let reader):
+            return embedStreamedAudio(file: file, kind: kind, firstMel: mel, firstFrames: frames,
+                                      reader: reader, duration: meta.duration)
         }
+    }
+
+    /// Stream-embed audio of ANY length: one embedding per 240 s segment, decoding the NEXT
+    /// segment on a background queue while the GPU embeds the current one - the audio twin of
+    /// embedScannedPDF. Peak memory is two segments (~30 MB) regardless of duration; the old
+    /// design allocated the whole file's PCM up front, which both overflowed AudioToolbox's
+    /// 32-bit byte count on multi-hour files (issue #7) and would have fed the backbone an
+    /// unbounded sequence. Chunks carry start-timestamp locators ("12:00").
+    func embedStreamedAudio(file: CrawledFile, kind: String, firstMel: [Float], firstFrames: Int,
+                            reader: OmniAudioPreprocess.AudioSegmentReader, duration: Double) -> [IndexedChunk] {   // internal for tests
+        // Reader calls are sequenced (the loop waits for the prefetch before starting the next
+        // one), so `reader` is only ever used by one thread at a time.
+        final class Box: @unchecked Sendable { var next: (mel: [Float], frames: Int)? }
+        let prefetchQ = DispatchQueue(label: "omni.indexer.audio-prefetch")
+        var out: [IndexedChunk] = []
+        var current: (mel: [Float], frames: Int)? = (firstMel, firstFrames)
+        var exhausted = false
+        var seg = 0
+        func locator(_ index: Int) -> String {
+            let s = Int(Double(index) * OmniAudioPreprocess.segmentSeconds)
+            return s >= 3600 ? String(format: "%d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60)
+                             : String(format: "%d:%02d", s / 60, s % 60)
+        }
+        while let cur = current {
+            // Cancel contract: never return a partial chunk set (it would be stored under the
+            // file's current mtime and silently truncate it forever) - same as embedScannedPDF.
+            if isCancelled { return [] }
+            let box = Box()
+            let sync = DispatchGroup()
+            if !exhausted {
+                sync.enter()
+                prefetchQ.async { box.next = reader.nextMelSegment(); sync.leave() }
+            }
+            if cur.frames > 0 {   // frames == 0: tail too short for the tower - skip the segment
+                guard let vec = embedder.embedAudioMel(cur.mel, frames: cur.frames) else {
+                    sync.wait()
+                    return []   // audio path unavailable: nothing to index
+                }
+                out.append(IndexedChunk(path: file.url.path, modified: file.modified, size: file.size,
+                                        kind: kind, chunkIndex: seg, snippet: file.url.lastPathComponent,
+                                        embedding: vec, duration: duration, locator: locator(seg)))
+            }
+            sync.wait()
+            current = box.next
+            if current == nil { exhausted = true }
+            seg += 1
+        }
+        return out
     }
 
     /// Stream-embed a scanned PDF of ANY length: rasterize + patchify `scanPageGroup` pages at a
