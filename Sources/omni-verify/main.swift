@@ -1604,11 +1604,13 @@ func videosegcheckRun(_ modelDir: String?) async throws -> Int32 {
             if let img = try? gen.copyCGImage(at: CMTime(seconds: t, preferredTimescale: 600), actualTime: nil) { frames.append(img) }
         }
         _ = engine.embedVideoFrames(frames)   // warm the shapes
+        MLX.GPU.resetPeakMemory()
         let tok0 = engine.tokensProcessed
         let t0 = Date()
         for _ in 0 ..< 3 { _ = engine.embedVideoFrames(frames) }
         let ms = -t0.timeIntervalSinceNow * 1000 / 3
-        print(String(format: "  SWEEP frames=%-3d  %.0f ms/video  %d tokens", n, ms, (engine.tokensProcessed - tok0) / 3))
+        print(String(format: "  SWEEP frames=%-3d  %.0f ms/video  %d tokens  GPU peak %.0f MB", n, ms,
+                     (engine.tokensProcessed - tok0) / 3, Double(MLX.GPU.peakMemory) / 1_048_576))
     }
     store.close()
     print("  RESULT: \(fails == 0 ? "PASS" : "FAIL (\(fails))")")
