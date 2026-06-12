@@ -1117,6 +1117,50 @@ public final class VectorStore: @unchecked Sendable {
     /// off-lock snapshot variant introduced a transient 2x-base memory burst for no real gain. So
     /// search stays under the lock; the wins are the base+delta (no per-query rebuild) and the
     /// numeric reduceTopK (no per-row path-string hashing).
+    /// Sync-fused search: takes the query as an UNEVALUATED [dim] fp32 graph (the engine's
+    /// pooled forward) so ONE GPU round-trip evaluates embed + scan + reduce together - the
+    /// second round-trip was ~2ms of every keystroke. Falls back to the classic path (evaluating
+    /// the query first) for quant mode and filtered queries, which need host floats up front.
+    /// Returns the hits AND the query vector (free after the shared eval) for the caller's
+    /// query cache / passage ranking.
+    public func search(queryGraph: MLXArray, filter: SearchFilter = SearchFilter(), topK: Int = 40) -> (hits: [SearchHit], query: [Float]) {
+        let fusible: Bool = queue.sync {
+            quantBase == nil && filter.isEmpty && Self.gpuReduce && mlxFileID != nil && baseRows > 0 && !baseDirty
+                && (rows.count - baseRows) <= Self.foldThreshold && queryGraph.size == dim
+        }
+        if !fusible {
+            MLX.eval(queryGraph)
+            let q = queryGraph.asArray(Float.self)
+            return (search(q, filter: filter, topK: topK), q)
+        }
+        let hits: [SearchHit] = queue.sync {
+            lastSearchAt = Date()
+            let n = rows.count
+            guard n > 0, dim > 0, flat16.count == n * dim else { return [] }
+            // Re-check under the lock (a write may have raced the fusible probe); rebuild if due.
+            if baseDirty || mlxBase == nil || (n - baseRows) > Self.foldThreshold { rebuildBaseLocked(rowCount: n) }
+            guard let base = mlxBase, let fid = mlxFileID else { return [] }
+            let qv = queryGraph.reshaped([dim, 1]).asType(.bfloat16)
+            let baseScore = MLX.matmul(base, qv)
+            var deltaGraph: MLXArray? = nil
+            if n > baseRows {
+                let deltaCount = n - baseRows
+                deltaGraph = flat16.withUnsafeBytes { raw in
+                    let p = raw.baseAddress!.advanced(by: baseRows * dim * MemoryLayout<UInt16>.size)
+                    let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: p),
+                                    count: deltaCount * dim * MemoryLayout<UInt16>.size, deallocator: .none)
+                    return MLX.matmul(MLXArray(data, [deltaCount, dim], dtype: .bfloat16), qv)
+                        .reshaped([deltaCount]).asType(.float32)
+                }
+            }
+            return fillSnippetsLocked(reduceTopKGPULocked(
+                baseScore: baseScore, fid: fid, deltaGraph: deltaGraph, topK: topK))
+        }
+        // Evaluated as an ancestor of the scan - this readback is a copy, not a GPU sync.
+        let q = queryGraph.asArray(Float.self)
+        return (hits, q)
+    }
+
     public func search(_ query: [Float], filter: SearchFilter = SearchFilter(), topK: Int = 40) -> [SearchHit] {
         let tCall = Self.searchTiming ? Date() : nil
         return queue.sync {
@@ -1158,19 +1202,19 @@ public final class VectorStore: @unchecked Sendable {
                 // foldThreshold) are scored and merged on the host. Filtered queries keep the
                 // host path (its reducer applies the filters).
                 if filter.isEmpty, Self.gpuReduce, let fid = mlxFileID, baseRows > 0 {
-                    var deltaScores: [Float] = []
+                    var deltaGraph: MLXArray? = nil
                     if n > baseRows {
                         let deltaCount = n - baseRows
-                        let ds: MLXArray = flat16.withUnsafeBytes { raw in
+                        deltaGraph = flat16.withUnsafeBytes { raw in
                             let p = raw.baseAddress!.advanced(by: baseRows * dim * MemoryLayout<UInt16>.size)
                             let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: p),
                                             count: deltaCount * dim * MemoryLayout<UInt16>.size, deallocator: .none)
                             return MLX.matmul(MLXArray(data, [deltaCount, dim], dtype: .bfloat16), qv)
+                                .reshaped([deltaCount]).asType(.float32)
                         }
-                        deltaScores = ds.reshaped([deltaCount]).asType(.float32).asArray(Float.self)
                     }
                     let result = fillSnippetsLocked(reduceTopKGPULocked(
-                        baseScore: baseScore, fid: fid, deltaScores: deltaScores, topK: topK))
+                        baseScore: baseScore, fid: fid, deltaGraph: deltaGraph, topK: topK))
                     if let t0 {
                         print(String(format: "[search] n=%d gpu-reduce path total=%.1fms", n, -t0.timeIntervalSinceNow * 1000))
                     }
@@ -1400,7 +1444,7 @@ public final class VectorStore: @unchecked Sendable {
     ///   B) bestRow[F]    = scatter-min(rowIdx where score == best)    (lowest row on ties)
     ///   C) top-K files   = argPartition(bestScore)                    (read back 2*K scalars)
     /// Host work after the matmul is O(K + delta), never O(N).
-    private func reduceTopKGPULocked(baseScore: MLXArray, fid: MLXArray, deltaScores: [Float], topK: Int) -> [SearchHit] {
+    private func reduceTopKGPULocked(baseScore: MLXArray, fid: MLXArray, deltaGraph: MLXArray?, topK: Int) -> [SearchHit] {
         let F = fileIDCount
         guard F > 0, topK > 0 else { return [] }
         let s32 = baseScore.reshaped([baseRows]).asType(.float32)
@@ -1428,7 +1472,10 @@ public final class VectorStore: @unchecked Sendable {
         let topIdx = kth > 0 ? MLX.argPartition(keyF, kth: kth)[kth...] : MLX.arange(0, F, dtype: .int32)
         let topScores = bestScore[topIdx]
         let topRows = bestRow[topIdx]
-        MLX.eval(topScores, topRows)
+        // ONE sync for the whole chain - including the delta matmul (previously its own eval)
+        // and, on the fused path, the query-embed forward upstream of baseScore.
+        if let deltaGraph { MLX.eval(topScores, topRows, deltaGraph) } else { MLX.eval(topScores, topRows) }
+        let deltaScores: [Float] = deltaGraph.map { $0.asArray(Float.self) } ?? []
         let scoresHost = topScores.asArray(Float.self)
         let rowsHost = topRows.asArray(Int32.self)
 

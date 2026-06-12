@@ -55,9 +55,30 @@ public final class OmniTextEncoder: @unchecked Sendable {
     }
 
     /// Encode a single string to an L2-normalized embedding (optionally Matryoshka-truncated).
+    /// Unevaluated pooled query graph for sync-fused search (see Qwen3Backbone.pooledQueryGraph);
+    /// nil -> caller uses encode().
+    public func queryGraph(_ text: String, as type: OmniInputType) -> MLXArray? {
+        let ids = tokenIds(text, type)
+        lastSequenceLength = ids.count
+        return backbone.pooledQueryGraph(ids: ids)
+    }
+
     public func encode(_ text: String, as type: OmniInputType, truncateDim: Int? = nil) -> [Float] {
         let ids = tokenIds(text, type)
         lastSequenceLength = ids.count
+        // Whole-forward compiled path (bucket-padded): one pre-traced graph instead of per-call
+        // graph construction - the fixed ~2ms that dominated short interactive queries. Falls
+        // back to the layered path beyond the largest bucket or when disabled.
+        if var v = backbone.encodePooledBucketed(ids: ids) {
+            if let d = truncateDim, d < v.count {
+                // Same math as pool's truncate: prefix slice + renormalize (the full vector is
+                // already L2-normalized; the constant factors out).
+                v = Array(v[0 ..< d])
+                let norm = sqrt(max(v.reduce(0) { $0 + $1 * $1 }, 1e-30))
+                for i in 0 ..< v.count { v[i] /= norm }
+            }
+            return v
+        }
         let embeds = backbone.embed(ids)
         let hidden = backbone.forward(inputsEmbeds: embeds, length: ids.count)
         return backbone.pool(hidden, length: ids.count, truncateDim: truncateDim)

@@ -572,6 +572,68 @@ if args.count >= 4 && args[1] == "stressbench" {
 // Folder-map projection timing: omni-verify projbench [dim] [Ns...]
 // Times the full ProjectionEngine UMAP layout (PCA-2D + kNN + 300 force epochs) at a few point
 // counts, to verify the memory-budgeted map cap (mapPointBudget) keeps the map fast. Serial, GPU.
+// Query-embed latency breakdown: omni-verify qbench <modelDir>
+// Times the per-keystroke path: tokenize alone, then full embedText(as:.query) warm medians for
+// short/medium queries, then the readback-free forward (eval only) - separating fixed dispatch
+// overhead from GPU math and host sync.
+if args.count >= 3 && args[1] == "qbench" {
+    let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    func median(_ n: Int, _ f: () -> Void) -> Double {
+        f(); f()   // warm
+        var ts: [Double] = []
+        for _ in 0 ..< n { let t = Date(); f(); ts.append(-t.timeIntervalSinceNow * 1000) }
+        return ts.sorted()[n / 2]
+    }
+    let queries = ["lease", "quarterly revenue report", "the photo of a brown dog running on the beach at sunset"]
+    for q in queries {
+        let ms = median(21) { _ = engine.embedText(q, as: .query) }
+        print(String(format: "embedText(query)  len=%-3d  %.2f ms", q.count, ms))
+    }
+    // Amortization check: how much is per-call overhead vs per-token math - embed 8 queries
+    // back to back in one batched call.
+    let batch = (0 ..< 8).map { "test query number \($0) with some words" }
+    let msB = median(11) { _ = engine.embedTextBatch(batch, as: .query) }
+    print(String(format: "embedTextBatch(8 queries)  %.2f ms total (%.2f ms/query)", msB, msB / 8))
+
+    // End-to-end keystroke pipeline: classic two-sync (embed, then search) vs sync-fused
+    // (unevaluated query graph driven by the store's single eval), over a synthetic store.
+    let dim = engine.dim
+    let dbURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("omni-qbench-\(ProcessInfo.processInfo.processIdentifier).sqlite")
+    defer { try? FileManager.default.removeItem(at: dbURL) }
+    let store = try VectorStore(dbURL: dbURL)
+    var rng: UInt64 = 0xDEADBEEF
+    func nextF() -> Float { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return Float(rng >> 40) / Float(1 << 24) - 0.5 }
+    var batchRows: [(path: String, chunks: [IndexedChunk])] = []
+    for i in 0 ..< 200_000 {
+        var v = [Float](repeating: 0, count: dim); var nrm: Float = 0
+        for k in 0 ..< dim { let x = nextF(); v[k] = x; nrm += x * x }
+        let inv = nrm > 0 ? 1 / nrm.squareRoot() : 0
+        for k in 0 ..< dim { v[k] *= inv }
+        batchRows.append(("/q/f\(i)", [IndexedChunk(path: "/q/f\(i)", modified: 1, size: 1, kind: "text", chunkIndex: 0, snippet: "s", embedding: v)]))
+        if batchRows.count >= 8192 { try store.replaceMany(batchRows); batchRows.removeAll(keepingCapacity: true) }
+    }
+    try store.replaceMany(batchRows)
+    _ = store.search([Float](repeating: 0.03, count: dim), topK: 10)   // build the base
+    let q2 = "quarterly revenue and the beach sunset photo"
+    let msClassic = median(21) {
+        let v = engine.embedQuery(q2)
+        _ = store.search(v, filter: SearchFilter(), topK: 60)
+    }
+    let msFused = median(21) {
+        if let g = engine.queryVectorGraph(q2) {
+            _ = store.search(queryGraph: g, filter: SearchFilter(), topK: 60)
+        }
+    }
+    print(String(format: "keystroke pipeline @200k:  classic(embed+search)=%.2f ms   fused(one sync)=%.2f ms", msClassic, msFused))
+    // Sanity: fused and classic must return the same top hits for the same text.
+    let vc = engine.embedQuery(q2)
+    let hc = store.search(vc, filter: SearchFilter(), topK: 10).map(\.path)
+    let hf = store.search(queryGraph: engine.queryVectorGraph(q2)!, filter: SearchFilter(), topK: 10).hits.map(\.path)
+    print("top-10 parity classic-vs-fused: \(hc == hf ? "MATCH" : "DIFFER: \(hc) vs \(hf)")")
+    store.close()
+    exit(0)
+}
+
 // Real-data PCA check: omni-verify projreal <index.sqlite> <folderPrefix> [cap]
 // Loads per-file vectors from a REAL store (read-only) and reports the engine's PCA timing,
 // acceptance (iteration vs SVD fallback), and captured-variance parity on real spectra.

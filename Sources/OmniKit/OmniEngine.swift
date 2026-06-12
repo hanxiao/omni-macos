@@ -387,6 +387,15 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     func runLowPriorityGPU<T>(_ work: () -> T) -> T { run(highPriority: false, work) }
 
     /// Embed a query for interactive search - runs at high priority.
+    /// The query's pooled vector as an UNEVALUATED graph, for fusing the embed's GPU round-trip
+    /// into the store's scan (one eval covers tokenize-side graph + forward + scan + reduce).
+    /// Graph construction runs inside the priority gate; evaluation happens wherever the caller
+    /// first forces it. nil -> use embedQuery (classic two-sync path).
+    public func queryVectorGraph(_ text: String) -> MLXArray? {
+        markQuery()
+        return run(highPriority: true) { textEncoder.queryGraph(text, as: .query) }
+    }
+
     public func embedQuery(_ text: String) -> [Float] {
         markQuery()   // signal the indexer to shrink/split its forwards while the user is searching
         return run(highPriority: true) { textEncoder.encode(text, as: .query) }

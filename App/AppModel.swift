@@ -1954,9 +1954,18 @@ final class AppModel {
         }
         searchWorkTask = Task.detached(priority: .userInitiated) {
             if Task.isCancelled { return }
-            let vec = engine.embedQuery(q)   // high priority: jumps ahead of indexing
-            if Task.isCancelled { return }   // superseded while embedding: don't run the store scan
-            let hits = store.search(vec, filter: filter, topK: 60)
+            // Sync-fused when available: the store's single eval drives the query forward, the
+            // scan, and the reduce in one GPU round-trip; the vector reads back for free after.
+            let vec: [Float]
+            let hits: [SearchHit]
+            if let g = engine.queryVectorGraph(q) {
+                if Task.isCancelled { return }
+                (hits, vec) = store.search(queryGraph: g, filter: filter, topK: 60)
+            } else {
+                vec = engine.embedQuery(q)   // high priority: jumps ahead of indexing
+                if Task.isCancelled { return }   // superseded while embedding: don't run the store scan
+                hits = store.search(vec, filter: filter, topK: 60)
+            }
             await MainActor.run {
                 guard token == self.searchToken else { return }
                 self.cacheQueryVector(q, vec)
