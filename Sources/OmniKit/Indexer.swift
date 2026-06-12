@@ -606,7 +606,10 @@ public final class Indexer: @unchecked Sendable {
                 // its kind AND the ignore policy still keeps it. A DISABLED modality is intentionally
                 // not crawled, so its known files being absent from `seen` is not a disk deletion -
                 // hold them out of scope so reconcile never auto-purges them (purge is explicit).
-                if let k = FileKind(rawValue: kindRaw), !settings.enabledKinds.contains(k) { return false }
+                // governing: a stored 'scan' row is gated by the Text toggle (scan never appears
+                // in enabledKinds) - checking the raw kind would hold deleted scanned PDFs out of
+                // stale-reconcile forever.
+                if let k = FileKind(rawValue: kindRaw), !settings.enabledKinds.contains(k.governing) { return false }
                 return !settings.ignore.isIgnored(path, isDir: false)
             }
             // Batch the deletion: one transaction + one in-memory rebuild, not one per path.
@@ -947,7 +950,7 @@ public final class Indexer: @unchecked Sendable {
                 let minS = category == .video ? settings.minVideoSeconds : settings.minAudioSeconds
                 if minS > 0, d < minS { return DecodedItem(file: file) }
             }
-        case .text:
+        case .text, .scan:   // .scan never comes from detection (extraction-time only)
             break
         }
 
@@ -1039,7 +1042,9 @@ public final class Indexer: @unchecked Sendable {
         guard let digest = Self.sha256(file.url, cap: cap) else { return nil }
         let fp: String
         switch category {
-        case .text:  fp = "c\(settings.maxCharsPerChunk)|o\(chunkOverlap)|d\(settings.maxImageDimension)"   // d: scanned-PDF render size
+        // .scan grouped for exhaustiveness only - contentKey is always called with the
+        // DETECTION kind, which is .text for every PDF (scanned or not).
+        case .text, .scan:  fp = "c\(settings.maxCharsPerChunk)|o\(chunkOverlap)|d\(settings.maxImageDimension)"   // d: scanned-PDF render size
         case .image: fp = "d\(settings.maxImageDimension)"
         // v2: uniform frame sampling + 240 s segmentation (pre-upgrade rows must not alias).
         case .video: fp = "v2|d\(settings.maxImageDimension)|f\(settings.maxVideoFrames)|s\(Int(Self.mediaSegmentSeconds))"
@@ -1144,7 +1149,7 @@ public final class Indexer: @unchecked Sendable {
             }
             return out
         case .pdfScan(let pageCount, let maxDimension):
-            return embedScannedPDF(file: file, kind: kind, pageCount: pageCount, maxDimension: maxDimension)
+            return embedScannedPDF(file: file, pageCount: pageCount, maxDimension: maxDimension)
         case .audioSegments(let mel, let frames, let reader):
             return embedStreamedAudio(file: file, kind: kind, firstMel: mel, firstFrames: frames,
                                       reader: reader, duration: meta.duration)
@@ -1249,7 +1254,7 @@ public final class Indexer: @unchecked Sendable {
     /// queue so the GPU is not idle during PDFKit rasterization. Peak memory is two groups
     /// (~8 pages at the default cap) regardless of page count; the old design materialized every
     /// page up front, which is why it was capped at 8 pages.
-    func embedScannedPDF(file: CrawledFile, kind: String, pageCount: Int, maxDimension: Int) -> [IndexedChunk] {   // internal for tests
+    func embedScannedPDF(file: CrawledFile, pageCount: Int, maxDimension: Int) -> [IndexedChunk] {   // internal for tests
         guard let doc = PDFDocument(url: file.url) else { return [] }
         let group = scanPageGroup
         // PDFKit rendering is not concurrency-safe per document: prep() calls are sequenced (the
@@ -1285,7 +1290,11 @@ public final class Indexer: @unchecked Sendable {
             if !current.isEmpty, let vecs = embedder.embedImages(current.map { $0.raw }) {
                 for (k, vec) in vecs.enumerated() where k < current.count {
                     let page = current[k].page
-                    out.append(IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
+                    // kind 'scan', not the file's detection kind ('text'): vision-embedded pages
+                    // are their own modality in the index - filterable, and targetable by future
+                    // scan-specific processing (OCR). Old rows are re-labeled by the store's
+                    // one-time migration (migrateScanKind), which matches THIS write pattern.
+                    out.append(IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: FileKind.scan.rawValue,
                                             chunkIndex: page, snippet: file.url.lastPathComponent, embedding: vec,
                                             locator: pageCount > 1 ? "Page \(page + 1)" : ""))
                 }

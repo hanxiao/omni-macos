@@ -499,7 +499,9 @@ struct MediaInfoLabel: View {
         default: return nil
         }
     }
-    private var isMedia: Bool { FileKind(rawValue: kind).map { $0 != .text } ?? false }
+    // scan excluded like text: a scanned-PDF row has no media header to read, so the legacy
+    // disk fallback would spawn a wasted task per row.
+    private var isMedia: Bool { FileKind(rawValue: kind).map { $0 != .text && $0 != .scan } ?? false }
 
     var body: some View {
         if let text = stored ?? loaded {

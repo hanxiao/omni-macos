@@ -2808,6 +2808,7 @@ if args.count >= 4 && args[1] == "idxbreak" {
         var decMs = 0.0, embMs = 0.0, embeddedFiles = 0, unitN = 0, tokDelta = 0
         var note = ""
         switch kind {
+        case .scan: continue   // the loop iterates detection kinds only; .scan never appears
         case .text:
             // decode: extract text + chunk (CPU). embed: textB-wide batches over all chunks (GPU).
             var allChunks: [String] = []

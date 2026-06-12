@@ -804,8 +804,10 @@ final class AppModel {
         }
         if let raw = UserDefaults.standard.array(forKey: "omni.kindOrder") as? [String] {
             var order = raw.compactMap { FileKind(rawValue: $0) }
-            for k in FileKind.allCases where !order.contains(k) { order.append(k) }   // keep all four
-            settings.kindOrder = order
+            // indexable, not allCases: 'scan' is extraction-time only and must never grow a
+            // File Types row (the order list feeds that UI).
+            for k in FileKind.indexable where !order.contains(k) { order.append(k) }   // keep all four
+            settings.kindOrder = order.filter { FileKind.indexable.contains($0) }
         }
         if let raw = UserDefaults.standard.array(forKey: "omni.pausedRoots") as? [String] {
             pausedRoots = Set(raw)
@@ -1003,8 +1005,11 @@ final class AppModel {
         if on { applyKind(k, on: true, purge: false); return }
         // Count this kind's indexed files OFF the main actor: fileCount(kind:) is a queue.sync linear
         // scan over the whole in-memory row set, which would stall the UI on a large index.
+        // Text governs the scan rows too (scanned PDFs live under the Text toggle), so its
+        // count - and the purge below - must cover both kinds.
         let store = self.store
-        let count = await Task.detached { store?.fileCount(kind: k.rawValue) ?? 0 }.value
+        let kinds = k == .text ? [k.rawValue, FileKind.scan.rawValue] : [k.rawValue]
+        let count = await Task.detached { store?.fileCount(kinds: kinds) ?? 0 }.value
         if count > 0 { pendingDisable = PendingDisable(kind: k, count: count) }   // ask; dialog calls applyKind
         else { applyKind(k, on: false, purge: false) }
     }
@@ -1022,7 +1027,12 @@ final class AppModel {
         if !on, purge, let store {
             // deleteKind is a SQL DELETE + O(N) in-place row compaction; run it off the main actor like
             // every other index mutation, then refresh stats back on the main actor.
-            Task.detached(priority: .utility) { store.deleteKind(k.rawValue); await MainActor.run { self.refreshIndexStats(store) } }
+            // scan rows are governed by Text; one deleteKinds pass = one scan + one compaction.
+            let kinds = k == .text ? [k.rawValue, FileKind.scan.rawValue] : [k.rawValue]
+            Task.detached(priority: .utility) {
+                store.deleteKinds(kinds)
+                await MainActor.run { self.refreshIndexStats(store) }
+            }
         }
         if enabledKindTowers != oldTowers {
             // Reload so the dropped tower leaves VRAM (or the newly needed one loads). Debounce so a
@@ -1147,6 +1157,13 @@ final class AppModel {
             }
         }
         if sawType {
+            // Scanned PDFs are a sub-kind of text documents: type:text keeps matching them
+            // (pre-scan-kind indexes stored them as text, and history/saved queries must not
+            // silently lose results), and -type:text drops them too. Naming scan explicitly
+            // always wins: "type:text -type:scan" = text only, "type:scan -type:text" = scans.
+            let explicitScan = includeKinds.contains(.scan)
+            if includeKinds.contains(.text) { includeKinds.insert(.scan) }
+            if excludeKinds.contains(.text), !explicitScan { excludeKinds.insert(.scan) }
             if !includeKinds.isEmpty { filterKinds = includeKinds.subtracting(excludeKinds) }
             else if !excludeKinds.isEmpty { filterKinds = Set(FileKind.allCases).subtracting(excludeKinds) }  // -type:x = all but x
         }
@@ -1177,7 +1194,19 @@ final class AppModel {
         var parts: [String] = []
         let s = semantic.trimmingCharacters(in: .whitespacesAndNewlines)
         if !s.isEmpty { parts.append(s) }
-        if !filterKinds.isEmpty { parts.append("type:" + filterKinds.map { $0.rawValue }.sorted().joined(separator: ",")) }
+        if !filterKinds.isEmpty {
+            // Canonical inverse of applyParsedQuery's text-superset expansion, so the box reads
+            // naturally and EVERY kind state round-trips through history replay:
+            //   {text, scan}  -> "type:text"            (parse re-expands to both)
+            //   {text}        -> "type:text -type:scan" (an explicit scan exclusion must survive)
+            //   {scan}        -> "type:scan"
+            var kinds = filterKinds
+            var neg = ""
+            if kinds.contains(.text) {
+                if kinds.contains(.scan) { kinds.remove(.scan) } else { neg = " -type:scan" }
+            }
+            parts.append("type:" + kinds.map { $0.rawValue }.sorted().joined(separator: ",") + neg)
+        }
         if !filterExt.isEmpty { parts.append("ext:" + filterExt) }
         if let f = filterFolder { parts.append("in:" + Self.quoteIfNeeded(f.path)) }
         if dateRange != .any { parts.append("date:" + dateRange.rawValue) }
@@ -1243,6 +1272,7 @@ final class AppModel {
         case "video", "videos", "movie", "movies", "clip", "clips": return .video
         case "audio", "sound", "music", "song", "songs": return .audio
         case "text", "txt", "doc", "docs", "document", "documents": return .text
+        case "scan", "scans", "scanned", "scanpdf", "scannedpdf", "scanned-pdf": return .scan
         default: return nil
         }
     }

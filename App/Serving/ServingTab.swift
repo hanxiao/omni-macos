@@ -258,7 +258,8 @@ struct ServingTab: View {
           -d '{"query": "invoice from Anthropic in February", "top_k": 10}'
         ```
 
-        Optional `filters`: `{"kinds": ["text"|"image"|"audio"|"video"], "folder": "/abs/path", "since": <epoch seconds>}`.
+        Optional `filters`: `{"kinds": ["text"|"image"|"audio"|"video"|"scan"], "folder": "/abs/path", "since": <epoch seconds>}`.
+        `"text"` includes scanned PDFs; `"scan"` is scanned PDFs only.
         Response: `{"results": [{"path", "score" (0..1), "snippet", "kind", "modified", "locator"}]}`.
         `locator` is where the best match sits inside the file ("Page 3", "Line 1240"; "" if n/a).
         Scores above ~0.45 are usually relevant; below ~0.3 usually noise.

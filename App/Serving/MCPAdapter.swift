@@ -95,8 +95,8 @@ enum MCPAdapter {
                     ],
                     "kinds": [
                         "type": "array",
-                        "items": ["type": "string", "enum": ["text", "image", "audio", "video"]],
-                        "description": "Restrict to these file kinds."
+                        "items": ["type": "string", "enum": ["text", "image", "audio", "video", "scan"]],
+                        "description": "Restrict to these file kinds. 'text' includes scanned PDFs; 'scan' is scanned PDFs only."
                     ],
                     "folder": [
                         "type": "string",
@@ -119,7 +119,12 @@ enum MCPAdapter {
         var topK = (args["top_k"] as? Int) ?? 10
         topK = max(1, min(topK, 50))
         var filter = SearchFilter()
-        if let kinds = args["kinds"] as? [String], !kinds.isEmpty { filter.kinds = Set(kinds) }
+        if let kinds = args["kinds"] as? [String], !kinds.isEmpty {
+            var set = Set(kinds)
+            // Same superset rule as the app: text includes scanned PDFs ('scan').
+            if set.contains(FileKind.text.rawValue) { set.insert(FileKind.scan.rawValue) }
+            filter.kinds = set
+        }
         if let folder = args["folder"] as? String, !folder.isEmpty { filter.folderPrefix = folder }
 
         let hits = backend.search(query, topK: topK, filter: filter)

@@ -11,6 +11,12 @@ import AppKit
 /// Coarse file category used for indexing decisions and the search "kind" filter.
 public enum FileKind: String, Sendable, CaseIterable {
     case image, video, audio, text
+    /// Scanned (image-only) PDF pages, embedded by the VISION tower. A real modality of its own
+    /// in the index - so the user can filter for it, and future model-specific processing (OCR)
+    /// can target `kind='scan'` rows directly - but a SUB-KIND of text everywhere policy is
+    /// concerned: detection still categorizes .pdf as text (scanned-ness is only known at
+    /// extraction), the Text enable-toggle governs it, and `type:text` keeps matching it.
+    case scan
 
     public var title: String {
         switch self {
@@ -18,6 +24,7 @@ public enum FileKind: String, Sendable, CaseIterable {
         case .video: return "Video"
         case .audio: return "Audio"
         case .text: return "Text"
+        case .scan: return "Scans"
         }
     }
 
@@ -27,8 +34,19 @@ public enum FileKind: String, Sendable, CaseIterable {
         case .video: return "film"
         case .audio: return "waveform"
         case .text: return "doc.text"
+        case .scan: return "doc.viewfinder"
         }
     }
+
+    /// The file-level categories detection can assign (`kind(for:)`). `scan` is decided at
+    /// extraction time and never appears here - the File Types settings, crawl gating, and
+    /// ignore synthesis iterate THESE, not `allCases`.
+    public static let indexable: [FileKind] = [.image, .video, .audio, .text]
+
+    /// The kind whose enable-toggle governs this stored kind: scanned-PDF rows live under the
+    /// Text toggle (a PDF is a text-category file at detection time). Consult this - never the
+    /// raw stored kind - when checking a stored row against `enabledKinds`.
+    public var governing: FileKind { self == .scan ? .text : self }
 }
 
 /// Content pulled from a file, ready to embed.
@@ -96,6 +114,7 @@ public enum FileExtractor {
         case .video: return videoExtensions.sorted()
         case .audio: return audioExtensions.sorted()
         case .text: return (textExtensions.union(pdfExtensions).union(officeExtensions)).sorted()
+        case .scan: return []   // .pdf belongs to text; scanned-ness is an extraction-time fact
         }
     }
 

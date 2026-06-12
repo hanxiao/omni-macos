@@ -268,7 +268,13 @@ enum SearchAdapter {
 
         var filter = SearchFilter()
         if let filters = body["filters"] as? [String: Any] {
-            if let kinds = filters["kinds"] as? [String] { filter.kinds = Set(kinds) }
+            if let kinds = filters["kinds"] as? [String] {
+                var set = Set(kinds)
+                // Same superset rule as the app: text documents include scanned PDFs ('scan'),
+                // so API clients asking for text don't silently lose them.
+                if set.contains(FileKind.text.rawValue) { set.insert(FileKind.scan.rawValue) }
+                filter.kinds = set
+            }
             if let folder = filters["folder"] as? String, !folder.isEmpty { filter.folderPrefix = folder }
             if let ext = filters["ext"] as? String, !ext.isEmpty { filter.ext = ext }
             if let since = filters["since"] as? Double { filter.since = since }

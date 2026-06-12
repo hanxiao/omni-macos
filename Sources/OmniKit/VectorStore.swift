@@ -453,8 +453,84 @@ public final class VectorStore: @unchecked Sendable {
             );
         """)
         exec("CREATE INDEX IF NOT EXISTS idx_content_key ON content_keys(key);")
+        migrateScanKind()
         setUserVersion(Self.schemaVersion)
         loadIntoMemory()
+    }
+
+    /// One-time re-label of scanned-PDF rows in pre-'scan' indexes. Those indexes stored
+    /// vision-embedded PDF pages as kind='text', indistinguishable from text chunks by schema -
+    /// but every shipped indexer derived their snippet from the FILE NAME alone, while text
+    /// chunks always carry a real excerpt of the page text. A file is re-labeled only if EVERY
+    /// chunk carries a known name-derived signature (extraction classifies a PDF all-or-nothing,
+    /// so true scans always do; a text PDF has at least one real excerpt). Pure metadata UPDATE:
+    /// no vectors touched, no re-embedding, schemaVersion unchanged, so old app versions keep
+    /// opening the index. Downgrade caveats (accepted - the index is a rebuildable cache): an
+    /// old binary's Text filter compares the raw kind string, so re-labeled rows only appear in
+    /// its unfiltered searches; and its reconcile does not recognize 'scan' as Text-governed, so
+    /// a downgrade running a full pass with Text disabled can purge them as stale.
+    /// The relabels and the done-flag commit in ONE checked transaction: any failure (e.g.
+    /// SQLITE_BUSY from a concurrent writer on first-open-after-upgrade) rolls back whole and
+    /// leaves the flag unset, so the next open retries - a failed pass is never recorded as
+    /// done. Runs in init, before `loadIntoMemory()`, so the in-memory mirrors are built
+    /// migrated. Rows written by a newer indexer already carry 'scan'.
+    private func migrateScanKind() {
+        let flag = "scan_kind_migrated"
+        var stmt: OpaquePointer?
+        var done = false
+        if sqlite3_prepare_v2(db, "SELECT value FROM meta WHERE key = ?;", -1, &stmt, nil) == SQLITE_OK {
+            sqlite3_bind_text(stmt, 1, flag, -1, SQLITE_TRANSIENT)
+            // Skip only on the affirmative value, so tests (and a future re-run) can reset to "0".
+            if sqlite3_step(stmt) == SQLITE_ROW, let v = sqlite3_column_text(stmt, 0) { done = String(cString: v) == "1" }
+        }
+        sqlite3_finalize(stmt); stmt = nil
+        if done { return }
+        // Every snippet form a shipped indexer has written for scanned-PDF pages, all derived
+        // from the file name only:
+        //   v0.1.46+        "name.pdf"
+        //   v0.1.0-v0.1.45  "name.pdf - page N" (multi-page) / "name.pdf - name.pdf" (single)
+        func nameDerived(_ snippet: String, base: String) -> Bool {
+            if snippet == base || snippet == "\(base) - \(base)" { return true }
+            let pagePrefix = "\(base) - page "
+            return snippet.hasPrefix(pagePrefix) && Int(snippet.dropFirst(pagePrefix.count)) != nil
+        }
+        // All text-kind chunks of .pdf files (LIKE is ASCII case-insensitive, so .PDF matches too).
+        var ok = true
+        var allChunksSigned: [String: Bool] = [:]
+        if sqlite3_prepare_v2(db, "SELECT path, snippet FROM chunks WHERE kind = 'text' AND path LIKE '%.pdf';", -1, &stmt, nil) == SQLITE_OK {
+            var rc = sqlite3_step(stmt)
+            while rc == SQLITE_ROW {
+                if let p = sqlite3_column_text(stmt, 0), let s = sqlite3_column_text(stmt, 1) {
+                    let path = String(cString: p)
+                    let signed = nameDerived(String(cString: s), base: (path as NSString).lastPathComponent)
+                    allChunksSigned[path] = (allChunksSigned[path] ?? true) && signed
+                }
+                rc = sqlite3_step(stmt)
+            }
+            if rc != SQLITE_DONE { ok = false }
+        } else { ok = false }
+        sqlite3_finalize(stmt); stmt = nil
+        guard ok else { return }   // flag stays unset; the next open retries
+        let scanned = allChunksSigned.filter { $0.value }.map { $0.key }
+        guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return }
+        if sqlite3_prepare_v2(db, "UPDATE chunks SET kind = ? WHERE path = ?;", -1, &stmt, nil) == SQLITE_OK {
+            for path in scanned {
+                sqlite3_reset(stmt); sqlite3_clear_bindings(stmt)
+                sqlite3_bind_text(stmt, 1, FileKind.scan.rawValue, -1, SQLITE_TRANSIENT)
+                sqlite3_bind_text(stmt, 2, path, -1, SQLITE_TRANSIENT)
+                if sqlite3_step(stmt) != SQLITE_DONE { ok = false; break }
+            }
+        } else { ok = false }
+        sqlite3_finalize(stmt); stmt = nil
+        if ok {
+            if sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO meta(key, value) VALUES(?, '1');", -1, &stmt, nil) == SQLITE_OK {
+                sqlite3_bind_text(stmt, 1, flag, -1, SQLITE_TRANSIENT)
+                if sqlite3_step(stmt) != SQLITE_DONE { ok = false }
+            } else { ok = false }
+            sqlite3_finalize(stmt); stmt = nil
+        }
+        if ok { ok = sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK }
+        if !ok { sqlite3_exec(db, "ROLLBACK;", nil, nil, nil) }
     }
 
     private var closed = false
@@ -802,27 +878,38 @@ public final class VectorStore: @unchecked Sendable {
     /// Delete every chunk of a given file kind (used when a content type is disabled).
     /// Distinct indexed files of one kind (rawValue). Drives the "remove N image files?" purge prompt
     /// shown when a modality is turned off.
-    public func fileCount(kind: String) -> Int {
-        queue.sync { Set(rows.filter { $0.kind == kind }.map { $0.path }).count }
+    public func fileCount(kind: String) -> Int { fileCount(kinds: [kind]) }
+
+    /// One pass for a multi-kind count (Text's purge prompt covers text + scan together).
+    public func fileCount(kinds: [String]) -> Int {
+        let set = Set(kinds)
+        return queue.sync { Set(rows.lazy.filter { set.contains($0.kind) }.map { $0.path }).count }
     }
 
-    public func deleteKind(_ kind: String) {
+    public func deleteKind(_ kind: String) { deleteKinds([kind]) }
+
+    /// Multi-kind delete in ONE pass: one SQL predicate, one in-memory compaction - a text+scan
+    /// purge would otherwise pay two full-table scans and two O(N) buffer compactions.
+    public func deleteKinds(_ kinds: [String]) {
+        guard !kinds.isEmpty else { return }
         queue.sync {
             guard dbOpen() else { return }
+            let set = Set(kinds)
+            let marks = Array(repeating: "?", count: kinds.count).joined(separator: ",")
             var stmt: OpaquePointer?
             // Key rows first (the subquery needs the chunks rows still present).
-            if sqlite3_prepare_v2(db, "DELETE FROM content_keys WHERE path IN (SELECT DISTINCT path FROM chunks WHERE kind = ?);", -1, &stmt, nil) == SQLITE_OK {
-                sqlite3_bind_text(stmt, 1, kind, -1, SQLITE_TRANSIENT)
+            if sqlite3_prepare_v2(db, "DELETE FROM content_keys WHERE path IN (SELECT DISTINCT path FROM chunks WHERE kind IN (\(marks)));", -1, &stmt, nil) == SQLITE_OK {
+                for (i, kind) in kinds.enumerated() { sqlite3_bind_text(stmt, Int32(i + 1), kind, -1, SQLITE_TRANSIENT) }
                 sqlite3_step(stmt)
             }
             sqlite3_finalize(stmt)
             stmt = nil
-            if sqlite3_prepare_v2(db, "DELETE FROM chunks WHERE kind = ?;", -1, &stmt, nil) == SQLITE_OK {
-                sqlite3_bind_text(stmt, 1, kind, -1, SQLITE_TRANSIENT)
+            if sqlite3_prepare_v2(db, "DELETE FROM chunks WHERE kind IN (\(marks));", -1, &stmt, nil) == SQLITE_OK {
+                for (i, kind) in kinds.enumerated() { sqlite3_bind_text(stmt, Int32(i + 1), kind, -1, SQLITE_TRANSIENT) }
                 sqlite3_step(stmt)
             }
             sqlite3_finalize(stmt)
-            removeRowsLocked { $0.kind == kind }
+            removeRowsLocked { set.contains($0.kind) }
         }
     }
 

@@ -81,7 +81,7 @@ public struct OmniIgnore: Sendable, Equatable {
             "# Noise directories (build output, caches, dependencies). Delete a line to start indexing it.",
         ]
         for name in FileCrawler.skipDirNames { lines.append("\(name)/") }
-        let disabledKinds = FileKind.allCases.filter { !enabledKinds.contains($0) }
+        let disabledKinds = FileKind.indexable.filter { !enabledKinds.contains($0) }
         let kindExts = Set(disabledKinds.flatMap { FileExtractor.extensions(for: $0) })
         if !disabledKinds.isEmpty {
             lines.append("")
