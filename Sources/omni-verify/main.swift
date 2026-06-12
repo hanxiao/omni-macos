@@ -572,6 +572,36 @@ if args.count >= 4 && args[1] == "stressbench" {
 // Folder-map projection timing: omni-verify projbench [dim] [Ns...]
 // Times the full ProjectionEngine UMAP layout (PCA-2D + kNN + 300 force epochs) at a few point
 // counts, to verify the memory-budgeted map cap (mapPointBudget) keeps the map fast. Serial, GPU.
+// Real-data PCA check: omni-verify projreal <index.sqlite> <folderPrefix> [cap]
+// Loads per-file vectors from a REAL store (read-only) and reports the engine's PCA timing,
+// acceptance (iteration vs SVD fallback), and captured-variance parity on real spectra.
+if args.count >= 4 && args[1] == "projreal" {
+    let store = try VectorStore(dbURL: URL(fileURLWithPath: args[2]))
+    let cap = (args.count >= 5 ? Int(args[4]) : nil) ?? 15_000
+    let data = store.vectorsUnderFolder(args[3], cap: cap, landmarkCap: cap)
+    print("projreal n=\(data.count) dim=\(data.dim) (total under folder: \(data.total))")
+    guard data.count > 10 else { print("too few files"); exit(1) }
+    let X = MLXArray(data.vectors, [data.count, data.dim]).asType(.float32); eval(X)
+    _ = ProjectionEngine.pca2DBasis(X)   // warm
+    let t = Date()
+    let basis = ProjectionEngine.pca2DBasis(X)
+    let ms = -t.timeIntervalSinceNow * 1000
+    let varIter = MLX.sum(basis.Y * basis.Y)
+    let mean = MLX.mean(X, axis: 0)
+    let Xc = X - mean
+    let cov = Xc.transposed().matmul(Xc) / Float(max(1, data.count - 1))
+    eval(cov)
+    let (_, _, Vt) = MLXLinalg.svd(cov, stream: .cpu)
+    let Ysvd = Xc.matmul(Vt[0 ..< 2].transposed())
+    let varSvd = MLX.sum(Ysvd * Ysvd)
+    eval(varIter, varSvd)
+    let ratio = varIter.item(Float.self) / max(varSvd.item(Float.self), 1e-30)
+    print(String(format: "pca2DBasis = %.1f ms   captured-variance vs SVD = %.6f %@",
+                 ms, ratio, ratio >= 0.999 ? "(PASS)" : "(FAIL)"))
+    store.close()
+    exit(0)
+}
+
 if args.count >= 2 && args[1] == "projbench" {
     let dim = (args.count >= 3 ? Int(args[2]) : nil) ?? 1024
     var rng: UInt64 = 0x9E3779B97F4A7C15
@@ -603,6 +633,22 @@ if args.count >= 2 && args[1] == "projbench" {
         var t = Date()
         let basis = ProjectionEngine.pca2DBasis(X)
         print(String(format: "  [breakdown n=%d] pca2DBasis(SVD) = %.0f ms", n0, -t.timeIntervalSinceNow * 1000))
+        // PCA-quality gate: captured variance of the engine's basis vs the exact CPU SVD's.
+        do {
+            let Y = basis.Y
+            let varIter = MLX.sum(Y * Y)
+            let mean = MLX.mean(X, axis: 0)
+            let Xc = X - mean
+            let cov = Xc.transposed().matmul(Xc) / Float(max(1, n0 - 1))
+            eval(cov)
+            let (_, _, Vt) = MLXLinalg.svd(cov, stream: .cpu)
+            let Ysvd = Xc.matmul(Vt[0 ..< 2].transposed())
+            let varSvd = MLX.sum(Ysvd * Ysvd)
+            eval(varIter, varSvd)
+            let ratio = varIter.item(Float.self) / max(varSvd.item(Float.self), 1e-30)
+            print(String(format: "  [breakdown n=%d] pca captured-variance vs SVD = %.6f %@", n0, ratio,
+                         ratio >= 0.999 ? "(PASS)" : "(FAIL <0.999)"))
+        }
         t = Date()
         let knnIdx = ProjectionEngine.knn(X, k: 15); eval(knnIdx)
         print(String(format: "  [breakdown n=%d] knn             = %.0f ms", n0, -t.timeIntervalSinceNow * 1000))
@@ -621,9 +667,34 @@ if args.count >= 2 && args[1] == "projbench" {
         _ = ProjectionEngine.layout(data, k: 15, epochs: 2)   // warm GPU kernels
         let t = Date()
         let pts = ProjectionEngine.layout(data, k: 15, epochs: 300)
+        let layoutSecs = -t.timeIntervalSinceNow
         let finite = pts.allSatisfy { $0.position.x.isFinite && $0.position.y.isFinite }
-        print(String(format: "  n=%-6d  UMAP full layout = %.3fs   (%d pts, finite=%@)",
-                     n, -t.timeIntervalSinceNow, pts.count, finite ? "yes" : "NO"))
+        // QUALITY GATE: the force layout uses float scatter-add atomics, so positions are NOT
+        // bit-stable run to run (measured: same build, different digests). Gate on neighborhood
+        // preservation instead: for a sample of points, the overlap between embedding-space kNN
+        // and 2D-layout kNN. A real regression moves this; atomics scheduling noise does not.
+        let kQ = 15
+        let X = MLXArray(data.vectors, [n, dim]).asType(.float32)
+        let embKNN = ProjectionEngine.knn(X, k: kQ).asArray(Int32.self)   // [n*k]
+        var pos = [Float](repeating: 0, count: n * 2)
+        for (i, p) in pts.enumerated() { pos[2*i] = p.position.x; pos[2*i+1] = p.position.y }
+        let sample = stride(from: 0, to: n, by: max(1, n / 1000))
+        var overlapSum = 0.0; var sampled = 0
+        for i in sample {
+            // brute-force 2D kNN of point i
+            var dists = [(Float, Int)](); dists.reserveCapacity(n - 1)
+            let xi = pos[2*i], yi = pos[2*i+1]
+            for j in 0 ..< n where j != i {
+                let dx = pos[2*j] - xi, dy = pos[2*j+1] - yi
+                dists.append((dx*dx + dy*dy, j))
+            }
+            let near2D = Set(dists.sorted { $0.0 < $1.0 }.prefix(kQ).map { $0.1 })
+            let nearEmb = Set((0 ..< kQ).map { Int(embKNN[i * kQ + $0]) })
+            overlapSum += Double(near2D.intersection(nearEmb).count) / Double(kQ)
+            sampled += 1
+        }
+        print(String(format: "  n=%-6d  UMAP full layout = %.3fs   (%d pts, finite=%@, knn-preservation@%d=%.4f)",
+                     n, layoutSecs, pts.count, finite ? "yes" : "NO", kQ, overlapSum / Double(max(1, sampled))))
         // Landmark mode: quadratic layout on 15k landmarks, every other point placed via IDW.
         if n > 15_000 {
             let lm = FolderVectors(paths: data.paths, kinds: data.kinds, vectors: data.vectors,
