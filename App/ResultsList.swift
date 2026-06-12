@@ -12,6 +12,9 @@ struct ResultsList<Footer: View>: View {
     @State private var gridWidth: CGFloat = 0
     /// Grid counterpart of the list's inline expansion: the path whose passages popover is open.
     @State private var passagesPopover: String?
+    /// Keyboard focus on the results container (list or gallery - one is mounted at a time),
+    /// settable programmatically for the search-field Down-arrow hand-off.
+    @FocusState private var resultsFocused: Bool
 
     private func toggle(_ path: String) {
         // Animated: the chevron rotation and the panel's insertion/removal track this mutation.
@@ -36,13 +39,30 @@ struct ResultsList<Footer: View>: View {
         .quickLookPreview(Binding(get: { model.previewURL }, set: { model.previewURL = $0 }))
         // Space toggles Quick Look in both views regardless of focus, and is left alone while
         // editing text (the search field). The selection drives what is previewed.
-        .background(QuickLookKeyMonitor(onSpace: { model.toggleQuickLook() }, onPreviewArrow: { delta in
-            // Only hijack arrows while Quick Look is open - then move the selection (which, via
-            // its didSet, keeps previewURL on the selected row so the panel updates live).
-            guard model.previewURL != nil else { return false }
-            model.moveSelection(rowDelta: delta)
-            return true
-        }))
+        .background(QuickLookKeyMonitor(
+            onSpace: { model.toggleQuickLook() },
+            onPreviewArrow: { vertical, forward in
+                // Only hijack arrows while Quick Look is open - then move the selection (which,
+                // via its didSet, keeps previewURL on the selected row so the panel updates
+                // live). In the gallery, up/down move by visual row, like Finder.
+                guard model.previewURL != nil else { return false }
+                let grid = model.viewMode == .grid
+                let step = (vertical && grid) ? gridColumns : 1
+                model.moveSelection(rowDelta: forward ? step : -step, gridColumns: grid ? gridColumns : nil)
+                return true
+            },
+            onSearchDown: {
+                // The Spotlight flow: Down in the search field selects the first result (or keeps
+                // a still-visible selection) and hands keyboard focus to the results, so the next
+                // Return/Space/arrows act on them.
+                guard !results.isEmpty else { return false }
+                if model.selection == nil || !results.contains(where: { $0.path == model.selection }) {
+                    model.selection = results.first?.path
+                }
+                NSApp.keyWindow?.makeFirstResponder(nil)
+                resultsFocused = true
+                return true
+            }))
         .onKeyPress(.return) { if model.hasSelection { model.openSelected(); return .handled }; return .ignored }
         // Passages are ranked against the CURRENT query vector - a new result set invalidates
         // them (and any open expansion/popover) in both views, so this lives here, not per-view.
@@ -109,6 +129,7 @@ struct ResultsList<Footer: View>: View {
             // focusable + onMoveCommand wiring the gallery uses. Right/left disclose/collapse the
             // selected row's passages - the Finder list-view convention for expandable rows.
             .focusable()
+            .focused($resultsFocused)
             .focusEffectDisabled()
             .onMoveCommand { direction in
                 switch direction {
@@ -187,13 +208,14 @@ struct ResultsList<Footer: View>: View {
             // Make the gallery keyboard-navigable like the list: arrow keys move the selection by
             // column/row, and Return/Space (handled on the body) then open/preview it.
             .focusable()
+            .focused($resultsFocused)
             .focusEffectDisabled()
             .onMoveCommand { direction in
                 switch direction {
-                case .up: model.moveSelection(rowDelta: -gridColumns)
-                case .down: model.moveSelection(rowDelta: gridColumns)
-                case .left: model.moveSelection(rowDelta: -1)
-                case .right: model.moveSelection(rowDelta: 1)
+                case .up: model.moveSelection(rowDelta: -gridColumns, gridColumns: gridColumns)
+                case .down: model.moveSelection(rowDelta: gridColumns, gridColumns: gridColumns)
+                case .left: model.moveSelection(rowDelta: -1, gridColumns: gridColumns)
+                case .right: model.moveSelection(rowDelta: 1, gridColumns: gridColumns)
                 @unknown default: break
                 }
             }
@@ -208,6 +230,10 @@ struct ResultsList<Footer: View>: View {
     }
 
     @ViewBuilder private func menu(_ hit: SearchHit) -> some View {
+        // The menu acts on the row under the cursor: select it as the menu opens, so the
+        // shortcut hints shown beside the items and a live Quick Look follow the same item the
+        // user right-clicked (previously they acted on the prior selection).
+        let _ = { if model.selection != hit.path { DispatchQueue.main.async { model.selection = hit.path } } }()
         let path = hit.path
         Button("Open") { open(path) }
             .keyboardShortcut("o", modifiers: .command)
@@ -236,10 +262,8 @@ struct ResultsList<Footer: View>: View {
         // Use this file itself as the query - doc-vs-doc "more like this" across all modalities.
         Button("Find Similar") { model.setFileQuery(URL(fileURLWithPath: path), similar: true) }
             .keyboardShortcut("f", modifiers: [.command, .option])
-        Divider()
         Button("Reveal in Finder") { reveal(path) }
             .keyboardShortcut("r", modifiers: [.command, .shift])
-        Divider()
         Button("Copy Path") {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(path, forType: .string)
@@ -264,6 +288,7 @@ struct ResultsList<Footer: View>: View {
 struct ResultRow: View {
     let hit: SearchHit
     var selected: Bool = false
+    @Environment(\.controlActiveState) private var controlActive
     var expandable: Bool = false
     var expanded: Bool = false
     var onToggle: (() -> Void)? = nil
@@ -311,11 +336,15 @@ struct ResultRow: View {
         }
         .padding(.vertical, 6)
         .padding(.horizontal, 10)
-        // Same selection treatment as the gallery cell: a translucent accent fill (not the
-        // system grey, which only shows when the List has focus). Consistent across both views.
+        // Same selection treatment as the gallery cell: a translucent accent fill. Dimmed to the
+        // system's unemphasized grey when the window is not key - the native cue (Finder, Mail)
+        // for where keyboard input will land. Radius is concentric with the 6pt thumbnail
+        // corners across the 6pt padding.
         .background(
-            selected ? Color.accentColor.opacity(0.18) : .clear,
-            in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+            selected ? (controlActive == .key
+                ? Color.accentColor.opacity(0.18)
+                : Color(nsColor: .unemphasizedSelectedContentBackgroundColor).opacity(0.8)) : .clear,
+            in: RoundedRectangle(cornerRadius: Design.cornerSmall + 6, style: .continuous)
         )
     }
 }
@@ -381,6 +410,7 @@ struct PassagesView: View {
 struct ResultGridItem: View {
     let hit: SearchHit
     let selected: Bool
+    @Environment(\.controlActiveState) private var controlActive
     private var url: URL { URL(fileURLWithPath: hit.path) }
 
     var body: some View {
@@ -420,9 +450,11 @@ struct ResultGridItem: View {
                 Text(verbatim: "X\nX").font(.caption).padding(.vertical, 1).hidden()
                 Text(url.lastPathComponent).font(.caption).lineLimit(2)
                     .multilineTextAlignment(.center)
-                    .foregroundStyle(selected ? .white : .primary)
+                    .foregroundStyle(selected && controlActive == .key ? .white : .primary)
                     .padding(.horizontal, 6).padding(.vertical, 1)
-                    .background(selected ? Color.accentColor : .clear, in: Capsule())
+                    .background(selected ? (controlActive == .key
+                        ? Color.accentColor
+                        : Color(nsColor: .unemphasizedSelectedContentBackgroundColor)) : .clear, in: Capsule())
                     .frame(maxWidth: 150)
             }
             ZStack {
@@ -434,9 +466,13 @@ struct ResultGridItem: View {
         .padding(8)
         // Native selection: a translucent accent fill behind the whole cell (thumbnail + label),
         // the way Finder and Photos indicate selection - not a hard ring hugging the image.
+        // Unemphasized grey when the window is not key; radius concentric with the 8pt thumbnail
+        // corners across the 8pt padding.
         .background(
-            selected ? Color.accentColor.opacity(0.18) : .clear,
-            in: RoundedRectangle(cornerRadius: Design.corner + 2, style: .continuous)
+            selected ? (controlActive == .key
+                ? Color.accentColor.opacity(0.18)
+                : Color(nsColor: .unemphasizedSelectedContentBackgroundColor).opacity(0.8)) : .clear,
+            in: RoundedRectangle(cornerRadius: Design.corner + 8, style: .continuous)
         )
     }
 }

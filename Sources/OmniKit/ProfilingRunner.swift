@@ -41,6 +41,7 @@ private final class ProgressBox: @unchecked Sendable { var p = IndexProgress() }
 /// `engine` so the measurement reflects the real embedding path. `onProgress` fires on a background
 /// thread; marshal to the main actor for UI. Returns the measured metrics.
 public func runProfilingPass(engine: OmniEngine, targetURL: URL, settings: IndexSettings,
+                             shouldCancel: (@Sendable () -> Bool)? = nil,
                              onProgress: @escaping @Sendable (IndexProgress) -> Void) async throws -> ProfilingMetrics {
     try await Task.detached(priority: .userInitiated) { () throws -> ProfilingMetrics in
         let dir = FileManager.default.temporaryDirectory
@@ -66,8 +67,12 @@ public func runProfilingPass(engine: OmniEngine, targetURL: URL, settings: Index
             // is embedded, giving a full-cost measurement rather than an incremental top-up).
             indexer.index(roots: [targetURL], settings: settings, force: true) { p in
                 box.p = p
+                // Cooperative cancel: checked at every progress tick; cancel() makes the pass
+                // wind down at the next file boundary (the same path the app's pause uses).
+                if shouldCancel?() == true { indexer.cancel() }
                 onProgress(p)
             }
+            if shouldCancel?() == true { throw CancellationError() }
 
             let seconds = max(0.0001, Date().timeIntervalSince(t0))
             let tokens = max(0, engine.tokensProcessed - tok0)

@@ -36,6 +36,19 @@ struct OmniApp: App {
                 Button("Reveal in Finder") { model.revealSelected() }
                     .keyboardShortcut("r", modifiers: [.command, .shift])
                     .disabled(!model.hasSelection)
+                // The menu bar owns these shortcuts too: keyboard equivalents declared only
+                // inside a closed context menu never fire on macOS, so the app's own Shortcuts
+                // window was advertising a dead Option-Cmd-F. The context-menu items remain as
+                // click targets naming the same chords.
+                Button("Find Similar") { model.findSimilarSelected() }
+                    .keyboardShortcut("f", modifiers: [.command, .option])
+                    .disabled(!model.hasSelection)
+                Button("Copy Path") { model.copySelectedPath() }
+                    .keyboardShortcut("c", modifiers: [.command, .option])
+                    .disabled(!model.hasSelection)
+                Divider()
+                Button("Search by a File\u{2026}") { model.searchByFilePanel() }
+                    .keyboardShortcut("o", modifiers: [.command, .shift])
                 Divider()
                 // Bookmark the current search. The menu bar owns the Cmd-D shortcut (always present,
                 // just disabled when there's nothing to save) so it works even when the toolbar star

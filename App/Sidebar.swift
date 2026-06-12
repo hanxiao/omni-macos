@@ -33,6 +33,16 @@ struct Sidebar: View {
                             // iCloud-Drive-style transfer indicator: a pie that fills as this
                             // folder is indexed (or sweeps when reconciling in the background).
                             CloudSyncPie(fraction: activeFraction(url))
+                        } else if model.deniedRoots.contains(url.path) {
+                            // macOS denied Omni access (TCC): without this badge the folder just
+                            // showed "0" forever with no explanation or recovery path.
+                            Button {
+                                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders")!)
+                            } label: {
+                                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Omni doesn't have permission to read this folder. Click to open System Settings > Privacy & Security, then allow Omni under Files and Folders.")
                         } else if model.indexedFiles > 0, let c = model.folderFileCounts[url.path] {
                             // Once anything is indexed, show every folder's real count - a
                             // plain "0" is an unambiguous "nothing here yet" rather than blank.
@@ -234,7 +244,7 @@ struct CloudSyncPie: View {
                         .animation(.easeInOut(duration: 0.2), value: fraction)
                 }
             } else {
-                ProgressView().controlSize(.small).scaleEffect(0.6)
+                ProgressView().controlSize(.mini)   // .mini renders crisp; scaleEffect rasterized fuzzy
             }
         }
         // A solid hover target so the .help tooltip fires anywhere over the glyph (the shapes

@@ -40,6 +40,7 @@ public final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unche
     private let lock = NSLock()
     private var perFile: (@Sendable (Int64, Int64) -> Void)?
     private var continuation: CheckedContinuation<URL, Error>?
+    private var currentTask: URLSessionDownloadTask?
 
     private func setProgressHandler(_ handler: (@Sendable (Int64, Int64) -> Void)?) {
         lock.withLock { perFile = handler }
@@ -90,8 +91,18 @@ public final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unche
     private func downloadOne(_ url: URL) async throws -> URL {
         try await withCheckedThrowingContinuation { cont in
             self.setContinuation(cont)
-            session.downloadTask(with: url).resume()
+            let task = session.downloadTask(with: url)
+            lock.withLock { currentTask = task }
+            task.resume()
         }
+    }
+
+    /// Cancel the in-flight file download. The task errors with URLError.cancelled, which
+    /// surfaces from download(variant:to:) - partial completed files remain and are skipped
+    /// (resumed) by the next attempt.
+    public func cancel() {
+        let task = lock.withLock { currentTask }
+        task?.cancel()
     }
 
     // MARK: URLSessionDownloadDelegate

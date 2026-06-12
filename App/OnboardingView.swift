@@ -22,6 +22,11 @@ struct OnboardingView: View {
                         .frame(width: 360)
                     Text(model.downloadLabel)
                         .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    // A multi-GB download on a slow connection must be escapable (HIG); partial
+                    // files are kept and skipped on the next attempt.
+                    Button("Cancel") { model.cancelDownload() }
+                        .controlSize(.small)
+                        .padding(.top, 2)
                 }
                 .padding(.top, 4)
             } else {
@@ -33,6 +38,13 @@ struct OnboardingView: View {
 
                 Button("Choose Model Folder\u{2026}") { pick() }
                     .buttonStyle(.plain).font(.callout).foregroundStyle(.secondary).padding(.top, 6)
+
+                // Frame the permission prompts BEFORE they fire: indexing starts right after the
+                // download, and macOS will ask for each folder with no other context.
+                Text("Omni starts by indexing your Documents, Downloads, and Desktop folders - macOS will ask for permission for each. You can add or remove folders anytime from the sidebar.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center).frame(maxWidth: 420)
+                    .padding(.top, 6)
             }
 
             if model.downloadFailed {
@@ -43,7 +55,7 @@ struct OnboardingView: View {
             VStack(spacing: 5) {
                 Image(systemName: "lock.shield").foregroundStyle(.tertiary)
                 Text("Private by design. Indexing and search run on your Mac's Apple silicon, so your files never leave the device. The model downloads once - after that, no internet is required.")
-                    .font(.caption).foregroundStyle(.tertiary)
+                    .font(.caption).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center).frame(maxWidth: 420)
             }
         }

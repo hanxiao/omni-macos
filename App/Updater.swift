@@ -55,6 +55,9 @@ enum Updater {
                 let (data, _) = try await URLSession.shared.data(for: req)
                 let m = try JSONDecoder().decode(Manifest.self, from: data)
                 if isNewer(m.version, than: currentVersion) {
+                    // A version the user explicitly skipped stays quiet on launch checks; the
+                    // menu command always shows it again (the user asked).
+                    if !userInitiated, UserDefaults.standard.string(forKey: "omni.skipVersion") == m.version { return }
                     promptAndInstall(m)
                 } else if userInitiated {
                     info("You're up to date", "Omni \(currentVersion) is the latest version.")
@@ -72,8 +75,16 @@ enum Updater {
         a.informativeText = "You have \(currentVersion). Omni will download the update, install it, and relaunch."
         a.addButton(withTitle: "Update and Relaunch")
         a.addButton(withTitle: "Later")
-        guard a.runModal() == .alertFirstButtonReturn else { return }
-        startUpdate(m)
+        a.addButton(withTitle: "Skip This Version")
+        switch a.runModal() {
+        case .alertFirstButtonReturn:
+            startUpdate(m)
+        case .alertThirdButtonReturn:
+            // Stop the daily launch check from re-prompting for this version.
+            UserDefaults.standard.set(m.version, forKey: "omni.skipVersion")
+        default:
+            break
+        }
     }
 
     // MARK: - Update flow
@@ -86,11 +97,13 @@ enum Updater {
             do {
                 guard let url = URL(string: m.url) else { throw UpdateError("The update has an invalid download URL.") }
                 progressUI.show("Updating Omni")
+                progressUI.onCancel = { downloadTask?.cancel() }
                 progressUI.status("Downloading Omni \(m.version)...")
                 progressUI.fraction(0)
                 let file = try await download(url)
                 dmg = file
 
+                progressUI.cancellable(false)   // past this point the steps are not interruptible
                 progressUI.status("Verifying...")
                 progressUI.indeterminate()
                 if let want = m.md5?.lowercased() {
@@ -113,10 +126,16 @@ enum Updater {
                 launchReplaceAndQuit(staged: staged, dest: dest)   // does not return - quits the app
             } catch {
                 progressUI.close()
+                // User-cancelled: just close - the fallback alert is for real failures.
+                if (error as? URLError)?.code == .cancelled { return }
                 fallback(m, dmg: dmg, reason: error.localizedDescription)
             }
         }
     }
+
+    /// In-flight update download, so the progress panel's Cancel button can stop it. Cleared
+    /// when the download completes; cancel is a no-op past that point (install is atomic).
+    private static var downloadTask: URLSessionDownloadTask?
 
     /// Download `url` to a temp .dmg, reporting progress to the panel. Returns the local file URL.
     private static func download(_ url: URL) async throws -> URL {
@@ -124,10 +143,12 @@ enum Updater {
         req.timeoutInterval = 60
         let delegate = DownloadDelegate { f in Task { @MainActor in progressUI.fraction(f) } }
         let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
-        defer { session.finishTasksAndInvalidate() }
+        defer { session.finishTasksAndInvalidate(); downloadTask = nil }
         return try await withCheckedThrowingContinuation { cont in
             delegate.continuation = cont
-            session.downloadTask(with: req).resume()
+            let task = session.downloadTask(with: req)
+            downloadTask = task
+            task.resume()
         }
     }
 
@@ -291,22 +312,31 @@ private final class UpdateProgress {
     private var window: NSWindow?
     private let label = NSTextField(labelWithString: "")
     private let bar = NSProgressIndicator()
+    private var cancelButton: NSButton?
+    /// Invoked by the Cancel button (set per update run; cleared by cancellable(false)).
+    var onCancel: (() -> Void)?
 
     func show(_ title: String) {
         if window == nil {
-            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 120),
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 132),
                              styleMask: [.titled], backing: .buffered, defer: false)
             w.isReleasedWhenClosed = false
             w.title = title
             let content = NSView(frame: w.contentRect(forFrameRect: w.frame))
-            label.frame = NSRect(x: 24, y: 64, width: 352, height: 36)
+            label.frame = NSRect(x: 24, y: 78, width: 352, height: 36)
             label.lineBreakMode = .byTruncatingTail
             label.maximumNumberOfLines = 2
-            bar.frame = NSRect(x: 24, y: 36, width: 352, height: 18)
+            bar.frame = NSRect(x: 24, y: 50, width: 352, height: 18)
             bar.style = .bar
             bar.minValue = 0; bar.maxValue = 1
             bar.isIndeterminate = false
-            content.addSubview(label); content.addSubview(bar)
+            // A multi-hundred-MB download must be escapable (HIG: cancel for lengthy operations);
+            // the titled-only window deliberately has no close button, so this is the way out.
+            let cancel = NSButton(title: "Cancel", target: self, action: #selector(cancelPressed))
+            cancel.bezelStyle = .rounded
+            cancel.frame = NSRect(x: 300, y: 10, width: 76, height: 30)
+            cancelButton = cancel
+            content.addSubview(label); content.addSubview(bar); content.addSubview(cancel)
             w.contentView = content
             w.center()
             window = w
@@ -331,5 +361,13 @@ private final class UpdateProgress {
     func close() {
         bar.stopAnimation(nil)
         window?.orderOut(nil)
+        cancellable(true)   // reset for the next run
     }
+
+    func cancellable(_ on: Bool) {
+        cancelButton?.isEnabled = on
+        if !on { onCancel = nil }
+    }
+
+    @objc private func cancelPressed() { onCancel?() }
 }
