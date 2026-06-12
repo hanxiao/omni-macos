@@ -569,24 +569,30 @@ private struct IndexTab: View {
             }
             Section("Index") {
                 LabeledContent("Indexed files", value: "\(model.indexedFiles)")
-                LabeledContent("Indexed Chunks", value: "\(model.indexedChunks)")
+                LabeledContent("Indexed chunks", value: "\(model.indexedChunks)")
                 LabeledContent("Size", value: ByteCountFormatter.string(fromByteCount: model.dbSizeBytes, countStyle: .file))
                 if let last = model.lastIndexed {
                     LabeledContent("Last indexed", value: last.formatted(.relative(presentation: .named)))
                 }
-                LabeledContent("Database location") {
-                    HStack(spacing: 8) {
-                        if !model.dbPath.isEmpty {
-                            Text(model.dbPath).font(.caption.monospaced()).foregroundStyle(.secondary)
-                                .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
-                        }
-                        Button("Change\u{2026}") { pickDatabase() }
-                            .help("Where the search index is stored. Changing the folder loads the index from there.")
-                        Button("Reveal in Finder") {
-                            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.dbPath)])
-                        }
-                        .disabled(model.dbPath.isEmpty)
+                // Manual row instead of LabeledContent: a long path makes LabeledContent
+                // wrap the value side under the label, while an HStack with a Spacer keeps
+                // everything on one line and lets the path truncate to whatever fits.
+                HStack(spacing: 8) {
+                    Text("Location")
+                    Spacer()
+                    if !model.dbPath.isEmpty {
+                        Text((model.dbPath as NSString).abbreviatingWithTildeInPath)
+                            .font(.caption.monospaced()).foregroundStyle(.secondary)
+                            .lineLimit(1).truncationMode(.middle)
+                            .help(model.dbPath)
                     }
+                    Button("Change\u{2026}") { pickDatabase() }
+                        .help("Where the search index is stored. Changing the folder loads the index from there.")
+                        .controlSize(.small)
+                    Button("Reveal in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.dbPath)])
+                    }
+                    .disabled(model.dbPath.isEmpty)
                     .controlSize(.small)
                 }
             }
