@@ -60,7 +60,7 @@ struct FolderEmbeddingVisualization: View {
                     // Same empty-state treatment as every search state in this pane
                     // (CenteredStatus) - the system ContentUnavailableView used different
                     // typography, so the pane's empty states visibly changed style.
-                    CenteredStatus(symbol: "circle.grid.cross", title: "No Files to Map",
+                    CenteredStatus(symbol: "circle.grid.cross", title: "No files to map",
                                    subtitle: "Nothing under \(folderName) is indexed yet.")
                         .allowsHitTesting(false)
                 }
@@ -383,7 +383,7 @@ struct FolderEmbeddingVisualization: View {
     }
 
     /// File actions for a dot - the same set (and shortcuts) as a search result's context menu.
-    /// "Find Similar" reuses `setFileQuery`, which runs a file-as-query search: that activates a query,
+    /// "Find similar" reuses `setFileQuery`, which runs a file-as-query search: that activates a query,
     /// so ContentView precedence swaps the map out for the live results (clearing it returns to the map).
     @ViewBuilder private func dotMenu(_ path: String) -> some View {
         Button("Open") { NSWorkspace.shared.openAsync(URL(fileURLWithPath: path)) }
@@ -391,13 +391,13 @@ struct FolderEmbeddingVisualization: View {
         Button("Quick Look") { model.previewURL = URL(fileURLWithPath: path) }
             .keyboardShortcut("y", modifiers: .command)
         Divider()
-        Button("Find Similar") { model.setFileQuery(URL(fileURLWithPath: path), similar: true) }
+        Button("Find similar") { model.setFileQuery(URL(fileURLWithPath: path), similar: true) }
             .keyboardShortcut("f", modifiers: [.command, .option])
         Divider()
         Button("Reveal in Finder") { NSWorkspace.shared.revealAsync(URL(fileURLWithPath: path)) }
             .keyboardShortcut("r", modifiers: [.command, .shift])
         Divider()
-        Button("Copy Path") {
+        Button("Copy path") {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(path, forType: .string)
         }

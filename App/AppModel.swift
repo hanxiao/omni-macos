@@ -50,7 +50,7 @@ enum HistoryMode: String, CaseIterable, Identifiable {
     var detail: String {
         switch self {
         case .auto: return "Every search you settle on is added to History."
-        case .onSubmit: return "Only searches you submit with Return are added. Find Similar still records."
+        case .onSubmit: return "Only searches you submit with Return are added. Find similar still records."
         case .manual: return "Nothing is added on its own. Use the Bookmark button to keep a search."
         }
     }
@@ -63,7 +63,7 @@ enum SortOrder: String, CaseIterable, Identifiable {
         switch self {
         case .relevance: return "Relevance"
         case .name: return "Name"
-        case .dateModified: return "Date Modified"
+        case .dateModified: return "Date modified"
         }
     }
 }
@@ -73,10 +73,10 @@ enum DateRange: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var title: String {
         switch self {
-        case .any: return "Any Time"
-        case .week: return "Past Week"
-        case .month: return "Past Month"
-        case .year: return "Past Year"
+        case .any: return "Any time"
+        case .week: return "Past week"
+        case .month: return "Past month"
+        case .year: return "Past year"
         }
     }
     var since: Double? {
@@ -313,7 +313,7 @@ final class AppModel {
     /// tokens (backbone sequence positions) per second. Both exactly measured.
     var filesPerSec: Double = 0
     var tokensPerSec: Double = 0
-    // Profiling ("Run Profiling" menu): downloads a fixed dataset and times an isolated index pass.
+    // Profiling ("Run profiling" menu): downloads a fixed dataset and times an isolated index pass.
     var isProfilingRunning = false
     /// Set while a benchmark runs; the sheet's Cancel button flips it (cooperative - the pass
     /// checks it at every progress tick and between phases).
@@ -1605,7 +1605,7 @@ final class AppModel {
             let a = NSAlert()
             a.messageText = "Switch to \(v.title)?"
             a.informativeText = "\(rebuildNote) Files will reindex from scratch, which can take a while on a large library."
-            a.addButton(withTitle: "Switch and Rebuild Index"); a.addButton(withTitle: "Cancel")
+            a.addButton(withTitle: "Switch and rebuild index"); a.addButton(withTitle: "Cancel")
             if a.runModal() == .alertFirstButtonReturn { switchVariant(v) }
         } else if !isDownloading {
             let a = NSAlert()

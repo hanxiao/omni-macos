@@ -36,7 +36,7 @@ struct OnboardingView: View {
                 }
                 .padding(.top, 4)
 
-                Button("Choose Model Folder\u{2026}") { pick() }
+                Button("Choose model folder\u{2026}") { pick() }
                     .buttonStyle(.plain).font(.callout).foregroundStyle(.secondary).padding(.top, 6)
 
                 // Frame the permission prompts BEFORE they fire: indexing starts right after the

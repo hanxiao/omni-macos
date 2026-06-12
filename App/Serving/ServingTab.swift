@@ -146,7 +146,7 @@ struct ServingTab: View {
                 } label: { Image(systemName: "doc.on.doc") }
                 .buttonStyle(.borderless).foregroundStyle(.secondary)
                 .help("Copy").disabled(model.serving.bearerToken.isEmpty)
-                Button("Generate New") {
+                Button("Generate new") {
                     model.serving.bearerToken = ServingController.generateToken()
                     revealToken = true   // show it so it can be copied
                 }

@@ -122,8 +122,8 @@ enum ProfilingService {
         Macs. It sends only hardware facts (chip, memory, macOS version) and timing numbers - never \
         your files, paths, or any personal information. You can turn this off anytime in Settings.
         """
-        a.addButton(withTitle: "Share Results")
-        a.addButton(withTitle: "Keep Local")
+        a.addButton(withTitle: "Share results")
+        a.addButton(withTitle: "Keep local")
         let share = a.runModal() == .alertFirstButtonReturn
         UserDefaults.standard.set(true, forKey: consentKey)       // decision recorded; don't ask again
         UserDefaults.standard.set(share, forKey: uploadEnabledKey)
