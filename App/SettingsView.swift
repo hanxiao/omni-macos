@@ -124,6 +124,23 @@ private struct ActivityTab: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
+            Section {
+                ForEach(model.kindOrder, id: \.self) { kind in
+                    orderRow(kind)
+                        .draggable(kind.rawValue)
+                        .dropDestination(for: String.self) { items, _ in
+                            guard let raw = items.first, let dragged = FileKind(rawValue: raw) else { return false }
+                            model.moveKind(dragged, before: kind)
+                            return true
+                        }
+                }
+            } header: {
+                Text("File Types")
+            } footer: {
+                Text("Turn a type off to stop indexing it and free its model from memory. Drag to set which types index first.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
             Section("Folders") {
                 ForEach(model.roots, id: \.self) { url in
                     let rp = model.progress.perRoot[url.path]
@@ -146,6 +163,21 @@ private struct ActivityTab: View {
         }
         .formStyle(.grouped)
     }
+
+    @ViewBuilder private func orderRow(_ k: FileKind) -> some View {
+        // While a disable is awaiting the purge/keep dialog the kind is still in enabledKinds, so reflect
+        // the pending-off state so the switch doesn't snap back to ON under the dialog.
+        let on = model.kindEnabled(k) && model.pendingDisable?.kind != k
+        HStack(spacing: 8) {
+            Image(systemName: "line.3.horizontal").foregroundStyle(.tertiary).font(.callout)
+            Label(k.title, systemImage: k.symbol)
+            Spacer()
+            Toggle("", isOn: Binding(get: { on }, set: { v in Task { await model.toggleKind(k, on: v) } }))
+                .labelsHidden().toggleStyle(.switch).controlSize(.mini)
+        }
+        .opacity(on ? 1 : 0.55)
+    }
+
 }
 
 private struct ContentTypesTab: View {
@@ -159,23 +191,6 @@ private struct ContentTypesTab: View {
 
     var body: some View {
         Form {
-            Section {
-                ForEach(model.kindOrder, id: \.self) { kind in
-                    orderRow(kind)
-                        .draggable(kind.rawValue)
-                        .dropDestination(for: String.self) { items, _ in
-                            guard let raw = items.first, let dragged = FileKind(rawValue: raw) else { return false }
-                            model.moveKind(dragged, before: kind)
-                            return true
-                        }
-                }
-            } header: {
-                Text("File Types")
-            } footer: {
-                Text("Turn a type off to stop indexing it and free its model from memory. Drag to set which types index first.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-
             Section {
                 Picker("Minimum image size", selection: Binding(get: { model.minImageDimension }, set: { model.minImageDimension = $0 })) {
                     Text("No minimum").tag(0)
@@ -255,20 +270,6 @@ private struct ContentTypesTab: View {
 
     /// One modality: drag handle (reorder = index priority) + an on/off switch. Off skips the kind
     /// AND unloads its model from memory; the ignore rules below filter further within what stays on.
-    @ViewBuilder private func orderRow(_ k: FileKind) -> some View {
-        // While a disable is awaiting the purge/keep dialog the kind is still in enabledKinds, so reflect
-        // the pending-off state so the switch doesn't snap back to ON under the dialog.
-        let on = model.kindEnabled(k) && model.pendingDisable?.kind != k
-        HStack(spacing: 8) {
-            Image(systemName: "line.3.horizontal").foregroundStyle(.tertiary).font(.callout)
-            Label(k.title, systemImage: k.symbol)
-            Spacer()
-            Toggle("", isOn: Binding(get: { on }, set: { v in Task { await model.toggleKind(k, on: v) } }))
-                .labelsHidden().toggleStyle(.switch).controlSize(.mini)
-        }
-        .opacity(on ? 1 : 0.55)
-    }
-
     @ViewBuilder private var previewBar: some View {
         VStack(alignment: .leading, spacing: 8) {
             if let d = model.ignorePreview?.danger {
@@ -568,7 +569,7 @@ private struct IndexTab: View {
             }
             Section("Index") {
                 LabeledContent("Indexed files", value: "\(model.indexedFiles)")
-                LabeledContent("Indexed Sections", value: "\(model.indexedChunks)")
+                LabeledContent("Indexed Chunks", value: "\(model.indexedChunks)")
                 LabeledContent("Size", value: ByteCountFormatter.string(fromByteCount: model.dbSizeBytes, countStyle: .file))
                 if let last = model.lastIndexed {
                     LabeledContent("Last indexed", value: last.formatted(.relative(presentation: .named)))
@@ -577,7 +578,7 @@ private struct IndexTab: View {
             Section {
                 // Selecting a variant switches to it if installed, or downloads it if not - no
                 // separate download button.
-                Picker("Model", selection: Binding(
+                Picker("Embedding model", selection: Binding(
                     get: { model.modelVariant },
                     set: { model.selectVariant($0) }
                 )) {

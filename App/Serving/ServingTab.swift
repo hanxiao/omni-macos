@@ -29,7 +29,6 @@ struct ServingTab: View {
         Form {
             serverSection
             accessSection
-            agentsSection
             exampleSection
             requestsSection
         }
@@ -57,6 +56,15 @@ struct ServingTab: View {
             ))
             .toggleStyle(.switch)
 
+            HStack(spacing: 10) {
+                Button("MCP") { showMCPSheet = true }
+                    .help("Connection config for MCP clients (Claude Code, Cursor, VS Code)")
+                Button("SKILL.md") { showSkillSheet = true }
+                    .help("A ready skill file for instruction-following agents")
+                Spacer()
+            }
+            .disabled(!model.serving.enabled)
+
             HStack {
                 Circle()
                     .fill(statusColor)
@@ -73,7 +81,7 @@ struct ServingTab: View {
         } header: {
             Text("Server")
         } footer: {
-            Text("Serves OpenAI, Jina, Cohere, and Gemini embedding endpoints plus search, backed by the local model.")
+            Text("Serves OpenAI, Jina, Cohere, and Gemini embedding endpoints plus search, backed by the local model. MCP hands the server to protocol clients; SKILL.md to instruction-following agents.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }
@@ -190,25 +198,6 @@ struct ServingTab: View {
             Text("Example")
         } footer: {
             Text("Start the server, then run the selected example in a terminal.")
-                .font(.caption).foregroundStyle(.secondary)
-        }
-    }
-
-    // MARK: - Agents
-
-    @ViewBuilder private var agentsSection: some View {
-        Section {
-            HStack(spacing: 10) {
-                Button("MCP\u{2026}") { showMCPSheet = true }
-                    .help("Connection config for MCP clients (Claude Code, Cursor, VS Code)")
-                Button("SKILL.md\u{2026}") { showSkillSheet = true }
-                    .help("A ready skill file for instruction-following agents")
-                Spacer()
-            }
-        } header: {
-            Text("Agents")
-        } footer: {
-            Text("Two ways to hand Omni to a local agent: MCP for clients that speak the protocol, SKILL.md for agents that follow written instructions.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }
