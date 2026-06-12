@@ -84,7 +84,7 @@ private struct ActivityTab: View {
                 case .paused:
                     HStack(spacing: 8) {
                         Image(systemName: "pause.circle.fill").foregroundStyle(.orange)
-                        Text("Paused \u{00B7} \(model.indexedFiles.formatted()) files indexed")
+                        Text("Paused \u{00B7} \(model.indexedFiles.formatted()) file\(model.indexedFiles == 1 ? "" : "s") indexed")
                         Spacer()
                         Button("Resume") { model.startIndexing() }.controlSize(.small)
                     }
@@ -110,7 +110,7 @@ private struct ActivityTab: View {
                     } else {
                         HStack(spacing: 8) {
                             Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                            Text(model.indexedFiles == 0 ? "Nothing indexed yet" : "Up to date \u{00B7} \(model.indexedFiles.formatted()) files")
+                            Text(model.indexedFiles == 0 ? "Nothing indexed yet" : "Up to date \u{00B7} \(model.indexedFiles.formatted()) file\(model.indexedFiles == 1 ? "" : "s")")
                             Spacer()
                             Button(model.indexedFiles == 0 ? "Index" : "Update") { model.startIndexing() }
                                 .controlSize(.small).disabled(!model.canIndex)
@@ -155,7 +155,7 @@ private struct ActivityTab: View {
                         } else if model.activeRoots.contains(url.path) {
                             Text("Updating\u{2026}").font(.caption).foregroundStyle(.secondary)
                         } else if let c = model.folderFileCounts[url.path] {
-                            Text("\(c.formatted()) files").font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
+                            Text("\(c.formatted()) file\(c == 1 ? "" : "s")").font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
                         }
                     }
                 }
@@ -264,7 +264,7 @@ private struct ContentTypesTab: View {
             Button("Keep in index") { model.applyKind(pd.kind, on: false, purge: false) }
             Button("Cancel", role: .cancel) { model.pendingDisable = nil }
         } message: { pd in
-            Text("\(pd.count) \(pd.kind.title.lowercased()) \(pd.count == 1 ? "file is" : "files are") already indexed. Remove them now, or keep them searchable and just stop indexing new ones.")
+            Text("\(pd.count) \(pd.kind.rawValue) \(pd.count == 1 ? "file is" : "files are") already indexed. Remove them now, or keep them searchable and just stop indexing new ones.")
         }
     }
 

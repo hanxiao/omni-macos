@@ -21,7 +21,7 @@ public enum FileKind: String, Sendable, CaseIterable {
     public var title: String {
         switch self {
         case .image: return "Images"
-        case .video: return "Video"
+        case .video: return "Videos"
         case .audio: return "Audio"
         case .text: return "Text"
         case .scan: return "Scans"

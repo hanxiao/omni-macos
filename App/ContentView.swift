@@ -160,7 +160,7 @@ struct ContentView: View {
             // pending search only fades a small spinner in under the same prompt - it never flashes
             // "No matches" while the debounce/search for what you just typed is still running.
             CenteredStatus(symbol: "sparkle.magnifyingglass",
-                           title: model.indexedFiles > 0 ? "Search \(model.indexedFiles.formatted()) files" : "Search your files",
+                           title: model.indexedFiles > 0 ? "Search \(model.indexedFiles.formatted()) file\(model.indexedFiles == 1 ? "" : "s")" : "Search your files",
                            subtitle: "Type a phrase. Results are ranked by meaning, across images, video, audio, and text.",
                            showSpinner: model.isResolving)
         } else if model.hiddenByThreshold > 0 {
@@ -181,7 +181,7 @@ struct ContentView: View {
     @ViewBuilder private var belowThresholdFooter: some View {
         if model.hiddenByThreshold > 0 {
             Button { model.showAllBelowThreshold() } label: {
-                Label("Show \(model.hiddenByThreshold) more matches", systemImage: "chevron.down")
+                Label("Show \(model.hiddenByThreshold) more \(model.hiddenByThreshold == 1 ? "match" : "matches")", systemImage: "chevron.down")
                     .font(.callout)
             }
             .buttonStyle(.plain)
