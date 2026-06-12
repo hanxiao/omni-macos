@@ -139,7 +139,7 @@ struct ContentView: View {
         if model.roots.isEmpty {
             CenteredStatus(symbol: "folder.badge.plus", title: "Add a folder to search",
                            subtitle: "Choose the folders you want to search. Omni indexes them automatically and keeps them up to date.",
-                           showSpinner: false, action: ("Add Folder\u{2026}", { pickFolder() }))
+                           showSpinner: false, action: ("Add folder\u{2026}", { pickFolder() }))
         } else if let err = model.queryError {
             CenteredStatus(symbol: "exclamationmark.triangle", title: "Couldn't search by that file",
                            subtitle: err, showSpinner: false)
@@ -167,12 +167,12 @@ struct ContentView: View {
             CenteredStatus(symbol: "line.3.horizontal.decrease.circle",
                            title: "No results above \(Int(model.minScore * 100))%",
                            subtitle: "\(model.hiddenByThreshold) weaker \(model.hiddenByThreshold == 1 ? "match is" : "matches are") hidden by the relevance threshold.",
-                           showSpinner: false, action: ("Show All Matches", { model.showAllBelowThreshold() }))
+                           showSpinner: false, action: ("Show all matches", { model.showAllBelowThreshold() }))
         } else if model.filtersActive {
             // Filters can hide every result; the empty state is the only place left to escape them.
             CenteredStatus(symbol: "line.3.horizontal.decrease.circle", title: "No matches",
                            subtitle: "Filters are hiding every result.", showSpinner: false,
-                           action: ("Clear Filters", { model.clearFilters() }))
+                           action: ("Clear filters", { model.clearFilters() }))
         } else {
             CenteredStatus(symbol: "magnifyingglass", title: "No matches", subtitle: "Try a different phrase.", showSpinner: false)
         }
@@ -181,7 +181,7 @@ struct ContentView: View {
     @ViewBuilder private var belowThresholdFooter: some View {
         if model.hiddenByThreshold > 0 {
             Button { model.showAllBelowThreshold() } label: {
-                Label("Show \(model.hiddenByThreshold) More Matches", systemImage: "chevron.down")
+                Label("Show \(model.hiddenByThreshold) more matches", systemImage: "chevron.down")
                     .font(.callout)
             }
             .buttonStyle(.plain)
@@ -219,7 +219,7 @@ struct ContentView: View {
                 // click target naming the same chord.
                 Button { model.searchByFilePanel() } label: { Image(systemName: "photo.badge.magnifyingglass") }
                     .help("Search by a file (image, audio, video, or text)  \u{21E7}\u{2318}O")
-                    .accessibilityLabel("Search by a File")
+                    .accessibilityLabel("Search by a file")
             }
         }
         // Bookmark the current search. The only way into History when recording is set to "Only when
@@ -236,11 +236,11 @@ struct ContentView: View {
                         Image(systemName: "star")
                     }
                 }
-                // Cmd-D is owned by the File-menu "Bookmark Search" command (single owner, avoids a
+                // Cmd-D is owned by the File-menu "Bookmark search" command (single owner, avoids a
                 // duplicate-shortcut conflict); the tooltip names it, and accessibilityLabel is what
                 // VoiceOver reads and what the toolbar-overflow menu shows for this icon-only button.
                 .help(model.currentSearchIsBookmarked ? "Remove bookmark  \u{2318}D" : "Bookmark this search  \u{2318}D")
-                .accessibilityLabel(model.currentSearchIsBookmarked ? "Remove Bookmark" : "Bookmark Search")
+                .accessibilityLabel(model.currentSearchIsBookmarked ? "Remove bookmark" : "Bookmark search")
             }
         }
         // Progressive disclosure: the filter/sort/view chrome appears only once there are results
@@ -262,12 +262,12 @@ struct ContentView: View {
                 // Tahoe: the inline sort menu + segmented view toggle render and overflow cleanly.
                 ControlGroup {
                     Menu {
-                        Picker("Sort By", selection: Binding(get: { model.sortOrder }, set: { model.sortOrder = $0 })) {
+                        Picker("Sort by", selection: Binding(get: { model.sortOrder }, set: { model.sortOrder = $0 })) {
                             ForEach(SortOrder.allCases) { Text($0.title).tag($0) }
                         }
                     } label: { Image(systemName: "arrow.up.arrow.down") }
                     .help("Sort by \(model.sortOrder.title)")
-                    .accessibilityLabel("Sort Results")
+                    .accessibilityLabel("Sort results")
 
                     Picker("View", selection: Binding(get: { model.viewMode }, set: { model.viewMode = $0 })) {
                         Image(systemName: "list.bullet").accessibilityLabel("List view").tag(ResultViewMode.list)
@@ -286,11 +286,11 @@ struct ContentView: View {
                         Label("as List", systemImage: "list.bullet").tag(ResultViewMode.list)
                     }
                     Divider()
-                    Picker("Sort By", selection: Binding(get: { model.sortOrder }, set: { model.sortOrder = $0 })) {
+                    Picker("Sort by", selection: Binding(get: { model.sortOrder }, set: { model.sortOrder = $0 })) {
                         ForEach(SortOrder.allCases) { Text($0.title).tag($0) }
                     }
                 } label: {
-                    Label("View Options", systemImage: "slider.horizontal.3")
+                    Label("View options", systemImage: "slider.horizontal.3")
                 }
                 .help("Sort and view")
             }
@@ -332,11 +332,11 @@ struct ContentView: View {
                 get: { model.filterFolder?.path ?? "" },
                 set: { model.filterFolder = $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
             )) {
-                Text("All Folders").tag("")
+                Text("All folders").tag("")
                 ForEach(model.roots, id: \.self) { Text($0.lastPathComponent).tag($0.path) }
             }
             Picker("Extension", selection: Binding(get: { model.filterExt }, set: { model.filterExt = $0 })) {
-                Text("Any Extension").tag("")
+                Text("Any extension").tag("")
                 ForEach(model.indexedExts, id: \.self) { Text(".\($0)").tag($0) }
             }
             Picker("Date", selection: Binding(get: { model.dateRange }, set: { model.dateRange = $0 })) {
@@ -346,12 +346,12 @@ struct ContentView: View {
                 Text("Any").tag(0.0); Text("25%").tag(0.25); Text("50%").tag(0.5); Text("70%").tag(0.7)
             }
             Divider()
-            Button("Clear Filters") { model.clearFilters() }.disabled(!model.filtersActive)
+            Button("Clear filters") { model.clearFilters() }.disabled(!model.filtersActive)
         } label: {
             Image(systemName: model.filtersActive ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
         }
         .help("Filter results")
-        .accessibilityLabel("Filter Results")
+        .accessibilityLabel("Filter results")
     }
 
     private func scheduleSearch() {
@@ -472,7 +472,7 @@ private struct QualifierBar: View {
             }
             Spacer(minLength: 8)
             Button { model.toggleLiteralQuery() } label: {
-                Label(model.literalQuery ? "Use as Query" : "Plain Text",
+                Label(model.literalQuery ? "Use as query" : "Plain text",
                       systemImage: model.literalQuery ? "line.3.horizontal.decrease.circle" : "textformat")
             }
             .buttonStyle(.bordered).controlSize(.small)
@@ -547,7 +547,7 @@ struct EngineFailedView: View {
             Text("Omni can't load its model").font(.title)
             HStack {
                 Button("Retry") { model.retryBootstrap() }.buttonStyle(.borderedProminent)
-                Button("Choose Model Folder\u{2026}") { pickModel() }
+                Button("Choose model folder\u{2026}") { pickModel() }
             }
             .controlSize(.large)
             DisclosureGroup("Details") {

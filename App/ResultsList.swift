@@ -80,7 +80,7 @@ struct ResultsList<Footer: View>: View {
                                       onToggle: { toggle(hit.path) })
                                 // Result rows are intentionally NOT draggable: an in-app row drag was
                                 // easy to misclick onto the search drop target. Drag-to-search is for
-                                // files coming from OUTSIDE the app (Finder); use Find Similar / Reveal
+                                // files coming from OUTSIDE the app (Finder); use Find similar / Reveal
                                 // in Finder for a result.
                                 .contentShape(Rectangle())
                                 .onTapGesture { model.selection = hit.path }
@@ -237,11 +237,11 @@ struct ResultsList<Footer: View>: View {
         if hit.chunkCount > 1 {
             switch model.viewMode {
             case .list:
-                Button(expanded.contains(path) ? "Hide Matching Passages" : "Show Matching Passages") {
+                Button(expanded.contains(path) ? "Hide matching passages" : "Show matching passages") {
                     toggle(path)
                 }
             case .grid:
-                Button("Show Matching Passages") {
+                Button("Show matching passages") {
                     // Load first, present after: the popover must mount at its final size
                     // (see the crash note at the .popover site).
                     Task {
@@ -253,11 +253,11 @@ struct ResultsList<Footer: View>: View {
         }
         Divider()
         // Use this file itself as the query - doc-vs-doc "more like this" across all modalities.
-        Button("Find Similar") { model.setFileQuery(URL(fileURLWithPath: path), similar: true) }
+        Button("Find similar") { model.setFileQuery(URL(fileURLWithPath: path), similar: true) }
             .keyboardShortcut("f", modifiers: [.command, .option])
         Button("Reveal in Finder") { model.selection = path; reveal(path) }
             .keyboardShortcut("r", modifiers: [.command, .shift])
-        Button("Copy Path") {
+        Button("Copy path") {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(path, forType: .string)
         }
@@ -268,7 +268,7 @@ struct ResultsList<Footer: View>: View {
         // whole root belongs to the sidebar, with its confirmation - not a one-click menu item.
         if model.canIgnoreEnclosingFolder(ofPath: path) {
             Divider()
-            Button("Ignore Folder \u{201C}\((path as NSString).deletingLastPathComponent.components(separatedBy: "/").last ?? "")\u{201D}") {
+            Button("Ignore folder \u{201C}\((path as NSString).deletingLastPathComponent.components(separatedBy: "/").last ?? "")\u{201D}") {
                 model.ignoreEnclosingFolder(ofPath: path)
             }
         }

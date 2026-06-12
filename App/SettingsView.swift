@@ -135,7 +135,7 @@ private struct ActivityTab: View {
                         }
                 }
             } header: {
-                Text("File Types")
+                Text("File types")
             } footer: {
                 Text("Turn a type off to stop indexing it and free its model from memory. Drag to set which types index first.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -220,7 +220,7 @@ private struct ContentTypesTab: View {
                     Text("256 characters").tag(256)
                 }
             } header: {
-                Text("Skip Small Files")
+                Text("Skip small files")
             } footer: {
                 Text("Skips files below these sizes, like icons, thumbnails, and very short clips.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -232,7 +232,7 @@ private struct ContentTypesTab: View {
                     Text("Download to index").tag(false)
                 }
             } header: {
-                Text("Cloud Files")
+                Text("Cloud files")
             } footer: {
                 Text("Files whose content is in iCloud or another cloud service but not on this Mac. Skipping indexes them when they download; the other option downloads each file to index it.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -246,7 +246,7 @@ private struct ContentTypesTab: View {
 
                 previewBar
             } header: {
-                Text("Ignore Rules")
+                Text("Ignore rules")
             } footer: {
                 Text("Applied after the file-type switches above. One .gitignore pattern per line: a leading ! re-includes, a trailing / matches folders.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -260,8 +260,8 @@ private struct ContentTypesTab: View {
             isPresented: Binding(get: { model.pendingDisable != nil }, set: { if !$0 { model.pendingDisable = nil } }),
             presenting: model.pendingDisable
         ) { pd in
-            Button("Remove \(pd.count) from Index", role: .destructive) { model.applyKind(pd.kind, on: false, purge: true) }
-            Button("Keep in Index") { model.applyKind(pd.kind, on: false, purge: false) }
+            Button("Remove \(pd.count) from index", role: .destructive) { model.applyKind(pd.kind, on: false, purge: true) }
+            Button("Keep in index") { model.applyKind(pd.kind, on: false, purge: false) }
             Button("Cancel", role: .cancel) { model.pendingDisable = nil }
         } message: { pd in
             Text("\(pd.count) \(pd.kind.title.lowercased()) \(pd.count == 1 ? "file is" : "files are") already indexed. Remove them now, or keep them searchable and just stop indexing new ones.")
@@ -284,7 +284,7 @@ private struct ContentTypesTab: View {
                     Text("\(p.removed.formatted()) removed")
                         .foregroundStyle(p.removed > 0 ? .orange : .secondary)
                     if !p.samples.isEmpty {
-                        Button("Show Samples") { showSamples = true }
+                        Button("Show samples") { showSamples = true }
                             .buttonStyle(.link)
                             .popover(isPresented: $showSamples, arrowEdge: .bottom) { samplePopover(p.samples) }
                     }
@@ -462,7 +462,7 @@ private struct PerformanceTab: View {
             }
             Section {
                 LabeledContent("Benchmark This Mac") {
-                    Button("Run Benchmark") { Task { await model.runProfiling() } }
+                    Button("Run benchmark") { Task { await model.runProfiling() } }
                         .controlSize(.small)
                         .disabled(model.isProfilingRunning || !model.canIndex)
                 }
@@ -520,7 +520,7 @@ private struct HistoryTab: View {
                     Text("\(model.recentHistoryCount) recent \u{00B7} \(model.bookmarkCount) bookmarked")
                         .foregroundStyle(.secondary).monospacedDigit()
                 }
-                Button("Clear Search History\u{2026}", role: .destructive) { confirmClear = true }
+                Button("Clear search history\u{2026}", role: .destructive) { confirmClear = true }
                     .disabled(model.recentHistoryCount == 0)
                     .help("Remove all recent searches. Your bookmarks are kept.")
             } footer: {
@@ -530,7 +530,7 @@ private struct HistoryTab: View {
         }
         .formStyle(.grouped)
         .confirmationDialog("Clear all recent searches?", isPresented: $confirmClear) {
-            Button("Clear Search History", role: .destructive) { model.clearSearchHistory() }
+            Button("Clear search history", role: .destructive) { model.clearSearchHistory() }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Your bookmarked searches will be kept.")

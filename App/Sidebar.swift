@@ -62,16 +62,16 @@ struct Sidebar: View {
                         // a paused folder is excluded from indexing and from live file-change
                         // updates; its already-indexed files stay searchable.
                         if model.isFolderPaused(url) {
-                            Button("Resume This Folder") { model.setFolderPaused(url, false) }
+                            Button("Resume this folder") { model.setFolderPaused(url, false) }
                         } else {
-                            Button("Pause This Folder") { model.setFolderPaused(url, true) }
+                            Button("Pause this folder") { model.setFolderPaused(url, true) }
                         }
                         Button("Reveal in Finder") { NSWorkspace.shared.revealAsync(url) }
                         // Swap the folder map to the OTHER projection (the same app-wide setting as
                         // Settings > Folder map layout), mirroring the Pause/Resume idiom above.
                         // Selecting the folder first makes the map visible in the new layout right
                         // away; the mode's didSet clears the layout cache and re-fits it.
-                        Button(model.mapUsesUMAP ? "Use Fast Map Layout" : "Use Detailed Map Layout") {
+                        Button(model.mapUsesUMAP ? "Use fast map layout" : "Use detailed map layout") {
                             selection = .folder(url)
                             model.mapUsesUMAP.toggle()
                         }
@@ -80,7 +80,7 @@ struct Sidebar: View {
                     }
                     .tag(SidebarSelection.folder(url))
                 }
-                Button { pickFolder() } label: { Label("Add Folder\u{2026}", systemImage: "plus") }
+                Button { pickFolder() } label: { Label("Add folder\u{2026}", systemImage: "plus") }
                     .buttonStyle(.plain)
             }
 
@@ -213,7 +213,7 @@ private struct HistorySections: View {
                     }
                     .help(item.isFile ? (item.filePath ?? item.displayLabel) : item.query)
                     .contextMenu {
-                        Button(item.bookmarked ? "Remove Bookmark" : "Bookmark") { model.toggleHistoryBookmark(item) }
+                        Button(item.bookmarked ? "Remove bookmark" : "Bookmark") { model.toggleHistoryBookmark(item) }
                         Divider()
                         Button("Remove") { model.removeHistory(item) }
                     }

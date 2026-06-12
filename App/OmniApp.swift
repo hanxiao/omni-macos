@@ -17,12 +17,12 @@ struct OmniApp: App {
         .commands {
             CommandGroup(replacing: .appInfo) {
                 Button("About Omni") { showAbout() }
-                Button("Check for Updates\u{2026}") { Updater.check(userInitiated: true) }
+                Button("Check for updates\u{2026}") { Updater.check(userInitiated: true) }
                 Divider()
                 // Benchmarks this Mac on a fixed 5000-file dataset; results (hardware + timing only)
                 // can be shared to hanxiao.io/omni.
                 // No ellipsis: the command runs immediately, with no further input (HIG).
-                Button("Run Benchmark") { Task { await model.runProfiling() } }
+                Button("Run benchmark") { Task { await model.runProfiling() } }
                     .disabled(model.isProfilingRunning || !model.canIndex)
             }
             // The primary actions on the selected result, reachable from the menu bar and keyboard
@@ -41,22 +41,22 @@ struct OmniApp: App {
                 // inside a closed context menu never fire on macOS, so the app's own Shortcuts
                 // window was advertising a dead Option-Cmd-F. The context-menu items remain as
                 // click targets naming the same chords.
-                Button("Find Similar") { model.findSimilarSelected() }
+                Button("Find similar") { model.findSimilarSelected() }
                     .keyboardShortcut("f", modifiers: [.command, .option])
                     .disabled(!model.hasSelection)
-                Button("Copy Path") { model.copySelectedPath() }
+                Button("Copy path") { model.copySelectedPath() }
                     .keyboardShortcut("c", modifiers: [.command, .option])
                     .disabled(!model.hasSelection)
                 Divider()
                 // Search-level actions in one group: start a search from a file, save the
                 // current one. (A lone item between two separators reads as over-separation.)
-                Button("Search by a File\u{2026}") { model.searchByFilePanel() }
+                Button("Search by a file\u{2026}") { model.searchByFilePanel() }
                     .keyboardShortcut("o", modifiers: [.command, .shift])
                     .disabled(model.phase != .ready)
                 // Bookmark the current search. The menu bar owns the Cmd-D shortcut (always present,
                 // just disabled when there's nothing to save) so it works even when the toolbar star
                 // is hidden; the toolbar button is a click target that names the same shortcut.
-                Button(model.currentSearchIsBookmarked ? "Remove Bookmark" : "Bookmark Search") {
+                Button(model.currentSearchIsBookmarked ? "Remove bookmark" : "Bookmark search") {
                     model.toggleBookmarkCurrentSearch()
                 }
                 .keyboardShortcut("d", modifiers: .command)
@@ -64,7 +64,7 @@ struct OmniApp: App {
             }
             // Add to the SYSTEM View menu (which NavigationSplitView already provides with Show
             // Sidebar / Full Screen) instead of declaring a second "View" CommandMenu - otherwise
-            // the menu bar shows two "View" menus. Cmd-1 gallery, Cmd-2 list, plus Sort By.
+            // the menu bar shows two "View" menus. Cmd-1 gallery, Cmd-2 list, plus Sort by.
             CommandGroup(after: .sidebar) {
                 Divider()
                 // Inline Picker so the active mode gets a checkmark (Finder-style); the Cmd-1/Cmd-2
@@ -76,17 +76,17 @@ struct OmniApp: App {
                 .pickerStyle(.inline)
                 .labelsHidden()
                 Divider()
-                Picker("Sort By", selection: Binding(get: { model.sortOrder }, set: { model.sortOrder = $0 })) {
+                Picker("Sort by", selection: Binding(get: { model.sortOrder }, set: { model.sortOrder = $0 })) {
                     ForEach(SortOrder.allCases) { Text($0.title).tag($0) }
                 }
             }
             CommandGroup(after: .toolbar) {
                 // Cmd-Shift-I, not Cmd-R: in a file browser Cmd-R reads as Finder's Show Original /
                 // Reload, so it is reserved (Reveal uses Cmd-Shift-R above).
-                Button(model.isPaused ? "Resume Indexing" : (model.indexedFiles == 0 ? "Index" : "Update")) { model.startIndexing() }
+                Button(model.isPaused ? "Resume indexing" : (model.indexedFiles == 0 ? "Index" : "Update")) { model.startIndexing() }
                     .keyboardShortcut("i", modifiers: [.command, .shift])
                     .disabled(model.isIndexing || !model.canIndex)
-                Button("Pause Indexing") { model.pauseIndexing() }
+                Button("Pause indexing") { model.pauseIndexing() }
                     .disabled(!model.isIndexing)
             }
             // Focus the toolbar search field (.searchable doesn't bind ⌘F on its own).
@@ -99,8 +99,8 @@ struct OmniApp: App {
                 .keyboardShortcut("f", modifiers: .command)
             }
             CommandGroup(replacing: .help) {
-                Button("Omni Website") { NSWorkspace.shared.open(URL(string: "https://hanxiao.io/omni")!) }
-                Button("Omni Keyboard Shortcuts") { showShortcuts() }
+                Button("Omni website") { NSWorkspace.shared.open(URL(string: "https://hanxiao.io/omni")!) }
+                Button("Omni keyboard shortcuts") { showShortcuts() }
                     .keyboardShortcut("/", modifiers: .command)
             }
         }
@@ -118,7 +118,7 @@ struct OmniApp: App {
             w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return
         }
         let win = NSWindow(contentViewController: NSHostingController(rootView: ShortcutsView()))
-        win.title = "Keyboard Shortcuts"
+        win.title = "Keyboard shortcuts"
         win.styleMask = [.titled, .closable]
         win.isReleasedWhenClosed = false      // keep the retained instance so reopening is instant
         win.center()
@@ -144,21 +144,21 @@ struct OmniApp: App {
     }
 }
 
-/// The keyboard-shortcuts reference (Help > Omni Keyboard Shortcuts, Cmd-/). Two aligned columns:
+/// The keyboard-shortcuts reference (Help > Omni keyboard shortcuts, Cmd-/). Two aligned columns:
 /// the action, and its keys rendered as monospaced key-caps - the native macOS reference style,
 /// replacing the old tab-aligned NSAlert text.
 private struct ShortcutsView: View {
     private let rows: [(action: String, keys: [String])] = [
-        ("Focus Search", ["\u{2318}F"]),
-        ("Search by a File", ["\u{21E7}\u{2318}O"]),
-        ("Find Similar", ["\u{2325}\u{2318}F"]),
-        ("Bookmark Search", ["\u{2318}D"]),
+        ("Focus search", ["\u{2318}F"]),
+        ("Search by a file", ["\u{21E7}\u{2318}O"]),
+        ("Find similar", ["\u{2325}\u{2318}F"]),
+        ("Bookmark search", ["\u{2318}D"]),
         ("Open", ["\u{2318}O", "\u{21A9}"]),
         ("Quick Look", ["\u{2318}Y", "Space"]),
         ("Reveal in Finder", ["\u{21E7}\u{2318}R"]),
         ("Gallery / List", ["\u{2318}1", "\u{2318}2"]),
         ("Index / Update / Resume", ["\u{21E7}\u{2318}I"]),
-        ("Move Selection", ["\u{2191}\u{2193}\u{2190}\u{2192}"]),
+        ("Move selection", ["\u{2191}\u{2193}\u{2190}\u{2192}"]),
     ]
     var body: some View {
         Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 10) {
