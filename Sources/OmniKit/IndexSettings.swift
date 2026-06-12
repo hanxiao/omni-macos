@@ -6,8 +6,12 @@ public struct IndexSettings: Sendable, Equatable {
     /// Cap the largest image/PDF-page side decoded for embedding. The vision model
     /// resizes to <= ~1.3MP anyway, so decoding larger wastes time and memory.
     public var maxImageDimension: Int = 1568
-    /// Frames sampled per video.
-    public var maxVideoFrames: Int = 6
+    /// Frames sampled uniformly per video (per 240 s segment for videos longer than one).
+    /// 32 matches the reference pipeline's evaluation policy, and the shared smart_resize
+    /// pixel budget makes it cost the same GPU tokens as 16 for >= 720p sources (measured:
+    /// 595 ms/6222 tok at 16 vs 590 ms/5830 tok at 32 on a 720p clip); perceptual dedup
+    /// collapses the static low-res case where extra frames would actually cost.
+    public var maxVideoFrames: Int = 32
     /// Longest text slice (characters) embedded as one chunk; longer text is split with overlap.
     public var maxCharsPerChunk: Int = 1800
 

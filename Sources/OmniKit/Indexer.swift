@@ -118,6 +118,10 @@ final class DecodedItem: @unchecked Sendable {
                    // Long audio (> one 240 s segment): the first segment's mel plus the open
                    // reader; the embed stage streams the rest with a prefetch, like .pdfScan.
                    audioSegments(mel: [Float], frames: Int, reader: OmniAudioPreprocess.AudioSegmentReader),
+                   // Long video (> one 240 s segment): parameters only - frame extraction is
+                   // seek-based and stateless, so the embed stage samples each segment lazily
+                   // with a prefetch. Nothing big crosses the decode boundary.
+                   videoSegments(duration: Double, maxFrames: Int, maxDimension: Int),
                    duplicate([IndexedChunk]) }   // content-dedup hit: rows ready to store, no embed needed
     let file: CrawledFile
     let kind: String
@@ -233,6 +237,17 @@ public final class Indexer: @unchecked Sendable {
     // long clip's Lmax wastes quadratic backbone work), so a bigger cap buys nothing here.
     public var audioFrameBudget = 24000
     public var audioMaxClipsPerBatch = 16
+
+    /// Seconds per long-media segment chunk (audio derives the same 240 s from its mel-frame
+    /// budget; video shares the window so audio and video locators line up).
+    static let mediaSegmentSeconds: Double = 240
+
+    /// Start-of-segment timestamp locator: "4:00", "1:20:00".
+    static func timeLocator(_ seconds: Double) -> String {
+        let s = Int(seconds)
+        return s >= 3600 ? String(format: "%d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60)
+                         : String(format: "%d:%02d", s / 60, s % 60)
+    }
 
     // NOTE: pass settings are deliberately NOT stored on self: decode workers run on concurrent
     // queues, and a second pass starting on another thread (rapid toggle/ignore-edit flows) would
@@ -954,6 +969,18 @@ public final class Indexer: @unchecked Sendable {
         }
 
         if category == .video {
+            // A video longer than one segment streams per 240 s window in the embed stage
+            // (one embedding + timestamp locator per window), mirroring long audio - a 3-hour
+            // recording becomes fully searchable instead of compressing into one start-biased
+            // vector. Frame extraction is stateless seeks, so the payload carries parameters
+            // only. Videos within one segment keep the single-clip path.
+            if meta.duration.isFinite, meta.duration > Self.mediaSegmentSeconds {
+                return DecodedItem(file: file, kind: kind,
+                                   payload: .videoSegments(duration: meta.duration,
+                                                           maxFrames: settings.maxVideoFrames,
+                                                           maxDimension: settings.maxImageDimension),
+                                   meta: meta, contentKey: contentKey)
+            }
             let frames = FileExtractor.videoFrames(file.url, maxFrames: settings.maxVideoFrames, maxDimension: settings.maxImageDimension)
             return frames.isEmpty ? DecodedItem(file: file) : DecodedItem(file: file, kind: kind, payload: .images(frames), meta: meta, contentKey: contentKey)
         }
@@ -1013,7 +1040,8 @@ public final class Indexer: @unchecked Sendable {
         switch category {
         case .text:  fp = "c\(settings.maxCharsPerChunk)|o\(chunkOverlap)|d\(settings.maxImageDimension)"   // d: scanned-PDF render size
         case .image: fp = "d\(settings.maxImageDimension)"
-        case .video: fp = "d\(settings.maxImageDimension)|f\(settings.maxVideoFrames)"
+        // v2: uniform frame sampling + 240 s segmentation (pre-upgrade rows must not alias).
+        case .video: fp = "v2|d\(settings.maxImageDimension)|f\(settings.maxVideoFrames)|s\(Int(Self.mediaSegmentSeconds))"
         case .audio: fp = "s\(OmniAudioPreprocess.segmentMelFrames)"   // segmenting changes long-audio chunking
         }
         return "1|\(category.rawValue)|\(ext)|m\(embedder.dim)|\(fp)|\(digest)"
@@ -1119,7 +1147,54 @@ public final class Indexer: @unchecked Sendable {
         case .audioSegments(let mel, let frames, let reader):
             return embedStreamedAudio(file: file, kind: kind, firstMel: mel, firstFrames: frames,
                                       reader: reader, duration: meta.duration)
+        case .videoSegments(let duration, let maxFrames, let maxDimension):
+            return embedStreamedVideo(file: file, kind: kind, duration: duration,
+                                      maxFrames: maxFrames, maxDimension: maxDimension)
         }
+    }
+
+    /// Stream-embed video of ANY length: one embedding per 240 s segment, sampling the NEXT
+    /// segment's frames on a background queue while the GPU embeds the current one - the video
+    /// twin of embedStreamedAudio. Frame extraction is stateless keyframe seeks, so peak memory
+    /// is two segments' frames regardless of duration. Chunks carry start-timestamp locators.
+    func embedStreamedVideo(file: CrawledFile, kind: String, duration: Double,
+                            maxFrames: Int, maxDimension: Int) -> [IndexedChunk] {   // internal for tests
+        final class Box: @unchecked Sendable { var frames: [CGImage] = [] }
+        let seg = Self.mediaSegmentSeconds
+        let count = max(1, Int(ceil(duration / seg)))
+        func sample(_ k: Int) -> [CGImage] {
+            isCancelled ? [] : FileExtractor.videoFrames(file.url, maxFrames: maxFrames, maxDimension: maxDimension,
+                                                         start: Double(k) * seg, end: Swift.min(duration, Double(k + 1) * seg))
+        }
+        let prefetchQ = DispatchQueue(label: "omni.indexer.video-prefetch")
+        var out: [IndexedChunk] = []
+        var current = sample(0)
+        var k = 0
+        while k < count {
+            // Cancel contract: never return a partial chunk set (it would be stored under the
+            // file's current mtime and silently truncate it forever) - same as embedScannedPDF.
+            if isCancelled { return [] }
+            let box = Box()
+            let sync = DispatchGroup()
+            if k + 1 < count {
+                sync.enter()
+                prefetchQ.async { box.frames = sample(k + 1); sync.leave() }
+            }
+            if !current.isEmpty {
+                guard let vec = embedder.embedVideoFrames(current) else {
+                    sync.wait()
+                    return []   // vision path unavailable: nothing to index
+                }
+                out.append(IndexedChunk(path: file.url.path, modified: file.modified, size: file.size,
+                                        kind: kind, chunkIndex: k, snippet: file.url.lastPathComponent,
+                                        embedding: vec, duration: duration,
+                                        locator: Self.timeLocator(Double(k) * seg)))
+            }
+            sync.wait()
+            current = box.frames
+            k += 1
+        }
+        return out
     }
 
     /// Stream-embed audio of ANY length: one embedding per 240 s segment, decoding the NEXT
@@ -1139,9 +1214,7 @@ public final class Indexer: @unchecked Sendable {
         var exhausted = false
         var seg = 0
         func locator(_ index: Int) -> String {
-            let s = Int(Double(index) * OmniAudioPreprocess.segmentSeconds)
-            return s >= 3600 ? String(format: "%d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60)
-                             : String(format: "%d:%02d", s / 60, s % 60)
+            Self.timeLocator(Double(index) * OmniAudioPreprocess.segmentSeconds)
         }
         while let cur = current {
             // Cancel contract: never return a partial chunk set (it would be stored under the
