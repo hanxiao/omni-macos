@@ -1508,15 +1508,18 @@ if args.count >= 4 && args[1] == "dedupbench" {
     func pass(_ label: String, force: Bool) async {
         let t0 = Date()
         let tok0 = engine.tokensProcessed
+        let busy0 = engine.gpuBusySeconds
         let final: IndexProgress = await withCheckedContinuation { cont in
             let done = NSLock(); var fired = false
             idx.index(roots: [target], settings: IndexSettings(), force: force) { p in
                 if p.done { done.lock(); let go = !fired; fired = true; done.unlock(); if go { cont.resume(returning: p) } }
             }
         }
-        print(String(format: "DEDUPBENCH %@  %.2fs  embedded=%d skipped=%d unchanged=%d failed=%d  gpuTokens=%d  (dedup=%@)",
-                     label, -t0.timeIntervalSinceNow, final.embedded, final.skipped, final.unchanged, final.failed,
-                     engine.tokensProcessed - tok0, Indexer.contentDedup ? "on" : "off"))
+        let wall = -t0.timeIntervalSinceNow
+        let busy = engine.gpuBusySeconds - busy0
+        print(String(format: "DEDUPBENCH %@  %.2fs  embedded=%d skipped=%d unchanged=%d failed=%d  gpuTokens=%d  gpuBusy=%.2fs (%.0f%%)  (dedup=%@)",
+                     label, wall, final.embedded, final.skipped, final.unchanged, final.failed,
+                     engine.tokensProcessed - tok0, busy, 100 * busy / max(0.001, wall), Indexer.contentDedup ? "on" : "off"))
     }
     await pass("fresh ", force: true)
     // Touch storm: bump every file's mtime without changing a byte (sync helper: enumerator
