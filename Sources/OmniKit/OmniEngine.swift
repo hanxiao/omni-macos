@@ -599,6 +599,29 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     /// Returns one vector per clip, in input order. The caller bounds N by a frame budget.
     public func embedAudioMelBatch(_ mels: [[Float]], frames: [Int]) -> [[Float]]? {
         guard let enc = audioEncoder, !mels.isEmpty else { return nil }
+        // While the user is searching, embed ONE clip per gate hold so a query preempts after ~one
+        // clip (~76ms measured) instead of waiting behind the whole cross-file batch - measured: a
+        // ~16-clip audio batch holds the gate ~0.97s in a SINGLE forward. This is the audio analogue
+        // of the per-image carve. Two differences from images: (1) audio batching DOES help
+        // throughput (~1.25x measured), so carving costs that during the 2s interactive window -
+        // acceptable: interactivity beats background audio throughput while actively searching, and
+        // full batching resumes when idle; (2) the carved per-clip embed is enc.encode(mel:) - the
+        // SAME call embedStreamedAudio uses per segment for long audio - so carved short-audio
+        // vectors are computed identically to long-audio segments (a consistency win), differing
+        // from the idle mixed-length batch only by the block-diagonal numerical effect (cos ~0.9999,
+        // the same batch-composition variance the index already carries). OMNI_MEDIA_CARVE=0 reverts.
+        if interactiveQueryActive, mels.count > 1, Self.mediaCarve {
+            var out: [[Float]] = []; out.reserveCapacity(mels.count)
+            for (mel, fr) in zip(mels, frames) {
+                let v = run(highPriority: false) { () -> [Float] in
+                    let vv = enc.encode(mel: mel, frames: fr, prefixIds: docPrefix, suffixIds: mediaSuffix)
+                    addTokens(enc.lastSequenceLength)
+                    return vv
+                }
+                out.append(v)
+            }
+            return out
+        }
         return run(highPriority: false) {
             let v = enc.encodeBatch(mels: mels, frames: frames, prefixIds: docPrefix, suffixIds: mediaSuffix)
             addTokens(enc.lastSequenceLength)
