@@ -535,6 +535,9 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     /// defaulting it off reclaims ~1.9% indexing throughput everywhere. OMNI_INDEX_GATE_BATCHES still
     /// caps it for a no-keystroke workload (e.g. the serving API searching during a heavy index pass).
     static let indexGateWindow: Int = (ProcessInfo.processInfo.environment["OMNI_INDEX_GATE_BATCHES"].flatMap { Int($0) }) ?? Int.max
+    /// Carve a multi-image embed into one-image gate holds while a query is active (see embedImages).
+    /// OMNI_MEDIA_CARVE=0 reverts to one whole-batch hold (the old behavior) for A/B.
+    static let mediaCarve = ProcessInfo.processInfo.environment["OMNI_MEDIA_CARVE"] != "0"
 
 
     public func embedImage(_ image: CGImage) -> [Float]? {
@@ -547,6 +550,26 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     /// One block-diagonal vision forward per `patchBudget` chunk; returns one vector per input.
     public func embedImages(_ raws: [OmniVisionPreprocess.RawPatches]) -> [[Float]]? {
         guard let enc = imageEncoder, !raws.isEmpty else { return nil }
+        // While the user is searching, embed ONE image per gate hold so an interactive query preempts
+        // after ~one image (~300ms) instead of waiting behind the whole batch - measured: an 8-image
+        // batch is ~2.3s in a SINGLE gate hold, and a query (incl. at startup, when the catch-up pass
+        // embeds a media backlog) waited 1-3s behind it. This is the media analogue of the text
+        // per-batch carving (the text path already shrinks its gate window when interactiveQueryActive).
+        // Block-diagonal image batching gives ~0 GPU throughput (the vision tower is saturated per
+        // image - measured), so splitting it costs ~nothing; vectors are per-image independent (same
+        // cu_seqlens forward), so bit-identical. Full batch when idle (max indexing pipeline overlap).
+        if interactiveQueryActive, raws.count > 1, Self.mediaCarve {
+            var out: [[Float]] = []; out.reserveCapacity(raws.count)
+            for r in raws {
+                let v = run(highPriority: false) { () -> [[Float]] in
+                    let vv = enc.encode(images: [(pixelValues: r.tensor(), gridTHW: r.gridTHW)], prefixIds: docPrefix, suffixIds: mediaSuffix)
+                    addTokens(enc.lastSequenceLength)
+                    return vv
+                }
+                out.append(contentsOf: v)
+            }
+            return out
+        }
         return run(highPriority: false) {
             // Build tensors on the GPU thread (MLXArray is not Sendable, so it can't cross the
             // decode boundary). Then one batched encode.

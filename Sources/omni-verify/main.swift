@@ -2123,6 +2123,31 @@ if args.count >= 2 && args[1] == "nanretrycheck" {
     exit(try nanretrycheckRun())
 }
 
+// Cold-start compile cost: omni-verify coldstart <modelDir>
+// Times the FIRST (cold, kernels uncompiled) vs SECOND (warm) of each GPU path, to see what a
+// search/index pays at app launch before anything is warmed. The live app uses loadValidated which
+// runs a MEDIA self-test (warms vision/audio) but NOT a text forward - so the first text query and
+// the first INDEXING text batch compile cold at startup, and a query fired then waits behind the
+// indexing batch's compile on the gate. This isolates that.
+if args.count >= 3 && args[1] == "coldstart" {
+    let t0 = Date()
+    let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))   // bare init, no media warmup
+    print(String(format: "engine init: %.0f ms", -t0.timeIntervalSinceNow * 1000))
+    func t(_ f: () -> Void) -> Double { let s = Date(); f(); return -s.timeIntervalSinceNow * 1000 }
+    let q1 = t { _ = engine.embedQuery("quarterly revenue report about cloud") }
+    let q2 = t { _ = engine.embedQuery("machine learning infrastructure budget") }
+    print(String(format: "embedQuery:           cold=%5.0f ms  warm=%4.0f ms  (compile~%.0f ms)", q1, q2, max(0, q1 - q2)))
+    let batch = (0 ..< 16).map { "document chunk \($0) describing cloud growth and machine learning infrastructure planning across the org for next year in some detail to fill a realistic chunk length" }
+    let b1 = t { _ = engine.embedTextBatches([batch], as: .passage) }
+    let b2 = t { _ = engine.embedTextBatches([batch], as: .passage) }
+    print(String(format: "embedTextBatches(16): cold=%5.0f ms  warm=%4.0f ms  (compile~%.0f ms)  <- the indexer's first batch", b1, b2, max(0, b1 - b2)))
+    // And a full 6-batch flush (textStageWindow) cold, since the first real flush is this size.
+    let flush = (0 ..< 6).map { _ in batch }
+    let f1 = t { _ = engine.embedTextBatches(flush, as: .passage) }   // already warm now, for reference
+    print(String(format: "embedTextBatches(6x16) warm=%.0f ms (a full flush, post-compile)", f1))
+    exit(0)
+}
+
 // Stat-scan cost: omni-verify statbench <index.sqlite> [root1,root2,...]
 // Times the per-tick stats refreshIndexStats runs every 1.5s during indexing: allIndexStats and
 // indexSummary do a full O(rows) scan (path Set, ext NSString alloc, per-folder prefix matching)
