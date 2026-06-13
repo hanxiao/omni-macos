@@ -1959,6 +1959,13 @@ final class AppModel {
                 await MainActor.run {
                     guard token == self.searchToken else { return }
                     self.searching = false
+                    // Arm the GPU buffer-cache trim after this search's GPU work. The MLX cache
+                    // fills from search (the file embed + the store matmul), and was previously
+                    // armed ONLY by an indexing pass - so a search-only session (the steady state
+                    // once the index is built) never reclaimed it and the footprint sat at the
+                    // cache limit (up to half the memory budget) all session. On a low-RAM Mac that
+                    // is real memory pressure. It now reclaims ~OMNI_IDLE_TRIM s after the user stops.
+                    self.engine?.indexingIdle()
                     guard let vec, let hits else {
                         self.queryError = "Couldn't read \(url.lastPathComponent) as a query."
                         self.rawResults = []; self.resolvedQuery = self.fileToken(url)
@@ -1991,6 +1998,7 @@ final class AppModel {
                     self.lastQueryVector = cached
                     self.applyResults(hits, resolved: q)
                     self.searching = false
+                    self.engine?.indexingIdle()   // arm the buffer-cache trim (see file-query path)
                 }
             }
             return
@@ -2015,6 +2023,7 @@ final class AppModel {
                 self.lastQueryVector = vec
                 self.applyResults(hits, resolved: q)
                 self.searching = false
+                self.engine?.indexingIdle()   // arm the buffer-cache trim (see file-query path)
             }
         }
     }
