@@ -112,8 +112,30 @@ public struct SearchFilter: Sendable {
     func accepts(path: String, kind: String, modified: Double) -> Bool {
         if !kinds.isEmpty && !kinds.contains(kind) { return false }
         if let f = folderPrefix, !(path == f || path.hasPrefix(f + "/")) { return false }
-        if let e = ext, !e.isEmpty, !path.lowercased().hasSuffix("." + e.lowercased()) { return false }
+        if let e = ext, !e.isEmpty, !Self.hasExtensionCI(path, e) { return false }
         if let s = since, modified < s { return false }
+        return true
+    }
+
+    /// Case-insensitive ".<ext>" suffix test over UTF-8 bytes, allocation-free. The old check did
+    /// `path.lowercased().hasSuffix(...)` which allocates a lowercased copy of the WHOLE path - and
+    /// the filtered reduce calls accepts once per per-file winner, so on a large filtered search that
+    /// was ~fileCount path-lowercased allocations (measured meaningful at 100k+ files, ~linear to 2M).
+    /// Extensions are ASCII, so an ASCII byte fold is exact (lowercasing non-ASCII path bytes ahead of
+    /// the dot never affects the ".ext" suffix). `ext` is the extension without a dot.
+    @inline(__always) static func hasExtensionCI(_ path: String, _ ext: String) -> Bool {
+        let p = path.utf8, e = ext.utf8
+        let need = e.count + 1
+        guard p.count >= need else { return false }
+        var pi = p.index(p.endIndex, offsetBy: -need)
+        if p[pi] != UInt8(ascii: ".") { return false }
+        pi = p.index(after: pi)
+        for eb in e {
+            var pb = p[pi]; if pb >= 65 && pb <= 90 { pb += 32 }   // ASCII upper -> lower
+            var el = eb;    if el >= 65 && el <= 90 { el += 32 }
+            if pb != el { return false }
+            pi = p.index(after: pi)
+        }
         return true
     }
 }
