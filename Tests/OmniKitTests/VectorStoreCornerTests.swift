@@ -63,6 +63,57 @@ final class VectorStoreCornerTests: XCTestCase {
         }
     }
 
+    /// A kind-filtered query rides the GPU reduce (mlxKindCode mask) instead of the host scan. The
+    /// mask must keep every allowed-kind file and exclude every disallowed-kind file, bit-for-bit
+    /// with the host reducer - across BOTH the base and the delta (rows inserted after the base was
+    /// built, masked on the host side of the merge). Planted exact-match files make the assertion
+    /// unambiguous (score ~1.0, no tie). The reducecheck bench proves full FNV parity; this locks the
+    /// core semantics into CI.
+    func testKindFilterGPUReduceKeepsAllowedExcludesDisallowed() throws {
+        let store = try VectorStore(dbURL: tempDB())
+        var rng = XorShift(2024)
+        let dim = 32
+        let q = rvec(dim, &rng)
+        // Background noise: 1000 files cycling four kinds, random vectors (none an exact match).
+        let kinds = ["text", "image", "scan", "audio"]
+        for i in 0 ..< 1000 {
+            let p = "/bg\(i)"
+            try store.replace(path: p, chunks: [chunk(p, 0, rvec(dim, &rng), kind: kinds[i % 4])])
+        }
+        // Planted exact matches of q in two kinds: one allowed (image), one disallowed (audio).
+        try store.replace(path: "/hit_image", chunks: [chunk("/hit_image", 0, q, kind: "image")])
+        try store.replace(path: "/hit_audio", chunks: [chunk("/hit_audio", 0, q, kind: "audio")])
+        _ = store.search(q, topK: 10)   // build the base over everything so far
+
+        var f = SearchFilter(); f.kinds = ["image"]
+        let baseHits = store.search(q, filter: f, topK: 20)
+        XCTAssertTrue(baseHits.allSatisfy { $0.kind == "image" }, "kind mask let a non-image file through")
+        XCTAssertEqual(baseHits.first?.path, "/hit_image", "the allowed exact match must rank first")
+        XCTAssertEqual(baseHits.first?.score ?? 0, 1.0, accuracy: 2e-2)
+        XCTAssertFalse(baseHits.contains { $0.path == "/hit_audio" }, "a disallowed-kind exact match must be excluded")
+
+        // Delta path: insert a second image exact-match AFTER the base was built (lands in the delta,
+        // masked on the host side of the GPU reduce's merge loop).
+        try store.replace(path: "/hit_image2", chunks: [chunk("/hit_image2", 0, q, kind: "image")])
+        try store.replace(path: "/hit_audio2", chunks: [chunk("/hit_audio2", 0, q, kind: "audio")])
+        let deltaHits = store.search(q, filter: f, topK: 20)
+        XCTAssertTrue(deltaHits.allSatisfy { $0.kind == "image" }, "delta kind mask let a non-image file through")
+        XCTAssertEqual(Set(deltaHits.prefix(2).map { $0.path }), ["/hit_image", "/hit_image2"],
+                       "both image exact matches (base + delta) must top the results")
+        XCTAssertFalse(deltaHits.contains { $0.path.hasPrefix("/hit_audio") }, "disallowed-kind delta row must be excluded")
+
+        // Multi-kind filter: image OR scan. Audio/text excluded; the two image hits still present.
+        var f2 = SearchFilter(); f2.kinds = ["image", "scan"]
+        let multiHits = store.search(q, filter: f2, topK: 20)
+        XCTAssertTrue(multiHits.allSatisfy { $0.kind == "image" || $0.kind == "scan" }, "multi-kind mask let a forbidden kind through")
+        XCTAssertTrue(Set(multiHits.map { $0.path }).isSuperset(of: ["/hit_image", "/hit_image2"]))
+        XCTAssertFalse(multiHits.contains { $0.path.hasPrefix("/hit_audio") })
+
+        // A filter matching no present kind returns empty (every row masked to -inf).
+        var f3 = SearchFilter(); f3.kinds = ["video"]
+        XCTAssertTrue(store.search(q, filter: f3, topK: 20).isEmpty, "filter with no matching kind must return nothing")
+    }
+
     /// Delete every path, then search returns empty and internal state is consistent.
     func testDeleteAllThenSearchEmpty() throws {
         let store = try VectorStore(dbURL: tempDB())
