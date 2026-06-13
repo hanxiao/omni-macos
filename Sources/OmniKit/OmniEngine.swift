@@ -526,19 +526,15 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     }
 
     /// Batches embedded per gate hold for a NON-actively-searched indexing flush (see embedTextBatches).
-    /// While the user is interacting, noteInteractive() puts the indexer in per-batch (window 1) mode
-    /// regardless of this, so this only governs the non-interactive case. Real-app A/B (M3 Ultra):
-    /// with the keystroke signal, capping vs whole-flush moved a search's worst-case gate wait only
-    /// 31ms -> 12ms (both imperceptible) while costing ~1.9% indexing throughput - not worth it on a
-    /// fast GPU. So cap ONLY on low-end, where the in-flight flush is slow enough that bounding the
-    /// first-search-after-idle wait matters; high-end keeps the full double-buffered flush (0% cost).
-    /// OMNI_INDEX_GATE_BATCHES overrides either way.
-    static let indexGateWindow: Int = {
-        if let v = ProcessInfo.processInfo.environment["OMNI_INDEX_GATE_BATCHES"].flatMap({ Int($0) }) { return v }
-        let lowEnd = ProcessInfo.processInfo.environment["OMNI_FORCE_LOWEND"] != nil
-            || ProcessInfo.processInfo.physicalMemory < 16_000_000_000
-        return lowEnd ? 2 : Int.max
-    }()
+    /// Off by default (whole flush). noteInteractive() - fired on every keystroke - puts the indexer in
+    /// per-batch (window 1) mode while the user is interacting, and that ALONE keeps search responsive
+    /// during indexing. A/B with the keystroke signal present (including low-end paths + slow flushes):
+    /// capping vs whole-flush is within noise (cold+signal 227ms vs 236ms), because the active path
+    /// overrides this cap; the cap only helped the artificial no-keystroke case (193ms vs 316ms), which
+    /// real interactive searches never hit (typing/history/filter all route through noteInteractive). So
+    /// defaulting it off reclaims ~1.9% indexing throughput everywhere. OMNI_INDEX_GATE_BATCHES still
+    /// caps it for a no-keystroke workload (e.g. the serving API searching during a heavy index pass).
+    static let indexGateWindow: Int = (ProcessInfo.processInfo.environment["OMNI_INDEX_GATE_BATCHES"].flatMap { Int($0) }) ?? Int.max
 
 
     public func embedImage(_ image: CGImage) -> [Float]? {
