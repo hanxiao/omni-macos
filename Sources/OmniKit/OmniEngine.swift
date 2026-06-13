@@ -508,10 +508,20 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         }
     }
 
-    /// Batches embedded per gate hold for a non-actively-searched indexing flush (see embedTextBatches).
-    /// 2 caps a search's worst-case gate wait to ~2 indexing batches while keeping in-window double-
-    /// buffering. OMNI_INDEX_GATE_BATCHES overrides; a large value restores the old whole-flush hold.
-    static let indexGateWindow = (ProcessInfo.processInfo.environment["OMNI_INDEX_GATE_BATCHES"].flatMap { Int($0) }) ?? 2
+    /// Batches embedded per gate hold for a NON-actively-searched indexing flush (see embedTextBatches).
+    /// While the user is interacting, noteInteractive() puts the indexer in per-batch (window 1) mode
+    /// regardless of this, so this only governs the non-interactive case. Real-app A/B (M3 Ultra):
+    /// with the keystroke signal, capping vs whole-flush moved a search's worst-case gate wait only
+    /// 31ms -> 12ms (both imperceptible) while costing ~1.9% indexing throughput - not worth it on a
+    /// fast GPU. So cap ONLY on low-end, where the in-flight flush is slow enough that bounding the
+    /// first-search-after-idle wait matters; high-end keeps the full double-buffered flush (0% cost).
+    /// OMNI_INDEX_GATE_BATCHES overrides either way.
+    static let indexGateWindow: Int = {
+        if let v = ProcessInfo.processInfo.environment["OMNI_INDEX_GATE_BATCHES"].flatMap({ Int($0) }) { return v }
+        let lowEnd = ProcessInfo.processInfo.environment["OMNI_FORCE_LOWEND"] != nil
+            || ProcessInfo.processInfo.physicalMemory < 16_000_000_000
+        return lowEnd ? 2 : Int.max
+    }()
 
 
     public func embedImage(_ image: CGImage) -> [Float]? {
