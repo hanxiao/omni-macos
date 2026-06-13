@@ -1518,7 +1518,9 @@ final class AppModel {
         let fp = fingerprint
         let dimReady = engineDim > 0
         Task.detached(priority: .utility) {
+            let tStat = omniPerfEnabled ? Date() : nil
             let summary = store.indexSummary(folders: rootPaths)   // one pass + one lock for stats AND per-folder counts
+            if let tStat { omniPerfLog(String(format: "stat-tick=%.0fms", -tStat.timeIntervalSinceNow * 1000)) }
             let stats = (fileCount: summary.fileCount, chunkCount: summary.chunkCount, kinds: summary.kinds, exts: summary.exts)
             let folders = summary.folderCounts
             let size = store.sizeBytes()
@@ -2003,12 +2005,14 @@ final class AppModel {
             }
             return
         }
+        let indexingNow = indexState == .indexing || !activeRoots.isEmpty   // snapshot for the perf log
         searchWorkTask = Task.detached(priority: .userInitiated) {
             if Task.isCancelled { return }
             // Sync-fused when available: the store's single eval drives the query forward, the
             // scan, and the reduce in one GPU round-trip; the vector reads back for free after.
             let vec: [Float]
             let hits: [SearchHit]
+            let tSearch = omniPerfEnabled ? Date() : nil
             if let g = engine.queryVectorGraph(q) {
                 if Task.isCancelled { return }
                 (hits, vec) = store.search(queryGraph: g, filter: filter, topK: 60)
@@ -2017,6 +2021,7 @@ final class AppModel {
                 if Task.isCancelled { return }   // superseded while embedding: don't run the store scan
                 hits = store.search(vec, filter: filter, topK: 60)
             }
+            if let tSearch { omniPerfLog(String(format: "search total=%.0fms indexing=%@ hits=%d", -tSearch.timeIntervalSinceNow * 1000, indexingNow ? "YES" : "no", hits.count)) }
             await MainActor.run {
                 guard token == self.searchToken else { return }
                 self.cacheQueryVector(q, vec)

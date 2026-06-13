@@ -134,6 +134,18 @@ public func omniSetMemoryLimit(_ bytes: Int) {
 /// Physical RAM in bytes (for choosing a sensible memory-limit slider range).
 public func omniPhysicalMemory() -> Int { Int(ProcessInfo.processInfo.physicalMemory) }
 
+// Opt-in perf log for diagnosing search/index latency on REAL hardware (esp. low-end, where the
+// in-flight indexing flush is slow enough that the gate wait actually bites). Enable by launching
+// the binary from a terminal with the env var and redirecting stderr, e.g.:
+//   OMNI_PERF_LOG=1 /Applications/Omni.app/Contents/MacOS/Omni 2> ~/omni-perf.log
+// then `grep search ~/omni-perf.log`. Lines: "gate-wait=Nms" (a query waiting behind indexing),
+// "search total=Nms indexing=YES|no ...", "stat-tick=Nms". Zero cost when off (one bool check).
+public let omniPerfEnabled = ProcessInfo.processInfo.environment["OMNI_PERF_LOG"] == "1"
+public func omniPerfLog(_ message: @autoclosure () -> String) {
+    guard omniPerfEnabled else { return }
+    FileHandle.standardError.write(Data(("[perf] " + message() + "\n").utf8))
+}
+
 public final class OmniEngine: Embedder, @unchecked Sendable {
     // var, not let: recoverMediaPath() swaps in freshly loaded encoders when a cold-load weight
     // corruption is detected at runtime. All reads/writes happen inside the run() gate.
@@ -321,12 +333,17 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     /// (indexing) calls; a low-priority call also yields whenever a high-priority call
     /// is queued, so a search waits at most one in-flight embed.
     private func run<T>(highPriority: Bool, _ work: () -> T) -> T {
+        let tWait = omniPerfEnabled ? Date() : nil
         cond.lock()
         if highPriority { highWaiting += 1 }
         while busy || (!highPriority && highWaiting > 0) { cond.wait() }
         busy = true
         if highPriority { highWaiting -= 1 }
         cond.unlock()
+        if highPriority, let tWait {   // how long an interactive query waited behind in-flight indexing
+            let w = -tWait.timeIntervalSinceNow * 1000
+            if w >= 1 { omniPerfLog(String(format: "gate-wait=%.0fms", w)) }
+        }
         let t0 = Date()
         let result = work()
         trimLock.withLock {
