@@ -439,6 +439,88 @@ if args.count >= 2 && args[1] == "reducecheck" {
     exit(0)
 }
 
+// Base-rebuild (fold) spike: omni-verify foldbench [baseRows] [deltaRows] [dim] [rounds]
+// Measures the rebuildBaseLocked cost - the full bf16 base re-upload that fires when the delta
+// outgrows foldThreshold (or a structural change dirties the base). The folding search (the one
+// that crosses the threshold) pays the rebuild; the next search does not. Their difference is the
+// rebuild spike. Reports it across rounds plus GPU peak memory (the 2x-base burst is what hurts
+// an 8GB machine). Model-free: random normalized bf16 rows, dim defaults to the real 1024.
+if args.count >= 2 && args[1] == "foldbench" {
+    let baseRows = (args.count >= 3 ? Int(args[2]) : nil) ?? 1_000_000
+    let deltaRows = (args.count >= 4 ? Int(args[3]) : nil) ?? 60_000   // > foldThreshold (50k)
+    let dim = (args.count >= 5 ? Int(args[4]) : nil) ?? 1024
+    let rounds = (args.count >= 6 ? Int(args[5]) : nil) ?? 3
+    let dbURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("omni-foldbench-\(ProcessInfo.processInfo.processIdentifier).sqlite")
+    defer { try? FileManager.default.removeItem(at: dbURL) }
+    let store = try VectorStore(dbURL: dbURL)
+    var rng: UInt64 = 0xF01D_BE47_1234_5678
+    func nextF() -> Float { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return Float(rng >> 40) / Float(1 << 24) - 0.5 }
+    func vec() -> [Float] {
+        var v = [Float](repeating: 0, count: dim); var nrm: Float = 0
+        for k in 0 ..< dim { let x = nextF(); v[k] = x; nrm += x * x }
+        let inv = nrm > 0 ? 1 / nrm.squareRoot() : 0
+        for k in 0 ..< dim { v[k] *= inv }; return v
+    }
+    print("foldbench  baseRows=\(baseRows)  deltaRows=\(deltaRows)  dim=\(dim)  bf16 base ~ \(String(format: "%.2f", Double(baseRows * dim * 2) / 1e9)) GB")
+    var batch: [(path: String, chunks: [IndexedChunk])] = []
+    var counter = 0
+    func flush() { if !batch.isEmpty { try? store.replaceMany(batch); batch.removeAll(keepingCapacity: true) } }
+    for _ in 0 ..< baseRows {
+        batch.append(("/f\(counter)", [IndexedChunk(path: "/f\(counter)", modified: 1, size: 1, kind: "text", chunkIndex: 0, snippet: "s", embedding: vec())])); counter += 1
+        if batch.count >= 8192 { flush() }
+    }
+    flush()
+    let q = vec()
+    _ = store.search(q, topK: 20)   // build the base over baseRows
+    print(String(format: "  GPU peak after base build: %.0f MB", Double(MLX.GPU.peakMemory) / 1_048_576))
+    // Optional background GPU load (OMNI_FOLD_LOAD=1): a thread submitting continuous bf16 matmuls
+    // to keep the MLX stream busy, the same contention domain the rebuild's eval competes in when a
+    // fold fires WHILE the indexer's embed kernels are in flight (rebuild runs on the store queue,
+    // embeds on the engine gate - they serialize only at the GPU stream). This turns the isolated
+    // rebuild cost into the real under-indexing spike.
+    final class GPULoad: @unchecked Sendable { var stop = false; var iters = 0 }
+    let load = GPULoad()
+    let loaded = ProcessInfo.processInfo.environment["OMNI_FOLD_LOAD"] == "1"
+    let loadThreads = (ProcessInfo.processInfo.environment["OMNI_FOLD_LOAD_THREADS"].flatMap { Int($0) }) ?? 2
+    if loaded {
+        // Allocation-CHURNING load: fresh arrays each iter (like indexing's per-forward allocations)
+        // so the rebuild's 4GB alloc must contend with / reclaim from MLX's buffer cache, plus a big
+        // matmul to saturate compute+bandwidth. Multiple threads to oversubscribe the GPU stream.
+        for _ in 0 ..< Swift.max(1, loadThreads) {
+            DispatchQueue.global(qos: .utility).async {
+                while !load.stop {
+                    let a = MLXArray.zeros([1024, dim], dtype: .bfloat16)
+                    let b = MLXArray.zeros([dim, 2 * dim], dtype: .bfloat16)
+                    let c = MLX.matmul(a, b).asType(.float32)
+                    MLX.eval(c); load.iters += 1
+                }
+            }
+        }
+        usleep(200_000)   // let the load threads get going
+    }
+    func median(_ n: Int, _ f: () -> Void) -> Double {
+        var ts: [Double] = []; for _ in 0 ..< n { let t = Date(); f(); ts.append(-t.timeIntervalSinceNow * 1000) }
+        return ts.sorted()[n / 2]
+    }
+    for r in 0 ..< rounds {
+        // Append a delta that crosses foldThreshold, then the FIRST search folds (rebuild), the rest don't.
+        for _ in 0 ..< deltaRows {
+            batch.append(("/f\(counter)", [IndexedChunk(path: "/f\(counter)", modified: 1, size: 1, kind: "text", chunkIndex: 0, snippet: "s", embedding: vec())])); counter += 1
+            if batch.count >= 8192 { flush() }
+        }
+        flush()
+        let peak0 = Double(MLX.GPU.peakMemory) / 1_048_576
+        let tFold = Date(); _ = store.search(q, topK: 20); let foldMs = -tFold.timeIntervalSinceNow * 1000
+        let peak1 = Double(MLX.GPU.peakMemory) / 1_048_576
+        let warmMs = median(9) { _ = store.search(q, topK: 20) }
+        print(String(format: "  round %d  rows=%d  FOLD search=%.1f ms   warm search=%.1f ms   rebuild spike=%.1f ms   GPU peak %.0f->%.0f MB%@",
+                     r, counter, foldMs, warmMs, foldMs - warmMs, peak0, peak1, loaded ? "  [under GPU load]" : ""))
+    }
+    load.stop = true
+    store.close()
+    exit(0)
+}
+
 // Search benchmark: omni-verify searchbench [N] [dim] [queries]
 // Compares brute-force cosine scoring: CPU vDSP fp32 (current), CPU cblas_sgemv fp32 (the
 // doc-claimed-but-unwired path), and GPU MLX bf16 (resident bf16 matrix, one matmul/query).
