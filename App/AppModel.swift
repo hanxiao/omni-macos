@@ -1118,6 +1118,11 @@ final class AppModel {
     /// (debounced) search. The box "owns only what it mentions": a filter the box previously set but
     /// no longer names is cleared, while a filter set via the toolbar menu is left untouched.
     func applyParsedQuery(_ raw: String) {
+        // Tell the engine the user is interacting NOW (this runs on every keystroke, ~180ms before the
+        // debounced search). The indexer then shrinks + gates its forwards per-batch before the search's
+        // embed takes the GPU gate, so the search preempts sooner instead of waiting behind a full
+        // in-flight indexing flush. Cheap (one lock); the gate-window cap bounds the in-flight flush.
+        engine?.noteInteractive()
         rawQuery = raw
         suggestionsAllowed = false   // programmatic box write by default; handleQueryEdit re-arms it for real typing
         if raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { literalQuery = false }

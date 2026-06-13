@@ -16,6 +16,36 @@ final class BenchFlag: @unchecked Sendable {
     func set(_ x: Bool) { l.lock(); v = x; l.unlock() }
 }
 
+/// Background "indexer" for the searchunderindex bench: loops embedding a flush (low-priority gate)
+/// then writing its rows (store queue), exactly the shape of the real flushText -> embedTextBatches
+/// -> replaceMany cycle, so the engine gate AND the store-queue contention are both faithful. All
+/// mutable state is lock-guarded so the @Sendable run() closure has no mutable captures.
+final class SearchUnderIndexBG: @unchecked Sendable {
+    private let engine: OmniEngine
+    private let store: VectorStore
+    private let flushBatches: [[String]]
+    private let l = NSLock()
+    private var _stop = false, _finished = false, _flushes = 0, row: Int
+    init(engine: OmniEngine, store: VectorStore, flushBatches: [[String]], startRow: Int) {
+        self.engine = engine; self.store = store; self.flushBatches = flushBatches; self.row = startRow
+    }
+    var finished: Bool { l.lock(); defer { l.unlock() }; return _finished }
+    var flushes: Int { l.lock(); defer { l.unlock() }; return _flushes }
+    func stop() { l.lock(); _stop = true; l.unlock() }
+    func run() {
+        while !({ l.lock(); defer { l.unlock() }; return _stop }()) {
+            let vecs = engine.embedTextBatches(flushBatches, as: .passage)
+            let n = vecs.reduce(0) { $0 + $1.count }
+            l.lock(); var idx = row; row += n; l.unlock()
+            var rows: [(path: String, chunks: [IndexedChunk])] = []
+            for batch in vecs { for v in batch { rows.append(("/idx/f\(idx)", [IndexedChunk(path: "/idx/f\(idx)", modified: 1, size: 1, kind: "text", chunkIndex: 0, snippet: "s", embedding: v)])); idx += 1 } }
+            try? store.replaceMany(rows)
+            l.lock(); _flushes += 1; l.unlock()
+        }
+        l.lock(); _finished = true; l.unlock()
+    }
+}
+
 let args = CommandLine.arguments
 
 // Fast deterministic embedder for concurrency stress (no GPU): isolates the FS/store/pipeline/cancel
@@ -630,6 +660,123 @@ if args.count >= 3 && args[1] == "qbench" {
     let hc = store.search(vc, filter: SearchFilter(), topK: 10).map(\.path)
     let hf = store.search(queryGraph: engine.queryVectorGraph(q2)!, filter: SearchFilter(), topK: 10).hits.map(\.path)
     print("top-10 parity classic-vs-fused: \(hc == hf ? "MATCH" : "DIFFER: \(hc) vs \(hf)")")
+    store.close()
+    exit(0)
+}
+
+// Search latency UNDER concurrent indexing load: omni-verify searchunderindex <modelDir> [storeRows]
+// Reproduces the contention the user reports - a query firing WHILE the indexer is mid-flight. A
+// background thread does the indexer's real GPU work (embedTextBatches as .passage, the same call
+// flushText makes) plus store writes (replaceMany, growing the delta), looping for the run. The
+// foreground fires queries in two cadences and reports the latency distribution:
+//   warm: queries 0.4s apart - inside the 2s adaptive-batch + proactive-fold windows (mitigated)
+//   cold: queries 2.6s apart - the "type-wait-type-wait" case; both windows expire between queries,
+//         so each query waits behind a full in-flight indexing flush.
+// Prints the idle baseline first. A/B the mitigations with OMNI_ADAPTIVE_BATCH=0 / OMNI_PROACTIVE_FOLD=0,
+// and the low-end paths with OMNI_FORCE_LOWEND=1.
+if args.count >= 3 && args[1] == "searchunderindex" {
+    let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    let startRows = (args.count >= 4 ? Int(args[3]) : nil) ?? 300_000
+    let dim = engine.dim
+    let dbURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("omni-sui-\(ProcessInfo.processInfo.processIdentifier).sqlite")
+    defer { try? FileManager.default.removeItem(at: dbURL) }
+    let store = try VectorStore(dbURL: dbURL)
+    var rng: UInt64 = 0x9E3779B97F4A7C15
+    func nextF() -> Float { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return Float(rng >> 40) / Float(1 << 24) - 0.5 }
+    func randUnit() -> [Float] {
+        var v = [Float](repeating: 0, count: dim); var nrm: Float = 0
+        for k in 0 ..< dim { let x = nextF(); v[k] = x; nrm += x * x }
+        let inv = nrm > 0 ? 1 / nrm.squareRoot() : 0
+        for k in 0 ..< dim { v[k] *= inv }
+        return v
+    }
+    print("searchunderindex: building \(startRows)-row store (dim \(dim))\u{2026}")
+    var batchRows: [(path: String, chunks: [IndexedChunk])] = []
+    for i in 0 ..< startRows {
+        batchRows.append(("/q/f\(i)", [IndexedChunk(path: "/q/f\(i)", modified: 1, size: 1, kind: "text", chunkIndex: 0, snippet: "s", embedding: randUnit())]))
+        if batchRows.count >= 8192 { try store.replaceMany(batchRows); batchRows.removeAll(keepingCapacity: true) }
+    }
+    try store.replaceMany(batchRows)
+    _ = store.search([Float](repeating: 0.03, count: dim), topK: 10)   // build the base
+
+    // A flush shaped like the indexer's textStageWindow (textBatchSize*6 = 96 chunks), varied length.
+    let words = "the quarterly revenue report describes cloud growth machine learning infrastructure and budget planning across the engineering organization for next fiscal year in detail".split(separator: " ").map(String.init)
+    func chunkText(_ seed: Int, _ chars: Int) -> String {
+        var s = ""; var i = seed
+        while s.count < chars { s += words[i % words.count] + " "; i += 1 }
+        return String(s.prefix(chars))
+    }
+    let flushBatches: [[String]] = (0 ..< 6).map { b in (0 ..< 16).map { chunkText($0 * 7 + b * 13, 180 + (($0 * 53 + b * 97) % 1500)) } }
+
+    var embedMs: [Double] = [], searchMs: [Double] = []   // per-call breakdown (cold pattern)
+    func sample(_ q: String, breakdown: Bool = false) -> Double {
+        let t = Date()
+        let v = engine.embedQuery(q)
+        let te = -t.timeIntervalSinceNow * 1000
+        let t2 = Date()
+        _ = store.search(v, filter: SearchFilter(), topK: 60)
+        let ts = -t2.timeIntervalSinceNow * 1000
+        if breakdown { embedMs.append(te); searchMs.append(ts) }
+        return te + ts
+    }
+    func stats(_ label: String, _ xs: [Double]) {
+        guard !xs.isEmpty else { print("  \(label): (none)"); return }
+        let s = xs.sorted()
+        let p = { (q: Double) in s[Swift.min(s.count - 1, Swift.max(0, Int(Double(s.count) * q)))] }
+        print(String(format: "  %-22@  n=%2d  min=%4.0f  p50=%4.0f  p95=%4.0f  max=%4.0f ms", label as NSString, xs.count, s.first!, p(0.5), p(0.95), s.last!))
+    }
+    func query(_ i: Int) -> String { "quarterly revenue and cloud machine learning report variant \(i) about the beach sunset photo" }
+
+    // 1) Idle baseline: measured BEFORE any background load starts.
+    var idle: [Double] = []
+    for i in 0 ..< 20 { idle.append(sample(query(1000 + i))) }
+
+    // Background "indexer": embed a flush (low-priority gate) then write its rows (store queue), forever.
+    // State is lock-guarded in a class so the @Sendable closure has no mutable captures.
+    let bg = SearchUnderIndexBG(engine: engine, store: store, flushBatches: flushBatches, startRow: startRows)
+    DispatchQueue.global(qos: .utility).async { bg.run() }
+    usleep(400_000)   // let a flush get in flight
+
+    // Pure-indexing throughput (no foreground queries): isolates the gate-window cap's cost on
+    // indexing speed - the "no moat regression" check. flush = 96 chunks.
+    let pf0 = bg.flushes; usleep(5_000_000); let pureFlushes = bg.flushes - pf0
+    let pureRate = Double(pureFlushes) / 5.0
+
+    // 2) Warm: queries 0.4s apart (inside the 2s windows -> adaptive batch + proactive fold engaged).
+    var warm: [Double] = []
+    for i in 0 ..< 20 { warm.append(sample(query(i))); usleep(400_000) }
+
+    // 3) Cold / type-wait-type-wait: 2.6s gap so both windows expire between queries.
+    var cold: [Double] = []
+    for i in 0 ..< 8 { cold.append(sample(query(500 + i), breakdown: true)); usleep(2_600_000) }
+
+    // 4) Realistic type-wait-type-wait WITH keystroke signaling (fix B): each query is preceded by a
+    //    short typing burst that calls noteInteractive(), then the ~180ms debounce, then the search -
+    //    so the indexer is already in per-batch mode when the search's embed takes the gate. Isolates
+    //    fix B (run with OMNI_INDEX_GATE_BATCHES=999 to remove the gate-window cap and see B alone).
+    var coldSig: [Double] = []
+    for i in 0 ..< 8 {
+        engine.noteInteractive(); usleep(140_000)
+        engine.noteInteractive(); usleep(140_000)   // a 2-keystroke "type" burst (~0.28s)
+        usleep(180_000)                              // the search debounce
+        coldSig.append(sample(query(700 + i)))
+        usleep(2_600_000)
+    }
+
+    bg.stop()
+    while !bg.finished { usleep(2_000) }
+    let env = ProcessInfo.processInfo.environment
+    let adaptiveOn = env["OMNI_ADAPTIVE_BATCH"] != "0"
+    let foldOn = env["OMNI_PROACTIVE_FOLD"] != "0"
+    let lowEnd = env["OMNI_FORCE_LOWEND"] != nil
+    print(String(format: "searchunderindex (adaptiveBatch=%@, lowEnd=%@): pure-index throughput=%.1f flushes/s (96-chunk)", adaptiveOn ? "Y":"N", lowEnd ? "Y":"N", pureRate))
+    stats("idle (no indexing)", idle)
+    stats("warm <2s gap", warm)
+    stats("cold/type-wait >2.6s", cold)
+    stats("  cold embed only", embedMs)
+    stats("  cold search only", searchMs)
+    stats("cold+keystroke-signal", coldSig)
+    print(String(format: "  contention (cold p50 - idle p50): %.0f ms", cold.sorted()[cold.count/2] - idle.sorted()[idle.count/2]))
     store.close()
     exit(0)
 }

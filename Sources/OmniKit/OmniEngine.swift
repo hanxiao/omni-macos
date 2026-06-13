@@ -416,6 +416,12 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     private let queryStampLock = NSLock()
     private var _lastQueryAt = Date.distantPast
     private func markQuery() { queryStampLock.withLock { _lastQueryAt = Date() } }
+    /// Signal interactive activity (e.g. a keystroke in the search box) WITHOUT embedding. The
+    /// debounced search fires ~180 ms after the last keystroke; stamping here means the indexer is
+    /// already in its shrink-and-gate-per-batch mode by the time the search's embed takes the gate,
+    /// so the search preempts after one short forward instead of waiting behind a full in-flight
+    /// indexing flush. Cheap (one lock + Date); safe to call on every keystroke.
+    public func noteInteractive() { markQuery() }
     private static let queryActiveWindow: TimeInterval =
         (ProcessInfo.processInfo.environment["OMNI_QUERY_ACTIVE_WINDOW"].flatMap { Double($0) }) ?? 2.0
     /// True if an interactive query ran within the active window (default 2s). Off by env
@@ -467,33 +473,33 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         // collapses the query's gate wait from ~one full flush to ~one small forward. Sacrifices
         // cross-batch double-buffering for the ~2s the user is typing; reverts to the full
         // double-buffered single-call flush (max throughput) once typing stops.
-        if type != .query, interactiveQueryActive, tokenized.count > 1 {
-            var out: [[[Float]]] = []; out.reserveCapacity(tokenized.count)
-            for b in tokenized {
-                out.append(contentsOf: run(highPriority: false) {
-                    let r = textEncoder.encodeTokenBatchesPipelined([b])
-                    addTokens(textEncoder.lastSequenceLength)
-                    return r
-                })
+        // Gate-window size for an INDEXING flush: the number of batches embedded under ONE run()
+        // (i.e. one gate hold). The gate only yields to a waiting high-priority query BETWEEN
+        // run() calls, so this is the WORST-CASE number of indexing batches a search waits behind.
+        //   - actively searching: 1 batch (the tightest latency; the indexer also shrinks each batch)
+        //   - otherwise: `indexGateWindow` batches (default 2). Measured: a search firing during
+        //     indexing in a type-wait cadence (the 2s "active" window already expired) waited behind
+        //     the WHOLE flush (~6 batches / ~0.3s here, multiples of that on a low-end GPU). Capping
+        //     the window collapses that wait to ~2 batches. The async double-buffered pipeline still
+        //     overlaps WITHIN a window; only the cross-window readout overlap is given up, which the
+        //     throughput sweep shows is marginal. Vectors are bit-identical (independent per batch).
+        //     OMNI_INDEX_GATE_BATCHES tunes it (a large value restores the old whole-flush behavior).
+        if type != .query, tokenized.count > 1 {
+            let window = interactiveQueryActive ? 1 : Self.indexGateWindow
+            if window < tokenized.count {
+                var out: [[[Float]]] = []; out.reserveCapacity(tokenized.count)
+                var i = 0
+                while i < tokenized.count {
+                    let group = Array(tokenized[i ..< Swift.min(i + window, tokenized.count)])
+                    out.append(contentsOf: run(highPriority: false) {
+                        let r = textEncoder.encodeTokenBatchesPipelined(group)
+                        addTokens(textEncoder.lastSequenceLength)
+                        return r
+                    })
+                    i += window
+                }
+                return out
             }
-            return out
-        }
-        let lowEnd = ProcessInfo.processInfo.environment["OMNI_FORCE_LOWEND"] != nil
-            || ProcessInfo.processInfo.physicalMemory < 16_000_000_000
-        if type != .query, lowEnd, tokenized.count > 2 {
-            var out: [[[Float]]] = []; out.reserveCapacity(tokenized.count)
-            let groupSize = (tokenized.count + 1) / 2
-            var i = 0
-            while i < tokenized.count {
-                let group = Array(tokenized[i ..< min(i + groupSize, tokenized.count)])
-                out.append(contentsOf: run(highPriority: false) {
-                    let r = textEncoder.encodeTokenBatchesPipelined(group)
-                    addTokens(textEncoder.lastSequenceLength)
-                    return r
-                })
-                i += groupSize
-            }
-            return out
         }
         return run(highPriority: type == .query) {
             let v = textEncoder.encodeTokenBatchesPipelined(tokenized)
@@ -501,6 +507,11 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             return v
         }
     }
+
+    /// Batches embedded per gate hold for a non-actively-searched indexing flush (see embedTextBatches).
+    /// 2 caps a search's worst-case gate wait to ~2 indexing batches while keeping in-window double-
+    /// buffering. OMNI_INDEX_GATE_BATCHES overrides; a large value restores the old whole-flush hold.
+    static let indexGateWindow = (ProcessInfo.processInfo.environment["OMNI_INDEX_GATE_BATCHES"].flatMap { Int($0) }) ?? 2
 
 
     public func embedImage(_ image: CGImage) -> [Float]? {
