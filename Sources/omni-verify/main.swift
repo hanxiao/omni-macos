@@ -2185,8 +2185,26 @@ if args.count >= 2 && args[1] == "statverify" {
     store.close(); store = try VectorStore(dbURL: dir)   // reload path
     check("after reload")
     store.close()
-    print("statverify: completed (OMNI_STAT_VERIFY=1 aborts on any mismatch)")
-    exit(0)
+
+    // Ext-filter correctness: hasExtensionCI (allocation-free) must match the case-insensitive
+    // ".ext" suffix semantics exactly, including mixed case and ext-like substrings.
+    let dir2 = FileManager.default.temporaryDirectory.appendingPathComponent("sve-\(UUID().uuidString).sqlite")
+    defer { try? FileManager.default.removeItem(at: dir2) }
+    let s2 = try VectorStore(dbURL: dir2)
+    let paths = ["/d/a.pdf", "/d/b.PDF", "/d/c.Pdf", "/d/notpdf", "/d/x.pdftxt", "/d/y.txt", "/d/pdf", "/d/z.pdf.bak"]
+    try s2.replaceMany(paths.map { ($0, [ch($0, "text", 0)]) })
+    var f = SearchFilter(); f.ext = "pdf"
+    let got = Set(s2.search([1, 0, 0, 0], filter: f, topK: 50).map { $0.path })
+    let want = Set(paths.filter { $0.lowercased().hasSuffix(".pdf") })   // reference semantics
+    var extFails = 0
+    if got != want { extFails += 1; print("  EXT FAIL: got \(got.sorted()) want \(want.sorted())") }
+    else { print("  ext:pdf -> \(got.sorted()) (matches reference)") }
+    f.ext = "PDF"   // filter ext itself uppercase must also work
+    let got2 = Set(s2.search([1, 0, 0, 0], filter: f, topK: 50).map { $0.path })
+    if got2 != want { extFails += 1; print("  EXT(upper) FAIL: \(got2.sorted())") }
+    s2.close()
+    print("statverify: completed (\(extFails == 0 ? "ext PASS" : "ext FAIL"); OMNI_STAT_VERIFY=1 aborts on any aggregate mismatch)")
+    exit(extFails == 0 ? 0 : 1)
 }
 
 // Idle-trim check: omni-verify trimcheck <modelDir>
