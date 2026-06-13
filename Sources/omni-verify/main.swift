@@ -2570,6 +2570,32 @@ if args.count >= 4 && args[1] == "audiobench" {
     let sN = -tN.timeIntervalSinceNow
     print(String(format: "  BATCH-N   %.2fs  => %.1f clips/s  (%.0f ms/clip, %d vecs)  speedup %.2fx",
                  sN, Double(mels.count) / sN, sN / Double(mels.count) * 1000, done, s1 / sN))
+
+    // INTERACTIVE CARVE parity + granularity. With a query active, embedAudioMelBatch embeds ONE
+    // clip per gate hold so a search preempts after ~one clip (BATCH-1 latency above) instead of the
+    // whole batch (BATCH-N). The carved per-clip vector must be BIT-IDENTICAL to embedAudioMel - the
+    // same call the streamed long-audio path uses per segment - so carving only changes WHEN a clip's
+    // solo vector is produced, never its value. It differs from the idle mixed-length batch by the
+    // block-diagonal numerical effect (cos ~0.9999), the batch-composition variance the index already
+    // carries. (Run with OMNI_MEDIA_CARVE=0 to confirm the carve path is the only difference.)
+    let allMels = mels.map { $0.mel }, allFrames = mels.map { $0.frames }
+    let perClip = zip(allMels, allFrames).map { engine.embedAudioMel($0.0, frames: $0.1) ?? [] }
+    let idleBatched = engine.embedAudioMelBatch(allMels, frames: allFrames) ?? []
+    engine.noteInteractive()                                   // open the 2s interactive window
+    let carved = engine.embedAudioMelBatch(allMels, frames: allFrames) ?? []
+    var carveExact = true, minCarveVsSolo: Float = 1, minCarveVsBatch: Float = 1
+    if carved.count == mels.count && perClip.count == mels.count && idleBatched.count == mels.count {
+        for i in 0 ..< mels.count {
+            if carved[i] != perClip[i] { carveExact = false }   // bit-identical to the solo path
+            minCarveVsSolo = Swift.min(minCarveVsSolo, cosine(carved[i], perClip[i]))
+            minCarveVsBatch = Swift.min(minCarveVsBatch, cosine(carved[i], idleBatched[i]))
+        }
+        print(String(format: "  CARVE     %d clips  carved==solo(embedAudioMel): %@  (min cos vs solo %.7f)  min cos carved-vs-idle-batch %.7f",
+                     mels.count, carveExact ? "EXACT" : "DIFFER", minCarveVsSolo, minCarveVsBatch))
+        print("  CARVE     per-query gate hold drops from the whole batch (BATCH-N total) to ~one clip (BATCH-1 ms/clip)")
+    } else {
+        print("  CARVE     SKIP (carve did not return one vector per clip - check interactiveQueryActive)")
+    }
     exit(0)
 }
 
