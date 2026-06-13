@@ -363,6 +363,36 @@ public final class VectorStore: @unchecked Sendable {
     @inline(__always) private func canonicalKind(_ k: String) -> String {
         idKind[Int(internKind(k))]
     }
+    // Live index aggregates maintained INCREMENTALLY so the per-1.5s-tick stats (refreshIndexStats ->
+    // indexSummary) cost O(1) instead of a full O(rows) scan that built a path Set + an NSString ext
+    // per row while HOLDING the search queue. Measured 371ms/call at 667k rows (2M+ would be ~1.1s) -
+    // a periodic search stall during indexing. Updated at the file 0->1 / 1->0 transitions (the same
+    // points fileChunkCount is maintained), so they track inserts/deletes without a rescan.
+    private var liveFiles = 0                          // distinct files with >=1 live chunk
+    private var kindFileCounts: [String: Int] = [:]    // kind -> file count (keys = the kinds present)
+    private var extFileCounts: [String: Int] = [:]     // ext  -> file count (keys = the extensions present)
+    @inline(__always) private func extOf(_ p: String) -> String { (p as NSString).pathExtension.lowercased() }
+    private func resetAggregatesLocked() { liveFiles = 0; kindFileCounts.removeAll(keepingCapacity: true); extFileCounts.removeAll(keepingCapacity: true) }
+    /// Add one chunk for file `fid`; on the file's first live chunk (0->1) bump the aggregates.
+    @inline(__always) private func fileChunkInc(_ fid: Int32, _ kind: String, _ path: String) {
+        if fileChunkCount[Int(fid)] == 0 {
+            liveFiles += 1
+            kindFileCounts[kind, default: 0] += 1
+            let e = extOf(path); if !e.isEmpty { extFileCounts[e, default: 0] += 1 }
+        }
+        fileChunkCount[Int(fid)] += 1
+    }
+    /// Drop one chunk for file `fid`; on its last live chunk (1->0) decrement the aggregates.
+    @inline(__always) private func fileChunkDec(_ fid: Int32, _ kind: String, _ path: String) {
+        let n = fileChunkCount[Int(fid)] - 1
+        fileChunkCount[Int(fid)] = n
+        if n == 0 {
+            liveFiles -= 1
+            if let c = kindFileCounts[kind] { if c <= 1 { kindFileCounts[kind] = nil } else { kindFileCounts[kind] = c - 1 } }
+            let e = extOf(path); if !e.isEmpty, let c = extFileCounts[e] { if c <= 1 { extFileCounts[e] = nil } else { extFileCounts[e] = c - 1 } }
+        }
+    }
+
     /// Rebuild the dense fileID/pathID/kindCode tables from the current `rows`. Call after any
     /// structural change that rewrites or reorders `rows` (compaction, reload, wipe).
     private func rebuildFileIDsLocked() {
@@ -373,10 +403,11 @@ public final class VectorStore: @unchecked Sendable {
         fileID.reserveCapacity(rows.count)
         kindCode.removeAll(keepingCapacity: true)
         kindCode.reserveCapacity(rows.count)
+        resetAggregatesLocked()
         for r in rows {
             let fid = internPath(r.path)
             fileID.append(fid)
-            fileChunkCount[Int(fid)] += 1
+            fileChunkInc(fid, r.kind, r.path)
             kindCode.append(internKind(r.kind))
         }
     }
@@ -617,7 +648,7 @@ public final class VectorStore: @unchecked Sendable {
                 flat16.append(contentsOf: bfs[i])
                 let fid = internPath(c.path)
                 fileID.append(fid)
-                fileChunkCount[Int(fid)] += 1
+                fileChunkInc(fid, c.kind, c.path)
                 kindCode.append(internKind(c.kind))
             }
             presentPaths.insert(path)
@@ -692,7 +723,7 @@ public final class VectorStore: @unchecked Sendable {
                     flat16.append(contentsOf: bfs[wi][ci])
                     let fid = internPath(c.path)
                     fileID.append(fid)
-                    fileChunkCount[Int(fid)] += 1
+                    fileChunkInc(fid, c.kind, c.path)
                     kindCode.append(internKind(c.kind))
                 }
                 presentPaths.insert(it.path)
@@ -882,8 +913,9 @@ public final class VectorStore: @unchecked Sendable {
 
     /// One pass for a multi-kind count (Text's purge prompt covers text + scan together).
     public func fileCount(kinds: [String]) -> Int {
-        let set = Set(kinds)
-        return queue.sync { Set(rows.lazy.filter { set.contains($0.kind) }.map { $0.path }).count }
+        // Sum the per-kind file counts (a file is exactly one kind, so no double-count): O(kinds),
+        // not an O(rows) path-Set scan.
+        queue.sync { kinds.reduce(0) { $0 + (kindFileCounts[$1] ?? 0) } }
     }
 
     public func deleteKind(_ kind: String) { deleteKinds([kind]) }
@@ -953,6 +985,7 @@ public final class VectorStore: @unchecked Sendable {
             // rather than removeAll which keeps the ~1.6GB capacity reserved.
             rows = []; flat16.releaseAll(); presentPaths = []; fileID = []; pathID = [:]; idPath = []; fileChunkCount = []
             kindCode = []; kindID = [:]; idKind = []; invalidateBase()
+            resetAggregatesLocked()
             dim = 0
         }
     }
@@ -999,48 +1032,69 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     public var count: Int { queue.sync { rows.count } }
-    public var fileCount: Int { queue.sync { Set(rows.map { $0.path }).count } }
+    public var fileCount: Int { queue.sync { liveFiles } }
 
-    /// All four summary stats in a single lock acquisition + single pass over rows.
+    static let statVerify = ProcessInfo.processInfo.environment["OMNI_STAT_VERIFY"] == "1"
+
+    /// All four summary stats from the incremental aggregates - O(1), was an O(rows) path-Set +
+    /// per-row NSString-ext scan that held the search queue.
     public func allIndexStats() -> (fileCount: Int, chunkCount: Int, kinds: Set<String>, exts: Set<String>) {
-        queue.sync {
-            var paths = Set<String>(), k = Set<String>(), e = Set<String>()
-            for r in rows {
-                paths.insert(r.path); k.insert(r.kind)
-                let x = (r.path as NSString).pathExtension.lowercased(); if !x.isEmpty { e.insert(x) }
-            }
-            return (paths.count, rows.count, k, e)
-        }
+        queue.sync { (liveFiles, rows.count, Set(kindFileCounts.keys), Set(extFileCounts.keys)) }
     }
 
-    /// Distinct indexed files under a folder (path-boundary aware).
+    /// Distinct indexed files under a folder (path-boundary aware). Iterates LIVE FILES, not rows.
     public func fileCount(underFolder folder: String) -> Int {
         queue.sync {
-            var seen = Set<String>()
-            for r in rows where r.path == folder || r.path.hasPrefix(folder + "/") { seen.insert(r.path) }
-            return seen.count
+            let pfx = folder + "/"
+            var n = 0
+            for id in idPath.indices where fileChunkCount[id] > 0 {
+                let p = idPath[id]; if p == folder || p.hasPrefix(pfx) { n += 1 }
+            }
+            return n
         }
     }
 
-    /// All summary stats AND per-folder distinct-file counts in a SINGLE lock + SINGLE pass over rows.
-    /// refreshIndexStats calls this every progress tick on a large index, so folding the two scans
-    /// (allIndexStats + fileCounts) into one pass halves the queue time it steals from concurrent inserts.
+    /// Summary stats (O(1) from the incremental aggregates) plus per-folder distinct-file counts (one
+    /// pass over LIVE FILES, not rows). refreshIndexStats calls this every 1.5s during indexing, so
+    /// killing the O(rows) path-Set + per-row ext scan that held the search queue is the win (measured
+    /// 371ms -> the folder pass only, ~7x fewer iterations and zero per-row String alloc, on 667k rows).
+    /// OMNI_STAT_VERIFY=1 cross-checks the aggregates against the old full scan on every call.
     public func indexSummary(folders: [String])
         -> (fileCount: Int, chunkCount: Int, kinds: Set<String>, exts: Set<String>, folderCounts: [String: Int]) {
         queue.sync {
-            var paths = Set<String>(), k = Set<String>(), e = Set<String>()
-            let prefixes = folders.map { $0 + "/" }
-            var seen = [Set<String>](repeating: [], count: folders.count)
-            for r in rows {
-                paths.insert(r.path); k.insert(r.kind)
-                let x = (r.path as NSString).pathExtension.lowercased(); if !x.isEmpty { e.insert(x) }
-                for i in folders.indices where r.path == folders[i] || r.path.hasPrefix(prefixes[i]) {
-                    seen[i].insert(r.path)
-                }
-            }
             var fc: [String: Int] = [:]
-            for i in folders.indices { fc[folders[i]] = seen[i].count }
-            return (paths.count, rows.count, k, e, fc)
+            if !folders.isEmpty {
+                let prefixes = folders.map { $0 + "/" }
+                var counts = [Int](repeating: 0, count: folders.count)
+                // idPath holds each distinct path once (per file id); the live filter skips dead ids.
+                for id in idPath.indices where fileChunkCount[id] > 0 {
+                    let p = idPath[id]
+                    for i in folders.indices where p == folders[i] || p.hasPrefix(prefixes[i]) { counts[i] += 1 }
+                }
+                for i in folders.indices { fc[folders[i]] = counts[i] }
+            }
+            let result = (liveFiles, rows.count, Set(kindFileCounts.keys), Set(extFileCounts.keys), fc)
+            if Self.statVerify { verifyAggregatesLocked(folders: folders, against: result) }
+            return result
+        }
+    }
+
+    /// Debug cross-check (OMNI_STAT_VERIFY=1): recompute the summary the old O(rows) way and abort on
+    /// any divergence, so a missed mutation hook in the incremental aggregates is caught loudly in
+    /// tests/benches. Runs inside the queue; never enabled in shipping builds.
+    private func verifyAggregatesLocked(folders: [String],
+                                        against r: (fileCount: Int, chunkCount: Int, kinds: Set<String>, exts: Set<String>, folderCounts: [String: Int])) {
+        var paths = Set<String>(), k = Set<String>(), e = Set<String>()
+        let prefixes = folders.map { $0 + "/" }
+        var seen = [Set<String>](repeating: [], count: folders.count)
+        for row in rows {
+            paths.insert(row.path); k.insert(row.kind)
+            let x = (row.path as NSString).pathExtension.lowercased(); if !x.isEmpty { e.insert(x) }
+            for i in folders.indices where row.path == folders[i] || row.path.hasPrefix(prefixes[i]) { seen[i].insert(row.path) }
+        }
+        var fc: [String: Int] = [:]; for i in folders.indices { fc[folders[i]] = seen[i].count }
+        if r.fileCount != paths.count || r.kinds != k || r.exts != e || r.folderCounts != fc {
+            fatalError("STAT_VERIFY mismatch: files \(r.fileCount)/\(paths.count) kinds \(r.kinds)/\(k) exts \(r.exts)/\(e) folders \(r.folderCounts)/\(fc)")
         }
     }
 
@@ -1049,19 +1103,18 @@ public final class VectorStore: @unchecked Sendable {
     /// `refreshIndexStats` calls every progress tick, so the per-folder fan-out (O(folders * rows),
     /// folders+1 lock acquisitions) was a serial-queue hog that starved search and the folder map
     /// during indexing. A row is counted for every folder it falls under, so overlapping/nested
-    /// inputs stay correct.
+    /// inputs stay correct. Iterates LIVE FILES (idPath), not rows.
     public func fileCounts(underFolders folders: [String]) -> [String: Int] {
         queue.sync {
             guard !folders.isEmpty else { return [:] }
             let prefixes = folders.map { $0 + "/" }
-            var seen = [Set<String>](repeating: [], count: folders.count)
-            for r in rows {
-                for i in folders.indices where r.path == folders[i] || r.path.hasPrefix(prefixes[i]) {
-                    seen[i].insert(r.path)
-                }
+            var counts = [Int](repeating: 0, count: folders.count)
+            for id in idPath.indices where fileChunkCount[id] > 0 {
+                let p = idPath[id]
+                for i in folders.indices where p == folders[i] || p.hasPrefix(prefixes[i]) { counts[i] += 1 }
             }
             var out: [String: Int] = [:]
-            for i in folders.indices { out[folders[i]] = seen[i].count }
+            for i in folders.indices { out[folders[i]] = counts[i] }
             return out
         }
     }
@@ -1846,7 +1899,7 @@ public final class VectorStore: @unchecked Sendable {
     private static let walSoftCapBytes = 32 << 20
     private static let walHardCapBytes = 256 << 20
 
-    public func kinds() -> Set<String> { queue.sync { Set(rows.map { $0.kind }) } }
+    public func kinds() -> Set<String> { queue.sync { Set(kindFileCounts.keys) } }
 
     /// Rank a single file's chunks against the query (for the "which passage matched" UI).
     public func rankChunks(_ query: [Float], path: String, topK: Int = 6) -> [ChunkHit] {
@@ -2045,7 +2098,7 @@ public final class VectorStore: @unchecked Sendable {
             for i in 0 ..< rows.count {
                 if shouldRemove(i) {
                     removedPaths.insert(rows[i].path)
-                    fileChunkCount[Int(fileID[i])] -= 1
+                    fileChunkDec(fileID[i], rows[i].kind, rows[i].path)
                     if i < firstRemoved { firstRemoved = i }
                     continue
                 }
@@ -2081,6 +2134,7 @@ public final class VectorStore: @unchecked Sendable {
     private func loadIntoMemory() {
         rows.removeAll(); flat16.removeAll(); presentPaths.removeAll(); fileID.removeAll(); pathID.removeAll()
         idPath.removeAll(); fileChunkCount.removeAll(); kindCode.removeAll(); kindID.removeAll(); idKind.removeAll(); dim = 0
+        resetAggregatesLocked()
         // Pre-size the buffers to the final row/element count so the bf16 buffer is filled in place
         // rather than grown through ~log2(N) reallocations. One COUNT(*) + one dim read up front.
         let total = scalarQuery("SELECT COUNT(*) FROM chunks")
@@ -2122,7 +2176,7 @@ public final class VectorStore: @unchecked Sendable {
                                 width: width, height: height, duration: duration, locator: locator))
                 let fid = internPath(path)
                 fileID.append(fid)
-                fileChunkCount[Int(fid)] += 1
+                fileChunkInc(fid, kind, path)
                 kindCode.append(internKind(kind))
                 presentPaths.insert(path)
             }

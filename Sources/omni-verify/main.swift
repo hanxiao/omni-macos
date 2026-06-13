@@ -2123,6 +2123,72 @@ if args.count >= 2 && args[1] == "nanretrycheck" {
     exit(try nanretrycheckRun())
 }
 
+// Stat-scan cost: omni-verify statbench <index.sqlite> [root1,root2,...]
+// Times the per-tick stats refreshIndexStats runs every 1.5s during indexing: allIndexStats and
+// indexSummary do a full O(rows) scan (path Set, ext NSString alloc, per-folder prefix matching)
+// while HOLDING the serial queue a concurrent search waits on. Reports the queue-hold per call.
+if args.count >= 3 && args[1] == "statbench" {
+    let store = try VectorStore(dbURL: URL(fileURLWithPath: args[2]))
+    let roots = (args.count >= 4 ? args[3].split(separator: ",").map(String.init) : [])
+    print("statbench: \(store.count) rows, \(roots.count) roots")
+    func median(_ n: Int, _ f: () -> Void) -> Double {
+        f()
+        var ts: [Double] = []
+        for _ in 0 ..< n { let t = Date(); f(); ts.append(-t.timeIntervalSinceNow * 1000) }
+        return ts.sorted()[n / 2]
+    }
+    let a = median(11) { _ = store.allIndexStats() }
+    print(String(format: "  allIndexStats()          %.1f ms / call", a))
+    if !roots.isEmpty {
+        let s = median(11) { _ = store.indexSummary(folders: roots) }
+        print(String(format: "  indexSummary(%d folders)  %.1f ms / call  <- runs every 1.5s during indexing, holds the search queue", roots.count, s))
+    }
+    let fc = median(11) { _ = store.fileCount }
+    print(String(format: "  fileCount                %.1f ms / call", fc))
+    store.close()
+    exit(0)
+}
+
+// Incremental-stats correctness: omni-verify statverify  (run with OMNI_STAT_VERIFY=1)
+// Exercises every mutation path (add / update / delete-folder / delete-kind / delete-ext / reload)
+// and calls indexSummary after each; with OMNI_STAT_VERIFY=1 that aborts on any divergence between
+// the incremental aggregates and a fresh full O(rows) recompute. Proves the lockstep hooks are right.
+if args.count >= 2 && args[1] == "statverify" {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("sv-\(UUID().uuidString).sqlite")
+    defer { try? FileManager.default.removeItem(at: dir) }
+    func ch(_ path: String, _ kind: String, _ i: Int) -> IndexedChunk {
+        IndexedChunk(path: path, modified: 1, size: 1, kind: kind, chunkIndex: i, snippet: "s", embedding: [1, 0, 0, 0])
+    }
+    let roots = ["/a", "/b"]
+    var store = try VectorStore(dbURL: dir)
+    func check(_ label: String) {
+        let s = store.indexSummary(folders: roots)   // OMNI_STAT_VERIFY=1 fatalErrors on mismatch
+        print("  \(label): files=\(s.fileCount) chunks=\(s.chunkCount) kinds=\(s.kinds.sorted()) exts=\(s.exts.sorted()) folders=\(s.folderCounts)")
+    }
+    try store.replaceMany([
+        ("/a/x.txt", [ch("/a/x.txt", "text", 0), ch("/a/x.txt", "text", 1)]),
+        ("/a/y.pdf", [ch("/a/y.pdf", "scan", 0), ch("/a/y.pdf", "scan", 1)]),
+        ("/b/z.png", [ch("/b/z.png", "image", 0)]),
+        ("/b/w.mp3", [ch("/b/w.mp3", "audio", 0)]),
+    ])
+    check("after add 4")
+    try store.replace(path: "/a/x.txt", chunks: [ch("/a/x.txt", "text", 0)])      // update: 2 chunks -> 1
+    check("after update x.txt")
+    try store.replace(path: "/a/x.txt", chunks: [ch("/a/x.txt", "text", 0), ch("/a/x.txt", "text", 1), ch("/a/x.txt", "text", 2)])  // 1 -> 3
+    check("after grow x.txt")
+    store.deleteUnderFolder("/b")     // removes z.png + w.mp3 (image, audio gone)
+    check("after delete /b")
+    store.deleteKinds(["scan"])       // removes y.pdf (scan gone)
+    check("after delete scan")
+    try store.replaceMany([("/a/n.json", [ch("/a/n.json", "text", 0)]), ("/b/m.png", [ch("/b/m.png", "image", 0)])])
+    check("after re-add 2")
+    store.close(); store = try VectorStore(dbURL: dir)   // reload path
+    check("after reload")
+    store.close()
+    print("statverify: completed (OMNI_STAT_VERIFY=1 aborts on any mismatch)")
+    exit(0)
+}
+
 // Idle-trim check: omni-verify trimcheck <modelDir>
 // Verifies the debounced GPU buffer-cache trim end to end in-process: run an embed burst, arm
 // indexingIdle() (OMNI_IDLE_TRIM seconds, set it small, e.g. 2), and watch MLX cache memory drop
