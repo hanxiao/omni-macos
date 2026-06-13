@@ -1186,6 +1186,7 @@ final class AppModel {
     /// then run. `reSearch` false for the client-side post-filters (score/sort), which only reshape the
     /// already-fetched results - keeping the query-embedding cache and avoiding a needless re-search.
     private func syncBoxFromFilters(reSearch: Bool) {
+        engine?.noteInteractive()   // a filter-menu change is interactive too; signal before the search
         literalQuery = false
         rawQuery = serializeSearch(semantic: query)
         suggestionsAllowed = false   // a filter-menu change rewrites the box; don't pop the dropdown for it
