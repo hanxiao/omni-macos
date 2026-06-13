@@ -370,27 +370,33 @@ if args.count >= 2 && args[1] == "reducecheck" {
     // Base: n files; every 7th file has 3 chunks; every 100th file DUPLICATES the previous
     // file's vector exactly (engineered cross-file tie). Chunk 1 of multi-chunk files
     // duplicates chunk 0 (engineered within-file tie -> lowest row index must win).
+    // A file is exactly one kind; cycle four kinds across files so a kind-filtered query must
+    // exclude whole files (all their chunks share the file's kind). The GPU reduce masks these
+    // rows to -inf; the host reducer `continue`s them - the digests must match either way.
+    let kindList = ["text", "image", "scan", "audio"]
     var batch: [(path: String, chunks: [IndexedChunk])] = []
     var lastVec = vec(0)
     for i in 0 ..< n {
         let v = (i % 100 == 99) ? lastVec : vec(i)
         lastVec = v
-        var chunks = [IndexedChunk(path: "/r/f\(i)", modified: 1, size: 1, kind: "text", chunkIndex: 0, snippet: "s", embedding: v)]
+        let kind = kindList[i % kindList.count]
+        var chunks = [IndexedChunk(path: "/r/f\(i)", modified: 1, size: 1, kind: kind, chunkIndex: 0, snippet: "s", embedding: v)]
         if i % 7 == 0 {
-            chunks.append(IndexedChunk(path: "/r/f\(i)", modified: 1, size: 1, kind: "text", chunkIndex: 1, snippet: "s", embedding: v))
-            chunks.append(IndexedChunk(path: "/r/f\(i)", modified: 1, size: 1, kind: "text", chunkIndex: 2, snippet: "s", embedding: vec(i + 1_000_000)))
+            chunks.append(IndexedChunk(path: "/r/f\(i)", modified: 1, size: 1, kind: kind, chunkIndex: 1, snippet: "s", embedding: v))
+            chunks.append(IndexedChunk(path: "/r/f\(i)", modified: 1, size: 1, kind: kind, chunkIndex: 2, snippet: "s", embedding: vec(i + 1_000_000)))
         }
         batch.append(("/r/f\(i)", chunks))
         if batch.count >= 4096 { try store.replaceMany(batch); batch.removeAll(keepingCapacity: true) }
     }
     try store.replaceMany(batch)
-    func digest(_ phase: String) {
+    func digest(_ phase: String, filterKinds: Set<String> = []) {
+        var filter = SearchFilter(); filter.kinds = filterKinds
         var rng2: UInt64 = 42
         func qf() -> Float { rng2 ^= rng2 << 13; rng2 ^= rng2 >> 7; rng2 ^= rng2 << 17; return Float(rng2 >> 40) / Float(1 << 24) - 0.5 }
         var all = ""
         for _ in 0 ..< 25 {
             var q = [Float](repeating: 0, count: dim); for k in 0 ..< dim { q[k] = qf() }
-            let hits = store.search(q, topK: 40)
+            let hits = store.search(q, filter: filter, topK: 40)
             // The reducer contract (documented on reduceTopK) is exact winners with tie POOLS:
             // order within an equal-score run, and membership at the K-th boundary's pool, are
             // pool-equivalent. Canonicalize per query: above the boundary score, sort by
@@ -413,15 +419,22 @@ if args.count >= 2 && args[1] == "reducecheck" {
         print("\(phase) fnv=\(String(h, radix: 16))")
     }
     digest("base")   // first search builds the base
+    digest("base-img", filterKinds: ["image"])               // single-kind filter
+    digest("base-imgscan", filterKinds: ["image", "scan"])   // multi-kind filter
+    digest("base-none", filterKinds: ["nonexistent"])        // no file matches -> empty
     // Delta: 500 more files (below foldThreshold - they stay unfolded), incl. a tie against an
-    // EXISTING base file's vector (cross base/delta tie -> base row must win).
+    // EXISTING base file's vector (cross base/delta tie -> base row must win). Delta files cycle
+    // kinds too, so the kind mask must skip disallowed delta rows in the host merge loop.
     var delta: [(path: String, chunks: [IndexedChunk])] = []
     for i in 0 ..< 500 {
         let v = (i % 50 == 0) ? lastVec : vec(2_000_000 + i)
-        delta.append(("/r/d\(i)", [IndexedChunk(path: "/r/d\(i)", modified: 2, size: 1, kind: "text", chunkIndex: 0, snippet: "s", embedding: v)]))
+        let kind = kindList[i % kindList.count]
+        delta.append(("/r/d\(i)", [IndexedChunk(path: "/r/d\(i)", modified: 2, size: 1, kind: kind, chunkIndex: 0, snippet: "s", embedding: v)]))
     }
     try store.replaceMany(delta)
     digest("delta")
+    digest("delta-img", filterKinds: ["image"])
+    digest("delta-imgscan", filterKinds: ["image", "scan"])
     store.close()
     exit(0)
 }
@@ -633,13 +646,15 @@ if args.count >= 3 && args[1] == "qbench" {
     let store = try VectorStore(dbURL: dbURL)
     var rng: UInt64 = 0xDEADBEEF
     func nextF() -> Float { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return Float(rng >> 40) / Float(1 << 24) - 0.5 }
+    let qbRows = (args.count >= 4 ? Int(args[3]) : nil) ?? 200_000
+    let qbKinds = ["text", "image", "scan", "audio"]
     var batchRows: [(path: String, chunks: [IndexedChunk])] = []
-    for i in 0 ..< 200_000 {
+    for i in 0 ..< qbRows {
         var v = [Float](repeating: 0, count: dim); var nrm: Float = 0
         for k in 0 ..< dim { let x = nextF(); v[k] = x; nrm += x * x }
         let inv = nrm > 0 ? 1 / nrm.squareRoot() : 0
         for k in 0 ..< dim { v[k] *= inv }
-        batchRows.append(("/q/f\(i)", [IndexedChunk(path: "/q/f\(i)", modified: 1, size: 1, kind: "text", chunkIndex: 0, snippet: "s", embedding: v)]))
+        batchRows.append(("/q/f\(i)", [IndexedChunk(path: "/q/f\(i)", modified: 1, size: 1, kind: qbKinds[i % 4], chunkIndex: 0, snippet: "s", embedding: v)]))
         if batchRows.count >= 8192 { try store.replaceMany(batchRows); batchRows.removeAll(keepingCapacity: true) }
     }
     try store.replaceMany(batchRows)
@@ -655,11 +670,34 @@ if args.count >= 3 && args[1] == "qbench" {
         }
     }
     print(String(format: "keystroke pipeline @200k:  classic(embed+search)=%.2f ms   fused(one sync)=%.2f ms", msClassic, msFused))
+    // Kind-filtered keystroke latency. A single kind toggle (type:image, type:scan, ...) used to
+    // drop the query onto the O(N) host reduce; it now rides the GPU reduce with a per-row kind mask.
+    // A/B host-vs-GPU by running this bench with OMNI_GPU_REDUCE=0 then =1 (gpuReduce gates fusible).
+    var kf = SearchFilter(); kf.kinds = ["image", "scan"]   // ~half the files survive the filter
+    let msFilteredFused = median(21) {
+        if let g = engine.queryVectorGraph(q2) { _ = store.search(queryGraph: g, filter: kf, topK: 60) }
+    }
+    let msFilteredClassic = median(21) {
+        let v = engine.embedQuery(q2)
+        _ = store.search(v, filter: kf, topK: 60)
+    }
+    print(String(format: "kind-filtered @%d:  classic=%.2f ms   fused=%.2f ms   (OMNI_GPU_REDUCE gates host vs GPU)", qbRows, msFilteredClassic, msFilteredFused))
+    // Search-only latency (embed excluded: one precomputed query vector, time only store.search).
+    // This isolates matmul+reduce, where the host O(N) scan that a kind filter used to force shows
+    // up. plain rides the GPU reduce already; kind-filtered now rides it too (was host before).
+    let vq = engine.embedQuery(q2)
+    let msPlainSearch = median(41) { _ = store.search(vq, filter: SearchFilter(), topK: 60) }
+    let msKindSearch  = median(41) { _ = store.search(vq, filter: kf, topK: 60) }
+    print(String(format: "search-only @%d:  plain=%.2f ms   kind-filtered=%.2f ms   (OMNI_GPU_REDUCE gates host vs GPU)", qbRows, msPlainSearch, msKindSearch))
     // Sanity: fused and classic must return the same top hits for the same text.
     let vc = engine.embedQuery(q2)
     let hc = store.search(vc, filter: SearchFilter(), topK: 10).map(\.path)
     let hf = store.search(queryGraph: engine.queryVectorGraph(q2)!, filter: SearchFilter(), topK: 10).hits.map(\.path)
     print("top-10 parity classic-vs-fused: \(hc == hf ? "MATCH" : "DIFFER: \(hc) vs \(hf)")")
+    // Kind-filtered parity: fused (GPU path when enabled) vs classic-with-filter must agree.
+    let hcf = store.search(vc, filter: kf, topK: 10).map(\.path)
+    let hff = store.search(queryGraph: engine.queryVectorGraph(q2)!, filter: kf, topK: 10).hits.map(\.path)
+    print("top-10 parity kind-filtered classic-vs-fused: \(hcf == hff ? "MATCH" : "DIFFER: \(hcf) vs \(hff)")")
     store.close()
     exit(0)
 }

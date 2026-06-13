@@ -299,6 +299,11 @@ public final class VectorStore: @unchecked Sendable {
     /// [baseRows] int32 fileID copy on the GPU, rebuilt with mlxBase (full mode only): lets the
     /// plain-query reduce run as GPU scatter ops instead of an O(N) host scan of all scores.
     private var mlxFileID: MLXArray?
+    /// Resident per-row kind code (Int32, [0,baseRows)), lockstep with mlxFileID. Lets a kind-filtered
+    /// query mask disallowed-kind rows to -inf ON the GPU and stay on the fast reduce/candidate path,
+    /// instead of falling back to the O(rows) host scan. A file is exactly one kind, so per-row masking
+    /// is per-file masking - bit-exact with the host reduce's per-row kind skip. Tiny (~4 bytes/row).
+    private var mlxKindCode: MLXArray?
     // QUANTIZED BASE (the low-end scaling mode): when the full bf16 base would claim too much of the
     // user's memory budget, the GPU-resident scan matrix is a 4-bit group-quantized replica instead
     // (MLX quantizedMM - the heavily-optimized LLM-weights kernel; ~4x less resident and ~4x less
@@ -339,7 +344,7 @@ public final class VectorStore: @unchecked Sendable {
     private func bf16Row(_ v: [Float]) -> [UInt16] { v.map(Self.toBF16) }
     // Force a full base rebuild on the next search. Used by structural changes (delete/compact/
     // reload) that shift row indices; plain appends do NOT call this (they extend the delta).
-    private func invalidateBase() { baseDirty = true; mlxBase = nil; quantBase = nil; baseRows = 0 }
+    private func invalidateBase() { baseDirty = true; mlxBase = nil; mlxFileID = nil; mlxKindCode = nil; quantBase = nil; baseRows = 0 }
     // Membership index of the paths currently in `rows`. Lets replace() know in O(1) whether a
     // path pre-exists, so a brand-new file skips removeRowsLocked entirely (no O(N) scan per file
     // during a full index). Rebuilt from the surviving rows whenever removeRowsLocked compacts.
@@ -1287,7 +1292,8 @@ public final class VectorStore: @unchecked Sendable {
     /// query cache / passage ranking.
     public func search(queryGraph: MLXArray, filter: SearchFilter = SearchFilter(), topK: Int = 40) -> (hits: [SearchHit], query: [Float]) {
         let fusible: Bool = queue.sync {
-            quantBase == nil && filter.isEmpty && Self.gpuReduce && mlxFileID != nil && baseRows > 0 && !baseDirty
+            quantBase == nil && onlyKindFiltered(filter) && Self.gpuReduce && mlxFileID != nil && baseRows > 0 && !baseDirty
+                && (filter.kinds.isEmpty || mlxKindCode != nil)
                 && (rows.count - baseRows) <= Self.foldThreshold && queryGraph.size == dim
         }
         if !fusible {
@@ -1316,7 +1322,7 @@ public final class VectorStore: @unchecked Sendable {
                 }
             }
             return fillSnippetsLocked(reduceTopKGPULocked(
-                baseScore: baseScore, fid: fid, deltaGraph: deltaGraph, topK: topK))
+                baseScore: baseScore, fid: fid, deltaGraph: deltaGraph, topK: topK, filter: filter))
         }
         // Evaluated as an ancestor of the scan - this readback is a copy, not a GPU sync.
         let q = queryGraph.asArray(Float.self)
@@ -1361,9 +1367,11 @@ public final class VectorStore: @unchecked Sendable {
                 // PLAIN-QUERY FAST PATH (full mode): best-chunk-per-file reduction ON the GPU.
                 // The scores are already resident post-matmul; reading all N back and scanning
                 // them on the host was ~4ms of a ~9.5ms query at 2M rows. Delta rows (bounded by
-                // foldThreshold) are scored and merged on the host. Filtered queries keep the
-                // host path (its reducer applies the filters).
-                if filter.isEmpty, Self.gpuReduce, let fid = mlxFileID, baseRows > 0 {
+                // foldThreshold) are scored and merged on the host. A kind-only filter rides this
+                // path too (masked per-row on the GPU via mlxKindCode); folder/ext/since filters
+                // still fall to the host reducer below.
+                if onlyKindFiltered(filter), Self.gpuReduce, let fid = mlxFileID, baseRows > 0,
+                   filter.kinds.isEmpty || mlxKindCode != nil {
                     var deltaGraph: MLXArray? = nil
                     if n > baseRows {
                         let deltaCount = n - baseRows
@@ -1376,7 +1384,7 @@ public final class VectorStore: @unchecked Sendable {
                         }
                     }
                     let result = fillSnippetsLocked(reduceTopKGPULocked(
-                        baseScore: baseScore, fid: fid, deltaGraph: deltaGraph, topK: topK))
+                        baseScore: baseScore, fid: fid, deltaGraph: deltaGraph, topK: topK, filter: filter))
                     if let t0 {
                         print(String(format: "[search] n=%d gpu-reduce path total=%.1fms", n, -t0.timeIntervalSinceNow * 1000))
                     }
@@ -1598,6 +1606,16 @@ public final class VectorStore: @unchecked Sendable {
     /// OMNI_GPU_REDUCE=0 falls back to the host reducer (A/B + safety).
     static let gpuReduce = ProcessInfo.processInfo.environment["OMNI_GPU_REDUCE"] != "0"
 
+    /// A filter the GPU reduce can serve: only `kinds` may be set (masked per-row via the resident
+    /// kind code), while `folderPrefix`/`ext`/`since` still force the host path (they need the
+    /// canonical paths or a resident per-row modified time the GPU reduce does not carry). An empty
+    /// filter passes too - this is a superset of `isEmpty`. A kind-only filter is the common toolbar
+    /// case (type:image, type:scan, ...), so routing it through the GPU reduce closes the gap where a
+    /// single kind toggle dropped the query onto the O(N) host scan.
+    private func onlyKindFiltered(_ f: SearchFilter) -> Bool {
+        f.folderPrefix == nil && (f.ext?.isEmpty ?? true) && f.since == nil
+    }
+
     /// Best-chunk-per-file + top-K on the GPU for the full-mode plain-query path. Winner parity
     /// with reduceTopK is EXACT, including ties: per file, the max score wins and the LOWEST row
     /// index breaks ties (host uses a strict `>` over ascending rows); across base and delta the
@@ -1606,11 +1624,26 @@ public final class VectorStore: @unchecked Sendable {
     ///   B) bestRow[F]    = scatter-min(rowIdx where score == best)    (lowest row on ties)
     ///   C) top-K files   = argPartition(bestScore)                    (read back 2*K scalars)
     /// Host work after the matmul is O(K + delta), never O(N).
-    private func reduceTopKGPULocked(baseScore: MLXArray, fid: MLXArray, deltaGraph: MLXArray?, topK: Int) -> [SearchHit] {
+    private func reduceTopKGPULocked(baseScore: MLXArray, fid: MLXArray, deltaGraph: MLXArray?, topK: Int,
+                                     filter: SearchFilter = SearchFilter()) -> [SearchHit] {
         let F = fileIDCount
         guard F > 0, topK > 0 else { return [] }
         let s32 = baseScore.reshaped([baseRows]).asType(.float32)
-        let sClean = MLX.which(s32 .== s32, s32, MLXArray(-Float.infinity))   // NaN rows lose
+        var sClean = MLX.which(s32 .== s32, s32, MLXArray(-Float.infinity))   // NaN rows lose
+        // Kind filter (only kinds set; onlyKindFiltered guaranteed by the caller): force every row of a
+        // disallowed kind to -inf BEFORE the scatter-max, exactly as a NaN row is forced. A disallowed
+        // file's best then scores -inf and the existing `.isFinite` guard below drops it - identical to
+        // the host reducer's per-row kind `continue`. The delta rows get the same skip on the host side.
+        // A file is exactly one kind, so this per-row mask is a per-file mask (bit-exact, no tie shift).
+        var kindAllowed: [Bool]? = nil
+        if !filter.kinds.isEmpty, let kc = mlxKindCode {
+            var allowF = [Float](repeating: 0, count: 256)   // 256-slot gather table (kindCode is UInt8)
+            var allowB = [Bool](repeating: false, count: 256)
+            for k in filter.kinds { if let id = kindID[k] { allowF[Int(id)] = 1; allowB[Int(id)] = true } }
+            let mask = MLXArray(allowF)[kc]                  // [baseRows] gather: 1 allowed, 0 disallowed
+            sClean = MLX.which(mask .> 0.5, sClean, MLXArray(-Float.infinity))
+            kindAllowed = allowB
+        }
         var bestScore = MLX.full([F], values: MLXArray(-Float.infinity))
         bestScore = bestScore.at[fid].maximum(sClean)
         let rowBest = bestScore[fid]                                          // [N] each row's file-best
@@ -1656,6 +1689,7 @@ public final class VectorStore: @unchecked Sendable {
         for (i, dot) in deltaScores.enumerated() {
             guard dot.isFinite else { continue }
             let ri = baseRows + i
+            if let ka = kindAllowed, !ka[Int(kindCode[ri])] { continue }   // disallowed-kind delta row
             let f = fileID[ri]
             if let cur = candScore[f] {
                 if dot > cur { candScore[f] = dot; candRow[f] = Int32(ri) }   // strict >: base wins ties
@@ -1814,6 +1848,7 @@ public final class VectorStore: @unchecked Sendable {
         // returns to MLX's cache and is often reused by the new allocation outright.
         mlxBase = nil
         mlxFileID = nil
+        mlxKindCode = nil
         quantBase = nil
         let byteCount = rowCount * dim * MemoryLayout<UInt16>.size
         let bits = Self.quantBitsFor(baseBytes: byteCount)
@@ -1867,7 +1902,14 @@ public final class VectorStore: @unchecked Sendable {
                 MLXArray(Array(UnsafeBufferPointer(rebasing: fp[0 ..< rowCount])))
             }
             mlxFileID = fid
-            MLX.eval(mlxBase!, fid)
+            // GPU kind code in lockstep (Int32 [rowCount], ~4 bytes/row): lets a kind-filtered query
+            // mask disallowed-kind rows to -inf on the GPU and stay on the fast reduce path. kindCode
+            // is UInt8 (<=256 kinds); widen to Int32 for use as a gather index into the 256-slot mask.
+            let kc = kindCode.withUnsafeBufferPointer { kp in
+                MLXArray(UnsafeBufferPointer(rebasing: kp[0 ..< rowCount]).map { Int32($0) })
+            }
+            mlxKindCode = kc
+            MLX.eval(mlxBase!, fid, kc)
             quantBits = 0
         }
         baseRows = rowCount
