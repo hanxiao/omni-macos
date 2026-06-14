@@ -14,7 +14,16 @@ public struct FileCrawler: Sendable {
     /// Modalities the user has turned on. The coarse filter applied BEFORE `ignore`: a file is
     /// indexed iff its kind is in this set AND it is not ignored. Default: all four kinds on.
     public var enabledKinds: Set<FileKind>
-    public var maxFileSize: Int
+    /// Per-kind file-size ceiling in bytes; a kind with NO entry is uncapped. Video and audio stream
+    /// in bounded 240 s segments (embedStreamedVideo/Audio), so a multi-GB file is memory-safe - only
+    /// slower to index - and is left uncapped. Text reads only the first maxTextBytes (2 MB) regardless
+    /// of file size, so its size is irrelevant - uncapped. Images are decoded by ImageIO (which parses
+    /// the whole file), so they keep a guard against pathological inputs. (Was a single 200 MB cap on
+    /// ALL kinds, which silently skipped every multi-GB video - the exact files the streamed pipeline
+    /// exists for. See issue #9.)
+    public var maxFileSize: [FileKind: Int]
+    /// Default policy: only images are capped (200 MB); video/audio/text are uncapped.
+    public static let defaultMaxFileSize: [FileKind: Int] = [.image: 200_000_000]
 
     /// Well-known noise directories. No longer special-cased in the crawl - migration SEEDS these as
     /// editable patterns in the default .omniignore (so power users can remove them).
@@ -25,7 +34,8 @@ public struct FileCrawler: Sendable {
     ]
 
     public init(roots: [URL], ignore: OmniIgnore = OmniIgnore(text: ""),
-                enabledKinds: Set<FileKind> = [.text, .image, .video, .audio], maxFileSize: Int = 200_000_000) {
+                enabledKinds: Set<FileKind> = [.text, .image, .video, .audio],
+                maxFileSize: [FileKind: Int] = FileCrawler.defaultMaxFileSize) {
         self.roots = roots
         self.ignore = ignore
         self.enabledKinds = enabledKinds
@@ -61,7 +71,7 @@ public struct FileCrawler: Sendable {
                       let kind = FileExtractor.kind(for: url), enabledKinds.contains(kind),
                       !ignore.isIgnored(url.path, isDir: false) else { continue }
                 let size = vals.fileSize ?? 0
-                if size > maxFileSize { continue }
+                if let cap = maxFileSize[kind], size > cap { continue }   // per-kind cap; uncapped kinds stream
                 let mtime = vals.contentModificationDate?.timeIntervalSince1970 ?? 0
                 onFile(CrawledFile(url: url, modified: mtime, size: size))
             }
