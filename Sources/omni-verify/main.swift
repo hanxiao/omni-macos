@@ -521,6 +521,59 @@ if args.count >= 2 && args[1] == "foldbench" {
     exit(0)
 }
 
+// Refold probe: omni-verify refoldprobe [baseRows] [writes] [dim]
+// EMPIRICAL test of the claim "proactiveRefoldLocked re-quantizes the whole base on every write
+// during active search in quant mode". Builds a base, then does APPEND-ONLY writes (new paths ->
+// delta only, never dirties the base; delta kept well under foldThreshold) while keeping a search
+// active (search within the 2s window before each write). The ONLY thing that can trigger a
+// rebuildBaseLocked in this loop is proactiveRefoldLocked. Count REBUILD lines (OMNI_SEARCH_TIMING=1)
+// between PROBE-START and PROBE-END: full mode should show ~0 (mlxBase != nil), quant mode shows the
+// bug if it rebuilds per write. Run with OMNI_REFOLD_MIN_INTERVAL=0 to remove the 0.25s floor and
+// expose the per-write behavior; default floor shows the realistic ~4/s cap. A/B: with vs without
+// OMNI_QUANT_BASE=4.
+if args.count >= 2 && args[1] == "refoldprobe" {
+    let baseRows = (args.count >= 3 ? Int(args[2]) : nil) ?? 200_000
+    let writes = (args.count >= 4 ? Int(args[3]) : nil) ?? 30
+    let dim = (args.count >= 5 ? Int(args[4]) : nil) ?? 1024
+    let appendPer = 200   // small delta per write; writes*appendPer must stay < foldThreshold (50k)
+    let dbURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("omni-refoldprobe-\(ProcessInfo.processInfo.processIdentifier).sqlite")
+    defer { try? FileManager.default.removeItem(at: dbURL) }
+    let store = try VectorStore(dbURL: dbURL)
+    var rng: UInt64 = 0xCAFE_F00D_1234_5678
+    func nextF() -> Float { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return Float(rng >> 40) / Float(1 << 24) - 0.5 }
+    func vec() -> [Float] {
+        var v = [Float](repeating: 0, count: dim); var nrm: Float = 0
+        for k in 0 ..< dim { let x = nextF(); v[k] = x; nrm += x * x }
+        let inv = nrm > 0 ? 1 / nrm.squareRoot() : 0
+        for k in 0 ..< dim { v[k] *= inv }; return v
+    }
+    let quant = ProcessInfo.processInfo.environment["OMNI_QUANT_BASE"]
+    let floor = ProcessInfo.processInfo.environment["OMNI_REFOLD_MIN_INTERVAL"] ?? "0.25(default)"
+    print("refoldprobe baseRows=\(baseRows) writes=\(writes) appendPer=\(appendPer) dim=\(dim) OMNI_QUANT_BASE=\(quant ?? "unset") REFOLD_FLOOR=\(floor)")
+    if writes * appendPer >= 50_000 { print("WARN: writes*appendPer >= foldThreshold; legitimate folds will confound the probe") }
+    var counter = 0
+    var batch: [(path: String, chunks: [IndexedChunk])] = []
+    for _ in 0 ..< baseRows {
+        batch.append(("/b\(counter)", [IndexedChunk(path: "/b\(counter)", modified: 1, size: 1, kind: "text", chunkIndex: 0, snippet: "s", embedding: vec())])); counter += 1
+        if batch.count >= 8192 { try store.replaceMany(batch); batch.removeAll(keepingCapacity: true) }
+    }
+    if !batch.isEmpty { try store.replaceMany(batch); batch.removeAll(keepingCapacity: true) }
+    let q = vec()
+    _ = store.search(q, topK: 10)   // build the base (logs ONE REBUILD before PROBE-START)
+    print("PROBE-START")
+    for _ in 0 ..< writes {
+        _ = store.search(q, topK: 10)   // keep the store "actively searched" (within 2s window)
+        var w: [(path: String, chunks: [IndexedChunk])] = []
+        for _ in 0 ..< appendPer {
+            w.append(("/w\(counter)", [IndexedChunk(path: "/w\(counter)", modified: 1, size: 1, kind: "text", chunkIndex: 0, snippet: "s", embedding: vec())])); counter += 1
+        }
+        try store.replaceMany(w)   // proactiveRefoldLocked runs at the tail
+    }
+    print("PROBE-END writes=\(writes) finalRows=\(counter)")
+    store.close()
+    exit(0)
+}
+
 // Search benchmark: omni-verify searchbench [N] [dim] [queries]
 // Compares brute-force cosine scoring: CPU vDSP fp32 (current), CPU cblas_sgemv fp32 (the
 // doc-claimed-but-unwired path), and GPU MLX bf16 (resident bf16 matrix, one matmul/query).
