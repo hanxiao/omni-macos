@@ -162,6 +162,22 @@ private struct ActivityTab: View {
             }
         }
         .formStyle(.grouped)
+        // The kind on/off toggles live in THIS tab (orderRow). A confirmationDialog only presents
+        // while its host view is on screen, so the disable-confirmation must be attached HERE, next
+        // to the toggles - when it lived on the Content tab, disabling a kind-with-files from the
+        // Indexing tab set pendingDisable but the dialog never showed, so applyKind was never called
+        // and the toggle silently did nothing.
+        .confirmationDialog(
+            model.pendingDisable.map { "Stop indexing \($0.kind.title.lowercased())?" } ?? "",
+            isPresented: Binding(get: { model.pendingDisable != nil }, set: { if !$0 { model.pendingDisable = nil } }),
+            presenting: model.pendingDisable
+        ) { pd in
+            Button("Remove \(pd.count) from index", role: .destructive) { model.applyKind(pd.kind, on: false, purge: true) }
+            Button("Keep in index") { model.applyKind(pd.kind, on: false, purge: false) }
+            Button("Cancel", role: .cancel) { model.pendingDisable = nil }
+        } message: { pd in
+            Text("\(pd.count) \(pd.kind.rawValue) \(pd.count == 1 ? "file is" : "files are") already indexed. Remove them now, or keep them searchable and just stop indexing new ones.")
+        }
     }
 
     @ViewBuilder private func orderRow(_ k: FileKind) -> some View {
@@ -255,21 +271,10 @@ private struct ContentTypesTab: View {
         .formStyle(.grouped)
         .onAppear { if !loaded { draft = model.ignoreText; loaded = true } }
         .onChange(of: draft) { _, newValue in schedulePreview(newValue) }
-        .confirmationDialog(
-            model.pendingDisable.map { "Stop indexing \($0.kind.title.lowercased())?" } ?? "",
-            isPresented: Binding(get: { model.pendingDisable != nil }, set: { if !$0 { model.pendingDisable = nil } }),
-            presenting: model.pendingDisable
-        ) { pd in
-            Button("Remove \(pd.count) from index", role: .destructive) { model.applyKind(pd.kind, on: false, purge: true) }
-            Button("Keep in index") { model.applyKind(pd.kind, on: false, purge: false) }
-            Button("Cancel", role: .cancel) { model.pendingDisable = nil }
-        } message: { pd in
-            Text("\(pd.count) \(pd.kind.rawValue) \(pd.count == 1 ? "file is" : "files are") already indexed. Remove them now, or keep them searchable and just stop indexing new ones.")
-        }
     }
 
-    /// One modality: drag handle (reorder = index priority) + an on/off switch. Off skips the kind
-    /// AND unloads its model from memory; the ignore rules below filter further within what stays on.
+    /// Live preview of what the current ignore rules match: a danger warning plus the affected-file
+    /// count, so the user sees the blast radius before saving.
     @ViewBuilder private var previewBar: some View {
         VStack(alignment: .leading, spacing: 8) {
             if let d = model.ignorePreview?.danger {
