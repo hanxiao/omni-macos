@@ -148,18 +148,21 @@ public func omniPerfLog(_ message: @autoclosure () -> String) {
 
 public final class OmniEngine: Embedder, @unchecked Sendable {
     // var, not let: recoverMediaPath() swaps in freshly loaded encoders when a cold-load weight
-    // corruption is detected at runtime. textEncoder is only ever read AND written INSIDE the run()
-    // gate (embedText runs the encode in run(); the swap runs in run()), so the gate serializes it.
-    // The MEDIA encoders are different: callers read `guard let enc = imageEncoder` OUTSIDE the gate
-    // before entering run(), so the recovery swap could race those reads - a class-reference var read
-    // concurrent with a write is a data race (UB). Guard the media encoders with encoderLock via
-    // computed wrappers so every read and the swap are mutually exclusive; the hot text path stays
-    // lock-free (it is already gated). Reads are coarse-grained (one per ~76-306ms embed), so the
-    // lock is negligible.
-    private var textEncoder: OmniTextEncoder
+    // corruption is detected at runtime. ALL THREE encoders are read from threads that are not the
+    // swapper: media callers read `guard let enc = imageEncoder` OUTSIDE the run() gate, and the text
+    // path reads textEncoder OUTSIDE the gate too (embedTextBatches tokenizes before taking the gate).
+    // A class-reference var read concurrent with the recovery swap is a data race (UB). So all three
+    // go behind encoderLock via computed wrappers: every read and every swap are mutually exclusive.
+    // The cost is one uncontended lock acquire per encode CALL (not per token) - one per query and
+    // one per indexing flush - so it does not touch the per-token throughput of the moat.
     private let encoderLock = NSLock()
+    private var _textEncoder: OmniTextEncoder
     private var _imageEncoder: OmniImageEncoder?
     private var _audioEncoder: OmniAudioEncoder?
+    private var textEncoder: OmniTextEncoder {
+        get { encoderLock.withLock { _textEncoder } }
+        set { encoderLock.withLock { _textEncoder = newValue } }
+    }
     private var imageEncoder: OmniImageEncoder? {
         get { encoderLock.withLock { _imageEncoder } }
         set { encoderLock.withLock { _imageEncoder = newValue } }
@@ -214,7 +217,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         self.keepVision = keepVision
         self.keepAudio = keepAudio
         let text = OmniTextEncoder(weights: weights, config: config, tokenizer: tokenizer)
-        self.textEncoder = text
+        self._textEncoder = text
         self.docPrefix = text.prefixTokenIds(.passage)
         self.queryPrefix = text.prefixTokenIds(.query)
         self.mediaSuffix = text.suffixTokenIds
