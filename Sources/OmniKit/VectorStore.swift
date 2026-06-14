@@ -1927,7 +1927,13 @@ public final class VectorStore: @unchecked Sendable {
         guard Self.proactiveFold, searchRecentlyActiveLocked() else { return }
         let n = rows.count
         guard n > 0, dim > 0, flat16.count == n * dim else { return }
-        guard baseDirty || mlxBase == nil || (n - baseRows) > Self.foldThreshold else { return }
+        // Quant-aware, exactly like search(_:)'s rebuild condition: in quant mode mlxBase stays nil
+        // (the scan replica is quantBase), so a bare `mlxBase == nil` here fires on EVERY write and
+        // re-folds the whole base (re-quantize + a full flat16 mapToScratch remap) per write during
+        // active search - defeating foldThreshold's batching on exactly the low-end machines quant
+        // mode serves. Only rebuild when NEITHER resident base exists, or the delta outgrew the fold
+        // threshold, or a structural change dirtied it. (refoldprobe: quant 30 rebuilds/30 writes -> 0.)
+        guard baseDirty || (mlxBase == nil && quantBase == nil) || (n - baseRows) > Self.foldThreshold else { return }
         // Rate limit: the high-rate writers (text full pass, reconcile) batch many files per write, so
         // in practice this fires at most ~once per flush window. The floor only matters for residual
         // PER-FILE writers (media stores) - without it, ~10 stores/s during active search would spend
