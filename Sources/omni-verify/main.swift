@@ -574,6 +574,68 @@ if args.count >= 2 && args[1] == "refoldprobe" {
     exit(0)
 }
 
+// Media memory probe: omni-verify mediamem <videoFile> [modelDir]
+// Answers "does lifting the per-kind size cap (#9) let a multi-GB video burst memory?" empirically.
+// Streams the video the way the indexer does (embedStreamedVideo): one 240 s segment at a time,
+// extracting up to 32 frames per segment via AVAssetImageGenerator (the SAME API + settings as
+// FileExtractor.videoFrames - keyframe SEEKS, maximumSize downsample, per-frame autoreleasepool),
+// optionally embedding each segment if a modelDir is given. Tracks peak phys_footprint (host RSS) and
+// MLX GPU peak. The claim under test: peak memory is bounded by frames-in-flight (one segment), NOT
+// by file size or duration. Compare a small clip vs a multi-GB one - peak RSS should be ~flat.
+if args.count >= 3 && args[1] == "mediamem" {
+    let url = URL(fileURLWithPath: args[2])
+    let fileSize = ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.intValue ?? 0
+    let asset = AVURLAsset(url: url)
+    let dur = CMTimeGetSeconds(asset.duration)   // sync, matches FileExtractor.videoFrames
+    guard dur.isFinite, dur > 0 else { print("mediamem: cannot read duration (undecodable container?)"); exit(1) }
+    let segSec = 240.0
+    let segCount = max(1, Int((dur / segSec).rounded(.up)))
+    let engine: OmniEngine? = args.count >= 4 ? try await OmniEngine(modelDir: URL(fileURLWithPath: args[3])) : nil
+    // Mirror of FileExtractor.videoFrames (no perceptual dedup, so we KEEP all 32 frames = the
+    // worst-case memory per segment).
+    func extractSeg(_ lo: Double, _ hi: Double, maxFrames: Int = 32, maxDim: Int = 1568) -> [CGImage] {
+        let gen = AVAssetImageGenerator(asset: asset)
+        gen.appliesPreferredTrackTransform = true
+        gen.requestedTimeToleranceBefore = .positiveInfinity
+        gen.requestedTimeToleranceAfter = .positiveInfinity
+        gen.maximumSize = CGSize(width: maxDim, height: maxDim)
+        var kept: [CGImage] = []
+        for i in 0 ..< max(1, maxFrames) {
+            autoreleasepool {
+                let t = lo + (hi - lo) * (Double(i) + 0.5) / Double(maxFrames)
+                if let img = try? gen.copyCGImage(at: CMTime(seconds: t, preferredTimescale: 600), actualTime: nil) { kept.append(img) }
+            }
+        }
+        return kept
+    }
+    let base = churnFootprintMB()
+    var peakRSS = base, frames = 0
+    let t0 = Date()
+    for s in 0 ..< segCount {
+        autoreleasepool {
+            let fs = extractSeg(Double(s) * segSec, Swift.min(dur, Double(s + 1) * segSec))
+            frames += fs.count
+            if let engine, !fs.isEmpty { _ = engine.embedVideoFrames(fs) }   // per-segment embed, like the indexer
+            peakRSS = Swift.max(peakRSS, churnFootprintMB())
+            // Per-segment GPU + RSS, to see whether memory PLATEAUS (bounded) or ACCUMULATES per
+            // segment (would burst on a long video). active = live buffers; peak = high-water mark.
+            if engine != nil {
+                print(String(format: "  seg %2d/%d  frames=%2d  GPU active=%.0fMB peak=%.0fMB  RSS=%.0fMB",
+                             s, segCount, fs.count, Double(MLX.GPU.activeMemory) / 1_048_576,
+                             Double(MLX.GPU.peakMemory) / 1_048_576, churnFootprintMB()))
+            }
+        }
+        peakRSS = Swift.max(peakRSS, churnFootprintMB())
+    }
+    let secs = -t0.timeIntervalSinceNow
+    let gpuPeak = engine != nil ? Double(MLX.GPU.peakMemory) / 1_048_576 : 0
+    print(String(format: "mediamem  file=%.0fMB  duration=%.0fs  segments=%d  frames=%d  embed=%@  %.1fs",
+                 Double(fileSize) / 1_048_576, dur, segCount, frames, engine != nil ? "yes" : "no", secs))
+    print(String(format: "  HOST phys_footprint: base=%.0fMB  peak=%.0fMB  delta=%.0fMB", base, peakRSS, peakRSS - base))
+    if engine != nil { print(String(format: "  GPU peak: %.0fMB", gpuPeak)) }
+    exit(0)
+}
+
 // Search benchmark: omni-verify searchbench [N] [dim] [queries]
 // Compares brute-force cosine scoring: CPU vDSP fp32 (current), CPU cblas_sgemv fp32 (the
 // doc-claimed-but-unwired path), and GPU MLX bf16 (resident bf16 matrix, one matmul/query).
