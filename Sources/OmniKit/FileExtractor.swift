@@ -147,8 +147,19 @@ public enum FileExtractor {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         let data = handle.readData(ofLength: maxTextBytes)
-        let str = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? ""
-        let trimmed = str.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A file larger than maxTextBytes is cut at the cap, which can split a multi-byte UTF-8
+        // codepoint at the boundary. String(data:.utf8) then returns nil and we would fall through to
+        // isoLatin1, decoding the ENTIRE file as Latin-1 mojibake (every CJK/emoji char garbled). When
+        // the read hit the cap, drop up to 3 trailing bytes to reach a codepoint boundary so a valid
+        // UTF-8 file stays UTF-8; only a genuinely non-UTF-8 file then falls back to Latin-1.
+        var str = String(data: data, encoding: .utf8)
+        if str == nil && data.count == maxTextBytes {
+            for drop in 1 ... 3 where str == nil {
+                str = String(data: data.subdata(in: 0 ..< (data.count - drop)), encoding: .utf8)
+            }
+        }
+        let decoded = str ?? String(data: data, encoding: .isoLatin1) ?? ""
+        let trimmed = decoded.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? .empty : .text(trimmed)
     }
 
