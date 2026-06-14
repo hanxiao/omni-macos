@@ -1301,13 +1301,19 @@ public final class VectorStore: @unchecked Sendable {
             let q = queryGraph.asArray(Float.self)
             return (search(q, filter: filter, topK: topK), q)
         }
+        var needClassic = false
         let hits: [SearchHit] = queue.sync {
             lastSearchAt = Date()
             let n = rows.count
             guard n > 0, dim > 0, flat16.count == n * dim else { return [] }
             // Re-check under the lock (a write may have raced the fusible probe); rebuild if due.
-            if baseDirty || mlxBase == nil || (n - baseRows) > Self.foldThreshold { rebuildBaseLocked(rowCount: n) }
-            guard let base = mlxBase, let fid = mlxFileID else { return [] }
+            // Quant-aware, like search(_:): rebuild only when NEITHER resident base exists.
+            if baseDirty || (mlxBase == nil && quantBase == nil) || (n - baseRows) > Self.foldThreshold { rebuildBaseLocked(rowCount: n) }
+            // A racing write may have flipped the base to quant mode since the fusible probe (mlxBase
+            // stays nil in quant mode). The fused GPU path does not apply; fall back to the classic
+            // quant-capable path AFTER releasing the lock - calling search() here would re-enter
+            // queue.sync and deadlock. (Was: returned an empty result for this one query.)
+            guard let base = mlxBase, let fid = mlxFileID else { needClassic = true; return [] }
             let qv = queryGraph.reshaped([dim, 1]).asType(.bfloat16)
             let baseScore = MLX.matmul(base, qv)
             var deltaGraph: MLXArray? = nil
@@ -1323,6 +1329,12 @@ public final class VectorStore: @unchecked Sendable {
             }
             return fillSnippetsLocked(reduceTopKGPULocked(
                 baseScore: baseScore, fid: fid, deltaGraph: deltaGraph, topK: topK, filter: filter))
+        }
+        if needClassic {
+            // Quant flip mid-call: evaluate the query and run the classic (quant-capable) path.
+            MLX.eval(queryGraph)
+            let q = queryGraph.asArray(Float.self)
+            return (search(q, filter: filter, topK: topK), q)
         }
         // Evaluated as an ancestor of the scan - this readback is a copy, not a GPU sync.
         let q = queryGraph.asArray(Float.self)
