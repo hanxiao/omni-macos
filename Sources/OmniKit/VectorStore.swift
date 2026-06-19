@@ -984,6 +984,7 @@ public final class VectorStore: @unchecked Sendable {
             }
             sqlite3_finalize(stmt)
             removeRowsLocked { set.contains($0.kind) }
+            checkpointIfDueLocked(forceStat: true)   // bulk delete inflates the WAL; fold it (self-review fix)
         }
     }
 
@@ -1014,6 +1015,7 @@ public final class VectorStore: @unchecked Sendable {
             }
             sqlite3_finalize(kstmt)
             removeRowsLocked { disabled($0.path) }
+            checkpointIfDueLocked(forceStat: true)   // bulk delete inflates the WAL; fold it (self-review fix)
         }
     }
 
@@ -1029,6 +1031,7 @@ public final class VectorStore: @unchecked Sendable {
             kindCode = []; kindID = [:]; idKind = []; invalidateBase()
             resetAggregatesLocked()
             dim = 0
+            checkpointIfDueLocked(forceStat: true)   // a full wipe inflates the WAL; fold it (self-review fix)
         }
     }
 
@@ -1306,9 +1309,10 @@ public final class VectorStore: @unchecked Sendable {
     /// Returns the hits AND the query vector (free after the shared eval) for the caller's
     /// query cache / passage ranking.
     public func search(queryGraph: MLXArray, filter: SearchFilter = SearchFilter(), topK: Int = 40) -> (hits: [SearchHit], query: [Float]) {
-        // Preconditions that read no shared state - resolved off the lock. A filtered/odd-size query or
-        // a disabled GPU reduce skips the lock entirely and takes the classic path.
-        let prelimFusible = Self.gpuReduce && onlyKindFiltered(filter) && queryGraph.size == dim
+        // Preconditions that read no shared state - resolved off the lock. A filtered query or a
+        // disabled GPU reduce skips the lock entirely and takes the classic path. (queryGraph.size == dim
+        // is checked INSIDE the lock below, since `dim` is mutable shared state - self-review fix.)
+        let prelimFusible = Self.gpuReduce && onlyKindFiltered(filter)
         var needClassic = !prelimFusible
         // ONE locked snapshot does the fusibility decision AND the execution. The old code took the
         // queue twice (a probe sync then an execute sync) and had to re-check inside because "a write
@@ -1321,6 +1325,7 @@ public final class VectorStore: @unchecked Sendable {
             let fusible = quantBase == nil && mlxFileID != nil && baseRows > 0 && !baseDirty
                 && (filter.kinds.isEmpty || mlxKindCode != nil)
                 && (n - baseRows) <= Self.foldThreshold
+                && queryGraph.size == dim   // dim is shared state - read under the lock (self-review fix)
             guard fusible else { needClassic = true; return nil }
             guard n > 0, dim > 0, flat16.count == n * dim else { return [] }
             if baseDirty || (mlxBase == nil && quantBase == nil) || (n - baseRows) > Self.foldThreshold { rebuildBaseLocked(rowCount: n) }
@@ -1353,13 +1358,17 @@ public final class VectorStore: @unchecked Sendable {
         return (hits ?? [], q)
     }
 
-    public func search(_ query: [Float], filter: SearchFilter = SearchFilter(), topK: Int = 40) -> [SearchHit] {
+    /// `markActive`: when true (default), stamps the store "recently searched" so concurrent writes
+    /// proactively refold the base. The bootstrap warm-up probe passes false: it wants to warm the
+    /// reduce kernels + trigger the fold WITHOUT faking a 2s search-active window that would make the
+    /// startup index pass refold repeatedly and keep mlxBase resident. (self-review fix)
+    public func search(_ query: [Float], filter: SearchFilter = SearchFilter(), topK: Int = 40, markActive: Bool = true) -> [SearchHit] {
         let tCall = Self.searchTiming ? Date() : nil
         return queue.sync {
             if let tCall { print(String(format: "[search] lockwait=%.1fms", -tCall.timeIntervalSinceNow * 1000)) }
-            lastSearchAt = Date()   // mark the store "actively searched" so writes proactively refold the base
             let n = rows.count
             guard n > 0, dim > 0, query.count == dim, flat16.count == n * dim else { return [] }
+            if markActive { lastSearchAt = Date() }   // stamp AFTER the guard so an empty/invalid query never fakes a search window
             if baseDirty || (mlxBase == nil && quantBase == nil) || (n - baseRows) > Self.foldThreshold {
                 rebuildBaseLocked(rowCount: n)
             }

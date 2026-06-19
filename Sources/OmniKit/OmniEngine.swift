@@ -319,6 +319,11 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
                     textEncoder = OmniTextEncoder(weights: weights, config: config, tokenizer: tokenizer)
                     imageEncoder = OmniImageEncoder(weights: weights, config: config)
                     audioEncoder = OmniAudioEncoder(weights: weights, config: config)
+                    // Adopt the freshly-loaded dict: the encoders now reference it, so the old
+                    // (corrupted) weightStore must be released, else it stays strong-referenced
+                    // (clearCache cannot reclaim it) AND a later setTowers() would rebuild surviving
+                    // encoders from the stale corrupted arrays, resurrecting the NaN. (self-review fix)
+                    self.weightStore = weights
                     return true
                 } catch {
                     FileHandle.standardError.write(Data("OmniEngine: media-path recovery reload failed: \(error)\n".utf8))

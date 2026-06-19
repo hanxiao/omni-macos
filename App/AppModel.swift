@@ -1044,22 +1044,35 @@ final class AppModel {
             modalityReloadTask = Task { [weak self] in
                 try? await Task.sleep(for: .milliseconds(250))
                 guard !Task.isCancelled, let self else { return }
-                guard let engine = self.engine else { await self.bootstrap(); return }
-                let towers = self.enabledKindTowers
-                let needsAbsentTower = (towers.vision && !engine.supportsImages) || (towers.audio && !engine.supportsAudio)
-                if needsAbsentTower {
-                    self.phase = .loadingModel
-                    await self.bootstrap()
-                } else if towers.vision != engine.supportsImages || towers.audio != engine.supportsAudio {
-                    await Task.detached(priority: .userInitiated) { engine.setTowers(keepVision: towers.vision, keepAudio: towers.audio) }.value
-                    self.supportsImages = engine.supportsImages
-                    self.audioSupported = engine.supportsAudio
-                    self.startIndexing()   // crawl any files the surviving towers now cover
-                }
+                await self.reconcileTowers()
             }
         } else if on {
             startIndexing()   // tower already resident; just crawl the now-included files
         }
+    }
+
+    /// Make the live engine's resident towers match `enabledKindTowers`, converging even if the user
+    /// toggles again mid-operation. A pure DROP is done in place (setTowers: ~10x faster than a reload,
+    /// no old+new double-resident burst); anything needing an ABSENT tower's bytes does a full reload
+    /// (bootstrap). The in-place drop runs off the main actor and is NOT cancellable, so after it we
+    /// RE-READ the live settings and recurse if they diverged - otherwise a drop-then-reenable burst
+    /// could leave a modality removed while settings say enabled. (self-review fix for F11)
+    private func reconcileTowers() async {
+        guard let engine = self.engine else { await self.bootstrap(); return }
+        let towers = self.enabledKindTowers
+        if towers.vision == engine.supportsImages && towers.audio == engine.supportsAudio { return }   // converged
+        let needsAbsentTower = (towers.vision && !engine.supportsImages) || (towers.audio && !engine.supportsAudio)
+        if needsAbsentTower {
+            self.phase = .loadingModel
+            await self.bootstrap()   // reloads the live enabledKindTowers set, so the engine converges
+            return
+        }
+        // Pure drop: setTowers is synchronous GPU work, so run it off the main actor.
+        await Task.detached(priority: .userInitiated) { engine.setTowers(keepVision: towers.vision, keepAudio: towers.audio) }.value
+        self.supportsImages = engine.supportsImages
+        self.audioSupported = engine.supportsAudio
+        self.startIndexing()           // crawl any files the surviving towers now cover
+        await self.reconcileTowers()   // settings may have changed during the off-actor drop; converge
     }
 
     /// Re-enabling a modality should fully include it again, so drop a leftover `*.ext` exclude block a
@@ -1503,7 +1516,10 @@ final class AppModel {
             // reduce and triggers the base fold, so the user's first real query skips both. (F1)
             Task.detached(priority: .utility) {
                 engine.warmText()
-                _ = store.search([Float](repeating: 0, count: engine.dim), topK: 10)
+                // markActive: false - warm the reduce kernels + trigger the base fold WITHOUT faking a
+                // 2s search-active window that would make the concurrent startup index pass refold
+                // repeatedly and keep mlxBase resident for folds nobody requested. (self-review fix)
+                _ = store.search([Float](repeating: 0, count: engine.dim), topK: 10, markActive: false)
             }
             if canIndex { startIndexing() }
         } catch {
