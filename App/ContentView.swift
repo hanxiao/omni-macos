@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import OmniKit
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @Environment(AppModel.self) private var model: AppModel
@@ -119,18 +120,48 @@ struct ContentView: View {
                 emptyState
             }
         }
-        // Drop a supported file from Finder anywhere on the content to search by it.
-        .dropDestination(for: URL.self) { urls, _ in
-            guard let url = urls.first(where: { FileExtractor.kind(for: $0) != nil }) else { return false }
-            model.setFileQuery(url)
-            return true
-        } isTargeted: { fileDropTargeted = $0 }
+        // Drag an image, file, or text from anywhere (Finder, a browser, another app) - or paste one
+        // (Cmd-V) - to search by it. An image that arrives as bitmap data (a browser drag/copy, not a
+        // file on disk) is written to a temp file and run through the same file-query path.
+        .onDrop(of: [.image, .fileURL, .text, .plainText], isTargeted: $fileDropTargeted) { providers in
+            handleSearchDrop(providers)
+        }
         .overlay {
             if fileDropTargeted {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .strokeBorder(Color.accentColor, lineWidth: 2).padding(6).allowsHitTesting(false)
             }
         }
+    }
+
+    // MARK: - Drag & paste to search
+
+    /// Route a drop onto the search surface: a supported FILE first (Finder/local file), else an
+    /// IMAGE (a browser bitmap with no backing file), else TEXT. Async loads run off the main thread,
+    /// so each hands back to the main actor. Returns whether we accept the drop.
+    private func handleSearchDrop(_ providers: [NSItemProvider]) -> Bool {
+        if let p = providers.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }) {
+            _ = p.loadObject(ofClass: NSURL.self) { obj, _ in
+                guard let url = obj as? URL, url.isFileURL, FileExtractor.kind(for: url) != nil else { return }
+                Task { @MainActor in model.setFileQuery(url) }
+            }
+            return true
+        }
+        if let p = providers.first(where: { $0.canLoadObject(ofClass: NSImage.self) }) {
+            _ = p.loadObject(ofClass: NSImage.self) { obj, _ in
+                guard let img = obj as? NSImage else { return }
+                Task { @MainActor in model.searchByImage(img) }
+            }
+            return true
+        }
+        if let p = providers.first(where: { $0.canLoadObject(ofClass: NSString.self) }) {
+            _ = p.loadObject(ofClass: NSString.self) { obj, _ in
+                guard let s = obj as? String else { return }
+                Task { @MainActor in model.searchByText(s) }
+            }
+            return true
+        }
+        return false
     }
 
     @ViewBuilder private var emptyState: some View {
@@ -159,10 +190,9 @@ struct ContentView: View {
             // Idle prompt, and the in-flight search state. They share one calm placeholder so a
             // pending search only fades a small spinner in under the same prompt - it never flashes
             // "No matches" while the debounce/search for what you just typed is still running.
-            CenteredStatus(symbol: "sparkle.magnifyingglass",
-                           title: model.indexedFiles > 0 ? "Search \(model.indexedFiles.formatted()) file\(model.indexedFiles == 1 ? "" : "s")" : "Search your files",
-                           subtitle: "Type a phrase. Results are ranked by meaning, across images, video, audio, and text.",
-                           showSpinner: model.isResolving)
+            SearchWaysPrompt(
+                title: model.indexedFiles > 0 ? "Search \(model.indexedFiles.formatted()) file\(model.indexedFiles == 1 ? "" : "s")" : "Search your files",
+                showSpinner: model.isResolving)
         } else if model.hiddenByThreshold > 0 {
             CenteredStatus(symbol: "line.3.horizontal.decrease.circle",
                            title: "No results above \(Int(model.minScore * 100))%",
@@ -532,6 +562,43 @@ struct CenteredStatus: View {
                 }
                 .controlSize(.large).padding(.top, 4)
             }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding()
+    }
+}
+
+/// The idle search prompt. Same icon + title as CenteredStatus, but instead of one sentence it lists
+/// every way to start a search as bullets - typing, dragging, pasting, picking a file, Find Similar.
+/// Icons match the real controls (photo.badge.magnifyingglass = the search-by-file button,
+/// square.on.square = the Find Similar / file-query chip) so the list maps onto the actual UI.
+struct SearchWaysPrompt: View {
+    let title: String
+    var showSpinner: Bool = false
+
+    // (icon, text). Icons mirror the toolbar/menu/chip controls they describe.
+    private let ways: [(icon: String, text: String)] = [
+        ("character.cursor.ibeam", "Type a phrase, ranked by meaning"),
+        ("arrow.down.doc", "Drag in an image, file, or text"),
+        ("doc.on.clipboard", "Paste an image or text  \u{2318}V"),
+        ("photo.badge.magnifyingglass", "Search by a file  \u{21E7}\u{2318}O"),
+        ("square.on.square", "Right-click a result for Find Similar"),
+    ]
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "sparkle.magnifyingglass").font(.system(size: 44, weight: .light)).foregroundStyle(.tertiary)
+            Text(title).font(.title)
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(ways, id: \.icon) { w in
+                    HStack(alignment: .firstTextBaseline, spacing: 10) {
+                        Image(systemName: w.icon).foregroundStyle(.tertiary).frame(width: 20)
+                        Text(w.text)
+                    }
+                }
+            }
+            .font(.callout).foregroundStyle(.secondary)   // content-width block; the outer VStack centers it
+            if showSpinner { ProgressView().controlSize(.small).padding(.top, 4) }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding()

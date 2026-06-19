@@ -1836,6 +1836,58 @@ final class AppModel {
         rawResults = []; resolvedQuery = ""; selection = nil
     }
 
+    /// Run a text search programmatically - a dragged or pasted text string. Mirrors a typed query:
+    /// drop any file query, parse the string into the semantic query + qualifiers (which also fills
+    /// the search box via rawQuery), and search immediately.
+    func searchByText(_ text: String) {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty, phase == .ready else { return }
+        fileQuery = nil; queryError = nil
+        suggestionsAllowed = false        // programmatic, not a keystroke: keep the typeahead closed
+        applyParsedQuery(t)               // sets rawQuery (the search box) + filters + semantic query
+        search()
+    }
+
+    /// Search by an image given as raw bytes - a dragged or pasted bitmap that is NOT a file on disk
+    /// (e.g. an image dragged or copied from a browser). Writes it to a uniquely-named temp file with
+    /// a friendly name (the file-query chip shows that name) and runs the standard file-query path.
+    func searchByImage(data: Data, suggestedExtension ext: String = "png") {
+        guard phase == .ready else { return }
+        do {
+            let dir = FileManager.default.temporaryDirectory
+                .appendingPathComponent("omni-drop-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let url = dir.appendingPathComponent("Dropped image.\(ext)")
+            try data.write(to: url)
+            setFileQuery(url)
+        } catch {
+            queryError = "Couldn't read the dropped image."
+        }
+    }
+
+    /// Search by an NSImage (a dragged/pasted bitmap from a browser or another app). Re-encodes to
+    /// PNG (lossless from the decoded bitmap) and runs the image-bytes path.
+    func searchByImage(_ image: NSImage) {
+        guard let tiff = image.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
+              let png = rep.representation(using: .png, properties: [:]) else {
+            queryError = "Couldn't read that image."; return
+        }
+        searchByImage(data: png)
+    }
+
+    /// Search by whatever is on the general pasteboard, preferring a real FILE (an image file copied
+    /// in Finder embeds better than its thumbnail), then a bitmap IMAGE (a browser copy-image with no
+    /// file), then TEXT. Used by the Edit > Paste command so Cmd-V searches by the clipboard.
+    func pasteToSearch() {
+        let pb = NSPasteboard.general
+        if let url = (pb.readObjects(forClasses: [NSURL.self]) as? [URL])?
+            .first(where: { $0.isFileURL && FileExtractor.kind(for: $0) != nil }) {
+            setFileQuery(url); return
+        }
+        if let img = NSImage(pasteboard: pb) { searchByImage(img); return }
+        if let s = pb.string(forType: .string) { searchByText(s) }
+    }
+
     /// Show the embedding map for `url` (or clear it when nil). Pulls per-file vectors off-thread,
     /// then runs ProjectionEngine through the low-priority GPU gate, streaming animation snapshots
     /// into `folderProjection` on the main actor. Cancels any in-flight fit (cancel-on-change) and

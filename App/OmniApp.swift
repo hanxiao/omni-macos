@@ -25,6 +25,21 @@ struct OmniApp: App {
                 Button("Run benchmark") { Task { await model.runProfiling() } }
                     .disabled(model.isProfilingRunning || !model.canIndex)
             }
+            // Cmd-V searches by the clipboard. A FILE or IMAGE on the clipboard (e.g. an image copied
+            // from a browser) starts a file/image search; plain text falls through to the normal paste
+            // (into a focused search field, or a text search when nothing is focused). Replacing
+            // .pasteboard means re-declaring Cut/Copy/Select All, which just forward to the standard
+            // responder-chain selectors - unchanged behavior - so text editing everywhere is preserved.
+            CommandGroup(replacing: .pasteboard) {
+                Button("Cut") { NSApp.sendAction(#selector(NSText.cut(_:)), to: nil, from: nil) }
+                    .keyboardShortcut("x", modifiers: .command)
+                Button("Copy") { NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: nil) }
+                    .keyboardShortcut("c", modifiers: .command)
+                Button("Paste") { pasteCommand() }
+                    .keyboardShortcut("v", modifiers: .command)
+                Button("Select All") { NSApp.sendAction(#selector(NSText.selectAll(_:)), to: nil, from: nil) }
+                    .keyboardShortcut("a", modifiers: .command)
+            }
             // The primary actions on the selected result, reachable from the menu bar and keyboard
             // with visible shortcut hints (previously double-click / context-menu only).
             CommandGroup(after: .newItem) {
@@ -141,6 +156,32 @@ struct OmniApp: App {
             .version: "",                            // suppress the build-number "(1)" in parens
             .credits: credits,
         ])
+    }
+
+    /// Cmd-V routing: a FILE or IMAGE on the clipboard searches by it (so an image copied from a
+    /// browser works); plain text falls through to the normal paste - into a focused text field
+    /// (the search box), or, when nothing is focused, a text search.
+    private func pasteCommand() {
+        let pb = NSPasteboard.general
+        let hasFile = ((pb.readObjects(forClasses: [NSURL.self]) as? [URL]) ?? []).contains { $0.isFileURL }
+        let hasImage = NSImage(pasteboard: pb) != nil
+        if hasFile || hasImage {
+            model.pasteToSearch()
+        } else if isTextResponderFocused() {
+            NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil)   // normal text paste
+        } else if pb.string(forType: .string) != nil {
+            model.pasteToSearch()                                              // no field focused -> text search
+        } else {
+            NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil)
+        }
+    }
+
+    /// True when a text field/editor is first responder (the search box's field editor is an editable
+    /// NSTextView), so a plain-text paste goes into it rather than starting a search.
+    private func isTextResponderFocused() -> Bool {
+        guard let fr = NSApp.keyWindow?.firstResponder else { return false }
+        if let tv = fr as? NSTextView { return tv.isEditable }
+        return fr is NSTextField
     }
 }
 
