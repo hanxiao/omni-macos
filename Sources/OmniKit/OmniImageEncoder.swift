@@ -182,7 +182,9 @@ public final class OmniImageEncoder: @unchecked Sendable {
     /// the placeholder token is overwritten, so the image and video paths are
     /// identical given the (temporal) features.
     public func encodeVideo(_ frames: [CGImage], prefixIds: [Int] = [], suffixIds: [Int] = []) -> [Float]? {
+        let tP = Self.mediaTiming ? Date() : nil
         guard let (pixelValues, grid) = OmniVideoPreprocess.preprocess(frames) else { return nil }
+        if let tP { print(String(format: "[media] video-preprocess(%d frames) %.1fms", frames.count, -tP.timeIntervalSinceNow * 1000)) }
         return encode(pixelValues: pixelValues, gridTHW: grid, prefixIds: prefixIds, suffixIds: suffixIds)
     }
 
