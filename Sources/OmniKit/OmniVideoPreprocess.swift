@@ -43,33 +43,44 @@ public enum OmniVideoPreprocess {
     /// grid `[(grid_t, grid_h, grid_w)]` for a single clip, or `nil` if `frames`
     /// is empty.
     public static func preprocess(_ frames: [CGImage]) -> (pixelValues: MLXArray, gridTHW: [(Int, Int, Int)])? {
+        guard let raw = preprocessRaw(frames) else { return nil }
+        return (raw.tensor(), raw.gridTHW)
+    }
+
+    /// CPU-only preprocess producing a Sendable raw buffer (the form that can cross the indexer's
+    /// concurrent-decode -> serial-embed boundary, so the heavy patchify need not run on the GPU
+    /// gate). The patchify transpose runs in PARALLEL across cores via `concurrentPerform` over
+    /// (temporal-group x merged-block) tiles; each tile writes a disjoint, contiguous slice of `out`,
+    /// so no synchronization is needed. Byte-for-byte identical to the prior serial path: same output
+    /// row order, and the normalize is folded into the pixel accessor with the same op order
+    /// `(v*rescale - mean)/std`. Reuses OmniVisionPreprocess.RawPatches (same [n,1536] layout +
+    /// tensor() builder). Returns nil for empty input.
+    public static func preprocessRaw(_ frames: [CGImage]) -> OmniVisionPreprocess.RawPatches? {
         guard let first = frames.first else { return nil }
-
         let numFrames = frames.count
-        let h0 = first.height
-        let w0 = first.width
-        // Qwen3VL video smart_resize: the temporal-padded frame count feeds the
-        // pixel budget; all frames share the SAME (hBar, wBar).
-        let (hBar, wBar) = smartResize(numFrames: numFrames, height: h0, width: w0)
+        // Qwen3VL video smart_resize: the temporal-padded frame count feeds the pixel budget; all
+        // frames share the SAME (hBar, wBar).
+        let (hBar, wBar) = smartResize(numFrames: numFrames, height: first.height, width: first.width)
 
-        // Per-frame bicubic draw -> normalized HWC Float buffers (0..255 -> (x/255-0.5)/0.5).
         // Temporal-pad to a multiple of temporalPatchSize by repeating the last frame.
         let pad = ((-numFrames) % temporalPatchSize + temporalPatchSize) % temporalPatchSize
         let paddedCount = numFrames + pad
+        let frameStride = hBar * wBar * inChannels
 
-        var framePixels: [[Float]] = []
-        framePixels.reserveCapacity(paddedCount)
-        for f in frames {
-            let rgb = drawRGB(f, width: wBar, height: hBar)  // [hBar*wBar*3], HWC, 0..255
-            var norm = [Float](repeating: 0, count: rgb.count)
-            for i in 0 ..< rgb.count {
-                norm[i] = (rgb[i] * rescale - imageMean) / imageStd
+        // Per-frame bicubic draw into ONE contiguous RAW (0..255) buffer; normalize is folded into
+        // px() below (same op order as before). The last frame is repeated to fill the temporal pad
+        // (matches numpy np.repeat); px() normalizes it identically, so values are unchanged.
+        var allFrames = [Float](repeating: 0, count: paddedCount * frameStride)
+        allFrames.withUnsafeMutableBufferPointer { ab in
+            let aPtr = ab.baseAddress!
+            for (fi, f) in frames.enumerated() {
+                let rgb = drawRGB(f, width: wBar, height: hBar)   // [frameStride], HWC, 0..255
+                rgb.withUnsafeBufferPointer { aPtr.advanced(by: fi * frameStride).update(from: $0.baseAddress!, count: frameStride) }
             }
-            framePixels.append(norm)
-        }
-        // Repeat the last frame to fill the temporal pad (matches numpy np.repeat).
-        if pad > 0, let last = framePixels.last {
-            for _ in 0 ..< pad { framePixels.append(last) }
+            if pad > 0 {
+                let src = aPtr.advanced(by: (numFrames - 1) * frameStride)
+                for p in 0 ..< pad { aPtr.advanced(by: (numFrames + p) * frameStride).update(from: src, count: frameStride) }
+            }
         }
 
         let gridT = paddedCount / temporalPatchSize
@@ -82,34 +93,42 @@ public enum OmniVideoPreprocess {
         let numPatches = gridT * gridH * gridW
         var out = [Float](repeating: 0, count: numPatches * rowLen)
 
-        // Normalized HWC pixel accessor for a specific (already normalized) frame.
-        @inline(__always) func px(_ frame: [Float], _ row: Int, _ col: Int, _ c: Int) -> Float {
-            frame[(row * wBar + col) * inChannels + c]
-        }
-
-        // Materialize the HF transpose (0,1,4,7,5,8,3,2,6,9) directly.
-        // Patch (output-row) order: grid_t, merged_h, merged_w, m_h, m_w.
-        // Within a row: channel, temporal, ph, pw - where temporal indexes the
-        // two DISTINCT frames of the temporal group (gt*2 + 0, gt*2 + 1).
-        var rowIdx = 0
-        for gt in 0 ..< gridT {                       // grid_t (temporal group)
-            let frame0 = framePixels[gt * temporalPatchSize + 0]
-            let frame1 = framePixels[gt * temporalPatchSize + 1]
-            for bh in 0 ..< mergedH {                 // merged_h
-                for bw in 0 ..< mergedW {             // merged_w
-                    for mh in 0 ..< mergeSize {       // intra-block row
-                        for mw in 0 ..< mergeSize {   // intra-block col
+        // Materialize the HF transpose (0,1,4,7,5,8,3,2,6,9) directly. Output-row order:
+        // grid_t, merged_h, merged_w, m_h, m_w; within a row: channel, temporal, ph, pw - where
+        // temporal indexes the two DISTINCT frames of the group (gt*2+0, gt*2+1). Each (gt, merged
+        // block) tile owns mergeSize*mergeSize consecutive rows and writes a disjoint slice of `out`,
+        // so the loop parallelizes with no synchronization - exactly the image path's pattern.
+        let blocksPerT = mergedH * mergedW
+        let blocks = gridT * blocksPerT
+        let perBlockRows = mergeSize * mergeSize
+        allFrames.withUnsafeBufferPointer { fb in
+            out.withUnsafeMutableBufferPointer { ob in
+                let fPtr = fb.baseAddress!
+                @inline(__always) func px(_ frameIdx: Int, _ row: Int, _ col: Int, _ c: Int) -> Float {
+                    let v = fPtr[frameIdx * frameStride + (row * wBar + col) * inChannels + c]
+                    return (v * rescale - imageMean) / imageStd
+                }
+                nonisolated(unsafe) let outP = ob.baseAddress!
+                DispatchQueue.concurrentPerform(iterations: blocks) { blk in
+                    let gt = blk / blocksPerT
+                    let rem = blk % blocksPerT
+                    let bh = rem / mergedW
+                    let bw = rem % mergedW
+                    let frame0 = gt * temporalPatchSize + 0
+                    let frame1 = gt * temporalPatchSize + 1
+                    var rowIdx = blk * perBlockRows
+                    for mh in 0 ..< mergeSize {
+                        for mw in 0 ..< mergeSize {
                             let patchRow0 = (bh * mergeSize + mh) * patchSize
                             let patchCol0 = (bw * mergeSize + mw) * patchSize
                             var o = rowIdx * rowLen
-                            for c in 0 ..< inChannels {  // channel
-                                // temporal index 0 -> frame0, index 1 -> frame1.
-                                for ti in 0 ..< temporalPatchSize {  // temporal
+                            for c in 0 ..< inChannels {
+                                for ti in 0 ..< temporalPatchSize {
                                     let frame = (ti == 0) ? frame0 : frame1
-                                    for ph in 0 ..< patchSize {       // patch_h
+                                    for ph in 0 ..< patchSize {
                                         let r = patchRow0 + ph
-                                        for pw in 0 ..< patchSize {   // patch_w
-                                            out[o] = px(frame, r, patchCol0 + pw, c)
+                                        for pw in 0 ..< patchSize {
+                                            outP[o] = px(frame, r, patchCol0 + pw, c)
                                             o += 1
                                         }
                                     }
@@ -122,8 +141,7 @@ public enum OmniVideoPreprocess {
             }
         }
 
-        let pixelValues = MLXArray(out, [numPatches, rowLen]).asType(.float32)
-        return (pixelValues, [(gridT, gridH, gridW)])
+        return OmniVisionPreprocess.RawPatches(pixels: out, gridTHW: [(gridT, gridH, gridW)])
     }
 
     // MARK: - smart_resize
