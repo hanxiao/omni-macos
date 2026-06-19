@@ -1324,33 +1324,36 @@ public final class Indexer: @unchecked Sendable {
         let totalCount = text.count
         if totalCount <= limit { return [TextPiece(text: text, locator: "")] }   // single chunk: position is trivial
         // No chunk-count cap: coverage is bounded only by FileExtractor.maxTextBytes at extraction.
-        // The Character array is ~16B/Character; estimatedDecodedBytes accounts for it so the
-        // pipeline's byte budget throttles concurrent large files instead of a silent truncation.
-        let scalars = Array(text)
+        // Single FORWARD String.Index walk - no full Array(text) copy (that was a [Character] at
+        // ~16B/grapheme, ~16x the UTF-8 string). Boundaries stay on exact Character (grapheme) units,
+        // so every emitted chunk is byte-identical to the old Array slicing; only the host transient
+        // shrinks. estimatedDecodedBytes still over-counts (conservative throttling, no regression). (F15)
         var pieces: [TextPiece] = []
-        var start = 0
         let step = max(1, limit - chunkOverlap)
-        var line = 1          // running line number at `lineMark` (plain origin; one forward pass total)
-        var lineMark = 0
-        func locatorFor(_ start: Int) -> String {
+        var line = 1          // running line number at `lineMarkIdx` (plain origin; one forward pass total)
+        var lineMarkIdx = text.startIndex
+        func locatorFor(_ sIdx: String.Index, _ sOff: Int) -> String {
             switch origin {
             case .plain:
-                while lineMark < start { if scalars[lineMark].isNewline { line += 1 }; lineMark += 1 }
+                while lineMarkIdx < sIdx { if text[lineMarkIdx].isNewline { line += 1 }; lineMarkIdx = text.index(after: lineMarkIdx) }
                 return "Line \(line)"
             case .paged(let starts):
                 guard !starts.isEmpty else { return "" }
                 var lo = 0, hi = starts.count - 1   // last page whose start offset <= chunk start
-                while lo < hi { let mid = (lo + hi + 1) / 2; if starts[mid] <= start { lo = mid } else { hi = mid - 1 } }
+                while lo < hi { let mid = (lo + hi + 1) / 2; if starts[mid] <= sOff { lo = mid } else { hi = mid - 1 } }
                 return "Page \(lo + 1)"
             case .opaque:
                 return ""
             }
         }
-        while start < scalars.count {
-            let end = min(start + limit, scalars.count)
-            pieces.append(TextPiece(text: String(scalars[start ..< end]), locator: locatorFor(start)))
-            if end == scalars.count { break }
-            start += step
+        var startIdx = text.startIndex
+        var startOff = 0
+        while startOff < totalCount {
+            let endIdx = text.index(startIdx, offsetBy: limit, limitedBy: text.endIndex) ?? text.endIndex
+            pieces.append(TextPiece(text: String(text[startIdx ..< endIdx]), locator: locatorFor(startIdx, startOff)))
+            if endIdx == text.endIndex { break }
+            startIdx = text.index(startIdx, offsetBy: step, limitedBy: text.endIndex) ?? text.endIndex
+            startOff += step
         }
         return pieces
     }
