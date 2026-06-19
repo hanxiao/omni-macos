@@ -158,22 +158,28 @@ struct OmniApp: App {
         ])
     }
 
-    /// Cmd-V routing: a FILE or IMAGE on the clipboard searches by it (so an image copied from a
-    /// browser works); plain text falls through to the normal paste - into a focused text field
-    /// (the search box), or, when nothing is focused, a text search.
+    /// Cmd-V routing. Two guards keep this from hijacking ordinary text editing:
+    /// 1. A focused editable text field with text on the clipboard always gets a normal paste - so an
+    ///    incidental image flavor (Numbers/Excel cells carry a TIFF rendering alongside their text)
+    ///    can't turn a paste into the search box, the Settings ignore editor, or the serving fields
+    ///    into an image search.
+    /// 2. Search-by-clipboard is a main-window affordance: only the window that owns the search field
+    ///    turns a FILE/IMAGE (or, with nothing focused, text) into a search. Other windows (Settings,
+    ///    Shortcuts) get the standard paste so their text fields keep working.
     private func pasteCommand() {
         let pb = NSPasteboard.general
-        let hasFile = ((pb.readObjects(forClasses: [NSURL.self]) as? [URL]) ?? []).contains { $0.isFileURL }
-        let hasImage = NSImage(pasteboard: pb) != nil
-        if hasFile || hasImage {
-            model.pasteToSearch()
-        } else if isTextResponderFocused() {
-            NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil)   // normal text paste
-        } else if pb.string(forType: .string) != nil {
-            model.pasteToSearch()                                              // no field focused -> text search
-        } else {
+        let hasText = pb.string(forType: .string) != nil
+        if isTextResponderFocused() && hasText {
             NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil)
+            return
         }
+        let ownsSearch = (NSApp.keyWindow?.toolbar?.items.contains { $0 is NSSearchToolbarItem }) ?? false
+        if ownsSearch {
+            let hasFile = ((pb.readObjects(forClasses: [NSURL.self]) as? [URL]) ?? []).contains { $0.isFileURL }
+            let hasImage = NSImage(pasteboard: pb) != nil
+            if hasFile || hasImage || hasText { model.pasteToSearch(); return }
+        }
+        NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil)
     }
 
     /// True when a text field/editor is first responder (the search box's field editor is an editable

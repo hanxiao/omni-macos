@@ -121,9 +121,11 @@ struct ContentView: View {
             }
         }
         // Drag an image, file, or text from anywhere (Finder, a browser, another app) - or paste one
-        // (Cmd-V) - to search by it. An image that arrives as bitmap data (a browser drag/copy, not a
-        // file on disk) is written to a temp file and run through the same file-query path.
-        .onDrop(of: [.image, .fileURL, .text, .plainText], isTargeted: $fileDropTargeted) { providers in
+        // (Cmd-V) - to search by it. SwiftUI's .onDrop gives us reachability over the results list and
+        // the empty state alike, but a web image dragged from Chrome/Safari arrives as inline encoded
+        // bytes, a file promise, or a remote URL - none of which loadObject(NSImage/NSURL) can resolve.
+        // So we read the raw drag pasteboard for the full flavor set, and fall back to the providers.
+        .onDrop(of: [.image, .fileURL, .url, .text, .plainText], isTargeted: $fileDropTargeted) { providers in
             handleSearchDrop(providers)
         }
         .overlay {
@@ -134,12 +136,74 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Drag & paste to search
+    // MARK: - Drag to search
 
-    /// Route a drop onto the search surface: a supported FILE first (Finder/local file), else an
-    /// IMAGE (a browser bitmap with no backing file), else TEXT. Async loads run off the main thread,
-    /// so each hands back to the main actor. Returns whether we accept the drop.
+    /// Route a drop onto the search surface. Reachability is SwiftUI's (the closure fires over the
+    /// results list and the empty state alike); for the payload we read the raw drag pasteboard,
+    /// which carries the full flavor set a browser provides, then fall back to the item providers.
     private func handleSearchDrop(_ providers: [NSItemProvider]) -> Bool {
+        if handleDragPasteboard(NSPasteboard(name: .drag)) { return true }
+        return handleDropProviders(providers)
+    }
+
+    /// Read a drag/paste pasteboard in fidelity order: a local file, inline image bytes (Chrome's
+    /// public.jpeg/png, Safari/Firefox public.tiff), a file promise (Safari/Chrome), a remote image
+    /// URL it downloads (Firefox / URL-only), then any other bitmap, then text. Model calls run on
+    /// the main actor; the async promise/download paths hop back to it.
+    private func handleDragPasteboard(_ pb: NSPasteboard) -> Bool {
+        // 1) Local file (Finder, Mail attachment): the existing file-query path. Take the first
+        //    SUPPORTED file, so a mixed multi-file drag still finds the one Omni can search.
+        if let url = (pb.readObjects(forClasses: [NSURL.self],
+                                     options: [.urlReadingFileURLsOnly: true]) as? [URL])?
+            .first(where: { FileExtractor.kind(for: $0) != nil }) {
+            Task { @MainActor in model.setFileQuery(url) }
+            return true
+        }
+        // 2) Inline image bytes - synchronous, no network; preferred (Omni re-encodes to PNG anyway).
+        if let (data, ext) = Self.pasteboardImageBytes(pb) {
+            Task { @MainActor in model.searchByImage(data: data, suggestedExtension: ext) }
+            return true
+        }
+        // 3) File promise (Safari, Chrome): the browser writes the file into our temp dir, async.
+        //    Honor a single promise (the first) so one drag is one search - a multi-image drag must
+        //    not fire N staggered searches with a nondeterministic winner. The omni-drop- prefix lets
+        //    the launch sweep reclaim the dir. (FileManager.temporaryDirectory is per-user-writable.)
+        if let promise = (pb.readObjects(forClasses: [NSFilePromiseReceiver.self], options: nil)
+            as? [NSFilePromiseReceiver])?.first {
+            let dest = FileManager.default.temporaryDirectory
+                .appendingPathComponent("omni-drop-promise-\(UUID().uuidString)", isDirectory: true)
+            try? FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
+            promise.receivePromisedFiles(atDestination: dest, options: [:],
+                                         operationQueue: OperationQueue()) { url, error in
+                guard error == nil, FileExtractor.kind(for: url) != nil else { return }
+                Task { @MainActor in model.setFileQuery(url) }
+            }
+            return true
+        }
+        // 4) Remote image URL (Firefox / URL-only): download, then confirm it decodes as an image
+        //    (a linked <img> can put the link href on public.url instead of the image src).
+        if let remote = (pb.readObjects(forClasses: [NSURL.self], options: nil) as? [URL])?
+            .first(where: { !$0.isFileURL && ($0.scheme == "http" || $0.scheme == "https") }) {
+            downloadImage(remote, textFallback: remote.absoluteString)   // a bare link -> text search
+            return true
+        }
+        // 5) Any other bitmap the pasteboard can vend.
+        if let img = NSImage(pasteboard: pb) {
+            Task { @MainActor in model.searchByImage(img) }
+            return true
+        }
+        // 6) Text.
+        if let s = pb.string(forType: .string), !s.isEmpty {
+            Task { @MainActor in model.searchByText(s) }
+            return true
+        }
+        return false
+    }
+
+    /// Fallback when the drag pasteboard is unavailable: resolve through the SwiftUI item providers.
+    /// Covers the common cases (Finder file, a data-backed image, a Chrome web image whose remote URL
+    /// surfaces as a provider), and only text-searches a dropped URL when it is not an image.
+    private func handleDropProviders(_ providers: [NSItemProvider]) -> Bool {
         if let p = providers.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }) {
             _ = p.loadObject(ofClass: NSURL.self) { obj, _ in
                 guard let url = obj as? URL, url.isFileURL, FileExtractor.kind(for: url) != nil else { return }
@@ -154,6 +218,14 @@ struct ContentView: View {
             }
             return true
         }
+        if let p = providers.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.url.identifier) }) {
+            _ = p.loadObject(ofClass: NSURL.self) { obj, _ in
+                guard let url = obj as? URL, !url.isFileURL,
+                      url.scheme == "http" || url.scheme == "https" else { return }
+                downloadImage(url, textFallback: url.absoluteString)
+            }
+            return true
+        }
         if let p = providers.first(where: { $0.canLoadObject(ofClass: NSString.self) }) {
             _ = p.loadObject(ofClass: NSString.self) { obj, _ in
                 guard let s = obj as? String else { return }
@@ -162,6 +234,36 @@ struct ContentView: View {
             return true
         }
         return false
+    }
+
+    /// Download a remote URL and search by it if the bytes decode as an image; otherwise, if a text
+    /// fallback was given (a bare hyperlink), run a text search on it.
+    private func downloadImage(_ url: URL, textFallback: String? = nil) {
+        URLSession.shared.dataTask(with: url) { data, response, _ in
+            guard let data, NSImage(data: data) != nil else {
+                if let textFallback { Task { @MainActor in model.searchByText(textFallback) } }
+                return
+            }
+            let ext = response?.mimeType
+                .flatMap { UTType(mimeType: $0)?.preferredFilenameExtension } ?? "png"
+            Task { @MainActor in model.searchByImage(data: data, suggestedExtension: ext) }
+        }.resume()
+    }
+
+    /// Encoded image bytes off a pasteboard: a named bitmap type first, then any image UTI
+    /// (catches Chrome's public.jpeg / public.gif / public.webp).
+    static func pasteboardImageBytes(_ pb: NSPasteboard) -> (Data, String)? {
+        for t in [NSPasteboard.PasteboardType.png, .tiff] {
+            if let d = pb.data(forType: t), let e = UTType(t.rawValue)?.preferredFilenameExtension {
+                return (d, e)
+            }
+        }
+        for t in pb.types ?? [] {
+            guard let ut = UTType(t.rawValue), ut.conforms(to: .image),
+                  let d = pb.data(forType: t) else { continue }
+            return (d, ut.preferredFilenameExtension ?? "png")
+        }
+        return nil
     }
 
     @ViewBuilder private var emptyState: some View {

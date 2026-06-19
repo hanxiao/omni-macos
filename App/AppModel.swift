@@ -117,7 +117,10 @@ final class AppModel {
     var suggestionsAllowed = false
     /// A file used as the query (any modality - the embedding space is shared). When set, the active
     /// query is this file, not `query`. `similar` = doc-vs-doc "find similar" vs query-by-file.
-    struct FileQuery: Equatable { var url: URL; var kind: FileKind; var similar: Bool; var fromHistory: Bool = false }
+    // `transient` marks a query whose file is an ephemeral temp copy (a dragged/pasted bitmap with no
+    // real file on disk): the chip and search work as usual, but it is kept out of persisted History,
+    // whose UUID temp path would never dedup and would dangle once the OS purges the temp dir.
+    struct FileQuery: Equatable { var url: URL; var kind: FileKind; var similar: Bool; var fromHistory: Bool = false; var transient: Bool = false }
     var fileQuery: FileQuery? = nil
     var queryError: String? = nil   // a file query that couldn't be embedded (decode/missing)
     var rawResults: [SearchHit] = [] { didSet { recomputeResults() } }   // kind/folder/ext/date filtered, score-sorted
@@ -537,6 +540,7 @@ final class AppModel {
     let serving = ServingController()
 
     init() {
+        Self.sweepDroppedImageTemps()
         loadRoots()
         loadSettings()
         loadIgnore()
@@ -549,6 +553,18 @@ final class AppModel {
         if retain > 0 { historyRetentionDays = retain } else { pruneHistory(); persistHistory() }
         if let raw = UserDefaults.standard.string(forKey: "omni.viewMode"), let m = ResultViewMode(rawValue: raw) { viewMode = m }
         Task { await bootstrap() }
+    }
+
+    /// Reclaim leftover dropped/pasted-image temp dirs (omni-drop-*) from previous sessions. Each
+    /// holds a re-encoded copy of a dragged/pasted image (and the file-promise downloads) and is
+    /// never needed across launches, but nothing deletes them mid-session, so they accumulate.
+    private static func sweepDroppedImageTemps() {
+        let tmp = FileManager.default.temporaryDirectory
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: tmp, includingPropertiesForKeys: nil) else { return }
+        for url in entries where url.lastPathComponent.hasPrefix("omni-drop-") {
+            try? FileManager.default.removeItem(at: url)
+        }
     }
 
     // MARK: - Search history
@@ -1813,7 +1829,7 @@ final class AppModel {
     private func fileToken(_ url: URL) -> String { "\u{0000}file:\(url.path)" }
 
     /// Use a file as the query (any supported modality). `similar` = doc-vs-doc "find similar".
-    func setFileQuery(_ url: URL, similar: Bool = false, fromHistory: Bool = false) {
+    func setFileQuery(_ url: URL, similar: Bool = false, fromHistory: Bool = false, transient: Bool = false) {
         if !FileManager.default.isReadableFile(atPath: url.path) {
             queryError = FileManager.default.fileExists(atPath: url.path)
                 ? "\(url.lastPathComponent) can't be read (permission denied)."
@@ -1827,7 +1843,7 @@ final class AppModel {
             return
         }
         query = ""; rawQuery = ""        // the text field empties; the chip represents the query
-        fileQuery = FileQuery(url: url, kind: kind, similar: similar, fromHistory: fromHistory)
+        fileQuery = FileQuery(url: url, kind: kind, similar: similar, fromHistory: fromHistory, transient: transient)
         search()
     }
 
@@ -1859,7 +1875,7 @@ final class AppModel {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             let url = dir.appendingPathComponent("Dropped image.\(ext)")
             try data.write(to: url)
-            setFileQuery(url)
+            setFileQuery(url, transient: true)   // ephemeral temp file: keep it out of persisted History
         } catch {
             queryError = "Couldn't read the dropped image."
         }
@@ -2063,7 +2079,9 @@ final class AppModel {
                     if stored == nil { self.cacheFileQueryVector(cacheKey, vec) }
                     self.lastQueryVector = vec
                     self.applyResults(hits, resolved: self.fileToken(url))
-                    if !fq.fromHistory { self.recordFileQueryToHistory(fq) }   // re-running from history must not reorder it
+                    // Re-running from history must not reorder it; a transient temp-file image must
+                    // not enter History at all (its UUID path never dedups and soon dangles).
+                    if !fq.fromHistory && !fq.transient { self.recordFileQueryToHistory(fq) }
                 }
             }
             return
