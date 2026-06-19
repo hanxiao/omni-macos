@@ -60,6 +60,11 @@ public final class OmniVisionTower: @unchecked Sendable {
     /// OMNI_VISION_SDPA_FP32=1 restores full-fp32 SDPA i/o.
     static let sdpaBF16IO = ProcessInfo.processInfo.environment["OMNI_VISION_SDPA_FP32"] != "1"
 
+    /// Batch the uniform-size attention windows (video: grid_t windows of grid_h*grid_w; or a
+    /// same-size image batch) into ONE block-diagonal SDPA instead of a per-window Swift loop -
+    /// bit-identical, far fewer kernel launches (F2). OMNI_VIZ_SDPA_LOOP=1 forces the old loop (A/B).
+    static let sdpaWindowLoop = ProcessInfo.processInfo.environment["OMNI_VIZ_SDPA_LOOP"] == "1"
+
     /// Weight cast to the tower compute dtype (fp32 by default). Hoisting the cast here keeps every
     /// matmul in one dtype so packing is shape-invariant.
     ///
@@ -362,18 +367,40 @@ public final class OmniVisionTower: @unchecked Sendable {
                 scale: scale, mask: .none)
             out = o[0].transposed(1, 0, 2).reshaped([n, numHeads * headDim])
         } else {
-            var outs: [MLXArray] = []
-            for wi in 0 ..< (cuSeqlens.count - 1) {
-                let s = cuSeqlens[wi], e = cuSeqlens[wi + 1]
-                let qi = qh[0..., s ..< e, 0...].expandedDimensions(axis: 0)
-                let ki = kh[0..., s ..< e, 0...].expandedDimensions(axis: 0)
-                let vi = vh[0..., s ..< e, 0...].expandedDimensions(axis: 0)
-                let oi = MLXFast.scaledDotProductAttention(
-                    queries: qi, keys: ki, values: vi, scale: scale, mask: .none)
-                outs.append(oi[0])      // [heads, win, headDim]
+            let numWin = cuSeqlens.count - 1
+            let win = cuSeqlens[1] - cuSeqlens[0]
+            // All windows the same size? (Video: grid_t windows of grid_h*grid_w; or a same-size image
+            // batch.) Then batch them into ONE block-diagonal SDPA instead of numWin launches.
+            let uniform = !Self.sdpaWindowLoop && win > 0
+                && (1 ..< numWin).allSatisfy { cuSeqlens[$0 + 1] - cuSeqlens[$0] == win }
+            if uniform {
+                // n = numWin*win is contiguous and window-major, so reshape the seq axis to
+                // [numWin, win] and use numWin as the SDPA batch. mask:.none keeps each window
+                // attending only to itself; flash attention is per-(batch,head) independent, so this
+                // is bit-identical to the per-window loop, in one kernel launch. (F2)
+                let qb = qh.reshaped([numHeads, numWin, win, headDim]).transposed(1, 0, 2, 3)
+                let kb = kh.reshaped([numHeads, numWin, win, headDim]).transposed(1, 0, 2, 3)
+                let vb = vh.reshaped([numHeads, numWin, win, headDim]).transposed(1, 0, 2, 3)
+                let ob = MLXFast.scaledDotProductAttention(
+                    queries: qb, keys: kb, values: vb, scale: scale, mask: .none)
+                // [numWin, heads, win, headDim] -> [heads, numWin, win, headDim] -> [heads, n, headDim]
+                let cat = ob.transposed(1, 0, 2, 3).reshaped([numHeads, n, headDim])
+                out = cat.transposed(1, 0, 2).reshaped([n, numHeads * headDim])
+            } else {
+                // Mixed-size windows (a multi-image batch of differing resolutions): per-window loop.
+                var outs: [MLXArray] = []
+                for wi in 0 ..< (cuSeqlens.count - 1) {
+                    let s = cuSeqlens[wi], e = cuSeqlens[wi + 1]
+                    let qi = qh[0..., s ..< e, 0...].expandedDimensions(axis: 0)
+                    let ki = kh[0..., s ..< e, 0...].expandedDimensions(axis: 0)
+                    let vi = vh[0..., s ..< e, 0...].expandedDimensions(axis: 0)
+                    let oi = MLXFast.scaledDotProductAttention(
+                        queries: qi, keys: ki, values: vi, scale: scale, mask: .none)
+                    outs.append(oi[0])      // [heads, win, headDim]
+                }
+                let cat = MLX.concatenated(outs, axis: 1)   // [heads, n, headDim]
+                out = cat.transposed(1, 0, 2).reshaped([n, numHeads * headDim])
             }
-            let cat = MLX.concatenated(outs, axis: 1)   // [heads, n, headDim]
-            out = cat.transposed(1, 0, 2).reshaped([n, numHeads * headDim])
         }
         // Cast the attention output back to the residual-stream dtype before the proj matmul.
         if out.dtype != attnDtype { out = out.asType(attnDtype) }
