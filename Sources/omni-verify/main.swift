@@ -735,6 +735,46 @@ if args.count >= 4 && args[1] == "towerbench" {
     exit(0)
 }
 
+// In-place tower drop vs full reload: omni-verify towerdropbench <modelDir>
+// Proves F11: setTowers() frees a dropped tower's VRAM in place, reaching the SAME resident memory as
+// a fresh load with that tower disabled, WITHOUT a safetensors reload (and far faster). Serial, GPU.
+if args.count >= 3 && args[1] == "towerdropbench" {
+    let modelDir = URL(fileURLWithPath: args[2])
+    func mb(_ b: Int) -> Double { Double(b) / 1_048_576 }
+    // Reference: a fresh text-only load, scoped so its engine (and weights) release before the subject.
+    func freshTextOnly() async throws -> (mb: Double, ms: Double) {
+        MLX.GPU.clearCache(); MLX.GPU.resetPeakMemory()
+        let base = MLX.GPU.activeMemory
+        let t = Date()
+        let e = try await OmniEngine(modelDir: modelDir, keepVision: false, keepAudio: false)
+        let ms = -t.timeIntervalSinceNow * 1000
+        _ = e.embedText("warm", as: .query)
+        return (mb(MLX.GPU.activeMemory - base), ms)   // e released at return
+    }
+    let ref = try await freshTextOnly()
+    MLX.GPU.clearCache()
+    // Subject: full engine, then drop both towers in place.
+    MLX.GPU.resetPeakMemory()
+    let base = MLX.GPU.activeMemory
+    let engine = try await OmniEngine(modelDir: modelDir, keepVision: true, keepAudio: true)
+    _ = engine.embedText("warm", as: .query)
+    let fullMB = mb(MLX.GPU.activeMemory - base)
+    let t0 = Date()
+    engine.setTowers(keepVision: false, keepAudio: false)
+    let dropMs = -t0.timeIntervalSinceNow * 1000
+    MLX.GPU.clearCache()
+    let afterDropMB = mb(MLX.GPU.activeMemory - base)
+    print("towerdropbench model=\(modelDir.lastPathComponent)")
+    print(String(format: "  full engine resident:         %.0f MB", fullMB))
+    print(String(format: "  after setTowers(text-only):   %.0f MB   (in-place drop %.0f ms)", afterDropMB, dropMs))
+    print(String(format: "  fresh text-only load:         %.0f MB   (from-disk reload %.0f ms)", ref.mb, ref.ms))
+    let gap = afterDropMB - ref.mb
+    print(String(format: "  VRAM gap (in-place - fresh):  %+.0f MB   %@", gap, abs(gap) < 80 ? "MATCH (no tower retained)" : "MISMATCH (a ref pins the dropped tower)"))
+    print(String(format: "  freed by drop:                %.0f MB   (%.1fx faster than reload)", fullMB - afterDropMB, ref.ms / max(dropMs, 0.01)))
+    _ = engine.embedText("still works after drop", as: .query)   // surviving text path must still embed
+    exit(0)
+}
+
 // Rapid-interaction memory stress: omni-verify stressbench <modelDir> [iters] [capGB]
 // Simulates the UI stress flow (switch history-query <-> map <-> type/delete/retype) at the GPU
 // level: each iteration does a VARIABLE-shape query embed + a VARIABLE-size folder-map projection +
@@ -2380,6 +2420,18 @@ if args.count >= 3 && args[1] == "coldstart" {
     let flush = (0 ..< 6).map { _ in batch }
     let f1 = t { _ = engine.embedTextBatches(flush, as: .passage) }   // already warm now, for reference
     print(String(format: "embedTextBatches(6x16) warm=%.0f ms (a full flush, post-compile)", f1))
+
+    // F1: with warmText() run first (as the app now does off the critical path), the FIRST real query
+    // and FIRST index batch should hit warm kernels - i.e. equal the warm numbers above, not the cold.
+    let t2 = Date()
+    let engine2 = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))   // fresh, bare init
+    print(String(format: "\n[F1] engine2 init: %.0f ms", -t2.timeIntervalSinceNow * 1000))
+    let wt = t { engine2.warmText() }
+    print(String(format: "[F1] warmText(): %.0f ms  (runs off the critical path, before indexing)", wt))
+    let q1b = t { _ = engine2.embedQuery("quarterly revenue report about cloud") }
+    print(String(format: "[F1] first embedQuery:           %5.0f ms  (cold was %.0f ms, warm %.0f ms)", q1b, q1, q2))
+    let b1b = t { _ = engine2.embedTextBatches([batch], as: .passage) }
+    print(String(format: "[F1] first embedTextBatches(16): %5.0f ms  (cold was %.0f ms, warm %.0f ms)", b1b, b1, b2))
     exit(0)
 }
 

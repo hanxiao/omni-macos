@@ -1035,17 +1035,27 @@ final class AppModel {
             }
         }
         if enabledKindTowers != oldTowers {
-            // Reload so the dropped tower leaves VRAM (or the newly needed one loads). Debounce so a
-            // burst of toggles coalesces into ONE bootstrap that reads the FINAL modality set - two
-            // concurrent bootstraps would each load an engine and race the swap, possibly leaving the
-            // engine out of sync with the towers. bootstrap ends with an incremental pass that picks up
-            // newly enabled files.
-            phase = .loadingModel
+            // Debounce so a burst of toggles coalesces into ONE action that reads the FINAL modality
+            // set. A pure DROP (the final set needs no tower the engine dropped) is done IN PLACE by
+            // setTowers - no safetensors reload, no old+new double-resident burst, ~10x faster (F11).
+            // ENABLE (a tower the live engine does not hold) still needs a full reload to read the
+            // absent bytes; bootstrap also picks up the newly enabled files.
             modalityReloadTask?.cancel()
             modalityReloadTask = Task { [weak self] in
                 try? await Task.sleep(for: .milliseconds(250))
-                guard !Task.isCancelled else { return }
-                await self?.bootstrap()
+                guard !Task.isCancelled, let self else { return }
+                guard let engine = self.engine else { await self.bootstrap(); return }
+                let towers = self.enabledKindTowers
+                let needsAbsentTower = (towers.vision && !engine.supportsImages) || (towers.audio && !engine.supportsAudio)
+                if needsAbsentTower {
+                    self.phase = .loadingModel
+                    await self.bootstrap()
+                } else if towers.vision != engine.supportsImages || towers.audio != engine.supportsAudio {
+                    await Task.detached(priority: .userInitiated) { engine.setTowers(keepVision: towers.vision, keepAudio: towers.audio) }.value
+                    self.supportsImages = engine.supportsImages
+                    self.audioSupported = engine.supportsAudio
+                    self.startIndexing()   // crawl any files the surviving towers now cover
+                }
             }
         } else if on {
             startIndexing()   // tower already resident; just crawl the now-included files
@@ -1487,6 +1497,14 @@ final class AppModel {
             // app was closed, rebuilds after a model switch) and stays current. It is
             // incremental - already-embedded, unchanged files are skipped by mtime, so a
             // complete index just does a quick crawl and stops. The flow is: add folders, search.
+            // Warm the text query + indexing Metal kernels and the compiled query graph OFF the
+            // critical path (loadValidated warms only the media towers), so the first keystroke and
+            // first index batch hit warm kernels. The zero-vector warm search also exercises the GPU
+            // reduce and triggers the base fold, so the user's first real query skips both. (F1)
+            Task.detached(priority: .utility) {
+                engine.warmText()
+                _ = store.search([Float](repeating: 0, count: engine.dim), topK: 10)
+            }
             if canIndex { startIndexing() }
         } catch {
             self.phase = .failed("\(error)")

@@ -91,4 +91,9 @@ public struct WeightStore {
         eval(Array(w.values))
         self.weights = w
     }
+
+    /// Build from an already-merged, already-evaluated weight dictionary: no disk read, no LoRA
+    /// merge, no eval. Used by OmniEngine.setTowers to drop a tower in-place by filtering the live
+    /// dict (the surviving arrays are the exact same evaluated MLXArray instances). (F11)
+    public init(rawWeights: [String: MLXArray]) { self.weights = rawWeights }
 }

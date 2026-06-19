@@ -592,6 +592,10 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     private var closed = false
+    private var snippetStmt: OpaquePointer?   // cached SELECT reused by fillSnippetsLocked (F3)
+    private var dedupStmt: OpaquePointer?     // cached SELECT reused by duplicateChunks (F8)
+    private var bytesWrittenSinceCkpt = 0     // in-process WAL-growth estimate, gates the per-write stat (F17)
+    private var ckptCounterSeeded = false
 
     /// Must be checked (on `queue`) before touching `db`: after `close()` a straggling call from an
     /// orphaned indexing pass would otherwise hand sqlite a NULL handle - defined-but-misuse on
@@ -604,6 +608,8 @@ public final class VectorStore: @unchecked Sendable {
     public func close() {
         queue.sync {
             guard !closed, let h = db else { closed = true; return }
+            sqlite3_finalize(snippetStmt); snippetStmt = nil   // finalize cached stmts before close (F3/F8)
+            sqlite3_finalize(dedupStmt); dedupStmt = nil
             sqlite3_exec(h, "PRAGMA wal_checkpoint(TRUNCATE);", nil, nil, nil)
             sqlite3_close(h)
             db = nil
@@ -615,6 +621,8 @@ public final class VectorStore: @unchecked Sendable {
         // Safety net if close() was not called explicitly. deinit runs after all queued work and at
         // refcount 0 (no concurrent access), so the raw checkpoint + close is safe without the queue.
         guard !closed, let h = db else { return }
+        sqlite3_finalize(snippetStmt); snippetStmt = nil
+        sqlite3_finalize(dedupStmt); dedupStmt = nil
         sqlite3_exec(h, "PRAGMA wal_checkpoint(TRUNCATE);", nil, nil, nil)
         sqlite3_close(h)
         db = nil
@@ -663,6 +671,7 @@ public final class VectorStore: @unchecked Sendable {
                     exec("ROLLBACK;")
                     throw OmniError.store("insert step failed")
                 }
+                bytesWrittenSinceCkpt += c.embedding.count * 2 + c.snippet.utf8.count + 160   // WAL-growth estimate (F17)
             }
             exec("COMMIT;")
             // Only rebuild the in-memory buffer if this path already had rows. For a new file
@@ -735,6 +744,7 @@ public final class VectorStore: @unchecked Sendable {
                         exec("ROLLBACK;")
                         throw OmniError.store("insert step failed")
                     }
+                    bytesWrittenSinceCkpt += c.embedding.count * 2 + c.snippet.utf8.count + 160   // WAL-growth estimate (F17)
                 }
             }
             exec("COMMIT;")
@@ -776,7 +786,7 @@ public final class VectorStore: @unchecked Sendable {
             exec("COMMIT;")
             removeRowsByPathsLocked([path])
             proactiveRefoldLocked()
-            checkpointIfDueLocked()
+            checkpointIfDueLocked(forceStat: true)   // deletes carry no byte estimate (F17)
         }
     }
 
@@ -816,14 +826,19 @@ public final class VectorStore: @unchecked Sendable {
         queue.sync {
             guard dbOpen() else { return nil }
             var cand: [(path: String, modified: Double)] = []
-            var stmt: OpaquePointer?
-            if sqlite3_prepare_v2(db, "SELECT path, modified FROM content_keys WHERE key = ? LIMIT 4;", -1, &stmt, nil) == SQLITE_OK {
-                sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT)
-                while sqlite3_step(stmt) == SQLITE_ROW {
-                    cand.append((String(cString: sqlite3_column_text(stmt, 0)), sqlite3_column_double(stmt, 1)))
-                }
+            // Reuse a cached statement (matching storedFiles): decode() calls this per non-dataless
+            // file across the whole corpus, so the per-call prepare/plan/finalize added up on the
+            // store queue. (F8) Race-free: only runs on `queue`.
+            if dedupStmt == nil {
+                guard sqlite3_prepare_v2(db, "SELECT path, modified FROM content_keys WHERE key = ? LIMIT 4;", -1, &dedupStmt, nil) == SQLITE_OK else { return nil }
             }
-            sqlite3_finalize(stmt)
+            let stmt = dedupStmt
+            sqlite3_reset(stmt); sqlite3_clear_bindings(stmt)
+            sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT)
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                cand.append((String(cString: sqlite3_column_text(stmt, 0)), sqlite3_column_double(stmt, 1)))
+            }
+            sqlite3_reset(stmt)
             for c in cand {
                 if let chunks = chunksForCurrentPathLocked(c.path, modified: c.modified) { return chunks }
             }
@@ -901,7 +916,7 @@ public final class VectorStore: @unchecked Sendable {
             exec("COMMIT;")
             removeRowsByPathsLocked(paths)   // one rebuild for the whole set (id-mask, no path hashing)
             proactiveRefoldLocked()
-            checkpointIfDueLocked()
+            checkpointIfDueLocked(forceStat: true)   // deletes carry no byte estimate (F17)
         }
     }
 
@@ -929,7 +944,7 @@ public final class VectorStore: @unchecked Sendable {
             sqlite3_finalize(kstmt)
             removeRowsLocked { $0.path == folder || $0.path.hasPrefix(folder + "/") }
             proactiveRefoldLocked()
-            checkpointIfDueLocked()
+            checkpointIfDueLocked(forceStat: true)   // deletes carry no byte estimate (F17)
         }
     }
 
@@ -1291,29 +1306,27 @@ public final class VectorStore: @unchecked Sendable {
     /// Returns the hits AND the query vector (free after the shared eval) for the caller's
     /// query cache / passage ranking.
     public func search(queryGraph: MLXArray, filter: SearchFilter = SearchFilter(), topK: Int = 40) -> (hits: [SearchHit], query: [Float]) {
-        let fusible: Bool = queue.sync {
-            quantBase == nil && onlyKindFiltered(filter) && Self.gpuReduce && mlxFileID != nil && baseRows > 0 && !baseDirty
-                && (filter.kinds.isEmpty || mlxKindCode != nil)
-                && (rows.count - baseRows) <= Self.foldThreshold && queryGraph.size == dim
-        }
-        if !fusible {
-            MLX.eval(queryGraph)
-            let q = queryGraph.asArray(Float.self)
-            return (search(q, filter: filter, topK: topK), q)
-        }
-        var needClassic = false
-        let hits: [SearchHit] = queue.sync {
+        // Preconditions that read no shared state - resolved off the lock. A filtered/odd-size query or
+        // a disabled GPU reduce skips the lock entirely and takes the classic path.
+        let prelimFusible = Self.gpuReduce && onlyKindFiltered(filter) && queryGraph.size == dim
+        var needClassic = !prelimFusible
+        // ONE locked snapshot does the fusibility decision AND the execution. The old code took the
+        // queue twice (a probe sync then an execute sync) and had to re-check inside because "a write
+        // may have raced the fusible probe"; with a single snapshot that window - and one dispatch
+        // round-trip per query - is gone. nil signals "fall to the classic quant-capable path", done
+        // AFTER the lock to avoid a re-entrant queue.sync deadlock (the same pattern as before). (F18)
+        let hits: [SearchHit]? = prelimFusible ? queue.sync { () -> [SearchHit]? in
             lastSearchAt = Date()
             let n = rows.count
+            let fusible = quantBase == nil && mlxFileID != nil && baseRows > 0 && !baseDirty
+                && (filter.kinds.isEmpty || mlxKindCode != nil)
+                && (n - baseRows) <= Self.foldThreshold
+            guard fusible else { needClassic = true; return nil }
             guard n > 0, dim > 0, flat16.count == n * dim else { return [] }
-            // Re-check under the lock (a write may have raced the fusible probe); rebuild if due.
-            // Quant-aware, like search(_:): rebuild only when NEITHER resident base exists.
             if baseDirty || (mlxBase == nil && quantBase == nil) || (n - baseRows) > Self.foldThreshold { rebuildBaseLocked(rowCount: n) }
-            // A racing write may have flipped the base to quant mode since the fusible probe (mlxBase
-            // stays nil in quant mode). The fused GPU path does not apply; fall back to the classic
-            // quant-capable path AFTER releasing the lock - calling search() here would re-enter
-            // queue.sync and deadlock. (Was: returned an empty result for this one query.)
-            guard let base = mlxBase, let fid = mlxFileID else { needClassic = true; return [] }
+            // A rebuild can flip the base to quant mode (mlxBase stays nil); the fused GPU path no
+            // longer applies, so fall back to the classic quant-capable path after the lock.
+            guard let base = mlxBase, let fid = mlxFileID else { needClassic = true; return nil }
             let qv = queryGraph.reshaped([dim, 1]).asType(.bfloat16)
             let baseScore = MLX.matmul(base, qv)
             var deltaGraph: MLXArray? = nil
@@ -1329,16 +1342,15 @@ public final class VectorStore: @unchecked Sendable {
             }
             return fillSnippetsLocked(reduceTopKGPULocked(
                 baseScore: baseScore, fid: fid, deltaGraph: deltaGraph, topK: topK, filter: filter))
-        }
+        } : nil
         if needClassic {
-            // Quant flip mid-call: evaluate the query and run the classic (quant-capable) path.
             MLX.eval(queryGraph)
             let q = queryGraph.asArray(Float.self)
             return (search(q, filter: filter, topK: topK), q)
         }
         // Evaluated as an ancestor of the scan - this readback is a copy, not a GPU sync.
         let q = queryGraph.asArray(Float.self)
-        return (hits, q)
+        return (hits ?? [], q)
     }
 
     public func search(_ query: [Float], filter: SearchFilter = SearchFilter(), topK: Int = 40) -> [SearchHit] {
@@ -1592,18 +1604,23 @@ public final class VectorStore: @unchecked Sendable {
     /// time. Must run on `queue`. A closed db (shutdown race) just leaves snippets empty.
     private func fillSnippetsLocked(_ hits: [SearchHit]) -> [SearchHit] {
         guard !hits.isEmpty, dbOpen() else { return hits }
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT snippet FROM chunks WHERE path = ? AND chunk_index = ?;", -1, &stmt, nil) == SQLITE_OK else { return hits }
-        defer { sqlite3_finalize(stmt) }
+        // Prepare once and reuse: the parse+plan and finalize ran on every keystroke-driven search,
+        // inside the lock concurrent searches and indexing writes wait on. Only ever runs on `queue`,
+        // so a single cached handle is race-free. (F3)
+        if snippetStmt == nil {
+            guard sqlite3_prepare_v2(db, "SELECT snippet FROM chunks WHERE path = ? AND chunk_index = ?;", -1, &snippetStmt, nil) == SQLITE_OK else { return hits }
+        }
+        let stmt = snippetStmt
         var out = hits
         for i in 0 ..< out.count {
-            sqlite3_reset(stmt)
+            sqlite3_reset(stmt); sqlite3_clear_bindings(stmt)
             sqlite3_bind_text(stmt, 1, out[i].path, -1, SQLITE_TRANSIENT)
             sqlite3_bind_int(stmt, 2, Int32(out[i].chunkIndex))
             if sqlite3_step(stmt) == SQLITE_ROW, let c = sqlite3_column_text(stmt, 0) {
                 out[i].snippet = String(cString: c)
             }
         }
+        sqlite3_reset(stmt)   // release the read snapshot the cached statement would otherwise hold open
         return out
     }
 
@@ -1679,9 +1696,13 @@ public final class VectorStore: @unchecked Sendable {
         let topIdx = kth > 0 ? MLX.argPartition(keyF, kth: kth)[kth...] : MLX.arange(0, F, dtype: .int32)
         let topScores = bestScore[topIdx]
         let topRows = bestRow[topIdx]
+        // argPartition returns uint32 indices; the host candidate map keys on Int32. Cast BEFORE the
+        // eval and fold it into the one sync below, so reading idxHost is a pure copy rather than a
+        // second command-buffer round-trip on an orphaned [K] cast node (F5).
+        let topIdxI = topIdx.asType(.int32)
         // ONE sync for the whole chain - including the delta matmul (previously its own eval)
         // and, on the fused path, the query-embed forward upstream of baseScore.
-        if let deltaGraph { MLX.eval(topScores, topRows, deltaGraph) } else { MLX.eval(topScores, topRows) }
+        if let deltaGraph { MLX.eval(topScores, topRows, topIdxI, deltaGraph) } else { MLX.eval(topScores, topRows, topIdxI) }
         let deltaScores: [Float] = deltaGraph.map { $0.asArray(Float.self) } ?? []
         let scoresHost = topScores.asArray(Float.self)
         let rowsHost = topRows.asArray(Int32.self)
@@ -1691,7 +1712,7 @@ public final class VectorStore: @unchecked Sendable {
         var candScore = [Int32: Float]()   // fid -> best score
         var candRow = [Int32: Int32]()     // fid -> winning row
         candScore.reserveCapacity(K + deltaScores.count)
-        let idxHost = topIdx.asType(.int32).asArray(Int32.self)
+        let idxHost = topIdxI.asArray(Int32.self)   // already materialized in the eval above (F5)
         for j in 0 ..< scoresHost.count {
             let r = rowsHost[j]
             guard r != Int32.max, scoresHost[j].isFinite else { continue }    // file absent from base
@@ -1970,12 +1991,25 @@ public final class VectorStore: @unchecked Sendable {
     /// (a checkpoint then runs anyway; one bounded stall beats unbounded disk). Single-connection
     /// store: TRUNCATE never waits on other readers. Crash-durability is unchanged in kind - the index
     /// is a rebuildable cache, and a lost WAL tail just means the next pass re-embeds those files.
-    private func checkpointIfDueLocked() {
+    private func checkpointIfDueLocked(forceStat: Bool = false) {
+        // The WAL only grows by the bytes we insert, so below the soft cap we cannot be due. Gate the
+        // per-write attributesOfItem stat (a syscall + a ~12-entry NSDictionary alloc) behind a cheap
+        // in-process byte counter: ~99% of indexing writes oscillate well under the soft cap and now
+        // skip the syscall entirely. The estimate UNDER-counts real WAL growth (row text + frame +
+        // page overhead), so crossing it only ever fires the exact stat LATE - still far below the
+        // hard cap - never early, so no checkpoint is missed. Deletes carry no byte estimate, so they
+        // force the exact stat. Seed once from the real WAL size (a prior crash can leave a tail). (F17)
+        if !ckptCounterSeeded {
+            bytesWrittenSinceCkpt = ((try? FileManager.default.attributesOfItem(atPath: dbURL.path + "-wal")[.size]) as? Int) ?? 0
+            ckptCounterSeeded = true
+        }
+        guard forceStat || bytesWrittenSinceCkpt >= Self.walSoftCapBytes else { return }
         let wal = ((try? FileManager.default.attributesOfItem(atPath: dbURL.path + "-wal")[.size]) as? Int) ?? 0
         guard wal > Self.walSoftCapBytes else { return }
         if searchRecentlyActiveLocked() && wal < Self.walHardCapBytes { return }
         let t = Self.searchTiming ? Date() : nil
         exec("PRAGMA wal_checkpoint(TRUNCATE);")
+        bytesWrittenSinceCkpt = 0
         if let t { print(String(format: "[ckpt] wal=%dMB %.1fms", wal >> 20, -t.timeIntervalSinceNow * 1000)) }
     }
     private static let walSoftCapBytes = 32 << 20

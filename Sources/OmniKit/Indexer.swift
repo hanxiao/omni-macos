@@ -273,7 +273,18 @@ public final class Indexer: @unchecked Sendable {
     public func index(roots: [URL], settings: IndexSettings = .default, force: Bool = false, onProgress: @escaping (IndexProgress) -> Void) {
         queue.sync { cancelled = false }
         var p = IndexProgress()
-        let known = store.indexedFiles()
+        // The known-files snapshot is a whole-table GROUP BY (O(rows)) that shares no resource with
+        // the filesystem crawl below, yet it ran strictly before the crawl. Compute it concurrently
+        // and join just before its first consumer (the first pipeline / the stale reconcile), so
+        // time-to-first-embed is max(crawl, query) instead of their sum - most visible at startup on
+        // a large existing index. (F6)
+        final class KnownBox: @unchecked Sendable { var v: [String: StoredFile] = [:] }
+        let knownBox = KnownBox()
+        let knownReady = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .utility).async { [store = store] in
+            knownBox.v = store.indexedFiles()
+            knownReady.signal()
+        }
         var seen = Set<String>()
 
         // Single crawl: walk each root ONCE, collecting its files and setting the determinate
@@ -311,6 +322,9 @@ public final class Indexer: @unchecked Sendable {
         // forward, which keeps the GPU fed. Decode stays concurrent within each phase.
         var byKind: [FileKind: [CrawledFile]] = [:]
         for f in interleaved { byKind[FileExtractor.kind(for: f.url) ?? .text, default: []].append(f) }
+
+        knownReady.wait()             // join the concurrently-computed indexedFiles() before its first use (F6)
+        let known = knownBox.v
 
         var doneByRoot: [String: Int] = [:]
         func tick(_ path: String) {

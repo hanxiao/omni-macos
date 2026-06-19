@@ -193,8 +193,13 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     // Retained for recoverMediaPath(): a runtime weight reload reuses the parsed tokenizer and
     // must honor the same tower selection the engine was built with.
     private let tokenizer: Tokenizer
-    private let keepVision: Bool
-    private let keepAudio: Bool
+    private var keepVision: Bool
+    private var keepAudio: Bool
+    // Retained so setTowers() can drop a tower in-place (filter the live, already-merged/evaluated
+    // dict + rebuild surviving encoders) instead of a full safetensors reload. COW: the encoders
+    // already hold these exact arrays, so retaining the store costs ~0 extra bytes. (F11)
+    private let config: OmniConfig
+    private var weightStore: WeightStore
     public var supportsImages: Bool { imageEncoder != nil }
     public var supportsVideo: Bool { imageEncoder != nil }
     public var supportsAudio: Bool { audioEncoder != nil }
@@ -216,6 +221,8 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         self.tokenizer = tokenizer
         self.keepVision = keepVision
         self.keepAudio = keepAudio
+        self.config = config
+        self.weightStore = weights
         let text = OmniTextEncoder(weights: weights, config: config, tokenizer: tokenizer)
         self._textEncoder = text
         self.docPrefix = text.prefixTokenIds(.passage)
@@ -330,6 +337,36 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     private let recoverLock = NSLock()
     private var lastRecoverAt = Date.distantPast
 
+    /// Drop a tower in-place when the user turns a modality OFF, instead of a full safetensors reload
+    /// (which re-reads ~1.9GB, re-runs the fp32 LoRA merge, force-evals the backbone, and runs 6 media
+    /// probes - all to end up with LESS resident, plus a transient old+new double-residency). Builds a
+    /// filtered copy of the live (already-merged, already-evaluated) weight dict with the dropped
+    /// tower's keys removed, rebuilds ONLY the surviving encoders on it, nils the dropped encoder, and
+    /// trims the freed buffers. Runs inside the run() gate and via the encoderLock setters - the same
+    /// serialization as recoverMediaPath - so the swap is data-race-free. Surviving encoders are built
+    /// from the IDENTICAL evaluated arrays (no re-read, no re-merge), so embeddings are bit-identical.
+    /// ENABLE (adding a tower back) needs the absent bytes and MUST stay a full reload at the call
+    /// site; setTowers only ever filters resident weights. (F11)
+    public func setTowers(keepVision newKeepVision: Bool, keepAudio newKeepAudio: Bool) {
+        run(highPriority: false) {
+            var w = weightStore.weights
+            if !newKeepVision {
+                for k in Array(w.keys) where k.hasPrefix("vision_tower.") || k.hasPrefix("merger.") { w.removeValue(forKey: k) }
+            }
+            if !newKeepAudio {
+                for k in Array(w.keys) where k.hasPrefix("audio_tower.") || k.hasPrefix("audio_projector.") { w.removeValue(forKey: k) }
+            }
+            let filtered = WeightStore(rawWeights: w)
+            textEncoder = OmniTextEncoder(weights: filtered, config: config, tokenizer: tokenizer)
+            imageEncoder = newKeepVision ? OmniImageEncoder(weights: filtered, config: config) : nil
+            audioEncoder = newKeepAudio ? OmniAudioEncoder(weights: filtered, config: config) : nil
+            weightStore = filtered
+            keepVision = newKeepVision
+            keepAudio = newKeepAudio
+            MLX.GPU.clearCache()   // release the dropped tower's buffers so VRAM falls to the surviving set
+        }
+    }
+
     /// A tiny solid-gray CGImage for the image self-test (CoreGraphics only, no AppKit).
     private static func solidTestImage(side: Int = 56) -> CGImage {
         let cs = CGColorSpaceCreateDeviceRGB()
@@ -435,6 +472,18 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     public func embedQuery(_ text: String) -> [Float] {
         markQuery()   // signal the indexer to shrink/split its forwards while the user is searching
         return run(highPriority: true) { textEncoder.encode(text, as: .query) }
+    }
+
+    /// Warm the text query + indexing forward Metal kernels and the compiled B==1 whole-forward query
+    /// graph OFF the critical path. loadValidated warms only the media towers, so without this the
+    /// first interactive query and the first indexing text batch each cold-compile their pipelines
+    /// (and the query graph trace) on the user's first action. Discards results; does NOT stamp
+    /// markQuery (so no 2s interactive carve). Call once after load, before indexing kicks off. (F1)
+    public func warmText() {
+        run(highPriority: false) {
+            if let g = textEncoder.queryGraph("warm up the query path now", as: .query) { MLX.eval(g) }   // B==1 query whole-forward
+            _ = textEncoder.encodeBatch(["warm up the passage forward", "a second short passage"], as: .passage)   // B>1 eager indexing shape
+        }
     }
 
     // Cumulative backbone sequence positions (tokens) processed by INDEXING embeds (queries
