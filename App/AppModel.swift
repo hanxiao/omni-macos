@@ -345,8 +345,10 @@ final class AppModel {
     var historyMode: HistoryMode = .auto {
         didSet { UserDefaults.standard.set(historyMode.rawValue, forKey: "omni.historyMode") }
     }
-    /// Recent (non-bookmarked) searches older than this many days are pruned. Default 7.
-    var historyRetentionDays: Int = 7 {
+    /// Recent (non-bookmarked) searches older than this many days are pruned. Default 31 (about a
+    /// month), so the sidebar's day buckets - Yesterday, Previous 7 Days, Previous 30 Days - actually
+    /// fill in. Users who picked a shorter window in Settings keep it.
+    var historyRetentionDays: Int = 31 {
         didSet {
             UserDefaults.standard.set(historyRetentionDays, forKey: "omni.historyRetentionDays")
             pruneHistory(); persistHistory()
@@ -584,13 +586,17 @@ final class AppModel {
         }
     }
 
-    /// Drop non-bookmarked file recents whose file is gone - notably the dropped/pasted-image recents
-    /// that older versions wrote with a since-deleted temp path. They would only error on click.
-    /// Bookmarks are kept: an explicit save survives even if its file later disappears.
+    /// Drop non-bookmarked file recents that point at a gone *ephemeral* file - the dropped/pasted-image
+    /// recents older versions wrote under a since-deleted temp/query-images path. Scoped to those paths
+    /// on purpose: a missing real file is left alone (it may just be on an unmounted volume right now),
+    /// and bookmarks are always kept.
     private func pruneDeadFileRecents() {
+        let tmp = FileManager.default.temporaryDirectory.path
         let before = searchHistory.count
-        searchHistory.removeAll {
-            !$0.bookmarked && $0.isFile && !FileManager.default.fileExists(atPath: $0.filePath ?? "")
+        searchHistory.removeAll { item in
+            guard !item.bookmarked, item.isFile, let p = item.filePath,
+                  !FileManager.default.fileExists(atPath: p) else { return false }
+            return p.hasPrefix(tmp) || p.contains("/omni-drop-") || Self.isQueryImage(URL(fileURLWithPath: p))
         }
         if searchHistory.count != before { persistHistory() }
     }
@@ -598,7 +604,8 @@ final class AppModel {
     // MARK: - Search history
 
     /// History grouped for the sidebar: a pinned "Bookmarks" group, then recents bucketed by time
-    /// (Today / Yesterday / Previous 7 Days / Earlier). Only non-empty groups are returned, in order.
+    /// (Today / Yesterday / Previous 7 Days / Previous 30 Days / Earlier). Only non-empty groups are
+    /// returned, in order.
     var historyGroups: [(title: String, items: [HistoryItem])] {
         let cal = Calendar.current, now = Date()
         let bookmarks = searchHistory.filter { $0.bookmarked }.sorted { $0.lastUsed > $1.lastUsed }
@@ -607,12 +614,14 @@ final class AppModel {
             if cal.isDateInToday(d) { return 0 }
             if cal.isDateInYesterday(d) { return 1 }
             let days = cal.dateComponents([.day], from: cal.startOfDay(for: d), to: cal.startOfDay(for: now)).day ?? 99
-            return days < 7 ? 2 : 3
+            if days < 7 { return 2 }
+            if days < 30 { return 3 }
+            return 4
         }
-        let names = ["Today", "Yesterday", "Previous 7 Days", "Earlier"]
+        let names = ["Today", "Yesterday", "Previous 7 Days", "Previous 30 Days", "Earlier"]
         var groups: [(String, [HistoryItem])] = []
         if !bookmarks.isEmpty { groups.append(("Bookmarks", bookmarks)) }
-        for b in 0 ... 3 {
+        for b in 0 ... 4 {
             let items = recents.filter { bucket($0.lastUsed) == b }
             if !items.isEmpty { groups.append((names[b], items)) }
         }
