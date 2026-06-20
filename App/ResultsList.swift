@@ -72,7 +72,7 @@ struct ResultsList<Footer: View>: View {
                     ForEach(results, id: \.path) { hit in
                         VStack(spacing: 0) {
                             ResultRow(hit: hit,
-                                      selected: model.selection == hit.path,
+                                      selected: model.selectedPaths.contains(hit.path),
                                       // Only multi-chunk files (long docs, multi-page PDFs) have a
                                       // per-chunk breakdown; a single-embedding file gets no chevron.
                                       expandable: hit.chunkCount > 1,
@@ -83,7 +83,7 @@ struct ResultsList<Footer: View>: View {
                                 // files coming from OUTSIDE the app (Finder); use Find similar / Reveal
                                 // in Finder for a result.
                                 .contentShape(Rectangle())
-                                .onTapGesture { model.selection = hit.path }
+                                .onTapGesture { handleTap(hit.path) }
                                 .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
                                 .contextMenu { menu(hit) }
                             // chunkCount guard: if a reindex turned the file single-chunk while its
@@ -156,13 +156,13 @@ struct ResultsList<Footer: View>: View {
             ScrollView {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: gridMin, maximum: 220), spacing: Design.gapLarge)], spacing: Design.gapLarge) {
                     ForEach(results, id: \.path) { hit in
-                        ResultGridItem(hit: hit, selected: model.selection == hit.path)
+                        ResultGridItem(hit: hit, selected: model.selectedPaths.contains(hit.path))
                             // Make the whole cell tappable, not just the opaque thumbnail/label - without
                             // this, clicking the transparent padding around a small item did nothing.
                             // (The list row already has this; the grid relied on .draggable's hit area,
                             // which was removed.)
                             .contentShape(Rectangle())
-                            .onTapGesture { model.selection = hit.path }
+                            .onTapGesture { handleTap(hit.path) }
                             .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
                             .contextMenu { menu(hit) }
                             // The grid's counterpart of the list's inline expansion: a popover
@@ -257,11 +257,21 @@ struct ResultsList<Footer: View>: View {
             .keyboardShortcut("f", modifiers: [.command, .option])
         Button("Reveal in Finder") { model.selection = path; reveal(path) }
             .keyboardShortcut("r", modifiers: [.command, .shift])
-        Button("Copy path") {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(path, forType: .string)
+        // Copies the whole selection when this row is part of a multi-select (Finder behavior),
+        // otherwise just this path. (The shortcut hint mirrors the Edit-menu Cmd-C; a chord declared
+        // only inside a context menu never fires on macOS, so the real key handling lives there.)
+        if model.selectedPaths.count > 1, model.selectedPaths.contains(path) {
+            Button("Copy \(model.selectedPaths.count) paths") { model.copySelectedPaths() }
+                .keyboardShortcut("c", modifiers: .command)
+        } else {
+            Button("Copy path") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(path, forType: .string)
+            }
+            .keyboardShortcut("c", modifiers: .command)
         }
-        .keyboardShortcut("c", modifiers: [.command, .option])
+        Button("Select all") { model.selectAllResults() }
+            .keyboardShortcut("a", modifiers: .command)
         // Exclude this result's folder from indexing - the "stop showing me this build/cache noise"
         // action. Routes through the same apply path as the Settings ignore editor (backed up,
         // pruned, persisted, visible there). Hidden when the folder is an indexed root: removing a
@@ -276,6 +286,15 @@ struct ResultsList<Footer: View>: View {
 
     private func open(_ path: String) { NSWorkspace.shared.openAsync(URL(fileURLWithPath: path)) }
     private func reveal(_ path: String) { NSWorkspace.shared.revealAsync(URL(fileURLWithPath: path)) }
+
+    /// Click selection with Finder modifiers: Cmd toggles a row, Shift extends the range from the
+    /// anchor, plain click replaces the selection.
+    private func handleTap(_ path: String) {
+        let m = NSEvent.modifierFlags
+        if m.contains(.command) { model.toggleSelection(path) }
+        else if m.contains(.shift) { model.extendSelection(to: path) }
+        else { model.selectSingle(path) }
+    }
 }
 
 struct ResultRow: View {

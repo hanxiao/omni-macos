@@ -45,19 +45,18 @@ struct OmniApp: App {
                 Button("Run benchmark") { Task { await model.runProfiling() } }
                     .disabled(model.isProfilingRunning || !model.canIndex)
             }
-            // Cmd-V searches by the clipboard. A FILE or IMAGE on the clipboard (e.g. an image copied
-            // from a browser) starts a file/image search; plain text falls through to the normal paste
-            // (into a focused search field, or a text search when nothing is focused). Replacing
-            // .pasteboard means re-declaring Cut/Copy/Select All, which just forward to the standard
-            // responder-chain selectors - unchanged behavior - so text editing everywhere is preserved.
+            // Cmd-V/C/A are routed: when a text field is being edited they do the standard text
+            // paste/copy/select-all; otherwise they act on the search results - Cmd-V searches by a
+            // FILE or IMAGE on the clipboard, Cmd-C copies the selected result paths, Cmd-A selects
+            // every result. Replacing .pasteboard means re-declaring Cut too (plain responder forward).
             CommandGroup(replacing: .pasteboard) {
                 Button("Cut") { NSApp.sendAction(#selector(NSText.cut(_:)), to: nil, from: nil) }
                     .keyboardShortcut("x", modifiers: .command)
-                Button("Copy") { NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: nil) }
+                Button("Copy") { copyCommand() }
                     .keyboardShortcut("c", modifiers: .command)
                 Button("Paste") { pasteCommand() }
                     .keyboardShortcut("v", modifiers: .command)
-                Button("Select All") { NSApp.sendAction(#selector(NSText.selectAll(_:)), to: nil, from: nil) }
+                Button("Select All") { selectAllCommand() }
                     .keyboardShortcut("a", modifiers: .command)
             }
             // The primary actions on the selected result, reachable from the menu bar and keyboard
@@ -79,7 +78,7 @@ struct OmniApp: App {
                 Button("Find similar") { model.findSimilarSelected() }
                     .keyboardShortcut("f", modifiers: [.command, .option])
                     .disabled(!model.hasSelection)
-                Button("Copy path") { model.copySelectedPath() }
+                Button("Copy path") { model.copySelectedPaths() }
                     .keyboardShortcut("c", modifiers: [.command, .option])
                     .disabled(!model.hasSelection)
                 Divider()
@@ -200,6 +199,19 @@ struct OmniApp: App {
             if hasFile || hasImage || hasText { model.pasteToSearch(); return }
         }
         NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil)
+    }
+
+    /// Cmd-C: copy the selected result paths when the results have focus; otherwise the standard text
+    /// copy (so copying inside the search field, Settings, etc. is unchanged).
+    private func copyCommand() {
+        if !isTextResponderFocused(), model.hasSelection { model.copySelectedPaths() }
+        else { NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: nil) }
+    }
+
+    /// Cmd-A: select every result when not editing text; otherwise the standard select-all.
+    private func selectAllCommand() {
+        if !isTextResponderFocused(), !model.results.isEmpty { model.selectAllResults() }
+        else { NSApp.sendAction(#selector(NSText.selectAll(_:)), to: nil, from: nil) }
     }
 
     /// True when a text field/editor is first responder (the search box's field editor is an editable

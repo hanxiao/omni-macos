@@ -130,13 +130,18 @@ final class AppModel {
     /// "results not ready for what you just typed" apart from "this query genuinely has no matches",
     /// so it never flashes "No matches" during the debounce/search window.
     private(set) var resolvedQuery = ""
-    var selection: String? {           // selected result path (lifted out of the view)
+    var selection: String? {           // the ACTIVE result path - drives Quick Look, Open, arrow nav
         didSet {
             // If Quick Look is already open, follow the selection like Finder does - arrowing
             // through results updates the live preview instead of leaving it on the old file.
             if previewURL != nil, let s = selection { previewURL = URL(fileURLWithPath: s) }
         }
     }
+    /// The full multi-selection (result paths). `selection` is the active item within it; the set
+    /// drives the row highlight and a multi-path copy. A plain click collapses both to one item.
+    var selectedPaths: Set<String> = []
+    /// Anchor for shift-click range selection (the last item picked by a plain or Cmd click).
+    private var selectionAnchor: String?
     var previewURL: URL?               // drives Quick Look; set from the Space key and the menu
     private var lastQueryVector: [Float]?
 
@@ -239,10 +244,47 @@ final class AppModel {
     func openSelected() { if let u = selectedURL { NSWorkspace.shared.openAsync(u) } }
     func revealSelected() { if let u = selectedURL { NSWorkspace.shared.revealAsync(u) } }
     func findSimilarSelected() { if let u = selectedURL { setFileQuery(u, similar: true) } }
-    func copySelectedPath() {
-        guard let u = selectedURL else { return }
+    /// Copy every selected path (in result order, newline-separated). Falls back to the active item.
+    func copySelectedPaths() {
+        let ordered = results.filter { selectedPaths.contains($0.path) }.map { $0.path }
+        let paths = ordered.isEmpty ? (selection.map { [$0] } ?? []) : ordered
+        guard !paths.isEmpty else { return }
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(u.path, forType: .string)
+        NSPasteboard.general.setString(paths.joined(separator: "\n"), forType: .string)
+    }
+
+    // MARK: - Result selection (single + multi)
+
+    /// Make `path` the sole selection - a plain click or an arrow-key move.
+    func selectSingle(_ path: String) {
+        selection = path; selectedPaths = [path]; selectionAnchor = path
+    }
+    /// Cmd-click: add/remove `path`; it becomes the active item (or hands off when removed).
+    func toggleSelection(_ path: String) {
+        if selectedPaths.contains(path) {
+            selectedPaths.remove(path)
+            if selection == path { selection = selectedPaths.first }
+        } else {
+            selectedPaths.insert(path); selection = path
+        }
+        selectionAnchor = path
+    }
+    /// Shift-click: select the contiguous range (in result order) from the anchor to `path`.
+    func extendSelection(to path: String) {
+        let r = results
+        guard let anchor = selectionAnchor ?? selection,
+              let a = r.firstIndex(where: { $0.path == anchor }),
+              let b = r.firstIndex(where: { $0.path == path }) else { selectSingle(path); return }
+        selectedPaths = Set(r[(a <= b ? a...b : b...a)].map { $0.path })
+        selection = path                       // keep the anchor; the clicked end is now active
+    }
+    /// Select every result (Cmd-A / context menu).
+    func selectAllResults() {
+        let r = results
+        guard !r.isEmpty else { return }
+        selectedPaths = Set(r.map { $0.path })
+        if selection == nil { selection = r.first?.path }
+        selectionAnchor = selection
     }
     /// Search by a file (any modality - the embedding space is shared). Owned by the model so the
     /// File menu and the toolbar button trigger the same panel.
@@ -265,13 +307,13 @@ final class AppModel {
         let r = results
         guard !r.isEmpty else { return }
         guard let cur = selection.flatMap({ sel in r.firstIndex { $0.path == sel } }) else {
-            selection = r[rowDelta >= 0 ? 0 : r.count - 1].path
+            selectSingle(r[rowDelta >= 0 ? 0 : r.count - 1].path)
             return
         }
         let target = cur + rowDelta
         guard let cols = gridColumns, cols > 1 else {
             // List: clamp to the ends, Finder-style.
-            selection = r[max(0, min(r.count - 1, target))].path
+            selectSingle(r[max(0, min(r.count - 1, target))].path)
             return
         }
         // Gallery, Finder rules: horizontal steps stay within their visual row (no wrapping to
@@ -279,16 +321,16 @@ final class AppModel {
         // changes column - Up from the top row previously jumped to item 0).
         if abs(rowDelta) == 1 {
             guard target >= 0, target < r.count, target / cols == cur / cols else { return }
-            selection = r[target].path
+            selectSingle(r[target].path)
         } else {
             if target < 0 { return }
             if target >= r.count {
                 // Down into a shorter last row lands on its last item (Finder behavior).
                 guard cur / cols < (r.count - 1) / cols else { return }
-                selection = r[r.count - 1].path
+                selectSingle(r[r.count - 1].path)
                 return
             }
-            selection = r[target].path
+            selectSingle(r[target].path)
         }
     }
 
@@ -1904,7 +1946,7 @@ final class AppModel {
 
     func clearFileQuery() {
         fileQuery = nil; queryError = nil
-        rawResults = []; resolvedQuery = ""; selection = nil
+        rawResults = []; resolvedQuery = ""; selection = nil; selectedPaths = []; selectionAnchor = nil
     }
 
     /// Run a text search programmatically - a dragged or pasted text string. Mirrors a typed query:
@@ -2099,8 +2141,15 @@ final class AppModel {
         let isNewQuery = resolvedQuery != resolved
         rawResults = hits
         resolvedQuery = resolved
-        if isNewQuery { selection = nil }
-        else if let sel = selection, !hits.contains(where: { $0.path == sel }) { selection = nil }
+        if isNewQuery {
+            selection = nil; selectedPaths = []; selectionAnchor = nil
+        } else {
+            // A live refresh of the same query keeps the selection, minus any rows that vanished.
+            if let sel = selection, !hits.contains(where: { $0.path == sel }) { selection = nil }
+            let live = Set(hits.map { $0.path })
+            selectedPaths.formIntersection(live)
+            if let a = selectionAnchor, !live.contains(a) { selectionAnchor = nil }
+        }
     }
 
     func search() {
