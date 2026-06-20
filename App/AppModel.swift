@@ -1564,6 +1564,17 @@ final class AppModel {
                 store.metaSet("embedding_version", fingerprint)
             }
             refreshIndexStats(store)
+            // Warm the text-query Metal kernels + the compiled query graph and the GPU reduce BEFORE
+            // going ready, so the load spinner absorbs the one-time cold-compile cost instead of it
+            // leaking into the user's first search (the wait is worst on low-end GPUs). loadValidated
+            // warms only the media towers; this covers the query path. Awaited off the main actor (the
+            // spinner keeps animating), and it runs before the launch index pass below, so the compile
+            // never contends with indexing. markActive: false: warm the reduce + base fold without
+            // faking a search-active window.
+            await Task.detached(priority: .userInitiated) {
+                engine.warmText()
+                _ = store.search([Float](repeating: 0, count: engine.dim), topK: 10, markActive: false)
+            }.value
             self.phase = .ready
             restartWatcher()
             // Reclaim space left by a previously-emptied or heavily-pruned index. compact()
@@ -1575,17 +1586,8 @@ final class AppModel {
             // app was closed, rebuilds after a model switch) and stays current. It is
             // incremental - already-embedded, unchanged files are skipped by mtime, so a
             // complete index just does a quick crawl and stops. The flow is: add folders, search.
-            // Warm the text query + indexing Metal kernels and the compiled query graph OFF the
-            // critical path (loadValidated warms only the media towers), so the first keystroke and
-            // first index batch hit warm kernels. The zero-vector warm search also exercises the GPU
-            // reduce and triggers the base fold, so the user's first real query skips both. (F1)
-            Task.detached(priority: .utility) {
-                engine.warmText()
-                // markActive: false - warm the reduce kernels + trigger the base fold WITHOUT faking a
-                // 2s search-active window that would make the concurrent startup index pass refold
-                // repeatedly and keep mlxBase resident for folds nobody requested. (self-review fix)
-                _ = store.search([Float](repeating: 0, count: engine.dim), topK: 10, markActive: false)
-            }
+            // (The text-query path is already warmed above, before .ready, so the first index batch
+            // and the first interactive query both hit warm kernels.)
             if canIndex { startIndexing() }
         } catch {
             self.phase = .failed("\(error)")
