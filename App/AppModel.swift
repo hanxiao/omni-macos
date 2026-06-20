@@ -241,9 +241,44 @@ final class AppModel {
     var selectedURL: URL? { selection.map { URL(fileURLWithPath: $0) } }
     var hasSelection: Bool { selection != nil }
 
-    func openSelected() { if let u = selectedURL { NSWorkspace.shared.openAsync(u) } }
-    func revealSelected() { if let u = selectedURL { NSWorkspace.shared.revealAsync(u) } }
+    /// Every selected result path in result order (falls back to the active item).
+    private var selectedPathsOrdered: [String] {
+        let ordered = results.filter { selectedPaths.contains($0.path) }.map { $0.path }
+        return ordered.isEmpty ? (selection.map { [$0] } ?? []) : ordered
+    }
+    /// Open every selected result - Finder opens a whole selection on Return / double-click.
+    func openSelected() { for p in selectedPathsOrdered { NSWorkspace.shared.openAsync(URL(fileURLWithPath: p)) } }
+    /// Reveal every selected result in Finder, all highlighted in one window.
+    func revealSelected() {
+        let urls = selectedPathsOrdered.map { URL(fileURLWithPath: $0) }
+        guard !urls.isEmpty else { return }
+        NSWorkspace.shared.activateFileViewerSelecting(urls)
+    }
     func findSimilarSelected() { if let u = selectedURL { setFileQuery(u, similar: true) } }
+    /// Move files to the Trash (reversible). Drops them from the visible results at once; the index
+    /// catches the deletion through the file-system watcher.
+    func moveToTrash(_ paths: [String]) {
+        guard !paths.isEmpty else { return }
+        let set = Set(paths)
+        NSWorkspace.shared.recycle(paths.map { URL(fileURLWithPath: $0) }, completionHandler: nil)
+        rawResults.removeAll { set.contains($0.path) }
+        selectedPaths.subtract(set)
+        if let s = selection, set.contains(s) { selection = selectedPaths.first }
+        if let a = selectionAnchor, set.contains(a) { selectionAnchor = nil }
+        // Drop them from the index now, off the main actor, so a later search can't resurface a
+        // trashed file before the file-system watcher reconciles the deletion. deletePaths rebuilds
+        // the in-memory search index for the batch and is idempotent, so the watcher's eventual pass
+        // over the same paths is a harmless no-op. .userInitiated (not background) so it lands before
+        // the user's next query - the store's serial queue then orders it ahead of that search.
+        if let store {
+            Task.detached(priority: .userInitiated) {
+                store.deletePaths(set)
+                await MainActor.run { self.refreshIndexStats(store) }
+            }
+        }
+    }
+    /// Move the whole current selection to the Trash.
+    func moveSelectedToTrash() { moveToTrash(selectedPathsOrdered) }
     /// Copy every selected path (in result order, newline-separated). Falls back to the active item.
     func copySelectedPaths() {
         let ordered = results.filter { selectedPaths.contains($0.path) }.map { $0.path }

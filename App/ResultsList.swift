@@ -225,61 +225,76 @@ struct ResultsList<Footer: View>: View {
     @ViewBuilder private func menu(_ hit: SearchHit) -> some View {
         // NOTE: no side effects in this builder - macOS evaluates context-menu builders eagerly
         // during row rendering, so a "select on menu open" hack here thrashed the selection on
-        // every results render. Instead each ACTION selects the row it acts on, so the menu-bar
-        // shortcut hints and a live Quick Look follow the item the user actually invoked.
+        // every results render. Instead each ACTION selects the row it acts on. (Shortcut chords are
+        // display-only hints: a chord declared inside a context menu never fires on macOS, so the
+        // real key handling lives on the Edit/File menus.)
         let path = hit.path
-        Button("Open") { model.selection = path; open(path) }
-            .keyboardShortcut("o", modifiers: .command)
-        Button("Quick Look") { model.selection = path; model.previewURL = URL(fileURLWithPath: path) }
-            .keyboardShortcut("y", modifiers: .command)
-        // Per-chunk breakdown (pages of a PDF, passages of a long doc) - only for files that
-        // actually have several chunks. The list expands inline; the grid opens a popover.
-        if hit.chunkCount > 1 {
-            switch model.viewMode {
-            case .list:
-                Button(expanded.contains(path) ? "Hide matching passages" : "Show matching passages") {
-                    toggle(path)
-                }
-            case .grid:
-                Button("Show matching passages") {
-                    // Load first, present after: the popover must mount at its final size
-                    // (see the crash note at the .popover site).
-                    Task {
-                        if passagesCache[path] == nil { passagesCache[path] = await model.passages(for: path) }
-                        passagesPopover = path
+        let count = model.selectedPaths.count
+        // Right-clicking a row that is part of a multi-selection acts on the WHOLE selection (Finder
+        // behavior); only the actions that extend to many are shown - the single-item ones (Quick
+        // Look, passages, Find similar, Ignore folder) are hidden so the menu stays coherent.
+        if count > 1, model.selectedPaths.contains(path) {
+            Button("Open") { model.openSelected() }
+                .keyboardShortcut("o", modifiers: .command)
+            Button("Reveal in Finder") { model.revealSelected() }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+            Button("Copy \(count) paths") { model.copySelectedPaths() }
+                .keyboardShortcut("c", modifiers: .command)
+            Divider()
+            Button("Move \(count) items to Trash", role: .destructive) { model.moveSelectedToTrash() }
+                .keyboardShortcut(.delete, modifiers: .command)
+            Divider()
+            Button("Select all") { model.selectAllResults() }
+                .keyboardShortcut("a", modifiers: .command)
+        } else {
+            Button("Open") { model.selectSingle(path); open(path) }
+                .keyboardShortcut("o", modifiers: .command)
+            Button("Quick Look") { model.selectSingle(path); model.previewURL = URL(fileURLWithPath: path) }
+                .keyboardShortcut("y", modifiers: .command)
+            // Per-chunk breakdown (pages of a PDF, passages of a long doc) - only for files that
+            // actually have several chunks. The list expands inline; the grid opens a popover.
+            if hit.chunkCount > 1 {
+                switch model.viewMode {
+                case .list:
+                    Button(expanded.contains(path) ? "Hide matching passages" : "Show matching passages") {
+                        toggle(path)
+                    }
+                case .grid:
+                    Button("Show matching passages") {
+                        // Load first, present after: the popover must mount at its final size
+                        // (see the crash note at the .popover site).
+                        Task {
+                            if passagesCache[path] == nil { passagesCache[path] = await model.passages(for: path) }
+                            passagesPopover = path
+                        }
                     }
                 }
             }
-        }
-        Divider()
-        // Use this file itself as the query - doc-vs-doc "more like this" across all modalities.
-        Button("Find similar") { model.setFileQuery(URL(fileURLWithPath: path), similar: true) }
-            .keyboardShortcut("f", modifiers: [.command, .option])
-        Button("Reveal in Finder") { model.selection = path; reveal(path) }
-            .keyboardShortcut("r", modifiers: [.command, .shift])
-        // Copies the whole selection when this row is part of a multi-select (Finder behavior),
-        // otherwise just this path. (The shortcut hint mirrors the Edit-menu Cmd-C; a chord declared
-        // only inside a context menu never fires on macOS, so the real key handling lives there.)
-        if model.selectedPaths.count > 1, model.selectedPaths.contains(path) {
-            Button("Copy \(model.selectedPaths.count) paths") { model.copySelectedPaths() }
-                .keyboardShortcut("c", modifiers: .command)
-        } else {
+            Divider()
+            // Use this file itself as the query - doc-vs-doc "more like this" across all modalities.
+            Button("Find similar") { model.setFileQuery(URL(fileURLWithPath: path), similar: true) }
+                .keyboardShortcut("f", modifiers: [.command, .option])
+            Button("Reveal in Finder") { model.selectSingle(path); reveal(path) }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
             Button("Copy path") {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(path, forType: .string)
             }
             .keyboardShortcut("c", modifiers: .command)
-        }
-        Button("Select all") { model.selectAllResults() }
-            .keyboardShortcut("a", modifiers: .command)
-        // Exclude this result's folder from indexing - the "stop showing me this build/cache noise"
-        // action. Routes through the same apply path as the Settings ignore editor (backed up,
-        // pruned, persisted, visible there). Hidden when the folder is an indexed root: removing a
-        // whole root belongs to the sidebar, with its confirmation - not a one-click menu item.
-        if model.canIgnoreEnclosingFolder(ofPath: path) {
             Divider()
-            Button("Ignore folder \u{201C}\((path as NSString).deletingLastPathComponent.components(separatedBy: "/").last ?? "")\u{201D}") {
-                model.ignoreEnclosingFolder(ofPath: path)
+            Button("Move to Trash", role: .destructive) { model.moveToTrash([path]) }
+                .keyboardShortcut(.delete, modifiers: .command)
+            Button("Select all") { model.selectAllResults() }
+                .keyboardShortcut("a", modifiers: .command)
+            // Exclude this result's folder from indexing - the "stop showing me this build/cache
+            // noise" action. Routes through the same apply path as the Settings ignore editor (backed
+            // up, pruned, persisted, visible there). Hidden when the folder is an indexed root:
+            // removing a whole root belongs to the sidebar, with its confirmation.
+            if model.canIgnoreEnclosingFolder(ofPath: path) {
+                Divider()
+                Button("Ignore folder \u{201C}\((path as NSString).deletingLastPathComponent.components(separatedBy: "/").last ?? "")\u{201D}") {
+                    model.ignoreEnclosingFolder(ofPath: path)
+                }
             }
         }
     }

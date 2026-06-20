@@ -62,12 +62,16 @@ struct OmniApp: App {
             // The primary actions on the selected result, reachable from the menu bar and keyboard
             // with visible shortcut hints (previously double-click / context-menu only).
             CommandGroup(after: .newItem) {
+                // Open / Reveal / Copy / Move to Trash act on the WHOLE selection. Quick Look and
+                // Find similar are single-item, so they are disabled when several results are selected
+                // (the context menu hides them outright there).
+                let multi = model.selectedPaths.count > 1
                 Button("Open") { model.openSelected() }
                     .keyboardShortcut("o", modifiers: .command)
                     .disabled(!model.hasSelection)
                 Button("Quick Look") { model.toggleQuickLook() }
                     .keyboardShortcut("y", modifiers: .command)
-                    .disabled(!model.hasSelection)
+                    .disabled(!model.hasSelection || multi)
                 Button("Reveal in Finder") { model.revealSelected() }
                     .keyboardShortcut("r", modifiers: [.command, .shift])
                     .disabled(!model.hasSelection)
@@ -77,9 +81,14 @@ struct OmniApp: App {
                 // click targets naming the same chords.
                 Button("Find similar") { model.findSimilarSelected() }
                     .keyboardShortcut("f", modifiers: [.command, .option])
-                    .disabled(!model.hasSelection)
-                Button("Copy path") { model.copySelectedPaths() }
+                    .disabled(!model.hasSelection || multi)
+                Button(multi ? "Copy \(model.selectedPaths.count) paths" : "Copy path") { model.copySelectedPaths() }
                     .keyboardShortcut("c", modifiers: [.command, .option])
+                    .disabled(!model.hasSelection)
+                // Move to Trash (reversible). Cmd-Delete is routed: in a text field it stays the
+                // editor's delete-to-line-start, so typing in the search box can never trash files.
+                Button(multi ? "Move \(model.selectedPaths.count) Items to Trash" : "Move to Trash") { moveToTrashCommand() }
+                    .keyboardShortcut(.delete, modifiers: .command)
                     .disabled(!model.hasSelection)
                 Divider()
                 // Search-level actions in one group: start a search from a file, save the
@@ -212,6 +221,14 @@ struct OmniApp: App {
     private func selectAllCommand() {
         if !isTextResponderFocused(), !model.results.isEmpty { model.selectAllResults() }
         else { NSApp.sendAction(#selector(NSText.selectAll(_:)), to: nil, from: nil) }
+    }
+
+    /// Cmd-Delete: move the selected results to the Trash - but ONLY when the results have focus.
+    /// In a text field it stays the editor's delete-to-beginning-of-line, so Cmd-Delete while typing
+    /// in the search box can never trash files.
+    private func moveToTrashCommand() {
+        if !isTextResponderFocused(), model.hasSelection { model.moveSelectedToTrash() }
+        else { NSApp.sendAction(Selector("deleteToBeginningOfLine:"), to: nil, from: nil) }
     }
 
     /// True when a text field/editor is first responder (the search box's field editor is an editable
