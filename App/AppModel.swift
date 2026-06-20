@@ -542,7 +542,12 @@ final class AppModel {
     /// engine/store stay private - attach() is the only seam the serving layer sees.
     let serving = ServingController()
 
+    /// The live model, for the app-level quit handler (a global AppKit callback with no other seam to
+    /// reach it). Weak so it never keeps the model alive.
+    static weak var shared: AppModel?
+
     init() {
+        Self.shared = self
         Self.sweepDroppedImageTemps()
         loadRoots()
         loadSettings()
@@ -2503,6 +2508,11 @@ final class AppModel {
 
     /// Pause indexing. Files embedded so far are kept; resume continues from there.
     func pauseIndexing() { indexer?.cancel() }
+
+    /// Stop indexing for an orderly quit. The quit handler holds termination until `isIndexing`
+    /// clears - i.e. the worker has left MLX - so MLX's global C++ teardown on exit() can't race a
+    /// live embed and fault on the half-destroyed compiler cache.
+    func quiesceForQuit() { indexer?.cancel() }
 
     // MARK: - Profiling
 

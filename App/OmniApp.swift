@@ -1,8 +1,28 @@
 import SwiftUI
 import AppKit
 
+/// Drains in-flight indexing before the process exits. Without this, quitting - notably the
+/// auto-updater's relaunch (Updater.launchReplaceAndQuit -> NSApp.terminate) - runs MLX's C++ global
+/// destructors, which synchronize the GPU, while a background indexing task is still inside MLX; the
+/// worker then faults on the half-torn-down compiler cache (EXC_BAD_ACCESS). We cancel indexing and
+/// hold termination (bounded) until the worker has left MLX, so the teardown runs with nothing in
+/// flight. Covers every quit path (Cmd-Q and the updater alike).
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let model = AppModel.shared, model.isIndexing else { return .terminateNow }
+        model.quiesceForQuit()
+        Task { @MainActor in
+            let deadline = Date().addingTimeInterval(8)   // fallback: never hang the quit indefinitely
+            while model.isIndexing && Date() < deadline { try? await Task.sleep(nanoseconds: 100_000_000) }
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+}
+
 @main
 struct OmniApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var model = AppModel()
 
     var body: some Scene {
