@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import AppKit
+import CryptoKit
 import OmniKit
 
 enum ResultViewMode: String, CaseIterable { case list, grid }
@@ -546,6 +547,8 @@ final class AppModel {
         loadIgnore()
         loadPerf()
         loadHistory()
+        sweepUnsavedQueryImages()   // after loadHistory: keep bookmarked query images, drop the rest
+        pruneDeadFileRecents()      // clear dangling file recents (e.g. older temp-path image searches)
         if let raw = UserDefaults.standard.string(forKey: "omni.historyMode"), let m = HistoryMode(rawValue: raw) { historyMode = m }
         // Setting historyRetentionDays runs the day-based prune via didSet, so stale recents are
         // cleaned up at launch. integer(forKey:) returns 0 when unset -> keep the 7-day default.
@@ -555,9 +558,9 @@ final class AppModel {
         Task { await bootstrap() }
     }
 
-    /// Reclaim leftover dropped/pasted-image temp dirs (omni-drop-*) from previous sessions. Each
-    /// holds a re-encoded copy of a dragged/pasted image (and the file-promise downloads) and is
-    /// never needed across launches, but nothing deletes them mid-session, so they accumulate.
+    /// Reclaim leftover drop temp dirs (omni-drop-*) from previous sessions - the file-promise
+    /// receive dirs (a browser drag that materializes a file). Never needed across launches, but
+    /// nothing deletes them mid-session, so they accumulate.
     private static func sweepDroppedImageTemps() {
         let tmp = FileManager.default.temporaryDirectory
         guard let entries = try? FileManager.default.contentsOfDirectory(
@@ -565,6 +568,31 @@ final class AppModel {
         for url in entries where url.lastPathComponent.hasPrefix("omni-drop-") {
             try? FileManager.default.removeItem(at: url)
         }
+    }
+
+    /// Reclaim query-image dirs not referenced by a bookmark. A dropped/pasted image search keeps its
+    /// bytes under query-images/<hash>/ so an explicit bookmark survives launches; everything else was
+    /// a one-off lookup and is removed on the next launch. Runs after loadHistory (needs the bookmarks).
+    private func sweepUnsavedQueryImages() {
+        guard let dir = Self.queryImagesDir,
+              let entries = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+        else { return }
+        let keptHashes = Set(searchHistory.compactMap { $0.bookmarked ? $0.filePath : nil }
+            .map { (($0 as NSString).deletingLastPathComponent as NSString).lastPathComponent })
+        for sub in entries where !keptHashes.contains(sub.lastPathComponent) {
+            try? FileManager.default.removeItem(at: sub)
+        }
+    }
+
+    /// Drop non-bookmarked file recents whose file is gone - notably the dropped/pasted-image recents
+    /// that older versions wrote with a since-deleted temp path. They would only error on click.
+    /// Bookmarks are kept: an explicit save survives even if its file later disappears.
+    private func pruneDeadFileRecents() {
+        let before = searchHistory.count
+        searchHistory.removeAll {
+            !$0.bookmarked && $0.isFile && !FileManager.default.fileExists(atPath: $0.filePath ?? "")
+        }
+        if searchHistory.count != before { persistHistory() }
     }
 
     // MARK: - Search history
@@ -722,7 +750,14 @@ final class AppModel {
         if let fq = fileQuery {
             let path = fq.url.path
             if let i = searchHistory.firstIndex(where: { $0.filePath == path }) {
-                searchHistory[i].bookmarked.toggle(); searchHistory[i].lastUsed = Date()
+                if fq.transient {
+                    // An image search lives in History only as a bookmark; unbookmarking removes it
+                    // outright (its durable bytes are reclaimed next launch) rather than demoting it to
+                    // a recent, which would show a generic, soon-dangling "Dropped image" entry.
+                    searchHistory.remove(at: i)
+                } else {
+                    searchHistory[i].bookmarked.toggle(); searchHistory[i].lastUsed = Date()
+                }
             } else {
                 var item = HistoryItem(query: "", bookmarked: true, lastUsed: Date(),
                                        kinds: ctx.kinds, folder: ctx.folder, ext: ctx.ext,
@@ -1843,7 +1878,11 @@ final class AppModel {
             return
         }
         query = ""; rawQuery = ""        // the text field empties; the chip represents the query
-        fileQuery = FileQuery(url: url, kind: kind, similar: similar, fromHistory: fromHistory, transient: transient)
+        // A query image (a dropped/pasted bitmap under query-images) is ephemeral regardless of how we
+        // got here - fresh search, re-search, or a history re-run - so detect it by path. That keeps it
+        // out of recents and routes its bookmark toggle to remove-not-demote, consistently.
+        let ephemeral = transient || Self.isQueryImage(url)
+        fileQuery = FileQuery(url: url, kind: kind, similar: similar, fromHistory: fromHistory, transient: ephemeral)
         search()
     }
 
@@ -1869,16 +1908,42 @@ final class AppModel {
     /// a friendly name (the file-query chip shows that name) and runs the standard file-query path.
     func searchByImage(data: Data, suggestedExtension ext: String = "png") {
         guard phase == .ready else { return }
+        guard let base = Self.queryImagesDir else { queryError = "Couldn't read the dropped image."; return }
         do {
-            let dir = FileManager.default.temporaryDirectory
-                .appendingPathComponent("omni-drop-\(UUID().uuidString)", isDirectory: true)
+            // Content-addressed: the same image always maps to one dir, so re-searching it dedups and
+            // an explicit bookmark of it survives launches. setFileQuery marks it transient (out of
+            // recents); sweepUnsavedQueryImages reclaims it next launch unless a bookmark keeps it.
+            let dir = base.appendingPathComponent(Self.sha256Hex(data), isDirectory: true)
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             let url = dir.appendingPathComponent("Dropped image.\(ext)")
-            try data.write(to: url)
-            setFileQuery(url, transient: true)   // ephemeral temp file: keep it out of persisted History
+            if !FileManager.default.fileExists(atPath: url.path) { try data.write(to: url) }
+            setFileQuery(url, transient: true)
         } catch {
             queryError = "Couldn't read the dropped image."
         }
+    }
+
+    /// Durable, content-addressed store for query images. A dropped/pasted image search keeps its
+    /// bytes here (under <sha256>/) so re-searching dedups and a bookmark survives launches; anything
+    /// not referenced by a bookmark is reclaimed at the next launch by sweepUnsavedQueryImages().
+    private static var queryImagesDir: URL? {
+        guard let base = try? FileManager.default.url(
+            for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true) else { return nil }
+        let dir = base.appendingPathComponent("Omni/query-images", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    /// True if `url` lives under the query-images store - i.e. it is an ephemeral dropped/pasted image,
+    /// not a real file on disk. Does not create the directory.
+    static func isQueryImage(_ url: URL) -> Bool {
+        guard let base = try? FileManager.default.url(
+            for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false) else { return false }
+        return url.path.hasPrefix(base.appendingPathComponent("Omni/query-images").path + "/")
+    }
+
+    private static func sha256Hex(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     /// Search by an NSImage (a dragged/pasted bitmap from a browser or another app). Re-encodes to
