@@ -1835,18 +1835,29 @@ final class AppModel {
     }
 
     private func loadRoots() {
+        // Canonicalize on load too, so a root persisted before symlink resolution (e.g. a /tmp path)
+        // migrates to its resolved form and its per-folder count starts matching the index.
         if let saved = UserDefaults.standard.array(forKey: "omni.roots") as? [String], !saved.isEmpty {
-            roots = saved.map { URL(fileURLWithPath: $0) }
+            roots = canonicalizeRoots(saved.map { URL(fileURLWithPath: $0) })
         } else {
-            roots = FileCrawler.defaultRoots()
+            roots = canonicalizeRoots(FileCrawler.defaultRoots())
         }
     }
     private func saveRoots() { UserDefaults.standard.set(roots.map { $0.path }, forKey: "omni.roots") }
 
-    /// Collapse roots so none is nested inside another - overlapping roots would crawl,
-    /// embed, and count the same files twice.
+    /// Collapse roots so none is nested inside another - overlapping roots would crawl, embed, and
+    /// count the same files twice. Each root is first mapped to its filesystem canonical path (e.g.
+    /// /tmp -> /private/tmp) so it matches the paths the crawler indexes; otherwise per-folder counts
+    /// and every per-root op (remove, pause, ignore, folder map) prefix-match the wrong path and
+    /// silently miss. canonicalPath is required here, not resolvingSymlinksInPath - the latter strips
+    /// /private (it would leave /tmp as /tmp). Falls back to the given path when a root can't be
+    /// resolved (e.g. it no longer exists).
     private func canonicalizeRoots(_ roots: [URL]) -> [URL] {
-        let sorted = roots.sorted { $0.path.count < $1.path.count }   // ancestors first
+        let resolved = roots.map { url -> URL in
+            (try? url.resourceValues(forKeys: [.canonicalPathKey]))?.canonicalPath
+                .map { URL(fileURLWithPath: $0) } ?? url
+        }
+        let sorted = resolved.sorted { $0.path.count < $1.path.count }   // ancestors first
         var canonical: [URL] = []
         for r in sorted where !canonical.contains(where: { r.path == $0.path || r.path.hasPrefix($0.path + "/") }) {
             canonical.append(r)
