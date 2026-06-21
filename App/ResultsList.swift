@@ -309,6 +309,9 @@ struct ResultsList<Footer: View>: View {
         if m.contains(.command) { model.toggleSelection(path) }
         else if m.contains(.shift) { model.extendSelection(to: path) }
         else { model.selectSingle(path) }
+        // A click is a deliberate navigation - record it as a back/forward stop. Arrow-key moves
+        // (moveSelection) deliberately don't, so browsing the list doesn't flood the trail.
+        model.captureNavStop()
     }
 }
 

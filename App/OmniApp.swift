@@ -9,11 +9,11 @@ import AppKit
 /// flight. Covers every quit path (Cmd-Q and the updater alike).
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let model = AppModel.shared, model.isIndexing else { return .terminateNow }
+        guard let model = AppModel.shared, model.isEngineWorkInFlight else { return .terminateNow }
         model.quiesceForQuit()
         Task { @MainActor in
             let deadline = Date().addingTimeInterval(8)   // fallback: never hang the quit indefinitely
-            while model.isIndexing && Date() < deadline { try? await Task.sleep(nanoseconds: 100_000_000) }
+            while model.isEngineWorkInFlight && Date() < deadline { try? await Task.sleep(nanoseconds: 100_000_000) }
             NSApp.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
@@ -109,6 +109,17 @@ struct OmniApp: App {
             // Sidebar / Full Screen) instead of declaring a second "View" CommandMenu - otherwise
             // the menu bar shows two "View" menus. Cmd-1 gallery, Cmd-2 list, plus Sort by.
             CommandGroup(after: .sidebar) {
+                Divider()
+                // Back / forward through the session's search + selection trail (like Finder's Go menu).
+                // The menu OWNS the Cmd-[ / Cmd-] shortcuts (single owner, no duplicate-shortcut conflict
+                // with the toolbar chevrons, and they stay active even when the toolbar control is hidden
+                // in the idle state); the toolbar buttons just name the same chords.
+                Button("Back") { model.goBack() }
+                    .keyboardShortcut("[", modifiers: .command)
+                    .disabled(!model.canGoBack)
+                Button("Forward") { model.goForward() }
+                    .keyboardShortcut("]", modifiers: .command)
+                    .disabled(!model.canGoForward)
                 Divider()
                 // Inline Picker so the active mode gets a checkmark (Finder-style); the Cmd-1/Cmd-2
                 // shortcuts ride on the items.
@@ -252,9 +263,12 @@ private struct ShortcutsView: View {
         ("Open", ["\u{2318}O", "\u{21A9}"]),
         ("Quick Look", ["\u{2318}Y", "Space"]),
         ("Reveal in Finder", ["\u{21E7}\u{2318}R"]),
+        ("Copy path(s)", ["\u{2325}\u{2318}C"]),
+        ("Move to Trash", ["\u{2318}\u{232B}"]),
         ("Gallery / List", ["\u{2318}1", "\u{2318}2"]),
         ("Index / Update / Resume", ["\u{21E7}\u{2318}I"]),
         ("Move selection", ["\u{2191}\u{2193}\u{2190}\u{2192}"]),
+        ("Back / Forward", ["\u{2318}[", "\u{2318}]"]),
     ]
     var body: some View {
         Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 10) {

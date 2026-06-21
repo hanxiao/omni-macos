@@ -321,6 +321,94 @@ final class AppModel {
         if selection == nil { selection = r.first?.path }
         selectionAnchor = selection
     }
+
+    // MARK: - Back / forward navigation (Finder-style session history)
+
+    /// One stop in this session's view trail: a search (the text-box string OR a file query) plus the
+    /// result that was active there. Filters and sort are encoded as qualifiers inside `rawQuery`, so
+    /// restoring the box restores them too. Not persisted - this is the back/forward trail for the
+    /// current session only, distinct from the sidebar's recents/bookmarks.
+    struct NavEntry: Equatable {
+        var rawQuery: String          // text-box string ("" when fileQuery is set)
+        var fileQuery: FileQuery?     // a file / find-similar query, if that's the active mode
+        var selection: String?        // the active result path at this stop
+        /// Identity of the SEARCH alone (ignoring which result was selected within it).
+        var searchKey: String { fileQuery.map { "f|\($0.url.path)|\($0.similar)" } ?? "q|\(rawQuery)" }
+    }
+    private var navBack: [NavEntry] = []
+    private var navForward: [NavEntry] = []
+    private var navCurrent: NavEntry?
+    // The searchToken of the in-flight back/forward re-run, or nil when not navigating. Tying it to the
+    // token (not a bare bool) closes a race: if the user starts a new search before the navigated one
+    // settles, search() bumps searchToken, the nav search's continuation bails its `token == searchToken`
+    // guard and never reaches applyResults - so a bare flag would leak true and corrupt the trail. With a
+    // token, applyResults only consumes the nav restore when the SETTLING search is the navigated one.
+    private var navApplyingToken: Int?
+    private var pendingNavSelection: String?    // selection to restore once that navigated search settles
+
+    var canGoBack: Bool { !navBack.isEmpty }
+    var canGoForward: Bool { !navForward.isEmpty }
+
+    /// The view the user is looking at right now, or nil if the box is empty (nothing to record).
+    private func currentNavEntry() -> NavEntry? {
+        if let fq = fileQuery { return NavEntry(rawQuery: "", fileQuery: fq, selection: selection) }
+        guard !rawQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return NavEntry(rawQuery: rawQuery, fileQuery: nil, selection: selection)
+    }
+
+    /// Record the current view as a new stop. No-op mid-navigation or when nothing changed. Starting a
+    /// new search here clears the forward trail (you branched) - exactly like a browser or Finder.
+    func captureNavStop() {
+        guard navApplyingToken == nil, let entry = currentNavEntry() else { return }
+        if let cur = navCurrent {
+            if cur == entry { return }
+            navBack.append(cur)
+            if navBack.count > 100 { navBack.removeFirst(navBack.count - 100) }   // bound the trail
+        }
+        navCurrent = entry
+        navForward.removeAll()
+    }
+
+    func goBack() {
+        guard let prev = navBack.popLast() else { return }
+        if let cur = navCurrent { navForward.append(cur) }
+        applyNavEntry(prev)
+    }
+
+    func goForward() {
+        guard let next = navForward.popLast() else { return }
+        if let cur = navCurrent { navBack.append(cur) }
+        applyNavEntry(next)
+    }
+
+    private func applyNavEntry(_ entry: NavEntry) {
+        navApplyingToken = nil; pendingNavSelection = nil   // drop any prior pending restore
+        let sameSearch = navCurrent?.searchKey == entry.searchKey
+        navCurrent = entry
+        if sameSearch {
+            // Same result set is already on screen - just restore the selection within it.
+            if let sel = entry.selection, results.contains(where: { $0.path == sel }) {
+                selection = sel; selectedPaths = [sel]; selectionAnchor = sel
+            } else {
+                selection = nil; selectedPaths = []; selectionAnchor = nil
+            }
+            return
+        }
+        // A different search - re-run it; the selection is restored when ITS results settle (applyResults).
+        pendingNavSelection = entry.selection
+        if let fq = entry.fileQuery {
+            setFileQuery(fq.url, similar: fq.similar, fromHistory: true)   // fromHistory: don't re-record
+            // setFileQuery early-returns (file missing/unreadable/unsupported) without running a search;
+            // there's nothing to settle, so don't arm the pending restore (would otherwise leak).
+            guard fileQuery != nil else { pendingNavSelection = nil; return }
+        } else {
+            fileQuery = nil; queryError = nil
+            applyParsedQuery(entry.rawQuery)
+            search()
+        }
+        // Consume the restore only when the search just launched here settles (search() bumped the token).
+        navApplyingToken = searchToken
+    }
     /// Search by a file (any modality - the embedding space is shared). Owned by the model so the
     /// File menu and the toolbar button trigger the same panel.
     func searchByFilePanel() {
@@ -380,6 +468,13 @@ final class AppModel {
     var indexState: IndexState = .idle
     var isIndexing: Bool { indexState == .indexing }
     var isPaused: Bool { indexState == .paused }
+    /// True while ANY pass that can be inside the engine/MLX is in flight: the normal/full pass
+    /// (indexState == .indexing), a catch-up pass for newly added roots (tracked via activeRoots,
+    /// which deliberately does NOT flip indexState), or an fs-reconcile pass. The quit drain must
+    /// wait on all three - a catch-up pass embedding a scanned PDF sits inside MLX, and letting
+    /// exit() run MLX's C++ destructors while it does faults the worker (EXC_BAD_ACCESS in
+    /// CompilerCache::find). isIndexing alone misses the catch-up and reconcile paths.
+    var isEngineWorkInFlight: Bool { isIndexing || !activeRoots.isEmpty || fsReconcileInFlight }
     /// Indexing has started but nothing has been processed yet - still crawling folders, or
     /// compiling the model's GPU kernels on first run (slow on smaller Macs, instant on a Mac
     /// Studio). The UI shows "Preparing" here so a 0-progress bar does not look stuck.
@@ -1888,7 +1983,7 @@ final class AppModel {
     /// re-invokes this, so passes serialize on the single Indexer. Obsolete index skips it (the pending
     /// full reindex covers the new folders).
     private func catchUpPendingRoots() {
-        guard !indexObsolete, indexState != .indexing, activeRoots.isEmpty,
+        guard !isTerminating, !indexObsolete, indexState != .indexing, activeRoots.isEmpty,
               let indexer, let store, !pendingCatchUpRoots.isEmpty else { return }
         let batch = pendingCatchUpRoots.filter { roots.contains($0) }
         pendingCatchUpRoots.removeAll()
@@ -2196,6 +2291,21 @@ final class AppModel {
             selectedPaths.formIntersection(live)
             if let a = selectionAnchor, !live.contains(a) { selectionAnchor = nil }
         }
+        // Back/forward integration. When THIS settling search is the navigated one (its token matches),
+        // restore the remembered selection and don't record a stop. Otherwise it's an ordinary/superseding
+        // search: drop any stale nav-pending (the navigated search was cancelled before it settled) and
+        // record a stop, which branches the forward trail. Matching on searchToken (not a bare flag) is
+        // what makes a new search started mid-navigation behave correctly instead of corrupting the trail.
+        if let nt = navApplyingToken, nt == searchToken {
+            if let sel = pendingNavSelection, hits.contains(where: { $0.path == sel }) {
+                selection = sel; selectedPaths = [sel]; selectionAnchor = sel
+            }
+            pendingNavSelection = nil
+            navApplyingToken = nil
+        } else if isNewQuery {
+            if navApplyingToken != nil { navApplyingToken = nil; pendingNavSelection = nil }
+            captureNavStop()
+        }
     }
 
     func search() {
@@ -2380,7 +2490,7 @@ final class AppModel {
     /// Start or resume indexing. Indexing is incremental - already-embedded files are
     /// skipped by modification time, so resuming simply continues where it left off.
     func startIndexing() {
-        guard let indexer, let store, indexState != .indexing else { return }
+        guard !isTerminating, let indexer, let store, indexState != .indexing else { return }
         // A catch-up pass (added folders) or FS reconcile is mid-flight on the SAME Indexer: starting
         // a full pass now would run two passes concurrently (shared `cancelled` flag, double
         // embedding, racing reconciles). Cancel it and defer; its completion drains the flag.
@@ -2548,6 +2658,7 @@ final class AppModel {
     /// catch-up roots, then buffered FS events. Each step that starts a new pass owns the rest of
     /// the chain through its own completion handler, so passes never overlap.
     private func drainDeferredAfterPass(_ store: VectorStore) {
+        guard !isTerminating else { return }   // quitting: don't re-kick a pass that would re-enter MLX
         let removed = pendingRootRemovals
         pendingRootRemovals.removeAll()
         if !removed.isEmpty {
@@ -2574,7 +2685,7 @@ final class AppModel {
     }
 
     private func drainPendingFSChanges() {
-        guard !pendingFSPaths.isEmpty, !fsReconcileInFlight, let indexer, let store else { return }
+        guard !isTerminating, !pendingFSPaths.isEmpty, !fsReconcileInFlight, let indexer, let store else { return }
         // Globally paused: keep the events buffered (resume's pass completion re-drains them).
         // Running update() now would also hit the stale cancel and silently DROP the batch.
         guard indexState != .paused else { return }
@@ -2609,7 +2720,13 @@ final class AppModel {
     /// Stop indexing for an orderly quit. The quit handler holds termination until `isIndexing`
     /// clears - i.e. the worker has left MLX - so MLX's global C++ teardown on exit() can't race a
     /// live embed and fault on the half-destroyed compiler cache.
-    func quiesceForQuit() { indexer?.cancel() }
+    /// Set once the app is terminating so no new index pass starts after the quit drain begins. Without
+    /// it, quiesceForQuit's single cancel() is undone by the next pass's resetCancelled() (a catch-up or
+    /// FS-reconcile re-kicked from a completion) which re-enters MLX - the exact teardown race the drain
+    /// is meant to prevent. The guarded entry points below all early-return while this is true.
+    private var isTerminating = false
+
+    func quiesceForQuit() { isTerminating = true; indexer?.cancel() }
 
     // MARK: - Profiling
 

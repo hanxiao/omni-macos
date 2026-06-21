@@ -66,17 +66,13 @@ struct ContentView: View {
                 .navigationSplitViewColumnWidth(min: 230, ideal: 260, max: 320)
         } detail: {
             detail
-                .navigationTitle("Omni")
-                .navigationSubtitle(subtitle)
+                // No navigationTitle/navigationSubtitle: either one claims the leading toolbar slot and
+                // pushes back/forward to its right. The window's title TEXT is hidden (WindowTitleHider)
+                // so back/forward own the true leading edge with no "Omni" label - while the toolbar
+                // keeps its Liquid Glass material (unlike .hiddenTitleBar, which would strip it).
                 .toolbar { toolbar }
+                .background(WindowTitleHider())
         }
-    }
-
-    private var subtitle: String {
-        guard model.phase == .ready, model.hasQuery, !model.isResolving else { return "" }
-        let n = model.results.count
-        if n == 0 { return "" }
-        return n >= 60 ? "Top \(n) results" : "\(n) result\(n == 1 ? "" : "s")"
     }
 
     // MARK: - Detail
@@ -333,8 +329,9 @@ struct ContentView: View {
 
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
         // macOS 26 (Tahoe) shows the NavigationSplitView sidebar toggle automatically; macOS 15 and
-        // earlier don't, so add an explicit one there (toggleSidebar: travels the responder chain to
-        // the split view controller backing NavigationSplitView).
+        // earlier don't, so add an explicit one there (toggleSidebar: travels the responder chain to the
+        // split view controller backing NavigationSplitView). Declared BEFORE back/forward so the leading
+        // order is [sidebar][< >], matching Finder (on Tahoe the system toggle is already left of these).
         if #unavailable(macOS 26.0) {
             ToolbarItem(placement: .navigation) {
                 Button { NSApp.sendAction(Selector(("toggleSidebar:")), to: nil, from: nil) } label: {
@@ -343,10 +340,45 @@ struct ContentView: View {
                 .help("Show or hide the sidebar")
             }
         }
+        // Finder-style back/forward at the leading edge of the content toolbar. The window's title TEXT
+        // is hidden (WindowTitleHider), so the chevrons own the leading edge with no "Omni" label. The
+        // toolbar ITEM is unconditional and wraps the chevrons in an always-present HStack: a directly
+        // conditional .navigation item reorders unpredictably, whereas the always-present HStack holds a
+        // stable leading slot and the conditional chevrons inside it just appear/vanish. Progressive
+        // disclosure: the chevrons show only once there's somewhere to go, so the idle state is empty
+        // here. Cmd-[ / Cmd-] match Finder and Safari; each chevron disables independently at the end of
+        // its trail. Grouped so on Tahoe they share one Liquid Glass pill.
+        ToolbarItem(placement: .navigation) {
+            HStack(spacing: 0) {
+                if model.phase == .ready, model.canGoBack || model.canGoForward {
+                    ControlGroup {
+                        // The View menu owns Cmd-[ / Cmd-] (single owner, avoids a duplicate-shortcut
+                        // conflict); these buttons are click targets that name the same chords.
+                        Button { model.goBack() } label: { Image(systemName: "chevron.backward") }
+                            .disabled(!model.canGoBack)
+                            .help("Back  \u{2318}[")
+                            .accessibilityLabel("Back")
+                        Button { model.goForward() } label: { Image(systemName: "chevron.forward") }
+                            .disabled(!model.canGoForward)
+                            .help("Forward  \u{2318}]")
+                            .accessibilityLabel("Forward")
+                    }
+                    .fixedSize()
+                }
+            }
+        }
+        // Flexible space after back/forward pushes every other control to the trailing edge (chevrons
+        // own the left, everything else is right-aligned), and on Tahoe it's also the correct separator
+        // between Liquid Glass toolbar groups - the leading chevron pill and the trailing control pills
+        // read as distinct glass surfaces.
+        if #available(macOS 26.0, *) {
+            ToolbarSpacer(.flexible)
+        }
         // Search by a file (any modality - the embedding space is shared). Available whenever the
-        // app can search, since it can start a query from the empty state too.
+        // app can search, since it can start a query from the empty state too. Trailing placement so
+        // everything except back/forward is right-aligned (back/forward own the leading edge).
         if model.phase == .ready {
-            ToolbarItem(placement: .automatic) {
+            ToolbarItem(placement: .primaryAction) {
                 // The File menu owns the Shift-Cmd-O shortcut (always present); this is the
                 // click target naming the same chord.
                 Button { model.searchByFilePanel() } label: { Image(systemName: "photo.badge.magnifyingglass") }
@@ -357,7 +389,7 @@ struct ContentView: View {
         // Bookmark the current search. The only way into History when recording is set to "Only when
         // I bookmark", and a quick save otherwise. Appears once there's a search to keep.
         if model.phase == .ready, model.hasActiveSearch {
-            ToolbarItem(placement: .automatic) {
+            ToolbarItem(placement: .primaryAction) {
                 Button { model.toggleBookmarkCurrentSearch() } label: {
                     // No explicit color in the unbookmarked state, so the toolbar can dim it like every
                     // other button when the window resigns key (e.g. while Settings is open). Yellow is
@@ -732,5 +764,24 @@ struct EngineFailedView: View {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true; panel.canChooseFiles = false
         if panel.runModal() == .OK, let url = panel.url { model.setModelDir(url) }
+    }
+}
+
+/// Hides the window's TITLE TEXT (not the title bar) so the toolbar's leading slot is free for the
+/// back/forward chevrons and there's no redundant "Omni" label - while the title bar (and its Liquid
+/// Glass toolbar material) stays intact, unlike `.hiddenTitleBar`. Re-applied on every update because
+/// SwiftUI re-asserts `.visible` from the Window scene's title; the window keeps its "Omni" title for
+/// the Window menu, Mission Control, and Stage Manager.
+private struct WindowTitleHider: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let v = NSView()
+        // The view isn't in a window yet at make time; defer one hop to grab it.
+        DispatchQueue.main.async { v.window?.titleVisibility = .hidden }
+        return v
+    }
+    func updateNSView(_ nsView: NSView, context: Context) {
+        // updateNSView already runs on the main thread; set directly and only when it actually differs,
+        // so SwiftUI's frequent updates (every keystroke / indexing tick) don't schedule a redundant hop.
+        if let w = nsView.window, w.titleVisibility != .hidden { w.titleVisibility = .hidden }
     }
 }
