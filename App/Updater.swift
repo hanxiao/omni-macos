@@ -58,7 +58,7 @@ enum Updater {
                     // A version the user explicitly skipped stays quiet on launch checks; the
                     // menu command always shows it again (the user asked).
                     if !userInitiated, UserDefaults.standard.string(forKey: "omni.skipVersion") == m.version { return }
-                    promptAndInstall(m)
+                    await promptAndInstall(m)
                 } else if userInitiated {
                     info("You're up to date", "Omni \(currentVersion) is the latest version.")
                 }
@@ -68,13 +68,18 @@ enum Updater {
         }
     }
 
-    private static func promptAndInstall(_ m: Manifest) {
+    private static func promptAndInstall(_ m: Manifest) async {
         guard !inProgress else { return }
+        // Pull the changelog for every release between what the user has and what's offered, so the
+        // prompt shows what they actually gain (they may be several versions behind). Best-effort:
+        // an empty string just falls back to the plain prompt.
+        let notes = await fetchReleaseNotes(from: currentVersion, to: m.version)
         let a = NSAlert()
         a.messageText = "Omni \(m.version) is available"
         a.informativeText = "You have \(currentVersion). Omni will download the update, install it, and relaunch."
-        a.addButton(withTitle: "Update and relaunch")
-        a.addButton(withTitle: "Later")
+        if !notes.isEmpty { a.accessoryView = notesView(notes) }
+        a.addButton(withTitle: "Update and relaunch")          // default (rightmost, Return)
+        a.addButton(withTitle: "Later").keyEquivalent = "\u{1b}"  // Esc dismisses (HIG: cancel-equivalent)
         a.addButton(withTitle: "Skip this version")
         switch a.runModal() {
         case .alertFirstButtonReturn:
@@ -85,6 +90,95 @@ enum Updater {
         default:
             break
         }
+    }
+
+    // MARK: - Release notes (GitHub)
+
+    /// The repo is public, so its releases API needs no auth. Each release body carries a
+    /// "What's changed since vX" bullet list (see .github/workflows/release.yml).
+    private static let releasesURL = "https://api.github.com/repos/hanxiao/omni-macos/releases?per_page=100"
+    private struct GHRelease: Decodable { let tag_name: String; let name: String?; let body: String? }
+
+    /// Release tags are "v0.3.9"; the manifest/About version is "0.3.9".
+    private static func releaseVersion(_ tag: String) -> String {
+        tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+    }
+
+    /// Concatenated changelogs for every release in (current, target], newest first. "" on any failure.
+    private static func fetchReleaseNotes(from current: String, to target: String) async -> String {
+        guard let url = URL(string: releasesURL) else { return "" }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 12
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        do {
+            let (data, _) = try await URLSession.shared.data(for: req)
+            // The API returns releases newest-first, which is the order we want to display.
+            let releases = try JSONDecoder().decode([GHRelease].self, from: data)
+            let sections = releases.compactMap { r -> String? in
+                let v = releaseVersion(r.tag_name)
+                guard isNewer(v, than: current), !isNewer(v, than: target) else { return nil }   // current < v <= target
+                let header = (r.name?.isEmpty == false ? r.name! : "Omni \(v)")
+                let changes = changesSection(r.body ?? "")
+                return changes.isEmpty ? header : "\(header)\n\(changes)"
+            }
+            return sections.joined(separator: "\n\n")
+        } catch { return "" }
+    }
+
+    /// The "What's changed" bullets from a release body, dropping the repeated "## Install" footer and
+    /// the "## What's changed..." heading (the per-version header above it already says the version).
+    private static func changesSection(_ body: String) -> String {
+        var s = body
+        if let r = s.range(of: "\n## Install") { s = String(s[..<r.lowerBound]) }
+        let kept = s.split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.hasPrefix("#") }
+            .joined(separator: "\n")
+        return kept.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// A read-only, selectable, vertically scrolling changelog for the NSAlert accessory. Version
+    /// headers are bold so the multi-version list scans at a glance; colors are semantic so it adapts
+    /// to light/dark mode.
+    private static func notesView(_ text: String) -> NSView {
+        let w: CGFloat = 420, h: CGFloat = 240
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.borderType = .bezelBorder
+        scroll.drawsBackground = true
+        let tv = NSTextView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        tv.isEditable = false
+        tv.isSelectable = true
+        tv.drawsBackground = true
+        tv.backgroundColor = .textBackgroundColor
+        tv.textContainerInset = NSSize(width: 6, height: 6)
+        tv.textStorage?.setAttributedString(notesAttributed(text))
+        tv.isVerticallyResizable = true
+        tv.isHorizontallyResizable = false
+        tv.minSize = NSSize(width: 0, height: h)
+        tv.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        tv.textContainer?.widthTracksTextView = true
+        tv.textContainer?.containerSize = NSSize(width: w - 12, height: CGFloat.greatestFiniteMagnitude)
+        scroll.documentView = tv
+        return scroll
+    }
+
+    /// Render the changelog: bold for version-header lines (anything that isn't a "- " bullet or blank),
+    /// regular for bullets. Semantic colors keep it correct in both appearances.
+    private static func notesAttributed(_ text: String) -> NSAttributedString {
+        let body = NSFont.systemFont(ofSize: 12)
+        let header = NSFont.boldSystemFont(ofSize: 12)
+        let out = NSMutableAttributedString()
+        let lines = text.components(separatedBy: "\n")
+        for (i, line) in lines.enumerated() {
+            let isHeader = !line.isEmpty && !line.hasPrefix("-")
+            out.append(NSAttributedString(string: line, attributes: [
+                .font: isHeader ? header : body,
+                .foregroundColor: NSColor.labelColor,
+            ]))
+            if i < lines.count - 1 { out.append(NSAttributedString(string: "\n", attributes: [.font: body])) }
+        }
+        return out
     }
 
     // MARK: - Update flow
