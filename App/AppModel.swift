@@ -1729,17 +1729,20 @@ final class AppModel {
                 store.metaSet("embedding_version", fingerprint)
             }
             refreshIndexStats(store)
-            // Warm the text-query Metal kernels + the compiled query graph and the GPU reduce BEFORE
-            // going ready, so the load spinner absorbs the one-time cold-compile cost instead of it
-            // leaking into the user's first search (the wait is worst on low-end GPUs). loadValidated
-            // warms only the media towers; this covers the query path. Awaited off the main actor (the
-            // spinner keeps animating), and it runs before the launch index pass below, so the compile
-            // never contends with indexing. markActive: false: warm the reduce + base fold without
-            // faking a search-active window.
-            await Task.detached(priority: .userInitiated) {
+            // Warm the text-query Metal kernels + the compiled query graph + the GPU reduce/base-fold
+            // in the BACKGROUND, and go .ready immediately - do NOT await it. On a low-end GPU the cold
+            // Metal compile plus the first base-fold (folding the whole resident vector matrix into GPU
+            // memory) can take many seconds to a minute; gating .ready behind that made launch look hung
+            // on an M2 (regressed in 0.3.8). Going ready right away restores the fast 0.3.7 startup on
+            // every machine, high- and low-end alike. The first user query still lands on warm kernels:
+            // warmText grabs the serialized GPU gate within milliseconds of launch - long before a human
+            // can click into the search box and submit a query - so a query fired during startup queues
+            // behind the in-flight warm and runs on the now-compiled kernels instead of cold-compiling.
+            // markActive: false: warm the reduce + base fold without faking a search-active window.
+            let warm = Task.detached(priority: .userInitiated) {
                 engine.warmText()
                 _ = store.search([Float](repeating: 0, count: engine.dim), topK: 10, markActive: false)
-            }.value
+            }
             self.phase = .ready
             restartWatcher()
             // Reclaim space left by a previously-emptied or heavily-pruned index. compact()
@@ -1751,9 +1754,12 @@ final class AppModel {
             // app was closed, rebuilds after a model switch) and stays current. It is
             // incremental - already-embedded, unchanged files are skipped by mtime, so a
             // complete index just does a quick crawl and stops. The flow is: add folders, search.
-            // (The text-query path is already warmed above, before .ready, so the first index batch
-            // and the first interactive query both hit warm kernels.)
-            if canIndex { startIndexing() }
+            // Deferred behind the warm-up so the cold compile + first base-fold never contends with the
+            // launch index pass for the GPU - that contention is what made the pre-0.3.8 fire-and-forget
+            // warm slow and could leave the first query cold. On a fast GPU the warm-up finishes in ~1s,
+            // so this is effectively immediate; on a slow GPU indexing (invisible background work) simply
+            // starts a few seconds later, which is strictly better than racing the compile.
+            Task { await warm.value; if self.canIndex { self.startIndexing() } }
         } catch {
             self.phase = .failed("\(error)")
         }
