@@ -468,13 +468,6 @@ final class AppModel {
     var indexState: IndexState = .idle
     var isIndexing: Bool { indexState == .indexing }
     var isPaused: Bool { indexState == .paused }
-    /// True while ANY pass that can be inside the engine/MLX is in flight: the normal/full pass
-    /// (indexState == .indexing), a catch-up pass for newly added roots (tracked via activeRoots,
-    /// which deliberately does NOT flip indexState), or an fs-reconcile pass. The quit drain must
-    /// wait on all three - a catch-up pass embedding a scanned PDF sits inside MLX, and letting
-    /// exit() run MLX's C++ destructors while it does faults the worker (EXC_BAD_ACCESS in
-    /// CompilerCache::find). isIndexing alone misses the catch-up and reconcile paths.
-    var isEngineWorkInFlight: Bool { isIndexing || !activeRoots.isEmpty || fsReconcileInFlight }
     /// Indexing has started but nothing has been processed yet - still crawling folders, or
     /// compiling the model's GPU kernels on first run (slow on smaller Macs, instant on a Mac
     /// Studio). The UI shows "Preparing" here so a 0-progress bar does not look stuck.

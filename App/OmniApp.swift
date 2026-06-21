@@ -1,22 +1,19 @@
 import SwiftUI
 import AppKit
 
-/// Drains in-flight indexing before the process exits. Without this, quitting - notably the
-/// auto-updater's relaunch (Updater.launchReplaceAndQuit -> NSApp.terminate) - runs MLX's C++ global
-/// destructors, which synchronize the GPU, while a background indexing task is still inside MLX; the
-/// worker then faults on the half-torn-down compiler cache (EXC_BAD_ACCESS). We cancel indexing and
-/// hold termination (bounded) until the worker has left MLX, so the teardown runs with nothing in
-/// flight. Covers every quit path (Cmd-Q and the updater alike).
+/// Exits the process immediately on quit, bypassing AppKit's normal exit(). The reason: letting the C
+/// runtime run atexit/static destructors tears down MLX's C++ globals (Scheduler, CompilerCache), which
+/// synchronize the GPU - and if a background worker is still inside MLX that races the half-torn-down
+/// compiler cache and faults (the EXC_BAD_ACCESS from v0.3.7), while on the updater's relaunch path it
+/// could hang there, leaving the app stuck at "Omni will relaunch..." and never quitting. _exit
+/// terminates at the kernel level WITHOUT running any of those destructors - no GPU sync, no race, no
+/// hang - which is safe here: we cancel indexing first, SQLite is WAL-crash-safe, and defaults are
+/// flushed. Covers every quit path (Cmd-Q, AppleEvent, and the updater's NSApp.terminate) uniformly.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let model = AppModel.shared, model.isEngineWorkInFlight else { return .terminateNow }
-        model.quiesceForQuit()
-        Task { @MainActor in
-            let deadline = Date().addingTimeInterval(8)   // fallback: never hang the quit indefinitely
-            while model.isEngineWorkInFlight && Date() < deadline { try? await Task.sleep(nanoseconds: 100_000_000) }
-            NSApp.reply(toApplicationShouldTerminate: true)
-        }
-        return .terminateLater
+        AppModel.shared?.quiesceForQuit()       // stop indexing so no new MLX work starts mid-exit
+        UserDefaults.standard.synchronize()     // persist settings/history/roots before the hard exit
+        _exit(0)                                 // immediate; skips the MLX C++ destructors (no GPU-sync hang/crash)
     }
 }
 
