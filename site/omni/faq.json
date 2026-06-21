@@ -397,7 +397,7 @@
       "items": [
         {
           "q": "How do I let Claude Code or another AI agent search my files?",
-          "a": "Turn on Settings > Serving, then click MCP in the Agents section. Copy the one-line command for Claude Code (claude mcp add --transport http omni http://127.0.0.1:51234/mcp) or the mcpServers JSON block for Cursor, VS Code, or Claude Desktop. The agent gets a 'search' tool that queries the same index the app uses - by meaning, across text, images, audio, and video."
+          "a": "Turn on Settings > Serving, then click MCP in the Agents section. Copy the one-line command for Claude Code (claude mcp add --transport http omni http://127.0.0.1:51234/mcp) or the mcpServers JSON block for Cursor, VS Code, or Claude Desktop. The agent gets 'search' and 'search_inline' tools that query the same index the app uses - by meaning, across text, images, audio, and video."
         },
         {
           "q": "What is the SKILL.md button for?",
@@ -405,7 +405,7 @@
         },
         {
           "q": "What exactly can an agent do through the MCP endpoint?",
-          "a": "One tool: search. It takes a natural-language query plus optional top_k, file-kind, and folder filters, and returns file paths with relevance scores and text snippets. Agents read the files themselves with their own tools - Omni never sends file contents. Raw vectors are available separately via the /v1/embeddings endpoint."
+          "a": "Two tools. 'search' takes a natural-language query plus optional top_k, file-kind, and folder filters; it returns file paths with relevance scores and text snippets, and can inline image thumbnails (include_images) so visual results render in the client. 'search_inline' ranks the best passages within a specific set of files or folders you name - fast, since only the query is re-embedded. Agents read the files themselves with their own tools - Omni never sends file contents. Raw vectors are available separately via the /v1/embeddings endpoint."
         },
         {
           "q": "Is the agent endpoint safe to expose?",

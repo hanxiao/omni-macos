@@ -11,6 +11,9 @@ protocol ServingBackend: Sendable {
     func embedBatch(_ texts: [String], query: Bool) -> [[Float]]
     /// Semantic search: embeds `query` at high priority and scores against the store.
     func search(_ query: String, topK: Int, filter: SearchFilter) -> [SearchHit]
+    /// Rank passages WITHIN an explicit set of files/folders. Embeds `query` (high priority)
+    /// and scores against the already-indexed chunk vectors of those paths only.
+    func searchInline(_ query: String, paths: [String], topK: Int) -> [InlineChunkHit]
 }
 
 /// Wraps OmniEngine + VectorStore. @unchecked Sendable is justified: every member it
@@ -48,5 +51,10 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
     func search(_ query: String, topK: Int, filter: SearchFilter) -> [SearchHit] {
         let vec = engine.embedQuery(query)
         return store.search(vec, filter: filter, topK: topK)
+    }
+
+    func searchInline(_ query: String, paths: [String], topK: Int) -> [InlineChunkHit] {
+        let vec = engine.embedQuery(query)
+        return store.rankChunksAcross(vec, paths: paths, topK: topK)
     }
 }

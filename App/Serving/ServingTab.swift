@@ -276,8 +276,18 @@ struct ServingTab: View {
 
         ## MCP
 
-        The same search is exposed as an MCP tool at `\(base)/mcp` (streamable HTTP) if you
-        prefer the protocol over raw HTTP.
+        The server also speaks MCP (streamable HTTP) at `\(base)/mcp` - point any MCP client at
+        that URL. Two tools:
+
+        - `search` - the same semantic search as above. Args: `query` (required), `top_k` (default
+          10, max 50), `kinds`, `folder`, `max_snippet` (snippet chars per result, default 200), and
+          `include_images` (when true, image and scanned-PDF hits carry an inline JPEG thumbnail so
+          they render in the client). Each result also returns a `resource_link` - a `file://` URI
+          the client can open or preview.
+        - `search_inline` - rank the best passages WITHIN a specific set of files or folders. Args:
+          `query` and `paths` (absolute file or folder paths), plus `top_k` and `max_snippet`. Reuses
+          the index (only the query is embedded), so it is fast - use it to pinpoint where something
+          is discussed across documents you already know.
         """
     }
 

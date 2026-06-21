@@ -65,6 +65,17 @@ public struct ChunkHit: Sendable, Identifiable {
     public var id: Int { chunkIndex }
 }
 
+/// One matching passage when the search spans an explicit SET of files (so it carries its
+/// own path/kind, unlike ChunkHit which is always scoped to one known file).
+public struct InlineChunkHit: Sendable {
+    public let path: String
+    public let kind: String
+    public let chunkIndex: Int
+    public let score: Float
+    public var snippet: String
+    public let locator: String
+}
+
 /// Per-FILE mean-pooled, L2-normalized fp32 vectors for a folder, used by the folder embedding
 /// visualization. Returned as a plain [Float] (not MLXArray, which is non-Sendable) so it can
 /// cross a Task boundary; ProjectionEngine rebuilds the MLXArray on the GPU thread.
@@ -2058,6 +2069,98 @@ public final class VectorStore: @unchecked Sendable {
                 }
             }
             return hits.sorted { $0.score > $1.score }.prefix(topK).map { $0 }
+        }
+    }
+
+    /// Upper bound on in-scope chunks for rankChunksAcross. search_inline is for a known, small set of
+    /// files/folders; this stops an over-broad arg (e.g. a top-level root) from pulling the whole index
+    /// into one query and holding the shared store lock. At 256-dim bf16, this caps the gather + matmul
+    /// at ~100 MB / tens of ms - bounded, vs the old host loop's seconds.
+    private static let maxInlineScanRows = 200_000
+
+    /// Rank the best-matching chunks across an explicit set of files/folders for a pre-embedded query.
+    /// Each input path is either an exact indexed file or a folder prefix (all indexed files under it).
+    /// Reuses the resident vectors - nothing is re-embedded or re-read from disk. The in-scope rows are
+    /// gathered and scored in ONE MLX matmul on the GPU (exact bf16 dot products), not a per-chunk host
+    /// loop. Returns [] if the scope exceeds maxInlineScanRows (too broad). Snippets are fetched only for
+    /// the winners. Scores are cosine (vectors are L2-normalized at index time).
+    public func rankChunksAcross(_ query: [Float], paths: [String], topK: Int = 10) -> [InlineChunkHit] {
+        queue.sync {
+            let n = rows.count
+            guard dim > 0, query.count == dim, !paths.isEmpty, n > 0, flat16.count == n * dim else { return [] }
+            // Normalize each requested path ONCE (strip a single trailing slash) so the prefix test is
+            // allocation-free in the loop and a folder arg with a trailing slash ("/x/Docs/") still matches.
+            let bases = paths.compactMap { p -> String? in
+                let b = p.hasSuffix("/") ? String(p.dropLast()) : p
+                return b.isEmpty ? nil : b
+            }
+            guard !bases.isEmpty else { return [] }
+            var inScope = Set<Int32>()
+            for (p, fid) in pathID where bases.contains(where: { p == $0 || p.hasPrefix($0 + "/") }) {
+                inScope.insert(fid)
+            }
+            guard !inScope.isEmpty else { return [] }
+
+            // In-scope row indices, capped so an over-broad scope can't hold the lock.
+            var idx: [Int] = []
+            idx.reserveCapacity(4096)
+            for i in 0 ..< fileID.count where inScope.contains(fileID[i]) {
+                idx.append(i)
+                if idx.count > Self.maxInlineScanRows { return [] }   // scope too broad - narrow the paths
+            }
+            guard !idx.isEmpty else { return [] }
+
+            // GPU scoring: gather the in-scope rows' bf16 vectors into one contiguous [m, dim] matrix and
+            // score them against the query in a single matmul - exact, and orders of magnitude faster than
+            // a host bf16->fp32 + vDSP_dotpr loop per chunk (which scaled to seconds and held this lock).
+            let m = idx.count
+            var gathered = [UInt16](repeating: 0, count: m * dim)
+            flat16.withUnsafeBufferPointer { src in
+                gathered.withUnsafeMutableBufferPointer { dst in
+                    guard let s = src.baseAddress, let d = dst.baseAddress else { return }
+                    for (j, i) in idx.enumerated() {
+                        memcpy(d + j * dim, s + i * dim, dim * MemoryLayout<UInt16>.size)
+                    }
+                }
+            }
+            let qv = MLXArray(query, [dim, 1]).asType(.bfloat16)
+            let scores: [Float] = gathered.withUnsafeBytes { raw in
+                let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!),
+                                count: m * dim * MemoryLayout<UInt16>.size, deallocator: .none)
+                let mat = MLXArray(data, [m, dim], dtype: .bfloat16)   // MLXArray copies at construction
+                let s = MLX.matmul(mat, qv).reshaped([m]).asType(.float32)
+                MLX.eval(s)
+                return s.asArray(Float.self)
+            }
+
+            // Top-k by score over the gathered rows.
+            let winners = Array(zip(idx, scores).filter { $0.1.isFinite }
+                .sorted { $0.1 > $1.1 }.prefix(max(1, topK)))
+            guard !winners.isEmpty else { return [] }
+
+            // Snippets for just the winning chunks (point lookups by path + chunk index).
+            var snippetOf: [Int: String] = [:]
+            if dbOpen() {
+                var sStmt: OpaquePointer?
+                if sqlite3_prepare_v2(db, "SELECT snippet FROM chunks WHERE path = ? AND chunk_index = ?;", -1, &sStmt, nil) == SQLITE_OK {
+                    for (i, _) in winners {
+                        let r = rows[i]
+                        sqlite3_reset(sStmt)
+                        sqlite3_bind_text(sStmt, 1, r.path, -1, SQLITE_TRANSIENT)
+                        sqlite3_bind_int(sStmt, 2, Int32(r.chunkIndex))
+                        if sqlite3_step(sStmt) == SQLITE_ROW, let c = sqlite3_column_text(sStmt, 0) {
+                            snippetOf[i] = String(cString: c)
+                        }
+                    }
+                }
+                sqlite3_finalize(sStmt)
+            }
+
+            return winners.map { (i, score) in
+                let r = rows[i]
+                return InlineChunkHit(path: r.path, kind: r.kind, chunkIndex: r.chunkIndex,
+                                      score: score, snippet: snippetOf[i] ?? "", locator: r.locator)
+            }
         }
     }
 
