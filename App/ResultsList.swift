@@ -12,6 +12,12 @@ struct ResultsList<Footer: View>: View {
     @State private var gridWidth: CGFloat = 0
     /// Grid counterpart of the list's inline expansion: the path whose passages popover is open.
     @State private var passagesPopover: String?
+    /// One name shared by the frame reporters, the drag gesture, and the rubber-band overlay. The list
+    /// and gallery are never on screen together, so reusing the string is safe. The realized-item frames
+    /// themselves live as @State INSIDE the marquee modifier - they refresh on every scroll tick
+    /// (viewport-relative), so keeping them out of this view's body avoids re-evaluating the whole
+    /// list/gallery on scroll just to track rectangles only a drag ever reads.
+    private let marqueeSpace = "omni.results.viewport"
 
     private func toggle(_ path: String) {
         // Animated: the chevron rotation and the panel's insertion/removal track this mutation.
@@ -86,6 +92,7 @@ struct ResultsList<Footer: View>: View {
                                 .onTapGesture { handleTap(hit.path) }
                                 .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
                                 .contextMenu { menu(hit) }
+                                .reportResultFrame(hit.path, in: marqueeSpace)
                             // chunkCount guard: if a reindex turned the file single-chunk while its
                             // path sat in `expanded` (same result set, so the reset below does not
                             // fire), the chevron is gone - don't strand an open expansion either.
@@ -140,6 +147,7 @@ struct ResultsList<Footer: View>: View {
             .onChange(of: model.resolvedQuery) { _, _ in
                 if let first = results.first?.path { proxy.scrollTo(first, anchor: .top) }
             }
+            .marqueeSelect(space: marqueeSpace)
         }
     }
 
@@ -165,6 +173,7 @@ struct ResultsList<Footer: View>: View {
                             .onTapGesture { handleTap(hit.path) }
                             .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
                             .contextMenu { menu(hit) }
+                            .reportResultFrame(hit.path, in: marqueeSpace)
                             // The grid's counterpart of the list's inline expansion: a popover
                             // anchored to the cell (the Photos/Finder info pattern - cells stay
                             // uniform, the breakdown floats with system vibrancy). Passages are
@@ -219,6 +228,7 @@ struct ResultsList<Footer: View>: View {
             .onChange(of: model.resolvedQuery) { _, _ in
                 if let first = results.first?.path { proxy.scrollTo(first, anchor: .top) }
             }
+            .marqueeSelect(space: marqueeSpace)
         }
     }
 
@@ -233,58 +243,66 @@ struct ResultsList<Footer: View>: View {
         // Right-clicking a row that is part of a multi-selection acts on the WHOLE selection (Finder
         // behavior); only the actions that extend to many are shown - the single-item ones (Quick
         // Look, passages, Find similar, Ignore folder) are hidden so the menu stays coherent.
+        // Tahoe (macOS 26) context menus carry a leading SF Symbol per item; we icon EVERY item so the
+        // menu reads consistently (a half-iconed menu looks broken). On macOS 14/15 the system renders
+        // these Labels text-only, so this degrades cleanly. Symbols track Finder's conventions.
         if count > 1, model.selectedPaths.contains(path) {
-            Button("Open") { model.openSelected() }
+            Button { model.openSelected() } label: { Label("Open", systemImage: "arrow.up.forward.app") }
                 .keyboardShortcut("o", modifiers: .command)
-            Button("Reveal in Finder") { model.revealSelected() }
+            Button { model.revealSelected() } label: { Label("Reveal in Finder", systemImage: "folder") }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
-            Button("Copy \(count) paths") { model.copySelectedPaths() }
+            Button { model.copySelectedPaths() } label: { Label("Copy \(count) paths", systemImage: "doc.on.doc") }
                 .keyboardShortcut("c", modifiers: .command)
+            // Native macOS share picker (AirDrop, Mail, Messages, ...) over the whole selection - the
+            // same system sheet Finder's Share opens, anchored to the menu. (ShareLink, no deprecated API.)
+            ShareLink(items: model.selectedURLsOrdered) { Label("Share\u{2026}", systemImage: "square.and.arrow.up") }
             Divider()
-            Button("Move \(count) items to Trash", role: .destructive) { model.moveSelectedToTrash() }
+            Button(role: .destructive) { model.moveSelectedToTrash() } label: { Label("Move \(count) items to Trash", systemImage: "trash") }
                 .keyboardShortcut(.delete, modifiers: .command)
             Divider()
-            Button("Select all") { model.selectAllResults() }
+            Button { model.selectAllResults() } label: { Label("Select all", systemImage: "checkmark.circle") }
                 .keyboardShortcut("a", modifiers: .command)
         } else {
-            Button("Open") { model.selectSingle(path); open(path) }
+            Button { model.selectSingle(path); open(path) } label: { Label("Open", systemImage: "arrow.up.forward.app") }
                 .keyboardShortcut("o", modifiers: .command)
-            Button("Quick Look") { model.selectSingle(path); model.previewURL = URL(fileURLWithPath: path) }
+            Button { model.selectSingle(path); model.previewURL = URL(fileURLWithPath: path) } label: { Label("Quick Look", systemImage: "eye") }
                 .keyboardShortcut("y", modifiers: .command)
             // Per-chunk breakdown (pages of a PDF, passages of a long doc) - only for files that
             // actually have several chunks. The list expands inline; the grid opens a popover.
             if hit.chunkCount > 1 {
                 switch model.viewMode {
                 case .list:
-                    Button(expanded.contains(path) ? "Hide matching passages" : "Show matching passages") {
-                        toggle(path)
+                    Button { toggle(path) } label: {
+                        Label(expanded.contains(path) ? "Hide matching passages" : "Show matching passages", systemImage: "text.alignleft")
                     }
                 case .grid:
-                    Button("Show matching passages") {
+                    Button {
                         // Load first, present after: the popover must mount at its final size
                         // (see the crash note at the .popover site).
                         Task {
                             if passagesCache[path] == nil { passagesCache[path] = await model.passages(for: path) }
                             passagesPopover = path
                         }
-                    }
+                    } label: { Label("Show matching passages", systemImage: "text.alignleft") }
                 }
             }
             Divider()
             // Use this file itself as the query - doc-vs-doc "more like this" across all modalities.
-            Button("Find similar") { model.setFileQuery(URL(fileURLWithPath: path), similar: true) }
+            Button { model.setFileQuery(URL(fileURLWithPath: path), similar: true) } label: { Label("Find similar", systemImage: "sparkle.magnifyingglass") }
                 .keyboardShortcut("f", modifiers: [.command, .option])
-            Button("Reveal in Finder") { model.selectSingle(path); reveal(path) }
+            Button { model.selectSingle(path); reveal(path) } label: { Label("Reveal in Finder", systemImage: "folder") }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
-            Button("Copy path") {
+            Button {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(path, forType: .string)
-            }
+            } label: { Label("Copy path", systemImage: "doc.on.doc") }
             .keyboardShortcut("c", modifiers: .command)
+            // Native macOS share picker for this file - the same system sheet Finder's Share opens.
+            ShareLink(item: URL(fileURLWithPath: path)) { Label("Share\u{2026}", systemImage: "square.and.arrow.up") }
             Divider()
-            Button("Move to Trash", role: .destructive) { model.moveToTrash([path]) }
+            Button(role: .destructive) { model.moveToTrash([path]) } label: { Label("Move to Trash", systemImage: "trash") }
                 .keyboardShortcut(.delete, modifiers: .command)
-            Button("Select all") { model.selectAllResults() }
+            Button { model.selectAllResults() } label: { Label("Select all", systemImage: "checkmark.circle") }
                 .keyboardShortcut("a", modifiers: .command)
             // Exclude this result's folder from indexing - the "stop showing me this build/cache
             // noise" action. Routes through the same apply path as the Settings ignore editor (backed
@@ -292,8 +310,8 @@ struct ResultsList<Footer: View>: View {
             // removing a whole root belongs to the sidebar, with its confirmation.
             if model.canIgnoreEnclosingFolder(ofPath: path) {
                 Divider()
-                Button("Ignore folder \u{201C}\((path as NSString).deletingLastPathComponent.components(separatedBy: "/").last ?? "")\u{201D}") {
-                    model.ignoreEnclosingFolder(ofPath: path)
+                Button { model.ignoreEnclosingFolder(ofPath: path) } label: {
+                    Label("Ignore folder \u{201C}\((path as NSString).deletingLastPathComponent.components(separatedBy: "/").last ?? "")\u{201D}", systemImage: "eye.slash")
                 }
             }
         }
@@ -323,6 +341,9 @@ struct ResultRow: View {
     var expanded: Bool = false
     var onToggle: (() -> Void)? = nil
     private var url: URL { URL(fileURLWithPath: hit.path) }
+    /// Emphasized = selected AND the window is key: the state that earns the solid accent fill and
+    /// white text. A non-key window falls back to the unemphasized grey, like every native list.
+    private var emphasized: Bool { selected && controlActive == .key }
 
     var body: some View {
         HStack(alignment: .center, spacing: 12) {
@@ -366,14 +387,17 @@ struct ResultRow: View {
         }
         .padding(.vertical, 6)
         .padding(.horizontal, 10)
-        // Same selection treatment as the gallery cell: a translucent accent fill. Dimmed to the
-        // system's unemphasized grey when the window is not key - the native cue (Finder, Mail)
-        // for where keyboard input will land. Radius is concentric with the 6pt thumbnail
+        // Native list selection (Finder, Mail): the SOLID emphasized accent fill with white text when
+        // the window is key, the system's unemphasized grey (with normal label text) when it is not -
+        // the cue for where keyboard input lands. White text comes from driving the whole row's
+        // foreground to the selection text color, so the secondary/tertiary metadata derive their
+        // translucent-white tints from it automatically. Radius concentric with the 6pt thumbnail
         // corners across the 6pt padding.
+        .foregroundStyle(emphasized ? AnyShapeStyle(Color(nsColor: .alternateSelectedControlTextColor)) : AnyShapeStyle(.primary))
         .background(
             selected ? (controlActive == .key
-                ? Color.accentColor.opacity(0.18)
-                : Color(nsColor: .unemphasizedSelectedContentBackgroundColor).opacity(0.8)) : .clear,
+                ? Color(nsColor: .selectedContentBackgroundColor)
+                : Color(nsColor: .unemphasizedSelectedContentBackgroundColor)) : .clear,
             in: RoundedRectangle(cornerRadius: Design.cornerSmall + 6, style: .continuous)
         )
     }
@@ -483,7 +507,7 @@ struct ResultGridItem: View {
                     .foregroundStyle(selected && controlActive == .key ? .white : .primary)
                     .padding(.horizontal, 6).padding(.vertical, 1)
                     .background(selected ? (controlActive == .key
-                        ? Color.accentColor
+                        ? Color(nsColor: .selectedContentBackgroundColor)
                         : Color(nsColor: .unemphasizedSelectedContentBackgroundColor)) : .clear, in: Capsule())
                     .frame(maxWidth: 150)
             }
@@ -500,7 +524,7 @@ struct ResultGridItem: View {
         // corners across the 8pt padding.
         .background(
             selected ? (controlActive == .key
-                ? Color.accentColor.opacity(0.18)
+                ? Color(nsColor: .selectedContentBackgroundColor).opacity(0.18)
                 : Color(nsColor: .unemphasizedSelectedContentBackgroundColor).opacity(0.8)) : .clear,
             in: RoundedRectangle(cornerRadius: Design.corner + 8, style: .continuous)
         )
@@ -592,4 +616,81 @@ private func prettyDir(_ url: URL) -> String {
     let dir = url.deletingLastPathComponent().path
     let home = FileManager.default.homeDirectoryForCurrentUser.path
     return dir.hasPrefix(home) ? "~" + dir.dropFirst(home.count) : dir
+}
+
+// MARK: - Marquee (rubber-band) selection
+
+/// Frames of the realized result rows/cells, keyed by path, gathered in the scroll viewport's
+/// coordinate space. Each item publishes its own frame; the modifier reduces them into one map.
+private struct ResultItemFramesKey: PreferenceKey {
+    static let defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { $1 })
+    }
+}
+
+private extension View {
+    /// Publish this item's frame (in the named viewport space) for marquee hit-testing. A transparent
+    /// GeometryReader background measures without affecting layout or hit area.
+    func reportResultFrame(_ path: String, in space: String) -> some View {
+        background(GeometryReader { g in
+            Color.clear.preference(key: ResultItemFramesKey.self, value: [path: g.frame(in: .named(space))])
+        })
+    }
+
+    func marqueeSelect(space: String) -> some View {
+        modifier(MarqueeSelect(space: space))
+    }
+}
+
+/// Finder-style rubber-band selection: a left-button click-drag over the results draws a rectangle and
+/// selects every item it touches. On macOS a click-drag does NOT scroll (the wheel/trackpad do), so the
+/// drag is free to mean "marquee" without fighting the scroll view. minimumDistance keeps a plain click
+/// a click (the row's own tap still fires). Holding Shift or Command adds to the existing selection.
+private struct MarqueeSelect: ViewModifier {
+    @Environment(AppModel.self) private var model
+    let space: String
+    // Owned here, not in ResultsList: the item frames refresh on every scroll tick, so confining them to
+    // this modifier means a scroll re-evaluates only this overlay, not the whole list/gallery body.
+    @State private var frames: [String: CGRect] = [:]
+    @State private var origin: CGPoint?
+    @State private var rect: CGRect?
+    @State private var base: Set<String> = []
+
+    func body(content: Content) -> some View {
+        content
+            .coordinateSpace(name: space)
+            .onPreferenceChange(ResultItemFramesKey.self) { frames = $0 }
+            .overlay(alignment: .topLeading) {
+                if let rect {
+                    // The native macOS rubber-band is a NEUTRAL translucent grey, not the accent: a
+                    // Finder marquee sampled on white measured fill = grey 230 (label @ 0.10) and border
+                    // = grey 170 (label @ 0.33). Driving both off labelColor reproduces those exactly in
+                    // light mode and inverts to the same faint-white rectangle in dark, like the system.
+                    Rectangle()
+                        .fill(Color(nsColor: .labelColor).opacity(0.1))
+                        .overlay(Rectangle().strokeBorder(Color(nsColor: .labelColor).opacity(0.33), lineWidth: 1))
+                        .frame(width: rect.width, height: rect.height)
+                        .offset(x: rect.minX, y: rect.minY)
+                        .allowsHitTesting(false)
+                }
+            }
+            .gesture(
+                DragGesture(minimumDistance: 6, coordinateSpace: .named(space))
+                    .onChanged { v in
+                        if origin == nil {
+                            origin = v.startLocation
+                            let m = NSEvent.modifierFlags
+                            base = (m.contains(.shift) || m.contains(.command)) ? model.selectedPaths : []
+                        }
+                        let o = origin ?? v.startLocation
+                        let r = CGRect(x: min(o.x, v.location.x), y: min(o.y, v.location.y),
+                                       width: abs(v.location.x - o.x), height: abs(v.location.y - o.y))
+                        rect = r
+                        let hit = Set(frames.compactMap { $0.value.intersects(r) ? $0.key : nil })
+                        model.applyMarqueeSelection(base.union(hit))
+                    }
+                    .onEnded { _ in origin = nil; rect = nil }
+            )
+    }
 }

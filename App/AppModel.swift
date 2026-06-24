@@ -246,6 +246,9 @@ final class AppModel {
         let ordered = results.filter { selectedPaths.contains($0.path) }.map { $0.path }
         return ordered.isEmpty ? (selection.map { [$0] } ?? []) : ordered
     }
+    /// Every selected result as a file URL, in result order (falls back to the active item). The
+    /// share picker shares the whole selection, the same set Open/Reveal/Copy/Trash act on.
+    var selectedURLsOrdered: [URL] { selectedPathsOrdered.map { URL(fileURLWithPath: $0) } }
     /// Open every selected result - Finder opens a whole selection on Return / double-click.
     func openSelected() { for p in selectedPathsOrdered { NSWorkspace.shared.openAsync(URL(fileURLWithPath: p)) } }
     /// Reveal every selected result in Finder, all highlighted in one window.
@@ -312,6 +315,17 @@ final class AppModel {
               let b = r.firstIndex(where: { $0.path == path }) else { selectSingle(path); return }
         selectedPaths = Set(r[(a <= b ? a...b : b...a)].map { $0.path })
         selection = path                       // keep the anchor; the clicked end is now active
+    }
+    /// Apply a rubber-band (marquee) drag's hit set as the live selection. Called on every drag tick,
+    /// so it is cheap and idempotent. Keeps `selection` (the active item that drives Quick Look and a
+    /// following shift-click) on a member of the set - the existing active item if it is still inside
+    /// the rectangle, else the topmost hit in result order - and pins the anchor there too.
+    func applyMarqueeSelection(_ paths: Set<String>) {
+        selectedPaths = paths
+        if selection == nil || !paths.contains(selection!) {
+            selection = results.first { paths.contains($0.path) }?.path
+        }
+        selectionAnchor = selection
     }
     /// Select every result (Cmd-A / context menu).
     func selectAllResults() {

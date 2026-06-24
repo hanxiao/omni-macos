@@ -82,6 +82,10 @@ struct OmniApp: App {
                 Button(multi ? "Copy \(model.selectedPaths.count) paths" : "Copy path") { model.copySelectedPaths() }
                     .keyboardShortcut("c", modifiers: [.command, .option])
                     .disabled(!model.hasSelection)
+                // Native share picker over the whole selection, mirroring the context menu. Like
+                // Finder's Share it carries no key equivalent; disabled with nothing selected.
+                ShareLink(items: model.selectedURLsOrdered) { Text("Share\u{2026}") }
+                    .disabled(!model.hasSelection)
                 // Move to Trash (reversible). Cmd-Delete is routed: in a text field it stays the
                 // editor's delete-to-line-start, so typing in the search box can never trash files.
                 Button(multi ? "Move \(model.selectedPaths.count) Items to Trash" : "Move to Trash") { moveToTrashCommand() }
