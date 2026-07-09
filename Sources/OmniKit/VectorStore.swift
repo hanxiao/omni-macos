@@ -49,6 +49,9 @@ public struct SearchHit: Sendable {
     public var width: Int = 0
     public var height: Int = 0
     public var duration: Double = 0
+    /// Byte size of the file VERSION that was indexed (from the chunk row, filled lazily with the
+    /// snippet for the winners only); 0 = unknown (row predates the size column).
+    public var size: Int = 0
     /// Position of the best-matching chunk inside the file ("Page 3", "Line 1240"); "" if n/a.
     public var locator: String = ""
     /// Total indexed chunks of this FILE (pages/passages), regardless of filters. 1 = single
@@ -105,6 +108,22 @@ public struct StoredFile: Sendable {
     public let modified: Double
     public let size: Int
     public let kind: String
+}
+
+/// Per-file index status for the serving layer (/v1/files/status and the MCP file_status tool):
+/// everything an external agent needs to decide whether Omni's index currently covers a file.
+/// Read straight from the chunk rows; no vector data is touched.
+public struct FileIndexStatus: Sendable {
+    /// mtime of the file VERSION that was indexed (the crawler's contentModificationDate).
+    public let modified: Double
+    /// Byte size of that version.
+    public let size: Int
+    public let kind: String
+    /// Number of indexed chunks (pages/passages) for the file.
+    public let chunkCount: Int
+    /// When the indexer last wrote this file's rows, epoch seconds; 0 = the rows predate the
+    /// indexed_at column (indexed by an older app version - a real stamp appears on reindex).
+    public let indexedAt: Double
 }
 
 /// Constraints applied to search results. Score thresholding is intentionally NOT
@@ -507,6 +526,12 @@ public final class VectorStore: @unchecked Sendable {
         addColumnIfMissing("height", "INTEGER NOT NULL DEFAULT 0")
         addColumnIfMissing("duration", "REAL NOT NULL DEFAULT 0")
         addColumnIfMissing("locator", "TEXT NOT NULL DEFAULT ''")
+        // When the indexer last WROTE this row, epoch seconds (vs `modified`, which is the file's
+        // own mtime as of indexing). Additive like the display metadata above: rows from older
+        // indexes default to 0 = unknown and pick up a real stamp on their next reindex. Read only
+        // by the serving layer's per-file status lookup; search never reads it and it is not
+        // resident, so it costs nothing on the query path.
+        addColumnIfMissing("indexed_at", "REAL NOT NULL DEFAULT 0")
         // Content-dedup sidecar: one row per indexed file, mapping a content key (hash of the
         // embedding-relevant bytes + the preprocess settings) to the path whose chunks realized it.
         // ADDITIVE and self-healing, so index compatibility holds in BOTH directions: an old app
@@ -655,7 +680,8 @@ public final class VectorStore: @unchecked Sendable {
             exec("BEGIN;")
             deletePathLocked(path)
             let bfs = chunks.map { bf16Row($0.embedding) }   // fp32 -> bf16 once, reused for blob + memory
-            let sql = "INSERT INTO chunks(path, modified, size, kind, chunk_index, snippet, dim, vec, width, height, duration, locator) VALUES(?,?,?,?,?,?,?,?,?,?,?,?);"
+            let now = Date().timeIntervalSince1970           // one indexed_at stamp for the whole call
+            let sql = "INSERT INTO chunks(path, modified, size, kind, chunk_index, snippet, dim, vec, width, height, duration, locator, indexed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?);"
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                 exec("ROLLBACK;")
@@ -678,6 +704,7 @@ public final class VectorStore: @unchecked Sendable {
                 sqlite3_bind_int(stmt, 10, Int32(c.height))
                 sqlite3_bind_double(stmt, 11, c.duration)
                 sqlite3_bind_text(stmt, 12, c.locator, -1, SQLITE_TRANSIENT)
+                sqlite3_bind_double(stmt, 13, now)
                 guard sqlite3_step(stmt) == SQLITE_DONE else {
                     exec("ROLLBACK;")
                     throw OmniError.store("insert step failed")
@@ -724,9 +751,10 @@ public final class VectorStore: @unchecked Sendable {
                 }
             }
             let bfs = work.map { $0.chunks.map { bf16Row($0.embedding) } }   // fp32 -> bf16 once
+            let now = Date().timeIntervalSince1970                           // one indexed_at stamp per batch
             let tSql = Self.searchTiming ? Date() : nil
             exec("BEGIN;")
-            let sql = "INSERT INTO chunks(path, modified, size, kind, chunk_index, snippet, dim, vec, width, height, duration, locator) VALUES(?,?,?,?,?,?,?,?,?,?,?,?);"
+            let sql = "INSERT INTO chunks(path, modified, size, kind, chunk_index, snippet, dim, vec, width, height, duration, locator, indexed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?);"
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                 exec("ROLLBACK;")
@@ -751,6 +779,7 @@ public final class VectorStore: @unchecked Sendable {
                     sqlite3_bind_int(stmt, 10, Int32(c.height))
                     sqlite3_bind_double(stmt, 11, c.duration)
                     sqlite3_bind_text(stmt, 12, c.locator, -1, SQLITE_TRANSIENT)
+                    sqlite3_bind_double(stmt, 13, now)
                     guard sqlite3_step(stmt) == SQLITE_DONE else {
                         exec("ROLLBACK;")
                         throw OmniError.store("insert step failed")
@@ -1081,6 +1110,73 @@ public final class VectorStore: @unchecked Sendable {
                 if sqlite3_step(stmt) == SQLITE_ROW, sqlite3_column_type(stmt, 0) != SQLITE_NULL {
                     let kind = sqlite3_column_text(stmt, 2).map { String(cString: $0) } ?? ""
                     out[p] = StoredFile(modified: sqlite3_column_double(stmt, 0), size: Int(sqlite3_column_int64(stmt, 1)), kind: kind)
+                }
+            }
+            return out
+        }
+    }
+
+    /// Index status for ONLY the given paths, for the serving layer's per-file lookup. Same shape
+    /// as storedFiles(paths:) - presentPaths short-circuits misses with no SQL, hits are idx_path
+    /// B-tree aggregates - plus the chunk count and the newest indexed_at stamp. Read-only metadata:
+    /// never touches vectors or the GPU. The batch is deduplicated and processed in fixed slices,
+    /// each under its OWN queue.sync, so a concurrent per-keystroke search waits at most one slice -
+    /// a maximum-size status batch can never hold the serial queue for its full duration.
+    public func fileStatus(paths: [String]) -> [String: FileIndexStatus] {
+        guard !paths.isEmpty else { return [:] }
+        let unique = Array(Set(paths))
+        var out: [String: FileIndexStatus] = [:]
+        let slice = 256
+        var i = 0
+        while i < unique.count {
+            let group = unique[i ..< min(i + slice, unique.count)]
+            i += slice
+            queue.sync {
+                guard dbOpen() else { return }
+                var stmt: OpaquePointer?
+                guard sqlite3_prepare_v2(db, """
+                    SELECT MAX(modified), MAX(size), MAX(kind), MAX(indexed_at), COUNT(*)
+                    FROM chunks WHERE path = ?;
+                    """, -1, &stmt, nil) == SQLITE_OK else { return }
+                defer { sqlite3_finalize(stmt) }
+                for p in group where presentPaths.contains(p) {
+                    sqlite3_reset(stmt); sqlite3_clear_bindings(stmt)
+                    sqlite3_bind_text(stmt, 1, p, -1, SQLITE_TRANSIENT)
+                    if sqlite3_step(stmt) == SQLITE_ROW, sqlite3_column_type(stmt, 0) != SQLITE_NULL {
+                        let kind = sqlite3_column_text(stmt, 2).map { String(cString: $0) } ?? ""
+                        out[p] = FileIndexStatus(modified: sqlite3_column_double(stmt, 0),
+                                                 size: Int(sqlite3_column_int64(stmt, 1)),
+                                                 kind: kind,
+                                                 chunkCount: Int(sqlite3_column_int(stmt, 4)),
+                                                 indexedAt: sqlite3_column_double(stmt, 3))
+                    }
+                }
+            }
+        }
+        return out
+    }
+
+    /// Content-identity keys for ONLY the given paths, from the dedup sidecar: two paths with the
+    /// SAME key hold byte-identical embedding-relevant content (under the same preprocess
+    /// settings), so the serving layer can mark duplicate search hits. Returns (key, modified)
+    /// so the caller can apply the SAME lockstep rule duplicateChunks(key:) uses - only trust a
+    /// sidecar row whose modified matches the live chunk rows (a stale row from an older app
+    /// rewriting chunks must not mislabel). Bounded by the caller (search winners, <= 200);
+    /// PK lookups only, no vector data touched.
+    public func contentKeys(paths: [String]) -> [String: (key: String, modified: Double)] {
+        guard !paths.isEmpty else { return [:] }
+        return queue.sync {
+            guard dbOpen() else { return [:] }
+            var out: [String: (key: String, modified: Double)] = [:]
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "SELECT key, modified FROM content_keys WHERE path = ?;",
+                                     -1, &stmt, nil) == SQLITE_OK else { return out }
+            defer { sqlite3_finalize(stmt) }
+            for p in Set(paths) {
+                sqlite3_reset(stmt); sqlite3_clear_bindings(stmt)
+                sqlite3_bind_text(stmt, 1, p, -1, SQLITE_TRANSIENT)
+                if sqlite3_step(stmt) == SQLITE_ROW, let k = sqlite3_column_text(stmt, 0) {
+                    out[p] = (String(cString: k), sqlite3_column_double(stmt, 1))
                 }
             }
             return out
@@ -1628,7 +1724,7 @@ public final class VectorStore: @unchecked Sendable {
         // inside the lock concurrent searches and indexing writes wait on. Only ever runs on `queue`,
         // so a single cached handle is race-free. (F3)
         if snippetStmt == nil {
-            guard sqlite3_prepare_v2(db, "SELECT snippet FROM chunks WHERE path = ? AND chunk_index = ?;", -1, &snippetStmt, nil) == SQLITE_OK else { return hits }
+            guard sqlite3_prepare_v2(db, "SELECT snippet, size FROM chunks WHERE path = ? AND chunk_index = ?;", -1, &snippetStmt, nil) == SQLITE_OK else { return hits }
         }
         let stmt = snippetStmt
         var out = hits
@@ -1638,6 +1734,7 @@ public final class VectorStore: @unchecked Sendable {
             sqlite3_bind_int(stmt, 2, Int32(out[i].chunkIndex))
             if sqlite3_step(stmt) == SQLITE_ROW, let c = sqlite3_column_text(stmt, 0) {
                 out[i].snippet = String(cString: c)
+                out[i].size = Int(sqlite3_column_int64(stmt, 1))   // same PK row, free with the snippet
             }
         }
         sqlite3_reset(stmt)   // release the read snapshot the cached statement would otherwise hold open

@@ -1,5 +1,6 @@
 import Foundation
 import OmniKit
+import UniformTypeIdentifiers
 
 // All adapters are stateless enums. They parse JSON via JSONSerialization, call the
 // backend, and emit a provider-shaped JSON response. The engine emits fixed 1024-d
@@ -37,6 +38,14 @@ private func base64Encode(_ vec: [Float]) -> String {
 
 private func badRequest(_ message: String, type: String = "invalid_request_error") -> HTTPResponse {
     HTTPResponse.json(["error": ["message": message, "type": type]], status: 400)
+}
+
+/// IANA MIME type inferred from the path extension (e.g. "image/jpeg"); nil if unknown.
+/// Shared by the search/status adapters and MCP so every surface labels files identically.
+func mimeType(forPath path: String) -> String? {
+    let ext = (path as NSString).pathExtension
+    guard !ext.isEmpty else { return nil }
+    return UTType(filenameExtension: ext)?.preferredMIMEType
 }
 
 // MARK: - OpenAI + Jina (one OpenAI-shaped emitter)
@@ -282,18 +291,125 @@ enum SearchAdapter {
         }
 
         let hits = backend.search(query, topK: topK, filter: filter)
+        // Duplicate grouping: hits sharing a content_key are byte-identical files (the dedup
+        // sidecar), so an agent picking between matches knows which ones are literally copies.
+        // Lockstep rule as duplicateChunks: only trust a key whose modified matches the hit's.
+        let contentKeys = backend.contentKeys(paths: hits.map { $0.path })
         let results: [[String: Any]] = hits.map { hit in
-            [
+            var row: [String: Any] = [
                 "path": hit.path,
                 "score": Double(max(0, min(1, hit.score))),
                 "snippet": hit.snippet,
                 "kind": hit.kind,
                 "modified": hit.modified,
                 // Best-matching chunk's position inside the file ("Page 3", "Line 1240"); "" if n/a.
-                "locator": hit.locator
+                "locator": hit.locator,
+                // Total indexed chunks (pages/passages) in this file.
+                "chunk_count": hit.chunkCount
             ]
+            // Media metadata recorded at index time, so downstream agents can weigh image
+            // resolution or clip length without opening the file. All of it is already resident
+            // in the hit (or fetched with the snippet for the winners only) - zero extra cost.
+            // 0 = unknown/not applicable (e.g. rows indexed before these columns existed): omitted.
+            if hit.width > 0 { row["width"] = hit.width }
+            if hit.height > 0 { row["height"] = hit.height }
+            if hit.duration > 0 { row["duration"] = hit.duration }
+            if hit.size > 0 { row["bytes"] = hit.size }
+            if let mime = mimeType(forPath: hit.path) { row["mime_type"] = mime }
+            if let ck = contentKeys[hit.path], ck.modified == hit.modified { row["content_key"] = ck.key }
+            return row
         }
         return HTTPResponse.json(["query": query, "results": results])
+    }
+}
+
+// MARK: - File index status
+
+/// POST /v1/files/status: for each given absolute file path, whether Omni's index currently
+/// covers it and how fresh that coverage is. `up_to_date` uses the indexer's own change-detection
+/// signature - on-disk (mtime, size) equal to the stored (modified, size) - read with the exact
+/// resourceValues expressions the crawler uses, so the answer always agrees with what a reconcile
+/// pass would do. Read-only, index-backed metadata lookups: nothing is embedded, the GPU is never
+/// touched, and indexing/search speed is unaffected.
+enum FileStatusAdapter {
+    static func handle(_ req: HTTPRequest, _ backend: any ServingBackend) -> HTTPResponse {
+        guard let body = JSONBody.object(req) else { return badRequest("invalid JSON body") }
+        // "paths": [...] is the canonical form; a single "path" string is accepted for convenience.
+        // A present-but-mistyped "paths" gets its own message, not the generic "is required".
+        var paths: [String]
+        if let raw = body["paths"] {
+            guard let arr = raw as? [String] else {
+                return badRequest("'paths' must be an array of strings")
+            }
+            paths = arr
+        } else if let one = body["path"] as? String {
+            paths = [one]
+        } else {
+            paths = []
+        }
+        paths = paths.filter { !$0.isEmpty }
+        if paths.isEmpty { return badRequest("'paths' (array of absolute file paths) is required") }
+        if paths.count > servingMaxInputs { return badRequest("'paths' exceeds \(servingMaxInputs) items") }
+
+        return HTTPResponse.json(["files": rows(for: paths, backend: backend)])
+    }
+
+    /// One status row per input path, input order preserved. Shared with the MCP file_status tool.
+    static func rows(for paths: [String], backend: any ServingBackend) -> [[String: Any]] {
+        let normalized = paths.map(normalize)
+        let status = backend.fileStatus(paths: normalized)
+
+        return normalized.map { p in
+            guard let st = status[p] else {
+                // Not indexed: report only that, with NO disk probe. Stat-ing arbitrary paths
+                // would let any (LAN-token) caller test the existence of files far outside the
+                // indexed roots; this endpoint reports index coverage, nothing more.
+                return ["path": p, "indexed": false]
+            }
+            // Freshness: same attribute source as the crawler (FileCrawler.swift) -
+            // contentModificationDate + fileSize via resourceValues - so double-for-double
+            // equality against the stored signature mirrors the indexer's own change
+            // detection ("prev.modified == mtime, prev.size == size").
+            let vals = try? URL(fileURLWithPath: p).resourceValues(
+                forKeys: [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey])
+            let exists = vals?.isRegularFile ?? false
+            let diskMtime = vals?.contentModificationDate?.timeIntervalSince1970 ?? 0
+            let diskSize = vals?.fileSize ?? 0
+            var row: [String: Any] = [
+                "path": p,
+                "indexed": true,
+                // False when the indexed file has since been deleted (or replaced by a non-file).
+                "exists": exists,
+                "kind": st.kind,
+                "chunk_count": st.chunkCount,
+                // mtime + byte size of the file VERSION the index holds.
+                "modified": st.modified,
+                "bytes": st.size,
+                "up_to_date": exists && diskMtime == st.modified && diskSize == st.size
+            ]
+            // When the indexer last wrote these rows; absent if the rows predate the
+            // indexed_at column (they get a real stamp on their next reindex).
+            if st.indexedAt > 0 { row["indexed_at"] = st.indexedAt }
+            return row
+        }
+    }
+
+    /// Lexical-only cleanup to the store's path identity (the crawler's verbatim absolute paths):
+    /// tilde expansion, duplicate/trailing slashes removed, "." and ".." collapsed - WITHOUT
+    /// consulting the filesystem. NSString.standardizingPath is deliberately NOT used: it rewrites
+    /// "/private/tmp/..." to "/tmp/..." (a symlink-derived transform), while the store keys
+    /// /private-form paths verbatim (AppModel.canonicalizeRoots converts /tmp-style roots INTO
+    /// /private form), so a stored path fed back in would stop matching. The index never resolves
+    /// symlinks, so neither does this.
+    private static func normalize(_ raw: String) -> String {
+        let expanded = (raw as NSString).expandingTildeInPath
+        var parts: [String] = []
+        for comp in expanded.split(separator: "/") {
+            if comp == "." { continue }
+            if comp == ".." { if !parts.isEmpty { parts.removeLast() }; continue }
+            parts.append(String(comp))
+        }
+        return "/" + parts.joined(separator: "/")
     }
 }
 

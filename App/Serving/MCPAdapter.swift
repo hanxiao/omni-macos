@@ -11,9 +11,10 @@ import AppKit
 /// transport - `claude mcp add --transport http`, Cursor, VS Code, etc. - with zero setup
 /// beyond the URL.
 ///
-/// One tool is exposed: `search`. Agents that want raw vectors use the OpenAI-style
-/// /v1/embeddings endpoint instead; MCP is for the thing agents actually do with Omni -
-/// reach the user's files by meaning.
+/// Three tools are exposed: `search` (whole-index), `search_inline` (rank passages within
+/// given paths), and `file_status` (index coverage/freshness per file). Agents that want raw
+/// vectors use the OpenAI-style /v1/embeddings endpoint instead; MCP is for the things agents
+/// actually do with Omni - reach the user's files by meaning and trust what the index covers.
 enum MCPAdapter {
     /// The newest protocol revision this server knows. If the client asks for a different
     /// one we echo the client's (every revision we care about shares this method surface).
@@ -59,14 +60,15 @@ enum MCPAdapter {
                 "capabilities": ["tools": [:] as [String: Any]],
                 "serverInfo": ["name": "omni", "title": "Omni - local semantic file search",
                                "version": appVersion],
-                "instructions": "Search the user's local files by meaning. Files of every kind - text, code, PDFs, images, audio, video - share one embedding space, so describe the CONTENT you want in natural language (any language). `search` finds files across the whole index; `search_inline` ranks the best passages WITHIN a specific set of files or folders you already know. Results are file paths with scores and snippets; read the files yourself if you need their full contents."
+                "instructions": "Search the user's local files by meaning. Files of every kind - text, code, PDFs, images, audio, video - share one embedding space, so describe the CONTENT you want in natural language (any language). `search` finds files across the whole index; `search_inline` ranks the best passages WITHIN a specific set of files or folders you already know; `file_status` reports whether given files are indexed and whether the index is still fresh for them. Results are file paths with scores, snippets, and media metadata (resolution, duration, size); read the files yourself if you need their full contents."
             ])
 
         case "ping":
             return result(id: id, [:])
 
         case "tools/list":
-            return result(id: id, ["tools": [searchToolDescriptor(), searchInlineToolDescriptor()]])
+            return result(id: id, ["tools": [searchToolDescriptor(), searchInlineToolDescriptor(),
+                                             fileStatusToolDescriptor()]])
 
         case "tools/call":
             guard let name = params["name"] as? String else {
@@ -76,6 +78,7 @@ enum MCPAdapter {
             switch name {
             case "search":        return callSearch(id: id, args: args, backend: backend)
             case "search_inline": return callSearchInline(id: id, args: args, backend: backend)
+            case "file_status":   return callFileStatus(id: id, args: args, backend: backend)
             default:
                 return HTTPResponse.json(jsonRPCError(id: id, code: -32602, message: "unknown tool: \(name)"))
             }
@@ -151,6 +154,9 @@ enum MCPAdapter {
         if let folder = args["folder"] as? String, !folder.isEmpty { filter.folderPrefix = folder }
 
         let hits = backend.search(query, topK: topK, filter: filter)
+        // Duplicate grouping for structuredContent - same key = byte-identical file (see
+        // SearchAdapter; lockstep rule keeps stale sidecar rows from mislabeling).
+        let contentKeys = backend.contentKeys(paths: hits.map { $0.path })
 
         // The response interleaves, per result, a human/LLM-readable text block and a
         // `resource_link` (a file:// URI the client can open or render directly). Capable
@@ -162,16 +168,31 @@ enum MCPAdapter {
         } else {
             var inlined = 0          // thumbnails emitted so far (capped)
             var cappedSkips = 0      // media hits skipped specifically because the cap was already reached
+            var firstWithKey: [String: Int] = [:]   // content_key -> 1-based rank of its first hit
             for (i, h) in hits.enumerated() {
                 let score = Int((max(0, min(1, h.score)) * 100).rounded())
                 let loc = h.locator.isEmpty ? "" : ", \(h.locator)"
-                var text = "\(i + 1). \(h.path)  (\(h.kind), \(score)%\(loc))"
+                // Resolution/duration/size suffix on media hits only (text hits stay clean):
+                // lets the reading agent weigh quality without a follow-up call.
+                let isTextKind = h.kind == FileKind.text.rawValue
+                var meta = isTextKind ? "" : mediaLabel(width: h.width, height: h.height,
+                                                        duration: h.duration, bytes: h.size)
+                // Flag byte-identical copies of an earlier hit right in the text line, so a
+                // text-only agent doesn't weigh the same file twice.
+                if let ck = contentKeys[h.path], ck.modified == h.modified {
+                    if let first = firstWithKey[ck.key] {
+                        meta += ", identical copy of result \(first)"
+                    } else {
+                        firstWithKey[ck.key] = i + 1
+                    }
+                }
+                var text = "\(i + 1). \(h.path)  (\(h.kind), \(score)%\(loc)\(meta))"
                 if maxSnippet > 0 {
                     let snippet = h.snippet.replacingOccurrences(of: "\n", with: " ")
                     if !snippet.isEmpty { text += "\n   \(String(snippet.prefix(maxSnippet)))" }
                 }
                 content.append(["type": "text", "text": text])
-                content.append(resourceLink(for: h, description: "\(h.kind), \(score)%\(loc)"))
+                content.append(resourceLink(for: h, description: "\(h.kind), \(score)%\(loc)\(meta)"))
                 let isMedia = h.kind == FileKind.image.rawValue || h.kind == FileKind.scan.rawValue
                 if includeImages && isMedia {
                     if inlined >= maxInlineImages {
@@ -206,6 +227,8 @@ enum MCPAdapter {
             if h.width > 0 { row["width"] = h.width }
             if h.height > 0 { row["height"] = h.height }
             if h.duration > 0 { row["duration"] = h.duration }
+            if h.size > 0 { row["bytes"] = h.size }
+            if let ck = contentKeys[h.path], ck.modified == h.modified { row["content_key"] = ck.key }
             return row
         }
         return result(id: id, [
@@ -303,6 +326,68 @@ enum MCPAdapter {
         ])
     }
 
+    // MARK: - The file_status tool
+
+    private static func fileStatusToolDescriptor() -> [String: Any] {
+        [
+            "name": "file_status",
+            "title": "Check whether files are indexed",
+            "description": "For each given absolute file path, report whether Omni's index currently covers it: indexed or not, the file kind, the number of indexed chunks (pages/passages), the modified time and byte size of the indexed version, when it was last indexed (indexed_at, when known), and up_to_date - whether the file on disk still matches the indexed version. Use it to check coverage before search_inline, or to tell whether a file's latest edits are searchable yet. Read-only and fast: nothing is embedded or read from the file contents.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "paths": [
+                        "type": "array",
+                        "items": ["type": "string"],
+                        "description": "Absolute file paths to check (files, not folders; up to 2048)."
+                    ] as [String: Any]
+                ] as [String: Any],
+                "required": ["paths"]
+            ] as [String: Any]
+        ]
+    }
+
+    private static func callFileStatus(id: Any, args: [String: Any], backend: any ServingBackend) -> HTTPResponse {
+        let paths = (args["paths"] as? [String])?.filter { !$0.isEmpty } ?? []
+        guard !paths.isEmpty else {
+            return result(id: id, [
+                "content": [["type": "text", "text": "file_status failed: 'paths' must be a non-empty array of absolute file paths"]],
+                "isError": true
+            ])
+        }
+        // Same cap as POST /v1/files/status: an unbounded batch would sweep the store's
+        // queue and stat the disk once per path.
+        guard paths.count <= servingMaxInputs else {
+            return result(id: id, [
+                "content": [["type": "text", "text": "file_status failed: 'paths' exceeds \(servingMaxInputs) items"]],
+                "isError": true
+            ])
+        }
+        let rows = FileStatusAdapter.rows(for: paths, backend: backend)
+
+        let content: [[String: Any]] = rows.enumerated().map { i, row in
+            let p = row["path"] as? String ?? ""
+            let line: String
+            if row["indexed"] as? Bool == true {
+                let kind = row["kind"] as? String ?? "?"
+                let chunks = row["chunk_count"] as? Int ?? 0
+                let fresh: String
+                if row["up_to_date"] as? Bool == true { fresh = "up to date" }
+                else if row["exists"] as? Bool == true { fresh = "STALE: file changed on disk since indexing" }
+                else { fresh = "file MISSING on disk" }
+                line = "\(i + 1). \(p)  indexed (\(kind), \(chunks) chunk\(chunks == 1 ? "" : "s"), \(fresh))"
+            } else {
+                line = "\(i + 1). \(p)  NOT indexed"
+            }
+            return ["type": "text", "text": line]
+        }
+        return result(id: id, [
+            "content": content,
+            "structuredContent": ["files": rows],
+            "isError": false
+        ])
+    }
+
     /// An MCP `resource_link` content block pointing at a local file. Clients that render
     /// resources can open or preview the image/audio/video/document directly; the rest
     /// ignore it and fall back to the adjacent text block.
@@ -317,11 +402,30 @@ enum MCPAdapter {
         return link
     }
 
-    /// IANA MIME type inferred from the path extension (e.g. "image/jpeg"); nil if unknown.
-    private static func mimeType(forPath path: String) -> String? {
-        let ext = (path as NSString).pathExtension
-        guard !ext.isEmpty else { return nil }
-        return UTType(filenameExtension: ext)?.preferredMIMEType
+    // mimeType(forPath:) is shared with the HTTP adapters - see SchemaAdapters.swift.
+
+    /// Compact human-readable media suffix for a hit's text line / resource_link description:
+    /// resolution for images ("4032x3024"), duration for audio/video ("12:34", "1:23:45"), and
+    /// the indexed byte size - the quality clues an agent needs to pick between similar hits.
+    private static func mediaLabel(width: Int, height: Int, duration: Double, bytes: Int) -> String {
+        var parts: [String] = []
+        if width > 0 && height > 0 { parts.append("\(width)x\(height)") }
+        if duration > 0 {
+            let s = Int(duration.rounded())
+            parts.append(s >= 3600 ? String(format: "%d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60)
+                                   : String(format: "%d:%02d", s / 60, s % 60))
+        }
+        if bytes > 0 { parts.append(bytesLabel(bytes)) }
+        return parts.isEmpty ? "" : ", " + parts.joined(separator: ", ")
+    }
+
+    /// "8.2 MB"-style label without ByteCountFormatter (not documented thread-safe; this runs
+    /// on the connection's detached task).
+    private static func bytesLabel(_ bytes: Int) -> String {
+        let units = ["B", "KB", "MB", "GB", "TB"]
+        var v = Double(bytes), i = 0
+        while v >= 1000, i < units.count - 1 { v /= 1000; i += 1 }
+        return i == 0 ? "\(bytes) B" : String(format: v < 10 ? "%.1f %@" : "%.0f %@", v, units[i])
     }
 
     // MARK: - Inline thumbnails

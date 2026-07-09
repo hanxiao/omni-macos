@@ -36,7 +36,7 @@ struct ServingTab: View {
         .frame(height: 520)   // matches the Content tab so switching tall tabs doesn't jump
         .sheet(isPresented: $showMCPSheet) {
             AgentConfigSheet(title: "Connect agents over MCP",
-                             subtitle: "Works with every MCP client that speaks the HTTP transport (Claude Code, Cursor, VS Code, ...). One tool is exposed: search.",
+                             subtitle: "Works with every MCP client that speaks the HTTP transport (Claude Code, Cursor, VS Code, ...). Tools: search, search_inline, file_status.",
                              text: mcpConfigText, saveAs: nil)
         }
         .sheet(isPresented: $showSkillSheet) {
@@ -81,7 +81,7 @@ struct ServingTab: View {
         } header: {
             Text("Server")
         } footer: {
-            Text("Serves OpenAI, Jina, Cohere, and Gemini embedding endpoints plus search, backed by the local model. MCP hands the server to protocol clients; SKILL.md to instruction-following agents.")
+            Text("Serves OpenAI, Jina, Cohere, and Gemini embedding endpoints plus search and per-file index status, backed by the local model. MCP hands the server to protocol clients; SKILL.md to instruction-following agents.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }
@@ -260,9 +260,28 @@ struct ServingTab: View {
 
         Optional `filters`: `{"kinds": ["text"|"image"|"audio"|"video"|"scan"], "folder": "/abs/path", "since": <epoch seconds>}`.
         `"text"` includes scanned PDFs; `"scan"` is scanned PDFs only.
-        Response: `{"results": [{"path", "score" (0..1), "snippet", "kind", "modified", "locator"}]}`.
-        `locator` is where the best match sits inside the file ("Page 3", "Line 1240"; "" if n/a).
-        Scores above ~0.45 are usually relevant; below ~0.3 usually noise.
+        Response: `{"results": [{"path", "score" (0..1), "snippet", "kind", "modified", "locator", "chunk_count", ...}]}`.
+        `locator` is where the best match sits inside the file ("Page 3", "Line 1240"; "" if n/a);
+        `chunk_count` is how many chunks (pages/passages) the file has in the index. Hits also
+        carry `bytes` (indexed file size) and `mime_type`, and media hits add `width`/`height`
+        (px) and `duration` (seconds) recorded at index time - so you can prefer, say, the
+        4032x3024 original over a 192px thumbnail without opening either. Hits that are
+        byte-identical copies share a `content_key`: collapse them before choosing. Fields are
+        omitted when unknown. Scores above ~0.45 are usually relevant; below ~0.3 usually noise.
+
+        ## File status (is this file indexed, and is the index fresh?)
+
+        ```bash
+        curl -s \(base)/v1/files/status\(authFlag) -H 'Content-Type: application/json' \\
+          -d '{"paths": ["/abs/file1.pdf", "/abs/file2.png"]}'
+        ```
+
+        Response: `{"files": [{"path", "indexed", and when indexed: "exists", "kind", "chunk_count",
+        "modified", "bytes", "up_to_date", "indexed_at"?}]}`. `up_to_date` compares the on-disk
+        (mtime, size) with the indexed version - false means the file on disk changed (or was
+        deleted, see `exists`) after it was indexed. `indexed_at` (epoch seconds) is when the
+        indexer last wrote the file; absent on files indexed by older app versions. Files only
+        (not folders); up to 2048 paths. Non-indexed paths return just `{"path", "indexed": false}`.
 
         ## Health check
 
@@ -277,17 +296,21 @@ struct ServingTab: View {
         ## MCP
 
         The server also speaks MCP (streamable HTTP) at `\(base)/mcp` - point any MCP client at
-        that URL. Two tools:
+        that URL. Three tools:
 
         - `search` - the same semantic search as above. Args: `query` (required), `top_k` (default
           10, max 50), `kinds`, `folder`, `max_snippet` (snippet chars per result, default 200), and
           `include_images` (when true, image and scanned-PDF hits carry an inline JPEG thumbnail so
           they render in the client). Each result also returns a `resource_link` - a `file://` URI
-          the client can open or preview.
+          the client can open or preview - and media hits carry resolution/duration/size.
         - `search_inline` - rank the best passages WITHIN a specific set of files or folders. Args:
           `query` and `paths` (absolute file or folder paths), plus `top_k` and `max_snippet`. Reuses
           the index (only the query is embedded), so it is fast - use it to pinpoint where something
           is discussed across documents you already know.
+        - `file_status` - per-file index coverage. Args: `paths` (absolute file paths, up to 2048).
+          Reports indexed, kind, chunk count, the indexed version's (modified, bytes), exists, and
+          `up_to_date` - whether the on-disk file still matches the index. Same data as
+          `/v1/files/status` above.
         """
     }
 

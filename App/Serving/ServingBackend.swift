@@ -14,6 +14,13 @@ protocol ServingBackend: Sendable {
     /// Rank passages WITHIN an explicit set of files/folders. Embeds `query` (high priority)
     /// and scores against the already-indexed chunk vectors of those paths only.
     func searchInline(_ query: String, paths: [String], topK: Int) -> [InlineChunkHit]
+    /// Index status for an explicit set of absolute file paths: which are indexed, as what kind,
+    /// at which stored (modified, size) signature, with how many chunks. Read-only SQLite
+    /// metadata lookups; never touches the engine or the vector data.
+    func fileStatus(paths: [String]) -> [String: FileIndexStatus]
+    /// Content-identity keys (dedup sidecar) for the given paths, with the sidecar's modified
+    /// stamp so callers can apply the lockstep staleness rule. Same key = byte-identical content.
+    func contentKeys(paths: [String]) -> [String: (key: String, modified: Double)]
 }
 
 /// Wraps OmniEngine + VectorStore. @unchecked Sendable is justified: every member it
@@ -56,5 +63,13 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
     func searchInline(_ query: String, paths: [String], topK: Int) -> [InlineChunkHit] {
         let vec = engine.embedQuery(query)
         return store.rankChunksAcross(vec, paths: paths, topK: topK)
+    }
+
+    func fileStatus(paths: [String]) -> [String: FileIndexStatus] {
+        store.fileStatus(paths: paths)
+    }
+
+    func contentKeys(paths: [String]) -> [String: (key: String, modified: Double)] {
+        store.contentKeys(paths: paths)
     }
 }

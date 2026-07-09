@@ -959,10 +959,12 @@ public final class Indexer: @unchecked Sendable {
                 }
             }
         case .video, .audio:
-            if let d = FileExtractor.mediaDuration(file.url) {
-                meta = (0, 0, d)
+            if let info = FileExtractor.mediaInfo(file.url) {
+                // Video rows carry the file's ORIGINAL resolution (a quality signal for the
+                // serving layer), not the downscaled frame size fed to the encoder.
+                meta = (info.width, info.height, info.duration)
                 let minS = category == .video ? settings.minVideoSeconds : settings.minAudioSeconds
-                if minS > 0, d < minS { return DecodedItem(file: file) }
+                if minS > 0, info.duration < minS { return DecodedItem(file: file) }
             }
         case .text, .scan:   // .scan never comes from detection (extraction-time only)
             break
@@ -1133,7 +1135,8 @@ public final class Indexer: @unchecked Sendable {
             if kind == FileKind.video.rawValue {
                 guard let vec = embedder.embedVideoFrames(images) else { return [] }
                 return [IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
-                                     chunkIndex: 0, snippet: file.url.lastPathComponent, embedding: vec, duration: meta.duration)]
+                                     chunkIndex: 0, snippet: file.url.lastPathComponent, embedding: vec,
+                                     width: meta.width, height: meta.height, duration: meta.duration)]
             }
             // Safety fallback (non-video CGImages, e.g. a conformer that didn't preprocess): serial.
             var out: [IndexedChunk] = []
@@ -1169,7 +1172,8 @@ public final class Indexer: @unchecked Sendable {
                                       reader: reader, duration: meta.duration)
         case .videoSegments(let duration, let maxFrames, let maxDimension):
             return embedStreamedVideo(file: file, kind: kind, duration: duration,
-                                      maxFrames: maxFrames, maxDimension: maxDimension)
+                                      maxFrames: maxFrames, maxDimension: maxDimension,
+                                      width: meta.width, height: meta.height)
         }
     }
 
@@ -1178,7 +1182,8 @@ public final class Indexer: @unchecked Sendable {
     /// twin of embedStreamedAudio. Frame extraction is stateless keyframe seeks, so peak memory
     /// is two segments' frames regardless of duration. Chunks carry start-timestamp locators.
     func embedStreamedVideo(file: CrawledFile, kind: String, duration: Double,
-                            maxFrames: Int, maxDimension: Int) -> [IndexedChunk] {   // internal for tests
+                            maxFrames: Int, maxDimension: Int,
+                            width: Int = 0, height: Int = 0) -> [IndexedChunk] {   // internal for tests
         final class Box: @unchecked Sendable { var frames: [CGImage] = [] }
         let seg = Self.mediaSegmentSeconds
         let count = max(1, Int(ceil(duration / seg)))
@@ -1207,7 +1212,7 @@ public final class Indexer: @unchecked Sendable {
                 }
                 out.append(IndexedChunk(path: file.url.path, modified: file.modified, size: file.size,
                                         kind: kind, chunkIndex: k, snippet: file.url.lastPathComponent,
-                                        embedding: vec, duration: duration,
+                                        embedding: vec, width: width, height: height, duration: duration,
                                         locator: Self.timeLocator(Double(k) * seg)))
             }
             sync.wait()

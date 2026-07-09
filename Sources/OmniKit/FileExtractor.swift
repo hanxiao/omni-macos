@@ -246,6 +246,19 @@ public enum FileExtractor {
         return d.isFinite && d > 0 ? d : nil
     }
 
+    /// Duration plus the ORIGINAL pixel dimensions of a video (rotation applied, so portrait
+    /// phone clips report portrait dims), from the SAME single AVURLAsset header read that
+    /// mediaDuration does - no extra file open. (duration, 0, 0) for audio-only assets;
+    /// nil when the duration is unusable.
+    public static func mediaInfo(_ url: URL) -> (duration: Double, width: Int, height: Int)? {
+        let asset = AVURLAsset(url: url)
+        let d = CMTimeGetSeconds(asset.duration)
+        guard d.isFinite, d > 0 else { return nil }
+        guard let track = asset.tracks(withMediaType: .video).first else { return (d, 0, 0) }
+        let sz = track.naturalSize.applying(track.preferredTransform)
+        return (d, Int(abs(sz.width).rounded()), Int(abs(sz.height).rounded()))
+    }
+
     static func loadImage(_ url: URL, maxDimension: Int = 1568) -> CGImage? {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let opts: [CFString: Any] = [

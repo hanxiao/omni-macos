@@ -38,6 +38,8 @@ struct Router: Sendable {
             return CohereAdapter.handle(req, backend, v2: true)
         case ("POST", "/v1/search"):
             return SearchAdapter.handle(req, backend)
+        case ("POST", "/v1/files/status"):
+            return FileStatusAdapter.handle(req, backend)
         default:
             break
         }
