@@ -272,7 +272,14 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     /// finite. Low-rate corruption can still slip through - the runtime backstop is
     /// recoverMediaPath(), triggered by the indexer when a real embed comes back non-finite.
     private func mediaPathFinite(probes: Int = 3) -> Bool {
-        for _ in 0 ..< probes {
+        // The image probes vary the solid's luminance so they double as a DISTINCTNESS check
+        // (below) at zero extra cost: a second cold-load corruption mode produces CONSTANT
+        // (finite) media forwards - every image embeds to the same vector, which passes a
+        // finiteness check and would silently break search and tagging alike (observed in
+        // tag-eval processes: identical scores for every image).
+        let levels: [CGFloat] = [0.15, 0.85, 0.5]
+        var probeVecs: [[Float]] = []
+        for p in 0 ..< probes {
             if supportsAudio {
                 let frames = 8   // >= 3 mel frames so the audio tower pool is well-defined
                 let mel = [Float](repeating: 0, count: audioMelBins * frames)
@@ -280,10 +287,18 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
                    !v.allSatisfy({ $0.isFinite }) { return false }
             }
             if supportsImages {
-                let raw = OmniVisionPreprocess.preprocessRaw(Self.solidTestImage())
-                if let vs = embedImages([raw]), let v = vs.first,
-                   !v.allSatisfy({ $0.isFinite }) { return false }
+                let raw = OmniVisionPreprocess.preprocessRaw(Self.solidTestImage(level: levels[p % levels.count]))
+                if let vs = embedImages([raw]), let v = vs.first {
+                    if !v.allSatisfy({ $0.isFinite }) { return false }
+                    probeVecs.append(v)
+                }
             }
+        }
+        // Two solids of different luminance must NOT embed identically: a healthy model
+        // separates them clearly; a constant forward gives (near-)bit-equal vectors.
+        if probeVecs.count >= 2, probeVecs[0].count == probeVecs[1].count {
+            let maxDiff = zip(probeVecs[0], probeVecs[1]).map { abs($0 - $1) }.max() ?? 0
+            if maxDiff < 1e-4 { return false }
         }
         return true
     }
@@ -373,11 +388,11 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     }
 
     /// A tiny solid-gray CGImage for the image self-test (CoreGraphics only, no AppKit).
-    private static func solidTestImage(side: Int = 56) -> CGImage {
+    private static func solidTestImage(side: Int = 56, level: CGFloat = 0.5) -> CGImage {
         let cs = CGColorSpaceCreateDeviceRGB()
         let ctx = CGContext(data: nil, width: side, height: side, bitsPerComponent: 8, bytesPerRow: 0,
                             space: cs, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
-        ctx.setFillColor(CGColor(red: 0.5, green: 0.5, blue: 0.5, alpha: 1))
+        ctx.setFillColor(CGColor(red: level, green: level, blue: level, alpha: 1))
         ctx.fill(CGRect(x: 0, y: 0, width: side, height: side))
         return ctx.makeImage()!
     }
@@ -690,6 +705,89 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             }
         } else {
             for i in 0 ..< vecs.count where i < scores.count { tags[i] = tagger.finalize(scores[i]) }
+        }
+        return (vecs, tags)
+    }
+
+    /// Raw [2V] tag score rows (patch-max; global) for each input against `tagger`'s label
+    /// matrix - no finalize, no prior involvement. Powers the CWR crop scoring and the eval
+    /// harness. Same low-priority gate as every other media embed.
+    public func embedImagesTagScores(_ raws: [OmniVisionPreprocess.RawPatches], tagger: OmniTagger) -> [[Float]]? {
+        guard let enc = imageEncoder, !raws.isEmpty else { return nil }
+        // Same interactive carve as embedImages: one gate hold per input while the user is
+        // searching, so a query waits behind at most one crop/image forward, never a batch.
+        let groups: [[OmniVisionPreprocess.RawPatches]] =
+            (interactiveQueryActive && raws.count > 1 && Self.mediaCarve) ? raws.map { [$0] } : [raws]
+        var out: [[Float]] = []
+        for group in groups {
+            let scores = run(highPriority: false) { () -> [[Float]]? in
+                let inputs: [OmniImageEncoder.Preprocessed] = group.map { (pixelValues: $0.tensor(), gridTHW: $0.gridTHW) }
+                let r = enc.encode(images: inputs, prefixIds: docPrefix, suffixIds: mediaSuffix, tagger: tagger)
+                addTokens(enc.lastSequenceLength)
+                return r.tagScores
+            }
+            guard let scores else { return nil }
+            out.append(contentsOf: scores)
+        }
+        return out
+    }
+
+    /// embedImagesTagged plus the study's CWR multi-crop refinement: `crops[i]` (the 2x2+center
+    /// grid of input i, empty to skip that input) are scored against the label matrix and their
+    /// per-label max - max(patch-max, global) per crop, max across crops - fuses into input i's
+    /// centered scores before NMS. ~6x the tag GPU cost per refined image, applied only where
+    /// the caller chooses (the search-driven retag path); index-time tagging never pays it.
+    public func embedImagesTaggedHQ(_ raws: [OmniVisionPreprocess.RawPatches],
+                                    crops: [[OmniVisionPreprocess.RawPatches]]) -> (vecs: [[Float]], tags: [[String]])? {
+        guard crops.contains(where: { !$0.isEmpty }), let tagger else { return embedImagesTagged(raws) }
+        guard let enc = imageEncoder, !raws.isEmpty, crops.count == raws.count else { return nil }
+        // Interactive carve for the main batch too (crop scoring carves inside
+        // embedImagesTagScores): a search typed during a retag flush preempts per image.
+        var vecs: [[Float]] = []
+        var mainScores: [[Float]] = []
+        let groups: [[OmniVisionPreprocess.RawPatches]] =
+            (interactiveQueryActive && raws.count > 1 && Self.mediaCarve) ? raws.map { [$0] } : [raws]
+        for group in groups {
+            let r = run(highPriority: false) { () -> ([[Float]], [[Float]]?) in
+                let inputs: [OmniImageEncoder.Preprocessed] = group.map { (pixelValues: $0.tensor(), gridTHW: $0.gridTHW) }
+                let r = enc.encode(images: inputs, prefixIds: docPrefix, suffixIds: mediaSuffix, tagger: tagger)
+                addTokens(enc.lastSequenceLength)
+                return r
+            }
+            vecs.append(contentsOf: r.0)
+            if let s = r.1 { mainScores.append(contentsOf: s) }
+        }
+        let scores = mainScores
+        guard scores.count == vecs.count else { return (vecs, Array(repeating: [], count: vecs.count)) }
+        // Score all crops of the batch in one encoder call (patch-budget chunked internally),
+        // then reduce each image's crop rows to its [V] per-label max.
+        let flatCrops = crops.flatMap { $0 }
+        let cropScores = flatCrops.isEmpty ? [] : (embedImagesTagScores(flatCrops, tagger: tagger) ?? [])
+        let v = tagger.labels.count
+        var cropMaxPerImage = [[Float]?](repeating: nil, count: raws.count)
+        var off = 0
+        for i in 0 ..< raws.count where !crops[i].isEmpty {
+            let count = crops[i].count
+            defer { off += count }
+            // A short/failed crop scoring leaves this image un-refined (base tags still emit).
+            guard off + count <= cropScores.count else { continue }
+            // Non-finite crop rows (the cold-load corruption can NaN some forwards while the
+            // main image stays finite) must be EXCLUDED, not max()-swallowed: Swift's max drops
+            // a NaN operand, so an all-NaN crop set would otherwise reduce to a uniform FINITE
+            // -greatestFiniteMagnitude that sails past finalize's guard and ties every centered
+            // score - the permanent vocab-order-junk failure mode. Skip bad rows; if none
+            // survive, the image keeps nil cropMax and emits base-quality tags.
+            let rows = cropScores[off ..< off + count]
+                .filter { $0.count == 2 * v && !$0.contains(where: { !$0.isFinite }) }
+            guard !rows.isEmpty else { continue }
+            var m = [Float](repeating: -.greatestFiniteMagnitude, count: v)
+            for row in rows {
+                for j in 0 ..< v { m[j] = max(m[j], max(row[j], row[v + j])) }
+            }
+            cropMaxPerImage[i] = m
+        }
+        let tags: [[String]] = (0 ..< vecs.count).map { i in
+            tagger.finalize(scores[i], cropMax: cropMaxPerImage[i])
         }
         return (vecs, tags)
     }

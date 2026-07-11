@@ -31,6 +31,10 @@ public protocol Embedder: AnyObject {
     /// embedVideoFrames plus open-vocabulary content tags for the clip (empty when tagging is
     /// unavailable). Default impl: plain embedding with empty tags.
     func embedVideoFramesTagged(_ frames: [CGImage]) -> (vec: [Float], tags: [String])?
+    /// embedImagesTagged with CWR multi-crop tag refinement for inputs that carry crops.
+    /// Default impl ignores the crops (base-quality tags).
+    func embedImagesTaggedHQ(_ raws: [OmniVisionPreprocess.RawPatches],
+                             crops: [[OmniVisionPreprocess.RawPatches]]) -> (vecs: [[Float]], tags: [[String]])?
     /// Embed an audio file (decode + mel + audio tower). Nil if unavailable.
     func embedAudio(_ url: URL) -> [Float]?
     /// Embed from a precomputed mel buffer (lets mel run in the concurrent decode stage).
@@ -66,6 +70,13 @@ public extension Embedder {
     /// Default: plain video embedding with empty tags. OmniEngine overrides.
     func embedVideoFramesTagged(_ frames: [CGImage]) -> (vec: [Float], tags: [String])? {
         embedVideoFrames(frames).map { ($0, []) }
+    }
+
+    /// Default: ignore the crops and tag at base quality. OmniEngine overrides with the CWR
+    /// multi-crop refinement (per-label max over crop scores fused before NMS).
+    func embedImagesTaggedHQ(_ raws: [OmniVisionPreprocess.RawPatches],
+                             crops: [[OmniVisionPreprocess.RawPatches]]) -> (vecs: [[Float]], tags: [[String]])? {
+        embedImagesTagged(raws)
     }
 
     /// Default: no pipelining, just embed each batch in turn. Conformances that support the
@@ -154,6 +165,9 @@ final class DecodedItem: @unchecked Sendable {
     /// decode. Recorded in the store once the file's chunks land, so identical content found
     /// later (a copy, a move, a touched-but-unmodified file) reuses them instead of re-embedding.
     let contentKey: String?
+    /// CWR crop patches for HQ tag refinement (retag pass, single-frame images only): the 5
+    /// study crops, preprocessed on the decode stage. Empty = tag at base quality.
+    var hqCrops: [OmniVisionPreprocess.RawPatches] = []
     init(file: CrawledFile, kind: String = "", payload: Payload = .empty, unchanged: Bool = false, abandoned: Bool = false,
          meta: (width: Int, height: Int, duration: Double) = (0, 0, 0), contentKey: String? = nil) {
         self.file = file; self.kind = kind; self.payload = payload; self.unchanged = unchanged; self.abandoned = abandoned
@@ -801,13 +815,20 @@ public final class Indexer: @unchecked Sendable {
         // Cross-file IMAGE staging for live updates, mirroring the full pass: still images are one
         // RawPatches each, so per-file embedding fed the batch-N tower one image at a time.
         var iStage: [(file: CrawledFile, kind: String, raws: [OmniVisionPreprocess.RawPatches],
-                      meta: (width: Int, height: Int, duration: Double))] = []
+                      meta: (width: Int, height: Int, duration: Double),
+                      hqCrops: [OmniVisionPreprocess.RawPatches])] = []
         var iStagedRaws = 0
         func flushImagesU() {
             guard !iStage.isEmpty else { return }
             let batch = iStage; iStage = []; iStagedRaws = 0
             let allRaws = batch.flatMap { $0.raws }
-            guard let (vecs, tags) = self.embedder.embedImagesTagged(allRaws), vecs.count == allRaws.count else {
+            // Per-RAW crop alignment: single-raw files carry their 5 CWR crops (retag pass with
+            // hqMediaTags), everything else an empty slot - the engine refines only where crops exist.
+            let allCrops: [[OmniVisionPreprocess.RawPatches]] = batch.flatMap { b in
+                b.raws.count == 1 ? [b.hqCrops] : Array(repeating: [], count: b.raws.count)
+            }
+            guard let (vecs, tags) = self.embedder.embedImagesTaggedHQ(allRaws, crops: allCrops),
+                  vecs.count == allRaws.count else {
                 for b in batch { acceptCompleted(b.file.url.path, []) }
                 return
             }
@@ -838,8 +859,11 @@ public final class Indexer: @unchecked Sendable {
                 }
                 if tBuf.count >= tWindow { flushTextU(drainAll: false) }
             case .imagePatches(let raws) where !raws.isEmpty:
-                iStage.append((item.file, item.kind, raws, item.meta))
-                iStagedRaws += raws.count
+                iStage.append((item.file, item.kind, raws, item.meta, item.hqCrops))
+                // HQ crops are full RawPatches (~fp32 megabytes each): count them toward the
+                // flush threshold so a retag batch holds ~3 files' crops at once, not 16 - the
+                // staging byte ceiling stays what it was for plain images on low-RAM machines.
+                iStagedRaws += raws.count + item.hqCrops.count
                 if iStagedRaws >= 16 { flushImagesU() }
             default:
                 acceptCompleted(path, self.embed(item))
@@ -946,7 +970,9 @@ public final class Indexer: @unchecked Sendable {
         let dim = max(256, settings.maxImageDimension)
         let oneImage = dim * dim * 12   // ~fp32 RGB after the vision preprocess
         let ext = file.url.pathExtension.lowercased()
-        if FileExtractor.imageExtensions.contains(ext) { return oneImage }
+        // HQ retag decodes also materialize the 5 CWR crop RawPatches (each up to ~image size
+        // after smart-resize): budget the item at its real resident weight.
+        if FileExtractor.imageExtensions.contains(ext) { return settings.hqMediaTags ? oneImage * 6 : oneImage }
         if FileExtractor.videoExtensions.contains(ext) { return max(1, settings.maxVideoFrames) * oneImage }
         if FileExtractor.audioExtensions.contains(ext) { return 64_000_000 }   // mel + frame stack, rough
         if FileExtractor.pdfExtensions.contains(ext) || FileExtractor.officeExtensions.contains(ext) {
@@ -1067,7 +1093,16 @@ public final class Indexer: @unchecked Sendable {
             // Still images: run the CPU preprocess (resize + parallel patchify) HERE, in the
             // concurrent decode stage, so the serialized GPU thread only does the tower.
             let raws = images.map { OmniVisionPreprocess.preprocessRaw($0) }
-            return DecodedItem(file: file, kind: kind, payload: .imagePatches(raws), meta: meta, contentKey: contentKey)
+            let item = DecodedItem(file: file, kind: kind, payload: .imagePatches(raws), meta: meta, contentKey: contentKey)
+            // HQ tag refinement (retag pass only): cut the study's 5 CWR crops here on the
+            // concurrent decode stage, so the GPU stage just scores them. Single-frame images
+            // only - multi-page images get per-page tags already.
+            if settings.hqMediaTags, images.count == 1, let img = images.first {
+                item.hqCrops = OmniTagger.cwrCropRects(width: img.width, height: img.height)
+                    .compactMap { img.cropping(to: $0) }
+                    .map { OmniVisionPreprocess.preprocessRaw($0) }
+            }
+            return item
         }
     }
 
@@ -1177,8 +1212,11 @@ public final class Indexer: @unchecked Sendable {
             return out
         case .imagePatches(let raws):
             // Batch-N: ONE block-diagonal vision forward over all images (capped by the encoder's
-            // patch budget). Order is preserved.
-            guard let (vecs, tags) = embedder.embedImagesTagged(raws) else {
+            // patch budget). Order is preserved. HQ crops ride along when the item carries them
+            // (retag pass; also the non-finite recovery re-decode, which recomputes them).
+            let crops: [[OmniVisionPreprocess.RawPatches]] = raws.count == 1
+                ? [item.hqCrops] : Array(repeating: [], count: raws.count)
+            guard let (vecs, tags) = embedder.embedImagesTaggedHQ(raws, crops: crops) else {
                 // Vision path unavailable: nothing to index.
                 return []
             }

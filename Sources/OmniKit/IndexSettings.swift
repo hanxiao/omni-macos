@@ -56,6 +56,12 @@ public struct IndexSettings: Sendable, Equatable {
     /// rows back, so the backfill could never converge. Normal indexing never sets this.
     public var forceFreshEmbed: Bool = false
 
+    /// CWR multi-crop tag refinement for still images (5 extra crop forwards per image, the
+    /// study's proven quality lever). TRANSIENT - set only by the search-driven retag pass,
+    /// where the batch is 8 files the user is actually looking at; the bulk index pass never
+    /// pays it. Video/scans are unaffected (their segments/pages are already localized views).
+    public var hqMediaTags: Bool = false
+
     public init(enabledKinds: Set<FileKind> = [.text, .image, .video, .audio]) {
         self.enabledKinds = enabledKinds
     }

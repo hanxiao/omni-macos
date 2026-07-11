@@ -2859,6 +2859,7 @@ final class AppModel {
         pendingRetag.removeFirst(batch.count)
         var s = effectiveSettings()
         s.forceFreshEmbed = true   // dedup would hand a file its own untagged rows back
+        s.hqMediaTags = true       // CWR 5-crop refinement: these are files the user is looking at
         indexer.resetCancelled()
         tagBackfillActive = true
         fsReconcileInFlight = true

@@ -34,6 +34,12 @@ public final class OmniTagger: @unchecked Sendable {
     public static let topK = 5
     /// The prior freezes after this many images (stable estimate; deterministic afterwards).
     private static let priorFreezeCount = 64
+    /// CWR multi-crop fusion weight for the 5-crop (2x2+center) config. The Python study (fp32)
+    /// measured 0.8 optimal; the shipped Swift/bf16 pipeline re-swept on the same COCO-150
+    /// benchmark (omni-verify tageval) and 1.0 is marginally better twice-replicated - P@1
+    /// 0.847 vs 0.833, identical mAP 0.697 (base: 0.773/0.645). The 14-crop config only adds
+    /// mAP ~0.01 for ~3x more compute, so 5-crop at 1.0 is what ships.
+    public static let cropWeight: Float = 1.0
 
     // MARK: - State
 
@@ -223,15 +229,21 @@ public final class OmniTagger: @unchecked Sendable {
     // MARK: - Finalize (CPU side)
 
     /// Turn one image's evaluated [2V] scores into tags: update/apply the prior, fuse patch +
-    /// global (a=0.7), then greedy embedding-NMS over the top candidates. ~1ms CPU.
-    public func finalize(_ scores: [Float], topK: Int = OmniTagger.topK) -> [String] {
+    /// global (a=0.7), then greedy embedding-NMS over the top candidates. ~0.2ms CPU.
+    /// `cropMax` (optional, [V]) is the CWR multi-crop refinement: the per-label max over the
+    /// image's 2x2+center crop scores, fused at `cropWeight` after prior-centering - the study's
+    /// one proven accuracy lever (small objects become large in the crop that contains them).
+    /// Crop scores never enter the prior; only the full image's do.
+    public func finalize(_ scores: [Float], cropMax: [Float]? = nil, topK: Int = OmniTagger.topK) -> [String] {
         let v = labels.count
         guard scores.count == 2 * v else { return [] }
+        if let cropMax { guard cropMax.count == v else { return [] } }
         // A non-finite forward (one corrupt image, a transient GPU fault) must be rejected
         // WHOLE: a single NaN entering the running prior mean would freeze NaN into the prior
         // and turn every later tag into constant vocab-order junk. No tags for this image
         // (its snippet falls back to the filename, so the backfill retries it later).
         guard !scores.contains(where: { !$0.isFinite }) else { return [] }
+        if let cropMax, cropMax.contains(where: { !$0.isFinite }) { return [] }
         let sp = Array(scores[0 ..< v]), sg = Array(scores[v ..< 2 * v])
         lock.lock()
         // Center against the prior AS IT WAS before this image - subtracting a mean that
@@ -261,6 +273,9 @@ public final class OmniTagger: @unchecked Sendable {
         var cen = [Float](repeating: 0, count: v)
         for i in 0 ..< v {
             cen[i] = Self.patchWeight * (sp[i] - cmup[i]) + (1 - Self.patchWeight) * (sg[i] - cmug[i])
+        }
+        if let cropMax {
+            for i in 0 ..< v { cen[i] += Self.cropWeight * (cropMax[i] - cmup[i]) }
         }
         let tSel = Self.tagTiming ? Date() : nil
         // Top-`nmsPool` candidates by centered score. Partial selection, not a full sort:
@@ -296,8 +311,8 @@ public final class OmniTagger: @unchecked Sendable {
     /// via a size-k min-heap instead of O(V log V): measured 1.3ms -> ~0.1ms at V=25465.)
     /// Precondition: values are FINITE - the comparator is not a total order under NaN.
     /// finalize guards non-finite score rows before selection; any new caller must too.
-    /// Internal for the selection-parity unit test.
-    static func topIndices(_ x: [Float], k: Int) -> [Int] {
+    /// Public for the selection-parity unit test and the eval harness (omni-verify tageval).
+    public static func topIndices(_ x: [Float], k: Int) -> [Int] {
         guard k > 0 else { return [] }
         let n = x.count
         if n <= k {
@@ -356,6 +371,56 @@ public final class OmniTagger: @unchecked Sendable {
     /// True once the prior is frozen (read-only): finalize calls are then independent and the
     /// engine may run a batch's finalizes concurrently.
     public var priorIsFrozen: Bool { lock.withLock { priorFrozen } }
+
+    // MARK: - CWR crops
+
+    /// The study's 5-crop CWR geometry for an image of the given pixel size: a 2x2 grid with
+    /// 15% overlap plus the center 50% crop. A small object becomes large in whichever crop
+    /// contains it, so its patch signal goes from weak to strong; per-label MAX across crops
+    /// keeps the strongest evidence (averaging would dilute it - measured worse).
+    public static func cwrCropRects(width: Int, height: Int) -> [CGRect] {
+        let w = CGFloat(width), h = CGFloat(height)
+        var out: [CGRect] = []
+        let cw = w / 2, ch = h / 2, ox = cw * 0.15, oy = ch * 0.15
+        for j in 0 ..< 2 {
+            for i in 0 ..< 2 {
+                let x0 = max(0, CGFloat(i) * cw - ox), y0 = max(0, CGFloat(j) * ch - oy)
+                let x1 = min(w, CGFloat(i + 1) * cw + ox), y1 = min(h, CGFloat(j + 1) * ch + oy)
+                out.append(CGRect(x: x0, y: y0, width: x1 - x0, height: y1 - y0))
+            }
+        }
+        out.append(CGRect(x: w * 0.25, y: h * 0.25, width: w * 0.5, height: h * 0.5))
+        return out
+    }
+
+    /// Build a tagger over an ARBITRARY label matrix without touching disk - used by the eval
+    /// harness (omni-verify tageval scores the 80 COCO categories, not the vocab) and tests.
+    /// `rows` must be L2-normalized, one per label.
+    public convenience init?(labels: [String], rows: [[Float]]) {
+        guard !labels.isEmpty, labels.count == rows.count, let dim = rows.first?.count else { return nil }
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omni-tagger-mem-\(ProcessInfo.processInfo.processIdentifier)-\(labels.count).cache")
+        var half: [UInt16] = []
+        half.reserveCapacity(labels.count * dim)
+        for r in rows {
+            guard r.count == dim else { return nil }
+            for f in r { half.append(bf16(f)) }
+        }
+        // Reuse the exact file format + loader (mmap path included) rather than a parallel
+        // in-memory branch that could drift from production.
+        var data = Data()
+        data.append(Self.magic)
+        let labelBytes = Data(labels.joined(separator: "\n").utf8)
+        for v in [UInt32(labels.count), UInt32(dim), UInt32(labelBytes.count)] {
+            var le = v.littleEndian
+            withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
+        }
+        data.append(labelBytes)
+        data.append(Data(count: Self.matrixOffset(labelBytes.count) - data.count))
+        half.withUnsafeBytes { data.append(contentsOf: $0) }
+        guard (try? data.write(to: tmp, options: .atomic)) != nil else { return nil }
+        self.init(cacheURL: tmp, dim: dim)
+    }
 
     // MARK: - Neutral seed images
 

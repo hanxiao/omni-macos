@@ -589,7 +589,7 @@ if args.count >= 2 && args[1] == "refoldprobe" {
 // the label cache (~1-2 min, reused after; delete the file to rebuild).
 if args.count >= 4 && args[1] == "tagprobe" {
     let modelDir = URL(fileURLWithPath: args[2])
-    let engine = try await OmniEngine(modelDir: modelDir, keepAudio: false)
+    let engine = try await OmniEngine.loadValidated(modelDir: modelDir, keepAudio: false)
     let labels = OmniTagger.gatedLabels(modelDir: modelDir)
     print("tagprobe: \(labels.count) gated labels (dim \(engine.dim))")
     guard !labels.isEmpty else { print("FAIL: no gated labels parsed"); exit(1) }
@@ -627,6 +627,15 @@ if args.count >= 4 && args[1] == "tagprobe" {
         let norm = vecs[0].reduce(Float(0)) { $0 + $1 * $1 }.squareRoot()
         print(String(format: "%@ (%.0fms, |v|=%.3f): %@", url.lastPathComponent, ms, norm,
                      tag0.joined(separator: ", ")))
+        // HQ A/B: the same image through the CWR 5-crop product path (finalize cropMax fusion).
+        let crops = OmniTagger.cwrCropRects(width: img.width, height: img.height)
+            .compactMap { img.cropping(to: $0) }
+            .map { OmniVisionPreprocess.preprocessRaw($0) }
+        let tHQ = Date()
+        if let (_, hqTags) = engine.embedImagesTaggedHQ([raw], crops: [crops]), let hq0 = hqTags.first {
+            print(String(format: "%@ HQ (%.0fms): %@", url.lastPathComponent,
+                         -tHQ.timeIntervalSinceNow * 1000, hq0.joined(separator: ", ")))
+        }
     }
     // A/B overhead: the same batch through the plain embed vs the tagged embed, warm, x3.
     var abRaws: [OmniVisionPreprocess.RawPatches] = []
@@ -648,12 +657,131 @@ if args.count >= 4 && args[1] == "tagprobe" {
     exit(0)
 }
 
+// Tag quality eval: omni-verify tageval <modelDir> <workspaceDir> [cropWeight...]
+// The study's COCO-150 80-category benchmark (eval_coco.py / exp_cwr2.py) run through the REAL
+// Swift pipeline: 3-template label ensemble, patch-max + global fuse (a=0.7), eval-set
+// self-centering, P@1/P@3/R@5/mAP - then the CWR 5-crop refinement at the given fusion weights.
+// Reference (Python, fp32): base mAP 0.635 / P@1 0.753; 5-crop +0.8 -> mAP 0.693 / P@1 0.813.
+if args.count >= 4 && args[1] == "tageval" {
+    let modelDir = URL(fileURLWithPath: args[2])
+    let ws = URL(fileURLWithPath: args[3])
+    let weights: [Float] = args.count > 4 ? args[4...].compactMap { Float($0) } : [0.5, 0.8, 1.0, 1.3]
+    let engine = try await OmniEngine.loadValidated(modelDir: modelDir, keepAudio: false)
+
+    guard let catsData = try? Data(contentsOf: ws.appendingPathComponent("eval_cats.json")),
+          let cats = try? JSONSerialization.jsonObject(with: catsData) as? [String],
+          let gtData = try? Data(contentsOf: ws.appendingPathComponent("eval_gt.json")),
+          let gt = try? JSONSerialization.jsonObject(with: gtData) as? [String: [String]] else {
+        print("tageval: missing eval_cats.json / eval_gt.json in \(ws.path)"); exit(1)
+    }
+    let ids = Array(gt.keys).sorted()
+    print("tageval: \(ids.count) imgs, \(cats.count) cats")
+
+    // 3-template prompt ensemble per category, averaged then renormalized (eval_coco.enc_labels).
+    let templates = ["a photo of a %@.", "a photo of the %@.", "a picture of a %@."]
+    var rows = [[Float]](repeating: [Float](repeating: 0, count: engine.dim), count: cats.count)
+    for tpl in templates {
+        let vecs = engine.embedTextBatch(cats.map { String(format: tpl, $0) }, as: .passage)
+        for (c, v) in vecs.enumerated() { for d in 0 ..< engine.dim { rows[c][d] += v[d] } }
+    }
+    for c in 0 ..< cats.count {
+        let n = rows[c].reduce(Float(0)) { $0 + $1 * $1 }.squareRoot() + 1e-9
+        for d in 0 ..< engine.dim { rows[c][d] /= n }
+    }
+    guard let evalTagger = OmniTagger(labels: cats, rows: rows) else { print("tageval: tagger init failed"); exit(1) }
+
+    func loadImg(_ id: String) -> CGImage? {
+        let url = ws.appendingPathComponent("eval_imgs/\(id).jpg")
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        return CGImageSourceCreateThumbnailAtIndex(src, 0, [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: 1568] as CFDictionary)
+    }
+
+    let nCats = cats.count
+    var base = [[Float]](), cropMax = [[Float]]()
+    let t0 = Date()
+    for (k, id) in ids.enumerated() {
+        guard let img = loadImg(id) else { print("missing \(id)"); exit(1) }
+        let raw = OmniVisionPreprocess.preprocessRaw(img)
+        guard let s = engine.embedImagesTagScores([raw], tagger: evalTagger)?.first, s.count == 2 * nCats else {
+            print("score failed \(id)"); exit(1)
+        }
+        base.append((0 ..< nCats).map { 0.7 * s[$0] + 0.3 * s[nCats + $0] })
+        let crops = OmniTagger.cwrCropRects(width: img.width, height: img.height)
+            .compactMap { img.cropping(to: $0) }
+            .map { OmniVisionPreprocess.preprocessRaw($0) }
+        guard let cs = engine.embedImagesTagScores(crops, tagger: evalTagger), cs.count == crops.count else {
+            print("crop score failed \(id)"); exit(1)
+        }
+        var m = [Float](repeating: -.greatestFiniteMagnitude, count: nCats)
+        for row in cs { for j in 0 ..< nCats { m[j] = max(m[j], max(row[j], row[nCats + j])) } }
+        cropMax.append(m)
+        // Degeneracy self-check: the cold-load media corruption can produce CONSTANT (finite)
+        // forwards that pass loadValidated's finiteness probe - two different images then score
+        // identically and every metric collapses to tie-break noise. Catch it immediately;
+        // exit 2 tells the caller to retry in a fresh process.
+        if k == 1 {
+            let d = zip(base[0], base[1]).map { abs($0 - $1) }.max() ?? 0
+            if d < 1e-3 {
+                print("tageval: DEGENERATE media path (identical scores for different images) - rerun")
+                exit(2)
+            }
+        }
+        if k % 25 == 0 { print(String(format: "  %d/%d (%.0fs)", k, ids.count, -t0.timeIntervalSinceNow)) }
+    }
+
+    // Metrics per eval_coco.py: self-center over the eval set, then P@k / R@5 / class mAP.
+    var y = [[Bool]](repeating: [Bool](repeating: false, count: nCats), count: ids.count)
+    let catIndex = Dictionary(uniqueKeysWithValues: cats.enumerated().map { ($1, $0) })
+    for (i, id) in ids.enumerated() { for c in gt[id] ?? [] { if let ci = catIndex[c] { y[i][ci] = true } } }
+    func metrics(_ s: [[Float]], _ tag: String) {
+        let n = s.count
+        var mean = [Float](repeating: 0, count: nCats)
+        for r in s { for j in 0 ..< nCats { mean[j] += r[j] } }
+        for j in 0 ..< nCats { mean[j] /= Float(n) }
+        let sc = s.map { r in (0 ..< nCats).map { r[$0] - mean[$0] } }
+        func patk(_ k: Int) -> (p: Double, r: Double) {
+            var p = 0.0, rr = 0.0
+            for i in 0 ..< n {
+                let top = OmniTagger.topIndices(sc[i], k: k)
+                let hits = top.filter { y[i][$0] }.count
+                p += Double(hits) / Double(k)
+                rr += Double(hits) / Double(max(y[i].filter { $0 }.count, 1))
+            }
+            return (p / Double(n), rr / Double(n))
+        }
+        var aps: [Double] = []
+        for c in 0 ..< nCats {
+            let pos = (0 ..< n).filter { y[$0][c] }.count
+            if pos == 0 { continue }
+            let order = (0 ..< n).sorted { sc[$0][c] != sc[$1][c] ? sc[$0][c] > sc[$1][c] : $0 < $1 }
+            var tp = 0, ap = 0.0
+            for (rank, i) in order.enumerated() where y[i][c] {
+                tp += 1
+                ap += Double(tp) / Double(rank + 1)
+            }
+            aps.append(ap / Double(pos))
+        }
+        print(String(format: "  %-22s P@1=%.3f P@3=%.3f R@5=%.3f mAP=%.3f",
+                     (tag as NSString).utf8String!, patk(1).p, patk(3).p, patk(5).r,
+                     aps.reduce(0, +) / Double(aps.count)))
+    }
+    metrics(base, "base (fast mode)")
+    for w in weights {
+        let fused = (0 ..< ids.count).map { i in (0 ..< nCats).map { base[i][$0] + w * cropMax[i][$0] } }
+        metrics(fused, String(format: "base+%.1f*crop5max", w))
+    }
+    exit(0)
+}
+
 // Tag speed bench: omni-verify tagbench <modelDir> <image>
 // Per-stage cost of the tagging add-on: GPU score graph + readback (batch A/B, warm) and the
 // CPU finalize breakdown (set OMNI_TAG_TIMING=1 for cen/select/nms splits).
 if args.count >= 4 && args[1] == "tagbench" {
     let modelDir = URL(fileURLWithPath: args[2])
-    let engine = try await OmniEngine(modelDir: modelDir, keepAudio: false)
+    let engine = try await OmniEngine.loadValidated(modelDir: modelDir, keepAudio: false)
     let cacheURL = FileManager.default.temporaryDirectory
         .appendingPathComponent("omni-tagprobe-d\(engine.dim).cache")
     if !FileManager.default.fileExists(atPath: cacheURL.path) {
