@@ -3,6 +3,13 @@ import AppKit
 import QuickLook
 import OmniKit
 
+/// Kinds whose snippets are generated content tags (media) - the Generate Tags menu item
+/// applies to these only; text snippets are real excerpts. (File-scope: ResultsList is
+/// generic, which forbids static stored properties.)
+private let taggableKinds: Set<String> = [
+    FileKind.image.rawValue, FileKind.scan.rawValue, FileKind.video.rawValue
+]
+
 struct ResultsList<Footer: View>: View {
     @Environment(AppModel.self) private var model: AppModel
     let results: [SearchHit]
@@ -240,6 +247,9 @@ struct ResultsList<Footer: View>: View {
         // real key handling lives on the Edit/File menus.)
         let path = hit.path
         let count = model.selectedPaths.count
+        let selectionHasMedia = model.rawResults.contains {
+            model.selectedPaths.contains($0.path) && taggableKinds.contains($0.kind)
+        }
         // Right-clicking a row that is part of a multi-selection acts on the WHOLE selection (Finder
         // behavior); only the actions that extend to many are shown - the single-item ones (Quick
         // Look, passages, Find similar, Ignore folder) are hidden so the menu stays coherent.
@@ -256,6 +266,11 @@ struct ResultsList<Footer: View>: View {
             // Native macOS share picker (AirDrop, Mail, Messages, ...) over the whole selection - the
             // same system sheet Finder's Share opens, anchored to the menu. (ShareLink, no deprecated API.)
             ShareLink(items: model.selectedURLsOrdered) { Label("Share\u{2026}", systemImage: "square.and.arrow.up") }
+            // (Re)generate content tags for the selected media - explicit request, HQ quality.
+            // Shown only when the selection contains taggable media and the tagger is ready.
+            if model.canGenerateTags, selectionHasMedia {
+                Button { model.requestTags(Array(model.selectedPaths)) } label: { Label("Generate Tags", systemImage: "tag") }
+            }
             Divider()
             Button(role: .destructive) { model.moveSelectedToTrash() } label: { Label("Move \(count) items to Trash", systemImage: "trash") }
                 .keyboardShortcut(.delete, modifiers: .command)
@@ -290,6 +305,11 @@ struct ResultsList<Footer: View>: View {
             // Use this file itself as the query - doc-vs-doc "more like this" across all modalities.
             Button { model.setFileQuery(URL(fileURLWithPath: path), similar: true) } label: { Label("Find similar", systemImage: "sparkle.magnifyingglass") }
                 .keyboardShortcut("f", modifiers: [.command, .option])
+            // (Re)generate this file's content tags - explicit request, HQ quality. Media only:
+            // a text file's snippet is a real excerpt, tags would be a downgrade.
+            if model.canGenerateTags, taggableKinds.contains(hit.kind) {
+                Button { model.selectSingle(path); model.requestTags([path]) } label: { Label("Generate Tags", systemImage: "tag") }
+            }
             Button { model.selectSingle(path); reveal(path) } label: { Label("Reveal in Finder", systemImage: "folder") }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
             Button {

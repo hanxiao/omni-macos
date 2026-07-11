@@ -2360,6 +2360,7 @@ final class AppModel {
         searchDebounce?.cancel()   // a direct search supersedes any pending debounced one
         searchWorkTask?.cancel()   // and supersedes the previous in-flight search's embed + store scan
         guard let engine, let store else { return }
+        yieldRetagToSearch()       // background tag refinement gets fully out of a query's way
         // A real query is taking the GPU: cancel any in-flight folder-map fit so it doesn't compete
         // with the embed/search. The folder stays selected; clearing the query returns to the map.
         if fileQuery != nil || !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -2808,9 +2809,44 @@ final class AppModel {
     /// forward is non-finite and the finiteness guard rejects it) is not retried every search.
     private var retagSeen = Set<String>()
     private var tagBackfillActive = false
+    /// Set when a user search cancels an in-flight retag batch: the completion re-queues the
+    /// batch instead of dropping it.
+    private var tagBackfillYieldedToSearch = false
     private var retagKickTask: Task<Void, Never>?
     private static let tagBackfillBatch = 8
     private static let retagQueueCap = 512
+
+    /// A user search takes absolute priority over background tag refinement: cancel the
+    /// in-flight retag batch (its files re-queue and finish later, at true idle). The engine
+    /// gate already limits a query's wait to ~one image/crop forward; this stops the retag from
+    /// consuming GPU BETWEEN keystrokes too, which measurably dragged search on low-end Macs.
+    private func yieldRetagToSearch() {
+        guard tagBackfillActive, !tagBackfillYieldedToSearch else { return }
+        tagBackfillYieldedToSearch = true
+        indexer?.cancel()   // safe: the retag holds the only in-flight pipeline (guards ensure it)
+    }
+
+    /// True when the tagger is attached and ready - drives the context menu's Generate Tags item.
+    var canGenerateTags: Bool { imageTagsEnabled && engine?.tagger != nil }
+
+    /// Explicit "Generate Tags" from the results context menu: (re)tag these files with the HQ
+    /// crop refinement, regardless of their current snippet - unlike the lazy backfill, an
+    /// explicit request also regenerates existing tags. Media only (a text file's snippet is a
+    /// real excerpt; tags would be a downgrade). Jumps the front of the retag queue and starts
+    /// immediately - the user is looking at these rows waiting for them to update.
+    func requestTags(_ paths: [String]) {
+        guard canGenerateTags else { return }
+        let media: Set<String> = [FileKind.image.rawValue, FileKind.scan.rawValue, FileKind.video.rawValue]
+        let byPath = Dictionary(uniqueKeysWithValues: rawResults.map { ($0.path, $0.kind) })
+        let mediaPaths = paths.filter { media.contains(byPath[$0] ?? "") }
+        guard !mediaPaths.isEmpty else { return }
+        pendingRetag.removeAll { mediaPaths.contains($0) }
+        pendingRetag.insert(contentsOf: mediaPaths, at: 0)
+        retagSeen.formUnion(mediaPaths)   // the lazy enqueue must not re-add them this session
+        retagKickTask?.cancel()
+        retagKickTask = nil
+        scheduleTagBackfill()
+    }
 
     /// Queue the untagged media among these search hits for a background re-tag, and arm a
     /// short debounce so the work starts after the user stops typing (each keystroke's results
@@ -2827,7 +2863,9 @@ final class AppModel {
             pendingRetag.append(h.path)
             added = true
         }
-        guard added else { return }
+        // Re-arm the kick whenever there is queued work, not only on new additions - a batch
+        // that yielded to a search re-queues its files and relies on THIS to resume later.
+        guard added || !pendingRetag.isEmpty else { return }
         retagKickTask?.cancel()
         retagKickTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(3))   // let the query settle first
@@ -2843,7 +2881,7 @@ final class AppModel {
     /// real work always wins between batches. The GPU work itself is the engine's normal
     /// low-priority gate - an interactive search preempts per image.
     private func scheduleTagBackfill() {
-        guard !isTerminating, imageTagsEnabled, !tagBackfillActive,
+        guard !isTerminating, imageTagsEnabled, !tagBackfillActive, !searching,
               indexState != .indexing, indexState != .paused,
               activeRoots.isEmpty, !fsReconcileInFlight, pendingFSPaths.isEmpty,
               let engine, engine.tagger != nil, let indexer, let store else { return }
@@ -2862,19 +2900,30 @@ final class AppModel {
         s.hqMediaTags = true       // CWR 5-crop refinement: these are files the user is looking at
         indexer.resetCancelled()
         tagBackfillActive = true
+        tagBackfillYieldedToSearch = false
         fsReconcileInFlight = true
         Task.detached(priority: .utility) {
             indexer.update(paths: batch, settings: s, force: true)
             await MainActor.run {
                 self.fsReconcileInFlight = false
                 self.tagBackfillActive = false
-                self.refreshIndexStats(store)
-                // The re-tagged rows are already in the store: refresh the live results so the
-                // tags the user just "requested" by searching appear without another keystroke.
-                if !self.query.isEmpty { self.scheduleSearch() }
-                // Anything that queued while the batch ran (FS events, root changes) drains
-                // first; the chain's tail re-enters here for the next batch once idle again.
-                self.drainDeferredAfterPass(store)
+                if self.tagBackfillYieldedToSearch {
+                    // The batch was cancelled to give a search the GPU: put its files back at
+                    // the front (some may re-embed once - idle-time cost, correctness unchanged)
+                    // and let the post-search enqueue path re-arm the kick.
+                    self.tagBackfillYieldedToSearch = false
+                    self.pendingRetag.removeAll { batch.contains($0) }
+                    self.pendingRetag.insert(contentsOf: batch, at: 0)
+                } else {
+                    self.refreshIndexStats(store)
+                    // The re-tagged rows are already in the store: refresh the live results so
+                    // the tags the user just "requested" by searching appear without another
+                    // keystroke.
+                    if !self.query.isEmpty { self.scheduleSearch() }
+                    // Anything that queued while the batch ran (FS events, root changes) drains
+                    // first; the chain's tail re-enters here for the next batch once idle again.
+                    self.drainDeferredAfterPass(store)
+                }
             }
         }
     }

@@ -714,15 +714,16 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     /// harness. Same low-priority gate as every other media embed.
     public func embedImagesTagScores(_ raws: [OmniVisionPreprocess.RawPatches], tagger: OmniTagger) -> [[Float]]? {
         guard let enc = imageEncoder, !raws.isEmpty else { return nil }
-        // Same interactive carve as embedImages: one gate hold per input while the user is
-        // searching, so a query waits behind at most one crop/image forward, never a batch.
-        let groups: [[OmniVisionPreprocess.RawPatches]] =
-            (interactiveQueryActive && raws.count > 1 && Self.mediaCarve) ? raws.map { [$0] } : [raws]
+        // ALWAYS one gate hold per input - not just while a search is active. This path serves
+        // background tag refinement, where latency is free but a query must never wait behind a
+        // multi-crop hold (a 15-crop hold is seconds on a low-end GPU, and the retag fires right
+        // when the user is likely to type the next query). Per-image batching gains ~0 GPU
+        // throughput anyway (the vision tower saturates per image - see embedImages).
         var out: [[Float]] = []
-        for group in groups {
+        for raw in raws {
             let scores = run(highPriority: false) { () -> [[Float]]? in
-                let inputs: [OmniImageEncoder.Preprocessed] = group.map { (pixelValues: $0.tensor(), gridTHW: $0.gridTHW) }
-                let r = enc.encode(images: inputs, prefixIds: docPrefix, suffixIds: mediaSuffix, tagger: tagger)
+                let r = enc.encode(images: [(pixelValues: raw.tensor(), gridTHW: raw.gridTHW)],
+                                   prefixIds: docPrefix, suffixIds: mediaSuffix, tagger: tagger)
                 addTokens(enc.lastSequenceLength)
                 return r.tagScores
             }
@@ -741,16 +742,15 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
                                     crops: [[OmniVisionPreprocess.RawPatches]]) -> (vecs: [[Float]], tags: [[String]])? {
         guard crops.contains(where: { !$0.isEmpty }), let tagger else { return embedImagesTagged(raws) }
         guard let enc = imageEncoder, !raws.isEmpty, crops.count == raws.count else { return nil }
-        // Interactive carve for the main batch too (crop scoring carves inside
-        // embedImagesTagScores): a search typed during a retag flush preempts per image.
+        // ALWAYS one gate hold per image (crop scoring does the same inside
+        // embedImagesTagScores): this is background refinement, and a query typed during a
+        // retag flush must preempt after ~one forward, never wait out a batch hold.
         var vecs: [[Float]] = []
         var mainScores: [[Float]] = []
-        let groups: [[OmniVisionPreprocess.RawPatches]] =
-            (interactiveQueryActive && raws.count > 1 && Self.mediaCarve) ? raws.map { [$0] } : [raws]
-        for group in groups {
+        for raw in raws {
             let r = run(highPriority: false) { () -> ([[Float]], [[Float]]?) in
-                let inputs: [OmniImageEncoder.Preprocessed] = group.map { (pixelValues: $0.tensor(), gridTHW: $0.gridTHW) }
-                let r = enc.encode(images: inputs, prefixIds: docPrefix, suffixIds: mediaSuffix, tagger: tagger)
+                let r = enc.encode(images: [(pixelValues: raw.tensor(), gridTHW: raw.gridTHW)],
+                                   prefixIds: docPrefix, suffixIds: mediaSuffix, tagger: tagger)
                 addTokens(enc.lastSequenceLength)
                 return r
             }
