@@ -685,6 +685,17 @@ final class AppModel {
         }
     }
 
+    /// Open-vocabulary image tags: newly indexed images get a content-tag snippet ("cat, couch,
+    /// crib") scored during the same embedding forward pass, replacing the bare filename.
+    /// Existing rows keep their snippet until their file next (re)indexes.
+    var imageTagsEnabled: Bool = true {
+        didSet {
+            guard oldValue != imageTagsEnabled else { return }
+            persistPerf()
+            Task { await self.ensureTagger() }
+        }
+    }
+
     // Index storage info (for the Settings > Model tab).
     var dbPath = ""
     var dbSizeBytes: Int64 = 0
@@ -1351,6 +1362,7 @@ final class AppModel {
         if d.object(forKey: "omni.minVideoSec") != nil { minVideoSeconds = max(0, d.double(forKey: "omni.minVideoSec")) }
         if d.object(forKey: "omni.minTextChars") != nil { minTextChars = max(0, d.integer(forKey: "omni.minTextChars")) }
         if d.object(forKey: "omni.skipDataless") != nil { skipDatalessFiles = d.bool(forKey: "omni.skipDataless") }
+        if d.object(forKey: "omni.imageTags") != nil { imageTagsEnabled = d.bool(forKey: "omni.imageTags") }
     }
     private func persistPerf() {
         let d = UserDefaults.standard
@@ -1363,6 +1375,7 @@ final class AppModel {
         d.set(minVideoSeconds, forKey: "omni.minVideoSec")
         d.set(minTextChars, forKey: "omni.minTextChars")
         d.set(skipDatalessFiles, forKey: "omni.skipDataless")
+        d.set(imageTagsEnabled, forKey: "omni.imageTags")
     }
 
     // MARK: - Filters
@@ -1681,6 +1694,15 @@ final class AppModel {
     private func bootstrap() async {
         applyMemoryLimit()
         watchActivationForDeniedRoots()
+        // A model/db switch tears the old engine down: stop any in-flight label-cache build on
+        // it (buildCache checks cancellation per batch) and drop the stale re-tag queue (it
+        // belongs to the old store; new searches against the new store re-fill it).
+        taggerSetupTask?.cancel()
+        taggerSetupTask = nil
+        retagKickTask?.cancel()
+        retagKickTask = nil
+        pendingRetag.removeAll()
+        retagSeen.removeAll()
         // installedVariants is Settings-only - compute it off the launch critical path (it walks
         // every variant dir, slow on the external model volume).
         Task.detached { let v = ModelLocator.installedVariants(); await MainActor.run { self.installedVariants = v } }
@@ -1773,7 +1795,14 @@ final class AppModel {
             // warm slow and could leave the first query cold. On a fast GPU the warm-up finishes in ~1s,
             // so this is effectively immediate; on a slow GPU indexing (invisible background work) simply
             // starts a few seconds later, which is strictly better than racing the compile.
-            Task { await warm.value; if self.canIndex { self.startIndexing() } }
+            Task {
+                await warm.value
+                // Attach (or build once) the image tagger BEFORE the launch pass, so a first
+                // index tags images on the way in. Cache hit = milliseconds; the one-time build
+                // just delays the invisible background pass, never readiness.
+                await self.ensureTagger()
+                if self.canIndex { self.startIndexing() }
+            }
         } catch {
             self.phase = .failed("\(error)")
         }
@@ -1996,7 +2025,12 @@ final class AppModel {
     /// re-invokes this, so passes serialize on the single Indexer. Obsolete index skips it (the pending
     /// full reindex covers the new folders).
     private func catchUpPendingRoots() {
+        // !fsReconcileInFlight: a watcher reconcile or a tag-backfill batch owns the Indexer right
+        // now (it holds that flag WITHOUT populating activeRoots) - launching index() here would
+        // run two embed pipelines on one Indexer and wipe the in-flight one's cancel flag. The
+        // reconcile/backfill completion re-enters drainDeferredAfterPass, which calls back here.
         guard !isTerminating, !indexObsolete, indexState != .indexing, activeRoots.isEmpty,
+              !fsReconcileInFlight,
               let indexer, let store, !pendingCatchUpRoots.isEmpty else { return }
         let batch = pendingCatchUpRoots.filter { roots.contains($0) }
         pendingCatchUpRoots.removeAll()
@@ -2295,6 +2329,7 @@ final class AppModel {
         let isNewQuery = resolvedQuery != resolved
         rawResults = hits
         resolvedQuery = resolved
+        enqueueRetagCandidates(hits)
         if isNewQuery {
             selection = nil; selectedPaths = []; selectionAnchor = nil
         } else {
@@ -2451,7 +2486,66 @@ final class AppModel {
         s.minVideoSeconds = minVideoSeconds
         s.minTextChars = minTextChars
         s.skipDataless = skipDatalessFiles
+        s.imageTags = imageTagsEnabled
         return s
+    }
+
+    // MARK: - Image tagger (open-vocabulary tags from the same model)
+
+    /// Label-cache path: next to the index (follows the custom database folder), one per
+    /// vector dim so Nano and Small each get a cache built by their own text tower.
+    static func tagCacheURL(dim: Int) throws -> URL {
+        try indexURL().deletingLastPathComponent().appendingPathComponent("tags-d\(dim).cache")
+    }
+
+    /// In-flight label-cache build/attach; superseded (cancelled) by any newer ensureTagger call
+    /// and by bootstrap, so a stale build can neither re-attach after the user toggled tagging
+    /// off nor keep embedding on a torn-down engine across a model/db switch. The generation
+    /// counter tells a finished call whether ITS task is still the tracked one (Task itself is
+    /// not Equatable), so it never clears a newer call's handle.
+    private var taggerSetupTask: Task<OmniTagger?, Never>?
+    private var taggerSetupGen: UInt64 = 0
+
+    /// Make the engine's tagger match the toggle. Detach is immediate. Attach loads the label
+    /// cache - building it once if missing (~25k gated vocab words through the passage encoder;
+    /// seconds on a fast GPU, under a minute on a low-end one, all through the engine's normal
+    /// low-priority gate so searches preempt between batches) - seeds the base-rate prior with
+    /// procedural neutral images, and only THEN publishes the tagger (an unseeded tagger visible
+    /// to an in-flight media flush would store permanent junk tags). The attach itself re-checks
+    /// the toggle and engine identity on the main actor. Runs before the launch index pass so
+    /// first-indexed images get tags rather than waiting for their next content change.
+    func ensureTagger() async {
+        taggerSetupTask?.cancel()   // supersede an older build (toggle flips, model switch)
+        taggerSetupTask = nil
+        taggerSetupGen += 1
+        let gen = taggerSetupGen
+        guard let engine else { return }
+        guard imageTagsEnabled else { engine.tagger = nil; return }
+        guard engine.supportsImages, engine.tagger == nil,
+              let url = try? Self.tagCacheURL(dim: engine.dim) else { return }
+        let modelDir = engine.modelDir
+        // The detached task builds/loads and SEEDS the tagger but never touches self; the
+        // attach happens back on the main actor below, with the world re-checked.
+        let task = Task.detached(priority: .utility) { () -> OmniTagger? in
+            if !FileManager.default.fileExists(atPath: url.path) {
+                let labels = OmniTagger.gatedLabels(modelDir: modelDir)
+                guard !labels.isEmpty else { return nil }
+                let t0 = Date()
+                guard OmniTagger.buildCache(labels: labels, embedder: engine, to: url,
+                                            isCancelled: { Task.isCancelled }) else { return nil }
+                omniPerfLog(String(format: "[tags] label cache built in %.1fs", -t0.timeIntervalSinceNow))
+            }
+            guard !Task.isCancelled, let tagger = OmniTagger(cacheURL: url, dim: engine.dim) else { return nil }
+            engine.seedTaggerPrior(tagger)   // BEFORE publishing - see doc comment
+            return tagger
+        }
+        taggerSetupTask = task
+        let built = await task.value
+        if taggerSetupGen == gen { taggerSetupTask = nil }
+        // Publish only if THIS call is still the current one (gen), the toggle is still on, and
+        // the engine was not swapped by a model/db switch while the cache built.
+        guard let built, taggerSetupGen == gen, imageTagsEnabled, self.engine === engine else { return }
+        engine.tagger = built
     }
 
     // MARK: - Live updates (FSEvents)
@@ -2694,6 +2788,93 @@ final class AppModel {
         catchUpPendingRoots()
         if indexState != .indexing && activeRoots.isEmpty && !fsReconcileInFlight {
             drainPendingFSChanges()
+        }
+        // Lowest priority in the chain: with all real work drained and the pipelines idle,
+        // re-tag the next batch of already-indexed media that still carries filename snippets.
+        if indexState != .indexing, activeRoots.isEmpty, !fsReconcileInFlight {
+            scheduleTagBackfill()
+        }
+    }
+
+    // MARK: - Lazy tag backfill (untagged media that APPEAR IN SEARCH RESULTS get re-tagged)
+
+    /// Media files seen in search results whose snippet is still filename-derived (indexed
+    /// before tagging existed), waiting for a background re-tag. Fed by applyResults; consumed
+    /// in small batches when the app is otherwise idle. Deliberately NOT a whole-index crawl:
+    /// new files tag at index time, and old files earn a re-tag by actually surfacing in a
+    /// search - cost tracks what the user looks at, not the corpus size.
+    private var pendingRetag: [String] = []
+    /// Everything enqueued this session, so a file whose re-tag yields no tags (e.g. its
+    /// forward is non-finite and the finiteness guard rejects it) is not retried every search.
+    private var retagSeen = Set<String>()
+    private var tagBackfillActive = false
+    private var retagKickTask: Task<Void, Never>?
+    private static let tagBackfillBatch = 8
+    private static let retagQueueCap = 512
+
+    /// Queue the untagged media among these search hits for a background re-tag, and arm a
+    /// short debounce so the work starts after the user stops typing (each keystroke's results
+    /// pass through here). Cheap: a few string checks over <= 60 hits on the main actor.
+    private func enqueueRetagCandidates(_ hits: [SearchHit]) {
+        guard imageTagsEnabled, engine?.tagger != nil else { return }
+        let media: Set<String> = [FileKind.image.rawValue, FileKind.scan.rawValue, FileKind.video.rawValue]
+        var added = false
+        for h in hits where media.contains(h.kind)
+            && pendingRetag.count < Self.retagQueueCap
+            && !retagSeen.contains(h.path)
+            && OmniTagger.nameDerivedSnippet(h.snippet, path: h.path) {
+            retagSeen.insert(h.path)
+            pendingRetag.append(h.path)
+            added = true
+        }
+        guard added else { return }
+        retagKickTask?.cancel()
+        retagKickTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(3))   // let the query settle first
+            guard !Task.isCancelled else { return }
+            self?.scheduleTagBackfill()
+        }
+    }
+
+    /// Re-embed the next batch of queued media through the normal reconcile pipeline
+    /// (`update(force:)` with the content-dedup shortcut bypassed), which rewrites their rows
+    /// with tagged snippets. Runs ONLY when nothing else is: it takes the same
+    /// fsReconcileInFlight slot as a watcher reconcile, so FS events buffer during a batch and
+    /// real work always wins between batches. The GPU work itself is the engine's normal
+    /// low-priority gate - an interactive search preempts per image.
+    private func scheduleTagBackfill() {
+        guard !isTerminating, imageTagsEnabled, !tagBackfillActive,
+              indexState != .indexing, indexState != .paused,
+              activeRoots.isEmpty, !fsReconcileInFlight, pendingFSPaths.isEmpty,
+              let engine, engine.tagger != nil, let indexer, let store else { return }
+        // Revalidate against LIVE roots: a path whose root was removed or paused since it was
+        // queued must not be re-embedded (update(force:) would re-INSERT rows deleteUnderFolder
+        // just removed, resurrecting the folder in search results).
+        pendingRetag.removeAll { p in
+            rootKey(for: p) == nil
+                || pausedRoots.contains(where: { p == $0 || p.hasPrefix($0 + "/") })
+        }
+        guard !pendingRetag.isEmpty else { return }
+        let batch = Array(pendingRetag.prefix(Self.tagBackfillBatch))
+        pendingRetag.removeFirst(batch.count)
+        var s = effectiveSettings()
+        s.forceFreshEmbed = true   // dedup would hand a file its own untagged rows back
+        indexer.resetCancelled()
+        tagBackfillActive = true
+        fsReconcileInFlight = true
+        Task.detached(priority: .utility) {
+            indexer.update(paths: batch, settings: s, force: true)
+            await MainActor.run {
+                self.fsReconcileInFlight = false
+                self.tagBackfillActive = false
+                self.refreshIndexStats(store)
+                // The re-tagged rows are already in the store: refresh the live results so the
+                // tags the user just "requested" by searching appear without another keystroke.
+                if !self.query.isEmpty { self.scheduleSearch() }
+                // Anything that queued while the batch ran (FS events, root changes) drains
+                // first; the chain's tail re-enters here for the next batch once idle again.
+                self.drainDeferredAfterPass(store)
+            }
         }
     }
 

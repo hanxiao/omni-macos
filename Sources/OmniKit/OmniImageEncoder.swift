@@ -70,9 +70,19 @@ public final class OmniImageEncoder: @unchecked Sendable {
     /// N=1 is bit-identical to `encode(pixelValues:gridTHW:)`: a single-item tower forward (cu_seqlens
     /// = [0, h*w], one full-attention window) and the same single-sequence backbone + pool.
     public func encode(images inputs: [Preprocessed], prefixIds: [Int] = [], suffixIds: [Int] = []) -> [[Float]] {
-        if inputs.isEmpty { lastSequenceLength = 0; return [] }
+        encode(images: inputs, prefixIds: prefixIds, suffixIds: suffixIds, tagger: nil).vecs
+    }
+
+    /// Same batched embedding, optionally scoring each image's patch rows against `tagger`'s
+    /// label matrix INSIDE the same per-chunk eval (the hidden states are already computed for
+    /// pooling; tagging adds one matmul + reduce per image, no extra forward). `tagScores[i]` is
+    /// the raw [2V] score vector for input i (see OmniTagger.finalize), nil array when no tagger.
+    public func encode(images inputs: [Preprocessed], prefixIds: [Int] = [], suffixIds: [Int] = [],
+                       tagger: OmniTagger?) -> (vecs: [[Float]], tagScores: [[Float]]?) {
+        if inputs.isEmpty { lastSequenceLength = 0; return ([], tagger == nil ? nil : []) }
         var out: [[Float]] = []
         out.reserveCapacity(inputs.count)
+        var scores: [[Float]] = []
         var seqTotal = 0
         var i = 0
         while i < inputs.count {
@@ -86,18 +96,23 @@ public final class OmniImageEncoder: @unchecked Sendable {
                 j += 1
             }
             let chunk = Array(inputs[i ..< j])
-            let (vecs, seq) = encodeChunk(chunk, prefixIds: prefixIds, suffixIds: suffixIds)
+            let (vecs, chunkScores, seq) = encodeChunk(chunk, prefixIds: prefixIds, suffixIds: suffixIds, tagger: tagger)
             out.append(contentsOf: vecs)
+            if let chunkScores { scores.append(contentsOf: chunkScores) }
             seqTotal += seq
             i = j
         }
         lastSequenceLength = seqTotal
-        return out
+        return (out, tagger == nil ? nil : scores)
     }
 
     /// One bounded (block-diagonal) vision-tower forward over the chunk, then a B=1 backbone pass
     /// per image. Returns the per-image vectors and the sum of per-image sequence lengths (tok/s).
-    private func encodeChunk(_ inputs: [Preprocessed], prefixIds: [Int], suffixIds: [Int]) -> (vecs: [[Float]], seqTotal: Int) {
+    /// With a `tagger`, each image's patch hidden rows (already computed for the pool) are also
+    /// scored against the label matrix as part of the SAME eval; the [2V] score rows come back
+    /// alongside the vectors.
+    private func encodeChunk(_ inputs: [Preprocessed], prefixIds: [Int], suffixIds: [Int],
+                             tagger: OmniTagger? = nil) -> (vecs: [[Float]], tagScores: [[Float]]?, seqTotal: Int) {
         // Pack pixel values + grids for a single block-diagonal tower forward.
         let packedPixels = inputs.count == 1 ? inputs[0].pixelValues
             : MLX.concatenated(inputs.map { $0.pixelValues }, axis: 0)
@@ -137,6 +152,7 @@ public final class OmniImageEncoder: @unchecked Sendable {
         let sufEmbed: MLXArray? = suffixIds.isEmpty ? nil : backbone.embed(suffixIds)
         var pooled: [MLXArray] = []
         pooled.reserveCapacity(perImage.count)
+        var tagGraphs: [MLXArray] = []
         var seqTotal = 0
         for feats in perImage {
             let n = feats.dim(0)
@@ -148,20 +164,34 @@ public final class OmniImageEncoder: @unchecked Sendable {
             if let sufEmbed { parts.append(sufEmbed) }
             let length = prefixIds.count + n + 2 + suffixIds.count
             let hidden = backbone.forward(inputsEmbeds: MLX.concatenated(parts, axis: 1), length: length)
-            pooled.append(backbone.poolGraph(hidden, length: length))
+            let pool = backbone.poolGraph(hidden, length: length)
+            pooled.append(pool)
+            if let tagger {
+                // The image's patch rows sit between [prefix][vision_start] and [vision_end]:
+                // rows [prefixLen+1, prefixLen+1+n). Same hidden tensor the pool reads - the
+                // score graph joins this chunk's single eval below.
+                let pStart = prefixIds.count + 1
+                let patches = hidden[0, pStart ..< (pStart + n)]
+                tagGraphs.append(tagger.scoreGraph(patches: patches, pooled: pool))
+            }
             seqTotal += length
         }
         let tB = Self.mediaTiming ? Date() : nil
         if let tLoop, let tB { print(String(format: "[media] bb-graph-build(%d imgs) %.1fms", perImage.count, tB.timeIntervalSince(tLoop) * 1000)) }
-        eval(pooled)
+        eval(pooled + tagGraphs)
         if let tB { print(String(format: "[media] bb-eval(%d imgs, %d toks) %.1fms", perImage.count, seqTotal, -tB.timeIntervalSinceNow * 1000)) }
-        return (pooled.map { $0.asArray(Float.self) }, seqTotal)
+        return (pooled.map { $0.asArray(Float.self) },
+                tagger == nil ? nil : tagGraphs.map { $0.asArray(Float.self) },
+                seqTotal)
     }
 
     static let mediaTiming = ProcessInfo.processInfo.environment["OMNI_MEDIA_TIMING"] == "1"
 
-    /// Single-sequence inject + forward + last-token pool (the original scalar path).
-    private func injectAndPool(_ features: MLXArray, prefixIds: [Int], suffixIds: [Int]) -> (vec: [Float], length: Int) {
+    /// Single-sequence inject + forward + last-token pool (the original scalar path). With a
+    /// `tagger`, the vision-token hidden rows are also scored against the label matrix in the
+    /// same eval (the exact scalar analogue of the batched path's tag hook).
+    private func injectAndPool(_ features: MLXArray, prefixIds: [Int], suffixIds: [Int],
+                               tagger: OmniTagger? = nil) -> (vec: [Float], tagScores: [Float]?, length: Int) {
         let n = features.dim(0)
         let dim = cfg.text.hiddenSize
         let feats = features.asType(.float32).reshaped([1, n, dim])
@@ -174,7 +204,14 @@ public final class OmniImageEncoder: @unchecked Sendable {
         let inputsEmbeds = MLX.concatenated(parts, axis: 1)
         let length = prefixIds.count + n + 2 + suffixIds.count
         let hidden = backbone.forward(inputsEmbeds: inputsEmbeds, length: length)
-        return (backbone.pool(hidden, length: length), length)
+        guard let tagger else {
+            return (backbone.pool(hidden, length: length), nil, length)
+        }
+        let pool = backbone.poolGraph(hidden, length: length)
+        let pStart = prefixIds.count + 1
+        let score = tagger.scoreGraph(patches: hidden[0, pStart ..< (pStart + n)], pooled: pool)
+        eval([pool, score])
+        return (pool.asArray(Float.self), score.asArray(Float.self), length)
     }
 
     /// Embed a clip from sampled frames as a single temporal video embedding.
@@ -182,21 +219,34 @@ public final class OmniImageEncoder: @unchecked Sendable {
     /// the placeholder token is overwritten, so the image and video paths are
     /// identical given the (temporal) features.
     public func encodeVideo(_ frames: [CGImage], prefixIds: [Int] = [], suffixIds: [Int] = []) -> [Float]? {
+        encodeVideo(frames, prefixIds: prefixIds, suffixIds: suffixIds, tagger: nil).vec
+    }
+
+    /// Video clip embedding, optionally tag-scored (temporal vision patches through the same
+    /// backbone rows the pool reads - the video analogue of the image tag hook).
+    public func encodeVideo(_ frames: [CGImage], prefixIds: [Int] = [], suffixIds: [Int] = [],
+                            tagger: OmniTagger?) -> (vec: [Float]?, tagScores: [Float]?) {
         let tP = Self.mediaTiming ? Date() : nil
-        guard let (pixelValues, grid) = OmniVideoPreprocess.preprocess(frames) else { return nil }
+        guard let (pixelValues, grid) = OmniVideoPreprocess.preprocess(frames) else { return (nil, nil) }
         if let tP { print(String(format: "[media] video-preprocess(%d frames) %.1fms", frames.count, -tP.timeIntervalSinceNow * 1000)) }
-        return encode(pixelValues: pixelValues, gridTHW: grid, prefixIds: prefixIds, suffixIds: suffixIds)
+        let r = encode(pixelValues: pixelValues, gridTHW: grid, prefixIds: prefixIds, suffixIds: suffixIds, tagger: tagger)
+        return (r.vec, r.tagScores)
     }
 
     /// Embed from already-preprocessed pixel values (used by the parity test).
     /// Sequence: [prefix] + [vision_start] + features + [vision_end], last-token pooled.
     public func encode(pixelValues: MLXArray, gridTHW: [(Int, Int, Int)], prefixIds: [Int] = [], suffixIds: [Int] = []) -> [Float] {
+        encode(pixelValues: pixelValues, gridTHW: gridTHW, prefixIds: prefixIds, suffixIds: suffixIds, tagger: nil).vec
+    }
+
+    public func encode(pixelValues: MLXArray, gridTHW: [(Int, Int, Int)], prefixIds: [Int] = [], suffixIds: [Int] = [],
+                       tagger: OmniTagger?) -> (vec: [Float], tagScores: [Float]?) {
         let features = tower.forward(pixelValues, gridTHW: gridTHW)   // [N_merged, dim]
         // image/video tokens are replaced by the vision features. Contiguous, so we build
         // inputs_embeds by concatenation rather than scatter. The suffix (e.g. Nano's end-of-text)
         // makes last-token pooling land on the same token the text path pools at.
-        let r = injectAndPool(features, prefixIds: prefixIds, suffixIds: suffixIds)
+        let r = injectAndPool(features, prefixIds: prefixIds, suffixIds: suffixIds, tagger: tagger)
         lastSequenceLength = r.length
-        return r.vec
+        return (r.vec, r.tagScores)
     }
 }

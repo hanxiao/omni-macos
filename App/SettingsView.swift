@@ -141,6 +141,19 @@ private struct ActivityTab: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
+            Section {
+                Toggle("Generate tags", isOn: Binding(
+                    get: { model.imageTagsEnabled },
+                    set: { model.imageTagsEnabled = $0 }
+                ))
+                .toggleStyle(.switch)
+            } header: {
+                Text("Image & video tagging")
+            } footer: {
+                Text("Describes photos, videos, and scans with a few words (\"cat, couch, crib\"), generated on-device while indexing.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
             Section("Folders") {
                 ForEach(model.roots, id: \.self) { url in
                     let rp = model.progress.perRoot[url.path]

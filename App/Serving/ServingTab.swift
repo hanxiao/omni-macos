@@ -266,8 +266,10 @@ struct ServingTab: View {
         carry `bytes` (indexed file size) and `mime_type`, and media hits add `width`/`height`
         (px) and `duration` (seconds) recorded at index time - so you can prefer, say, the
         4032x3024 original over a 192px thumbnail without opening either. Hits that are
-        byte-identical copies share a `content_key`: collapse them before choosing. Fields are
-        omitted when unknown. Scores above ~0.45 are usually relevant; below ~0.3 usually noise.
+        byte-identical copies share a `content_key`: collapse them before choosing. Image hits
+        indexed with tagging on carry a few content words as their `snippet` ("cat, couch,
+        crib") instead of the filename. Fields are omitted when unknown. Scores above ~0.45
+        are usually relevant; below ~0.3 usually noise.
 
         ## File status (is this file indexed, and is the index fresh?)
 

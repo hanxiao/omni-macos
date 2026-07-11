@@ -22,8 +22,15 @@ public protocol Embedder: AnyObject {
     /// Batch-N image: embed several already-preprocessed images in ONE block-diagonal vision
     /// forward (output order matches input). Nil if the vision path is unavailable.
     func embedImages(_ raws: [OmniVisionPreprocess.RawPatches]) -> [[Float]]?
+    /// embedImages plus open-vocabulary content tags per image, computed from the same forward
+    /// pass when a tagger is available. `tags[i]` is empty when tagging is unavailable for that
+    /// image. Default impl: plain embedImages with empty tags (mock embedders never tag).
+    func embedImagesTagged(_ raws: [OmniVisionPreprocess.RawPatches]) -> (vecs: [[Float]], tags: [[String]])?
     /// Embed sampled video frames as one temporal embedding. Nil if unavailable.
     func embedVideoFrames(_ frames: [CGImage]) -> [Float]?
+    /// embedVideoFrames plus open-vocabulary content tags for the clip (empty when tagging is
+    /// unavailable). Default impl: plain embedding with empty tags.
+    func embedVideoFramesTagged(_ frames: [CGImage]) -> (vec: [Float], tags: [String])?
     /// Embed an audio file (decode + mel + audio tower). Nil if unavailable.
     func embedAudio(_ url: URL) -> [Float]?
     /// Embed from a precomputed mel buffer (lets mel run in the concurrent decode stage).
@@ -49,6 +56,17 @@ public extension Embedder {
 
     /// Default: no recovery available (test doubles). OmniEngine overrides with a weight reload.
     func recoverMediaPath() -> Bool { false }
+
+    /// Default: plain embedding with empty tags (test doubles never tag). OmniEngine overrides
+    /// with the shared-forward tagger scoring when a tagger is attached.
+    func embedImagesTagged(_ raws: [OmniVisionPreprocess.RawPatches]) -> (vecs: [[Float]], tags: [[String]])? {
+        embedImages(raws).map { ($0, Array(repeating: [], count: $0.count)) }
+    }
+
+    /// Default: plain video embedding with empty tags. OmniEngine overrides.
+    func embedVideoFramesTagged(_ frames: [CGImage]) -> (vec: [Float], tags: [String])? {
+        embedVideoFrames(frames).map { ($0, []) }
+    }
 
     /// Default: no pipelining, just embed each batch in turn. Conformances that support the
     /// async double-buffer (OmniEngine) override this.
@@ -539,7 +557,9 @@ public final class Indexer: @unchecked Sendable {
                     guard !stage.isEmpty else { return }
                     let batch = stage; stage = []; stagedRaws = 0
                     let allRaws = batch.flatMap { $0.raws }
-                    guard let vecs = self.embedder.embedImages(allRaws), vecs.count == allRaws.count else {
+                    // Tags ride the same forward pass (empty when no tagger is attached); a tagged
+                    // image's snippet becomes its content tags instead of the bare filename.
+                    guard let (vecs, tags) = self.embedder.embedImagesTagged(allRaws), vecs.count == allRaws.count else {
                         for b in batch { storeChunks(b.file.url.path, []) }   // vision unavailable/fault
                         return
                     }
@@ -549,7 +569,8 @@ public final class Indexer: @unchecked Sendable {
                         var out: [IndexedChunk] = []
                         for (i, vec) in vecs[off ..< (off + b.raws.count)].enumerated() {
                             out.append(IndexedChunk(path: b.file.url.path, modified: b.file.modified, size: b.file.size,
-                                                    kind: b.kind, chunkIndex: i, snippet: b.file.url.lastPathComponent,
+                                                    kind: b.kind, chunkIndex: i,
+                                                    snippet: Self.imageSnippet(tags, at: off + i, fallback: b.file.url),
                                                     embedding: vec,
                                                     width: b.raws.count == 1 ? b.meta.width : 0,
                                                     height: b.raws.count == 1 ? b.meta.height : 0,
@@ -648,7 +669,10 @@ public final class Indexer: @unchecked Sendable {
 
     /// Targeted update for a set of changed paths (from the file watcher). Re-embeds
     /// changed/added supported files and removes deleted/unsupported ones. No crawl.
-    public func update(paths: [String], settings: IndexSettings) {
+    /// `force: true` (the tag backfill) re-embeds the given files even when their (mtime, size)
+    /// signature is unchanged - everything else (deletion/exclusion handling, batching, store
+    /// writes) is identical to a watcher reconcile.
+    public func update(paths: [String], settings: IndexSettings, force: Bool = false) {
         let fm = FileManager.default
         // Resolve the concrete files first: the explicit events, plus a crawl of any directory event
         // (a new folder / bulk move-in carries only the folder path). Then look up the PRIOR stored
@@ -707,7 +731,7 @@ public final class Indexer: @unchecked Sendable {
             guard let vals = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]) else { continue }
             let mtime = vals.contentModificationDate?.timeIntervalSince1970 ?? 0
             let size = vals.fileSize ?? 0
-            if let prev = known[path], prev.modified == mtime, prev.size == size { continue }  // unchanged
+            if !force, let prev = known[path], prev.modified == mtime, prev.size == size { continue }  // unchanged
             // Dataless under the skip policy: do NOT queue it for embedding (the read would download
             // it) and do NOT delete any existing entry (a remotely-modified evicted file keeps its
             // old vectors - stale beats invisible; relying on the embed stage's empty result instead
@@ -783,7 +807,7 @@ public final class Indexer: @unchecked Sendable {
             guard !iStage.isEmpty else { return }
             let batch = iStage; iStage = []; iStagedRaws = 0
             let allRaws = batch.flatMap { $0.raws }
-            guard let vecs = self.embedder.embedImages(allRaws), vecs.count == allRaws.count else {
+            guard let (vecs, tags) = self.embedder.embedImagesTagged(allRaws), vecs.count == allRaws.count else {
                 for b in batch { acceptCompleted(b.file.url.path, []) }
                 return
             }
@@ -792,7 +816,8 @@ public final class Indexer: @unchecked Sendable {
                 var out: [IndexedChunk] = []
                 for (i, vec) in vecs[off ..< (off + b.raws.count)].enumerated() {
                     out.append(IndexedChunk(path: b.file.url.path, modified: b.file.modified, size: b.file.size,
-                                            kind: b.kind, chunkIndex: i, snippet: b.file.url.lastPathComponent,
+                                            kind: b.kind, chunkIndex: i,
+                                            snippet: Self.imageSnippet(tags, at: off + i, fallback: b.file.url),
                                             embedding: vec,
                                             width: b.raws.count == 1 ? b.meta.width : 0,
                                             height: b.raws.count == 1 ? b.meta.height : 0,
@@ -979,7 +1004,7 @@ public final class Indexer: @unchecked Sendable {
         // construction: same input bytes + same settings produce the same vectors, so copying
         // the stored rows is the embedding, minus the work.
         var contentKey: String? = nil
-        if Self.contentDedup {
+        if Self.contentDedup, !settings.forceFreshEmbed {
             contentKey = self.contentKey(file, category: category, settings: settings)
             if let ck = contentKey, let src = store.duplicateChunks(key: ck) {
                 noteDedupHit()
@@ -1133,9 +1158,10 @@ public final class Indexer: @unchecked Sendable {
         case .images(let images):
             // Only video frames reach here now (one temporal clip -> one embedding).
             if kind == FileKind.video.rawValue {
-                guard let vec = embedder.embedVideoFrames(images) else { return [] }
+                guard let (vec, tags) = embedder.embedVideoFramesTagged(images) else { return [] }
                 return [IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
-                                     chunkIndex: 0, snippet: file.url.lastPathComponent, embedding: vec,
+                                     chunkIndex: 0, snippet: Self.imageSnippet([tags], at: 0, fallback: file.url),
+                                     embedding: vec,
                                      width: meta.width, height: meta.height, duration: meta.duration)]
             }
             // Safety fallback (non-video CGImages, e.g. a conformer that didn't preprocess): serial.
@@ -1152,7 +1178,7 @@ public final class Indexer: @unchecked Sendable {
         case .imagePatches(let raws):
             // Batch-N: ONE block-diagonal vision forward over all images (capped by the encoder's
             // patch budget). Order is preserved.
-            guard let vecs = embedder.embedImages(raws) else {
+            guard let (vecs, tags) = embedder.embedImagesTagged(raws) else {
                 // Vision path unavailable: nothing to index.
                 return []
             }
@@ -1160,7 +1186,8 @@ public final class Indexer: @unchecked Sendable {
             var out: [IndexedChunk] = []
             for (i, vec) in vecs.enumerated() {
                 out.append(IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
-                                        chunkIndex: i, snippet: file.url.lastPathComponent, embedding: vec,
+                                        chunkIndex: i, snippet: Self.imageSnippet(tags, at: i, fallback: file.url),
+                                        embedding: vec,
                                         width: raws.count == 1 ? meta.width : 0, height: raws.count == 1 ? meta.height : 0,
                                         locator: raws.count > 1 ? "Page \(i + 1)" : ""))
             }
@@ -1206,12 +1233,15 @@ public final class Indexer: @unchecked Sendable {
                 prefetchQ.async { box.frames = sample(k + 1); sync.leave() }
             }
             if !current.isEmpty {
-                guard let vec = embedder.embedVideoFrames(current) else {
+                guard let (vec, tags) = embedder.embedVideoFramesTagged(current) else {
                     sync.wait()
                     return []   // vision path unavailable: nothing to index
                 }
+                // Per-segment tags: a 3-hour recording's snippet describes what each 240 s
+                // window shows, not just the whole file.
                 out.append(IndexedChunk(path: file.url.path, modified: file.modified, size: file.size,
-                                        kind: kind, chunkIndex: k, snippet: file.url.lastPathComponent,
+                                        kind: kind, chunkIndex: k,
+                                        snippet: Self.imageSnippet([tags], at: 0, fallback: file.url),
                                         embedding: vec, width: width, height: height, duration: duration,
                                         locator: Self.timeLocator(Double(k) * seg)))
             }
@@ -1306,15 +1336,17 @@ public final class Indexer: @unchecked Sendable {
                 sync.enter()
                 prefetchQ.async { box.result = prep(range); sync.leave() }
             }
-            if !current.isEmpty, let vecs = embedder.embedImages(current.map { $0.raw }) {
+            if !current.isEmpty, let (vecs, tags) = embedder.embedImagesTagged(current.map { $0.raw }) {
                 for (k, vec) in vecs.enumerated() where k < current.count {
                     let page = current[k].page
                     // kind 'scan', not the file's detection kind ('text'): vision-embedded pages
                     // are their own modality in the index - filterable, and targetable by future
                     // scan-specific processing (OCR). Old rows are re-labeled by the store's
                     // one-time migration (migrateScanKind), which matches THIS write pattern.
+                    // Per-PAGE tags as the snippet ("invoice, table, signature") when available.
                     out.append(IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: FileKind.scan.rawValue,
-                                            chunkIndex: page, snippet: file.url.lastPathComponent, embedding: vec,
+                                            chunkIndex: page, snippet: Self.imageSnippet(tags, at: k, fallback: file.url),
+                                            embedding: vec,
                                             locator: pageCount > 1 ? "Page \(page + 1)" : ""))
                 }
             }
@@ -1361,6 +1393,14 @@ public final class Indexer: @unchecked Sendable {
             startOff += step
         }
         return pieces
+    }
+
+    /// Snippet for an image chunk: its open-vocabulary content tags when the tagger produced
+    /// them ("cat, couch, crib"), else the filename - the pre-tagging behavior, and the
+    /// fallback while the label cache is still building or tagging is off.
+    static func imageSnippet(_ tags: [[String]], at i: Int, fallback url: URL) -> String {
+        guard i < tags.count, !tags[i].isEmpty else { return url.lastPathComponent }
+        return tags[i].joined(separator: ", ")
     }
 
     private func snippet(_ text: String) -> String {

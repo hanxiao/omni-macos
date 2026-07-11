@@ -451,7 +451,9 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             let idle = self.trimLock.withLock { -self.lastGPUWork.timeIntervalSinceNow }
             if idle >= delay * 0.5 {
                 // Only frees FREE (cached) buffers - a concurrent forward's live arrays are
-                // untouched; its next allocations just miss the cache once.
+                // untouched; its next allocations just miss the cache once. The tagger's
+                // resident label matrix goes with it (rebuilt from its mmap on next use).
+                self.tagger?.releaseMatrix()
                 MLX.GPU.clearCache()
             } else {
                 self.scheduleTrim(gen: gen, delay: delay)   // GPU active again - check back later
@@ -621,6 +623,77 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     /// Batch-N image embedding from already-preprocessed (Sendable) raw patches. The CPU preprocess
     /// runs in the indexer's concurrent decode stage; this call only does the GPU tower+backbone.
     /// One block-diagonal vision forward per `patchBudget` chunk; returns one vector per input.
+    /// The optional image tagger (open-vocabulary tags from the same forward pass). Set once by
+    /// the app after the label cache is built/loaded; read on the serialized GPU path.
+    private let taggerLock = NSLock()
+    private var _tagger: OmniTagger?
+    public var tagger: OmniTagger? {
+        get { taggerLock.withLock { _tagger } }
+        set { taggerLock.withLock { _tagger = newValue } }
+    }
+
+    /// Seed a tagger's per-label prior with its procedural neutral images. Takes the tagger as
+    /// an explicit parameter and MUST be called BEFORE assigning `engine.tagger`: the moment the
+    /// property is set, any in-flight media flush picks the tagger up on its next batch, and a
+    /// finalize against an empty prior stores permanent vocab-junk snippets (and marks the prior
+    /// non-empty, skipping the seed). No-op when the prior is already seeded (persisted .prior).
+    public func seedTaggerPrior(_ tagger: OmniTagger) {
+        guard tagger.needsSeed, let enc = imageEncoder else { return }
+        let raws = OmniTagger.seedImages().map { OmniVisionPreprocess.preprocessRaw($0) }
+        let scores = run(highPriority: false) { () -> [[Float]]? in
+            let inputs: [OmniImageEncoder.Preprocessed] = raws.map { (pixelValues: $0.tensor(), gridTHW: $0.gridTHW) }
+            let r = enc.encode(images: inputs, prefixIds: docPrefix, suffixIds: mediaSuffix, tagger: tagger)
+            addTokens(enc.lastSequenceLength)
+            return r.tagScores
+        }
+        for s in scores ?? [] { _ = tagger.finalize(s) }   // accumulate the prior; tags discarded
+    }
+
+    /// embedImages plus open-vocabulary tags per image, from the SAME backbone forward (the
+    /// patch rows are scored against the resident label matrix inside the batch's single eval).
+    /// `tags[i]` is empty when tagging was unavailable for that image. Falls back to plain
+    /// embedding (empty tags) when no tagger is set.
+    public func embedImagesTagged(_ raws: [OmniVisionPreprocess.RawPatches]) -> (vecs: [[Float]], tags: [[String]])? {
+        guard let enc = imageEncoder, !raws.isEmpty else { return nil }
+        guard let tagger else {
+            return embedImages(raws).map { ($0, Array(repeating: [], count: $0.count)) }
+        }
+        var vecs: [[Float]] = []
+        var scores: [[Float]] = []
+        // Same interactive carve as embedImages: while the user is searching, ONE image per gate
+        // hold so a query preempts after ~one image instead of waiting behind the whole batch.
+        let groups: [[OmniVisionPreprocess.RawPatches]] =
+            (interactiveQueryActive && raws.count > 1 && Self.mediaCarve) ? raws.map { [$0] } : [raws]
+        for group in groups {
+            let r = run(highPriority: false) { () -> ([[Float]], [[Float]]?) in
+                let inputs: [OmniImageEncoder.Preprocessed] = group.map { (pixelValues: $0.tensor(), gridTHW: $0.gridTHW) }
+                let r = enc.encode(images: inputs, prefixIds: docPrefix, suffixIds: mediaSuffix, tagger: tagger)
+                addTokens(enc.lastSequenceLength)
+                return r
+            }
+            vecs.append(contentsOf: r.0)
+            if let s = r.1 { scores.append(contentsOf: s) }
+        }
+        // Finalize on the CPU, off the GPU gate (centering + partial select + NMS). Once the
+        // prior is FROZEN (read-only - everything after the first 64 images ever), the per-image
+        // finalizes are independent: run them across cores so the CPU tail between GPU batches
+        // is one finalize long, not n. Pre-freeze stays serial so the prior accumulates in
+        // deterministic order.
+        var tags = [[String]](repeating: [], count: vecs.count)
+        if tagger.priorIsFrozen, vecs.count > 2 {
+            let scoresRef = scores
+            tags.withUnsafeMutableBufferPointer { buf in
+                let out = buf   // concurrent writes to DISJOINT slots
+                DispatchQueue.concurrentPerform(iterations: out.count) { i in
+                    out[i] = i < scoresRef.count ? tagger.finalize(scoresRef[i]) : []
+                }
+            }
+        } else {
+            for i in 0 ..< vecs.count where i < scores.count { tags[i] = tagger.finalize(scores[i]) }
+        }
+        return (vecs, tags)
+    }
+
     public func embedImages(_ raws: [OmniVisionPreprocess.RawPatches]) -> [[Float]]? {
         guard let enc = imageEncoder, !raws.isEmpty else { return nil }
         // While the user is searching, embed ONE image per gate hold so an interactive query preempts
@@ -651,6 +724,21 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             addTokens(enc.lastSequenceLength)
             return v
         }
+    }
+
+    /// embedVideoFrames plus open-vocabulary tags for the clip, scored during the same forward
+    /// (the temporal vision patches feed the same label matmul as image patches). Empty tags
+    /// when no tagger is attached.
+    public func embedVideoFramesTagged(_ frames: [CGImage]) -> (vec: [Float], tags: [String])? {
+        guard let enc = imageEncoder else { return nil }
+        guard let tagger else { return embedVideoFrames(frames).map { ($0, []) } }
+        let r = run(highPriority: false) { () -> (vec: [Float]?, tagScores: [Float]?) in
+            let r = enc.encodeVideo(frames, prefixIds: docPrefix, suffixIds: mediaSuffix, tagger: tagger)
+            addTokens(enc.lastSequenceLength)
+            return r
+        }
+        guard let vec = r.vec else { return nil }
+        return (vec, r.tagScores.map { tagger.finalize($0) } ?? [])
     }
 
     public func embedVideoFrames(_ frames: [CGImage]) -> [Float]? {

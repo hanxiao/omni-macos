@@ -45,6 +45,17 @@ public struct IndexSettings: Sendable, Equatable {
     /// stays searchable. `false` restores read-through behavior: indexing downloads as it goes.
     public var skipDataless: Bool = true
 
+    /// Open-vocabulary image tags (OmniTagger): images indexed while the tagger is ready get a
+    /// content-tag snippet ("kitty, cosy, plush") instead of the bare filename. Rides the same
+    /// embedding forward pass (one extra matmul per image); OFF only disables the extra scoring.
+    /// Existing rows are untouched either way - tags appear as files (re)index.
+    public var imageTags: Bool = true
+
+    /// Bypass the content-dedup shortcut and always run the real embed. TRANSIENT - set only by
+    /// the tag-backfill pass: dedup would otherwise hand a re-tagged file its OWN old (untagged)
+    /// rows back, so the backfill could never converge. Normal indexing never sets this.
+    public var forceFreshEmbed: Bool = false
+
     public init(enabledKinds: Set<FileKind> = [.text, .image, .video, .audio]) {
         self.enabledKinds = enabledKinds
     }

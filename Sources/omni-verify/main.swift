@@ -582,6 +582,108 @@ if args.count >= 2 && args[1] == "refoldprobe" {
 // optionally embedding each segment if a modelDir is given. Tracks peak phys_footprint (host RSS) and
 // MLX GPU peak. The claim under test: peak memory is bounded by frames-in-flight (one segment), NOT
 // by file size or duration. Compare a small clip vs a multi-GB one - peak RSS should be ~flat.
+// Tag probe: omni-verify tagprobe <modelDir> <image...>
+// Validates the OmniTagger pipeline (word-start gate -> label cache -> patch scoring -> NMS)
+// end-to-end through the REAL encoder path, against the Python reference study's example
+// images (cat.jpg -> kitty/cosy/plush..., zebra.jpg -> zebra/stripes/...). First run builds
+// the label cache (~1-2 min, reused after; delete the file to rebuild).
+if args.count >= 4 && args[1] == "tagprobe" {
+    let modelDir = URL(fileURLWithPath: args[2])
+    let engine = try await OmniEngine(modelDir: modelDir, keepAudio: false)
+    let labels = OmniTagger.gatedLabels(modelDir: modelDir)
+    print("tagprobe: \(labels.count) gated labels (dim \(engine.dim))")
+    guard !labels.isEmpty else { print("FAIL: no gated labels parsed"); exit(1) }
+    let cacheURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("omni-tagprobe-d\(engine.dim).cache")
+    if !FileManager.default.fileExists(atPath: cacheURL.path) {
+        let t0 = Date()
+        print("building label cache -> \(cacheURL.path)")
+        guard OmniTagger.buildCache(labels: labels, embedder: engine, to: cacheURL, progress: { done, total in
+            if done % 5120 == 0 || done == total { print("  \(done)/\(total)") }
+        }) else { print("FAIL: cache build"); exit(1) }
+        print(String(format: "cache built in %.1fs", -t0.timeIntervalSinceNow))
+    }
+    guard let tagger = OmniTagger(cacheURL: cacheURL, dim: engine.dim) else {
+        print("FAIL: cache load"); exit(1)
+    }
+    let tSeed = Date()
+    engine.seedTaggerPrior(tagger)   // neutral-image prior BEFORE attach (no-op if persisted)
+    engine.tagger = tagger
+    print(String(format: "prior seeded in %.1fs", -tSeed.timeIntervalSinceNow))
+    for path in args[3...] {
+        let url = URL(fileURLWithPath: path)
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let img = CGImageSourceCreateThumbnailAtIndex(src, 0, [
+                  kCGImageSourceCreateThumbnailFromImageAlways: true,
+                  kCGImageSourceThumbnailMaxPixelSize: 1568,
+                  kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary)
+        else { print("\(url.lastPathComponent): cannot decode"); continue }
+        let raw = OmniVisionPreprocess.preprocessRaw(img)
+        let t0 = Date()
+        guard let (vecs, tags) = engine.embedImagesTagged([raw]), let tag0 = tags.first else {
+            print("\(url.lastPathComponent): embed failed"); continue
+        }
+        let ms = -t0.timeIntervalSinceNow * 1000
+        let norm = vecs[0].reduce(Float(0)) { $0 + $1 * $1 }.squareRoot()
+        print(String(format: "%@ (%.0fms, |v|=%.3f): %@", url.lastPathComponent, ms, norm,
+                     tag0.joined(separator: ", ")))
+    }
+    // A/B overhead: the same batch through the plain embed vs the tagged embed, warm, x3.
+    var abRaws: [OmniVisionPreprocess.RawPatches] = []
+    for path in args[3...] {
+        let url = URL(fileURLWithPath: path)
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let img = CGImageSourceCreateThumbnailAtIndex(src, 0, [
+                  kCGImageSourceCreateThumbnailFromImageAlways: true,
+                  kCGImageSourceThumbnailMaxPixelSize: 1568,
+                  kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary) else { continue }
+        abRaws.append(OmniVisionPreprocess.preprocessRaw(img))
+    }
+    for round in 0 ..< 3 {
+        let tP = Date(); _ = engine.embedImages(abRaws); let plain = -tP.timeIntervalSinceNow * 1000
+        let tT = Date(); _ = engine.embedImagesTagged(abRaws); let tagged = -tT.timeIntervalSinceNow * 1000
+        print(String(format: "A/B round %d (%d imgs): plain=%.0fms tagged=%.0fms overhead=%.1f%%",
+                     round, abRaws.count, plain, tagged, (tagged - plain) / plain * 100))
+    }
+    exit(0)
+}
+
+// Tag speed bench: omni-verify tagbench <modelDir> <image>
+// Per-stage cost of the tagging add-on: GPU score graph + readback (batch A/B, warm) and the
+// CPU finalize breakdown (set OMNI_TAG_TIMING=1 for cen/select/nms splits).
+if args.count >= 4 && args[1] == "tagbench" {
+    let modelDir = URL(fileURLWithPath: args[2])
+    let engine = try await OmniEngine(modelDir: modelDir, keepAudio: false)
+    let cacheURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("omni-tagprobe-d\(engine.dim).cache")
+    if !FileManager.default.fileExists(atPath: cacheURL.path) {
+        let labels = OmniTagger.gatedLabels(modelDir: modelDir)
+        guard OmniTagger.buildCache(labels: labels, embedder: engine, to: cacheURL) else { exit(1) }
+    }
+    guard let tagger = OmniTagger(cacheURL: cacheURL, dim: engine.dim) else { exit(1) }
+    engine.seedTaggerPrior(tagger)
+    engine.tagger = tagger
+    guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: args[3]) as CFURL, nil),
+          let img = CGImageSourceCreateThumbnailAtIndex(src, 0, [
+              kCGImageSourceCreateThumbnailFromImageAlways: true,
+              kCGImageSourceThumbnailMaxPixelSize: 1568] as CFDictionary) else { exit(1) }
+    let raw = OmniVisionPreprocess.preprocessRaw(img)
+    for n in [1, 2, 4, 8] {
+        let r = engine.embedImagesTagged(Array(repeating: raw, count: n))
+        print("batch \(n): tags per img = \(r?.tags.map { $0.count } ?? [])")
+    }
+    let batch = Array(repeating: raw, count: 8)
+    _ = engine.embedImagesTagged(batch)   // warm
+    _ = engine.embedImages(batch)
+    for round in 0 ..< 3 {
+        let tP = Date(); _ = engine.embedImages(batch); let plain = -tP.timeIntervalSinceNow * 1000
+        let tT = Date(); let r = engine.embedImagesTagged(batch); let tagged = -tT.timeIntervalSinceNow * 1000
+        print(String(format: "round %d: plain=%.1fms tagged=%.1fms overhead=%.2fms/img (tags: %@)",
+                     round, plain, tagged, (tagged - plain) / 8, r?.tags.first?.joined(separator: ",") ?? "-"))
+    }
+    exit(0)
+}
+
 if args.count >= 3 && args[1] == "mediamem" {
     let url = URL(fileURLWithPath: args[2])
     let fileSize = ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.intValue ?? 0
