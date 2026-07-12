@@ -534,6 +534,15 @@ public final class VectorStore: @unchecked Sendable {
             );
         """)
         exec("CREATE INDEX IF NOT EXISTS idx_path ON chunks(path);")
+        // Partial COVERING index for the tag: search filter - the term scan reads only media
+        // rows' (kind, snippet, path) from ~MBs of index pages instead of dragging the whole
+        // chunks B-tree (whose leaves carry the ~1.5KB vec blobs, gigabytes of I/O) through the
+        // page cache: measured 450-1050ms cold -> tens of ms. Partial (media kinds only) keeps
+        // it small; additive and invisible to older app versions; built once at open.
+        exec("""
+            CREATE INDEX IF NOT EXISTS idx_media_snippet ON chunks(kind, snippet, path)
+            WHERE kind IN ('image','scan','video');
+            """)
         // Additive, lazy migration for indexes created before the display-metadata columns existed:
         // ADD COLUMN is an O(1) metadata change (no table rewrite, no forced reindex), and existing
         // rows default to 0 so the UI just falls back to a one-time on-disk read for them. Done
