@@ -220,6 +220,11 @@ private struct HistorySections: View {
                         Spacer(minLength: 0)
                         if item.isFile, !item.bookmarked, let k = item.fileKind, let fk = FileKind(rawValue: k), fk != .text {
                             Image(systemName: fk.symbol).font(.caption2).foregroundStyle(.tertiary)
+                        } else if !item.isFile,
+                                  SearchQueryParser.parse(item.displayText).qualifiers.contains(where: { $0.key == "tag" }) {
+                            // Same trailing-glyph treatment as the file rows' kind symbol: a
+                            // quiet hint that this query filters by content tag.
+                            Image(systemName: "tag").font(.caption2).foregroundStyle(.tertiary)
                         }
                     }
                     .help(item.isFile ? (item.filePath ?? item.displayLabel) : item.displayText)
