@@ -2165,6 +2165,15 @@ final class AppModel {
             return
         }
         query = ""; rawQuery = ""        // the text field empties; the chip represents the query
+        // Tag qualifiers live ONLY in the query language - with the box emptied they must not
+        // silently keep constraining this file's results (a leftover tag:beard filtered a
+        // photo's similar-search down to beard-tagged files). The other filter dimensions keep
+        // their long-standing carryover: the toolbar can still drive them during a file query.
+        if !filterTags.isEmpty || !filterTagsExclude.isEmpty {
+            suppressFilterEffects = true
+            filterTags = ""; filterTagsExclude = ""
+            suppressFilterEffects = false
+        }
         // A query image (a dropped/pasted bitmap under query-images) is ephemeral regardless of how we
         // got here - fresh search, re-search, or a history re-run - so detect it by path. That keeps it
         // out of recents and routes its bookmark toggle to remove-not-demote, consistently.
