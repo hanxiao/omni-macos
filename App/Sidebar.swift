@@ -103,6 +103,17 @@ struct Sidebar: View {
             if case .folder(let url) = sel { model.selectFolderForVisualization(url) }
             else { model.selectFolderForVisualization(nil) }
         }
+        // Editing the query by hand invalidates a selected saved search: deselect (Finder drops
+        // the smart-folder highlight the same way). This also fixes a dead click - selection is
+        // sticky, so re-clicking the still-selected row never fired onChange and the results
+        // stayed on the typed query.
+        .onChange(of: model.rawQuery) { _, raw in
+            if case .history(let id) = selection,
+               let item = model.searchHistory.first(where: { $0.id == id }),
+               item.displayText != raw {
+                selection = nil
+            }
+        }
         // Keep the highlight in sync with the ACTIVE query (text or file). When the active query no
         // longer matches the selected history row, drop the selection - otherwise the row stays
         // "stuck" selected and clicking it again is a no-op (no selection change = no re-run), which
