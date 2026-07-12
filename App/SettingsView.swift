@@ -418,6 +418,19 @@ private struct PerformanceTab: View {
     var body: some View {
         Form {
             Section {
+                Toggle("Search as you type", isOn: Binding(
+                    get: { model.instantSearchEnabled },
+                    set: { model.instantSearchEnabled = $0 }
+                ))
+                .toggleStyle(.switch)
+            } header: {
+                Text("Search")
+            } footer: {
+                Text("Off: results update when you press Return instead of on every keystroke.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            Section {
                 Picker("Max image size", selection: Binding(get: { model.maxImageDimension }, set: { model.maxImageDimension = $0 })) {
                     Text("1024 px").tag(1024)
                     Text("1280 px").tag(1280)

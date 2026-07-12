@@ -20,8 +20,13 @@ struct ContentView: View {
         model.applyParsedQuery(raw)
         model.suggestionsAllowed = true   // this fires only on real keystrokes (the .searchable set:), so arm the dropdown
         if !model.query.isEmpty, model.fileQuery != nil { model.fileQuery = nil; model.queryError = nil }
-        if model.fileQuery == nil { scheduleSearch() }
-        scheduleHistoryRecord()
+        // Instant search off: typing still parses filters and pops suggestions, but the search
+        // itself waits for Return (.onSubmit) - kinder to low-end GPUs. Clearing the box always
+        // runs (its empty-query path clears the stale results); auto-history records only what
+        // actually searched (Return records via onSubmit).
+        let cleared = raw.trimmingCharacters(in: .whitespaces).isEmpty
+        if model.fileQuery == nil, model.instantSearchEnabled || cleared { scheduleSearch() }
+        if model.instantSearchEnabled { scheduleHistoryRecord() }
     }
 
     var body: some View {
@@ -568,7 +573,7 @@ struct ContentView: View {
                 let neg = tok.hasPrefix("-") ? "-" : ""
                 let low = (neg.isEmpty ? tok : String(tok.dropFirst())).lowercased()
                 if !low.isEmpty {
-                    for k in ["type:", "ext:", "in:", "date:", "after:", "score:", "sort:"] where k.hasPrefix(low) {
+                    for k in ["type:", "tag:", "ext:", "in:", "date:", "after:", "score:", "sort:"] where k.hasPrefix(low) {
                         out.append(Suggestion(label: neg + k, completion: "\(prefix)\(neg)\(k)", icon: "line.3.horizontal.decrease.circle"))
                     }
                 }

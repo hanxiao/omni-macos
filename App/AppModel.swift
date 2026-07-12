@@ -623,6 +623,10 @@ final class AppModel {
     var filterKinds: Set<FileKind> = [] { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
     var filterFolder: URL? = nil { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
     var filterExt: String = "" { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
+    /// Content-tag filter (`tag:bear`, comma-separated any-of; exclude via `-tag:x`). Matched
+    /// whole-tag against the generated media tag snippets, resolved store-side.
+    var filterTags: String = "" { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
+    var filterTagsExclude: String = "" { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
     var dateRange: DateRange = .any { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
     var minScore: Double = defaultMinScore { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: false) } } }
     var sortOrder: SortOrder = .relevance { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: false) } } }
@@ -683,6 +687,13 @@ final class AppModel {
             persistPerf()
             if !skipDatalessFiles { startIndexing() }
         }
+    }
+
+    /// Search-as-you-type (default). OFF = the search runs on Return only; typing still parses
+    /// filters and offers suggestions. Kinder to low-end GPUs, where every keystroke's embed +
+    /// scan is noticeable.
+    var instantSearchEnabled: Bool = true {
+        didSet { guard oldValue != instantSearchEnabled else { return }; persistPerf() }
     }
 
     /// Open-vocabulary image tags: newly indexed images get a content-tag snippet ("cat, couch,
@@ -1039,12 +1050,25 @@ final class AppModel {
     var isResolving: Bool {
         if let fq = fileQuery { return searching || resolvedQuery != fileToken(fq.url) }
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        // With instant search OFF, typed-but-unsubmitted text is a deliberate rest state, not a
+        // pending search - without this the empty-state spinner would spin forever.
+        guard instantSearchEnabled || searching else { return false }
         return !q.isEmpty && (searching || resolvedQuery != q)
+    }
+
+    /// Re-run the visible query after background index changes (a pass, a reconcile, a retag
+    /// batch). Gated so instant-search-OFF never embeds a half-typed, never-submitted query:
+    /// refresh only what the user actually searched (query == resolvedQuery) or when instant
+    /// search would have searched it anyway.
+    private func refreshSearchAfterBackgroundChange() {
+        guard !query.isEmpty, instantSearchEnabled || query == resolvedQuery else { return }
+        scheduleSearch()
     }
 
     var filtersActive: Bool {
         !filterKinds.isEmpty || filterFolder != nil
-            || !filterExt.isEmpty || dateRange != .any
+            || !filterExt.isEmpty || !filterTags.isEmpty || !filterTagsExclude.isEmpty
+            || dateRange != .any
             || minScore != Self.defaultMinScore
     }
 
@@ -1176,7 +1200,7 @@ final class AppModel {
             if !drop.isEmpty { store.deletePaths(drop); store.compact() }
             await MainActor.run {
                 self.refreshIndexStats(store)
-                if !self.query.isEmpty { self.scheduleSearch() }
+                self.refreshSearchAfterBackgroundChange()
                 self.startIndexing()   // pick up files the new policy now allows
             }
         }
@@ -1363,6 +1387,7 @@ final class AppModel {
         if d.object(forKey: "omni.minTextChars") != nil { minTextChars = max(0, d.integer(forKey: "omni.minTextChars")) }
         if d.object(forKey: "omni.skipDataless") != nil { skipDatalessFiles = d.bool(forKey: "omni.skipDataless") }
         if d.object(forKey: "omni.imageTags") != nil { imageTagsEnabled = d.bool(forKey: "omni.imageTags") }
+        if d.object(forKey: "omni.instantSearch") != nil { instantSearchEnabled = d.bool(forKey: "omni.instantSearch") }
     }
     private func persistPerf() {
         let d = UserDefaults.standard
@@ -1376,6 +1401,7 @@ final class AppModel {
         d.set(minTextChars, forKey: "omni.minTextChars")
         d.set(skipDatalessFiles, forKey: "omni.skipDataless")
         d.set(imageTagsEnabled, forKey: "omni.imageTags")
+        d.set(instantSearchEnabled, forKey: "omni.instantSearch")
     }
 
     // MARK: - Filters
@@ -1432,6 +1458,14 @@ final class AppModel {
                 sawType = true
                 let kinds = qual.value.split(separator: ",").compactMap { Self.mapKind(String($0)) }
                 if qual.negated { excludeKinds.formUnion(kinds) } else { includeKinds.formUnion(kinds) }
+            case "tag":
+                // Accumulate like type: does - "tag:beach tag:sunset" means any-of, matching
+                // what the qualifier chips display (last-one-wins would silently drop chips).
+                if qual.negated {
+                    filterTagsExclude = filterTagsExclude.isEmpty ? qual.value : filterTagsExclude + "," + qual.value
+                } else {
+                    filterTags = filterTags.isEmpty ? qual.value : filterTags + "," + qual.value
+                }
             case "ext": filterExt = qual.value.hasPrefix(".") ? String(qual.value.dropFirst()) : qual.value
             case "in":  if let url = Self.resolveFolder(qual.value) { filterFolder = url }
             case "date": if let d = DateRange(rawValue: qual.value.lowercased()) { dateRange = d }
@@ -1458,6 +1492,7 @@ final class AppModel {
     /// Reset every filter dimension to its default (caller holds the applyingParsedQuery guard).
     private func resetAllFilters() {
         filterKinds = []; filterExt = ""; filterFolder = nil
+        filterTags = ""; filterTagsExclude = ""
         dateRange = .any; minScore = Self.defaultMinScore; sortOrder = .relevance
     }
 
@@ -1493,6 +1528,8 @@ final class AppModel {
             }
             parts.append("type:" + kinds.map { $0.rawValue }.sorted().joined(separator: ",") + neg)
         }
+        if !filterTags.isEmpty { parts.append("tag:" + Self.quoteIfNeeded(filterTags)) }
+        if !filterTagsExclude.isEmpty { parts.append("-tag:" + Self.quoteIfNeeded(filterTagsExclude)) }
         if !filterExt.isEmpty { parts.append("ext:" + filterExt) }
         if let f = filterFolder { parts.append("in:" + Self.quoteIfNeeded(f.path)) }
         if dateRange != .any { parts.append("date:" + dateRange.rawValue) }
@@ -1603,6 +1640,10 @@ final class AppModel {
         f.folderPrefix = filterFolder?.path
         f.ext = filterExt.isEmpty ? nil : filterExt
         f.since = dateRange.since
+        // Terms only; the store resolves them to path sets on its own queue (cached), so no
+        // snippet scan ever runs on the main thread.
+        f.tagTerms = filterTags.split(separator: ",").map(String.init).filter { !$0.isEmpty }
+        f.tagExcludeTerms = filterTagsExclude.split(separator: ",").map(String.init).filter { !$0.isEmpty }
         return f
     }
 
@@ -2065,7 +2106,7 @@ final class AppModel {
                             self.pendingCatchUpRoots.append(contentsOf: batch.filter { self.roots.contains($0) })
                         }
                         self.refreshIndexStats(store)
-                        if !self.query.isEmpty { self.scheduleSearch() }
+                        self.refreshSearchAfterBackgroundChange()
                         self.drainDeferredAfterPass(store)   // removals/restart/catch-ups/FS queued mid-pass
                         self.refitFolderMapIfPending()
                     }
@@ -2096,7 +2137,7 @@ final class AppModel {
                 store.compact()
                 await MainActor.run {
                     self.refreshIndexStats(store)
-                    if !self.query.isEmpty { self.scheduleSearch() }
+                    self.refreshSearchAfterBackgroundChange()
                 }
             }
         }
@@ -2424,6 +2465,21 @@ final class AppModel {
 
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else {
+            // A standalone tag filter ("tag:beard" with no search text) is the natural way to
+            // browse a tag: list every match, newest first, instead of an empty screen.
+            if !filterTags.isEmpty || !filterTagsExclude.isEmpty {
+                searching = true
+                searchWorkTask = Task.detached(priority: .userInitiated) {
+                    if Task.isCancelled { return }
+                    let hits = store.listMatching(filter: filter, topK: 60)
+                    await MainActor.run {
+                        guard token == self.searchToken else { return }
+                        self.applyResults(hits, resolved: self.rawQuery)
+                        self.searching = false
+                    }
+                }
+                return
+            }
             rawResults = []; resolvedQuery = ""; searching = false
             refitFolderVizIfNeeded()   // empty box + a folder still selected -> back to its map
             return
@@ -2698,7 +2754,7 @@ final class AppModel {
                                 store.compact()
                                 await MainActor.run {
                                     self.refreshIndexStats(store)
-                                    if !self.query.isEmpty { self.scheduleSearch() }
+                                    self.refreshSearchAfterBackgroundChange()
                                     if !self.roots.isEmpty { self.startIndexing() }
                                 }
                             }
@@ -2714,7 +2770,7 @@ final class AppModel {
                         }
                         self.indexState = p.cancelled ? .paused : .idle
                         self.refreshIndexStats(store)
-                        if !self.query.isEmpty { self.scheduleSearch() }
+                        self.refreshSearchAfterBackgroundChange()
                         if !p.cancelled { self.drainPendingFSChanges() }
                         self.refitFolderMapIfPending()
                     }
@@ -2775,7 +2831,7 @@ final class AppModel {
                 store.compact()
                 await MainActor.run {
                     self.refreshIndexStats(store)
-                    if !self.query.isEmpty { self.scheduleSearch() }
+                    self.refreshSearchAfterBackgroundChange()
                     self.drainDeferredAfterPass(store)   // removals drained; continue the chain
                 }
             }
@@ -2919,7 +2975,7 @@ final class AppModel {
                     // The re-tagged rows are already in the store: refresh the live results so
                     // the tags the user just "requested" by searching appear without another
                     // keystroke.
-                    if !self.query.isEmpty { self.scheduleSearch() }
+                    self.refreshSearchAfterBackgroundChange()
                     // Anything that queued while the batch ran (FS events, root changes) drains
                     // first; the chain's tail re-enters here for the next batch once idle again.
                     self.drainDeferredAfterPass(store)
@@ -2948,7 +3004,7 @@ final class AppModel {
                 self.activeRoots.subtract(touched)
                 self.markIndexed(store)   // a reconcile brought the index current just now
                 self.refreshIndexStats(store)
-                if !self.query.isEmpty { self.scheduleSearch() }
+                self.refreshSearchAfterBackgroundChange()
                 self.fsReconcileInFlight = false
                 // Work queued while this reconcile ran (folder removals, a deferred full pass,
                 // added roots, more FS events) drains in one place, in fixed priority.

@@ -133,9 +133,22 @@ public struct SearchFilter: Sendable {
     public var folderPrefix: String? = nil    // restrict to a folder (path-boundary aware)
     public var ext: String? = nil             // restrict to a file extension (no dot)
     public var since: Double? = nil           // modified >= since (epoch seconds)
+    /// Content-tag terms (`tag:bear` / `-tag:cat`): the file's generated tag snippet must
+    /// contain (any of) `tagTerms` and none of `tagExcludeTerms`, matched as whole tags.
+    /// Snippets are not resident, so the store resolves these into path sets at search entry
+    /// (resolveTagFilterLocked) - a cached single scan on the serial queue, never per row.
+    public var tagTerms: [String] = []
+    public var tagExcludeTerms: [String] = []
+    // Resolved by the store at search entry from tagTerms/tagExcludeTerms; per-row checks
+    // then cost one Set lookup on the resident canonical path.
+    var tagAllow: Set<String>? = nil
+    var tagDeny: Set<String>? = nil
 
     /// No constraints set - the common plain-query case (enables the GPU candidate fast path).
-    var isEmpty: Bool { kinds.isEmpty && folderPrefix == nil && (ext?.isEmpty ?? true) && since == nil }
+    var isEmpty: Bool {
+        kinds.isEmpty && folderPrefix == nil && (ext?.isEmpty ?? true) && since == nil
+            && tagTerms.isEmpty && tagExcludeTerms.isEmpty
+    }
 
     public init() {}
 
@@ -144,6 +157,8 @@ public struct SearchFilter: Sendable {
         if let f = folderPrefix, !(path == f || path.hasPrefix(f + "/")) { return false }
         if let e = ext, !e.isEmpty, !Self.hasExtensionCI(path, e) { return false }
         if let s = since, modified < s { return false }
+        if let allow = tagAllow, !allow.contains(path) { return false }
+        if let deny = tagDeny, deny.contains(path) { return false }
         return true
     }
 
@@ -432,6 +447,7 @@ public final class VectorStore: @unchecked Sendable {
     private func resetAggregatesLocked() { liveFiles = 0; kindFileCounts.removeAll(keepingCapacity: true); extFileCounts.removeAll(keepingCapacity: true) }
     /// Add one chunk for file `fid`; on the file's first live chunk (0->1) bump the aggregates.
     @inline(__always) private func fileChunkInc(_ fid: Int32, _ kind: String, _ path: String) {
+        invalidateTagFilterCacheLocked()   // any row change can add/remove a tag match
         if fileChunkCount[Int(fid)] == 0 {
             liveFiles += 1
             kindFileCounts[kind, default: 0] += 1
@@ -441,6 +457,7 @@ public final class VectorStore: @unchecked Sendable {
     }
     /// Drop one chunk for file `fid`; on its last live chunk (1->0) decrement the aggregates.
     @inline(__always) private func fileChunkDec(_ fid: Int32, _ kind: String, _ path: String) {
+        invalidateTagFilterCacheLocked()
         let n = fileChunkCount[Int(fid)] - 1
         fileChunkCount[Int(fid)] = n
         if n == 0 {
@@ -1070,6 +1087,7 @@ public final class VectorStore: @unchecked Sendable {
             rows = []; flat16.releaseAll(); presentPaths = []; fileID = []; pathID = [:]; idPath = []; fileChunkCount = []
             kindCode = []; kindID = [:]; idKind = []; invalidateBase()
             resetAggregatesLocked()
+            invalidateTagFilterCacheLocked()   // wipe bypasses fileChunkDec; keep the invariant
             dim = 0
             checkpointIfDueLocked(forceStat: true)   // a full wipe inflates the WAL; fold it (self-review fix)
         }
@@ -1154,6 +1172,32 @@ public final class VectorStore: @unchecked Sendable {
             }
         }
         return out
+    }
+
+    /// Filter-only listing (no semantic query): every file passing `filter`, newest first.
+    /// Powers standalone tag browsing ("tag:beard" with an empty search box). Resident walk +
+    /// the winners' snippet fill - no GPU, no embedding.
+    public func listMatching(filter: SearchFilter, topK: Int = 60) -> [SearchHit] {
+        queue.sync {
+            guard dbOpen(), !rows.isEmpty else { return [] }
+            let f = resolveTagFilterLocked(filter)
+            var firstRow: [Int32: Int] = [:]   // fid -> first row index (carries the file's metadata)
+            for i in rows.indices {
+                let r = rows[i]
+                guard f.accepts(path: r.path, kind: r.kind, modified: r.modified) else { continue }
+                let fid = fileID[i]
+                if firstRow[fid] == nil { firstRow[fid] = i }
+            }
+            let winners = firstRow.values.sorted { rows[$0].modified > rows[$1].modified }.prefix(topK)
+            let hits = winners.map { i -> SearchHit in
+                let r = rows[i]
+                return SearchHit(path: r.path, score: 0, snippet: "", kind: r.kind,
+                                 chunkIndex: r.chunkIndex, modified: r.modified,
+                                 width: r.width, height: r.height, duration: r.duration,
+                                 locator: r.locator, chunkCount: Int(fileChunkCount[Int(fileID[i])]))
+            }
+            return fillSnippetsLocked(hits)
+        }
     }
 
     /// Content-identity keys for ONLY the given paths, from the dedup sidecar: two paths with the
@@ -1473,6 +1517,9 @@ public final class VectorStore: @unchecked Sendable {
         let tCall = Self.searchTiming ? Date() : nil
         return queue.sync {
             if let tCall { print(String(format: "[search] lockwait=%.1fms", -tCall.timeIntervalSinceNow * 1000)) }
+            // tag: terms resolve to path sets here, on the queue (cached across keystrokes; a
+            // tag-filtered query always takes this classic path - onlyKindFiltered is false).
+            let filter = resolveTagFilterLocked(filter)
             let n = rows.count
             guard n > 0, dim > 0, query.count == dim, flat16.count == n * dim else { return [] }
             if markActive { lastSearchAt = Date() }   // stamp AFTER the guard so an empty/invalid query never fakes a search window
@@ -1652,7 +1699,11 @@ public final class VectorStore: @unchecked Sendable {
     private func rerankLocked(coarse: [Float], n: Int, query: [Float], filter: SearchFilter, topK: Int) -> [Float] {
         let C = min(baseRows, min(4096, max(1024, topK * 32)))
         let kinds = filter.kinds, hasKind = !kinds.isEmpty, since = filter.since
+        // tagAllow/tagDeny are path-based prefilters exactly like folder/ext: they MUST gate
+        // candidate selection here, or a tag-filtered quant-mode query silently loses every
+        // match whose coarse score falls outside the global top-C.
         let pathFiltered = filter.folderPrefix != nil || (filter.ext?.isEmpty == false)
+            || filter.tagAllow != nil || filter.tagDeny != nil
         var kindAllowed = [Bool](repeating: false, count: 256)
         if hasKind { for k in kinds { if let id = kindID[k] { kindAllowed[Int(id)] = true } } }
 
@@ -1760,6 +1811,61 @@ public final class VectorStore: @unchecked Sendable {
     /// single kind toggle dropped the query onto the O(N) host scan.
     private func onlyKindFiltered(_ f: SearchFilter) -> Bool {
         f.folderPrefix == nil && (f.ext?.isEmpty ?? true) && f.since == nil
+            && f.tagTerms.isEmpty && f.tagExcludeTerms.isEmpty
+    }
+
+    // MARK: - Tag-term filter resolution
+
+    /// Cache of tag-term resolutions (terms-key -> matching path set). A small dictionary, not
+    /// a single slot: an allow + deny pair in one query and the keystroke prefixes of a term
+    /// each get their own entry, so typing "tag:beach -tag:night" scans each distinct term set
+    /// once. Cleared whole by EVERY row mutation via fileChunkInc/Dec, so a just-(re)tagged
+    /// file is immediately findable through `tag:`.
+    private var tagFilterCache: [String: Set<String>] = [:]
+    private static let tagFilterCacheCap = 8
+    func invalidateTagFilterCacheLocked() { if !tagFilterCache.isEmpty { tagFilterCache.removeAll(keepingCapacity: true) } }
+
+    /// Resolve `tagTerms`/`tagExcludeTerms` into resident path sets (locked; called at search
+    /// entry). Whole-tag, case-insensitive match against the ", "-joined tag snippets of media
+    /// rows: snippet normalized to ",a,b,c," then LIKE '%,term,%' - no partial-word hits
+    /// ("cat" never matches "scattered"). One indexed scan per distinct term list, cached.
+    private func resolveTagFilterLocked(_ f: SearchFilter) -> SearchFilter {
+        guard !f.tagTerms.isEmpty || !f.tagExcludeTerms.isEmpty else { return f }
+        var out = f
+        if !f.tagTerms.isEmpty { out.tagAllow = pathsMatchingTagTermsLocked(f.tagTerms) }
+        if !f.tagExcludeTerms.isEmpty { out.tagDeny = pathsMatchingTagTermsLocked(f.tagExcludeTerms) }
+        return out
+    }
+
+    private func pathsMatchingTagTermsLocked(_ terms: [String]) -> Set<String> {
+        // Generated tags are >= 3-char lowercase words (the word-start gate), so shorter terms
+        // can never match: return empty WITHOUT scanning - this also makes the first two
+        // keystrokes of a tag term free while the user types it.
+        let norm = terms.map { $0.lowercased().trimmingCharacters(in: .whitespaces) }
+            .filter { $0.count >= 3 && !$0.contains("%") && !$0.contains("_") }
+        guard !norm.isEmpty, dbOpen() else { return [] }
+        let key = norm.sorted().joined(separator: ",")
+        if let cached = tagFilterCache[key] { return cached }
+        var paths = Set<String>()
+        var stmt: OpaquePointer?
+        // One pass over the media rows; per-term OR of whole-tag LIKEs on the normalized list.
+        // The snippet-equals-filename guard excludes untagged fallback rows: a filename like
+        // "Beach, Sunset.JPG" must not make an untagged file answer to tag:beach.
+        let clauses = norm.map { _ in "(',' || REPLACE(LOWER(snippet), ', ', ',') || ',') LIKE ('%,' || ? || ',%')" }
+            .joined(separator: " OR ")
+        let sql = """
+            SELECT DISTINCT path FROM chunks
+            WHERE kind IN ('image','scan','video')
+              AND substr(path, -length(snippet)) <> snippet
+              AND (\(clauses));
+            """
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        for (i, t) in norm.enumerated() { sqlite3_bind_text(stmt, Int32(i + 1), t, -1, SQLITE_TRANSIENT) }
+        while sqlite3_step(stmt) == SQLITE_ROW { paths.insert(String(cString: sqlite3_column_text(stmt, 0))) }
+        if tagFilterCache.count >= Self.tagFilterCacheCap { tagFilterCache.removeAll(keepingCapacity: true) }
+        tagFilterCache[key] = paths
+        return paths
     }
 
     /// Best-chunk-per-file + top-K on the GPU for the full-mode plain-query path. Winner parity

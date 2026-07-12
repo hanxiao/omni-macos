@@ -205,13 +205,15 @@ private struct HistorySections: View {
                         } else {
                             Image(systemName: "magnifyingglass").foregroundStyle(Color.secondary).frame(width: 16)
                         }
-                        Text(item.displayLabel).lineLimit(1).truncationMode(item.isFile ? .middle : .tail)
+                        HistoryQueryLabel(item: item)
                         Spacer(minLength: 0)
                         if item.isFile, !item.bookmarked, let k = item.fileKind, let fk = FileKind(rawValue: k), fk != .text {
                             Image(systemName: fk.symbol).font(.caption2).foregroundStyle(.tertiary)
                         }
                     }
-                    .help(item.isFile ? (item.filePath ?? item.displayLabel) : item.query)
+                    // Full raw query (all qualifiers included) on hover - the chips show at
+                    // most three, and the +N overflow badge has no disclosure of its own.
+                    .help(item.isFile ? (item.filePath ?? item.displayLabel) : item.displayText)
                     .contextMenu {
                         Button(item.bookmarked ? "Remove bookmark" : "Bookmark") { model.toggleHistoryBookmark(item) }
                         Divider()
@@ -222,6 +224,52 @@ private struct HistorySections: View {
             }
         }
     }
+}
+
+/// A history row's label: the semantic text plus each `key:value` qualifier rendered as a mini
+/// capsule (the sidebar-sized cousin of the QualifierBar chips), so "sunset type:image tag:beach"
+/// reads as structured filters instead of raw token soup. File queries keep the plain filename.
+/// The parser is pure and micro-cheap, and HistorySections only re-renders on history changes.
+private struct HistoryQueryLabel: View {
+    let item: HistoryItem
+
+    var body: some View {
+        if item.isFile {
+            Text(item.displayLabel).lineLimit(1).truncationMode(.middle)
+        } else {
+            let parsed = SearchQueryParser.parse(item.displayText)
+            HStack(spacing: 4) {
+                if !parsed.semanticText.isEmpty {
+                    Text(parsed.semanticText).lineLimit(1).truncationMode(.tail)
+                }
+                // Chips render at intrinsic size (long values pre-shortened, never squished by
+                // layout - a squeezed middle-truncation turns "type image" into "t... i...e");
+                // overflow past the row edge just clips, and the row tooltip has the full query.
+                ForEach(Array(parsed.qualifiers.prefix(3).enumerated()), id: \.offset) { _, q in
+                    HStack(spacing: 2) {
+                        if q.negated { Text("-").foregroundStyle(.tertiary) }
+                        Text(q.key).fontWeight(.medium).foregroundStyle(.tint)
+                        Text(shortValue(q.value)).foregroundStyle(.secondary)
+                    }
+                    .font(.caption2)
+                    .padding(.horizontal, 5).padding(.vertical, 1)
+                    .background(.quaternary, in: Capsule())
+                    .fixedSize()
+                }
+                if parsed.qualifiers.count > 3 {
+                    Text("+\(parsed.qualifiers.count - 3)").font(.caption2).foregroundStyle(.tertiary)
+                }
+            }
+        }
+    }
+}
+
+/// Middle-shorten a chip value in TEXT (not layout) so folder paths keep head and tail:
+/// "/Users/hanxiao/Documents/Projects" -> "/Users/h…rojects".
+private func shortValue(_ v: String, cap: Int = 18) -> String {
+    guard v.count > cap else { return v }
+    let keep = (cap - 1) / 2
+    return "\(v.prefix(keep))\u{2026}\(v.suffix(keep))"
 }
 
 /// iCloud-Drive-style transfer indicator. Matches Finder's sidebar pie: a faint monochrome

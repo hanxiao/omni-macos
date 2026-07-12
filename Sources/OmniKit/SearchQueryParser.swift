@@ -30,6 +30,7 @@ public enum SearchQueryParser {
     public static func canonicalKey(_ word: String) -> String? {
         switch word {
         case "type", "kind": return "type"
+        case "tag", "tags": return "tag"
         case "ext", "extension": return "ext"
         case "in", "folder", "path": return "in"
         case "date": return "date"
@@ -49,7 +50,7 @@ public enum SearchQueryParser {
     private static let qualifierRegex: NSRegularExpression? = {
         // (start-of-string or whitespace) then an optional '-', a whitelisted key, ':', and a value
         // that is either a quoted string or a run of non-space characters.
-        let pattern = #"(?:^|\s)(-?(?:type|kind|ext|extension|in|folder|path|date|after|since|score|relevance|min|sort):(?:"[^"]*"|\S+))"#
+        let pattern = #"(?:^|\s)(-?(?:type|kind|tag|tags|ext|extension|in|folder|path|date|after|since|score|relevance|min|sort):(?:"[^"]*"|\S+))"#
         return try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
     }()
 
