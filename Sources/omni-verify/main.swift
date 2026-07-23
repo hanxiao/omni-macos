@@ -1689,6 +1689,103 @@ if args.count >= 3 && args[1] == "embbench" {
     exit(0)
 }
 
+// Tokenizer-vs-GPU split: omni-verify tokbench <modelDir> <rootDir> [secs]
+// A text-indexing flush is tokenizeParallel (all cores) then encodeTokenBatchesPipelined (GPU),
+// run back to back, so its wall is T_tok + T_gpu. This measures each half separately on REAL
+// files under <rootDir> (indexer's chunk window: 1800 chars, 200 overlap; length-sorted batches
+// of 16, 6-batch flush windows) and reports the tokenizer's share of the flush - the "is the
+// tokenizer the bottleneck" number. Also times single-query tokenization for the search path.
+if args.count >= 4 && args[1] == "tokbench" {
+    let dir = URL(fileURLWithPath: args[2])
+    let root = URL(fileURLWithPath: args[3])
+    let secs = (args.count >= 5 ? Double(args[4]) : nil) ?? 10
+    let exts: Set<String> = ["txt", "md", "swift", "py", "js", "ts", "json", "html", "csv", "yml", "yaml", "sh", "log", "tex"]
+    func gatherTexts() -> [String] {
+        var texts: [String] = []
+        var bytes = 0
+        if let walker = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey]) {
+            for case let url as URL in walker {
+                if bytes >= 24 << 20 { break }
+                guard exts.contains(url.pathExtension.lowercased()),
+                      let s = try? String(contentsOf: url, encoding: .utf8), !s.isEmpty else { continue }
+                texts.append(s); bytes += s.utf8.count
+            }
+        }
+        return texts
+    }
+    let texts = gatherTexts()
+    guard !texts.isEmpty else { print("no text files under \(root.path)"); exit(1) }
+    var chunks: [String] = []
+    for t in texts {
+        if t.count <= 1800 { chunks.append(t); continue }
+        var idx = t.startIndex
+        while true {
+            let end = t.index(idx, offsetBy: 1800, limitedBy: t.endIndex) ?? t.endIndex
+            chunks.append(String(t[idx ..< end]))
+            if end == t.endIndex { break }
+            idx = t.index(idx, offsetBy: 1600, limitedBy: t.endIndex) ?? t.endIndex
+        }
+    }
+    // Length-sorted batches of 16 grouped into 6-batch flush windows, the indexer's shape.
+    chunks.sort { $0.count < $1.count }
+    var windows: [[[String]]] = []
+    var i = 0
+    while i + 96 <= chunks.count || (windows.isEmpty && i < chunks.count) {
+        var groups: [[String]] = []
+        var j = i
+        while j < min(i + 96, chunks.count) { groups.append(Array(chunks[j ..< min(j + 16, chunks.count)])); j += 16 }
+        windows.append(groups); i += 96
+    }
+    let corpusBytes = chunks.reduce(0) { $0 + $1.utf8.count }
+    print("tokbench corpus: \(texts.count) files, \(chunks.count) chunks, \(corpusBytes >> 20) MB, \(windows.count) flush windows")
+    let cfg = try OmniConfig(modelDir: dir)
+    let weights = try WeightStore(modelDir: dir, loraScale: cfg.loraScale, keepVision: false)
+    let enc = try await OmniTextEncoder(modelDir: dir, weights: weights, config: cfg)
+    _ = enc.encodeBatch(Array(chunks.prefix(16)), as: .passage)                    // warm kernels
+    // (a) tokenization half, exactly as embedTextBatches runs it: tokenizeParallel per batch.
+    var tokTokens = 0, tokBytes = 0, tokWindows = 0
+    var t0 = Date()
+    var deadline = t0.addingTimeInterval(secs / 2)
+    outer: while Date() < deadline {
+        for w in windows {
+            let ids = w.map { enc.tokenizeParallel($0, .passage) }
+            tokTokens += ids.reduce(0) { $0 + $1.reduce(0) { $0 + $1.count } }
+            tokBytes += w.reduce(0) { $0 + $1.reduce(0) { $0 + $1.utf8.count } }
+            tokWindows += 1
+            if Date() >= deadline { break outer }
+        }
+    }
+    let tokWall = -t0.timeIntervalSinceNow
+    // (b) GPU half on pre-tokenized ids, one pipelined call per flush window.
+    let pretok = windows.map { w in w.map { enc.tokenizeParallel($0, .passage) } }
+    var gpuTokens = 0, gpuWindows = 0
+    t0 = Date()
+    deadline = t0.addingTimeInterval(secs / 2)
+    outer2: while Date() < deadline {
+        for w in pretok {
+            _ = enc.encodeTokenBatchesPipelined(w)
+            gpuTokens += enc.lastSequenceLength
+            gpuWindows += 1
+            if Date() >= deadline { break outer2 }
+        }
+    }
+    let gpuWall = -t0.timeIntervalSinceNow
+    let tokPerWin = tokWall / Double(tokWindows)                 // seconds per 96-chunk flush
+    let gpuPerWin = gpuWall / Double(gpuWindows)
+    // (c) search path: one short query, tokenize only.
+    let q = "quarterly report beach sunset photo"
+    t0 = Date()
+    for _ in 0 ..< 2000 { _ = enc.tokenIds(q, .query) }
+    let qUS = -t0.timeIntervalSinceNow / 2000 * 1e6
+    print(String(format: "tokenize: %.1f MB/s  %.2f Mtok/s  (%.1f ms per 96-chunk flush)",
+                 Double(tokBytes) / tokWall / 1e6, Double(tokTokens) / tokWall / 1e6, tokPerWin * 1e3))
+    print(String(format: "gpu:      %.0f tok/s              (%.1f ms per 96-chunk flush)",
+                 Double(gpuTokens) / gpuWall, gpuPerWin * 1e3))
+    print(String(format: "flush share: tokenizer %.1f%%, gpu %.1f%%   query tokenize: %.0f us",
+                 100 * tokPerWin / (tokPerWin + gpuPerWin), 100 * gpuPerWin / (tokPerWin + gpuPerWin), qUS))
+    exit(0)
+}
+
 // Concurrency benchmark: omni-verify concbench [N] [dim] [queries]
 // Drives the REAL VectorStore and measures search latency (a) idle with a warm cache and (b) while
 // the store is being mutated by new-file inserts (the "search during indexing" case), plus
