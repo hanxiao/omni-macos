@@ -565,6 +565,44 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     /// Tokenization runs in parallel up front, off the GPU path. Output order matches input.
     public func embedTextBatches(_ batches: [[String]], as type: OmniInputType) -> [[[Float]]] {
         if batches.isEmpty { return [] }
+        // TOKENIZE-AHEAD: for an indexing flush, a producer thread tokenizes batches in order
+        // while the pipelined encode consumes them, so batch K+1's (all-core) BPE runs during
+        // batch K's GPU forward and only batch 0's tokenization is paid on the wall. Measured
+        // serial cost it hides: 18ms tokenize vs 319ms GPU per 96-chunk flush (tokbench, real
+        // files, nano/M3 Ultra). Ids, batch order, and per-batch graphs are unchanged, so
+        // vectors are bit-identical to the serial path (flushsum-verified). The producer runs
+        // at the caller's QoS; it only ever WAITS to be consumed, never on the consumer, so
+        // there is no circular wait. OMNI_TOK_OVERLAP=0 restores tokenize-everything-first.
+        if type != .query, batches.count > 1, Self.tokOverlapEnabled {
+            let slots = TokenSlots(count: batches.count)
+            nonisolated(unsafe) let enc = textEncoder
+            let qos = DispatchQoS.QoSClass(rawValue: qos_class_self()) ?? .utility
+            DispatchQueue.global(qos: qos).async {
+                for (i, b) in batches.enumerated() { slots.put(i, enc.tokenizeParallel(b, type)) }
+            }
+            let window = interactiveQueryActive ? 1 : Self.indexGateWindow
+            if window < batches.count {
+                // Windowed gate holds (interactive search active, or OMNI_INDEX_GATE_BATCHES):
+                // one producer spans all windows, so tokenization also proceeds BETWEEN holds.
+                var out: [[[Float]]] = []; out.reserveCapacity(batches.count)
+                var i = 0
+                while i < batches.count {
+                    let lo = i, hi = Swift.min(i + window, batches.count)
+                    out.append(contentsOf: run(highPriority: false) {
+                        let r = textEncoder.encodeTokenBatchesPipelined(count: hi - lo) { slots.take(lo + $0) }
+                        addTokens(textEncoder.lastSequenceLength)
+                        return r
+                    })
+                    i = hi
+                }
+                return out
+            }
+            return run(highPriority: false) {
+                let v = textEncoder.encodeTokenBatchesPipelined(count: batches.count) { slots.take($0) }
+                addTokens(textEncoder.lastSequenceLength)
+                return v
+            }
+        }
         // Tokenize every batch across cores BEFORE taking the serial gate, so the GPU pipeline
         // inside run() is never stalled waiting on the (single-threaded per call) BPE tokenizer.
         let tokenized = batches.map { textEncoder.tokenizeParallel($0, type) }
@@ -611,6 +649,25 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         return run(highPriority: type == .query) {
             let v = textEncoder.encodeTokenBatchesPipelined(tokenized)
             if type != .query { addTokens(textEncoder.lastSequenceLength) }
+            return v
+        }
+    }
+
+    /// Tokenize-ahead flag for indexing flushes (see embedTextBatches). Default ON.
+    public static let tokOverlapEnabled = ProcessInfo.processInfo.environment["OMNI_TOK_OVERLAP"] != "0"
+
+    /// Ordered handoff of tokenized batches from the tokenize-ahead producer to the pipelined
+    /// encode. take(i) blocks until put(i) has landed; each slot is filled once and taken once.
+    private final class TokenSlots: @unchecked Sendable {
+        private let cond = NSCondition()
+        private var slots: [[[Int]]?]
+        init(count: Int) { slots = Array(repeating: nil, count: count) }
+        func put(_ i: Int, _ ids: [[Int]]) { cond.lock(); slots[i] = ids; cond.broadcast(); cond.unlock() }
+        func take(_ i: Int) -> [[Int]] {
+            cond.lock()
+            while slots[i] == nil { cond.wait() }
+            let v = slots[i]!; slots[i] = nil
+            cond.unlock()
             return v
         }
     }

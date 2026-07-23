@@ -1786,6 +1786,73 @@ if args.count >= 4 && args[1] == "tokbench" {
     exit(0)
 }
 
+// Flush parity checksum: omni-verify flushsum <modelDir> <rootDir> [windows]
+// Runs engine.embedTextBatches over tokbench-style real-file flush windows and prints an FNV
+// hash over every output vector's exact bits. Run twice, OMNI_TOK_OVERLAP=0 vs =1: equal hashes
+// prove the tokenize-ahead path is bit-identical to the serial path.
+if args.count >= 4 && args[1] == "flushsum" {
+    let dir = URL(fileURLWithPath: args[2])
+    let root = URL(fileURLWithPath: args[3])
+    let maxWindows = (args.count >= 5 ? Int(args[4]) : nil) ?? 12
+    let exts: Set<String> = ["txt", "md", "swift", "py", "js", "ts", "json", "html", "csv", "yml", "yaml", "sh", "log", "tex"]
+    func gatherTexts() -> [String] {
+        var texts: [String] = []
+        var bytes = 0
+        if let walker = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey]) {
+            for case let url as URL in walker {
+                if bytes >= 24 << 20 { break }
+                guard exts.contains(url.pathExtension.lowercased()),
+                      let s = try? String(contentsOf: url, encoding: .utf8), !s.isEmpty else { continue }
+                texts.append(s); bytes += s.utf8.count
+            }
+        }
+        return texts
+    }
+    let texts = gatherTexts()
+    guard !texts.isEmpty else { print("no text files under \(root.path)"); exit(1) }
+    var chunks: [String] = []
+    for t in texts {
+        if t.count <= 1800 { chunks.append(t); continue }
+        var idx = t.startIndex
+        while true {
+            let end = t.index(idx, offsetBy: 1800, limitedBy: t.endIndex) ?? t.endIndex
+            chunks.append(String(t[idx ..< end]))
+            if end == t.endIndex { break }
+            idx = t.index(idx, offsetBy: 1600, limitedBy: t.endIndex) ?? t.endIndex
+        }
+    }
+    chunks.sort { $0.count < $1.count }
+    let engine = try await OmniEngine(modelDir: dir)
+    _ = engine.embedTextBatches([Array(chunks.prefix(16))], as: .passage)          // warm kernels
+    let t0 = Date()
+    var h: UInt64 = 14695981039346656037
+    var vecs = 0
+    // Sample windows ACROSS the length-sorted list (stride), not just its short head, so the
+    // measured mix matches the corpus's real chunk-length distribution.
+    let total = chunks.count / 96
+    let take = min(maxWindows, total)
+    let stride = max(1, total / max(1, take))
+    var starts: [Int] = []
+    var w = 0
+    while starts.count < take, w < total { starts.append(w * 96); w += stride }
+    for i in starts {
+        var groups: [[String]] = []
+        var j = i
+        while j < i + 96 { groups.append(Array(chunks[j ..< j + 16])); j += 16 }
+        for batch in engine.embedTextBatches(groups, as: .passage) {
+            for v in batch {
+                vecs += 1
+                for f in v { for b in withUnsafeBytes(of: f.bitPattern, Array.init) { h = (h ^ UInt64(b)) &* 1099511628211 } }
+            }
+        }
+    }
+    let wall = -t0.timeIntervalSinceNow
+    let overlap = ProcessInfo.processInfo.environment["OMNI_TOK_OVERLAP"] ?? "default"
+    print(String(format: "flushsum overlap=%@  %d vectors  fnv=%016llx  %.2fs  %.1f chunks/s",
+                 overlap, vecs, h, wall, Double(vecs) / wall))
+    exit(0)
+}
+
 // Concurrency benchmark: omni-verify concbench [N] [dim] [queries]
 // Drives the REAL VectorStore and measures search latency (a) idle with a warm cache and (b) while
 // the store is being mutated by new-file inserts (the "search during indexing" case), plus

@@ -139,17 +139,28 @@ public final class OmniTextEncoder: @unchecked Sendable {
     ///
     /// Falls back to a plain per-batch loop when the flag is off.
     public func encodeTokenBatchesPipelined(_ batches: [[[Int]]]) -> [[[Float]]] {
-        if batches.isEmpty { return [] }
+        encodeTokenBatchesPipelined(count: batches.count) { batches[$0] }
+    }
+
+    /// Pipelined encode pulling batch i's ids from `provider` right before its graph is built,
+    /// so a caller can tokenize batch i+1 on another thread while batch i's forward runs on the
+    /// GPU (see OmniEngine.embedTextBatches tokenize-ahead). `provider` is called exactly once
+    /// per index, in order, on this thread; it may block until that batch's ids are ready. The
+    /// array overload above routes through here with an immediate provider, so both forms build
+    /// the identical graph per batch - vectors are bit-identical either way.
+    public func encodeTokenBatchesPipelined(count: Int, provider: (Int) -> [[Int]]) -> [[[Float]]] {
+        if count == 0 { return [] }
         if !Self.asyncEvalEnabled {
             var total = 0
-            let out = batches.map { b -> [[Float]] in let v = encodeTokenBatch(b); total += lastSequenceLength; return v }
+            let out = (0 ..< count).map { i -> [[Float]] in let v = encodeTokenBatch(provider(i)); total += lastSequenceLength; return v }
             lastSequenceLength = total
             return out
         }
-        var results = [[[Float]]](repeating: [], count: batches.count)
+        var results = [[[Float]]](repeating: [], count: count)
         var pending: (stacked: MLXArray, count: Int, index: Int)? = nil
         var total = 0
-        for (i, ids) in batches.enumerated() {
+        for i in 0 ..< count {
+            let ids = provider(i)
             if ids.isEmpty { results[i] = []; continue }
             let (embeds, lengths) = backbone.embedBatch(ids)
             total += lengths.reduce(0, +)
