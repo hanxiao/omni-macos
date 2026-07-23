@@ -1786,6 +1786,37 @@ if args.count >= 4 && args[1] == "tokbench" {
     exit(0)
 }
 
+// Streamed-video A/B: omni-verify vidbench <modelDir> <videoFile>
+// Indexes ONE video through the real Indexer (video kind only) into a fresh store and prints
+// wall time plus the store path (embedding blobs hashed externally for parity). A/B with
+// OMNI_VIDEO_PRE_OVERLAP=0 vs =1: same chunks, bit-identical vectors, less wall on multi-
+// segment videos (prefetch runs the CPU patchify during the GPU forward).
+if args.count >= 4 && args[1] == "vidbench" {
+    let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    let src = URL(fileURLWithPath: args[3])
+    let tmpRoot = FileManager.default.temporaryDirectory.appendingPathComponent("vidb-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: tmpRoot, withIntermediateDirectories: true)
+    try FileManager.default.copyItem(at: src, to: tmpRoot.appendingPathComponent(src.lastPathComponent))
+    defer { try? FileManager.default.removeItem(at: tmpRoot) }
+    let tmpDB = FileManager.default.temporaryDirectory.appendingPathComponent("vidb-\(UUID().uuidString).sqlite")
+    let store = try VectorStore(dbURL: tmpDB)
+    let idx = Indexer(store: store, embedder: engine)
+    let benchSettings = IndexSettings(enabledKinds: [.video])
+    let t0 = Date()
+    await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+        let done = NSLock(); nonisolated(unsafe) var fired = false
+        idx.index(roots: [tmpRoot], settings: benchSettings, force: true) { p in
+            if p.done {
+                done.lock(); let go = !fired; fired = true; done.unlock()
+                if go { cont.resume() }
+            }
+        }
+    }
+    let overlap = ProcessInfo.processInfo.environment["OMNI_VIDEO_PRE_OVERLAP"] ?? "default"
+    print(String(format: "vidbench overlap=%@  %.2fs  db=%@", overlap, Date().timeIntervalSince(t0), tmpDB.path))
+    exit(0)
+}
+
 // Flush parity checksum: omni-verify flushsum <modelDir> <rootDir> [windows]
 // Runs engine.embedTextBatches over tokbench-style real-file flush windows and prints an FNV
 // hash over every output vector's exact bits. Run twice, OMNI_TOK_OVERLAP=0 vs =1: equal hashes

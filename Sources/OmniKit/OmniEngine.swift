@@ -887,18 +887,28 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     public func embedVideoFramesTagged(_ frames: [CGImage]) -> (vec: [Float], tags: [String])? {
         guard let enc = imageEncoder else { return nil }
         guard let tagger else { return embedVideoFrames(frames).map { ($0, []) } }
-        let r = run(highPriority: false) { () -> (vec: [Float]?, tagScores: [Float]?) in
-            let r = enc.encodeVideo(frames, prefixIds: docPrefix, suffixIds: mediaSuffix, tagger: tagger)
+        // CPU patchify OFF the gate (measured 185ms per 32-frame segment held it): a waiting
+        // query grabs the gate that much sooner during video indexing. Same graph as encodeVideo
+        // (which is exactly preprocessRaw + tensor + encode), so vectors are bit-identical.
+        guard let raw = OmniVideoPreprocess.preprocessRaw(frames) else { return nil }
+        let r = run(highPriority: false) { () -> (vec: [Float], tagScores: [Float]?) in
+            let r = enc.encode(pixelValues: raw.tensor(), gridTHW: raw.gridTHW,
+                               prefixIds: docPrefix, suffixIds: mediaSuffix, tagger: tagger)
             addTokens(enc.lastSequenceLength)
             return r
         }
-        guard let vec = r.vec else { return nil }
-        return (vec, r.tagScores.map { tagger.finalize($0) } ?? [])
+        return (r.vec, r.tagScores.map { tagger.finalize($0) } ?? [])
     }
 
     public func embedVideoFrames(_ frames: [CGImage]) -> [Float]? {
         guard let enc = imageEncoder, !frames.isEmpty else { return nil }
-        return run(highPriority: false) { let v = enc.encodeVideo(frames, prefixIds: docPrefix, suffixIds: mediaSuffix); addTokens(enc.lastSequenceLength); return v }
+        // Same off-gate CPU patchify as embedVideoFramesTagged.
+        guard let raw = OmniVideoPreprocess.preprocessRaw(frames) else { return nil }
+        return run(highPriority: false) {
+            let v = enc.encode(pixelValues: raw.tensor(), gridTHW: raw.gridTHW, prefixIds: docPrefix, suffixIds: mediaSuffix)
+            addTokens(enc.lastSequenceLength)
+            return v
+        }
     }
 
     public func embedAudio(_ url: URL) -> [Float]? {
