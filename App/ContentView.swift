@@ -71,10 +71,11 @@ struct ContentView: View {
                 .navigationSplitViewColumnWidth(min: 230, ideal: 260, max: 320)
         } detail: {
             detail
-                // No navigationTitle/navigationSubtitle: either one claims the leading toolbar slot and
-                // pushes back/forward to its right. The window's title TEXT is hidden (WindowTitleHider)
-                // so back/forward own the true leading edge with no "Omni" label - while the toolbar
-                // keeps its Liquid Glass material (unlike .hiddenTitleBar, which would strip it).
+                // No navigationTitle/navigationSubtitle: either one claims the leading toolbar slot
+                // and pushes back/forward to its right. The WINDOW title ("Omni", from the Window
+                // scene) stays visible - stock titlebar chrome on Sequoia is load-bearing (system
+                // sidebar toggle, tracking separator, divider-drag rendering), and Tahoe shows the
+                // title too.
                 .toolbar { toolbar }
                 .background(WindowTitleHider(onSearchByFile: { model.searchByFilePanel() }))
         }
@@ -809,17 +810,18 @@ private struct WindowTitleHider: NSViewRepresentable {
     /// Called when the in-field search-by-file button is clicked.
     var onSearchByFile: () -> Void
 
-    /// Window/toolbar tuner (an invisible background view holding an NSWindow.didUpdate observer;
-    /// every pass is guard-cheap and no-ops when nothing changed):
-    /// - pre-Tahoe: re-asserts `titleVisibility = .hidden`. SwiftUI's toolbar rebuilds (phase
-    ///   changes, item updates) reset it back to visible after the one-shot hide below, which is
-    ///   why the title - and with it Sequoia's vertical title-area separator - kept showing on
-    ///   macOS 14/15. Also caps the search field at Tahoe's ~300pt so it stops swallowing the
-    ///   flexible space that pushes the trailing controls right. On macOS 26 both are untouched -
-    ///   Tahoe's toolbar is already the reference layout.
-    /// - all systems: keeps the search-by-file button installed INSIDE the search field's trailing
-    ///   edge (magnifier left, upload right - Spotlight-style), docking it left of the clear (x)
-    ///   button whenever the field has text. Reinstalled whenever SwiftUI recreates the field.
+    /// Toolbar tuner (an invisible background view holding coalesced observers; despite the
+    /// legacy name it no longer touches the window title - stock Sequoia titlebar chrome, i.e.
+    /// the visible "Omni" title, the system sidebar toggle, and the split tracking separator,
+    /// proved load-bearing: every attempt to hide any of them broke another state - the toggle
+    /// vanished, section layout collapsed, or divider drags misrendered). What it does do:
+    /// - pre-Tahoe: caps the search field at Tahoe's ~300pt and installs the flexible-space
+    ///   width constraint on the chevrons item so the trailing cluster hugs the right edge.
+    /// - all systems: keeps the search-by-file button installed INSIDE the search field's
+    ///   trailing edge (magnifier left, upload right), docking left of the clear (x) button
+    ///   whenever the field has text, and shrinks the stock magnifier to match.
+    /// All work runs in a coalesced main.async pass - never synchronously inside a window or
+    /// toolbar notification, where mutations mid-SwiftUI-commit are unsafe.
     final class TunerView: NSView {
         var onSearchByFile: (() -> Void)?
         // nonisolated(unsafe): deinit is nonisolated under strict concurrency; the view lives and
@@ -832,13 +834,6 @@ private struct WindowTitleHider: NSViewRepresentable {
             guard observers.isEmpty, window != nil else { return }
             scheduleApply()
             let nc = NotificationCenter.default
-            // Observers only SCHEDULE work; nothing layout-affecting runs synchronously in a
-            // notification. NSWindow.didUpdate and the toolbar item notifications fire in the
-            // middle of SwiftUI's own commit, and every synchronous mutation tried there -
-            // insertItem, removeItem, even activating a layout constraint - intermittently
-            // tripped a SwiftUI update-within-update precondition at launch (three distinct crash
-            // reports, one per approach). A coalesced main.async pass runs between runloop turns,
-            // after SwiftUI's commit, and is invisible at interaction speed.
             observers.append(nc.addObserver(forName: NSWindow.didUpdateNotification, object: window, queue: nil) { [weak self] _ in
                 self?.scheduleApply()
             })
@@ -866,12 +861,9 @@ private struct WindowTitleHider: NSViewRepresentable {
         }
 
         private func apply(_ w: NSWindow) {
-            if #unavailable(macOS 26.0) {
-                if w.titleVisibility != .hidden { w.titleVisibility = .hidden }
-            }
             guard let toolbar = w.toolbar else { return }
             if #unavailable(macOS 26.0) {
-                shapeToolbar(toolbar)
+                installStretch(toolbar)
             }
             for item in toolbar.items {
                 guard let s = item as? NSSearchToolbarItem else { continue }
@@ -882,58 +874,21 @@ private struct WindowTitleHider: NSViewRepresentable {
             }
         }
 
-        private var reshaping = false
-
-        /// Pre-Tahoe toolbar shape, idempotent:
-        /// - blank out the split-view tracking separator, the vertical line that continues the
-        ///   sidebar divider through the toolbar on macOS 14/15; Tahoe draws none. HIDE its view
-        ///   rather than remove the item: removal collapses the sidebar/detail toolbar sectioning
-        ///   and takes the system sidebar toggle with it (observed).
-        /// - inject the native .flexibleSpace item after the back/forward item so the trailing
-        ///   cluster and the capped search field hug the right edge like Tahoe. Every SwiftUI-side
-        ///   stretch alternative failed in practice: a Spacer toolbar item is dropped outright, and
-        ///   a maxWidth-infinity item held its stretch only until the next toolbar reconciliation.
-        private func shapeToolbar(_ toolbar: NSToolbar) {
-            // The guard lives HERE, around every mutation path: insertItem fires willAdd
-            // SYNCHRONOUSLY (before the item is in `items`), so an unguarded notification handler
-            // re-entering this function saw "no flexible space yet" and inserted a duplicate
-            // (observed live: two NSToolbarFlexibleSpaceItems after a search).
-            guard !reshaping else { return }
-            reshaping = true
-            defer { reshaping = false }
-            for item in toolbar.items where item.itemIdentifier.rawValue.hasPrefix("com.apple.SwiftUI.splitViewSeparator") {
-                guard let v = item.view else { continue }
-                // alpha 0, NOT isHidden: the tracking separator's view anchors the toolbar's
-                // sidebar/detail section partition, and hiding it collapses that layout - the
-                // flexible space went zero-width and everything packed left (measured live:
-                // search field at x=493 hidden vs x=1586 transparent). Transparent keeps the
-                // partition and draws no line.
-                if v.isHidden { v.isHidden = false }
-                if v.alphaValue != 0 { v.alphaValue = 0 }
-            }
-            // Enforce POSITION, not mere presence: SwiftUI rebuilds re-insert their items before
-            // an existing flexible space (observed live: [chevrons][search][flex] after a search,
-            // flex last pushes nothing). The invariant is flex immediately after the back/forward
-            // item - the first SwiftUI-UUID-identified item - and before the trailing cluster.
+        /// Pre-Tahoe flexible space WITHOUT touching the item list: programmatic insert/remove on
+        /// a SwiftUI-owned toolbar is pruned/reordered by reconciliation (the per-click flash) and
+        /// consults SwiftUI's delegate mid-flight. Instead the chevrons item's HOSTING VIEW gets
+        /// the classic flexible-toolbar-item recipe - a huge width constraint at low priority.
+        /// AppKit stretches it over the slack, the SwiftUI content fills leading-aligned
+        /// (LegacyToolbarStretch + the clear filler), and the item list never changes.
+        /// Re-installed whenever SwiftUI swaps the hosting view (the identifier marks it done).
+        private func installStretch(_ toolbar: NSToolbar) {
             func isSwiftUIItem(_ id: NSToolbarItem.Identifier) -> Bool {
                 id.rawValue.count == 36 && id.rawValue.filter { $0 == "-" }.count == 4
             }
-            // Flexible space WITHOUT touching the item list: programmatic insertItem/removeItem on
-            // a SwiftUI-owned toolbar consults SwiftUI's toolbar delegate mid-flight and
-            // intermittently tripped a SwiftUI update-within-update precondition at launch (two
-            // crash reports), and reconciliation pruned/reordered injected items anyway (the
-            // per-click flash). Instead, the chevrons item's HOSTING VIEW gets the classic
-            // flexible-toolbar-item recipe: a huge width constraint at low priority. AppKit's
-            // constraint-based toolbar layout stretches it over the slack (other items' required
-            // constraints win for their natural sizes), the SwiftUI content inside fills
-            // leading-aligned (LegacyToolbarStretch + the clear filler), and nothing in the item
-            // list changes - no delegate, no reconciliation fight. Re-installed whenever SwiftUI
-            // swaps the hosting view on a rebuild (the constraint identifier marks it done).
             let items = toolbar.items
             // The chevrons item is the FIRST SwiftUI-UUID item (declaration order; the system
             // toggle and tracking separator that precede it carry com.apple identifiers).
-            let uuidIdxs = items.indices.filter { isSwiftUIItem(items[$0].itemIdentifier) }
-            guard let chevronsIdx = uuidIdxs.first,
+            guard let chevronsIdx = items.firstIndex(where: { isSwiftUIItem($0.itemIdentifier) }),
                   let hostView = items[chevronsIdx].view else { return }
             let marker = "omni.legacy-flex"
             if !hostView.constraints.contains(where: { $0.identifier == marker }) {
@@ -944,17 +899,16 @@ private struct WindowTitleHider: NSViewRepresentable {
             }
         }
 
-        /// The upload button lives as a subview of the NSSearchField, frame-pinned to the trailing
-        /// edge; when the field has text it steps left so the system clear (x) button stays fully
-        /// clickable. Defensive by construction: if any expectation fails the button simply does
-        /// not appear - the field itself is never altered.
+        /// The upload button lives as a subview of the NSSearchField, frame-pinned to the pill's
+        /// trailing edge; when the field has text it steps left so the system clear (x) button
+        /// stays fully clickable. Defensive by construction: if any expectation fails the button
+        /// simply does not appear - the field itself is never altered.
         private func installAccessory(in field: NSSearchField) {
             let side: CGFloat = 20   // hit target + hover-highlight capsule; the glyph inside is 11pt
             let hasText = !field.stringValue.isEmpty
             // Anchor to the CELL's cancel-button rect - the pill's true inner trailing edge. The
             // NSSearchField view can extend past the drawn pill (trailing padding), so math off
-            // bounds.width parked the button visually outside the field. Empty field: sit where
-            // the (hidden) x would be; with text: step left so the x stays fully clickable.
+            // bounds.width parked the button visually outside the field.
             let cancelRect = (field.cell as? NSSearchFieldCell)?.cancelButtonRect(forBounds: field.bounds)
                 ?? NSRect(x: field.bounds.width - 24, y: 0, width: 16, height: field.bounds.height)
             let x = hasText ? cancelRect.minX - side - 2 : cancelRect.maxX - side
@@ -1003,14 +957,9 @@ private struct WindowTitleHider: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         let v = TunerView()
         v.onSearchByFile = onSearchByFile
-        // The view isn't in a window yet at make time; defer one hop to grab it.
-        DispatchQueue.main.async { v.window?.titleVisibility = .hidden }
         return v
     }
     func updateNSView(_ nsView: NSView, context: Context) {
         (nsView as? TunerView)?.onSearchByFile = onSearchByFile
-        // updateNSView already runs on the main thread; set directly and only when it actually differs,
-        // so SwiftUI's frequent updates (every keystroke / indexing tick) don't schedule a redundant hop.
-        if let w = nsView.window, w.titleVisibility != .hidden { w.titleVisibility = .hidden }
     }
 }
