@@ -85,7 +85,9 @@ struct ContentView: View {
     @ViewBuilder private var detail: some View {
         switch model.phase {
         case .loadingModel:
-            CenteredStatus(symbol: "brain", title: "Loading the Omni model", subtitle: "Starting the on-device model\u{2026}", showSpinner: true, progress: model.loadingProgress)
+            // No subtitle: it repeated the title ("Starting the on-device model..." under "Loading
+            // the Omni model"), and the determinate bar already communicates the wait.
+            CenteredStatus(symbol: "brain", title: "Loading the Omni model", subtitle: "", showSpinner: true, progress: model.loadingProgress)
         case .noModel:
             OnboardingView()
         case .failed(let msg):
@@ -692,8 +694,10 @@ struct CenteredStatus: View {
         VStack(spacing: 12) {
             Image(systemName: symbol).font(.system(size: 44, weight: .light)).foregroundStyle(.tertiary)
             Text(title).font(.title)
-            Text(subtitle).font(.callout).foregroundStyle(.secondary)
-                .multilineTextAlignment(.center).frame(maxWidth: 400)
+            if !subtitle.isEmpty {
+                Text(subtitle).font(.callout).foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center).frame(maxWidth: 400)
+            }
             if let progress {
                 ProgressView(value: progress)
                     .progressViewStyle(.linear)
