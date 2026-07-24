@@ -350,12 +350,11 @@ struct ContentView: View {
         // its trail. Grouped so on Tahoe they share one Liquid Glass pill.
         ToolbarItem(placement: .navigation) {
             HStack(spacing: 0) {
-                // A completely empty toolbar item has zero intrinsic size, and AppKit on macOS 14/15
-                // logs an "ambiguous width/height" warning for it on every toolbar layout pass. A 1pt
-                // clear filler gives the item a size without a visible footprint (pre-26 only).
-                if #unavailable(macOS 26.0) {
-                    Color.clear.frame(width: 1, height: 1)
-                }
+                // A completely empty toolbar item has zero intrinsic size, and AppKit logs an
+                // "ambiguous width/height" warning for it on every toolbar layout pass - measured
+                // on macOS 26 too (12 hits at launch), not just 14/15, so the filler is
+                // unconditional. 1pt of clear gives the item a size without a visible footprint.
+                Color.clear.frame(width: 1, height: 1)
                 if model.phase == .ready, model.canGoBack || model.canGoForward {
                     ControlGroup {
                         // The View menu owns Cmd-[ / Cmd-] (single owner, avoids a duplicate-shortcut
@@ -371,12 +370,8 @@ struct ContentView: View {
                     }
                     .fixedSize()
                 }
-                if #unavailable(macOS 26.0) {
-                    // 1pt filler: a completely empty toolbar item has zero intrinsic size and AppKit
-                    // logs an ambiguous-size warning for it on every layout pass before the chevrons
-                    // first appear.
-                    Color.clear.frame(width: 1, height: 1)
-                }
+                // Trailing 1pt filler, same reason as the leading one (all systems).
+                Color.clear.frame(width: 1, height: 1)
             }
         }
         // Flexible space after back/forward pushes every other control to the trailing edge (chevrons
@@ -871,7 +866,10 @@ private struct WindowTitleHider: NSViewRepresentable {
                 if b.frame != want { b.frame = want }
                 return
             }
-            guard let icon = NSImage(systemSymbolName: "square.and.arrow.up",
+            // photo.badge.magnifyingglass: the SAME symbol this action already wears in the
+            // empty-state hint row and the file-query chip. square.and.arrow.up was tried first
+            // and read as Share - which it literally is elsewhere in this app (context menus).
+            guard let icon = NSImage(systemSymbolName: "photo.badge.magnifyingglass",
                                      accessibilityDescription: "Search by a file") else { return }
             // Shrink the field's own magnifier to the same 11pt so the two glyphs read as one
             // family (the stock loupe is drawn noticeably larger). Idempotent via the cell tag.
