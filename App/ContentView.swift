@@ -333,18 +333,12 @@ struct ContentView: View {
     }
 
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
-        // macOS 26 (Tahoe) shows the NavigationSplitView sidebar toggle automatically; macOS 15 and
-        // earlier don't, so add an explicit one there (toggleSidebar: travels the responder chain to the
-        // split view controller backing NavigationSplitView). Declared BEFORE back/forward so the leading
-        // order is [sidebar][< >], matching Finder (on Tahoe the system toggle is already left of these).
-        if #unavailable(macOS 26.0) {
-            ToolbarItem(placement: .navigation) {
-                Button { NSApp.sendAction(Selector(("toggleSidebar:")), to: nil, from: nil) } label: {
-                    Image(systemName: "sidebar.left")
-                }
-                .help("Show or hide the sidebar")
-            }
-        }
+        // No explicit sidebar toggle on ANY macOS: NavigationSplitView provides the system one on
+        // Sequoia too - in the sidebar column next to the traffic lights, exactly where Finder puts
+        // it (and it follows the sidebar into the detail edge when collapsed). The former
+        // #unavailable(macOS 26) button here was added on the belief that pre-Tahoe lacked the
+        // automatic toggle; in reality it duplicated it, so macOS 14/15 showed TWO toggles (one per
+        // toolbar section). Tahoe never had the extra button, so its toolbar is unchanged.
         // Finder-style back/forward at the leading edge of the content toolbar. The window's title TEXT
         // is hidden (WindowTitleHider), so the chevrons own the leading edge with no "Omni" label. The
         // toolbar ITEM is unconditional and wraps the chevrons in an always-present HStack: a directly
@@ -355,6 +349,14 @@ struct ContentView: View {
         // its trail. Grouped so on Tahoe they share one Liquid Glass pill.
         ToolbarItem(placement: .navigation) {
             HStack(spacing: 0) {
+                // A completely empty toolbar item has zero intrinsic size, and AppKit on macOS 14/15
+                // logs an "ambiguous width/height" warning for it on every toolbar layout pass (a
+                // dozen times at launch, before the chevrons first appear). A 1pt clear filler gives
+                // the item a size without a visible footprint. Pre-26 only, so the Tahoe Liquid
+                // Glass pill grouping stays byte-identical.
+                if #unavailable(macOS 26.0) {
+                    Color.clear.frame(width: 1, height: 1)
+                }
                 if model.phase == .ready, model.canGoBack || model.canGoForward {
                     ControlGroup {
                         // The View menu owns Cmd-[ / Cmd-] (single owner, avoids a duplicate-shortcut
