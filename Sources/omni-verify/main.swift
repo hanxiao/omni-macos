@@ -2167,7 +2167,13 @@ if args.count >= 2 && args[1] == "loadbench" {
         if !batch.isEmpty { try store.replaceMany(batch) }
     }   // store deinits here (WAL checkpoint), simulating a clean prior exit
     var times: [Double] = []
-    for _ in 0..<5 { let t = Date(); _ = try VectorStore(dbURL: tmp); times.append(-t.timeIntervalSinceNow*1000) }
+    // close() each store: it stamps the row sidecar (quant-mode indexes), so iteration 1 measures
+    // the full SQLite scan and iterations 2+ measure sidecar adoption when it is enabled.
+    for i in 0..<5 {
+        let t = Date(); let s = try VectorStore(dbURL: tmp); let ms = -t.timeIntervalSinceNow*1000
+        s.close(); times.append(ms)
+        print(String(format: "  open #%d: %.0f ms", i + 1, ms))
+    }
     times.sort()
     print(String(format: "loadbench N=%d dim=%d  VectorStore reopen (loadIntoMemory): median %.0f ms  min %.0f ms", N, dim, times[times.count/2], times.first ?? 0))
     print("  -> opt 2A overlaps this with the engine load, removing it from launch wall-clock")
