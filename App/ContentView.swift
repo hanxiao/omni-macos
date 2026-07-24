@@ -76,7 +76,7 @@ struct ContentView: View {
                 // so back/forward own the true leading edge with no "Omni" label - while the toolbar
                 // keeps its Liquid Glass material (unlike .hiddenTitleBar, which would strip it).
                 .toolbar { toolbar }
-                .background(WindowTitleHider())
+                .background(WindowTitleHider(onSearchByFile: { model.searchByFilePanel() }))
         }
     }
 
@@ -381,18 +381,15 @@ struct ContentView: View {
         if #available(macOS 26.0, *) {
             ToolbarSpacer(.flexible)
         }
-        // Search by a file (any modality - the embedding space is shared). Available whenever the
-        // app can search, since it can start a query from the empty state too. Trailing placement so
-        // everything except back/forward is right-aligned (back/forward own the leading edge).
-        if model.phase == .ready {
-            ToolbarItem(placement: .primaryAction) {
-                // The File menu owns the Shift-Cmd-O shortcut (always present); this is the
-                // click target naming the same chord.
-                Button { model.searchByFilePanel() } label: { Image(systemName: "photo.badge.magnifyingglass") }
-                    .help("Search by a file (image, audio, video, or text)  \u{21E7}\u{2318}O")
-                    .accessibilityLabel("Search by a file")
-            }
-        }
+        // Pre-Tahoe gets the equivalent flexible space from WindowTitleHider's tuner, which inserts
+        // AppKit's native .flexibleSpace NSToolbarItem after the chevrons: a SwiftUI
+        // `ToolbarItem { Spacer() }` is silently DROPPED on macOS 14/15 (verified via the live
+        // NSToolbar's item list), so without the AppKit item nothing separates the leading chevrons
+        // from the trailing cluster and the stretchy search field parks every control center-left.
+        // Search by a file lives INSIDE the search field (trailing upload glyph, installed by
+        // WindowTitleHider's tuner - magnifier left, upload right), not as a separate toolbar
+        // button. The File menu owns the Shift-Cmd-O shortcut; the in-field button is the click
+        // target naming the same chord.
         // Bookmark the current search. The only way into History when recording is set to "Only when
         // I bookmark", and a quick save otherwise. Appears once there's a search to keep.
         if model.phase == .ready, model.hasActiveSearch {
@@ -780,13 +777,119 @@ struct EngineFailedView: View {
 /// SwiftUI re-asserts `.visible` from the Window scene's title; the window keeps its "Omni" title for
 /// the Window menu, Mission Control, and Stage Manager.
 private struct WindowTitleHider: NSViewRepresentable {
+    /// Called when the in-field search-by-file button is clicked.
+    var onSearchByFile: () -> Void
+
+    /// Window/toolbar tuner (an invisible background view holding an NSWindow.didUpdate observer;
+    /// every pass is guard-cheap and no-ops when nothing changed):
+    /// - pre-Tahoe: re-asserts `titleVisibility = .hidden`. SwiftUI's toolbar rebuilds (phase
+    ///   changes, item updates) reset it back to visible after the one-shot hide below, which is
+    ///   why the title - and with it Sequoia's vertical title-area separator - kept showing on
+    ///   macOS 14/15. Also caps the search field at Tahoe's ~300pt so it stops swallowing the
+    ///   flexible space that pushes the trailing controls right. On macOS 26 both are untouched -
+    ///   Tahoe's toolbar is already the reference layout.
+    /// - all systems: keeps the search-by-file button installed INSIDE the search field's trailing
+    ///   edge (magnifier left, upload right - Spotlight-style), docking it left of the clear (x)
+    ///   button whenever the field has text. Reinstalled whenever SwiftUI recreates the field.
+    final class TunerView: NSView {
+        var onSearchByFile: (() -> Void)?
+        // nonisolated(unsafe): deinit is nonisolated under strict concurrency; the view lives and
+        // dies on the main thread, so the unregistration is race-free in practice.
+        nonisolated(unsafe) private var observer: NSObjectProtocol?
+        private static let accessoryTag = 0xF17E
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard observer == nil, let w = window else { return }
+            apply(w)
+            observer = NotificationCenter.default.addObserver(
+                forName: NSWindow.didUpdateNotification, object: w, queue: nil) { [weak self] note in
+                guard let w = note.object as? NSWindow else { return }
+                MainActor.assumeIsolated { self?.apply(w) }
+            }
+        }
+        deinit { if let observer { NotificationCenter.default.removeObserver(observer) } }
+
+        private func apply(_ w: NSWindow) {
+            if #unavailable(macOS 26.0) {
+                if w.titleVisibility != .hidden { w.titleVisibility = .hidden }
+            }
+            guard let toolbar = w.toolbar else { return }
+            if #unavailable(macOS 26.0) {
+                insertFlexibleSpaceIfNeeded(toolbar)
+            }
+            for item in toolbar.items {
+                guard let s = item as? NSSearchToolbarItem else { continue }
+                if #unavailable(macOS 26.0) {
+                    if s.preferredWidthForSearchField != 300 { s.preferredWidthForSearchField = 300 }
+                }
+                installAccessory(in: s.searchField)
+            }
+        }
+
+        /// Pre-Tahoe stand-in for ToolbarSpacer(.flexible): SwiftUI drops a Spacer toolbar item on
+        /// macOS 14/15, so the native .flexibleSpace NSToolbarItem is inserted directly - after the
+        /// back/forward item (the first SwiftUI-UUID-identified item; the sidebar toggle and split
+        /// separator precede it), so the trailing cluster and the capped search field hug the right
+        /// edge exactly like Tahoe. Re-inserted whenever a SwiftUI toolbar rebuild prunes it.
+        private func insertFlexibleSpaceIfNeeded(_ toolbar: NSToolbar) {
+            guard !toolbar.items.contains(where: { $0.itemIdentifier == .flexibleSpace }) else { return }
+            func isSwiftUIItem(_ id: NSToolbarItem.Identifier) -> Bool {
+                id.rawValue.count == 36 && id.rawValue.filter { $0 == "-" }.count == 4
+            }
+            guard let anchor = toolbar.items.firstIndex(where: { isSwiftUIItem($0.itemIdentifier) }) else { return }
+            toolbar.insertItem(withItemIdentifier: .flexibleSpace, at: anchor + 1)
+        }
+
+        /// The upload button lives as a subview of the NSSearchField, frame-pinned to the trailing
+        /// edge; when the field has text it steps left so the system clear (x) button stays fully
+        /// clickable. Defensive by construction: if any expectation fails the button simply does
+        /// not appear - the field itself is never altered.
+        private func installAccessory(in field: NSSearchField) {
+            let side: CGFloat = 20   // hit target + hover-highlight capsule; the glyph inside is 13pt
+            let hasText = !field.stringValue.isEmpty
+            let trailingGap: CGFloat = hasText ? 24 : 3
+            let x = field.bounds.width - trailingGap - side
+            let y = (field.bounds.height - side) / 2
+            if let b = field.viewWithTag(Self.accessoryTag) as? NSButton {
+                let want = NSRect(x: x, y: y, width: side, height: side)
+                if b.frame != want { b.frame = want }
+                return
+            }
+            guard let icon = NSImage(systemSymbolName: "square.and.arrow.up",
+                                     accessibilityDescription: "Search by a file") else { return }
+            let b = NSButton(frame: NSRect(x: x, y: y, width: side, height: side))
+            b.tag = Self.accessoryTag
+            // Match the field's own magnifier: same 13pt regular-weight symbol metrics, same
+            // secondary tint. accessoryBarAction + border-on-hover is the native in-field button
+            // treatment (Spotlight's mic): a soft rounded highlight on hover, darker while pressed.
+            b.image = icon.withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
+            b.bezelStyle = .accessoryBarAction
+            b.isBordered = true
+            b.showsBorderOnlyWhileMouseInside = true
+            b.setButtonType(.momentaryPushIn)
+            b.imagePosition = .imageOnly
+            b.contentTintColor = .secondaryLabelColor
+            b.target = self
+            b.action = #selector(fireSearchByFile)
+            b.toolTip = "Search by a file (image, audio, video, or text)  \u{21E7}\u{2318}O"
+            b.setAccessibilityLabel("Search by a file")
+            b.autoresizingMask = [.minXMargin]   // stay pinned to the trailing edge on resize
+            field.addSubview(b)
+        }
+
+        @objc private func fireSearchByFile() { onSearchByFile?() }
+    }
+
     func makeNSView(context: Context) -> NSView {
-        let v = NSView()
+        let v = TunerView()
+        v.onSearchByFile = onSearchByFile
         // The view isn't in a window yet at make time; defer one hop to grab it.
         DispatchQueue.main.async { v.window?.titleVisibility = .hidden }
         return v
     }
     func updateNSView(_ nsView: NSView, context: Context) {
+        (nsView as? TunerView)?.onSearchByFile = onSearchByFile
         // updateNSView already runs on the main thread; set directly and only when it actually differs,
         // so SwiftUI's frequent updates (every keystroke / indexing tick) don't schedule a redundant hop.
         if let w = nsView.window, w.titleVisibility != .hidden { w.titleVisibility = .hidden }
