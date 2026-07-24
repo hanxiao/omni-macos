@@ -358,6 +358,13 @@ struct ContentView: View {
                 // Glass pill grouping stays byte-identical.
                 if #unavailable(macOS 26.0) {
                     Color.clear.frame(width: 1, height: 1)
+                    // This item IS the pre-Tahoe flexible space: stretching it inside SwiftUI's own
+                    // toolbar model pushes the trailing cluster right WITHOUT injecting a foreign
+                    // .flexibleSpace NSToolbarItem - which SwiftUI's reconciliation pruned on every
+                    // state change (each result click re-rendered left-packed for a frame, then our
+                    // re-insert snapped it right: the "flashy" toolbar). Nothing to prune = nothing
+                    // to flash. Tahoe keeps ToolbarSpacer(.flexible) and this stays 1pt there.
+                    Spacer(minLength: 0)
                 }
                 if model.phase == .ready, model.canGoBack || model.canGoForward {
                     ControlGroup {
@@ -375,6 +382,7 @@ struct ContentView: View {
                     .fixedSize()
                 }
             }
+            .modifier(LegacyToolbarStretch())
         }
         // Flexible space after back/forward pushes every other control to the trailing edge (chevrons
         // own the left, everything else is right-aligned), and on Tahoe it's also the correct separator
@@ -680,6 +688,19 @@ private struct FileQueryChip: View {
     }
 }
 
+/// Pre-Tahoe: lets the chevrons toolbar item grow to absorb all slack (its trailing Spacer does
+/// the pushing), making it the toolbar's flexible space. On macOS 26 it is a no-op - Tahoe uses
+/// the real ToolbarSpacer and this item stays at its natural width.
+private struct LegacyToolbarStretch: ViewModifier {
+    func body(content: Content) -> some View {
+        if #unavailable(macOS 26.0) {
+            content.frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            content
+        }
+    }
+}
+
 struct CenteredStatus: View {
     let symbol: String
     let title: String
@@ -857,24 +878,16 @@ private struct WindowTitleHider: NSViewRepresentable {
             }
         }
 
-        /// Pre-Tahoe toolbar shape, idempotent:
-        /// - drop the split-view tracking separator, the vertical line that continues the sidebar
-        ///   divider through the toolbar on macOS 14/15; Tahoe draws none, and it reads as a stray
-        ///   bar once the title is hidden and the controls hug the right edge.
-        /// - inject the native .flexibleSpace NSToolbarItem after the back/forward item (the first
-        ///   SwiftUI-UUID-identified item; the sidebar toggle precedes it): SwiftUI drops a Spacer
-        ///   toolbar item on 14/15, and without a flexible space the trailing cluster and the
-        ///   capped search field pack left instead of hugging the right edge like Tahoe.
+        /// Pre-Tahoe toolbar shape, idempotent: drop the split-view tracking separator, the
+        /// vertical line that continues the sidebar divider through the toolbar on macOS 14/15;
+        /// Tahoe draws none, and it reads as a stray bar once the title is hidden and the controls
+        /// hug the right edge. The right-hugging itself is SwiftUI-native (the stretchy chevrons
+        /// item, see LegacyToolbarStretch) - an injected .flexibleSpace item was pruned by
+        /// SwiftUI's reconciliation on every state change and made the whole toolbar flash.
         private func shapeToolbar(_ toolbar: NSToolbar) {
             if let i = toolbar.items.firstIndex(where: { $0.itemIdentifier.rawValue.hasPrefix("com.apple.SwiftUI.splitViewSeparator") }) {
                 toolbar.removeItem(at: i)
             }
-            guard !toolbar.items.contains(where: { $0.itemIdentifier == .flexibleSpace }) else { return }
-            func isSwiftUIItem(_ id: NSToolbarItem.Identifier) -> Bool {
-                id.rawValue.count == 36 && id.rawValue.filter { $0 == "-" }.count == 4
-            }
-            guard let anchor = toolbar.items.firstIndex(where: { isSwiftUIItem($0.itemIdentifier) }) else { return }
-            toolbar.insertItem(withItemIdentifier: .flexibleSpace, at: anchor + 1)
         }
 
         /// The upload button lives as a subview of the NSSearchField, frame-pinned to the trailing
