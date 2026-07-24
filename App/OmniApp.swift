@@ -110,6 +110,13 @@ struct OmniApp: App {
             // Sidebar / Full Screen) instead of declaring a second "View" CommandMenu - otherwise
             // the menu bar shows two "View" menus. Cmd-1 gallery, Cmd-2 list, plus Sort by.
             CommandGroup(after: .sidebar) {
+                // Sequoia's View menu lacks the automatic Show/Hide Sidebar item here (Tahoe
+                // provides its own - gated so the menu never shows two). Same responder-chain
+                // action and Ctrl-Cmd-S chord as the system item.
+                if #unavailable(macOS 26.0) {
+                    Button("Toggle Sidebar") { NSApp.sendAction(Selector(("toggleSidebar:")), to: nil, from: nil) }
+                        .keyboardShortcut("s", modifiers: [.command, .control])
+                }
                 Divider()
                 // Back / forward through the session's search + selection trail (like Finder's Go menu).
                 // The menu OWNS the Cmd-[ / Cmd-] shortcuts (single owner, no duplicate-shortcut conflict
