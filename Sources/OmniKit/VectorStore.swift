@@ -203,6 +203,15 @@ final class Vec16Buffer {
     private var heap: [UInt16] = []
     private var base: UnsafeMutableRawPointer? = nil   // reservation start (mmap mode)
     private var reserveBytes = 0
+    // The scratch file's descriptor stays OPEN after mapToScratch (the vnode is already unlinked,
+    // so lifetime semantics are unchanged) so growFileCoverage can ftruncate+map the file over the
+    // anonymous append tail INCREMENTALLY - a fold then makes only the delta file-backed instead
+    // of rewriting the whole region (O(delta) disk writes, not O(N)).
+    private var fd: Int32 = -1
+    private var fileBytes = 0                           // reservation prefix currently file-backed
+    /// True when the mapping is over the NAMED persistent vector sidecar (mapPersistent), false
+    /// for the unlinked private scratch. Gates sidecar stamping.
+    private(set) var isPersistent = false
     private(set) var count = 0                          // logical UInt16 element count
     var isMapped: Bool { base != nil }
 
@@ -232,13 +241,30 @@ final class Vec16Buffer {
     }
 
     func removeAll() {
-        if let base { munmap(base, reserveBytes); self.base = nil; reserveBytes = 0 }
+        unmapScratch()
         heap.removeAll(); count = 0
     }
     /// Release capacity too (the wipe path).
     func releaseAll() {
-        if let base { munmap(base, reserveBytes); self.base = nil; reserveBytes = 0 }
+        unmapScratch()
         heap = []; count = 0
+    }
+
+    private func unmapScratch() {
+        if let base { munmap(base, reserveBytes); self.base = nil; reserveBytes = 0 }
+        if fd >= 0 { close(fd); fd = -1 }   // also releases the flock in persistent mode
+        fileBytes = 0
+        isPersistent = false
+    }
+
+    /// Release the file descriptor (and with it the exclusive flock) while KEEPING the mapping
+    /// readable: after close() the store never mutates again, but stragglers may still search the
+    /// in-memory state, and a successor store (same process; tests, a model switch) must be able
+    /// to lock the sidecar for itself. Page coherence is by vnode, so the successor sees the same
+    /// bytes.
+    func releaseFileLock() {
+        if fd >= 0 { close(fd); fd = -1 }
+        isPersistent = false
     }
 
     func withUnsafeBufferPointer<R>(_ body: (UnsafeBufferPointer<UInt16>) throws -> R) rethrows -> R {
@@ -264,35 +290,150 @@ final class Vec16Buffer {
     }
 
     /// Move the CURRENT bytes into a fresh unlinked scratch file mapping (or rewrite the existing
-    /// one - called at quant-mode activation and at each fold, when the logical bytes are settled).
-    /// `tailSlackElements` sizes the anonymous append tail (the delta between folds). Any failure
+    /// one - called at quant-mode activation, and by ensureScratch when the reservation runs out).
+    /// `tailSlackElements` sizes the anonymous append tail (one fold's delta); the reservation adds
+    /// half the file size on top so incremental folds can extend coverage in place many times before
+    /// a full remap - virtual address space only, physical pages are only committed when touched.
+    /// `precommitElements` (load path) sizes the file for bytes that are ABOUT to be appended, so
+    /// they land in pageable file pages directly instead of transiting the heap. Any failure
     /// leaves the buffer in (correct) heap mode.
-    func mapToScratch(dir: URL, tailSlackElements: Int) {
+    func mapToScratch(dir: URL, tailSlackElements: Int, precommitElements: Int = 0) {
         let pageSize = Int(getpagesize())
-        let dataBytes = count * 2
-        let fileBytes = max(pageSize, (dataBytes + pageSize - 1) / pageSize * pageSize)
-        let newReserve = fileBytes + max(64 << 20, tailSlackElements * 2)
+        let dataBytes = max(count, precommitElements) * 2
+        let newFileBytes = max(pageSize, (dataBytes + pageSize - 1) / pageSize * pageSize)
+        let newReserve = newFileBytes + max(64 << 20, max(tailSlackElements * 2, newFileBytes / 2))
         let path = dir.appendingPathComponent(".omni-vec-scratch-\(getpid())-\(UInt32.random(in: 0...UInt32.max))").path
-        let fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0o600)
-        guard fd >= 0 else { return }
+        let newFD = open(path, O_RDWR | O_CREAT | O_EXCL, 0o600)
+        guard newFD >= 0 else { return }
         unlink(path)                                      // ephemeral: kernel reclaims on last close
-        guard ftruncate(fd, off_t(fileBytes)) == 0 else { close(fd); return }
+        guard ftruncate(newFD, off_t(newFileBytes)) == 0 else { close(newFD); return }
         // One contiguous reservation: anonymous RW everywhere, then the file mapped FIXED over the front.
         guard let resv = mmap(nil, newReserve, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0),
-              resv != MAP_FAILED else { close(fd); return }
-        guard let fmap = mmap(resv, fileBytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0),
-              fmap != MAP_FAILED else { munmap(resv, newReserve); close(fd); return }
-        close(fd)                                          // mapping keeps the (unlinked) vnode alive
+              resv != MAP_FAILED else { close(newFD); return }
+        guard let fmap = mmap(resv, newFileBytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, newFD, 0),
+              fmap != MAP_FAILED else { munmap(resv, newReserve); close(newFD); return }
         // Copy the logical bytes in, then release the old storage.
         withUnsafeBytes { src in
             if let s = src.baseAddress, src.count > 0 { memcpy(resv, s, src.count) }
         }
         let logical = count
-        if let old = base { munmap(old, reserveBytes) }
+        unmapScratch()
         heap = []
         base = resv
         reserveBytes = newReserve
+        fd = newFD                                        // kept open so growFileCoverage can extend
+        fileBytes = newFileBytes
         count = logical
+    }
+
+    /// Extend the file-backed prefix over the anonymous append tail up to the current count, so
+    /// bytes appended since the last fold become pageable file pages WITHOUT rewriting the region.
+    /// The tail's live bytes are preserved across the MAP_FIXED (copied out and back - the delta is
+    /// bounded by the fold threshold, a ~77MB memcpy at most). Failure is benign: the tail simply
+    /// stays anonymous (correct, just not evictable-for-free) until the next full remap.
+    private func growFileCoverage() {
+        guard let base, fd >= 0 else { return }
+        let pageSize = Int(getpagesize())
+        let dataBytes = count * 2
+        guard dataBytes > fileBytes else { return }
+        let newFileBytes = min(reserveBytes, (dataBytes + pageSize - 1) / pageSize * pageSize)
+        guard newFileBytes > fileBytes else { return }
+        let deltaBytes = dataBytes - fileBytes
+        var tmp = [UInt8](repeating: 0, count: deltaBytes)
+        tmp.withUnsafeMutableBytes { if let d = $0.baseAddress { memcpy(d, base.advanced(by: fileBytes), deltaBytes) } }
+        guard ftruncate(fd, off_t(newFileBytes)) == 0 else { return }
+        guard let m = mmap(base.advanced(by: fileBytes), newFileBytes - fileBytes,
+                           PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, off_t(fileBytes)),
+              m != MAP_FAILED else { return }
+        tmp.withUnsafeBytes { if let s = $0.baseAddress { memcpy(base.advanced(by: fileBytes), s, deltaBytes) } }
+        fileBytes = newFileBytes
+    }
+
+    /// Fold-time scratch maintenance: map on first use, extend coverage incrementally after, and
+    /// regrow the VA reservation in place (same file, no data rewrite) when it cannot hold another
+    /// fold's delta.
+    func ensureScratch(dir: URL, tailSlackElements: Int) {
+        if isMapped {
+            if (count + tailSlackElements) * 2 > reserveBytes {
+                regrowReservation(tailSlackElements: tailSlackElements)
+            }
+            growFileCoverage()
+        } else {
+            mapToScratch(dir: dir, tailSlackElements: tailSlackElements)
+        }
+    }
+
+    /// Replace the VA reservation with a larger one over the SAME open file: the file region is
+    /// re-mapped (shared pages, no copy), only the anonymous tail's live bytes move. Failure keeps
+    /// the old reservation (appends past it fall back to heap - correct, as ever).
+    private func regrowReservation(tailSlackElements: Int) {
+        guard let oldBase = base, fd >= 0 else { return }
+        let newReserve = fileBytes + max(64 << 20, max(tailSlackElements * 2, fileBytes / 2))
+        guard newReserve > reserveBytes else { return }
+        guard let resv = mmap(nil, newReserve, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0),
+              resv != MAP_FAILED else { return }
+        guard let fmap = mmap(resv, fileBytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0),
+              fmap != MAP_FAILED else { munmap(resv, newReserve); return }
+        let tailBytes = max(0, count * 2 - fileBytes)
+        if tailBytes > 0 { memcpy(resv.advanced(by: fileBytes), oldBase.advanced(by: fileBytes), tailBytes) }
+        munmap(oldBase, reserveBytes)
+        base = resv
+        reserveBytes = newReserve
+    }
+
+    /// PERSISTENT scratch: same mechanics as mapToScratch, but over a NAMED file that survives the
+    /// process - the maintained mapping IS the on-disk vector sidecar, so persistence costs zero
+    /// extra writes (the kernel flushes dirty pages; msyncFile() forces it at stamp time). The file
+    /// is flock'd exclusively: a second store on the same index (tests, a stale process) fails the
+    /// lock and falls back to the private unlinked scratch, so two mappings can never stomp each
+    /// other. `adoptElements` > 0 maps existing content READ-ON-DEMAND (no bulk read at open);
+    /// otherwise the file is truncated fresh for `precommitElements` of incoming appends.
+    /// Returns false (state unchanged, caller falls back) on any failure.
+    @discardableResult
+    func mapPersistent(url: URL, tailSlackElements: Int, precommitElements: Int = 0, adoptElements: Int = 0) -> Bool {
+        precondition(!isMapped, "mapPersistent replaces heap or starts fresh - never remaps")
+        precondition(adoptElements == 0 || count == 0, "adopt is an open-time operation")
+        let pageSize = Int(getpagesize())
+        let dataBytes = max(count, max(adoptElements, precommitElements)) * 2
+        let newFileBytes = max(pageSize, (dataBytes + pageSize - 1) / pageSize * pageSize)
+        let newFD = open(url.path, O_RDWR | O_CREAT, 0o600)
+        guard newFD >= 0 else { return false }
+        guard flock(newFD, LOCK_EX | LOCK_NB) == 0 else { close(newFD); return false }
+        if adoptElements > 0 {
+            var st = stat()
+            guard fstat(newFD, &st) == 0, st.st_size >= off_t(adoptElements * 2) else {
+                flock(newFD, LOCK_UN); close(newFD); return false
+            }
+        }
+        guard ftruncate(newFD, off_t(newFileBytes)) == 0 else { flock(newFD, LOCK_UN); close(newFD); return false }
+        let newReserve = newFileBytes + max(64 << 20, max(tailSlackElements * 2, newFileBytes / 2))
+        guard let resv = mmap(nil, newReserve, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0),
+              resv != MAP_FAILED else { flock(newFD, LOCK_UN); close(newFD); return false }
+        guard let fmap = mmap(resv, newFileBytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, newFD, 0),
+              fmap != MAP_FAILED else { munmap(resv, newReserve); flock(newFD, LOCK_UN); close(newFD); return false }
+        // Migrating live heap content (the fold that first activates quant mode mid-session):
+        // move the current bytes into the file region, exactly like mapToScratch does.
+        if adoptElements == 0, count > 0 {
+            withUnsafeBytes { src in
+                if let s = src.baseAddress, src.count > 0 { memcpy(resv, s, src.count) }
+            }
+        }
+        let logical = adoptElements > 0 ? adoptElements : count
+        heap = []
+        base = resv
+        reserveBytes = newReserve
+        fd = newFD
+        fileBytes = newFileBytes
+        isPersistent = true
+        count = logical
+        return true
+    }
+
+    /// Flush the file-backed prefix to disk (the persistent sidecar's stamp point). Most pages are
+    /// already clean; only the recent delta is dirty, so this is cheap in steady state.
+    func msyncFile() {
+        guard let base, fileBytes > 0 else { return }
+        msync(base, fileBytes, MS_SYNC)
     }
 
     private func fallbackToHeap() {
@@ -301,12 +442,11 @@ final class Vec16Buffer {
         arr.withUnsafeMutableBufferPointer { dst in
             if let d = dst.baseAddress { memcpy(d, b, count * 2) }
         }
-        munmap(b, reserveBytes)
-        base = nil; reserveBytes = 0
+        unmapScratch()
         heap = arr
     }
 
-    deinit { if let b = base { munmap(b, reserveBytes) } }
+    deinit { unmapScratch() }
 }
 
 /// Accelerate GEMV (cblas_sgemv) per query; SQLite is the durable source of truth.
@@ -323,6 +463,7 @@ public final class VectorStore: @unchecked Sendable {
     // (~800B/chunk measured at 2M realistic rows), yet it is only read for a search's <=60 winners
     // and one file's chunks in rankChunks - both fetched lazily from SQLite by primary key.
     struct Row { let path: String; let kind: String; let chunkIndex: Int; let modified: Double
+                 var size: Int = 0
                  var width: Int = 0; var height: Int = 0; var duration: Double = 0; var locator: String = "" }
     private var rows: [Row] = []
     // Single source of truth for embeddings: contiguous bf16 bits, [count*dim], row i = rows[i].
@@ -368,6 +509,18 @@ public final class VectorStore: @unchecked Sendable {
     }
     private var baseRows = 0
     private var baseDirty = true
+    /// Monotone counter over CHUNK mutations, persisted in `meta` INSIDE each mutation's SQLite
+    /// transaction - so it moves atomically with the rows it describes. The row-table sidecar is
+    /// stamped with this value; at open, a stamp that does not match the db's counter means the
+    /// sidecar predates some committed change (or a crash landed between them) and it is rejected.
+    /// VACUUM (compact) is deliberately unbumped: it renumbers rowids but preserves logical content
+    /// and row order. Loaded from meta at open, 0 for pre-counter indexes.
+    private var mutationGen: Int64 = 0
+    private func bumpGenLocked() {
+        mutationGen += 1
+        exec("INSERT OR REPLACE INTO meta(key, value) VALUES('mutation_gen','\(mutationGen)');")
+        scheduleRowStampLocked()   // debounced: the sidecar re-stamps once writes go quiet
+    }
     private static let foldThreshold = 50_000
     // Last interactive search time (queue-guarded). When a write invalidates the base WHILE the user is
     // actively searching, the write rebuilds the base in place (it already holds the queue, and runs
@@ -573,9 +726,11 @@ public final class VectorStore: @unchecked Sendable {
             );
         """)
         exec("CREATE INDEX IF NOT EXISTS idx_content_key ON content_keys(key);")
-        migrateScanKind()
+        mutationGen = Int64(scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='mutation_gen'"))
+        migrateScanKind()   // bumps the gen inside its txn when it rewrites kinds
         setUserVersion(Self.schemaVersion)
         loadIntoMemory()
+        tryAdoptQuantReplicaLocked()   // init has exclusive access; every failure mode falls back to build-on-first-search
     }
 
     /// One-time re-label of scanned-PDF rows in pre-'scan' indexes. Those indexes stored
@@ -649,6 +804,7 @@ public final class VectorStore: @unchecked Sendable {
             } else { ok = false }
             sqlite3_finalize(stmt); stmt = nil
         }
+        if ok { bumpGenLocked() }   // kind rewrites invalidate the row-table sidecar (same txn)
         if ok { ok = sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK }
         if !ok { sqlite3_exec(db, "ROLLBACK;", nil, nil, nil) }
     }
@@ -669,6 +825,9 @@ public final class VectorStore: @unchecked Sendable {
     /// synchronous checkpoint + close runs off the main actor instead of at the @MainActor ref-drop site.
     public func close() {
         queue.sync {
+            stampRowSidecarLocked(sync: true)       // durable row table; no-op if current
+            persistQuantReplicaLocked(sync: true)   // durable before the handle goes away; no-op if current
+            flat16.releaseFileLock()                // successor stores may now adopt the vec sidecar
             guard !closed, let h = db else { closed = true; return }
             sqlite3_finalize(snippetStmt); snippetStmt = nil   // finalize cached stmts before close (F3/F8)
             sqlite3_finalize(dedupStmt); dedupStmt = nil
@@ -737,6 +896,7 @@ public final class VectorStore: @unchecked Sendable {
                 }
                 bytesWrittenSinceCkpt += c.embedding.count * 2 + c.snippet.utf8.count + 160   // WAL-growth estimate (F17)
             }
+            bumpGenLocked()
             exec("COMMIT;")
             // Only rebuild the in-memory buffer if this path already had rows. For a new file
             // (the dominant indexing case) there is nothing to remove, so skip the O(N) scan and
@@ -744,7 +904,7 @@ public final class VectorStore: @unchecked Sendable {
             if presentPaths.contains(path) { removeRowsByPathsLocked([path]) }
             for (i, c) in chunks.enumerated() {
                 rows.append(Row(path: canonicalPath(c.path), kind: canonicalKind(c.kind), chunkIndex: c.chunkIndex, modified: c.modified,
-                                width: c.width, height: c.height, duration: c.duration, locator: c.locator))
+                                size: c.size, width: c.width, height: c.height, duration: c.duration, locator: c.locator))
                 flat16.append(contentsOf: bfs[i])
                 let fid = internPath(c.path)
                 fileID.append(fid)
@@ -813,6 +973,7 @@ public final class VectorStore: @unchecked Sendable {
                     bytesWrittenSinceCkpt += c.embedding.count * 2 + c.snippet.utf8.count + 160   // WAL-growth estimate (F17)
                 }
             }
+            bumpGenLocked()
             exec("COMMIT;")
             let tRm = Self.searchTiming ? Date() : nil
             let affected = Set(work.map { $0.path })
@@ -822,7 +983,7 @@ public final class VectorStore: @unchecked Sendable {
             for (wi, it) in work.enumerated() {
                 for (ci, c) in it.chunks.enumerated() {
                     rows.append(Row(path: canonicalPath(c.path), kind: canonicalKind(c.kind), chunkIndex: c.chunkIndex, modified: c.modified,
-                                    width: c.width, height: c.height, duration: c.duration, locator: c.locator))
+                                    size: c.size, width: c.width, height: c.height, duration: c.duration, locator: c.locator))
                     flat16.append(contentsOf: bfs[wi][ci])
                     let fid = internPath(c.path)
                     fileID.append(fid)
@@ -849,6 +1010,7 @@ public final class VectorStore: @unchecked Sendable {
             guard dbOpen() else { return }
             exec("BEGIN;")
             deletePathLocked(path)
+            bumpGenLocked()
             exec("COMMIT;")
             removeRowsByPathsLocked([path])
             proactiveRefoldLocked()
@@ -979,6 +1141,7 @@ public final class VectorStore: @unchecked Sendable {
                 }
             }
             sqlite3_finalize(kstmt)
+            bumpGenLocked()
             exec("COMMIT;")
             removeRowsByPathsLocked(paths)   // one rebuild for the whole set (id-mask, no path hashing)
             proactiveRefoldLocked()
@@ -993,6 +1156,7 @@ public final class VectorStore: @unchecked Sendable {
         guard !folder.isEmpty, folder != "/" else { return }
         queue.sync {
             guard dbOpen() else { return }
+            exec("BEGIN;")
             var stmt: OpaquePointer?
             // Range form of `path LIKE folder||'/%'`: SQLite's default case-insensitive LIKE (plus
             // the OR) defeats idx_path and scans the whole table; `>= '<folder>/' AND < '<folder>0'`
@@ -1008,6 +1172,8 @@ public final class VectorStore: @unchecked Sendable {
                 sqlite3_step(kstmt)
             }
             sqlite3_finalize(kstmt)
+            bumpGenLocked()
+            exec("COMMIT;")
             removeRowsLocked { $0.path == folder || $0.path.hasPrefix(folder + "/") }
             proactiveRefoldLocked()
             checkpointIfDueLocked(forceStat: true)   // deletes carry no byte estimate (F17)
@@ -1036,6 +1202,7 @@ public final class VectorStore: @unchecked Sendable {
             guard dbOpen() else { return }
             let set = Set(kinds)
             let marks = Array(repeating: "?", count: kinds.count).joined(separator: ",")
+            exec("BEGIN;")
             var stmt: OpaquePointer?
             // Key rows first (the subquery needs the chunks rows still present).
             if sqlite3_prepare_v2(db, "DELETE FROM content_keys WHERE path IN (SELECT DISTINCT path FROM chunks WHERE kind IN (\(marks)));", -1, &stmt, nil) == SQLITE_OK {
@@ -1049,6 +1216,8 @@ public final class VectorStore: @unchecked Sendable {
                 sqlite3_step(stmt)
             }
             sqlite3_finalize(stmt)
+            bumpGenLocked()
+            exec("COMMIT;")
             removeRowsLocked { set.contains($0.kind) }
             checkpointIfDueLocked(forceStat: true)   // bulk delete inflates the WAL; fold it (self-review fix)
         }
@@ -1064,6 +1233,7 @@ public final class VectorStore: @unchecked Sendable {
             func disabled(_ path: String) -> Bool { lower.contains((path as NSString).pathExtension.lowercased()) }
             let victims = Set(rows.filter { disabled($0.path) }.map { $0.path })
             guard !victims.isEmpty else { return }
+            exec("BEGIN;")
             var stmt: OpaquePointer?
             if sqlite3_prepare_v2(db, "DELETE FROM chunks WHERE path = ?;", -1, &stmt, nil) == SQLITE_OK {
                 for path in victims {
@@ -1080,6 +1250,8 @@ public final class VectorStore: @unchecked Sendable {
                 }
             }
             sqlite3_finalize(kstmt)
+            bumpGenLocked()
+            exec("COMMIT;")
             removeRowsLocked { disabled($0.path) }
             checkpointIfDueLocked(forceStat: true)   // bulk delete inflates the WAL; fold it (self-review fix)
         }
@@ -1089,12 +1261,17 @@ public final class VectorStore: @unchecked Sendable {
     public func wipeChunks() {
         queue.sync {
             guard dbOpen() else { return }
+            exec("BEGIN;")
             exec("DELETE FROM chunks;")
             exec("DELETE FROM content_keys;")
+            bumpGenLocked()
+            exec("COMMIT;")
             // Release the backing buffers (a wipe will not refill to the same size immediately),
             // rather than removeAll which keeps the ~1.6GB capacity reserved.
             rows = []; flat16.releaseAll(); presentPaths = []; fileID = []; pathID = [:]; idPath = []; fileChunkCount = []
             kindCode = []; kindID = [:]; idKind = []; invalidateBase()
+            try? FileManager.default.removeItem(at: quantReplicaURL); lastPersistedBaseRows = -1   // replica is of wiped rows
+            removeRowSidecarFiles()   // sidecar caches the wiped rows; releaseAll() above dropped the mapping
             resetAggregatesLocked()
             invalidateTagFilterCacheLocked()   // wipe bypasses fileChunkDec; keep the invariant
             dim = 0
@@ -1102,20 +1279,33 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
-    /// path -> (modified, size) for incremental change detection.
+    /// path -> (modified, size) for incremental change detection. Served from the RESIDENT rows,
+    /// not SQLite: the old `GROUP BY path` dragged the entire chunks B-tree - whose leaves carry
+    /// the vec blobs, gigabytes of pages - through the page cache ON the store queue. Caught live
+    /// at 3.8M rows on a base M-chip: minutes of pread with every search queued behind it, at the
+    /// start of every catch-up pass. The in-memory pass reproduces MAX(modified)/MAX(size)/
+    /// MAX(kind) per path in a few hundred ms with zero disk. Rows whose stored dim mismatched the
+    /// index (skipped at load) now report as unindexed and re-embed - self-healing where the SQL
+    /// form kept them stale forever.
     public func indexedFiles() -> [String: StoredFile] {
         queue.sync {
             guard dbOpen() else { return [:] }
-            var out: [String: StoredFile] = [:]
-            var stmt: OpaquePointer?
-            if sqlite3_prepare_v2(db, "SELECT path, MAX(modified), MAX(size), MAX(kind) FROM chunks GROUP BY path;", -1, &stmt, nil) == SQLITE_OK {
-                while sqlite3_step(stmt) == SQLITE_ROW {
-                    let p = String(cString: sqlite3_column_text(stmt, 0))
-                    let kind = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? ""
-                    out[p] = StoredFile(modified: sqlite3_column_double(stmt, 1), size: Int(sqlite3_column_int64(stmt, 2)), kind: kind)
-                }
+            let n = pathID.count
+            var modified = [Double](repeating: -.greatestFiniteMagnitude, count: n)
+            var size = [Int](repeating: Int.min, count: n)
+            var kind = [String?](repeating: nil, count: n)
+            for i in 0 ..< rows.count {
+                let f = Int(fileID[i])
+                let r = rows[i]
+                if r.modified > modified[f] { modified[f] = r.modified }
+                if r.size > size[f] { size[f] = r.size }
+                if kind[f] == nil || r.kind > kind[f]! { kind[f] = r.kind }
             }
-            sqlite3_finalize(stmt)
+            var out: [String: StoredFile] = [:]
+            out.reserveCapacity(liveFiles)
+            for f in 0 ..< n where kind[f] != nil {   // nil = interned path with no live rows
+                out[idPath[f]] = StoredFile(modified: modified[f], size: size[f], kind: kind[f] ?? "")
+            }
             return out
         }
     }
@@ -2103,8 +2293,589 @@ public final class VectorStore: @unchecked Sendable {
     /// Build the owned base score matrix over rows [0, rowCount). mlx_array_new_data copies, so the
     /// result is independent of flat16 (which reallocates as indexing appends) - no aliasing. Called
     /// only on a structural change or fold, not per query. Must run on `queue`.
+    // MARK: - Persisted quantized replica
+    //
+    // The quantized scan replica is a pure function of flat16's first `baseRows` rows, and
+    // building it for a multi-million-row index is exactly the launch cost that made the first
+    // search unusable on low-end machines. Persist it next to the index and adopt it at open when
+    // it still matches. VALIDITY is content-based, not bookkeeping-based: the file stores row
+    // count, dim, group/bits, and an FNV-1a 64 checksum over ~512 sampled rows of the bf16 prefix;
+    // adoption recomputes the checksum over the freshly loaded rows and rejects (and deletes the
+    // file) on any mismatch, falling back to exactly today's full rebuild. The prefix invariant
+    // holds because load order is contractual (ORDER BY rowid in loadIntoMemory), appends only
+    // ever land past the prefix (rowid max+1), and deletes shift the sampled bytes so a stale
+    // replica cannot validate. OMNI_QUANT_PERSIST=0 disables save and load.
+
+    private static let quantPersistEnabled = ProcessInfo.processInfo.environment["OMNI_QUANT_PERSIST"] != "0"
+    private var quantReplicaURL: URL {
+        dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".quant")
+    }
+    private var lastPersistedBaseRows = -1          // baseRows covered by the on-disk replica (-1 = none)
+    private var replicaLaunchPersistScheduled = false
+    /// Serializes replica FILE writes (the close-path sync write vs the post-fold async write).
+    /// Never takes `queue`, so queue -> persistIO.sync cannot deadlock.
+    private let persistIO = DispatchQueue(label: "omni.vectorstore.quant-persist", qos: .utility)
+
+    private struct QuantReplicaHeader: Codable, Sendable {
+        var magic: String, rows: Int, dim: Int, group: Int, bits: Int
+        var wqShape: [Int], wqDType: String, wqBytes: Int, wqSum: String
+        var scShape: [Int], scDType: String, scBytes: Int, scSum: String
+        var biShape: [Int]?, biDType: String?, biBytes: Int?, biSum: String?
+        var checksum: String
+    }
+
+    /// FNV-1a 64 over ~256 sampled 4KB pages of a blob (always the first and last page). Guards
+    /// adoption against a corrupted or misread replica blob, which would otherwise become garbage
+    /// coarse scores (silent recall collapse) until the next full rebuild. Sampled, not full: the
+    /// blobs are ~GBs and adoption must stay far cheaper than the fold it replaces.
+    private static func blobChecksum(_ d: Data) -> String {
+        var h: UInt64 = 0xcbf2_9ce4_8422_2325
+        let page = 4096
+        let pages = (d.count + page - 1) / page
+        let step = Swift.max(1, pages / 256)
+        d.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            func mix(page p: Int) {
+                let lo = p * page, hi = Swift.min(lo + page, d.count)
+                for i in lo ..< hi { h = (h ^ UInt64(raw[i])) &* 0x0000_0100_0000_01b3 }
+            }
+            var p = 0
+            while p < pages { mix(page: p); p += step }
+            if pages > 0 { mix(page: pages - 1) }
+        }
+        return String(h, radix: 16)
+    }
+
+    private static func dtypeTag(_ d: DType) -> String? {
+        switch d {
+        case .uint32: return "uint32"
+        case .bfloat16: return "bfloat16"
+        case .float16: return "float16"
+        case .float32: return "float32"
+        default: return nil
+        }
+    }
+    private static func tagDType(_ s: String) -> (dtype: DType, size: Int)? {
+        switch s {
+        case "uint32": return (.uint32, 4)
+        case "bfloat16": return (.bfloat16, 2)
+        case "float16": return (.float16, 2)
+        case "float32": return (.float32, 4)
+        default: return nil
+        }
+    }
+
+    /// FNV-1a 64 over ~512 evenly sampled rows (always including the first and last) of flat16's
+    /// first `r` rows. Content ground truth for replica validity: any structural change shifts the
+    /// bytes of (nearly) every row after the change point, so sampling catches it; the pathological
+    /// miss would need identical vectors at every sampled offset, in which case the quantized
+    /// scores are identical anyway.
+    private func prefixChecksumLocked(rows r: Int) -> UInt64 {
+        var h: UInt64 = 0xcbf2_9ce4_8422_2325
+        flat16.withUnsafeBufferPointer { buf in
+            func mix(_ row: Int) {
+                for i in row * dim ..< (row + 1) * dim { h = (h ^ UInt64(buf[i])) &* 0x0000_0100_0000_01b3 }
+            }
+            let samples = 512
+            if r <= samples {
+                for row in 0 ..< r { mix(row) }
+            } else {
+                let stride = r / samples
+                var row = 0
+                while row < r { mix(row); row += stride }
+                mix(r - 1)
+            }
+        }
+        return h
+    }
+
+    /// Persistence policy: the replica's value is skipping the LAUNCH fold, so it is written once
+    /// shortly after the first quant build of the process (async - only the snapshot runs on the
+    /// store queue) and once at close() if the covered prefix grew since. Incremental folds do not
+    /// rewrite the file mid-session: a launch adopts the persisted prefix and scores the tail as
+    /// delta, then folds it incrementally.
+    private func quantReplicaChangedLocked() {
+        guard Self.quantPersistEnabled, quantBase != nil, !replicaLaunchPersistScheduled else { return }
+        replicaLaunchPersistScheduled = true
+        guard baseRows != lastPersistedBaseRows else { return }   // adopted replica already covers this
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 10) { [weak self] in
+            guard let self else { return }
+            self.queue.sync {
+                self.persistQuantReplicaLocked(sync: false)
+                // A structural change can invalidate the base in the window before this fires; the
+                // write is then skipped, so re-arm and let the next rebuild schedule a fresh attempt.
+                if self.quantBase == nil { self.replicaLaunchPersistScheduled = false }
+            }
+        }
+    }
+
+    /// Snapshot (arrays -> Data, checksum) on the store queue; file write on persistIO. `sync`
+    /// (the close path) blocks until the file is durably renamed; async leaves only the write
+    /// off-queue. No-op when the on-disk replica already covers the current prefix.
+    private func persistQuantReplicaLocked(sync: Bool) {
+        guard Self.quantPersistEnabled, let qb = quantBase, baseRows > 0, dim > 0,
+              baseRows != lastPersistedBaseRows, flat16.count >= baseRows * dim else { return }
+        guard let wqTag = Self.dtypeTag(qb.wq.dtype), let scTag = Self.dtypeTag(qb.scales.dtype) else { return }
+        var biTag: String? = nil
+        if let bi = qb.biases {
+            guard let t = Self.dtypeTag(bi.dtype) else { return }
+            biTag = t
+        }
+        let wqData = qb.wq.asData(access: .copy).data
+        let scData = qb.scales.asData(access: .copy).data
+        let biData = qb.biases?.asData(access: .copy).data
+        let header = QuantReplicaHeader(
+            magic: "omni-quant-1", rows: baseRows, dim: dim, group: Self.quantGroup, bits: quantBits,
+            wqShape: qb.wq.shape, wqDType: wqTag, wqBytes: wqData.count, wqSum: Self.blobChecksum(wqData),
+            scShape: qb.scales.shape, scDType: scTag, scBytes: scData.count, scSum: Self.blobChecksum(scData),
+            biShape: qb.biases?.shape, biDType: biTag, biBytes: biData?.count, biSum: biData.map { Self.blobChecksum($0) },
+            checksum: String(prefixChecksumLocked(rows: baseRows), radix: 16))
+        lastPersistedBaseRows = baseRows
+        let url = quantReplicaURL
+        let tmp = url.deletingLastPathComponent().appendingPathComponent(url.lastPathComponent + ".tmp")
+        let job: @Sendable () -> Void = {
+            guard var head = try? JSONEncoder().encode(header) else { return }
+            head.append(0x0A)
+            let fm = FileManager.default
+            guard fm.createFile(atPath: tmp.path, contents: nil),
+                  let fh = try? FileHandle(forWritingTo: tmp) else { return }
+            do {
+                try fh.write(contentsOf: head)
+                try fh.write(contentsOf: wqData)
+                try fh.write(contentsOf: scData)
+                if let biData { try fh.write(contentsOf: biData) }
+                try fh.close()
+                try? fm.removeItem(at: url)
+                try fm.moveItem(at: tmp, to: url)
+            } catch {
+                try? fh.close()
+                try? fm.removeItem(at: tmp)
+            }
+        }
+        if sync { persistIO.sync(execute: job) } else { persistIO.async(execute: job) }
+    }
+
+    /// Adopt the persisted replica at open (called from init, which has exclusive access - no
+    /// queue needed). On success the first search skips the full-base quantize entirely; rows
+    /// loaded past the replica's prefix are the delta, exactly as if the fold had happened in a
+    /// prior session. Every failure path deletes the file and leaves the store in the historical
+    /// build-on-first-search state.
+    private func tryAdoptQuantReplicaLocked() {
+        guard Self.quantPersistEnabled else { return }
+        let url = quantReplicaURL
+        // The app quits via _exit (deliberate - see OmniApp.applicationShouldTerminate), which can
+        // strand an in-flight .tmp mid-write. It is garbage by construction (never renamed); GBs of
+        // it must not accumulate in Application Support.
+        try? FileManager.default.removeItem(at: url.deletingLastPathComponent().appendingPathComponent(url.lastPathComponent + ".tmp"))
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        func reject() { try? FileManager.default.removeItem(at: url) }
+        let n = rows.count
+        guard n > 0, dim > 0, dim % Self.quantGroup == 0 else { reject(); return }
+        let bits = Self.quantBitsFor(baseBytes: n * dim * MemoryLayout<UInt16>.size)
+        guard bits > 0 else { reject(); return }
+        guard let fh = try? FileHandle(forReadingFrom: url) else { reject(); return }
+        defer { try? fh.close() }
+        guard let headChunk = try? fh.read(upToCount: 4096), let nl = headChunk.firstIndex(of: 0x0A),
+              let header = try? JSONDecoder().decode(QuantReplicaHeader.self, from: headChunk[headChunk.startIndex ..< nl])
+        else { reject(); return }
+        guard header.magic == "omni-quant-1", header.rows > 0, header.rows <= n,
+              header.dim == dim, header.group == Self.quantGroup, header.bits == bits,
+              header.rows == baseRows || baseRows == 0,   // baseRows is 0 fresh out of loadIntoMemory
+              flat16.count >= header.rows * dim,
+              let wqT = Self.tagDType(header.wqDType), let scT = Self.tagDType(header.scDType),
+              header.wqShape.count == 2, header.wqShape[0] == header.rows,
+              header.scShape.count == 2, header.scShape[0] == header.rows,
+              header.wqBytes == header.wqShape.reduce(1, *) * wqT.size,
+              header.scBytes == header.scShape.reduce(1, *) * scT.size,
+              header.checksum == String(prefixChecksumLocked(rows: header.rows), radix: 16)
+        else { reject(); return }
+        var biT: (dtype: DType, size: Int)? = nil
+        if let tag = header.biDType {
+            guard let t = Self.tagDType(tag), let shape = header.biShape, let bytes = header.biBytes,
+                  shape.count == 2, shape[0] == header.rows, bytes == shape.reduce(1, *) * t.size
+            else { reject(); return }
+            biT = t
+        }
+        guard (try? fh.seek(toOffset: UInt64(nl - headChunk.startIndex + 1))) != nil else { reject(); return }
+        guard let wqData = try? fh.read(upToCount: header.wqBytes), wqData.count == header.wqBytes,
+              Self.blobChecksum(wqData) == header.wqSum,
+              let scData = try? fh.read(upToCount: header.scBytes), scData.count == header.scBytes,
+              Self.blobChecksum(scData) == header.scSum
+        else { reject(); return }
+        var biArr: MLXArray? = nil
+        if let biT, let biShape = header.biShape, let biBytes = header.biBytes {
+            guard let biData = try? fh.read(upToCount: biBytes), biData.count == biBytes,
+                  Self.blobChecksum(biData) == header.biSum else { reject(); return }
+            biArr = MLXArray(biData, biShape, dtype: biT.dtype)
+        }
+        let wq = MLXArray(wqData, header.wqShape, dtype: wqT.dtype)
+        let sc = MLXArray(scData, header.scShape, dtype: scT.dtype)
+        var toEval = [wq, sc]
+        if let biArr { toEval.append(biArr) }
+        MLX.eval(toEval)
+        quantBase = (wq, sc, biArr)
+        quantBits = bits
+        baseRows = header.rows
+        baseDirty = false
+        lastPersistedBaseRows = header.rows
+        if Self.searchTiming { print("[search] ADOPT quant replica rows=\(header.rows) of \(n)") }
+    }
+
+    // MARK: - Row-table sidecar (skip the O(N) SQLite open scan)
+    //
+    // Opening a multi-million-row index used to decode every chunks row out of SQLite (the 9.6GB
+    // B-tree, vec blobs included) before the app could serve anything - ~140s measured at 3.8M
+    // rows on a base M-chip. The sidecar caches what loadIntoMemory builds: the vectors live in a
+    // NAMED persistent scratch file (maintained for free through the existing mmap - open just
+    // maps it, pages fault in on demand), and the row metadata (paths, kinds, per-row fields) is
+    // written as one binary blob at quiescent points. VALIDITY: the header carries the mutation
+    // generation (bumped inside every chunk-mutating transaction), and adoption additionally
+    // requires COUNT(*) parity, dim match, and ~32 sampled rows byte-equal against SQLite point
+    // lookups. Any mismatch deletes the sidecar and falls back to the full scan - SQLite remains
+    // the sole source of truth. Gated to quant-mode indexes; OMNI_ROW_SIDECAR=0 disables.
+
+    private static let rowSidecarEnabled = ProcessInfo.processInfo.environment["OMNI_ROW_SIDECAR"] != "0"
+    private var rowSidecarURL: URL { dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".rows") }
+    private var vecSidecarURL: URL { dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".vecs") }
+    private var lastStampedGen: Int64 = -1
+    private var stampToken: UInt64 = 0
+
+    private struct RowSidecarHeader: Codable, Sendable {
+        var magic: String, gen: Int64, dim: Int, rowCount: Int, pathCount: Int, kindCount: Int
+        var recordBytes: Int, locatorBytes: Int, pathOffBytes: Int, pathBlobBytes: Int, kindOffBytes: Int, kindBlobBytes: Int
+    }
+    /// Fixed-width per-row record; see stampRowSidecarLocked for the field layout.
+    private static let rowRecordSize = 56
+
+    /// Debounced from bumpGenLocked (i.e. from every mutation): stamp once writes go quiet.
+    private func scheduleRowStampLocked(after delay: TimeInterval = 90) {
+        guard Self.rowSidecarEnabled, flat16.isPersistent else { return }
+        stampToken += 1
+        let token = stampToken
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.queue.sync {
+                guard self.stampToken == token else { return }   // superseded: more mutations arrived
+                self.stampRowSidecarLocked(sync: false)
+            }
+        }
+    }
+
+    /// Serialize the resident row table and stamp it with the current generation. The vectors are
+    /// already on disk (persistent scratch) - msync makes them durable first, so the stamp never
+    /// describes vector bytes that could still be lost. Metadata build runs on the queue (~1s at
+    /// 3.8M rows, at idle); the file write happens on persistIO.
+    private func stampRowSidecarLocked(sync: Bool) {
+        guard Self.rowSidecarEnabled, dbOpen(), flat16.isPersistent, dim > 0, !rows.isEmpty,
+              mutationGen != lastStampedGen, flat16.count == rows.count * dim else { return }
+        let t0 = omniPerfEnabled ? Date() : nil
+        flat16.msyncFile()
+        let n = rows.count
+        // Pre-sized [UInt8] buffers, not Data: appending millions of few-byte chunks through
+        // Data's COW machinery measured 21s at 3.8M rows on the store queue; the same build into
+        // raw arrays is ~1s. Converted to Data once, by move, at the end.
+        var locBytes = [UInt8]()
+        var records = [UInt8](repeating: 0, count: n * Self.rowRecordSize)
+        records.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
+            for i in 0 ..< n {
+                let r = rows[i]
+                let o = i * Self.rowRecordSize
+                raw.storeBytes(of: fileID[i], toByteOffset: o, as: Int32.self)
+                raw.storeBytes(of: Int32(r.chunkIndex), toByteOffset: o + 4, as: Int32.self)
+                raw.storeBytes(of: Int32(r.width), toByteOffset: o + 8, as: Int32.self)
+                raw.storeBytes(of: Int32(r.height), toByteOffset: o + 12, as: Int32.self)
+                raw.storeBytes(of: r.modified, toByteOffset: o + 16, as: Double.self)
+                raw.storeBytes(of: r.duration, toByteOffset: o + 24, as: Double.self)
+                raw.storeBytes(of: Int64(r.size), toByteOffset: o + 32, as: Int64.self)
+                if r.locator.isEmpty {
+                    raw.storeBytes(of: UInt32(0), toByteOffset: o + 40, as: UInt32.self)
+                    raw.storeBytes(of: UInt32(0), toByteOffset: o + 44, as: UInt32.self)
+                } else {
+                    raw.storeBytes(of: UInt32(locBytes.count), toByteOffset: o + 40, as: UInt32.self)
+                    let before = locBytes.count
+                    locBytes.append(contentsOf: r.locator.utf8)
+                    raw.storeBytes(of: UInt32(locBytes.count - before), toByteOffset: o + 44, as: UInt32.self)
+                }
+                raw.storeBytes(of: kindCode[i], toByteOffset: o + 48, as: UInt8.self)
+            }
+        }
+        let locBlob = Data(locBytes)
+        func table(_ strings: [String]) -> (offsets: Data, blob: Data) {
+            var offs = [UInt8](); offs.reserveCapacity((strings.count + 1) * 4)
+            var blob = [UInt8]()
+            for s in strings {
+                withUnsafeBytes(of: UInt32(blob.count).littleEndian) { offs.append(contentsOf: $0) }
+                blob.append(contentsOf: s.utf8)
+            }
+            withUnsafeBytes(of: UInt32(blob.count).littleEndian) { offs.append(contentsOf: $0) }
+            return (Data(offs), Data(blob))
+        }
+        let paths = table(idPath)
+        let kinds = table(idKind)
+        let header = RowSidecarHeader(
+            magic: "omni-rows-1", gen: mutationGen, dim: dim, rowCount: n,
+            pathCount: idPath.count, kindCount: idKind.count,
+            recordBytes: records.count, locatorBytes: locBlob.count,
+            pathOffBytes: paths.offsets.count, pathBlobBytes: paths.blob.count,
+            kindOffBytes: kinds.offsets.count, kindBlobBytes: kinds.blob.count)
+        lastStampedGen = mutationGen
+        let url = rowSidecarURL
+        let tmp = url.deletingLastPathComponent().appendingPathComponent(url.lastPathComponent + ".tmp")
+        if let t0 { omniPerfLog(String(format: "row-stamp build=%.0fms rows=%d", -t0.timeIntervalSinceNow * 1000, n)) }
+        let recordsOut = Data(records)
+        let locBlobOut = locBlob
+        let job: @Sendable () -> Void = {
+            guard var head = try? JSONEncoder().encode(header) else { return }
+            head.append(0x0A)
+            let fm = FileManager.default
+            guard fm.createFile(atPath: tmp.path, contents: nil),
+                  let fh = try? FileHandle(forWritingTo: tmp) else { return }
+            do {
+                try fh.write(contentsOf: head)
+                try fh.write(contentsOf: recordsOut)
+                try fh.write(contentsOf: locBlobOut)
+                try fh.write(contentsOf: paths.offsets)
+                try fh.write(contentsOf: paths.blob)
+                try fh.write(contentsOf: kinds.offsets)
+                try fh.write(contentsOf: kinds.blob)
+                try fh.close()
+                try? fm.removeItem(at: url)
+                try fm.moveItem(at: tmp, to: url)
+            } catch {
+                try? fh.close()
+                try? fm.removeItem(at: tmp)
+            }
+        }
+        if sync { persistIO.sync(execute: job) } else { persistIO.async(execute: job) }
+    }
+
+    private func removeRowSidecarFiles() {
+        try? FileManager.default.removeItem(at: rowSidecarURL)
+        try? FileManager.default.removeItem(at: vecSidecarURL)
+        lastStampedGen = -1
+    }
+
+    /// Vector backing for quant folds: prefer the NAMED sidecar file - that is what makes the
+    /// row-table stamp possible - and fall back to the private unlinked scratch when the sidecar
+    /// is disabled or another store holds its lock. mapPersistent overwrites the file's content
+    /// with the live bytes, so a stale on-disk state can never leak in.
+    private func ensureVecScratchLocked() {
+        if !flat16.isMapped, Self.rowSidecarEnabled, dim > 0 {
+            flat16.mapPersistent(url: vecSidecarURL, tailSlackElements: Self.foldThreshold * dim)
+        }
+        flat16.ensureScratch(dir: dbURL.deletingLastPathComponent(),
+                             tailSlackElements: Self.foldThreshold * dim)
+    }
+
+    /// Adopt the sidecar at open (init context - exclusive). On success the entire SQLite row scan
+    /// is skipped; the vectors are the mapped sidecar file (read on demand). Every failure path
+    /// unmaps, deletes both files, and returns false for the historical full scan.
+    private func tryAdoptRowSidecarLocked() -> Bool {
+        guard Self.rowSidecarEnabled else { return false }
+        let fm = FileManager.default
+        try? fm.removeItem(at: rowSidecarURL.deletingLastPathComponent()
+            .appendingPathComponent(rowSidecarURL.lastPathComponent + ".tmp"))   // _exit stranded write
+        guard fm.fileExists(atPath: rowSidecarURL.path), fm.fileExists(atPath: vecSidecarURL.path) else { return false }
+        func reject() -> Bool { flat16.removeAll(); removeRowSidecarFiles(); return false }
+        guard let fh = try? FileHandle(forReadingFrom: rowSidecarURL) else { return reject() }
+        defer { try? fh.close() }
+        guard let headChunk = try? fh.read(upToCount: 4096), let nl = headChunk.firstIndex(of: 0x0A),
+              let header = try? JSONDecoder().decode(RowSidecarHeader.self, from: headChunk[headChunk.startIndex ..< nl])
+        else { return reject() }
+        guard header.magic == "omni-rows-1", header.gen == mutationGen,
+              header.rowCount > 0, header.dim > 0, header.dim % Self.quantGroup == 0,
+              Self.quantBitsFor(baseBytes: header.rowCount * header.dim * 2) > 0,
+              header.recordBytes == header.rowCount * Self.rowRecordSize,
+              header.pathCount > 0, header.kindCount > 0,
+              header.pathOffBytes == (header.pathCount + 1) * 4,
+              header.kindOffBytes == (header.kindCount + 1) * 4,
+              scalarQuery("SELECT COUNT(*) FROM chunks") == header.rowCount
+        else { return reject() }
+        guard flat16.mapPersistent(url: vecSidecarURL, tailSlackElements: Self.foldThreshold * header.dim,
+                                   adoptElements: header.rowCount * header.dim) else { return reject() }
+        guard (try? fh.seek(toOffset: UInt64(nl - headChunk.startIndex + 1))) != nil,
+              let records = try? fh.read(upToCount: header.recordBytes), records.count == header.recordBytes,
+              header.locatorBytes >= 0,
+              let locBlob = header.locatorBytes == 0 ? Data() : try? fh.read(upToCount: header.locatorBytes),
+              locBlob.count == header.locatorBytes,
+              let pathOffs = try? fh.read(upToCount: header.pathOffBytes), pathOffs.count == header.pathOffBytes,
+              let pathBlob = try? fh.read(upToCount: header.pathBlobBytes), pathBlob.count == header.pathBlobBytes,
+              let kindOffs = try? fh.read(upToCount: header.kindOffBytes), kindOffs.count == header.kindOffBytes,
+              let kindBlob = try? fh.read(upToCount: header.kindBlobBytes), kindBlob.count == header.kindBlobBytes
+        else { return reject() }
+        func strings(_ offs: Data, _ blob: Data, _ count: Int) -> [String]? {
+            var out = [String](); out.reserveCapacity(count)
+            var ok = true
+            offs.withUnsafeBytes { (op: UnsafeRawBufferPointer) in
+                blob.withUnsafeBytes { (bp: UnsafeRawBufferPointer) in
+                    var prev = op.loadUnaligned(fromByteOffset: 0, as: UInt32.self)
+                    for i in 1 ... count {
+                        let end = op.loadUnaligned(fromByteOffset: i * 4, as: UInt32.self)
+                        guard end >= prev, Int(end) <= blob.count else { ok = false; return }
+                        let slice = UnsafeRawBufferPointer(rebasing: bp[Int(prev) ..< Int(end)])
+                        out.append(String(decoding: slice, as: UTF8.self))
+                        prev = end
+                    }
+                }
+            }
+            return ok ? out : nil
+        }
+        guard let pathTable = strings(pathOffs, pathBlob, header.pathCount),
+              let kindTable = strings(kindOffs, kindBlob, header.kindCount) else { return reject() }
+
+        // SAMPLED CONTENT VALIDATION against SQLite point lookups (PK btree, ~ms total): vectors,
+        // modified, size, and kind for ~32 evenly spaced rows must match byte-for-byte. This is
+        // the backstop for any missed generation bump - a shifted or altered row set cannot pass.
+        let sampleCount = min(32, header.rowCount)
+        let stride = max(1, header.rowCount / sampleCount)
+        var sampleOK = true
+        records.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "SELECT vec, modified, size, kind, dim FROM chunks WHERE path = ? AND chunk_index = ?;", -1, &stmt, nil) == SQLITE_OK else { sampleOK = false; return }
+            defer { sqlite3_finalize(stmt) }
+            var i = 0
+            while i < header.rowCount, sampleOK {
+                let o = i * Self.rowRecordSize
+                let fid = Int(raw.loadUnaligned(fromByteOffset: o, as: Int32.self))
+                let ci = raw.loadUnaligned(fromByteOffset: o + 4, as: Int32.self)
+                let modified = raw.loadUnaligned(fromByteOffset: o + 16, as: Double.self)
+                let size = raw.loadUnaligned(fromByteOffset: o + 32, as: Int64.self)
+                let kc = Int(raw.loadUnaligned(fromByteOffset: o + 48, as: UInt8.self))
+                guard fid >= 0, fid < pathTable.count, kc < kindTable.count else { sampleOK = false; break }
+                sqlite3_reset(stmt); sqlite3_clear_bindings(stmt)
+                sqlite3_bind_text(stmt, 1, pathTable[fid], -1, SQLITE_TRANSIENT)
+                sqlite3_bind_int(stmt, 2, ci)
+                guard sqlite3_step(stmt) == SQLITE_ROW,
+                      sqlite3_column_double(stmt, 1) == modified,
+                      sqlite3_column_int64(stmt, 2) == size,
+                      String(cString: sqlite3_column_text(stmt, 3)) == kindTable[kc],
+                      Int(sqlite3_column_int(stmt, 4)) == header.dim,
+                      let blob = sqlite3_column_blob(stmt, 0)
+                else { sampleOK = false; break }
+                let blobBytes = Int(sqlite3_column_bytes(stmt, 0))
+                let ok: Bool = flat16.withUnsafeBufferPointer { fb in
+                    let row = UnsafeBufferPointer(rebasing: fb[i * header.dim ..< (i + 1) * header.dim])
+                    if blobBytes == header.dim * 2 {
+                        return memcmp(row.baseAddress!, blob, header.dim * 2) == 0
+                    } else if blobBytes == header.dim * 4 {   // legacy fp32 row: compare post-conversion
+                        let fp = blob.assumingMemoryBound(to: Float.self)
+                        for j in 0 ..< header.dim where Self.toBF16(fp[j]) != row[j] { return false }
+                        return true
+                    }
+                    return false
+                }
+                if !ok { sampleOK = false }
+                i += stride
+            }
+        }
+        guard sampleOK else { return reject() }
+
+        // Commit: rebuild the derived structures exactly as loadIntoMemory would have.
+        dim = header.dim
+        idPath = pathTable
+        idKind = kindTable
+        pathID = [:]; pathID.reserveCapacity(pathTable.count)
+        for (i, p) in pathTable.enumerated() { pathID[p] = Int32(i) }
+        kindID = [:]
+        for (i, k) in kindTable.enumerated() { kindID[k] = UInt8(i) }
+        fileChunkCount = [Int32](repeating: 0, count: pathTable.count)
+        rows.removeAll(); rows.reserveCapacity(header.rowCount)
+        fileID.removeAll(); fileID.reserveCapacity(header.rowCount)
+        kindCode.removeAll(); kindCode.reserveCapacity(header.rowCount)
+        resetAggregatesLocked()
+        records.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            locBlob.withUnsafeBytes { (lb: UnsafeRawBufferPointer) in
+                for i in 0 ..< header.rowCount {
+                    let o = i * Self.rowRecordSize
+                    let fid = raw.loadUnaligned(fromByteOffset: o, as: Int32.self)
+                    let kc = raw.loadUnaligned(fromByteOffset: o + 48, as: UInt8.self)
+                    let locOff = Int(raw.loadUnaligned(fromByteOffset: o + 40, as: UInt32.self))
+                    let locLen = Int(raw.loadUnaligned(fromByteOffset: o + 44, as: UInt32.self))
+                    let locator = locLen > 0 && locOff + locLen <= locBlob.count
+                        ? String(decoding: UnsafeRawBufferPointer(rebasing: lb[locOff ..< locOff + locLen]), as: UTF8.self) : ""
+                    let path = idPath[Int(fid)]
+                    let kind = idKind[Int(kc)]
+                    rows.append(Row(path: path, kind: kind,
+                                    chunkIndex: Int(raw.loadUnaligned(fromByteOffset: o + 4, as: Int32.self)),
+                                    modified: raw.loadUnaligned(fromByteOffset: o + 16, as: Double.self),
+                                    size: Int(raw.loadUnaligned(fromByteOffset: o + 32, as: Int64.self)),
+                                    width: Int(raw.loadUnaligned(fromByteOffset: o + 8, as: Int32.self)),
+                                    height: Int(raw.loadUnaligned(fromByteOffset: o + 12, as: Int32.self)),
+                                    duration: raw.loadUnaligned(fromByteOffset: o + 24, as: Double.self),
+                                    locator: locator))
+                    fileID.append(fid)
+                    kindCode.append(kc)
+                    fileChunkInc(fid, kind, path)
+                }
+            }
+        }
+        presentPaths = Set(idPath.enumerated().compactMap { fileChunkCount[$0.offset] > 0 ? $0.element : nil })
+        lastStampedGen = mutationGen
+        invalidateBase()
+        if Self.searchTiming { print("[search] ADOPT row sidecar rows=\(header.rowCount) files=\(idPath.count)") }
+        return true
+    }
+
+    /// Group-quantize flat16 rows [range) in SLABS: converting through one full bf16 MLXArray
+    /// would leave a range-sized transient in MLX's buffer cache (measured: it ERASED the
+    /// quantization's memory win) and would spike an 8GB machine at exactly the moment it
+    /// is memory-tight. 128k-row slabs bound the transient to ~200MB, and each slab reuses
+    /// the previous one's cached buffer. The packed outputs concat along axis 0 (wq rows
+    /// are independently packed), so the result is identical to a one-shot quantize - and,
+    /// for the same reason, quantizing only a DELTA range and concatenating onto an existing
+    /// replica is bit-identical to re-quantizing everything.
+    private func quantizeRowsLocked(_ range: Range<Int>, bits: Int) -> (wqs: [MLXArray], scs: [MLXArray], bss: [MLXArray]) {
+        let slab = 131_072
+        var wqs: [MLXArray] = [], scs: [MLXArray] = [], bss: [MLXArray] = []
+        var off = range.lowerBound
+        flat16.withUnsafeBytes { raw in
+            while off < range.upperBound {
+                let count = Swift.min(slab, range.upperBound - off)
+                let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!.advanced(by: off * dim * MemoryLayout<UInt16>.size)),
+                                count: count * dim * MemoryLayout<UInt16>.size, deallocator: .none)
+                let part = MLXArray(data, [count, dim], dtype: .bfloat16)
+                let q = MLX.quantized(part, groupSize: Self.quantGroup, bits: bits)
+                var toEval = [q.wq, q.scales]
+                if let b = q.biases { toEval.append(b) }
+                MLX.eval(toEval)
+                wqs.append(q.wq); scs.append(q.scales); if let b = q.biases { bss.append(b) }
+                off += count
+            }
+        }
+        return (wqs, scs, bss)
+    }
+
     private func rebuildBaseLocked(rowCount: Int) {
         let tR = Self.searchTiming ? Date() : nil
+        let byteCount = rowCount * dim * MemoryLayout<UInt16>.size
+        let bits = Self.quantBitsFor(baseBytes: byteCount)
+        // INCREMENTAL FOLD: a pure append onto a live quant replica (no structural change, same
+        // quant decision) quantizes ONLY the delta rows and concatenates them onto the existing
+        // packed arrays - O(delta) quantize + O(delta) scratch writes instead of re-quantizing all
+        // N rows and rewriting the whole scratch file (which took ~minutes at 3.8M rows on a base
+        // M-chip and made the first search after every fold unusable there). Bit-identical to the
+        // full rebuild: wq rows are packed independently per `quantizeRowsLocked`, and the concat
+        // preserves row order. Anything else - structural dirty, mode flip, bits change, biases
+        // arity mismatch - falls through to the full rebuild below, which stays byte-identical to
+        // the historical behavior.
+        if bits > 0, bits == quantBits, let qb = quantBase, !baseDirty,
+           rowCount > baseRows, dim % Self.quantGroup == 0, flat16.count >= rowCount * dim {
+            let deltaRows = rowCount - baseRows
+            let (wqs, scs, bss) = quantizeRowsLocked(baseRows ..< rowCount, bits: bits)
+            if !wqs.isEmpty, (qb.biases == nil) == bss.isEmpty {
+                let wq = MLX.concatenated([qb.wq] + wqs, axis: 0)
+                let sc = MLX.concatenated([qb.scales] + scs, axis: 0)
+                let bi: MLXArray? = qb.biases.map { MLX.concatenated([$0] + bss, axis: 0) }
+                var toEval = [wq, sc]
+                if let bi { toEval.append(bi) }
+                MLX.eval(toEval)
+                quantBase = (wq, sc, bi)
+                baseRows = rowCount
+                ensureVecScratchLocked()
+                quantReplicaChangedLocked()
+                if let tR { print(String(format: "[search] FOLD delta=%d rows=%d %.1fms", deltaRows, rowCount, -tR.timeIntervalSinceNow * 1000)) }
+                return
+            }
+        }
         defer { if let tR { print(String(format: "[search] REBUILD base rows=%d %.1fms", rowCount, -tR.timeIntervalSinceNow * 1000)) } }
         // Release the OLD base before allocating the new one: holding both across the copy doubled
         // the transient GPU footprint (2x ~1GB at 627k rows, linearly worse at scale) - the burst
@@ -2115,32 +2886,8 @@ public final class VectorStore: @unchecked Sendable {
         mlxFileID = nil
         mlxKindCode = nil
         quantBase = nil
-        let byteCount = rowCount * dim * MemoryLayout<UInt16>.size
-        let bits = Self.quantBitsFor(baseBytes: byteCount)
         if bits > 0, dim % Self.quantGroup == 0 {
-            // Group-quantize the scan replica in SLABS: converting through one full bf16 MLXArray
-            // would leave a base-sized transient in MLX's buffer cache (measured: it ERASED the
-            // quantization's memory win) and would spike an 8GB machine at exactly the moment it
-            // is memory-tight. 128k-row slabs bound the transient to ~200MB, and each slab reuses
-            // the previous one's cached buffer. The packed outputs concat along axis 0 (wq rows
-            // are independently packed), so the result is identical to a one-shot quantize.
-            let slab = 131_072
-            var wqs: [MLXArray] = [], scs: [MLXArray] = [], bss: [MLXArray] = []
-            var off = 0
-            flat16.withUnsafeBytes { raw in
-                while off < rowCount {
-                    let count = Swift.min(slab, rowCount - off)
-                    let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!.advanced(by: off * dim * MemoryLayout<UInt16>.size)),
-                                    count: count * dim * MemoryLayout<UInt16>.size, deallocator: .none)
-                    let part = MLXArray(data, [count, dim], dtype: .bfloat16)
-                    let q = MLX.quantized(part, groupSize: Self.quantGroup, bits: bits)
-                    var toEval = [q.wq, q.scales]
-                    if let b = q.biases { toEval.append(b) }
-                    MLX.eval(toEval)
-                    wqs.append(q.wq); scs.append(q.scales); if let b = q.biases { bss.append(b) }
-                    off += count
-                }
-            }
+            let (wqs, scs, bss) = quantizeRowsLocked(0 ..< rowCount, bits: bits)
             let wq = wqs.count == 1 ? wqs[0] : MLX.concatenated(wqs, axis: 0)
             let sc = scs.count == 1 ? scs[0] : MLX.concatenated(scs, axis: 0)
             let bi: MLXArray? = bss.isEmpty ? nil : (bss.count == 1 ? bss[0] : MLX.concatenated(bss, axis: 0))
@@ -2151,11 +2898,12 @@ public final class VectorStore: @unchecked Sendable {
             quantBits = bits
             // Pageable host copy: with the GPU scanning the quantized replica, the exact bf16 bytes
             // are only touched by rerank gathers, rankChunks/fileVector, the folder map, and
-            // compaction - move them to the unlinked scratch mapping so the OS can evict the cold
-            // bulk on memory-tight machines. Rewritten at each fold so the absorbed delta becomes
-            // file-backed too. Heap mode resumes automatically if the mapping ever fails.
-            flat16.mapToScratch(dir: dbURL.deletingLastPathComponent(),
-                                tailSlackElements: Self.foldThreshold * dim)
+            // compaction - keep them in the file-backed scratch mapping so the OS can evict the
+            // cold bulk on memory-tight machines. First activation maps (the named sidecar when
+            // available); afterwards folds only extend file coverage over the delta. Heap mode
+            // resumes automatically if the mapping ever fails.
+            ensureVecScratchLocked()
+            quantReplicaChangedLocked()
         } else {
             flat16.withUnsafeBytes { raw in
                 let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!),
@@ -2532,16 +3280,22 @@ public final class VectorStore: @unchecked Sendable {
     private func compactRowsLocked(_ shouldRemove: (Int) -> Bool) -> Set<String> {
         var removedPaths = Set<String>()
         var firstRemoved = Int.max
+        // Original indices of the base rows [0, baseRows) that SURVIVE this compaction, materialized
+        // lazily on the first in-base removal (identity until then). Feeds the quant-replica gather
+        // below; nil = no base row was removed.
+        var baseSurvivors: [Int32]? = nil
         var w = 0   // write cursor, in dim-slice / row units
         flat16.withUnsafeMutableBufferPointer { fb in
             guard let base = fb.baseAddress else { return }
             for i in 0 ..< rows.count {
                 if shouldRemove(i) {
+                    if i < baseRows, baseSurvivors == nil { baseSurvivors = (0 ..< Int32(i)).map { $0 } }
                     removedPaths.insert(rows[i].path)
                     fileChunkDec(fileID[i], rows[i].kind, rows[i].path)
                     if i < firstRemoved { firstRemoved = i }
                     continue
                 }
+                if i < baseRows, baseSurvivors != nil { baseSurvivors?.append(Int32(i)) }
                 if w != i {
                     (base + w * dim).update(from: base + i * dim, count: dim)
                     rows[w] = rows[i]; fileID[w] = fileID[i]; kindCode[w] = kindCode[i]
@@ -2558,8 +3312,42 @@ public final class VectorStore: @unchecked Sendable {
         // [baseRows, n) - the common "re-edit a recently indexed file" case - rows [0, baseRows) are
         // byte-untouched (the write cursor never diverged before `firstRemoved`), so the base stays
         // valid and we skip the ~65ms rebuild entirely. Delta-only shrink keeps baseRows correct.
-        if firstRemoved < baseRows { invalidateBase() }
+        if firstRemoved < baseRows, !compactQuantBaseLocked(baseSurvivors) { invalidateBase() }
         return removedPaths
+    }
+
+    /// Structural shrink of the QUANT replica without re-quantizing: quantized rows are packed
+    /// independently (see quantizeRowsLocked), so gathering the surviving rows out of the packed
+    /// arrays yields byte-identical results to re-quantizing the compacted flat16 - at the cost of
+    /// one GPU gather instead of an O(N) quantize + eval. This is what keeps search alive during a
+    /// catch-up indexing pass on a huge index: every modified file used to invalidate the base and
+    /// the next write re-quantized ALL rows (~minutes at 3.8M rows on a base M-chip, with searches
+    /// queued behind it); now it is a ~tens-of-ms gather. Returns false (caller invalidates, the
+    /// historical path) in bf16 mode - its rebuild is a cheap host copy - or when the base is
+    /// already dirty.
+    private func compactQuantBaseLocked(_ baseSurvivors: [Int32]?) -> Bool {
+        guard let qb = quantBase, !baseDirty, quantBits > 0, let survivors = baseSurvivors else { return false }
+        guard !survivors.isEmpty else {
+            // Every base row was removed; drop the replica and let the next search rebuild over
+            // whatever delta remains.
+            return false
+        }
+        let idx = MLXArray(survivors)
+        let wq = qb.wq.take(idx, axis: 0)
+        let sc = qb.scales.take(idx, axis: 0)
+        let bi = qb.biases.map { $0.take(idx, axis: 0) }
+        var toEval = [wq, sc]
+        if let bi { toEval.append(bi) }
+        MLX.eval(toEval)
+        quantBase = (wq, sc, bi)
+        baseRows = survivors.count
+        // The on-disk replica no longer matches this prefix: mark it un-persisted and re-arm the
+        // async persist so a later fold (or close) writes a fresh one. Adoption's checksum would
+        // reject the stale file anyway; this just restores freshness within the session.
+        lastPersistedBaseRows = -1
+        replicaLaunchPersistScheduled = false
+        if Self.searchTiming { print("[search] GATHER base survivors=\(survivors.count)") }
+        return true
     }
 
     private func deletePathLocked(_ path: String) {
@@ -2575,19 +3363,47 @@ public final class VectorStore: @unchecked Sendable {
         rows.removeAll(); flat16.removeAll(); presentPaths.removeAll(); fileID.removeAll(); pathID.removeAll()
         idPath.removeAll(); fileChunkCount.removeAll(); kindCode.removeAll(); kindID.removeAll(); idKind.removeAll(); dim = 0
         resetAggregatesLocked()
+        if tryAdoptRowSidecarLocked() { return }   // validated cache of everything below; SQLite stays truth
         // Pre-size the buffers to the final row/element count so the bf16 buffer is filled in place
         // rather than grown through ~log2(N) reallocations. One COUNT(*) + one dim read up front.
         let total = scalarQuery("SELECT COUNT(*) FROM chunks")
         let d0 = scalarQuery("SELECT dim FROM chunks LIMIT 1")
         if total > 0 && d0 > 0 {
             rows.reserveCapacity(total)
-            flat16.reserveCapacity(total * d0)
+            // SCRATCH-FIRST LOAD: when this index will run in quant mode (same predicate the fold
+            // uses), stream the bf16 bytes into the file-backed scratch mapping from the start
+            // instead of anonymous heap. A multi-GB heap load forced macOS to swap-storm a 16GB
+            // machine for the whole launch (measured: system swap +9GB, 99s to ready at 3.8M rows);
+            // dirty file pages flush lazily and evict for free. Steady state is IDENTICAL to before
+            // (the first fold moved these bytes to the same mapping anyway) - only the launch path
+            // changes. Small indexes (bf16 mode) keep the heap exactly as before. If the mapping
+            // fails, reserveCapacity below restores the historical heap path.
+            if Self.quantBitsFor(baseBytes: total * d0 * MemoryLayout<UInt16>.size) > 0, d0 % Self.quantGroup == 0 {
+                // Prefer the NAMED persistent file (it doubles as the vector sidecar - a later
+                // stamp makes the next open skip this whole scan); a second store on the same
+                // index fails the flock and gets the private unlinked scratch instead.
+                if Self.rowSidecarEnabled {
+                    flat16.mapPersistent(url: vecSidecarURL, tailSlackElements: Self.foldThreshold * d0,
+                                         precommitElements: total * d0)
+                }
+                if !flat16.isMapped {
+                    flat16.mapToScratch(dir: dbURL.deletingLastPathComponent(),
+                                        tailSlackElements: Self.foldThreshold * d0,
+                                        precommitElements: total * d0)
+                }
+            }
+            flat16.reserveCapacity(total * d0)   // no-op when mapped
             presentPaths.reserveCapacity(total)
             fileID.reserveCapacity(total)
             kindCode.reserveCapacity(total)
         }
         var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, "SELECT path, kind, chunk_index, dim, vec, modified, width, height, duration, locator FROM chunks;", -1, &stmt, nil) == SQLITE_OK {
+        // ORDER BY rowid makes the load order EXPLICITLY the insertion order (a plain full scan
+        // returns it in practice, but it is not contractual). In-memory row order == rowid order
+        // is the invariant the persisted quant replica depends on: appends always take rowid
+        // max+1 (inserted last), deletes preserve relative order on both sides. Free on a rowid
+        // table (the scan already walks the B-tree in rowid order - no sort step).
+        if sqlite3_prepare_v2(db, "SELECT path, kind, chunk_index, dim, vec, modified, width, height, duration, locator, size FROM chunks ORDER BY rowid;", -1, &stmt, nil) == SQLITE_OK {
             while sqlite3_step(stmt) == SQLITE_ROW {
                 let path = canonicalPath(String(cString: sqlite3_column_text(stmt, 0)))
                 let kind = canonicalKind(String(cString: sqlite3_column_text(stmt, 1)))
@@ -2613,6 +3429,7 @@ public final class VectorStore: @unchecked Sendable {
                     flat16.append(contentsOf: repeatElement(0, count: d))   // short/corrupt row
                 }
                 rows.append(Row(path: path, kind: kind, chunkIndex: ci, modified: modified,
+                                size: Int(sqlite3_column_int64(stmt, 10)),
                                 width: width, height: height, duration: duration, locator: locator))
                 let fid = internPath(path)
                 fileID.append(fid)
@@ -2623,6 +3440,9 @@ public final class VectorStore: @unchecked Sendable {
         }
         sqlite3_finalize(stmt)
         invalidateBase()
+        // A read-only session (open, search, quit) would otherwise never earn a sidecar; stamp
+        // once the open settles. Mutations reschedule via bumpGenLocked as usual.
+        scheduleRowStampLocked(after: 120)
     }
 
     private func userVersion() -> Int32 {
