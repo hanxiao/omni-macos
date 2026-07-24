@@ -85,7 +85,7 @@ struct ContentView: View {
     @ViewBuilder private var detail: some View {
         switch model.phase {
         case .loadingModel:
-            CenteredStatus(symbol: "brain", title: "Loading the Omni model", subtitle: "Starting the on-device model\u{2026}", showSpinner: true)
+            CenteredStatus(symbol: "brain", title: "Loading the Omni model", subtitle: "Starting the on-device model\u{2026}", showSpinner: true, progress: model.loadingProgress)
         case .noModel:
             OnboardingView()
         case .failed(let msg):
@@ -683,6 +683,8 @@ struct CenteredStatus: View {
     let title: String
     let subtitle: String
     var showSpinner: Bool = false
+    /// Determinate 0...1 -> a native linear progress bar replaces the indeterminate spinner.
+    var progress: Double? = nil
     var action: (String, () -> Void)? = nil
     var secondary: (String, () -> Void)? = nil
 
@@ -692,7 +694,12 @@ struct CenteredStatus: View {
             Text(title).font(.title)
             Text(subtitle).font(.callout).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center).frame(maxWidth: 400)
-            if showSpinner { ProgressView().controlSize(.small).padding(.top, 4) }
+            if let progress {
+                ProgressView(value: progress)
+                    .progressViewStyle(.linear)
+                    .frame(width: 280)
+                    .padding(.top, 4)
+            } else if showSpinner { ProgressView().controlSize(.small).padding(.top, 4) }
             if action != nil || secondary != nil {
                 HStack(spacing: 10) {
                     if let action { Button(action.0, action: action.1).buttonStyle(.borderedProminent) }
@@ -858,12 +865,23 @@ private struct WindowTitleHider: NSViewRepresentable {
             }
             guard let icon = NSImage(systemSymbolName: "square.and.arrow.up",
                                      accessibilityDescription: "Search by a file") else { return }
+            // Shrink the field's own magnifier to the same 11pt so the two glyphs read as one
+            // family (the stock loupe is drawn noticeably larger). Idempotent via the cell tag.
+            if let cell = field.cell as? NSSearchFieldCell, let loupeCell = cell.searchButtonCell,
+               loupeCell.tag != Self.accessoryTag,
+               let loupe = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: "Search") {
+                let img = loupe.withSymbolConfiguration(.init(pointSize: 11, weight: .regular))
+                loupeCell.image = img
+                loupeCell.alternateImage = img
+                loupeCell.tag = Self.accessoryTag
+            }
             let b = NSButton(frame: NSRect(x: x, y: y, width: side, height: side))
             b.tag = Self.accessoryTag
-            // Match the field's own magnifier: same 13pt regular-weight symbol metrics, same
-            // secondary tint. accessoryBarAction + border-on-hover is the native in-field button
-            // treatment (Spotlight's mic): a soft rounded highlight on hover, darker while pressed.
-            b.image = icon.withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
+            // 11pt glyph inside the 20pt hover target: the accessoryBarAction highlight capsule
+            // gets visible breathing room around the icon, matching the (shrunk) magnifier.
+            // accessoryBarAction + border-on-hover is the native in-field button treatment
+            // (Spotlight's mic): a soft rounded highlight on hover, darker while pressed.
+            b.image = icon.withSymbolConfiguration(.init(pointSize: 11, weight: .regular))
             b.bezelStyle = .accessoryBarAction
             b.isBordered = true
             b.showsBorderOnlyWhileMouseInside = true

@@ -96,6 +96,32 @@ enum DateRange: String, CaseIterable, Identifiable {
 final class AppModel {
     enum Phase: Equatable { case loadingModel, noModel, ready, failed(String) }
 
+    /// Determinate launch progress (0...1) while phase == .loadingModel; nil once ready/failed
+    /// (or before bootstrap has begun). Combined 50/50 from the store's row-load fraction and the
+    /// engine's GPU materialization fraction - both real measurements (see bootstrap). Monotonic:
+    /// only ever moves forward within one launch.
+    var loadingProgress: Double? = nil
+    @ObservationIgnored private var storeLoadFrac = 0.0
+    @ObservationIgnored private var engineLoadFrac = 0.0
+    private func noteStoreLoadFrac(_ f: Double) { storeLoadFrac = max(storeLoadFrac, min(1, f)); refreshLoadingProgress() }
+    private func noteEngineLoadFrac(_ f: Double) { engineLoadFrac = max(engineLoadFrac, min(1, f)); refreshLoadingProgress() }
+    private func refreshLoadingProgress() {
+        guard phase == .loadingModel else { return }
+        loadingProgress = max(loadingProgress ?? 0, 0.5 * storeLoadFrac + 0.5 * engineLoadFrac)
+    }
+    /// Total GPU bytes this launch will materialize: the weights file plus the persisted quant
+    /// replica (both known before loading starts). The denominator for the engine-side fraction.
+    private static func expectedGPULoadBytes(modelDir: URL) -> Int {
+        func size(_ url: URL) -> Int {
+            ((try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? Int) ?? 0
+        }
+        var total = size(modelDir.appendingPathComponent("model.safetensors"))
+        if let idx = try? Self.indexURL() {
+            total += size(idx.deletingLastPathComponent().appendingPathComponent(idx.lastPathComponent + ".quant"))
+        }
+        return total
+    }
+
     static let defaultMinScore = 0.0   // show all matches by default; users can raise the bar in Search settings
 
     /// Cosine similarity is -1...1; the UI presents it as a 0...100% relevance, clamping the
@@ -1753,11 +1779,26 @@ final class AppModel {
         else { phase = .noModel; return }
         modelPath = dir.path
         modelVariant = dir.path.contains("nano") ? .nano : .small
+        // REAL launch progress, not an animation: the store reports its row-load fraction directly,
+        // and the engine side is MLX's live GPU allocation against the total bytes KNOWN up front
+        // (weights file + persisted quant replica - everything that must materialize before ready).
+        storeLoadFrac = 0; engineLoadFrac = 0; loadingProgress = 0
+        let gpuTotal = Double(max(1, Self.expectedGPULoadBytes(modelDir: dir)))
+        let progressSampler = Task { [weak self] in
+            while !Task.isCancelled {
+                let frac = min(1, Double(omniGPUActiveMemory()) / gpuTotal)
+                await MainActor.run { self?.noteEngineLoadFrac(frac) }
+                try? await Task.sleep(nanoseconds: 200_000_000)
+            }
+        }
+        defer { progressSampler.cancel(); loadingProgress = nil }
         do {
             // Load the store (CPU: reads the index into memory) concurrently with the engine (IO/GPU:
             // weights + tokenizer) - they're independent, so overlap removes the store load from the
             // critical path. VectorStore/OmniEngine are Sendable; neither touches MainActor state here.
-            async let storeC = try VectorStore(dbURL: try Self.indexURL())
+            async let storeC = try VectorStore(dbURL: try Self.indexURL(), onLoadProgress: { [weak self] f in
+                Task { @MainActor in self?.noteStoreLoadFrac(f) }
+            })
             // loadValidated self-tests the media embedding path and reloads weights if the first
             // (cold) load hit the MLX uninitialized-memory NaN, so media indexes reliably. Only load
             // the towers for enabled modalities so a turned-off kind never occupies VRAM.

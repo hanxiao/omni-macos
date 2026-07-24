@@ -134,6 +134,11 @@ public func omniSetMemoryLimit(_ bytes: Int) {
 /// Physical RAM in bytes (for choosing a sensible memory-limit slider range).
 public func omniPhysicalMemory() -> Int { Int(ProcessInfo.processInfo.physicalMemory) }
 
+/// Bytes of live (non-cache) MLX GPU allocations. The launch progress bar reads this while the
+/// model weights + resident index materialize: total GPU bytes to come are known up front (weights
+/// file + persisted quant replica), so active/total is a REAL progress fraction, not an animation.
+public func omniGPUActiveMemory() -> Int { MLX.Memory.activeMemory }
+
 // Opt-in perf log for diagnosing search/index latency on REAL hardware (esp. low-end, where the
 // in-flight indexing flush is slow enough that the gate wait actually bites). Enable by launching
 // the binary from a terminal with the env var and redirecting stderr, e.g.:

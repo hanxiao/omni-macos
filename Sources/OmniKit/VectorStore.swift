@@ -640,9 +640,13 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     public let dbURL: URL
+    /// Open-time progress (0...1 over the row load, sidecar or full scan), for the launch UI.
+    /// Called on the opening thread, at coarse strides - never per row. nil = no reporting.
+    private let onLoadProgress: (@Sendable (Double) -> Void)?
 
-    public init(dbURL: URL) throws {
+    public init(dbURL: URL, onLoadProgress: (@Sendable (Double) -> Void)? = nil) throws {
         self.dbURL = dbURL
+        self.onLoadProgress = onLoadProgress
         try FileManager.default.createDirectory(at: dbURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         guard sqlite3_open(dbURL.path, &db) == SQLITE_OK else {
             throw OmniError.store("open failed: \(String(cString: sqlite3_errmsg(db)))")
@@ -2768,6 +2772,7 @@ public final class VectorStore: @unchecked Sendable {
             }
         }
         guard sampleOK else { return reject() }
+        onLoadProgress?(0.25)   // files read + validated; the row rebuild below is the bulk
 
         // Commit: rebuild the derived structures exactly as loadIntoMemory would have.
         dim = header.dim
@@ -2785,6 +2790,9 @@ public final class VectorStore: @unchecked Sendable {
         records.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             locBlob.withUnsafeBytes { (lb: UnsafeRawBufferPointer) in
                 for i in 0 ..< header.rowCount {
+                    if let onLoadProgress, i % 262_144 == 0 {
+                        onLoadProgress(0.25 + 0.75 * Double(i) / Double(header.rowCount))
+                    }
                     let o = i * Self.rowRecordSize
                     let fid = raw.loadUnaligned(fromByteOffset: o, as: Int32.self)
                     let kc = raw.loadUnaligned(fromByteOffset: o + 48, as: UInt8.self)
@@ -2811,6 +2819,7 @@ public final class VectorStore: @unchecked Sendable {
         presentPaths = Set(idPath.enumerated().compactMap { fileChunkCount[$0.offset] > 0 ? $0.element : nil })
         lastStampedGen = mutationGen
         invalidateBase()
+        onLoadProgress?(1)
         if Self.searchTiming { print("[search] ADOPT row sidecar rows=\(header.rowCount) files=\(idPath.count)") }
         return true
     }
@@ -3405,6 +3414,9 @@ public final class VectorStore: @unchecked Sendable {
         // table (the scan already walks the B-tree in rowid order - no sort step).
         if sqlite3_prepare_v2(db, "SELECT path, kind, chunk_index, dim, vec, modified, width, height, duration, locator, size FROM chunks ORDER BY rowid;", -1, &stmt, nil) == SQLITE_OK {
             while sqlite3_step(stmt) == SQLITE_ROW {
+                if let onLoadProgress, total > 0, rows.count % 65536 == 0 {
+                    onLoadProgress(Double(rows.count) / Double(total))
+                }
                 let path = canonicalPath(String(cString: sqlite3_column_text(stmt, 0)))
                 let kind = canonicalKind(String(cString: sqlite3_column_text(stmt, 1)))
                 let ci = Int(sqlite3_column_int(stmt, 2))
@@ -3440,6 +3452,7 @@ public final class VectorStore: @unchecked Sendable {
         }
         sqlite3_finalize(stmt)
         invalidateBase()
+        onLoadProgress?(1)
         // A read-only session (open, search, quit) would otherwise never earn a sidecar; stamp
         // once the open settles. Mutations reschedule via bumpGenLocked as usual.
         scheduleRowStampLocked(after: 120)
