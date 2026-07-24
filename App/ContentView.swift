@@ -372,14 +372,12 @@ struct ContentView: View {
                     .fixedSize()
                 }
                 if #unavailable(macOS 26.0) {
-                    // Together with LegacyToolbarStretch and the AppKit width constraint installed
-                    // by the tuner, this filler absorbs the item's stretch so the chevrons stay
-                    // leading and the trailing cluster is pushed to the window edge. A concrete
-                    // clear view, NOT Spacer: SwiftUI drops toolbar items it deems spacer-only.
-                    Color.clear.frame(minWidth: 1, maxWidth: .infinity, minHeight: 1, maxHeight: 1)
+                    // 1pt filler: a completely empty toolbar item has zero intrinsic size and AppKit
+                    // logs an ambiguous-size warning for it on every layout pass before the chevrons
+                    // first appear.
+                    Color.clear.frame(width: 1, height: 1)
                 }
             }
-            .modifier(LegacyToolbarStretch())
         }
         // Flexible space after back/forward pushes every other control to the trailing edge (chevrons
         // own the left, everything else is right-aligned), and on Tahoe it's also the correct separator
@@ -685,20 +683,6 @@ private struct FileQueryChip: View {
     }
 }
 
-/// Pre-Tahoe: lets the chevrons toolbar item's content fill whatever width the item is given
-/// (leading-aligned, the trailing clear filler absorbs the rest). The width itself comes from a
-/// low-priority AppKit constraint the tuner installs on the item's hosting view - SwiftUI-only
-/// stretch held only until the next toolbar reconciliation. No-op on macOS 26.
-private struct LegacyToolbarStretch: ViewModifier {
-    func body(content: Content) -> some View {
-        if #unavailable(macOS 26.0) {
-            content.frame(maxWidth: .infinity, alignment: .leading)
-        } else {
-            content
-        }
-    }
-}
-
 struct CenteredStatus: View {
     let symbol: String
     let title: String
@@ -862,40 +846,9 @@ private struct WindowTitleHider: NSViewRepresentable {
 
         private func apply(_ w: NSWindow) {
             guard let toolbar = w.toolbar else { return }
-            if #unavailable(macOS 26.0) {
-                installStretch(toolbar)
-            }
             for item in toolbar.items {
                 guard let s = item as? NSSearchToolbarItem else { continue }
-                if #unavailable(macOS 26.0) {
-                    if s.preferredWidthForSearchField != 300 { s.preferredWidthForSearchField = 300 }
-                }
                 installAccessory(in: s.searchField)
-            }
-        }
-
-        /// Pre-Tahoe flexible space WITHOUT touching the item list: programmatic insert/remove on
-        /// a SwiftUI-owned toolbar is pruned/reordered by reconciliation (the per-click flash) and
-        /// consults SwiftUI's delegate mid-flight. Instead the chevrons item's HOSTING VIEW gets
-        /// the classic flexible-toolbar-item recipe - a huge width constraint at low priority.
-        /// AppKit stretches it over the slack, the SwiftUI content fills leading-aligned
-        /// (LegacyToolbarStretch + the clear filler), and the item list never changes.
-        /// Re-installed whenever SwiftUI swaps the hosting view (the identifier marks it done).
-        private func installStretch(_ toolbar: NSToolbar) {
-            func isSwiftUIItem(_ id: NSToolbarItem.Identifier) -> Bool {
-                id.rawValue.count == 36 && id.rawValue.filter { $0 == "-" }.count == 4
-            }
-            let items = toolbar.items
-            // The chevrons item is the FIRST SwiftUI-UUID item (declaration order; the system
-            // toggle and tracking separator that precede it carry com.apple identifiers).
-            guard let chevronsIdx = items.firstIndex(where: { isSwiftUIItem($0.itemIdentifier) }),
-                  let hostView = items[chevronsIdx].view else { return }
-            let marker = "omni.legacy-flex"
-            if !hostView.constraints.contains(where: { $0.identifier == marker }) {
-                let c = hostView.widthAnchor.constraint(equalToConstant: 8000)
-                c.priority = NSLayoutConstraint.Priority(240)
-                c.identifier = marker
-                c.isActive = true
             }
         }
 

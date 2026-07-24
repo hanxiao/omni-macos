@@ -15,6 +15,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         UserDefaults.standard.synchronize()     // persist settings/history/roots before the hard exit
         _exit(0)                                 // immediate; skips the MLX C++ destructors (no GPU-sync hang/crash)
     }
+
+    // UI debug tap (OMNI_UI_DEBUG=1 only): on SIGUSR2, dump a window self-render and the toolbar
+    // item frames to /tmp. Exists because ATTACHING lldb to evaluate the same questions crashes
+    // the live app (expression evaluation re-enters SwiftUI mid-commit); an in-process dump on the
+    // app's own main queue is safe. Inert in normal runs - the source is never installed.
+    private var uiDebugSource: DispatchSourceSignal?
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        guard ProcessInfo.processInfo.environment["OMNI_UI_DEBUG"] == "1" else { return }
+        signal(SIGUSR2, SIG_IGN)
+        let src = DispatchSource.makeSignalSource(signal: SIGUSR2, queue: .main)
+        src.setEventHandler { MainActor.assumeIsolated { Self.dumpUIDebug() } }   // queue is .main
+        src.resume()
+        uiDebugSource = src
+    }
+    @MainActor private static func dumpUIDebug() {
+        guard let w = NSApp.windows.first(where: { $0.toolbar != nil }),
+              let frame = w.contentView?.superview else { return }
+        var lines = ["window \(NSStringFromRect(w.frame))"]
+        for it in w.toolbar?.items ?? [] {
+            let r = it.view.map { $0.convert($0.bounds, to: nil) } ?? .zero
+            lines.append("\(it.itemIdentifier.rawValue) frame=\(NSStringFromRect(r))")
+            for c in it.view?.constraints ?? [] {
+                lines.append("   constraint: \(c)")
+            }
+        }
+        try? lines.joined(separator: "\n").write(toFile: "/tmp/omni-debug-toolbar.txt", atomically: true, encoding: .utf8)
+        if let rep = frame.bitmapImageRepForCachingDisplay(in: frame.bounds) {
+            frame.cacheDisplay(in: frame.bounds, to: rep)
+            try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: "/tmp/omni-debug-shot.png"))
+        }
+    }
 }
 
 @main
