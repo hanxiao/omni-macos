@@ -335,22 +335,10 @@ struct ContentView: View {
     }
 
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
-        // Explicit sidebar toggle, pre-Tahoe only. The full story, learned the hard way: Sequoia's
-        // NavigationSplitView DOES provide a system toggle, but only while the window TITLE is
-        // visible - titleVisibility=.hidden (which this app needs: it is also what removes the
-        // title-area separator bar) collapses the system toggle with it. When the title-hide was
-        // broken, the system toggle showed and this button read as a duplicate; with the hide
-        // working, it is the only toggle. Tahoe shows the system toggle regardless and never runs
-        // this block.
-        if #unavailable(macOS 26.0) {
-            ToolbarItem(placement: .navigation) {
-                Button { NSApp.sendAction(Selector(("toggleSidebar:")), to: nil, from: nil) } label: {
-                    Image(systemName: "sidebar.left")
-                }
-                .help("Show or hide the sidebar")
-                .accessibilityLabel("Show or hide the sidebar")
-            }
-        }
+        // No explicit sidebar toggle: Sequoia's system toggle (next to the traffic lights, like
+        // Finder) lives and dies with the split-view TRACKING SEPARATOR item, which this app keeps
+        // (transparent - see the tuner). Hiding the title does NOT collapse it; only removing the
+        // separator item does. An explicit button here therefore always duplicates the system one.
         // Finder-style back/forward at the leading edge of the content toolbar. The window's title TEXT
         // is hidden (WindowTitleHider), so the chevrons own the leading edge with no "Omni" label. The
         // toolbar ITEM is unconditional and wraps the chevrons in an always-present HStack: a directly
@@ -942,8 +930,10 @@ private struct WindowTitleHider: NSViewRepresentable {
             // list changes - no delegate, no reconciliation fight. Re-installed whenever SwiftUI
             // swaps the hosting view on a rebuild (the constraint identifier marks it done).
             let items = toolbar.items
+            // The chevrons item is the FIRST SwiftUI-UUID item (declaration order; the system
+            // toggle and tracking separator that precede it carry com.apple identifiers).
             let uuidIdxs = items.indices.filter { isSwiftUIItem(items[$0].itemIdentifier) }
-            guard let chevronsIdx = uuidIdxs.count >= 2 ? uuidIdxs[1] : uuidIdxs.first,
+            guard let chevronsIdx = uuidIdxs.first,
                   let hostView = items[chevronsIdx].view else { return }
             let marker = "omni.legacy-flex"
             if !hostView.constraints.contains(where: { $0.identifier == marker }) {
