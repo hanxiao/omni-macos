@@ -806,20 +806,39 @@ private struct WindowTitleHider: NSViewRepresentable {
         var onSearchByFile: (() -> Void)?
         // nonisolated(unsafe): deinit is nonisolated under strict concurrency; the view lives and
         // dies on the main thread, so the unregistration is race-free in practice.
-        nonisolated(unsafe) private var observer: NSObjectProtocol?
+        nonisolated(unsafe) private var observers: [NSObjectProtocol] = []
         private static let accessoryTag = 0xF17E
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
-            guard observer == nil, let w = window else { return }
+            guard observers.isEmpty, let w = window else { return }
             apply(w)
-            observer = NotificationCenter.default.addObserver(
-                forName: NSWindow.didUpdateNotification, object: w, queue: nil) { [weak self] note in
+            let nc = NotificationCenter.default
+            // Backstop: re-apply on window updates (catches wholesale toolbar replacement).
+            observers.append(nc.addObserver(forName: NSWindow.didUpdateNotification, object: w, queue: nil) { [weak self] note in
                 guard let w = note.object as? NSWindow else { return }
                 MainActor.assumeIsolated { self?.apply(w) }
+            })
+            // Fast path: SwiftUI toolbar rebuilds prune the injected flexible space and revive the
+            // tracking separator; reacting to the toolbar's own mutation notifications reshapes it
+            // in the same runloop turn, before the frame renders - the didUpdate-only version let
+            // the left-packed layout flash for a beat and then jump right. Async because the
+            // notification fires mid-mutation (no reentrant toolbar edits).
+            for name in [NSToolbar.didRemoveItemNotification, NSToolbar.willAddItemNotification] {
+                observers.append(nc.addObserver(forName: name, object: nil, queue: nil) { [weak self] note in
+                    guard let tb = note.object as? NSToolbar else { return }
+                    MainActor.assumeIsolated {
+                        guard let self, let w = self.window, tb === w.toolbar else { return }
+                        DispatchQueue.main.async { [weak self] in
+                            if let w = self?.window { self?.apply(w) }
+                        }
+                    }
+                })
             }
         }
-        deinit { if let observer { NotificationCenter.default.removeObserver(observer) } }
+        deinit {
+            for o in observers { NotificationCenter.default.removeObserver(o) }
+        }
 
         private func apply(_ w: NSWindow) {
             if #unavailable(macOS 26.0) {
@@ -827,7 +846,7 @@ private struct WindowTitleHider: NSViewRepresentable {
             }
             guard let toolbar = w.toolbar else { return }
             if #unavailable(macOS 26.0) {
-                insertFlexibleSpaceIfNeeded(toolbar)
+                shapeToolbar(toolbar)
             }
             for item in toolbar.items {
                 guard let s = item as? NSSearchToolbarItem else { continue }
@@ -838,12 +857,18 @@ private struct WindowTitleHider: NSViewRepresentable {
             }
         }
 
-        /// Pre-Tahoe stand-in for ToolbarSpacer(.flexible): SwiftUI drops a Spacer toolbar item on
-        /// macOS 14/15, so the native .flexibleSpace NSToolbarItem is inserted directly - after the
-        /// back/forward item (the first SwiftUI-UUID-identified item; the sidebar toggle and split
-        /// separator precede it), so the trailing cluster and the capped search field hug the right
-        /// edge exactly like Tahoe. Re-inserted whenever a SwiftUI toolbar rebuild prunes it.
-        private func insertFlexibleSpaceIfNeeded(_ toolbar: NSToolbar) {
+        /// Pre-Tahoe toolbar shape, idempotent:
+        /// - drop the split-view tracking separator, the vertical line that continues the sidebar
+        ///   divider through the toolbar on macOS 14/15; Tahoe draws none, and it reads as a stray
+        ///   bar once the title is hidden and the controls hug the right edge.
+        /// - inject the native .flexibleSpace NSToolbarItem after the back/forward item (the first
+        ///   SwiftUI-UUID-identified item; the sidebar toggle precedes it): SwiftUI drops a Spacer
+        ///   toolbar item on 14/15, and without a flexible space the trailing cluster and the
+        ///   capped search field pack left instead of hugging the right edge like Tahoe.
+        private func shapeToolbar(_ toolbar: NSToolbar) {
+            if let i = toolbar.items.firstIndex(where: { $0.itemIdentifier.rawValue.hasPrefix("com.apple.SwiftUI.splitViewSeparator") }) {
+                toolbar.removeItem(at: i)
+            }
             guard !toolbar.items.contains(where: { $0.itemIdentifier == .flexibleSpace }) else { return }
             func isSwiftUIItem(_ id: NSToolbarItem.Identifier) -> Bool {
                 id.rawValue.count == 36 && id.rawValue.filter { $0 == "-" }.count == 4
