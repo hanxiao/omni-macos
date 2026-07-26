@@ -1377,6 +1377,67 @@ public final class VectorStore: @unchecked Sendable {
         return out
     }
 
+    /// Tags already generated for the given paths, as stored. Read-only SQLite metadata: no GPU,
+    /// no embedding, nothing recomputed - this reports what the index HAS, which is exactly what
+    /// the `tag:` search qualifier matches against.
+    ///
+    /// Tags live in the media row's `snippet`, ", "-joined (Indexer.imageSnippet). The separator is
+    /// load-bearing: the tag filter normalizes with REPLACE(LOWER(snippet), ', ', ',') at :2057, so
+    /// splitting on anything else would silently disagree with what `tag:` finds. Only the media
+    /// kinds carry tags, and the kind filter is in the SQL rather than in Swift because a text file
+    /// can hold thousands of chunks and each row read drags the leaf page carrying its vec blob.
+    ///
+    /// Rows whose snippet is still filename-derived (indexed before tagging, or a forward that
+    /// returned no tags) are dropped via OmniTagger.nameDerivedSnippet rather than the search
+    /// filter's `substr(path, -length(snippet)) <> snippet` suffix test: that test misses the
+    /// legacy scanned-PDF forms, which are kind='scan' after the migration and would be reported
+    /// as if they were tags.
+    ///
+    /// Per CHUNK in the store (multi-page scans and long video segments each carry their own tag
+    /// set); unioned per file here, first-seen order preserved so the per-chunk ranking survives.
+    /// Sliced like fileStatus so a 2048-path batch cannot stall a per-keystroke search.
+    public func storedTags(paths: [String]) -> [String: [String]] {
+        guard !paths.isEmpty else { return [:] }
+        let unique = Array(Set(paths))
+        var out: [String: [String]] = [:]
+        let slice = 256
+        var i = 0
+        while i < unique.count {
+            let group = unique[i ..< Swift.min(i + slice, unique.count)]
+            i += slice
+            queue.sync {
+                guard dbOpen() else { return }
+                var stmt: OpaquePointer?
+                guard sqlite3_prepare_v2(db, """
+                    SELECT snippet FROM chunks
+                    WHERE path = ? AND kind IN ('image','scan','video')
+                    ORDER BY chunk_index;
+                    """, -1, &stmt, nil) == SQLITE_OK else { return }
+                defer { sqlite3_finalize(stmt) }
+                for p in group where presentPaths.contains(p) {
+                    sqlite3_reset(stmt); sqlite3_clear_bindings(stmt)
+                    sqlite3_bind_text(stmt, 1, p, -1, SQLITE_TRANSIENT)
+                    var tags: [String] = []
+                    var seen = Set<String>()
+                    var isMedia = false
+                    while sqlite3_step(stmt) == SQLITE_ROW {
+                        isMedia = true
+                        guard let c = sqlite3_column_text(stmt, 0) else { continue }
+                        let snippet = String(cString: c)
+                        if snippet.isEmpty || OmniTagger.nameDerivedSnippet(snippet, path: p) { continue }
+                        for t in snippet.components(separatedBy: ", ") where !t.isEmpty && seen.insert(t).inserted {
+                            tags.append(t)
+                        }
+                    }
+                    // Present-but-untagged media still gets an entry (empty list) so the caller can
+                    // tell "media with no tags yet" from "not a media file at all" (absent key).
+                    if isMedia { out[p] = tags }
+                }
+            }
+        }
+        return out
+    }
+
     /// Filter-only listing (no semantic query): every file passing `filter`, newest first.
     /// Powers standalone tag browsing ("tag:beard" with an empty search box). Resident walk +
     /// the winners' snippet fill - no GPU, no embedding.
@@ -1574,9 +1635,16 @@ public final class VectorStore: @unchecked Sendable {
             // First pass: every distinct file under the folder, in row order.
             var seen = [Bool](repeating: false, count: nGlobal)
             var allGids: [Int] = []; var allPaths: [String] = []; var allKinds: [String] = []
+            // Remember WHICH rows matched. The accumulate pass below used to re-walk every chunk row
+            // in the whole index and re-run underFolder (a String hasPrefix) on each one - a second
+            // full string scan to rediscover what this pass already knows. On a large index that is
+            // most of the hold, and the hold is on the serial store queue that interactive search
+            // also waits on. Int32 row indices: 4 bytes per MATCHING row, not per index row.
+            var matchRows: [Int32] = []
             for i in 0 ..< rows.count {
                 let p = rows[i].path
                 guard underFolder(p) else { continue }
+                matchRows.append(Int32(i))
                 let gid = Int(fileID[i])
                 if !seen[gid] { seen[gid] = true; allGids.append(gid); allPaths.append(p); allKinds.append(rows[i].kind) }
             }
@@ -1620,8 +1688,8 @@ public final class VectorStore: @unchecked Sendable {
             flat16.withUnsafeBufferPointer { fb in
                 guard let base = fb.baseAddress else { return }
                 sums.withUnsafeMutableBufferPointer { s in
-                    for i in 0 ..< rows.count {
-                        guard underFolder(rows[i].path) else { continue }
+                    for r in matchRows {                      // only the rows pass 1 already matched
+                        let i = Int(r)
                         let li = globalToLocal[Int(fileID[i])]
                         guard li >= 0 else { continue }       // file beyond cap
                         let so = Int(li) * dim, off = i * dim
