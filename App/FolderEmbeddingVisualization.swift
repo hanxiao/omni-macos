@@ -343,6 +343,7 @@ struct FolderEmbeddingVisualization: View {
         // finished arrays back. Cancel any in-flight build so rapid folder switches / light-dark flips
         // (which can fire selectedFolderForViz AND projectionGeneration in one tick) don't stack loops.
         rebuildTask?.cancel()
+        let noOverlap = model.mapNoOverlap
         rebuildTask = Task { @MainActor in
             let built = await Task.detached(priority: .userInitiated) { () -> (pos: [SIMD2<Float>], col: [SIMD4<Float>], bbox: SIMD4<Float>, kinds: [FileKind])? in
                 if Task.isCancelled { return nil }
@@ -365,6 +366,25 @@ struct FolderEmbeddingVisualization: View {
                     }
                 }
                 if pts.isEmpty { mn = .zero; mx = .zero }
+                // Optional overlap removal, applied to the FINISHED layout (display-only, so the
+                // cached projection is untouched and the toggle needs no refit). Grid sized ~15%
+                // larger than the point count so clusters keep a little slack instead of being
+                // packed solid. Measured 9.2 ms at 61.6k points - see `omni-verify gridbench`.
+                if noOverlap, pts.count > 1 {
+                    var flat = [Float](repeating: 0, count: pos.count * 2)
+                    for (i, v) in pos.enumerated() { flat[2*i] = v.x; flat[2*i+1] = v.y }
+                    let cells = Int(Double(pos.count) * 1.15)
+                    let cols = max(1, Int(Double(cells).squareRoot().rounded(.up)))
+                    let rows = max(1, (cells + cols - 1) / cols)
+                    let g = ProjectionEngine.gridify(flat, count: pos.count, cols: cols, rows: rows)
+                    mn = SIMD2<Float>(.greatestFiniteMagnitude, .greatestFiniteMagnitude)
+                    mx = SIMD2<Float>(-.greatestFiniteMagnitude, -.greatestFiniteMagnitude)
+                    for i in 0 ..< pos.count {
+                        let v = SIMD2<Float>(g[2*i], g[2*i+1])
+                        pos[i] = v
+                        mn = pointwiseMin(mn, v); mx = pointwiseMax(mx, v)
+                    }
+                }
                 let ext = pointwiseMax(mx - mn, SIMD2<Float>(1e-5, 1e-5))
                 let present = FileKind.allCases.filter { kindsSeen.contains($0.rawValue) }
                 return (pos, col, SIMD4<Float>((mn.x + mx.x) / 2, (mn.y + mx.y) / 2, ext.x, ext.y), present)

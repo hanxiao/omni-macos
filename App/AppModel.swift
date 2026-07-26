@@ -220,6 +220,15 @@ final class AppModel {
     private func touchProjection(_ url: URL) {
         if let i = projectionCacheOrder.firstIndex(of: url) { projectionCacheOrder.append(projectionCacheOrder.remove(at: i)) }
     }
+    /// Snap the finished layout onto a grid so no two dots overlap (DGrid). Display-only: it does
+    /// not change the fit, so toggling re-lays the existing projection without refitting.
+    var mapNoOverlap: Bool = UserDefaults.standard.bool(forKey: "omni.mapNoOverlap") {
+        didSet {
+            guard oldValue != mapNoOverlap else { return }
+            UserDefaults.standard.set(mapNoOverlap, forKey: "omni.mapNoOverlap")
+            projectionGeneration &+= 1   // republish so the view rebuilds its point cloud
+        }
+    }
     /// Folder-map layout. false = PCA (fast, N-light, instant - the default, safe on low-RAM Macs);
     /// true = UMAP (richer clusters + the click-to-spotlight neighbor graph, but the kNN step builds
     /// large GPU distance tiles + a 300-epoch force layout that can freeze a low-memory Mac).

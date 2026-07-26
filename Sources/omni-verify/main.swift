@@ -1376,8 +1376,55 @@ if args.count >= 2 && args[1] == "projbench" {
         eval(Y)
         print(String(format: "  [breakdown n=%d] force x300      = %.0f ms", n0, -t.timeIntervalSinceNow * 1000))
     }
+    // kNN preservation of an arbitrary 2D layout: for a sample of points, the overlap between
+    // their embedding-space kNN and their 2D kNN. Shared so UMAP and PCA are scored the SAME way -
+    // without a like-for-like PCA number, a low UMAP score cannot be read as good or bad.
+    // Cluster purity of the 2D neighborhood: for a sample of points, the fraction of their kQ
+    // nearest 2D neighbors drawn from the SAME generated cluster. This is the metric that says
+    // whether the map is semantically right, and it is the one kNN preservation cannot express:
+    // with 500 points per cluster, preserving the exact 15 nearest of 500 co-cluster members is
+    // not achievable in 2D, so a low kNN score is expected even from a perfect layout. Random
+    // placement scores 1/clusters; a layout that groups clusters correctly scores near 1.
+    func clusterPurity(_ pos: [Float], n: Int, clusters: Int, kQ: Int) -> Double {
+        let sample = stride(from: 0, to: n, by: max(1, n / 1000))
+        var pureSum = 0.0; var sampled = 0
+        for i in sample {
+            var dists = [(Float, Int)](); dists.reserveCapacity(n - 1)
+            let xi = pos[2*i], yi = pos[2*i+1]
+            for j in 0 ..< n where j != i {
+                let dx = pos[2*j] - xi, dy = pos[2*j+1] - yi
+                dists.append((dx*dx + dy*dy, j))
+            }
+            let mine = i % clusters
+            let same = dists.sorted { $0.0 < $1.0 }.prefix(kQ).filter { $0.1 % clusters == mine }.count
+            pureSum += Double(same) / Double(kQ)
+            sampled += 1
+        }
+        return pureSum / Double(max(1, sampled))
+    }
+
+    func knnPreservation(_ pos: [Float], embKNN: [Int32], n: Int, kQ: Int) -> Double {
+        let sample = stride(from: 0, to: n, by: max(1, n / 1000))
+        var overlapSum = 0.0; var sampled = 0
+        for i in sample {
+            var dists = [(Float, Int)](); dists.reserveCapacity(n - 1)
+            let xi = pos[2*i], yi = pos[2*i+1]
+            for j in 0 ..< n where j != i {
+                let dx = pos[2*j] - xi, dy = pos[2*j+1] - yi
+                dists.append((dx*dx + dy*dy, j))
+            }
+            let near2D = Set(dists.sorted { $0.0 < $1.0 }.prefix(kQ).map { $0.1 })
+            let nearEmb = Set((0 ..< kQ).map { Int(embKNN[i * kQ + $0]) })
+            overlapSum += Double(near2D.intersection(nearEmb).count) / Double(kQ)
+            sampled += 1
+        }
+        return overlapSum / Double(max(1, sampled))
+    }
+
     for n in Ns {
         let data = makeData(n)
+        // One embedding-space kNN per n, shared by both layouts' preservation scores.
+        let embKNNShared = ProjectionEngine.knn(MLXArray(data.vectors, [n, dim]).asType(.float32), k: 15).asArray(Int32.self)
         _ = ProjectionEngine.layout(data, k: 15, epochs: 2)   // warm GPU kernels
         let t = Date()
         let pts = ProjectionEngine.layout(data, k: 15, epochs: 300)
@@ -1388,8 +1435,7 @@ if args.count >= 2 && args[1] == "projbench" {
         // preservation instead: for a sample of points, the overlap between embedding-space kNN
         // and 2D-layout kNN. A real regression moves this; atomics scheduling noise does not.
         let kQ = 15
-        let X = MLXArray(data.vectors, [n, dim]).asType(.float32)
-        let embKNN = ProjectionEngine.knn(X, k: kQ).asArray(Int32.self)   // [n*k]
+        let embKNN = embKNNShared
         var pos = [Float](repeating: 0, count: n * 2)
         for (i, p) in pts.enumerated() { pos[2*i] = p.position.x; pos[2*i+1] = p.position.y }
         let sample = stride(from: 0, to: n, by: max(1, n / 1000))
@@ -1407,8 +1453,9 @@ if args.count >= 2 && args[1] == "projbench" {
             overlapSum += Double(near2D.intersection(nearEmb).count) / Double(kQ)
             sampled += 1
         }
-        print(String(format: "  n=%-6d  UMAP full layout = %.3fs   (%d pts, finite=%@, knn-preservation@%d=%.4f)",
-                     n, layoutSecs, pts.count, finite ? "yes" : "NO", kQ, overlapSum / Double(max(1, sampled))))
+        print(String(format: "  n=%-6d  UMAP full layout = %.3fs   (%d pts, finite=%@, knn-pres@%d=%.4f cluster-purity@%d=%.3f, random=%.3f)",
+                     n, layoutSecs, pts.count, finite ? "yes" : "NO", kQ, overlapSum / Double(max(1, sampled)),
+                     kQ, clusterPurity(pos, n: n, clusters: max(8, n / 500), kQ: kQ), 1.0 / Double(max(8, n / 500))))
         // PCA MODE - the DEFAULT (UMAP refinement is opt-in via Settings). Until this existed every
         // number in this bench described the opt-in path, so the mode most users actually see was
         // unmeasured. Mirrors project(refine: false) exactly: pca2DBasis over the landmarks, then
@@ -1434,8 +1481,20 @@ if args.count >= 2 && args[1] == "projbench" {
                 }
                 placeMs = -tpl.timeIntervalSinceNow * 1000
             }
-            print(String(format: "  n=%-6d  PCA mode(L=%d) = %.3fs   (basis %.0f ms + project-rest %.0f ms)",
-                         n, L, (basisMs + placeMs) / 1000, basisMs, placeMs))
+            // Same preservation metric the UMAP layout is scored with, on the FULL-n PCA layout,
+            // so the two are directly comparable. If UMAP is not clearly better than PCA here, the
+            // force layout is not earning its ~17x cost.
+            var pcaPres = -1.0; var pcaPurity = -1.0
+            if L == n {
+                var ppos = [Float](repeating: 0, count: n * 2)
+                let yh = basis.Y.asArray(Float.self)
+                for i in 0 ..< min(n * 2, yh.count) { ppos[i] = yh[i] }
+                pcaPres = knnPreservation(ppos, embKNN: embKNNShared, n: n, kQ: 15)
+                pcaPurity = clusterPurity(ppos, n: n, clusters: max(8, n / 500), kQ: 15)
+            }
+            print(String(format: "  n=%-6d  PCA mode(L=%d) = %.3fs   (basis %.0f ms + project-rest %.0f ms)%@",
+                         n, L, (basisMs + placeMs) / 1000, basisMs, placeMs,
+                         pcaPres >= 0 ? String(format: "  knn-pres@15=%.4f cluster-purity@15=%.3f", pcaPres, pcaPurity) : ""))
         }
         // Landmark mode: quadratic layout on 15k landmarks, every other point placed via IDW.
         if n > 15_000 {
@@ -1489,6 +1548,75 @@ if args.count >= 5 && args[1] == "mapbench" {
     }
     store.close()
     exit(0)
+}
+
+// Overlap-removal bench: omni-verify gridbench [n] [dim]
+// Times DGrid on a real projection and CHECKS the guarantee: exactly one point per cell, no two
+// dots within a cell diagonal. Also reports how much the arrangement moved (cluster purity before
+// and after), because a grid that scrambles the clusters would be worthless however fast it is.
+if args.count >= 2 && args[1] == "gridbench" {
+    let n = (args.count >= 3 ? Int(args[2]) : nil) ?? 30_000
+    let dim = (args.count >= 4 ? Int(args[3]) : nil) ?? 768
+    var rng: UInt64 = 0x9E3779B97F4A7C15
+    func nextF() -> Float { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return Float(rng >> 40) / Float(1 << 24) }
+    func gauss() -> Float { let u1 = max(nextF(), 1e-7), u2 = nextF(); return sqrtf(-2 * logf(u1)) * cosf(2 * .pi * u2) }
+    let clusters = max(8, n / 500)
+    var centers = [Float](repeating: 0, count: clusters * dim)
+    for i in 0 ..< centers.count { centers[i] = gauss() }
+    var v = [Float](repeating: 0, count: n * dim)
+    var paths: [String] = []; var kinds: [String] = []
+    for i in 0 ..< n {
+        let c = i % clusters; var nrm: Float = 0
+        for k in 0 ..< dim { let x = centers[c * dim + k] + 0.4 * gauss(); v[i * dim + k] = x; nrm += x * x }
+        let inv = nrm > 0 ? 1 / nrm.squareRoot() : 0
+        for k in 0 ..< dim { v[i * dim + k] *= inv }
+        paths.append("/f\(i)"); kinds.append("text")
+    }
+    let data = FolderVectors(paths: paths, kinds: kinds, vectors: v, dim: dim)
+    let pts = ProjectionEngine.layout(data, k: 15, epochs: 300)
+    var pos = [Float](repeating: 0, count: n * 2)
+    for (i, p) in pts.enumerated() { pos[2*i] = p.position.x; pos[2*i+1] = p.position.y }
+
+    // Square-ish grid with ~15% slack, so clusters keep a little breathing room.
+    let cells = Int(Double(n) * 1.15)
+    let cols = max(1, Int(Double(cells).squareRoot().rounded(.up))), rows = max(1, (cells + cols - 1) / cols)
+    _ = ProjectionEngine.gridify(pos, count: n, cols: cols, rows: rows)   // warm
+    let t = Date()
+    let g = ProjectionEngine.gridify(pos, count: n, cols: cols, rows: rows)
+    let ms = -t.timeIntervalSinceNow * 1000
+
+    // GUARANTEE: no two points share a cell.
+    var occupied = Set<Int64>(); var collisions = 0
+    var minX = Float.greatestFiniteMagnitude, maxX = -Float.greatestFiniteMagnitude
+    var minY = Float.greatestFiniteMagnitude, maxY = -Float.greatestFiniteMagnitude
+    for i in 0 ..< n {
+        minX = min(minX, g[2*i]); maxX = max(maxX, g[2*i])
+        minY = min(minY, g[2*i+1]); maxY = max(maxY, g[2*i+1])
+    }
+    let cw = (maxX - minX) / Float(max(1, cols - 1)), ch = (maxY - minY) / Float(max(1, rows - 1))
+    for i in 0 ..< n {
+        let c = Int64((g[2*i] - minX) / max(cw, 1e-9) + 0.5)
+        let r = Int64((g[2*i+1] - minY) / max(ch, 1e-9) + 0.5)
+        if !occupied.insert(r &* 100_000 &+ c).inserted { collisions += 1 }
+    }
+    func purity(_ p: [Float]) -> Double {
+        let kQ = 15
+        var sum = 0.0; var cnt = 0
+        for i in stride(from: 0, to: n, by: max(1, n / 400)) {
+            var d = [(Float, Int)](); d.reserveCapacity(n - 1)
+            let xi = p[2*i], yi = p[2*i+1]
+            for j in 0 ..< n where j != i { let dx = p[2*j] - xi, dy = p[2*j+1] - yi; d.append((dx*dx + dy*dy, j)) }
+            let mine = i % clusters
+            sum += Double(d.sorted { $0.0 < $1.0 }.prefix(kQ).filter { $0.1 % clusters == mine }.count) / Double(kQ)
+            cnt += 1
+        }
+        return sum / Double(max(1, cnt))
+    }
+    print("gridbench n=\(n) dim=\(dim) grid=\(cols)x\(rows) (\(cols*rows) cells for \(n) points)")
+    print(String(format: "  gridify           = %.1f ms", ms))
+    print("  cell collisions   = \(collisions)  \(collisions == 0 ? "(PASS: no two dots share a cell)" : "(FAIL)")")
+    print(String(format: "  cluster-purity@15 = %.3f before -> %.3f after", purity(pos), purity(g)))
+    exit(collisions == 0 ? 0 : 1)
 }
 
 if args.count >= 2 && args[1] == "searchbench" {

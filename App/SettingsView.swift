@@ -459,10 +459,11 @@ private struct PerformanceTab: View {
                     Text("Fast \u{00B7} PCA").tag(false)
                     Text("Detailed \u{00B7} UMAP").tag(true)
                 }
+                Toggle("Spread dots so none overlap", isOn: Binding(get: { model.mapNoOverlap }, set: { model.mapNoOverlap = $0 }))
             } header: {
                 Text("Folder map")
             } footer: {
-                Text("PCA is instant and light, the safe default. UMAP separates clusters better and enables click-to-spotlight of nearest neighbors. Large folders are sampled to stay within the memory cap below.")
+                Text("PCA is instant and light, the safe default. UMAP separates clusters better and enables click-to-spotlight of nearest neighbors. Large folders are sampled to stay within the memory cap below. Spreading snaps the layout to a grid so every file is separately visible and hoverable - clusters stay put, but the map stops showing density through overlap.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {

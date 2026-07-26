@@ -463,6 +463,117 @@ public final class ProjectionEngine: @unchecked Sendable {
         return Y.asArray(Float.self)
     }
 
+    // MARK: - Overlap removal (DGrid)
+
+    /// Snap a 2D layout onto a grid so NO two dots overlap, keeping the arrangement as close to the
+    /// input as a lattice allows. This is DGrid (Hilasaca et al., "A Grid-based Method for Removing
+    /// Overlaps of Dimensionality Reduction Scatterplot Layouts"): recursively split the point set
+    /// along its wider axis, dividing the grid-cell budget in the same proportion, until each point
+    /// owns exactly one cell. One point per cell is a structural guarantee, not a convergence
+    /// criterion - there is no iteration and no failure mode.
+    ///
+    /// Cost is one median selection per level over the points in that block: O(n log n) overall,
+    /// entirely on the CPU, with no allocation per level beyond the index array. Measured against
+    /// the fit it replaces nothing and adds single-digit milliseconds (see `omni-verify gridbench`).
+    ///
+    /// WHAT IT COSTS VISUALLY, stated plainly: the map stops showing density. Today overlapping
+    /// translucent dots are how a dense cluster reads as dense; on a grid every occupied cell looks
+    /// identical, so a 500-file cluster and a 50-file cluster differ only in area. Cluster SHAPE is
+    /// also squared off. In exchange every file becomes individually visible and hoverable, which
+    /// in a dense cloud it currently is not.
+    ///
+    /// `cols`/`rows` must satisfy cols*rows >= count. Returns row-major [count*2] positions in the
+    /// same coordinate frame as the input (the grid is fitted to the input's bounding box).
+    public static func gridify(_ pos: [Float], count: Int, cols: Int, rows: Int) -> [Float] {
+        guard count > 0, pos.count >= count * 2, cols > 0, rows > 0, cols * rows >= count else { return pos }
+        var out = [Float](repeating: 0, count: count * 2)
+        var idx = Array(0 ..< count)
+
+        // Fit the output grid to the input's bounding box so the result overlays the original.
+        var minX = Float.greatestFiniteMagnitude, maxX = -Float.greatestFiniteMagnitude
+        var minY = Float.greatestFiniteMagnitude, maxY = -Float.greatestFiniteMagnitude
+        for i in 0 ..< count {
+            let x = pos[2*i], y = pos[2*i+1]
+            guard x.isFinite, y.isFinite else { continue }
+            minX = Swift.min(minX, x); maxX = Swift.max(maxX, x)
+            minY = Swift.min(minY, y); maxY = Swift.max(maxY, y)
+        }
+        if !(minX < maxX) { minX -= 0.5; maxX += 0.5 }
+        if !(minY < maxY) { minY -= 0.5; maxY += 0.5 }
+        let cellW = (maxX - minX) / Float(cols), cellH = (maxY - minY) / Float(rows)
+
+        // Iterative worklist rather than recursion: a 60k-point split is ~16 deep, but an explicit
+        // stack keeps this off the Swift call stack and makes the cost obvious.
+        struct Block { var lo: Int; var hi: Int; var col: Int; var row: Int; var cols: Int; var rows: Int }
+        var stack = [Block(lo: 0, hi: count, col: 0, row: 0, cols: cols, rows: rows)]
+        idx.withUnsafeMutableBufferPointer { ix in
+            while let b = stack.popLast() {
+                let n = b.hi - b.lo
+                guard n > 0 else { continue }
+                if n == 1 || (b.cols == 1 && b.rows == 1) {
+                    // Deposit whatever remains at this block's origin cell (n == 1 in practice;
+                    // the cols*rows >= count precondition prevents a pile-up).
+                    for t in b.lo ..< b.hi {
+                        let p = ix[t]
+                        out[2*p]     = minX + (Float(b.col) + 0.5) * cellW
+                        out[2*p + 1] = minY + (Float(b.row) + 0.5) * cellH
+                    }
+                    continue
+                }
+                // Split the wider side of the CELL block, so cells stay near-square as we descend.
+                let splitCols = b.cols * Int(cellW > 0 ? 1 : 1) >= 0 && (b.cols >= b.rows)
+                if splitCols {
+                    let leftCols = b.cols / 2
+                    // Give each side points in proportion to the cells it owns.
+                    let leftCap = Int((Double(leftCols) / Double(b.cols) * Double(n)).rounded())
+                    let k = Swift.max(0, Swift.min(n, leftCap))
+                    if k > 0 && k < n {
+                        partitionByX(ix, b.lo, b.hi, k, pos)
+                    }
+                    stack.append(Block(lo: b.lo, hi: b.lo + k, col: b.col, row: b.row, cols: leftCols, rows: b.rows))
+                    stack.append(Block(lo: b.lo + k, hi: b.hi, col: b.col + leftCols, row: b.row, cols: b.cols - leftCols, rows: b.rows))
+                } else {
+                    let botRows = b.rows / 2
+                    let botCap = Int((Double(botRows) / Double(b.rows) * Double(n)).rounded())
+                    let k = Swift.max(0, Swift.min(n, botCap))
+                    if k > 0 && k < n {
+                        partitionByY(ix, b.lo, b.hi, k, pos)
+                    }
+                    stack.append(Block(lo: b.lo, hi: b.lo + k, col: b.col, row: b.row, cols: b.cols, rows: botRows))
+                    stack.append(Block(lo: b.lo + k, hi: b.hi, col: b.col, row: b.row + botRows, cols: b.cols, rows: b.rows - botRows))
+                }
+            }
+        }
+        return out
+    }
+
+    /// Reorder ix[lo..<hi] so the k smallest by x come first (quickselect; average O(hi-lo)).
+    private static func partitionByX(_ ix: UnsafeMutableBufferPointer<Int>, _ lo: Int, _ hi: Int, _ k: Int, _ pos: [Float]) {
+        selectNth(ix, lo, hi, lo + k) { pos[2 * $0] }
+    }
+    private static func partitionByY(_ ix: UnsafeMutableBufferPointer<Int>, _ lo: Int, _ hi: Int, _ k: Int, _ pos: [Float]) {
+        selectNth(ix, lo, hi, lo + k) { pos[2 * $0 + 1] }
+    }
+
+    /// In-place quickselect on an index array by an arbitrary key. Median-of-three pivot keeps the
+    /// already-sorted-ish inputs a projection produces off the quadratic path.
+    private static func selectNth(_ ix: UnsafeMutableBufferPointer<Int>, _ lo: Int, _ hi: Int, _ nth: Int,
+                                  _ key: (Int) -> Float) {
+        var lo = lo, hi = hi
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2
+            let a = key(ix[lo]), b = key(ix[mid]), c = key(ix[hi - 1])
+            let pivot = Swift.max(Swift.min(a, b), Swift.min(Swift.max(a, b), c))
+            var i = lo, j = hi - 1
+            while i <= j {
+                while key(ix[i]) < pivot { i += 1 }
+                while key(ix[j]) > pivot { j -= 1 }
+                if i <= j { ix.swapAt(i, j); i += 1; j -= 1 }
+            }
+            if nth <= j { hi = j + 1 } else if nth >= i { lo = i } else { return }
+        }
+    }
+
     /// Chunked brute-force kNN that never materializes the full N x N distance matrix.
     public static func knn(_ X: MLXArray, k: Int) -> MLXArray {     // -> [n, k] int32
         let n = X.dim(0)
