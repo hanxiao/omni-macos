@@ -1409,6 +1409,34 @@ if args.count >= 2 && args[1] == "projbench" {
         }
         print(String(format: "  n=%-6d  UMAP full layout = %.3fs   (%d pts, finite=%@, knn-preservation@%d=%.4f)",
                      n, layoutSecs, pts.count, finite ? "yes" : "NO", kQ, overlapSum / Double(max(1, sampled))))
+        // PCA MODE - the DEFAULT (UMAP refinement is opt-in via Settings). Until this existed every
+        // number in this bench described the opt-in path, so the mode most users actually see was
+        // unmeasured. Mirrors project(refine: false) exactly: pca2DBasis over the landmarks, then
+        // the remaining rows projected through that same basis in placement-sized tiles.
+        for lmCap in [15_000, n] where lmCap <= n {
+            let L = min(lmCap, n)
+            let XL = ProjectionEngine.hostTile(data, 0, L)
+            _ = ProjectionEngine.pca2DBasis(XL)   // warm
+            let tp = Date()
+            let basis = ProjectionEngine.pca2DBasis(XL)
+            eval(basis.Y)
+            let basisMs = -tp.timeIntervalSinceNow * 1000
+            var placeMs = 0.0
+            if L < n {
+                let tileRows = ProjectionEngine.placementTileRows(dim)
+                let tpl = Date()
+                var s = L
+                while s < n {
+                    let e = min(s + tileRows, n)
+                    _ = ProjectionEngine.pcaProjectTile(tile: ProjectionEngine.hostTile(data, s, e),
+                                                        mean: basis.mean, comps: basis.comps)
+                    s = e
+                }
+                placeMs = -tpl.timeIntervalSinceNow * 1000
+            }
+            print(String(format: "  n=%-6d  PCA mode(L=%d) = %.3fs   (basis %.0f ms + project-rest %.0f ms)",
+                         n, L, (basisMs + placeMs) / 1000, basisMs, placeMs))
+        }
         // Landmark mode: quadratic layout on 15k landmarks, every other point placed via IDW.
         if n > 15_000 {
             let lm = FolderVectors(paths: data.paths, kinds: data.kinds, vectors: data.vectors,
@@ -1420,6 +1448,46 @@ if args.count >= 2 && args[1] == "projbench" {
                          n, -tl.timeIntervalSinceNow, lpts.count, lfinite ? "yes" : "NO"))
         }
     }
+    exit(0)
+}
+
+// Folder-map bench on a REAL index: omni-verify mapbench <modelDir> <dbPath> <folder> [capGB] [pca|umap]
+// Runs exactly what the app runs when you click a folder - store.vectorsUnderFolder followed by
+// ProjectionEngine.project - with the caps derived from AppModel's mapPointBudget/mapTotalPointCap
+// for the given memory cap, so a low-end machine's shape can be reproduced here. projbench only
+// exercises the ungated sync `layout()`; this is the gated async path the user actually waits on.
+// Point it at a COPY of an index, not a live one.
+if args.count >= 5 && args[1] == "mapbench" {
+    let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    let store = try VectorStore(dbURL: URL(fileURLWithPath: args[3]))
+    let folder = args[4]
+    let capGB = (args.count >= 6 ? Double(args[5]) : nil) ?? 6
+    let refine = (args.count >= 7 ? args[6] : "umap") != "pca"
+    // Mirrors App/AppModel.swift mapPointBudget / mapTotalPointCap.
+    let dim = engine.dim
+    let bpp = Double(max(256, dim) * 4 * 5)
+    let nBudget = Int(capGB * 0.12 * 1_073_741_824 / bpp)
+    let ceiling = refine ? max(5_000, min(60_000, Int(capGB / 6.0 * 15_000)))
+                         : max(20_000, min(250_000, Int(capGB / 6.0 * 60_000)))
+    let mapCap = max(2_000, min(nBudget, ceiling))
+    let totalCap = max(mapCap, min(Int(capGB * 0.12 * 1_073_741_824 / Double(max(256, dim) * 4 * 2)), 250_000))
+    print("mapbench folder=\(folder) capGB=\(capGB) mode=\(refine ? "umap" : "pca") dim=\(dim) landmarkCap=\(mapCap) totalCap=\(totalCap)")
+
+    let proj = ProjectionEngine(engine: engine)
+    for pass in 1 ... 2 {
+        let t0 = Date()
+        let data = store.vectorsUnderFolder(folder, cap: totalCap, landmarkCap: mapCap)
+        let pullMs = -t0.timeIntervalSinceNow * 1000
+        guard data.count > 0 else { print("  no indexed files under that folder"); break }
+        let t1 = Date()
+        let r = await proj.project(data, refine: refine)
+        let fitMs = -t1.timeIntervalSinceNow * 1000
+        let finite = r.points.allSatisfy { $0.position.x.isFinite && $0.position.y.isFinite }
+        print(String(format: "  pass%d  pull=%7.0f ms  fit=%7.0f ms  total=%7.0f ms   (n=%d L=%d pts=%d knn=%d finite=%@)",
+                     pass, pullMs, fitMs, pullMs + fitMs, data.count, data.landmarkCount,
+                     r.points.count, r.knn.count, finite ? "yes" : "NO"))
+    }
+    store.close()
     exit(0)
 }
 

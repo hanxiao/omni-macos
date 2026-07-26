@@ -19,6 +19,9 @@ struct FolderEmbeddingVisualization: View {
     let folderName: String
 
     @State private var hovered: ProjectionPoint?
+    @State private var hoveredIndex: Int?                     // gates the publish above to real changes
+    @State private var hoverDwellPath: String?                // hovered path once the cursor settles
+    @State private var hoverDwellTask: Task<Void, Never>?
     @State private var hoverLocation: CGPoint = .zero
     @State private var lastHoverResolveLoc: CGPoint = .zero   // last cursor pos we ran the hit-test for (movement gate)
     @State private var rebuildTask: Task<Void, Never>?        // off-main point-cloud build, cancelled on rapid re-fit
@@ -174,10 +177,26 @@ struct FolderEmbeddingVisualization: View {
                     if hypot(loc.x - lastHoverResolveLoc.x, loc.y - lastHoverResolveLoc.y) >= 3 {
                         lastHoverResolveLoc = loc
                         hoverLocation = loc
-                        hovered = nearestIndex(to: loc, in: geo.size).map { model.folderProjection[$0] }
+                        // Publish the hovered POINT only when the index actually changes. Sweeping
+                        // within one dot re-published an identical ProjectionPoint every 3px, and
+                        // because it carries two Strings that meant retain/release plus a chip
+                        // rebuild per sample for no visible difference. The chip still follows the
+                        // cursor via hoverLocation.
+                        let idx = nearestIndex(to: loc, in: geo.size)
+                        if idx != hoveredIndex {
+                            hoveredIndex = idx
+                            hovered = idx.map { model.folderProjection[$0] }
+                            let path = hovered?.path
+                            hoverDwellTask?.cancel()
+                            hoverDwellTask = Task { @MainActor in
+                                try? await Task.sleep(for: .milliseconds(140))
+                                if !Task.isCancelled { hoverDwellPath = path }
+                            }
+                        }
                     }
                 case .ended:
-                    hovered = nil
+                    hovered = nil; hoveredIndex = nil
+                    hoverDwellTask?.cancel(); hoverDwellTask = nil; hoverDwellPath = nil
                 }
             }
             // Right-click a dot for the same file actions as a search result. The target is the dot
@@ -201,7 +220,7 @@ struct FolderEmbeddingVisualization: View {
         // lands, so this blanks the old map under the "Mapping..." spinner instead of leaving it
         // stale). The GPU buffer then rebuilds when a new layout lands (keyed on the generation, since
         // two folders can share a file count) or the appearance flips.
-        .onChange(of: model.selectedFolderForViz) { hovered = nil; selectedIndex = nil; resetView(); rebuildPoints() }
+        .onChange(of: model.selectedFolderForViz) { hovered = nil; hoveredIndex = nil; selectedIndex = nil; resetView(); rebuildPoints() }
         .onChange(of: model.projectionGeneration) { rebuildPoints() }
         .onChange(of: colorScheme) { rebuildPoints() }
         .onAppear { rebuildPoints() }
@@ -406,7 +425,11 @@ struct FolderEmbeddingVisualization: View {
 
     @ViewBuilder private func hoverChip(for h: ProjectionPoint, in size: CGSize) -> some View {
         VStack(spacing: 5) {
-            Thumbnail(path: h.path, side: 72)
+            // Dwell-gated: sweeping the cursor across a dense cloud crosses dozens of dots, and
+            // handing Thumbnail a new path for each one queues a decode (and a QuickLook fallback
+            // for non-images) per dot - work whose result is on screen for a few milliseconds. The
+            // ring and the filename stay immediate; only the picture waits for the cursor to settle.
+            Thumbnail(path: hoverDwellPath ?? h.path, side: 72)
             Text((h.path as NSString).lastPathComponent)
                 .font(.caption).lineLimit(1).truncationMode(.middle)
                 .frame(maxWidth: 132)
@@ -448,17 +471,38 @@ struct FolderEmbeddingVisualization: View {
 
     /// Index of the nearest point to `loc` within `hitRadius` (linear scan - no rendering, so cheap
     /// even at 50k+). Returns the index so callers can look up the file and its kNN row.
+    /// Scans the packed `positions` array in MODEL space rather than `model.folderProjection` in
+    /// screen space. Two changes, both about what the loop touches per mouse-move sample:
+    ///   - stride drops from a ~40-byte ProjectionPoint (SIMD2 plus two Strings) to an 8-byte
+    ///     SIMD2<Float>, so the scan streams 5x fewer bytes - the ~8x-worse axis on a low-end Mac;
+    ///   - the per-point call to `screenMap`'s escaping closure disappears. The transform is
+    ///     uniform-scale, so inverting it ONCE and comparing in model space is equivalent: a
+    ///     screen-space hit circle is a model-space circle of radius hitRadius/scale.
+    /// Same index returned, so the ring, chip and kNN spotlight are unchanged.
     private func nearestIndex(to loc: CGPoint, in size: CGSize) -> Int? {
-        let pts = model.folderProjection
-        guard pts.count > 0 else { return nil }
-        let map = screenMap(in: size)
+        let pts = positions
+        // Row-aligned with folderProjection by construction; if a rebuild is mid-flight and they
+        // disagree, resolve nothing this sample rather than index the shorter array.
+        guard !pts.isEmpty, pts.count == model.folderProjection.count else { return nil }
+        let cx = bbox.x, cy = bbox.y, extX = bbox.z, extY = bbox.w
+        let rect = CGRect(origin: .zero, size: size).insetBy(dx: Self.inset, dy: Self.inset)
+        let scale = min(rect.width / CGFloat(extX), rect.height / CGFloat(extY)) * effectiveZoom
+        guard scale > 0, scale.isFinite else { return nil }
+        let panNow = effectivePan
+        let mx = Float((loc.x - rect.midX - panNow.width) / scale) + cx
+        let my = Float((loc.y - rect.midY - panNow.height) / scale) + cy
+        let r = Float(Self.hitRadius / scale)
         var best: Int?
-        var bestD = Self.hitRadius * Self.hitRadius
-        for i in 0 ..< pts.count {
-            let s = map(pts[i].position)
-            let dx = s.x - loc.x, dy = s.y - loc.y
-            let d = dx * dx + dy * dy
-            if d < bestD { bestD = d; best = i }
+        var bestD = r * r
+        pts.withUnsafeBufferPointer { buf in
+            for i in 0 ..< buf.count {
+                let p = buf[i]
+                // Same non-finite clamp screenMap applies, so a bad position stays at the center.
+                let dx = (p.x.isFinite ? p.x : cx) - mx
+                let dy = (p.y.isFinite ? p.y : cy) - my
+                let d = dx * dx + dy * dy
+                if d < bestD { bestD = d; best = i }
+            }
         }
         return best
     }

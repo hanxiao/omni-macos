@@ -48,6 +48,9 @@ public final class ProjectionEngine: @unchecked Sendable {
     private static let smallN = 50          // below this, skip force (PCA-2D only)
     private static let batchEpochs = 10     // epochs per gated batch / eval barrier
     private static let initStd: Float = 5.0 // target std of the PCA-2D force init
+    /// Compute the all-points PCA fallback only on the branches that read it. OMNI_VIZ_LAZY_PCA=0
+    /// restores the eager pass for A/B.
+    static let lazyPCAFallback = ProcessInfo.processInfo.environment["OMNI_VIZ_LAZY_PCA"] != "0"
 
     // MARK: - Public entry (gated, async)
 
@@ -67,6 +70,14 @@ public final class ProjectionEngine: @unchecked Sendable {
         let L = min(max(data.landmarkCount, 1), n)
         let cancelled = ProjectionResult(points: [], knn: [], k: k)
 
+        // A map fit is user-initiated work the user is watching, but it takes the gate at LOW
+        // priority, so without this its slices queue behind whole indexing flushes (indexGateWindow
+        // defaults to Int.max, i.e. one flush = one hold - "~6 batches / ~0.3s here, multiples of
+        // that on a low-end GPU"). Stamping interactivity puts the indexer into per-batch mode for
+        // the fit's duration, so each slice waits at most one short forward. Re-stamped between
+        // slices below because the window expires after ~2s. Cheap: one lock plus a Date.
+        engine.noteInteractive()
+
         // Step 1 (gated): landmark matrix + PCA basis + landmark PCA-2D layout.
         var Y0host = [Float]()
         var XL = MLXArray(); var Y0 = MLXArray()
@@ -84,27 +95,47 @@ public final class ProjectionEngine: @unchecked Sendable {
         // All-points PCA positions: landmarks from Y0, the rest projected EXACTLY through the same
         // basis, in memory-bounded tiles. This is both the PCA-mode result and the fallback if the
         // force layout goes non-finite.
-        var pcaAll = Y0host
-        if L < n {
-            pcaAll.reserveCapacity(n * 2)
-            let tileRows = Self.placementTileRows(d)
-            var start = L
-            while start < n {
-                let end = min(start + tileRows, n)
-                let part = engine.runLowPriorityGPU { () -> [Float] in
-                    Self.pcaProjectTile(tile: Self.hostTile(data, start, end), mean: pcaMean, comps: pcaComps)
+        //
+        // LAZY: only three branches consume it - the !refine return just below, the tiny-L return,
+        // and the non-finite fallback at the very end. In UMAP mode with a landmark split (the
+        // expensive configuration) none of those normally fire, so computing it up front meant
+        // streaming every non-landmark row through a GEMM and building n ProjectionPoints purely to
+        // throw them away. Byte-identical output; the fallback just pays for itself when it fires.
+        var pcaPointsCache: [ProjectionPoint]?
+        func pcaPointsAll() async -> [ProjectionPoint]? {
+            _ = Self.lazyPCAFallback   // referenced so the eager A/B path below stays honest
+            if let c = pcaPointsCache { return c }
+            var pcaAll = Y0host
+            if L < n {
+                pcaAll.reserveCapacity(n * 2)
+                let tileRows = Self.placementTileRows(d)
+                var start = L
+                while start < n {
+                    let end = min(start + tileRows, n)
+                    let part = engine.runLowPriorityGPU { () -> [Float] in
+                        Self.pcaProjectTile(tile: Self.hostTile(data, start, end), mean: pcaMean, comps: pcaComps)
+                    }
+                    pcaAll.append(contentsOf: part)
+                    if Task.isCancelled { return nil }
+                    await Task.yield()
+                    start = end
                 }
-                pcaAll.append(contentsOf: part)
-                if Task.isCancelled { return cancelled }
-                await Task.yield()
-                start = end
             }
+            let pts = Self.makePoints(pcaAll, data)
+            pcaPointsCache = pts
+            return pts
         }
-        let pcaPoints = Self.makePoints(pcaAll, data)
+
+        // A/B: OMNI_VIZ_LAZY_PCA=0 forces the pre-change behavior (compute the all-points PCA
+        // fallback up front even in UMAP mode, where nothing normally reads it).
+        if !Self.lazyPCAFallback { _ = await pcaPointsAll() }
 
         // PCA-only (default, light): stop here. UMAP refinement (better cluster separation + the
         // neighbor graph for click-to-spotlight) is opt-in via Settings.
-        if !refine { return ProjectionResult(points: pcaPoints, knn: [], k: 0) }
+        if !refine {
+            guard let pts = await pcaPointsAll() else { return cancelled }
+            return ProjectionResult(points: pts, knn: [], k: 0)
+        }
 
         // kNN graph over the LANDMARKS, computed ONCE: it both seeds the force layout and is
         // returned for the click-to-highlight-neighbors UI. Skipped only when too few rows (<= k).
@@ -119,7 +150,10 @@ public final class ProjectionEngine: @unchecked Sendable {
 
         // Tiny landmark sets: force layout is meaningless; the PCA layout is the answer. A split
         // never lands here (the landmark budget floor is far above smallN), so pcaPoints == all rows.
-        if L <= Self.smallN || L <= 2 || !haveKNN { return ProjectionResult(points: pcaPoints, knn: knnHost, k: k) }
+        if L <= Self.smallN || L <= 2 || !haveKNN {
+            guard let pts = await pcaPointsAll() else { return cancelled }
+            return ProjectionResult(points: pts, knn: knnHost, k: k)
+        }
         if Task.isCancelled { return cancelled }
         await Task.yield()
 
@@ -156,6 +190,7 @@ public final class ProjectionEngine: @unchecked Sendable {
             }
             epoch = end
             if Task.isCancelled { return cancelled }
+            engine.noteInteractive()   // keep the indexer in per-batch mode across the whole fit
             await Task.yield()
         }
 
@@ -170,7 +205,7 @@ public final class ProjectionEngine: @unchecked Sendable {
             let tileRows = Self.placementTileRows(L)
             var XLt = MLXArray(); var YLmlx = MLXArray()
             _ = engine.runLowPriorityGPU { () -> Int in
-                XLt = XL.transposed()
+                XLt = MLX.negative(XL.transposed())   // pre-negated once; see placeTileIDW
                 YLmlx = MLXArray(host, [L, 2])
                 eval(XLt, YLmlx)
                 return 0
@@ -179,7 +214,7 @@ public final class ProjectionEngine: @unchecked Sendable {
             while start < n {
                 let end = min(start + tileRows, n)
                 let (pos, idx) = engine.runLowPriorityGPU { () -> ([Float], [Int32]) in
-                    Self.placeTileIDW(XLt: XLt, YL: YLmlx, tile: Self.hostTile(data, start, end), k: k)
+                    Self.placeTileIDW(XLtNeg: XLt, YL: YLmlx, tile: Self.hostTile(data, start, end), k: k)
                 }
                 host.append(contentsOf: pos)
                 knnHost.append(contentsOf: idx)
@@ -191,7 +226,10 @@ public final class ProjectionEngine: @unchecked Sendable {
 
         // umap-with-pca-fallback: any non-finite landmark layout -> the exact PCA positions instead
         // (the spotlight graph is layout-independent and kept).
-        if !finite { return ProjectionResult(points: pcaPoints, knn: knnHost, k: k) }
+        if !finite {
+            guard let pts = await pcaPointsAll() else { return cancelled }
+            return ProjectionResult(points: pts, knn: knnHost, k: k)
+        }
         return ProjectionResult(points: Self.makePoints(host, data), knn: knnHost, k: k)
     }
 
@@ -243,13 +281,13 @@ public final class ProjectionEngine: @unchecked Sendable {
 
         // Place the non-landmark rows by IDW over their nearest landmarks (see project()).
         if L < n {
-            let XLt = XL.transposed()
+            let XLt = MLX.negative(XL.transposed())   // pre-negated once; see placeTileIDW
             let YLmlx = MLXArray(host, [L, 2])
             let tileRows = placementTileRows(L)
             var start = L
             while start < n {
                 let end = min(start + tileRows, n)
-                host.append(contentsOf: placeTileIDW(XLt: XLt, YL: YLmlx, tile: hostTile(data, start, end), k: k).pos)
+                host.append(contentsOf: placeTileIDW(XLtNeg: XLt, YL: YLmlx, tile: hostTile(data, start, end), k: k).pos)
                 start = end
             }
         }
@@ -381,7 +419,7 @@ public final class ProjectionEngine: @unchecked Sendable {
     // Tiles bound the GEMM memory; total FLOPs are rest x L x d (linear in rest, not quadratic).
 
     /// Rows [start, end) of data.vectors as a [t, d] MLXArray.
-    static func hostTile(_ data: FolderVectors, _ start: Int, _ end: Int) -> MLXArray {
+    public static func hostTile(_ data: FolderVectors, _ start: Int, _ end: Int) -> MLXArray {
         let d = data.dim
         return data.vectors.withUnsafeBufferPointer { buf in
             MLXArray(Array(UnsafeBufferPointer(rebasing: buf[(start * d) ..< (end * d)])), [end - start, d])
@@ -389,21 +427,27 @@ public final class ProjectionEngine: @unchecked Sendable {
     }
 
     /// Tile rows for the placement GEMM: bound the [t, L] similarity matrix to ~200MB.
-    static func placementTileRows(_ landmarks: Int) -> Int {
+    public static func placementTileRows(_ landmarks: Int) -> Int {
         max(1, 200_000_000 / max(1, landmarks * 4))
     }
 
     /// Place one tile of non-landmark rows: returns row-major [t*2] positions and the [t*k] nearest
     /// landmark indices (nearest first - they double as the spotlight kNN rows for these points,
     /// valid globally because landmarks are the first rows of the result).
-    static func placeTileIDW(XLt: MLXArray, YL: MLXArray, tile: MLXArray, k: Int) -> (pos: [Float], knn: [Int32]) {
-        let sims = tile.matmul(XLt)                                       // [t, L] cosine
-        let part = MLX.argPartition(MLX.negative(sims), kth: k, axis: 1)[0..., 0 ..< k]   // top-k, unordered
-        let simK = MLX.takeAlong(sims, part, axis: 1)                     // [t, k]
-        let ord = MLX.argSort(MLX.negative(simK), axis: 1)                // nearest first
+    /// `XLtNeg` is the landmark matrix pre-negated ONCE by the caller, so the [t, L] tile comes out
+    /// of the GEMM already negated and the whole selection runs in negated space. The old form
+    /// built the positive tile and then materialized `MLX.negative(sims)` - a second full [t, L]
+    /// buffer (200 MB at the placement tile bound) written and read for nothing. Bit-identical:
+    /// IEEE negation is exact, so `2 - 2*s` and `2 + 2*(-s)` produce the same float, and ranking on
+    /// -cos is the same ranking either way.
+    static func placeTileIDW(XLtNeg: MLXArray, YL: MLXArray, tile: MLXArray, k: Int) -> (pos: [Float], knn: [Int32]) {
+        let negSims = tile.matmul(XLtNeg)                                 // [t, L] -cosine
+        let part = MLX.argPartition(negSims, kth: k, axis: 1)[0..., 0 ..< k]   // top-k, unordered
+        let negSimK = MLX.takeAlong(negSims, part, axis: 1)               // [t, k]
+        let ord = MLX.argSort(negSimK, axis: 1)                           // nearest first
         let idx = MLX.takeAlong(part, ord, axis: 1)                       // [t, k]
-        let s = MLX.takeAlong(simK, ord, axis: 1)
-        let d2 = MLX.maximum(2.0 - 2.0 * s, MLXArray(Float(0)))           // squared L2 on the unit sphere
+        let ns = MLX.takeAlong(negSimK, ord, axis: 1)                     // -cos, nearest first
+        let d2 = MLX.maximum(2.0 + 2.0 * ns, MLXArray(Float(0)))          // squared L2 on the unit sphere
         var w = 1.0 / (d2 + 1e-4)                                         // IDW: coincident row -> its landmark
         w = w / MLX.sum(w, axis: 1, keepDims: true)                       // [t, k]
         let nbr = YL[idx.reshaped([-1])].reshaped([idx.dim(0), k, 2])     // [t, k, 2]
@@ -413,7 +457,7 @@ public final class ProjectionEngine: @unchecked Sendable {
     }
 
     /// Exact PCA projection of one tile through the landmark-fitted basis.
-    static func pcaProjectTile(tile: MLXArray, mean: MLXArray, comps: MLXArray) -> [Float] {
+    public static func pcaProjectTile(tile: MLXArray, mean: MLXArray, comps: MLXArray) -> [Float] {
         let Y = (tile - mean).matmul(comps.transposed())
         eval(Y)
         return Y.asArray(Float.self)

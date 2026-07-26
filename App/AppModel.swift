@@ -2342,7 +2342,13 @@ final class AppModel {
             // Stream carries (layout, total-files-under-folder) so the caption can say "N of M" when the
             // folder was subsampled to the memory budget - total is the pre-sample distinct count.
             let stream = AsyncStream<(ProjectionResult, Int)> { continuation in
-                let worker = Task.detached(priority: .utility) {
+                // .userInitiated, not .utility: DispatchQueue.sync runs the block on the CALLING
+                // thread, so a utility worker put the entire vectorsUnderFolder pull - and every
+                // host-side copy inside project() - on the EFFICIENCY cluster. On this dev box that
+                // is invisible; on a 4P+4E MacBook it is most of why the map feels slow, and the
+                // user is watching a spinner for it. GPU priority is a separate knob: the fit still
+                // runs behind runLowPriorityGPU, so this cannot let the map jump ahead of a search.
+                let worker = Task.detached(priority: .userInitiated) {
                     // Settle briefly first: clicking folders back-and-forth cancels this task before the
                     // scan starts, so we don't enqueue an uncancellable full vectorsUnderFolder scan per
                     // click on the shared serial store queue. Short enough to feel instant for a single
@@ -2350,9 +2356,16 @@ final class AppModel {
                     // machine-gun click-through to just the folder the selection lands on.
                     try? await Task.sleep(for: .milliseconds(120))
                     if Task.isCancelled { continuation.finish(); return }
+                    let tPull = Date()
                     let data = store.vectorsUnderFolder(folder, cap: totalCap, landmarkCap: mapCap)
+                    omniPerfLog(String(format: "map pull=%.0fms n=%d landmarks=%d dim=%d",
+                                       -tPull.timeIntervalSinceNow * 1000, data.count, data.landmarkCount, data.dim))
                     if Task.isCancelled { continuation.finish(); return }
-                    continuation.yield((await proj.project(data, refine: refine), data.total))   // PCA / UMAP
+                    let tFit = Date()
+                    let fitted = await proj.project(data, refine: refine)                        // PCA / UMAP
+                    omniPerfLog(String(format: "map fit=%.0fms mode=%@ pts=%d",
+                                       -tFit.timeIntervalSinceNow * 1000, refine ? "umap" : "pca", fitted.points.count))
+                    continuation.yield((fitted, data.total))
                     continuation.finish()
                 }
                 continuation.onTermination = { _ in worker.cancel() }
