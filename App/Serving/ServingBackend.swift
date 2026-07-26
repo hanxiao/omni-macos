@@ -21,6 +21,17 @@ protocol ServingBackend: Sendable {
     /// Content-identity keys (dedup sidecar) for the given paths, with the sidecar's modified
     /// stamp so callers can apply the lockstep staleness rule. Same key = byte-identical content.
     func contentKeys(paths: [String]) -> [String: (key: String, modified: Double)]
+    /// Tags already generated at index time for the given paths. Read-only, no GPU. A key is
+    /// present only for indexed MEDIA rows; an empty array means indexed media with no tags yet.
+    func storedTags(paths: [String]) -> [String: [String]]
+    /// Whether on-demand tagging can run right now: vision loaded AND a tagger attached (the label
+    /// cache is built asynchronously after launch, and the user can switch tagging off entirely).
+    var canTag: Bool { get }
+    /// Compute tags for already-decoded images, WITHOUT folding them into the corpus prior.
+    /// `crops[i]` carries image i's CWR crops for HQ refinement (empty = base quality).
+    /// Returns one tag list per input, input order preserved; nil when tagging is unavailable.
+    func tagImages(_ raws: [OmniVisionPreprocess.RawPatches],
+                   crops: [[OmniVisionPreprocess.RawPatches]], topK: Int) -> [[String]]?
 }
 
 /// Wraps OmniEngine + VectorStore. @unchecked Sendable is justified: every member it
@@ -71,5 +82,42 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
 
     func contentKeys(paths: [String]) -> [String: (key: String, modified: Double)] {
         store.contentKeys(paths: paths)
+    }
+
+    func storedTags(paths: [String]) -> [String: [String]] {
+        store.storedTags(paths: paths)
+    }
+
+    var canTag: Bool { engine.supportsImages && engine.tagger != nil }
+
+    func tagImages(_ raws: [OmniVisionPreprocess.RawPatches],
+                   crops: [[OmniVisionPreprocess.RawPatches]], topK: Int) -> [[String]]? {
+        // Read the tagger ONCE into a local: the property can change identity mid-request when the
+        // user switches model or toggles tagging off (AppModel.ensureTagger), and the score rows
+        // must be finalized against the very matrix that produced them.
+        guard !raws.isEmpty, let tagger = engine.tagger else { return nil }
+        guard let scores = engine.embedImagesTagScores(raws, tagger: tagger) else { return nil }
+        guard scores.count == raws.count else { return nil }
+
+        // HQ refinement: score every crop of the batch, then reduce each image's rows to its
+        // per-label max. Same geometry and same reduction the indexer's HQ path uses, so a tag
+        // computed here matches the tag the index would store for that image.
+        let v = tagger.labels.count
+        var cropMax = [[Float]?](repeating: nil, count: raws.count)
+        let flat = crops.flatMap { $0 }
+        if !flat.isEmpty, let cropScores = engine.embedImagesTagScores(flat, tagger: tagger) {
+            var off = 0
+            for i in 0 ..< raws.count where i < crops.count && !crops[i].isEmpty {
+                let count = crops[i].count
+                defer { off += count }
+                guard off + count <= cropScores.count else { continue }
+                cropMax[i] = OmniTagger.cropMaxRow(cropScores[off ..< off + count], labelCount: v)
+            }
+        }
+        // accumulatePrior: false - see OmniTagger.finalize. Serving must never fold a caller's
+        // image into the user's corpus prior, which freezes permanently after 64 images.
+        return scores.enumerated().map {
+            tagger.finalize($0.element, cropMax: cropMax[$0.offset], topK: topK, accumulatePrior: false)
+        }
     }
 }

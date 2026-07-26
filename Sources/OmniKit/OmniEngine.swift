@@ -833,20 +833,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             defer { off += count }
             // A short/failed crop scoring leaves this image un-refined (base tags still emit).
             guard off + count <= cropScores.count else { continue }
-            // Non-finite crop rows (the cold-load corruption can NaN some forwards while the
-            // main image stays finite) must be EXCLUDED, not max()-swallowed: Swift's max drops
-            // a NaN operand, so an all-NaN crop set would otherwise reduce to a uniform FINITE
-            // -greatestFiniteMagnitude that sails past finalize's guard and ties every centered
-            // score - the permanent vocab-order-junk failure mode. Skip bad rows; if none
-            // survive, the image keeps nil cropMax and emits base-quality tags.
-            let rows = cropScores[off ..< off + count]
-                .filter { $0.count == 2 * v && !$0.contains(where: { !$0.isFinite }) }
-            guard !rows.isEmpty else { continue }
-            var m = [Float](repeating: -.greatestFiniteMagnitude, count: v)
-            for row in rows {
-                for j in 0 ..< v { m[j] = max(m[j], max(row[j], row[v + j])) }
-            }
-            cropMaxPerImage[i] = m
+            cropMaxPerImage[i] = OmniTagger.cropMaxRow(cropScores[off ..< off + count], labelCount: v)
         }
         let tags: [[String]] = (0 ..< vecs.count).map { i in
             tagger.finalize(scores[i], cropMax: cropMaxPerImage[i])

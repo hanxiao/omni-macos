@@ -234,7 +234,15 @@ public final class OmniTagger: @unchecked Sendable {
     /// image's 2x2+center crop scores, fused at `cropWeight` after prior-centering - the study's
     /// one proven accuracy lever (small objects become large in the crop that contains them).
     /// Crop scores never enter the prior; only the full image's do.
-    public func finalize(_ scores: [Float], cropMax: [Float]? = nil, topK: Int = OmniTagger.topK) -> [String] {
+    /// `accumulatePrior: false` centers against the prior but does NOT fold this image into it.
+    /// Required for on-demand callers (the serving API): the prior is a running mean of the USER'S
+    /// corpus base rate, and it freezes permanently after `priorFreezeCount` images. An API client
+    /// tagging arbitrary images would otherwise bake non-corpus statistics into `<cache>.prior`
+    /// forever - seedTaggerPrior already spends 6 of the 64, so a few dozen requests could do it.
+    /// The returned tags are unaffected either way: centering reads the prior AS IT WAS (cmup/cmug
+    /// below), so skipping the update changes nothing about THIS image's result.
+    public func finalize(_ scores: [Float], cropMax: [Float]? = nil, topK: Int = OmniTagger.topK,
+                         accumulatePrior: Bool = true) -> [String] {
         let v = labels.count
         guard scores.count == 2 * v else { return [] }
         if let cropMax { guard cropMax.count == v else { return [] } }
@@ -252,7 +260,7 @@ public final class OmniTagger: @unchecked Sendable {
         // is seeded from procedural neutral images (seedImages) before any real image, so
         // even image #1 gets the base-rate words removed.
         let cmup = mup, cmug = mug
-        if !priorFrozen {
+        if accumulatePrior, !priorFrozen {
             // Running mean over images seen = per-corpus base-rate removal (the study used
             // neutral stock images as a proxy for exactly this). Freeze once stable so tags
             // are deterministic afterwards.
@@ -371,6 +379,25 @@ public final class OmniTagger: @unchecked Sendable {
     /// True once the prior is frozen (read-only): finalize calls are then independent and the
     /// engine may run a batch's finalizes concurrently.
     public var priorIsFrozen: Bool { lock.withLock { priorFrozen } }
+
+    /// Reduce one image's CWR crop score rows to the per-label MAX row that `finalize` takes as
+    /// `cropMax`, or nil when no row is usable (the caller then emits base-quality tags).
+    ///
+    /// Non-finite crop rows (the cold-load corruption can NaN some forwards while the main image
+    /// stays finite) must be EXCLUDED, not max()-swallowed: Swift's max drops a NaN operand, so an
+    /// all-NaN crop set would otherwise reduce to a uniform FINITE -greatestFiniteMagnitude that
+    /// sails past finalize's guard and ties every centered score - the permanent vocab-order-junk
+    /// failure mode. Shared by the indexer's HQ path and the serving API so that reasoning lives
+    /// in exactly one place.
+    public static func cropMaxRow(_ rows: ArraySlice<[Float]>, labelCount v: Int) -> [Float]? {
+        let usable = rows.filter { $0.count == 2 * v && !$0.contains(where: { !$0.isFinite }) }
+        guard !usable.isEmpty else { return nil }
+        var m = [Float](repeating: -.greatestFiniteMagnitude, count: v)
+        for row in usable {
+            for j in 0 ..< v { m[j] = Swift.max(m[j], Swift.max(row[j], row[v + j])) }
+        }
+        return m
+    }
 
     // MARK: - CWR crops
 

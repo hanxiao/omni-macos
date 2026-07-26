@@ -1,4 +1,5 @@
 import Foundation
+import ImageIO
 import OmniKit
 import UniformTypeIdentifiers
 
@@ -46,6 +47,24 @@ func mimeType(forPath path: String) -> String? {
     let ext = (path as NSString).pathExtension
     guard !ext.isEmpty else { return nil }
     return UTType(filenameExtension: ext)?.preferredMIMEType
+}
+
+/// Lexical-only cleanup to the store's path identity (the crawler's verbatim absolute paths):
+/// tilde expansion, duplicate/trailing slashes removed, "." and ".." collapsed - WITHOUT
+/// consulting the filesystem. NSString.standardizingPath is deliberately NOT used: it rewrites
+/// "/private/tmp/..." to "/tmp/..." (a symlink-derived transform), while the store keys
+/// /private-form paths verbatim (AppModel.canonicalizeRoots converts /tmp-style roots INTO
+/// /private form), so a stored path fed back in would stop matching. The index never resolves
+/// symlinks, so neither does this.
+func normalizeStorePath(_ raw: String) -> String {
+    let expanded = (raw as NSString).expandingTildeInPath
+    var parts: [String] = []
+    for comp in expanded.split(separator: "/") {
+        if comp == "." { continue }
+        if comp == ".." { if !parts.isEmpty { parts.removeLast() }; continue }
+        parts.append(String(comp))
+    }
+    return "/" + parts.joined(separator: "/")
 }
 
 // MARK: - OpenAI + Jina (one OpenAI-shaped emitter)
@@ -394,24 +413,253 @@ enum FileStatusAdapter {
         }
     }
 
-    /// Lexical-only cleanup to the store's path identity (the crawler's verbatim absolute paths):
-    /// tilde expansion, duplicate/trailing slashes removed, "." and ".." collapsed - WITHOUT
-    /// consulting the filesystem. NSString.standardizingPath is deliberately NOT used: it rewrites
-    /// "/private/tmp/..." to "/tmp/..." (a symlink-derived transform), while the store keys
-    /// /private-form paths verbatim (AppModel.canonicalizeRoots converts /tmp-style roots INTO
-    /// /private form), so a stored path fed back in would stop matching. The index never resolves
-    /// symlinks, so neither does this.
-    private static func normalize(_ raw: String) -> String {
-        let expanded = (raw as NSString).expandingTildeInPath
-        var parts: [String] = []
-        for comp in expanded.split(separator: "/") {
-            if comp == "." { continue }
-            if comp == ".." { if !parts.isEmpty { parts.removeLast() }; continue }
-            parts.append(String(comp))
+    /// Local alias; the definition is `normalizeStorePath`, at file scope so every path-taking
+    /// adapter (status, tags) resolves to the same store identity.
+    static func normalize(_ raw: String) -> String { normalizeStorePath(raw) }
+}
+
+// MARK: - Tags
+
+/// Longest edge an incoming image is decoded to before patchifying. Matches
+/// IndexSettings.maxImageDimension, so a tag computed here is the tag the indexer would store.
+private let tagMaxImageDimension = 1568
+
+/// A path argument is honored only when it sits inside one of the user's indexed roots.
+///
+/// Without this an authenticated LAN caller could tag ANY image on the Mac, which is a far larger
+/// disclosure than the existence probe /v1/files/status already refuses to be (see the "NO disk
+/// probe" note in FileStatusAdapter.rows). Inside a root the content is already reachable through
+/// /v1/search, so tagging adds no new exposure. Read per request rather than snapshotted at attach
+/// time: ServingController.attach runs once at engine load (AppModel.swift), and the user can add
+/// or remove roots at any point afterwards.
+private func pathIsInIndexedRoot(_ path: String) -> Bool {
+    let roots = (UserDefaults.standard.array(forKey: "omni.roots") as? [String]) ?? []
+    for r in roots {
+        let root = normalizeStorePath(r)
+        if path == root || path.hasPrefix(root.hasSuffix("/") ? root : root + "/") { return true }
+    }
+    return false
+}
+
+/// Decode one request image to a CGImage, downscaled the way the indexer does.
+/// Accepts a filesystem path (root-gated by the caller) or inline bytes as base64 / a data: URI.
+private func decodeRequestImage(path: String?, base64: String?) -> CGImage? {
+    var source: CGImageSource?
+    if let path {
+        source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil)
+    } else if var b64 = base64 {
+        // "data:image/png;base64,AAAA..." - keep only the payload.
+        if b64.hasPrefix("data:"), let comma = b64.firstIndex(of: ",") { b64 = String(b64[b64.index(after: comma)...]) }
+        guard let data = Data(base64Encoded: b64, options: [.ignoreUnknownCharacters]) else { return nil }
+        source = CGImageSourceCreateWithData(data as CFData, nil)
+    }
+    guard let src = source else { return nil }
+    // Thumbnail decode rather than full decode + resize: one pass, honors EXIF orientation, and
+    // never materializes a 100MP buffer for a photo we are about to shrink anyway.
+    let opts: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceThumbnailMaxPixelSize: tagMaxImageDimension
+    ]
+    return CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary)
+}
+
+/// POST /v1/files/tags: the tags Omni ALREADY generated for the given indexed paths - the same
+/// strings the `tag:` search qualifier matches on. Read-only index metadata: nothing is embedded,
+/// the GPU is never touched, and indexing/search speed is unaffected. Use /v1/tag to tag an image
+/// that is not indexed (or to re-tag one without writing to the index).
+enum FileTagsAdapter {
+    static func handle(_ req: HTTPRequest, _ backend: any ServingBackend) -> HTTPResponse {
+        guard let body = JSONBody.object(req) else { return badRequest("invalid JSON body") }
+        var paths: [String]
+        if let raw = body["paths"] {
+            guard let arr = raw as? [String] else { return badRequest("'paths' must be an array of strings") }
+            paths = arr
+        } else if let one = body["path"] as? String {
+            paths = [one]
+        } else {
+            paths = []
         }
-        return "/" + parts.joined(separator: "/")
+        paths = paths.filter { !$0.isEmpty }
+        if paths.isEmpty { return badRequest("'paths' (array of absolute file paths) is required") }
+        if paths.count > servingMaxInputs { return badRequest("'paths' exceeds \(servingMaxInputs) items") }
+
+        return HTTPResponse.json(["files": rows(for: paths, backend: backend)])
+    }
+
+    /// One row per input path, input order preserved. Shared with the MCP tag tool.
+    static func rows(for paths: [String], backend: any ServingBackend) -> [[String: Any]] {
+        let normalized = paths.map(normalizeStorePath)
+        let tags = backend.storedTags(paths: normalized)
+        let status = backend.fileStatus(paths: normalized)
+
+        return normalized.map { p in
+            // Absent from storedTags means "no indexed media rows for this path". Distinguish the
+            // two reasons using the status lookup we already have, so a caller can tell a text
+            // file (never tagged, by design) from a path Omni has never seen. No disk probe here
+            // either, for the same reason FileStatusAdapter refuses one.
+            guard let t = tags[p] else {
+                guard let st = status[p] else { return ["path": p, "indexed": false, "tags": []] }
+                return ["path": p, "indexed": true, "kind": st.kind, "taggable": false, "tags": []]
+            }
+            return [
+                "path": p,
+                "indexed": true,
+                "kind": status[p]?.kind ?? "",
+                "taggable": true,
+                // Empty means indexed media that carries no tags yet: tagging was off, the label
+                // cache was still building, or the forward returned nothing usable.
+                "tags": t
+            ]
+        }
     }
 }
+
+/// POST /v1/tag: compute open-vocabulary tags for an image, on demand.
+///
+/// Input is either {"path": "/abs/file.jpg"} (must sit inside an indexed root) or
+/// {"image": "<base64 | data: URI>"}; "paths"/"images" arrays are accepted for batches. Runs the
+/// vision tower + tagger on the GPU at INDEXING priority, so an interactive search still preempts
+/// it. The result is ephemeral: nothing is written to the index, and - unlike the indexer's own
+/// tagging - the image is never folded into the corpus prior (see OmniTagger.finalize).
+enum TagAdapter {
+    static func handle(_ req: HTTPRequest, _ backend: any ServingBackend) -> HTTPResponse {
+        guard let body = JSONBody.object(req) else { return badRequest("invalid JSON body") }
+
+        var paths: [String] = []
+        if let raw = body["paths"] {
+            guard let arr = raw as? [String] else { return badRequest("'paths' must be an array of strings") }
+            paths = arr.filter { !$0.isEmpty }
+        } else if let one = body["path"] as? String, !one.isEmpty {
+            paths = [one]
+        }
+        var images: [String] = []
+        if let raw = body["images"] {
+            guard let arr = raw as? [String] else { return badRequest("'images' must be an array of base64 strings") }
+            images = arr.filter { !$0.isEmpty }
+        } else if let one = body["image"] as? String, !one.isEmpty {
+            images = [one]
+        }
+        if paths.isEmpty && images.isEmpty {
+            return badRequest("'path' (inside an indexed folder) or 'image' (base64) is required")
+        }
+        let hqRequested = (body["hq"] as? Bool) ?? true
+        let maxImages = hqRequested ? tagMaxImagesHQ : tagMaxImages
+        if paths.count + images.count > maxImages {
+            return badRequest("at most \(maxImages) images per request\(hqRequested ? " in hq mode (each image is 6 forwards; pass \"hq\": false for \(tagMaxImages))" : "")")
+        }
+
+        var topK = (body["top_k"] as? Int) ?? OmniTagger.topK
+        topK = max(1, min(topK, 25))
+
+        // HQ (CWR multi-crop) refinement is ON by default so this endpoint returns the SAME tags
+        // the indexer would store for the image (Indexer.swift cuts the same 5 crops on its retag
+        // pass). Base quality is a different answer, not just a faster one - a small object that
+        // only becomes legible inside a crop is missed without it. "hq": false opts out: 1 forward
+        // per image instead of 6, at the cost of disagreeing with the stored tags.
+        let hq = (body["hq"] as? Bool) ?? true
+
+        // Availability is a server state, not a bad request: vision may be unloaded, tagging may be
+        // switched off, or the label cache may still be building on first launch. 503 tells a
+        // client to retry rather than to fix its request.
+        guard backend.canTag else {
+            return HTTPResponse.json([
+                "error": ["message": "image tagging is not available (tagging disabled, or the label cache is still building)",
+                          "type": "service_unavailable"]
+            ], status: 503)
+        }
+
+        // Decode everything BEFORE taking the GPU: preprocessRaw saturates every core via
+        // concurrentPerform, and holding the engine gate across it would stall search for no reason.
+        var raws: [OmniVisionPreprocess.RawPatches] = []
+        var crops: [[OmniVisionPreprocess.RawPatches]] = []
+        var labels: [String] = []
+        // The same 5-crop CWR geometry the indexer cuts, so HQ tags here match HQ tags there.
+        func cutCrops(_ cg: CGImage) -> [OmniVisionPreprocess.RawPatches] {
+            guard hq else { return [] }
+            return OmniTagger.cwrCropRects(width: cg.width, height: cg.height)
+                .compactMap { cg.cropping(to: $0) }
+                .map { OmniVisionPreprocess.preprocessRaw($0) }
+        }
+        for p in paths {
+            let np = normalizeStorePath(p)
+            guard pathIsInIndexedRoot(np) else {
+                return badRequest("'\(np)' is outside the indexed folders; pass the image inline as 'image' instead")
+            }
+            guard let cg = decodeRequestImage(path: np, base64: nil) else {
+                return badRequest("could not decode an image at '\(np)'")
+            }
+            raws.append(OmniVisionPreprocess.preprocessRaw(cg))
+            crops.append(cutCrops(cg))
+            labels.append(np)
+        }
+        for (i, b64) in images.enumerated() {
+            guard let cg = decodeRequestImage(path: nil, base64: b64) else {
+                return badRequest("'image[\(i)]' is not decodable base64 image data")
+            }
+            raws.append(OmniVisionPreprocess.preprocessRaw(cg))
+            crops.append(cutCrops(cg))
+            labels.append("")
+        }
+
+        guard let tagged = backend.tagImages(raws, crops: crops, topK: topK) else {
+            return HTTPResponse.json([
+                "error": ["message": "tagging failed (the vision model is unavailable)", "type": "service_unavailable"]
+            ], status: 503)
+        }
+
+        let results: [[String: Any]] = tagged.enumerated().map { i, tags in
+            var row: [String: Any] = ["tags": tags]
+            if i < labels.count, !labels[i].isEmpty { row["path"] = labels[i] }
+            return row
+        }
+        return HTTPResponse.json(["hq": hq, "results": results])
+    }
+
+    /// Recompute tags for indexed-root paths, shaped like FileTagsAdapter.rows so the MCP tag tool
+    /// can render stored and recomputed answers with one code path. Always HQ, matching the tags
+    /// the indexer would store. nil when tagging is unavailable (the caller reports that once);
+    /// a per-path problem lands in that row's "error" instead of failing the whole call.
+    static func computeRows(paths: [String], topK: Int, backend: any ServingBackend) -> [[String: Any]]? {
+        guard backend.canTag else { return nil }
+        var raws: [OmniVisionPreprocess.RawPatches] = []
+        var crops: [[OmniVisionPreprocess.RawPatches]] = []
+        var ok: [String] = []
+        var rows: [String: [String: Any]] = [:]
+        for raw in paths {
+            let p = normalizeStorePath(raw)
+            guard pathIsInIndexedRoot(p) else {
+                rows[p] = ["path": p, "tags": [], "error": "outside the indexed folders"]
+                continue
+            }
+            guard let cg = decodeRequestImage(path: p, base64: nil) else {
+                rows[p] = ["path": p, "tags": [], "error": "not a decodable image"]
+                continue
+            }
+            raws.append(OmniVisionPreprocess.preprocessRaw(cg))
+            crops.append(OmniTagger.cwrCropRects(width: cg.width, height: cg.height)
+                .compactMap { cg.cropping(to: $0) }
+                .map { OmniVisionPreprocess.preprocessRaw($0) })
+            ok.append(p)
+        }
+        if !raws.isEmpty {
+            guard let tagged = backend.tagImages(raws, crops: crops, topK: topK) else { return nil }
+            for (i, p) in ok.enumerated() where i < tagged.count {
+                rows[p] = ["path": p, "tags": tagged[i], "taggable": true, "recomputed": true]
+            }
+        }
+        return paths.map { rows[normalizeStorePath($0)] ?? ["path": normalizeStorePath($0), "tags": []] }
+    }
+}
+
+/// Far below servingMaxInputs: each image is a full vision-tower forward (tens of ms even on this
+/// hardware) and the whole batch is decoded into memory up front, so the text-batch cap would let
+/// one request hold the GPU for minutes. The 8 MB request-body cap (HTTPMessage.maxBody) is the
+/// other practical limit on inline images: base64 inflates by 4/3, so ~5.9 MB of source bytes.
+private let tagMaxImages = 16
+/// HQ scores 5 crops on top of the image, one gate hold each, and holds all six raw pixel buffers
+/// at once - a real memory spike on a low-RAM Mac. Cap the default (HQ) mode far lower.
+private let tagMaxImagesHQ = 4
 
 // MARK: - Health / models
 

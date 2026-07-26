@@ -68,7 +68,7 @@ enum MCPAdapter {
 
         case "tools/list":
             return result(id: id, ["tools": [searchToolDescriptor(), searchInlineToolDescriptor(),
-                                             fileStatusToolDescriptor()]])
+                                             fileStatusToolDescriptor(), tagImageToolDescriptor()]])
 
         case "tools/call":
             guard let name = params["name"] as? String else {
@@ -79,6 +79,7 @@ enum MCPAdapter {
             case "search":        return callSearch(id: id, args: args, backend: backend)
             case "search_inline": return callSearchInline(id: id, args: args, backend: backend)
             case "file_status":   return callFileStatus(id: id, args: args, backend: backend)
+            case "tag_image":     return callTagImage(id: id, args: args, backend: backend)
             default:
                 return HTTPResponse.json(jsonRPCError(id: id, code: -32602, message: "unknown tool: \(name)"))
             }
@@ -384,6 +385,94 @@ enum MCPAdapter {
         return result(id: id, [
             "content": content,
             "structuredContent": ["files": rows],
+            "isError": false
+        ])
+    }
+
+    // MARK: - The tag_image tool
+
+    private static func tagImageToolDescriptor() -> [String: Any] {
+        [
+            "name": "tag_image",
+            "title": "Describe an image with open-vocabulary tags",
+            "description": "Return short descriptive tags for images on this Mac (a photo, a screenshot, a scanned page, a video frame). Give absolute file paths inside the user's indexed folders. By default this reports the tags Omni already generated at index time, which are the same words the `tag:` search qualifier matches, so it is instant and costs nothing. Set recompute=true to run the vision model now instead - use that only for a file Omni has not indexed yet, or when the file changed since it was indexed. Tags are single lowercase words and may include other languages.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "paths": [
+                        "type": "array",
+                        "items": ["type": "string"],
+                        "description": "Absolute image paths inside the user's indexed folders."
+                    ] as [String: Any],
+                    "recompute": [
+                        "type": "boolean",
+                        "description": "Run the vision model now rather than reading stored tags. Slower (a GPU forward per image, plus 5 refinement crops) and capped at \(mcpTagRecomputeMax) images. Off by default."
+                    ] as [String: Any],
+                    "top_k": [
+                        "type": "integer",
+                        "description": "How many tags per image when recomputing (1-25, default 5). Ignored when reading stored tags."
+                    ] as [String: Any]
+                ] as [String: Any],
+                "required": ["paths"]
+            ] as [String: Any]
+        ]
+    }
+
+    /// Recompute is far more expensive than a stored read (6 GPU forwards per image in HQ mode),
+    /// and an agent cannot see that cost, so it gets a much tighter cap than servingMaxInputs.
+    private static let mcpTagRecomputeMax = 4
+
+    private static func callTagImage(id: Any, args: [String: Any], backend: any ServingBackend) -> HTTPResponse {
+        let paths = (args["paths"] as? [String])?.filter { !$0.isEmpty } ?? []
+        guard !paths.isEmpty else {
+            return result(id: id, [
+                "content": [["type": "text", "text": "tag_image failed: 'paths' must be a non-empty array of absolute image paths"]],
+                "isError": true
+            ])
+        }
+        let recompute = (args["recompute"] as? Bool) ?? false
+        var topK = (args["top_k"] as? Int) ?? OmniTagger.topK
+        topK = max(1, min(topK, 25))
+
+        let rows: [[String: Any]]
+        if recompute {
+            guard paths.count <= mcpTagRecomputeMax else {
+                return result(id: id, [
+                    "content": [["type": "text", "text": "tag_image failed: recompute is limited to \(mcpTagRecomputeMax) images per call; drop recompute to read stored tags for more"]],
+                    "isError": true
+                ])
+            }
+            guard let computed = TagAdapter.computeRows(paths: paths, topK: topK, backend: backend) else {
+                return result(id: id, [
+                    "content": [["type": "text", "text": "tag_image failed: tagging is unavailable (it is switched off, or the label cache is still building)"]],
+                    "isError": true
+                ])
+            }
+            rows = computed
+        } else {
+            rows = FileTagsAdapter.rows(for: paths, backend: backend)
+        }
+
+        let content: [[String: Any]] = rows.enumerated().map { i, row in
+            let p = row["path"] as? String ?? ""
+            let tags = row["tags"] as? [String] ?? []
+            let line: String
+            if let err = row["error"] as? String {
+                line = "\(i + 1). \(p)  \(err)"
+            } else if !tags.isEmpty {
+                line = "\(i + 1). \(p)  \(tags.joined(separator: ", "))"
+            } else if row["indexed"] as? Bool == false {
+                line = "\(i + 1). \(p)  NOT indexed (pass recompute=true to tag it now)"
+            } else if row["taggable"] as? Bool == false {
+                line = "\(i + 1). \(p)  not an image (only images, scanned pages and video carry tags)"
+            } else {
+                line = "\(i + 1). \(p)  no tags yet"
+            }
+            return ["type": "text", "text": line]
+        }
+        return result(id: id, [
+            "content": content,
+            "structuredContent": ["files": rows, "recomputed": recompute],
             "isError": false
         ])
     }

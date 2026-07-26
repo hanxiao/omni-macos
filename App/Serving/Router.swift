@@ -40,6 +40,10 @@ struct Router: Sendable {
             return SearchAdapter.handle(req, backend)
         case ("POST", "/v1/files/status"):
             return FileStatusAdapter.handle(req, backend)
+        case ("POST", "/v1/files/tags"):
+            return FileTagsAdapter.handle(req, backend)
+        case ("POST", "/v1/tag"):
+            return TagAdapter.handle(req, backend)
         default:
             break
         }

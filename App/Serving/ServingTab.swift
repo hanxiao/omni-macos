@@ -16,7 +16,7 @@ struct ServingTab: View {
 
     /// Top-level example category: the search endpoint, or an embedding endpoint.
     private enum ExampleKind: String, CaseIterable, Identifiable {
-        case search = "Search", embed = "Embed"
+        case search = "Search", embed = "Embed", tags = "Tags"
         var id: String { rawValue }
     }
     /// The embedding API schema styles the server speaks (all served at once).
@@ -36,7 +36,7 @@ struct ServingTab: View {
         .frame(height: 520)   // matches the Content tab so switching tall tabs doesn't jump
         .sheet(isPresented: $showMCPSheet) {
             AgentConfigSheet(title: "Connect agents over MCP",
-                             subtitle: "Works with every MCP client that speaks the HTTP transport (Claude Code, Cursor, VS Code, ...). Tools: search, search_inline, file_status.",
+                             subtitle: "Works with every MCP client that speaks the HTTP transport (Claude Code, Cursor, VS Code, ...). Tools: search, search_inline, file_status, tag_image.",
                              text: mcpConfigText, saveAs: nil)
         }
         .sheet(isPresented: $showSkillSheet) {
@@ -81,7 +81,7 @@ struct ServingTab: View {
         } header: {
             Text("Server")
         } footer: {
-            Text("Serves OpenAI, Jina, Cohere, and Gemini embedding endpoints plus search and per-file index status, backed by the local model. MCP hands the server to protocol clients; SKILL.md to instruction-following agents.")
+            Text("Serves OpenAI, Jina, Cohere, and Gemini embedding endpoints plus search, per-file index status, and image tags, backed by the local model. MCP hands the server to protocol clients; SKILL.md to instruction-following agents.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }
@@ -268,7 +268,8 @@ struct ServingTab: View {
         4032x3024 original over a 192px thumbnail without opening either. Hits that are
         byte-identical copies share a `content_key`: collapse them before choosing. Image hits
         indexed with tagging on carry a few content words as their `snippet` ("cat, couch,
-        crib") instead of the filename. Fields are omitted when unknown. Scores above ~0.45
+        crib") instead of the filename - see Image tags below to read those as a list, or to
+        tag a picture that is not indexed. Fields are omitted when unknown. Scores above ~0.45
         are usually relevant; below ~0.3 usually noise.
 
         ## File status (is this file indexed, and is the index fresh?)
@@ -284,6 +285,30 @@ struct ServingTab: View {
         deleted, see `exists`) after it was indexed. `indexed_at` (epoch seconds) is when the
         indexer last wrote the file; absent on files indexed by older app versions. Files only
         (not folders); up to 2048 paths. Non-indexed paths return just `{"path", "indexed": false}`.
+
+        ## Image tags (what is in this picture?)
+
+        ```bash
+        curl -s \(base)/v1/files/tags\(authFlag) -H 'Content-Type: application/json' \\
+          -d '{"paths": ["/abs/photo.jpg"]}'
+        ```
+
+        Response: `{"files": [{"path", "indexed", "kind", "taggable", "tags": [...]}]}`. These are
+        the tags Omni generated at index time - the same words `tag:` matches in a search - so the
+        call is instant and costs nothing. `taggable` is false for text and audio, which carry no
+        tags. An empty `tags` on taggable media means it has not been tagged yet.
+
+        To tag an image Omni has NOT indexed, or to re-tag a changed file, compute on demand:
+
+        ```bash
+        curl -s \(base)/v1/tag\(authFlag) -H 'Content-Type: application/json' \\
+          -d '{"path": "/abs/photo.jpg", "top_k": 5}'
+        ```
+
+        `path` must be inside the user's indexed folders; otherwise send the bytes as
+        `{"image": "<base64 or data: URI>"}`. Multi-crop refinement is on by default so the result
+        matches what the index would store - pass `"hq": false` for one forward per image instead
+        of six. Nothing is written to the index. Max 4 images per request (16 with `hq: false`).
 
         ## Health check
 
@@ -330,6 +355,9 @@ struct ServingTab: View {
         let ct = " -H 'Content-Type: application/json'"
         if exampleKind == .search {
             return "curl \(base)/v1/search\(ct)\(auth) -d '{\"query\":\"invoices\",\"top_k\":5}'"
+        }
+        if exampleKind == .tags {
+            return "curl \(base)/v1/files/tags\(ct)\(auth) -d '{\"path\":\"/path/to/photo.jpg\"}'"
         }
         switch embedSchema {
         case .openai:
