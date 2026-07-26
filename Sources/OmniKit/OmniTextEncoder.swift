@@ -115,8 +115,8 @@ public final class OmniTextEncoder: @unchecked Sendable {
         if idsList.isEmpty { return [] }
         let (embeds, lengths) = backbone.embedBatch(idsList)
         lastSequenceLength = lengths.reduce(0, +)
-        let hidden = backbone.forward(inputsEmbeds: embeds, length: 0, lengths: lengths)
-        return backbone.poolBatch(hidden, lengths: lengths)
+        let stacked = backbone.forwardPooled(inputsEmbeds: embeds, lengths: lengths)
+        return backbone.poolBatchReadout(stacked, count: lengths.count)
     }
 
     /// Whether the async double-buffer pipeline is enabled. Default ON (overlaps batch K+1's GPU
@@ -164,8 +164,7 @@ public final class OmniTextEncoder: @unchecked Sendable {
             if ids.isEmpty { results[i] = []; continue }
             let (embeds, lengths) = backbone.embedBatch(ids)
             total += lengths.reduce(0, +)
-            let hidden = backbone.forward(inputsEmbeds: embeds, length: 0, lengths: lengths)
-            let stacked = backbone.poolBatchGraph(hidden, lengths: lengths)
+            let stacked = backbone.forwardPooled(inputsEmbeds: embeds, lengths: lengths)
             asyncEval([stacked])   // kick off this batch's GPU forward+pool, don't block
             // While that runs on the GPU, read back the previous batch's (already-launched) result.
             if let prev = pending {

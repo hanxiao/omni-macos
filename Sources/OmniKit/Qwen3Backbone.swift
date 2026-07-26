@@ -70,24 +70,26 @@ final class Qwen3Backbone: @unchecked Sendable {
         return (rows.asType(computeDType), lengths)
     }
 
-    /// Last-token pool per row (using real lengths) + L2 normalize. One eval.
-    func poolBatch(_ hidden: MLXArray, lengths: [Int]) -> [[Float]] {
-        let dim = cfg.text.hiddenSize
-        let stacked = poolBatchGraph(hidden, lengths: lengths)
-        eval(stacked)
-        let flat = stacked.asArray(Float.self)
-        return (0 ..< lengths.count).map { Array(flat[$0 * dim ..< ($0 + 1) * dim]) }
-    }
-
     /// SAFE TEXT LEVER (a): build the pooled [B, dim] graph but DO NOT host-sync. The caller
     /// drives `asyncEval` and reads it later, so the GPU forward of the next batch can overlap
     /// the CPU readout of this one. Identical math to `poolBatch` - only the eval is deferred.
     func poolBatchGraph(_ hidden: MLXArray, lengths: [Int]) -> MLXArray {
         // One gather instead of B row-slices + a stack (B+1 kernels -> 1): take each row's
         // last-real-token hidden state via takeAlongAxis on the L axis. Identical rows.
-        let idx = MLXArray(lengths.map { Int32($0 - 1) }, [lengths.count, 1, 1])     // [B, 1, 1]
-        let picked = MLX.takeAlong(hidden, idx, axis: 1)                             // [B, 1, dim]
-        var stacked = picked.reshaped([lengths.count, cfg.text.hiddenSize]).asType(.float32)
+        let picked = MLX.takeAlong(hidden, poolIndexGraph(lengths), axis: 1)         // [B, 1, dim]
+        return l2RowsGraph(picked, count: lengths.count)
+    }
+
+    /// The [B, 1, 1] gather index that selects each row's last REAL token on the L axis.
+    /// Shared by poolBatchGraph and forwardPooled so both narrow to exactly the same rows.
+    private func poolIndexGraph(_ lengths: [Int]) -> MLXArray {
+        MLXArray(lengths.map { Int32($0 - 1) }, [lengths.count, 1, 1])
+    }
+
+    /// [B, 1, dim] (or [B, dim]) -> fp32 L2-normalized [B, dim]. Factored out of poolBatchGraph so
+    /// the tail-narrowed forward reuses the byte-for-byte same pooling arithmetic.
+    private func l2RowsGraph(_ picked: MLXArray, count: Int) -> MLXArray {
+        var stacked = picked.reshaped([count, cfg.text.hiddenSize]).asType(.float32)
         stacked = stacked / MLX.sqrt((stacked * stacked).sum(axis: 1, keepDims: true))
         return stacked
     }
@@ -126,6 +128,54 @@ final class Qwen3Backbone: @unchecked Sendable {
         }
         return rmsNorm(h, "language_model.norm.weight")
     }
+
+    /// SAFE TEXT LEVER (c): `forward` + last-token pool, with the FINAL layer's per-row tail run only
+    /// on the rows the pool keeps.
+    ///
+    /// Last-token pooling reads exactly one row per sequence (poolBatchGraph). Attention mixes rows,
+    /// so layers 0..N-2 and the last layer's attention must run at full [B, Lmax] width. But after
+    /// the last attention nothing mixes rows again: the post-attention rmsNorm, gate/up/down, the
+    /// second residual and the final norm are all strictly per-row, and every row but the pooled one
+    /// is then discarded. So we gather the pooled rows right after the last attention and run that
+    /// tail on [B, 1, dim] instead of [B, Lmax, dim]. For a B=16, Lmax~500 batch that is 16 rows of
+    /// MLP instead of 8000. The last layer's MLP is 3 x hidden x intermediate of the 12-layer
+    /// backbone's parameters (6.25% on nano: 7.08M of 113.2M), removed for (Lmax-1)/Lmax of the rows,
+    /// plus one [B, Lmax, intermediate] transient, two full-width residual adds and two full-width
+    /// norm passes per forward.
+    ///
+    /// NOT bit-identical to forward+poolBatchGraph: the tail GEMMs go from M = B*Lmax to M = B, and a
+    /// different tile config regroups the fp32 K-accumulation. Every op and its order on the
+    /// surviving row are unchanged, so the drift is at rounding level - gated by levercheck
+    /// (cos >= 0.999) and the reference fixtures, not by a bit compare.
+    ///
+    /// Falls back to the plain route when disabled OR when the compiled whole-block path would be
+    /// used (OMNI_COMPILE_BLOCK=1 forces compile for all batches; that graph is traced at full width
+    /// and must not be bypassed silently). OMNI_TAIL_ROWS=0 disables.
+    func forwardPooled(inputsEmbeds: MLXArray, lengths: [Int]) -> MLXArray {
+        let B = inputsEmbeds.dim(0)
+        let wouldCompile = compileEnv == "1" || (compileEnv != "0" && B == 1 && inputsEmbeds.dim(1) <= 512)
+        guard Self.tailRowsEnabled, !wouldCompile, cfg.text.numLayers > 1, B == lengths.count else {
+            let hidden = forward(inputsEmbeds: inputsEmbeds, length: 0, lengths: lengths)
+            return poolBatchGraph(hidden, lengths: lengths)
+        }
+        let mask = attentionMask(inputsEmbeds, lengths: lengths)
+        var h = inputsEmbeds.asType(computeDType)
+        let last = cfg.text.numLayers - 1
+        for i in 0 ..< last {
+            let p = "language_model.layers.\(i)."
+            h = h + attention(rmsNorm(h, p + "input_layernorm.weight"), p, mask: mask)
+            h = h + mlp(rmsNorm(h, p + "post_attention_layernorm.weight"), p)
+        }
+        // Final layer: attention at full width (it is the last op that reads other rows), then narrow.
+        let p = "language_model.layers.\(last)."
+        h = h + attention(rmsNorm(h, p + "input_layernorm.weight"), p, mask: mask)
+        h = MLX.takeAlong(h, poolIndexGraph(lengths), axis: 1)                       // [B, 1, dim]
+        h = h + mlp(rmsNorm(h, p + "post_attention_layernorm.weight"), p)
+        h = rmsNorm(h, "language_model.norm.weight")
+        return l2RowsGraph(h, count: lengths.count)
+    }
+
+    static let tailRowsEnabled = ProcessInfo.processInfo.environment["OMNI_TAIL_ROWS"] != "0"
 
     /// SAFE TEXT LEVER (b): run all `numLayers` blocks through one compiled kernel.
     ///
