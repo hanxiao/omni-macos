@@ -193,6 +193,8 @@ public final class Indexer: @unchecked Sendable {
 
     // Content dedup: identical bytes never embed twice. OMNI_CONTENT_DEDUP=0 disables (A/B).
     public static let contentDedup = ProcessInfo.processInfo.environment["OMNI_CONTENT_DEDUP"] != "0"
+    /// Chunk-level vector reuse on the live-update path (OMNI_CHUNK_CACHE=0 disables, for A/B).
+    public static let chunkCache = ProcessInfo.processInfo.environment["OMNI_CHUNK_CACHE"] != "0"
 
     // OMNI_NAN_DEBUG=1: dump non-finite embedding details to stderr (os.Logger from an unbundled
     // CLI never reaches `log show` on some systems, so benches need a direct channel).
@@ -238,6 +240,20 @@ public final class Indexer: @unchecked Sendable {
     private func noteDedupHit() { dedupLock.withLock { _dedupHits += 1 } }
     /// Dedup hits since the last call (concurrent decode threads increment).
     private func takeDedupHits() -> Int { dedupLock.withLock { let n = _dedupHits; _dedupHits = 0; return n } }
+    private var _chunkReuse = 0
+    private func noteChunkReuse(_ k: Int) { guard k > 0 else { return }; dedupLock.withLock { _chunkReuse += k } }
+    private func takeChunkReuse() -> Int { dedupLock.withLock { let n = _chunkReuse; _chunkReuse = 0; return n } }
+
+    /// Identity of one text chunk for vector reuse: the chunk's exact text plus everything that
+    /// decides the vector those bytes produce. Mirrors contentKey's fingerprint discipline one
+    /// level down - a settings change must never resurrect a stale vector - and like contentKey
+    /// it is keyed on the embedder dimension, with a model switch handled by forceFreshEmbed.
+    func chunkKey(_ text: String, settings: IndexSettings) -> String {
+        var h = SHA256()
+        h.update(data: Data("1|c\(settings.maxCharsPerChunk)|o\(chunkOverlap)|m\(embedder.dim)|".utf8))
+        h.update(data: Data(text.utf8))
+        return h.finalize().prefix(16).map { String(format: "%02x", $0) }.joined()
+    }
 
     // Text chunking. maxCharsPerChunk now comes per-pass from IndexSettings (user-set).
     // There is deliberately NO per-file chunk-count cap: the only bound on text coverage is
@@ -402,7 +418,7 @@ public final class Indexer: @unchecked Sendable {
                 // Cross-file text batching: buffer chunks from many files and embed them in
                 // batches of textBatchSize (one GPU forward). A file is stored once all of its
                 // chunks have come back, so per-file atomicity is preserved.
-                var buf: [(fid: Int, idx: Int, text: String, snippet: String, locator: String)] = []
+                var buf: [(fid: Int, idx: Int, text: String, snippet: String, locator: String, key: String)] = []
                 var acc: [Int: (file: CrawledFile, kind: String, total: Int, done: [IndexedChunk])] = [:]
                 var nextFid = 0
                 // Buffer several batches before draining so we can LENGTH-BUCKET them: sorting the
@@ -463,7 +479,7 @@ public final class Indexer: @unchecked Sendable {
                     // throughput cost that only applies during the ~2s of active typing). Full
                     // textBatchSize buckets otherwise, for peak indexing throughput.
                     let carve = embedder.interactiveQueryActive ? Swift.min(textBatchSize, Self.searchCarve) : textBatchSize
-                    var groups: [[(fid: Int, idx: Int, text: String, snippet: String, locator: String)]] = []
+                    var groups: [[(fid: Int, idx: Int, text: String, snippet: String, locator: String, key: String)]] = []
                     while buf.count > floor {
                         let take = Swift.min(carve, buf.count)
                         groups.append(Array(buf.prefix(take))); buf.removeFirst(take)
@@ -476,7 +492,7 @@ public final class Indexer: @unchecked Sendable {
                             guard var a = acc[b.fid] else { continue }
                             a.done.append(IndexedChunk(path: a.file.url.path, modified: a.file.modified, size: a.file.size,
                                                        kind: a.kind, chunkIndex: b.idx, snippet: b.snippet, embedding: vecs[k],
-                                                       locator: b.locator))
+                                                       locator: b.locator, chunkKey: b.key))
                             acc[b.fid] = a
                             if a.done.count == a.total { stageStore(a.file.url.path, a.done); acc[b.fid] = nil }
                         }
@@ -492,7 +508,15 @@ public final class Indexer: @unchecked Sendable {
                     case .text(let pieces) where !pieces.isEmpty:
                         let fid = nextFid; nextFid += 1
                         acc[fid] = (item.file, item.kind, pieces.count, [])
-                        for (j, piece) in pieces.enumerated() { buf.append((fid, j, piece.text, self.snippet(piece.text), piece.locator)) }
+                        // Keys are written on every text path so a later edit can reuse these
+                        // vectors; the full pass itself never reuses (unchanged files already
+                        // short-circuit above, and cross-file chunk duplication measured 3.15%,
+                        // not worth a global index). A SHA over the chunk text on the serial
+                        // consume side is immaterial against a pass that is 99% GPU-busy.
+                        for (j, piece) in pieces.enumerated() {
+                            buf.append((fid, j, piece.text, self.snippet(piece.text), piece.locator,
+                                        self.chunkKey(piece.text, settings: settings)))
+                        }
                         if buf.count >= textStageWindow { flushText(drainAll: false) }
                     case .duplicate(let chunks):
                         // Content-dedup hit: rows are ready, join the batched store directly.
@@ -763,7 +787,7 @@ public final class Indexer: @unchecked Sendable {
         // user-visible indexing there is (files appear as you save them), so they now stage text
         // chunks across files and embed per length-bucketed window exactly like index(). Media
         // items keep the per-file path (their batching lives in the encoders).
-        var tBuf: [(fid: Int, idx: Int, text: String, snippet: String, locator: String)] = []
+        var tBuf: [(fid: Int, idx: Int, text: String, snippet: String, locator: String, key: String)] = []
         var tAcc: [Int: (path: String, file: CrawledFile, kind: String, total: Int, done: [IndexedChunk])] = [:]
         var tNextFid = 0
         let tWindow = textBatchSize * 6
@@ -793,7 +817,7 @@ public final class Indexer: @unchecked Sendable {
             guard tBuf.count > floor else { return }
             tBuf.sort { $0.text.count < $1.text.count }
             let carve = embedder.interactiveQueryActive ? Swift.min(textBatchSize, Self.searchCarve) : textBatchSize
-            var groups: [[(fid: Int, idx: Int, text: String, snippet: String, locator: String)]] = []
+            var groups: [[(fid: Int, idx: Int, text: String, snippet: String, locator: String, key: String)]] = []
             while tBuf.count > floor {
                 let take = Swift.min(carve, tBuf.count)
                 groups.append(Array(tBuf.prefix(take))); tBuf.removeFirst(take)
@@ -806,7 +830,7 @@ public final class Indexer: @unchecked Sendable {
                     guard var a = tAcc[b.fid] else { continue }
                     a.done.append(IndexedChunk(path: a.path, modified: a.file.modified, size: a.file.size,
                                                kind: a.kind, chunkIndex: b.idx, snippet: b.snippet, embedding: vecs[k],
-                                               locator: b.locator))
+                                               locator: b.locator, chunkKey: b.key))
                     tAcc[b.fid] = a
                     if a.done.count == a.total { acceptCompleted(a.path, a.done); tAcc[b.fid] = nil }
                 }
@@ -853,11 +877,45 @@ public final class Indexer: @unchecked Sendable {
             switch item.payload {
             case .text(let pieces) where !pieces.isEmpty:
                 let fid = tNextFid; tNextFid += 1
-                tAcc[fid] = (path, item.file, item.kind, pieces.count, [])
+                // Chunk-level reuse. chunk() cuts a fixed grid from the START of the text, so an
+                // edit leaves every chunk boundary before it byte-identical, and an append leaves
+                // all of them identical except the tail. Those chunks already have a vector in the
+                // store, and taking it back is exactly the substitution file-level content dedup
+                // makes (which only fires when the WHOLE file is unchanged), one level finer.
+                //
+                // The lookup is here on the SERIAL consume side rather than next to the file-level
+                // dedup in decode(): decode runs at bounded concurrency under estimatedDecodedBytes,
+                // a byte throttle with no term for retrieved vectors, so doing it there would hold
+                // up to activeProcessorCount files' worth of [Float] outside the budget that exists
+                // to protect small machines. Here it is one file at a time.
+                //
+                // Only the VECTOR is reused. chunkIndex, snippet and locator are recomputed from the
+                // new chunk, because "Line N" shifts whenever earlier text changes length.
+                let keys = pieces.map { self.chunkKey($0.text, settings: settings) }
+                let reuseOK = Self.chunkCache && !settings.forceFreshEmbed && pieces.count > 1
+                let prior = reuseOK ? self.store.chunkVectors(path: path, dim: self.embedder.dim) : [:]
+                var reused: [IndexedChunk] = []
+                var pending: [(j: Int, piece: TextPiece, key: String)] = []
                 for (j, piece) in pieces.enumerated() {
-                    tBuf.append((fid, j, piece.text, self.snippet(piece.text), piece.locator))
+                    let key = keys[j]
+                    if let v = prior[key] {
+                        reused.append(IndexedChunk(path: path, modified: item.file.modified, size: item.file.size,
+                                                   kind: item.kind, chunkIndex: j, snippet: self.snippet(piece.text),
+                                                   embedding: v, locator: piece.locator, chunkKey: key))
+                    } else {
+                        pending.append((j, piece, key))
+                    }
                 }
-                if tBuf.count >= tWindow { flushTextU(drainAll: false) }
+                self.noteChunkReuse(reused.count)
+                if pending.isEmpty {
+                    acceptCompleted(path, reused)          // whole file served from the store
+                } else {
+                    tAcc[fid] = (path, item.file, item.kind, pieces.count, reused)
+                    for e in pending {
+                        tBuf.append((fid, e.j, e.piece.text, self.snippet(e.piece.text), e.piece.locator, e.key))
+                    }
+                    if tBuf.count >= tWindow { flushTextU(drainAll: false) }
+                }
             case .imagePatches(let raws) where !raws.isEmpty:
                 iStage.append((item.file, item.kind, raws, item.meta, item.hqCrops))
                 // HQ crops are full RawPatches (~fp32 megabytes each): count them toward the

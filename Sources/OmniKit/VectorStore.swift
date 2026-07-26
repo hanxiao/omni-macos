@@ -20,9 +20,13 @@ public struct IndexedChunk: Sendable {
     /// Where this chunk sits inside its file, human-readable ("Page 3", "Line 1240").
     /// Empty when the file has a single chunk or no meaningful position.
     public var locator: String
+    /// Hash of this chunk's exact text plus the settings that determine its vector. Lets a later
+    /// edit of the same file reuse this row's embedding for the chunks the edit did not touch,
+    /// instead of taking another forward pass. Empty = not eligible (media, or an older row).
+    public var chunkKey: String
 
     public init(path: String, modified: Double, size: Int = 0, kind: String, chunkIndex: Int, snippet: String, embedding: [Float],
-                width: Int = 0, height: Int = 0, duration: Double = 0, locator: String = "") {
+                width: Int = 0, height: Int = 0, duration: Double = 0, locator: String = "", chunkKey: String = "") {
         self.path = path
         self.modified = modified
         self.size = size
@@ -34,6 +38,7 @@ public struct IndexedChunk: Sendable {
         self.height = height
         self.duration = duration
         self.locator = locator
+        self.chunkKey = chunkKey
     }
 }
 
@@ -736,6 +741,10 @@ public final class VectorStore: @unchecked Sendable {
         // by the serving layer's per-file status lookup; search never reads it and it is not
         // resident, so it costs nothing on the query path.
         addColumnIfMissing("indexed_at", "REAL NOT NULL DEFAULT 0")
+        // Per-chunk content hash, for chunk-level vector reuse on the live-update path. Additive
+        // and lazy like the columns above: pre-existing rows carry '' and simply get no reuse
+        // until their file is next embedded. Never read by search; not resident.
+        addColumnIfMissing("chunk_key", "TEXT NOT NULL DEFAULT ''")
         // Content-dedup sidecar: one row per indexed file, mapping a content key (hash of the
         // embedding-relevant bytes + the preprocess settings) to the path whose chunks realized it.
         // ADDITIVE and self-healing, so index compatibility holds in BOTH directions: an old app
@@ -891,7 +900,7 @@ public final class VectorStore: @unchecked Sendable {
             deletePathLocked(path)
             let bfs = chunks.map { bf16Row($0.embedding) }   // fp32 -> bf16 once, reused for blob + memory
             let now = Date().timeIntervalSince1970           // one indexed_at stamp for the whole call
-            let sql = "INSERT INTO chunks(path, modified, size, kind, chunk_index, snippet, dim, vec, width, height, duration, locator, indexed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?);"
+            let sql = "INSERT INTO chunks(path, modified, size, kind, chunk_index, snippet, dim, vec, width, height, duration, locator, indexed_at, chunk_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?);"
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                 exec("ROLLBACK;")
@@ -915,6 +924,7 @@ public final class VectorStore: @unchecked Sendable {
                 sqlite3_bind_double(stmt, 11, c.duration)
                 sqlite3_bind_text(stmt, 12, c.locator, -1, SQLITE_TRANSIENT)
                 sqlite3_bind_double(stmt, 13, now)
+                sqlite3_bind_text(stmt, 14, c.chunkKey, -1, SQLITE_TRANSIENT)
                 guard sqlite3_step(stmt) == SQLITE_DONE else {
                     exec("ROLLBACK;")
                     throw OmniError.store("insert step failed")
@@ -965,7 +975,7 @@ public final class VectorStore: @unchecked Sendable {
             let now = Date().timeIntervalSince1970                           // one indexed_at stamp per batch
             let tSql = Self.searchTiming ? Date() : nil
             exec("BEGIN;")
-            let sql = "INSERT INTO chunks(path, modified, size, kind, chunk_index, snippet, dim, vec, width, height, duration, locator, indexed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?);"
+            let sql = "INSERT INTO chunks(path, modified, size, kind, chunk_index, snippet, dim, vec, width, height, duration, locator, indexed_at, chunk_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?);"
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                 exec("ROLLBACK;")
@@ -991,6 +1001,7 @@ public final class VectorStore: @unchecked Sendable {
                     sqlite3_bind_double(stmt, 11, c.duration)
                     sqlite3_bind_text(stmt, 12, c.locator, -1, SQLITE_TRANSIENT)
                     sqlite3_bind_double(stmt, 13, now)
+                sqlite3_bind_text(stmt, 14, c.chunkKey, -1, SQLITE_TRANSIENT)
                     guard sqlite3_step(stmt) == SQLITE_DONE else {
                         exec("ROLLBACK;")
                         throw OmniError.store("insert step failed")
@@ -1075,6 +1086,42 @@ public final class VectorStore: @unchecked Sendable {
     /// with its key (lockstep), so a stale key row - the path re-embedded by an old app version,
     /// deleted, or mid-replace - can never leak wrong vectors. The file's OWN row is a valid
     /// source: a touched-but-identical file (git checkout, re-save) reuses its own chunks.
+    /// Prior per-chunk vectors for one path, keyed by chunk hash. The live-update path uses this
+    /// to skip forward passes for the chunks an edit did not touch: the chunker cuts a fixed grid
+    /// from the start of the text, so an edit leaves every chunk before it byte-identical, and an
+    /// append leaves all but the tail identical.
+    ///
+    /// Only rows whose stored dim matches the caller's and whose vector is finite are returned -
+    /// the same guard chunksForCurrentPathLocked applies - so a dim change or a poisoned row can
+    /// never be resurrected. Rows written before this column existed carry '' and are skipped.
+    /// `cap` bounds the transient: the caller holds one file's vectors at a time, and a 2MB text
+    /// file is ~1250 chunks, so this is single-digit MB by construction.
+    public func chunkVectors(path: String, dim wantDim: Int, cap: Int = 4096) -> [String: [Float]] {
+        queue.sync {
+            guard dbOpen(), wantDim > 0 else { return [:] }
+            var out: [String: [Float]] = [:]
+            var stmt: OpaquePointer?
+            let sql = "SELECT chunk_key, dim, vec FROM chunks WHERE path = ? AND chunk_key <> '' LIMIT ?;"
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [:] }
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_int(stmt, 2, Int32(cap))
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                guard Int(sqlite3_column_int(stmt, 1)) == wantDim,
+                      let kc = sqlite3_column_text(stmt, 0),
+                      let blob = sqlite3_column_blob(stmt, 2) else { continue }
+                let bytes = Int(sqlite3_column_bytes(stmt, 2))
+                guard bytes == wantDim * 2 else { continue }        // bf16 rows only
+                var v = [Float](repeating: 0, count: wantDim)
+                let src = blob.assumingMemoryBound(to: UInt16.self)
+                for i in 0 ..< wantDim { v[i] = Self.fromBF16(src[i]) }
+                guard v.allSatisfy({ $0.isFinite }) else { continue }
+                out[String(cString: kc)] = v
+            }
+            return out
+        }
+    }
+
     public func duplicateChunks(key: String) -> [IndexedChunk]? {
         queue.sync {
             guard dbOpen() else { return nil }
@@ -1104,7 +1151,7 @@ public final class VectorStore: @unchecked Sendable {
         var out: [IndexedChunk] = []
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, """
-            SELECT modified, size, kind, chunk_index, snippet, dim, vec, width, height, duration, locator
+            SELECT modified, size, kind, chunk_index, snippet, dim, vec, width, height, duration, locator, chunk_key
             FROM chunks WHERE path = ? ORDER BY chunk_index;
             """, -1, &stmt, nil) == SQLITE_OK else { return nil }
         defer { sqlite3_finalize(stmt) }
@@ -1135,7 +1182,13 @@ public final class VectorStore: @unchecked Sendable {
                                     embedding: vec,
                                     width: Int(sqlite3_column_int(stmt, 7)), height: Int(sqlite3_column_int(stmt, 8)),
                                     duration: sqlite3_column_double(stmt, 9),
-                                    locator: sqlite3_column_text(stmt, 10).map { String(cString: $0) } ?? ""))
+                                    locator: sqlite3_column_text(stmt, 10).map { String(cString: $0) } ?? "",
+                                    // Carried so a file-level dedup hit keeps its rows eligible for
+                                    // chunk-level reuse on the next edit. The key describes the chunk
+                                    // TEXT, which is identical by definition here: the whole file's
+                                    // bytes matched. Dropping it would silently cost those files
+                                    // (6% of text files, measured) their per-chunk reuse.
+                                    chunkKey: sqlite3_column_text(stmt, 11).map { String(cString: $0) } ?? ""))
         }
         return out.isEmpty ? nil : out
     }

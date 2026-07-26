@@ -2762,6 +2762,99 @@ if args.count >= 4 && args[1] == "dedupbench" {
     exit(0)
 }
 
+// Chunk-reuse A/B: omni-verify editbench <modelDir> <root> [nEdits]
+// Copies <root> to scratch, indexes it with the REAL embedder, then appends one line to each of
+// the first nEdits multi-chunk text files and times update() - the FSEvents save path, which is
+// where all of the chunk-reuse benefit lands. churnbench cannot measure this: it runs FastEmbedder
+// with no GPU. Run with OMNI_CHUNK_CACHE=0 and =1 and diff the two.
+// Each run also dumps every stored vector to <db>.vecdump so the two arms can be compared
+// bit-for-bit; reuse is only correct if the dumps are identical.
+if args.count >= 4 && args[1] == "editbench" {
+    let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[2]))
+    let nEdits = (args.count >= 5 ? Int(args[4]) : nil) ?? 40
+    let editStyle = args.count >= 6 ? args[5] : "append"      // append | mid
+    let fm = FileManager.default
+    // Deterministic scratch name: both arms index byte-identical trees.
+    var work = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("editbench-corpus", isDirectory: true)
+    try? fm.removeItem(at: work)
+    try fm.copyItem(at: URL(fileURLWithPath: args[3]), to: work)
+    if let rp = realpath(work.path, nil) { work = URL(fileURLWithPath: String(cString: rp), isDirectory: true); free(rp) }
+    defer { try? fm.removeItem(at: work) }
+    let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("editbench.sqlite")
+    for e in ["", "-wal", "-shm", ".rows", ".vecs", ".quant", ".vecdump"] {
+        try? fm.removeItem(at: URL(fileURLWithPath: tmp.path + e))
+    }
+    let store = try VectorStore(dbURL: tmp)
+    let idx = Indexer(store: store, embedder: engine)
+    var settings = IndexSettings(enabledKinds: [.text])
+    settings.ignore = OmniIgnore(text: FileCrawler.skipDirNames.map { "\($0)/" }.joined(separator: "\n"))
+    let t0 = Date()
+    let first: IndexProgress = await withCheckedContinuation { cont in
+        let l = NSLock(); var fired = false
+        idx.index(roots: [work], settings: settings, force: true) { p in
+            if p.done { l.lock(); let go = !fired; fired = true; l.unlock(); if go { cont.resume(returning: p) } }
+        }
+    }
+    print(String(format: "EDITBENCH index: %d files, %d chunks, %.2fs", first.embedded, store.count, -t0.timeIntervalSinceNow))
+
+    // Edit: append a line. An append leaves every earlier chunk boundary byte-identical, which is
+    // the reuse case; it is also the single most common real edit (notes, logs, appended sections).
+    // Sync helper: enumerator iteration is unavailable in async contexts (same trap as dedupbench).
+    func appendToFiles(_ root: URL, _ limit: Int) -> [String] {
+        var out: [String] = []
+        guard let en = fm.enumerator(at: root, includingPropertiesForKeys: nil) else { return out }
+        for case let u as URL in en where out.count < limit {
+            guard (try? u.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true,
+                  FileExtractor.textExtensions.contains(u.pathExtension.lowercased()),
+                  let sz = try? fm.attributesOfItem(atPath: u.path)[.size] as? Int, sz > 4000
+            else { continue }
+            if editStyle == "mid" {
+                // Insert at the midpoint: every chunk boundary AFTER the edit shifts, so only the
+                // chunks before it can be reused. This is the honest average case; append is best.
+                guard let d = try? Data(contentsOf: u) else { continue }
+                let cut = d.count / 2
+                var out2 = d.prefix(cut)
+                out2.append(Data("\ninserted line for editbench\n".utf8))
+                out2.append(d.suffix(from: cut))
+                guard (try? out2.write(to: u)) != nil else { continue }
+            } else {
+                guard let fh = try? FileHandle(forWritingTo: u) else { continue }
+                try? fh.seekToEnd()
+                try? fh.write(contentsOf: Data("\nappended line for editbench\n".utf8))
+                try? fh.close()
+            }
+            out.append(u.path)
+        }
+        return out
+    }
+    let edited = appendToFiles(work, nEdits)
+    print("edited \(edited.count) multi-chunk text files (\(editStyle))")
+
+    let tok0 = engine.tokensProcessed, busy0 = engine.gpuBusySeconds
+    let t1 = Date()
+    idx.update(paths: edited, settings: settings)
+    let wall = -t1.timeIntervalSinceNow
+    print(String(format: "EDITBENCH update: %.3fs  gpuTokens=%d  gpuBusy=%.3fs  (chunk cache=%@)",
+                 wall, engine.tokensProcessed - tok0, engine.gpuBusySeconds - busy0,
+                 Indexer.chunkCache ? "on" : "off"))
+
+    // Vector dump for the cross-arm exactness diff.
+    var dump = ""
+    for p in edited.sorted() {
+        for h in store.rankChunks([Float](repeating: 0, count: engine.dim), path: p, topK: 100000).sorted(by: { $0.chunkIndex < $1.chunkIndex }) {
+            dump += "\(p)#\(h.chunkIndex)\n"
+        }
+    }
+    for p in edited.sorted() {
+        guard let v = store.fileVector(p) else { continue }
+        dump += p + " " + v.map { String(format: "%08x", $0.bitPattern) }.joined(separator: ",") + "\n"
+    }
+    try? dump.write(toFile: tmp.path + ".vecdump", atomically: true, encoding: .utf8)
+    print("vector dump -> \(tmp.path).vecdump  (\(dump.utf8.count) bytes)")
+    store.close()
+    exit(0)
+}
+
 // Long-audio segmentation check: omni-verify audiosegcheck [modelDir]
 // Issue #7: a whole-file AVAudioPCMBuffer overflows AudioToolbox's 32-bit byte count for
 // >= ~3 h 23 m stereo 44.1 kHz (frames x channels x 4 >= 2^32), aborting the scan. Verifies the
