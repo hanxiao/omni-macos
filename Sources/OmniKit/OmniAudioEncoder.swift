@@ -127,7 +127,12 @@ public final class OmniAudioEncoder: @unchecked Sendable {
         }
         let batched = MLX.concatenated(padded, axis: 0)     // [B, Lmax, dim]
         lastSequenceLength = lengths.reduce(0, +)
-        let hidden = backbone.forward(inputsEmbeds: batched, length: lmax, lengths: lengths)
-        return backbone.poolBatch(hidden, lengths: lengths)
+        // Same tail narrowing as the batched text path: nothing after the last layer's attention
+        // mixes rows, and only each clip's last real token survives the pool. Clip lengths vary
+        // more than text chunks do (a 30s clip beside a 3s one), so the padded rows this skips are
+        // a larger share here than there. No tagger reads these hidden states (unlike the image
+        // path), so there is nothing else keeping the discarded rows alive.
+        let stacked = backbone.forwardPooled(inputsEmbeds: batched, lengths: lengths)
+        return backbone.poolBatchReadout(stacked, count: lengths.count)
     }
 }
