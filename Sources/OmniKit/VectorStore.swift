@@ -328,9 +328,14 @@ final class Vec16Buffer {
 
     /// Extend the file-backed prefix over the anonymous append tail up to the current count, so
     /// bytes appended since the last fold become pageable file pages WITHOUT rewriting the region.
-    /// The tail's live bytes are preserved across the MAP_FIXED (copied out and back - the delta is
-    /// bounded by the fold threshold, a ~77MB memcpy at most). Failure is benign: the tail simply
-    /// stays anonymous (correct, just not evictable-for-free) until the next full remap.
+    /// The tail's live bytes are written to the file with pwrite BEFORE the MAP_FIXED lands on
+    /// them, so the new mapping reads back exactly what was there: no staging buffer, and the
+    /// transient is a page-cache write rather than an allocation the size of the delta. That
+    /// matters because the delta is only bounded by the fold threshold when folds are actually
+    /// running - an index-only session (no searches, so no folds) grows it to the reservation
+    /// slack, and this runs on the machines with the least memory to spare.
+    /// Failure is benign: the tail simply stays anonymous (correct, just not evictable-for-free)
+    /// until the next attempt.
     private func growFileCoverage() {
         guard let base, fd >= 0 else { return }
         let pageSize = Int(getpagesize())
@@ -338,15 +343,31 @@ final class Vec16Buffer {
         guard dataBytes > fileBytes else { return }
         let newFileBytes = min(reserveBytes, (dataBytes + pageSize - 1) / pageSize * pageSize)
         guard newFileBytes > fileBytes else { return }
-        let deltaBytes = dataBytes - fileBytes
-        var tmp = [UInt8](repeating: 0, count: deltaBytes)
-        tmp.withUnsafeMutableBytes { if let d = $0.baseAddress { memcpy(d, base.advanced(by: fileBytes), deltaBytes) } }
         guard ftruncate(fd, off_t(newFileBytes)) == 0 else { return }
+        // Push the anonymous tail into the file first. Source is anonymous memory past fileBytes,
+        // destination is the not-yet-mapped file region at the same offset: no aliasing.
+        var off = fileBytes
+        let end = dataBytes
+        while off < end {
+            let w = pwrite(fd, base.advanced(by: off), end - off, off_t(off))
+            guard w > 0 else { return }   // coverage unchanged; live bytes still in the tail
+            off += w
+        }
         guard let m = mmap(base.advanced(by: fileBytes), newFileBytes - fileBytes,
                            PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, off_t(fileBytes)),
               m != MAP_FAILED else { return }
-        tmp.withUnsafeBytes { if let s = $0.baseAddress { memcpy(base.advanced(by: fileBytes), s, deltaBytes) } }
         fileBytes = newFileBytes
+    }
+
+    /// Stamp-time coverage extension: make the file back every live element. Returns false when it
+    /// could not, which is the caller's signal not to write a header describing bytes the file
+    /// cannot serve. Appends never exceed the reservation while mapped (they fall back to heap
+    /// first, which clears isPersistent), so coverage can always reach count here.
+    @discardableResult
+    func extendFileCoverage() -> Bool {
+        guard isMapped, fd >= 0 else { return false }
+        growFileCoverage()
+        return fileBytes >= count * 2
     }
 
     /// Fold-time scratch maintenance: map on first use, extend coverage incrementally after, and
@@ -2606,6 +2627,8 @@ public final class VectorStore: @unchecked Sendable {
     // the sole source of truth. Gated to quant-mode indexes; OMNI_ROW_SIDECAR=0 disables.
 
     private static let rowSidecarEnabled = ProcessInfo.processInfo.environment["OMNI_ROW_SIDECAR"] != "0"
+    /// Test switch only: 0 reproduces the pre-fix stamp that outran the vector file.
+    private static let sidecarCoverEnabled = ProcessInfo.processInfo.environment["OMNI_SIDECAR_COVER"] != "0"
     private var rowSidecarURL: URL { dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".rows") }
     private var vecSidecarURL: URL { dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".vecs") }
     private var lastStampedGen: Int64 = -1
@@ -2640,6 +2663,20 @@ public final class VectorStore: @unchecked Sendable {
         guard Self.rowSidecarEnabled, dbOpen(), flat16.isPersistent, dim > 0, !rows.isEmpty,
               mutationGen != lastStampedGen, flat16.count == rows.count * dim else { return }
         let t0 = omniPerfEnabled ? Date() : nil
+        // The header describes rows.count vectors, so the FILE has to cover them. Rows appended
+        // since the last fold live in the mapping's anonymous tail, and only the fold path
+        // (rebuildBaseLocked -> ensureVecScratchLocked) ever extended coverage - so a stamp taken
+        // after any post-fold append described bytes the file did not have. The next open failed
+        // mapPersistent's fstat guard, and the rejection DELETES both sidecars and runs the full
+        // SQLite scan. Since folds only happen on the search path, background indexing followed by
+        // quiet was the common case, and the sidecar was discarded on essentially every launch.
+        // Extend coverage first, and if that fails, skip the stamp rather than write a header that
+        // is guaranteed to be rejected.
+        // OMNI_SIDECAR_COVER=0 restores the pre-fix behaviour so the regression test can A/B the
+        // bug inside one binary; it is a test switch, not a tuning knob.
+        if Self.sidecarCoverEnabled {
+            guard flat16.extendFileCoverage() else { return }
+        }
         flat16.msyncFile()
         let n = rows.count
         // Pre-sized [UInt8] buffers, not Data: appending millions of few-byte chunks through

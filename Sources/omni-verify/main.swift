@@ -2377,6 +2377,118 @@ if args.count >= 2 && args[1] == "loadbench" {
     exit(0)
 }
 
+// Row-sidecar adoption check: omni-verify sidecarcheck [N] [dim] [appendAfterFold]
+//
+// Reproduces the sequence that made the sidecar unusable in the field: fold (search), then append
+// WITHOUT searching again, then close. The stamp used to describe rows the .vecs file did not
+// cover, so the next open failed mapPersistent's fstat guard, deleted both sidecars and ran the
+// full SQLite scan - on every launch, since background indexing then quiet is the normal pattern.
+// loadbench cannot catch this: it never writes after the mapping is established.
+if args.count >= 2 && args[1] == "sidecarcheck" {
+    // Two forms. Synthetic: `sidecarcheck [N] [dim] [K]`. Real scale: pass an existing db path as
+    // the first argument to run the same sequence against a real index - use a COPY, it appends.
+    let existing = args.count >= 3 && FileManager.default.fileExists(atPath: args[2]) ? args[2] : nil
+    let N = existing != nil ? 0 : ((args.count >= 3 ? Int(args[2]) : nil) ?? 60_000)
+    let dim = (args.count >= 4 ? Int(args[3]) : nil) ?? 768
+    let K = (args.count >= 5 ? Int(args[4]) : nil) ?? 1_500
+    setenv("OMNI_QUANT_BASE", "4", 1)          // the sidecar is gated to quant-mode indexes
+    let tmp = existing.map { URL(fileURLWithPath: $0) }
+        ?? URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("sidecarcheck-\(N)-\(dim).sqlite")
+    let rowsURL = URL(fileURLWithPath: tmp.path + ".rows")
+    let vecsURL = URL(fileURLWithPath: tmp.path + ".vecs")
+    if existing == nil {
+        for e in ["", "-wal", "-shm", ".rows", ".vecs", ".quant"] {
+            try? FileManager.default.removeItem(at: URL(fileURLWithPath: tmp.path + e))
+        }
+    }
+    // Dense seeded vectors, not unit basis: with basis rows every row sharing i%dim scores
+    // identically and the top-k order is arbitrary, so a fidelity comparison would be meaningless.
+    func unit(_ i: Int) -> [Float] {
+        var st = UInt64(bitPattern: Int64(i &* 6364136223846793005 &+ 1442695040888963407)) | 1
+        var v = [Float](repeating: 0, count: dim); var n: Float = 0
+        for k in 0..<dim {
+            st ^= st << 13; st ^= st >> 7; st ^= st << 17
+            let x = Float(Int32(truncatingIfNeeded: st)) / Float(Int32.max)
+            v[k] = x; n += x * x
+        }
+        n = n.squareRoot(); if n > 0 { for k in 0..<dim { v[k] /= n } }
+        return v
+    }
+    func rowsFor(_ lo: Int, _ hi: Int) -> [(path: String, chunks: [IndexedChunk])] {
+        (lo..<hi).map { i in ("p\(i)", [IndexedChunk(path: "p\(i)", modified: 0, kind: "text",
+                                                     chunkIndex: 0, snippet: "", embedding: unit(i))]) }
+    }
+    var probeBefore: [String] = []
+    var base = N
+    do {
+        let store = try VectorStore(dbURL: tmp)
+        if existing == nil {
+            var batch = rowsFor(0, N)
+            while !batch.isEmpty { try store.replaceMany(Array(batch.prefix(2000))); batch.removeFirst(min(2000, batch.count)) }
+        } else {
+            base = store.count
+            print("  seeded from a real index copy: \(base) rows")
+        }
+        // Fold: the search path is the only thing that builds the quant base and extends coverage.
+        _ = store.search(unit(1), topK: 5)
+        // Now the field pattern: append with NO search after it, so no fold follows.
+        var tail = rowsFor(base, base + K)
+        while !tail.isEmpty { try store.replaceMany(Array(tail.prefix(500))); tail.removeFirst(min(500, tail.count)) }
+        probeBefore = store.search(unit(7), topK: 10).map { $0.path }
+        store.close()                                   // stamps the sidecar
+    }
+    let hdr = (try? FileHandle(forReadingFrom: rowsURL).readToEnd()).flatMap { d -> [String: Any]? in
+        guard let nl = d.firstIndex(of: 0x0A) else { return nil }
+        return try? JSONSerialization.jsonObject(with: d[d.startIndex..<nl]) as? [String: Any]
+    }
+    let stampedRows = (hdr?["rowCount"] as? Int) ?? -1
+    let stampedDim = (hdr?["dim"] as? Int) ?? -1
+    let vecBytes = (try? FileManager.default.attributesOfItem(atPath: vecsURL.path)[.size] as? Int) ?? 0
+    let needBytes = stampedRows * stampedDim * 2
+    print("sidecarcheck base=\(base) dim=\(dim) appended-after-fold=\(K)\(existing != nil ? " [real index copy]" : "")")
+    print("  stamped rowCount = \(stampedRows), dim = \(stampedDim)")
+    print("  .vecs bytes      = \(vecBytes)   needed = \(needBytes)   \(vecBytes >= needBytes ? "COVERED" : "SHORT by \((needBytes - vecBytes) / max(1, stampedDim * 2)) rows")")
+    // Reopen: a rejected sidecar deletes both files, so their survival IS the adoption signal.
+    let t = Date()
+    let re = try VectorStore(dbURL: tmp)
+    let openMs = -t.timeIntervalSinceNow * 1000
+    let adopted = FileManager.default.fileExists(atPath: rowsURL.path)
+    // Fidelity is checked on the VECTORS, not on top-k order: with a quantized base the top-k of
+    // near-tied random vectors reorders under int4 noise, which says nothing about the sidecar.
+    // The failure mode that matters is a tail row served as zeros - which is exactly what a
+    // zero-extended .vecs would produce, and the 32-sample validator strides too coarsely to see
+    // it (its last sample lands well before the rows appended after the final fold).
+    var worst: Float = 0
+    var zeroRows = 0
+    var checked = 0
+    for i in stride(from: base, to: base + K, by: max(1, K / 200)) + [base, base + K/2, base + K - 1] {
+        guard let got = re.fileVector("p\(i)") else { continue }
+        let want = unit(i)
+        checked += 1
+        if got.allSatisfy({ $0 == 0 }) { zeroRows += 1 }
+        var d: Float = 0
+        for k in 0..<min(got.count, want.count) { d = max(d, abs(got[k] - want[k])) }
+        worst = max(worst, d)
+    }
+    let probeAfter = re.search(unit(7), topK: 10).map { $0.path }
+    let count = re.count
+    re.close()
+    print(String(format: "  reopen           = %.0f ms", openMs))
+    print("  sidecar adopted  = \(adopted)")
+    print("  rows after       = \(count) (expected \(base + K))")
+    print("  top-10 overlap   = \(Set(probeAfter).intersection(probeBefore).count)/10 (int4 base reorders near-ties; informational)")
+    print(String(format: "  vector fidelity  = %d rows checked, %d all-zero, max |delta| vs source = %.5f (bf16 tolerance 0.004)", checked, zeroRows, worst))
+    if existing == nil {
+        for e in ["", "-wal", "-shm", ".rows", ".vecs", ".quant"] {
+            try? FileManager.default.removeItem(at: URL(fileURLWithPath: tmp.path + e))
+        }
+    }
+    let pass = adopted && vecBytes >= needBytes && count == base + K && stampedRows == base + K
+            && zeroRows == 0 && checked > 100 && worst < 0.004
+    print(pass ? "PASS" : "FAIL")
+    exit(pass ? 0 : 1)
+}
+
 // Crawl benchmark: omni-verify crawlbench [folder]
 // Quantifies the single-pass-crawl win: OLD two-pass (count walk + collect walk) vs NEW one-pass
 // (collect only) on a real folder. Warm-cache, so it's a LOWER BOUND on the cold-start saving
