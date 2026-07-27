@@ -114,8 +114,8 @@ jobs:
       # this commit from re-triggering the release workflow (no infinite loop).
       - name: Commit version bump
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "Han Xiao"
+          git config user.email "han.xiao@jina.ai"
           git add project.yml
           git commit -m "chore: release v${{ steps.ver.outputs.version }} [skip ci]"
           git push origin HEAD:main
@@ -164,8 +164,8 @@ jobs:
           DMG: dist/Omni-${{ steps.ver.outputs.version }}.dmg
         run: |
           if [ -z "$SITE_TOKEN" ]; then echo "no SITE_TOKEN secret; skipping site update"; exit 0; fi
-          git config --global user.email "omni-ci@users.noreply.github.com"
-          git config --global user.name "omni-ci"
+          git config --global user.email "han.xiao@jina.ai"
+          git config --global user.name "Han Xiao"
           MD5=$(md5 -q "$DMG")
           # The DMG ships under a VERSIONED filename (Omni-<version>.dmg). Each release is therefore a
           # brand-new URL Cloudflare has never cached, so a download can never serve a stale binary -

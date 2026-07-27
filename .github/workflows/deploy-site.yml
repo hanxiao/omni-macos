@@ -28,8 +28,8 @@ jobs:
           SITE_TOKEN: ${{ secrets.SITE_TOKEN }}
         run: |
           if [ -z "$SITE_TOKEN" ]; then echo "no SITE_TOKEN secret; cannot deploy"; exit 1; fi
-          git config --global user.email "omni-ci@users.noreply.github.com"
-          git config --global user.name "omni-ci"
+          git config --global user.email "han.xiao@jina.ai"
+          git config --global user.name "Han Xiao"
           rm -rf /tmp/site-only   # self-hosted runner reuses /tmp; a prior clone would block this one
           git clone --depth 1 "https://x-access-token:${SITE_TOKEN}@github.com/hanxiao/hanxiao.github.io.git" /tmp/site-only
 
