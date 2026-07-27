@@ -2762,6 +2762,73 @@ if args.count >= 4 && args[1] == "dedupbench" {
     exit(0)
 }
 
+// Video patchify parity/memory: omni-verify vidpatchparity <video> [frames]
+// Decodes N frames, runs the video preprocess, and prints a checksum plus the peak footprint
+// delta across the call. Compare the checksum against the pre-change build: the staging buffer's
+// element type must not change a single output float.
+if args.count >= 3 && args[1] == "vidpatchparity" {
+    let nFrames = (args.count >= 4 ? Int(args[3]) : nil) ?? 32
+    let asset = AVURLAsset(url: URL(fileURLWithPath: args[2]))
+    let dur = try await asset.load(.duration)
+    let gen = AVAssetImageGenerator(asset: asset)
+    gen.appliesPreferredTrackTransform = true
+    gen.requestedTimeToleranceBefore = .zero; gen.requestedTimeToleranceAfter = .zero
+    var frames: [CGImage] = []
+    for k in 0..<nFrames {
+        let t = CMTime(seconds: dur.seconds * Double(k) / Double(nFrames), preferredTimescale: 600)
+        if let img = try? gen.copyCGImage(at: t, actualTime: nil) { frames.append(img) }
+    }
+    guard let f0 = frames.first else { print("no frames decoded"); exit(1) }
+    func foot() -> Int {
+        var info = task_vm_info_data_t()
+        var c = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) { p in p.withMemoryRebound(to: integer_t.self, capacity: Int(c)) {
+            task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &c) } }
+        return kr == KERN_SUCCESS ? Int(info.phys_footprint) : 0
+    }
+    let before = foot()
+    let t = Date()
+    guard let raw = OmniVideoPreprocess.preprocessRaw(frames) else { print("preprocess returned nil"); exit(1) }
+    let ms = -t.timeIntervalSinceNow * 1000
+    let after = foot()
+    var hash: UInt64 = 0xcbf29ce484222325
+    for f in raw.pixels { var b = UInt64(f.bitPattern); for _ in 0..<4 { hash = (hash ^ (b & 0xff)) &* 0x100000001b3; b >>= 8 } }
+    print(String(format: "vidpatchparity frames=%d src=%dx%d  patches=%d  %.1f ms  footprint %.0f -> %.0f MB (+%.0f MB)  checksum=%016llx",
+                 frames.count, f0.width, f0.height, raw.numPatches, ms,
+                 Double(before) / 1048576, Double(after) / 1048576, Double(after - before) / 1048576, hash))
+    exit(0)
+}
+
+// Vision patchify parity/timing: omni-verify vispatchparity <image> [reps]
+// Prints a checksum of the raw patch buffer and the per-call wall time. The temporal-slot copy
+// (OMNI_TEMPORAL_COPY) must not change a single float: run both arms and compare checksums.
+if args.count >= 3 && args[1] == "vispatchparity" {
+    guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: args[2]) as CFURL, nil),
+          let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+        print("cannot read image at \(args[2])"); exit(1)
+    }
+    let reps = (args.count >= 4 ? Int(args[3]) : nil) ?? 20
+    var raw = OmniVisionPreprocess.preprocessRaw(img)        // warm
+    var ts: [Double] = []
+    for _ in 0..<reps {
+        let t = Date()
+        raw = OmniVisionPreprocess.preprocessRaw(img)
+        ts.append(-t.timeIntervalSinceNow * 1000)
+    }
+    ts.sort()
+    // FNV-1a over the exact float bits: any value change moves it.
+    var hash: UInt64 = 0xcbf29ce484222325
+    for f in raw.pixels {
+        var b = UInt64(f.bitPattern)
+        for _ in 0..<4 { hash = (hash ^ (b & 0xff)) &* 0x100000001b3; b >>= 8 }
+    }
+    print(String(format: "vispatchparity %dx%d  patches=%d  floats=%d  p50=%.2f ms  min=%.2f ms  checksum=%016llx  copy=%@",
+                 img.width, img.height, raw.numPatches, raw.pixels.count,
+                 ts[ts.count / 2], ts[0], hash,
+                 ProcessInfo.processInfo.environment["OMNI_TEMPORAL_COPY"] ?? "1"))
+    exit(0)
+}
+
 // VACUUM memory A/B: omni-verify compactbench [N] [dim] [deleteFrac]
 // Builds an index, deletes a fraction of it to create free pages, then compacts, sampling
 // phys_footprint throughout. Run with OMNI_VACUUM_TMP=memory and =file to A/B.

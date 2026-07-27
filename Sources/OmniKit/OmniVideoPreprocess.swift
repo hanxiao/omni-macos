@@ -70,11 +70,11 @@ public enum OmniVideoPreprocess {
         // Per-frame bicubic draw into ONE contiguous RAW (0..255) buffer; normalize is folded into
         // px() below (same op order as before). The last frame is repeated to fill the temporal pad
         // (matches numpy np.repeat); px() normalizes it identically, so values are unchanged.
-        var allFrames = [Float](repeating: 0, count: paddedCount * frameStride)
+        var allFrames = [UInt8](repeating: 0, count: paddedCount * frameStride)
         allFrames.withUnsafeMutableBufferPointer { ab in
             let aPtr = ab.baseAddress!
             for (fi, f) in frames.enumerated() {
-                let rgb = drawRGB(f, width: wBar, height: hBar)   // [frameStride], HWC, 0..255
+                let rgb = drawRGB8(f, width: wBar, height: hBar)  // [frameStride], HWC, 0..255 bytes
                 rgb.withUnsafeBufferPointer { aPtr.advanced(by: fi * frameStride).update(from: $0.baseAddress!, count: frameStride) }
             }
             if pad > 0 {
@@ -105,7 +105,7 @@ public enum OmniVideoPreprocess {
             out.withUnsafeMutableBufferPointer { ob in
                 let fPtr = fb.baseAddress!
                 @inline(__always) func px(_ frameIdx: Int, _ row: Int, _ col: Int, _ c: Int) -> Float {
-                    let v = fPtr[frameIdx * frameStride + (row * wBar + col) * inChannels + c]
+                    let v = Float(fPtr[frameIdx * frameStride + (row * wBar + col) * inChannels + c])
                     return (v * rescale - imageMean) / imageStd
                 }
                 nonisolated(unsafe) let outP = ob.baseAddress!
@@ -188,29 +188,27 @@ public enum OmniVideoPreprocess {
     /// interpolation quality, then return an HWC Float buffer of the RGB channels
     /// (alpha dropped), values in 0..255. deviceRGB color space,
     /// premultiplied-last layout. Identical backend to OmniVisionPreprocess.
-    private static func drawRGB(_ image: CGImage, width: Int, height: Int) -> [Float] {
+    /// Same draw, kept as bytes. The all-frames staging buffer holds raw 0..255 values that px()
+    /// normalizes on read, so storing them as Float cost 4 bytes per component for no information:
+    /// at a 32-frame segment that buffer is the largest single allocation in the video path, and it
+    /// is co-resident with an out buffer of its own. Float(UInt8) is exact, so px() reconstructs
+    /// the identical Float and every output value is unchanged.
+    private static func drawRGB8(_ image: CGImage, width: Int, height: Int) -> [UInt8] {
         let cs = CGColorSpaceCreateDeviceRGB()
         let bytesPerRow = width * 4
         var buf = [UInt8](repeating: 0, count: height * bytesPerRow)
         buf.withUnsafeMutableBytes { raw in
-            let ctx = CGContext(
-                data: raw.baseAddress,
-                width: width,
-                height: height,
-                bitsPerComponent: 8,
-                bytesPerRow: bytesPerRow,
-                space: cs,
-                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-            )!
+            let ctx = CGContext(data: raw.baseAddress, width: width, height: height,
+                                bitsPerComponent: 8, bytesPerRow: bytesPerRow, space: cs,
+                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
             ctx.interpolationQuality = .high
             ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
         }
-
-        var rgb = [Float](repeating: 0, count: height * width * 3)
+        var rgb = [UInt8](repeating: 0, count: height * width * 3)
         for i in 0 ..< (height * width) {
-            rgb[i * 3 + 0] = Float(buf[i * 4 + 0])  // R
-            rgb[i * 3 + 1] = Float(buf[i * 4 + 1])  // G
-            rgb[i * 3 + 2] = Float(buf[i * 4 + 2])  // B
+            rgb[i * 3 + 0] = buf[i * 4 + 0]
+            rgb[i * 3 + 1] = buf[i * 4 + 1]
+            rgb[i * 3 + 2] = buf[i * 4 + 2]
         }
         return rgb
     }
