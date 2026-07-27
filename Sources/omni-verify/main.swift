@@ -2923,6 +2923,11 @@ if args.count >= 2 && args[1] == "gateparity" {
     _ = store.search(vec(1), topK: 10)          // fold: everything above becomes base
     var tail = rows(N, N + D)
     while !tail.isEmpty { try store.replaceMany(Array(tail.prefix(1000))); tail.removeFirst(min(1000, tail.count)) }
+    // Optional quiet period: lets the debounced idle fold run, which is the case it exists for
+    // (indexing burst, then the user comes back and searches).
+    if let sleepSec = args.count >= 7 ? Double(args[6]) : nil, sleepSec > 0 {
+        try? await Task.sleep(nanoseconds: UInt64(sleepSec * 1e9))
+    }
     var dump = "", times: [Double] = []
     for q in 0..<nq {
         let qv = vec(1_000_000 + q)
@@ -2935,7 +2940,8 @@ if args.count >= 2 && args[1] == "gateparity" {
     times.sort()
     print(String(format: "gateparity base=%d delta=%d dim=%d q=%d  p50=%.2f ms  p95=%.2f ms  min=%.2f ms  (gate=%@)",
                  N, D, dim, nq, times[times.count / 2], times[Int(Double(times.count) * 0.95)], times[0],
-                 VectorStore.cantWinGate ? "on" : "off"))
+                 (VectorStore.cantWinGate ? "gate" : "nogate")
+                   + "/" + (ProcessInfo.processInfo.environment["OMNI_IDLE_FOLD"] == "0" ? "nofold" : "fold")))
     try? dump.write(toFile: tmp.path + ".hits", atomically: true, encoding: .utf8)
     print("hits -> \(tmp.path).hits (\(dump.utf8.count) bytes)")
     store.close()

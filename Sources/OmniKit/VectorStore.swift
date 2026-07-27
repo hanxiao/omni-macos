@@ -546,6 +546,7 @@ public final class VectorStore: @unchecked Sendable {
         mutationGen += 1
         exec("INSERT OR REPLACE INTO meta(key, value) VALUES('mutation_gen','\(mutationGen)');")
         scheduleRowStampLocked()   // debounced: the sidecar re-stamps once writes go quiet
+        scheduleIdleFoldLocked()   // debounced: fold the delta once writes go quiet
     }
     private static let foldThreshold = 50_000
     // Last interactive search time (queue-guarded). When a write invalidates the base WHILE the user is
@@ -2714,6 +2715,8 @@ public final class VectorStore: @unchecked Sendable {
     public static let cantWinGate = ProcessInfo.processInfo.environment["OMNI_CANTWIN"] != "0"
     /// Shrink the page cache for the duration of VACUUM (OMNI_VACUUM_CACHE=0 disables, for A/B).
     public static let vacuumSmallCache = ProcessInfo.processInfo.environment["OMNI_VACUUM_CACHE"] != "0"
+    /// Fold the delta after writes go quiet (OMNI_IDLE_FOLD=0 disables, for A/B).
+    static let idleFold = ProcessInfo.processInfo.environment["OMNI_IDLE_FOLD"] != "0"
     private var rowSidecarURL: URL { dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".rows") }
     private var vecSidecarURL: URL { dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".vecs") }
     private var lastStampedGen: Int64 = -1
@@ -3135,6 +3138,35 @@ public final class VectorStore: @unchecked Sendable {
     /// turns a ~65ms rebuild into a multi-hundred-ms search stall). Idle indexing skips this (the lazy
     /// search-path rebuild is fine when no query is waiting). Mirrors search()'s rebuild condition, so
     /// the next search finds baseDirty == false and a delta within threshold. Output is identical.
+    /// Fold the delta once WRITES go quiet, as opposed to proactiveRefoldLocked which folds when a
+    /// SEARCH is active. The two are disjoint and cover opposite cases: after an indexing burst
+    /// with no searching, the delta just sits there, and the next query pays both the delta matmul
+    /// (a host-to-GPU copy of deltaCount*dim*2 bytes, re-uploaded per query because MLXArray copies
+    /// at construction) and, when the base is dirty, the rebuild itself. Doing the rebuild on an
+    /// idle timer moves work the next query would have done anyway off its latency path, and unlike
+    /// caching the uploaded delta it costs no steady-state memory.
+    ///
+    /// Deliberately skipped while a search is recently active: the rebuild holds the serial queue,
+    /// so folding into a live query would create exactly the stall this is meant to remove. That
+    /// case is proactiveRefoldLocked's, and it has its own rate limit.
+    private var idleFoldToken: UInt64 = 0
+    private func scheduleIdleFoldLocked(after delay: TimeInterval = 2) {
+        guard Self.idleFold else { return }
+        idleFoldToken += 1
+        let token = idleFoldToken
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.queue.sync {
+                guard self.idleFoldToken == token else { return }      // more writes arrived
+                guard !self.searchRecentlyActiveLocked() else { return }
+                let n = self.rows.count
+                guard n > 0, self.dim > 0, self.flat16.count == n * self.dim, n > self.baseRows else { return }
+                if Self.searchTiming { print("[search] IDLE FOLD rows=\(n) delta=\(n - self.baseRows)") }
+                self.rebuildBaseLocked(rowCount: n)
+            }
+        }
+    }
+
     private func proactiveRefoldLocked() {
         guard Self.proactiveFold, searchRecentlyActiveLocked() else { return }
         let n = rows.count
