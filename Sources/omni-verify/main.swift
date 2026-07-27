@@ -2762,6 +2762,60 @@ if args.count >= 4 && args[1] == "dedupbench" {
     exit(0)
 }
 
+// Search parity + timing under a large unfolded delta: omni-verify gateparity [base] [delta] [dim] [q]
+// Builds a store with `base` folded rows and `delta` unfolded ones, runs q deterministic queries,
+// prints per-query timing and dumps every hit to <db>.hits for a cross-arm diff. The can't-win
+// gate (OMNI_CANTWIN) must not change a single hit: run both arms and diff.
+if args.count >= 2 && args[1] == "gateparity" {
+    let N = (args.count >= 3 ? Int(args[2]) : nil) ?? 200_000
+    let D = (args.count >= 4 ? Int(args[3]) : nil) ?? 40_000
+    let dim = (args.count >= 5 ? Int(args[4]) : nil) ?? 768
+    let nq = (args.count >= 6 ? Int(args[5]) : nil) ?? 30
+    let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("gateparity.sqlite")
+    for e in ["", "-wal", "-shm", ".rows", ".vecs", ".quant", ".hits"] {
+        try? FileManager.default.removeItem(at: URL(fileURLWithPath: tmp.path + e))
+    }
+    func vec(_ i: Int) -> [Float] {
+        var st = UInt64(bitPattern: Int64(i &* 6364136223846793005 &+ 1442695040888963407)) | 1
+        var v = [Float](repeating: 0, count: dim); var n: Float = 0
+        for k in 0..<dim { st ^= st << 13; st ^= st >> 7; st ^= st << 17
+            let x = Float(Int32(truncatingIfNeeded: st)) / Float(Int32.max); v[k] = x; n += x * x }
+        n = n.squareRoot(); if n > 0 { for k in 0..<dim { v[k] /= n } }
+        return v
+    }
+    // Several chunks per file, so the per-file reduce and its tie-breaks are actually exercised.
+    func rows(_ lo: Int, _ hi: Int) -> [(path: String, chunks: [IndexedChunk])] {
+        stride(from: lo, to: hi, by: 4).map { i in
+            ("f\(i / 4)", (0..<4).map { c in
+                IndexedChunk(path: "f\(i / 4)", modified: 0, kind: "text", chunkIndex: c,
+                             snippet: "", embedding: vec(i + c)) })
+        }
+    }
+    let store = try VectorStore(dbURL: tmp)
+    var batch = rows(0, N)
+    while !batch.isEmpty { try store.replaceMany(Array(batch.prefix(1000))); batch.removeFirst(min(1000, batch.count)) }
+    _ = store.search(vec(1), topK: 10)          // fold: everything above becomes base
+    var tail = rows(N, N + D)
+    while !tail.isEmpty { try store.replaceMany(Array(tail.prefix(1000))); tail.removeFirst(min(1000, tail.count)) }
+    var dump = "", times: [Double] = []
+    for q in 0..<nq {
+        let qv = vec(1_000_000 + q)
+        let t = Date()
+        let hits = store.search(qv, topK: 60)
+        times.append(-t.timeIntervalSinceNow * 1000)
+        dump += "q\(q)\n"
+        for h in hits { dump += "  \(h.path)#\(h.chunkIndex) \(String(format: "%08x", h.score.bitPattern))\n" }
+    }
+    times.sort()
+    print(String(format: "gateparity base=%d delta=%d dim=%d q=%d  p50=%.2f ms  p95=%.2f ms  min=%.2f ms  (gate=%@)",
+                 N, D, dim, nq, times[times.count / 2], times[Int(Double(times.count) * 0.95)], times[0],
+                 VectorStore.cantWinGate ? "on" : "off"))
+    try? dump.write(toFile: tmp.path + ".hits", atomically: true, encoding: .utf8)
+    print("hits -> \(tmp.path).hits (\(dump.utf8.count) bytes)")
+    store.close()
+    exit(0)
+}
+
 // Chunk-reuse A/B: omni-verify editbench <modelDir> <root> [nEdits]
 // Copies <root> to scratch, indexes it with the REAL embedder, then appends one line to each of
 // the first nEdits multi-chunk text files and times update() - the FSEvents save path, which is

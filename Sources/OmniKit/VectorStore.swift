@@ -2018,10 +2018,29 @@ public final class VectorStore: @unchecked Sendable {
             best[f] = (score, row)
         }
         for (j, ri) in cand.enumerated() { offer(ri, exScores[j]) }
-        for (j, sc) in deltaScores.enumerated() { offer(Int32(baseRows + j), sc) }
+        // Can't-win gate for the delta rows. The gate is the K-th best PER-FILE score among the
+        // base candidates, not the K-th best row score: K rows above a threshold can all belong to
+        // one file, so a row-level threshold would not bound the file-level result and could drop
+        // a delta row that belongs in the top-K. Selecting it costs one bounded pass over at most
+        // C = 4096 entries and then saves a hash lookup on each of up to 50,000 delta rows.
+        // Strict <: an equal score can still displace the K-th file on the fileID tie-break.
+        // Only worth computing when the delta is large enough to pay for the selection: sorting
+        // at most C scores costs tens of microseconds, and below a few thousand delta rows the
+        // lookups it saves are worth less than that.
+        var gate: Float = -.infinity
+        if Self.cantWinGate, best.count >= topK, topK > 0, deltaScores.count >= 4096 {
+            var sc = best.values.map { $0.score }
+            sc.sort(by: >)
+            gate = sc[topK - 1]
+        }
+        for (j, sc) in deltaScores.enumerated() where sc >= gate { offer(Int32(baseRows + j), sc) }
 
-        // Top-K files by best-chunk score.
-        let winners = best.values.sorted { $0.score > $1.score }.prefix(topK)
+        // Top-K files by best-chunk score, ties broken on ascending fileID. Without the secondary
+        // key this sorted a Dictionary's values, whose iteration order is randomized, so which
+        // member of an exact-tie pool came back varied between otherwise identical runs. The GPU
+        // reduce path already breaks ties this way; this makes the two agree.
+        let winners = best.sorted { $0.value.score != $1.value.score ? $0.value.score > $1.value.score : $0.key < $1.key }
+            .prefix(topK).map { $0.value }
         return winners.map { w in
             let r = rows[Int(w.row)]
             return SearchHit(path: r.path, score: w.score, snippet: "", kind: r.kind,
@@ -2287,8 +2306,17 @@ public final class VectorStore: @unchecked Sendable {
             candScore[idxHost[j]] = scoresHost[j]
             candRow[idxHost[j]] = r
         }
+        // Can't-win gate. When the base seeded a full K candidates, the smallest seeded score is
+        // the K-th best base score, and a delta row below it can neither enter the top-K (K files
+        // already beat it) nor improve a candidate (that candidate's score is >= the gate, so the
+        // strict > below would fail). Skipping it is exact.
+        //
+        // The comparison must be STRICT: an equal score can still displace the K-th file, because
+        // ties break to the lower fileID. And the gate must come BEFORE the dictionary lookup -
+        // gating after it only saves the insert, while the hash lookup is the bulk of the loop.
+        let gate: Float = (Self.cantWinGate && candScore.count >= topK) ? (candScore.values.min() ?? -.infinity) : -.infinity
         for (i, dot) in deltaScores.enumerated() {
-            guard dot.isFinite else { continue }
+            guard dot.isFinite, dot >= gate else { continue }
             let ri = baseRows + i
             if let ka = kindAllowed, !ka[Int(kindCode[ri])] { continue }   // disallowed-kind delta row
             let f = fileID[ri]
@@ -2682,6 +2710,8 @@ public final class VectorStore: @unchecked Sendable {
     private static let rowSidecarEnabled = ProcessInfo.processInfo.environment["OMNI_ROW_SIDECAR"] != "0"
     /// Test switch only: 0 reproduces the pre-fix stamp that outran the vector file.
     private static let sidecarCoverEnabled = ProcessInfo.processInfo.environment["OMNI_SIDECAR_COVER"] != "0"
+    /// Can't-win gate on the delta merge (OMNI_CANTWIN=0 disables, for A/B). Exact either way.
+    public static let cantWinGate = ProcessInfo.processInfo.environment["OMNI_CANTWIN"] != "0"
     private var rowSidecarURL: URL { dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".rows") }
     private var vecSidecarURL: URL { dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".vecs") }
     private var lastStampedGen: Int64 = -1
