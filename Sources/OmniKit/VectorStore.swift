@@ -2712,6 +2712,8 @@ public final class VectorStore: @unchecked Sendable {
     private static let sidecarCoverEnabled = ProcessInfo.processInfo.environment["OMNI_SIDECAR_COVER"] != "0"
     /// Can't-win gate on the delta merge (OMNI_CANTWIN=0 disables, for A/B). Exact either way.
     public static let cantWinGate = ProcessInfo.processInfo.environment["OMNI_CANTWIN"] != "0"
+    /// Shrink the page cache for the duration of VACUUM (OMNI_VACUUM_CACHE=0 disables, for A/B).
+    public static let vacuumSmallCache = ProcessInfo.processInfo.environment["OMNI_VACUUM_CACHE"] != "0"
     private var rowSidecarURL: URL { dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".rows") }
     private var vecSidecarURL: URL { dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".vecs") }
     private var lastStampedGen: Int64 = -1
@@ -3378,7 +3380,26 @@ public final class VectorStore: @unchecked Sendable {
             let free = intPragma("freelist_count")
             guard total > 0, Double(free) / Double(total) >= minFreeRatio else { return 0 }
             let before = onDiskBytes()
-            exec("VACUUM;")
+            // VACUUM rewrites the whole database through this connection, and it does that with
+            // the connection's page cache, which is sized for bulk insert (256MB at the default
+            // 6GB cap). Measured on a 398MB index with 40% free pages, phys_footprint rose 522MB
+            // during compact; shrinking the cache to 2MB for the duration takes that to 0MB at no
+            // wall-clock cost (0.43s vs 0.42s). It runs with the model weights and the vector base
+            // already resident, and at the default 0.15 gate the live data can be 85% of the file,
+            // so on a small machine that spike is a plausible swap trigger.
+            //
+            // NOT temp_store. VACUUM's transient database does honour temp_store, and in isolation
+            // the pragma is worth 257MB (sqlite3 CLI, 392MB db: 430MB peak in MEMORY mode against
+            // 173MB in FILE mode) - but on THIS connection it changes nothing at the default cache
+            // (522MB either way), and once the cache is shrunk, FILE mode is strictly worse:
+            // +167MB and 0.69s against +0MB and 0.42s. The page cache was the whole effect.
+            let restoreCache = OmniMemoryBudget.scaled(anchor6GB: 262_144, floor: 65_536, ceiling: 262_144)
+            if Self.vacuumSmallCache { exec("PRAGMA cache_size=-2000;") }
+            let rc = sqlite3_exec(db, "VACUUM;", nil, nil, nil)
+            // exec() ignores return codes; this one matters. A silently failing VACUUM means space
+            // is never reclaimed again, and the caller would report 0 bytes freed forever.
+            if rc != SQLITE_OK { print("[store] VACUUM failed (rc=\(rc)); no space reclaimed") }
+            exec("PRAGMA cache_size=-\(restoreCache);")
             exec("PRAGMA wal_checkpoint(TRUNCATE);")
             return max(0, before - onDiskBytes())
         }

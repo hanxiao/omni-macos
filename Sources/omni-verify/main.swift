@@ -2762,6 +2762,65 @@ if args.count >= 4 && args[1] == "dedupbench" {
     exit(0)
 }
 
+// VACUUM memory A/B: omni-verify compactbench [N] [dim] [deleteFrac]
+// Builds an index, deletes a fraction of it to create free pages, then compacts, sampling
+// phys_footprint throughout. Run with OMNI_VACUUM_TMP=memory and =file to A/B.
+if args.count >= 2 && args[1] == "compactbench" {
+    let N = (args.count >= 3 ? Int(args[2]) : nil) ?? 120_000
+    let dim = (args.count >= 4 ? Int(args[3]) : nil) ?? 768
+    let frac = (args.count >= 5 ? Double(args[4]) : nil) ?? 0.4
+    let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("compactbench.sqlite")
+    for e in ["", "-wal", "-shm", ".rows", ".vecs", ".quant"] {
+        try? FileManager.default.removeItem(at: URL(fileURLWithPath: tmp.path + e))
+    }
+    // Sampler with its own footprint reader. NOT the top-level churnFootprintMB(): top-level
+    // funcs in main.swift are MainActor-isolated, and calling one from this background queue
+    // trips dispatch_assert_queue and takes the process down with a bare SIGTRAP.
+    final class Peak: @unchecked Sendable {
+        private let l = NSLock(); private var v: Int; private var go = true
+        init(_ v: Int) { self.v = v }
+        static func footprint() -> Int {
+            var info = task_vm_info_data_t()
+            var c = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+            let kr = withUnsafeMutablePointer(to: &info) { p in p.withMemoryRebound(to: integer_t.self, capacity: Int(c)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &c) } }
+            return kr == KERN_SUCCESS ? Int(info.phys_footprint) : 0
+        }
+        func offer(_ x: Int) { l.lock(); v = Swift.max(v, x); l.unlock() }
+        var value: Int { l.lock(); defer { l.unlock() }; return v }
+        var running: Bool { l.lock(); defer { l.unlock() }; return go }
+        func stop() { l.lock(); go = false; l.unlock() }
+    }
+    func vec(_ i: Int) -> [Float] { var v = [Float](repeating: 0, count: dim); v[i % dim] = 1; return v }
+    let store = try VectorStore(dbURL: tmp)
+    var batch: [(path: String, chunks: [IndexedChunk])] = []
+    for i in 0..<N {
+        batch.append(("p\(i)", [IndexedChunk(path: "p\(i)", modified: 0, kind: "text", chunkIndex: 0,
+                                             snippet: String(repeating: "x", count: 200), embedding: vec(i))]))
+        if batch.count == 2000 { try store.replaceMany(batch); batch.removeAll(keepingCapacity: true) }
+    }
+    if !batch.isEmpty { try store.replaceMany(batch) }
+    store.deletePaths(Set((0..<Int(Double(N) * frac)).map { "p\($0)" }))
+    let sizeBefore = (try? FileManager.default.attributesOfItem(atPath: tmp.path)[.size] as? Int) ?? 0
+    let base = Peak.footprint()
+    let pk = Peak(base)
+    DispatchQueue.global().async { while pk.running { pk.offer(Peak.footprint()); usleep(2000) } }
+    let t = Date()
+    let freed = store.compact(minFreeRatio: 0.05)
+    let wall = -t.timeIntervalSinceNow
+    pk.stop(); usleep(20000)
+    let peak = pk.value
+    print(String(format: "compactbench N=%d dim=%d deleted=%.0f%%  db %.0f MB  freed %.0f MB  wall %.2fs  base %.0f MB  peak %.0f MB  (+%.0f MB)  smallCache=%@",
+                 N, dim, frac * 100, Double(sizeBefore) / 1048576, Double(freed) / 1048576, wall,
+                 Double(base) / 1048576, Double(peak) / 1048576, Double(peak - base) / 1048576,
+                 ProcessInfo.processInfo.environment["OMNI_VACUUM_CACHE"] ?? "1"))
+    store.close()
+    for e in ["", "-wal", "-shm", ".rows", ".vecs", ".quant"] {
+        try? FileManager.default.removeItem(at: URL(fileURLWithPath: tmp.path + e))
+    }
+    exit(0)
+}
+
 // Search parity + timing under a large unfolded delta: omni-verify gateparity [base] [delta] [dim] [q]
 // Builds a store with `base` folded rows and `delta` unfolded ones, runs q deterministic queries,
 // prints per-query timing and dumps every hit to <db>.hits for a cross-arm diff. The can't-win
