@@ -2762,6 +2762,89 @@ if args.count >= 4 && args[1] == "dedupbench" {
     exit(0)
 }
 
+// Candidate-selection microbench: omni-verify selbench [rows] [C] [reps]
+// Times the top-C selection in isolation and compares three strategies on the SAME scores:
+//   argPartition : what ships. MLX routes ArgPartition::eval_gpu to gpu_merge_sort (sort.cpp:342,
+//                  "We direct arg partition to sort for now"), so this is a full argsort.
+//   strided-max  : one max-reduction over a [N/B, B] view, giving one candidate per residue class
+//                  mod B. Approximate as a top-C set, but a globally top-ranked row is the max of
+//                  its class with high probability, which is all the shortlist has to preserve.
+//                  Membership depends only on index mod B, so it does not move when the delta folds.
+//   block-max    : the same reduction over contiguous blocks. Included only to show why it is the
+//                  wrong choice: membership depends on N, so folding changes the candidate set.
+// Reports how many of the true top-10 and true top-C each strategy keeps.
+if args.count >= 2 && args[1] == "selbench" {
+    let N = (args.count >= 3 ? Int(args[2]) : nil) ?? 1_000_000
+    let C = (args.count >= 4 ? Int(args[3]) : nil) ?? 4096
+    let reps = (args.count >= 5 ? Int(args[4]) : nil) ?? 20
+    var st = UInt64(0x9E3779B97F4A7C15)
+    var host = [Float](repeating: 0, count: N)
+    for i in 0..<N { st ^= st << 13; st ^= st >> 7; st ^= st << 17
+        host[i] = Float(Int32(truncatingIfNeeded: st)) / Float(Int32.max) }
+    let scores = MLXArray(host, [N]); MLX.eval(scores)
+    let mergeRounds = Int(ceil(log2(Double(max(1, (N + 2047) / 2048)))))
+    print("selbench N=\(N) C=\(C) reps=\(reps)")
+    print(String(format: "  argPartition traffic model: (20+16*%d)*N = %.1f MB; floor (one read) = %.1f MB",
+                 mergeRounds, Double((20 + 16 * mergeRounds) * N) / 1048576, Double(4 * N) / 1048576))
+    func timeIt(_ label: String, _ body: () -> MLXArray) -> [Int32] {
+        var r = body(); MLX.eval(r)
+        var ts: [Double] = []
+        for _ in 0..<reps { let t = Date(); r = body(); MLX.eval(r); ts.append(-t.timeIntervalSinceNow * 1000) }
+        ts.sort()
+        let got = r.asType(.int32).asArray(Int32.self)
+        print(String(format: "  %-13s p50 %6.3f ms   min %6.3f ms   candidates %d", (label as NSString).utf8String!, ts[ts.count/2], ts[0], got.count))
+        return got
+    }
+    let order = host.enumerated().sorted { $0.element > $1.element }.map { Int32($0.offset) }
+    let true10 = Set(order.prefix(10)), trueC = Set(order.prefix(C))
+    let kth = N - C
+    let exact = timeIt("argPartition", { MLX.argPartition(scores, kth: kth)[kth...] })
+    // strided: pad to a multiple of C, view as [rows, C], reduce over axis 0 -> one per residue class
+    let padRows = (N + C - 1) / C
+    let padded = padRows * C
+    let sPad = padded == N ? scores
+        : MLX.concatenated([scores, MLX.full([padded - N], values: MLXArray(-Float.infinity))], axis: 0)
+    MLX.eval(sPad)
+    let strided = timeIt("strided-max", {
+        let v = sPad.reshaped([padRows, C])
+        return MLX.argMax(v, axis: 0) * MLXArray(Int32(C)) + MLX.arange(0, C, dtype: .int32)
+    })
+    // Two-stage proper: stage 1 takes one max per residue class with B = mult*C classes, stage 2
+    // selects the exact top-C among those B. Stage 2 is an argPartition over B, not N.
+    for mult in [4, 8] {
+        let B = C * mult
+        let pr = (N + B - 1) / B, pd = pr * B
+        let sp = pd == N ? scores
+            : MLX.concatenated([scores, MLX.full([pd - N], values: MLXArray(-Float.infinity))], axis: 0)
+        MLX.eval(sp)
+        let two = timeIt("two-stage x\(mult)", {
+            let v = sp.reshaped([pr, B])
+            let idx = MLX.argMax(v, axis: 0) * MLXArray(Int32(B)) + MLX.arange(0, B, dtype: .int32)
+            let vals = MLX.max(v, axis: 0)
+            let k2 = B - C
+            let sel = MLX.argPartition(vals, kth: k2)[k2...]
+            return MLX.takeAlong(idx, sel, axis: 0)
+        })
+        let g = Set(two.filter { $0 >= 0 && Int($0) < N })
+        print(String(format: "  two-stage x%d  keeps top-10: %2d/10   keeps top-C: %5.1f%%",
+                     mult, g.intersection(true10).count,
+                     100.0 * Double(g.intersection(trueC).count) / Double(C)))
+    }
+    let block = timeIt("block-max", {
+        let v = sPad.reshaped([C, padRows])
+        return MLX.argMax(v, axis: 1) + MLX.arange(0, C, dtype: .int32) * MLXArray(Int32(padRows))
+    })
+    // fidelity: does each strategy keep the true top-10 and how much of the true top-C
+
+    for (name, got) in [("argPartition", exact), ("strided-max", strided), ("block-max", block)] {
+        let g = Set(got.filter { $0 >= 0 && Int($0) < N })
+        print(String(format: "  %-13s keeps top-10: %2d/10   keeps top-C: %5.1f%%",
+                     (name as NSString).utf8String!, g.intersection(true10).count,
+                     100.0 * Double(g.intersection(trueC).count) / Double(C)))
+    }
+    exit(0)
+}
+
 // Funnel recall against an exact fp32 reference: omni-verify funnelrecall <maxRows> [dim] [queries] [realDb]
 //
 // This is the corrected form of the paper's corpus-size table. It isolates the question the paper
@@ -2907,8 +2990,26 @@ if args.count >= 3 && args[1] == "funnelrecall" {
                                              transpose: true, groupSize: 64, bits: 4).reshaped([N])
             MLX.eval(coarse)
             ti.append(-t0.timeIntervalSinceNow * 1000)
-            let cs = coarse.asType(.float32).asArray(Float.self)
-            let cand = top(cs, Swift.min(C, N))
+            var cand: [Int]
+            if ProcessInfo.processInfo.environment["OMNI_SEL"] == "twostage" {
+                // Stage 1: one max per residue class mod B (fold-invariant membership).
+                // Stage 2: exact top-C among the B survivors.
+                let B = Swift.min(C * (Int(ProcessInfo.processInfo.environment["OMNI_SEL_MULT"] ?? "8") ?? 8), N)
+                let pr = (N + B - 1) / B, pd = pr * B
+                let sp = pd == N ? coarse
+                    : MLX.concatenated([coarse, MLX.full([pd - N], values: MLXArray(-Float.infinity))], axis: 0)
+                let v = sp.reshaped([pr, B])
+                let idx = MLX.argMax(v, axis: 0) * MLXArray(Int32(B)) + MLX.arange(0, B, dtype: .int32)
+                let vals = MLX.max(v, axis: 0)
+                let k2 = Swift.max(0, B - C)
+                let sel = MLX.argPartition(vals, kth: k2)[k2...]
+                let picked = MLX.takeAlong(idx, sel, axis: 0)
+                MLX.eval(picked)
+                cand = picked.asType(.int32).asArray(Int32.self).map { Int($0) }.filter { $0 < N }
+            } else {
+                let cs = coarse.asType(.float32).asArray(Float.self)
+                cand = top(cs, Swift.min(C, N))
+            }
             var packed = [Float](repeating: 0, count: cand.count * dim)
             for (t, r) in cand.enumerated() { for k in 0..<dim { packed[t*dim+k] = vecs[r*dim+k] } }
             let ex = MLX.matmul(MLXArray(packed, [cand.count, dim]).asType(.bfloat16), qv32.asType(.bfloat16))
