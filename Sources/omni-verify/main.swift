@@ -2959,6 +2959,7 @@ if args.count >= 4 && args[1] == "editbench" {
     let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[2]))
     let nEdits = (args.count >= 5 ? Int(args[4]) : nil) ?? 40
     let editStyle = args.count >= 6 ? args[5] : "append"      // append | mid
+    let reconcile = args.count >= 7 ? args[6] : "update"      // update | pass (full index() reconcile)
     let fm = FileManager.default
     // Deterministic scratch name: both arms index byte-identical trees.
     var work = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("editbench-corpus", isDirectory: true)
@@ -3018,9 +3019,19 @@ if args.count >= 4 && args[1] == "editbench" {
 
     let tok0 = engine.tokensProcessed, busy0 = engine.gpuBusySeconds
     let t1 = Date()
-    idx.update(paths: edited, settings: settings)
+    if reconcile == "pass" {
+        // The path a file edited while the app was CLOSED takes: a non-forced full reconcile.
+        _ = await withCheckedContinuation { (cont: CheckedContinuation<IndexProgress, Never>) in
+            let l = NSLock(); var fired = false
+            idx.index(roots: [work], settings: settings, force: false) { p in
+                if p.done { l.lock(); let go = !fired; fired = true; l.unlock(); if go { cont.resume(returning: p) } }
+            }
+        }
+    } else {
+        idx.update(paths: edited, settings: settings)
+    }
     let wall = -t1.timeIntervalSinceNow
-    print(String(format: "EDITBENCH update: %.3fs  gpuTokens=%d  gpuBusy=%.3fs  (chunk cache=%@)",
+    print(String(format: "EDITBENCH \(reconcile): %.3fs  gpuTokens=%d  gpuBusy=%.3fs  (chunk cache=%@)",
                  wall, engine.tokensProcessed - tok0, engine.gpuBusySeconds - busy0,
                  Indexer.chunkCache ? "on" : "off"))
 

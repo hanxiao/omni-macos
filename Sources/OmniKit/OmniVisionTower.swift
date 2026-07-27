@@ -77,7 +77,15 @@ public final class OmniVisionTower: @unchecked Sendable {
     /// for the rarest modality. Tower forwards are serialized by the engine gate, so the lazy
     /// dictionary needs no lock.
     private var fp32WeightCache: [String: MLXArray] = [:]
-    private lazy var cacheFP32Weights: Bool = fp32Compute && OmniMemoryBudget.capBytes >= 4 << 30
+    /// Two bugs lived in the previous `private lazy var ... capBytes >= 4 << 30`:
+    /// - `4 << 30` is a binary 4 GiB, but the cap is built from decimal GB
+    ///   (AppModel: `Int(maxMemoryGB * 1_000_000_000)`), so a user who followed the Settings footer
+    ///   and set exactly 4 got 4.0e9 < 4.295e9 and silently no cache.
+    /// - `lazy` froze the decision at the first forward, and raising the cap in Settings only calls
+    ///   applyMemoryLimit(), never a reload - so the cache stayed off until the next launch on a
+    ///   machine that could easily afford it.
+    /// Computed and decimal fixes both. Unchanged for 8GB machines, whose cap is 3.
+    private var cacheFP32Weights: Bool { fp32Compute && OmniMemoryBudget.capBytes >= 4_000_000_000 }
     private func wc(_ key: String) -> MLXArray {
         let a = w[key]
         guard fp32Compute, a.dtype != .float32 else { return a }

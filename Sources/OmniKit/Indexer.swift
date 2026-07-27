@@ -507,17 +507,41 @@ public final class Indexer: @unchecked Sendable {
                     switch item.payload {
                     case .text(let pieces) where !pieces.isEmpty:
                         let fid = nextFid; nextFid += 1
-                        acc[fid] = (item.file, item.kind, pieces.count, [])
-                        // Keys are written on every text path so a later edit can reuse these
-                        // vectors; the full pass itself never reuses (unchanged files already
-                        // short-circuit above, and cross-file chunk duplication measured 3.15%,
-                        // not worth a global index). A SHA over the chunk text on the serial
-                        // consume side is immaterial against a pass that is 99% GPU-busy.
+                        // Same chunk-level reuse as the live-update path. A file edited while the
+                        // app was CLOSED reaches the store through here, not through update(), so
+                        // without this it re-embeds every chunk while the identical edit made with
+                        // the app running costs one forward. Gated on the file being already known:
+                        // a cold index has nothing to reuse and should not pay a query per file.
+                        // Cross-file reuse is still declined - it measured 3.15% and would need a
+                        // global chunk_key index - so this stays path-scoped, one file at a time.
+                        let keys = pieces.map { self.chunkKey($0.text, settings: settings) }
+                        let reuseOK = Self.chunkCache && !settings.forceFreshEmbed
+                            && pieces.count > 1 && known[path] != nil
+                        let prior = reuseOK ? self.store.chunkVectors(path: path, dim: self.embedder.dim) : [:]
+                        var reused: [IndexedChunk] = []
+                        var pending: [(j: Int, piece: TextPiece, key: String)] = []
                         for (j, piece) in pieces.enumerated() {
-                            buf.append((fid, j, piece.text, self.snippet(piece.text), piece.locator,
-                                        self.chunkKey(piece.text, settings: settings)))
+                            if let v = prior[keys[j]] {
+                                reused.append(IndexedChunk(path: path, modified: item.file.modified,
+                                                           size: item.file.size, kind: item.kind, chunkIndex: j,
+                                                           snippet: self.snippet(piece.text), embedding: v,
+                                                           locator: piece.locator, chunkKey: keys[j]))
+                            } else {
+                                pending.append((j, piece, keys[j]))
+                            }
                         }
-                        if buf.count >= textStageWindow { flushText(drainAll: false) }
+                        self.noteChunkReuse(reused.count)
+                        acc[fid] = (item.file, item.kind, pieces.count, reused)
+                        if pending.isEmpty {
+                            stageStore(path, reused)            // whole file served from the store
+                            acc[fid] = nil
+                        } else {
+                            for e in pending {
+                                buf.append((fid, e.j, e.piece.text, self.snippet(e.piece.text),
+                                            e.piece.locator, e.key))
+                            }
+                            if buf.count >= textStageWindow { flushText(drainAll: false) }
+                        }
                     case .duplicate(let chunks):
                         // Content-dedup hit: rows are ready, join the batched store directly.
                         stageStore(path, chunks)

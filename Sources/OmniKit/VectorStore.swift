@@ -3359,7 +3359,9 @@ public final class VectorStore: @unchecked Sendable {
     public func chunkCount(path: String) -> Int {
         queue.sync {
             guard let id = pathID[path] else { return 0 }
-            return fileID.reduce(0) { $1 == id ? $0 + 1 : $0 }
+            // fileChunkCount is this exact count, maintained in lockstep at every mutation and
+            // already trusted by listMatching; the O(N) scan over fileID was redundant.
+            return Int(fileChunkCount[Int(id)])
         }
     }
 
