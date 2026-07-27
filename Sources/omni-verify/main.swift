@@ -2762,6 +2762,171 @@ if args.count >= 4 && args[1] == "dedupbench" {
     exit(0)
 }
 
+// Funnel recall against an exact fp32 reference: omni-verify funnelrecall <maxRows> [dim] [queries] [realDb]
+//
+// This is the corrected form of the paper's corpus-size table. It isolates the question the paper
+// makes a claim about - does an exact bf16 scan lose ordering power as N grows - from the store,
+// SQLite, and the gemv overflow (every matmul here is sliced below the int32 row limit).
+//
+// Three arms per N, all against the same fp32 exact top-10:
+//   fp32   : the reference itself (recall 1.0 by construction, reported as a sanity check)
+//   bf16   : full-precision-of-record scan, what the paper calls the exact bf16 scan
+//   int4   : MLX quantized coarse scan -> top-C -> exact bf16 rerank, i.e. the shipping funnel
+// With a real index path, vectors are sampled from it; beyond its size, and when omitted, vectors
+// are synthetic with per-corpus statistics matched to the real ones (see stats printout).
+if args.count >= 3 && args[1] == "funnelrecall" {
+    let maxRows = Int(args[2]) ?? 1_000_000
+    let dim = (args.count >= 4 ? Int(args[3]) : nil) ?? 768
+    let nq  = (args.count >= 5 ? Int(args[4]) : nil) ?? 64
+    let realDb = args.count >= 6 ? args[5] : nil
+    let topK = 10, C = 4096
+    let limit = Int(Int32.max) / dim
+
+    // ---- source vectors -------------------------------------------------------------------
+    var vecs = [Float](repeating: 0, count: maxRows * dim)
+    var realUsed = 0
+    if let path = realDb, let fh = FileHandle(forReadingAtPath: path) {
+        // Flat float32 [rows, dim] exported from the real index (see Tools/export_vectors.py).
+        let want = maxRows * dim * 4
+        if let d = try? fh.read(upToCount: want) {
+            realUsed = d.count / (dim * 4)
+            d.withUnsafeBytes { raw in
+                let f = raw.baseAddress!.assumingMemoryBound(to: Float.self)
+                for i in 0 ..< (realUsed * dim) { vecs[i] = f[i] }
+            }
+        }
+        try? fh.close()
+        print("sourced \(realUsed) real vectors from \(path)")
+    }
+    // Synthetic tail: isotropic Gaussian + a shared mean direction, then L2 normalized. The mean
+    // component is what makes real embedding corpora anisotropic; alpha is fitted below.
+    if realUsed < maxRows {
+        var mu = [Float](repeating: 0, count: dim)
+        if realUsed > 0 {
+            for i in 0..<realUsed { for k in 0..<dim { mu[k] += vecs[i * dim + k] } }
+            var n: Float = 0; for k in 0..<dim { mu[k] /= Float(realUsed); n += mu[k] * mu[k] }
+            n = n.squareRoot(); if n > 0 { for k in 0..<dim { mu[k] /= n } }
+        } else {
+            for k in 0..<dim { mu[k] = k == 0 ? 1 : 0 }
+        }
+        // alpha from the real corpus's mean pairwise cosine when available, else a typical 0.35.
+        var alpha: Float = 0.35
+        if realUsed > 1000 {
+            var acc: Float = 0
+            for i in 0..<1000 { var d: Float = 0; for k in 0..<dim { d += vecs[i * dim + k] * mu[k] }; acc += d }
+            alpha = Swift.max(0, Swift.min(0.95, acc / 1000))
+        }
+        print(String(format: "synthesizing %d vectors, anisotropy alpha=%.3f", maxRows - realUsed, alpha))
+        let lo = realUsed
+        DispatchQueue.concurrentPerform(iterations: 64) { w in
+            let a = lo + (maxRows - lo) * w / 64, b = lo + (maxRows - lo) * (w + 1) / 64
+            var st = UInt64(bitPattern: Int64(a &* 6364136223846793005 &+ 1442695040888963407)) | 1
+            for i in a..<b {
+                var n: Float = 0
+                for k in 0..<dim {
+                    st ^= st << 13; st ^= st >> 7; st ^= st << 17
+                    let u1 = Float(st >> 40) / Float(1 << 24)
+                    st ^= st << 13; st ^= st >> 7; st ^= st << 17
+                    let u2 = Float(st >> 40) / Float(1 << 24)
+                    let g = (-2 * Swift.max(1e-7, u1).squareRoot().squareRoot()).isNaN ? 0 :
+                            (-2 * Foundation.log(Swift.max(1e-7, u1))).squareRoot() * Foundation.cos(2 * .pi * u2)
+                    let v = g * (1 - alpha) + mu[k] * alpha
+                    vecs[i * dim + k] = v; n += v * v
+                }
+                n = n.squareRoot(); if n > 0 { for k in 0..<dim { vecs[i * dim + k] /= n } }
+            }
+        }
+    }
+
+    // ---- queries: real vectors perturbed, so they sit in-distribution ----------------------
+    var qs = [Float](repeating: 0, count: nq * dim)
+    for j in 0..<nq {
+        let src = (j * 7919) % maxRows
+        var st = UInt64(bitPattern: Int64(j &* 2654435761 &+ 12345)) | 1
+        var n: Float = 0
+        for k in 0..<dim {
+            st ^= st << 13; st ^= st >> 7; st ^= st << 17
+            let e = (Float(Int32(truncatingIfNeeded: st)) / Float(Int32.max)) * 0.25
+            let v = vecs[src * dim + k] + e
+            qs[j * dim + k] = v; n += v * v
+        }
+        n = n.squareRoot(); if n > 0 { for k in 0..<dim { qs[j * dim + k] /= n } }
+    }
+
+    func slicedMM(_ mat: MLXArray, _ q: MLXArray, _ rows: Int) -> MLXArray {
+        guard rows > limit else { return MLX.matmul(mat, q) }
+        var parts: [MLXArray] = []; var off = 0
+        while off < rows { let n = Swift.min(limit, rows - off)
+            parts.append(MLX.matmul(mat[off ..< (off + n)], q)); off += n }
+        return MLX.concatenated(parts, axis: 0)
+    }
+    // Linear top-k: a full sort of 4M floats per query per arm would dominate the run.
+    // Ties break to the lower index, matching the store's tie discipline.
+    func top(_ scores: [Float], _ k: Int) -> [Int] {
+        var idx = [Int](); idx.reserveCapacity(k + 1)
+        var val = [Float](); val.reserveCapacity(k + 1)
+        var worst = -Float.infinity
+        for (i, v) in scores.enumerated() {
+            if idx.count == k && v <= worst { continue }
+            var pos = 0
+            while pos < idx.count && (val[pos] > v || (val[pos] == v && idx[pos] < i)) { pos += 1 }
+            idx.insert(i, at: pos); val.insert(v, at: pos)
+            if idx.count > k { idx.removeLast(); val.removeLast() }
+            worst = val[idx.count - 1]
+        }
+        return idx
+    }
+
+    print("\nrows        fp32 ref     bf16 recall@10   int4+rerank recall@10   bf16 ms   int4 ms   bf16 GB   int4 GB")
+    var sizes: [Int] = []
+    var n = 250_000
+    while n <= maxRows { sizes.append(n); n *= 2 }
+    if sizes.last != maxRows { sizes.append(maxRows) }
+    for N in sizes {
+        let flat = MLXArray(Array(vecs[0 ..< (N * dim)]), [N, dim])
+        let f32 = flat.asType(.float32)
+        let b16 = flat.asType(.bfloat16)
+        let q4 = MLX.quantized(b16, groupSize: 64, bits: 4)
+        MLX.eval(f32, b16, q4.wq, q4.scales, q4.biases)
+        var rb = 0.0, ri = 0.0
+        var tb: [Double] = [], ti: [Double] = []
+        for j in 0..<nq {
+            let qv32 = MLXArray(Array(qs[j*dim ..< (j+1)*dim]), [dim, 1])
+            let gt = top(slicedMM(f32, qv32, N).reshaped([N]).asArray(Float.self), topK)
+            let gtSet = Set(gt)
+            let qb = qv32.asType(.bfloat16); MLX.eval(qb)
+            var t0 = Date()
+            let sbA = slicedMM(b16, qb, N).reshaped([N]).asType(.float32); MLX.eval(sbA)
+            tb.append(-t0.timeIntervalSinceNow * 1000)
+            let sb = sbA.asArray(Float.self)
+            rb += Double(Set(top(sb, topK)).intersection(gtSet).count) / Double(topK)
+            // funnel: coarse int4 -> top-C -> exact bf16 rerank
+            t0 = Date()
+            let coarse = MLX.quantizedMatmul(qv32.reshaped([1, dim]).asType(.bfloat16), q4.wq,
+                                             scales: q4.scales, biases: q4.biases,
+                                             transpose: true, groupSize: 64, bits: 4).reshaped([N])
+            MLX.eval(coarse)
+            ti.append(-t0.timeIntervalSinceNow * 1000)
+            let cs = coarse.asType(.float32).asArray(Float.self)
+            let cand = top(cs, Swift.min(C, N))
+            var packed = [Float](repeating: 0, count: cand.count * dim)
+            for (t, r) in cand.enumerated() { for k in 0..<dim { packed[t*dim+k] = vecs[r*dim+k] } }
+            let ex = MLX.matmul(MLXArray(packed, [cand.count, dim]).asType(.bfloat16), qv32.asType(.bfloat16))
+            MLX.eval(ex)
+            let exs = ex.reshaped([cand.count]).asType(.float32).asArray(Float.self)
+            let picks = top(exs, topK).map { cand[$0] }
+            ri += Double(Set(picks).intersection(gtSet).count) / Double(topK)
+        }
+        tb.sort(); ti.sort()
+        print(String(format: "%9d   %6.4f       %6.4f           %6.4f      %7.2f      %7.2f      %6.2f     %6.2f",
+                     N, 1.0, rb / Double(nq), ri / Double(nq),
+                     tb[tb.count/2], ti[ti.count/2],
+                     Double(N) * Double(dim) * 2 / 1_073_741_824,
+                     Double(N) * Double(dim) / 2 / 1_073_741_824 + Double(N) * Double(dim) / 64 * 4 / 1_073_741_824))
+    }
+    exit(0)
+}
+
 // End-to-end overflow check through the real store: omni-verify bigscan [rows] [dim]
 // Builds a bf16-mode store above MLX's int32 gemv row-offset limit and checks that search returns
 // the planted answer. Run with OMNI_GEMV_SLICE=0 to see the pre-fix behaviour.
