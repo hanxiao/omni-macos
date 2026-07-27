@@ -2762,6 +2762,110 @@ if args.count >= 4 && args[1] == "dedupbench" {
     exit(0)
 }
 
+// End-to-end overflow check through the real store: omni-verify bigscan [rows] [dim]
+// Builds a bf16-mode store above MLX's int32 gemv row-offset limit and checks that search returns
+// the planted answer. Run with OMNI_GEMV_SLICE=0 to see the pre-fix behaviour.
+if args.count >= 2 && args[1] == "bigscan" {
+    let rows = (args.count >= 3 ? Int(args[2]) : nil) ?? 3_000_000
+    let dim  = (args.count >= 4 ? Int(args[3]) : nil) ?? 768
+    setenv("OMNI_QUANT_BASE", "0", 1)          // force the bf16 base: this is the affected path
+    let limit = Int(Int32.max) / dim
+    let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("bigscan.sqlite")
+    for e in ["", "-wal", "-shm", ".rows", ".vecs", ".quant"] {
+        try? FileManager.default.removeItem(at: URL(fileURLWithPath: tmp.path + e))
+    }
+    defer { for e in ["", "-wal", "-shm", ".rows", ".vecs", ".quant"] {
+        try? FileManager.default.removeItem(at: URL(fileURLWithPath: tmp.path + e)) } }
+    // Every row is a unit basis vector; row i answers query e_(i % dim) with score 1. Plant one
+    // distinctive row far ABOVE the overflow threshold and one far below, then ask for both.
+    func basis(_ k: Int) -> [Float] { var v = [Float](repeating: 0, count: dim); v[k] = 1; return v }
+    let store = try VectorStore(dbURL: tmp)
+    var batch: [(path: String, chunks: [IndexedChunk])] = []
+    batch.reserveCapacity(4000)
+    for i in 0..<rows {
+        // Reserve dim-1 as the planted signal, used by exactly two rows.
+        let k = (i == 12_345 || i == rows - 7) ? dim - 1 : i % (dim - 1)
+        batch.append(("r\(i)", [IndexedChunk(path: "r\(i)", modified: 0, kind: "text",
+                                            chunkIndex: 0, snippet: "", embedding: basis(k))]))
+        if batch.count == 4000 { try store.replaceMany(batch); batch.removeAll(keepingCapacity: true) }
+    }
+    if !batch.isEmpty { try store.replaceMany(batch) }
+    print("bigscan rows=\(store.count) dim=\(dim)  int32 gemv limit=\(limit)  slicing=\(ProcessInfo.processInfo.environment["OMNI_GEMV_SLICE"] ?? "1")")
+    let hits = store.search(basis(dim - 1), topK: 10)
+    let paths = Set(hits.prefix(10).map { $0.path })
+    let below = paths.contains("r12345"), above = paths.contains("r\(rows - 7)")
+    print("  planted below limit (r12345)      found: \(below)")
+    print("  planted above limit (r\(rows - 7)) found: \(above)")
+    print("  top-10 scores: " + hits.prefix(4).map { String(format: "%.4f", $0.score) }.joined(separator: " "))
+    // Any row scoring above 1.0 is impossible for unit vectors: it means the kernel read foreign memory.
+    let impossible = hits.filter { $0.score > 1.001 }.count
+    print("  impossible scores (>1.0): \(impossible)")
+    store.close()
+    let pass = below && above && impossible == 0
+    print(pass ? "PASS" : "FAIL")
+    exit(pass ? 0 : 1)
+}
+
+// GEMV int32 index overflow probe: omni-verify gemvoverflow [rows] [dim]
+// MLX routes a [N,d] x [d,1] matmul to the gemv kernel, whose row advance is
+// `mat += out_row * matrix_ld` with BOTH operands int32 (gemv.metal:151, :111-112). The product
+// overflows at out_row >= 2^31/d. This compares a single full-height matmul against the same
+// matmul evaluated in slices that individually stay under the threshold. Identical scores mean no
+// overflow; a divergence that starts exactly at 2^31/d confirms it.
+if args.count >= 2 && args[1] == "gemvoverflow" {
+    let rows = (args.count >= 3 ? Int(args[2]) : nil) ?? 3_000_000
+    let dim  = (args.count >= 4 ? Int(args[3]) : nil) ?? 768
+    let threshold = Int(Int32.max) / dim
+    print("gemvoverflow rows=\(rows) dim=\(dim)  int32 overflow threshold = \(threshold) rows")
+    print(String(format: "  base is %.2f GB bf16", Double(rows) * Double(dim) * 2 / 1_073_741_824))
+    // Row i is a constant vector of value ((i % 64) + 1)/64, exact in bf16. Distinct adjacent rows
+    // mean a wrapped pointer lands on a different value with high probability.
+    var host = [Float](repeating: 0, count: rows * dim)
+    host.withUnsafeMutableBufferPointer { hb in
+        let p = hb.baseAddress!
+        DispatchQueue.concurrentPerform(iterations: 64) { w in
+            let lo = rows * w / 64, hi = rows * (w + 1) / 64
+            for i in lo..<hi {
+                let v = Float((i % 64) + 1) / 64
+                for k in 0..<dim { p[i * dim + k] = v }
+            }
+        }
+    }
+    let base = MLXArray(host, [rows, dim]).asType(.bfloat16)
+    host = []
+    let q = MLXArray([Float](repeating: 1, count: dim), [dim, 1]).asType(.bfloat16)
+    MLX.eval(base, q)
+    let full = MLX.matmul(base, q).reshaped([rows]).asType(.float32)
+    MLX.eval(full)
+    let fh = full.asArray(Float.self)
+    // Sliced: every call sees out_row < threshold, so no call can overflow.
+    let span = threshold / 2
+    var parts: [MLXArray] = []
+    var off = 0
+    while off < rows {
+        let n = Swift.min(span, rows - off)
+        parts.append(MLX.matmul(base[off ..< (off + n)], q).reshaped([n]).asType(.float32))
+        off += n
+    }
+    let sliced = MLX.concatenated(parts, axis: 0)
+    MLX.eval(sliced)
+    let sh = sliced.asArray(Float.self)
+    var firstBad = -1, nBad = 0
+    var badBelow = 0
+    for i in 0..<rows where fh[i] != sh[i] {
+        nBad += 1
+        if firstBad < 0 { firstBad = i }
+        if i < threshold { badBelow += 1 }
+    }
+    print("  slices used      = \(parts.count) of <= \(span) rows each")
+    print("  mismatching rows = \(nBad) of \(rows)  (\(String(format: "%.1f", 100.0 * Double(nBad) / Double(rows)))%)")
+    print("  first mismatch   = \(firstBad)   expected \(threshold) if int32 overflow")
+    print("  mismatches below threshold = \(badBelow)  (expected 0)")
+    let confirmed = nBad > 0 && firstBad >= threshold - dim && badBelow == 0
+    print(confirmed ? "OVERFLOW CONFIRMED" : (nBad == 0 ? "no divergence: kernel is safe at this size" : "divergence does NOT match the overflow model"))
+    exit(0)
+}
+
 // Video patchify parity/memory: omni-verify vidpatchparity <video> [frames]
 // Decodes N frames, runs the video preprocess, and prints a checksum plus the peak footprint
 // delta across the call. Compare the checksum against the pre-change build: the staging buffer's

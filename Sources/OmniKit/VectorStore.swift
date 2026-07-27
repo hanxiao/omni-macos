@@ -1830,7 +1830,7 @@ public final class VectorStore: @unchecked Sendable {
             // longer applies, so fall back to the classic quant-capable path after the lock.
             guard let base = mlxBase, let fid = mlxFileID else { needClassic = true; return nil }
             let qv = queryGraph.reshaped([dim, 1]).asType(.bfloat16)
-            let baseScore = MLX.matmul(base, qv)
+            let baseScore = gemvSafe(base, qv, rows: baseRows)
             var deltaGraph: MLXArray? = nil
             if n > baseRows {
                 let deltaCount = n - baseRows
@@ -1896,7 +1896,7 @@ public final class VectorStore: @unchecked Sendable {
                     return result
                 }
             } else {
-                baseScore = MLX.matmul(mlxBase!, qv)
+                baseScore = gemvSafe(mlxBase!, qv, rows: baseRows)
                 // PLAIN-QUERY FAST PATH (full mode): best-chunk-per-file reduction ON the GPU.
                 // The scores are already resident post-matmul; reading all N back and scanning
                 // them on the host was ~4ms of a ~9.5ms query at 2M rows. Delta rows (bounded by
@@ -1965,6 +1965,39 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
+
+
+    /// `[rows, dim] x [dim, 1]` split so no single kernel launch can overflow a 32-bit row offset.
+    ///
+    /// MLX routes a matmul with `min(M, N) == 1` to its gemv kernel, whose row advance is
+    /// `mat += out_row * matrix_ld` with BOTH operands declared `int` (gemv.metal). The product
+    /// overflows at `out_row * dim >= 2^31`, after which rows advance by a wrapped negative offset
+    /// and score against memory outside the base. Measured directly with `omni-verify
+    /// gemvoverflow 3000000 768`: the first corrupted row is 2,796,204, exactly `2^31 / 768`, every
+    /// row above it is wrong, and no row below it is.
+    ///
+    /// This is reachable in production. The quant gate gives the bf16 base to anyone whose cap is
+    /// four times the base, and `capBytes` defaults to physical memory, so a large-memory Mac with
+    /// more than ~2.8M chunks searched a corrupted matrix. The int4 replica is not affected: `qmv`
+    /// indexes `[rows, dim/8]` uint32, which does not overflow until ~22M rows at dim 768, and the
+    /// delta and rerank matmuls are bounded by the fold threshold and by C.
+    ///
+    /// Slices are offset views of a row-major array, so this copies nothing; the concatenate joins
+    /// one scalar per row per span. Below the limit it is the original single call, unchanged.
+    /// OMNI_GEMV_SLICE=0 restores the unsliced call for A/B.
+    private func gemvSafe(_ mat: MLXArray, _ qv: MLXArray, rows: Int) -> MLXArray {
+        let limit = Int(Int32.max) / Swift.max(1, dim)
+        guard Self.gemvSlice, rows > limit else { return MLX.matmul(mat, qv) }
+        var parts: [MLXArray] = []
+        parts.reserveCapacity((rows + limit - 1) / limit)
+        var off = 0
+        while off < rows {
+            let n = Swift.min(limit, rows - off)
+            parts.append(MLX.matmul(mat[off ..< (off + n)], qv))
+            off += n
+        }
+        return MLX.concatenated(parts, axis: 0)
+    }
 
     /// The plain-query fast path for quant mode. GPU: argPartition the coarse scores for the top-C
     /// row indices (no full readback). Host: gather those C rows' exact bf16 vectors from flat16,
@@ -2713,6 +2746,8 @@ public final class VectorStore: @unchecked Sendable {
     private static let sidecarCoverEnabled = ProcessInfo.processInfo.environment["OMNI_SIDECAR_COVER"] != "0"
     /// Can't-win gate on the delta merge (OMNI_CANTWIN=0 disables, for A/B). Exact either way.
     public static let cantWinGate = ProcessInfo.processInfo.environment["OMNI_CANTWIN"] != "0"
+    /// Split the base gemv below MLX's int32 row-offset limit (OMNI_GEMV_SLICE=0 disables, for A/B).
+    static let gemvSlice = ProcessInfo.processInfo.environment["OMNI_GEMV_SLICE"] != "0"
     /// Shrink the page cache for the duration of VACUUM (OMNI_VACUUM_CACHE=0 disables, for A/B).
     public static let vacuumSmallCache = ProcessInfo.processInfo.environment["OMNI_VACUUM_CACHE"] != "0"
     /// Fold the delta after writes go quiet (OMNI_IDLE_FOLD=0 disables, for A/B).
