@@ -35,6 +35,14 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   (DEVELOPER_ID_P12, DEVELOPER_ID_P12_PASSWORD, AC_APPLE_ID, AC_PASSWORD, SITE_TOKEN).
 - notarize.sh takes AC_* creds from env (no keychain profile) so the self-hosted runner works.
 
+## Commit identity
+- Commits are ALWAYS authored by Han Xiao <han.xiao@jina.ai>. Never omni-ci, never
+  github-actions[bot], never any other bot identity - in this repo or any other on this machine.
+  The global ~/.gitconfig was set to omni-ci until 2026-07-27, which misattributed 403 commits;
+  history was rewritten and both CI workflows now commit under the owner's name.
+- Local commits are SSH-signed (gpg.format=ssh, key ~/.ssh/id_ed25519.pub). Verify with
+  `git log --format='%h %an %G?'` - expect G, not N.
+
 ## Style
 - Site (site/omni): keep the homepage Features section lean - exactly 4 cards.
 - No emojis, no em dashes. Lean commits and docs. License is Apache 2.0.
