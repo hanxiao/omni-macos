@@ -2762,6 +2762,69 @@ if args.count >= 4 && args[1] == "dedupbench" {
     exit(0)
 }
 
+// Does concatenating the filename into the chunk text make files findable by name?
+// omni-verify nameconcat <modelDir> <corpusDir> [n]
+// Embeds each file's first chunk three ways - plain, name prepended, name appended - then queries
+// with the bare basename and reports where the right file lands in each variant. Appended is tested
+// separately because the backbone pools the LAST token, so position is not incidental.
+if args.count >= 4 && args[1] == "nameconcat" {
+    let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[2]))
+    let n = (args.count >= 5 ? Int(args[4]) : nil) ?? 200
+    let fm = FileManager.default
+    func collect(_ root: URL, _ limit: Int) -> [URL] {   // sync: enumerator is not async-safe
+        var out: [URL] = []
+        guard let e = fm.enumerator(at: root, includingPropertiesForKeys: nil) else { return out }
+        for case let u as URL in e where out.count < limit {
+            guard FileExtractor.textExtensions.contains(u.pathExtension.lowercased()),
+                  let sz = try? fm.attributesOfItem(atPath: u.path)[.size] as? Int, sz > 600, sz < 200_000
+            else { continue }
+            out.append(u)
+        }
+        return out
+    }
+    let files = collect(URL(fileURLWithPath: args[3]), n)
+    guard files.count >= 20 else { print("need >= 20 text files, got \(files.count)"); exit(1) }
+    var plain: [String] = [], pre: [String] = [], post: [String] = [], names: [String] = []
+    for u in files {
+        guard let raw = try? String(contentsOf: u, encoding: .utf8) else { continue }
+        let body = String(raw.prefix(1800))
+        let base = u.lastPathComponent
+        plain.append(body); pre.append(base + "\n\n" + body); post.append(body + "\n\n" + base)
+        names.append(base)
+    }
+    print("nameconcat: \(plain.count) files from \(args[3])")
+
+    let qs = engine.embedTextBatch(names, as: .query)
+    let variants: [(String, [[Float]])] = [
+        ("plain            ", engine.embedTextBatch(plain, as: .passage)),
+        ("filename prepended", engine.embedTextBatch(pre, as: .passage)),
+        ("filename appended ", engine.embedTextBatch(post, as: .passage)),
+    ]
+    func cos(_ a: [Float], _ b: [Float]) -> Float { zip(a, b).reduce(0) { $0 + $1.0 * $1.1 } }
+    print("\n                     top-1     top-10    mean rank of the correct file")
+    for (label, docs) in variants {
+        var t1 = 0, t10 = 0, rankSum = 0
+        for (i, q) in qs.enumerated() {
+            let scored = docs.enumerated().map { ($0.offset, cos(q, $0.element)) }
+                .sorted { $0.1 != $1.1 ? $0.1 > $1.1 : $0.0 < $1.0 }
+            let r = (scored.firstIndex { $0.0 == i } ?? docs.count) + 1
+            if r == 1 { t1 += 1 }; if r <= 10 { t10 += 1 }; rankSum += r
+        }
+        let c = Double(qs.count)
+        print(String(format: "  %@  %5.1f%%    %5.1f%%    %6.1f of %d",
+                     label, 100 * Double(t1) / c, 100 * Double(t10) / c, Double(rankSum) / c, docs.count))
+    }
+    // does concatenation disturb the semantic ranking it is bolted onto?
+    print("\nsemantic drift: cosine(plain, variant) per document")
+    for (label, docs) in variants.dropFirst() {
+        let base = variants[0].1
+        var lo: Float = 1, sum: Float = 0
+        for i in 0..<docs.count { let c = cos(base[i], docs[i]); lo = Swift.min(lo, c); sum += c }
+        print(String(format: "  %@  mean %.4f   min %.4f", label, sum / Float(docs.count), lo))
+    }
+    exit(0)
+}
+
 // Filename channel: omni-verify lexcheck <dbCopy> [n]
 // Builds the filename index over a copy of a real store, then measures (a) whether typed filenames
 // are retrievable, (b) that the gate stays shut on prose, (c) query cost. Dense recall is not
