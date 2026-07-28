@@ -19,7 +19,8 @@ struct ResultsList<Footer: View>: View {
     @State private var gridWidth: CGFloat = 0
     /// Grid counterpart of the list's inline expansion: the path whose passages popover is open.
     @State private var passagesPopover: String?
-    /// The query whose results we have already scrolled to the top for. Scrolling on the query
+    /// The result-set identity we have already scrolled to the top for: query AND filters, so a
+    /// toolbar filter change - which replaces every row without touching the query - resets too. Scrolling on the query
     /// change alone fired before the new results arrived, so it scrolled to the OUTGOING first row
     /// and the view stayed put - visible when replaying a history item from a scrolled list.
     /// Scrolling when the results LAND, gated on the query having changed, fires once per new query
@@ -156,9 +157,14 @@ struct ResultsList<Footer: View>: View {
                 withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(sel, anchor: nil) }
             }
             // A NEW query reads top-down: jump back to the best hit once its results exist.
-            .onChange(of: results.map(\.path)) { _, _ in
-                guard scrolledForQuery != model.resolvedQuery else { return }
-                scrolledForQuery = model.resolvedQuery
+            // initial: true seeds the gate at mount. ResultsList is only rendered when results are
+            // non-empty, so the view appears at the moment the FIRST result set lands and that
+            // landing never fires a plain onChange - the gate would stay nil for the whole first
+            // query, and the next same-query row change (a background reindex, "show N more", a
+            // trashed row) would yank a scrolled list back to the top.
+            .onChange(of: results.map(\.path), initial: true) { _, _ in
+                guard scrolledForQuery != model.resultsToken else { return }
+                scrolledForQuery = model.resultsToken
                 if let first = results.first?.path { proxy.scrollTo(first, anchor: .top) }
             }
             .marqueeSelect(space: marqueeSpace)
@@ -239,9 +245,14 @@ struct ResultsList<Footer: View>: View {
                 withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(sel, anchor: nil) }
             }
             // A NEW query reads top-down: jump back to the best hit once its results exist.
-            .onChange(of: results.map(\.path)) { _, _ in
-                guard scrolledForQuery != model.resolvedQuery else { return }
-                scrolledForQuery = model.resolvedQuery
+            // initial: true seeds the gate at mount. ResultsList is only rendered when results are
+            // non-empty, so the view appears at the moment the FIRST result set lands and that
+            // landing never fires a plain onChange - the gate would stay nil for the whole first
+            // query, and the next same-query row change (a background reindex, "show N more", a
+            // trashed row) would yank a scrolled list back to the top.
+            .onChange(of: results.map(\.path), initial: true) { _, _ in
+                guard scrolledForQuery != model.resultsToken else { return }
+                scrolledForQuery = model.resultsToken
                 if let first = results.first?.path { proxy.scrollTo(first, anchor: .top) }
             }
             .marqueeSelect(space: marqueeSpace)

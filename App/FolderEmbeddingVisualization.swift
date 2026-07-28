@@ -220,8 +220,13 @@ struct FolderEmbeddingVisualization: View {
         // lands, so this blanks the old map under the "Mapping..." spinner instead of leaving it
         // stale). The GPU buffer then rebuilds when a new layout lands (keyed on the generation, since
         // two folders can share a file count) or the appearance flips.
-        .onChange(of: model.selectedFolderForViz) { hovered = nil; hoveredIndex = nil; selectedIndex = nil; resetView(); rebuildPoints() }
-        .onChange(of: model.projectionGeneration) { rebuildPoints() }
+        .onChange(of: model.selectedFolderForViz) { clearCursor(); resetView(); rebuildPoints() }
+        // A refit of the SAME folder - a PCA/UMAP switch, a stats reconcile, a post-index refit -
+        // bumps the generation without changing the folder, and every row index it produces refers
+        // to a different file. selectedIndex/hovered are row indices into the projection they were
+        // taken from, so they have to die with it; only the camera survives, because zoom and pan
+        // are in layout space and a refit of the same folder should not throw the user's view away.
+        .onChange(of: model.projectionGeneration) { clearCursor(); rebuildPoints() }
         .onChange(of: colorScheme) { rebuildPoints() }
         .onAppear { rebuildPoints() }
     }
@@ -230,6 +235,15 @@ struct FolderEmbeddingVisualization: View {
 
     private func zoomBy(_ factor: CGFloat) {
         withAnimation(.easeOut(duration: 0.15)) { zoom = (zoom * factor).clamped(to: Self.zoomRange) }
+    }
+    /// Drop every piece of state that is an index into, or a lookup against, the current
+    /// projection. Anything that survives a refit must be in layout space, not row space.
+    private func clearCursor() {
+        hovered = nil
+        hoveredIndex = nil
+        hoverDwellPath = nil
+        selectedIndex = nil
+        litNeighbors = []
     }
     private func resetView() {
         withAnimation(.easeOut(duration: 0.18)) { zoom = 1; pan = .zero }

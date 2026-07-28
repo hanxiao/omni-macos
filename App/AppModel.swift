@@ -2450,10 +2450,25 @@ final class AppModel {
     /// query starts clean - the selection clears so the list reads top-down from the best hit -
     /// while a refresh of the SAME query (live re-runs while indexing) keeps the selection if
     /// its row survived, so a watcher tick never yanks the user's focus.
+    /// Identity of the result set now on screen: the resolved query PLUS the filters that produced
+    /// it. resolvedQuery alone is not that identity - a toolbar filter change replaces every row
+    /// while leaving the semantic text untouched, so anything gated on resolvedQuery treats a
+    /// wholly new result set as a refresh of the old one. Kept separate from resolvedQuery rather
+    /// than folded into it because isResolving compares resolvedQuery against the semantic text and
+    /// would spin forever against a different key space.
+    private(set) var resultsToken: String = ""
+
+    private func filterSignature() -> String {
+        [filterKinds.map(\.rawValue).sorted().joined(separator: ","),
+         filterFolder?.path ?? "", filterExt, filterFilename, filterTags, filterTagsExclude,
+         dateRange.rawValue, String(sortOrder.hashValue)].joined(separator: "\u{1}")
+    }
+
     private func applyResults(_ hits: [SearchHit], resolved: String) {
         let isNewQuery = resolvedQuery != resolved
         rawResults = hits
         resolvedQuery = resolved
+        resultsToken = resolved + "\u{1}" + filterSignature()
         enqueueRetagCandidates(hits)
         if isNewQuery {
             selection = nil; selectedPaths = []; selectionAnchor = nil
