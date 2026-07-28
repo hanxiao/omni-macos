@@ -2762,6 +2762,54 @@ if args.count >= 4 && args[1] == "dedupbench" {
     exit(0)
 }
 
+// Filename channel: omni-verify lexcheck <dbCopy> [n]
+// Builds the filename index over a copy of a real store, then measures (a) whether typed filenames
+// are retrievable, (b) that the gate stays shut on prose, (c) query cost. Dense recall is not
+// measured here - the point is the channel and the gate, and OMNI_LEXICAL=0 gives the baseline.
+if args.count >= 3 && args[1] == "lexcheck" {
+    let dbPath = args[2]
+    let n = (args.count >= 4 ? Int(args[3]) : nil) ?? 200
+    let store = try VectorStore(dbURL: URL(fileURLWithPath: dbPath))
+    var t = Date()
+    store.prepareLexicalIndex()
+    print(String(format: "lexcheck  build %.2fs  files=%d", -t.timeIntervalSinceNow, store.fileCount))
+    let side = dbPath + ".names"
+    let sz = (try? FileManager.default.attributesOfItem(atPath: side)[.size] as? Int) ?? 0
+    print(String(format: "  sidecar %.2f MB", Double(sz) / 1048576))
+    // sample real basenames straight out of the store
+    let all = store.allIndexedPaths()
+    guard !all.isEmpty else { print("empty store"); exit(1) }
+    var st = UInt64(0x243F6A8885A308D3)
+    func rnd(_ m: Int) -> Int { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return Int(st % UInt64(m)) }
+    var names: [String] = []
+    while names.count < n { let p = all[rnd(all.count)]
+        let b = (p as NSString).lastPathComponent
+        if b.count >= 4 { names.append(b) } }
+    let dim = 768
+    let zero = [Float](repeating: 0, count: dim)
+    var hit1 = 0, hit10 = 0
+    t = Date()
+    for b in names {
+        let hits = store.search(zero, topK: 10, markActive: false, textQuery: b)
+        if let f = hits.first, ((f.path as NSString).lastPathComponent) == b { hit1 += 1 }
+        if hits.contains(where: { ($0.path as NSString).lastPathComponent == b }) { hit10 += 1 }
+    }
+    let per = -t.timeIntervalSinceNow * 1000 / Double(names.count)
+    print(String(format: "  typed filename, n=%d:  top-1 %.1f%%   top-10 %.1f%%   %.2f ms/query",
+                 names.count, 100.0 * Double(hit1) / Double(names.count),
+                 100.0 * Double(hit10) / Double(names.count), per))
+    // gate discipline: prose must not trip it
+    let prose = ["photos of a cat on a couch", "the design of the priority gate",
+                 "what did we decide about memory", "how does the indexer handle deletes",
+                 "notes from the meeting last week", "a picture of the mountains at sunset"]
+    let fired = prose.filter { LexicalIndexProbe.shouldFuse($0) }.count
+    let namesFired = names.prefix(50).filter { LexicalIndexProbe.shouldFuse($0) }.count
+    print("  gate: fires on \(fired)/\(prose.count) prose queries, \(namesFired)/50 filenames")
+    store.close()
+    print((fired == 0 && namesFired >= 45 && hit10 >= names.count * 8 / 10) ? "PASS" : "REVIEW")
+    exit(0)
+}
+
 // Candidate-selection microbench: omni-verify selbench [rows] [C] [reps]
 // Times the top-C selection in isolation and compares three strategies on the SAME scores:
 //   argPartition : what ships. MLX routes ArgPartition::eval_gpu to gpu_merge_sort (sort.cpp:342,

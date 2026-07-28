@@ -68,7 +68,7 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
 
     func search(_ query: String, topK: Int, filter: SearchFilter) -> [SearchHit] {
         let vec = engine.embedQuery(query)
-        return store.search(vec, filter: filter, topK: topK)
+        return store.search(vec, filter: filter, topK: topK, textQuery: query)
     }
 
     func searchInline(_ query: String, paths: [String], topK: Int) -> [InlineChunkHit] {

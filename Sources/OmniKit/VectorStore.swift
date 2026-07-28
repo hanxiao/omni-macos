@@ -1566,6 +1566,70 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
+    // MARK: - Filename lexical channel
+    //
+    // Dense retrieval never sees the filename: text rows embed chunk text and media rows embed
+    // pixels or mel frames. Measured on a 993,854-chunk index that leaves media files
+    // unretrievable by their own name at any k. This sidecar restores that one capability without
+    // touching the vector path: it is built from paths already in the store, queried on its own
+    // connection off this queue, and fused only when the query looks like a name.
+    private lazy var lexical = LexicalIndex(indexURL: dbURL)
+
+    /// Distinct indexed paths. Used to build the filename index; runs on the queue like any read.
+    public func allIndexedPaths() -> [String] {
+        queue.sync {
+            guard dbOpen() else { return [] }
+            var out: [String] = []; out.reserveCapacity(liveFiles)
+            var st: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "SELECT DISTINCT path FROM chunks;", -1, &st, nil) == SQLITE_OK else { return [] }
+            defer { sqlite3_finalize(st) }
+            while sqlite3_step(st) == SQLITE_ROW {
+                if let c = sqlite3_column_text(st, 0) { out.append(String(cString: c)) }
+            }
+            return out
+        }
+    }
+
+    /// Build the filename index if it is missing or stale. Safe to call at any time; it is a no-op
+    /// when current. Never call it on the store's queue - it takes its own lock and does its own IO.
+    public func prepareLexicalIndex() {
+        let stamp = queue.sync { mutationGen }
+        lexical.rebuildIfStale(paths: self.allIndexedPaths(), stamp: stamp)
+    }
+
+    /// Materialize display rows for paths the dense scan did not return. Indexed by the chunks
+    /// primary key, so this is a handful of point lookups, not a scan.
+    private func hitsForPaths(_ paths: [String]) -> [SearchHit] {
+        guard !paths.isEmpty else { return [] }
+        return queue.sync {
+            guard dbOpen() else { return [] }
+            var out: [SearchHit] = []
+            var st: OpaquePointer?
+            let sql = """
+                SELECT modified, size, kind, chunk_index, snippet, width, height, duration, locator
+                FROM chunks WHERE path = ? ORDER BY chunk_index LIMIT 1;
+                """
+            guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { return [] }
+            defer { sqlite3_finalize(st) }
+            for p in paths {
+                sqlite3_reset(st)
+                sqlite3_bind_text(st, 1, p, -1, SQLITE_TRANSIENT)
+                guard sqlite3_step(st) == SQLITE_ROW else { continue }
+                let cc = pathID[p].map { Int(fileChunkCount[Int($0)]) } ?? 1
+                out.append(SearchHit(
+                    path: p, score: 0, snippet: sqlite3_column_text(st, 4).map { String(cString: $0) } ?? "",
+                    kind: sqlite3_column_text(st, 2).map { String(cString: $0) } ?? "text",
+                    chunkIndex: Int(sqlite3_column_int(st, 3)),
+                    modified: sqlite3_column_double(st, 0),
+                    width: Int(sqlite3_column_int(st, 5)), height: Int(sqlite3_column_int(st, 6)),
+                    duration: sqlite3_column_double(st, 7), size: Int(sqlite3_column_int64(st, 1)),
+                    locator: sqlite3_column_text(st, 8).map { String(cString: $0) } ?? "",
+                    chunkCount: cc))
+            }
+            return out
+        }
+    }
+
     public var count: Int { queue.sync { rows.count } }
     public var fileCount: Int { queue.sync { liveFiles } }
 
@@ -1805,7 +1869,14 @@ public final class VectorStore: @unchecked Sendable {
     /// the query first) for quant mode and filtered queries, which need host floats up front.
     /// Returns the hits AND the query vector (free after the shared eval) for the caller's
     /// query cache / passage ranking.
-    public func search(queryGraph: MLXArray, filter: SearchFilter = SearchFilter(), topK: Int = 40) -> (hits: [SearchHit], query: [Float]) {
+    public func search(queryGraph: MLXArray, filter: SearchFilter = SearchFilter(), topK: Int = 40,
+                       textQuery: String? = nil) -> (hits: [SearchHit], query: [Float]) {
+        let r = searchGraphDense(queryGraph: queryGraph, filter: filter, topK: topK)
+        guard let text = textQuery, LexicalIndex.enabled, LexicalIndex.shouldFuse(text) else { return r }
+        return (fuseLexical(dense: r.hits, text: text, filter: filter, topK: topK), r.query)
+    }
+
+    private func searchGraphDense(queryGraph: MLXArray, filter: SearchFilter = SearchFilter(), topK: Int = 40) -> (hits: [SearchHit], query: [Float]) {
         // Preconditions that read no shared state - resolved off the lock. A filtered query or a
         // disabled GPU reduce skips the lock entirely and takes the classic path. (queryGraph.size == dim
         // is checked INSIDE the lock below, since `dim` is mutable shared state - self-review fix.)
@@ -1859,7 +1930,76 @@ public final class VectorStore: @unchecked Sendable {
     /// proactively refold the base. The bootstrap warm-up probe passes false: it wants to warm the
     /// reduce kernels + trigger the fold WITHOUT faking a 2s search-active window that would make the
     /// startup index pass refold repeatedly and keep mlxBase resident. (self-review fix)
-    public func search(_ query: [Float], filter: SearchFilter = SearchFilter(), topK: Int = 40, markActive: Bool = true) -> [SearchHit] {
+    /// `textQuery` is the raw text the user typed, when the caller has it. Supplying it lets the
+    /// filename channel contribute; omitting it reproduces the dense-only behaviour exactly, which
+    /// is why it is optional rather than required.
+    public func search(_ query: [Float], filter: SearchFilter = SearchFilter(), topK: Int = 40,
+                       markActive: Bool = true, textQuery: String? = nil) -> [SearchHit] {
+        let dense = searchDense(query, filter: filter, topK: topK, markActive: markActive)
+        guard let text = textQuery, LexicalIndex.enabled, LexicalIndex.shouldFuse(text) else { return dense }
+        return fuseLexical(dense: dense, text: text, filter: filter, topK: topK)
+    }
+
+    /// Reciprocal-rank fusion of the dense ranking with the filename channel.
+    ///
+    /// RRF is used rather than a score blend because the two channels have incommensurable scales:
+    /// a cosine and a bm25 have no common unit, and every convex combination measured on the live
+    /// index either failed to fix filenames or destroyed the semantic ranking. Ranks have no unit.
+    /// k is small (10) so a top-few lexical match can actually reach the top; the gate is what keeps
+    /// that from firing on prose.
+    ///
+    /// The lexical list is capped: 8,075 files in the reference corpus share the basename
+    /// "results.json", and an uncapped list would flood the results with one name.
+    private func fuseLexical(dense: [SearchHit], text: String, filter: SearchFilter, topK: Int) -> [SearchHit] {
+        let names = lexical.match(text, limit: Swift.min(topK, 24))
+        guard !names.isEmpty else { return dense }
+        // Asymmetric RRF. Symmetric k gave a perfect filename match exactly the weight of an
+        // arbitrary dense hit, so a typed filename could not reach rank 1 (measured: top-1 0.0%,
+        // top-10 74%). Dense keeps the standard k=60; the lexical channel gets k=20, which lets a
+        // strong name match climb without letting a weak one displace a confident dense result.
+        var rank: [String: Double] = [:]
+        for (i, h) in dense.enumerated() { rank[h.path, default: 0] += 1.0 / Double(60 + i + 1) }
+        var lexRank: [String: Double] = [:]
+        for (i, p) in names.enumerated() { lexRank[p] = 1.0 / Double(20 + i + 1) }
+        // An exact basename match is unambiguous intent: the user typed this file's name. Nothing a
+        // dense scan returns should outrank it. Normalized so "OmniEngine.swift", "omniengine.swift"
+        // and "omni engine swift" all count as exact.
+        let qn = LexicalIndex.terms(text).joined(separator: " ")
+        for p in names where LexicalIndex.terms((p as NSString).lastPathComponent).joined(separator: " ") == qn {
+            lexRank[p, default: 0] += 1.0
+        }
+        // Only admit lexical-only files that pass the same filter the dense path applied, or a
+        // filtered search would silently gain rows the filter excluded.
+        let denseSet = Set(dense.map { $0.path })
+        let extra = names.filter { !denseSet.contains($0) }
+        let materialized = hitsForPaths(extra).filter { passesFilterForLexical($0, filter) }
+        for (p, r) in lexRank { rank[p, default: 0] += r }
+        var pool = dense + materialized
+        // Stable order: fused score, then the dense order, so ties never depend on dictionary order.
+        let densePos = Dictionary(uniqueKeysWithValues: dense.enumerated().map { ($1.path, $0) })
+        pool.sort {
+            let a = rank[$0.path] ?? 0, b = rank[$1.path] ?? 0
+            if a != b { return a > b }
+            return (densePos[$0.path] ?? Int.max) < (densePos[$1.path] ?? Int.max)
+        }
+        return Array(pool.prefix(topK))
+    }
+
+    /// The subset of SearchFilter that can be evaluated on a materialized hit without the resident
+    /// row tables. Kind, recency and extension are all present on the hit; folder is a path prefix.
+    private func passesFilterForLexical(_ h: SearchHit, _ f: SearchFilter) -> Bool {
+        if !f.kinds.isEmpty, !f.kinds.contains(h.kind) { return false }
+        if let since = f.since, h.modified < since { return false }
+        if let folder = f.folderPrefix, !h.path.hasPrefix(folder) { return false }
+        if let ext = f.ext, !ext.isEmpty {
+            let e = (h.path as NSString).pathExtension.lowercased()
+            if !ext.contains(e) { return false }
+        }
+        return true
+    }
+
+    private func searchDense(_ query: [Float], filter: SearchFilter = SearchFilter(), topK: Int = 40,
+                             markActive: Bool = true) -> [SearchHit] {
         let tCall = Self.searchTiming ? Date() : nil
         return queue.sync {
             if let tCall { print(String(format: "[search] lockwait=%.1fms", -tCall.timeIntervalSinceNow * 1000)) }

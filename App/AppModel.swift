@@ -1869,6 +1869,11 @@ final class AppModel {
             let warm = Task.detached(priority: .userInitiated) {
                 engine.warmText()
                 _ = store.search([Float](repeating: 0, count: engine.dim), topK: 10, markActive: false)
+                // Filename channel: derived from paths already in the store, so it needs no
+                // re-index. Built here, off the main actor and off the store's serial queue, and
+                // skipped entirely when already current. Search works without it; it just cannot
+                // answer a filename until this returns.
+                Task.detached(priority: .utility) { [store] in store.prepareLexicalIndex() }
             }
             self.phase = .ready
             restartWatcher()
@@ -2562,7 +2567,7 @@ final class AppModel {
             touchQueryVector(q)   // LRU: a re-run query shouldn't be first in line for eviction
             searchWorkTask = Task.detached(priority: .userInitiated) {
                 if Task.isCancelled { return }   // superseded before the scan started: skip it
-                let hits = store.search(cached, filter: filter, topK: 60)
+                let hits = store.search(cached, filter: filter, topK: 60, textQuery: q)
                 await MainActor.run {
                     guard token == self.searchToken else { return }
                     self.lastQueryVector = cached
@@ -2583,11 +2588,11 @@ final class AppModel {
             let tSearch = omniPerfEnabled ? Date() : nil
             if let g = engine.queryVectorGraph(q) {
                 if Task.isCancelled { return }
-                (hits, vec) = store.search(queryGraph: g, filter: filter, topK: 60)
+                (hits, vec) = store.search(queryGraph: g, filter: filter, topK: 60, textQuery: q)
             } else {
                 vec = engine.embedQuery(q)   // high priority: jumps ahead of indexing
                 if Task.isCancelled { return }   // superseded while embedding: don't run the store scan
-                hits = store.search(vec, filter: filter, topK: 60)
+                hits = store.search(vec, filter: filter, topK: 60, textQuery: q)
             }
             if let tSearch { omniPerfLog(String(format: "search total=%.0fms indexing=%@ hits=%d", -tSearch.timeIntervalSinceNow * 1000, indexingNow ? "YES" : "no", hits.count)) }
             await MainActor.run {
