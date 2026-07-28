@@ -1604,32 +1604,54 @@ public final class VectorStore: @unchecked Sendable {
 
     /// Materialize display rows for paths the dense scan did not return. Indexed by the chunks
     /// primary key, so this is a handful of point lookups, not a scan.
-    private func hitsForPaths(_ paths: [String]) -> [SearchHit] {
+    private func hitsForPaths(_ paths: [String], query: [Float]? = nil) -> [SearchHit] {
         guard !paths.isEmpty else { return [] }
         return queue.sync {
             guard dbOpen() else { return [] }
             var out: [SearchHit] = []
             var st: OpaquePointer?
+            // Score these exactly rather than leaving them at zero. A file found by name is often a
+            // strong semantic match too, and a zero would both render as "0%" and be dropped by any
+            // score: threshold the user sets. The vectors are already in the row we are reading, so
+            // the true best-chunk score costs one dot product per chunk of a handful of files.
             let sql = """
-                SELECT modified, size, kind, chunk_index, snippet, width, height, duration, locator
-                FROM chunks WHERE path = ? ORDER BY chunk_index LIMIT 1;
+                SELECT modified, size, kind, chunk_index, snippet, width, height, duration, locator,
+                       dim, vec
+                FROM chunks WHERE path = ? ORDER BY chunk_index;
                 """
             guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { return [] }
             defer { sqlite3_finalize(st) }
             for p in paths {
                 sqlite3_reset(st)
                 sqlite3_bind_text(st, 1, p, -1, SQLITE_TRANSIENT)
-                guard sqlite3_step(st) == SQLITE_ROW else { continue }
+                var best: (score: Float, row: Int32) = (-Float.infinity, 0)
+                var meta: (Double, Int, String, Int, String, Int, Int, Double, String)? = nil
+                while sqlite3_step(st) == SQLITE_ROW {
+                    let d = Int(sqlite3_column_int(st, 9))
+                    var sc: Float = 0
+                    if let q = query, d == q.count, let blob = sqlite3_column_blob(st, 10),
+                       Int(sqlite3_column_bytes(st, 10)) == d * 2 {
+                        let bf = blob.assumingMemoryBound(to: UInt16.self)
+                        for k in 0 ..< d { sc += Self.fromBF16(bf[k]) * q[k] }
+                    }
+                    if sc > best.score || meta == nil {
+                        best = (sc, sqlite3_column_int(st, 3))
+                        meta = (sqlite3_column_double(st, 0), Int(sqlite3_column_int64(st, 1)),
+                                sqlite3_column_text(st, 2).map { String(cString: $0) } ?? "text",
+                                Int(sqlite3_column_int(st, 3)),
+                                sqlite3_column_text(st, 4).map { String(cString: $0) } ?? "",
+                                Int(sqlite3_column_int(st, 5)), Int(sqlite3_column_int(st, 6)),
+                                sqlite3_column_double(st, 7),
+                                sqlite3_column_text(st, 8).map { String(cString: $0) } ?? "")
+                    }
+                }
+                guard let m = meta else { continue }
                 let cc = pathID[p].map { Int(fileChunkCount[Int($0)]) } ?? 1
                 out.append(SearchHit(
-                    path: p, score: 0, snippet: sqlite3_column_text(st, 4).map { String(cString: $0) } ?? "",
-                    kind: sqlite3_column_text(st, 2).map { String(cString: $0) } ?? "text",
-                    chunkIndex: Int(sqlite3_column_int(st, 3)),
-                    modified: sqlite3_column_double(st, 0),
-                    width: Int(sqlite3_column_int(st, 5)), height: Int(sqlite3_column_int(st, 6)),
-                    duration: sqlite3_column_double(st, 7), size: Int(sqlite3_column_int64(st, 1)),
-                    locator: sqlite3_column_text(st, 8).map { String(cString: $0) } ?? "",
-                    chunkCount: cc))
+                    path: p, score: best.score.isFinite ? best.score : 0, snippet: m.4,
+                    kind: m.2, chunkIndex: m.3, modified: m.0,
+                    width: m.5, height: m.6, duration: m.7, size: m.1,
+                    locator: m.8, chunkCount: cc))
             }
             return out
         }
@@ -1879,10 +1901,10 @@ public final class VectorStore: @unchecked Sendable {
         let r = searchGraphDense(queryGraph: queryGraph, filter: filter, topK: topK)
         guard LexicalIndex.enabled else { return r }
         if let explicit = filter.filenameQuery, !explicit.isEmpty {
-            return (fuseLexical(dense: r.hits, text: explicit, filter: filter, topK: topK, explicit: true), r.query)
+            return (fuseLexical(dense: r.hits, text: explicit, filter: filter, topK: topK, explicit: true, denseQuery: r.query), r.query)
         }
         guard let text = textQuery, LexicalIndex.shouldFuse(text) else { return r }
-        return (fuseLexical(dense: r.hits, text: text, filter: filter, topK: topK, explicit: false), r.query)
+        return (fuseLexical(dense: r.hits, text: text, filter: filter, topK: topK, explicit: false, denseQuery: r.query), r.query)
     }
 
     private func searchGraphDense(queryGraph: MLXArray, filter: SearchFilter = SearchFilter(), topK: Int = 40) -> (hits: [SearchHit], query: [Float]) {
@@ -1949,10 +1971,10 @@ public final class VectorStore: @unchecked Sendable {
         // Explicit `filename:` beats the heuristic. Otherwise a bare query contributes only if it
         // looks like a name, and then only in proportion to how well it matches.
         if let explicit = filter.filenameQuery, !explicit.isEmpty {
-            return fuseLexical(dense: dense, text: explicit, filter: filter, topK: topK, explicit: true)
+            return fuseLexical(dense: dense, text: explicit, filter: filter, topK: topK, explicit: true, denseQuery: query)
         }
         guard let text = textQuery, LexicalIndex.shouldFuse(text) else { return dense }
-        return fuseLexical(dense: dense, text: text, filter: filter, topK: topK, explicit: false)
+        return fuseLexical(dense: dense, text: text, filter: filter, topK: topK, explicit: false, denseQuery: query)
     }
 
     /// Reciprocal-rank fusion of the dense ranking with the filename channel.
@@ -1966,7 +1988,7 @@ public final class VectorStore: @unchecked Sendable {
     /// The lexical list is capped: 8,075 files in the reference corpus share the basename
     /// "results.json", and an uncapped list would flood the results with one name.
     private func fuseLexical(dense: [SearchHit], text: String, filter: SearchFilter, topK: Int,
-                             explicit: Bool) -> [SearchHit] {
+                             explicit: Bool, denseQuery: [Float]? = nil) -> [SearchHit] {
         let names = lexical.match(text, limit: explicit ? topK : Swift.min(topK, 24))
         guard !names.isEmpty else { return dense }
         // Asymmetric RRF. Symmetric k gave a perfect filename match exactly the weight of an
@@ -2004,7 +2026,7 @@ public final class VectorStore: @unchecked Sendable {
         // filtered search would silently gain rows the filter excluded.
         let denseSet = Set(dense.map { $0.path })
         let extra = names.filter { !denseSet.contains($0) }
-        let materialized = hitsForPaths(extra).filter { passesFilterForLexical($0, filter) }
+        let materialized = hitsForPaths(extra, query: denseQuery).filter { passesFilterForLexical($0, filter) }
         for (p, r) in lexRank { rank[p, default: 0] += r }
         var pool = dense + materialized
         // Stable order: fused score, then the dense order, so ties never depend on dictionary order.

@@ -572,7 +572,7 @@ struct ContentView: View {
                 let neg = tok.hasPrefix("-") ? "-" : ""
                 let low = (neg.isEmpty ? tok : String(tok.dropFirst())).lowercased()
                 if !low.isEmpty {
-                    for k in ["type:", "tag:", "ext:", "in:", "date:", "after:", "score:", "sort:"] where k.hasPrefix(low) {
+                    for k in ["type:", "tag:", "ext:", "in:", "filename:", "date:", "after:", "score:", "sort:"] where k.hasPrefix(low) {
                         out.append(Suggestion(label: neg + k, completion: "\(prefix)\(neg)\(k)", icon: "line.3.horizontal.decrease.circle"))
                     }
                 }
@@ -601,6 +601,9 @@ struct ContentView: View {
         case "sort": return ["relevance", "name", "date"]
         case "ext": return model.indexedExts
         case "in": return model.roots.map { ($0.path as NSString).abbreviatingWithTildeInPath }
+        // filename: takes free text - there is nothing sensible to enumerate, and offering a
+        // sample of 135,000 basenames would be noise rather than help.
+        case "filename": return []
         default: return []
         }
     }
