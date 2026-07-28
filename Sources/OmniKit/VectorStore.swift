@@ -142,6 +142,11 @@ public struct SearchFilter: Sendable {
     /// contain (any of) `tagTerms` and none of `tagExcludeTerms`, matched as whole tags.
     /// Snippets are not resident, so the store resolves these into path sets at search entry
     /// (resolveTagFilterLocked) - a cached single scan on the serial queue, never per row.
+    /// Explicit filename intent from a `filename:` clause. When set, the lexical channel answers
+    /// at full strength and the shape heuristic is bypassed entirely: the user has said what they
+    /// mean, so there is nothing left to guess. Empty means "no explicit request", and the channel
+    /// falls back to contributing weakly when a bare query happens to look like a name.
+    public var filenameQuery: String? = nil
     public var tagTerms: [String] = []
     public var tagExcludeTerms: [String] = []
     // Resolved by the store at search entry from tagTerms/tagExcludeTerms; per-row checks
@@ -1872,8 +1877,12 @@ public final class VectorStore: @unchecked Sendable {
     public func search(queryGraph: MLXArray, filter: SearchFilter = SearchFilter(), topK: Int = 40,
                        textQuery: String? = nil) -> (hits: [SearchHit], query: [Float]) {
         let r = searchGraphDense(queryGraph: queryGraph, filter: filter, topK: topK)
-        guard let text = textQuery, LexicalIndex.enabled, LexicalIndex.shouldFuse(text) else { return r }
-        return (fuseLexical(dense: r.hits, text: text, filter: filter, topK: topK), r.query)
+        guard LexicalIndex.enabled else { return r }
+        if let explicit = filter.filenameQuery, !explicit.isEmpty {
+            return (fuseLexical(dense: r.hits, text: explicit, filter: filter, topK: topK, explicit: true), r.query)
+        }
+        guard let text = textQuery, LexicalIndex.shouldFuse(text) else { return r }
+        return (fuseLexical(dense: r.hits, text: text, filter: filter, topK: topK, explicit: false), r.query)
     }
 
     private func searchGraphDense(queryGraph: MLXArray, filter: SearchFilter = SearchFilter(), topK: Int = 40) -> (hits: [SearchHit], query: [Float]) {
@@ -1936,8 +1945,14 @@ public final class VectorStore: @unchecked Sendable {
     public func search(_ query: [Float], filter: SearchFilter = SearchFilter(), topK: Int = 40,
                        markActive: Bool = true, textQuery: String? = nil) -> [SearchHit] {
         let dense = searchDense(query, filter: filter, topK: topK, markActive: markActive)
-        guard let text = textQuery, LexicalIndex.enabled, LexicalIndex.shouldFuse(text) else { return dense }
-        return fuseLexical(dense: dense, text: text, filter: filter, topK: topK)
+        guard LexicalIndex.enabled else { return dense }
+        // Explicit `filename:` beats the heuristic. Otherwise a bare query contributes only if it
+        // looks like a name, and then only in proportion to how well it matches.
+        if let explicit = filter.filenameQuery, !explicit.isEmpty {
+            return fuseLexical(dense: dense, text: explicit, filter: filter, topK: topK, explicit: true)
+        }
+        guard let text = textQuery, LexicalIndex.shouldFuse(text) else { return dense }
+        return fuseLexical(dense: dense, text: text, filter: filter, topK: topK, explicit: false)
     }
 
     /// Reciprocal-rank fusion of the dense ranking with the filename channel.
@@ -1950,8 +1965,9 @@ public final class VectorStore: @unchecked Sendable {
     ///
     /// The lexical list is capped: 8,075 files in the reference corpus share the basename
     /// "results.json", and an uncapped list would flood the results with one name.
-    private func fuseLexical(dense: [SearchHit], text: String, filter: SearchFilter, topK: Int) -> [SearchHit] {
-        let names = lexical.match(text, limit: Swift.min(topK, 24))
+    private func fuseLexical(dense: [SearchHit], text: String, filter: SearchFilter, topK: Int,
+                             explicit: Bool) -> [SearchHit] {
+        let names = lexical.match(text, limit: explicit ? topK : Swift.min(topK, 24))
         guard !names.isEmpty else { return dense }
         // Asymmetric RRF. Symmetric k gave a perfect filename match exactly the weight of an
         // arbitrary dense hit, so a typed filename could not reach rank 1 (measured: top-1 0.0%,
@@ -1974,7 +1990,8 @@ public final class VectorStore: @unchecked Sendable {
             let covered = Double(bt.filter { qt.contains($0) }.count) / Double(bt.count)
             let used = Double(qt.filter { t in bt.contains(t) }.count) / Double(Swift.max(1, qt.count))
             let strength = Swift.min(covered, used)
-            lexRank[p] = strength / Double(120 + i + 1)
+            // Explicit intent: the channel leads. Implicit: it may only nudge.
+            lexRank[p] = strength / Double((explicit ? 5 : 120) + i + 1)
         }
         // An exact basename match is unambiguous intent: the user typed this file's name. Nothing a
         // dense scan returns should outrank it. Normalized so "OmniEngine.swift", "omniengine.swift"

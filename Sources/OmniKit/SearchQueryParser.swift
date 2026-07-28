@@ -33,6 +33,7 @@ public enum SearchQueryParser {
         case "tag", "tags": return "tag"
         case "ext", "extension": return "ext"
         case "in", "folder", "path": return "in"
+        case "filename", "name", "file": return "filename"
         case "date": return "date"
         case "after", "since": return "after"
         case "score", "relevance", "min": return "score"
@@ -50,7 +51,7 @@ public enum SearchQueryParser {
     private static let qualifierRegex: NSRegularExpression? = {
         // (start-of-string or whitespace) then an optional '-', a whitelisted key, ':', and a value
         // that is either a quoted string or a run of non-space characters.
-        let pattern = #"(?:^|\s)(-?(?:type|kind|tag|tags|ext|extension|in|folder|path|date|after|since|score|relevance|min|sort):(?:"[^"]*"|\S+))"#
+        let pattern = #"(?:^|\s)(-?(?:type|kind|tag|tags|ext|extension|in|folder|path|filename|name|file|date|after|since|score|relevance|min|sort):(?:"[^"]*"|\S+))"#
         return try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
     }()
 

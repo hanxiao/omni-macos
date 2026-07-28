@@ -658,6 +658,10 @@ final class AppModel {
     var filterKinds: Set<FileKind> = [] { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
     var filterFolder: URL? = nil { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
     var filterExt: String = "" { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
+    /// Explicit `filename:` intent. Not a filter - it does not exclude anything - but a request for
+    /// the filename channel to lead the ranking. Kept beside the filters because it arrives through
+    /// the same qualifier grammar.
+    var filterFilename: String = "" { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
     /// Content-tag filter (`tag:bear`, comma-separated any-of; exclude via `-tag:x`). Matched
     /// whole-tag against the generated media tag snippets, resolved store-side.
     var filterTags: String = "" { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
@@ -1503,6 +1507,7 @@ final class AppModel {
                 }
             case "ext": filterExt = qual.value.hasPrefix(".") ? String(qual.value.dropFirst()) : qual.value
             case "in":  if let url = Self.resolveFolder(qual.value) { filterFolder = url }
+            case "filename": filterFilename = qual.negated ? "" : qual.value
             case "date": if let d = DateRange(rawValue: qual.value.lowercased()) { dateRange = d }
             case "after": if let d = Self.mapAfter(qual.value) { dateRange = d }
             case "score": if let s = Self.mapScore(qual.value) { minScore = s }
@@ -1526,7 +1531,7 @@ final class AppModel {
 
     /// Reset every filter dimension to its default (caller holds the applyingParsedQuery guard).
     private func resetAllFilters() {
-        filterKinds = []; filterExt = ""; filterFolder = nil
+        filterKinds = []; filterExt = ""; filterFolder = nil; filterFilename = ""
         filterTags = ""; filterTagsExclude = ""
         dateRange = .any; minScore = Self.defaultMinScore; sortOrder = .relevance
     }
@@ -1566,6 +1571,7 @@ final class AppModel {
         if !filterTags.isEmpty { parts.append("tag:" + Self.quoteIfNeeded(filterTags)) }
         if !filterTagsExclude.isEmpty { parts.append("-tag:" + Self.quoteIfNeeded(filterTagsExclude)) }
         if !filterExt.isEmpty { parts.append("ext:" + filterExt) }
+        if !filterFilename.isEmpty { parts.append("filename:" + Self.quoteIfNeeded(filterFilename)) }
         if let f = filterFolder { parts.append("in:" + Self.quoteIfNeeded(f.path)) }
         if dateRange != .any { parts.append("date:" + dateRange.rawValue) }
         if minScore != Self.defaultMinScore { parts.append("score:\(Int((minScore * 100).rounded()))%") }
@@ -1674,6 +1680,7 @@ final class AppModel {
         f.kinds = Set(filterKinds.map { $0.rawValue })
         f.folderPrefix = filterFolder?.path
         f.ext = filterExt.isEmpty ? nil : filterExt
+        f.filenameQuery = filterFilename.isEmpty ? nil : filterFilename
         f.since = dateRange.since
         // Terms only; the store resolves them to path sets on its own queue (cached), so no
         // snippet scan ever runs on the main thread.
