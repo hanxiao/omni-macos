@@ -19,6 +19,12 @@ struct ResultsList<Footer: View>: View {
     @State private var gridWidth: CGFloat = 0
     /// Grid counterpart of the list's inline expansion: the path whose passages popover is open.
     @State private var passagesPopover: String?
+    /// The query whose results we have already scrolled to the top for. Scrolling on the query
+    /// change alone fired before the new results arrived, so it scrolled to the OUTGOING first row
+    /// and the view stayed put - visible when replaying a history item from a scrolled list.
+    /// Scrolling when the results LAND, gated on the query having changed, fires once per new query
+    /// and never on a same-query refresh from live indexing.
+    @State private var scrolledForQuery: String?
     /// One name shared by the frame reporters, the drag gesture, and the rubber-band overlay. The list
     /// and gallery are never on screen together, so reusing the string is safe. The realized-item frames
     /// themselves live as @State INSIDE the marquee modifier - they refresh on every scroll tick
@@ -149,9 +155,10 @@ struct ResultsList<Footer: View>: View {
                 // arrow press made keyboard navigation jumpy.
                 withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(sel, anchor: nil) }
             }
-            // A NEW query reads top-down: jump back to the best hit. Keyed on resolvedQuery, not
-            // the result paths - a same-query refresh (live index updates) must keep the position.
-            .onChange(of: model.resolvedQuery) { _, _ in
+            // A NEW query reads top-down: jump back to the best hit once its results exist.
+            .onChange(of: results.map(\.path)) { _, _ in
+                guard scrolledForQuery != model.resolvedQuery else { return }
+                scrolledForQuery = model.resolvedQuery
                 if let first = results.first?.path { proxy.scrollTo(first, anchor: .top) }
             }
             .marqueeSelect(space: marqueeSpace)
@@ -231,8 +238,10 @@ struct ResultsList<Footer: View>: View {
                 // arrow press made keyboard navigation jumpy.
                 withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(sel, anchor: nil) }
             }
-            // A NEW query reads top-down: jump back to the best hit (same rule as the list view).
-            .onChange(of: model.resolvedQuery) { _, _ in
+            // A NEW query reads top-down: jump back to the best hit once its results exist.
+            .onChange(of: results.map(\.path)) { _, _ in
+                guard scrolledForQuery != model.resolvedQuery else { return }
+                scrolledForQuery = model.resolvedQuery
                 if let first = results.first?.path { proxy.scrollTo(first, anchor: .top) }
             }
             .marqueeSelect(space: marqueeSpace)
