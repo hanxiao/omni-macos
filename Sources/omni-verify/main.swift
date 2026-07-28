@@ -2896,6 +2896,32 @@ if args.count >= 3 && args[1] == "lexcheck" {
                  "distributed systems latency", "machine learning embeddings", "swift concurrency",
                  "vacation photos italy", "budget spreadsheet 2025", "resume draft",
                  "error handling in rust", "database migration plan", "onboarding checklist"]
+    // THE DAMAGE SIDE. Everything above measures what the channel finds; this measures what it
+    // costs. Real query embeddings, dense baseline against fused, top-10 overlap per query.
+    if args.count >= 5 {
+        let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[4]))
+        var kept = 0, total = 0, moved = 0, firedN = 0
+        var worst = (q: "", kept: 10)
+        for pq in prose {
+            let qv = engine.embedQuery(pq)
+            let base = store.search(qv, topK: 10, markActive: false)
+            let fused = store.search(qv, topK: 10, markActive: false, textQuery: pq)
+            let b = base.map { $0.path }, f = Set(fused.map { $0.path })
+            let k = b.filter { f.contains($0) }.count
+            kept += k; total += b.count
+            if b.first != fused.first?.path { moved += 1 }
+            if LexicalIndexProbe.shouldFuse(pq) { firedN += 1 }
+            if k < worst.kept { worst = (pq, k) }
+        }
+        print(String(format: "  prose retention: %d/%d of the dense top-10 kept (%.1f%%), gate fired %d/%d, rank-1 changed %d",
+                     kept, total, 100.0 * Double(kept) / Double(Swift.max(1, total)), firedN, prose.count, moved))
+        print("    worst query: \"\(worst.q)\" kept \(worst.kept)/10")
+        // explicit clause: does it actually lead?
+        var ef = SearchFilter(); ef.filenameQuery = "readme"
+        let ex = store.search(engine.embedQuery("readme"), filter: ef, topK: 10, markActive: false)
+        let named = ex.filter { ($0.path as NSString).lastPathComponent.lowercased().contains("readme") }.count
+        print("    filename:readme -> \(named)/\(ex.count) of top-10 have readme in the name")
+    }
     let fired = prose.filter { LexicalIndexProbe.shouldFuse($0) }.count
     let namesFired = names.prefix(50).filter { LexicalIndexProbe.shouldFuse($0) }.count
     print("  gate: fires on \(fired)/\(prose.count) prose queries, \(namesFired)/50 filenames")
