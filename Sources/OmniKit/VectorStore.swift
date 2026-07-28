@@ -1959,8 +1959,23 @@ public final class VectorStore: @unchecked Sendable {
         // strong name match climb without letting a weak one displace a confident dense result.
         var rank: [String: Double] = [:]
         for (i, h) in dense.enumerated() { rank[h.path, default: 0] += 1.0 / Double(60 + i + 1) }
+        // Match quality, not just rank, decides how loudly the channel speaks. The gate is a
+        // heuristic and it leaks: measured, it fires on 9 of 23 natural-language queries. So the
+        // fusion is built to make a wrong gate decision HARMLESS rather than relying on the gate
+        // being right. A partial name match contributes weakly (k=120) and can only add results at
+        // the tail; it cannot displace a confident dense hit. Only a match that covers the whole
+        // basename is treated as intent.
         var lexRank: [String: Double] = [:]
-        for (i, p) in names.enumerated() { lexRank[p] = 1.0 / Double(20 + i + 1) }
+        let qt = Set(LexicalIndex.terms(text))
+        for (i, p) in names.enumerated() {
+            let bt = LexicalIndex.terms((p as NSString).lastPathComponent)
+            guard !bt.isEmpty else { continue }
+            // fraction of the basename the query accounts for, and vice versa
+            let covered = Double(bt.filter { qt.contains($0) }.count) / Double(bt.count)
+            let used = Double(qt.filter { t in bt.contains(t) }.count) / Double(Swift.max(1, qt.count))
+            let strength = Swift.min(covered, used)
+            lexRank[p] = strength / Double(120 + i + 1)
+        }
         // An exact basename match is unambiguous intent: the user typed this file's name. Nothing a
         // dense scan returns should outrank it. Normalized so "OmniEngine.swift", "omniengine.swift"
         // and "omni engine swift" all count as exact.

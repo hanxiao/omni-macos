@@ -2862,9 +2862,40 @@ if args.count >= 3 && args[1] == "lexcheck" {
                  names.count, 100.0 * Double(hit1) / Double(names.count),
                  100.0 * Double(hit10) / Double(names.count), per))
     // gate discipline: prose must not trip it
+    // media basenames specifically: the defect that motivated the channel
+    let media = all.filter { p in ["jpg","jpeg","png","heic","mp4","mov","mp3","wav","m4a","gif","webp"]
+        .contains((p as NSString).pathExtension.lowercased()) }
+    if !media.isEmpty {
+        var mh = 0, mn = 0
+        for i in stride(from: 0, to: media.count, by: Swift.max(1, media.count / 60)) where mn < 60 {
+            let b = (media[i] as NSString).lastPathComponent
+            mn += 1
+            let hits = store.search(zero, topK: 10, markActive: false, textQuery: b)
+            if hits.contains(where: { ($0.path as NSString).lastPathComponent == b }) { mh += 1 }
+        }
+        print(String(format: "  media by filename, n=%d: top-10 %.1f%%", mn, 100.0 * Double(mh) / Double(mn)))
+    }
+    // CJK / non-Latin basenames: does the channel reach them at all
+    let cjk = all.filter { p in (p as NSString).lastPathComponent.unicodeScalars.contains {
+        (0x3040...0x30FF).contains($0.value) || (0x4E00...0x9FFF).contains($0.value) || (0xAC00...0xD7AF).contains($0.value) } }
+    if cjk.isEmpty { print("  CJK basenames in corpus: 0 (cannot test)") } else {
+        var ch = 0, cn = 0
+        for p in cjk.prefix(40) {
+            let b = (p as NSString).lastPathComponent; cn += 1
+            let hits = store.search(zero, topK: 10, markActive: false, textQuery: b)
+            if hits.contains(where: { ($0.path as NSString).lastPathComponent == b }) { ch += 1 }
+        }
+        print(String(format: "  CJK by filename,   n=%d: top-10 %.1f%%", cn, 100.0 * Double(ch) / Double(cn)))
+    }
     let prose = ["photos of a cat on a couch", "the design of the priority gate",
                  "what did we decide about memory", "how does the indexer handle deletes",
-                 "notes from the meeting last week", "a picture of the mountains at sunset"]
+                 "notes from the meeting last week", "a picture of the mountains at sunset",
+                 "how do we handle memory pressure", "what changed in the indexer recently",
+                 "sunset over the ocean", "invoice from last quarter", "meeting notes",
+                 "quarterly revenue report", "screenshots of the dashboard", "cat sitting on a laptop",
+                 "distributed systems latency", "machine learning embeddings", "swift concurrency",
+                 "vacation photos italy", "budget spreadsheet 2025", "resume draft",
+                 "error handling in rust", "database migration plan", "onboarding checklist"]
     let fired = prose.filter { LexicalIndexProbe.shouldFuse($0) }.count
     let namesFired = names.prefix(50).filter { LexicalIndexProbe.shouldFuse($0) }.count
     print("  gate: fires on \(fired)/\(prose.count) prose queries, \(namesFired)/50 filenames")
