@@ -56,11 +56,19 @@ struct ContentView: View {
         }
     }
 
-    private func focusSearchField() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+    /// The search field is installed by AppKit as a side effect of `.searchable` being applied, on
+    /// AppKit's own schedule - a different publish from the model flag this is keyed on. A single
+    /// delayed attempt was a guess at that latency, and when the guess lost (a cold launch, where
+    /// model loading and the first toolbar layout compete) it returned silently and the caret was
+    /// simply never placed. Retry on a short cadence until the item exists, then focus it once.
+    private func focusSearchField(attemptsLeft: Int = 12) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + (attemptsLeft == 12 ? 0.4 : 0.15)) {
             guard let window = NSApp.windows.first(where: { $0.isVisible && $0.toolbar != nil }),
                   let item = window.toolbar?.items.compactMap({ $0 as? NSSearchToolbarItem }).first
-            else { return }
+            else {
+                if attemptsLeft > 1 { focusSearchField(attemptsLeft: attemptsLeft - 1) }
+                return
+            }
             window.makeFirstResponder(item.searchField)
         }
     }
@@ -124,6 +132,13 @@ struct ContentView: View {
                 emptyState
             }
         }
+        // The Quick Look presenter belongs to the whole pane, not to the results list. It used to
+        // live inside ResultsList, which is mounted only while there are results - the exact
+        // complement of the folder map above it - so the map's own "Quick Look" action wrote
+        // previewURL with no presenter anywhere in the hierarchy: nothing opened, nothing cleared
+        // it, and the panel then popped open by itself on that file the next time any search put
+        // the results list back on screen.
+        .quickLookPreview(Binding(get: { model.previewURL }, set: { model.previewURL = $0 }))
         // Drag an image, file, or text from anywhere (Finder, a browser, another app) - or paste one
         // (Cmd-V) - to search by it. SwiftUI's .onDrop gives us reachability over the results list and
         // the empty state alike, but a web image dragged from Chrome/Safari arrives as inline encoded

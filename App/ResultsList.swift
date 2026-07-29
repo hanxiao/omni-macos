@@ -23,8 +23,8 @@ struct ResultsList<Footer: View>: View {
     /// toolbar filter change - which replaces every row without touching the query - resets too. Scrolling on the query
     /// change alone fired before the new results arrived, so it scrolled to the OUTGOING first row
     /// and the view stayed put - visible when replaying a history item from a scrolled list.
-    /// Scrolling when the results LAND, gated on the query having changed, fires once per new query
-    /// and never on a same-query refresh from live indexing.
+    /// Scrolling when that identity is republished, which happens in the same block that assigns
+    /// the rows, fires once per new result set and never on a same-query refresh from live indexing.
     @State private var scrolledForQuery: String?
     /// One name shared by the frame reporters, the drag gesture, and the rubber-band overlay. The list
     /// and gallery are never on screen together, so reusing the string is safe. The realized-item frames
@@ -43,7 +43,20 @@ struct ResultsList<Footer: View>: View {
 
     private func fetchPassages(_ path: String) {
         guard passagesCache[path] == nil else { return }
-        Task { passagesCache[path] = await model.passages(for: path) }
+        // Re-validate after the await, against the LIVE model. passages(for:) ranks against the
+        // query vector that was current when it started, and the rank runs on the store's serial
+        // queue behind indexing and search, so a background refresh landing inside that window is
+        // ordinary. The cache is cleared by a different handler than the one that fills it, and
+        // nothing orders the two: without this guard the task resumes and writes the OLD query's
+        // ranking into the just-cleared dictionary, where the `passagesCache[path] == nil`
+        // short-circuit above then serves it until the next results change.
+        let token = model.resolvedQuery
+        Task {
+            let ranked = await model.passages(for: path)
+            guard model.resolvedQuery == token,
+                  model.results.contains(where: { $0.path == path }) else { return }
+            passagesCache[path] = ranked
+        }
     }
 
     var body: some View {
@@ -53,7 +66,10 @@ struct ResultsList<Footer: View>: View {
             case .grid: gridView
             }
         }
-        .quickLookPreview(Binding(get: { model.previewURL }, set: { model.previewURL = $0 }))
+        // The .quickLookPreview PRESENTER lives one level up, on ContentView's content stack, not
+        // here: this view is mounted only while there are results, so a previewURL written from the
+        // folder map (its dot menu) had no presenter in the hierarchy at all, and the value then sat
+        // set until the next result set mounted this view and popped the panel open by itself.
         // Space toggles Quick Look in both views regardless of focus, and is left alone while
         // editing text (the search field). The selection drives what is previewed.
         .background(QuickLookKeyMonitor(
@@ -70,12 +86,24 @@ struct ResultsList<Footer: View>: View {
             },
             isPreviewOpen: { model.previewURL != nil }))
         .onKeyPress(.return) { if model.hasSelection { model.openSelected(); return .handled }; return .ignored }
-        // Passages are ranked against the CURRENT query vector - a new result set invalidates
-        // them (and any open expansion/popover) in both views, so this lives here, not per-view.
-        .onChange(of: results.map(\.path)) { _, _ in
+        // Passages are ranked against the CURRENT query vector, so the QUERY is what invalidates
+        // them - not the path list, which is a different publish and decoupled in both directions.
+        // It changes constantly under an unchanged query (every background index pass, a trashed
+        // row, "show N more matches"), and each one wiped a still-valid cache and closed an open
+        // panel; and it can come back byte-identical across a genuinely NEW query (a small or
+        // filtered index whose hits all fit under topK, in a content-derived sort order), which
+        // left the cache holding a ranking computed against the previous query's vector.
+        .onChange(of: model.resolvedQuery) { _, _ in
             expanded = []
             passagesCache = [:]
             passagesPopover = nil
+        }
+        // A row that vanished under the SAME query takes its own state with it, and nothing else's:
+        // the remaining panels are still ranked against the query that is still on screen.
+        .onChange(of: results.map(\.path)) { _, paths in
+            let live = Set(paths)
+            expanded.formIntersection(live)
+            if let p = passagesPopover, !live.contains(p) { passagesPopover = nil }
         }
     }
 
@@ -157,12 +185,19 @@ struct ResultsList<Footer: View>: View {
                 withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(sel, anchor: nil) }
             }
             // A NEW query reads top-down: jump back to the best hit once its results exist.
+            // Keyed on the result-set identity rather than on the path list, because the paths are
+            // not query identity: on a corpus where every hit fits under topK, in a content-derived
+            // sort order, two different queries can return a byte-identical array, and then this
+            // handler never ran at all - no jump to the best hit, and the gate was left holding the
+            // previous query while the model had moved on, so the next unrelated same-query refresh
+            // scrolled to the top out of nowhere. resultsToken is published inside the same
+            // synchronous block that assigns the rows, so it can never fire before they exist.
             // initial: true seeds the gate at mount. ResultsList is only rendered when results are
             // non-empty, so the view appears at the moment the FIRST result set lands and that
             // landing never fires a plain onChange - the gate would stay nil for the whole first
             // query, and the next same-query row change (a background reindex, "show N more", a
             // trashed row) would yank a scrolled list back to the top.
-            .onChange(of: results.map(\.path), initial: true) { _, _ in
+            .onChange(of: model.resultsToken, initial: true) { _, _ in
                 guard scrolledForQuery != model.resultsToken else { return }
                 scrolledForQuery = model.resultsToken
                 if let first = results.first?.path { proxy.scrollTo(first, anchor: .top) }
@@ -245,12 +280,19 @@ struct ResultsList<Footer: View>: View {
                 withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(sel, anchor: nil) }
             }
             // A NEW query reads top-down: jump back to the best hit once its results exist.
+            // Keyed on the result-set identity rather than on the path list, because the paths are
+            // not query identity: on a corpus where every hit fits under topK, in a content-derived
+            // sort order, two different queries can return a byte-identical array, and then this
+            // handler never ran at all - no jump to the best hit, and the gate was left holding the
+            // previous query while the model had moved on, so the next unrelated same-query refresh
+            // scrolled to the top out of nowhere. resultsToken is published inside the same
+            // synchronous block that assigns the rows, so it can never fire before they exist.
             // initial: true seeds the gate at mount. ResultsList is only rendered when results are
             // non-empty, so the view appears at the moment the FIRST result set lands and that
             // landing never fires a plain onChange - the gate would stay nil for the whole first
             // query, and the next same-query row change (a background reindex, "show N more", a
             // trashed row) would yank a scrolled list back to the top.
-            .onChange(of: results.map(\.path), initial: true) { _, _ in
+            .onChange(of: model.resultsToken, initial: true) { _, _ in
                 guard scrolledForQuery != model.resultsToken else { return }
                 scrolledForQuery = model.resultsToken
                 if let first = results.first?.path { proxy.scrollTo(first, anchor: .top) }
@@ -313,9 +355,18 @@ struct ResultsList<Footer: View>: View {
                 case .grid:
                     Button {
                         // Load first, present after: the popover must mount at its final size
-                        // (see the crash note at the .popover site).
+                        // (see the crash note at the .popover site). Both writes are re-validated
+                        // against the LIVE model after the rank's await, for the same reason
+                        // fetchPassages is: the results can be replaced while the store's serial
+                        // queue works through it, and presenting then either showed the previous
+                        // query's passages or anchored the popover to a cell that no longer exists,
+                        // which presents nothing and leaves the state pointing at a dead path.
                         Task {
-                            if passagesCache[path] == nil { passagesCache[path] = await model.passages(for: path) }
+                            let token = model.resolvedQuery
+                            let ranked = passagesCache[path] == nil ? await model.passages(for: path) : nil
+                            guard model.resolvedQuery == token,
+                                  model.results.contains(where: { $0.path == path }) else { return }
+                            if let ranked { passagesCache[path] = ranked }
                             passagesPopover = path
                         }
                     } label: { Label("Show matching passages", systemImage: "text.alignleft") }
