@@ -87,11 +87,25 @@ struct ChunkThumb: View {
             }
         }
         .frame(width: 64, height: 42)
-        .task(id: "\(path)|\(locator)") {
+        // kind is part of the id because load() branches on it: a path+locator whose kind changed
+        // otherwise kept serving the previous kind's render.
+        .task(id: "\(path)|\(kind)|\(locator)") {
             let (p, k, l) = (path, kind, locator)
-            image = await Task.detached(priority: .userInitiated) {
+            // This view survives an id change (the ForEach identity is the chunk INDEX, so a
+            // reindex that shifts chunk boundaries hands index N a new locator), and the write-back
+            // below is not ordered against it. Clearing first means a load shows the placeholder
+            // rather than the previous chunk's frame, matching Thumbnail.load.
+            if image != nil { image = nil }
+            let loaded = await Task.detached(priority: .userInitiated) {
                 ChunkPreview.load(path: p, kind: k, locator: l, maxSide: 64)
             }.value
+            // SwiftUI cancels the old task when the id changes, but the detached child is not
+            // cancellable and Task<NSImage?, Never>.value does not throw on cancellation, so the
+            // superseded load resumes anyway - and two loads for one cell can finish out of order
+            // (a video seek is far slower than a PDF page render), last writer wins. Guarding the
+            // write-back is what Thumbnail already does at both of its own resume points.
+            if Task.isCancelled { return }
+            image = loaded
         }
     }
 }

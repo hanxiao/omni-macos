@@ -72,7 +72,15 @@ struct Sidebar: View {
                         // Selecting the folder first makes the map visible in the new layout right
                         // away; the mode's didSet clears the layout cache and re-fits it.
                         Button(model.mapUsesUMAP ? "Use fast map layout" : "Use detailed map layout") {
+                            // Point the MODEL at this folder before flipping the mode. Writing
+                            // `selection` only reaches the model on the next update pass, through
+                            // the .onChange below, while mapUsesUMAP's didSet refits
+                            // selectedFolderForViz synchronously - so toggling first started a full
+                            // projection fit for the PREVIOUSLY selected folder, which the arriving
+                            // selection change then cancelled: wasted GPU work on the very path
+                            // that exists to keep the map out of search's way.
                             selection = .folder(url)
+                            model.selectFolderForVisualization(url)
                             model.mapUsesUMAP.toggle()
                         }
                         Divider()

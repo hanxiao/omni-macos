@@ -286,17 +286,29 @@ private struct ContentTypesTab: View {
         .onChange(of: draft) { _, newValue in schedulePreview(newValue) }
     }
 
+    /// The published preview ONLY when it describes the text currently in the editor. The two are
+    /// separate publishes: `draft` moves on every keystroke, the preview 350ms and a whole index
+    /// scan later, and previewIgnore deliberately leaves the previous result up while it recomputes.
+    /// Rendering it unconditionally meant the bar showed the OLD rule's numbers - and the old
+    /// rule's danger banner, or no banner at all - while Apply stayed enabled the whole time, so a
+    /// rule that prunes the entire index could be committed under the harmless numbers of the rule
+    /// before it. Mismatched now falls through to the existing "Calculating..." branch.
+    private var preview: AppModel.IgnorePreview? {
+        guard let p = model.ignorePreview, p.forText == draft else { return nil }
+        return p
+    }
+
     /// Live preview of what the current ignore rules match: a danger warning plus the affected-file
     /// count, so the user sees the blast radius before saving.
     @ViewBuilder private var previewBar: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if let d = model.ignorePreview?.danger {
+            if let d = preview?.danger {
                 Label(d, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption).foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
             HStack(spacing: 12) {
-                if let p = model.ignorePreview {
+                if let p = preview {
                     Text("\(p.kept.formatted()) kept")
                         .foregroundStyle(.secondary)
                     Text("\(p.removed.formatted()) removed")
