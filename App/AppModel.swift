@@ -160,7 +160,12 @@ final class AppModel {
         didSet {
             // If Quick Look is already open, follow the selection like Finder does - arrowing
             // through results updates the live preview instead of leaving it on the old file.
-            if previewURL != nil, let s = selection { previewURL = URL(fileURLWithPath: s) }
+            // Symmetric on purpose: the rule used to fire only when the selection MOVED, so every
+            // path that nils it (a new query, clearing the file query, trashing the row, pruning to
+            // the visible list) left the panel previewing a file that is no longer in the list -
+            // and left previewURL non-nil, which re-opened the panel by itself the next time a
+            // presenter mounted. Following the selection to nil closes it instead, in one place.
+            if previewURL != nil { previewURL = selection.map { URL(fileURLWithPath: $0) } }
         }
     }
     /// The full multi-selection (result paths). `selection` is the active item within it; the set
@@ -1082,6 +1087,20 @@ final class AppModel {
         case .name: results = above.sorted { ($0.path as NSString).lastPathComponent.localizedCaseInsensitiveCompare(($1.path as NSString).lastPathComponent) == .orderedAscending }
         case .dateModified: results = above.sorted { $0.modified > $1.modified }
         }
+        // Prune the selection to what is actually rendered, HERE, where `results` is derived, rather
+        // than only where a search settles. The visible set shrinks from several publishes that are
+        // not a search: raising the relevance threshold from the filter menu or a `score:` qualifier
+        // (minScore's didSet calls recomputeResults directly, with no search and no selection
+        // bookkeeping), a sort change, a trashed row, an emptied box. A selection that survives its
+        // own row leaves the File menu, Space, Return and Move to Trash acting on a file the user
+        // cannot see, and moveSelection's index lookup fails and jumps back to result 0.
+        guard !selectedPaths.isEmpty || selection != nil || selectionAnchor != nil else { return }
+        let live = Set(results.map(\.path))
+        // The active item hands off to a surviving member of the selection, exactly as moveToTrash
+        // has always done - with a single selected row that set is now empty, so it clears.
+        if !selectedPaths.isSubset(of: live) { selectedPaths.formIntersection(live) }
+        if let s = selection, !live.contains(s) { selection = selectedPaths.first }
+        if let a = selectionAnchor, !live.contains(a) { selectionAnchor = nil }
     }
 
     /// True while a non-empty query's results are not yet ready (debouncing or searching). The UI
@@ -1092,15 +1111,36 @@ final class AppModel {
         // With instant search OFF, typed-but-unsubmitted text is a deliberate rest state, not a
         // pending search - without this the empty-state spinner would spin forever.
         guard instantSearchEnabled || searching else { return false }
-        return !q.isEmpty && (searching || resolvedQuery != q)
+        // A standalone tag browse ("tag:beard" with no text) is a query search() explicitly
+        // supports, but its semantic text is empty by construction, so keying on `q` alone
+        // reported "not resolving" for the whole run: no spinner, and on an empty result the pane
+        // fell through to the no-query branch, which with a folder selected replaces an ACTIVE
+        // search with the folder map. Its settled token is the raw box string, not `q`.
+        if q.isEmpty {
+            guard !filterTags.isEmpty || !filterTagsExclude.isEmpty else { return false }
+            return searching || resolvedQuery != rawQuery
+        }
+        return searching || resolvedQuery != q
     }
 
     /// Re-run the visible query after background index changes (a pass, a reconcile, a retag
     /// batch). Gated so instant-search-OFF never embeds a half-typed, never-submitted query:
-    /// refresh only what the user actually searched (query == resolvedQuery) or when instant
-    /// search would have searched it anyway.
+    /// refresh only what the user actually searched or what instant search would have searched
+    /// anyway.
     private func refreshSearchAfterBackgroundChange() {
-        guard !query.isEmpty, instantSearchEnabled || query == resolvedQuery else { return }
+        // `query` is only the active query in ONE of the three modes search() supports: a file
+        // query puts its subject in `fileQuery` and forces `query` to "", and a standalone tag
+        // browse has an empty `query` by construction. Keying the guard on `query` alone therefore
+        // dropped the refresh for both, and a find-similar or `tag:` result set sat frozen through
+        // indexing, reconciles and retag batches - never picking up new files, never losing deleted
+        // ones - while a text query on the same screen refreshed every pass.
+        guard fileQuery != nil || !query.isEmpty || !filterTags.isEmpty || !filterTagsExclude.isEmpty else { return }
+        // The instant-search rest state applies to what was TYPED. The token the displayed results
+        // carry is `query` for a text search and the raw box string for a tag-only browse; a file
+        // query is always explicit, so it refreshes either way.
+        if fileQuery == nil, !instantSearchEnabled {
+            guard (query.isEmpty ? rawQuery : query) == resolvedQuery else { return }
+        }
         scheduleSearch()
     }
 
@@ -1170,6 +1210,13 @@ final class AppModel {
         var removed: Int
         var samples: [String]   // a handful of currently-indexed paths the edit would exclude
         var danger: String?     // set when the edit looks destructive (removes most of the index / a whole root)
+        /// The editor text this was computed for. The preview and the draft it describes are
+        /// published by different events - the draft on every keystroke, this 350ms and a full
+        /// index scan later - and a recompute deliberately leaves the previous result on screen,
+        /// so without a correlation key the bar reads as the blast radius of text that is no
+        /// longer in the editor. The sequence token solves the other half (a late result winning
+        /// over a newer one); it cannot tell the caller WHICH text the displayed numbers describe.
+        var forText: String
     }
     private(set) var ignorePreview: IgnorePreview?
     private var ignorePreviewSeq = 0
@@ -1196,7 +1243,7 @@ final class AppModel {
                 } else { kept += 1 }
             }
             let danger = Self.ignoreDanger(removed: removed, total: kept + removed, roots: rootPaths, candidate: candidate)
-            let preview = IgnorePreview(kept: kept, removed: removed, samples: samples.sorted(), danger: danger)
+            let preview = IgnorePreview(kept: kept, removed: removed, samples: samples.sorted(), danger: danger, forText: text)
             await MainActor.run {
                 guard seq == self.ignorePreviewSeq else { return }   // a newer edit superseded this
                 self.ignorePreview = preview
@@ -1320,6 +1367,7 @@ final class AppModel {
     /// Entry point for the Content tab toggle. Turning a kind OFF while it has indexed files asks
     /// first (purge vs keep); turning ON applies immediately and indexes the newly included files.
     func toggleKind(_ k: FileKind, on: Bool) async {
+        kindToggleSeq += 1
         if on { applyKind(k, on: true, purge: false); return }
         // Count this kind's indexed files OFF the main actor: fileCount(kind:) is a queue.sync linear
         // scan over the whole in-memory row set, which would stall the UI on a large index.
@@ -1327,16 +1375,28 @@ final class AppModel {
         // count - and the purge below - must cover both kinds.
         let store = self.store
         let kinds = k == .text ? [k.rawValue, FileKind.scan.rawValue] : [k.rawValue]
+        let seq = kindToggleSeq
         let count = await Task.detached { store?.fileCount(kinds: kinds) ?? 0 }.value
+        // The count runs on the store's contended serial queue, and the row keeps rendering ON for
+        // its whole duration (enabledKinds is untouched until applyKind runs), which invites a
+        // second tap. Publishing pendingDisable unconditionally on resume then raised a "stop
+        // indexing images?" dialog for a kind the user had just switched back ON, and answering it
+        // purged every row of an enabled kind. A later toggle - in either direction - wins.
+        guard seq == kindToggleSeq else { return }
         if count > 0 { pendingDisable = PendingDisable(kind: k, count: count) }   // ask; dialog calls applyKind
         else { applyKind(k, on: false, purge: false) }
     }
+
+    /// Bumped by every kind toggle and every commit, so a count that lands after the user changed
+    /// their mind is dropped instead of resurrecting a decision they reversed.
+    private var kindToggleSeq = 0
 
     private var modalityReloadTask: Task<Void, Never>?
 
     /// Commit a modality change: update the set, optionally purge its embeddings, reload the engine
     /// only when the tower requirement changed (to free/load VRAM), and reindex when turning one on.
     func applyKind(_ k: FileKind, on: Bool, purge: Bool) {
+        kindToggleSeq += 1   // a commit settles the question: an in-flight count must not reopen it
         pendingDisable = nil
         let oldTowers = enabledKindTowers
         settings.set(k, on)
@@ -1471,8 +1531,20 @@ final class AppModel {
         rawQuery = raw
         suggestionsAllowed = false   // programmatic box write by default; handleQueryEdit re-arms it for real typing
         if raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { literalQuery = false }
+        // minScore and sortOrder are CLIENT-SIDE post-filters whose only publish path is
+        // recomputeResults, reached through their didSets - which the suppression below turns off.
+        // The suppression is right for the re-search dimensions (one search instead of eight), but
+        // it left the derived list to be repaired by the FOLLOWING search's rawResults, a different
+        // signal that does not always come: with instant search off, editing the qualifiers of a
+        // non-empty box changes these two in the model and schedules no search at all, so deleting
+        // `score:70%` cleared the chip while the list kept showing the 3 rows that passed the old
+        // threshold, under a footer offering the 57 it was still hiding.
+        let priorMinScore = minScore, priorSortOrder = sortOrder
         applyingParsedQuery = true
-        defer { applyingParsedQuery = false }
+        defer {
+            applyingParsedQuery = false
+            if minScore != priorMinScore || sortOrder != priorSortOrder { recomputeResults() }
+        }
 
         // The box string is the SINGLE source of truth for filters: reset to a clean slate every time,
         // then set exactly what the string names. (No menu-vs-box ownership - a menu change rewrites
@@ -2207,23 +2279,34 @@ final class AppModel {
 
     // MARK: - Search
 
-    /// A query is active if there's typed text OR a file subject.
-    var hasQuery: Bool { fileQuery != nil || !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    /// A query is active if there's typed text, a file subject, OR a standalone tag browse. The tag
+    /// dimension counts because search() treats it as a query in its own right (`tag:beard` with no
+    /// text lists every match); without it an active, empty tag search read as "no query at all",
+    /// which suppressed the spinner and, with a folder selected, handed the pane to the folder map.
+    var hasQuery: Bool {
+        fileQuery != nil || !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !filterTags.isEmpty || !filterTagsExclude.isEmpty
+    }
     /// Stable resolvedQuery token for a file subject (distinct from any typed text).
     private func fileToken(_ url: URL) -> String { "\u{0000}file:\(url.path)" }
 
     /// Use a file as the query (any supported modality). `similar` = doc-vs-doc "find similar".
     func setFileQuery(_ url: URL, similar: Bool = false, fromHistory: Bool = false, transient: Bool = false) {
+        // Both guards clear rather than stamp: a file token published with no fileQuery behind it
+        // claims the displayed (empty) results belong to a query that was never adopted, so
+        // isResolving compared that token against the still-present typed text, and a later,
+        // successful retry of the SAME file settled onto the token already there - read as a
+        // refresh, not a new query, so it kept the old selection and recorded no history stop.
         if !FileManager.default.isReadableFile(atPath: url.path) {
             queryError = FileManager.default.fileExists(atPath: url.path)
                 ? "\(url.lastPathComponent) can't be read (permission denied)."
                 : "\(url.lastPathComponent) no longer exists."
-            fileQuery = nil; rawResults = []; resolvedQuery = fileToken(url)
+            fileQuery = nil; rawResults = []; resolvedQuery = ""
             return
         }
         guard let kind = FileExtractor.kind(for: url) else {
             queryError = "\(url.lastPathComponent) isn't a searchable file type."
-            fileQuery = nil; rawResults = []; resolvedQuery = fileToken(url)
+            fileQuery = nil; rawResults = []; resolvedQuery = ""
             return
         }
         query = ""; rawQuery = ""        // the text field empties; the chip represents the query
@@ -2247,6 +2330,12 @@ final class AppModel {
     func clearFileQuery() {
         fileQuery = nil; queryError = nil
         rawResults = []; resolvedQuery = ""; selection = nil; selectedPaths = []; selectionAnchor = nil
+        // The other exit from a file query - typing the box empty - refits the map here, and
+        // starting the file query is what cancelled the fit in the first place (search() cancels
+        // it AFTER selectFolderForVisualization has already emptied folderProjection). Clearing via
+        // the chip's X skipped this, so the map came straight back with an empty projection and
+        // showed "No files to map" for a fully indexed folder until it was reselected.
+        refitFolderVizIfNeeded()
     }
 
     /// Run a text search programmatically - a dragged or pasted text string. Mirrors a typed query:
@@ -2335,6 +2424,13 @@ final class AppModel {
         projectionTask?.cancel(); projectionTask = nil
         selectedFolderForViz = url
         folderProjection = []; folderKNN = []; folderKNNk = 0; folderProjectionFitting = false
+        // Announce the emptying on the same signal the view rebuilds its point cloud from. A real
+        // folder switch is covered by selectedFolderForViz above, but a refit of the SAME folder
+        // (the PCA/UMAP toggle, a deferred post-index refit) changes neither the folder nor the
+        // generation, so nothing the view watches published and it kept drawing the previous
+        // layout's dots over a projection that is now empty: hover and click hit-test against
+        // folderProjection and silently did nothing for the length of the fit.
+        projectionGeneration &+= 1
         guard let url, let engine, let store else { return }
         // Deliberately does NOT clear the query or filters: sidebar selection must never destroy
         // typed search state (no native sidebar does). The map surfaces via precedence the moment
@@ -2474,8 +2570,12 @@ final class AppModel {
             selection = nil; selectedPaths = []; selectionAnchor = nil
         } else {
             // A live refresh of the same query keeps the selection, minus any rows that vanished.
-            if let sel = selection, !hits.contains(where: { $0.path == sel }) { selection = nil }
-            let live = Set(hits.map { $0.path })
+            // Tested against `results`, the collection the list actually renders, not the raw store
+            // output: `results` drops every hit under minScore, so with a relevance threshold set a
+            // path can be in `hits` and absent from the list. rawResults' didSet has already
+            // recomputed `results` above, so it is current here.
+            if let sel = selection, !results.contains(where: { $0.path == sel }) { selection = nil }
+            let live = Set(results.map { $0.path })
             selectedPaths.formIntersection(live)
             if let a = selectionAnchor, !live.contains(a) { selectionAnchor = nil }
         }
@@ -2485,7 +2585,12 @@ final class AppModel {
         // record a stop, which branches the forward trail. Matching on searchToken (not a bare flag) is
         // what makes a new search started mid-navigation behave correctly instead of corrupting the trail.
         if let nt = navApplyingToken, nt == searchToken {
-            if let sel = pendingNavSelection, hits.contains(where: { $0.path == sel }) {
+            // `results`, not `hits`, for the same reason as above, and so this copy of the rule
+            // agrees with the one in applyNavEntry: restoring a stop whose remembered file scores
+            // below the threshold used to assign a selection that is not in the rendered list, so
+            // no row highlighted, scrollTo was a silent no-op on an id the ForEach does not carry,
+            // and Return / Move to Trash then acted on an invisible file.
+            if let sel = pendingNavSelection, results.contains(where: { $0.path == sel }) {
                 selection = sel; selectedPaths = [sel]; selectionAnchor = sel
             }
             pendingNavSelection = nil
