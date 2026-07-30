@@ -815,8 +815,8 @@ private struct WindowTitleHider: NSViewRepresentable {
     /// - pre-Tahoe: caps the search field at Tahoe's ~300pt and installs the flexible-space
     ///   width constraint on the chevrons item so the trailing cluster hugs the right edge.
     /// - all systems: keeps the search-by-file button installed INSIDE the search field's
-    ///   trailing edge (magnifier left, upload right), docking left of the clear (x) button
-    ///   whenever the field has text, and shrinks the stock magnifier to match.
+    ///   trailing edge (magnifier left, upload right), hidden while the field has text so it
+    ///   cannot be drawn over by a long query, and shrinks the stock magnifier to match.
     /// All work runs in a coalesced main.async pass - never synchronously inside a window or
     /// toolbar notification, where mutations mid-SwiftUI-commit are unsafe.
     final class TunerView: NSView {
@@ -866,9 +866,10 @@ private struct WindowTitleHider: NSViewRepresentable {
         }
 
         /// The upload button lives as a subview of the NSSearchField, frame-pinned to the pill's
-        /// trailing edge; when the field has text it steps left so the system clear (x) button
-        /// stays fully clickable. Defensive by construction: if any expectation fails the button
-        /// simply does not appear - the field itself is never altered.
+        /// trailing edge, and hidden entirely while the field has text - the text run owns that
+        /// space and a long query would otherwise be drawn over the glyph. Defensive by
+        /// construction: if any expectation fails the button simply does not appear - the field
+        /// itself is never altered.
         private func installAccessory(in field: NSSearchField) {
             let side: CGFloat = 20   // hit target + hover-highlight capsule; the glyph inside is 11pt
             let hasText = !field.stringValue.isEmpty
@@ -877,9 +878,16 @@ private struct WindowTitleHider: NSViewRepresentable {
             // bounds.width parked the button visually outside the field.
             let cancelRect = (field.cell as? NSSearchFieldCell)?.cancelButtonRect(forBounds: field.bounds)
                 ?? NSRect(x: field.bounds.width - 24, y: 0, width: 16, height: field.bounds.height)
-            let x = hasText ? cancelRect.minX - side - 2 : cancelRect.maxX - side
+            let x = cancelRect.maxX - side
             let y = (field.bounds.height - side) / 2
+            // Hidden as soon as there is text, which is why nothing needs to reserve room in the
+            // text run. SwiftUI lays that run across the whole pill and reserves a trailing gutter
+            // for its own clear (x) button only; a second button parked inside the run got drawn
+            // over by long queries. Hiding it removes the collision by construction AND gives the
+            // query the full width. Nothing is lost: this action starts a file query, so invoking
+            // it mid-text would discard the typed query anyway, and it stays on Shift-Cmd-O.
             if let b = field.viewWithTag(Self.accessoryTag) as? NSButton {
+                b.isHidden = hasText
                 let want = NSRect(x: x, y: y, width: side, height: side)
                 if b.frame != want { b.frame = want }
                 return
@@ -917,6 +925,7 @@ private struct WindowTitleHider: NSViewRepresentable {
             b.toolTip = "Search by a file (image, audio, video, or text)  \u{21E7}\u{2318}O"
             b.setAccessibilityLabel("Search by a file")
             b.autoresizingMask = [.minXMargin]   // stay pinned to the trailing edge on resize
+            b.isHidden = hasText
             field.addSubview(b)
         }
 
