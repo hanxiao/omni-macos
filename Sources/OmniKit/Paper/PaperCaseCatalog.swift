@@ -237,18 +237,25 @@ public enum PaperCaseCatalog {
             PaperParameter("throughput_window_s", .double(5), unit: .seconds, scaling: .scaled(minimum: 1)),
             PaperParameter("idle_queries", .int(12), scaling: .scaled(minimum: 2)),
             PaperParameter("warm_queries", .int(12), scaling: .scaled(minimum: 2)),
-            PaperParameter("cold_queries", .int(6), scaling: .scaled(minimum: 2)),
-            PaperParameter("cold_keystroke_queries", .int(6), scaling: .scaled(minimum: 2)),
+            // The cold pair is what Table 2 is made of, and it is the one measurement whose own
+            // control (a no-keystroke pair, whose arms CANNOT differ) has to read near zero for the
+            // armed pair to mean anything. At 6 queries over 2 runs a single outlier moved that
+            // control by hundreds of percent and the cross-machine row had to be withdrawn. These
+            // counts and runs_per_arm below are sized so the control is tight enough to publish.
+            PaperParameter("cold_queries", .int(12), scaling: .scaled(minimum: 2)),
+            PaperParameter("cold_keystroke_queries", .int(12), scaling: .scaled(minimum: 2)),
             // The delays ARE the measurement (they set which cache state each query hits) and are
             // identical on every machine, so they never scale.
             PaperParameter("warm_delay_s", .double(0.4), unit: .seconds),
             PaperParameter("cold_delay_s", .double(2.6), unit: .seconds),
-            PaperParameter("runs_per_arm", .int(2), scaling: .scaled(minimum: 1)),
+            PaperParameter("runs_per_arm", .int(4), scaling: .scaled(minimum: 1)),
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p06_shape, title: "Search under indexing",
             deliverable: "Table 2 (tab:shape) all rows, plus the max and throughput columns",
-            budgetSeconds: 400,
+            // Doubled with the query counts and runs above: the case is the suite's longest, and the
+            // alternative to spending the time is a row that cannot be published.
+            budgetSeconds: 820,
             arms: [PaperArm("unshaped", PaperLeverSet(adaptiveBatch: false)),
                    PaperArm("shaped", PaperLeverSet(adaptiveBatch: true))],
             params: p, arithmeticPeakMB: storePeakMB(rows: rows, quantized: false),
