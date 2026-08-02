@@ -25,15 +25,22 @@ final class SearchUnderIndexBG: @unchecked Sendable {
     private let store: VectorStore
     private let flushBatches: [[String]]
     private let l = NSLock()
-    private var _stop = false, _finished = false, _flushes = 0, row: Int
+    private var _stop = false, _finished = false, _paused = false, _flushes = 0, row: Int
     init(engine: OmniEngine, store: VectorStore, flushBatches: [[String]], startRow: Int) {
         self.engine = engine; self.store = store; self.flushBatches = flushBatches; self.row = startRow
     }
     var finished: Bool { l.lock(); defer { l.unlock() }; return _finished }
     var flushes: Int { l.lock(); defer { l.unlock() }; return _flushes }
     func stop() { l.lock(); _stop = true; l.unlock() }
+    /// Query-triggered pause: the simpler alternative to shaping. The indexer stops entirely while
+    /// the user is interacting, so a search never queues behind a flush at all. What it costs is
+    /// indexing throughput for as long as the pause is held, which is what the keystroke-phase
+    /// flush count below measures.
+    func pause() { l.lock(); _paused = true; l.unlock() }
+    func resume() { l.lock(); _paused = false; l.unlock() }
     func run() {
         while !({ l.lock(); defer { l.unlock() }; return _stop }()) {
+            if ({ l.lock(); defer { l.unlock() }; return _paused }()) { usleep(2_000); continue }
             let vecs = engine.embedTextBatches(flushBatches, as: .passage)
             let n = vecs.reduce(0) { $0 + $1.count }
             l.lock(); var idx = row; row += n; l.unlock()
@@ -1403,17 +1410,27 @@ if args.count >= 3 && args[1] == "searchunderindex" {
     //    so the indexer is already in per-batch mode when the search's embed takes the gate. Isolates
     //    fix B (run with OMNI_INDEX_GATE_BATCHES=999 to remove the gate-window cap and see B alone).
     var coldSig: [Double] = []
+    // OMNI_PAUSE_ON_QUERY=1 replaces shaping with the simpler design: stop the indexer outright for
+    // the duration of the interaction. Both the latency and the throughput it costs are reported.
+    let pauseOnQuery = ProcessInfo.processInfo.environment["OMNI_PAUSE_ON_QUERY"] == "1"
+    let sigFlush0 = bg.flushes
+    let sigT0 = Date()
     for i in 0 ..< 8 {
+        if pauseOnQuery { bg.pause() }
         engine.noteInteractive(); usleep(140_000)
         engine.noteInteractive(); usleep(140_000)   // a 2-keystroke "type" burst (~0.28s)
         usleep(180_000)                              // the search debounce
         coldSig.append(sample(query(700 + i)))
+        if pauseOnQuery { bg.resume() }
         usleep(2_600_000)
     }
+    let sigRate = Double(bg.flushes - sigFlush0) / max(0.001, -sigT0.timeIntervalSinceNow)
 
     bg.stop()
     while !bg.finished { usleep(2_000) }
     let env = ProcessInfo.processInfo.environment
+    print(String(format: "  interactive-phase index throughput = %.2f flushes/s%@", sigRate,
+                 pauseOnQuery ? "  (indexer paused while typing)" : ""))
     let adaptiveOn = env["OMNI_ADAPTIVE_BATCH"] != "0"
     let foldOn = env["OMNI_PROACTIVE_FOLD"] != "0"
     let lowEnd = env["OMNI_FORCE_LOWEND"] != nil
