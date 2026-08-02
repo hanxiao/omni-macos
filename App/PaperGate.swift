@@ -49,7 +49,15 @@ struct PaperGated<Content: View>: View {
     @State private var monitor: Any?
 
     var body: some View {
-        Group { if visible { content() } }
+        // The hidden branch renders a zero-size `Color.clear` rather than nothing. `Group { if
+        // false { } }` collapses to an EmptyView, and SwiftUI skips lifecycle modifiers on one -
+        // so `onAppear` never ran, the flags monitor was never installed, and holding Option could
+        // not reveal anything. That broke the gate in EXACTLY the case it exists for: closed, on a
+        // borrowed Mac, waiting for the modifier. It looked like it worked only while the
+        // `omni.paper` default was set, which makes the first branch render and fires onAppear.
+        Group {
+            if visible { content() } else { Color.clear.frame(width: 0, height: 0) }
+        }
             .onAppear {
                 visible = PaperGate.isEnabled
                 // SwiftUI does not guarantee balanced appear/disappear: a second onAppear would
