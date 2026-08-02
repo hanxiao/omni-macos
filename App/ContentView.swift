@@ -50,9 +50,15 @@ struct ContentView: View {
         }
         // Spotlight-style: put the caret in the search field as soon as the app can search.
         .onChange(of: showsSearch, initial: true) { _, shows in if shows { focusSearchField() } }
-        // Profiling progress as a native sheet on the main window (not a stray floating panel).
-        .sheet(isPresented: Binding(get: { model.isProfilingRunning }, set: { _ in })) {
-            ProfilingSheet()
+        // Benchmark progress and the paper result as ONE native sheet on the main window (not a
+        // stray floating panel). A single route rather than two `.sheet` modifiers on the same
+        // view: stacked sheets race each other on presentation, and the paper run has to hand the
+        // progress sheet over to the result sheet.
+        .sheet(item: Binding(get: { model.activeSheet }, set: { model.activeSheet = $0 })) { route in
+            switch route {
+            case .progress: ProfilingSheet()
+            case .paperResult: PaperResultSheet()
+            }
         }
     }
 

@@ -22,7 +22,9 @@ import SQLite3
 /// failing the store.
 final class LexicalIndex: @unchecked Sendable {
     /// OMNI_LEXICAL=0 disables the channel entirely; search then behaves exactly as before it existed.
-    static let enabled = ProcessInfo.processInfo.environment["OMNI_LEXICAL"] != "0"
+    /// PAPER LEVER (var, not let): the paper suite pins it OFF for every vector case - the filename
+    /// channel is a corpus statistic, and leaving it on would perturb the search timings it measures.
+    nonisolated(unsafe) static var enabled = ProcessInfo.processInfo.environment["OMNI_LEXICAL"] != "0"
 
     private let url: URL
     private let lock = NSLock()

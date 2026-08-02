@@ -92,4 +92,36 @@ public struct IndexSettings: Sendable, Equatable {
         s.kindOrder = [.image, .audio, .video, .text]
         return s
     }()
+
+    /// Fixed workload for the hidden paper benchmark. NOT `.profiling`: that one enables all four
+    /// modalities, and the paper's index-pass case measures the text path over a synthetic text
+    /// corpus - a media file appearing in the tree would change both the token count and the batch
+    /// composition. Text only, no minimums, tags off (the tagger may or may not be resident, and a
+    /// tagged image costs an extra matmul), noise dirs pruned so the crawl matches the app's.
+    /// Frozen on purpose: changing any of these breaks comparability with every export already
+    /// collected, exactly as for `.profiling`.
+    public static let paper: IndexSettings = {
+        var s = IndexSettings(enabledKinds: [.text])
+        s.maxCharsPerChunk = 1800
+        s.minImageDimension = 0; s.minAudioSeconds = 0; s.minVideoSeconds = 0; s.minTextChars = 0
+        s.disabledExtensions = []
+        s.imageTags = false
+        s.skipDataless = true
+        s.ignore = OmniIgnore(text: FileCrawler.skipDirNames.map { "\($0)/" }.joined(separator: "\n"))
+        s.kindOrder = [.text]
+        return s
+    }()
+
+    /// The media variant of `.paper`, used only by the optional tagging-overhead case. Images only;
+    /// `imageTags` is the arm variable and is set by the case, not here.
+    public static let paperMedia: IndexSettings = {
+        var s = IndexSettings(enabledKinds: [.image])
+        s.maxImageDimension = 1568
+        s.minImageDimension = 0; s.minAudioSeconds = 0; s.minVideoSeconds = 0; s.minTextChars = 0
+        s.disabledExtensions = []
+        s.skipDataless = true
+        s.ignore = OmniIgnore(text: FileCrawler.skipDirNames.map { "\($0)/" }.joined(separator: "\n"))
+        s.kindOrder = [.image]
+        return s
+    }()
 }

@@ -70,8 +70,11 @@ struct OmniApp: App {
                 // Benchmarks this Mac on a fixed 5000-file dataset; results (hardware + timing only)
                 // can be shared to hanxiao.io/omni.
                 // No ellipsis: the command runs immediately, with no further input (HIG).
+                // No "Paper" item here on purpose: a hidden developer-only run does not belong in
+                // the App menu, where it is one slip away from a user starting a 25-minute
+                // benchmark. Its only entry point is the gated control in Settings > Performance.
                 Button("Run benchmark") { Task { await model.runProfiling() } }
-                    .disabled(model.isProfilingRunning || !model.canIndex)
+                    .disabled(model.isProfilingRunning || model.isPaperRunning || !model.canIndex)
             }
             // Cmd-V/C/A are routed: when a text field is being edited they do the standard text
             // paste/copy/select-all; otherwise they act on the search results - Cmd-V searches by a

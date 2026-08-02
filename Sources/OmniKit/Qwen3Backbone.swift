@@ -175,7 +175,8 @@ final class Qwen3Backbone: @unchecked Sendable {
         return l2RowsGraph(h, count: lengths.count)
     }
 
-    static let tailRowsEnabled = ProcessInfo.processInfo.environment["OMNI_TAIL_ROWS"] != "0"
+    // PAPER LEVER: var so the paper suite can A/B tail-row narrowing in-process (see PaperLevers).
+    nonisolated(unsafe) static var tailRowsEnabled = ProcessInfo.processInfo.environment["OMNI_TAIL_ROWS"] != "0"
 
     /// SAFE TEXT LEVER (b): run all `numLayers` blocks through one compiled kernel.
     ///

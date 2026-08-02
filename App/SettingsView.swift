@@ -339,7 +339,11 @@ private struct ContentTypesTab: View {
                 }
                 .keyboardShortcut("s", modifiers: .command)
                 .buttonStyle(.borderedProminent)
-                .disabled(!dirty)
+                // isPaperRunning: applying rules deletes rows and VACUUMs the user's store from a
+                // detached task, which is a write to that store while the suite holds process-wide
+                // levers (vacuumSmallCache among them) - and it competes with every measurement.
+                // The draft is kept, so Apply works the moment the run ends.
+                .disabled(!dirty || model.isPaperRunning)
             }
             .font(.callout)
         }
@@ -426,6 +430,8 @@ private struct IgnoreEditor: NSViewRepresentable {
 
 private struct PerformanceTab: View {
     @Environment(AppModel.self) private var model: AppModel
+    /// Only for the hidden paper run: its sheet lives on the main window, which may be closed.
+    @Environment(\.openWindow) private var openWindow
     private var memoryCeiling: Double { max(8, min(model.physicalMemoryGB.rounded(), 128)) }
     var body: some View {
         Form {
@@ -497,18 +503,48 @@ private struct PerformanceTab: View {
                         Text("\(Int(memoryCeiling))").font(.caption2).foregroundStyle(.tertiary)
                     }
                     .labelsHidden()
+                    // Locked while the paper run holds the cap. Settings is its own window, so this
+                    // pane stays live behind the run's sheet: moving the slider would persist the
+                    // new value and apply it, and the run's restore would then put the OLD cap back
+                    // on MLX - leaving the effective cap and the one shown here disagreeing until
+                    // relaunch. It also silently corrupts the run, which pins the cap as a class.
+                    .disabled(model.isPaperRunning)
                 }
             } header: {
                 Text("Memory")
             } footer: {
-                Text("Caps memory for the model and the folder map. Keep it above ~4 GB; 0 means unlimited.")
+                Text(model.isPaperRunning
+                     ? "Locked while the paper benchmark runs: it pins the cap and restores yours when it finishes."
+                     : "Caps memory for the model and the folder map. Keep it above ~4 GB; 0 means unlimited.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
                 LabeledContent("Benchmark This Mac") {
-                    Button("Run benchmark") { Task { await model.runProfiling() } }
-                        .controlSize(.small)
-                        .disabled(model.isProfilingRunning || !model.canIndex)
+                    HStack(spacing: 8) {
+                        Button("Run benchmark") { Task { await model.runProfiling() } }
+                            .controlSize(.small)
+                            .disabled(model.isProfilingRunning || model.isPaperRunning || !model.canIndex)
+                        // Hidden developer control (PaperGate: OMNI_PAPER=1, the omni.paper default,
+                        // or Option held). Absent rather than disabled when the gate is closed.
+                        // Gated on phase == .ready, NOT canIndex: the paper suite measures a
+                        // self-contained synthetic workload and is exactly as valid on a machine
+                        // where the user has never picked a folder.
+                        PaperGated {
+                            // Opens the main window FIRST: the progress sheet - and the only Cancel
+                            // button a 25-minute run has - is presented by ContentView, and the main
+                            // window is closable while Settings stays open. Started from there with
+                            // it closed, the run had no progress, no cancel and no result sheet, and
+                            // indexing stayed suppressed until it finished on its own.
+                            Button("Paper") {
+                                openWindow(id: "main")
+                                Task { await model.runPaperBenchmark() }
+                            }
+                            .controlSize(.small)
+                            .disabled(model.isPaperRunning || model.isProfilingRunning || model.phase != .ready)
+                            .help("Paper measurement suite - up to 25 minutes, synthetic data, "
+                                  + "the real index is untouched")
+                        }
+                    }
                 }
                 Toggle(isOn: Binding(get: { model.shareProfilingResults }, set: { model.shareProfilingResults = $0 })) {
                     Text("Share results")
@@ -601,7 +637,11 @@ private struct IndexTab: View {
                             }
                             HStack {
                                 if let v = model.indexBuiltVariant {
-                                    Button("Switch to \(v.title)") { model.selectVariant(v) }.disabled(model.isDownloading)
+                                    // isPaperRunning: a variant switch tears the engine down and
+                                    // rebuilds it, and the paper run is holding that exact engine
+                                    // on a detached thread for up to 25 minutes.
+                                    Button("Switch to \(v.title)") { model.selectVariant(v) }
+                                        .disabled(model.isDownloading || model.isPaperRunning)
                                 }
                                 Button("Reindex") { model.startIndexing() }
                                     .disabled(model.isIndexing || !model.canIndex)
@@ -637,6 +677,10 @@ private struct IndexTab: View {
                         Spacer()
                         Button("Change\u{2026}") { pickDatabase() }
                             .help("Where the search index is stored. Changing the folder loads the index from there.")
+                            // isPaperRunning: the run captured the CURRENT index paths as the ones
+                            // its filesystem must refuse to open, and a swap mid-run would move the
+                            // index out from under that list.
+                            .disabled(model.isPaperRunning)
                         Button("Reveal in Finder") {
                             NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.dbPath)])
                         }
@@ -657,7 +701,9 @@ private struct IndexTab: View {
                             .tag(v)
                     }
                 }
-                .disabled(model.isDownloading || model.isIndexing)
+                // isPaperRunning for the same reason as the banner's switch button: the run holds
+                // the loaded engine, and selectVariant replaces it.
+                .disabled(model.isDownloading || model.isIndexing || model.isPaperRunning)
 
                 if model.isDownloading {
                     VStack(alignment: .leading, spacing: 4) {

@@ -532,9 +532,16 @@ public final class VectorStore: @unchecked Sendable {
     private var quantBase: (wq: MLXArray, scales: MLXArray, biases: MLXArray?)? = nil
     private var quantBits = 0          // active bits of quantBase (0 = full bf16 base)
     private static let quantGroup = 64
+    /// PAPER LEVER: forces the base representation regardless of the auto policy. The auto rule below
+    /// is a function of the memory CAP, so at CAP-3 the bf16/int4 boundary sits at 500k rows and at
+    /// CAP-6 at 1M - the same row count would silently be measured in a different representation on
+    /// an 8 GB and a 16 GB machine, making the two Table-3 rows incomparable. The paper's scan case
+    /// forces both arms explicitly instead. nil = ship behaviour.
+    nonisolated(unsafe) static var quantBaseOverride: Int? = nil
     /// Policy: OMNI_QUANT_BASE forces (0=off, 4, 8); unset = auto-on at 4 bits when the full base
     /// would exceed a quarter of the user's memory cap (Settings > Performance).
     static func quantBitsFor(baseBytes: Int) -> Int {
+        if let v = quantBaseOverride { return v }
         if let s = ProcessInfo.processInfo.environment["OMNI_QUANT_BASE"], let v = Int(s) { return v }
         return baseBytes > OmniMemoryBudget.capBytes / 4 ? 4 : 0
     }
@@ -562,7 +569,8 @@ public final class VectorStore: @unchecked Sendable {
     private var lastSearchAt = Date.distantPast
     private static let searchActiveWindow: TimeInterval = 2.0
     private func searchRecentlyActiveLocked() -> Bool { -lastSearchAt.timeIntervalSinceNow < Self.searchActiveWindow }
-    static let proactiveFold = ProcessInfo.processInfo.environment["OMNI_PROACTIVE_FOLD"] != "0"
+    /// PAPER LEVER (var, not let): see the block near cantWinGate.
+    nonisolated(unsafe) static var proactiveFold = ProcessInfo.processInfo.environment["OMNI_PROACTIVE_FOLD"] != "0"
 
     // fp32 <-> bf16 (round-to-nearest-even). Embeddings are L2-normalized and finite, so |x| <= ~1
     // and the rounding add never overflows.
@@ -1659,6 +1667,25 @@ public final class VectorStore: @unchecked Sendable {
 
     public var count: Int { queue.sync { rows.count } }
     public var fileCount: Int { queue.sync { liveFiles } }
+
+    /// Bits of the CURRENTLY resident scan matrix (0 = full bf16 base, 4/8 = quantized replica).
+    /// Stamped by the paper suite so the exported scan row says which representation it measured.
+    public var baseModeBits: Int { queue.sync { quantBits } }
+
+    /// PAPER SUITE ONLY: drop the resident scan matrix so the next search rebuilds it under the
+    /// arm's base policy, without touching a single row of data. Table 3's scan columns need both
+    /// representations over the SAME rows; rebuilding the row data per arm would spend the whole
+    /// case budget on inserts and would not even be the same measurement (the vectors would differ).
+    ///
+    /// The bits are deliberately NOT set here. `quantBaseOverride` is a process-wide lever, and
+    /// every lever mutation belongs to PaperLeverController - owner-thread check, no nesting,
+    /// restore in a defer, and a `pinned` snapshot that must stay accurate. p08's arms already
+    /// declare `quantBase` in their lever sets, so the override is the arm's value by the time a
+    /// body runs; writing it again here was a second, unowned writer on a shipping library's public
+    /// surface. Internal for the same reason: nothing outside this module may reach it.
+    func invalidateBaseForBenchmark() {
+        queue.sync { invalidateBase() }
+    }
 
     static let statVerify = ProcessInfo.processInfo.environment["OMNI_STAT_VERIFY"] == "1"
 
@@ -2938,14 +2965,18 @@ public final class VectorStore: @unchecked Sendable {
     private static let rowSidecarEnabled = ProcessInfo.processInfo.environment["OMNI_ROW_SIDECAR"] != "0"
     /// Test switch only: 0 reproduces the pre-fix stamp that outran the vector file.
     private static let sidecarCoverEnabled = ProcessInfo.processInfo.environment["OMNI_SIDECAR_COVER"] != "0"
+    // PAPER LEVERS (var, not let): the in-app paper suite A/Bs these in one process. setenv() after
+    // first touch is either a no-op or a permanent change to the live app, and spawning omni-verify
+    // is not an option (it is not in the app bundle, and a second process loads a second model).
+    // The suite mutates them only between cases/arms with no work in flight, and restores in a defer.
     /// Can't-win gate on the delta merge (OMNI_CANTWIN=0 disables, for A/B). Exact either way.
-    public static let cantWinGate = ProcessInfo.processInfo.environment["OMNI_CANTWIN"] != "0"
+    nonisolated(unsafe) public static var cantWinGate = ProcessInfo.processInfo.environment["OMNI_CANTWIN"] != "0"
     /// Split the base gemv below MLX's int32 row-offset limit (OMNI_GEMV_SLICE=0 disables, for A/B).
-    static let gemvSlice = ProcessInfo.processInfo.environment["OMNI_GEMV_SLICE"] != "0"
+    nonisolated(unsafe) static var gemvSlice = ProcessInfo.processInfo.environment["OMNI_GEMV_SLICE"] != "0"
     /// Shrink the page cache for the duration of VACUUM (OMNI_VACUUM_CACHE=0 disables, for A/B).
-    public static let vacuumSmallCache = ProcessInfo.processInfo.environment["OMNI_VACUUM_CACHE"] != "0"
+    nonisolated(unsafe) public static var vacuumSmallCache = ProcessInfo.processInfo.environment["OMNI_VACUUM_CACHE"] != "0"
     /// Fold the delta after writes go quiet (OMNI_IDLE_FOLD=0 disables, for A/B).
-    static let idleFold = ProcessInfo.processInfo.environment["OMNI_IDLE_FOLD"] != "0"
+    nonisolated(unsafe) static var idleFold = ProcessInfo.processInfo.environment["OMNI_IDLE_FOLD"] != "0"
     private var rowSidecarURL: URL { dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".rows") }
     private var vecSidecarURL: URL { dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".vecs") }
     private var lastStampedGen: Int64 = -1

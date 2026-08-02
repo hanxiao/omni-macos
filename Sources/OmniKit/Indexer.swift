@@ -192,9 +192,11 @@ public final class Indexer: @unchecked Sendable {
     private var cancelled = false
 
     // Content dedup: identical bytes never embed twice. OMNI_CONTENT_DEDUP=0 disables (A/B).
-    public static let contentDedup = ProcessInfo.processInfo.environment["OMNI_CONTENT_DEDUP"] != "0"
+    // PAPER LEVER (var, not let): the in-app paper suite A/Bs this in-process; see PaperLevers.
+    nonisolated(unsafe) public static var contentDedup = ProcessInfo.processInfo.environment["OMNI_CONTENT_DEDUP"] != "0"
     /// Chunk-level vector reuse on the live-update path (OMNI_CHUNK_CACHE=0 disables, for A/B).
-    public static let chunkCache = ProcessInfo.processInfo.environment["OMNI_CHUNK_CACHE"] != "0"
+    /// PAPER LEVER: var so Table 4's reindex-seconds columns can be measured in one process.
+    nonisolated(unsafe) public static var chunkCache = ProcessInfo.processInfo.environment["OMNI_CHUNK_CACHE"] != "0"
 
     // OMNI_NAN_DEBUG=1: dump non-finite embedding details to stderr (os.Logger from an unbundled
     // CLI never reaches `log show` on some systems, so benches need a direct channel).

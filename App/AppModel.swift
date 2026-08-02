@@ -551,7 +551,108 @@ final class AppModel {
     var profilingDetail = ""
     var profilingFraction: Double? = nil   // nil = indeterminate (download/unzip/upload)
     var profilingStartedAt: Date? = nil    // start of the indexing pass, for live elapsed/ETA
+    /// Whether the progress sheet shows the live elapsed line. Was keyed on the phase label being
+    /// the literal string "Indexing", which silently drops the timing line for every phase name the
+    /// paper run publishes - and a 25-minute sheet with no clock on it looks hung.
+    var profilingShowsTiming = false
     var lastProfilingReport: ProfilingReport?
+
+    // MARK: - Paper benchmark (hidden "Paper" button, PaperGate)
+
+    /// Deliberately not the profiling flags. The two runs must never overlap and each refuses while
+    /// the other is up; one shared flag would make that unprovable, and the paper run's progress
+    /// carries per-case state a 30-second dataset pass has no use for.
+    var isPaperRunning = false
+    var paperCancel: CancelFlag?
+    /// Phase label, shown only when there is no timing line yet ("Preparing...", "Cancelling...").
+    var paperPhase = ""
+    /// The running case and its own sub-progress: "p06 search under indexing - arm 2 of 2".
+    var paperDetail = ""
+    /// Machine condition while it runs, shown only when it is worth seeing (non-nominal thermal
+    /// state, or swap that actually grew).
+    var paperEnvLine = ""
+    /// "case 6 of 13" - the counter, next to the elapsed clock.
+    var paperCaseLine = ""
+    /// Completed budget weight over total. No ETA: case durations vary too much across machines for
+    /// a budget-derived estimate to be anything but a lie.
+    var paperFraction: Double? = nil
+    var paperStartedAt: Date? = nil
+    /// The last run's report, the text that was rendered from it, and where it was auto-saved.
+    /// Kept after the sheet closes: minutes of measurement must survive an accidental Done.
+    var lastPaperReport: PaperReport?
+    var lastPaperReportText = ""
+    var lastPaperReportURL: URL?
+    func cancelPaperRun() {
+        paperCancel?.on = true
+        paperPhase = "Cancelling\u{2026}"
+        // The elapsed clock keeps running (progress updates stop at the cancel, and a frozen sheet
+        // is what makes people force-quit mid-benchmark), so the cancel state goes where the case
+        // counter was, and the detail line says what the wait actually is: MLX work is not
+        // interruptible, so acknowledging takes one indivisible unit - a gemv, or one file's embed.
+        paperCaseLine = "cancelling"
+        paperDetail = "finishing the current step, then reporting what completed"
+    }
+    /// The loaded engine, for the paper run only. `engine` stays private - nothing outside AppModel
+    /// touches it - but the suite must reuse the ALREADY LOADED one: constructing a second would
+    /// double resident VRAM on exactly the 8 GB machine this must not wedge.
+    var paperEngine: OmniEngine? { engine }
+    /// Paths the paper run's filesystem refuses to open, in either direction (equal, parent, or
+    /// child). The index file, its containing folder (which holds every sidecar), and the live
+    /// store's own URL if the user moved the database elsewhere.
+    var paperProtectedIndexURLs: [URL] {
+        var urls: [URL] = []
+        if let index = try? Self.indexURL() { urls += [index, index.deletingLastPathComponent()] }
+        if let db = store?.dbURL { urls += [db, db.deletingLastPathComponent()] }
+        return urls
+    }
+    /// Stop / rebuild the FSEvents watcher around a paper run. The watcher is the one producer that
+    /// can start embedding work with no user action, and the suite moves process-wide levers, so a
+    /// reconcile firing mid-run would embed the user's files under a benchmark arm.
+    func stopWatcherForPaperRun() { watcher?.stop(); watcher = nil }
+    func restartWatcherForPaperRun() { restartWatcher() }
+    /// True while ANY embed pipeline owns the Indexer, not just the visible full pass. A watcher
+    /// reconcile and a tag-backfill batch hold `fsReconcileInFlight` WITHOUT ever setting
+    /// `indexState`, so a run that waited on `indexState` alone left one of them writing the USER's
+    /// store for the whole run - under the suite's process-wide levers, and with the run's own
+    /// measurements sharing the GPU with it.
+    var isIndexWorkInFlight: Bool {
+        indexState == .indexing || !activeRoots.isEmpty || fsReconcileInFlight
+    }
+    /// Re-kick everything the run's `!isPaperRunning` guards DEFERRED rather than dropped: folder
+    /// removals, a queued full pass, added-folder catch-ups, buffered FS events and the tag
+    /// backfill, in the app's own fixed priority. Called on every exit path of the run (completion,
+    /// cancel, failure, refusal) with `isPaperRunning` already false.
+    ///
+    /// Without this, only `if wasIndexing { startIndexing() }` ran, so with the index idle at the
+    /// start nothing re-drained: a file deleted during a run kept its rows until some later full
+    /// pass, which is a user-visible regression that outlives the run (measured, reproduced twice).
+    func resumeAfterPaperRun(wasIndexing: Bool) {
+        // A pass that was running when the run started is expressed as the same deferred restart
+        // the rest of the app uses, so it drains in priority order (removals first) instead of
+        // racing them.
+        if wasIndexing { restartAfterPause = true }
+        guard let store else { return }
+        drainDeferredAfterPass(store)
+        // Results shown on screen may have gone stale: every background refresh was suppressed for
+        // the duration (a search re-reads the user's store under whatever levers were pinned).
+        refreshSearchAfterBackgroundChange()
+    }
+
+    /// The one sheet the main window presents, as a route rather than two independent booleans.
+    /// Stacking a second `.sheet` on the same view is a known presentation race, and the progress
+    /// sheet has to hand over to the result sheet without both being on screen.
+    enum SheetRoute: Identifiable, Equatable {
+        case progress
+        /// Run id only: identity for the presentation, the report itself stays on the model.
+        case paperResult(String)
+        var id: String {
+            switch self {
+            case .progress: "progress"
+            case .paperResult(let runId): "paper:" + runId
+            }
+        }
+    }
+    var activeSheet: SheetRoute?
     /// Settings opt-in for uploading profiling results (mirrors ProfilingService's persisted flag).
     var shareProfilingResults: Bool = UserDefaults.standard.bool(forKey: "omni.profiling.uploadEnabled") {
         didSet { ProfilingService.setShareEnabled(shareProfilingResults) }
@@ -682,6 +783,14 @@ final class AppModel {
     }
 
     // Indexing performance settings.
+    /// Set only while `loadPerf()` is assigning, and read by `persistPerf()`.
+    ///
+    /// Every one of the eleven perf properties persists the WHOLE set from its `didSet`. Without
+    /// this flag the FIRST assignment of a load wrote the other ten back out at their in-memory
+    /// defaults, over the user's stored values, and the rest of the load then read those defaults
+    /// back - so only the first key survived a relaunch and the other ten silently reset every
+    /// launch. The load must not write.
+    private var isLoadingPerf = false
     var maxImageDimension: Int = 1568 { didSet { persistPerf() } }
     var maxVideoFrames: Int = 32 { didSet { persistPerf() } }
     /// Longest text slice (characters) embedded as one chunk.
@@ -794,6 +903,10 @@ final class AppModel {
     init() {
         Self.shared = self
         Self.sweepDroppedImageTemps()
+        // Reclaim the stores a paper run left behind if it was killed mid-run. Off the main thread:
+        // it is a $TMPDIR scan and can delete hundreds of MB. Unconditional by design - the gate
+        // being closed is exactly the case where nothing else would ever clean up.
+        DispatchQueue.global(qos: .utility).async { PaperFS.sweepAbandonedRuns() }
         loadRoots()
         loadSettings()
         loadIgnore()
@@ -1128,6 +1241,11 @@ final class AppModel {
     /// refresh only what the user actually searched or what instant search would have searched
     /// anyway.
     private func refreshSearchAfterBackgroundChange() {
+        // !isPaperRunning: a search re-reads the USER's store under whatever levers the suite has
+        // pinned, and a dirty base would be REBUILT - and its quant sidecar persisted - at the
+        // arm's forced bits, which outlives the run. resumeAfterPaperRun re-runs this once the
+        // levers are back.
+        guard !isPaperRunning else { return }
         // `query` is only the active query in ONE of the three modes search() supports: a file
         // query puts its subject in `fileQuery` and forces `query` to "", and a standalone tag
         // browse has an empty `query` by construction. Keying the guard on `query` alone therefore
@@ -1469,6 +1587,10 @@ final class AppModel {
     }
 
     private func loadPerf() {
+        // See `isLoadingPerf`. The single write at the end is what still seeds a first launch, where
+        // the maxMemoryGB default below is computed from physical RAM rather than read.
+        isLoadingPerf = true
+        defer { isLoadingPerf = false; persistPerf() }
         let d = UserDefaults.standard
         if d.object(forKey: "omni.maxImageDim") != nil { maxImageDimension = max(512, d.integer(forKey: "omni.maxImageDim")) }
         if d.object(forKey: "omni.maxVideoFrames") != nil {
@@ -1489,6 +1611,7 @@ final class AppModel {
         if d.object(forKey: "omni.instantSearch") != nil { instantSearchEnabled = d.bool(forKey: "omni.instantSearch") }
     }
     private func persistPerf() {
+        guard !isLoadingPerf else { return }
         let d = UserDefaults.standard
         d.set(maxImageDimension, forKey: "omni.maxImageDim")
         d.set(maxVideoFrames, forKey: "omni.maxVideoFrames")
@@ -2204,7 +2327,10 @@ final class AppModel {
         // now (it holds that flag WITHOUT populating activeRoots) - launching index() here would
         // run two embed pipelines on one Indexer and wipe the in-flight one's cancel flag. The
         // reconcile/backfill completion re-enters drainDeferredAfterPass, which calls back here.
-        guard !isTerminating, !indexObsolete, indexState != .indexing, activeRoots.isEmpty,
+        // !isPaperRunning: the paper suite moves process-wide levers (tail rows, chunk cache, the
+        // can't-win gate), so a pass starting mid-run would embed the user's files under a
+        // benchmark arm. The run's completion resumes indexing, which re-enters here.
+        guard !isTerminating, !isPaperRunning, !indexObsolete, indexState != .indexing, activeRoots.isEmpty,
               !fsReconcileInFlight,
               let indexer, let store, !pendingCatchUpRoots.isEmpty else { return }
         let batch = pendingCatchUpRoots.filter { roots.contains($0) }
@@ -2859,6 +2985,12 @@ final class AppModel {
     /// skipped by modification time, so resuming simply continues where it left off.
     func startIndexing() {
         guard !isTerminating, let indexer, let store, indexState != .indexing else { return }
+        // !isPaperRunning: same reason as catchUpPendingRoots - the suite owns the engine and the
+        // levers for the duration. REMEMBERED, not dropped: a Reindex/Update/Resume that arrives
+        // during a 25-minute run (the menu item and the Settings buttons stay live) would otherwise
+        // silently do nothing, and the run's resume drains restartAfterPause exactly as a paused
+        // pass's completion does.
+        guard !isPaperRunning else { restartAfterPause = true; return }
         // A catch-up pass (added folders) or FS reconcile is mid-flight on the SAME Indexer: starting
         // a full pass now would run two passes concurrently (shared `cancelled` flag, double
         // embedding, racing reconciles). Cancel it and defer; its completion drains the flag.
@@ -2943,6 +3075,16 @@ final class AppModel {
                         // folder-removal restart - updated the index just now; a clean finish with
                         // nothing left to do also confirms it is current as of now.
                         if p.embedded > 0 || !p.cancelled { self.markIndexed(store) }
+                        // A paper run cancelled this pass to quiesce the app. Leave every deferred
+                        // request QUEUED - this is the one completion that acts on them without
+                        // going through drainDeferredAfterPass, and its removals branch would run a
+                        // delete + VACUUM on the user's store under the suite's levers. The run's
+                        // resume drains all three in the same priority order.
+                        if self.isPaperRunning {
+                            self.indexState = p.cancelled ? .paused : .idle
+                            self.refreshIndexStats(store)
+                            return
+                        }
                         // Deferred-recovery is keyed on WHAT was queued (removals / a paused-folder
                         // restart / added roots), NOT on p.cancelled: a folder removed or paused in the
                         // exact instant the pass finished naturally would otherwise strand its request.
@@ -3027,6 +3169,12 @@ final class AppModel {
     /// the chain through its own completion handler, so passes never overlap.
     private func drainDeferredAfterPass(_ store: VectorStore) {
         guard !isTerminating else { return }   // quitting: don't re-kick a pass that would re-enter MLX
+        // !isPaperRunning: every branch below writes to the USER's store (a delete + VACUUM, a full
+        // pass, a reconcile, a tag batch) while the suite holds process-wide levers, and the VACUUM
+        // branch is not covered by the per-producer guards because it sets no in-flight flag. Each
+        // queue is preserved untouched here, and the run's resumeAfterPaperRun re-enters this in
+        // the same priority order.
+        guard !isPaperRunning else { return }
         let removed = pendingRootRemovals
         pendingRootRemovals.removeAll()
         if !removed.isEmpty {
@@ -3141,7 +3289,7 @@ final class AppModel {
     /// real work always wins between batches. The GPU work itself is the engine's normal
     /// low-priority gate - an interactive search preempts per image.
     private func scheduleTagBackfill() {
-        guard !isTerminating, imageTagsEnabled, !tagBackfillActive, !searching,
+        guard !isTerminating, !isPaperRunning, imageTagsEnabled, !tagBackfillActive, !searching,
               indexState != .indexing, indexState != .paused,
               activeRoots.isEmpty, !fsReconcileInFlight, pendingFSPaths.isEmpty,
               let engine, engine.tagger != nil, let indexer, let store else { return }
@@ -3189,7 +3337,10 @@ final class AppModel {
     }
 
     private func drainPendingFSChanges() {
-        guard !isTerminating, !pendingFSPaths.isEmpty, !fsReconcileInFlight, let indexer, let store else { return }
+        // !isPaperRunning: the watcher is stopped for the run, but events buffered before it was
+        // stopped must stay buffered - a reconcile shares the Indexer and the levers with the suite.
+        guard !isTerminating, !isPaperRunning, !pendingFSPaths.isEmpty, !fsReconcileInFlight,
+              let indexer, let store else { return }
         // Globally paused: keep the events buffered (resume's pass completion re-drains them).
         // Running update() now would also hit the stale cancel and silently DROP the batch.
         guard indexState != .paused else { return }
@@ -3243,11 +3394,13 @@ final class AppModel {
     /// throughput + peak VRAM, write a local report, and - with one-time consent - upload it. Live
     /// indexing is restored afterward no matter how the run ends.
     func runProfiling() async {
-        guard !isProfilingRunning, let engine else { return }
+        guard !isProfilingRunning, !isPaperRunning, let engine else { return }
         isProfilingRunning = true
         let cancelFlag = CancelFlag()
         profilingCancel = cancelFlag
         profilingPhase = ""; profilingDetail = ""; profilingFraction = nil
+        profilingShowsTiming = false
+        activeSheet = .progress
         let wasIndexing = (indexState == .indexing)
 
         // Pause any live pass and wait (bounded) for it to actually stop, so the measurement is not
@@ -3262,6 +3415,8 @@ final class AppModel {
             isProfilingRunning = false
             profilingCancel = nil
             profilingPhase = ""; profilingDetail = ""; profilingFraction = nil; profilingStartedAt = nil
+            profilingShowsTiming = false
+            if activeSheet == .progress { activeSheet = nil }
             if wasIndexing { startIndexing() }   // resume where it left off (incremental)
         }
 
@@ -3283,6 +3438,7 @@ final class AppModel {
             profilingDetail = "0 of \(total) files"
             profilingFraction = 0
             profilingStartedAt = Date()   // anchor for the live elapsed/ETA readout
+            profilingShowsTiming = true
             // Fixed canonical settings (NOT the user's) so every machine indexes the same workload -
             // that is what makes the crowdsourced numbers comparable.
             let metrics = try await runProfilingPass(engine: engine, targetURL: folder, settings: .profiling,
@@ -3307,6 +3463,7 @@ final class AppModel {
 
             if cancelFlag.on { throw CancellationError() }
             profilingPhase = "Uploading results\u{2026}"; profilingFraction = nil; profilingDetail = ""
+            profilingShowsTiming = false
             if ProfilingService.ensureConsent() { await ProfilingService.upload(report) }
             shareProfilingResults = ProfilingService.uploadsEnabled   // reflect the consent choice in Settings
 

@@ -250,6 +250,149 @@ if args.count >= 2 && args[1] == "churnbench" {
     exit(try churnbenchRun(nFiles, secs))
 }
 
+// The hidden paper benchmark, headless: omni-verify paper <modelDir> [--scale F] [--out PATH]
+//                                                         [--max-wall S] [--no-pin-cap]
+//
+// Same PaperSuite the app's button drives, so a case can be validated without building and
+// launching the app - and it is what runs the mandated sub-minute `--scale 0.1` smoke test before
+// anyone spends 25 minutes on a borrowed laptop.
+//
+// The body is a SYNC function on purpose: the suite blocks on MLX, sleeps its fixed inter-case gaps
+// and waits on semaphores, all of which are illegal on top-level async main. Same shape as
+// churnbenchRun above.
+//
+// The user's real index is passed to PaperFS as a protected path, so the choke point's
+// preconditions trap rather than merely documenting that nothing here opens it.
+final class PaperCancelFlag: @unchecked Sendable {
+    private let l = NSLock(); private var v = false
+    var on: Bool { l.lock(); defer { l.unlock() }; return v }
+    func set() { l.lock(); v = true; l.unlock() }
+}
+
+/// Prints one line per case rather than one per progress sample: the relay fires on every detail
+/// change and a headless run's log should be readable, not a scroll.
+final class PaperConsoleProgress: @unchecked Sendable {
+    private let l = NSLock()
+    private var lastCase = ""
+    private var lastDetailAt = Date.distantPast
+    func apply(_ p: PaperProgress) {
+        l.lock()
+        let newCase = p.caseId != lastCase
+        if newCase { lastCase = p.caseId; lastDetailAt = .distantPast }
+        // Throttle within a case so a tight measurement loop cannot spend its budget on stdout.
+        let show = newCase || Date().timeIntervalSince(lastDetailAt) > 5
+        if show { lastDetailAt = Date() }
+        l.unlock()
+        guard show else { return }
+        let mm = Int(p.elapsedSeconds) / 60, ss = Int(p.elapsedSeconds) % 60
+        func pad(_ s: String, _ n: Int) -> String { s.count >= n ? s : s + String(repeating: " ", count: n - s.count) }
+        var line = String(format: "  [%02d:%02d] %2d/%2d ", mm, ss, p.caseIndex, p.caseCount)
+            + pad(p.caseId, 14) + (p.detail.isEmpty ? p.caseTitle : p.detail)
+        if p.thermal != "nominal" { line += "  thermal:\(p.thermal)" }
+        if p.swapDeltaMB > 0 { line += String(format: "  swap+%.0fMB", p.swapDeltaMB) }
+        print(line)
+        fflush(stdout)
+    }
+}
+
+func paperRun(engine: OmniEngine, scale: Double, maxWall: Double, outPath: String?,
+              pinCap: Bool) throws -> Int32 {
+    // Everything the run may never touch. PaperFS preconditions on these, so a body that tried to
+    // open the real index would trap here rather than corrupting it.
+    let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+        .first!.appendingPathComponent("Omni", isDirectory: true)
+    let protected = [support, support.appendingPathComponent("index.sqlite")]
+
+    let spec = PaperCorpusSpec(scale: scale)
+    let runId = UUID().uuidString
+    PaperFS.sweepStale(currentCorpusVersion: spec.directoryTag)
+    let fs = try PaperFS(runId: runId, corpusVersion: spec.directoryTag, protectedIndexURLs: protected)
+
+    let memoryBytes = Int(ProcessInfo.processInfo.physicalMemory)
+    let capClass = PaperCapClass.forMachine(memoryBytes: memoryBytes)
+    print("paper  suite=\(PaperCaseCatalog.suiteId) schema=\(PaperCaseCatalog.schema) scale=\(scale) "
+          + "cap=\(capClass.rawValue) maxWall=\(Int(maxWall))s")
+    print("  run dir: \(fs.runDir.path)")
+    let missing = PaperAllCaseBodies.missingIDs
+    if !missing.isEmpty { print("  no body compiled in for: \(missing.map(\.rawValue).joined(separator: ", "))") }
+    // Must be empty. Two providers answering for one id means the number came from whichever was
+    // asked first, which no export should ever have to explain.
+    let contested = PaperAllCaseBodies.contestedIDs
+    if !contested.isEmpty { print("  WARNING: claimed by BOTH body files: \(contested.map(\.rawValue).joined(separator: ", "))") }
+
+    // Generated before the run rather than inside the first case that needs it: generation is not a
+    // measurement and has no business inside a case's budget. Cached across runs by content hash.
+    let t0 = Date()
+    let corpus = try PaperCorpus.ensure(in: fs, spec: spec, progress: { print("  corpus: \($0)") })
+    print(String(format: "  corpus: %@ %d files, %.2f MB, fnv1a64=%@ (%@, %.1fs)",
+                 spec.directoryTag, spec.totalFiles, Double(corpus.totalBytes) / 1e6, corpus.fnv1a64,
+                 corpus.regenerated ? "generated" : "reused", Date().timeIntervalSince(t0)))
+
+    // Ctrl-C is the cancel path, not a kill: the suite always returns what it measured, so an
+    // interrupted run still writes a PARTIAL report. A DispatchSource handler rather than signal(),
+    // because the run thread is blocked and a handler must not run on it.
+    let cancel = PaperCancelFlag()
+    signal(SIGINT, SIG_IGN)
+    let sigsrc = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
+    sigsrc.setEventHandler { print("\n  cancel requested, finishing the current unit of work\u{2026}"); cancel.set() }
+    sigsrc.resume()
+
+    let progress = PaperConsoleProgress()
+    let config = PaperRunConfig(runId: runId, scale: scale, maxWallSeconds: maxWall,
+                                pinMemoryCapBytes: pinCap ? capClass.capBytes : nil)
+    let result = PaperSuite.run(config: config, engine: engine, fs: fs, bodies: PaperAllCaseBodies(),
+                                isCancelled: { cancel.on },
+                                onProgress: { p in progress.apply(p) })
+    sigsrc.cancel()
+
+    let report = PaperReport(result: result, statics: SystemProbe.statics(),
+                             app: PaperAppIdentity.collect(engine: engine), corpus: corpus.stamp)
+    let text = report.renderText()
+    let written = try report.write(into: fs)
+    if let outPath {
+        let out = URL(fileURLWithPath: outPath)
+        try Data(text.utf8).write(to: out, options: .atomic)
+        try report.renderJSON().write(to: out.deletingPathExtension().appendingPathExtension("json"),
+                                      options: .atomic)
+        print("  wrote \(out.path)")
+    }
+    // Drop the bulk, keep the report: the stores are hundreds of megabytes and are dead the moment
+    // the run ends. sweepStale removes the whole run dir 24 h later.
+    try? FileManager.default.removeItem(at: fs.storesDir)
+    try? FileManager.default.removeItem(at: fs.scratchDir)
+
+    print("")
+    print(text, terminator: "")
+    print("  report: \(written.txt.path)")
+    switch result.status {
+    case .complete: return 0
+    case .partial, .cancelled: return 0     // a partial run is a result, not a failure
+    case .abortedSwap, .failed: return 1
+    }
+}
+
+if args.count >= 3 && args[1] == "paper" {
+    var scale = 1.0
+    var maxWall = PaperCaseCatalog.maxWallSeconds
+    var outPath: String?
+    var pinCap = true
+    var i = 3
+    while i < args.count {
+        switch args[i] {
+        case "--scale": scale = Double(args[i + 1]) ?? 1.0; i += 2
+        case "--max-wall": maxWall = Double(args[i + 1]) ?? maxWall; i += 2
+        case "--out": outPath = args[i + 1]; i += 2
+        // The app always pins the cap class. Left switchable here because a headless run on a box
+        // whose whole point is a bigger cap should be able to say so, and the export stamps it.
+        case "--no-pin-cap": pinCap = false; i += 1
+        default: print("unknown paper flag: \(args[i])"); exit(2)
+        }
+    }
+    guard scale > 0, scale <= 1.0 else { print("--scale must be in (0, 1]"); exit(2) }
+    let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[2]))
+    exit(try paperRun(engine: engine, scale: scale, maxWall: maxWall, outPath: outPath, pinCap: pinCap))
+}
+
 // Content-dedup correctness: omni-verify dedupcheck
 // Exercises the content_keys machinery end to end with a counting embedder (no GPU): a byte-
 // identical copy indexed in a later pass must reuse stored rows (zero new embeds), a touched-but-

@@ -100,6 +100,13 @@ public enum ModelLocator {
 /// same position as text, fixing cross-modal alignment (Nano's image vectors were orthogonal).
 public let omniEmbeddingVersion = "omni-2-mediasuffix"
 
+/// The mlx-swift version this binary links. MLX exposes no runtime version symbol, so it is baked
+/// here and Scripts/check-mlx-version.sh fails the build if it drifts from Package.resolved. It is
+/// load-bearing, not cosmetic: measurements exported by the paper suite are only comparable across
+/// machines when the MLX kernels are the same build, and one of the paper's design retractions is
+/// specific to this version's SDPA scheduling.
+public let omniMLXVersion = "0.31.3"
+
 /// The user's effective memory cap (the Settings cap; physical RAM when Unlimited). OmniKit's
 /// batching budgets (image patch packing, audio batch sizing, the decode-pipeline byte gate)
 /// derive from THIS, not from physical RAM: the cap is the contract the user set in a public app,
@@ -130,6 +137,12 @@ public func omniSetMemoryLimit(_ bytes: Int) {
         MLX.Memory.cacheLimit = max(Int(ProcessInfo.processInfo.physicalMemory) / 3, 512 * 1024 * 1024)
     }
 }
+
+/// The cap currently in force, in bytes. Read by the paper suite to stamp `pin.memory_cap_gb`, and
+/// by the headless runner to restore the cap it pinned. The APP restores through applyMemoryLimit()
+/// instead: this getter cannot distinguish "Unlimited" from "capped at exactly physical RAM", and
+/// those two take different branches in omniSetMemoryLimit.
+public func omniMemoryLimitBytes() -> Int { OmniMemoryBudget.capBytes }
 
 /// Physical RAM in bytes (for choosing a sensible memory-limit slider range).
 public func omniPhysicalMemory() -> Int { Int(ProcessInfo.processInfo.physicalMemory) }
@@ -513,6 +526,18 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         }
     }
 
+    /// PAPER SUITE ONLY: run the tokenizer half of `embedTextBatches` and nothing else, returning the
+    /// token count. The paper's "tokenizer share of a flush" number needs tokenize-only vs full over
+    /// the SAME batches; tokbench gets that by constructing its own OmniTextEncoder, which inside the
+    /// app would load a second copy of the weights - roughly 1.9 GB on Nano, i.e. the exact allocation
+    /// that wedges an 8 GB machine. Runs off the GPU gate because it never touches the GPU.
+    public func tokenizeOnlyForBenchmark(_ batches: [[String]], as type: OmniInputType) -> Int {
+        let enc = textEncoder
+        var total = 0
+        for b in batches { total += enc.tokenizeParallel(b, type).reduce(0) { $0 + $1.count } }
+        return total
+    }
+
     // Cumulative backbone sequence positions (tokens) processed by INDEXING embeds (queries
     // excluded). Thread-safe; the UI samples it to show live tok/s.
     private let tokenLock = NSLock()
@@ -542,7 +567,12 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         guard Self.adaptiveBatch else { return false }
         return queryStampLock.withLock { -_lastQueryAt.timeIntervalSinceNow < Self.queryActiveWindow }
     }
-    static let adaptiveBatch = ProcessInfo.processInfo.environment["OMNI_ADAPTIVE_BATCH"] != "0"
+    // PAPER LEVER: var, not let, so the in-app paper suite can A/B it. setenv() in-process cannot:
+    // the static is read once, and after first touch a setenv is either a silent no-op or a
+    // PERMANENT behaviour change to the live app. The suite mutates it only between cases/arms,
+    // only while no work is in flight (indexing paused, serving refused, cases strictly serial),
+    // and always restores it in a defer. See PaperLevers.
+    nonisolated(unsafe) static var adaptiveBatch = ProcessInfo.processInfo.environment["OMNI_ADAPTIVE_BATCH"] != "0"
 
     // Embedder conformance - used by the indexer, so these run at low (indexing) priority.
     // Query-typed calls also stamp markQuery(): the serving endpoints (/v1/embeddings task=query)

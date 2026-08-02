@@ -153,7 +153,7 @@ enum ProfilingService {
 
 /// Native progress sheet for a profiling run - slides down from the main window (vs a stray
 /// free-floating window). Determinate during indexing, indeterminate for download/unzip/upload.
-/// Presented while AppModel.isProfilingRunning is true and dismissed when it flips false.
+/// Presented while AppModel.activeSheet is .progress and dismissed when the run clears it.
 /// Cross-actor cancellation token: written by the sheet's Cancel button on the main actor, read
 /// from the benchmark's progress callbacks on background threads. Lock-guarded so the cross-
 /// thread reads are well-defined under the Swift memory model.
@@ -166,8 +166,19 @@ final class CancelFlag: @unchecked Sendable {
     }
 }
 
+/// Serves both runs: the 30-second profiling pass and the up-to-25-minute paper suite. One sheet
+/// rather than two, because they can never be on screen together (each refuses while the other is
+/// running) and the shape - title, clock, bar, detail, Cancel - is the same. Which run it is showing
+/// is read from the model, never passed in, so a sheet that outlives a run cannot show stale fields.
 struct ProfilingSheet: View {
     @Environment(AppModel.self) private var model: AppModel
+
+    private var isPaper: Bool { model.isPaperRunning }
+    private var phase: String { isPaper ? model.paperPhase : model.profilingPhase }
+    private var detail: String { isPaper ? model.paperDetail : model.profilingDetail }
+    private var fraction: Double? { isPaper ? model.paperFraction : model.profilingFraction }
+    private var startedAt: Date? { isPaper ? model.paperStartedAt : model.profilingStartedAt }
+    private var cancelled: Bool { (isPaper ? model.paperCancel : model.profilingCancel)?.on ?? true }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -176,39 +187,53 @@ struct ProfilingSheet: View {
                     .font(.system(size: 18))
                     .foregroundStyle(.tint)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Benchmark").font(.headline)
-                    // During the indexing pass, show live elapsed + ETA (ticking every second) instead
-                    // of the static "Indexing" label; other phases keep their name.
-                    if model.profilingPhase == "Indexing", let start = model.profilingStartedAt {
+                    Text(isPaper ? "Paper benchmark" : "Benchmark").font(.headline)
+                    // Once there is timed work to report, show a live elapsed clock (ticking every
+                    // second) instead of a static label. A quarter-hour sheet whose text never
+                    // changes reads as hung, and that is what makes people force-quit mid-run.
+                    if model.profilingShowsTiming, let start = startedAt {
                         TimelineView(.periodic(from: .now, by: 1)) { ctx in
                             Text(Self.timingLine(elapsed: ctx.date.timeIntervalSince(start),
-                                                 fraction: model.profilingFraction ?? 0))
+                                                 fraction: fraction ?? 0,
+                                                 // No ETA for the paper suite: case durations vary
+                                                 // too much across machines for a budget-derived
+                                                 // estimate to be anything but a lie.
+                                                 eta: isPaper ? nil : true,
+                                                 suffix: isPaper ? model.paperCaseLine : ""))
                                 .font(.subheadline.monospacedDigit()).foregroundStyle(.secondary).lineLimit(1)
                         }
                     } else {
-                        Text(model.profilingPhase.isEmpty ? "Working\u{2026}" : model.profilingPhase)
+                        Text(phase.isEmpty ? "Working\u{2026}" : phase)
                             .font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
                     }
                 }
                 Spacer(minLength: 0)
             }
-            if let f = model.profilingFraction {
+            if let f = fraction {
                 ProgressView(value: f)
             } else {
                 ProgressView().progressViewStyle(.linear)   // indeterminate barber-pole
             }
-            if !model.profilingDetail.isEmpty {
-                Text(model.profilingDetail)
+            if !detail.isEmpty {
+                Text(detail)
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.middle)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            // Machine condition, paper run only, and only when it is worth seeing: a thermal state
+            // above nominal or swap that actually grew both mean the numbers are drifting.
+            if isPaper, !model.paperEnvLine.isEmpty {
+                Text(model.paperEnvLine)
+                    .font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
+                    .lineLimit(1).truncationMode(.tail)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             HStack {
                 Spacer()
                 // HIG: every lengthy operation needs a cancel affordance - this one downloads a
                 // dataset and runs minutes of GPU work while blocking the window.
-                Button("Cancel") { model.cancelProfiling() }
-                    .disabled(model.profilingCancel?.on ?? true)
+                Button("Cancel") { if isPaper { model.cancelPaperRun() } else { model.cancelProfiling() } }
+                    .disabled(cancelled)
             }
         }
         .padding(20)
@@ -217,13 +242,15 @@ struct ProfilingSheet: View {
     }
 
     /// "1:05 elapsed  ·  ~48s left" - ETA from the linear progress fraction, suppressed until there's
-    /// enough progress (>2%) for a stable estimate.
-    private static func timingLine(elapsed: Double, fraction: Double) -> String {
-        let el = fmtDur(elapsed) + " elapsed"
-        if fraction > 0.02, fraction < 1 {
-            return el + "  \u{00B7}  ~" + fmtDur(elapsed * (1 - fraction) / fraction) + " left"
+    /// enough progress (>2%) for a stable estimate. `eta: nil` drops it entirely; `suffix` carries
+    /// the paper run's case counter.
+    private static func timingLine(elapsed: Double, fraction: Double, eta: Bool?, suffix: String) -> String {
+        var line = fmtDur(elapsed) + " elapsed"
+        if eta == true, fraction > 0.02, fraction < 1 {
+            line += "  \u{00B7}  ~" + fmtDur(elapsed * (1 - fraction) / fraction) + " left"
         }
-        return el
+        if !suffix.isEmpty { line += "  \u{00B7}  " + suffix }
+        return line
     }
     private static func fmtDur(_ s: Double) -> String {
         let t = max(0, Int(s.rounded()))
