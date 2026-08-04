@@ -169,8 +169,8 @@ public enum PaperCaseCatalog {
         let all = [canary(scale), sdpa(scale), textLever(scale), indexPass(scale),
                    editReuse(scale), gate(scale), scan(memoryBytes, scale),
                    select(memoryBytes, scale), compact(scale),
-                   liveEnv(scale), liveQuery(scale), liveIndex(scale), liveSave(scale), liveTag(scale),
-                   liveShape(scale)]
+                   liveEnv(scale), liveQuery(scale), liveIndex(scale), liveTag(scale),
+                   liveShape(scale), liveSave(memoryBytes, scale)]
         guard let only = onlyCases else { return all }
         return all.filter { only.contains($0.id) }
     }
@@ -467,9 +467,14 @@ public enum PaperCaseCatalog {
             requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
     }
 
-    private static func liveSave(_ scale: Double) -> PaperCaseSpec {
+    private static func liveSave(_ memoryBytes: Int, _ scale: Double) -> PaperCaseSpec {
+        // Tiered by memory, not fixed: on a 16 GB machine holding a multi-million-chunk index the
+        // app's own store, the encoder and this case's second store do not fit at 80 files, and the
+        // run pages. The M2 proved that by aborting on swap with 828 MB of growth, after which its
+        // second arm read 22% slower than its first for no reason but pressure.
+        let files = gibibytes(memoryBytes) >= tier24GiB ? 80 : 32
         let p = PaperParams([
-            PaperParameter("files", .int(80), scaling: .scaled(minimum: 10)),
+            PaperParameter("files", .int(files), scaling: .scaled(minimum: 10)),
             // Big enough to hold several chunks: a one-chunk file has no unchanged prefix, so the
             // reuse arm would have nothing to reuse and the pair would measure the same thing twice.
             PaperParameter("min_bytes", .int(8_000)),
@@ -484,7 +489,10 @@ public enum PaperCaseCatalog {
             budgetSeconds: 700,
             arms: [PaperArm("cache_off", PaperLeverSet(chunkCache: false)),
                    PaperArm("cache_on", PaperLeverSet(chunkCache: true))],
-            params: p, arithmeticPeakMB: nil,
+            // Measured footprint delta of this case on the M2: 1,529 MB. Declared so the runner's
+            // memory guard can decline it on a machine with no room, instead of the machine paging
+            // and the suite aborting on swap after the case has already spent ten minutes.
+            params: p, arithmeticPeakMB: 1_500,
             requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
     }
 
