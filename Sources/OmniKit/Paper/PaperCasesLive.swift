@@ -241,6 +241,21 @@ public enum PaperCasesLive {
                 // save that follows it.
                 indexer.index(roots: [staged.dir], settings: .paper, force: false) { _ in }
 
+                // Chunks per staged file, which is what makes a zero interpretable: reuse can only
+                // fire on a file that produced more than one chunk, so a difference of nothing
+                // between the arms means something different depending on this number.
+                if arm == "cache_on" {
+                    let summary = store.indexSummary(folders: [])
+                    out.metrics.append(PaperMetric("staged_chunks", runs: [Double(summary.chunkCount)],
+                                                   unit: .count, aggregate: .single))
+                    if summary.fileCount > 0 {
+                        out.metrics.append(PaperMetric.derived(
+                            "staged_chunks_per_file",
+                            value: Double(summary.chunkCount) / Double(summary.fileCount),
+                            unit: .count, from: ["staged_chunks"]))
+                    }
+                }
+
                 var samples: [Double] = []
                 for (i, url) in staged.files.enumerated() {
                     try ctx.checkCancel()
