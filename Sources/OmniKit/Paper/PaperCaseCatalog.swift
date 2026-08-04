@@ -173,7 +173,7 @@ public enum PaperCaseCatalog {
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p01_sdpa, title: "Fused attention curve",
-            deliverable: "Fig. 2 (fig:latency) fused-attention curve",
+            deliverable: "App. A.1 fused-attention curve (fig:latency) and the operand ladder (tab:encoder)",
             budgetSeconds: 45,
             arms: [PaperArm("steel_bf16"), PaperArm("steel_fp32")],
             params: p,
@@ -194,7 +194,7 @@ public enum PaperCaseCatalog {
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p02_textlever, title: "Tail-row narrowing",
-            deliverable: "Sec. 4.8 tail-row narrowing",
+            deliverable: "Sec. 4.3 tail-row narrowing row of tab:main",
             budgetSeconds: 150,
             arms: [PaperArm("tail_off", PaperLeverSet(tailRows: false)),
                    PaperArm("tail_on", PaperLeverSet(tailRows: true))],
@@ -208,11 +208,11 @@ public enum PaperCaseCatalog {
             PaperParameter("wide_files", .int(4000), scaling: .scaled(minimum: 100)),
             PaperParameter("text_batch_size", .int(16)),
             PaperParameter("max_chars_per_chunk", .int(1800)),
-            PaperParameter("passes", .texts(["fresh", "unchanged", "touch"])),
+            PaperParameter("passes", .texts(["fresh"])),
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p03_indexpass, title: "Index pass",
-            deliverable: "Sec. 2 encoding is the whole cost: occupancy, files/s, tok/s, peak VRAM",
+            deliverable: "Sec. 4.3 tab:main first block: occupancy and throughput per GPU core, pinned corpus",
             budgetSeconds: 330,
             // Dedup is pinned on for the whole suite rather than being an arm here: the corpus is
             // generated with repeated paragraphs on purpose and the off arm would measure the
@@ -244,7 +244,7 @@ public enum PaperCaseCatalog {
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p05_editreuse, title: "Chunk reuse on edits",
-            deliverable: "Table 4 (tab:reuse) reindex-seconds columns",
+            deliverable: "App. A.2 tab:reuse, and the two reuse rows of tab:main",
             budgetSeconds: 240,
             arms: [PaperArm("cache_off", PaperLeverSet(chunkCache: false)),
                    PaperArm("cache_on", PaperLeverSet(chunkCache: true))],
@@ -298,7 +298,7 @@ public enum PaperCaseCatalog {
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p07_gate, title: "Can't-win prune and idle fold",
-            deliverable: "Sec. 3.2 can't-win prune with byte-identical hits, Sec. 4.2 idle fold",
+            deliverable: "Sec. 4.3 prune and idle-fold rows of tab:main",
             budgetSeconds: 260,
             // Both pairs run against ONE store, toggled between query sets: rebuilding per arm would
             // spend the budget on inserts and would not even be the same rows.
@@ -320,7 +320,7 @@ public enum PaperCaseCatalog {
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p08_scan, title: "Scan latency through the shipped store",
-            deliverable: "Table 3 (tab:scale) scan-latency columns",
+            deliverable: "Sec. 4.3 tab:cross funnel crossover, all rungs",
             budgetSeconds: 360,
             // Both representations are forced, never auto-selected: the ship policy's boundary is a
             // function of the memory CAP, so auto would pick int4 at 500k on CAP-3 and bf16 on
@@ -340,7 +340,7 @@ public enum PaperCaseCatalog {
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p09_select, title: "Top-k selection floor",
-            deliverable: "Sec. 4.3 selection floor and two-stage speedup",
+            deliverable: "App. A.4 selection floor and the two-stage speedup",
             budgetSeconds: 45,
             arms: [PaperArm("argpartition"), PaperArm("strided_max"),
                    PaperArm("twostage_x4"), PaperArm("twostage_x8")],
@@ -359,7 +359,7 @@ public enum PaperCaseCatalog {
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p10_compact, title: "Compaction peak",
-            deliverable: "Sec. 4.6 compaction peak, the highest-value per-machine memory number",
+            deliverable: "Sec. 4.3 compaction row of tab:main, and the compaction row of App. A.5 tab:cap",
             budgetSeconds: 240,
             arms: [PaperArm("smallcache_off", PaperLeverSet(vacuumSmallCache: false)),
                    PaperArm("smallcache_on", PaperLeverSet(vacuumSmallCache: true))],
@@ -420,7 +420,7 @@ public enum PaperCaseCatalog {
     private static func liveEnv(_ scale: Double) -> PaperCaseSpec {
         PaperCaseSpec(
             id: .p13_env, title: "The machine's own corpus",
-            deliverable: "Sec. 4.1 machines-and-corpora table: files, chunks, index bytes, modality mix",
+            deliverable: "Sec. 4.1 tab:machines corpus block: files, chunks, index bytes, modality mix",
             budgetSeconds: 60, arms: [], params: .empty, arithmeticPeakMB: nil,
             requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
     }
@@ -428,15 +428,15 @@ public enum PaperCaseCatalog {
     private static func liveQuery(_ scale: Double) -> PaperCaseSpec {
         let p = PaperParams([
             PaperParameter("text_queries", .int(240), scaling: .scaled(minimum: 20)),
-            PaperParameter("media_queries", .int(40), scaling: .scaled(minimum: 4)),
+            PaperParameter("media_queries", .int(100), scaling: .scaled(minimum: 4)),
             PaperParameter("warmup_queries", .int(5), scaling: .scaled(minimum: 1)),
             PaperParameter("pivot_files", .int(24), scaling: .scaled(minimum: 4)),
             PaperParameter("top_k", .int(40)),
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p14_query, title: "Query latency on the live index",
-            deliverable: "Sec. 4.2 task-latency table: text, filename, find-similar, image, audio, video",
-            budgetSeconds: 420, arms: [], params: p, arithmeticPeakMB: nil,
+            deliverable: "Sec. 4.2 tab:tasks: text, filename, find-similar, image, audio and video query rows",
+            budgetSeconds: 600, arms: [], params: p, arithmeticPeakMB: nil,
             requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
     }
 
@@ -446,7 +446,7 @@ public enum PaperCaseCatalog {
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p15_index, title: "Indexing pass over real files",
-            deliverable: "Sec. 4.2 throughput block: files/s, tokens/s, bytes/s, occupancy",
+            deliverable: "Sec. 4.1 tab:machines third block: files/s, tokens/s, occupancy, peak GPU",
             budgetSeconds: 420, arms: [], params: p, arithmeticPeakMB: nil,
             requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
     }
@@ -460,7 +460,7 @@ public enum PaperCaseCatalog {
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p16_save, title: "Save latency on real files",
-            deliverable: "Sec. 4.2 save row, and what chunk reuse is worth on a real corpus",
+            deliverable: "Sec. 4.2 tab:tasks save row, both reuse arms",
             budgetSeconds: 420,
             arms: [PaperArm("cache_off", PaperLeverSet(chunkCache: false)),
                    PaperArm("cache_on", PaperLeverSet(chunkCache: true))],
@@ -474,7 +474,7 @@ public enum PaperCaseCatalog {
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p17_tag, title: "Tagging real images",
-            deliverable: "Sec. 4.2 image-index row and the open-vocabulary tagging overhead",
+            deliverable: "Sec. 4.2 tab:tasks image-index rows, tags off and on",
             budgetSeconds: 300,
             arms: [PaperArm("tags_off"), PaperArm("tags_on")],
             params: p, arithmeticPeakMB: nil,
@@ -490,7 +490,7 @@ public enum PaperCaseCatalog {
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p18_liveshape, title: "Search under indexing, on the live index",
-            deliverable: "Sec. 4.2 search-while-indexing row, p50/p95/p99 against an idle floor",
+            deliverable: "Sec. 4.2 tab:tasks search-under-indexing row, against the idle floor",
             budgetSeconds: 600,
             arms: [PaperArm("unshaped", PaperLeverSet(adaptiveBatch: false)),
                    PaperArm("shaped", PaperLeverSet(adaptiveBatch: true))],
