@@ -85,10 +85,20 @@ public enum PaperCaseCatalog {
     public static let suiteId = "paper-v2"
     public static let schema = 2
 
-    /// Global wall-clock cap. The budgets sum to more than this on purpose: the cap is what the
-    /// operator is promised, the budgets are what each case may spend before it yields. Raised for
-    /// v2: an honest p99 needs samples in the hundreds, and the live family adds six cases.
-    public static let maxWallSeconds: Double = 2700
+    /// Global wall-clock cap, derived rather than fixed.
+    ///
+    /// A fixed cap turns a slow machine into a PARTIAL run: the gate that admits a case compares
+    /// the elapsed time plus that case's whole budget against this number, so on a machine that is
+    /// merely slow the last cases record `skipped:budget` and the export cannot be presented as a
+    /// complete suite. Deriving the cap from the budgets themselves removes that failure: it sits
+    /// above everything the suite may spend, so only a hang can reach it.
+    public static var maxWallSeconds: Double {
+        let all = specs(memoryBytes: 64 << 30)
+        let budgets = all.reduce(0) { $0 + $1.budgetSeconds }
+        let closing = all.first { $0.runsAtBothEnds }?.budgetSeconds ?? 0
+        let gaps = Double(all.count + 1) * 6          // inter-case settle, generously
+        return budgets + closing + gaps + 600         // plus corpus generation and slack
+    }
 
     /// MLX RNG seed, reseeded before every case so a case's inputs do not depend on what ran first.
     public static let mlxSeed: UInt64 = 0x0DEC0DE
@@ -163,7 +173,7 @@ public enum PaperCaseCatalog {
     /// harness - so the carried numbers and the new ones describe the same system.
     ///
     /// Set this to nil to run the whole suite again.
-    public static let onlyCases: Set<PaperCaseID>? = [.p11_canary, .p16_save, .p17_tag, .p18_liveshape]
+    public static let onlyCases: Set<PaperCaseID>? = nil
 
     public static func specs(memoryBytes: Int, scale: Double = 1.0) -> [PaperCaseSpec] {
         let all = [canary(scale), sdpa(scale), textLever(scale), indexPass(scale),
