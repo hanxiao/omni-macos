@@ -548,6 +548,14 @@ public struct PaperReport: Sendable, Codable {
     /// about it. A partial run has to LOOK partial before any number is read.
     private func warningLines(duplicates: Int) -> [String] {
         var w: [String] = []
+        // A subset build measures a few cases on purpose. That has to be visible before any number
+        // is read, or the missing cases look like cases that failed.
+        if let only = PaperCaseCatalog.onlyCases {
+            w.append("SUBSET RUN: this build measures only "
+                     + only.map(\.rawValue).sorted().joined(separator: ", ")
+                     + ". Every other case is carried from the previous full run; nothing under "
+                     + "measurement changed between the two builds.")
+        }
         if result.status != .complete || result.casesOK != result.casesTotal {
             w.append("PARTIAL RUN (status \(result.status.rawValue), \(result.casesOK) of \(result.casesTotal) cases ok). "
                      + "Do not present this as a complete suite.")

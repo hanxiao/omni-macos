@@ -151,12 +151,28 @@ public enum PaperCaseCatalog {
     ///    machine's own images.
     ///
     /// Their bodies are still compiled in, so re-adding one here is a one-line change.
+    /// The cases this build runs, or nil for all of them.
+    ///
+    /// The full suite was collected on three machines under build 0.3.28 and every table in the
+    /// paper is filled from it EXCEPT the three cases whose first run was invalid: p16 spent its
+    /// budget before timing an edit, p17 toggled a setting the indexing path does not read, and p18
+    /// timed the wrong half of a query. Those three are fixed, so this build re-measures only them
+    /// and the thermal canary that brackets any run.
+    ///
+    /// Nothing under measurement changed between the two builds - the fixes are confined to the
+    /// harness - so the carried numbers and the new ones describe the same system.
+    ///
+    /// Set this to nil to run the whole suite again.
+    public static let onlyCases: Set<PaperCaseID>? = [.p11_canary, .p16_save, .p17_tag, .p18_liveshape]
+
     public static func specs(memoryBytes: Int, scale: Double = 1.0) -> [PaperCaseSpec] {
-        [canary(scale), sdpa(scale), textLever(scale), indexPass(scale),
-         editReuse(scale), gate(scale), scan(memoryBytes, scale),
-         select(memoryBytes, scale), compact(scale),
-         liveEnv(scale), liveQuery(scale), liveIndex(scale), liveSave(scale), liveTag(scale),
-         liveShape(scale)]
+        let all = [canary(scale), sdpa(scale), textLever(scale), indexPass(scale),
+                   editReuse(scale), gate(scale), scan(memoryBytes, scale),
+                   select(memoryBytes, scale), compact(scale),
+                   liveEnv(scale), liveQuery(scale), liveIndex(scale), liveSave(scale), liveTag(scale),
+                   liveShape(scale)]
+        guard let only = onlyCases else { return all }
+        return all.filter { only.contains($0.id) }
     }
 
     // MARK: - The cases
