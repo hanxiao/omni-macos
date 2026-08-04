@@ -271,6 +271,14 @@ public enum PaperCasesLive {
                 out.metrics += PaperMetric.distribution("save", samples: samples,
                                                         unit: .milliseconds, arm: arm,
                                                         note: "one edited file through the watcher path")
+                // A case that measured nothing has to say so. The sampler selects by KIND, and a
+                // PDF or an office document is text by kind while not being editable as text, so
+                // on a corpus made of those this loop times nothing and the export would otherwise
+                // carry an ok status with no distribution and no reason.
+                if samples.isEmpty {
+                    out.facts.append(PaperFact("\(arm)_status",
+                                               "no staged file could be read and rewritten as UTF-8 text"))
+                }
             }
         }
         // What reuse is worth on real files, at the median and at the tail.
