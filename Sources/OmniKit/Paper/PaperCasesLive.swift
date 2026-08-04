@@ -225,7 +225,7 @@ public enum PaperCasesLive {
         guard let live = ctx.live else { out.note = noLive; return out }
         guard let staged = try stage(ctx, kinds: [.text], limit: ctx.params.int("files"),
                                      dir: "p16-real", minBytes: ctx.params.int("min_bytes"),
-                                     maxBytes: ctx.params.int("max_bytes"),
+                                     maxBytes: ctx.params.int("max_bytes"), requireUTF8: true,
                                      out: &out) else { return out }
 
         for arm in ["cache_off", "cache_on"] {
@@ -447,12 +447,21 @@ public enum PaperCasesLive {
     /// which is a legitimate outcome on a corpus without audio or without images.
     static func stage(_ ctx: PaperContext, kinds: Set<FileKind>, limit: Int, dir: String,
                       minBytes: Int = 1_024, maxBytes: Int = 8_000_000,
+                      requireUTF8: Bool = false,
                       out: inout PaperCaseOutput) throws -> StagedSample? {
         guard let live = ctx.live else { out.note = noLive; return nil }
         ctx.progress("sampling real files")
-        let picked = PaperFileSampler(roots: live.roots)
-            .sample(kinds: kinds, limit: limit, minBytes: minBytes, maxBytes: maxBytes,
+        // A case that edits a file needs one it can read and rewrite as text. A PDF or an office
+        // document is text by KIND while not being plain text on disk, and a corpus made of those
+        // left the M3 Pro with nothing to time. Oversample and keep only what survives the check.
+        let ask = requireUTF8 ? limit * 4 : limit
+        var picked = PaperFileSampler(roots: live.roots)
+            .sample(kinds: kinds, limit: ask, minBytes: minBytes, maxBytes: maxBytes,
                     shouldContinue: { ctx.shouldContinue })
+        if requireUTF8 {
+            picked = picked.filter { (try? String(contentsOf: $0, encoding: .utf8)) != nil }
+            if picked.count > limit { picked = Array(picked.prefix(limit)) }
+        }
         guard !picked.isEmpty else {
             out.note = "no files of kind \(kinds.map(\.rawValue).sorted().joined(separator: "|")) under the roots"
             return nil

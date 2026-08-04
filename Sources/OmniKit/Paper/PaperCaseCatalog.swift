@@ -472,7 +472,8 @@ public enum PaperCaseCatalog {
         // app's own store, the encoder and this case's second store do not fit at 80 files, and the
         // run pages. The M2 proved that by aborting on swap with 828 MB of growth, after which its
         // second arm read 22% slower than its first for no reason but pressure.
-        let files = gibibytes(memoryBytes) >= tier24GiB ? 80 : 32
+        // 110, so the nearest-rank p99 is the 109th sample rather than the maximum.
+        let files = 110
         let p = PaperParams([
             PaperParameter("files", .int(files), scaling: .scaled(minimum: 10)),
             // Big enough to hold several chunks: a one-chunk file has no unchanged prefix, so the
@@ -486,7 +487,7 @@ public enum PaperCaseCatalog {
         return PaperCaseSpec(
             id: .p16_save, title: "Save latency on real files",
             deliverable: "Sec. 4.2 tab:tasks save row, both reuse arms",
-            budgetSeconds: 700,
+            budgetSeconds: 900,
             arms: [PaperArm("cache_off", PaperLeverSet(chunkCache: false)),
                    PaperArm("cache_on", PaperLeverSet(chunkCache: true))],
             // Measured footprint delta of this case on the M2: 1,529 MB. Declared so the runner's
@@ -498,12 +499,12 @@ public enum PaperCaseCatalog {
 
     private static func liveTag(_ scale: Double) -> PaperCaseSpec {
         let p = PaperParams([
-            PaperParameter("images", .int(48), scaling: .scaled(minimum: 4)),
+            PaperParameter("images", .int(110), scaling: .scaled(minimum: 4)),
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p17_tag, title: "Tagging real images",
             deliverable: "Sec. 4.2 tab:tasks image-index rows, tags off and on",
-            budgetSeconds: 300,
+            budgetSeconds: 480,
             arms: [PaperArm("tags_off"), PaperArm("tags_on")],
             params: p, arithmeticPeakMB: nil,
             requiresVisionTower: true, runsAtBothEnds: false, driftMetricKey: nil)
