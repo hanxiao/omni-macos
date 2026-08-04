@@ -139,10 +139,22 @@ public enum PaperCaseCatalog {
     ///     home directory is the one most likely to run long or find nothing, so nothing the paper
     ///     needs for its ablation tables sits behind it.
     /// The runner appends the canary's closing invocation itself.
+    /// Retired, and why. Each was measuring something the paper either stopped claiming or now
+    /// measures better on a real corpus, and each cost wall time on every machine:
+    ///
+    ///  - `tokShare` (40 s): the tokenizer's share of a batch. `indexPass` already reports
+    ///    accelerator occupancy, which carries the same claim without a second case.
+    ///  - `shape` (820 s, the suite's most expensive case): search under indexing on a synthetic
+    ///    200k store. `liveShape` measures the same two arms against the machine's own index with
+    ///    p50/p95/p99 and an idle floor, which is the claim the paper actually makes.
+    ///  - `media` (90 s): tagging overhead on generated images. `liveTag` measures it on the
+    ///    machine's own images.
+    ///
+    /// Their bodies are still compiled in, so re-adding one here is a one-line change.
     public static func specs(memoryBytes: Int, scale: Double = 1.0) -> [PaperCaseSpec] {
-        [canary(scale), sdpa(scale), textLever(scale), indexPass(scale), tokShare(scale),
-         editReuse(scale), shape(scale), gate(scale), scan(memoryBytes, scale),
-         select(memoryBytes, scale), compact(scale), media(scale),
+        [canary(scale), sdpa(scale), textLever(scale), indexPass(scale),
+         editReuse(scale), gate(scale), scan(memoryBytes, scale),
+         select(memoryBytes, scale), compact(scale),
          liveEnv(scale), liveQuery(scale), liveIndex(scale), liveSave(scale), liveTag(scale),
          liveShape(scale)]
     }
