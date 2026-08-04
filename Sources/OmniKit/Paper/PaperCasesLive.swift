@@ -225,6 +225,7 @@ public enum PaperCasesLive {
         guard let live = ctx.live else { out.note = noLive; return out }
         guard let staged = try stage(ctx, kinds: [.text], limit: ctx.params.int("files"),
                                      dir: "p16-real", minBytes: ctx.params.int("min_bytes"),
+                                     maxBytes: ctx.params.int("max_bytes"),
                                      out: &out) else { return out }
 
         for arm in ["cache_off", "cache_on"] {
@@ -285,8 +286,16 @@ public enum PaperCasesLive {
             let store = try ctx.fs.store(named: name)
             defer { ctx.fs.discard(store, named: name) }
             let indexer = Indexer(store: store, embedder: ctx.engine)
-            var settings = IndexSettings.paperMedia
-            settings.imageTags = (arm == "tags_on")
+            let settings = IndexSettings.paperMedia
+            // Tagging is gated by whether a tagger is ATTACHED TO THE ENGINE, not by a settings
+            // flag: nothing on the indexing path reads IndexSettings.imageTags. Toggling that flag
+            // measured the same work twice, which is what the first run of this case reported.
+            let savedTagger = ctx.engine.tagger
+            defer { ctx.engine.tagger = savedTagger }
+            ctx.engine.tagger = (arm == "tags_on") ? savedTagger : nil
+            if arm == "tags_on", savedTagger == nil {
+                out.facts.append(PaperFact("tags_on_status", "no tagger attached to the engine"))
+            }
 
             var samples: [Double] = []
             for (i, url) in staged.files.enumerated() {
@@ -328,8 +337,11 @@ public enum PaperCasesLive {
         // accelerator. Every loaded number below is read against this.
         var idle: [Double] = []
         for i in 0 ..< queries where ctx.shouldContinue {
-            let v = ctx.engine.embedQuery(queryTexts[i % queryTexts.count])
-            idle.append(timeMs { _ = live.store.search(v, topK: topK, markActive: false) })
+            let text = queryTexts[i % queryTexts.count]
+            idle.append(timeMs {
+                let v = ctx.engine.embedQuery(text)
+                _ = live.store.search(v, topK: topK, markActive: true)
+            })
         }
         out.metrics += PaperMetric.distribution("idle", samples: idle, unit: .milliseconds,
                                                 note: "the live index, no indexer running")
@@ -351,8 +363,13 @@ public enum PaperCasesLive {
                 let done = DispatchSemaphore(value: 0)
                 let paths = staged.files.map(\.path)
                 DispatchQueue.global(qos: .utility).async {
+                    // One file per call, cycling. Handing update() the whole staged set at once
+                    // makes the indexer's unit of work as large as the sample, which is not the
+                    // load a watcher produces and not the unit the gate arbitrates.
+                    var i = 0
                     while !stop.isOn {
-                        indexer.update(paths: paths, settings: .paper, force: true)
+                        indexer.update(paths: [paths[i % paths.count]], settings: .paper, force: true)
+                        i += 1
                     }
                     done.signal()
                 }
@@ -367,8 +384,14 @@ public enum PaperCasesLive {
                     // would measure the same thing.
                     ctx.engine.noteInteractive()
                     Thread.sleep(forTimeInterval: p.double("debounce_s"))
-                    let v = ctx.engine.embedQuery(queryTexts[i % queryTexts.count])
-                    samples.append(timeMs { _ = live.store.search(v, topK: topK, markActive: true) })
+                    // The whole query, encode included. The encode is where a query queues behind
+                    // the indexer on the shared gate, so timing the store call alone measures the
+                    // one half the mechanism does not act on.
+                    let text = queryTexts[i % queryTexts.count]
+                    samples.append(timeMs {
+                        let v = ctx.engine.embedQuery(text)
+                        _ = live.store.search(v, topK: topK, markActive: true)
+                    })
                     if i % 10 == 0 { ctx.progress("\(arm): query \(i + 1)/\(queries)") }
                 }
                 out.metrics += PaperMetric.distribution("loaded", samples: samples,
@@ -400,11 +423,12 @@ public enum PaperCasesLive {
     /// what was staged. Returns nil (with `out.note` set) when the machine has nothing of that kind,
     /// which is a legitimate outcome on a corpus without audio or without images.
     static func stage(_ ctx: PaperContext, kinds: Set<FileKind>, limit: Int, dir: String,
-                      minBytes: Int = 1_024, out: inout PaperCaseOutput) throws -> StagedSample? {
+                      minBytes: Int = 1_024, maxBytes: Int = 8_000_000,
+                      out: inout PaperCaseOutput) throws -> StagedSample? {
         guard let live = ctx.live else { out.note = noLive; return nil }
         ctx.progress("sampling real files")
         let picked = PaperFileSampler(roots: live.roots)
-            .sample(kinds: kinds, limit: limit, minBytes: minBytes,
+            .sample(kinds: kinds, limit: limit, minBytes: minBytes, maxBytes: maxBytes,
                     shouldContinue: { ctx.shouldContinue })
         guard !picked.isEmpty else {
             out.note = "no files of kind \(kinds.map(\.rawValue).sorted().joined(separator: "|")) under the roots"

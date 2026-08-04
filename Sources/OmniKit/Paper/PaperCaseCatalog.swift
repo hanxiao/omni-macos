@@ -453,15 +453,19 @@ public enum PaperCaseCatalog {
 
     private static func liveSave(_ scale: Double) -> PaperCaseSpec {
         let p = PaperParams([
-            PaperParameter("files", .int(120), scaling: .scaled(minimum: 10)),
+            PaperParameter("files", .int(80), scaling: .scaled(minimum: 10)),
             // Big enough to hold several chunks: a one-chunk file has no unchanged prefix, so the
             // reuse arm would have nothing to reuse and the pair would measure the same thing twice.
             PaperParameter("min_bytes", .int(8_000)),
+            // And small enough that building the index the edit lands on does not eat the budget:
+            // at 8 MB the sample drew scanned PDFs whose pages each cost a vision forward, and on
+            // both laptops the setup pass consumed the case before one edit was timed.
+            PaperParameter("max_bytes", .int(1_000_000)),
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p16_save, title: "Save latency on real files",
             deliverable: "Sec. 4.2 tab:tasks save row, both reuse arms",
-            budgetSeconds: 420,
+            budgetSeconds: 700,
             arms: [PaperArm("cache_off", PaperLeverSet(chunkCache: false)),
                    PaperArm("cache_on", PaperLeverSet(chunkCache: true))],
             params: p, arithmeticPeakMB: nil,
