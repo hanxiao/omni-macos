@@ -140,6 +140,10 @@ public struct PaperContext: Sendable {
     public let params: PaperParams
     public let engine: OmniEngine
     public let fs: PaperFS
+    /// The machine's real index, when the suite runs inside the app and one exists. Read-only for
+    /// every case that touches it (see PaperCasesLive). nil outside the app, where the live family
+    /// records its own note rather than a measured zero.
+    public let live: PaperLiveIndex?
     public let scale: Double
     public let capClass: PaperCapClass
     public let memoryBytes: Int
@@ -222,6 +226,7 @@ public enum PaperSuite {
                            engine: OmniEngine,
                            fs: PaperFS,
                            bodies: PaperCaseBodies,
+                           live: PaperLiveIndex? = nil,
                            isCancelled: @escaping @Sendable () -> Bool = { false },
                            onProgress: @escaping @Sendable (PaperProgress) -> Void = { _ in }) -> PaperSuiteResult {
         let memoryBytes = Int(ProcessInfo.processInfo.physicalMemory)
@@ -317,6 +322,7 @@ public enum PaperSuite {
                 relay.environment(thermal: envBegin.thermal,
                                   swapDeltaMB: max(0, envBegin.swapUsedMB - begin.swapUsedMB))
                 let ctx = PaperContext(spec: spec, params: spec.params, engine: engine, fs: fs,
+                                       live: live,
                                        scale: config.scale, capClass: capClass,
                                        memoryBytes: memoryBytes, repetition: step.repetition,
                                        deadline: Date().addingTimeInterval(spec.budgetSeconds),

@@ -15,21 +15,22 @@ public struct PaperAllCaseBodies: PaperCaseBodies {
     public init() {}
 
     public func body(for id: PaperCaseID) -> PaperCaseBody? {
-        PaperCasesCompute.body(for: id) ?? PaperCasesStore.body(for: id)
+        PaperCasesCompute.body(for: id) ?? PaperCasesStore.body(for: id) ?? PaperCasesLive.body(for: id)
     }
 
     /// Cases with no body in this build. They record `skipped:unimplemented`, never a measured zero.
     public static var missingIDs: [PaperCaseID] {
-        PaperCaseID.allCases.filter {
-            PaperCasesCompute.body(for: $0) == nil && PaperCasesStore.body(for: $0) == nil
-        }
+        PaperCaseID.allCases.filter { providerCount(for: $0) == 0 }
     }
 
-    /// Cases claimed by both providers. Must be empty; a runner should say so loudly rather than
-    /// quietly measuring one of the two implementations.
+    /// Cases claimed by more than one provider. Must be empty; a runner should say so loudly rather
+    /// than quietly measuring one of the implementations.
     public static var contestedIDs: [PaperCaseID] {
-        PaperCaseID.allCases.filter {
-            PaperCasesCompute.body(for: $0) != nil && PaperCasesStore.body(for: $0) != nil
-        }
+        PaperCaseID.allCases.filter { providerCount(for: $0) > 1 }
+    }
+
+    private static func providerCount(for id: PaperCaseID) -> Int {
+        [PaperCasesCompute.body(for: id), PaperCasesStore.body(for: id), PaperCasesLive.body(for: id)]
+            .reduce(0) { $0 + ($1 == nil ? 0 : 1) }
     }
 }

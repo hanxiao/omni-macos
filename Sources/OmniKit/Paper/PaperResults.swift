@@ -54,6 +54,11 @@ public enum PaperUnit: String, Sendable, Codable, CaseIterable {
 /// measured once by construction (a ratio between two other metrics, a peak, a byte count).
 public enum PaperAggregate: String, Sendable, Codable {
     case median, mean, minimum, maximum, sum, single
+    /// Tail percentiles, by NEAREST RANK on the sorted samples (no interpolation): the reported
+    /// value is one that was actually measured, which is what a latency claim has to be. A tail
+    /// percentile is only as good as the sample count, so every distribution also emits its own n
+    /// and `PaperMetric.distribution` refuses to invent a p99 out of too few samples.
+    case p95, p99
 }
 
 /// One measured number, with everything needed to judge it.
@@ -124,10 +129,46 @@ public struct PaperMetric: Sendable, Codable, Equatable {
         case .minimum: return runs.min() ?? 0
         case .maximum: return runs.max() ?? 0
         case .sum: return runs.reduce(0, +)
+        case .p95: return nearestRank(runs, 0.95)
+        case .p99: return nearestRank(runs, 0.99)
         case .single:
             precondition(runs.count == 1, "a .single metric must have exactly one run, got \(runs.count)")
             return runs[0]
         }
+    }
+
+    /// Nearest-rank percentile: the smallest measured sample at or above the p-th position.
+    static func nearestRank(_ runs: [Double], _ p: Double) -> Double {
+        let s = runs.sorted()
+        let rank = Int((p * Double(s.count)).rounded(.up))
+        return s[min(max(rank - 1, 0), s.count - 1)]
+    }
+
+    /// The latency contract for a task: p50, p95, p99 and the sample count, from ONE sample vector.
+    ///
+    /// The count travels as its own metric because a percentile without it is unreadable: at n=20 a
+    /// "p99" is just the maximum wearing a better name. p99 is emitted only at `minimumForP99`
+    /// samples or more; below that the caller gets p50/p95/n and the export shows no p99 rather
+    /// than a number that cannot mean what it says.
+    public static func distribution(_ key: String, samples: [Double], unit: PaperUnit,
+                                    arm: String? = nil, note: String? = nil,
+                                    minimumForP99: Int = 100) -> [PaperMetric] {
+        guard !samples.isEmpty else { return [] }
+        // The arm belongs in the KEY, not only in the `arm` field: the export composes one key per
+        // metric and asserts they are distinct, so two arms emitting the same key is a duplicate
+        // rather than two rows. Same convention the store cases already use ("unshaped.cold.p50").
+        let base = arm.map { "\($0).\(key)" } ?? key
+        var out = [
+            PaperMetric("\(base).p50", runs: samples, unit: unit, aggregate: .median, arm: arm, note: note),
+            PaperMetric("\(base).p95", runs: samples, unit: unit, aggregate: .p95, arm: arm),
+        ]
+        if samples.count >= minimumForP99 {
+            out.append(PaperMetric("\(base).p99", runs: samples, unit: unit, aggregate: .p99, arm: arm))
+        }
+        out.append(PaperMetric("\(base).n", runs: [Double(samples.count)], unit: .count,
+                               aggregate: .single, arm: arm,
+                               note: samples.count < minimumForP99 ? "p99 withheld: under \(minimumForP99) samples" : nil))
+        return out
     }
 }
 

@@ -302,8 +302,47 @@ final class PaperConsoleProgress: @unchecked Sendable {
     }
 }
 
+/// Open an index for the live-corpus family, headless. The path is whatever the operator names, so
+/// this is the one place the CLI can be pointed at a real index; PaperFS still refuses to write
+/// anywhere near it, and every live case that mutates stages its own copies (see PaperCasesLive).
+/// Intended for a scratch index built from real files, which is what the smoke test uses.
+func openLiveIndex(indexPath: String, roots: [String]) -> PaperLiveIndex? {
+    let url = URL(fileURLWithPath: indexPath)
+    guard let store = try? VectorStore(dbURL: url) else {
+        print("  live: could not open \(url.path)")
+        return nil
+    }
+    let rootURLs = roots.map { URL(fileURLWithPath: $0) }
+    let summary = store.indexSummary(folders: rootURLs.map(\.path))
+    print("  live: \(summary.fileCount) files, \(summary.chunkCount) chunks, dim \(store.vectorDim)")
+    return PaperLiveIndex(store: store, roots: rootURLs,
+                          modelVariant: store.metaGet("index_model_variant") ?? "unknown")
+}
+
+/// Build a scratch index over a real directory and hand it back as the live index. This is how the
+/// live family is smoke-tested without going anywhere near the app's own index: real files, real
+/// modalities, a store the run owns and can delete.
+func buildLiveIndex(engine: OmniEngine, root: String) -> PaperLiveIndex? {
+    let rootURL = URL(fileURLWithPath: root)
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("omni-paper-live-\(UUID().uuidString)", isDirectory: true)
+    guard (try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)) != nil,
+          let store = try? VectorStore(dbURL: dir.appendingPathComponent("live.sqlite")) else {
+        print("  live: could not create the scratch index")
+        return nil
+    }
+    print("  live: indexing \(rootURL.path)\u{2026}")
+    let t0 = Date()
+    Indexer(store: store, embedder: engine).index(roots: [rootURL], settings: .default) { _ in }
+    let s = store.indexSummary(folders: [rootURL.path])
+    print(String(format: "  live: %d files, %d chunks, dim %d (%.1fs)",
+                 s.fileCount, s.chunkCount, store.vectorDim, Date().timeIntervalSince(t0)))
+    guard s.chunkCount > 0 else { print("  live: nothing indexable under that root"); return nil }
+    return PaperLiveIndex(store: store, roots: [rootURL], modelVariant: "smoke")
+}
+
 func paperRun(engine: OmniEngine, scale: Double, maxWall: Double, outPath: String?,
-              pinCap: Bool) throws -> Int32 {
+              pinCap: Bool, live: PaperLiveIndex? = nil) throws -> Int32 {
     // Everything the run may never touch. PaperFS preconditions on these, so a body that tried to
     // open the real index would trap here rather than corrupting it.
     let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
@@ -348,6 +387,7 @@ func paperRun(engine: OmniEngine, scale: Double, maxWall: Double, outPath: Strin
     let config = PaperRunConfig(runId: runId, scale: scale, maxWallSeconds: maxWall,
                                 pinMemoryCapBytes: pinCap ? capClass.capBytes : nil)
     let result = PaperSuite.run(config: config, engine: engine, fs: fs, bodies: PaperAllCaseBodies(),
+                                live: live,
                                 isCancelled: { cancel.on },
                                 onProgress: { p in progress.apply(p) })
     sigsrc.cancel()
@@ -383,12 +423,22 @@ if args.count >= 3 && args[1] == "paper" {
     var maxWall = PaperCaseCatalog.maxWallSeconds
     var outPath: String?
     var pinCap = true
+    var liveIndexPath: String?
+    var liveRoots: [String] = []
+    var liveBuildRoot: String?
     var i = 3
     while i < args.count {
         switch args[i] {
         case "--scale": scale = Double(args[i + 1]) ?? 1.0; i += 2
         case "--max-wall": maxWall = Double(args[i + 1]) ?? maxWall; i += 2
         case "--out": outPath = args[i + 1]; i += 2
+        // The live-corpus family (p13-p18). Without both, those cases record "no live index"
+        // rather than measuring anything: there is no default index here, on purpose.
+        case "--live-index": liveIndexPath = args[i + 1]; i += 2
+        case "--live-roots": liveRoots = args[i + 1].split(separator: ",").map(String.init); i += 2
+        // Build a scratch index over a real directory and measure against that. What the smoke
+        // test uses, so the live family is exercised on real files without touching a real index.
+        case "--live-build": liveBuildRoot = args[i + 1]; i += 2
         // The app always pins the cap class. Left switchable here because a headless run on a box
         // whose whole point is a bigger cap should be able to say so, and the export stamps it.
         case "--no-pin-cap": pinCap = false; i += 1
@@ -397,7 +447,10 @@ if args.count >= 3 && args[1] == "paper" {
     }
     guard scale > 0, scale <= 1.0 else { print("--scale must be in (0, 1]"); exit(2) }
     let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[2]))
-    exit(try paperRun(engine: engine, scale: scale, maxWall: maxWall, outPath: outPath, pinCap: pinCap))
+    let live = liveBuildRoot.flatMap { buildLiveIndex(engine: engine, root: $0) }
+        ?? liveIndexPath.flatMap { openLiveIndex(indexPath: $0, roots: liveRoots) }
+    exit(try paperRun(engine: engine, scale: scale, maxWall: maxWall, outPath: outPath,
+                      pinCap: pinCap, live: live))
 }
 
 // Content-dedup correctness: omni-verify dedupcheck

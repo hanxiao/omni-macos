@@ -36,3 +36,6 @@ bench/
 
 # scratch screenshots used while producing site/omni/assets - not repo material
 site-assets/
+
+# Local planning notes, not part of the shipped source
+PAPERBENCH-PLAN.md

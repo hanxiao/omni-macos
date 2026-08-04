@@ -596,6 +596,15 @@ final class AppModel {
     /// touches it - but the suite must reuse the ALREADY LOADED one: constructing a second would
     /// double resident VRAM on exactly the 8 GB machine this must not wedge.
     var paperEngine: OmniEngine? { engine }
+    /// The live index, for the paper run's live-corpus cases. Handed over READ-ONLY by contract:
+    /// those cases search it and read its summary, and every case that writes stages a sample of
+    /// real files into PaperFS and indexes those into a throwaway store instead. `store` itself
+    /// stays private for the same reason `engine` does.
+    var paperLiveIndex: PaperLiveIndex? {
+        guard let store, !roots.isEmpty else { return nil }
+        return PaperLiveIndex(store: store, roots: roots,
+                              modelVariant: indexModelVariantRaw ?? "unknown")
+    }
     /// Paths the paper run's filesystem refuses to open, in either direction (equal, parent, or
     /// child). The index file, its containing folder (which holds every sidecar), and the live
     /// store's own URL if the user moved the database elsewhere.

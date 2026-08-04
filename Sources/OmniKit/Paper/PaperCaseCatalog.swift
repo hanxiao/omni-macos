@@ -38,6 +38,9 @@ public enum PaperCapClass: String, Sendable, Codable {
 public enum PaperCaseID: String, Sendable, Codable, CaseIterable {
     case p01_sdpa, p02_textlever, p03_indexpass, p04_tokshare, p05_editreuse, p06_shape
     case p07_gate, p08_scan, p09_select, p10_compact, p11_canary, p12_media
+    /// The live-corpus family: the machine's own files, at its own scale. These do not merge across
+    /// machines and are not meant to - see PaperCasesLive.
+    case p13_env, p14_query, p15_index, p16_save, p17_tag, p18_liveshape
 }
 
 /// One arm of a case: a name that appears in every key the arm produced, plus the levers it moves.
@@ -77,12 +80,15 @@ public struct PaperCaseSpec: Sendable {
 
 public enum PaperCaseCatalog {
     /// Suite identity and schema. Bumped deliberately; two exports that disagree never merge.
-    public static let suiteId = "paper-v1"
-    public static let schema = 1
+    /// v2 adds the live-corpus family (p13-p18) and the p50/p95/p99 distribution contract, so a v1
+    /// export has no rows for either and must not be merged with one that does.
+    public static let suiteId = "paper-v2"
+    public static let schema = 2
 
     /// Global wall-clock cap. The budgets sum to more than this on purpose: the cap is what the
-    /// operator is promised, the budgets are what each case may spend before it yields.
-    public static let maxWallSeconds: Double = 1500
+    /// operator is promised, the budgets are what each case may spend before it yields. Raised for
+    /// v2: an honest p99 needs samples in the hundreds, and the live family adds six cases.
+    public static let maxWallSeconds: Double = 2700
 
     /// MLX RNG seed, reseeded before every case so a case's inputs do not depend on what ran first.
     public static let mlxSeed: UInt64 = 0x0DEC0DE
@@ -129,11 +135,16 @@ public enum PaperCaseCatalog {
     ///     still yields something citable.
     ///  3. Then the rest in dependency-free numeric order, with the optional media case last
     ///     because it is the one that may not run at all.
+    ///  4. The live family last of all. It reads the user's own index, and a case that samples a
+    ///     home directory is the one most likely to run long or find nothing, so nothing the paper
+    ///     needs for its ablation tables sits behind it.
     /// The runner appends the canary's closing invocation itself.
     public static func specs(memoryBytes: Int, scale: Double = 1.0) -> [PaperCaseSpec] {
         [canary(scale), sdpa(scale), textLever(scale), indexPass(scale), tokShare(scale),
          editReuse(scale), shape(scale), gate(scale), scan(memoryBytes, scale),
-         select(memoryBytes, scale), compact(scale), media(scale)]
+         select(memoryBytes, scale), compact(scale), media(scale),
+         liveEnv(scale), liveQuery(scale), liveIndex(scale), liveSave(scale), liveTag(scale),
+         liveShape(scale)]
     }
 
     // MARK: - The cases
@@ -385,6 +396,94 @@ public enum PaperCaseCatalog {
             // Skipped rather than satisfied: loading the tower would double resident VRAM, which is
             // the exact allocation that wedges an 8 GB machine.
             requiresVisionTower: true, runsAtBothEnds: false, driftMetricKey: nil)
+    }
+
+    // MARK: - The live family
+    //
+    // Sample counts here are set by what a percentile needs, not by what a mean needs: 240 text
+    // queries put the p99 at the 238th sorted sample rather than at the maximum. The media counts
+    // are lower because each one decodes a file and runs a tower, and PaperMetric.distribution
+    // withholds a p99 it cannot support rather than printing the maximum under that name.
+
+    private static func liveEnv(_ scale: Double) -> PaperCaseSpec {
+        PaperCaseSpec(
+            id: .p13_env, title: "The machine's own corpus",
+            deliverable: "Sec. 4.1 machines-and-corpora table: files, chunks, index bytes, modality mix",
+            budgetSeconds: 60, arms: [], params: .empty, arithmeticPeakMB: nil,
+            requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
+    }
+
+    private static func liveQuery(_ scale: Double) -> PaperCaseSpec {
+        let p = PaperParams([
+            PaperParameter("text_queries", .int(240), scaling: .scaled(minimum: 20)),
+            PaperParameter("media_queries", .int(40), scaling: .scaled(minimum: 4)),
+            PaperParameter("warmup_queries", .int(5), scaling: .scaled(minimum: 1)),
+            PaperParameter("pivot_files", .int(24), scaling: .scaled(minimum: 4)),
+            PaperParameter("top_k", .int(40)),
+        ]).scaled(by: scale)
+        return PaperCaseSpec(
+            id: .p14_query, title: "Query latency on the live index",
+            deliverable: "Sec. 4.2 task-latency table: text, filename, find-similar, image, audio, video",
+            budgetSeconds: 420, arms: [], params: p, arithmeticPeakMB: nil,
+            requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
+    }
+
+    private static func liveIndex(_ scale: Double) -> PaperCaseSpec {
+        let p = PaperParams([
+            PaperParameter("files", .int(400), scaling: .scaled(minimum: 20)),
+        ]).scaled(by: scale)
+        return PaperCaseSpec(
+            id: .p15_index, title: "Indexing pass over real files",
+            deliverable: "Sec. 4.2 throughput block: files/s, tokens/s, bytes/s, occupancy",
+            budgetSeconds: 420, arms: [], params: p, arithmeticPeakMB: nil,
+            requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
+    }
+
+    private static func liveSave(_ scale: Double) -> PaperCaseSpec {
+        let p = PaperParams([
+            PaperParameter("files", .int(120), scaling: .scaled(minimum: 10)),
+            // Big enough to hold several chunks: a one-chunk file has no unchanged prefix, so the
+            // reuse arm would have nothing to reuse and the pair would measure the same thing twice.
+            PaperParameter("min_bytes", .int(8_000)),
+        ]).scaled(by: scale)
+        return PaperCaseSpec(
+            id: .p16_save, title: "Save latency on real files",
+            deliverable: "Sec. 4.2 save row, and what chunk reuse is worth on a real corpus",
+            budgetSeconds: 420,
+            arms: [PaperArm("cache_off", PaperLeverSet(chunkCache: false)),
+                   PaperArm("cache_on", PaperLeverSet(chunkCache: true))],
+            params: p, arithmeticPeakMB: nil,
+            requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
+    }
+
+    private static func liveTag(_ scale: Double) -> PaperCaseSpec {
+        let p = PaperParams([
+            PaperParameter("images", .int(48), scaling: .scaled(minimum: 4)),
+        ]).scaled(by: scale)
+        return PaperCaseSpec(
+            id: .p17_tag, title: "Tagging real images",
+            deliverable: "Sec. 4.2 image-index row and the open-vocabulary tagging overhead",
+            budgetSeconds: 300,
+            arms: [PaperArm("tags_off"), PaperArm("tags_on")],
+            params: p, arithmeticPeakMB: nil,
+            requiresVisionTower: true, runsAtBothEnds: false, driftMetricKey: nil)
+    }
+
+    private static func liveShape(_ scale: Double) -> PaperCaseSpec {
+        let p = PaperParams([
+            PaperParameter("queries", .int(120), scaling: .scaled(minimum: 10)),
+            PaperParameter("load_files", .int(60), scaling: .scaled(minimum: 8)),
+            PaperParameter("top_k", .int(40)),
+            PaperParameter("debounce_s", .double(0.18), unit: .seconds),
+        ]).scaled(by: scale)
+        return PaperCaseSpec(
+            id: .p18_liveshape, title: "Search under indexing, on the live index",
+            deliverable: "Sec. 4.2 search-while-indexing row, p50/p95/p99 against an idle floor",
+            budgetSeconds: 600,
+            arms: [PaperArm("unshaped", PaperLeverSet(adaptiveBatch: false)),
+                   PaperArm("shaped", PaperLeverSet(adaptiveBatch: true))],
+            params: p, arithmeticPeakMB: nil,
+            requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
     }
 
     private static func scaledInt(_ v: Int, _ scale: Double, minimum: Int) -> Int {

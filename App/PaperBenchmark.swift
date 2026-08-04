@@ -37,6 +37,10 @@ extension AppModel {
         // while running and the progress sheet is modal - three independent locks, because the
         // second run would race the first one's levers on process-wide statics.
         guard !isPaperRunning, !isProfilingRunning, phase == .ready, let engine = paperEngine else { return }
+        // Captured on the main actor, before the detached work: the live family measures the user's
+        // own corpus, and reaching for the store from the detached task would touch actor-isolated
+        // state. nil when no index is open, which the live cases report rather than measure around.
+        let live = paperLiveIndex
         // Claimed BEFORE the preflight, not after: the battery confirmation runs a nested modal run
         // loop, which drains the main queue - so a second click's queued Task ran there and passed
         // the guard above while the first was still asking. Both runs then raced the same statics.
@@ -157,7 +161,7 @@ extension AppModel {
                 progress: { publishDetail($0) },
                 cancelled: { cancel.on })
             let result = PaperSuite.run(config: config, engine: engine, fs: fs,
-                                        bodies: paperCaseBodies(),
+                                        bodies: paperCaseBodies(), live: live,
                                         isCancelled: { cancel.on },
                                         onProgress: { p in
                                             Task { @MainActor in self?.applyPaperProgress(p) }
