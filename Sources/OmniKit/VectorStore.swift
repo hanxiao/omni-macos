@@ -493,6 +493,13 @@ public final class VectorStore: @unchecked Sendable {
     // the snippet is NOT resident at all: at ~220 chars x N chunks it dominated resident metadata
     // (~800B/chunk measured at 2M realistic rows), yet it is only read for a search's <=60 winners
     // and one file's chunks in rankChunks - both fetched lazily from SQLite by primary key.
+    /// Byte cost of one row of bookkeeping, for `omni-verify storemem`.
+    public static var rowStride: Int { MemoryLayout<Row>.stride }
+    /// Logical vs reserved element count of the vector buffer, for `omni-verify storemem`.
+    public var vectorBufferUse: (used: Int, capacity: Int, mapped: Bool) {
+        queue.sync { (flat16.count, flat16.capacityElements, flat16.isMapped) }
+    }
+
     struct Row { let path: String; let kind: String; let chunkIndex: Int; let modified: Double
                  var size: Int = 0
                  var width: Int = 0; var height: Int = 0; var duration: Double = 0; var locator: String = "" }
@@ -538,13 +545,63 @@ public final class VectorStore: @unchecked Sendable {
     /// an 8 GB and a 16 GB machine, making the two Table-3 rows incomparable. The paper's scan case
     /// forces both arms explicitly instead. nil = ship behaviour.
     nonisolated(unsafe) static var quantBaseOverride: Int? = nil
+    /// Rows above which the 4-bit replica is the FASTER scan on this device, independent of memory.
+    ///
+    /// The memory rule below answers "does the bf16 base fit"; it does not answer "which one wins",
+    /// and the two thresholds are far apart on a narrow machine. Measured end to end (exact bf16 p50
+    /// over funnel p50, 40 queries a rung, 6 GB cap, same seeded vectors): the 10-14 core machines
+    /// are past 1.0 by 250k rows and read 1.74-1.78 at 500k, the 20-core M4 Pro crosses between 250k
+    /// and 500k, and the 80-core M3 Ultra not until 500k-1M. `omni-verify gatebench` reproduces the
+    /// ladder on any machine. Wider device = more bandwidth to spend on the exact scan and the same
+    /// fixed selection cost to amortise, so the crossover moves right with core count.
+    ///
+    /// Conservative by construction: each step sits at or above the rung where that class was
+    /// measured ahead, so the replica never turns on before it is the faster representation.
+    public static func crossoverRows(gpuCores: Int?) -> Int {
+        guard let cores = gpuCores else { return 1_000_000 }   // unknown device: the widest threshold
+        switch cores {
+        case ..<16: return 250_000
+        case ..<32: return 500_000
+        default: return 1_000_000
+        }
+    }
+    nonisolated(unsafe) private static let deviceCrossoverRows: Int =
+        crossoverRows(gpuCores: SystemProbe.gpuCores())
     /// Policy: OMNI_QUANT_BASE forces (0=off, 4, 8); unset = auto-on at 4 bits when the full base
-    /// would exceed a quarter of the user's memory cap (Settings > Performance).
-    static func quantBitsFor(baseBytes: Int) -> Int {
+    /// would exceed a quarter of the user's memory cap (Settings > Performance), OR when the corpus
+    /// is past the row count at which the replica is simply the faster scan on this device.
+    static func quantBitsFor(baseBytes: Int, rowCount: Int = 0) -> Int {
         if let v = quantBaseOverride { return v }
         if let s = ProcessInfo.processInfo.environment["OMNI_QUANT_BASE"], let v = Int(s) { return v }
-        return baseBytes > OmniMemoryBudget.capBytes / 4 ? 4 : 0
+        if baseBytes > OmniMemoryBudget.capBytes / 4 { return 4 }
+        return rowCount > deviceCrossoverRows ? 4 : 0
     }
+    // MARK: - Tombstones
+    //
+    // Removing a file's rows used to compact the whole store: every row after the first removed one
+    // moved forward in flat16 and in the lockstep rows/fileID/kindCode arrays. That is proportional
+    // to the INDEX, not to the file, so saving one edited file cost 50 ms at a million rows and grew
+    // linearly from there (`omni-verify savebench`). The bytes are the floor - a per-row forward move
+    // of 1.5 GB measures 74 ms at 20.7 GB/s on an M3 Ultra - so the only way out is not to move them.
+    //
+    // Rows inside the resident base [0, baseRows) are therefore marked dead and left where they are.
+    // Nothing can select them: every place a base score is produced masks them to -inf, which the
+    // isFinite checks the reducers already apply then discard. Rows in the delta [baseRows, n) still
+    // compact physically, which is cheap because the delta is bounded by foldThreshold.
+    //
+    // Dead rows are collected by the next full rebuild, and forced to collect once they pass
+    // `deadBudget`, so the store cannot drift into scanning mostly-dead rows. Cold paths that walk
+    // `rows` directly rather than through a score compact first, so their logic is untouched.
+    nonisolated(unsafe) public static var tombstones =
+        ProcessInfo.processInfo.environment["OMNI_TOMBSTONE"] != "0"
+    private var deadRows = Set<Int32>()
+    /// Resident int32 index list for the GPU mask, rebuilt only when `deadRows` changes.
+    private var deadIdxCache: MLXArray?
+    /// Past this many tombstones the next base build collects them: 5% of the base, never fewer
+    /// than 4096, so a small store does not compact on every save and a large one cannot accumulate
+    /// a scan whose rows are mostly discarded.
+    private var deadBudget: Int { Swift.min(Swift.max(4_096, baseRows / 20), baseRows / 4) }
+
     private var baseRows = 0
     private var baseDirty = true
     /// Monotone counter over CHUNK mutations, persisted in `meta` INSIDE each mutation's SQLite
@@ -582,6 +639,12 @@ public final class VectorStore: @unchecked Sendable {
     private func bf16Row(_ v: [Float]) -> [UInt16] { v.map(Self.toBF16) }
     // Force a full base rebuild on the next search. Used by structural changes (delete/compact/
     // reload) that shift row indices; plain appends do NOT call this (they extend the delta).
+    /// Forget the tombstones because the rows they index are gone. Only correct where `rows` is
+    /// rebuilt or emptied wholesale - the sources those paths read from (the database, the row
+    /// sidecar) never contain a deleted row. Clearing this anywhere a row still stands would bring
+    /// a deleted file back to life.
+    private func resetTombstonesLocked() { deadRows.removeAll(); deadIdxCache = nil }
+
     private func invalidateBase() { baseDirty = true; mlxBase = nil; mlxFileID = nil; mlxKindCode = nil; quantBase = nil; baseRows = 0 }
     // Membership index of the paths currently in `rows`. Lets replace() know in O(1) whether a
     // path pre-exists, so a brand-new file skips removeRowsLocked entirely (no O(N) scan per file
@@ -1361,7 +1424,7 @@ public final class VectorStore: @unchecked Sendable {
             // Release the backing buffers (a wipe will not refill to the same size immediately),
             // rather than removeAll which keeps the ~1.6GB capacity reserved.
             rows = []; flat16.releaseAll(); presentPaths = []; fileID = []; pathID = [:]; idPath = []; fileChunkCount = []
-            kindCode = []; kindID = [:]; idKind = []; invalidateBase()
+            kindCode = []; kindID = [:]; idKind = []; resetTombstonesLocked(); invalidateBase()
             try? FileManager.default.removeItem(at: quantReplicaURL); lastPersistedBaseRows = -1   // replica is of wiped rows
             removeRowSidecarFiles()   // sidecar caches the wiped rows; releaseAll() above dropped the mapping
             resetAggregatesLocked()
@@ -1381,6 +1444,7 @@ public final class VectorStore: @unchecked Sendable {
     /// form kept them stale forever.
     public func indexedFiles() -> [String: StoredFile] {
         queue.sync {
+            ensureCompactLocked()
             guard dbOpen() else { return [:] }
             let n = pathID.count
             var modified = [Double](repeating: -.greatestFiniteMagnitude, count: n)
@@ -1531,6 +1595,7 @@ public final class VectorStore: @unchecked Sendable {
     /// the winners' snippet fill - no GPU, no embedding.
     public func listMatching(filter: SearchFilter, topK: Int = 60) -> [SearchHit] {
         queue.sync {
+            ensureCompactLocked()
             guard dbOpen(), !rows.isEmpty else { return [] }
             let f = resolveTagFilterLocked(filter)
             var firstRow: [Int32: Int] = [:]   // fid -> first row index (carries the file's metadata)
@@ -1540,7 +1605,16 @@ public final class VectorStore: @unchecked Sendable {
                 let fid = fileID[i]
                 if firstRow[fid] == nil { firstRow[fid] = i }
             }
-            let winners = firstRow.values.sorted { rows[$0].modified > rows[$1].modified }.prefix(topK)
+            // Sorted on mtime alone, files that share one - a checkout, an unpack, a synced folder,
+            // any corpus whose timestamps were not preserved - ordered by Dictionary iteration,
+            // which is seeded per process. The browse list therefore reshuffled between launches
+            // for no visible reason. Path is the deterministic secondary key, the same fix the two
+            // score reducers already carry for tied scores.
+            let winners = firstRow.values
+                .sorted { rows[$0].modified != rows[$1].modified
+                          ? rows[$0].modified > rows[$1].modified
+                          : rows[$0].path < rows[$1].path }
+                .prefix(topK)
             let hits = winners.map { i -> SearchHit in
                 let r = rows[i]
                 return SearchHit(path: r.path, score: 0, snippet: "", kind: r.kind,
@@ -1665,7 +1739,7 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
-    public var count: Int { queue.sync { rows.count } }
+    public var count: Int { queue.sync { rows.count - deadRows.count } }
     public var fileCount: Int { queue.sync { liveFiles } }
 
     /// Bits of the CURRENTLY resident scan matrix (0 = full bf16 base, 4/8 = quantized replica).
@@ -1692,7 +1766,7 @@ public final class VectorStore: @unchecked Sendable {
     /// All four summary stats from the incremental aggregates - O(1), was an O(rows) path-Set +
     /// per-row NSString-ext scan that held the search queue.
     public func allIndexStats() -> (fileCount: Int, chunkCount: Int, kinds: Set<String>, exts: Set<String>) {
-        queue.sync { (liveFiles, rows.count, Set(kindFileCounts.keys), Set(extFileCounts.keys)) }
+        queue.sync { (liveFiles, rows.count - deadRows.count, Set(kindFileCounts.keys), Set(extFileCounts.keys)) }
     }
 
     /// Distinct indexed files under a folder (path-boundary aware). Iterates LIVE FILES, not rows.
@@ -1726,7 +1800,7 @@ public final class VectorStore: @unchecked Sendable {
                 }
                 for i in folders.indices { fc[folders[i]] = counts[i] }
             }
-            let result = (liveFiles, rows.count, Set(kindFileCounts.keys), Set(extFileCounts.keys), fc)
+            let result = (liveFiles, rows.count - deadRows.count, Set(kindFileCounts.keys), Set(extFileCounts.keys), fc)
             if Self.statVerify { verifyAggregatesLocked(folders: folders, against: result) }
             return result
         }
@@ -1778,6 +1852,7 @@ public final class VectorStore: @unchecked Sendable {
     /// file itself, and never re-parses the file (so it can't diverge from how the indexer parsed it).
     public func fileVector(_ path: String) -> [Float]? {
         queue.sync {
+            ensureCompactLocked()
             // pathID is the intern table over the paths present in `rows`, so a miss means "not
             // indexed" without scanning; a hit turns the row scan into Int32 compares instead of
             // N string compares (~80B memcmp + ARC each) - 10-50x on a large index.
@@ -1814,6 +1889,7 @@ public final class VectorStore: @unchecked Sendable {
     /// pay the quadratic layout cost.
     public func vectorsUnderFolder(_ folder: String, cap: Int = .max, landmarkCap: Int = .max) -> FolderVectors {
         queue.sync {
+            ensureCompactLocked()
             guard dim > 0, !folder.isEmpty, folder != "/" else { return FolderVectors(paths: [], kinds: [], vectors: [], dim: dim) }
             let empty = FolderVectors(paths: [], kinds: [], vectors: [], dim: dim)
             let prefix = folder + "/"
@@ -1959,7 +2035,7 @@ public final class VectorStore: @unchecked Sendable {
             // longer applies, so fall back to the classic quant-capable path after the lock.
             guard let base = mlxBase, let fid = mlxFileID else { needClassic = true; return nil }
             let qv = queryGraph.reshaped([dim, 1]).asType(.bfloat16)
-            let baseScore = gemvSafe(base, qv, rows: baseRows)
+            let baseScore = maskDeadLocked(gemvSafe(base, qv, rows: baseRows))
             var deltaGraph: MLXArray? = nil
             if n > baseRows {
                 let deltaCount = n - baseRows
@@ -2099,9 +2175,10 @@ public final class VectorStore: @unchecked Sendable {
             // (x @ w.T via quantizedMM wants x as [1, dim]); exact rerank happens below.
             let baseScore: MLXArray
             if let qb = quantBase {
-                baseScore = MLX.quantizedMM(qv.transposed(1, 0), qb.wq, scales: qb.scales, biases: qb.biases,
-                                            transpose: true, groupSize: Self.quantGroup, bits: quantBits)
-                    .transposed(1, 0)
+                baseScore = maskDeadLocked(
+                    MLX.quantizedMM(qv.transposed(1, 0), qb.wq, scales: qb.scales, biases: qb.biases,
+                                    transpose: true, groupSize: Self.quantGroup, bits: quantBits)
+                        .transposed(1, 0))
                 // PLAIN-QUERY FAST PATH: select the top-C candidates ON THE GPU (argPartition) so the
                 // host never reads back or scans all N coarse scores, then exact-rescore just the
                 // candidates and reduce over candidates + delta only - O(C + delta) host work after
@@ -2117,7 +2194,7 @@ public final class VectorStore: @unchecked Sendable {
                     return result
                 }
             } else {
-                baseScore = gemvSafe(mlxBase!, qv, rows: baseRows)
+                baseScore = maskDeadLocked(gemvSafe(mlxBase!, qv, rows: baseRows))
                 // PLAIN-QUERY FAST PATH (full mode): best-chunk-per-file reduction ON the GPU.
                 // The scores are already resident post-matmul; reading all N back and scanning
                 // them on the host was ~4ms of a ~9.5ms query at 2M rows. Delta rows (bounded by
@@ -2220,6 +2297,68 @@ public final class VectorStore: @unchecked Sendable {
         return MLX.concatenated(parts, axis: 0)
     }
 
+    /// -inf at every tombstoned row, so no selection or reduction downstream can reach one. The
+    /// scatter is over the dead rows alone, so it costs nothing at the scale of the scan it guards.
+    /// Returns the argument untouched when there is nothing dead, which is the usual case.
+    private func maskDeadLocked(_ scores: MLXArray) -> MLXArray {
+        guard !deadRows.isEmpty else { return scores }
+        if deadIdxCache == nil {
+            deadIdxCache = MLXArray(deadRows.sorted())
+        }
+        scores[deadIdxCache!] = MLXArray(-Float.infinity)
+        return scores
+    }
+
+    /// Drop the tombstones for real. Called before any path that walks `rows` without going through
+    /// a score, and by the full base rebuild, so those paths never have to know tombstones exist.
+    private func ensureCompactLocked() {
+        guard !deadRows.isEmpty else { return }
+        _ = compactRowsLocked { _ in false }
+    }
+
+    /// Rows per tile for two-level selection, and the lever that turns it off for A/B.
+    private static let selectTile = 32
+    nonisolated(unsafe) public static var twoLevelSelect =
+        ProcessInfo.processInfo.environment["OMNI_TWO_LEVEL_SELECT"] != "0"
+
+    /// Indices of the C highest scores, exactly, without sorting all of them.
+    ///
+    /// MLX implements ArgPartition as a full merge sort on Metal ("We direct arg partition to sort
+    /// for now"), so asking for 1920 rows out of millions sorted millions. Cut the scores into tiles
+    /// of `selectTile` rows and take the C tiles with the highest maxima: each of those C maxima is
+    /// itself a distinct row at or above the C-th largest tile maximum, so the C-th largest GLOBAL
+    /// score is at least that value, and any row in the true top C therefore sits in a tile whose
+    /// maximum clears it. Selecting among those C tiles is exact, and costs a sort over rows/32 plus
+    /// a sort over 32C instead of a sort over rows. Boundary ties are resolved arbitrarily, exactly
+    /// as the single argPartition resolved them.
+    ///
+    /// Measured on an M3 Ultra at C=1920 (`omni-verify selectbench`), ms: 1.00 -> 0.47 at 1M rows,
+    /// 1.23 -> 0.41 at 2M, 1.96 -> 0.44 at 4M. Below ~250k rows the two are level, so the small-store
+    /// case keeps the single call rather than paying for two.
+    static func topCIndices(_ flat: MLXArray, rows: Int, C: Int) -> MLXArray {
+        let t = selectTile
+        let tileCount = rows / t
+        guard twoLevelSelect, C > 0, tileCount > 4 * C else {
+            let kth = rows - C
+            return MLX.argPartition(flat, kth: kth)[kth...]
+        }
+        let head = tileCount * t
+        let g = flat[0 ..< head].reshaped([tileCount, t])
+        let hot = MLX.argPartition(g.max(axis: 1), kth: tileCount - C)[(tileCount - C)...].asType(.int32)
+        // Tile id -> the global row indices that tile covers.
+        let offsets = MLX.arange(0, t, dtype: .int32).reshaped([1, t])
+        var pool = ((hot * Int32(t)).reshaped([C, 1]) + offsets).reshaped([C * t])
+        // The rows past the last whole tile are fewer than `selectTile`; admit them outright rather
+        // than reason about a partial tile.
+        if head < rows {
+            pool = MLX.concatenated([pool, MLX.arange(head, rows, dtype: .int32)])
+        }
+        let poolCount = C * t + (rows - head)
+        let kth2 = poolCount - C
+        let sel = MLX.argPartition(MLX.take(flat, pool, axis: 0), kth: kth2)[kth2...]
+        return MLX.take(pool, sel, axis: 0)
+    }
+
     /// The plain-query fast path for quant mode. GPU: argPartition the coarse scores for the top-C
     /// row indices (no full readback). Host: gather those C rows' exact bf16 vectors from flat16,
     /// rescore in one [C, dim] matmul, then reduce best-chunk-per-file over ONLY the C candidates
@@ -2229,8 +2368,7 @@ public final class VectorStore: @unchecked Sendable {
                                         candidateCount C: Int, query: [Float], topK: Int) -> [SearchHit] {
         // Top-C base candidates on the GPU; delta rows are exact and all enter the reduce.
         let flat = coarse.reshaped([baseRows])
-        let kth = baseRows - C
-        let topIdx = MLX.argPartition(flat, kth: kth)[kth...]
+        let topIdx = Self.topCIndices(flat, rows: baseRows, C: C)
         var deltaScores: [Float] = []
         if n > baseRows {
             let deltaCount = n - baseRows
@@ -2267,7 +2405,7 @@ public final class VectorStore: @unchecked Sendable {
         var best: [Int32: (score: Float, row: Int32)] = [:]
         best.reserveCapacity(cand.count + deltaScores.count)
         func offer(_ row: Int32, _ score: Float) {
-            guard score.isFinite else { return }
+            guard score.isFinite, !deadRows.contains(row) else { return }
             let f = fileID[Int(row)]
             if let cur = best[f], cur.score >= score { return }
             best[f] = (score, row)
@@ -2535,7 +2673,10 @@ public final class VectorStore: @unchecked Sendable {
         let mono = MLX.which(bits .>= topBit, MLXArray(UInt32.max) - bits, bits + topBit).asType(.uint64)
         let invFid = (MLXArray(UInt32.max) - MLX.arange(0, F, dtype: .uint32)).asType(.uint64)
         let keyF = (mono * MLXArray(UInt64(4_294_967_296))) + invFid   // mono << 32 | invFid
-        let topIdx = kth > 0 ? MLX.argPartition(keyF, kth: kth)[kth...] : MLX.arange(0, F, dtype: .int32)
+        // Same two-level selection as the candidate path, over files rather than rows. The tie-break
+        // key above is already total, so no two entries compare equal and the exactness argument in
+        // `topCIndices` applies unchanged.
+        let topIdx = kth > 0 ? Self.topCIndices(keyF, rows: F, C: F - kth) : MLX.arange(0, F, dtype: .int32)
         let topScores = bestScore[topIdx]
         let topRows = bestRow[topIdx]
         // argPartition returns uint32 indices; the host candidate map keys on Int32. Cast BEFORE the
@@ -2557,7 +2698,7 @@ public final class VectorStore: @unchecked Sendable {
         let idxHost = topIdxI.asArray(Int32.self)   // already materialized in the eval above (F5)
         for j in 0 ..< scoresHost.count {
             let r = rowsHost[j]
-            guard r != Int32.max, scoresHost[j].isFinite else { continue }    // file absent from base
+            guard r != Int32.max, scoresHost[j].isFinite, !deadRows.contains(r) else { continue }
             candScore[idxHost[j]] = scoresHost[j]
             candRow[idxHost[j]] = r
         }
@@ -2899,7 +3040,7 @@ public final class VectorStore: @unchecked Sendable {
         func reject() { try? FileManager.default.removeItem(at: url) }
         let n = rows.count
         guard n > 0, dim > 0, dim % Self.quantGroup == 0 else { reject(); return }
-        let bits = Self.quantBitsFor(baseBytes: n * dim * MemoryLayout<UInt16>.size)
+        let bits = Self.quantBitsFor(baseBytes: n * dim * MemoryLayout<UInt16>.size, rowCount: n)
         guard bits > 0 else { reject(); return }
         guard let fh = try? FileHandle(forReadingFrom: url) else { reject(); return }
         defer { try? fh.close() }
@@ -3008,6 +3149,7 @@ public final class VectorStore: @unchecked Sendable {
     /// describes vector bytes that could still be lost. Metadata build runs on the queue (~1s at
     /// 3.8M rows, at idle); the file write happens on persistIO.
     private func stampRowSidecarLocked(sync: Bool) {
+        ensureCompactLocked()   // the sidecar is the row table; it must not carry tombstones
         guard Self.rowSidecarEnabled, dbOpen(), flat16.isPersistent, dim > 0, !rows.isEmpty,
               mutationGen != lastStampedGen, flat16.count == rows.count * dim else { return }
         let t0 = omniPerfEnabled ? Date() : nil
@@ -3140,7 +3282,7 @@ public final class VectorStore: @unchecked Sendable {
         else { return reject() }
         guard header.magic == "omni-rows-1", header.gen == mutationGen,
               header.rowCount > 0, header.dim > 0, header.dim % Self.quantGroup == 0,
-              Self.quantBitsFor(baseBytes: header.rowCount * header.dim * 2) > 0,
+              Self.quantBitsFor(baseBytes: header.rowCount * header.dim * 2, rowCount: header.rowCount) > 0,
               header.recordBytes == header.rowCount * Self.rowRecordSize,
               header.pathCount > 0, header.kindCount > 0,
               header.pathOffBytes == (header.pathCount + 1) * 4,
@@ -3236,7 +3378,7 @@ public final class VectorStore: @unchecked Sendable {
         kindID = [:]
         for (i, k) in kindTable.enumerated() { kindID[k] = UInt8(i) }
         fileChunkCount = [Int32](repeating: 0, count: pathTable.count)
-        rows.removeAll(); rows.reserveCapacity(header.rowCount)
+        rows.removeAll(); rows.reserveCapacity(header.rowCount); resetTombstonesLocked()
         fileID.removeAll(); fileID.reserveCapacity(header.rowCount)
         kindCode.removeAll(); kindCode.reserveCapacity(header.rowCount)
         resetAggregatesLocked()
@@ -3309,7 +3451,7 @@ public final class VectorStore: @unchecked Sendable {
     private func rebuildBaseLocked(rowCount: Int) {
         let tR = Self.searchTiming ? Date() : nil
         let byteCount = rowCount * dim * MemoryLayout<UInt16>.size
-        let bits = Self.quantBitsFor(baseBytes: byteCount)
+        let bits = Self.quantBitsFor(baseBytes: byteCount, rowCount: rowCount)
         // INCREMENTAL FOLD: a pure append onto a live quant replica (no structural change, same
         // quant decision) quantizes ONLY the delta rows and concatenates them onto the existing
         // packed arrays - O(delta) quantize + O(delta) scratch writes instead of re-quantizing all
@@ -3491,6 +3633,7 @@ public final class VectorStore: @unchecked Sendable {
     /// Rank a single file's chunks against the query (for the "which passage matched" UI).
     public func rankChunks(_ query: [Float], path: String, topK: Int = 6) -> [ChunkHit] {
         queue.sync {
+            ensureCompactLocked()
             guard dim > 0, query.count == dim, let id = pathID[path] else { return [] }
             // Snippets are not resident (see Row): fetch this one file's chunk snippets in a single
             // indexed SELECT, keyed by chunk index.
@@ -3537,6 +3680,7 @@ public final class VectorStore: @unchecked Sendable {
     /// the winners. Scores are cosine (vectors are L2-normalized at index time).
     public func rankChunksAcross(_ query: [Float], paths: [String], topK: Int = 10) -> [InlineChunkHit] {
         queue.sync {
+            ensureCompactLocked()
             let n = rows.count
             guard dim > 0, query.count == dim, !paths.isEmpty, n > 0, flat16.count == n * dim else { return [] }
             // Normalize each requested path ONCE (strip a single trailing slash) so the prefix test is
@@ -3743,19 +3887,27 @@ public final class VectorStore: @unchecked Sendable {
         var any = false
         for p in paths { if let id = pathID[p] { let idx = Int(id); if idx < idMask.count { idMask[idx] = true; any = true } } }
         guard any else { return }
-        // Resolve the id mask to per-ROW flags BEFORE compacting. compactRowsLocked mutates fileID
-        // in lockstep with rows/flat16, so the predicate must not read fileID through a live buffer
-        // pointer (mutating an array inside its own withUnsafeBufferPointer closure is an exclusivity
-        // violation - it happened to work, but it is undefined behavior). A standalone flags array
-        // costs one O(N) integer pass and is immune to the compaction's writes.
-        var removeRow = [Bool](repeating: false, count: rows.count)
+        // Tombstoning writes nothing that `fileID` aliases - it marks dead indices and leaves every
+        // buffer in place - so the predicate may read fileID through a pointer, and the common save
+        // costs one integer pass with no allocation at all. The physical compaction cannot: it
+        // rewrites fileID in lockstep with rows and flat16, and reading an array through a buffer
+        // pointer while that same array is being mutated is an exclusivity violation. It therefore
+        // still materializes per-row flags first, which are immune to its own writes.
+        var removed = Set<String>()
+        var tombstoned = false
         idMask.withUnsafeBufferPointer { m in
             fileID.withUnsafeBufferPointer { fid in
-                for i in 0 ..< removeRow.count { removeRow[i] = m[Int(fid[i])] }
+                if let r = tombstoneOnlyLocked({ m[Int(fid[$0])] }) { removed = r; tombstoned = true }
             }
         }
-        let removed = removeRow.withUnsafeBufferPointer { rm in
-            compactRowsLocked { rm[$0] }
+        if !tombstoned {
+            var removeRow = [Bool](repeating: false, count: rows.count)
+            idMask.withUnsafeBufferPointer { m in
+                fileID.withUnsafeBufferPointer { fid in
+                    for i in 0 ..< removeRow.count { removeRow[i] = m[Int(fid[i])] }
+                }
+            }
+            removed = removeRow.withUnsafeBufferPointer { rm in compactRowsLocked { rm[$0] } }
         }
         presentPaths.subtract(removed.isEmpty ? paths : removed)
     }
@@ -3765,7 +3917,7 @@ public final class VectorStore: @unchecked Sendable {
         // the base in sync if anything is actually removed (the base was previously left stale here).
         guard dim > 0 else {
             if rows.contains(where: predicate) {
-                rows.removeAll(where: predicate)
+                rows.removeAll(where: predicate); resetTombstonesLocked()
                 presentPaths = Set(rows.map { $0.path })
                 rebuildFileIDsLocked()
                 invalidateBase()
@@ -3777,7 +3929,7 @@ public final class VectorStore: @unchecked Sendable {
         // prior row to remove. Without it, every stored file rebuilt the entire ~dim*rows.count
         // buffer (a multi-GB memmove on a large index), making indexing and reconcile O(N^2).
         guard rows.contains(where: predicate) else { return }
-        let removed = compactRowsLocked { predicate(rows[$0]) }
+        let removed = removeRowsFastLocked { predicate(rows[$0]) }
         presentPaths.subtract(removed)
     }
 
@@ -3789,7 +3941,48 @@ public final class VectorStore: @unchecked Sendable {
     /// id, a fully-removed id just goes unreferenced (fileIDCount becomes an upper bound -> the
     /// reducer's per-file array is merely oversized, never wrong); loadIntoMemory rebuilds them densely
     /// next launch. Returns the set of removed paths (for presentPaths maintenance). Invalidates base.
+    /// Remove rows without moving the index: what falls inside the resident base is tombstoned,
+    /// what falls in the delta compacts as before. Falls back to a full compaction when the
+    /// tombstones would pass `deadBudget`, which also collects the ones already standing.
+    private func removeRowsFastLocked(_ shouldRemove: (Int) -> Bool) -> Set<String> {
+        tombstoneOnlyLocked(shouldRemove) ?? compactRowsLocked(shouldRemove)
+    }
+
+    /// Tombstone every matching row, or return nil when this removal cannot be served that way and
+    /// the caller must fall back to a physical compaction. Mutates nothing the predicate may be
+    /// reading through a buffer pointer.
+    private func tombstoneOnlyLocked(_ shouldRemove: (Int) -> Bool) -> Set<String>? {
+        guard Self.tombstones, dim > 0, baseRows > 0 else { return nil }
+        var inBase: [Int32] = []
+        var deltaHits = false
+        for i in 0 ..< rows.count where shouldRemove(i) {
+            if i < baseRows {
+                if !deadRows.contains(Int32(i)) { inBase.append(Int32(i)) }
+            } else {
+                deltaHits = true
+            }
+        }
+        guard !inBase.isEmpty, !deltaHits, deadRows.count + inBase.count <= deadBudget else {
+            return nil
+        }
+        var removedPaths = Set<String>()
+        for i in inBase {
+            let r = rows[Int(i)]
+            removedPaths.insert(r.path)
+            fileChunkDec(fileID[Int(i)], r.kind, r.path)
+            deadRows.insert(i)
+        }
+        deadIdxCache = nil
+        return removedPaths
+    }
+
     private func compactRowsLocked(_ shouldRemove: (Int) -> Bool) -> Set<String> {
+        // Every physical compaction also collects the standing tombstones - they are rows nothing
+        // may return, and this is the one pass that can drop them for free. Their bookkeeping was
+        // done when they were marked, so they must NOT be counted again here: `fileChunkDec` twice
+        // on one row would drive a file's chunk count negative, and re-reporting the path would let
+        // the caller subtract a path that has since been re-added.
+        let dead = deadRows
         var removedPaths = Set<String>()
         var firstRemoved = Int.max
         // Original indices of the base rows [0, baseRows) that SURVIVE this compaction, materialized
@@ -3800,10 +3993,13 @@ public final class VectorStore: @unchecked Sendable {
         flat16.withUnsafeMutableBufferPointer { fb in
             guard let base = fb.baseAddress else { return }
             for i in 0 ..< rows.count {
-                if shouldRemove(i) {
+                let alreadyDead = dead.contains(Int32(i))
+                if alreadyDead || shouldRemove(i) {
                     if i < baseRows, baseSurvivors == nil { baseSurvivors = (0 ..< Int32(i)).map { $0 } }
-                    removedPaths.insert(rows[i].path)
-                    fileChunkDec(fileID[i], rows[i].kind, rows[i].path)
+                    if !alreadyDead {
+                        removedPaths.insert(rows[i].path)
+                        fileChunkDec(fileID[i], rows[i].kind, rows[i].path)
+                    }
                     if i < firstRemoved { firstRemoved = i }
                     continue
                 }
@@ -3817,6 +4013,8 @@ public final class VectorStore: @unchecked Sendable {
         }
         let removed = rows.count - w
         guard removed > 0 else { return removedPaths }
+        deadRows.removeAll(keepingCapacity: true)   // collected by this pass
+        deadIdxCache = nil
         flat16.removeLast(removed * dim)
         rows.removeLast(removed); fileID.removeLast(removed); kindCode.removeLast(removed)
         // The base is the resident copy of rows [0, baseRows). It only goes stale if a removed row was
@@ -3873,6 +4071,7 @@ public final class VectorStore: @unchecked Sendable {
 
     private func loadIntoMemory() {
         rows.removeAll(); flat16.removeAll(); presentPaths.removeAll(); fileID.removeAll(); pathID.removeAll()
+        resetTombstonesLocked()
         idPath.removeAll(); fileChunkCount.removeAll(); kindCode.removeAll(); kindID.removeAll(); idKind.removeAll(); dim = 0
         resetAggregatesLocked()
         if tryAdoptRowSidecarLocked() { return }   // validated cache of everything below; SQLite stays truth
@@ -3890,7 +4089,7 @@ public final class VectorStore: @unchecked Sendable {
             // (the first fold moved these bytes to the same mapping anyway) - only the launch path
             // changes. Small indexes (bf16 mode) keep the heap exactly as before. If the mapping
             // fails, reserveCapacity below restores the historical heap path.
-            if Self.quantBitsFor(baseBytes: total * d0 * MemoryLayout<UInt16>.size) > 0, d0 % Self.quantGroup == 0 {
+            if Self.quantBitsFor(baseBytes: total * d0 * MemoryLayout<UInt16>.size, rowCount: total) > 0, d0 % Self.quantGroup == 0 {
                 // Prefer the NAMED persistent file (it doubles as the vector sidecar - a later
                 // stamp makes the next open skip this whole scan); a second store on the same
                 // index fails the flock and gets the private unlinked scratch instead.
