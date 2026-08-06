@@ -2,15 +2,28 @@ import SwiftUI
 import AppKit
 import OmniKit
 
+private enum SettingsTab: Hashable { case indexing, content, performance, storage, history, serving }
+
 struct SettingsView: View {
+    // Selection is BOUND, not left to the TabView, purely so the live memory sampler can be gated
+    // on "Performance is the visible tab". A SwiftUI TabView keeps a pane alive once it has been
+    // visited, so .onAppear/.task alone would keep sampling forever after one visit.
+    @State private var tab: SettingsTab = .indexing
+
     var body: some View {
-        TabView {
+        TabView(selection: $tab) {
             ActivityTab().tabItem { Label("Indexing", systemImage: "arrow.triangle.2.circlepath") }
+                .tag(SettingsTab.indexing)
             ContentTypesTab().tabItem { Label("Content", systemImage: "square.grid.2x2") }
-            PerformanceTab().tabItem { Label("Performance", systemImage: "speedometer") }
+                .tag(SettingsTab.content)
+            PerformanceTab(isVisible: tab == .performance).tabItem { Label("Performance", systemImage: "speedometer") }
+                .tag(SettingsTab.performance)
             IndexTab().tabItem { Label("Storage", systemImage: "externaldrive") }
+                .tag(SettingsTab.storage)
             HistoryTab().tabItem { Label("History", systemImage: "clock.arrow.circlepath") }
+                .tag(SettingsTab.history)
             ServingTab().tabItem { Label("Serving", systemImage: "network") }
+                .tag(SettingsTab.serving)
         }
         // Size to the selected tab rather than forcing one height across five differently sized
         // panes (the Storage tab can show an out-of-date banner plus a Model section). Keeps the
@@ -429,6 +442,8 @@ private struct IgnoreEditor: NSViewRepresentable {
 }
 
 private struct PerformanceTab: View {
+    /// True only while THIS is the selected Settings tab - the live memory sampler's on switch.
+    var isVisible: Bool
     @Environment(AppModel.self) private var model: AppModel
     /// Only for the hidden paper run: its sheet lives on the main window, which may be closed.
     @Environment(\.openWindow) private var openWindow
@@ -511,12 +526,15 @@ private struct PerformanceTab: View {
                     // relaunch. It also silently corrupts the run, which pins the cap as a class.
                     .disabled(model.isPaperRunning)
                 }
+                MemoryBreakdown(isVisible: isVisible)
             } header: {
                 Text("Memory")
             } footer: {
+                // Names the two slices the cap actually governs, now that the bar above makes the
+                // difference visible: the cap is an MLX limit, so a total above it is normal.
                 Text(model.isPaperRunning
                      ? "Locked while the benchmark runs; your cap is restored after."
-                     : "Caps the model and the folder map. Keep above ~4 GB; 0 is unlimited.")
+                     : "The cap covers Model and Cache above, not the whole app. 0 is unlimited.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
@@ -564,6 +582,94 @@ private struct PerformanceTab: View {
             }
         }
         .formStyle(.grouped)
+    }
+}
+
+/// Live breakdown of Omni's OWN memory - the same capacity-bar idiom System Settings > Storage
+/// uses for a disk, scaled to this process instead of the machine. The whole bar is the app's
+/// phys_footprint (what Activity Monitor shows for Omni), and the slices are measured parts of it,
+/// so the question it answers is "where did Omni's memory go", never "how full is my Mac".
+private struct MemoryBreakdown: View {
+    /// Sampling runs ONLY while the Performance tab is the visible one. Not `.onAppear`: a
+    /// SwiftUI TabView keeps a visited pane alive, so an appear-driven loop would keep ticking
+    /// behind every other tab and after the window is closed. Nothing outside this pane - search,
+    /// indexing, the main window - ever pays for the monitor.
+    var isVisible: Bool
+    @Environment(AppModel.self) private var model: AppModel
+    @State private var sample = AppModel.MemorySample()
+
+    /// Order matters: biggest and most stable first, catch-all last, so the bar doesn't reshuffle
+    /// as values move. Grey for the remainder mirrors the free-space slice in System Settings.
+    private var slices: [(name: String, color: Color, bytes: Int, help: String)] {
+        [("Model", .blue, sample.model, "Weights and activations held by MLX"),
+         ("Cache", .teal, sample.cache, "Freed MLX buffers kept for reuse - reclaimed under memory pressure"),
+         ("Index", .purple, sample.index, "Vectors and row table the search reads"),
+         ("Other", Color(nsColor: .systemGray), sample.other, "App, thumbnails, database cache, frameworks")]
+    }
+
+    private func fmt(_ bytes: Int) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .memory)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Omni is using")
+                Spacer()
+                Text(fmt(sample.total)).foregroundStyle(.secondary).monospacedDigit()
+            }
+            bar
+            legend
+        }
+        // Keyed on isVisible: SwiftUI cancels and restarts the task whenever it flips, so leaving
+        // the tab stops the loop at the next await and re-entering starts a fresh one.
+        .task(id: isVisible) {
+            guard isVisible else { return }
+            while !Task.isCancelled {
+                sample = await model.sampleMemory()
+                if omniMemLogEnabled {
+                    FileHandle.standardError.write(Data("[mem-ui] tick\n".utf8))
+                }
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
+    }
+
+    @ViewBuilder private var bar: some View {
+        GeometryReader { geo in
+            let total = max(1, sample.total)
+            HStack(spacing: 0) {
+                ForEach(Array(slices.enumerated()), id: \.offset) { i, s in
+                    // The last slice takes whatever is left instead of its own rounded width, so
+                    // four roundings can never leave a hairline gap at the trailing edge.
+                    let w = i == slices.count - 1
+                        ? nil
+                        : (geo.size.width * CGFloat(s.bytes) / CGFloat(total)).rounded(.down)
+                    Rectangle().fill(s.color)
+                        .frame(width: w)
+                        .frame(maxWidth: w == nil ? .infinity : nil)
+                }
+            }
+        }
+        .frame(height: 16)
+        .background(Color(nsColor: .quaternaryLabelColor))
+        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+    }
+
+    @ViewBuilder private var legend: some View {
+        LazyVGrid(columns: [GridItem(.flexible(), alignment: .leading),
+                            GridItem(.flexible(), alignment: .leading)], spacing: 4) {
+            ForEach(Array(slices.enumerated()), id: \.offset) { _, s in
+                HStack(spacing: 5) {
+                    Circle().fill(s.color).frame(width: 7, height: 7)
+                    Text(s.name)
+                    Spacer(minLength: 4)
+                    Text(fmt(s.bytes)).foregroundStyle(.secondary).monospacedDigit()
+                }
+                .help(s.help)
+            }
+        }
+        .font(.caption)
     }
 }
 

@@ -1,9 +1,33 @@
 import Foundation
 
+/// One crawled file. Stores the PATH, not a URL, and hands out a URL on demand.
+///
+/// A full index pass holds every crawled file in memory at once (per-root lists, the interleaved
+/// list, and the by-kind grouping), so what this struct retains is multiplied by the file count.
+/// A Foundation URL is not one object: it brings a CFURL, an NSPathStore2 for the path, and - the
+/// moment anything reads `resourceValues` - a CoreServices `_FileCache` holding those values, plus
+/// the CFStrings inside it. Measured on a 211k-file index: 264k `_FileCache` (84 MB), 264k NSURL,
+/// 597k NSPathStore2 and 1.7M CFStrings alive at once, ~550 MB of heap that the user sees as
+/// "Other" and cannot explain. One Swift String per file is a single allocation; the URL is rebuilt
+/// where it is used and dies immediately after.
 public struct CrawledFile: Sendable {
-    public let url: URL
+    public let path: String
     public let modified: Double
     public let size: Int
+
+    /// Materialized per access - deliberately not stored. Callers use it once per file, which is
+    /// nothing next to decoding and embedding that file.
+    public var url: URL { URL(fileURLWithPath: path) }
+
+    public init(path: String, modified: Double, size: Int) {
+        self.path = path
+        self.modified = modified
+        self.size = size
+    }
+
+    public init(url: URL, modified: Double, size: Int) {
+        self.init(path: url.path, modified: modified, size: size)
+    }
 }
 
 /// Recursively enumerates supported files under a set of roots, skipping hidden
@@ -58,22 +82,33 @@ public struct FileCrawler: Sendable {
             guard let en = fm.enumerator(at: root, includingPropertiesForKeys: keys,
                                          options: [.skipsHiddenFiles], errorHandler: { _, _ in true })
             else { continue }
+            let keySet = Set(keys)
             for case let url as URL in en {
                 if !shouldContinue() { return }
-                guard let vals = try? url.resourceValues(forKeys: Set(keys)) else { continue }
-                if vals.isDirectory == true {
-                    if ignore.isIgnored(url.path, isDir: true) || vals.isPackage == true {
-                        en.skipDescendants()
+                // Per-iteration pool: the enumerator vends autoreleased URLs and every
+                // resourceValues read allocates more Foundation objects behind them. Without a
+                // pool here they all pile up until the walk RETURNS - hundreds of thousands of
+                // objects on a large root, freed only after the crawl no longer needs them.
+                var crawled: CrawledFile?
+                autoreleasepool {
+                    guard let vals = try? url.resourceValues(forKeys: keySet) else { return }
+                    if vals.isDirectory == true {
+                        if ignore.isIgnored(url.path, isDir: true) || vals.isPackage == true {
+                            en.skipDescendants()
+                        }
+                        return
                     }
-                    continue
+                    guard vals.isRegularFile == true,
+                          let kind = FileExtractor.kind(for: url), enabledKinds.contains(kind),
+                          !ignore.isIgnored(url.path, isDir: false) else { return }
+                    let size = vals.fileSize ?? 0
+                    if let cap = maxFileSize[kind], size > cap { return }   // per-kind cap; uncapped kinds stream
+                    let mtime = vals.contentModificationDate?.timeIntervalSince1970 ?? 0
+                    crawled = CrawledFile(path: url.path, modified: mtime, size: size)
                 }
-                guard vals.isRegularFile == true,
-                      let kind = FileExtractor.kind(for: url), enabledKinds.contains(kind),
-                      !ignore.isIgnored(url.path, isDir: false) else { continue }
-                let size = vals.fileSize ?? 0
-                if let cap = maxFileSize[kind], size > cap { continue }   // per-kind cap; uncapped kinds stream
-                let mtime = vals.contentModificationDate?.timeIntervalSince1970 ?? 0
-                onFile(CrawledFile(url: url, modified: mtime, size: size))
+                // Handed over OUTSIDE the pool: onFile is the caller's pipeline, and its own
+                // allocations have nothing to do with this iteration's temporaries.
+                if let crawled { onFile(crawled) }
             }
         }
     }

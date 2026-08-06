@@ -260,6 +260,15 @@ final class Vec16Buffer {
         heap = []; count = 0
     }
 
+    /// Bytes this arena contributes to the process footprint (anonymous memory only).
+    ///
+    /// Heap mode: all of it. Mapped mode: the file-backed prefix is clean pages the kernel drops
+    /// and re-reads for free, so it costs no footprint - but everything appended since the last
+    /// growFileCoverage sits in the ANONYMOUS TAIL of the reservation and costs every byte. That
+    /// tail is not a rounding error: mid-index it was measured at 1.27 GB in one allocation, which
+    /// is exactly the kind of memory a user hunts for and cannot see.
+    var anonymousBytes: Int { isMapped ? max(0, count * 2 - fileBytes) : count * 2 }
+
     private func unmapScratch() {
         if let base { munmap(base, reserveBytes); self.base = nil; reserveBytes = 0 }
         if fd >= 0 { close(fd); fd = -1 }   // also releases the flock in persistent mode
@@ -3804,6 +3813,41 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     public func sizeBytes() -> Int64 { queue.sync { onDiskBytes() } }
+
+    /// What the SEARCH DATA costs in memory right now, split by where it lives. Feeds the Settings
+    /// breakdown, which would otherwise file both halves under the wrong heading: the quantized
+    /// base is MLXArrays, so it shows up inside MLX's active total and reads as "the model", when
+    /// it is the index. Takes the store queue like sizeBytes(), so call it OFF the main actor -
+    /// a bulk index write can hold that queue for a while.
+    ///
+    /// Under-reports rather than guesses: row path strings on the heap are not counted, and the
+    /// file-backed part of the vector arena is excluded (clean pages, no footprint).
+    public struct SearchMemory: Sendable {
+        public var cpu = 0   // vector-arena tail + row table
+        public var gpu = 0   // quantized base held as MLXArrays
+        public init(cpu: Int = 0, gpu: Int = 0) { self.cpu = cpu; self.gpu = gpu }
+    }
+
+    public func residentSearchMemory() -> SearchMemory {
+        queue.sync { memoryLocked() }
+    }
+
+    /// Non-blocking variant for the Settings monitor. The work is 6 us; the WAIT is what matters -
+    /// measured at 23 ms when a bulk index write owns the queue - and a monitor has no business
+    /// parking a thread for that long once a second. The caller keeps its previous numbers if this
+    /// never fires; nothing downstream needs the sample to be punctual.
+    public func residentSearchMemory(_ completion: @escaping @Sendable (SearchMemory) -> Void) {
+        queue.async { completion(self.memoryLocked()) }
+    }
+
+    private func memoryLocked() -> SearchMemory {
+        var m = SearchMemory()
+        m.cpu = flat16.anonymousBytes + rows.count * MemoryLayout<Row>.stride
+        if let q = quantBase {
+            m.gpu = q.wq.nbytes + q.scales.nbytes + (q.biases?.nbytes ?? 0)
+        }
+        return m
+    }
 
     /// Reclaim disk space after deletions. SQLite keeps pages freed by DELETE inside the file
     /// (its high-water mark never drops on its own), so the on-disk size stays put until VACUUM

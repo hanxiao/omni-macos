@@ -173,6 +173,12 @@ public func omniPhysicalMemory() -> Int { Int(ProcessInfo.processInfo.physicalMe
 /// file + persisted quant replica), so active/total is a REAL progress fraction, not an animation.
 public func omniGPUActiveMemory() -> Int { MLX.Memory.activeMemory }
 
+/// Bytes MLX is holding in its RECLAIMABLE buffer cache - freed allocations kept for reuse rather
+/// than returned to the OS. It is part of the process footprint and is usually the second-largest
+/// thing in it, so the Settings memory breakdown shows it as its own slice: it looks like leaked
+/// memory otherwise, when it is the cap doing exactly what it was told (see cacheLimit above).
+public func omniGPUCacheMemory() -> Int { MLX.Memory.cacheMemory }
+
 // Opt-in perf log for diagnosing search/index latency on REAL hardware (esp. low-end, where the
 // in-flight indexing flush is slow enough that the gate wait actually bites). Enable by launching
 // the binary from a terminal with the env var and redirecting stderr, e.g.:

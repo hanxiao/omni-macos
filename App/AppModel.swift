@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import AppKit
 import CryptoKit
+import os
 import OmniKit
 
 enum ResultViewMode: String, CaseIterable { case list, grid }
@@ -38,6 +39,11 @@ struct HistoryItem: Codable, Sendable, Identifiable, Equatable {
 
 /// When a search enters History. Mirrors how macOS apps treat recents - automatic, on explicit
 /// submit, or only when the user deliberately saves one (Smart-Folder style).
+/// Opt-in memory tracing (`OMNI_MEM_LOG=1`), read once. Gates both the app-lifetime sampler in
+/// AppModel and the Settings pane's own tick line, so "is the monitor running right now" is an
+/// observable fact rather than an assumption about SwiftUI's view lifetime.
+let omniMemLogEnabled = ProcessInfo.processInfo.environment["OMNI_MEM_LOG"] == "1"
+
 enum HistoryMode: String, CaseIterable, Identifiable {
     case auto, onSubmit, manual
     var id: String { rawValue }
@@ -898,6 +904,108 @@ final class AppModel {
     private var store: VectorStore?
     private var indexer: Indexer?
     private var searchToken = 0
+
+    /// One reading of where Omni's own memory is going. `total` is the process phys_footprint -
+    /// the number Activity Monitor calls Memory - and the parts are measured, not apportioned:
+    /// `model` and `cache` come from MLX, `index` from the store's resident arena + row table.
+    /// `other` is the REMAINDER (UI, thumbnails, SQLite page cache, frameworks), so the parts
+    /// always add up to the total exactly and no slice is ever invented.
+    struct MemorySample: Equatable {
+        var total = 0, model = 0, cache = 0, index = 0, other = 0
+        /// The Index slice split by where it lives, kept for the log and for anyone asking why a
+        /// mostly-mmapped index costs RAM at all: `indexGPU` is the quantized base held as
+        /// MLXArrays, `indexCPU` is the row table plus the vector arena's not-yet-folded tail.
+        /// The big bf16 base is mapped from the on-disk sidecar and appears in NEITHER - clean
+        /// file-backed pages cost no footprint.
+        var indexGPU = 0, indexCPU = 0
+        /// How long the sample took (mach + MLX counters only - the store is read off-thread).
+        /// `indexFresh` is false when the store queue was busy and the previous index numbers
+        /// were carried forward. Logged, never shown in the UI.
+        var sampleUs = 0.0
+        var indexFresh = true
+    }
+
+    /// Opt-in memory trace, same idiom as OMNI_PERF_LOG: one line every 5 s with the SAME numbers
+    /// (`omniMemLogEnabled` also gates the Settings sampler's own tick line, so the gating can be
+    /// watched from the log rather than inferred).
+    /// the Settings breakdown shows, so the attribution can be checked on a real index without a
+    /// screenshot (and while a long index pass runs unattended). Launch from a terminal with
+    ///   OMNI_MEM_LOG=1 /Applications/Omni.app/Contents/MacOS/Omni 2> ~/omni-mem.log
+    func startMemoryLogIfRequested() {
+        guard omniMemLogEnabled else { return }
+        Task { [weak self] in
+            while let self, !Task.isCancelled {
+                let s = await self.sampleMemory()
+                let mb = { (b: Int) in String(format: "%.0f", Double(b) / 1_048_576) }
+                FileHandle.standardError.write(Data(
+                    "[mem] total=\(mb(s.total))MB model=\(mb(s.model))MB cache=\(mb(s.cache))MB index=\(mb(s.index))MB (gpu=\(mb(s.indexGPU)) cpu=\(mb(s.indexCPU))) other=\(mb(s.other))MB sample=\(String(format: "%.0f", s.sampleUs))us fresh=\(s.indexFresh ? 1 : 0)\n"
+                        .utf8))
+                try? await Task.sleep(for: .seconds(5))
+            }
+        }
+    }
+
+    /// Last store reading, reused when the store queue is busy - see sampleMemory().
+    @ObservationIgnored private var lastSearchMemory = VectorStore.SearchMemory()
+
+    /// Sample the breakdown. Nothing here runs on the main actor, and nothing BLOCKS on a lock the
+    /// app's real work uses: the footprint and MLX reads are mach/allocator counters (19 us for the
+    /// whole sample, measured), and the one shared lock - the store queue - is taken ASYNC with a
+    /// deadline. A bulk index write can own that queue for tens of ms (23 ms measured); rather than
+    /// park a thread there once a second, the sample gives up and reuses the previous numbers.
+    nonisolated func sampleMemory() async -> MemorySample {
+        let store = await self.store
+        let previous = await self.lastSearchMemory
+        let (search, fresh) = await Self.searchMemory(store, fallback: previous)
+        await MainActor.run { self.lastSearchMemory = search }
+        return await Task.detached(priority: .utility) {
+            var s = MemorySample()
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            s.total = SystemProbe.footprintBytes()
+            s.cache = omniGPUCacheMemory()
+            // The quantized base is MLXArrays, so MLX counts it as active memory - but it is the
+            // INDEX, not the model. Move it across, or the Model slice absorbs 1.4 GB of search
+            // data and the user is told the weights are twice their real size.
+            s.indexFresh = fresh
+            s.indexGPU = search.gpu
+            s.indexCPU = search.cpu
+            s.index = search.cpu + search.gpu
+            s.model = max(0, omniGPUActiveMemory() - search.gpu)
+            // Clamp before subtracting: the three measured parts come from different clocks (MLX
+            // can allocate between the footprint read and its own), so a momentary overshoot must
+            // shrink a slice rather than produce a negative remainder that breaks the bar.
+            let parts = s.model + s.cache + s.index
+            if parts > s.total { s.total = parts }
+            s.other = s.total - parts
+            s.sampleUs = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1000
+            return s
+        }.value
+    }
+
+    /// Ask the store for its memory numbers without ever blocking on its queue. Resolves with the
+    /// fresh reading if the queue answers within the deadline, otherwise with `fallback` (the
+    /// previous reading) - the monitor showing one-second-stale index bytes is invisible; a
+    /// stalled sampler thread during a heavy index pass is not.
+    private nonisolated static func searchMemory(_ store: VectorStore?,
+                                                 fallback: VectorStore.SearchMemory)
+        async -> (VectorStore.SearchMemory, Bool) {
+            guard let store else { return (.init(), true) }
+            return await withCheckedContinuation { cont in
+                let done = OSAllocatedUnfairLock(initialState: false)
+                @Sendable func finish(_ m: VectorStore.SearchMemory, _ fresh: Bool) {
+                    let first = done.withLock { was -> Bool in
+                        if was { return false }
+                        was = true
+                        return true
+                    }
+                    if first { cont.resume(returning: (m, fresh)) }
+                }
+                store.residentSearchMemory { finish($0, true) }
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(60)) {
+                    finish(fallback, false)
+                }
+            }
+    }
 
     /// Owns the in-process HTTP serving layer. Constructed eagerly so it can load its own
     /// "omni.serving.*" defaults in init; the engine and store are handed to it in bootstrap via
@@ -1980,6 +2088,7 @@ final class AppModel {
 
     private func bootstrap() async {
         applyMemoryLimit()
+        startMemoryLogIfRequested()
         watchActivationForDeniedRoots()
         // A model/db switch tears the old engine down: stop any in-flight label-cache build on
         // it (buildCache checks cancellation per batch) and drop the stale re-tag queue (it
