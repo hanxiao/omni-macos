@@ -288,6 +288,11 @@ public enum SystemProbe {
         return out.isEmpty ? nil : out
     }
 
+    /// GPU core count, resolved once. The store reads this to place the bf16/int4 crossover, which
+    /// is on the base-build path, so it must not re-walk the IORegistry each time.
+    nonisolated(unsafe) private static let cachedGPUCores: Int? = gpuCoreCount()
+    public static func gpuCores() -> Int? { cachedGPUCores }
+
     /// GPU core count from the IORegistry. The app is unsandboxed, so no entitlement is needed, and
     /// this costs microseconds - `system_profiler` costs about a second and is never worth it here.
     private static func gpuCoreCount() -> Int? {

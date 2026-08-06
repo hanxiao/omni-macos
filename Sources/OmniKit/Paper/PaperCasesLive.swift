@@ -466,7 +466,16 @@ public enum PaperCasesLive {
             out.note = "no files of kind \(kinds.map(\.rawValue).sorted().joined(separator: "|")) under the roots"
             return nil
         }
-        let root = try ctx.fs.scratch(named: dir)
+        // realpath, for the reason p05 states: $TMPDIR is a symlink on macOS and the crawl records
+        // the prefix it walked, so a staged URL of /var/... against a stored /private/var/... makes
+        // update() look up a path the store has never seen. chunkVectors matches on path equality,
+        // so the lookup returns nothing and every chunk is re-embedded under both arms - a 0%
+        // saving that reads as a result. `omni-verify pathreuse` holds this down.
+        var root = try ctx.fs.scratch(named: dir)
+        if let rp = realpath(root.path, nil) {
+            root = URL(fileURLWithPath: String(cString: rp), isDirectory: true)
+            free(rp)
+        }
         let staged = try paperStageRealFiles(picked, into: root)
         guard !staged.isEmpty else { out.note = "no real file could be staged"; return nil }
         let bytes = staged.reduce(0) { sum, u in
