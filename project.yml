@@ -45,3 +45,43 @@ targets:
         INFOPLIST_KEY_NSDownloadsFolderUsageDescription: "Omni indexes your Downloads so you can search them by meaning."
         INFOPLIST_KEY_NSDesktopFolderUsageDescription: "Omni indexes your Desktop so you can search them by meaning."
         INFOPLIST_KEY_LSMinimumSystemVersion: "14.0"
+
+  OmniUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources:
+      - UITests
+    dependencies:
+      - target: Omni
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.hanxiao.omni.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: minimal
+        TEST_TARGET_NAME: Omni
+        CODE_SIGN_IDENTITY: "Apple Development"
+        CODE_SIGN_STYLE: Manual
+        DEVELOPMENT_TEAM: ${OMNI_TEAM_ID}
+
+schemes:
+  # Declaring any scheme turns off XcodeGen's implicit ones, and Scripts/build-app.sh builds
+  # `-scheme Omni`, so the app scheme has to be declared explicitly now rather than left to
+  # whatever Xcode happened to autocreate in xcuserdata.
+  Omni:
+    build:
+      targets:
+        Omni: all
+    run:
+      config: Debug
+    archive:
+      config: Release
+
+  OmniUITests:
+    build:
+      targets:
+        Omni: all
+        OmniUITests: [test]
+    test:
+      targets:
+        - OmniUITests
