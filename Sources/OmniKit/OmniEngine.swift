@@ -123,13 +123,34 @@ public enum OmniMemoryBudget {
     }
 }
 
+/// Fraction of the memory cap handed to the MLX buffer cache.
+///
+/// Was one half, which at the 6 GB default is 3 GB of reclaimable buffers - the largest single
+/// thing the cap hands out, and resident as far as the user and the pager are concerned. A quarter
+/// costs nothing measurable anywhere it was looked for (`omni-verify mapbench`, the paper index and
+/// query cases, all at CAP-6 on an M3 Ultra):
+///
+///   fraction  cache    index tok/s   index peak RSS   folder map   map footprint
+///   0.5       3.0 GB        83,059         3,534 MB       117 ms       1,785 MB
+///   0.25      1.5 GB        82,793         2,016 MB       119 ms       1,788 MB
+///   0.125     750 MB        82,853         1,153 MB       131 ms       1,020 MB
+///
+/// Indexing throughput is flat across all three and query latency stays inside run-to-run spread,
+/// so a quarter returns 1.5 GB for nothing. An eighth returns another 860 MB but is the first rung
+/// that costs the folder map anything, so it is left as a lever rather than the default.
+public let omniCacheFraction: Double =
+    ProcessInfo.processInfo.environment["OMNI_MLX_CACHE_FRACTION"].flatMap { Double($0) } ?? 0.25
+
 /// Hard-cap MLX memory usage (bytes). 0 = library default (no explicit cap). The
 /// buffer cache is set to half the limit. Takes effect immediately and globally.
 public func omniSetMemoryLimit(_ bytes: Int) {
     OmniMemoryBudget.capBytes = bytes > 0 ? bytes : Int(ProcessInfo.processInfo.physicalMemory)
     if bytes > 0 {
         MLX.Memory.memoryLimit = bytes
-        MLX.Memory.cacheLimit = max(bytes / 2, 256 * 1024 * 1024)
+        // Half the cap is reclaimable buffer cache, and it is by far the largest single thing the
+        // cap hands out: at the 6 GB default that is 3 GB the user sees as resident. A/B this
+        // fraction with OMNI_MLX_CACHE_FRACTION to weigh what it buys against what it holds.
+        MLX.Memory.cacheLimit = max(Int(Double(bytes) * omniCacheFraction), 256 * 1024 * 1024)
     } else {
         // "Unlimited" = no compute cap, but STILL bound the reclaimable buffer cache. Otherwise
         // sustained variable-shape work (folder maps + query embeds of changing sizes) lets MLX's
