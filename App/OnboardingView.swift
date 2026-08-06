@@ -5,14 +5,28 @@ import OmniKit
 struct OnboardingView: View {
     @Environment(AppModel.self) private var model: AppModel
 
+    // House rules for this screen, so it stays calm as copy changes:
+    // - TWO type sizes: `.title` for the one headline, `.callout` for every other string.
+    // - TWO text colors: primary for what you act on, secondary for everything that explains it.
+    //   No tertiary/quaternary text - stacking greys is what made this read as a wall.
+    // - ONE decision: which model to download. Nothing else is offered here.
     var body: some View {
         VStack(spacing: 18) {
-            Image(systemName: "square.stack")
-                .font(.system(size: 46, weight: .light))
-                .foregroundStyle(.tertiary)
+            // The app's own icon, read from the running bundle (NOT an asset name or a bundled
+            // file): whatever ships as AppIcon is what shows here, so the icon and this screen can
+            // never drift apart. It replaces an SF Symbol placeholder - a generic square.stack on
+            // the one screen where the app introduces itself.
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable().interpolation(.high)
+                .frame(width: 84, height: 84)
+                .accessibilityHidden(true)   // the headline right below already names the app
             Text("Welcome to Omni")
                 .font(.title).fontWeight(.semibold)
-            Text("Search images, video, audio, and text by meaning. The model runs on-device - pick one to download.")
+            // Says WHAT is downloading and WHY there is a download at all: people who just
+            // installed the app read a second download as a mistake or a trick. It also carries the
+            // privacy claim, which is why the lock.shield block that used to close this screen is
+            // gone rather than reworded.
+            Text("Searching by meaning needs an embedding model. It downloads once, then runs on this Mac - your files never leave it.")
                 .font(.callout).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center).frame(maxWidth: 440)
 
@@ -21,7 +35,7 @@ struct OnboardingView: View {
                     ProgressView(value: model.downloadFraction)
                         .frame(width: 360)
                     Text(model.downloadLabel)
-                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                        .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
                     // A multi-GB download on a slow connection must be escapable (HIG); partial
                     // files are kept and skipped on the next attempt.
                     Button("Cancel") { model.cancelDownload() }
@@ -30,33 +44,29 @@ struct OnboardingView: View {
                 }
                 .padding(.top, 4)
             } else {
+                // No "choose a folder" escape hatch. Omni does not run arbitrary models: these are
+                // the two jina-embeddings-v5-omni builds, and loading merges the retrieval LoRA and
+                // upcasts the backbone for THIS architecture - point it at anything else and it
+                // fails deep in the load. Someone who already has the weights is still covered
+                // without a control here: ModelLocator finds an existing HuggingFace snapshot or a
+                // staged copy on its own, and Settings > Storage > Model keeps an explicit
+                // Change... for the rare case, where the surrounding context makes it honest.
                 VStack(spacing: 10) {
-                    variantButton(.nano, size: "~1.9 GB \u{00B7} faster", prominent: true)
+                    variantButton(.nano, size: "~1.9 GB \u{00B7} recommended", prominent: true)
                     variantButton(.small, size: "~3.1 GB \u{00B7} higher quality", prominent: false)
                 }
                 .padding(.top, 4)
 
-                Button("Choose model folder\u{2026}") { pick() }
-                    .buttonStyle(.plain).font(.callout).foregroundStyle(.secondary).padding(.top, 6)
-
-                // Frame the permission prompts BEFORE they fire: indexing starts right after the
-                // download, and macOS will ask for each folder with no other context.
-                Text("Omni starts by indexing your Documents, Downloads, and Desktop folders - macOS will ask for permission for each. You can add or remove folders anytime from the sidebar.")
-                    .font(.caption).foregroundStyle(.secondary)
+                // Frames the macOS permission prompts BEFORE they fire: they arrive right after the
+                // download with no other context.
+                Text("Next, Omni asks for access to Desktop, Documents, and Downloads.")
+                    .font(.callout).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center).frame(maxWidth: 420)
                     .padding(.top, 6)
             }
 
             if model.downloadFailed {
-                Text(model.downloadLabel).font(.caption).foregroundStyle(.red).frame(maxWidth: 440)
-            }
-
-            Spacer().frame(height: 2)
-            VStack(spacing: 5) {
-                Image(systemName: "lock.shield").foregroundStyle(.tertiary)
-                Text("Private by design. Indexing and search run on your Mac's Apple silicon, so your files never leave the device. The model downloads once - after that, no internet is required.")
-                    .font(.caption).foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center).frame(maxWidth: 420)
+                Text(model.downloadLabel).font(.callout).foregroundStyle(.red).frame(maxWidth: 440)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -68,9 +78,10 @@ struct OnboardingView: View {
             Image(systemName: "arrow.down.circle")
             VStack(alignment: .leading, spacing: 1) {
                 Text("Download \(v.title)").fontWeight(.medium)
-                Text(size).font(.caption).foregroundStyle(.secondary)
+                Text(size).foregroundStyle(.secondary)
             }
         }
+        .font(.callout)
         .frame(width: 260, alignment: .leading)
 
         if prominent {
@@ -80,13 +91,5 @@ struct OnboardingView: View {
             Button { model.downloadModel(v) } label: { content }
                 .controlSize(.large).buttonStyle(.bordered)
         }
-    }
-
-    private func pick() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.prompt = "Select"
-        if panel.runModal() == .OK, let url = panel.url { model.setModelDir(url) }
     }
 }

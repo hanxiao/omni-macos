@@ -84,14 +84,31 @@ struct ContentView: View {
             Sidebar()
                 .navigationSplitViewColumnWidth(min: 230, ideal: 260, max: 320)
         } detail: {
-            detail
-                // No navigationTitle/navigationSubtitle: either one claims the leading toolbar slot
-                // and pushes back/forward to its right. The WINDOW title ("Omni", from the Window
-                // scene) stays visible - stock titlebar chrome on Sequoia is load-bearing (system
-                // sidebar toggle, tracking separator, divider-drag rendering), and Tahoe shows the
-                // title too.
-                .toolbar { toolbar }
-                .background(WindowTitleHider(onSearchByFile: { model.searchByFilePanel() }))
+            // No navigationTitle/navigationSubtitle: either one claims the leading toolbar slot
+            // and pushes back/forward to its right.
+            //
+            // The redundant "Omni" label next to the traffic lights is dropped through SwiftUI's
+            // own API, `toolbar(removing: .title)`, which removes only the title ITEM and leaves
+            // the toolbar background, the split tracking separator and the traffic lights intact.
+            // This is deliberately NOT the AppKit route that was tried before (setting
+            // NSWindow.titleVisibility from a window observer): mutating the window/toolbar in the
+            // middle of SwiftUI's commit is what took the system sidebar toggle and the toolbar's
+            // sidebar/detail sectioning down with it on Sequoia - see the tuner's notes below.
+            //
+            // Gated to macOS 26 because that is the only system this was verified on. The API
+            // itself exists from macOS 15, so widening the check is a one-token change once the
+            // same pass (title gone, system toggle present, divider drag clean, trailing cluster
+            // right-aligned) has been run on a Sequoia machine. macOS 14/15 keep stock chrome,
+            // which is the known-good state there.
+            Group {
+                if #available(macOS 26.0, *) {
+                    detail.toolbar(removing: .title)
+                } else {
+                    detail
+                }
+            }
+            .toolbar { toolbar }
+            .background(WindowTitleHider(onSearchByFile: { model.searchByFilePanel() }))
         }
     }
 
