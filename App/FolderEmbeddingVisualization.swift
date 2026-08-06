@@ -72,25 +72,31 @@ struct FolderEmbeddingVisualization: View {
                 // its nearest neighbors, then a thumbnail at every lit point so you see what each file
                 // IS without hovering. Thumbnails don't capture clicks, so clicking one re-selects that
                 // neighbor (the dot underneath) - letting you walk the neighbor graph.
-                if let sel = selectedIndex, sel < model.folderProjection.count {
+                // COORDINATES COME FROM `positions`, NEVER from folderProjection: with "spread dots"
+                // on, `positions` is the gridified layout the GPU actually draws (and the one the
+                // hit-test scans), while folderProjection still holds the pre-grid fit. Drawing from
+                // the latter put every ring, line and thumbnail at the file's OLD location, so the
+                // spotlight and the hover ring pointed at a dot that wasn't there. folderProjection
+                // is used for the path only.
+                if let sel = selectedIndex, sel < positions.count, positions.count == model.folderProjection.count {
                     let pts = model.folderProjection
                     ZStack {
                         Canvas { ctx, size in
                             let map = screenMap(in: size)
-                            let selP = map(pts[sel].position)
-                            for nb in litNeighbors where nb < pts.count {
-                                var path = Path(); path.move(to: selP); path.addLine(to: map(pts[nb].position))
+                            let selP = map(positions[sel])
+                            for nb in litNeighbors where nb < positions.count {
+                                var path = Path(); path.move(to: selP); path.addLine(to: map(positions[nb]))
                                 ctx.stroke(path, with: .color(.primary.opacity(0.22)), lineWidth: 1)
                             }
                         }
                         // Neighbors first, the selected file LAST so it (larger, accent-ringed) sits on top.
-                        ForEach((litNeighbors + [sel]).filter { $0 < pts.count }, id: \.self) { i in
+                        ForEach((litNeighbors + [sel]).filter { $0 < positions.count }, id: \.self) { i in
                             let isSel = (i == sel)
                             Thumbnail(path: pts[i].path, side: isSel ? 52 : 38, corner: 6)
                                 .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous)
                                     .strokeBorder(isSel ? Color.accentColor : .primary.opacity(0.2), lineWidth: isSel ? 2.5 : 1))
                                 .shadow(color: .black.opacity(0.25), radius: 3, y: 1)
-                                .position(screenPoint(pts[i].position, in: geo.size))
+                                .position(screenPoint(positions[i], in: geo.size))
                         }
                     }
                     .allowsHitTesting(false)
@@ -106,18 +112,20 @@ struct FolderEmbeddingVisualization: View {
                     ZStack {
                         // Hover: a ring on the dot (plain stroke, not glass) + a thumbnail-and-name
                         // chip near the cursor.
-                        if let h = hovered {
-                            let s = screenPoint(h.position, in: geo.size)
+                        // Ring position from `positions` (the drawn layout), same reason as the
+                        // spotlight above; `hovered` supplies the name and thumbnail only.
+                        if let h = hovered, let hi = hoveredIndex, hi < positions.count {
+                            let s = screenPoint(positions[hi], in: geo.size)
                             let d = max(Self.radius(for: positions.count), 3) * 2 + 5
                             Circle().stroke(.primary, lineWidth: 1.5)
                                 .frame(width: d, height: d).position(s).allowsHitTesting(false)
                             hoverChip(for: h, in: geo.size)
                         }
 
+                        // Interactive (it hosts the layout menu), like the zoom cluster below it.
                         caption
                             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                             .padding(Design.gapLarge)
-                            .allowsHitTesting(false)
 
                         zoomControls
                             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
@@ -288,6 +296,15 @@ struct FolderEmbeddingVisualization: View {
 
     // MARK: - Overlays
 
+    /// The top-left chip: what the map is showing, plus the map's own layout control. The two
+    /// layout choices that used to live only in Settings > Performance (PCA/UMAP, and the
+    /// no-overlap spread) hang off a pop-up at its trailing edge, so switching dense/sparse is one
+    /// click on the map itself. One capsule, a hairline separating label from control - the Tahoe
+    /// idiom for a map's own mode switch, where Maps puts its layer picker too.
+    ///
+    /// The live text stays OUTSIDE the Menu's label: a menu label is snapshotted, so the
+    /// observation reads inside it are not tracked, and a chip built while the fit was still
+    /// running kept showing "Desktop" with no file count for as long as the map was open.
     @ViewBuilder private var caption: some View {
         let count = model.folderProjection.count
         HStack(spacing: 6) {
@@ -305,12 +322,38 @@ struct FolderEmbeddingVisualization: View {
                     Text(total > count ? "\(count) of \(total) files"
                                        : "\(count) file\(count == 1 ? "" : "s")")
                         .foregroundStyle(.secondary).lineLimit(1)
+                    Divider().frame(height: 13)
+                    layoutMenu
                 }
             }
         }
         .font(.callout)
-        .padding(.horizontal, 10).padding(.vertical, 6)
-        .glassChip()
+        .padding(.horizontal, 10).padding(.vertical, 5)
+        .glassChip(interactive: true)
+    }
+
+    /// Layout pop-up inside the caption chip. Icon-only and static by design (see `caption`).
+    @ViewBuilder private var layoutMenu: some View {
+        Menu {
+            Picker("Layout", selection: Binding(get: { model.mapUsesUMAP }, set: { model.mapUsesUMAP = $0 })) {
+                Text("Fast \u{00B7} PCA").tag(false)
+                Text("Detailed \u{00B7} UMAP").tag(true)
+            }
+            .pickerStyle(.inline)
+            Divider()
+            Toggle("Spread dots so none overlap", isOn: Binding(get: { model.mapNoOverlap }, set: { model.mapNoOverlap = $0 }))
+        } label: {
+            Image(systemName: "chevron.down")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 16, height: 16)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)   // the chevron IS the label
+        .fixedSize()
+        .help("Map layout")
+        .accessibilityLabel("Map layout")
     }
 
     @ViewBuilder private var legend: some View {

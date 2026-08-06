@@ -66,7 +66,7 @@ private struct ActivityTab: View {
                         if model.isPreparing {
                             // No file processed yet: scanning folders / warming up the model. Show an
                             // explanation rather than a 0% bar that looks frozen.
-                            Text("Scanning your folders and warming up the model\u{2026}")
+                            Text("Scanning folders, warming up the model\u{2026}")
                                 .font(.caption).foregroundStyle(.secondary)
                         } else {
                             ProgressView(value: overall)
@@ -120,7 +120,7 @@ private struct ActivityTab: View {
             } header: {
                 Text("Status")
             } footer: {
-                Text("Omni keeps the index up to date automatically as files change. Click Update to check immediately.")
+                Text("Updates automatically as files change.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -137,7 +137,7 @@ private struct ActivityTab: View {
             } header: {
                 Text("File types")
             } footer: {
-                Text("Turn a type off to stop indexing it and free its model from memory. Drag to set which types index first.")
+                Text("Turn off to stop indexing a type and free its model. Drag to reorder.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -150,7 +150,7 @@ private struct ActivityTab: View {
             } header: {
                 Text("Image & video tagging")
             } footer: {
-                Text("Describes photos, videos, and scans with a few words (\"cat, couch, crib\"), generated on-device while indexing.")
+                Text("A few words per photo, video, or scan (\"cat, couch, crib\"), on-device while indexing.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -189,7 +189,7 @@ private struct ActivityTab: View {
             Button("Keep in index") { model.applyKind(pd.kind, on: false, purge: false) }
             Button("Cancel", role: .cancel) { model.pendingDisable = nil }
         } message: { pd in
-            Text("\(pd.count) \(pd.kind.rawValue) \(pd.count == 1 ? "file is" : "files are") already indexed. Remove them now, or keep them searchable and just stop indexing new ones.")
+            Text("\(pd.count) \(pd.kind.rawValue) \(pd.count == 1 ? "file is" : "files are") already indexed. Remove them, or keep them searchable and stop indexing new ones.")
         }
     }
 
@@ -251,7 +251,7 @@ private struct ContentTypesTab: View {
             } header: {
                 Text("Skip small files")
             } footer: {
-                Text("Skips files below these sizes, like icons, thumbnails, and very short clips.")
+                Text("Skips icons, thumbnails, and very short clips.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -263,7 +263,7 @@ private struct ContentTypesTab: View {
             } header: {
                 Text("Cloud files")
             } footer: {
-                Text("Files whose content is in iCloud or another cloud service but not on this Mac. Skipping indexes them when they download; the other option downloads each file to index it.")
+                Text("Files kept in the cloud, not on this Mac. Skipped ones are indexed once they download.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -277,7 +277,7 @@ private struct ContentTypesTab: View {
             } header: {
                 Text("Ignore rules")
             } footer: {
-                Text("Applied after the file-type switches above. One .gitignore pattern per line: a leading ! re-includes, a trailing / matches folders.")
+                Text("One .gitignore pattern per line: leading ! re-includes, trailing / matches folders.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -325,13 +325,13 @@ private struct ContentTypesTab: View {
                 }
                 Spacer()
                 Button("Import\u{2026}") { importIgnoreFile() }
-                    .help("Load patterns from a file on disk into the editor.")
+                    .help("Load patterns from a file")
                 if model.ignoreHasBackup {
                     Button("Revert") {
                         model.revertIgnore()
                         draft = model.ignoreText
                     }
-                    .help("Undo the last applied change.")
+                    .help("Undo the last applied change")
                 }
                 Button("Apply") {
                     previewTask?.cancel()
@@ -444,7 +444,7 @@ private struct PerformanceTab: View {
             } header: {
                 Text("Search")
             } footer: {
-                Text("Off: results update when you press Return instead of on every keystroke.")
+                Text("Off: results update on Return.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -469,7 +469,7 @@ private struct PerformanceTab: View {
             } header: {
                 Text("Throughput")
             } footer: {
-                Text("Smaller caps trade some detail for faster indexing.")
+                Text("Smaller caps index faster, with less detail.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
@@ -478,10 +478,11 @@ private struct PerformanceTab: View {
                     Text("Detailed \u{00B7} UMAP").tag(true)
                 }
                 Toggle("Spread dots so none overlap", isOn: Binding(get: { model.mapNoOverlap }, set: { model.mapNoOverlap = $0 }))
+                    .help("Snaps dots to a grid so every file stays hoverable; hides density")
             } header: {
                 Text("Folder map")
             } footer: {
-                Text("PCA is instant and light, the safe default. UMAP separates clusters better and enables click-to-spotlight of nearest neighbors. Large folders are sampled to stay within the memory cap below. Spreading snaps the layout to a grid so every file is separately visible and hoverable - clusters stay put, but the map stops showing density through overlap.")
+                Text("PCA is instant; UMAP separates clusters better and adds click-to-spotlight.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
@@ -514,8 +515,8 @@ private struct PerformanceTab: View {
                 Text("Memory")
             } footer: {
                 Text(model.isPaperRunning
-                     ? "Locked while the paper benchmark runs: it pins the cap and restores yours when it finishes."
-                     : "Caps memory for the model and the folder map. Keep it above ~4 GB; 0 means unlimited.")
+                     ? "Locked while the benchmark runs; your cap is restored after."
+                     : "Caps the model and the folder map. Keep above ~4 GB; 0 is unlimited.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
@@ -541,8 +542,7 @@ private struct PerformanceTab: View {
                             }
                             .controlSize(.small)
                             .disabled(model.isPaperRunning || model.isProfilingRunning || model.phase != .ready)
-                            .help("Paper measurement suite - up to 25 minutes, synthetic data, "
-                                  + "the real index is untouched")
+                            .help("Paper suite - up to 25 min, synthetic data, your index untouched")
                         }
                     }
                 }
@@ -559,7 +559,7 @@ private struct PerformanceTab: View {
             } header: {
                 Text("Profiling")
             } footer: {
-                Text("Benchmarks indexing on a fixed 300-file dataset. Sharing sends hardware and timing only - never your files - to the public results on hanxiao.io/omni.")
+                Text("Indexes a fixed 300-file dataset. Sharing sends hardware and timing only - never your files - to hanxiao.io/omni.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -579,7 +579,6 @@ private struct HistoryTab: View {
                 Picker("Add searches to History", selection: Binding(get: { model.historyMode }, set: { model.historyMode = $0 })) {
                     ForEach(HistoryMode.allCases) { Text($0.title).tag($0) }
                 }
-                .help("Choose when a search is remembered in the sidebar")
             } footer: {
                 Text(model.historyMode.detail).font(.caption).foregroundStyle(.secondary)
             }
@@ -590,9 +589,8 @@ private struct HistoryTab: View {
                     Text("14 days").tag(14)
                     Text("31 days").tag(31)
                 }
-                .help("How long recent searches are kept before they are removed")
             } footer: {
-                Text("Recent searches older than this are removed automatically. Bookmarked searches are always kept.")
+                Text("Older searches are removed automatically. Bookmarks are kept.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
@@ -602,10 +600,7 @@ private struct HistoryTab: View {
                 }
                 Button("Clear search history\u{2026}", role: .destructive) { confirmClear = true }
                     .disabled(model.recentHistoryCount == 0)
-                    .help("Remove all recent searches. Your bookmarks are kept.")
-            } footer: {
-                Text("Clearing removes recent searches from the sidebar. Your bookmarks stay.")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .help("Remove all recent searches; bookmarks are kept")
             }
         }
         .formStyle(.grouped)
@@ -629,10 +624,10 @@ private struct IndexTab: View {
                         VStack(alignment: .leading, spacing: 6) {
                             Text("Index doesn't match the loaded model").fontWeight(.medium)
                             if let v = model.indexBuiltVariant {
-                                Text("Built with \(v.title); \(model.modelVariant.title) is loaded. Switch back to keep this index, or reindex with the current model.")
+                                Text("Built with \(v.title), now running \(model.modelVariant.title). Switch back to keep it, or reindex.")
                                     .font(.caption).foregroundStyle(.secondary)
                             } else {
-                                Text("It was built with an older embedding version. Reindex so results stay accurate.")
+                                Text("Built with an older embedding version. Reindex to keep results accurate.")
                                     .font(.caption).foregroundStyle(.secondary)
                             }
                             HStack {
@@ -676,7 +671,7 @@ private struct IndexTab: View {
                     HStack(spacing: 8) {
                         Spacer()
                         Button("Change\u{2026}") { pickDatabase() }
-                            .help("Where the search index is stored. Changing the folder loads the index from there.")
+                            .help("Where the index is stored; changing loads the index from there")
                             // isPaperRunning: the run captured the CURRENT index paths as the ones
                             // its filesystem must refuse to open, and a swap mid-run would move the
                             // index out from under that list.
@@ -739,7 +734,7 @@ private struct IndexTab: View {
             } header: {
                 Text("Model")
             } footer: {
-                Text("Pick a variant to switch to it or download it. Switching rebuilds the index - the two models use different embeddings.")
+                Text("Picking a variant switches to it, or downloads it. Switching rebuilds the index.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }

@@ -36,12 +36,12 @@ struct ServingTab: View {
         .frame(height: 520)   // matches the Content tab so switching tall tabs doesn't jump
         .sheet(isPresented: $showMCPSheet) {
             AgentConfigSheet(title: "Connect agents over MCP",
-                             subtitle: "Works with every MCP client that speaks the HTTP transport (Claude Code, Cursor, VS Code, ...). Tools: search, search_inline, file_status, tag_image.",
+                             subtitle: "For any MCP client with HTTP transport (Claude Code, Cursor, VS Code). Tools: search, search_inline, file_status, tag_image.",
                              text: mcpConfigText, saveAs: nil)
         }
         .sheet(isPresented: $showSkillSheet) {
             AgentConfigSheet(title: "SKILL.md for instruction-following agents",
-                             subtitle: "Drop this file where your agent reads skills (e.g. ~/.claude/skills/omni-search/SKILL.md) or paste it into its instructions.",
+                             subtitle: "Save where your agent reads skills (e.g. ~/.claude/skills/omni-search/SKILL.md), or paste into its instructions.",
                              text: skillMarkdown, saveAs: "SKILL.md")
         }
     }
@@ -81,7 +81,7 @@ struct ServingTab: View {
         } header: {
             Text("Server")
         } footer: {
-            Text("Serves OpenAI, Jina, Cohere, and Gemini embedding endpoints plus search, per-file index status, and image tags, backed by the local model. MCP hands the server to protocol clients; SKILL.md to instruction-following agents.")
+            Text("A local HTTP API for search, tags, and embeddings. MCP and SKILL.md set up agents.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }
@@ -146,16 +146,17 @@ struct ServingTab: View {
                 } label: { Image(systemName: "doc.on.doc") }
                 .buttonStyle(.borderless).foregroundStyle(.secondary)
                 .help("Copy").disabled(model.serving.bearerToken.isEmpty)
-                Button("Generate new") {
+                Button("Renew") {
                     model.serving.bearerToken = ServingController.generateToken()
                     revealToken = true   // show it so it can be copied
                 }
+                .help("Replace the token with a new one")
                 .buttonStyle(.link)
             }
         } header: {
             Text("Access")
         } footer: {
-            Text("Local network always requires a token (one is generated if empty). Token, port, or scope changes restart the server.")
+            Text("Local network requires a token, generated if empty. Changes restart the server.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }
@@ -197,7 +198,7 @@ struct ServingTab: View {
         } header: {
             Text("Example")
         } footer: {
-            Text("Start the server, then run the selected example in a terminal.")
+            Text("Run this in a terminal with the server on.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }

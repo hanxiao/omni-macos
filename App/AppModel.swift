@@ -50,9 +50,9 @@ enum HistoryMode: String, CaseIterable, Identifiable {
     }
     var detail: String {
         switch self {
-        case .auto: return "Every search you settle on is added to History."
-        case .onSubmit: return "Only searches you submit with Return are added. Find similar still records."
-        case .manual: return "Nothing is added on its own. Use the Bookmark button to keep a search."
+        case .auto: return "Every search you settle on is kept."
+        case .onSubmit: return "Only searches submitted with Return, plus Find Similar."
+        case .manual: return "Nothing is kept until you bookmark it."
         }
     }
 }

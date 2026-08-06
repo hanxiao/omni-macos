@@ -356,6 +356,39 @@ struct ContentView: View {
         if #available(macOS 26.0, *) { return .primaryAction } else { return .automatic }
     }
 
+    /// Whether the back/forward chevrons have anything to show. Also decides whether the leading
+    /// toolbar item gets a Liquid Glass background on Tahoe - an empty item must not draw one.
+    private var showsHistoryControls: Bool {
+        model.phase == .ready && (model.canGoBack || model.canGoForward)
+    }
+
+    @ViewBuilder private var historyControls: some View {
+        HStack(spacing: 0) {
+            // A completely empty toolbar item has zero intrinsic size, and AppKit logs an
+            // "ambiguous width/height" warning for it on every toolbar layout pass - measured
+            // on macOS 26 too (12 hits at launch), not just 14/15, so the filler is
+            // unconditional. 1pt of clear gives the item a size without a visible footprint.
+            Color.clear.frame(width: 1, height: 1)
+            if showsHistoryControls {
+                ControlGroup {
+                    // The View menu owns Cmd-[ / Cmd-] (single owner, avoids a duplicate-shortcut
+                    // conflict); these buttons are click targets that name the same chords.
+                    Button { model.goBack() } label: { Image(systemName: "chevron.backward") }
+                        .disabled(!model.canGoBack)
+                        .help("Back  \u{2318}[")
+                        .accessibilityLabel("Back")
+                    Button { model.goForward() } label: { Image(systemName: "chevron.forward") }
+                        .disabled(!model.canGoForward)
+                        .help("Forward  \u{2318}]")
+                        .accessibilityLabel("Forward")
+                }
+                .fixedSize()
+            }
+            // Trailing 1pt filler, same reason as the leading one (all systems).
+            Color.clear.frame(width: 1, height: 1)
+        }
+    }
+
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
         // No explicit sidebar toggle: Sequoia's system toggle (next to the traffic lights, like
         // Finder) lives and dies with the split-view TRACKING SEPARATOR item, which this app keeps
@@ -369,31 +402,15 @@ struct ContentView: View {
         // disclosure: the chevrons show only once there's somewhere to go, so the idle state is empty
         // here. Cmd-[ / Cmd-] match Finder and Safari; each chevron disables independently at the end of
         // its trail. Grouped so on Tahoe they share one Liquid Glass pill.
-        ToolbarItem(placement: .navigation) {
-            HStack(spacing: 0) {
-                // A completely empty toolbar item has zero intrinsic size, and AppKit logs an
-                // "ambiguous width/height" warning for it on every toolbar layout pass - measured
-                // on macOS 26 too (12 hits at launch), not just 14/15, so the filler is
-                // unconditional. 1pt of clear gives the item a size without a visible footprint.
-                Color.clear.frame(width: 1, height: 1)
-                if model.phase == .ready, model.canGoBack || model.canGoForward {
-                    ControlGroup {
-                        // The View menu owns Cmd-[ / Cmd-] (single owner, avoids a duplicate-shortcut
-                        // conflict); these buttons are click targets that name the same chords.
-                        Button { model.goBack() } label: { Image(systemName: "chevron.backward") }
-                            .disabled(!model.canGoBack)
-                            .help("Back  \u{2318}[")
-                            .accessibilityLabel("Back")
-                        Button { model.goForward() } label: { Image(systemName: "chevron.forward") }
-                            .disabled(!model.canGoForward)
-                            .help("Forward  \u{2318}]")
-                            .accessibilityLabel("Forward")
-                    }
-                    .fixedSize()
-                }
-                // Trailing 1pt filler, same reason as the leading one (all systems).
-                Color.clear.frame(width: 1, height: 1)
-            }
+        if #available(macOS 26.0, *) {
+            // Tahoe draws a Liquid Glass capsule behind every toolbar item, including this one when
+            // it holds nothing but the 1pt fillers - which rendered as a thin white vertical bar
+            // left of the window title whenever there was no history to go back to. Hide the shared
+            // background while the item is empty; the chevrons keep their pill when they appear.
+            ToolbarItem(placement: .navigation) { historyControls }
+                .sharedBackgroundVisibility(showsHistoryControls ? .automatic : .hidden)
+        } else {
+            ToolbarItem(placement: .navigation) { historyControls }
         }
         // Flexible space after back/forward pushes every other control to the trailing edge (chevrons
         // own the left, everything else is right-aligned), and on Tahoe it's also the correct separator

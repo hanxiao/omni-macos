@@ -602,6 +602,19 @@ struct ResultGridItem: View {
                         : Color(nsColor: .unemphasizedSelectedContentBackgroundColor)) : .clear, in: Capsule())
                     .frame(maxWidth: 150)
             }
+            // The snippet - for media, the content tags ("cat, couch, crib"); for text, the matching
+            // excerpt. The list row shows it, so the grid does too; without it a gallery of photos
+            // was the one view where tagging produced nothing visible. Same reserve-the-line trick as
+            // the name above, so cells without a snippet keep the row's thumbnails aligned.
+            ZStack {
+                Text(verbatim: "0").font(.caption2).hidden()
+                if !hit.snippet.isEmpty, hit.snippet != url.lastPathComponent {
+                    Text(hit.snippet).font(.caption2).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.tail)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 150)
+                }
+            }
             ZStack {
                 Text(verbatim: "0").font(.caption2).hidden()
                 MediaInfoLabel(path: hit.path, kind: hit.kind, width: hit.width, height: hit.height, duration: hit.duration, separator: false)
