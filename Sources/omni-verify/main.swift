@@ -550,6 +550,497 @@ if args.count >= 2 && args[1] == "dedupcheck" {
     exit(try dedupcheckRun())
 }
 
+// Chunk-reuse path parity: omni-verify pathreuse
+// Reproduces the exact sequence a save measurement runs - index(roots:) to build the index the
+// edit lands on, then update(paths:) on one appended file - under two staging roots: the raw
+// $TMPDIR path and its realpath. The crawl records the enumerator's canonical prefix, so with the
+// raw root the update looks up a path the store has never seen, chunkVectors returns nothing, and
+// every chunk is re-embedded. A CountingEmbedder makes that visible as a number rather than as a
+// latency that could be anything. Prints embeds per arm; the realpath arm must re-embed only the
+// tail chunk.
+func pathreuseRun() throws -> Int32 {
+    func arm(_ label: String, resolve: Bool) throws -> (first: Int, update: Int, chunks: Int) {
+        var root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("omni-pathreuse-\(label)-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+        try? FileManager.default.removeItem(at: root)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        if resolve, let rp = realpath(root.path, nil) {
+            root = URL(fileURLWithPath: String(cString: rp), isDirectory: true); free(rp)
+        }
+        defer { try? FileManager.default.removeItem(at: root) }
+        // 40 lines of ~95 chars is ~3.8 kB, several chunks at the paper preset's 1800 chars.
+        let body = (0 ..< 40).map { "Line \($0): the distributed search index keeps embeddings current across folders." }
+            .joined(separator: "\n")
+        let file = root.appendingPathComponent("doc.txt")
+        try body.write(to: file, atomically: true, encoding: .utf8)
+
+        let store = try VectorStore(dbURL: root.appendingPathComponent("index.sqlite"))
+        let emb = CountingEmbedder()
+        let indexer = Indexer(store: store, embedder: emb)
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            indexer.index(roots: [root], settings: .paper, force: false) { p in if p.done { done.signal() } }
+        }
+        guard done.wait(timeout: .now() + 60) == .success else { return (-1, -1, -1) }
+        let first = emb.textEmbeds
+        let chunks = store.indexSummary(folders: []).chunkCount
+        // The append p16 applies, then the watcher path on the URL the harness holds.
+        try (body + "\nappended line for the save measurement\n").write(to: file, atomically: true, encoding: .utf8)
+        indexer.update(paths: [file.path], settings: .paper)
+        return (first, emb.textEmbeds - first, chunks)
+    }
+    print("pathreuse   one file, append edit, .paper settings (1800 chars/chunk)")
+    let raw = try arm("raw", resolve: false)
+    let res = try arm("realpath", resolve: true)
+    print("  raw $TMPDIR root      first-index embeds=\(raw.first) chunks=\(raw.chunks)  update embeds=\(raw.update)")
+    print("  realpath root         first-index embeds=\(res.first) chunks=\(res.chunks)  update embeds=\(res.update)")
+    let ok = raw.chunks > 1 && res.update < raw.update
+    print("  \(ok ? "ok  " : "FAIL") reuse fires only under realpath: \(raw.update) -> \(res.update) embeds on the edit")
+    return ok ? 0 : 1
+}
+if args.count >= 2 && args[1] == "pathreuse" {
+    exit(try pathreuseRun())
+}
+
+// Save cost against index size: omni-verify savebench [rows] [chunksPerFile]
+// replace() on a path that already has rows runs compactRowsLocked, which walks EVERY row with a
+// closure predicate, then memmoves flat16 and copies each surviving Row (three Strings, so ARC
+// traffic) forward from the first removed index. The work therefore scales with the index, not
+// with the file, and with where in the index the file sits. Times a re-save of the first, middle
+// and last file at each row count so the shape is visible rather than asserted. No GPU: vectors
+// come from PaperVectors, so this measures the store and nothing else.
+func savebenchRun(_ rowsMax: Int, _ chunksPerFile: Int) throws -> Int32 {
+    let dim = 768
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("omni-savebench-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+    try? FileManager.default.removeItem(at: root)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    print("savebench   dim=\(dim) chunksPerFile=\(chunksPerFile)  (ms per replace() of one already-indexed file)")
+    print("     rows      files      front     middle       back")
+    var ladder: [Int] = []
+    var r = 125_000
+    while r <= rowsMax { ladder.append(r); r *= 2 }
+    for rows in ladder {
+        let store = try VectorStore(dbURL: root.appendingPathComponent("s\(rows).sqlite"))
+        _ = try PaperVectors.buildStore(rows: rows, into: store, chunksPerFile: chunksPerFile, dim: dim)
+        let files = rows / chunksPerFile
+        _ = store.search(PaperVectors.query(0, dim: dim), topK: 10)   // fold the base first
+        func resave(_ k: Int) -> Double {
+            let g = PaperVectors.fileGroup(k, chunksPerFile: chunksPerFile, dim: dim)
+            let t = Date()
+            try? store.replace(path: g.path, chunks: g.chunks)
+            return -t.timeIntervalSinceNow * 1000
+        }
+        // Warm the code paths on a file that is not one of the three reported.
+        _ = resave(files / 4)
+        let front = resave(0), middle = resave(files / 2), back = resave(files - 1)
+        print(String(format: "%9d  %9d  %9.1f  %9.1f  %9.1f", rows, files, front, middle, back))
+        store.close()
+    }
+    return 0
+}
+if args.count >= 2 && args[1] == "savebench" {
+    exit(try savebenchRun((args.count >= 3 ? Int(args[2]) : nil) ?? 1_000_000,
+                          (args.count >= 4 ? Int(args[3]) : nil) ?? 8))
+}
+
+// Replica choice against corpus size: omni-verify gatebench [rows]
+// The shipped gate picks the 4-bit replica on MEMORY alone (quantBitsFor: baseBytes > cap/4), so
+// on a 6 GB cap it flips at ~976k rows at dim 768. Table 7 of the paper says the funnel is already
+// the faster scan far below that on narrow machines. This times the two representations through
+// the shipped search() at each rung and prints which one the gate would have chosen, so the gap
+// between the choice and the crossover is a number.
+func gatebenchRun(_ rowsMax: Int, _ capGB: Double) throws -> Int32 {
+    let dim = 768, chunksPerFile = 8, queries = 40
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("omni-gatebench-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+    try? FileManager.default.removeItem(at: root)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    // The app pins a 6 GB cap by default; a bare headless process inherits physical memory, which
+    // would put the memory rule out of reach of every rung and make the ladder unreadable.
+    omniSetMemoryLimit(capGB > 0 ? Int(capGB * 1_000_000_000) : 6_000_000_000)
+    let capBytes = omniMemoryLimitBytes()
+    let memRows = (capBytes / 4) / (dim * 2)
+    let crossRows = VectorStore.crossoverRows(gpuCores: SystemProbe.gpuCores())
+    let gateRows = min(memRows, crossRows)
+    print("gatebench   dim=\(dim) queries=\(queries)  cap=\(String(format: "%.2f", Double(capBytes) / 1e9)) GB"
+          + "  gpuCores=\(SystemProbe.gpuCores().map(String.init) ?? "?")")
+    print("            memory rule flips at \(memRows) rows, crossover rule at \(crossRows) -> gate at \(gateRows)")
+    print("     rows   bf16 p50   int4 p50    speedup   gate picks   best")
+    var ladder: [Int] = []
+    var r = 125_000
+    while r <= rowsMax { ladder.append(r); r *= 2 }
+    for rows in ladder {
+        let store = try VectorStore(dbURL: root.appendingPathComponent("g\(rows).sqlite"))
+        _ = try PaperVectors.buildStore(rows: rows, into: store, chunksPerFile: chunksPerFile, dim: dim)
+        store.close()
+        // A fresh store per arm: the representation is chosen when the base is built, and
+        // OMNI_QUANT_BASE is read on every quantBitsFor call, so setting it before the open is
+        // enough to force the arm without reaching into internals.
+        func median(bits: Int) throws -> Double {
+            setenv("OMNI_QUANT_BASE", String(bits), 1)
+            let s2 = try VectorStore(dbURL: root.appendingPathComponent("g\(rows).sqlite"))
+            defer { s2.close() }
+            _ = s2.search(PaperVectors.query(0, dim: dim), topK: 60)   // build the base, untimed
+            var s: [Double] = []
+            for q in 0 ..< queries {
+                let v = PaperVectors.query(q, dim: dim)
+                let t = Date()
+                _ = s2.search(v, topK: 60)
+                s.append(-t.timeIntervalSinceNow * 1000)
+            }
+            s.sort()
+            return s[s.count / 2]
+        }
+        VectorStore.twoLevelSelect = false
+        let full = try median(bits: 0), quantOld = try median(bits: 4)
+        VectorStore.twoLevelSelect = true
+        let quant = try median(bits: 4)
+        unsetenv("OMNI_QUANT_BASE")
+        print(String(format: "            int4 selection: 1-level %.2f ms -> 2-level %.2f ms  (%.2fx)",
+                     quantOld, quant, quantOld / quant))
+        let picks = rows > gateRows ? "int4" : "bf16"
+        let best = quant < full ? "int4" : "bf16"
+        print(String(format: "%9d  %9.2f  %9.2f  %9.2fx  %10s   %s%s", rows, full, quant, full / quant,
+                     (picks as NSString).utf8String!, (best as NSString).utf8String!,
+                     ((picks == best ? "" : "   <- MISMATCH") as NSString).utf8String!))
+    }
+    return 0
+}
+// Selection strategies at scan scale: omni-verify selectbench [rowsMax] [C]
+// Both GPU selection sites route through MLX's ArgPartition, which its Metal backend implements as
+// a full merge sort ("We direct arg partition to sort for now"). The shortlist is 1920 rows out of
+// millions, so the sort is doing far more work than the question needs. Times the shipped call
+// against the pieces an exact two-level scheme would be built from, so the decision to write one
+// rests on numbers. All arms are timed with an explicit eval, medians over 20 calls.
+func selectbenchRun(_ rowsMax: Int, _ C: Int) throws -> Int32 {
+    func median(_ n: Int, _ body: () -> Void) -> Double {
+        body()   // warm the kernel cache
+        var s: [Double] = []
+        for _ in 0 ..< n {
+            let t = Date(); body(); s.append(-t.timeIntervalSinceNow * 1000)
+        }
+        s.sort(); return s[s.count / 2]
+    }
+    print("selectbench C=\(C)  (ms, median of 20)")
+    print("        rows   argPart  2L(t=4)  2L(t=8) 2L(t=16) 2L(t=32) 2L(t=64)     best")
+    var ladder: [Int] = []
+    var r = 250_000
+    while r <= rowsMax { ladder.append(r); r *= 2 }
+    for n in ladder {
+        // Scores shaped like real coarse scores: cosine-ish, clustered, no ties to speak of.
+        let scores = MLX.MLXRandom.normal([n]).asType(.float32)
+        MLX.eval(scores)
+        let argPart = median(20) { MLX.eval(MLX.argPartition(scores, kth: n - C)[(n - C)...]) }
+        // Two-level, exact: with t rows per tile, the C tiles holding the highest maxima contain
+        // every row that can reach the global top C - each of those C maxima is itself a distinct
+        // row at or above the C-th largest tile max, so the C-th largest GLOBAL score is at least
+        // that value, and any top-C row therefore sits in a tile whose max clears it. Selection
+        // becomes a sort over n/t plus a sort over C*t, never over n.
+        var times: [Double] = []
+        for tiles in [4, 8, 16, 32, 64] {
+            let tileCount = n / tiles
+            guard tileCount > C, tileCount * tiles == n else { times.append(.nan); continue }
+            times.append(median(20) {
+                let g = scores.reshaped([tileCount, tiles])
+                let hot = MLX.argPartition(g.max(axis: 1), kth: tileCount - C)[(tileCount - C)...]
+                let cand = MLX.take(g, hot, axis: 0).reshaped([C * tiles])
+                MLX.eval(MLX.argPartition(cand, kth: C * tiles - C)[(C * tiles - C)...])
+            })
+        }
+        let best = times.filter { $0.isFinite }.min() ?? .nan
+        print(String(format: "%12d %9.2f %8.2f %8.2f %8.2f %8.2f %8.2f  %6.2fx",
+                     n, argPart, times[0], times[1], times[2], times[3], times[4], argPart / best))
+    }
+    return 0
+}
+// Two-level selection parity: omni-verify selectparity [rows] [queries]
+// The shortlist feeds an exact rescore, so a wrong shortlist is a wrong result. Runs the same
+// queries through the shipped search() with OMNI_TWO_LEVEL_SELECT off and on and compares the hit
+// lists exactly - path, score bits and chunk index - so a divergence cannot hide behind rounding.
+func selectparityRun(_ rows: Int, _ queries: Int) throws -> Int32 {
+    let dim = 768, chunksPerFile = 8
+    omniSetMemoryLimit(6_000_000_000)
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("omni-selectparity-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+    try? FileManager.default.removeItem(at: root)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let dbURL = root.appendingPathComponent("p.sqlite")
+    let build = try VectorStore(dbURL: dbURL)
+    _ = try PaperVectors.buildStore(rows: rows, into: build, chunksPerFile: chunksPerFile, dim: dim)
+    build.close()
+
+    func digests(_ twoLevel: Bool, _ quantBits: Int) throws -> [String] {
+        setenv("OMNI_QUANT_BASE", String(quantBits), 1)
+        VectorStore.twoLevelSelect = twoLevel
+        let s = try VectorStore(dbURL: dbURL)
+        defer { s.close() }
+        var out: [String] = []
+        for q in 0 ..< queries {
+            let hits = s.search(PaperVectors.query(q, dim: dim), topK: 60)
+            out.append(hits.map { "\($0.path)|\($0.score.bitPattern)|\($0.chunkIndex)" }.joined(separator: ","))
+        }
+        return out
+    }
+    print("selectparity rows=\(rows) queries=\(queries) tile=32")
+    var fails = 0
+    for (label, bits) in [("int4 candidate path", 4), ("bf16 file-reduce path", 0)] {
+        let off = try digests(false, bits)
+        let on = try digests(true, bits)
+        let bad = zip(off, on).enumerated().filter { $0.element.0 != $0.element.1 }.map { $0.offset }
+        print("  \(bad.isEmpty ? "ok  " : "FAIL") \(label): \(queries - bad.count)/\(queries) identical"
+              + (bad.isEmpty ? "" : "  diverged at \(bad.prefix(5))"))
+        if !bad.isEmpty { fails += 1 }
+    }
+    unsetenv("OMNI_TWO_LEVEL_SELECT"); unsetenv("OMNI_QUANT_BASE")
+    VectorStore.twoLevelSelect = true
+    return fails == 0 ? 0 : 1
+}
+// Interleaved A/B of the selection strategy: omni-verify selectab [rows] [queries]
+// gatebench builds a fresh store per arm, which puts store construction and any drift between the
+// two numbers. Here one store serves both, and the arms alternate query by query, so the only thing
+// that differs between the two samples is the strategy.
+func selectabRun(_ rows: Int, _ queries: Int, _ bits: Int) throws -> Int32 {
+    let dim = 768, chunksPerFile = 8
+    omniSetMemoryLimit(6_000_000_000)
+    setenv("OMNI_QUANT_BASE", String(bits), 1)
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("omni-selectab-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+    try? FileManager.default.removeItem(at: root)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root); unsetenv("OMNI_QUANT_BASE") }
+    print("selectab    dim=\(dim) queries=\(queries) per arm, alternating on one store, base=\(bits == 0 ? "bf16" : "int4")")
+    print("        rows   1-level   2-level    ratio")
+    var ladder: [Int] = []
+    var r = 1_000_000
+    while r <= rows { ladder.append(r); r *= 2 }
+    for n in ladder {
+        let store = try VectorStore(dbURL: root.appendingPathComponent("s\(n).sqlite"))
+        _ = try PaperVectors.buildStore(rows: n, into: store, chunksPerFile: chunksPerFile, dim: dim)
+        VectorStore.twoLevelSelect = false
+        _ = store.search(PaperVectors.query(0, dim: dim), topK: 60)     // base fold, untimed
+        for w in 0 ..< 5 { _ = store.search(PaperVectors.query(w, dim: dim), topK: 60) }
+        var a: [Double] = [], b: [Double] = []
+        for q in 0 ..< queries {
+            let v = PaperVectors.query(q % 512, dim: dim)
+            for twoLevel in [false, true] {
+                VectorStore.twoLevelSelect = twoLevel
+                let t = Date()
+                _ = store.search(v, topK: 60)
+                let ms = -t.timeIntervalSinceNow * 1000
+                if twoLevel { b.append(ms) } else { a.append(ms) }
+            }
+        }
+        a.sort(); b.sort()
+        let m1 = a[a.count / 2], m2 = b[b.count / 2]
+        print(String(format: "%12d %9.3f %9.3f %8.2fx", n, m1, m2, m1 / m2))
+        store.close()
+    }
+    VectorStore.twoLevelSelect = true
+    return 0
+}
+if args.count >= 2 && args[1] == "selectab" {
+    exit(try selectabRun((args.count >= 3 ? Int(args[2]) : nil) ?? 4_000_000,
+                         (args.count >= 4 ? Int(args[3]) : nil) ?? 120,
+                         (args.count >= 5 ? Int(args[4]) : nil) ?? 4))
+}
+
+if args.count >= 2 && args[1] == "selectparity" {
+    exit(try selectparityRun((args.count >= 3 ? Int(args[2]) : nil) ?? 1_000_000,
+                             (args.count >= 4 ? Int(args[3]) : nil) ?? 60))
+}
+
+// Tombstone correctness: omni-verify tombstonecheck [rows] [edits]
+// Marking a row dead instead of moving it is only safe if nothing can ever return it. Runs the same
+// edit sequence with OMNI_TOMBSTONE off and on and compares what the store reports afterwards:
+// search hits over many queries, the chunk and file counts, per-file chunk counts, browse listings
+// and the folder-map view. Any divergence is a quality regression, which is the one thing this
+// optimisation is not allowed to cost.
+func tombstonecheckRun(_ rows: Int, _ edits: Int) throws -> Int32 {
+    let dim = 768, chunksPerFile = 8
+    omniSetMemoryLimit(6_000_000_000)
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("omni-tombstone-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+    try? FileManager.default.removeItem(at: root)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    func run(_ tombstones: Bool) throws -> [String] {
+        VectorStore.tombstones = tombstones
+        let url = root.appendingPathComponent("t\(tombstones).sqlite")
+        try? FileManager.default.removeItem(at: url)
+        let store = try VectorStore(dbURL: url)
+        defer { store.close() }
+        _ = try PaperVectors.buildStore(rows: rows, into: store, chunksPerFile: chunksPerFile, dim: dim)
+        _ = store.search(PaperVectors.query(0, dim: dim), topK: 60)    // fold the base
+        let files = rows / chunksPerFile
+        // A mixed edit stream: re-save with the same chunk count, with fewer, and delete outright.
+        for e in 0 ..< edits {
+            let k = (e * 7919) % files
+            switch e % 3 {
+            case 0:
+                let g = PaperVectors.fileGroup(k, chunksPerFile: chunksPerFile, dim: dim)
+                try store.replace(path: g.path, chunks: g.chunks)
+            case 1:
+                let g = PaperVectors.fileGroup(k, chunksPerFile: chunksPerFile, dim: dim)
+                try store.replace(path: g.path, chunks: Array(g.chunks.prefix(3)))
+            default:
+                store.deletePaths([PaperVectors.path(file: k)])
+            }
+        }
+        var out: [String] = []
+        out.append("count=\(store.count)")
+        let stats = store.allIndexStats()
+        out.append("files=\(stats.fileCount) chunks=\(stats.chunkCount) kinds=\(stats.kinds.sorted())")
+        for q in 0 ..< 80 {
+            let hits = store.search(PaperVectors.query(q, dim: dim), topK: 60)
+            out.append("q\(q):" + hits.map { "\($0.path)|\($0.score.bitPattern)|\($0.chunkIndex)|\($0.chunkCount)" }
+                .joined(separator: ","))
+        }
+        let listed = store.listMatching(filter: SearchFilter(), topK: 200)
+        out.append("list:" + listed.map { "\($0.path)|\($0.chunkIndex)" }.joined(separator: ","))
+        for k in [0, 11, 97] where k < files {
+            let ch = store.rankChunks(PaperVectors.query(1, dim: dim), path: PaperVectors.path(file: k), topK: 6)
+            out.append("chunks\(k):" + ch.map { "\($0.chunkIndex)|\($0.score.bitPattern)" }.joined(separator: ","))
+            out.append("vec\(k):" + (store.fileVector(PaperVectors.path(file: k))?.prefix(4).map { "\($0.bitPattern)" }
+                .joined(separator: ",") ?? "nil"))
+        }
+        out.append("indexed=\(store.indexedFiles().count)")
+        return out
+    }
+    // Reopen check: a tombstone indexes a row position, so it must never outlive the rows it
+    // indexes. Close the store after the edits, reopen it, and require the same answers - a stale
+    // dead index would mask live rows, and a lost one would resurrect a deleted file.
+    func reopen() throws -> (before: [String], after: [String]) {
+        VectorStore.tombstones = true
+        let url = root.appendingPathComponent("reopen.sqlite")
+        try? FileManager.default.removeItem(at: url)
+        var before: [String] = []
+        do {
+            let store = try VectorStore(dbURL: url)
+            _ = try PaperVectors.buildStore(rows: rows, into: store, chunksPerFile: chunksPerFile, dim: dim)
+            _ = store.search(PaperVectors.query(0, dim: dim), topK: 60)
+            for k in stride(from: 0, to: 200, by: 3) { store.deletePaths([PaperVectors.path(file: k)]) }
+            for q in 0 ..< 40 {
+                before.append(store.search(PaperVectors.query(q, dim: dim), topK: 60)
+                    .map { "\($0.path)|\($0.score.bitPattern)" }.joined(separator: ","))
+            }
+            before.append("count=\(store.count)")
+            store.close()
+        }
+        let store2 = try VectorStore(dbURL: url)
+        defer { store2.close() }
+        var after: [String] = []
+        for q in 0 ..< 40 {
+            after.append(store2.search(PaperVectors.query(q, dim: dim), topK: 60)
+                .map { "\($0.path)|\($0.score.bitPattern)" }.joined(separator: ","))
+        }
+        after.append("count=\(store2.count)")
+        return (before, after)
+    }
+    let ro = try reopen()
+    let roBad = zip(ro.before, ro.after).filter { $0 != $1 }.count
+    print("  \(roBad == 0 ? "ok  " : "FAIL") survives close/reopen: \(ro.before.count - roBad)/\(ro.before.count) identical")
+
+    let off = try run(false)
+    let control = try run(false)   // same configuration twice: separates a regression from a tie
+    let on = try run(true)
+    let ctlBad = Set(zip(off, control).enumerated().filter { $0.element.0 != $0.element.1 }.map { $0.offset })
+    if !ctlBad.isEmpty { print("  note: line(s) \(ctlBad.sorted()) differ between two IDENTICAL runs; excluded as non-deterministic") }
+    VectorStore.tombstones = true
+    print("tombstonecheck rows=\(rows) edits=\(edits) (replace-same, replace-fewer, delete)")
+    guard off.count == on.count else { print("  FAIL different shapes"); return 1 }
+    let bad = zip(off, on).enumerated().filter { !ctlBad.contains($0.offset) && $0.element.0 != $0.element.1 }
+    for (i, pair) in bad.prefix(3) {
+        print("  FAIL line \(i):")
+        print("    off: \(String(pair.0.prefix(160)))")
+        print("    on : \(String(pair.1.prefix(160)))")
+    }
+    print("  \(bad.isEmpty ? "ok  " : "FAIL") \(off.count - bad.count)/\(off.count) observations identical")
+    return bad.isEmpty ? 0 : 1
+}
+if args.count >= 2 && args[1] == "tombstonecheck" {
+    exit(try tombstonecheckRun((args.count >= 3 ? Int(args[2]) : nil) ?? 400_000,
+                               (args.count >= 4 ? Int(args[3]) : nil) ?? 60))
+}
+
+// Where a store's host memory goes: omni-verify storemem [rows]
+// The vectors are the obvious cost and are already as small as bf16 allows. This reports what the
+// row bookkeeping costs beside them, measured as resident footprint across each build stage rather
+// than computed from struct sizes, so String heap allocations are counted where they actually land.
+func storememRun(_ rows: Int) throws -> Int32 {
+    let dim = 768, chunksPerFile = 8
+    omniSetMemoryLimit(6_000_000_000)
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("omni-storemem-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+    try? FileManager.default.removeItem(at: root)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    print("storemem    rows=\(rows) dim=\(dim)")
+    print("  MemoryLayout<VectorStore.RowProbe>.stride = \(VectorStore.rowStride) bytes/row"
+          + "  -> \(Double(VectorStore.rowStride * rows) / 1e6) MB for `rows` alone")
+    let m0 = churnFootprintMB()
+    let store = try VectorStore(dbURL: root.appendingPathComponent("m.sqlite"))
+    _ = try PaperVectors.buildStore(rows: rows, into: store, chunksPerFile: chunksPerFile, dim: dim)
+    let m1 = churnFootprintMB()
+    _ = store.search(PaperVectors.query(0, dim: dim), topK: 60)
+    let m2 = churnFootprintMB()
+    print(String(format: "  after build   %+8.1f MB   (flat16 alone would be %.1f MB)",
+                 m1 - m0, Double(rows * dim * 2) / 1e6))
+    print(String(format: "  after fold    %+8.1f MB   (resident base)", m2 - m1))
+    print(String(format: "  total         %+8.1f MB", m2 - m0))
+    let vb = store.vectorBufferUse
+    print(String(format: "  vector buffer used %.0f MB, reserved %.0f MB (%.2fx), mapped=%@",
+                 Double(vb.used * 2) / 1e6, Double(vb.capacity * 2) / 1e6,
+                 Double(vb.capacity) / Double(max(1, vb.used)), vb.mapped ? "yes" : "no"))
+    store.close()
+    return 0
+}
+if args.count >= 2 && args[1] == "storemem" {
+    exit(try storememRun((args.count >= 3 ? Int(args[2]) : nil) ?? 1_000_000))
+}
+
+// Folder-map cost against the buffer cache: omni-verify mapbench [files] [dim]
+// The comment on the cache limit names folder maps as the sustained variable-shape work the cache
+// exists for, so shrinking it has to be tested here and not only on the indexing pass. Runs the
+// real ProjectionEngine over synthetic vectors and reports wall time and peak footprint.
+func mapbenchRun(_ files: Int, _ dim: Int) throws -> Int32 {
+    omniSetMemoryLimit(6_000_000_000)   // the app default, so the fraction actually applies
+    print("mapbench    files=\(files) dim=\(dim) cacheFraction=\(omniCacheFraction)"
+          + String(format: "  cacheLimit=%.0f MB", Double(MLX.Memory.cacheLimit) / 1e6))
+    var vecs = [Float](); vecs.reserveCapacity(files * dim)
+    for i in 0 ..< files { vecs.append(contentsOf: PaperVectors.vec(i, dim: dim)) }
+    let m0 = churnFootprintMB()
+    var best = Double.infinity
+    for _ in 0 ..< 3 {
+        let t = Date()
+        let fv = FolderVectors(paths: (0 ..< files).map { "f\($0)" },
+                               kinds: [String](repeating: "text", count: files),
+                               vectors: vecs, dim: dim)
+        _ = ProjectionEngine.layout(fv)
+        best = Swift.min(best, -t.timeIntervalSinceNow * 1000)
+    }
+    print(String(format: "  layout %.0f ms   footprint %+.0f MB", best, churnFootprintMB() - m0))
+    return 0
+}
+if args.count >= 2 && args[1] == "mapbench" {
+    exit(try mapbenchRun((args.count >= 3 ? Int(args[2]) : nil) ?? 4000,
+                         (args.count >= 4 ? Int(args[3]) : nil) ?? 768))
+}
+
+if args.count >= 2 && args[1] == "selectbench" {
+    exit(try selectbenchRun((args.count >= 3 ? Int(args[2]) : nil) ?? 4_000_000,
+                            (args.count >= 4 ? Int(args[3]) : nil) ?? 1920))
+}
+
+if args.count >= 2 && args[1] == "gatebench" {
+    exit(try gatebenchRun((args.count >= 3 ? Int(args[2]) : nil) ?? 2_000_000,
+                          (args.count >= 4 ? Double(args[3]) : nil) ?? 6))
+}
+
 // GPU-reduce parity: omni-verify reducecheck [N] [dim]
 // Deterministic store with engineered exact score ties (duplicated vectors) and multi-chunk
 // files; searches before and after un-folded delta inserts and prints a digest of every hit
@@ -3243,7 +3734,10 @@ if args.count >= 3 && args[1] == "funnelrecall" {
     let dim = (args.count >= 4 ? Int(args[3]) : nil) ?? 768
     let nq  = (args.count >= 5 ? Int(args[4]) : nil) ?? 64
     let realDb = args.count >= 6 ? args[5] : nil
-    let topK = 10, C = 4096
+    // Shortlist size. The store derives it as min(4096, max(1024, 32K)) from the requested result
+    // count, so the shipped interface (60 results) runs C = 1920, not the 4096 this defaulted to.
+    let topK = 10
+    let C = (args.count >= 7 ? Int(args[6]) : nil) ?? 4096
     let limit = Int(Int32.max) / dim
 
     // ---- source vectors -------------------------------------------------------------------
