@@ -147,6 +147,20 @@ cp -R <model snapshot> /private/tmp/omni-model
 make test                                    # compiles shaders, asserts the cosines
 ```
 
+## Citation
+
+If you use this software in your research, please cite:
+
+```bibtex
+@article{xiao2026omnimacos,
+  title   = {omni-macos: On-Device Omni-Modal Search on Apple Silicon},
+  author  = {Xiao, Han},
+  journal = {arXiv preprint arXiv:2608.05543},
+  year    = {2026},
+  url     = {https://arxiv.org/abs/2608.05543}
+}
+```
+
 ## License
 
 [Apache 2.0](LICENSE). The model weights are covered by the upstream Jina license
