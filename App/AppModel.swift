@@ -321,13 +321,22 @@ final class AppModel {
     }
 
     /// Ceiling on TOTAL dots in the map (landmarks + placed rest). Placement cost is linear and its
-    /// GEMM is tiled, so this bound is about the host vector buffer pulled from the store and the
-    /// render/hover cost of the scatter itself, not the layout math.
+    /// GEMM is tiled, so this bound is about what the map RETAINS per dot, not the layout math.
+    ///
+    /// It used to be dominated by the store pull: the whole folder's vectors came back as one
+    /// [n*dim] host buffer, 3 KB per file, which is why the bound sat at ~126k files on the default
+    /// 6 GB cap and a 259k-file home folder drew fewer than half its files ("N of M"). The pull now
+    /// streams (FolderVectors.tile), so that term is gone and what is left is the per-dot state that
+    /// genuinely stays alive: the projection points, the neighbour graph, the view's position/colour
+    /// arrays and the Metal buffers - measured at ~176 B/dot in UMAP mode, ~20x smaller. At the
+    /// default cap that puts the ceiling past 2M files, i.e. every file on any realistic index, while
+    /// still scaling down for someone who has pinned the cap low.
     var mapTotalPointCap: Int {
         let capGB = maxMemoryGB > 0 ? maxMemoryGB : physicalMemoryGB
-        let bytesPerPoint = Double(max(256, engineDim) * 4 * 2)   // host [Float] + tile headroom
-        let n = Int(capGB * 0.12 * 1_073_741_824 / bytesPerPoint)
-        return max(mapPointBudget, min(n, 250_000))
+        // points(40) + kNN k=15(60) + view positions/colours(40) + Metal buffers(24) + path/kind refs(32)
+        let bytesPerPoint = 176.0
+        let n = Int(capGB * 0.06 * 1_073_741_824 / bytesPerPoint)
+        return max(mapPointBudget, n)
     }
 
     var canIndex: Bool { phase == .ready && !roots.isEmpty }
@@ -2871,9 +2880,16 @@ final class AppModel {
                     try? await Task.sleep(for: .milliseconds(120))
                     if Task.isCancelled { continuation.finish(); return }
                     let tPull = Date()
-                    let data = store.vectorsUnderFolder(folder, cap: totalCap, landmarkCap: mapCap)
-                    omniPerfLog(String(format: "map pull=%.0fms n=%d landmarks=%d dim=%d",
-                                       -tPull.timeIntervalSinceNow * 1000, data.count, data.landmarkCount, data.dim))
+                    // Streaming: the pull returns the landmark rows plus a tile closure, and the
+                    // rest of the vectors are fetched one placement tile at a time inside the fit.
+                    // Byte-identical rows either way (omni-verify foldermapbench OMNI_MAP_VERIFY=1);
+                    // what changes is that the pull no longer holds n*dim floats, and no longer
+                    // holds the store lock for one multi-second block that every interactive search
+                    // queues behind - measured 1858 ms -> 74 holds of ~6 ms on a 259k-file folder.
+                    let data = store.vectorsUnderFolder(folder, cap: totalCap, landmarkCap: mapCap, streaming: true)
+                    omniPerfLog(String(format: "map pull=%.0fms n=%d of %d landmarks=%d dim=%d",
+                                       -tPull.timeIntervalSinceNow * 1000, data.count, data.total,
+                                       data.landmarkCount, data.dim))
                     if Task.isCancelled { continuation.finish(); return }
                     let tFit = Date()
                     let fitted = await proj.project(data, refine: refine)                        // PCA / UMAP
