@@ -202,6 +202,23 @@ final class AppModel {
     private var projectionTotals: [URL: Int] = [:]               // total files under each cached folder (for "N of M")
     private var projectionCacheOrder: [URL] = []                 // LRU order, oldest first
     private let projectionCacheCap = 6                           // bound: each entry is N points + N*k kNN
+    /// Byte ceiling on retained layouts, on top of the entry count. Six entries is not a bound on
+    /// anything real: a layout costs (points + k neighbors) per FILE, so six small folders retain a
+    /// few MB and six 250k-file folders retain ~100x that. Scaled off the user's memory cap like
+    /// every other budget here, with a floor so a tiny cap still keeps one map cached.
+    /// A/B lever, same idiom as OMNI_VIZ_LAZY_PCA: 0 restores the entry-count-only cache that never
+    /// released on leaving the map, so the two can be measured against each other in one build.
+    nonisolated static let vizCacheBounded = ProcessInfo.processInfo.environment["OMNI_VIZ_CACHE_BOUND"] != "0"
+    private var projectionCacheByteBudget: Int {
+        guard Self.vizCacheBounded else { return .max }
+        let capGB = maxMemoryGB > 0 ? maxMemoryGB : physicalMemoryGB
+        return max(32 << 20, Int(capGB * 0.02 * 1_073_741_824))
+    }
+    /// Retained size of one layout: the point cloud plus its neighbor graph. Path/kind strings are
+    /// not counted - those String instances are the store's own row strings, shared not copied.
+    private static func projectionBytes(_ r: ProjectionResult) -> Int {
+        r.points.count * MemoryLayout<ProjectionPoint>.stride + r.knn.count * MemoryLayout<Int32>.stride
+    }
     private var folderMapRefitPending = false                    // map refit deferred until the folder stops indexing
     /// Files under the currently shown folder before map subsampling (caption shows "N of M" when M > N).
     private(set) var folderProjectionTotal = 0
@@ -222,11 +239,31 @@ final class AppModel {
         else { touchProjection(url) }
         projectionCache[url] = result
         projectionTotals[url] = total
-        while projectionCacheOrder.count > projectionCacheCap {
+        // Evict oldest-first until BOTH bounds hold. Never down to zero: the last entry is the
+        // folder on screen, whose points `folderProjection` is holding anyway - dropping it would
+        // free nothing and cost a refit on the next glance.
+        var held = projectionCache.values.reduce(0) { $0 + Self.projectionBytes($1) }
+        let budget = projectionCacheByteBudget
+        while projectionCacheOrder.count > 1,
+              projectionCacheOrder.count > projectionCacheCap || held > budget {
             let evict = projectionCacheOrder.removeFirst()
+            if let r = projectionCache[evict] { held -= Self.projectionBytes(r) }
             projectionCache[evict] = nil   // re-fit on return is debounced + GPU-gated; map only, never retrieval
             projectionTotals[evict] = nil
         }
+    }
+
+    /// Drop every cached layout except the folder currently selected. Called when the map stops
+    /// being on screen (the user typed a query, or picked a non-folder view): browsing folders is
+    /// how the cache fills, and once the map is gone the browse history is retained for a return
+    /// that may never come. The SELECTED folder is kept because clearing the query is meant to put
+    /// its map straight back with no refit - that promise is the whole reason the cache exists.
+    func trimProjectionCacheToCurrent() {
+        guard Self.vizCacheBounded else { return }
+        let keep = selectedFolderForViz
+        guard projectionCacheOrder.contains(where: { $0 != keep }) else { return }
+        for u in projectionCacheOrder where u != keep { projectionCache[u] = nil; projectionTotals[u] = nil }
+        projectionCacheOrder.removeAll { $0 != keep }
     }
     private func touchProjection(_ url: URL) {
         if let i = projectionCacheOrder.firstIndex(of: url) { projectionCacheOrder.append(projectionCacheOrder.remove(at: i)) }

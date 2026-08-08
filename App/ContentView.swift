@@ -155,6 +155,11 @@ struct ContentView: View {
                 emptyState
             }
         }
+        // Leaving the map releases the folders browsed BEFORE this one. The selected folder's
+        // layout stays cached, so clearing the query still puts its map back instantly.
+        .onChange(of: showsFolderViz) { _, shown in
+            if !shown { model.trimProjectionCacheToCurrent() }
+        }
         // The Quick Look presenter belongs to the whole pane, not to the results list. It used to
         // live inside ResultsList, which is mounted only while there are results - the exact
         // complement of the folder map above it - so the map's own "Quick Look" action wrote
