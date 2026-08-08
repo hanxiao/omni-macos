@@ -90,7 +90,9 @@ public struct InlineChunkHit: Sendable {
 public struct FolderVectors: Sendable {
     public let paths: [String]      // one entry per FILE, row-aligned with vectors
     public let kinds: [String]      // FileKind rawValue per file, row-aligned
-    public let vectors: [Float]     // row-major [count*dim], fp32, L2-normalized, mean-pooled per file
+    /// Row-major [count*dim] fp32, L2-normalized, mean-pooled per file - EXCEPT when `streams` is
+    /// true, where this holds only the first `landmarkCount` rows and the rest arrive through `tile`.
+    public let vectors: [Float]
     public let dim: Int
     /// Distinct files under the folder BEFORE map subsampling (== count when not sampled). Lets the
     /// folder-map caption show "N of M" for any folder, including non-root subfolders.
@@ -99,12 +101,26 @@ public struct FolderVectors: Sendable {
     /// expensive layout (UMAP kNN + force, PCA SVD) runs on them, and the remaining rows are placed
     /// relative to them, so every file gets a dot at near-sample cost. == count when not sampled.
     public let landmarkCount: Int
+    /// Non-nil when the non-landmark rows are pulled ON DEMAND instead of held. `tile(start, end)`
+    /// returns rows [start, end) as row-major [(end - start) * dim] fp32 - byte-identical to the
+    /// slice `vectors` would have carried. Only ever called with `start >= landmarkCount`, and only
+    /// by ProjectionEngine.hostTile, which is the single reader of non-landmark rows.
+    ///
+    /// WHY: the layout consumes those rows in ONE forward sequential pass (one placement tile at a
+    /// time), so holding all of them costs count*dim*4 bytes - 795 MB for a 259k-file home folder -
+    /// to serve a working set of a few thousand rows. Streaming makes the pull's peak
+    /// O(tile*dim + count), which is what lets every file get a dot instead of the first N.
+    public let tile: (@Sendable (_ start: Int, _ end: Int) -> [Float])?
     public var count: Int { paths.count }
+    /// True when non-landmark rows are fetched on demand (so `vectors` is the landmark prefix only).
+    public var streams: Bool { tile != nil }
     public init(paths: [String], kinds: [String], vectors: [Float], dim: Int, total: Int? = nil,
-                landmarkCount: Int? = nil) {
+                landmarkCount: Int? = nil,
+                tile: (@Sendable (_ start: Int, _ end: Int) -> [Float])? = nil) {
         self.paths = paths; self.kinds = kinds; self.vectors = vectors; self.dim = dim
         self.total = total ?? paths.count
         self.landmarkCount = landmarkCount ?? paths.count
+        self.tile = tile
     }
 }
 
@@ -2273,6 +2289,73 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
+    /// Reusable global-id -> tile-row table for the streaming folder pull. Held across tiles so each
+    /// tile costs O(tile) to set up and tear down instead of O(files in the index) to zero a fresh
+    /// table (~1 MB memset per tile otherwise). Only ever touched inside `queue`.
+    final class TileScratch: @unchecked Sendable { var map: [Int32] = [] }
+
+    /// Mean-pooled, L2-normalized fp32 vectors for exactly these files, row-major [files.count*dim],
+    /// in the order given. Files the store no longer knows (deleted since the caller listed them)
+    /// come back as a zero row rather than shifting everything after them.
+    ///
+    /// Paths are re-resolved to file ids on every call, deliberately: a folder-map fit runs for
+    /// seconds while indexing may be committing, and a plan that cached row indices or ids would go
+    /// stale against a compaction and silently pool the WRONG file's chunks into a dot. Ids and row
+    /// windows are read fresh under the same lock any writer must take, so a tile is always a
+    /// consistent read of the store as it is now.
+    ///
+    /// Row order within a file is ascending, the same as the whole-folder pooling pass, so the
+    /// bf16->fp32 accumulation lands on bit-identical floats.
+    /// Caller must hold `queue`.
+    private func pooledFilesLocked(_ files: [String], scratch: TileScratch? = nil) -> [Float] {
+        let d = dim, t = files.count
+        var out = [Float](repeating: 0, count: t * d)
+        guard d > 0, t > 0 else { return out }
+        let nGlobal = max(1, fileChunkCount.count)
+        let scratch = scratch ?? TileScratch()
+        if scratch.map.count < nGlobal { scratch.map = [Int32](repeating: -1, count: nGlobal) }
+        var gids: [Int32] = []; gids.reserveCapacity(t)
+        for (i, p) in files.enumerated() {
+            guard let gid = pathID[p], Int(gid) < nGlobal, fileChunkCount[Int(gid)] > 0 else { continue }
+            scratch.map[Int(gid)] = Int32(i); gids.append(gid)
+        }
+        defer { for g in gids { scratch.map[Int(g)] = -1 } }   // O(tile) reset, not O(index)
+        guard !gids.isEmpty else { return out }
+        var counts = [Int](repeating: 0, count: t)
+        // No ensureCompactLocked() here: a tile must not trigger a whole-index compaction mid-fit,
+        // so unlike the whole-folder pass this one filters tombstones itself.
+        let dead = deadRows
+        flat16.withUnsafeBufferPointer { fb in
+            guard let base = fb.baseAddress else { return }
+            out.withUnsafeMutableBufferPointer { s in
+                for range in provenRowRangesLocked(gids, dead: dead) {
+                    for i in range.lowerBound ..< range.upperBound {
+                        let gid = Int(fileID[i])
+                        guard gid < nGlobal else { continue }
+                        let li = scratch.map[gid]
+                        guard li >= 0 else { continue }
+                        if !dead.isEmpty, dead.contains(Int32(i)) { continue }
+                        // SIMD8 widen-and-add. Bit-identical to the scalar `dst[k] += fromBF16(src[k])`
+                        // loop the whole-folder pass runs: the lanes are independent, so nothing is
+                        // reassociated, and bf16 -> fp32 is an exact 16-bit shift.
+                        Self.accumulateBF16(base + i * d, into: s.baseAddress! + Int(li) * d, count: d)
+                        counts[Int(li)] += 1
+                    }
+                }
+            }
+        }
+        out.withUnsafeMutableBufferPointer { s in
+            for f in 0 ..< t {
+                let so = f * d, c = Float(max(1, counts[f]))
+                var norm: Float = 0
+                for k in 0 ..< d { let v = s[so + k] / c; s[so + k] = v; norm += v * v }
+                let inv = norm > 0 ? 1.0 / norm.squareRoot() : 0
+                for k in 0 ..< d { s[so + k] *= inv }
+            }
+        }
+        return out
+    }
+
     /// Per-FILE mean-pooled, L2-normalized fp32 vectors for files under `folder` (path-boundary
     /// aware). Additive read-only helper for the folder visualization; does NOT touch search state.
     /// Runs under `queue` like every other reader.
@@ -2283,7 +2366,15 @@ public final class VectorStore: @unchecked Sendable {
     /// the remaining rows are every other file, in row order, up to `cap`. With cap == .max every
     /// file under the folder gets a row, so the map can place ALL files while only the landmarks
     /// pay the quadratic layout cost.
-    public func vectorsUnderFolder(_ folder: String, cap: Int = .max, landmarkCap: Int = .max) -> FolderVectors {
+    ///
+    /// `streaming` returns the LANDMARK rows only, plus a `tile` closure that pulls the rest on
+    /// demand (see FolderVectors.tile). Same rows, same floats, same order - the difference is that
+    /// peak memory becomes O(landmarks*dim + tile*dim) instead of O(files*dim), which is what makes
+    /// an uncapped `cap` affordable. It also breaks the single multi-second store-lock hold this
+    /// otherwise takes on a large folder into one short hold per tile, so an interactive search
+    /// waits behind a tile rather than behind the whole pull.
+    public func vectorsUnderFolder(_ folder: String, cap: Int = .max, landmarkCap: Int = .max,
+                                   streaming: Bool = false) -> FolderVectors {
         queue.sync {
             ensureCompactLocked()
             guard dim > 0, !folder.isEmpty, folder != "/" else { return FolderVectors(paths: [], kinds: [], vectors: [], dim: dim) }
@@ -2321,6 +2412,8 @@ public final class VectorStore: @unchecked Sendable {
             // by FIRST APPEARANCE IN ROW ORDER. The landmark even-stride sample below indexes into
             // that order, so any reordering here would silently change which files the folder map
             // draws as landmarks.
+            // Streaming pools per tile from freshly-resolved row windows, so it needs no row list
+            // at all - and at 4 bytes per matching row that list is ~18 MB on a whole-index folder.
             var matchRows: [Int32] = []
             // deadRows is empty here: ensureCompactLocked() above collected every tombstone, which
             // is also why this reader alone never has to filter dead rows out of the walk.
@@ -2331,7 +2424,7 @@ public final class VectorStore: @unchecked Sendable {
                     // sidecar path table ever carried a duplicate, and this loop can run over the
                     // whole index on the fallback path.
                     guard gid < nGlobal, inFolder[gid] else { continue }
-                    matchRows.append(Int32(i))
+                    if !streaming { matchRows.append(Int32(i)) }
                     if !seen[gid] { seen[gid] = true; allGids.append(gid); allPaths.append(rows[i].path); allKinds.append(rows[i].kind) }
                 }
             }
@@ -2370,6 +2463,23 @@ public final class VectorStore: @unchecked Sendable {
             let landmarkCount = min(total, lCap)
             let nFiles = order.count
 
+            if streaming {
+                // Landmarks now (the fit holds them resident for its whole duration); the rest on
+                // demand. Both go through the SAME per-tile pooler, so there is one implementation
+                // of "pool these files" rather than two that could drift.
+                let lm = pooledFilesLocked(Array(order[0 ..< landmarkCount]))
+                let scratch = TileScratch()
+                let plan = order        // immutable copy for the escaping tile closure
+                return FolderVectors(paths: order, kinds: kinds, vectors: lm, dim: dim, total: total,
+                                     landmarkCount: landmarkCount,
+                                     tile: { [weak self] start, end in
+                                         guard let self, start < end, end <= plan.count else { return [] }
+                                         return self.queue.sync {
+                                             self.pooledFilesLocked(Array(plan[start ..< end]), scratch: scratch)
+                                         }
+                                     })
+            }
+
             var sums = [Float](repeating: 0, count: nFiles * dim)
             var counts = [Int](repeating: 0, count: nFiles)
             flat16.withUnsafeBufferPointer { fb in
@@ -2379,8 +2489,9 @@ public final class VectorStore: @unchecked Sendable {
                         let i = Int(r)
                         let li = globalToLocal[Int(fileID[i])]
                         guard li >= 0 else { continue }       // file beyond cap
-                        let so = Int(li) * dim, off = i * dim
-                        for k in 0 ..< dim { s[so + k] += Self.fromBF16(base[off + k]) }
+                        // SIMD8 widen-and-add; bit-identical to the scalar loop it replaces (lanes
+                        // are independent, bf16 -> fp32 is an exact shift). Worth ~40% of this pass.
+                        Self.accumulateBF16(base + i * dim, into: s.baseAddress! + Int(li) * dim, count: dim)
                         counts[Int(li)] += 1
                     }
                 }

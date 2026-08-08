@@ -62,12 +62,14 @@ public final class ProjectionEngine: @unchecked Sendable {
                         k: Int = 15, epochs: Int = 300, negRate: Int = 5, seed: UInt64 = 42,
                         refine: Bool = true) async -> ProjectionResult {
         let n = data.count
-        guard n > 0, data.dim > 0, data.vectors.count == n * data.dim else { return ProjectionResult(points: [], knn: [], k: k) }
+        guard n > 0, data.dim > 0 else { return ProjectionResult(points: [], knn: [], k: k) }
         let d = data.dim
         // Landmarks: the rows the quadratic work runs on. L == n (no split) reproduces the
         // pre-landmark behavior exactly; with a split, the remaining rows are PLACED relative to the
         // landmark layout so every file gets a dot at near-sample cost.
         let L = min(max(data.landmarkCount, 1), n)
+        // A streaming pull holds only the landmark prefix; everything else arrives through hostTile.
+        guard data.vectors.count == (data.streams ? L * d : n * d) else { return ProjectionResult(points: [], knn: [], k: k) }
         let cancelled = ProjectionResult(points: [], knn: [], k: k)
 
         // A map fit is user-initiated work the user is watching, but it takes the gate at LOW
@@ -241,9 +243,10 @@ public final class ProjectionEngine: @unchecked Sendable {
     public static func layout(_ data: FolderVectors,
                               k: Int = 15, epochs: Int = 300, negRate: Int = 5, seed: UInt64 = 42) -> [ProjectionPoint] {
         let n = data.count
-        guard n > 0, data.dim > 0, data.vectors.count == n * data.dim else { return [] }
+        guard n > 0, data.dim > 0 else { return [] }
         let d = data.dim
         let L = min(max(data.landmarkCount, 1), n)
+        guard data.vectors.count == (data.streams ? L * d : n * d) else { return [] }
         let XL = L == n ? MLXArray(data.vectors, [n, d]).asType(.float32) : hostTile(data, 0, L)
         let (Y0, pcaMean, pcaComps) = pca2DBasis(XL)
         let Y0host = Y0.asArray(Float.self)
@@ -418,17 +421,43 @@ public final class ProjectionEngine: @unchecked Sendable {
     //     so a row that coincides with a landmark lands on it and everything else interpolates.
     // Tiles bound the GEMM memory; total FLOPs are rest x L x d (linear in rest, not quadratic).
 
-    /// Rows [start, end) of data.vectors as a [t, d] MLXArray.
+    /// Rows [start, end) of the folder's vectors as a [t, d] MLXArray.
+    ///
+    /// This is the ONLY reader of non-landmark rows, which is what makes streaming possible: when
+    /// `data.streams`, the rows past the landmark prefix are not resident at all and are pulled
+    /// from the store here, one tile at a time. Landmark rows always come from `data.vectors` -
+    /// the quadratic work needs them resident for the whole fit, so streaming them would re-pull
+    /// the same rows repeatedly.
     public static func hostTile(_ data: FolderVectors, _ start: Int, _ end: Int) -> MLXArray {
         let d = data.dim
+        if let tile = data.tile, start >= data.landmarkCount {
+            let flat = tile(start, end)
+            // A short pull means the store no longer has those files (deleted mid-fit). Pad with
+            // zeros rather than crashing on the shape: a zero row is placed at the layout's
+            // centroid, which is the honest position for a file we can no longer describe.
+            let want = (end - start) * d
+            return MLXArray(flat.count == want ? flat : flat + [Float](repeating: 0, count: max(0, want - flat.count)),
+                            [end - start, d])
+        }
         return data.vectors.withUnsafeBufferPointer { buf in
             MLXArray(Array(UnsafeBufferPointer(rebasing: buf[(start * d) ..< (end * d)])), [end - start, d])
         }
     }
 
-    /// Tile rows for the placement GEMM: bound the [t, L] similarity matrix to ~200MB.
+    /// Byte bound on ONE [t, L] placement tile. Total FLOPs are tile-invariant, so a smaller tile
+    /// only means more kernel launches.
+    ///
+    /// MEASURED, and the result is a null one worth recording so nobody re-derives the hypothesis:
+    /// sweeping this 200 -> 100 -> 50 -> 25 MB on a 259k-file folder map moved peak phys_footprint
+    /// by nothing (1971 / 2031 / 1930 / 2002 MB - inside run-to-run spread) and cost ~15% wall time
+    /// at 25 MB. The fit's peak is NOT made of placement tiles; it is the MLX buffer cache
+    /// (omniCacheFraction of the user's memory cap) plus the landmark kNN, and those are the levers
+    /// that would move it. OMNI_VIZ_TILE_MB re-runs that sweep.
+    static let placementTileBytes =
+        (ProcessInfo.processInfo.environment["OMNI_VIZ_TILE_MB"].flatMap { Int($0) } ?? 200) * 1_000_000
+    /// Tile rows for the placement GEMM.
     public static func placementTileRows(_ landmarks: Int) -> Int {
-        max(1, 200_000_000 / max(1, landmarks * 4))
+        max(1, placementTileBytes / max(1, landmarks * 4))
     }
 
     /// Place one tile of non-landmark rows: returns row-major [t*2] positions and the [t*k] nearest

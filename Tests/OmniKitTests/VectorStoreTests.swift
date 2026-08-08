@@ -162,6 +162,53 @@ final class VectorStoreTests: XCTestCase {
         XCTAssertEqual(full.landmarkCount, 10)
     }
 
+    /// The streaming pull must be the eager pull, minus the resident cost: same files, same order,
+    /// same floats. If these ever diverge, the folder map silently draws different dots depending
+    /// on which pull it used, which no visual check would catch.
+    func testVectorsUnderFolderStreamingMatchesEager() throws {
+        let url = tempDB()
+        let store = try VectorStore(dbURL: url)
+        let dim = 16
+        // Several chunks per file, so the mean-pooling (and its accumulation order) is exercised
+        // rather than a single row that pools trivially.
+        for i in 0 ..< 40 {
+            let path = "/d/f\(i).txt"
+            let chunks = (0 ..< (1 + i % 3)).map { c -> IndexedChunk in
+                var v = [Float](repeating: 0, count: dim)
+                v[i % dim] = 1; v[(i + c) % dim] += 0.5
+                return IndexedChunk(path: path, modified: 1, size: 1, kind: "text",
+                                    chunkIndex: c, snippet: "s", embedding: v)
+            }
+            try store.replace(path: path, chunks: chunks)
+        }
+        for (cap, lcap) in [(Int.max, Int.max), (30, 8), (40, 40), (5, 5)] {
+            let eager = store.vectorsUnderFolder("/d", cap: cap, landmarkCap: lcap)
+            let streamed = store.vectorsUnderFolder("/d", cap: cap, landmarkCap: lcap, streaming: true)
+            XCTAssertEqual(eager.paths, streamed.paths, "cap=\(cap)")
+            XCTAssertEqual(eager.kinds, streamed.kinds, "cap=\(cap)")
+            XCTAssertEqual(eager.total, streamed.total, "cap=\(cap)")
+            XCTAssertEqual(eager.landmarkCount, streamed.landmarkCount, "cap=\(cap)")
+            XCTAssertTrue(streamed.streams, "cap=\(cap): streaming pull must carry a tile provider")
+            // The landmark prefix is held; everything past it arrives through `tile`.
+            XCTAssertEqual(streamed.vectors.count, streamed.landmarkCount * dim, "cap=\(cap)")
+            var got = streamed.vectors
+            var s = streamed.landmarkCount
+            while s < streamed.count {
+                let e = min(s + 7, streamed.count)     // deliberately not a divisor of the count
+                got.append(contentsOf: streamed.tile?(s, e) ?? [])
+                s = e
+            }
+            XCTAssertEqual(got, eager.vectors, "cap=\(cap): streamed floats differ from eager")
+        }
+        // A file deleted after the plan was made must not shift the rows after it.
+        let streamed = store.vectorsUnderFolder("/d", cap: .max, landmarkCap: 4, streaming: true)
+        store.deletePath(streamed.paths[6])
+        let tile = streamed.tile?(4, 8) ?? []
+        XCTAssertEqual(tile.count, 4 * dim)
+        XCTAssertEqual(tile[(2 * dim) ..< (3 * dim)].max(), 0, "the deleted file must come back as a zero row")
+        XCTAssertGreaterThan(tile[(3 * dim) ..< (4 * dim)].max() ?? 0, 0, "the row after it must be unshifted")
+    }
+
     func testDeleteKindAndUnderFolder() throws {
         let url = tempDB()
         let store = try VectorStore(dbURL: url)

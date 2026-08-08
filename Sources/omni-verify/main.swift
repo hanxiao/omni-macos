@@ -1050,6 +1050,18 @@ func rowwindowcheckRun(_ files: Int, _ edits: Int) throws -> Int32 {
                 out.append("\(tag) fold\(i)_\(lc): total=\(fv.total) landmarks=\(fv.landmarkCount) "
                            + "paths=\(fv.paths.joined(separator: ",")) "
                            + "v=\(fv.vectors.prefix(64).map { "\($0.bitPattern)" }.joined(separator: ","))")
+                // Same folder pulled the streaming way: the rows arrive as landmark prefix + tiles,
+                // and every tile re-resolves paths to ids against the CURRENT store. This edit stream
+                // (re-saves, deletes, delete-then-re-add, folder-wide delete) is exactly the state
+                // that re-resolution exists for, so the digest has to cover it too.
+                let sv = store.vectorsUnderFolder(f, cap: caps, landmarkCap: lc, streaming: true)
+                var flat = sv.vectors
+                var s = sv.landmarkCount
+                while s < sv.count { let e = Swift.min(s + 7, sv.count); flat.append(contentsOf: sv.tile?(s, e) ?? []); s = e }
+                out.append("\(tag) sfold\(i)_\(lc): total=\(sv.total) landmarks=\(sv.landmarkCount) "
+                           + "paths=\(sv.paths.joined(separator: ",")) "
+                           + "v=\(flat.prefix(64).map { "\($0.bitPattern)" }.joined(separator: ","))"
+                           + " match=\(flat == fv.vectors && sv.paths == fv.paths ? "yes" : "NO")")
             }
         }
         for q in 0 ..< 24 {
@@ -2643,13 +2655,24 @@ if args.count >= 2 && args[1] == "projbench" {
     exit(0)
 }
 
-// Folder-map bench on a REAL index: omni-verify mapbench <modelDir> <dbPath> <folder> [capGB] [pca|umap]
+// Folder-map bench on a REAL index:
+//   omni-verify foldermapbench <modelDir> <dbPath> <folder> [capGB] [pca|umap] [totalCapOverride]
 // Runs exactly what the app runs when you click a folder - store.vectorsUnderFolder followed by
 // ProjectionEngine.project - with the caps derived from AppModel's mapPointBudget/mapTotalPointCap
 // for the given memory cap, so a low-end machine's shape can be reproduced here. projbench only
 // exercises the ungated sync `layout()`; this is the gated async path the user actually waits on.
 // Point it at a COPY of an index, not a live one.
-if args.count >= 5 && args[1] == "mapbench" {
+//
+// Reports THREE things, because the map is judged on all three and one of them alone is
+// misleading: wall time (pull + fit), peak phys_footprint (sampled continuously - the map's cost
+// is a burst, and a burst is invisible to a before/after reading), and kNN preservation of the
+// finished layout against the embedding-space neighbors of the same pulled vectors (so a change
+// that gets faster or lighter by drawing a worse map cannot pass unnoticed).
+//
+// The command name is NOT `mapbench`: that dispatch is already taken by the synthetic
+// buffer-cache bench above, which matches on `args.count >= 2` and so swallowed every invocation
+// of this one (Int("<modelDir path>") is nil, so it silently ran the 4000-file synthetic instead).
+if args.count >= 5 && args[1] == "foldermapbench" {
     let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
     let store = try VectorStore(dbURL: URL(fileURLWithPath: args[3]))
     let folder = args[4]
@@ -2662,22 +2685,215 @@ if args.count >= 5 && args[1] == "mapbench" {
     let ceiling = refine ? max(5_000, min(60_000, Int(capGB / 6.0 * 15_000)))
                          : max(20_000, min(250_000, Int(capGB / 6.0 * 60_000)))
     let mapCap = max(2_000, min(nBudget, ceiling))
-    let totalCap = max(mapCap, min(Int(capGB * 0.12 * 1_073_741_824 / Double(max(256, dim) * 4 * 2)), 250_000))
-    print("mapbench folder=\(folder) capGB=\(capGB) mode=\(refine ? "umap" : "pca") dim=\(dim) landmarkCap=\(mapCap) totalCap=\(totalCap)")
+    let derivedTotalCap = max(mapCap, min(Int(capGB * 0.12 * 1_073_741_824 / Double(max(256, dim) * 4 * 2)), 250_000))
+    let totalCap = (args.count >= 8 ? Int(args[7]) : nil) ?? derivedTotalCap
+    // Match the app: the cap also sets MLX's reclaimable buffer cache (omniCacheFraction of it).
+    // Without this the bench runs with an unbounded MLX cache and reads ~2 GB heavier than the app
+    // ever does, which would make the fit look like the memory problem it is not.
+    omniSetMemoryLimit(Int(capGB * 1_073_741_824))
+    print("foldermapbench folder=\(folder) capGB=\(capGB) mode=\(refine ? "umap" : "pca") dim=\(dim) landmarkCap=\(mapCap) totalCap=\(totalCap)"
+          + String(format: "  cacheLimit=%.0f MB", Double(MLX.Memory.cacheLimit) / 1_048_576))
+
+    // Continuous peak sampler. The pull allocates one n x dim host buffer and the fit allocates
+    // GPU tiles on top of it; both are transient, so a footprint read taken after either one has
+    // returned can miss the actual high-water mark entirely.
+    final class Peak: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _v: Double = 0
+        var value: Double { lock.lock(); defer { lock.unlock() }; return _v }
+        func note(_ x: Double) { lock.lock(); if x > _v { _v = x }; lock.unlock() }
+        func reset(_ x: Double) { lock.lock(); _v = x; lock.unlock() }
+    }
+    let peak = Peak()
+    let sampling = DispatchSemaphore(value: 0)
+    let sampler = Thread {
+        while sampling.wait(timeout: .now() + .milliseconds(5)) == .timedOut { peak.note(churnFootprintMB()) }
+    }
+    sampler.start()
+
+    // kNN preservation on a sample: for `qn` probe points, how much of their true embedding-space
+    // neighborhood survives in the 2D layout. Probes are strided over the result so landmarks and
+    // IDW-placed rows are both represented in proportion.
+    func preservation(_ data: FolderVectors, _ pts: [ProjectionPoint], kQ: Int = 15, qn: Int = 512) -> Double {
+        let n = pts.count
+        guard n > kQ + 1, data.count == n, data.vectors.count == n * data.dim else { return -1 }
+        let step = Swift.max(1, n / qn)
+        let probes = Array(stride(from: 0, to: n, by: step))
+        // True neighbors: one [probes, n] cosine GEMM on the GPU (vectors are unit length).
+        var q = [Float](); q.reserveCapacity(probes.count * data.dim)
+        for i in probes { q.append(contentsOf: data.vectors[i * data.dim ..< (i + 1) * data.dim]) }
+        let X = MLXArray(data.vectors, [n, data.dim]).asType(.float32)
+        let Q = MLXArray(q, [probes.count, data.dim]).asType(.float32)
+        let sims = Q.matmul(X.transposed())
+        let top = MLX.argPartition(MLX.negative(sims), kth: kQ + 1, axis: 1)[0..., 0 ... kQ]
+        eval(top)
+        let embIdx = top.asType(.int32).asArray(Int32.self)
+        // 2D neighbors: brute force on the CPU, probes x n, which at n ~ 10^5 is a few 10^7 ops.
+        var sum = 0.0
+        for (pi, i) in probes.enumerated() {
+            var emb = Set<Int>()
+            for c in 0 ... kQ { let j = Int(embIdx[pi * (kQ + 1) + c]); if j != i { emb.insert(j) } }
+            let xi = pts[i].position.x, yi = pts[i].position.y
+            var d = [(Float, Int)](); d.reserveCapacity(n - 1)
+            for j in 0 ..< n where j != i {
+                let dx = pts[j].position.x - xi, dy = pts[j].position.y - yi
+                d.append((dx * dx + dy * dy, j))
+            }
+            let near = Set(d.sorted { $0.0 < $1.0 }.prefix(kQ).map { $0.1 })
+            sum += Double(near.intersection(emb).count) / Double(kQ)
+        }
+        return sum / Double(probes.count)
+    }
+
+    // EQUIVALENCE: the streaming pull must produce the same files in the same order carrying the
+    // same floats as the eager one. Anything less and every timing below is measuring a different
+    // map. Exact, not approximate: both paths accumulate the same bf16 rows in the same order.
+    if ProcessInfo.processInfo.environment["OMNI_MAP_VERIFY"] == "1" {
+        let a = store.vectorsUnderFolder(folder, cap: totalCap, landmarkCap: mapCap)
+        let b = store.vectorsUnderFolder(folder, cap: totalCap, landmarkCap: mapCap, streaming: true)
+        var bad = 0, checked = 0
+        let orderOK = a.paths == b.paths && a.kinds == b.kinds && a.landmarkCount == b.landmarkCount && a.total == b.total
+        func compare(_ want: ArraySlice<Float>, _ got: [Float]) {
+            guard want.count == got.count else { bad += abs(want.count - got.count); return }
+            for (i, w) in want.enumerated() { checked += 1; if w != got[i] { bad += 1 } }
+        }
+        // Landmark prefix: streaming holds it eagerly, so compare it directly.
+        compare(a.vectors[0 ..< (b.landmarkCount * dim)], b.vectors)
+        // Everything past the prefix comes one placement tile at a time, exactly as the fit reads it -
+        // and each of those calls is one hold of the store lock that an interactive search waits
+        // behind, so time them: the eager pull's hold is a single block of the whole `pull=` figure.
+        let tileRows = ProjectionEngine.placementTileRows(mapCap)
+        var s = b.landmarkCount
+        var holds: [Double] = []
+        while s < a.count {
+            let e = Swift.min(s + tileRows, a.count)
+            let t = Date()
+            let got = b.tile?(s, e) ?? []
+            holds.append(-t.timeIntervalSinceNow * 1000)
+            compare(a.vectors[(s * dim) ..< (e * dim)], got)
+            s = e
+        }
+        print("  verify streaming: order=\(orderOK ? "same" : "DIFFERENT")  floats checked=\(checked) mismatched=\(bad)  \(orderOK && bad == 0 ? "PASS" : "FAIL")")
+        if !holds.isEmpty {
+            print(String(format: "  store-lock hold: tiles=%d  mean=%.1f ms  max=%.1f ms  sum=%.0f ms  (eager holds it once for the whole pull)",
+                         holds.count, holds.reduce(0, +) / Double(holds.count), holds.max() ?? 0, holds.reduce(0, +)))
+        }
+    }
 
     let proj = ProjectionEngine(engine: engine)
-    for pass in 1 ... 2 {
-        let t0 = Date()
-        let data = store.vectorsUnderFolder(folder, cap: totalCap, landmarkCap: mapCap)
-        let pullMs = -t0.timeIntervalSinceNow * 1000
-        guard data.count > 0 else { print("  no indexed files under that folder"); break }
-        let t1 = Date()
-        let r = await proj.project(data, refine: refine)
-        let fitMs = -t1.timeIntervalSinceNow * 1000
-        let finite = r.points.allSatisfy { $0.position.x.isFinite && $0.position.y.isFinite }
-        print(String(format: "  pass%d  pull=%7.0f ms  fit=%7.0f ms  total=%7.0f ms   (n=%d L=%d pts=%d knn=%d finite=%@)",
-                     pass, pullMs, fitMs, pullMs + fitMs, data.count, data.landmarkCount,
-                     r.points.count, r.knn.count, finite ? "yes" : "NO"))
+    // OMNI_MAP_ARM pins a single arm. Peak footprint is only comparable between arms run in
+    // SEPARATE processes: MLX's buffer cache and the malloc heap never fully return between runs,
+    // so whichever arm goes second starts from a higher, contaminated baseline.
+    let armFilter = ProcessInfo.processInfo.environment["OMNI_MAP_ARM"]
+    for arm in ["eager", "stream"] where armFilter == nil || armFilter == arm {
+        let streaming = arm == "stream"
+        for pass in 1 ... 2 {
+            MLX.GPU.clearCache()
+            let base = churnFootprintMB()
+            peak.reset(base)
+            let t0 = Date()
+            var data = store.vectorsUnderFolder(folder, cap: totalCap, landmarkCap: mapCap, streaming: streaming)
+            let pullMs = -t0.timeIntervalSinceNow * 1000
+            let afterPull = churnFootprintMB()
+            guard data.count > 0 else { print("  no indexed files under that folder"); break }
+            let t1 = Date()
+            let r = await proj.project(data, refine: refine)
+            let fitMs = -t1.timeIntervalSinceNow * 1000
+            let afterFit = churnFootprintMB()
+            let held = peak.value
+            let finite = r.points.allSatisfy { $0.position.x.isFinite && $0.position.y.isFinite }
+            print(String(format: "  %-6s pass%d  pull=%7.0f ms  fit=%7.0f ms  total=%7.0f ms   (n=%d of %d, L=%d pts=%d knn=%d finite=%@)",
+                         (arm as NSString).utf8String!, pass, pullMs, fitMs, pullMs + fitMs, data.count, data.total,
+                         data.landmarkCount, r.points.count, r.knn.count, finite ? "yes" : "NO"))
+            print(String(format: "                footprint base=%.0f MB  afterPull=+%.0f  afterFit=+%.0f  PEAK=+%.0f MB   gpuPeak=%.0f MB",
+                         base, afterPull - base, afterFit - base, held - base,
+                         Double(MLX.Memory.peakMemory) / 1_048_576))
+            if pass == 2 {
+                // Quality needs every vector resident; pull eagerly for the metric only, AFTER the
+                // peak window has been read, so scoring never inflates what is being reported.
+                let full = streaming ? store.vectorsUnderFolder(folder, cap: totalCap, landmarkCap: mapCap) : data
+                let pres = preservation(full, r.points)
+                if pres >= 0 { print(String(format: "                quality knn-pres@15 = %.4f", pres)) }
+            }
+            // Drop the pulled vectors before the next pass so the base reading is comparable.
+            data = FolderVectors(paths: [], kinds: [], vectors: [], dim: dim)
+        }
+    }
+    sampling.signal()
+    store.close()
+    exit(0)
+}
+
+// Folder-map CACHE bench on a REAL index:
+//   omni-verify foldermapcachebench <modelDir> <dbPath> <capGB> <folder> [folder ...]
+// Browsing folders is what fills AppModel's projection cache, and every entry it holds is a live
+// point cloud plus a neighbour graph. This replays that browse headlessly against the same LRU
+// policy the app runs, under both bounds, and reports what each retains:
+//
+//   count-only : evict past 6 entries (the old rule - six entries of any size)
+//   bounded    : evict past 6 entries OR past the byte budget, and on leaving the map keep only
+//                the folder still selected (the new rule)
+//
+// Peak footprint is not the question here; RETAINED bytes after the browse is, so this reports the
+// process footprint once each browse has settled.
+if args.count >= 5 && args[1] == "foldermapcachebench" {
+    let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    let store = try VectorStore(dbURL: URL(fileURLWithPath: args[3]))
+    let capGB = Double(args[4]) ?? 6
+    let folders = Array(args[5...])
+    omniSetMemoryLimit(Int(capGB * 1_073_741_824))
+    let dim = engine.dim
+    let bpp = Double(max(256, dim) * 4 * 5)
+    let mapCap = max(2_000, min(Int(capGB * 0.12 * 1_073_741_824 / bpp), max(5_000, min(60_000, Int(capGB / 6.0 * 15_000)))))
+    // Mirrors AppModel: 2% of the cap, floor 32 MB, and the same 6-entry LRU on top.
+    let byteBudget = Swift.max(32 << 20, Int(capGB * 0.02 * 1_073_741_824))
+    let entryCap = 6
+    func bytesOf(_ r: ProjectionResult) -> Int {
+        r.points.count * MemoryLayout<ProjectionPoint>.stride + r.knn.count * MemoryLayout<Int32>.stride
+    }
+    print("foldermapcachebench capGB=\(capGB) landmarkCap=\(mapCap) entryCap=\(entryCap)"
+          + String(format: "  byteBudget=%.0f MB  folders=%d", Double(byteBudget) / 1_048_576, folders.count))
+
+    let proj = ProjectionEngine(engine: engine)
+    // Each arm re-fits from scratch and retains NOTHING outside its own cache, so the footprint
+    // reading reflects what that policy is holding rather than what a shared fixture kept alive.
+    for bounded in [false, true] {
+        MLX.GPU.clearCache()
+        let base = churnFootprintMB()
+        var cache: [String: ProjectionResult] = [:]
+        var order: [String] = []
+        for f in folders {
+            let data = store.vectorsUnderFolder(f, cap: .max, landmarkCap: mapCap, streaming: true)
+            guard data.count > 0 else { if !bounded { print("  skip \(f): nothing indexed under it") }; continue }
+            let r = await proj.project(data, refine: true)
+            if !bounded {
+                print(String(format: "  fit %-40s n=%-7d layout=%6.1f MB", (f as NSString).utf8String!,
+                             r.points.count, Double(bytesOf(r)) / 1_048_576))
+            }
+            if cache[f] == nil { order.append(f) } else if let i = order.firstIndex(of: f) { order.append(order.remove(at: i)) }
+            cache[f] = r
+            var held = cache.values.reduce(0) { $0 + bytesOf($1) }
+            while order.count > 1, order.count > entryCap || (bounded && held > byteBudget) {
+                let e = order.removeFirst()
+                if let g = cache[e] { held -= bytesOf(g) }
+                cache[e] = nil
+            }
+        }
+        MLX.GPU.clearCache()
+        let browseEntries = order.count
+        let browseHeld = cache.values.reduce(0) { $0 + bytesOf($1) }
+        let afterBrowse = churnFootprintMB()
+        // "The user typed a query": the map leaves the screen, so the browse history goes with it.
+        if bounded {
+            let keep = order.last
+            for u in order where u != keep { cache[u] = nil }
+            order.removeAll { $0 != keep }
+        }
+        let hideHeld = cache.values.reduce(0) { $0 + bytesOf($1) }
+        let afterHide = churnFootprintMB()
+        print(String(format: "  %-10@  after browse: entries=%d retained=%6.1f MB (footprint %+.0f MB)   after leaving the map: entries=%d retained=%6.1f MB (footprint %+.0f MB)",
+                     bounded ? "bounded" : "count-only", browseEntries, Double(browseHeld) / 1_048_576,
+                     afterBrowse - base, order.count, Double(hideHeld) / 1_048_576, afterHide - base))
     }
     store.close()
     exit(0)
