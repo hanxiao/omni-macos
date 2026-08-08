@@ -967,6 +967,284 @@ if args.count >= 2 && args[1] == "tombstonecheck" {
                                (args.count >= 4 ? Int(args[3]) : nil) ?? 60))
 }
 
+// A corpus with real folder structure, for the readers a flat "f0"/"f1" corpus cannot exercise.
+// PaperVectors paths have no separator, so vectorsUnderFolder sees no folders in them at all.
+// `vec` indices stay disjoint from the paper corpus's so the two never share a vector.
+enum RowWindowCorpus {
+    static let base = 1 << 20
+    static func path(file k: Int, folders: Int) -> String { "/corpus/d\(k % folders)/f\(k)" }
+    static func group(_ k: Int, chunksPerFile: Int, folders: Int, dim: Int,
+                      chunks n: Int? = nil) -> (path: String, chunks: [IndexedChunk]) {
+        let p = path(file: k, folders: folders)
+        let c = n ?? chunksPerFile
+        return (p, (0 ..< c).map { i in
+            IndexedChunk(path: p, modified: Double(k), size: k, kind: k % 4 == 0 ? "image" : "text",
+                         chunkIndex: i, snippet: "",
+                         embedding: PaperVectors.vec(base + k * chunksPerFile + i, dim: dim))
+        })
+    }
+    static func build(_ files: Int, chunksPerFile: Int, folders: Int, dim: Int,
+                      into store: VectorStore) throws {
+        var batch: [(path: String, chunks: [IndexedChunk])] = []
+        for k in 0 ..< files {
+            batch.append(group(k, chunksPerFile: chunksPerFile, folders: folders, dim: dim))
+            if batch.count >= 512 { try store.replaceMany(batch); batch.removeAll(keepingCapacity: true) }
+        }
+        if !batch.isEmpty { try store.replaceMany(batch) }
+    }
+}
+
+// Per-file row window parity: omni-verify rowwindowcheck [files] [edits]
+// The window is a CONTAINMENT claim about where a file's rows are, and every reader that uses one
+// keeps its per-row fileID test, so the only thing that can go wrong is a window that is too NARROW
+// - which does not crash and does not look wrong, it just drops chunks out of an answer. So this
+// compares the five window readers, plus search and listMatching, with OMNI_ROW_WINDOW off and on,
+// over an edit stream built to produce every layout the store can reach: re-save with the same
+// chunk count, re-save with fewer, re-save with MORE, outright delete, delete-then-re-add (the case
+// that leaves dead rows at the old position and live rows at the tail), and a folder-wide delete.
+func rowwindowcheckRun(_ files: Int, _ edits: Int) throws -> Int32 {
+    let dim = 256, chunksPerFile = 6, folders = 16
+    omniSetMemoryLimit(6_000_000_000)
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("omni-rowwindow-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+    try? FileManager.default.removeItem(at: root)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    // Everything the five readers can disclose, flattened to comparable strings. Float outputs are
+    // compared by BIT PATTERN, not by tolerance: the windowed readers accumulate the same bf16 rows
+    // in the same ascending order, so identical is the claim, and a tolerance would hide a
+    // reordering that quietly changes a pooled vector.
+    func observe(_ store: VectorStore, _ tag: String) -> [String] {
+        var out: [String] = []
+        out.append("\(tag) count=\(store.count)")
+        let stats = store.allIndexStats()
+        out.append("\(tag) files=\(stats.fileCount) chunks=\(stats.chunkCount) kinds=\(stats.kinds.sorted())")
+        let probe = (0 ..< files).filter { $0 % 7 == 0 }
+        let paths = probe.map { RowWindowCorpus.path(file: $0, folders: folders) }
+        for (n, k) in probe.enumerated() where n < 40 {
+            let p = RowWindowCorpus.path(file: k, folders: folders)
+            out.append("\(tag) vec\(k):" + (store.fileVector(p)?.map { "\($0.bitPattern)" }.joined(separator: ",") ?? "nil"))
+            let ch = store.rankChunks(PaperVectors.query(k % 5, dim: dim), path: p, topK: 8)
+            out.append("\(tag) ch\(k):" + ch.map { "\($0.chunkIndex)|\($0.score.bitPattern)|\($0.locator)" }.joined(separator: ","))
+            out.append("\(tag) cc\(k):\(store.chunkCount(path: p))")
+        }
+        // pooledVectors over a whole result page at once - the per-keystroke shape.
+        let pooled = store.pooledVectors(paths: paths)
+        out.append("\(tag) pooled:" + paths.map { p in
+            (pooled[p]?.map { "\($0.bitPattern)" }.joined(separator: "-")) ?? "nil"
+        }.joined(separator: ","))
+        // rankChunksAcross: file args, folder args, and a mix of both.
+        for (i, scope) in [Array(paths.prefix(12)),
+                           ["/corpus/d3", "/corpus/d7/"],
+                           Array(paths.prefix(4)) + ["/corpus/d1"]].enumerated() {
+            let hits = store.rankChunksAcross(PaperVectors.query(i, dim: dim), paths: scope, topK: 12)
+            out.append("\(tag) across\(i):" + hits.map { "\($0.path)|\($0.chunkIndex)|\($0.score.bitPattern)" }
+                .joined(separator: ","))
+        }
+        // vectorsUnderFolder, including the landmark-subsampled shape whose stride sample depends on
+        // first-appearance-in-row-order.
+        for (i, f) in ["/corpus", "/corpus/d5", "/corpus/d11"].enumerated() {
+            for (caps, lc) in [(Int.max, Int.max), (64, 24)] {
+                let fv = store.vectorsUnderFolder(f, cap: caps, landmarkCap: lc)
+                out.append("\(tag) fold\(i)_\(lc): total=\(fv.total) landmarks=\(fv.landmarkCount) "
+                           + "paths=\(fv.paths.joined(separator: ",")) "
+                           + "v=\(fv.vectors.prefix(64).map { "\($0.bitPattern)" }.joined(separator: ","))")
+            }
+        }
+        for q in 0 ..< 24 {
+            out.append("\(tag) q\(q):" + store.search(PaperVectors.query(q, dim: dim), topK: 40)
+                .map { "\($0.path)|\($0.score.bitPattern)|\($0.chunkIndex)|\($0.chunkCount)" }.joined(separator: ","))
+        }
+        out.append("\(tag) list:" + store.listMatching(filter: SearchFilter(), topK: 120)
+            .map { "\($0.path)|\($0.chunkIndex)" }.joined(separator: ","))
+        return out
+    }
+
+    var fellBack = false
+    func run(_ windows: Bool, label: String) throws -> [String] {
+        VectorStore.rowWindows = windows
+        let url = root.appendingPathComponent("w\(label).sqlite")
+        try? FileManager.default.removeItem(at: url)
+        let store = try VectorStore(dbURL: url)
+        defer { store.close() }
+        try RowWindowCorpus.build(files, chunksPerFile: chunksPerFile, folders: folders, dim: dim, into: store)
+        _ = store.search(PaperVectors.query(0, dim: dim), topK: 40)   // fold the base
+        var out = observe(store, "fresh")
+        for e in 0 ..< edits {
+            let k = (e * 7919) % files
+            switch e % 6 {
+            case 0: try store.replace(path: RowWindowCorpus.path(file: k, folders: folders),
+                                      chunks: RowWindowCorpus.group(k, chunksPerFile: chunksPerFile, folders: folders, dim: dim).chunks)
+            case 1: try store.replace(path: RowWindowCorpus.path(file: k, folders: folders),
+                                      chunks: RowWindowCorpus.group(k, chunksPerFile: chunksPerFile, folders: folders, dim: dim, chunks: 2).chunks)
+            case 2: try store.replace(path: RowWindowCorpus.path(file: k, folders: folders),
+                                      chunks: RowWindowCorpus.group(k, chunksPerFile: chunksPerFile, folders: folders, dim: dim, chunks: chunksPerFile + 5).chunks)
+            case 3: store.deletePaths([RowWindowCorpus.path(file: k, folders: folders)])
+            case 4:
+                // Delete then re-add: the file's dead rows stay at their old position while its live
+                // rows land at the tail. A window that was not reset at the 1->0 transition would
+                // span from the old position to the end of the index - correct, but useless.
+                store.deletePaths([RowWindowCorpus.path(file: k, folders: folders)])
+                try store.replace(path: RowWindowCorpus.path(file: k, folders: folders),
+                                  chunks: RowWindowCorpus.group(k, chunksPerFile: chunksPerFile, folders: folders, dim: dim).chunks)
+            default:
+                try store.replaceMany((0 ..< 3).map {
+                    RowWindowCorpus.group((k + $0 * 13) % files, chunksPerFile: chunksPerFile, folders: folders, dim: dim)
+                })
+            }
+        }
+        out += observe(store, "edited")
+        // Reported, never compared: it is the one thing that is SUPPOSED to differ between arms.
+        // `spanned/live` after the edit stream is the number that says whether the windows stayed
+        // tight through delete-then-re-add, which is the layout that would make them useless.
+        let use = store.rowWindowUse
+        print(String(format: "  %@ covering=%@ files=%d live=%d spanned/live=%.4f widest=%d unproven=%d noWin=%d",
+                     label.padding(toLength: 4, withPad: " ", startingAt: 0), use.covering ? "yes" : "no",
+                     use.files, use.live, Double(use.spanned) / Double(max(1, use.live)), use.widest,
+                     use.unproven, use.noWin))
+        // A fallback is correct and invisible, so a store where the windows never engage passes
+        // every parity check while buying nothing. The on arm must never fall back.
+        if windows, use.unproven != 0 { print("  FAIL \(use.unproven) reads fell back to the full walk") }
+        fellBack = fellBack || (windows && use.unproven != 0)
+        return out
+    }
+
+    // Close/reopen: a window indexes a row position, so it must not outlive the rows it indexes.
+    // The reopen takes whichever load path the store picks (row sidecar or full SQLite scan) and
+    // both must rebuild the windows, so the same questions must get the same answers.
+    func reopen() throws -> (before: [String], after: [String]) {
+        VectorStore.rowWindows = true
+        let url = root.appendingPathComponent("reopen.sqlite")
+        try? FileManager.default.removeItem(at: url)
+        var before: [String] = []
+        do {
+            let store = try VectorStore(dbURL: url)
+            try RowWindowCorpus.build(files, chunksPerFile: chunksPerFile, folders: folders, dim: dim, into: store)
+            _ = store.search(PaperVectors.query(0, dim: dim), topK: 40)
+            for k in stride(from: 0, to: min(files, 120), by: 5) {
+                store.deletePaths([RowWindowCorpus.path(file: k, folders: folders)])
+            }
+            before = observe(store, "pre")
+            store.close()
+        }
+        let store2 = try VectorStore(dbURL: url)
+        defer { store2.close() }
+        return (before, observe(store2, "pre"))
+    }
+
+    print("rowwindowcheck files=\(files) chunksPerFile=\(chunksPerFile) folders=\(folders) edits=\(edits)")
+    let ro = try reopen()
+    let roBad = zip(ro.before, ro.after).filter { $0 != $1 }.count
+    print("  \(roBad == 0 ? "ok  " : "FAIL") survives close/reopen: \(ro.before.count - roBad)/\(ro.before.count) identical")
+
+    let off = try run(false, label: "off")
+    let control = try run(false, label: "ctl")   // same configuration twice: separates a regression from a tie
+    let on = try run(true, label: "on")
+    VectorStore.rowWindows = true
+    let ctlBad = Set(zip(off, control).enumerated().filter { $0.element.0 != $0.element.1 }.map { $0.offset })
+    if !ctlBad.isEmpty { print("  note: line(s) \(ctlBad.sorted().prefix(8)) differ between two IDENTICAL runs; excluded as non-deterministic") }
+    guard off.count == on.count else { print("  FAIL different shapes \(off.count) vs \(on.count)"); return 1 }
+    let bad = zip(off, on).enumerated().filter { !ctlBad.contains($0.offset) && $0.element.0 != $0.element.1 }
+    for (i, pair) in bad.prefix(3) {
+        print("  FAIL line \(i):")
+        print("    off: \(String(pair.0.prefix(200)))")
+        print("    on : \(String(pair.1.prefix(200)))")
+    }
+    print("  \(bad.isEmpty ? "ok  " : "FAIL") \(off.count - bad.count)/\(off.count) observations identical (off vs on)")
+    print("  \(fellBack ? "FAIL" : "ok  ") the windowed arm never fell back to the full walk")
+    return bad.isEmpty && roBad == 0 && !fellBack ? 0 : 1
+}
+if args.count >= 2 && args[1] == "rowwindowcheck" {
+    exit(try rowwindowcheckRun((args.count >= 3 ? Int(args[2]) : nil) ?? 900,
+                               (args.count >= 4 ? Int(args[3]) : nil) ?? 90))
+}
+
+// What the per-file row window is worth: omni-verify rowwindowbench [rows]
+// Position in the index is the whole story. The readers already stopped once they had the file's
+// chunks, so a file at the FRONT was always cheap; the cost was the rows BEFORE the file, and the
+// file a user runs Find similar or the passages panel on is usually the one just indexed - the very
+// end. So this reports front/middle/back separately at each rung, with the lever off and on, and
+// prints the measured window fragmentation, which is the assumption the whole design rests on.
+func rowwindowbenchRun(_ rowsMax: Int) throws -> Int32 {
+    let dim = 256, chunksPerFile = 8, folders = 32
+    omniSetMemoryLimit(6_000_000_000)
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("omni-rwbench-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+    try? FileManager.default.removeItem(at: root)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    var ladder: [Int] = []
+    var r = 125_000
+    while r <= rowsMax { ladder.append(r); r *= 2 }
+
+    print("rowwindowbench dim=\(dim) chunksPerFile=\(chunksPerFile)  (ms per call, by the file's position in the index)")
+    for rows in ladder {
+        let files = rows / chunksPerFile
+        let url = root.appendingPathComponent("b\(rows).sqlite")
+        try? FileManager.default.removeItem(at: url)
+        let store = try VectorStore(dbURL: url)
+        try RowWindowCorpus.build(files, chunksPerFile: chunksPerFile, folders: folders, dim: dim, into: store)
+        _ = store.search(PaperVectors.query(0, dim: dim), topK: 40)   // fold the base
+
+        let use = store.rowWindowUse
+        print(String(format: "  rows=%d files=%d  windows covering=%@ spanned/live=%.4f widest=%d",
+                     rows, use.files, use.covering ? "yes" : "no",
+                     Double(use.spanned) / Double(max(1, use.live)), use.widest))
+
+        // Repeat each measurement: the first call on a rung pages in the row array, and that page-in
+        // is not what either arm is being measured on.
+        func timed(_ reps: Int, _ body: (Int) -> Void) -> Double {
+            body(0)
+            let t = Date()
+            for i in 0 ..< reps { body(i) }
+            return -t.timeIntervalSinceNow * 1000 / Double(reps)
+        }
+        func at(_ frac: Double) -> String { RowWindowCorpus.path(file: min(files - 1, Int(Double(files) * frac)), folders: folders) }
+        let q = PaperVectors.query(3, dim: dim)
+        // A result page: 120 paths spread across the index, the shape pooledVectors sees per keystroke.
+        let page = (0 ..< 120).map { RowWindowCorpus.path(file: ($0 * max(1, files / 120)) % files, folders: folders) }
+
+        func pad(_ s: String, _ n: Int) -> String { s.padding(toLength: n, withPad: " ", startingAt: 0) }
+        print("     single-file reader   lever     front    middle      back")
+        for name in ["fileVector", "rankChunks"] {
+            for windows in [false, true] {
+                VectorStore.rowWindows = windows
+                let ms = [0.0, 0.5, 0.999].map { f -> Double in
+                    let p = at(f)
+                    return name == "fileVector"
+                        ? timed(20) { _ in _ = store.fileVector(p) }
+                        : timed(20) { _ in _ = store.rankChunks(q, path: p, topK: 8) }
+                }
+                print(String(format: "     %@ %@ %8.2f  %8.2f  %8.2f",
+                             pad(name, 20), pad(windows ? "on" : "off", 6), ms[0], ms[1], ms[2]))
+            }
+        }
+        // The last two columns are the ones that could REGRESS. The proof pass visits every row in
+        // every window before the reader's own pass, so a scope covering most of the index would be
+        // two passes where the walk was one - hence the span bail-out in provenRowRangesLocked.
+        // "/corpus" is every file in the store (100% coverage), and "over-broad" hands
+        // rankChunksAcross a scope it is going to refuse, which must stay as cheap as it ever was.
+        print("     multi-file reader    lever    pooled(120)  across(12)  folder 1/32   folder ALL   across refuse")
+        for windows in [false, true] {
+            VectorStore.rowWindows = windows
+            let pooled = timed(10) { _ in _ = store.pooledVectors(paths: page) }
+            let across = timed(10) { _ in _ = store.rankChunksAcross(q, paths: Array(page.prefix(12)), topK: 12) }
+            let folder = timed(3) { _ in _ = store.vectorsUnderFolder("/corpus/d7", cap: 4096, landmarkCap: 512) }
+            let folderAll = timed(2) { _ in _ = store.vectorsUnderFolder("/corpus", cap: 4096, landmarkCap: 512) }
+            let refuse = timed(5) { _ in _ = store.rankChunksAcross(q, paths: ["/corpus"], topK: 12) }
+            print(String(format: "     %@ %@ %10.2f  %10.2f  %11.2f  %11.2f  %12.2f",
+                         pad("spread page", 20), pad(windows ? "on" : "off", 6), pooled, across, folder, folderAll, refuse))
+        }
+        VectorStore.rowWindows = true
+        store.close()
+    }
+    return 0
+}
+if args.count >= 2 && args[1] == "rowwindowbench" {
+    exit(try rowwindowbenchRun((args.count >= 3 ? Int(args[2]) : nil) ?? 1_000_000))
+}
+
 // Where a store's host memory goes: omni-verify storemem [rows]
 // The vectors are the obvious cost and are already as small as bf16 allows. This reports what the
 // row bookkeeping costs beside them, measured as resident footprint across each build stage rather

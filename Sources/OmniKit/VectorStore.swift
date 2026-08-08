@@ -508,6 +508,23 @@ public final class VectorStore: @unchecked Sendable {
     public var vectorBufferUse: (used: Int, capacity: Int, mapped: Bool) {
         queue.sync { (flat16.count, flat16.capacityElements, flat16.isMapped) }
     }
+    /// Per-file row window occupancy, for `omni-verify rowwindowbench`. `spanned` is the total rows
+    /// the windows cover, `live` the live rows they contain: their ratio is the fragmentation the
+    /// window design is betting on being 1.0, so the bench reports it instead of assuming it.
+    public var rowWindowUse: (files: Int, spanned: Int, live: Int, widest: Int, covering: Bool,
+                              unproven: Int, noWin: Int) {
+        queue.sync {
+            var files = 0, spanned = 0, live = 0, widest = 0
+            for f in 0 ..< fileChunkCount.count where fileChunkCount[f] > 0 {
+                files += 1
+                live += Int(fileChunkCount[f])
+                let w = rawRowWindowLocked(Int32(f))
+                spanned += w.count
+                if w.count > widest { widest = w.count }
+            }
+            return (files, spanned, live, widest, rowWindowsUsableLocked, rowWindowUnproven, rowWindowNoWin)
+        }
+    }
 
     struct Row { let path: String; let kind: String; let chunkIndex: Int; let modified: Double
                  var size: Int = 0
@@ -717,9 +734,62 @@ public final class VectorStore: @unchecked Sendable {
     /// Per-file LIVE chunk count, indexed by file id (lockstep with idPath). Lets the candidate
     /// fast path build SearchHit.chunkCount without an O(N) row scan.
     private var fileChunkCount: [Int32] = []
+
+    // PER-FILE ROW WINDOW. The half-open row range [fileRowLo[f], fileRowHi[f]) that is guaranteed
+    // to contain every row of file f. Search results are per FILE but rows are per CHUNK, and five
+    // readers need "the rows of this one file": rankChunks, fileVector, pooledVectors,
+    // rankChunksAcross and vectorsUnderFolder. They used to find them by walking `fileID` from row
+    // 0. Four carried `remaining = fileChunkCount[id]` and stopped once they had them all, which
+    // reads like a bound and is not one: it is an EARLY EXIT, so the cost is the row index of the
+    // file's LAST chunk, not the file's chunk count. Rows append in index order, so the file the
+    // user just edited or just indexed - exactly the file Find similar and the passages panel are
+    // invoked on - sits at the tail and paid a full scan every time.
+    //
+    // A RANGE, not a row list, because the rows of one file are contiguous by construction:
+    // replace()/replaceMany() drop a path's old rows and append its new chunks consecutively,
+    // compactRowsLocked preserves relative order, and loadIntoMemory loads ORDER BY rowid. Measured
+    // on a production 992,465-row / 135,852-file index (its row sidecar carries fileID at offset 0
+    // of each record): sum(window) / sum(chunks) = 1.0000, all 135,852 files perfectly contiguous,
+    // mean window 7.3 rows, max 1250. So the range costs 8 bytes per FILE - 1.6 MB at 212k files -
+    // where an exact per-file row list costs 4 bytes per ROW, 18.9 MB as CSR and 27.5 MB as
+    // [[Int32]] (measured), and buys nothing over the range on real data.
+    //
+    // The range is also what makes this safe to bolt onto a lockstep invariant that search
+    // correctness already depends on. It is maintained by a min/max at the one funnel every append
+    // goes through, so it can only ever be too WIDE, never too narrow - and too wide is slow, not
+    // wrong. Fragmentation is reported by `omni-verify rowwindowbench`, so it stays measured.
+    private var fileRowLo: [Int32] = []
+    private var fileRowHi: [Int32] = []
+    /// `lo` of a file with no rows. Paired with `hi == 0`, so the range is empty either way.
+    private static let noRowLo = Int32.max
+    // Rows [0, rowWindowCovered) are accounted for in fileRowLo/fileRowHi. Readers use the windows
+    // ONLY when this equals rows.count and fall back to the old full walk otherwise. That is the
+    // whole safety argument: a mutation path that appends rows without going through
+    // appendRowMetaLocked, or that moves rows without rebuilding, leaves this short and degrades
+    // the reader to correct-but-slow instead of silently dropping a file's chunks from a result.
+    private var rowWindowCovered = 0
+    /// A/B lever (OMNI_ROW_WINDOW=0 disables). Off, every reader takes the pre-index full walk, so
+    /// `omni-verify rowwindowcheck` can compare both arms inside one binary.
+    nonisolated(unsafe) public static var rowWindows =
+        ProcessInfo.processInfo.environment["OMNI_ROW_WINDOW"] != "0"
+    /// Every reader that could not use its windows, split by reason. The fallback is correct and
+    /// silent, which is exactly the problem: a store where the windows never engage looks perfectly
+    /// healthy and is paying the full walk on every call. `rowwindowcheck` asserts `unproven` is
+    /// zero on the lever-on arm, so a maintenance path that quietly stops working fails a test
+    /// rather than turning into a performance mystery.
+    private var rowWindowUnproven = 0     // a window did not hold the file's live rows, or the tables were not covering
+    private var rowWindowNoWin = 0        // the windows spanned too much of the index to be worth two passes
+
     @inline(__always) private func internPath(_ p: String) -> Int32 {
         if let id = pathID[p] { return id }
-        let id = Int32(pathID.count); pathID[p] = id; idPath.append(p); fileChunkCount.append(0); return id
+        let id = Int32(pathID.count); pathID[p] = id; idPath.append(p); fileChunkCount.append(0)
+        // Grown HERE and not in the row loops, because a file id can outlive every one of its rows
+        // and can even be born without any: loadIntoMemory interns the path (line ~4359) before the
+        // guards that skip a dim-mismatched row, so idPath/fileChunkCount can be longer than the
+        // set of ids `rows` actually references. Sized off fileChunkCount, never off fileIDCount
+        // (== pathID.count), which a duplicated path in a sidecar path table would make smaller.
+        fileRowLo.append(Self.noRowLo); fileRowHi.append(0)
+        return id
     }
     @inline(__always) private func canonicalPath(_ p: String) -> String {
         idPath[Int(internPath(p))]
@@ -769,7 +839,215 @@ public final class VectorStore: @unchecked Sendable {
             liveFiles -= 1
             if let c = kindFileCounts[kind] { if c <= 1 { kindFileCounts[kind] = nil } else { kindFileCounts[kind] = c - 1 } }
             let e = extOf(path); if !e.isEmpty, let c = extFileCounts[e] { if c <= 1 { extFileCounts[e] = nil } else { extFileCounts[e] = c - 1 } }
+            // The file has no live rows left, so its window can be forgotten - and MUST be, or a
+            // re-index would union the old position with the new tail rows and hand back a window
+            // spanning most of the index. This is the tombstone case: the dead rows are still
+            // physically there at their old indices, which is why every reader that uses a window
+            // also rejects dead indices, exactly as it did when it walked the whole array.
+            fileRowLo[Int(fid)] = Self.noRowLo; fileRowHi[Int(fid)] = 0
         }
+    }
+
+    /// The one funnel for a row's dense metadata: fileID, kindCode, the per-file live count and the
+    /// per-file row window, appended together for the row about to occupy index `fileID.count`.
+    /// Every path that appends to `rows` goes through here, so the lockstep is structural rather
+    /// than four copies of the same four lines that a fifth append site could forget.
+    @inline(__always)
+    private func appendRowMetaLocked(_ fid: Int32, kindCode kc: UInt8, kind: String, path: String) {
+        let i = fileID.count
+        fileID.append(fid)
+        kindCode.append(kc)
+        fileChunkInc(fid, kind, path)
+        if fileRowLo[Int(fid)] > Int32(i) { fileRowLo[Int(fid)] = Int32(i) }
+        if fileRowHi[Int(fid)] < Int32(i) + 1 { fileRowHi[Int(fid)] = Int32(i) + 1 }
+        rowWindowCovered += 1
+    }
+
+    /// Recompute every window from `fileID`. One O(rows) integer pass (~2ms at 4.5M rows), for the
+    /// paths that move rows rather than append them. Only compactRowsLocked needs it, and that pass
+    /// is already O(rows) and orders of magnitude more expensive.
+    private func rebuildRowWindowsLocked() {
+        let f = fileChunkCount.count
+        fileRowLo = [Int32](repeating: Self.noRowLo, count: f)
+        fileRowHi = [Int32](repeating: 0, count: f)
+        fileID.withUnsafeBufferPointer { fid in
+            fileRowLo.withUnsafeMutableBufferPointer { lo in
+                fileRowHi.withUnsafeMutableBufferPointer { hi in
+                    for i in 0 ..< fid.count {
+                        let g = Int(fid[i])
+                        // Sized off fileChunkCount but indexed by fileID, through a buffer pointer:
+                        // the two track each other everywhere today, but an out-of-range id here
+                        // would be a silent heap write rather than a wrong answer. Skipping instead
+                        // leaves that file's window empty, which the read-time proof then rejects.
+                        guard g >= 0, g < f else { continue }
+                        if lo[g] > Int32(i) { lo[g] = Int32(i) }
+                        if hi[g] < Int32(i) + 1 { hi[g] = Int32(i) + 1 }
+                    }
+                }
+            }
+        }
+        rowWindowCovered = rows.count
+    }
+
+    /// Cross-check the whole per-file bookkeeping against a full rescan and abort on divergence.
+    /// Same idiom as OMNI_STAT_VERIFY (see statVerify): a debug switch, not a tuning knob.
+    ///
+    /// It re-derives `fileChunkCount` as well as the windows, on purpose. The read-time proof tests
+    /// a window against that counter, so the two are only ever checked against each other; if the
+    /// counter were itself wrong, a window matching it would pass. This is where that assumption
+    /// gets tested, and the O(rows) pass it needs is already being made.
+    static let rowWindowVerify = ProcessInfo.processInfo.environment["OMNI_ROW_WINDOW_VERIFY"] == "1"
+    private func rowWindowAuditLocked(_ where_: String) {
+        guard Self.rowWindowVerify else { return }
+        let f = fileChunkCount.count
+        guard fileID.count == rows.count else {
+            fatalError("[rowwindow] \(where_): fileID.count \(fileID.count) != rows.count \(rows.count)")
+        }
+        guard fileRowLo.count == f, fileRowHi.count == f else {
+            fatalError("[rowwindow] \(where_): window tables \(fileRowLo.count)/\(fileRowHi.count) != files \(f)")
+        }
+        var lo = [Int32](repeating: Self.noRowLo, count: f)
+        var hi = [Int32](repeating: 0, count: f)
+        var live = [Int32](repeating: 0, count: f)
+        for i in 0 ..< fileID.count {
+            let g = Int(fileID[i])
+            guard g >= 0, g < f else { fatalError("[rowwindow] \(where_): row \(i) has file id \(g) of \(f)") }
+            // LIVE rows only. A file that was deleted and re-added keeps its dead rows at the old
+            // position while fileChunkDec resets the window to the new ones, so bounding over dead
+            // rows too would fail a store that is behaving exactly as designed.
+            guard !deadRows.contains(Int32(i)) else { continue }
+            live[g] += 1
+            if lo[g] > Int32(i) { lo[g] = Int32(i) }
+            if hi[g] < Int32(i) + 1 { hi[g] = Int32(i) + 1 }
+        }
+        for g in 0 ..< f {
+            guard live[g] == fileChunkCount[g] else {
+                fatalError("[rowwindow] \(where_): file \(g) live \(live[g]) != fileChunkCount \(fileChunkCount[g])")
+            }
+            guard live[g] > 0 else { continue }
+            // Containment, not equality: a window is allowed to be wider than the file's rows.
+            guard fileRowLo[g] <= lo[g], fileRowHi[g] >= hi[g] else {
+                fatalError("[rowwindow] \(where_): file \(g) window [\(fileRowLo[g]),\(fileRowHi[g])) "
+                           + "does not contain rows [\(lo[g]),\(hi[g]))")
+            }
+        }
+        guard rowWindowCovered == rows.count else {
+            fatalError("[rowwindow] \(where_): covered \(rowWindowCovered) != rows \(rows.count)")
+        }
+    }
+
+    /// Drop every window. Used by the wipe/reload paths, which rebuild through the append funnel.
+    private func resetRowWindowsLocked() {
+        fileRowLo.removeAll(keepingCapacity: true); fileRowHi.removeAll(keepingCapacity: true)
+        rowWindowCovered = 0
+    }
+
+    /// The rows to scan for file `id`: its window when the table is covering, the whole row array
+    /// when it is not. Callers keep their existing `fileID[i] == id` test inside the range - a
+    /// window is a bound, not a membership claim - so a too-wide window is only slower, and the
+    /// fallback is exactly the pre-index behaviour.
+    ///
+    /// Clamped to rows.count on the way out. Nothing should be able to store an out-of-range index,
+    /// but a window is dereferenced directly into `flat16` where the old walk was bounded by the
+    /// loop itself, so the clamp is what keeps a bookkeeping bug a wrong ANSWER rather than an
+    /// out-of-bounds read.
+    @inline(__always) private func rawRowWindowLocked(_ id: Int32) -> Range<Int> {
+        let lo = Int(fileRowLo[Int(id)]), hi = Int(fileRowHi[Int(id)])
+        guard lo < hi else { return 0 ..< 0 }
+        return Swift.min(lo, rows.count) ..< Swift.min(hi, rows.count)
+    }
+
+    /// The windows are covering and the lever is on. Checked once per reader, not per row.
+    /// `fileID.count == rows.count` is the lockstep invariant itself: a window is used to index
+    /// straight into fileID, where the old walk was bounded by fileID.count, so it is checked here
+    /// rather than assumed.
+    @inline(__always) private var rowWindowsUsableLocked: Bool {
+        Self.rowWindows && rowWindowCovered == rows.count && fileID.count == rows.count
+            && fileRowLo.count == fileChunkCount.count && fileRowHi.count == fileChunkCount.count
+    }
+
+    /// Count file `id`'s live rows inside its own window. The window is a CONTAINMENT claim, and
+    /// this is the one number that tests it: `fileChunkCount[id]` live rows exist, and if the window
+    /// does not hold all of them it is too narrow and must not be used.
+    @inline(__always) private func liveRowsInWindowLocked(_ id: Int32, dead: Set<Int32>) -> Int {
+        let hasDead = !dead.isEmpty
+        var n = 0
+        for i in rawRowWindowLocked(id) where fileID[i] == id {
+            if !(hasDead && dead.contains(Int32(i))) { n += 1 }
+        }
+        return n
+    }
+
+    /// The rows a reader must scan to see every live row of `ids`, PROVEN complete: the files' own
+    /// windows when they hold all the rows the per-file live counts say exist, and otherwise the
+    /// whole row array, exactly as before this index existed.
+    ///
+    /// The proof is what makes this safe to attach to an invariant search correctness already
+    /// depends on. A window can only be built too WIDE by a min/max at the append funnel, but a
+    /// mutation path that moved rows without rebuilding could leave one too NARROW, and a too-narrow
+    /// window silently drops a file's chunks from a result. So completeness is re-derived on every
+    /// call instead of trusted: one integer pass over a mean of 7.3 rows per file, against the
+    /// 4.5M-row walk it replaces. Nothing here can make an answer wrong - the worst case is that
+    /// the fallback fires and the reader costs exactly what it cost before.
+    ///
+    /// A caveat worth stating: the proof is against `fileChunkCount`, so it inherits that counter's
+    /// correctness. It adds no new silent-failure mode (all four bounded readers already trust the
+    /// same counter for their early exit) but it does not fix that one either.
+    ///
+    /// Returned MERGED and ASCENDING, not file by file, because these readers depend on row order:
+    /// pooledVectors accumulates bf16 into a float sum (reordering changes the low bits),
+    /// rankChunksAcross gathers rows into a matmul whose top-K ties break on position, and
+    /// vectorsUnderFolder samples landmarks by first appearance in row order.
+    private func provenRowRangesLocked(_ ids: [Int32], dead: Set<Int32>, spanCap: Int = .max) -> [Range<Int>] {
+        let whole = rows.isEmpty ? [] : [0 ..< rows.count]
+        guard rowWindowsUsableLocked else { if Self.rowWindows { rowWindowUnproven += 1 }; return whole }
+        var out: [Range<Int>] = []
+        out.reserveCapacity(ids.count)
+        // Collect the windows and their total span FIRST, from the per-file table alone - no row is
+        // touched yet. The proof below visits every row in every window, so a windowed read costs
+        // about 2 x span where the full walk costs rows.count. Past span * 2 the index is a LOSS,
+        // and it is broad scopes that get there: vectorsUnderFolder on a folder that holds most of
+        // the index would otherwise pay two full passes where it used to pay one. `spanCap` is the
+        // caller's own ceiling (rankChunksAcross aborts over maxInlineScanRows, and that abort has
+        // to stay cheap - proving a scope we are about to refuse is exactly backwards).
+        var span = 0
+        for id in ids {
+            guard Int(id) < fileRowLo.count else { rowWindowUnproven += 1; return whole }
+            let r = rawRowWindowLocked(id)
+            if r.isEmpty { continue }
+            span += r.count
+            if span > spanCap || span * 2 >= rows.count { rowWindowNoWin += 1; return whole }
+            out.append(r)
+        }
+        for id in ids where Int(id) < fileRowLo.count {
+            guard liveRowsInWindowLocked(id, dead: dead) == Int(fileChunkCount[Int(id)]) else {
+                rowWindowUnproven += 1
+                return whole
+            }
+        }
+        guard out.count > 1 else { return out }
+        out.sort { $0.lowerBound < $1.lowerBound }
+        var merged: [Range<Int>] = [out[0]]
+        for r in out.dropFirst() {
+            let last = merged[merged.count - 1]
+            if r.lowerBound <= last.upperBound {
+                if r.upperBound > last.upperBound { merged[merged.count - 1] = last.lowerBound ..< r.upperBound }
+            } else {
+                merged.append(r)
+            }
+        }
+        return merged
+    }
+
+    /// Single-file form of provenRowRangesLocked. Returns one range: the file's window if it is
+    /// proven complete, otherwise the whole row array.
+    @inline(__always) private func provenRowWindowLocked(_ id: Int32, dead: Set<Int32>) -> Range<Int> {
+        guard rowWindowsUsableLocked, Int(id) < fileRowLo.count,
+              liveRowsInWindowLocked(id, dead: dead) == Int(fileChunkCount[Int(id)]) else {
+            if Self.rowWindows { rowWindowUnproven += 1 }
+            return 0 ..< rows.count
+        }
+        return rawRowWindowLocked(id)
     }
 
     /// Rebuild the dense fileID/pathID/kindCode tables from the current `rows`. Call after any
@@ -783,11 +1061,10 @@ public final class VectorStore: @unchecked Sendable {
         kindCode.removeAll(keepingCapacity: true)
         kindCode.reserveCapacity(rows.count)
         resetAggregatesLocked()
+        resetRowWindowsLocked()   // file ids are renumbered from zero here, so no window survives
         for r in rows {
             let fid = internPath(r.path)
-            fileID.append(fid)
-            fileChunkInc(fid, r.kind, r.path)
-            kindCode.append(internKind(r.kind))
+            appendRowMetaLocked(fid, kindCode: internKind(r.kind), kind: r.kind, path: r.path)
         }
     }
 
@@ -1068,11 +1345,10 @@ public final class VectorStore: @unchecked Sendable {
                                 size: c.size, width: c.width, height: c.height, duration: c.duration, locator: c.locator))
                 flat16.append(contentsOf: bfs[i])
                 let fid = internPath(c.path)
-                fileID.append(fid)
-                fileChunkInc(fid, c.kind, c.path)
-                kindCode.append(internKind(c.kind))
+                appendRowMetaLocked(fid, kindCode: internKind(c.kind), kind: c.kind, path: c.path)
             }
             presentPaths.insert(path)
+            rowWindowAuditLocked("replace")
             // No invalidateBase(): a new path's rows append past baseRows and are scored as delta.
             // A pre-existing path already triggered removeRowsLocked above, which invalidates.
             proactiveRefoldLocked()
@@ -1085,7 +1361,20 @@ public final class VectorStore: @unchecked Sendable {
     /// git checkout, synced folder); per-file replace() would be O(N) rebuild each = O(N*M). Result
     /// is identical: each path's old rows are removed and its new chunks appended.
     public func replaceMany(_ items: [(path: String, chunks: [IndexedChunk])]) throws {
-        let work = items.filter { !$0.chunks.isEmpty }
+        let nonEmpty = items.filter { !$0.chunks.isEmpty }
+        // One entry per path, keeping the LAST - which is what the SQL side already does, because
+        // deletePathLocked runs per entry inside the loop and a later entry erases an earlier one's
+        // inserts. The in-memory side removed per DISTINCT path once, up front, and then appended
+        // EVERY entry, so a batch carrying the same path twice left the store with rows SQLite did
+        // not have: duplicate chunks in results, an inflated chunkCount, and a file whose rows sit
+        // in two places at once. Reachable - Indexer.update builds its file list from a crawl plus
+        // the explicit arguments and never dedupes, so an FSEvents batch naming both a folder and a
+        // file inside it queues that file twice.
+        var seenPath = Set<String>()
+        var work: [(path: String, chunks: [IndexedChunk])] = []
+        work.reserveCapacity(nonEmpty.count)
+        for it in nonEmpty.reversed() where seenPath.insert(it.path).inserted { work.append(it) }
+        work.reverse()
         guard !work.isEmpty else { return }
         try queue.sync {
             guard dbOpen() else { throw OmniError.store("store closed") }
@@ -1148,12 +1437,11 @@ public final class VectorStore: @unchecked Sendable {
                                     size: c.size, width: c.width, height: c.height, duration: c.duration, locator: c.locator))
                     flat16.append(contentsOf: bfs[wi][ci])
                     let fid = internPath(c.path)
-                    fileID.append(fid)
-                    fileChunkInc(fid, c.kind, c.path)
-                    kindCode.append(internKind(c.kind))
+                    appendRowMetaLocked(fid, kindCode: internKind(c.kind), kind: c.kind, path: c.path)
                 }
                 presentPaths.insert(it.path)
             }
+            rowWindowAuditLocked("replaceMany")
             // No invalidateBase(): appended rows are scored as delta. Any pre-existing path in the
             // batch already triggered removeRowsLocked above, which invalidates the base.
             let tBeforeFold = Self.searchTiming ? Date() : nil
@@ -1474,6 +1762,7 @@ public final class VectorStore: @unchecked Sendable {
             // rather than removeAll which keeps the ~1.6GB capacity reserved.
             rows = []; flat16.releaseAll(); presentPaths = []; fileID = []; pathID = [:]; idPath = []; fileChunkCount = []
             kindCode = []; kindID = [:]; idKind = []; resetTombstonesLocked(); invalidateBase()
+            fileRowLo = []; fileRowHi = []; rowWindowCovered = 0   // same reason: release, not removeAll
             try? FileManager.default.removeItem(at: quantReplicaURL); lastPersistedBaseRows = -1   // replica is of wiped rows
             removeRowSidecarFiles()   // sidecar caches the wiped rows; releaseAll() above dropped the mapping
             resetAggregatesLocked()
@@ -1910,23 +2199,28 @@ public final class VectorStore: @unchecked Sendable {
             // pathID is the intern table over the paths present in `rows`, so a miss means "not
             // indexed" without scanning; a hit turns the row scan into Int32 compares instead of
             // N string compares (~80B memcmp + ARC each) - 10-50x on a large index.
-            guard dim > 0, let id = pathID[path] else { return nil }
+            guard dim > 0, fileID.count == rows.count, flat16.count >= rows.count * dim,
+                  let id = pathID[path] else { return nil }
             var sum = [Float](repeating: 0, count: dim)
             var count = 0
-            // Bounded by this file's live chunk count (ensureCompactLocked above has already
-            // collected any tombstones, so every match is live), and vectorized: Find similar is a
-            // menu action on a result the user is looking at, and it was scanning the whole base -
-            // 4.5M rows - with a scalar 768-iteration conversion per matching row, to pool a
-            // handful of chunks.
+            // This file's row window (see fileRowLo), so the scan is the file's own chunks and not
+            // every row before them. Find similar is a menu action on a result the user is looking
+            // at - which, right after an edit or an index pass, is the file at the very END of the
+            // row array, the worst case for the walk this replaces. `remaining` stays as the second
+            // stop condition: it costs nothing and it keeps the loop bounded if a window is ever
+            // wider than the file (see fileChunkDec).
             var remaining = Int(fileChunkCount[Int(id)])
             let dead = deadRows
             let hasDead = !dead.isEmpty
+            let window = provenRowWindowLocked(id, dead: dead)
             flat16.withUnsafeBufferPointer { fb in
                 guard let base = fb.baseAddress else { return }
                 sum.withUnsafeMutableBufferPointer { sp in
                     guard let dst = sp.baseAddress else { return }
-                    var i = 0
-                    while i < fileID.count, remaining > 0 {
+                    var i = window.lowerBound
+                    // Ascending, exactly as before, so the bf16 accumulation order - and therefore
+                    // the low bits of the pooled vector - are unchanged.
+                    while i < window.upperBound, remaining > 0 {
                         if fileID[i] == id, !(hasDead && dead.contains(Int32(i))) {
                             Self.accumulateBF16(base + i * dim, into: dst, count: dim)
                             count += 1
@@ -1971,7 +2265,18 @@ public final class VectorStore: @unchecked Sendable {
             // flat global->local table, and accumulate into a contiguous [Float] indexed by local file
             // index. (The old [String:[Float]] version hashed the path and COW'd a 768-float array on
             // every chunk - ~26s for a 42k-file folder; this is sub-second.)
-            let nGlobal = max(1, fileIDCount)
+            let nGlobal = max(1, fileChunkCount.count)
+            // Scope resolution moved off the row loop: the prefix test runs once per FILE against the
+            // path intern table (~135k) instead of once per ROW (~4.5M), and the row loop below reads
+            // a Bool by file id instead of running hasPrefix on a String. Exact, because a row's
+            // `path` IS the canonical idPath instance its fileID indexes (see canonicalPath) - the
+            // two tests cannot disagree. This is the same shape fileCount(underFolder:) already uses.
+            var inFolder = [Bool](repeating: false, count: nGlobal)
+            var scopedIds: [Int32] = []
+            for (gid, p) in idPath.enumerated() where gid < nGlobal && fileChunkCount[gid] > 0 {
+                if underFolder(p) { inFolder[gid] = true; scopedIds.append(Int32(gid)) }
+            }
+            guard !scopedIds.isEmpty else { return empty }
             // First pass: every distinct file under the folder, in row order.
             var seen = [Bool](repeating: false, count: nGlobal)
             var allGids: [Int] = []; var allPaths: [String] = []; var allKinds: [String] = []
@@ -1980,13 +2285,24 @@ public final class VectorStore: @unchecked Sendable {
             // full string scan to rediscover what this pass already knows. On a large index that is
             // most of the hold, and the hold is on the serial store queue that interactive search
             // also waits on. Int32 row indices: 4 bytes per MATCHING row, not per index row.
+            //
+            // Ascending over the in-scope files' merged row windows, so `allGids` is still ordered
+            // by FIRST APPEARANCE IN ROW ORDER. The landmark even-stride sample below indexes into
+            // that order, so any reordering here would silently change which files the folder map
+            // draws as landmarks.
             var matchRows: [Int32] = []
-            for i in 0 ..< rows.count {
-                let p = rows[i].path
-                guard underFolder(p) else { continue }
-                matchRows.append(Int32(i))
-                let gid = Int(fileID[i])
-                if !seen[gid] { seen[gid] = true; allGids.append(gid); allPaths.append(p); allKinds.append(rows[i].kind) }
+            // deadRows is empty here: ensureCompactLocked() above collected every tombstone, which
+            // is also why this reader alone never has to filter dead rows out of the walk.
+            for range in provenRowRangesLocked(scopedIds, dead: deadRows) {
+                for i in range.lowerBound ..< range.upperBound {
+                    let gid = Int(fileID[i])
+                    // gid < nGlobal is belt and braces: the id tables only diverge from idPath if a
+                    // sidecar path table ever carried a duplicate, and this loop can run over the
+                    // whole index on the fallback path.
+                    guard gid < nGlobal, inFolder[gid] else { continue }
+                    matchRows.append(Int32(i))
+                    if !seen[gid] { seen[gid] = true; allGids.append(gid); allPaths.append(rows[i].path); allKinds.append(rows[i].kind) }
+                }
             }
             let total = allPaths.count
             guard total > 0 else { return empty }
@@ -3449,6 +3765,11 @@ public final class VectorStore: @unchecked Sendable {
         kindID = [:]
         for (i, k) in kindTable.enumerated() { kindID[k] = UInt8(i) }
         fileChunkCount = [Int32](repeating: 0, count: pathTable.count)
+        // Sized off the sidecar's path table, exactly like fileChunkCount, because `fid` is read
+        // straight out of each record and indexes THAT table - it is not re-interned here.
+        fileRowLo = [Int32](repeating: Self.noRowLo, count: pathTable.count)
+        fileRowHi = [Int32](repeating: 0, count: pathTable.count)
+        rowWindowCovered = 0
         rows.removeAll(); rows.reserveCapacity(header.rowCount); resetTombstonesLocked()
         fileID.removeAll(); fileID.reserveCapacity(header.rowCount)
         kindCode.removeAll(); kindCode.reserveCapacity(header.rowCount)
@@ -3476,9 +3797,7 @@ public final class VectorStore: @unchecked Sendable {
                                     height: Int(raw.loadUnaligned(fromByteOffset: o + 12, as: Int32.self)),
                                     duration: raw.loadUnaligned(fromByteOffset: o + 24, as: Double.self),
                                     locator: locator))
-                    fileID.append(fid)
-                    kindCode.append(kc)
-                    fileChunkInc(fid, kind, path)
+                    appendRowMetaLocked(fid, kindCode: kc, kind: kind, path: path)
                 }
             }
         }
@@ -3706,7 +4025,11 @@ public final class VectorStore: @unchecked Sendable {
         queue.sync {
             // Tombstones skipped, not compacted - see fileVector. Disclosing a row's passages must
             // not trigger a base rewrite on the queue that search shares.
-            guard dim > 0, query.count == dim, let id = pathID[path] else { return [] }
+            // The dim/count preconditions are load-bearing now that the scan starts at a stored row
+            // index rather than walking up from 0: the walk could not run past the arrays, a window
+            // is dereferenced straight into flat16.
+            guard dim > 0, query.count == dim, fileID.count == rows.count,
+                  flat16.count >= rows.count * dim, let id = pathID[path] else { return [] }
             // Snippets are not resident (see Row): fetch this one file's chunk snippets in a single
             // indexed SELECT, keyed by chunk index.
             var snippets: [Int: String] = [:]
@@ -3723,17 +4046,21 @@ public final class VectorStore: @unchecked Sendable {
             var hits: [ChunkHit] = []
             let d = vDSP_Length(dim)
             var rowF = [Float](repeating: 0, count: dim)   // one row, bf16 -> fp32 for the dot
-            // Stop once this file's live chunks are all scored. This runs every time the user
-            // discloses a row's passages, and without the bound it scanned the whole base (4.5M
-            // rows) to find the handful of rows belonging to ONE file.
+            // This file's row window, plus the live-chunk stop. Runs every time the user discloses a
+            // row's passages, and the file whose passages are being read is usually the one that was
+            // just indexed - the tail of the row array, where the early exit never fired and the
+            // scan ran the whole base (4.5M rows) to score a handful of chunks.
             var remaining = Int(fileChunkCount[Int(id)])
             let dead = deadRows
             let hasDead = !dead.isEmpty
+            let window = provenRowWindowLocked(id, dead: dead)
             query.withUnsafeBufferPointer { q in
                 flat16.withUnsafeBufferPointer { fb in
                     guard let qp = q.baseAddress, let mb = fb.baseAddress else { return }
-                    var i = 0
-                    while i < fileID.count, remaining > 0 {
+                    // Ascending, so `hits` is built in the same order and the stable sort below
+                    // breaks ties between equal scores the same way it did before.
+                    var i = window.lowerBound
+                    while i < window.upperBound, remaining > 0 {
                         defer { i += 1 }
                         guard fileID[i] == id, !(hasDead && dead.contains(Int32(i))) else { continue }
                         remaining -= 1
@@ -3782,41 +4109,51 @@ public final class VectorStore: @unchecked Sendable {
             // scan, which visits every interned path in the index (212k on a large one) and runs a
             // prefix test per argument against each. That scan was ~1.6 s for 12 files; it now runs
             // only for arguments that are genuinely folders.
-            var inScope = [Bool](repeating: false, count: max(1, fileIDCount))
-            var scoped = 0
+            var inScope = [Bool](repeating: false, count: max(1, fileChunkCount.count))
+            var scopedIds: [Int32] = []
             var folderBases: [String] = []
             for b in bases {
                 if let fid = pathID[b] {
-                    if !inScope[Int(fid)] { inScope[Int(fid)] = true; scoped += 1 }
+                    if !inScope[Int(fid)] { inScope[Int(fid)] = true; scopedIds.append(fid) }
                 } else {
                     folderBases.append(b)
                 }
             }
             if !folderBases.isEmpty {
                 for (p, fid) in pathID where folderBases.contains(where: { p.hasPrefix($0 + "/") }) {
-                    if !inScope[Int(fid)] { inScope[Int(fid)] = true; scoped += 1 }
+                    if !inScope[Int(fid)] { inScope[Int(fid)] = true; scopedIds.append(fid) }
                 }
             }
-            guard scoped > 0 else { return [] }
+            guard !scopedIds.isEmpty else { return [] }
 
             // Rows we expect, from the live per-file counts, so the walk can stop once it has them
             // instead of always running to the end of a 4.5M-row base. Membership is a flat array
             // read rather than a Set hash per row.
             var remaining = 0
-            for id in 0 ..< inScope.count where inScope[id] { remaining += Int(fileChunkCount[id]) }
+            for id in scopedIds { remaining += Int(fileChunkCount[Int(id)]) }
 
             var idx: [Int] = []
             idx.reserveCapacity(min(4096, max(16, remaining)))
             let dead = deadRows
             let hasDead = !dead.isEmpty
-            var i = 0
-            while i < fileID.count, remaining > 0 {
-                if inScope[Int(fileID[i])], !(hasDead && dead.contains(Int32(i))) {
-                    idx.append(i)
-                    remaining -= 1
-                    if idx.count > Self.maxInlineScanRows { return [] }   // scope too broad - narrow the paths
+            // Only the in-scope files' row windows, in ascending row order, so `idx` comes out in
+            // exactly the order the full walk produced it. search_inline is a known, small set of
+            // files, so this is a few hundred rows instead of the whole index - and the
+            // maxInlineScanRows abort below now fires on genuinely broad SCOPES rather than on a
+            // narrow scope that happened to sit late in a big index.
+            // spanCap: an over-broad scope is REFUSED below, and refusing it has to stay cheap.
+            // Without the cap the proof pass would walk the very rows the abort exists to avoid.
+            outer: for range in provenRowRangesLocked(scopedIds, dead: dead, spanCap: Self.maxInlineScanRows) {
+                var i = range.lowerBound
+                while i < range.upperBound, remaining > 0 {
+                    if inScope[Int(fileID[i])], !(hasDead && dead.contains(Int32(i))) {
+                        idx.append(i)
+                        remaining -= 1
+                        if idx.count > Self.maxInlineScanRows { return [] }   // scope too broad - narrow the paths
+                    }
+                    i += 1
                 }
-                i += 1
+                if remaining <= 0 { break outer }
             }
             guard !idx.isEmpty else { return [] }
 
@@ -3947,19 +4284,21 @@ public final class VectorStore: @unchecked Sendable {
     /// missing vector as "cannot compare", never as "no match".
     public func pooledVectors(paths: [String]) -> [String: [Float]] {
         queue.sync {
-            guard dim > 0, !paths.isEmpty else { return [:] }
+            guard dim > 0, fileID.count == rows.count, flat16.count >= rows.count * dim,
+                  !paths.isEmpty else { return [:] }
             // Wanted paths -> dense file ids -> a flat id->slot table, so the row walk below compares
             // an Int32 instead of hashing a path String per row. On a 4.5M-row index that is the
             // difference between millions of string hashes and an array index, on the same serial
-            // queue interactive search runs on. (Same technique vectorsUnderFolder uses; a per-file
-            // row index would remove the walk entirely, but nothing else in the store maintains one.)
-            var globalToLocal = [Int32](repeating: -1, count: max(1, fileIDCount))
+            // queue interactive search runs on. (Same technique vectorsUnderFolder uses.)
+            var globalToLocal = [Int32](repeating: -1, count: max(1, fileChunkCount.count))
             var order: [String] = []
+            var wantedIds: [Int32] = []
             order.reserveCapacity(paths.count)
             for p in paths {
                 guard let gid = pathID[p], globalToLocal[Int(gid)] < 0 else { continue }
                 globalToLocal[Int(gid)] = Int32(order.count)
                 order.append(idPath[Int(gid)])
+                wantedIds.append(gid)
             }
             guard !order.isEmpty else { return [:] }
 
@@ -3974,7 +4313,7 @@ public final class VectorStore: @unchecked Sendable {
             // scans every row in the index (4.5M on a large one) even when the wanted files sit at
             // the front, which is the difference between a bounded cost and a full-index cost.
             var remaining = 0
-            for p in order { if let gid = pathID[p] { remaining += Int(fileChunkCount[Int(gid)]) } }
+            for gid in wantedIds { remaining += Int(fileChunkCount[Int(gid)]) }
             // Tombstones: `rows` keeps deleted chunks until a compaction collects them, and
             // fileChunkCount counts only LIVE ones. Pooling a dead row would fold a deleted chunk
             // into the file's vector, and would also spend one of `remaining` on it and stop the
@@ -3983,20 +4322,29 @@ public final class VectorStore: @unchecked Sendable {
             // and the check costs nothing in the overwhelmingly common case of a clean base.
             let dead = deadRows
             let hasDead = !dead.isEmpty
+            // Only the wanted files' row windows, merged, ascending - so each file's chunks are
+            // accumulated in the same order as the full walk and the pooled vectors are bit-identical.
+            // This is the reader that runs on every keystroke over a ~120-path result page, and the
+            // early exit above never helped it: one wanted file near the tail of the index dragged
+            // the walk across everything before it.
+            let ranges = provenRowRangesLocked(wantedIds, dead: dead)
             fileID.withUnsafeBufferPointer { fid in
                 flat16.withUnsafeBufferPointer { fb in
                     guard let base = fb.baseAddress else { return }
                     sums.withUnsafeMutableBufferPointer { s in
                         guard let sp = s.baseAddress else { return }
-                        var i = 0
-                        while i < rows.count, remaining > 0 {
-                            let li = Int(globalToLocal[Int(fid[i])])
-                            if li >= 0, !(hasDead && dead.contains(Int32(i))) {
-                                Self.accumulateBF16(base + i * dim, into: sp + li * dim, count: dim)
-                                counts[li] += 1
-                                remaining -= 1
+                        for range in ranges {
+                            var i = range.lowerBound
+                            while i < range.upperBound, remaining > 0 {
+                                let li = Int(globalToLocal[Int(fid[i])])
+                                if li >= 0, !(hasDead && dead.contains(Int32(i))) {
+                                    Self.accumulateBF16(base + i * dim, into: sp + li * dim, count: dim)
+                                    counts[li] += 1
+                                    remaining -= 1
+                                }
+                                i += 1
                             }
-                            i += 1
+                            if remaining <= 0 { break }
                         }
                     }
                 }
@@ -4035,7 +4383,13 @@ public final class VectorStore: @unchecked Sendable {
 
     private func memoryLocked() -> SearchMemory {
         var m = SearchMemory()
+        // Two capacity reads, no walk: this runs once a second from the Settings panel, on the queue
+        // interactive search contends for, and is documented at ~6us. 8 bytes per FILE, so 1.6MB at
+        // 212k files - reported rather than left in the UI's "Other" remainder. CAPACITY, not count:
+        // internPath appends one file at a time, so the arrays grow geometrically and up to twice
+        // the counted bytes are actually resident.
         m.cpu = flat16.anonymousBytes + rows.count * MemoryLayout<Row>.stride
+              + (fileRowLo.capacity + fileRowHi.capacity) * MemoryLayout<Int32>.stride
         if let q = quantBase {
             m.gpu = q.wq.nbytes + q.scales.nbytes + (q.biases?.nbytes ?? 0)
         }
@@ -4147,6 +4501,7 @@ public final class VectorStore: @unchecked Sendable {
             removed = removeRow.withUnsafeBufferPointer { rm in compactRowsLocked { rm[$0] } }
         }
         presentPaths.subtract(removed.isEmpty ? paths : removed)
+        rowWindowAuditLocked("removeRowsByPaths")
     }
 
     private func removeRowsLocked(_ predicate: (Row) -> Bool) {
@@ -4168,6 +4523,7 @@ public final class VectorStore: @unchecked Sendable {
         guard rows.contains(where: predicate) else { return }
         let removed = removeRowsFastLocked { predicate(rows[$0]) }
         presentPaths.subtract(removed)
+        rowWindowAuditLocked("removeRows")
     }
 
     /// Shared in-place compaction: drop every row index for which `shouldRemove` is true, keeping the
@@ -4254,6 +4610,12 @@ public final class VectorStore: @unchecked Sendable {
         deadIdxCache = nil
         flat16.removeLast(removed * dim)
         rows.removeLast(removed); fileID.removeLast(removed); kindCode.removeLast(removed)
+        // Every row index at or past `firstRemoved` just moved, so no window survives a compaction.
+        // Rebuilt here, OUTSIDE the flat16 closure and AFTER the truncation, for two reasons: the
+        // closure has its own early return (a nil base address) that skips its body while the
+        // truncation below still runs, and the rebuild must see the final fileID. One integer pass
+        // over ~18MB, against a compaction the commit that introduced it measured at ~1 second.
+        rebuildRowWindowsLocked()
         // The base is the resident copy of rows [0, baseRows). It only goes stale if a removed row was
         // INSIDE that region (everything after it shifts forward). If every removed row was in the delta
         // [baseRows, n) - the common "re-edit a recently indexed file" case - rows [0, baseRows) are
@@ -4311,6 +4673,7 @@ public final class VectorStore: @unchecked Sendable {
         resetTombstonesLocked()
         idPath.removeAll(); fileChunkCount.removeAll(); kindCode.removeAll(); kindID.removeAll(); idKind.removeAll(); dim = 0
         resetAggregatesLocked()
+        resetRowWindowsLocked()
         if tryAdoptRowSidecarLocked() { return }   // validated cache of everything below; SQLite stays truth
         // Pre-size the buffers to the final row/element count so the bf16 buffer is filled in place
         // rather than grown through ~log2(N) reallocations. One COUNT(*) + one dim read up front.
@@ -4383,9 +4746,7 @@ public final class VectorStore: @unchecked Sendable {
                                 size: Int(sqlite3_column_int64(stmt, 10)),
                                 width: width, height: height, duration: duration, locator: locator))
                 let fid = internPath(path)
-                fileID.append(fid)
-                fileChunkInc(fid, kind, path)
-                kindCode.append(internKind(kind))
+                appendRowMetaLocked(fid, kindCode: internKind(kind), kind: kind, path: path)
                 presentPaths.insert(path)
             }
         }
@@ -4394,6 +4755,7 @@ public final class VectorStore: @unchecked Sendable {
         onLoadProgress?(1)
         // A read-only session (open, search, quit) would otherwise never earn a sidecar; stamp
         // once the open settles. Mutations reschedule via bumpGenLocked as usual.
+        rowWindowAuditLocked("loadIntoMemory")
         scheduleRowStampLocked(after: 120)
     }
 
