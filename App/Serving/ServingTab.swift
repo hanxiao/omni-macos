@@ -266,8 +266,13 @@ struct ServingTab: View {
         `chunk_count` is how many chunks (pages/passages) the file has in the index. Hits also
         carry `bytes` (indexed file size) and `mime_type`, and media hits add `width`/`height`
         (px) and `duration` (seconds) recorded at index time - so you can prefer, say, the
-        4032x3024 original over a 192px thumbnail without opening either. Hits that are
-        byte-identical copies share a `content_key`: collapse them before choosing. Image hits
+        4032x3024 original over a 192px thumbnail without opening either. Copies of one file are
+        ALREADY collapsed for you: a hit that stands for several carries `duplicate_count`, the
+        other `duplicates` paths, and `duplicate_kind` - `exact` (byte-identical) or `near` (same
+        kind and extension, sizes within 10%, cosine >= 0.98). So `top_k` counts distinct files, and
+        you never spend context reading the same document twice. Pass `"group_duplicates": false`
+        for the flat list. (`content_key` is still there, and is now identity-per-size, if you want
+        to group differently.) Image hits
         indexed with tagging on carry a few content words as their `snippet` ("cat, couch,
         crib") instead of the filename - see Image tags below to read those as a list, or to
         tag a picture that is not indexed. Fields are omitted when unknown. Scores above ~0.45
@@ -327,7 +332,9 @@ struct ServingTab: View {
         that URL. Three tools:
 
         - `search` - the same semantic search as above. Args: `query` (required), `top_k` (default
-          10, max 50), `kinds`, `folder`, `max_snippet` (snippet chars per result, default 200), and
+          10, max 50), `kinds`, `folder`, `max_snippet` (snippet chars per result, default 200),
+          `group_duplicates` (collapse copies into one result, default true - the text line says
+          "N identical copies" and the structured row carries `duplicate_count`/`duplicates`), and
           `include_images` (when true, image and scanned-PDF hits carry an inline JPEG thumbnail so
           they render in the client). Each result also returns a `resource_link` - a `file://` URI
           the client can open or preview - and media hits carry resolution/duration/size.

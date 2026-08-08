@@ -95,7 +95,7 @@ enum MCPAdapter {
         [
             "name": "search",
             "title": "Search local files by meaning",
-            "description": "Semantic search over the files Omni has indexed on this Mac (text, code, PDFs, images, audio, video - all in one embedding space). Describe the content in natural language; keywords are not required and any language works. Returns file paths with relevance scores and text snippets.",
+            "description": "Semantic search over the files Omni has indexed on this Mac (text, code, PDFs, images, audio, video - all in one embedding space). Describe the content in natural language; keywords are not required and any language works. Returns file paths with relevance scores and text snippets. Copies of the same file are collapsed into one result by default (see group_duplicates), so top_k means distinct files.",
             "inputSchema": [
                 "type": "object",
                 "properties": [
@@ -125,6 +125,10 @@ enum MCPAdapter {
                     "folder": [
                         "type": "string",
                         "description": "Restrict to files under this absolute folder path."
+                    ],
+                    "group_duplicates": [
+                        "type": "boolean",
+                        "description": "Collapse copies of the same file into one result (default true). A collapsed result carries duplicate_count, duplicates (the other paths) and duplicate_kind ('exact' = byte-identical, 'near' = same kind and extension, sizes within 10%, cosine >= 0.98). Set false for the flat list with every copy as its own result."
                     ]
                 ] as [String: Any],
                 "required": ["query"]
@@ -154,10 +158,16 @@ enum MCPAdapter {
         }
         if let folder = args["folder"] as? String, !folder.isEmpty { filter.folderPrefix = folder }
 
-        let hits = backend.search(query, topK: topK, filter: filter)
-        // Duplicate grouping for structuredContent - same key = byte-identical file (see
-        // SearchAdapter; lockstep rule keeps stale sidecar rows from mislabeling).
-        let contentKeys = backend.contentKeys(paths: hits.map { $0.path })
+        // Same duplicate collapsing as the HTTP endpoint and the app's own list. Copies cost an
+        // agent more than they cost a human - every one is context spent re-reading a file it has
+        // already seen - so this defaults ON, with "group_duplicates": false for the flat list.
+        let group = (args["group_duplicates"] as? Bool) ?? true
+        let hits = backend.search(query, topK: group ? min(topK * 3, 150) : topK, filter: filter)
+        let groups = backend.groupedResults(hits, enabled: group, limit: topK)
+        let reps = groups.map(\.representative)
+        let dupesByPath = Dictionary(uniqueKeysWithValues: groups.map { ($0.representative.path, $0) })
+        // Lockstep rule keeps stale sidecar rows from mislabeling.
+        let contentKeys = backend.contentKeys(paths: reps.map { $0.path })
 
         // The response interleaves, per result, a human/LLM-readable text block and a
         // `resource_link` (a file:// URI the client can open or render directly). Capable
@@ -169,8 +179,7 @@ enum MCPAdapter {
         } else {
             var inlined = 0          // thumbnails emitted so far (capped)
             var cappedSkips = 0      // media hits skipped specifically because the cap was already reached
-            var firstWithKey: [String: Int] = [:]   // content_key -> 1-based rank of its first hit
-            for (i, h) in hits.enumerated() {
+            for (i, h) in reps.enumerated() {
                 let score = Int((max(0, min(1, h.score)) * 100).rounded())
                 let loc = h.locator.isEmpty ? "" : ", \(h.locator)"
                 // Resolution/duration/size suffix on media hits only (text hits stay clean):
@@ -178,14 +187,12 @@ enum MCPAdapter {
                 let isTextKind = h.kind == FileKind.text.rawValue
                 var meta = isTextKind ? "" : mediaLabel(width: h.width, height: h.height,
                                                         duration: h.duration, bytes: h.size)
-                // Flag byte-identical copies of an earlier hit right in the text line, so a
-                // text-only agent doesn't weigh the same file twice.
-                if let ck = contentKeys[h.path], ck.modified == h.modified {
-                    if let first = firstWithKey[ck.key] {
-                        meta += ", identical copy of result \(first)"
-                    } else {
-                        firstWithKey[ck.key] = i + 1
-                    }
+                // State what the row stands for, in the text block itself: a text-only agent must
+                // not have to parse structuredContent to learn that this result is really N files.
+                if let g = dupesByPath[h.path], g.isStack {
+                    meta += g.reason == .exact
+                        ? ", \(g.count) identical copies"
+                        : ", \(g.count) near-identical files"
                 }
                 var text = "\(i + 1). \(h.path)  (\(h.kind), \(score)%\(loc)\(meta))"
                 if maxSnippet > 0 {
@@ -212,7 +219,7 @@ enum MCPAdapter {
             }
         }
 
-        let structured: [[String: Any]] = hits.map { h in
+        let structured: [[String: Any]] = reps.map { h in
             var row: [String: Any] =
                 ["path": h.path,
                  "uri": URL(fileURLWithPath: h.path).absoluteString,
@@ -225,6 +232,12 @@ enum MCPAdapter {
                  "chunk_count": h.chunkCount,
                  "modified": h.modified]
             if let mime = mimeType(forPath: h.path) { row["mime_type"] = mime }
+            // Same three fields the HTTP endpoint emits, present only on a stack.
+            if let g = dupesByPath[h.path], g.isStack {
+                row["duplicate_count"] = g.count
+                row["duplicates"] = g.members.dropFirst().map(\.path)
+                row["duplicate_kind"] = g.reason == .exact ? "exact" : "near"
+            }
             if h.width > 0 { row["width"] = h.width }
             if h.height > 0 { row["height"] = h.height }
             if h.duration > 0 { row["duration"] = h.duration }

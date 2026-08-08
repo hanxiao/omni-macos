@@ -41,6 +41,15 @@ struct ResultsList<Footer: View>: View {
         }
     }
 
+    /// Open/close a stack. Selection deliberately stays on the representative: opening a stack
+    /// reveals copies, it does not change what the user has chosen.
+    private func toggleStack(_ id: String) {
+        withAnimation(.easeOut(duration: 0.18)) {
+            if model.expandedStacks.contains(id) { model.expandedStacks.remove(id) }
+            else { model.expandedStacks.insert(id) }
+        }
+    }
+
     private func fetchPassages(_ path: String) {
         guard passagesCache[path] == nil else { return }
         // Re-validate after the await, against the LIVE model. passages(for:) ranks against the
@@ -53,8 +62,10 @@ struct ResultsList<Footer: View>: View {
         let token = model.resolvedQuery
         Task {
             let ranked = await model.passages(for: path)
-            guard model.resolvedQuery == token,
-                  model.results.contains(where: { $0.path == path }) else { return }
+            // renderedPaths: an opened COPY is a live row, and testing `results` alone threw its
+            // ranking away on arrival - the panel then sat on "Ranking passages..." forever,
+            // because the cache entry it waits for was never written.
+            guard model.resolvedQuery == token, model.renderedPaths.contains(path) else { return }
             passagesCache[path] = ranked
         }
     }
@@ -100,8 +111,10 @@ struct ResultsList<Footer: View>: View {
         }
         // A row that vanished under the SAME query takes its own state with it, and nothing else's:
         // the remaining panels are still ranked against the query that is still on screen.
-        .onChange(of: results.map(\.path)) { _, paths in
-            let live = Set(paths)
+        .onChange(of: results.map(\.path)) { _, _ in
+            // renderedPaths, not the representative list: a copy inside an OPEN stack is on screen
+            // and its passages panel must survive a re-rank exactly like any other row's.
+            let live = model.renderedPaths
             expanded.formIntersection(live)
             if let p = passagesPopover, !live.contains(p) { passagesPopover = nil }
         }
@@ -117,7 +130,8 @@ struct ResultsList<Footer: View>: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 2) {
-                    ForEach(results, id: \.path) { hit in
+                    ForEach(model.groups) { group in
+                        let hit = group.representative
                         VStack(spacing: 0) {
                             ResultRow(hit: hit,
                                       selected: model.selectedPaths.contains(hit.path),
@@ -125,7 +139,12 @@ struct ResultsList<Footer: View>: View {
                                       // per-chunk breakdown; a single-embedding file gets no chevron.
                                       expandable: hit.chunkCount > 1,
                                       expanded: expanded.contains(hit.path),
-                                      onToggle: { toggle(hit.path) })
+                                      onToggle: { toggle(hit.path) },
+                                      // Stack: the row stands for `count` files. The badge is its own
+                                      // control so it never fights the passages chevron next to it.
+                                      stack: group.isStack ? (group.count, group.reason) : nil,
+                                      stackOpen: model.expandedStacks.contains(group.id),
+                                      onToggleStack: { toggleStack(group.id) })
                                 // Result rows are intentionally NOT draggable: an in-app row drag was
                                 // easy to misclick onto the search drop target. Drag-to-search is for
                                 // files coming from OUTSIDE the app (Finder); use Find similar / Reveal
@@ -152,6 +171,46 @@ struct ResultsList<Footer: View>: View {
                                     .padding(.bottom, 8)
                                     .transition(.opacity)
                             }
+                            // The stack, opened: its other copies as ordinary rows, indented under
+                            // the one that represents them. They are full rows on purpose - every
+                            // per-file action (open, Quick Look, reveal, trash) works on a copy
+                            // exactly as it does on any other result.
+                            if group.isStack, model.expandedStacks.contains(group.id) {
+                                ForEach(group.members.dropFirst(), id: \.path) { member in
+                                    // Level 2. A copy is a whole result, so it keeps its OWN
+                                    // per-chunk disclosure: stack open -> copy row -> that copy's
+                                    // matching passages. The chevron, the cache and the fetch are
+                                    // the same ones the representative uses (all keyed by path),
+                                    // so nothing here is a parallel implementation.
+                                    VStack(spacing: 0) {
+                                        ResultRow(hit: member,
+                                                  selected: model.selectedPaths.contains(member.path),
+                                                  expandable: member.chunkCount > 1,
+                                                  expanded: expanded.contains(member.path),
+                                                  onToggle: { toggle(member.path) })
+                                            .contentShape(Rectangle())
+                                            .onTapGesture { handleTap(member.path) }
+                                            .simultaneousGesture(TapGesture(count: 2).onEnded { open(member.path) })
+                                            .contextMenu { menu(member) }
+                                            .reportResultFrame(member.path, in: marqueeSpace)
+                                        if expanded.contains(member.path), member.chunkCount > 1 {
+                                            PassagesView(passages: passagesCache[member.path],
+                                                         fileName: URL(fileURLWithPath: member.path).lastPathComponent,
+                                                         path: member.path, kind: member.kind)
+                                                .padding(10)
+                                                .background(Color(.controlBackgroundColor), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                                                // Indented one level deeper than the representative's
+                                                // panel, so the nesting is legible at a glance.
+                                                .padding(.leading, 52)
+                                                .padding(.trailing, 12)
+                                                .padding(.bottom, 8)
+                                                .transition(.opacity)
+                                        }
+                                    }
+                                    .padding(.leading, 28)
+                                    .transition(.opacity)
+                                }
+                            }
                         }
                         .id(hit.path)
                     }
@@ -170,8 +229,10 @@ struct ResultsList<Footer: View>: View {
                 case .up: model.moveSelection(rowDelta: -1)
                 case .down: model.moveSelection(rowDelta: 1)
                 case .right:
+                    // renderedHit, not `results`: right-arrow must disclose the passages of an
+                    // opened COPY too, and that row is not in the representative list.
                     if let sel = model.selection, !expanded.contains(sel),
-                       results.first(where: { $0.path == sel })?.chunkCount ?? 0 > 1 { toggle(sel) }
+                       (model.renderedHit(sel)?.chunkCount ?? 0) > 1 { toggle(sel) }
                 case .left:
                     if let sel = model.selection, expanded.contains(sel) { toggle(sel) }
                 @unknown default: break
@@ -218,8 +279,12 @@ struct ResultsList<Footer: View>: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: gridMin, maximum: 220), spacing: Design.gapLarge)], spacing: Design.gapLarge) {
-                    ForEach(results, id: \.path) { hit in
-                        ResultGridItem(hit: hit, selected: model.selectedPaths.contains(hit.path))
+                    ForEach(model.groups) { group in
+                        let hit = group.representative
+                        ResultGridItem(hit: hit, selected: model.selectedPaths.contains(hit.path),
+                                       stack: group.isStack ? (group.count, group.reason) : nil,
+                                       stackOpen: model.expandedStacks.contains(group.id),
+                                       onToggleStack: { toggleStack(group.id) })
                             // Make the whole cell tappable, not just the opaque thumbnail/label - without
                             // this, clicking the transparent padding around a small item did nothing.
                             // (The list row already has this; the grid relied on .draggable's hit area,
@@ -249,6 +314,37 @@ struct ResultsList<Footer: View>: View {
                                 .frame(maxHeight: 320)
                             }
                             .id(hit.path)
+                        // An opened stack spills its copies into the grid as ordinary cells right
+                        // after the one that represents them - the gallery stays a uniform grid
+                        // (no cell grows, nothing reflows around a panel), and every copy is a
+                        // full-sized, selectable, openable result.
+                        if group.isStack, model.expandedStacks.contains(group.id) {
+                            ForEach(group.members.dropFirst(), id: \.path) { member in
+                                ResultGridItem(hit: member, selected: model.selectedPaths.contains(member.path))
+                                    .contentShape(Rectangle())
+                                    .onTapGesture { handleTap(member.path) }
+                                    .simultaneousGesture(TapGesture(count: 2).onEnded { open(member.path) })
+                                    .contextMenu { menu(member) }
+                                    .reportResultFrame(member.path, in: marqueeSpace)
+                                    // Level 2 in the gallery: a copy opens its own passages popover,
+                                    // anchored to its own cell, exactly like the representative.
+                                    .popover(isPresented: Binding(
+                                        get: { passagesPopover == member.path },
+                                        set: { if !$0 { passagesPopover = nil } }
+                                    ), arrowEdge: .bottom) {
+                                        ScrollView {
+                                            PassagesView(passages: passagesCache[member.path],
+                                                         fileName: URL(fileURLWithPath: member.path).lastPathComponent,
+                                                         path: member.path, kind: member.kind)
+                                                .padding(12)
+                                        }
+                                        .frame(width: 380)
+                                        .frame(maxHeight: 320)
+                                    }
+                                    .id(member.path)
+                                    .transition(.opacity)
+                            }
+                        }
                     }
                 }
                 .padding(Design.gapLarge)
@@ -340,6 +436,24 @@ struct ResultsList<Footer: View>: View {
             Button { model.selectAllResults() } label: { Label("Select all", systemImage: "checkmark.circle") }
                 .keyboardShortcut("a", modifiers: .command)
         } else {
+            // Stack actions, above the per-file ones. Everything else in this menu acts on the
+            // REPRESENTATIVE only - a collapsed stack is one file as far as opening, previewing and
+            // trashing go - so the two stack-wide actions are stated explicitly with their count.
+            // Deleting copies you cannot see is exactly the mistake this wording exists to prevent.
+            if let group = model.groups.first(where: { $0.id == path }), group.isStack {
+                Button { toggleStack(group.id) } label: {
+                    Label(model.expandedStacks.contains(group.id) ? "Hide \(group.count - 1) copies" : "Show \(group.count - 1) copies",
+                          systemImage: "square.stack.3d.down.right")
+                }
+                Button { model.selectPaths(group.paths) } label: {
+                    Label("Select all \(group.count)", systemImage: "checkmark.circle")
+                }
+                Divider()
+                Button(role: .destructive) { model.moveToTrash(group.paths) } label: {
+                    Label("Move all \(group.count) copies to Trash", systemImage: "trash")
+                }
+                Divider()
+            }
             Button { model.selectSingle(path); open(path) } label: { Label("Open", systemImage: "arrow.up.forward.app") }
                 .keyboardShortcut("o", modifiers: .command)
             Button { model.selectSingle(path); model.previewURL = URL(fileURLWithPath: path) } label: { Label("Quick Look", systemImage: "eye") }
@@ -365,7 +479,7 @@ struct ResultsList<Footer: View>: View {
                             let token = model.resolvedQuery
                             let ranked = passagesCache[path] == nil ? await model.passages(for: path) : nil
                             guard model.resolvedQuery == token,
-                                  model.results.contains(where: { $0.path == path }) else { return }
+                                  model.renderedPaths.contains(path) else { return }
                             if let ranked { passagesCache[path] = ranked }
                             passagesPopover = path
                         }
@@ -431,6 +545,10 @@ struct ResultRow: View {
     var expandable: Bool = false
     var expanded: Bool = false
     var onToggle: (() -> Void)? = nil
+    /// Non-nil when this row stands for a stack of duplicates: (member count, why they grouped).
+    var stack: (count: Int, reason: ResultGroup.Reason)? = nil
+    var stackOpen: Bool = false
+    var onToggleStack: (() -> Void)? = nil
     private var url: URL { URL(fileURLWithPath: hit.path) }
     /// Emphasized = selected AND the window is key: the state that earns the solid accent fill and
     /// white text. A non-key window falls back to the unemphasized grey, like every native list.
@@ -438,9 +556,12 @@ struct ResultRow: View {
 
     var body: some View {
         HStack(alignment: .center, spacing: 12) {
-            Thumbnail(path: hit.path, side: 40)
+            StackedThumbnail(path: hit.path, side: 40, corner: 6, depth: stack.map { min(2, $0.count - 1) } ?? 0)
             VStack(alignment: .leading, spacing: 2) {
-                Text(url.lastPathComponent).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
+                HStack(spacing: 6) {
+                    Text(url.lastPathComponent).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
+                    if let stack { stackBadge(stack) }
+                }
                 if !hit.snippet.isEmpty, hit.snippet != url.lastPathComponent {
                     Text(hit.snippet).font(.body).foregroundStyle(.secondary).lineLimit(1)
                 }
@@ -462,19 +583,32 @@ struct ResultRow: View {
             }
             Spacer()
             Text(scoreText(hit.score)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-            if expandable {
-                Button { onToggle?() } label: {
-                    Image(systemName: "chevron.right")
-                        .rotationEffect(.degrees(expanded ? 90 : 0))
-                        .foregroundStyle(.tertiary)
-                        // A bare glyph is a ~16px target; give it a comfortable hit area.
-                        .frame(width: 24, height: 24)
-                        .contentShape(Rectangle())
+            // The disclosure occupies a slot of FIXED width that exists on every row, present or
+            // not. Making the whole control conditional shifted the score column by 24pt between
+            // neighbouring rows - the eye reads a results list down its right edge, and a number
+            // that jumps left and right by whether that file happens to have several chunks is
+            // noise the user cannot act on. Same reason Finder reserves its disclosure column.
+            Group {
+                if expandable {
+                    Button { onToggle?() } label: {
+                        Image(systemName: "chevron.right")
+                            .rotationEffect(.degrees(expanded ? 90 : 0))
+                            .foregroundStyle(.tertiary)
+                            // A bare glyph is a ~16px target; give it a comfortable hit area.
+                            .frame(width: 24, height: 24)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Show matching passages (right arrow)")
+                    .accessibilityLabel(expanded ? "Hide matching passages" : "Show matching passages")
+                } else {
+                    // An explicit filler, not an empty branch: a Group whose condition is false
+                    // yields no view at all and .frame() then has nothing to size, so the slot
+                    // collapsed and the score still jumped. Color.clear occupies the slot.
+                    Color.clear
                 }
-                .buttonStyle(.plain)
-                .help("Show matching passages (right arrow)")
-                .accessibilityLabel(expanded ? "Hide matching passages" : "Show matching passages")
             }
+            .frame(width: 24, height: 24)
         }
         .padding(.vertical, 6)
         .padding(.horizontal, 10)
@@ -555,12 +689,17 @@ struct PassagesView: View {
 struct ResultGridItem: View {
     let hit: SearchHit
     let selected: Bool
+    /// Non-nil when this cell stands for a stack of duplicates.
+    var stack: (count: Int, reason: ResultGroup.Reason)? = nil
+    var stackOpen: Bool = false
+    var onToggleStack: (() -> Void)? = nil
     @Environment(\.controlActiveState) private var controlActive
     private var url: URL { URL(fileURLWithPath: hit.path) }
 
     var body: some View {
         VStack(spacing: 6) {
-            Thumbnail(path: hit.path, side: 128, corner: Design.corner)
+            StackedThumbnail(path: hit.path, side: 128, corner: Design.corner,
+                             depth: stack.map { min(2, $0.count - 1) } ?? 0)
                 .overlay {
                     // Glass chips over imagery (the one legitimate in-content use of vibrancy):
                     // legible over bright and dark thumbnails, appearance-adaptive. The pair shares
@@ -579,6 +718,27 @@ struct ResultGridItem: View {
                                     .padding(.horizontal, 5).padding(.vertical, 2)
                                     .glassChip().padding(5)
                                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                            }
+                            // Stack count, bottom-trailing so it never collides with the locator or
+                            // the score. Pressing it opens the stack, exactly like the list badge.
+                            if let stack {
+                                Button { onToggleStack?() } label: {
+                                    HStack(spacing: 3) {
+                                        Image(systemName: stackOpen ? "chevron.up" : "square.stack.3d.down.right.fill")
+                                        Text("\(stack.count)").monospacedDigit()
+                                    }
+                                    .font(.caption2)
+                                    .foregroundStyle(.primary)
+                                    .padding(.horizontal, 5).padding(.vertical, 2)
+                                    .glassChip(interactive: true)
+                                    .contentShape(Capsule())
+                                }
+                                .buttonStyle(.plain)
+                                .padding(5)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                                .help(stack.reason == .exact
+                                      ? "\(stack.count) byte-identical copies"
+                                      : "\(stack.count) near-identical files")
                             }
                         }
                     }
@@ -632,6 +792,58 @@ struct ResultGridItem: View {
                 : Color(nsColor: .unemphasizedSelectedContentBackgroundColor).opacity(0.8)) : .clear,
             in: RoundedRectangle(cornerRadius: Design.corner + 8, style: .continuous)
         )
+    }
+}
+
+/// The count control on a stacked row: "3 copies" / "3 similar", clickable to open the stack.
+/// A button rather than a label - the count is the ONLY affordance that says other files are here,
+/// so it has to be the thing you press. Kept out of the passages chevron's way on the trailing edge.
+extension ResultRow {
+    @ViewBuilder func stackBadge(_ stack: (count: Int, reason: ResultGroup.Reason)) -> some View {
+        Button { onToggleStack?() } label: {
+            HStack(spacing: 3) {
+                Image(systemName: stackOpen ? "chevron.down" : "square.stack.3d.down.right.fill")
+                    .font(.caption2)
+                Text(stack.reason == .exact ? "\(stack.count) copies" : "\(stack.count) similar")
+                    .font(.caption).monospacedDigit()
+            }
+            .padding(.horizontal, 6).padding(.vertical, 1)
+            .background(.quaternary, in: Capsule())
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help(stack.reason == .exact
+              ? "\(stack.count) byte-identical copies - click to show them"
+              : "\(stack.count) near-identical files - click to show them")
+    }
+}
+
+/// A thumbnail that reads as a pile when it stands for more than one file: `depth` cards peeking
+/// out behind the real one, offset down-right like a Dock stack. Purely decorative - the cards are
+/// the same rounded shape as the thumbnail so the pile keeps its silhouette at any size.
+struct StackedThumbnail: View {
+    let path: String
+    let side: CGFloat
+    var corner: CGFloat = 6
+    /// 0 = a plain thumbnail (no pile drawn at all).
+    var depth: Int = 0
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            ForEach(Array((0 ..< depth).reversed()), id: \.self) { i in
+                let step = CGFloat(i + 1) * (side > 60 ? 5 : 3)
+                RoundedRectangle(cornerRadius: corner, style: .continuous)
+                    .fill(Color(nsColor: .windowBackgroundColor))
+                    .overlay(RoundedRectangle(cornerRadius: corner, style: .continuous)
+                        .strokeBorder(.primary.opacity(0.14), lineWidth: 1))
+                    .frame(width: side, height: side)
+                    .offset(x: step, y: step)
+                    .shadow(color: .black.opacity(0.10), radius: 1, y: 0.5)
+            }
+            Thumbnail(path: path, side: side, corner: corner)
+        }
+        // Reserve the pile's overhang so a stacked row is not wider than its neighbours.
+        .padding(.trailing, depth > 0 ? CGFloat(depth) * (side > 60 ? 5 : 3) : 0)
     }
 }
 

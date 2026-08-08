@@ -31,7 +31,10 @@ struct FolderEmbeddingVisualization: View {
     @State private var baseColors: [SIMD4<Float>] = []    // full per-point RGBA (pre-dimming)
     @State private var colors: [SIMD4<Float>] = []        // displayed RGBA (dimmed when a point is selected)
     @State private var bbox = SIMD4<Float>(0, 0, 1, 1)    // cached (cx, cy, extX, extY) for O(1) hit-test + ring
-    @State private var presentKinds: [FileKind] = []      // legend entries, computed once per projection (not per frame)
+    @State private var presentKinds: [FileKind] = []
+    /// Columns of the grid when the layout is gridified (0 = not gridified). The dot size is
+    /// derived from this: in grid mode the cell PITCH is what a dot must fit inside.
+    @State private var gridCols = 0      // legend entries, computed once per projection (not per frame)
     @State private var dataVersion = 0
     @State private var zoom: CGFloat = 1
     @State private var pan: CGSize = .zero
@@ -54,7 +57,7 @@ struct FolderEmbeddingVisualization: View {
                 // GPU point cloud. Redraws only when data/zoom/pan change (not on hover).
                 MetalScatterView(points: positions, colors: colors, dataVersion: dataVersion,
                                  zoom: effectiveZoom, pan: effectivePan,
-                                 dotRadius: Self.radius(for: positions.count), inset: Self.inset)
+                                 dotRadius: dotRadius(in: geo.size), inset: Self.inset)
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)   // the GPU canvas isn't a VoiceOver target; see the container label
 
@@ -341,7 +344,7 @@ struct FolderEmbeddingVisualization: View {
             }
             .pickerStyle(.inline)
             Divider()
-            Toggle("Spread dots so none overlap", isOn: Binding(get: { model.mapNoOverlap }, set: { model.mapNoOverlap = $0 }))
+            Toggle("Grid layout", isOn: Binding(get: { model.mapNoOverlap }, set: { model.mapNoOverlap = $0 }))
         } label: {
             Image(systemName: "chevron.down")
                 .font(.caption2.weight(.semibold))
@@ -402,7 +405,8 @@ struct FolderEmbeddingVisualization: View {
         rebuildTask?.cancel()
         let noOverlap = model.mapNoOverlap
         rebuildTask = Task { @MainActor in
-            let built = await Task.detached(priority: .userInitiated) { () -> (pos: [SIMD2<Float>], col: [SIMD4<Float>], bbox: SIMD4<Float>, kinds: [FileKind])? in
+            let built = await Task.detached(priority: .userInitiated) { () -> (pos: [SIMD2<Float>], col: [SIMD4<Float>], bbox: SIMD4<Float>, kinds: [FileKind], gridCols: Int)? in
+                var gridColsOut = 0
                 if Task.isCancelled { return nil }
                 var pos = [SIMD2<Float>](); pos.reserveCapacity(pts.count)
                 var col = [SIMD4<Float>](); col.reserveCapacity(pts.count)
@@ -434,6 +438,7 @@ struct FolderEmbeddingVisualization: View {
                     let cols = max(1, Int(Double(cells).squareRoot().rounded(.up)))
                     let rows = max(1, (cells + cols - 1) / cols)
                     let g = ProjectionEngine.gridify(flat, count: pos.count, cols: cols, rows: rows)
+                    gridColsOut = cols
                     mn = SIMD2<Float>(.greatestFiniteMagnitude, .greatestFiniteMagnitude)
                     mx = SIMD2<Float>(-.greatestFiniteMagnitude, -.greatestFiniteMagnitude)
                     for i in 0 ..< pos.count {
@@ -444,13 +449,14 @@ struct FolderEmbeddingVisualization: View {
                 }
                 let ext = pointwiseMax(mx - mn, SIMD2<Float>(1e-5, 1e-5))
                 let present = FileKind.allCases.filter { kindsSeen.contains($0.rawValue) }
-                return (pos, col, SIMD4<Float>((mn.x + mx.x) / 2, (mn.y + mx.y) / 2, ext.x, ext.y), present)
+                return (pos, col, SIMD4<Float>((mn.x + mx.x) / 2, (mn.y + mx.y) / 2, ext.x, ext.y), present, gridColsOut)
             }.value
             guard !Task.isCancelled, let built else { return }
             positions = built.pos
             baseColors = built.col
             bbox = built.bbox
             presentKinds = built.kinds
+            gridCols = built.gridCols
             applyHighlight()
         }
     }
@@ -516,6 +522,19 @@ struct FolderEmbeddingVisualization: View {
         .allowsHitTesting(false)
         .position(x: min(max(hoverLocation.x, 80), size.width - 80),
                   y: max(64, hoverLocation.y - 66))
+    }
+
+    /// Dot radius for the current layout. In GRID mode it is derived from the cell pitch on screen,
+    /// not from the point count: a grid whose dots are wider than its cells fuses into a solid
+    /// sheet, and then the only thing the eye can pick out is the empty cells - the map reads as
+    /// far fewer files than it is drawing. Zooming in grows the cells, so the dots grow with them.
+    private func dotRadius(in size: CGSize) -> CGFloat {
+        let base = Self.radius(for: positions.count)
+        guard gridCols > 0, bbox.z > 0 else { return base }
+        let rect = CGRect(origin: .zero, size: size).insetBy(dx: Self.inset, dy: Self.inset)
+        let scale = min(rect.width / CGFloat(bbox.z), rect.height / CGFloat(bbox.w)) * effectiveZoom
+        let pitch = CGFloat(bbox.z) / CGFloat(gridCols) * scale      // one cell, in points
+        return max(0.5, min(base, pitch * 0.38))                      // ~24% gap between neighbours
     }
 
     /// Dot radius shrinks for very large folders so a dense cloud stays legible. Passed to the GPU.

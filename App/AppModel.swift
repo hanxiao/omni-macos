@@ -231,6 +231,19 @@ final class AppModel {
     private func touchProjection(_ url: URL) {
         if let i = projectionCacheOrder.firstIndex(of: url) { projectionCacheOrder.append(projectionCacheOrder.remove(at: i)) }
     }
+    /// Collapse near-identical results (not just byte-identical copies) into one stack. Defaults
+    /// ON. Byte-identical collapsing is not optional - it can only ever be right - but the near
+    /// tier is a judgement call on a similarity threshold, so it stays escapable.
+    var groupNearDuplicates: Bool = UserDefaults.standard.object(forKey: "omni.groupNearDuplicates") as? Bool ?? true {
+        didSet {
+            guard oldValue != groupNearDuplicates else { return }
+            UserDefaults.standard.set(groupNearDuplicates, forKey: "omni.groupNearDuplicates")
+            // Turning the near tier ON needs vectors that were never fetched; reload, don't just
+            // recompute against an empty cache.
+            loadGroupingInputs(for: rawResults, token: resultsToken)
+            recomputeResults()
+        }
+    }
     /// Snap the finished layout onto a grid so no two dots overlap (DGrid). Display-only: it does
     /// not change the fit, so toggling re-lays the existing projection without refitting.
     var mapNoOverlap: Bool = UserDefaults.standard.bool(forKey: "omni.mapNoOverlap") {
@@ -342,6 +355,13 @@ final class AppModel {
     /// Make `path` the sole selection - a plain click or an arrow-key move.
     func selectSingle(_ path: String) {
         selection = path; selectedPaths = [path]; selectionAnchor = path
+    }
+    /// Select every file in a stack at once, with the representative active. The members are not
+    /// rows of `results` (only the representative is), so this is the one way to get a whole stack
+    /// into the selection - which every multi-item action then treats like any Finder multi-select.
+    func selectPaths(_ paths: [String]) {
+        guard let first = paths.first else { return }
+        selectedPaths = Set(paths); selection = first; selectionAnchor = first
     }
     /// Cmd-click: add/remove `path`; it becomes the active item (or hands off when removed).
     func toggleSelection(_ path: String) {
@@ -1303,19 +1323,89 @@ final class AppModel {
 
     // MARK: - Derived results
 
+    /// Hits fetched per search. Deliberately larger than what the list shows: duplicate collapsing
+    /// removes rows AFTER the store has ranked them, and without headroom a query whose top slots
+    /// are copies of one file would end up with fewer distinct results than the user asked for.
+    /// Measured on a 212k-file index: 9.8% of top-60 slots were byte-identical copies of an earlier
+    /// hit, up to 33% on one query.
+    nonisolated static let searchTopK = 120
+
     /// Results above the relevance threshold, sorted by the chosen order. Memoized: recomputed only
     /// when an input (rawResults / minScore / sortOrder) changes, not on every render. The frequent
     /// indexing updates never touch these, so the results list is never re-filtered/sorted then.
+    ///
+    /// `results` holds one hit per GROUP - the representative - so every existing consumer
+    /// (selection, keyboard navigation, counts, the File menu, Quick Look) keeps working on a flat
+    /// list of files and needs no notion of stacks. `groups` carries the members for the views that
+    /// render them.
     private(set) var results: [SearchHit] = []
+    private(set) var groups: [ResultGroup] = []
     private(set) var hiddenByThreshold: Int = 0
+    /// Paths of stacks the user expanded, kept across recomputes so typing does not re-collapse a
+    /// stack the user opened. Keyed by representative path.
+    var expandedStacks: Set<String> = []
+    /// Files collapsed away into stacks - shown next to the result count so nothing is hidden
+    /// silently.
+    private(set) var collapsedCount: Int = 0
+
+    /// The hit for any rendered path, representative or opened copy. Keyboard disclosure needs the
+    /// row's chunkCount, and looking that up in `results` alone silently did nothing on a copy.
+    func renderedHit(_ path: String) -> SearchHit? {
+        if let h = results.first(where: { $0.path == path }) { return h }
+        for g in groups where g.isStack && expandedStacks.contains(g.id) {
+            if let h = g.members.first(where: { $0.path == path }) { return h }
+        }
+        return nil
+    }
+
+    /// EVERY path the results area can show right now: the representatives, plus the copies of any
+    /// stack the user has opened. The single source of truth for "is this row on screen", used by
+    /// selection pruning, by the passages cache, and by the popover presentation guard - each of
+    /// which silently did the wrong thing for an opened copy when it tested `results` alone.
+    var renderedPaths: Set<String> {
+        var live = Set(results.map(\.path))
+        guard !expandedStacks.isEmpty else { return live }
+        for g in groups where g.isStack && expandedStacks.contains(g.id) { live.formUnion(g.paths) }
+        return live
+    }
+
+    /// Duplicate collapsing for the current result page. Pure lookup plus arithmetic: one indexed
+    /// SQLite read for the content keys, one pooled-vector read off the resident base, one GEMM.
+    /// Nothing here re-runs the search or touches the ranking.
+    private func collapse(_ hits: [SearchHit]) -> [ResultGroup] {
+        guard hits.count > 1, !groupingKeys.isEmpty || !groupingVectors.isEmpty else {
+            return hits.map { ResultGroup(members: [$0], reason: .single) }
+        }
+        return ResultGrouping.group(hits: hits, vectors: groupingVectors, contentKeys: groupingKeys,
+                                    nearEnabled: groupNearDuplicates)
+    }
 
     private func recomputeResults() {
         let above = rawResults.filter { Self.relevance($0.score) >= minScore }
         hiddenByThreshold = rawResults.count - above.count
+        // Collapse duplicates BEFORE sorting, on the relevance order the store produced: grouping is
+        // anchor-first, and the anchor must be the best-ranked member, not whichever file happens to
+        // sort first by name. Grouping only ever runs over hits that already passed the threshold,
+        // so a copy below the cut can never resurrect its stack.
+        let collapsed = collapse(above)
+        collapsedCount = above.count - collapsed.count
+        let reps = collapsed.map(\.representative)
         switch sortOrder {
-        case .relevance: results = above
-        case .name: results = above.sorted { ($0.path as NSString).lastPathComponent.localizedCaseInsensitiveCompare(($1.path as NSString).lastPathComponent) == .orderedAscending }
-        case .dateModified: results = above.sorted { $0.modified > $1.modified }
+        case .relevance:
+            results = reps
+            groups = collapsed
+        case .name:
+            groups = collapsed.sorted { ($0.representative.path as NSString).lastPathComponent.localizedCaseInsensitiveCompare(($1.representative.path as NSString).lastPathComponent) == .orderedAscending }
+            results = groups.map(\.representative)
+        case .dateModified:
+            groups = collapsed.sorted { $0.representative.modified > $1.representative.modified }
+            results = groups.map(\.representative)
+        }
+        // Drop expansion state for stacks that no longer exist, so the set cannot grow unbounded
+        // across a session of typing.
+        if !expandedStacks.isEmpty {
+            let live = Set(groups.filter(\.isStack).map(\.id))
+            if !expandedStacks.isSubset(of: live) { expandedStacks.formIntersection(live) }
         }
         // Prune the selection to what is actually rendered, HERE, where `results` is derived, rather
         // than only where a search settles. The visible set shrinks from several publishes that are
@@ -1325,7 +1415,7 @@ final class AppModel {
         // own row leaves the File menu, Space, Return and Move to Trash acting on a file the user
         // cannot see, and moveSelection's index lookup fails and jumps back to result 0.
         guard !selectedPaths.isEmpty || selection != nil || selectionAnchor != nil else { return }
-        let live = Set(results.map(\.path))
+        let live = renderedPaths
         // The active item hands off to a surviving member of the selection, exactly as moveToTrash
         // has always done - with a single selected row that set is now empty, so it clears.
         if !selectedPaths.isSubset(of: live) { selectedPaths.formIntersection(live) }
@@ -2804,11 +2894,79 @@ final class AppModel {
          dateRange.rawValue, String(sortOrder.hashValue)].joined(separator: "\u{1}")
     }
 
+    /// Inputs duplicate collapsing needs, fetched ONCE per result set off the main actor and
+    /// cached here. Both store calls take the store queue, which a bulk index write can hold for
+    /// tens of ms; recomputeResults runs on the main actor on every keystroke, every threshold
+    /// nudge and every sort change, so it must never touch the store itself.
+    @ObservationIgnored private var groupingKeys: [String: (key: String, modified: Double)] = [:]
+    @ObservationIgnored private var groupingVectors: [String: [Float]] = [:]
+
+    /// Load the collapsing inputs for `hits` on a background task, then republish the derived
+    /// results. Called after the hits themselves are on screen: grouping is a refinement of a list
+    /// the user can already read, never a gate in front of it.
+    /// Pooled vectors already fetched, by path. Typing walks overlapping result sets - "beach",
+    /// "beach s", "beach su" mostly return the SAME files - so without this every keystroke re-reads
+    /// vectors the model already has, on the serial store queue that search itself runs on. Bounded
+    /// and cleared wholesale rather than aged: an entry is only stale if the file was re-indexed,
+    /// and a search after that re-fetches the paths it actually needs anyway.
+    @ObservationIgnored private var vectorCache: [String: [Float]] = [:]
+    /// 600 x 768 floats = ~1.8 MB. Sized against what typing actually touches (a query page is at
+    /// most `searchTopK` files and successive prefixes overlap heavily), NOT against the index -
+    /// this is a keystroke cache, and the app just spent a release making its memory legible.
+    private static let vectorCacheLimit = 600
+
+    private func loadGroupingInputs(for hits: [SearchHit], token: String) {
+        guard let store, hits.count > 1 else { groupingKeys = [:]; groupingVectors = [:]; return }
+        let paths = hits.map(\.path)
+        let wantNear = groupNearDuplicates
+        // A file can only group with one of the SAME kind and extension (the clustering's own
+        // guards), so a hit whose (kind, ext) bucket has no other member can never be part of a
+        // stack and its vector is never read. Exact, not heuristic - it applies the guard earlier -
+        // and on a mixed result page it removes most of the fetch.
+        var bucket: [String: Int] = [:]
+        func key(_ h: SearchHit) -> String { h.kind + "\u{1}" + (h.path as NSString).pathExtension.lowercased() }
+        for h in hits { bucket[key(h), default: 0] += 1 }
+        let groupable = hits.filter { bucket[key($0), default: 0] > 1 }.map(\.path)
+        // Only the paths whose vectors are not already cached reach the store.
+        let cached = vectorCache
+        let missing = wantNear ? groupable.filter { cached[$0] == nil } : []
+        Task { [weak self] in
+            let loaded = await Task.detached(priority: .userInitiated) { () -> ([String: (key: String, modified: Double)], [String: [Float]], Double, Double) in
+                let t0 = DispatchTime.now().uptimeNanoseconds
+                let keys = store.contentKeys(paths: paths)
+                let t1 = DispatchTime.now().uptimeNanoseconds
+                let vecs = missing.isEmpty ? [:] : store.pooledVectors(paths: missing)
+                let t2 = DispatchTime.now().uptimeNanoseconds
+                return (keys, vecs, Double(t1 - t0) / 1e6, Double(t2 - t1) / 1e6)
+            }.value
+            if omniMemLogEnabled {
+                FileHandle.standardError.write(Data(String(format: "[group] paths=%d missing=%d keys=%.1fms vectors=%.1fms\n",
+                                                          paths.count, missing.count, loaded.2, loaded.3).utf8))
+            }
+            await MainActor.run {
+                guard let self, self.resultsToken == token else { return }   // superseded search
+                self.groupingKeys = loaded.0
+                self.vectorCache.merge(loaded.1) { _, new in new }
+                // Over the cap, keep exactly the current page rather than dropping everything:
+                // wholesale clearing throws away the vectors the very next keystroke needs.
+                if self.vectorCache.count > Self.vectorCacheLimit {
+                    let keep = Set(paths)
+                    self.vectorCache = self.vectorCache.filter { keep.contains($0.key) }
+                }
+                self.groupingVectors = wantNear
+                    ? Dictionary(uniqueKeysWithValues: paths.compactMap { p in self.vectorCache[p].map { (p, $0) } })
+                    : [:]
+                self.recomputeResults()
+            }
+        }
+    }
+
     private func applyResults(_ hits: [SearchHit], resolved: String) {
         let isNewQuery = resolvedQuery != resolved
         rawResults = hits
         resolvedQuery = resolved
         resultsToken = resolved + "\u{1}" + filterSignature()
+        loadGroupingInputs(for: hits, token: resultsToken)
         enqueueRetagCandidates(hits)
         if isNewQuery {
             selection = nil; selectedPaths = []; selectionAnchor = nil
@@ -2878,13 +3036,24 @@ final class AppModel {
                 // vector - the exact indexed representation - so it always finds the file itself and
                 // cannot diverge from how the indexer parsed it. Falls back to re-embedding (with the
                 // index-matching extractor) for an external, not-yet-indexed file.
+                let tVec = DispatchTime.now().uptimeNanoseconds
                 let stored = similar ? store.fileVector(url.path) : nil
+                if omniMemLogEnabled, similar {
+                    FileHandle.standardError.write(Data(String(format: "[similar] fileVector=%.1fms hit=%@\n",
+                        Double(DispatchTime.now().uptimeNanoseconds - tVec) / 1e6,
+                        stored == nil ? "miss" : "stored").utf8))
+                }
                 let vec = stored ?? cachedVec
                     ?? engine.embedFileQuery(url, asDocument: similar, maxImageDimension: maxImg, maxVideoFrames: maxVid)
                 if Task.isCancelled { return }   // superseded while embedding: don't run the store scan
                 // Run the vector search OFF the main actor (matches the text path); doing it inside
                 // MainActor.run stalled the UI per file query, especially on a large index.
-                let hits = vec.map { store.search($0, filter: filter, topK: 60) }
+                let tScan = DispatchTime.now().uptimeNanoseconds
+                let hits = vec.map { store.search($0, filter: filter, topK: Self.searchTopK) }
+                if omniMemLogEnabled, similar {
+                    FileHandle.standardError.write(Data(String(format: "[similar] storeSearch=%.1fms hits=%d\n",
+                        Double(DispatchTime.now().uptimeNanoseconds - tScan) / 1e6, hits?.count ?? -1).utf8))
+                }
                 await MainActor.run {
                     guard token == self.searchToken else { return }
                     self.searching = false
@@ -2919,7 +3088,7 @@ final class AppModel {
                 searching = true
                 searchWorkTask = Task.detached(priority: .userInitiated) {
                     if Task.isCancelled { return }
-                    let hits = store.listMatching(filter: filter, topK: 60)
+                    let hits = store.listMatching(filter: filter, topK: Self.searchTopK)
                     await MainActor.run {
                         guard token == self.searchToken else { return }
                         self.applyResults(hits, resolved: self.rawQuery)
@@ -2938,7 +3107,7 @@ final class AppModel {
             touchQueryVector(q)   // LRU: a re-run query shouldn't be first in line for eviction
             searchWorkTask = Task.detached(priority: .userInitiated) {
                 if Task.isCancelled { return }   // superseded before the scan started: skip it
-                let hits = store.search(cached, filter: filter, topK: 60, textQuery: q)
+                let hits = store.search(cached, filter: filter, topK: Self.searchTopK, textQuery: q)
                 await MainActor.run {
                     guard token == self.searchToken else { return }
                     self.lastQueryVector = cached
@@ -2959,11 +3128,11 @@ final class AppModel {
             let tSearch = omniPerfEnabled ? Date() : nil
             if let g = engine.queryVectorGraph(q) {
                 if Task.isCancelled { return }
-                (hits, vec) = store.search(queryGraph: g, filter: filter, topK: 60, textQuery: q)
+                (hits, vec) = store.search(queryGraph: g, filter: filter, topK: Self.searchTopK, textQuery: q)
             } else {
                 vec = engine.embedQuery(q)   // high priority: jumps ahead of indexing
                 if Task.isCancelled { return }   // superseded while embedding: don't run the store scan
-                hits = store.search(vec, filter: filter, topK: 60, textQuery: q)
+                hits = store.search(vec, filter: filter, topK: Self.searchTopK, textQuery: q)
             }
             if let tSearch { omniPerfLog(String(format: "search total=%.0fms indexing=%@ hits=%d", -tSearch.timeIntervalSinceNow * 1000, indexingNow ? "YES" : "no", hits.count)) }
             await MainActor.run {
@@ -3127,7 +3296,7 @@ final class AppModel {
         let variant = modelVariant.rawValue
         if force {
             // Reset the visible counts to 0 directly; the actual wipe runs off the main actor below.
-            indexedFiles = 0; indexedChunks = 0; indexedKinds = []; rawResults = []
+            indexedFiles = 0; indexedChunks = 0; indexedKinds = []; rawResults = []; vectorCache.removeAll()
             indexStoredDim = 0
         }
         // Stamp the fingerprint at the START so a paused/partial index is not later mis-flagged obsolete.

@@ -456,10 +456,18 @@ private struct PerformanceTab: View {
                     set: { model.instantSearchEnabled = $0 }
                 ))
                 .toggleStyle(.switch)
+                // Byte-identical copies always collapse - that can only ever be right. This governs
+                // the NEAR tier, which is a similarity judgement, so it stays switchable.
+                Toggle("Stack near-identical results", isOn: Binding(
+                    get: { model.groupNearDuplicates },
+                    set: { model.groupNearDuplicates = $0 }
+                ))
+                .toggleStyle(.switch)
+                .help("Off: only byte-identical copies are stacked")
             } header: {
                 Text("Search")
             } footer: {
-                Text("Off: results update on Return.")
+                Text("Off: results update on Return. Identical copies always stack; near-identical ones are a judgement call.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -492,8 +500,8 @@ private struct PerformanceTab: View {
                     Text("Fast \u{00B7} PCA").tag(false)
                     Text("Detailed \u{00B7} UMAP").tag(true)
                 }
-                Toggle("Spread dots so none overlap", isOn: Binding(get: { model.mapNoOverlap }, set: { model.mapNoOverlap = $0 }))
-                    .help("Snaps dots to a grid so every file stays hoverable; hides density")
+                Toggle("Grid layout", isOn: Binding(get: { model.mapNoOverlap }, set: { model.mapNoOverlap = $0 }))
+                    .help("One file per cell, so every dot stays separately visible; hides density")
             } header: {
                 Text("Folder map")
             } footer: {

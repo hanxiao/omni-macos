@@ -309,12 +309,18 @@ enum SearchAdapter {
             else if let sinceInt = filters["since"] as? Int { filter.since = Double(sinceInt) }
         }
 
-        let hits = backend.search(query, topK: topK, filter: filter)
-        // Duplicate grouping: hits sharing a content_key are byte-identical files (the dedup
-        // sidecar), so an agent picking between matches knows which ones are literally copies.
+        // Duplicate collapsing, on by default: copies of one file waste an agent's top-k and its
+        // context exactly as they waste a human's screen. Pass "group_duplicates": false for the
+        // flat, pre-grouping list. When on, the search over-fetches so collapsing cannot leave the
+        // caller with fewer distinct files than it asked for.
+        let group = (body["group_duplicates"] as? Bool) ?? true
+        let fetch = group ? min(topK * 3, 300) : topK
+        let hits = backend.search(query, topK: fetch, filter: filter)
+        let groups = backend.groupedResults(hits, enabled: group, limit: topK)
         // Lockstep rule as duplicateChunks: only trust a key whose modified matches the hit's.
-        let contentKeys = backend.contentKeys(paths: hits.map { $0.path })
-        let results: [[String: Any]] = hits.map { hit in
+        let contentKeys = backend.contentKeys(paths: groups.map { $0.representative.path })
+        let results: [[String: Any]] = groups.map { g in
+            let hit = g.representative
             var row: [String: Any] = [
                 "path": hit.path,
                 "score": Double(max(0, min(1, hit.score))),
@@ -336,9 +342,18 @@ enum SearchAdapter {
             if hit.size > 0 { row["bytes"] = hit.size }
             if let mime = mimeType(forPath: hit.path) { row["mime_type"] = mime }
             if let ck = contentKeys[hit.path], ck.modified == hit.modified { row["content_key"] = ck.key }
+            // What this row stands for. Present only on a stack, so a flat result set is byte-for-byte
+            // what it was before grouping existed. "exact" = byte-identical (same content key AND
+            // size); "near" = same kind and extension, sizes within 10%, cosine >= 0.98.
+            if g.isStack {
+                row["duplicate_count"] = g.count
+                row["duplicates"] = g.members.dropFirst().map(\.path)
+                row["duplicate_kind"] = g.reason == .exact ? "exact" : "near"
+            }
             return row
         }
-        return HTTPResponse.json(["query": query, "results": results])
+        return HTTPResponse.json(["query": query, "results": results,
+                                  "grouped": group])
     }
 }
 

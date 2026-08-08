@@ -21,6 +21,9 @@ protocol ServingBackend: Sendable {
     /// Content-identity keys (dedup sidecar) for the given paths, with the sidecar's modified
     /// stamp so callers can apply the lockstep staleness rule. Same key = byte-identical content.
     func contentKeys(paths: [String]) -> [String: (key: String, modified: Double)]
+    /// Mean-pooled unit vectors per path - what duplicate grouping compares. Optional on the
+    /// protocol so a stub backend need not synthesize embeddings.
+    func pooledVectors(paths: [String]) -> [String: [Float]]
     /// Tags already generated at index time for the given paths. Read-only, no GPU. A key is
     /// present only for indexed MEDIA rows; an empty array means indexed media with no tags yet.
     func storedTags(paths: [String]) -> [String: [String]]
@@ -84,6 +87,10 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
         store.contentKeys(paths: paths)
     }
 
+    func pooledVectors(paths: [String]) -> [String: [Float]] {
+        store.pooledVectors(paths: paths)
+    }
+
     func storedTags(paths: [String]) -> [String: [String]] {
         store.storedTags(paths: paths)
     }
@@ -119,5 +126,29 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
         return scores.enumerated().map {
             tagger.finalize($0.element, cropMax: cropMax[$0.offset], topK: topK, accumulatePrior: false)
         }
+    }
+}
+
+// MARK: - Duplicate grouping for served results
+
+extension ServingBackend {
+    /// Group a served result page exactly as the app's UI does - same ResultGrouping, same
+    /// thresholds and guards - so an agent and a human looking at the same query see the same
+    /// notion of "these are the same file". Grouping is post-hoc here too: the search itself is
+    /// untouched, and `flat` is returned in rank order with each representative first.
+    ///
+    /// Returns the representatives plus, per representative, the copies it stands for. Callers
+    /// that pass `enabled: false` get every hit back as its own group, which is the pre-grouping
+    /// behaviour byte-for-byte.
+    func groupedResults(_ hits: [SearchHit], enabled: Bool, limit: Int) -> [ResultGroup] {
+        guard enabled, hits.count > 1 else {
+            return Array(hits.prefix(limit)).map { ResultGroup(members: [$0], reason: .single) }
+        }
+        let paths = hits.map(\.path)
+        let groups = ResultGrouping.group(hits: hits,
+                                          vectors: pooledVectors(paths: paths),
+                                          contentKeys: contentKeys(paths: paths),
+                                          nearEnabled: true)
+        return Array(groups.prefix(limit))
     }
 }

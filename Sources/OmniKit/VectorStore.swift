@@ -645,6 +645,46 @@ public final class VectorStore: @unchecked Sendable {
         return UInt16(truncatingIfNeeded: (b &+ 0x7FFF &+ ((b >> 16) & 1)) >> 16)
     }
     @inline(__always) static func fromBF16(_ x: UInt16) -> Float { Float(bitPattern: UInt32(x) << 16) }
+
+    /// dst[k] += bf16(src[k]), vectorized. bf16 -> fp32 is a pure 16-bit left shift into the
+    /// mantissa, so eight lanes convert with one shift and one bitcast - no lookup, no libm, no
+    /// intermediate buffer. The scalar version of this loop (the pattern rankChunks uses) is the
+    /// hot inner loop of pooling: 768 iterations per chunk row, and a 120-file result page can
+    /// carry thousands of rows.
+    /// dst[k] = bf16(src[k]), vectorized - the write-only sibling of accumulateBF16.
+    @inline(__always)
+    static func expandBF16(_ src: UnsafePointer<UInt16>, into dst: UnsafeMutablePointer<Float>, count: Int) {
+        var k = 0
+        while k + 8 <= count {
+            let raw = SIMD8<UInt32>(
+                UInt32(src[k]), UInt32(src[k + 1]), UInt32(src[k + 2]), UInt32(src[k + 3]),
+                UInt32(src[k + 4]), UInt32(src[k + 5]), UInt32(src[k + 6]), UInt32(src[k + 7])) &<< 16
+            for l in 0 ..< 8 { dst[k + l] = Float(bitPattern: raw[l]) }
+            k += 8
+        }
+        while k < count { dst[k] = fromBF16(src[k]); k += 1 }
+    }
+
+    @inline(__always)
+    static func accumulateBF16(_ src: UnsafePointer<UInt16>, into dst: UnsafeMutablePointer<Float>, count: Int) {
+        var k = 0
+        while k + 8 <= count {
+            let raw = SIMD8<UInt32>(
+                UInt32(src[k]), UInt32(src[k + 1]), UInt32(src[k + 2]), UInt32(src[k + 3]),
+                UInt32(src[k + 4]), UInt32(src[k + 5]), UInt32(src[k + 6]), UInt32(src[k + 7]))
+            let shifted = raw &<< 16
+            let widened = SIMD8<Float>(
+                Float(bitPattern: shifted[0]), Float(bitPattern: shifted[1]),
+                Float(bitPattern: shifted[2]), Float(bitPattern: shifted[3]),
+                Float(bitPattern: shifted[4]), Float(bitPattern: shifted[5]),
+                Float(bitPattern: shifted[6]), Float(bitPattern: shifted[7]))
+            let acc = SIMD8<Float>(dst[k], dst[k + 1], dst[k + 2], dst[k + 3],
+                                   dst[k + 4], dst[k + 5], dst[k + 6], dst[k + 7]) + widened
+            for l in 0 ..< 8 { dst[k + l] = acc[l] }
+            k += 8
+        }
+        while k < count { dst[k] += fromBF16(src[k]); k += 1 }
+    }
     private func bf16Row(_ v: [Float]) -> [UInt16] { v.map(Self.toBF16) }
     // Force a full base rebuild on the next search. Used by structural changes (delete/compact/
     // reload) that shift row indices; plain appends do NOT call this (they extend the delta).
@@ -1861,27 +1901,49 @@ public final class VectorStore: @unchecked Sendable {
     /// file itself, and never re-parses the file (so it can't diverge from how the indexer parsed it).
     public func fileVector(_ path: String) -> [Float]? {
         queue.sync {
-            ensureCompactLocked()
+            // NOT ensureCompactLocked(). Compaction rewrites the whole base, and measured on a
+            // 4.5M-row index that is ~1 SECOND held on the serial queue - paid by whoever calls
+            // first after an index pass, which for this function is the user pressing Find similar,
+            // and it blocks concurrent searches for the duration. Tombstones are collected by the
+            // base build on the search path anyway; here it is enough to skip them, exactly as
+            // pooledVectors does.
             // pathID is the intern table over the paths present in `rows`, so a miss means "not
             // indexed" without scanning; a hit turns the row scan into Int32 compares instead of
             // N string compares (~80B memcmp + ARC each) - 10-50x on a large index.
             guard dim > 0, let id = pathID[path] else { return nil }
             var sum = [Float](repeating: 0, count: dim)
             var count = 0
+            // Bounded by this file's live chunk count (ensureCompactLocked above has already
+            // collected any tombstones, so every match is live), and vectorized: Find similar is a
+            // menu action on a result the user is looking at, and it was scanning the whole base -
+            // 4.5M rows - with a scalar 768-iteration conversion per matching row, to pool a
+            // handful of chunks.
+            var remaining = Int(fileChunkCount[Int(id)])
+            let dead = deadRows
+            let hasDead = !dead.isEmpty
             flat16.withUnsafeBufferPointer { fb in
                 guard let base = fb.baseAddress else { return }
-                for i in 0 ..< fileID.count where fileID[i] == id {
-                    let off = i * dim
-                    for k in 0 ..< dim { sum[k] += Self.fromBF16(base[off + k]) }
-                    count += 1
+                sum.withUnsafeMutableBufferPointer { sp in
+                    guard let dst = sp.baseAddress else { return }
+                    var i = 0
+                    while i < fileID.count, remaining > 0 {
+                        if fileID[i] == id, !(hasDead && dead.contains(Int32(i))) {
+                            Self.accumulateBF16(base + i * dim, into: dst, count: dim)
+                            count += 1
+                            remaining -= 1
+                        }
+                        i += 1
+                    }
                 }
             }
             guard count > 0 else { return nil }
+            // The 1/count of the mean cancels in the normalization, so one vDSP scale does both.
             var norm: Float = 0
-            for k in 0 ..< dim { sum[k] /= Float(count); norm += sum[k] * sum[k] }
-            norm = norm.squareRoot()
+            let d = vDSP_Length(dim)
+            sum.withUnsafeBufferPointer { vDSP_dotpr($0.baseAddress!, 1, $0.baseAddress!, 1, &norm, d) }
             guard norm > 0 else { return nil }
-            for k in 0 ..< dim { sum[k] /= norm }
+            var scale = 1.0 / norm.squareRoot()
+            sum.withUnsafeMutableBufferPointer { vDSP_vsmul($0.baseAddress!, 1, &scale, $0.baseAddress!, 1, d) }
             return sum
         }
     }
@@ -3642,7 +3704,8 @@ public final class VectorStore: @unchecked Sendable {
     /// Rank a single file's chunks against the query (for the "which passage matched" UI).
     public func rankChunks(_ query: [Float], path: String, topK: Int = 6) -> [ChunkHit] {
         queue.sync {
-            ensureCompactLocked()
+            // Tombstones skipped, not compacted - see fileVector. Disclosing a row's passages must
+            // not trigger a base rewrite on the queue that search shares.
             guard dim > 0, query.count == dim, let id = pathID[path] else { return [] }
             // Snippets are not resident (see Row): fetch this one file's chunk snippets in a single
             // indexed SELECT, keyed by chunk index.
@@ -3660,11 +3723,25 @@ public final class VectorStore: @unchecked Sendable {
             var hits: [ChunkHit] = []
             let d = vDSP_Length(dim)
             var rowF = [Float](repeating: 0, count: dim)   // one row, bf16 -> fp32 for the dot
+            // Stop once this file's live chunks are all scored. This runs every time the user
+            // discloses a row's passages, and without the bound it scanned the whole base (4.5M
+            // rows) to find the handful of rows belonging to ONE file.
+            var remaining = Int(fileChunkCount[Int(id)])
+            let dead = deadRows
+            let hasDead = !dead.isEmpty
             query.withUnsafeBufferPointer { q in
                 flat16.withUnsafeBufferPointer { fb in
                     guard let qp = q.baseAddress, let mb = fb.baseAddress else { return }
-                    for i in 0 ..< fileID.count where fileID[i] == id {
-                        for k in 0 ..< dim { rowF[k] = Self.fromBF16(mb[i * dim + k]) }
+                    var i = 0
+                    while i < fileID.count, remaining > 0 {
+                        defer { i += 1 }
+                        guard fileID[i] == id, !(hasDead && dead.contains(Int32(i))) else { continue }
+                        remaining -= 1
+                        // Vectorized bf16 -> fp32 (see accumulateBF16): the scalar version of this
+                        // conversion ran dim times per chunk row.
+                        rowF.withUnsafeMutableBufferPointer { rp in
+                            Self.expandBF16(mb + i * dim, into: rp.baseAddress!, count: dim)
+                        }
                         var dot: Float = 0
                         rowF.withUnsafeBufferPointer { vDSP_dotpr($0.baseAddress!, 1, qp, 1, &dot, d) }
                         if dot.isFinite { hits.append(ChunkHit(chunkIndex: rows[i].chunkIndex, score: dot, snippet: snippets[rows[i].chunkIndex] ?? "", locator: rows[i].locator)) }
@@ -3689,7 +3766,8 @@ public final class VectorStore: @unchecked Sendable {
     /// the winners. Scores are cosine (vectors are L2-normalized at index time).
     public func rankChunksAcross(_ query: [Float], paths: [String], topK: Int = 10) -> [InlineChunkHit] {
         queue.sync {
-            ensureCompactLocked()
+            // Skip tombstones rather than compact - see fileVector. This is an interactive path
+            // (an agent's search_inline, the passages panel) and must not pay for a base rewrite.
             let n = rows.count
             guard dim > 0, query.count == dim, !paths.isEmpty, n > 0, flat16.count == n * dim else { return [] }
             // Normalize each requested path ONCE (strip a single trailing slash) so the prefix test is
@@ -3699,18 +3777,46 @@ public final class VectorStore: @unchecked Sendable {
                 return b.isEmpty ? nil : b
             }
             guard !bases.isEmpty else { return [] }
-            var inScope = Set<Int32>()
-            for (p, fid) in pathID where bases.contains(where: { p == $0 || p.hasPrefix($0 + "/") }) {
-                inScope.insert(fid)
+            // Scope resolution, cheapest first. Callers overwhelmingly pass FILE paths, and an
+            // indexed file is one dictionary hit - so try that before falling back to the prefix
+            // scan, which visits every interned path in the index (212k on a large one) and runs a
+            // prefix test per argument against each. That scan was ~1.6 s for 12 files; it now runs
+            // only for arguments that are genuinely folders.
+            var inScope = [Bool](repeating: false, count: max(1, fileIDCount))
+            var scoped = 0
+            var folderBases: [String] = []
+            for b in bases {
+                if let fid = pathID[b] {
+                    if !inScope[Int(fid)] { inScope[Int(fid)] = true; scoped += 1 }
+                } else {
+                    folderBases.append(b)
+                }
             }
-            guard !inScope.isEmpty else { return [] }
+            if !folderBases.isEmpty {
+                for (p, fid) in pathID where folderBases.contains(where: { p.hasPrefix($0 + "/") }) {
+                    if !inScope[Int(fid)] { inScope[Int(fid)] = true; scoped += 1 }
+                }
+            }
+            guard scoped > 0 else { return [] }
 
-            // In-scope row indices, capped so an over-broad scope can't hold the lock.
+            // Rows we expect, from the live per-file counts, so the walk can stop once it has them
+            // instead of always running to the end of a 4.5M-row base. Membership is a flat array
+            // read rather than a Set hash per row.
+            var remaining = 0
+            for id in 0 ..< inScope.count where inScope[id] { remaining += Int(fileChunkCount[id]) }
+
             var idx: [Int] = []
-            idx.reserveCapacity(4096)
-            for i in 0 ..< fileID.count where inScope.contains(fileID[i]) {
-                idx.append(i)
-                if idx.count > Self.maxInlineScanRows { return [] }   // scope too broad - narrow the paths
+            idx.reserveCapacity(min(4096, max(16, remaining)))
+            let dead = deadRows
+            let hasDead = !dead.isEmpty
+            var i = 0
+            while i < fileID.count, remaining > 0 {
+                if inScope[Int(fileID[i])], !(hasDead && dead.contains(Int32(i))) {
+                    idx.append(i)
+                    remaining -= 1
+                    if idx.count > Self.maxInlineScanRows { return [] }   // scope too broad - narrow the paths
+                }
+                i += 1
             }
             guard !idx.isEmpty else { return [] }
 
@@ -3830,6 +3936,93 @@ public final class VectorStore: @unchecked Sendable {
 
     public func residentSearchMemory() -> SearchMemory {
         queue.sync { memoryLocked() }
+    }
+
+    /// Mean-pooled, L2-normalized vector per path, for a SMALL explicit set (a page of search
+    /// results). Same pooling as vectorsUnderFolder, but membership-tested instead of
+    /// prefix-tested, and reading the resident base rather than SQLite - so a caller can compare
+    /// results to each other on every keystroke without touching the database.
+    ///
+    /// Paths with no resident rows are simply absent from the result; the caller must treat a
+    /// missing vector as "cannot compare", never as "no match".
+    public func pooledVectors(paths: [String]) -> [String: [Float]] {
+        queue.sync {
+            guard dim > 0, !paths.isEmpty else { return [:] }
+            // Wanted paths -> dense file ids -> a flat id->slot table, so the row walk below compares
+            // an Int32 instead of hashing a path String per row. On a 4.5M-row index that is the
+            // difference between millions of string hashes and an array index, on the same serial
+            // queue interactive search runs on. (Same technique vectorsUnderFolder uses; a per-file
+            // row index would remove the walk entirely, but nothing else in the store maintains one.)
+            var globalToLocal = [Int32](repeating: -1, count: max(1, fileIDCount))
+            var order: [String] = []
+            order.reserveCapacity(paths.count)
+            for p in paths {
+                guard let gid = pathID[p], globalToLocal[Int(gid)] < 0 else { continue }
+                globalToLocal[Int(gid)] = Int32(order.count)
+                order.append(idPath[Int(gid)])
+            }
+            guard !order.isEmpty else { return [:] }
+
+            let n = order.count
+            var sums = [Float](repeating: 0, count: n * dim)
+            var counts = [Int](repeating: 0, count: n)
+            // ONE fused pass: match and accumulate together. The two-pass version materialized a
+            // row-index and a slot array (up to ~1 MB of transients for 120 multi-chunk files) and
+            // walked the rows twice for no benefit - the match test is a single array load.
+            // How many rows we are looking for, from the per-file live chunk counts the store
+            // already maintains. The walk stops the moment it has them all: without this it always
+            // scans every row in the index (4.5M on a large one) even when the wanted files sit at
+            // the front, which is the difference between a bounded cost and a full-index cost.
+            var remaining = 0
+            for p in order { if let gid = pathID[p] { remaining += Int(fileChunkCount[Int(gid)]) } }
+            // Tombstones: `rows` keeps deleted chunks until a compaction collects them, and
+            // fileChunkCount counts only LIVE ones. Pooling a dead row would fold a deleted chunk
+            // into the file's vector, and would also spend one of `remaining` on it and stop the
+            // walk before the live rows were all in. Readers that can afford it call
+            // ensureCompactLocked() first; this one runs on a keystroke, so it filters instead -
+            // and the check costs nothing in the overwhelmingly common case of a clean base.
+            let dead = deadRows
+            let hasDead = !dead.isEmpty
+            fileID.withUnsafeBufferPointer { fid in
+                flat16.withUnsafeBufferPointer { fb in
+                    guard let base = fb.baseAddress else { return }
+                    sums.withUnsafeMutableBufferPointer { s in
+                        guard let sp = s.baseAddress else { return }
+                        var i = 0
+                        while i < rows.count, remaining > 0 {
+                            let li = Int(globalToLocal[Int(fid[i])])
+                            if li >= 0, !(hasDead && dead.contains(Int32(i))) {
+                                Self.accumulateBF16(base + i * dim, into: sp + li * dim, count: dim)
+                                counts[li] += 1
+                                remaining -= 1
+                            }
+                            i += 1
+                        }
+                    }
+                }
+            }
+            var out: [String: [Float]] = [:]
+            out.reserveCapacity(n)
+            let d = vDSP_Length(dim)
+            for f in 0 ..< n {
+                // Mean and L2-normalize through Accelerate: one dot product for the norm and one
+                // scalar multiply for both divisions folded together (mean * 1/||.|| in one pass).
+                var v = [Float](repeating: 0, count: dim)
+                var norm: Float = 0
+                sums.withUnsafeBufferPointer { sp in
+                    let row = sp.baseAddress! + f * dim
+                    vDSP_dotpr(row, 1, row, 1, &norm, d)
+                    guard norm > 0 else { return }
+                    var scale = 1.0 / norm.squareRoot()      // the 1/count cancels in the norm
+                    v.withUnsafeMutableBufferPointer { vp in
+                        vDSP_vsmul(row, 1, &scale, vp.baseAddress!, 1, d)
+                    }
+                }
+                guard norm > 0 else { continue }             // all-zero row: not comparable
+                out[order[f]] = v
+            }
+            return out
+        }
     }
 
     /// Non-blocking variant for the Settings monitor. The work is 6 us; the WAIT is what matters -

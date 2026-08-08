@@ -353,6 +353,15 @@ struct ContentView: View {
     }
 
     @ViewBuilder private var belowThresholdFooter: some View {
+        // Collapsing is never silent: if the list is shorter than the matches behind it, the
+        // difference is stated here. Not a button - the copies are reachable from their own stack,
+        // and a global "un-collapse" would just restore the noise the feature removes.
+        if model.collapsedCount > 0 {
+            Text("\(model.collapsedCount) duplicate\(model.collapsedCount == 1 ? "" : "s") stacked into the results above")
+                .font(.caption).foregroundStyle(.tertiary)
+                .frame(maxWidth: .infinity)
+                .padding(.top, 8)
+        }
         if model.hiddenByThreshold > 0 {
             Button { model.showAllBelowThreshold() } label: {
                 Label("Show \(model.hiddenByThreshold) more \(model.hiddenByThreshold == 1 ? "match" : "matches")", systemImage: "chevron.down")
