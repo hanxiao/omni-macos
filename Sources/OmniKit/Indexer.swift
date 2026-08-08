@@ -1210,7 +1210,13 @@ public final class Indexer: @unchecked Sendable {
         case .video: fp = "v2|d\(settings.maxImageDimension)|f\(settings.maxVideoFrames)|s\(Int(Self.mediaSegmentSeconds))"
         case .audio: fp = "s\(OmniAudioPreprocess.segmentMelFrames)"   // segmenting changes long-audio chunking
         }
-        return "1|\(category.rawValue)|\(ext)|m\(embedder.dim)|\(fp)|\(digest)"
+        // SIZE is part of the identity, and the version is 2 because of it. The digest covers only
+        // the bytes extract() reads - 2 MB for text - so without the size two files that merely
+        // SHARE A 2 MB PREFIX hashed identically and the indexer reused one's vectors for the
+        // other. Measured on a 212k-file index: 9 key groups / 35 files aliased that way, all
+        // append-only session logs from 4.2 MB to 18.0 MB carrying one embedding between them.
+        // Genuinely identical copies still dedup - equal bytes implies equal size.
+        return "2|\(category.rawValue)|\(ext)|m\(embedder.dim)|s\(file.size)|\(fp)|\(digest)"
     }
 
     /// Streaming SHA-256 of a file's first `cap` bytes (whole file when cap covers it).
