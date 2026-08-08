@@ -1160,6 +1160,157 @@ if args.count >= 2 && args[1] == "rowwindowcheck" {
                                (args.count >= 4 ? Int(args[3]) : nil) ?? 90))
 }
 
+// Store invariants that only a caller can break: omni-verify storefix
+// Each case below is a bug that was live in the store and is held down here because none of them is
+// reachable from the shipped indexer - they need the public store API used in a way the indexer
+// happens not to use it, so no existing test or harness covered them.
+func storefixRun() throws -> Int32 {
+    let dim = 32
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("omni-storefix-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+    try? FileManager.default.removeItem(at: root)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    var bad = 0
+    func check(_ ok: Bool, _ what: String, _ detail: String = "") {
+        print("  \(ok ? "ok  " : "FAIL") \(what)\(detail.isEmpty ? "" : "  (\(detail))")")
+        if !ok { bad += 1 }
+    }
+    func store(_ name: String) throws -> VectorStore {
+        let u = root.appendingPathComponent("\(name).sqlite")
+        try? FileManager.default.removeItem(at: u)
+        return try VectorStore(dbURL: u)
+    }
+    func chunk(_ p: String, _ i: Int, kind: String = "text", width: Int = dim) -> IndexedChunk {
+        IndexedChunk(path: p, modified: 1, size: 1, kind: kind, chunkIndex: i, snippet: "s\(i)",
+                     embedding: width == 0 ? [] : PaperVectors.vec(i + 7, dim: width))
+    }
+    print("storefix   (invariants reachable only through the public store API)")
+
+    // 1. A batch carrying the same path twice. SQL deletes per ENTRY inside the loop, so the last
+    // entry wins there; memory removed per DISTINCT path once and then appended every entry, so it
+    // ended up holding rows SQLite did not have. Reopening rebuilds from SQLite, so a memory/SQL
+    // divergence shows up as a row count that changes across a close.
+    do {
+        let s = try store("dupbatch")
+        try s.replaceMany([("a", (0 ..< 6).map { chunk("a", $0) }),
+                           ("b", (0 ..< 6).map { chunk("b", $0) }),
+                           ("a", (0 ..< 6).map { chunk("a", $0) })])
+        let live = s.count, aCount = s.chunkCount(path: "a")
+        s.close()
+        let s2 = try VectorStore(dbURL: root.appendingPathComponent("dupbatch.sqlite"))
+        let reloaded = s2.count
+        s2.close()
+        check(live == 12 && aCount == 6, "duplicate path in one replaceMany batch stores it once",
+              "rows=\(live) want 12, chunkCount(a)=\(aCount) want 6")
+        check(live == reloaded, "resident rows match SQLite across a reopen", "\(live) vs \(reloaded)")
+    }
+
+    // 2. A rejected write must not leave `dim` set on an empty store: dim decides whether a later
+    // delete renumbers file ids, tombstones, or takes the id-mask path.
+    do {
+        let s = try store("dimreject")
+        var threw = false
+        do { try s.replace(path: "a", chunks: [chunk("a", 0, width: 8), chunk("a", 1, width: 16)]) }
+        catch { threw = true }
+        check(threw, "a mixed-dimension batch is rejected")
+        var second = true
+        do { try s.replace(path: "b", chunks: [chunk("b", 0, width: 16), chunk("b", 1, width: 16)]) }
+        catch { second = false }
+        check(second, "the store still accepts a fresh dimension after the rejected write")
+        s.close()
+    }
+
+    // 3. A zero-length embedding used to satisfy `count == dim` while dim was still 0, appending
+    // rows with no vector bytes behind them.
+    do {
+        let s = try store("emptyembed")
+        var threw = false
+        do { try s.replace(path: "a", chunks: [chunk("a", 0, width: 0)]) } catch { threw = true }
+        check(threw, "a zero-length embedding is rejected")
+        check(s.count == 0, "no rows were appended for it", "rows=\(s.count)")
+        s.close()
+    }
+
+    // 4. close() ran the sidecar stamp - and with it a full physical compaction - before it checked
+    // whether it had already closed.
+    do {
+        let s = try store("doubleclose")
+        try s.replaceMany([("a", (0 ..< 4).map { chunk("a", $0) })])
+        s.close(); s.close(); s.close()
+        check(true, "repeated close() is a no-op and does not trap")
+    }
+
+    // 5. A predicate that matches SOME of a file's rows. Every removal helper reports the paths it
+    // TOUCHED, and presentPaths used to subtract all of them - evicting a path that still had rows,
+    // so the next replace() of that file skipped its remove-before-append and stored a second copy.
+    // One path with two kinds is not something the indexer produces, but the store API allows it.
+    do {
+        let s = try store("partial")
+        try s.replace(path: "a", chunks: (0 ..< 3).map { chunk("a", $0, kind: "text") }
+                                + (3 ..< 6).map { chunk("a", $0, kind: "image") })
+        check(s.chunkCount(path: "a") == 6, "mixed-kind file stored", "chunks=\(s.chunkCount(path: "a"))")
+        s.deleteKinds(["image"])
+        let afterDelete = s.chunkCount(path: "a")
+        check(afterDelete == 3, "partial delete left the other kind", "chunks=\(afterDelete)")
+        try s.replace(path: "a", chunks: (0 ..< 2).map { chunk("a", $0, kind: "text") })
+        let afterReplace = s.chunkCount(path: "a")
+        check(afterReplace == 2, "re-saving a partially-deleted file replaces rather than duplicates",
+              "chunks=\(afterReplace) want 2")
+        let live = s.count
+        s.close()
+        let s2 = try VectorStore(dbURL: root.appendingPathComponent("partial.sqlite"))
+        let reloaded = s2.count
+        s2.close()
+        check(live == reloaded, "resident rows match SQLite across a reopen", "\(live) vs \(reloaded)")
+    }
+
+    print("  \(bad == 0 ? "ok  " : "FAIL") \(bad) failing invariant(s)")
+    return bad == 0 ? 0 : 1
+}
+if args.count >= 2 && args[1] == "storefix" { exit(try storefixRun()) }
+
+// Open a REAL index and check its bookkeeping: omni-verify storeaudit <index.sqlite>
+// Everything else here builds its own synthetic store, so nothing covered an index an actual app
+// session produced - with whatever mix of tombstones, folds and interrupted writes that session left
+// behind. Run it with OMNI_ROW_WINDOW_VERIFY=1 to also re-derive fileChunkCount and the row windows
+// from a full rescan at every mutation (it traps on divergence).
+func storeauditRun(_ path: String) throws -> Int32 {
+    let url = URL(fileURLWithPath: path)
+    guard FileManager.default.fileExists(atPath: url.path) else { print("  FAIL no index at \(path)"); return 1 }
+    let store = try VectorStore(dbURL: url)
+    defer { store.close() }
+    var bad = 0
+    func check(_ ok: Bool, _ what: String) { print("  \(ok ? "ok  " : "FAIL") \(what)"); if !ok { bad += 1 } }
+    let stats = store.allIndexStats()
+    let use = store.rowWindowUse
+    print("storeaudit \(url.lastPathComponent)")
+    print("  files=\(stats.fileCount) chunks=\(stats.chunkCount) kinds=\(stats.kinds.sorted()) exts=\(stats.exts.sorted().prefix(8))")
+    print(String(format: "  windows covering=%@ files=%d live=%d spanned/live=%.4f widest=%d",
+                 use.covering ? "yes" : "no", use.files, use.live,
+                 Double(use.spanned) / Double(max(1, use.live)), use.widest))
+    check(use.live == stats.chunkCount, "per-file live counts sum to the chunk count")
+    check(use.files == stats.fileCount, "per-file windows cover exactly the live files")
+    check(use.covering, "the row window table is covering")
+    // Per-file reads on a sample, against the counts the store reports independently.
+    let files = store.indexedFiles().keys.sorted()
+    var vecOK = 0, chunkOK = 0, sampled = 0
+    for p in stride(from: 0, to: files.count, by: max(1, files.count / 40)).map({ files[$0] }) {
+        sampled += 1
+        if store.fileVector(p) != nil { vecOK += 1 }
+        if store.chunkCount(path: p) > 0 { chunkOK += 1 }
+    }
+    check(sampled > 0 && vecOK == sampled, "every sampled file pools a vector (\(vecOK)/\(sampled))")
+    check(sampled > 0 && chunkOK == sampled, "every sampled file reports chunks (\(chunkOK)/\(sampled))")
+    let pooled = store.pooledVectors(paths: Array(files.prefix(60)))
+    check(pooled.count == min(60, files.count), "pooledVectors answered for every requested path (\(pooled.count))")
+    let after = store.rowWindowUse
+    check(after.unproven == 0, "no read fell back to the full walk (unproven=\(after.unproven))")
+    print("  \(bad == 0 ? "ok  " : "FAIL") \(bad) failing check(s)")
+    return bad == 0 ? 0 : 1
+}
+if args.count >= 3 && args[1] == "storeaudit" { exit(try storeauditRun(args[2])) }
+
 // What the per-file row window is worth: omni-verify rowwindowbench [rows]
 // Position in the index is the whole story. The readers already stopped once they had the file's
 // chunks, so a file at the FRONT was always cheap; the cost was the rows BEFORE the file, and the

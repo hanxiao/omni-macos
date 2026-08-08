@@ -754,10 +754,13 @@ public final class VectorStore: @unchecked Sendable {
     // where an exact per-file row list costs 4 bytes per ROW, 18.9 MB as CSR and 27.5 MB as
     // [[Int32]] (measured), and buys nothing over the range on real data.
     //
-    // The range is also what makes this safe to bolt onto a lockstep invariant that search
-    // correctness already depends on. It is maintained by a min/max at the one funnel every append
-    // goes through, so it can only ever be too WIDE, never too narrow - and too wide is slow, not
-    // wrong. Fragmentation is reported by `omni-verify rowwindowbench`, so it stays measured.
+    // Safety, since this attaches to a lockstep invariant search correctness already depends on, has
+    // three parts and none of them is "maintain it carefully". APPENDS can only widen a window (a
+    // min/max at the one funnel they all go through), and too wide is slow, not wrong. MOVES are the
+    // only way to narrow one, so rowWindowCovered is an O(1) store-wide tripwire in front of every
+    // read. And a window is never trusted even then: provenRowRangesLocked re-derives completeness
+    // per call and hands back the whole row array if it does not hold. Fragmentation - the property
+    // the range shape rests on - is reported by `omni-verify rowwindowbench` rather than assumed.
     private var fileRowLo: [Int32] = []
     private var fileRowHi: [Int32] = []
     /// `lo` of a file with no rows. Paired with `hi == 0`, so the range is empty either way.
@@ -1166,8 +1169,20 @@ public final class VectorStore: @unchecked Sendable {
         mutationGen = Int64(scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='mutation_gen'"))
         migrateScanKind()   // bumps the gen inside its txn when it rewrites kinds
         setUserVersion(Self.schemaVersion)
-        loadIntoMemory()
-        tryAdoptQuantReplicaLocked()   // init has exclusive access; every failure mode falls back to build-on-first-search
+        // UNDER THE QUEUE, because init does NOT have exclusive access the way it looks like it
+        // does. migrateScanKind above reaches bumpGenLocked, which arms scheduleIdleFoldLocked - a
+        // 2-second timer that hops to a background thread and enters queue.sync. It arms on the
+        // first open of any index predating the scan_kind_migrated flag, whether or not anything is
+        // actually relabeled (the transaction runs even when the relabel set is empty). Loading a
+        // multi-million-row index takes far longer than 2 seconds, so that timer used to land INSIDE
+        // this load: rebuildBaseLocked snapshots fileID through a buffer pointer while the loop below
+        // is still appending to it, which is a data race on an array being reallocated. Taking the
+        // queue here makes the timer wait, and makes every access to the resident state
+        // queue-serialized, which is what the rest of the class already assumes.
+        queue.sync {
+            loadIntoMemory()
+            tryAdoptQuantReplicaLocked()   // every failure mode falls back to build-on-first-search
+        }
     }
 
     /// One-time re-label of scanned-PDF rows in pre-'scan' indexes. Those indexes stored
@@ -1262,10 +1277,15 @@ public final class VectorStore: @unchecked Sendable {
     /// synchronous checkpoint + close runs off the main actor instead of at the @MainActor ref-drop site.
     public func close() {
         queue.sync {
+            // Before the stamp, not after it. stampRowSidecarLocked starts with ensureCompactLocked,
+            // which physically compacts and shifts every row index; running that on an
+            // already-closed store is pure work whose result nothing can persist, and it used to
+            // happen on every repeat close() because the only `closed` check sat three lines below.
+            guard !closed else { return }
             stampRowSidecarLocked(sync: true)       // durable row table; no-op if current
             persistQuantReplicaLocked(sync: true)   // durable before the handle goes away; no-op if current
             flat16.releaseFileLock()                // successor stores may now adopt the vec sidecar
-            guard !closed, let h = db else { closed = true; return }
+            guard let h = db else { closed = true; return }
             sqlite3_finalize(snippetStmt); snippetStmt = nil   // finalize cached stmts before close (F3/F8)
             sqlite3_finalize(dedupStmt); dedupStmt = nil
             sqlite3_exec(h, "PRAGMA wal_checkpoint(TRUNCATE);", nil, nil, nil)
@@ -1292,13 +1312,9 @@ public final class VectorStore: @unchecked Sendable {
     public func replace(path: String, chunks: [IndexedChunk]) throws {
         try queue.sync {
             guard dbOpen() else { throw OmniError.store("store closed") }
-            // Dimension guard: all vectors must share the index dimension.
-            for c in chunks {
-                if dim == 0 { dim = c.embedding.count }
-                guard c.embedding.count == dim else {
-                    throw OmniError.store("embedding dim \(c.embedding.count) != index dim \(dim)")
-                }
-            }
+            // Dimension guard: all vectors must share the index dimension. Validated BEFORE `dim` is
+            // assigned - see validateDimLocked for why a rejected write must not leave it set.
+            try validateDimLocked(chunks)
             exec("BEGIN;")
             deletePathLocked(path)
             let bfs = chunks.map { bf16Row($0.embedding) }   // fp32 -> bf16 once, reused for blob + memory
@@ -1356,6 +1372,28 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
+    /// Check every chunk against the index dimension, and only then adopt one on a fresh index.
+    ///
+    /// The old form assigned inside the loop (`if dim == 0 { dim = c.embedding.count }`) and threw on
+    /// the next chunk, so a REJECTED write permanently set `dim` on an empty store. `dim` is not just
+    /// a width: it is the switch that decides whether a later delete renumbers file ids
+    /// (removeRowsLocked's dim == 0 branch), tombstones (tombstoneOnlyLocked requires dim > 0), or
+    /// takes the id-mask path - so a failed write silently changed how the next delete behaves.
+    ///
+    /// It also let a ZERO-LENGTH embedding through: with dim still 0, `0 == 0` satisfied the guard,
+    /// and the rows appended with nothing appended to flat16. That is the `dim == 0 && !rows.isEmpty`
+    /// state, and the next write carrying a real vector would set dim to a width the rows already in
+    /// the table have no bytes for.
+    private func validateDimLocked(_ chunks: [IndexedChunk]) throws {
+        guard let width = chunks.first?.embedding.count else { return }
+        guard width > 0 else { throw OmniError.store("empty embedding") }
+        let want = dim == 0 ? width : dim
+        for c in chunks where c.embedding.count != want {
+            throw OmniError.store("embedding dim \(c.embedding.count) != index dim \(want)")
+        }
+        dim = want
+    }
+
     /// Replace many paths in one transaction and ONE in-memory rebuild, instead of one rebuild per
     /// file. The file-watcher update path can touch many already-indexed files at once (bulk edit,
     /// git checkout, synced folder); per-file replace() would be O(N) rebuild each = O(N*M). Result
@@ -1378,14 +1416,7 @@ public final class VectorStore: @unchecked Sendable {
         guard !work.isEmpty else { return }
         try queue.sync {
             guard dbOpen() else { throw OmniError.store("store closed") }
-            for it in work {
-                for c in it.chunks {
-                    if dim == 0 { dim = c.embedding.count }
-                    guard c.embedding.count == dim else {
-                        throw OmniError.store("embedding dim \(c.embedding.count) != index dim \(dim)")
-                    }
-                }
-            }
+            try validateDimLocked(work.flatMap { $0.chunks })
             let bfs = work.map { $0.chunks.map { bf16Row($0.embedding) } }   // fp32 -> bf16 once
             let now = Date().timeIntervalSince1970                           // one indexed_at stamp per batch
             let tSql = Self.searchTiming ? Date() : nil
@@ -4473,8 +4504,13 @@ public final class VectorStore: @unchecked Sendable {
         // Map the (small) removed set to file-ids -> a bool mask indexed by id. Only currently-present
         // paths have an id and any rows; new paths in the set (a reconcile batch mixes add+modify) are
         // simply absent from the mask.
-        guard fileIDCount > 0 else { return }
-        var idMask = [Bool](repeating: false, count: fileIDCount)
+        // Sized off fileChunkCount, NOT fileIDCount. fileIDCount is pathID.count, and the sidecar
+        // adopt path builds pathID from the persisted path table without checking it for duplicates
+        // - one repeat there makes pathID.count smaller than idPath.count while fileID[i] can still
+        // reach idPath.count - 1. This mask is read through a buffer pointer as m[Int(fid[$0])], so
+        // that gap would be an unchecked out-of-bounds read, not a wrong answer.
+        guard !fileChunkCount.isEmpty else { return }
+        var idMask = [Bool](repeating: false, count: fileChunkCount.count)
         var any = false
         for p in paths { if let id = pathID[p] { let idx = Int(id); if idx < idMask.count { idMask[idx] = true; any = true } } }
         guard any else { return }
@@ -4500,8 +4536,26 @@ public final class VectorStore: @unchecked Sendable {
             }
             removed = removeRow.withUnsafeBufferPointer { rm in compactRowsLocked { rm[$0] } }
         }
-        presentPaths.subtract(removed.isEmpty ? paths : removed)
+        dropFromPresentLocked(removed.isEmpty ? paths : removed)
         rowWindowAuditLocked("removeRowsByPaths")
+    }
+
+    /// Drop `paths` from `presentPaths`, but only the ones that have no live chunk left.
+    ///
+    /// The removal helpers report every path they touched, not every path they emptied, and the old
+    /// `presentPaths.subtract(removed)` took that at face value. A predicate that matched SOME of a
+    /// file's rows therefore evicted a path that still had rows, and `replace()` keys its
+    /// remove-before-append on exactly this set (`if presentPaths.contains(path)`) - so the next save
+    /// of that file would skip the removal and append a second copy of its chunks beside the first.
+    /// No shipped predicate is partial today (kind and extension and folder are all per-file
+    /// properties, and one path carries one kind), which is why this has never fired; it is one
+    /// mixed-kind file away from firing, and it fails silently and unboundedly when it does.
+    @inline(__always) private func dropFromPresentLocked(_ paths: Set<String>) {
+        for p in paths {
+            let id = pathID[p].map(Int.init) ?? -1
+            let stillLive = id >= 0 && id < fileChunkCount.count && fileChunkCount[id] > 0
+            if !stillLive { presentPaths.remove(p) }
+        }
     }
 
     private func removeRowsLocked(_ predicate: (Row) -> Bool) {
@@ -4509,6 +4563,11 @@ public final class VectorStore: @unchecked Sendable {
         // the base in sync if anything is actually removed (the base was previously left stale here).
         guard dim > 0 else {
             if rows.contains(where: predicate) {
+                // resetTombstonesLocked FORGETS tombstones rather than collecting them, so any dead
+                // row that does not match the predicate would come back to life here. Correct only
+                // because this branch is unreachable with tombstones standing: marking one requires
+                // dim > 0 (tombstoneOnlyLocked), so a non-empty deadRows implies dim > 0 implies we
+                // are not in this branch. If that guard ever moves, this line resurrects rows.
                 rows.removeAll(where: predicate); resetTombstonesLocked()
                 presentPaths = Set(rows.map { $0.path })
                 rebuildFileIDsLocked()
@@ -4522,7 +4581,7 @@ public final class VectorStore: @unchecked Sendable {
         // buffer (a multi-GB memmove on a large index), making indexing and reconcile O(N^2).
         guard rows.contains(where: predicate) else { return }
         let removed = removeRowsFastLocked { predicate(rows[$0]) }
-        presentPaths.subtract(removed)
+        dropFromPresentLocked(removed)
         rowWindowAuditLocked("removeRows")
     }
 
@@ -4583,8 +4642,16 @@ public final class VectorStore: @unchecked Sendable {
         // below; nil = no base row was removed.
         var baseSurvivors: [Int32]? = nil
         var w = 0   // write cursor, in dim-slice / row units
+        // Did the pass below actually run? The truncation after it derives `removed` from `w`, so a
+        // closure that returns before the loop leaves w == 0 and makes `removed` the WHOLE row
+        // table - dropping every row with no fileChunkDec, no removedPaths, and every aggregate left
+        // describing rows that no longer exist. Unreachable today (this is only called with dim > 0
+        // and a non-empty `rows`, so flat16 is non-empty and its base address is real), but the
+        // blast radius is the entire index, so the pass reports rather than the cursor implying.
+        var scanned = false
         flat16.withUnsafeMutableBufferPointer { fb in
             guard let base = fb.baseAddress else { return }
+            scanned = true
             for i in 0 ..< rows.count {
                 let alreadyDead = dead.contains(Int32(i))
                 if alreadyDead || shouldRemove(i) {
@@ -4604,6 +4671,7 @@ public final class VectorStore: @unchecked Sendable {
                 w += 1
             }
         }
+        guard scanned else { return removedPaths }   // nothing was examined, so nothing may be dropped
         let removed = rows.count - w
         guard removed > 0 else { return removedPaths }
         deadRows.removeAll(keepingCapacity: true)   // collected by this pass
