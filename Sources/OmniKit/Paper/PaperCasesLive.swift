@@ -135,12 +135,24 @@ public enum PaperCasesLive {
         // forward pass, which is the claim Section 3.4 makes for it.
         let pivots = livePaths(live, engine: ctx.engine, limit: p.int("pivot_files"), topK: topK)
         var similar: [Double] = []
+        var pivotFetch: [Double] = []
         for i in 0 ..< textQueries where ctx.shouldContinue && !pivots.isEmpty {
-            guard let v = live.store.fileVector(pivots[i % pivots.count]) else { continue }
-            similar.append(timeMs { _ = live.store.search(v, topK: topK, markActive: false) })
+            // The fetch is a MEASURED component, not a free preamble. A text query reports
+            // text_encode next to text_scan; find similar has the same two halves - reading the
+            // pivot's stored vector, then scanning - and reporting only the scan understated what
+            // the user waits for. It mattered: the fetch pooled the file's chunks by walking the
+            // whole row base, and forced a base compaction before it, which measured ~1 s on the
+            // first call after an index pass against ~25 ms for the scan it was standing next to.
+            // find_similar keeps its old meaning (scan only) so published rows stay comparable.
+            var v: [Float]?
+            pivotFetch.append(timeMs { v = live.store.fileVector(pivots[i % pivots.count]) })
+            guard let vec = v else { continue }
+            similar.append(timeMs { _ = live.store.search(vec, topK: topK, markActive: false) })
         }
+        out.metrics += PaperMetric.distribution("pivot_fetch", samples: pivotFetch, unit: .milliseconds,
+                                                note: "read the pivot's stored vector (no forward pass)")
         out.metrics += PaperMetric.distribution("find_similar", samples: similar, unit: .milliseconds,
-                                                note: "stored pivot vector, no forward pass")
+                                                note: "scan only; add pivot_fetch for what the user waits for")
 
         // IMAGE -> anything, AUDIO -> anything, VIDEO -> anything: a real file from the machine's
         // own roots as the query. Fewer samples than text, because each one decodes a file and runs
