@@ -612,6 +612,7 @@ private struct MemoryBreakdown: View {
         [("Model", .blue, sample.model, "Weights and activations held by MLX"),
          ("Cache", .teal, sample.cache, "Freed MLX buffers kept for reuse - reclaimed under memory pressure"),
          ("Index", .purple, sample.index, "Vectors and row table the search reads"),
+         ("Visualization", .orange, sample.viz, "Folder-map layouts: the one on screen plus any kept for instant revisits"),
          ("Other", Color(nsColor: .systemGray), sample.other, "App, thumbnails, database cache, frameworks")]
     }
 

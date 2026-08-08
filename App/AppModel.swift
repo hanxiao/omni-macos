@@ -938,6 +938,12 @@ final class AppModel {
         /// The big bf16 base is mapped from the on-disk sidecar and appears in NEITHER - clean
         /// file-backed pages cost no footprint.
         var indexGPU = 0, indexCPU = 0
+        /// The folder map's RETAINED state: the live layout, its kNN graph, and every layout the
+        /// projection cache is holding for instant revisits. This is what the map still costs once
+        /// it is drawn - roughly 100 B per dot. It is deliberately NOT the peak: showing a map also
+        /// bursts through GPU tiles and (before streaming) a whole-folder vector buffer, and those
+        /// are transient MLX allocations that land in `cache`/`other` while they are alive.
+        var viz = 0
         /// How long the sample took (mach + MLX counters only - the store is read off-thread).
         /// `indexFresh` is false when the store queue was busy and the previous index numbers
         /// were carried forward. Logged, never shown in the UI.
@@ -958,7 +964,7 @@ final class AppModel {
                 let s = await self.sampleMemory()
                 let mb = { (b: Int) in String(format: "%.0f", Double(b) / 1_048_576) }
                 FileHandle.standardError.write(Data(
-                    "[mem] total=\(mb(s.total))MB model=\(mb(s.model))MB cache=\(mb(s.cache))MB index=\(mb(s.index))MB (gpu=\(mb(s.indexGPU)) cpu=\(mb(s.indexCPU))) other=\(mb(s.other))MB sample=\(String(format: "%.0f", s.sampleUs))us fresh=\(s.indexFresh ? 1 : 0)\n"
+                    "[mem] total=\(mb(s.total))MB model=\(mb(s.model))MB cache=\(mb(s.cache))MB index=\(mb(s.index))MB (gpu=\(mb(s.indexGPU)) cpu=\(mb(s.indexCPU))) viz=\(mb(s.viz))MB other=\(mb(s.other))MB sample=\(String(format: "%.0f", s.sampleUs))us fresh=\(s.indexFresh ? 1 : 0)\n"
                         .utf8))
                 try? await Task.sleep(for: .seconds(5))
             }
@@ -973,8 +979,27 @@ final class AppModel {
     /// whole sample, measured), and the one shared lock - the store queue - is taken ASYNC with a
     /// deadline. A bulk index write can own that queue for tens of ms (23 ms measured); rather than
     /// park a thread there once a second, the sample gives up and reuses the previous numbers.
+    /// Bytes the visualization owns. Points and kNN only - the paths inside ProjectionPoint are
+    /// heap strings this deliberately does not chase (they are the store's own row strings, shared
+    /// not copied), so this under-reports rather than guesses. The view's own GPU/host arrays
+    /// (positions, two colour buffers) belong to the SwiftUI view and are not reachable from here;
+    /// they stay in `other`.
+    ///
+    /// The live layout is counted ONLY when it is not also in the cache: `applyProjection` assigns
+    /// the cached arrays, so `folderProjection` and `projectionCache[selected]` are the same
+    /// storage, and adding both reported the current folder's map at twice its size.
+    private var vizBytes: Int {
+        let pt = MemoryLayout<ProjectionPoint>.stride
+        var n = 0
+        let live = selectedFolderForViz.flatMap { projectionCache[$0] }
+        if live == nil { n += folderProjection.count * pt + folderKNN.count * MemoryLayout<Int32>.stride }
+        for r in projectionCache.values { n += r.points.count * pt + r.knn.count * MemoryLayout<Int32>.stride }
+        return n
+    }
+
     nonisolated func sampleMemory() async -> MemorySample {
         let store = await self.store
+        let vizBytes = await self.vizBytes
         let previous = await self.lastSearchMemory
         let (search, fresh) = await Self.searchMemory(store, fallback: previous)
         await MainActor.run { self.lastSearchMemory = search }
@@ -994,7 +1019,8 @@ final class AppModel {
             // Clamp before subtracting: the three measured parts come from different clocks (MLX
             // can allocate between the footprint read and its own), so a momentary overshoot must
             // shrink a slice rather than produce a negative remainder that breaks the bar.
-            let parts = s.model + s.cache + s.index
+            s.viz = vizBytes
+            let parts = s.model + s.cache + s.index + s.viz
             if parts > s.total { s.total = parts }
             s.other = s.total - parts
             s.sampleUs = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1000
