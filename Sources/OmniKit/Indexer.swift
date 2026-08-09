@@ -246,6 +246,116 @@ public final class Indexer: @unchecked Sendable {
     private func noteChunkReuse(_ k: Int) { guard k > 0 else { return }; dedupLock.withLock { _chunkReuse += k } }
     private func takeChunkReuse() -> Int { dedupLock.withLock { let n = _chunkReuse; _chunkReuse = 0; return n } }
 
+    // CROSS-FILE CHUNK REUSE.
+    //
+    // The same passage recurs across DIFFERENT files - shared headers, quoted file contents,
+    // repeated tool schemas in agent logs - and each recurrence used to pay a full text forward.
+    // Chunk reuse existed but was path-scoped, on a note that cross-file reuse "measured 3.15%".
+    // That measurement is stale; re-measured on the current corpus with `omni-verify indexwaste`:
+    //
+    //   ~/.openclaw/agents/.../sessions   40.4% duplicate chunks, 40.3% of it CROSS-file
+    //   ~/Documents                        8.4% duplicate chunks,  8.4% of it CROSS-file
+    //
+    // Intra-file duplication is ~0.1%, which is why the path-scoped form could not see any of it.
+    // A bounded in-memory cache captures most of it with no global index, no schema change and no
+    // persistence - the thing the old note said would be required: at 32k entries it takes 37.4%
+    // of the available 40.4% on that corpus, and all 8.4% on Documents.
+    //
+    // Byte-identical by construction: the key is a SHA-256 of the exact chunk bytes plus everything
+    // that decides the vector (chunk size, overlap, embedder dim), so a hit is the same input to a
+    // deterministic forward. Truncated to 128 bits, where a collision over millions of chunks is
+    // ~1e-27. A model switch goes through forceFreshEmbed and the dim is in the key.
+    /// PAPER LEVER (var, not let): a `let` is initialised on first touch, so an in-process A/B that
+    /// flips the env between arms silently measures the FIRST arm twice - which is exactly how the
+    /// first version of reusecheck reported a 1.00x speedup for a change that was never enabled.
+    nonisolated(unsafe) public static var globalChunkReuse =
+        ProcessInfo.processInfo.environment["OMNI_CHUNK_REUSE_GLOBAL"] != "0"
+    private let chunkVecLock = NSLock()
+    private var chunkVecCache: [String: [Float]] = [:]
+    private var chunkVecOrder: [String] = []          // FIFO, oldest first
+    /// ~1% of the memory cap, so it scales down with the user's setting like every other budget.
+    private var chunkVecCap: Int {
+        let bytesPer = Swift.max(1, embedder.dim * MemoryLayout<Float>.size)
+        return Swift.max(2_048, Int(Double(OmniMemoryBudget.capBytes) * 0.01) / bytesPer)
+    }
+    func resetChunkVecCache() {
+        chunkVecLock.withLock { chunkVecCache.removeAll(keepingCapacity: false); chunkVecOrder.removeAll(keepingCapacity: false) }
+    }
+
+    /// Embed length-bucketed groups, reusing any vector already computed for the same chunk key in
+    /// this pass. `width` is the caller's bucket width, so the uniques are re-carved exactly the way
+    /// the caller carved (the interactive carve still applies). Output is positionally identical to
+    /// embedding every text.
+    private func embedGroupsReusing(_ groups: [[(text: String, key: String)]], width: Int) -> [[[Float]]] {
+        guard Self.globalChunkReuse, !settingsForceFresh else {
+            return embedder.embedTextBatches(groups.map { $0.map(\.text) }, as: .passage)
+        }
+        var out = groups.map { [[Float]](repeating: [], count: $0.count) }
+        var slotOf: [String: Int] = [:]
+        var uniqTexts: [String] = []
+        var uniqKeys: [String] = []
+        var owners: [[(Int, Int)]] = []
+        var hits = 0
+        chunkVecLock.lock()
+        for (g, grp) in groups.enumerated() {
+            for (i, e) in grp.enumerated() {
+                if !e.key.isEmpty, let v = chunkVecCache[e.key] { out[g][i] = v; hits += 1; continue }
+                if !e.key.isEmpty, let s = slotOf[e.key] { owners[s].append((g, i)); continue }
+                if !e.key.isEmpty { slotOf[e.key] = uniqTexts.count }
+                uniqTexts.append(e.text); uniqKeys.append(e.key); owners.append([(g, i)])
+            }
+        }
+        chunkVecLock.unlock()
+        noteChunkReuse(hits)
+        guard !uniqTexts.isEmpty else { return out }
+
+        // Re-bucket by length, same discipline as the caller: padding is already ~0% because of it.
+        var order = Array(uniqTexts.indices)
+        order.sort { uniqTexts[$0].count < uniqTexts[$1].count }
+        var batches: [[String]] = []
+        var batchIdx: [[Int]] = []
+        var i = 0
+        while i < order.count {
+            let e = Swift.min(i + Swift.max(1, width), order.count)
+            let idxs = Array(order[i ..< e])
+            batchIdx.append(idxs); batches.append(idxs.map { uniqTexts[$0] })
+            i = e
+        }
+        let vecs = embedder.embedTextBatches(batches, as: .passage)
+        chunkVecLock.lock()
+        for (bi, idxs) in batchIdx.enumerated() {
+            guard bi < vecs.count else { continue }
+            for (k, u) in idxs.enumerated() {
+                guard k < vecs[bi].count else { continue }
+                let v = vecs[bi][k]
+                for (g, gi) in owners[u] { out[g][gi] = v }
+                let key = uniqKeys[u]
+                if !key.isEmpty, chunkVecCache[key] == nil {
+                    chunkVecCache[key] = v
+                    chunkVecOrder.append(key)
+                }
+            }
+        }
+        let cap = chunkVecCap
+        while chunkVecOrder.count > cap {
+            let old = chunkVecOrder.removeFirst()
+            chunkVecCache[old] = nil
+        }
+        chunkVecLock.unlock()
+        return out
+    }
+    /// Set for the duration of a pass whose settings demand fresh vectors; reuse is off then.
+    private var settingsForceFresh = false
+    /// Arm the reuse cache for a pass. Cleared at every pass boundary ON PURPOSE: the duplication
+    /// this exploits is WITHIN a crawl (the same header across 172k session files in one pass), so
+    /// carrying the cache across passes buys almost nothing - and a cache that cannot outlive a pass
+    /// cannot serve a vector from a different model. `chunkKey` encodes the embedder DIM, not the
+    /// model, so two models of equal width would otherwise key alike; this makes that unreachable.
+    private func beginChunkReuse(_ settings: IndexSettings) {
+        settingsForceFresh = settings.forceFreshEmbed
+        resetChunkVecCache()
+    }
+
     /// Identity of one text chunk for vector reuse: the chunk's exact text plus everything that
     /// decides the vector those bytes produce. Mirrors contentKey's fingerprint discipline one
     /// level down - a settings change must never resurrect a stale vector - and like contentKey
@@ -321,6 +431,7 @@ public final class Indexer: @unchecked Sendable {
     /// Full incremental pass over `roots`. `onProgress` is called on a background
     /// thread; marshal to the main actor in the UI.
     public func index(roots: [URL], settings: IndexSettings = .default, force: Bool = false, onProgress: @escaping (IndexProgress) -> Void) {
+        beginChunkReuse(settings)
         queue.sync { cancelled = false }
         var p = IndexProgress()
         // The known-files snapshot is a whole-table GROUP BY (O(rows)) that shares no resource with
@@ -487,7 +598,8 @@ public final class Indexer: @unchecked Sendable {
                         groups.append(Array(buf.prefix(take))); buf.removeFirst(take)
                     }
                     if groups.isEmpty { return }
-                    let vecBatches = self.embedder.embedTextBatches(groups.map { $0.map { $0.text } }, as: .passage)
+                    let vecBatches = self.embedGroupsReusing(
+                        groups.map { $0.map { (text: $0.text, key: $0.key) } }, width: carve)
                     for (gi, batch) in groups.enumerated() {
                         let vecs = vecBatches[gi]
                         for (k, b) in batch.enumerated() {
@@ -737,6 +849,7 @@ public final class Indexer: @unchecked Sendable {
     /// signature is unchanged - everything else (deletion/exclusion handling, batching, store
     /// writes) is identical to a watcher reconcile.
     public func update(paths: [String], settings: IndexSettings, force: Bool = false) {
+        beginChunkReuse(settings)
         let fm = FileManager.default
         // Resolve the concrete files first: the explicit events, plus a crawl of any directory event
         // (a new folder / bulk move-in carries only the folder path). Then look up the PRIOR stored
@@ -849,7 +962,8 @@ public final class Indexer: @unchecked Sendable {
                 groups.append(Array(tBuf.prefix(take))); tBuf.removeFirst(take)
             }
             if groups.isEmpty { return }
-            let vecBatches = self.embedder.embedTextBatches(groups.map { $0.map { $0.text } }, as: .passage)
+            let vecBatches = self.embedGroupsReusing(
+                groups.map { $0.map { (text: $0.text, key: $0.key) } }, width: carve)
             for (gi, batch) in groups.enumerated() {
                 let vecs = vecBatches[gi]
                 for (k, b) in batch.enumerated() {

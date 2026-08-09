@@ -5937,6 +5937,198 @@ if args.count >= 3 && args[1] == "compilebench" {
 }
 
 
+// Does cross-file chunk reuse change any vector? omni-verify reusecheck <modelDir> <folder> [files]
+// The reuse is only legitimate if a cache hit is BYTE-IDENTICAL to embedding the text again. This
+// indexes the same folder twice into two fresh stores - reuse off, then on - and compares every
+// stored vector bit for bit. Anything but zero mismatches means the key is not identity.
+if args.count >= 4 && args[1] == "reusecheck" {
+    let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    let root = URL(fileURLWithPath: args[3])
+    let maxFiles = (args.count >= 5 ? Int(args[4]) : nil) ?? 400
+    omniSetMemoryLimit(6_000_000_000)
+    let settings = IndexSettings.default
+    _ = maxFiles   // the folder itself bounds the pass; point it at a small one
+
+    func runPass(reuse: Bool) -> ([String: [Float]], Double, Int) {
+        Indexer.globalChunkReuse = reuse   // set the lever DIRECTLY: a static let would already be fixed
+        let dbURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("omni-reusecheck-\(reuse ? "on" : "off").sqlite")
+        for suffix in ["", "-wal", "-shm", ".vecs", ".quant", ".names", ".names-wal", ".names-shm"] {
+            try? FileManager.default.removeItem(atPath: dbURL.path + suffix)
+        }
+        let store = try! VectorStore(dbURL: dbURL)
+        let indexer = Indexer(store: store, embedder: engine)
+        let done = DispatchSemaphore(value: 0)
+        let t = Date()
+        DispatchQueue.global().async {
+            indexer.index(roots: [root], settings: settings) { p in if p.done { done.signal() } }
+        }
+        _ = done.wait(timeout: .now() + 1800)
+        let secs = -t.timeIntervalSinceNow
+        var out: [String: [Float]] = [:]
+        for path in store.allIndexedPaths() {
+            for (k, v) in store.chunkVectors(path: path, dim: engine.dim) { out["\(path)|\(k)"] = v }
+        }
+        let n = store.count
+        store.close()
+        return (out, secs, n)
+    }
+
+    let (off, tOff, nOff) = runPass(reuse: false)
+    let (on, tOn, nOn) = runPass(reuse: true)
+    var missing = 0, differing = 0, compared = 0
+    for (k, v) in off {
+        guard let w = on[k] else { missing += 1; continue }
+        compared += 1
+        if v != w { differing += 1 }
+    }
+    print(String(format: "reusecheck  rows off=%d on=%d   vectors compared=%d  missing=%d  DIFFERING=%d",
+                 nOff, nOn, compared, missing, differing))
+    print(String(format: "            pass time  reuse-off=%.1fs   reuse-on=%.1fs   %.2fx",
+                 tOff, tOn, tOff / Swift.max(0.001, tOn)))
+    print(compared > 0 && missing == 0 && differing == 0
+          ? "            PASS - every vector byte-identical" : "            FAIL")
+    exit(compared > 0 && missing == 0 && differing == 0 ? 0 : 1)
+}
+
+// Is there FLOP left to remove from an indexing pass? omni-verify indexwaste <folder> [maxFiles]
+// Indexing is ~99% GPU, so only removing WORK moves a full pass - host-side tuning cannot. Two
+// kinds of work are removable with byte-identical output, and this measures both on a real corpus:
+//
+//   duplicate chunks  identical chunk TEXT embedded more than once. File-level content dedup
+//                     already exists; this asks whether the same passage recurs ACROSS files
+//                     (shared boilerplate, repeated headers) where that dedup cannot see it.
+//   padding waste     batches are length-sorted then carved into buckets, and every sequence in a
+//                     bucket is padded to the bucket's longest. The padded positions are real GPU
+//                     work producing nothing.
+//
+// Chunking is replicated here (character windows of maxCharsPerChunk with chunkOverlap) because
+// Indexer.chunk is internal; the boundaries are the same, which is what these counts depend on.
+if args.count >= 3 && args[1] == "indexwaste" {
+    let root = URL(fileURLWithPath: args[2])
+    let maxFiles = (args.count >= 4 ? Int(args[3]) : nil) ?? 4000
+    let limit = 1800, overlap = 200, bucket = 16
+    var texts: [String] = []
+    var fileOf: [Int] = []
+    var files = 0, skipped = 0
+    let en = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey],
+                                            options: [.skipsHiddenFiles])
+    while let u = en?.nextObject() as? URL, files < maxFiles {
+        guard FileExtractor.kind(for: u) == .text else { continue }
+        guard let c = try? FileExtractor.extract(u) else { skipped += 1; continue }
+        let t: String
+        switch c {
+        case .text(let x): t = x
+        case .pagedText(let x, _): t = x
+        default: skipped += 1; continue
+        }
+        guard !t.isEmpty else { skipped += 1; continue }
+        files += 1
+        if t.count <= limit { texts.append(t); fileOf.append(files - 1); continue }
+        let step = Swift.max(1, limit - overlap)
+        var startIdx = t.startIndex, startOff = 0
+        while startOff < t.count {
+            let endIdx = t.index(startIdx, offsetBy: limit, limitedBy: t.endIndex) ?? t.endIndex
+            texts.append(String(t[startIdx ..< endIdx])); fileOf.append(files - 1)
+            if endIdx == t.endIndex { break }
+            startIdx = t.index(startIdx, offsetBy: step, limitedBy: t.endIndex) ?? t.endIndex
+            startOff += step
+        }
+    }
+    guard !texts.isEmpty else { print("indexwaste: no extractable text under \(root.path)"); exit(1) }
+
+    // Duplicate chunk text, split by WHERE the duplicate is, because the two have different fixes:
+    // an intra-file repeat is catchable inside one file's own chunk list; a cross-file repeat needs
+    // the dedup to span files, which is the thing the indexer currently declines.
+    var seen = [Int: Int]()          // hash -> file index of first sighting
+    seen.reserveCapacity(texts.count)
+    var dupIntra = 0, dupCross = 0
+    for (i, t) in texts.enumerated() {
+        var h = Hasher(); h.combine(t)
+        let k = h.finalize()
+        if let first = seen[k] {
+            if first == fileOf[i] { dupIntra += 1 } else { dupCross += 1 }
+        } else {
+            seen[k] = fileOf[i]
+        }
+    }
+    let dupes = dupIntra + dupCross
+    // And how much a WINDOW-local dedup would catch - one that only remembers the last W chunks,
+    // needing no global index, no schema change and no persistence.
+    for W in [512, 4096, 32768, 262144] {
+        var win = [Int: Int]()       // hash -> position last seen
+        var hits = 0
+        for (i, t) in texts.enumerated() {
+            var h = Hasher(); h.combine(t)
+            let k = h.finalize()
+            if let last = win[k], i - last <= W { hits += 1 }
+            win[k] = i
+        }
+        print(String(format: "  window %-7d      : %.1f%% of chunks would hit a cache remembering the last %d",
+                     W, Double(hits) / Double(texts.count) * 100, W))
+    }
+
+    // Padding waste under the shipped scheme: sort by character count, carve into buckets, pad each
+    // bucket to its longest. Character count is what the indexer sorts on; tokens track it closely.
+    let sorted = texts.map(\.count).sorted()
+    var padded = 0, real = 0
+    var i = 0
+    while i < sorted.count {
+        let e = Swift.min(i + bucket, sorted.count)
+        let mx = sorted[e - 1]
+        for j in i ..< e { real += sorted[j]; padded += mx }
+        i = e
+    }
+    // And what a single unsorted batch would waste, as the counterfactual the sorting already beats.
+    var padNaive = 0
+    i = 0
+    while i < texts.count {
+        let e = Swift.min(i + bucket, texts.count)
+        let mx = texts[i ..< e].map(\.count).max() ?? 0
+        padNaive += mx * (e - i)
+        i = e
+    }
+    print("indexwaste root=\(root.lastPathComponent) files=\(files) chunks=\(texts.count) (skipped \(skipped))")
+    print(String(format: "  duplicate chunk text : %d of %d (%.1f%%)   intra-file %.1f%%   CROSS-file %.1f%%",
+                 dupes, texts.count, Double(dupes) / Double(texts.count) * 100,
+                 Double(dupIntra) / Double(texts.count) * 100, Double(dupCross) / Double(texts.count) * 100))
+    print(String(format: "  padding waste        : %.1f%% of positions are pad (length-sorted buckets of %d)",
+                 Double(padded - real) / Double(padded) * 100, bucket))
+    print(String(format: "  ... unsorted would be : %.1f%%   <- what the existing length-sort already saves",
+                 Double(padNaive - real) / Double(padNaive) * 100))
+    exit(0)
+}
+
+// Where the 2.55 ms query embed actually goes: omni-verify embedbreak <modelDir> [iters]
+// querybreak says embed is 45% of a cold query, but not how much of it is the GPU forward and how
+// much is the CPU tokenizer. Those have completely different levers - one is FLOPs, the other is
+// host string work - so the split decides whether there is anything left to do here at all.
+if args.count >= 3 && args[1] == "embedbreak" {
+    let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    let iters = (args.count >= 4 ? Int(args[3]) : nil) ?? 200
+    omniSetMemoryLimit(6_000_000_000)
+    // Query shapes people actually type, short to long.
+    // Short to long. If the forward were FLOP-bound the cost would track token count; if it is
+    // bandwidth-bound on the weights it stays flat until the activations get big enough to matter,
+    // and WHERE it stops being flat is the crossover worth knowing for the indexing side too.
+    let unit = "the memory profiling trace showed the base fold dominating startup on a cold cache "
+    var queries = ["cat", "beach sunset", "invoice pdf from last quarter",
+                   "a photograph of a team standing in front of a whiteboard covered in diagrams"]
+    for mult in [4, 12, 32, 64] { queries.append(String(repeating: unit, count: mult)) }
+    for q in queries {
+        _ = engine.embedQuery(q)                              // warm this shape
+        var full = Double.infinity, tok = Double.infinity
+        for _ in 0 ..< iters {
+            var t = Date(); _ = engine.embedQuery(q); full = Swift.min(full, -t.timeIntervalSinceNow * 1000)
+            t = Date(); _ = engine.tokenizeOnlyForBenchmark([[q]], as: .query); tok = Swift.min(tok, -t.timeIntervalSinceNow * 1000)
+        }
+        let n = engine.tokenizeOnlyForBenchmark([[q]], as: .query)
+        print(String(format: "  tokens=%-3d  embed=%5.2f ms  tokenize=%5.2f ms (%4.1f%%)  gpu=%5.2f ms   %.40@",
+                     n, full, tok, tok / full * 100, full - tok, q))
+    }
+    exit(0)
+}
+
 // The folder map's per-point rebuild: omni-verify vizbuildbench [n]
 // Between the fit landing and the dots appearing, the view walks every point to derive a colour -
 // extension out of the path, FNV hash, HSB->RGB. That was measured at 60k points and the total-dot
