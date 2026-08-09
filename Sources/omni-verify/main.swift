@@ -6735,10 +6735,17 @@ if args.count >= 4 && args[1] == "quantrecall" {
     if !filterTag.isEmpty && filterTag != "none" {
         print("  filter soundness: \(violations) out-of-scope  \(missed) fewer results than exact  \(violations == 0 && missed == 0 ? "PASS" : "CHECK")")
     }
-    if arm == "exact" {
+    // OMNI_QRC_WRITE_GT=1 lets a NON-exact arm write the ground truth, so two funnel runs can be
+    // compared against each other. That is the right comparison for a change that cannot alter a
+    // computed value - a paging hint, say: "recall" then reads as agreement between the two arms,
+    // and anything below 1.0000 means the change moved a result it had no business moving. It also
+    // avoids running the exact arm against a REAL index, which forces full bf16 mode and leaves the
+    // persisted quant replica needing a rebuild the user would pay for at next launch.
+    if arm == "exact" || ProcessInfo.processInfo.environment["OMNI_QRC_WRITE_GT"] == "1" {
         try? JSONEncoder().encode(GT(paths: out, scores: outScore)).write(to: gtPath)
-        print(String(format: "quantrecall arm=exact  src=%-6@ filter=%-6@ n=%d rows=%d  p50=%6.2f ms   (ground truth written)",
-                     source, filterTag, vecs.count, store.count, lat[vecs.count/2]))
+        print(String(format: "quantrecall arm=%-6@ src=%-6@ filter=%-6@ n=%d rows=%d  p50=%6.2f ms  p95=%6.2f ms  (ground truth written)",
+                     arm, source, filterTag, vecs.count, store.count,
+                     lat[vecs.count/2], lat[Swift.min(lat.count - 1, Int(Double(lat.count) * 0.95))]))
     } else {
         guard let d = try? Data(contentsOf: gtPath), let gtAll = try? JSONDecoder().decode(GT.self, from: d),
               gtAll.paths.count == out.count else {
