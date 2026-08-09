@@ -382,9 +382,18 @@ public final class Indexer: @unchecked Sendable {
     // long an interactive query can wait mid-indexing (the query's eval queues behind the in-flight
     // forward on the MLX stream). Measured: 48 -> ~385ms p95 search tail under load, 16 -> ~164ms,
     // while index throughput stays flat-to-better in 16..48 (long files even index faster at 16,
-    // less padding). 16 is the responsiveness sweet spot; vectors are identical (length-bucketing
-    // reassembles each file's chunks the same regardless of batch). OMNI_TEXT_BATCH overrides.
-    public var textBatchSize = (ProcessInfo.processInfo.environment["OMNI_TEXT_BATCH"].flatMap { Int($0) }) ?? 16
+    // less padding). 16 was the sweet spot of a sweep that stopped there: 16..48 was the range
+    // tested, on the expectation that smaller would cost throughput. Extending it DOWNWARD shows it
+    // does not - 8 is 5-6% FASTER than 16, reproducible to 0.1 s on two unrelated corpus shapes
+    // (jsonl agent logs 26.2 -> 24.8 s, Swift source 8.0 -> 7.5 s; omni-verify reusecheck). The
+    // forward is compute-bound at chunk lengths, so a bigger batch amortises a fixed weight read
+    // over work that was never the constraint and only adds memory pressure. So 8 wins on BOTH
+    // axes this knob trades between rather than trading one for the other.
+    //
+    // Vectors are unchanged, checked not assumed (omni-verify batchidentity): 4, 8 and 32 are
+    // BIT-IDENTICAL to 16. Only 64 moves at all, by max 1.3e-4 (cosine 0.99999999) - its own small
+    // argument against going up. OMNI_TEXT_BATCH overrides.
+    public var textBatchSize = (ProcessInfo.processInfo.environment["OMNI_TEXT_BATCH"].flatMap { Int($0) }) ?? 8
     /// Per-forward bucket size used while an interactive query is active (see flushText). Small =
     /// short GPU command buffers = low query latency during typing.
     static let searchCarve = (ProcessInfo.processInfo.environment["OMNI_SEARCH_CARVE"].flatMap { Int($0) }) ?? 4

@@ -4,6 +4,7 @@ import ImageIO
 import CoreGraphics
 import MLX
 import Accelerate
+import CryptoKit
 @preconcurrency import AVFoundation
 
 // Numeric validation of the MLX-Swift text encoder against Python reference fixtures.
@@ -5937,6 +5938,52 @@ if args.count >= 3 && args[1] == "compilebench" {
 }
 
 
+// Does the text batch size change any vector? omni-verify batchidentity <modelDir>
+// Batch size is a throughput/responsiveness knob, and it is only a free one if the vectors are
+// invariant to it. Right-padding plus the attention mask should make it so; this proves it rather
+// than trusting the comment, by embedding the same texts under several groupings and comparing.
+if args.count >= 3 && args[1] == "batchidentity" {
+    let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    omniSetMemoryLimit(6_000_000_000)
+    // Deliberately ragged lengths: equal-length batches would pad identically and prove nothing.
+    var texts: [String] = []
+    for i in 0 ..< 64 {
+        texts.append(String(repeating: "chunk \(i) with some realistic prose about indexing and vectors ",
+                            count: 1 + (i * 7) % 23))
+    }
+    func embed(batch: Int) -> [[Float]] {
+        var groups: [[String]] = []
+        var i = 0
+        while i < texts.count { let e = Swift.min(i + batch, texts.count); groups.append(Array(texts[i ..< e])); i = e }
+        return engine.embedTextBatches(groups, as: .passage).flatMap { $0 }
+    }
+    func compare(_ a: [[Float]], _ b: [[Float]], _ label: String) -> Double {
+        var diff = 0, maxAbs = 0.0, minCos = 1.0
+        for i in 0 ..< Swift.min(a.count, b.count) {
+            var dot = 0.0, na = 0.0, nb = 0.0
+            for j in 0 ..< a[i].count {
+                if a[i][j] != b[i][j] { diff += 1; maxAbs = Swift.max(maxAbs, Double(abs(a[i][j] - b[i][j]))) }
+                dot += Double(a[i][j]) * Double(b[i][j]); na += Double(a[i][j] * a[i][j]); nb += Double(b[i][j] * b[i][j])
+            }
+            if na > 0, nb > 0 { minCos = Swift.min(minCos, dot / (na.squareRoot() * nb.squareRoot())) }
+        }
+        print(String(format: "  %-34@ differing=%-7d  max|d|=%.3e  min cosine=%.8f", label, diff, maxAbs, minCos))
+        return maxAbs
+    }
+    // THE QUESTION THAT MATTERS for the batch-size knob: do the BATCHED paths agree with each other?
+    let ref16 = embed(batch: 16)
+    var worst = 0.0
+    for b in [4, 8, 32, 64] { worst = Swift.max(worst, compare(ref16, embed(batch: b), "batch \(b) vs shipped batch 16")) }
+    print(worst == 0 ? "  PASS - batch size does not move a vector (B>1 paths agree)"
+                     : String(format: "  batch size moves vectors by at most %.3e - read the cosine, not max|d|", worst))
+    // SEPARATE question: B==1 takes the COMPILED block path (Qwen3Backbone gates on B==1 && L<=512)
+    // and the comment there claims compile is bit-identical to eager. Test that claim directly, and
+    // report cosine rather than max|d| - a large absolute delta on one bf16 component is not the
+    // same thing as a moved embedding.
+    _ = compare(ref16, embed(batch: 1), "batch 1 (compiled) vs batch 16")
+    exit(0)
+}
+
 // Does cross-file chunk reuse change any vector? omni-verify reusecheck <modelDir> <folder> [files]
 // The reuse is only legitimate if a cache hit is BYTE-IDENTICAL to embedding the text again. This
 // indexes the same folder twice into two fresh stores - reuse off, then on - and compares every
@@ -6011,11 +6058,18 @@ if args.count >= 3 && args[1] == "indexwaste" {
     var texts: [String] = []
     var fileOf: [Int] = []
     var files = 0, skipped = 0
+    // Stage timing, so the host half of a pass can be priced against the GPU half. Cross-file chunk
+    // reuse removed ~37% of the embed FLOPs on this corpus, so the balance has moved and "indexing
+    // is 99% GPU" needs re-checking rather than re-quoting.
+    var tExtract = 0.0, tChunk = 0.0, tKey = 0.0
+    var bytesRead = 0
     let en = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey],
                                             options: [.skipsHiddenFiles])
     while let u = en?.nextObject() as? URL, files < maxFiles {
         guard FileExtractor.kind(for: u) == .text else { continue }
+        let tE = Date()
         guard let c = try? FileExtractor.extract(u) else { skipped += 1; continue }
+        tExtract += -tE.timeIntervalSinceNow
         let t: String
         switch c {
         case .text(let x): t = x
@@ -6024,10 +6078,17 @@ if args.count >= 3 && args[1] == "indexwaste" {
         }
         guard !t.isEmpty else { skipped += 1; continue }
         files += 1
-        if t.count <= limit { texts.append(t); fileOf.append(files - 1); continue }
+        bytesRead += t.utf8.count
+        let tC = Date()
+        defer { tChunk += -tC.timeIntervalSinceNow }
+        // totalCount hoisted, exactly as Indexer.chunk does. String.count is an O(n) grapheme walk,
+        // so evaluating it in the loop condition makes the chunker look O(n^2) - which is precisely
+        // the false reading the first version of this bench produced (3.86 s for 10 MB).
+        let totalCount = t.count
+        if totalCount <= limit { texts.append(t); fileOf.append(files - 1); continue }
         let step = Swift.max(1, limit - overlap)
         var startIdx = t.startIndex, startOff = 0
-        while startOff < t.count {
+        while startOff < totalCount {
             let endIdx = t.index(startIdx, offsetBy: limit, limitedBy: t.endIndex) ?? t.endIndex
             texts.append(String(t[startIdx ..< endIdx])); fileOf.append(files - 1)
             if endIdx == t.endIndex { break }
@@ -6088,7 +6149,21 @@ if args.count >= 3 && args[1] == "indexwaste" {
         padNaive += mx * (e - i)
         i = e
     }
+    // chunkKey is SHA-256 over every chunk's exact bytes, and cross-file reuse made it load-bearing
+    // (every chunk needs a key to look up, not just the ones that get reused). Price it.
+    let tK = Date()
+    var keySink = 0
+    for t in texts {
+        var h = SHA256()
+        h.update(data: Data("1|c1800|o200|m768|".utf8))
+        h.update(data: Data(t.utf8))
+        for b in h.finalize().prefix(1) { keySink &+= Int(b) }
+    }
+    tKey = -tK.timeIntervalSinceNow
+    _ = keySink
     print("indexwaste root=\(root.lastPathComponent) files=\(files) chunks=\(texts.count) (skipped \(skipped))")
+    print(String(format: "  HOST stages          : extract %.2fs   chunk %.2fs   chunkKey(SHA256) %.2fs   total %.2fs  (%.1f MB text)",
+                 tExtract, tChunk, tKey, tExtract + tChunk + tKey, Double(bytesRead) / 1_048_576))
     print(String(format: "  duplicate chunk text : %d of %d (%.1f%%)   intra-file %.1f%%   CROSS-file %.1f%%",
                  dupes, texts.count, Double(dupes) / Double(texts.count) * 100,
                  Double(dupIntra) / Double(texts.count) * 100, Double(dupCross) / Double(texts.count) * 100))
