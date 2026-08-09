@@ -580,6 +580,138 @@ public final class VectorStore: @unchecked Sendable {
     // the normal reducer over exact scores. Quality is gated by concbench's recall-vs-fp32-exact.
     private var quantBase: (wq: MLXArray, scales: MLXArray, biases: MLXArray?)? = nil
     private var quantBits = 0          // active bits of quantBase (0 = full bf16 base)
+    /// Candidates the coarse tier hands the exact rerank. The 4096 ceiling is the untested part of
+    /// the funnel: it was sized when the coarse tier was 4-bit, and the whole point of a cheaper
+    /// coarse tier is that you can BUY BACK its recall by oversampling more before reranking.
+    /// OMNI_CANDIDATES overrides it so bits and oversample can be swept against each other.
+    ///
+    /// SWEPT, 4.51M rows, 200 queries, recall@10 vs a bf16-exact ground truth (p50 ms in brackets):
+    ///
+    ///          C=1600        C=6400        C=25600       C=102400
+    ///   2-bit  0.9875 [6.0]  0.9925 [9.7]  1.0000 [20.9]  1.0000 [67.4]
+    ///   3-bit  1.0000 [5.5]  1.0000 [9.0]  1.0000 [20.9]  1.0000 [45.9]
+    ///
+    /// So oversampling DOES buy back what low bits lose - 2-bit reaches full recall at C=25600 -
+    /// but the exchange rate is ruinous. Restoring 2-bit to 1.0000 costs 16x the oversample and
+    /// 20.9 ms, when the FULL bf16 scan with no quantization at all runs in 15.2 ms. Past roughly
+    /// C=6400 the funnel is slower than the thing it exists to avoid.
+    ///
+    /// The asymmetry is structural: the coarse tier is sequential bandwidth over a compact resident
+    /// array (GPU's best case), while each extra candidate is a scattered 1.5 KB gather out of a
+    /// 6.5 GB mmap plus host reduce work - linear in C and cache-hostile. Trading the cheap resource
+    /// for the expensive one at 16:1 cannot win, which is what the 4096 ceiling was already encoding.
+    ///
+    /// (1-bit is not reachable here at all: MLX's affine quantize supports 2-8 bits, and a true
+    /// binary tier would need a popcount kernel, not quantizedMM.)
+    static let candidateOverride: Int? = ProcessInfo.processInfo.environment["OMNI_CANDIDATES"].flatMap(Int.init)
+    static func candidateCount(topK: Int) -> Int {
+        if let c = candidateOverride { return max(topK, c) }
+        return min(4096, max(1024, topK * 32))
+    }
+
+    /// A/B lever: 0 skips the exact rerank so the coarse 4-bit scores are final. See search().
+    static let quantRerank = ProcessInfo.processInfo.environment["OMNI_QUANT_RERANK"] != "0"
+
+    /// EXACT-TIER PRECISION EXPERIMENT. The rerank reads bf16 rows out of `flat16`, and `flat16`
+    /// has to cover EVERY row (any row can become a candidate) even though one query gathers ~0.09%
+    /// of them - which is what makes it 6.46 GB on a 258k-file index. The open question is whether
+    /// that tier has to be bf16 at 1536 B/row, or would hold at 8 bits and ~816 B/row.
+    ///
+    /// Set OMNI_RERANK_BITS to simulate it: the gathered candidate tile is round-tripped through
+    /// group-64 affine quantization at that width before the rescore matmul. Recall-equivalent to
+    /// actually storing the tier at those bits - the round trip is the only thing that changes the
+    /// numbers - so the quality question can be answered before building a second sidecar. Latency
+    /// is NOT representative (it adds a quantize the real thing would not do).
+    ///
+    /// MEASURED, 4.51M rows, 200 queries, against a bf16-exact ground truth (`quantrecall`):
+    ///
+    ///   tier    B/row   .vecs    recall@10   top1-exact
+    ///   bf16     1536   6.46 GB    1.0000       1.000
+    ///   8-bit     816   3.43 GB    0.9885       0.965
+    ///   6-bit     624   2.62 GB    0.9780       0.930
+    ///   5-bit     528   2.22 GB    0.9560       0.900
+    ///   4-bit     432   1.82 GB    0.9410       0.885
+    ///
+    /// So the answer is no: 8 bits does NOT hold the exact tier. Halving the file costs 3.5% of
+    /// first results, which is a visible quality change, not a rounding one. (The 4-bit rung lands
+    /// on 0.9410 against the no-rerank arm's 0.9425 - they are the same representation, so that
+    /// agreement is what says the simulation is faithful.)
+    ///
+    /// Where it could still pay: the tier only has to be bf16 on a machine that can CACHE 6.46 GB.
+    /// Below that it thrashes, and a 3.43 GB tier that stays cached would beat a bf16 one that does
+    /// not - the same reasoning `quantBitsFor` already applies to the scan replica. That would be a
+    /// memory-cap-driven mode, never a default.
+    static let rerankBits: Int? = ProcessInfo.processInfo.environment["OMNI_RERANK_BITS"].flatMap(Int.init)
+    /// Round-trip a gathered candidate tile through `rerankBits`, or return it untouched.
+    private static func exactTile(_ m: MLXArray, group: Int) -> MLXArray {
+        guard let b = rerankBits else { return m }
+        let q = MLX.quantized(m, groupSize: group, bits: b)
+        return MLX.dequantized(q.wq, scales: q.scales, biases: q.biases,
+                               groupSize: group, bits: b).asType(.bfloat16)
+    }
+
+    // RANDOMIZED HADAMARD PRECONDITIONER (TurboQuant, Zandieh et al. 2025, arXiv 2504.19874).
+    //
+    // R = (H / sqrt(d)) . diag(s), s in {-1,+1}, is ORTHOGONAL, so <Rx, Rq> == <x, q>: rotating both
+    // the stored rows and the query leaves every inner product the ranking is built on unchanged.
+    // What it changes is the DISTRIBUTION each 64-wide quantization group sees. Affine group quant
+    // spends its 16 levels on [min, max] of the group, so one outlier coordinate costs every other
+    // coordinate in that group its precision. After the rotation each coordinate is a normalized
+    // sum of all d, i.e. near-Gaussian and outlier-free, which is the shape affine quant handles
+    // best.
+    //
+    // This is the half of TurboQuant that costs nothing: the paper's other half swaps the affine
+    // codebook for a Lloyd-Max one, which MLX's quantizedMM cannot consume - that would need a
+    // custom Metal kernel, or a dequantize-then-matmul that gives back the bandwidth win the
+    // replica exists for. The rotation alone keeps quantizedMM untouched and adds one transform per
+    // query (microseconds at d=768) plus one per row at index time.
+    //
+    // MEASURED, AND IT DOES NOT HELP THIS DATA - kept behind the lever so the result is reproducible
+    // and nobody spends the idea twice. On the real 4.5M-row index, 200 queries, coarse scores taken
+    // as final (OMNI_QUANT_RERANK=0, i.e. the arm where quantization error is actually visible):
+    //
+    //   affine (today)          recall@10 = 0.9425   top1 = 0.880
+    //   Hadamard + affine       recall@10 = 0.9275   top1 = 0.850
+    //
+    // The reason is in `omni-verify quantdist`: the rotation exists to Gaussianize, and these
+    // vectors already are. Per 64-wide group the RAW embeddings measure crest 2.60 / excess
+    // kurtosis -0.12 (Gaussian is ~3.0 / 0), i.e. already outlier-free and slightly LIGHTER-tailed
+    // than Gaussian - the best case affine group quant can be handed. Rotating mixes them toward
+    // Gaussian from the good side: crest p99 3.61 -> 3.88, kurtosis p99 +1.79 -> +2.49. TurboQuant
+    // is written for LLM weights, whose outlier channels this fixes; an L2-normalized encoder output
+    // is already the thing it is trying to produce.
+    static let quantRotate = ProcessInfo.processInfo.environment["OMNI_QUANT_ROTATE"] == "1"
+    private var quantSigns: MLXArray? = nil
+    /// mx.hadamard_transform supports n = m * 2^k for m in {1, 12, 20, 28}. 768 = 12 * 64 and 1024 =
+    /// 2^10, so both shipped model dims qualify; anything else silently keeps the plain quantizer.
+    public static func hadamardCompatible(_ d: Int) -> Bool {
+        for m in [1, 12, 20, 28] {
+            var n = m
+            while n <= d { if n == d { return true }; n <<= 1 }
+        }
+        return false
+    }
+    /// Deterministic +-1 signs. Host xorshift rather than MLX.random so the vector cannot change
+    /// under an MLX version bump - a different sign vector silently mis-scores an existing replica.
+    private func quantSignsLocked() -> MLXArray? {
+        guard Self.quantRotate, dim > 0, Self.hadamardCompatible(dim) else { return nil }
+        if let s = quantSigns { return s }
+        var rng: UInt64 = 0x9E37_79B9_7F4A_7C15 &+ UInt64(dim)
+        var s = [Float](repeating: 0, count: dim)
+        for i in 0 ..< dim {
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17
+            s[i] = (rng >> 40) & 1 == 0 ? -1 : 1
+        }
+        let a = MLXArray(s, [dim])
+        MLX.eval(a)
+        quantSigns = a
+        return a
+    }
+    /// Rotate rows (last axis == dim) in fp32. Returns the input untouched when rotation is off.
+    private func rotateForQuantLocked(_ x: MLXArray) -> MLXArray {
+        guard let s = quantSignsLocked() else { return x }
+        return MLX.hadamardTransform(x.asType(.float32) * s, scale: 1.0 / Float(dim).squareRoot())
+    }
     private static let quantGroup = 64
     /// PAPER LEVER: forces the base representation regardless of the auto policy. The auto rule below
     /// is a function of the memory CAP, so at CAP-3 the bf16/int4 boundary sits at 500k rows and at
@@ -609,15 +741,53 @@ public final class VectorStore: @unchecked Sendable {
     }
     nonisolated(unsafe) private static let deviceCrossoverRows: Int =
         crossoverRows(gpuCores: SystemProbe.gpuCores())
+    /// WIDTH vs SPEED, measured in isolation (`omni-verify qmmbench 4500000 768`, M3 Ultra, two
+    /// settled runs agreeing to ~1%). Time is NOT monotone in bytes, because the kernel stops being
+    /// bandwidth-bound below 4 bits:
+    ///
+    ///   bits   B/row   ms     achieved
+    ///      8     816   4.74   642 GB/s  \
+    ///      6     624   3.72   625 GB/s   |  bandwidth-bound plateau: ms tracks bytes
+    ///      5     528   3.15   623 GB/s   |
+    ///      4     432   2.60   618 GB/s  /
+    ///      3     336   2.32   539 GB/s     <- minimum of the curve
+    ///      2     240   2.88   310 GB/s     <- 29% fewer bytes, 24% SLOWER
+    ///
+    /// Read that as time = bytes / bandwidth: a width wins when it cuts bytes by MORE than it costs
+    /// in efficiency, and the achieved GB/s alone says nothing about which is faster.
+    ///   4 -> 3: bytes -22%, efficiency -13%  ->  net 11% faster, even though 3-bit uses the bus
+    ///           worse. 3 does not divide 8, so values straddle byte boundaries and each load pays
+    ///           extra shift/mask to reassemble them - that is the whole 13%.
+    ///   3 -> 2: bytes -29%, efficiency -42%  ->  net 24% slower. 2-bit repacks cleanly, but it
+    ///           unpacks four values per loaded byte (4x 8-bit's dequant ALU), and the per-group
+    ///           scale+bias stream is a fixed 48 B/row that never shrinks - 20% of a 2-bit row, and
+    ///           a second, less coalesced stream.
+    /// So 3 bits is the fastest the scan can be at ANY width, not merely the smallest worth having,
+    /// and 2 bits costs time AND recall.
+    /// Measured on one machine with ~800 GB/s of peak bandwidth; a part with a different ALU-to-
+    /// bandwidth ratio could move the crossover, so re-run qmmbench before trusting it elsewhere.
+    ///
     /// Policy: OMNI_QUANT_BASE forces (0=off, 4, 8); unset = auto-on at 4 bits when the full base
     /// would exceed a quarter of the user's memory cap (Settings > Performance), OR when the corpus
     /// is past the row count at which the replica is simply the faster scan on this device.
     static func quantBitsFor(baseBytes: Int, rowCount: Int = 0) -> Int {
         if let v = quantBaseOverride { return v }
         if let s = ProcessInfo.processInfo.environment["OMNI_QUANT_BASE"], let v = Int(s) { return v }
-        if baseBytes > OmniMemoryBudget.capBytes / 4 { return 4 }
-        return rowCount > deviceCrossoverRows ? 4 : 0
+        if baseBytes > OmniMemoryBudget.capBytes / 4 { return Self.scanBits }
+        return rowCount > deviceCrossoverRows ? Self.scanBits : 0
     }
+    /// Width of the quantized scan replica. 3, not 4: measured on a 4.5M-row index it is the
+    /// minimum of the latency curve (see the table above), 22% smaller on disk and in memory, and
+    /// at least as accurate on every arm - equal on text (mean 0.9723 vs 0.9597 path recall, score
+    /// ratio 0.99998 vs 0.99995) and strictly better on image queries, where 3-bit reproduces the
+    /// exact ranking on 120/120 and 4-bit does not.
+    ///
+    /// KNOWN RESIDUAL RISK, stated because it is not measured: changing this width rejects every
+    /// existing .quant replica, so the first search after an update rebuilds it from flat16. That
+    /// is 572 ms on an M3 Ultra, but the comment on rebuildBaseLocked reports "~minutes at 3.8M
+    /// rows on a base M-chip" for a full rebuild, and it lands on whichever search arrives first.
+    /// The launch warm-up normally absorbs it; a user who searches immediately does not.
+    static let scanBits = 3
     // MARK: - Tombstones
     //
     // Removing a file's rows used to compact the whole store: every row after the first removed one
@@ -2704,8 +2874,15 @@ public final class VectorStore: @unchecked Sendable {
             // (x @ w.T via quantizedMM wants x as [1, dim]); exact rerank happens below.
             let baseScore: MLXArray
             if let qb = quantBase {
+                // The replica is stored rotated when the preconditioner is on, so the query must be
+                // rotated by the SAME orthogonal R to score against it. `qv` stays unrotated - every
+                // exact path below reads the untouched bf16 rows and must not see a rotated query.
+                // With the lever off this is the original `qv.transposed`, allocation for
+                // allocation: a disabled experiment must not cost the shipped path anything.
+                let qRow = Self.quantRotate ? rotateForQuantLocked(MLXArray(query, [1, dim])).asType(.bfloat16)
+                                            : qv.transposed(1, 0)
                 baseScore = maskDeadLocked(
-                    MLX.quantizedMM(qv.transposed(1, 0), qb.wq, scales: qb.scales, biases: qb.biases,
+                    MLX.quantizedMM(qRow, qb.wq, scales: qb.scales, biases: qb.biases,
                                     transpose: true, groupSize: Self.quantGroup, bits: quantBits)
                         .transposed(1, 0))
                 // PLAIN-QUERY FAST PATH: select the top-C candidates ON THE GPU (argPartition) so the
@@ -2713,7 +2890,7 @@ public final class VectorStore: @unchecked Sendable {
                 // candidates and reduce over candidates + delta only - O(C + delta) host work after
                 // the scan instead of O(N). Filtered queries keep the host path below (its candidate
                 // selection applies the filter prefilters).
-                let C = min(baseRows, min(4096, max(1024, topK * 32)))
+                let C = min(baseRows, Self.candidateCount(topK: topK))
                 if filter.isEmpty, baseRows > C {
                     let result = fillSnippetsLocked(searchCandidatesLocked(
                         coarse: baseScore, qv: qv, n: n, candidateCount: C, query: query, topK: topK))
@@ -2777,7 +2954,10 @@ public final class VectorStore: @unchecked Sendable {
             // isFinite check; per-file chunk counts are unaffected). Candidate selection applies
             // the kind/since/path prefilters from RESIDENT data so a filtered query cannot lose
             // its matches outside the coarse top-C.
-            if quantBase != nil {
+            // A/B LEVER, measurement only: OMNI_QUANT_RERANK=0 returns the coarse 4-bit scores as
+            // final, so the exact half of the funnel can be priced (recall AND latency) against the
+            // funnel and against an exact bf16 scan on a real index. Ship behaviour is unchanged.
+            if quantBase != nil, Self.quantRerank {
                 scores = rerankLocked(coarse: scores, n: n, query: query, filter: filter, topK: topK)
             }
             let t1 = Self.searchTiming ? Date() : nil
@@ -2914,21 +3094,31 @@ public final class VectorStore: @unchecked Sendable {
         }
         let cand = topIdx.asType(.int32).asArray(Int32.self)
 
-        // Exact rescore of the C candidates (host gather + one small matmul).
-        var packed = [UInt16](repeating: 0, count: cand.count * dim)
-        flat16.withUnsafeBufferPointer { fb in
-            packed.withUnsafeMutableBufferPointer { pb in
-                guard let src = fb.baseAddress, let dst = pb.baseAddress else { return }
-                for (j, ri) in cand.enumerated() { (dst + j * dim).update(from: src + Int(ri) * dim, count: dim) }
+        // Exact rescore of the C candidates (host gather + one small matmul). This is the OTHER
+        // half of the funnel: rerankLocked serves filtered queries, this serves plain ones, so an
+        // A/B that only disables one of them measures nothing on the path most queries take.
+        var exScores: [Float]
+        if Self.quantRerank {
+            var packed = [UInt16](repeating: 0, count: cand.count * dim)
+            flat16.withUnsafeBufferPointer { fb in
+                packed.withUnsafeMutableBufferPointer { pb in
+                    guard let src = fb.baseAddress, let dst = pb.baseAddress else { return }
+                    for (j, ri) in cand.enumerated() { (dst + j * dim).update(from: src + Int(ri) * dim, count: dim) }
+                }
             }
+            let exact: MLXArray = packed.withUnsafeBytes { raw in
+                let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!),
+                                count: cand.count * dim * MemoryLayout<UInt16>.size, deallocator: .none)
+                let tile = Self.exactTile(MLXArray(data, [cand.count, dim], dtype: .bfloat16), group: Self.quantGroup)
+                return MLX.matmul(tile, qv)
+            }
+            MLX.eval(exact)
+            exScores = exact.reshaped([cand.count]).asType(.float32).asArray(Float.self)
+        } else {
+            let cs = MLX.take(flat, topIdx, axis: 0)   // keep the coarse 4-bit scores as final
+            MLX.eval(cs)
+            exScores = cs.reshaped([cand.count]).asType(.float32).asArray(Float.self)
         }
-        let exact: MLXArray = packed.withUnsafeBytes { raw in
-            let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!),
-                            count: cand.count * dim * MemoryLayout<UInt16>.size, deallocator: .none)
-            return MLX.matmul(MLXArray(data, [cand.count, dim], dtype: .bfloat16), qv)
-        }
-        MLX.eval(exact)
-        let exScores = exact.reshaped([cand.count]).asType(.float32).asArray(Float.self)
 
         // Best chunk per file over candidates + delta (small dictionary - C + delta entries max).
         var best: [Int32: (score: Float, row: Int32)] = [:]
@@ -2983,7 +3173,7 @@ public final class VectorStore: @unchecked Sendable {
     /// C scales with topK and never exceeds 4096; when the base has <= C rows every row is a
     /// candidate and the result is exactly the full bf16 search.
     private func rerankLocked(coarse: [Float], n: Int, query: [Float], filter: SearchFilter, topK: Int) -> [Float] {
-        let C = min(baseRows, min(4096, max(1024, topK * 32)))
+        let C = min(baseRows, Self.candidateCount(topK: topK))
         let kinds = filter.kinds, hasKind = !kinds.isEmpty, since = filter.since
         // tagAllow/tagDeny are path-based prefilters exactly like folder/ext: they MUST gate
         // candidate selection here, or a tag-filtered quant-mode query silently loses every
@@ -3040,8 +3230,8 @@ public final class VectorStore: @unchecked Sendable {
         let exact: MLXArray = packed.withUnsafeBytes { raw in
             let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!),
                             count: hIdx.count * dim * MemoryLayout<UInt16>.size, deallocator: .none)
-            return MLX.matmul(MLXArray(data, [hIdx.count, dim], dtype: .bfloat16),
-                              MLXArray(query, [dim, 1]).asType(.bfloat16))
+            let tile = Self.exactTile(MLXArray(data, [hIdx.count, dim], dtype: .bfloat16), group: Self.quantGroup)
+            return MLX.matmul(tile, MLXArray(query, [dim, 1]).asType(.bfloat16))
         }
         MLX.eval(exact)
         let exScores = exact.reshaped([hIdx.count]).asType(.float32).asArray(Float.self)
@@ -3421,6 +3611,11 @@ public final class VectorStore: @unchecked Sendable {
         var scShape: [Int], scDType: String, scBytes: Int, scSum: String
         var biShape: [Int]?, biDType: String?, biBytes: Int?, biSum: String?
         var checksum: String
+        /// Whether the rows were Hadamard-rotated before quantizing. Optional so replicas written
+        /// before the preconditioner existed decode as nil == false. A replica whose rotation does
+        /// not match the running build must be REJECTED, not adopted: the scores would be a rotated
+        /// query against unrotated rows, which is not wrong-ish, it is noise.
+        var rotate: Bool?
     }
 
     /// FNV-1a 64 over ~256 sampled 4KB pages of a blob (always the first and last page). Guards
@@ -3527,7 +3722,8 @@ public final class VectorStore: @unchecked Sendable {
             wqShape: qb.wq.shape, wqDType: wqTag, wqBytes: wqData.count, wqSum: Self.blobChecksum(wqData),
             scShape: qb.scales.shape, scDType: scTag, scBytes: scData.count, scSum: Self.blobChecksum(scData),
             biShape: qb.biases?.shape, biDType: biTag, biBytes: biData?.count, biSum: biData.map { Self.blobChecksum($0) },
-            checksum: String(prefixChecksumLocked(rows: baseRows), radix: 16))
+            checksum: String(prefixChecksumLocked(rows: baseRows), radix: 16),
+            rotate: Self.quantRotate)
         lastPersistedBaseRows = baseRows
         let url = quantReplicaURL
         let tmp = url.deletingLastPathComponent().appendingPathComponent(url.lastPathComponent + ".tmp")
@@ -3578,6 +3774,7 @@ public final class VectorStore: @unchecked Sendable {
         else { reject(); return }
         guard header.magic == "omni-quant-1", header.rows > 0, header.rows <= n,
               header.dim == dim, header.group == Self.quantGroup, header.bits == bits,
+              (header.rotate ?? false) == (Self.quantRotate && Self.hadamardCompatible(dim)),
               header.rows == baseRows || baseRows == 0,   // baseRows is 0 fresh out of loadIntoMemory
               flat16.count >= header.rows * dim,
               let wqT = Self.tagDType(header.wqDType), let scT = Self.tagDType(header.scDType),
@@ -3960,7 +4157,9 @@ public final class VectorStore: @unchecked Sendable {
     /// for the same reason, quantizing only a DELTA range and concatenating onto an existing
     /// replica is bit-identical to re-quantizing everything.
     private func quantizeRowsLocked(_ range: Range<Int>, bits: Int) -> (wqs: [MLXArray], scs: [MLXArray], bss: [MLXArray]) {
-        let slab = 131_072
+        // Halved when rotating: the rotation runs in fp32, so the transient slab is 2x the bf16 one
+        // and this pass already sizes that transient for the tightest machine the mode serves.
+        let slab = Self.quantRotate ? 65_536 : 131_072
         var wqs: [MLXArray] = [], scs: [MLXArray] = [], bss: [MLXArray] = []
         var off = range.lowerBound
         flat16.withUnsafeBytes { raw in
@@ -3968,7 +4167,7 @@ public final class VectorStore: @unchecked Sendable {
                 let count = Swift.min(slab, range.upperBound - off)
                 let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!.advanced(by: off * dim * MemoryLayout<UInt16>.size)),
                                 count: count * dim * MemoryLayout<UInt16>.size, deallocator: .none)
-                let part = MLXArray(data, [count, dim], dtype: .bfloat16)
+                let part = rotateForQuantLocked(MLXArray(data, [count, dim], dtype: .bfloat16))
                 let q = MLX.quantized(part, groupSize: Self.quantGroup, bits: bits)
                 var toEval = [q.wq, q.scales]
                 if let b = q.biases { toEval.append(b) }

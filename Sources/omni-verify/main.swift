@@ -5933,6 +5933,445 @@ if args.count >= 3 && args[1] == "compilebench" {
 }
 
 
+// Why is a NARROWER quantized scan slower? omni-verify qmmbench [N] [dim]
+// The funnel measured 2-bit slower than 3-bit end to end, which no bandwidth argument explains -
+// fewer bytes should scan faster. This times MLX.quantizedMM alone, at the exact shape search uses
+// ([1, dim] x [N, dim] transposed, group 64), across every bit width the kernel supports, so the
+// kernel is separated from the gather, the reduce and the page cache. Also reports the implied
+// bandwidth, which is what says whether a width is bandwidth-bound or kernel-bound.
+if args.count >= 2 && args[1] == "qmmbench" {
+    let N = (args.count >= 3 ? Int(args[2]) : nil) ?? 4_500_000
+    let dim = (args.count >= 4 ? Int(args[3]) : nil) ?? 768
+    omniSetMemoryLimit(24_000_000_000)
+    print("qmmbench N=\(N) dim=\(dim) group=64   (search shape: [1,dim] x [N,dim]^T)")
+    var rng: UInt64 = 0x9E37_79B9_7F4A_7C15
+    func nextF() -> Float { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return Float(rng >> 40) / Float(1 << 24) - 0.5 }
+    var q = [Float](repeating: 0, count: dim)
+    for i in 0 ..< dim { q[i] = nextF() }
+    let qv = MLXArray(q, [1, dim]).asType(.bfloat16)
+    // Build the base once in bf16, then quantize it per width.
+    var base = [Float](repeating: 0, count: Swift.min(N, 1_000_000) * dim)
+    for i in 0 ..< base.count { base[i] = nextF() }
+    let tile = MLXArray(base, [Swift.min(N, 1_000_000), dim]).asType(.bfloat16)
+    base = []
+    let reps = Swift.max(1, N / tile.dim(0))
+    let W = reps == 1 ? tile : MLX.concatenated(Array(repeating: tile, count: reps), axis: 0)
+    MLX.eval(W)
+    let rowsN = W.dim(0)
+    print(String(format: "  base rows=%d  bf16 = %.2f GB", rowsN, Double(rowsN * dim * 2) / 1_073_741_824))
+    for bits in [8, 6, 5, 4, 3, 2] {
+        let qz = MLX.quantized(W, groupSize: 64, bits: bits)
+        MLX.eval(qz.wq, qz.scales)
+        if let b = qz.biases { MLX.eval(b) }
+        // Bytes the scan must actually read: packed weights + per-group scale and bias.
+        let bytes = rowsN * (dim * bits / 8) + rowsN * (dim / 64) * (qz.biases == nil ? 2 : 4)
+        var best = Double.infinity
+        for _ in 0 ..< 6 {
+            let t = Date()
+            let s = MLX.quantizedMM(qv, qz.wq, scales: qz.scales, biases: qz.biases,
+                                    transpose: true, groupSize: 64, bits: bits)
+            MLX.eval(s)
+            best = Swift.min(best, -t.timeIntervalSinceNow * 1000)
+        }
+        print(String(format: "  %d-bit  %6.2f ms   %5.0f B/row  %6.2f GB read  ->  %5.0f GB/s",
+                     bits, best, Double(bytes) / Double(rowsN), Double(bytes) / 1_073_741_824,
+                     Double(bytes) / 1_073_741_824 / (best / 1000)))
+        MLX.GPU.clearCache()
+    }
+    exit(0)
+}
+
+// Would a codebook/projection LEARNED FROM THIS CORPUS beat the fixed affine quantizer?
+//   omni-verify quantlearn <modelDir> <dbPath> <folder> [nQueries]
+// The scan tier's only job is to put the true top-K inside the top-C candidates the exact rerank
+// then reorders - a loose job (2-bit affine already keeps top-1 perfect). So the question is not
+// "how accurate can 4 bits be" but "how FEW bytes can do that job", and that is where a
+// data-dependent transform should win: a fixed quantizer must budget for 768 independent
+// dimensions, while a real corpus lives on far fewer.
+//
+// Learns a PCA basis on a held-out half of the corpus's own vectors, projects to K dims, quantizes
+// 4-bit group-64, and measures what the funnel actually needs: does the true exact top-50 survive
+// inside the projected tier's top-C? Ground truth is fp32 over the same vectors. Reports bytes per
+// row so the quality is priced, not just observed. Also runs matryoshka truncation (the model's own
+// reduction - jina-v5 trains prefixes to stand alone) as the fair comparison for "fewer dims".
+//
+// RESULT, 62,786 real vectors, 60 queries, scored at the harsher width (kept@384):
+//
+//   affine 768 @4 (shipped)   432 B   1.0000     matryoshka 512 @4   288 B   0.9940
+//   affine 768 @3             336 B   1.0000     matryoshka 512 @2   160 B   0.9563
+//   affine 768 @2             240 B   0.9973     matryoshka 256 @4   144 B   0.8520
+//   learned PCA 384 @4        216 B   0.8287     matryoshka 512 @8   544 B   0.9933
+//
+// Three separate ways of asking "can we trade dimensions for bits", one answer: no. Matryoshka
+// beats learned PCA at equal dims (0.8520 vs 0.7857 at 256), so the model's trained truncation is
+// better than anything the local corpus teaches - but BOTH lose to simply lowering the bit width
+// over all 768 dims. 512 dims at 8 bits (544 B) scores WORSE than 768 dims at 2 bits (240 B) while
+// costing 2.3x the space.
+//
+// The reason is structural: every dimension contributes independently to the inner product, so
+// coarse quantization adds noise that averages down across dims, while truncation deletes signal
+// that no precision restores. Wide-and-coarse dominates narrow-and-fine.
+if args.count >= 5 && args[1] == "quantlearn" {
+    let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    let store = try VectorStore(dbURL: URL(fileURLWithPath: args[3]))
+    let folder = args[4]
+    let nq = (args.count >= 6 ? Int(args[5]) : nil) ?? 60
+    omniSetMemoryLimit(6_000_000_000)
+    let d = engine.dim
+    let data = store.vectorsUnderFolder(folder, cap: 200_000, landmarkCap: 200_000)
+    let n = data.count
+    guard n > 5000 else { print("quantlearn: need a folder with more indexed files (got \(n))"); store.close(); exit(1) }
+    let C = 3840, K0 = 50    // the shipped candidate count, and the top-K the rerank must not lose
+    print("quantlearn folder=\(folder) rows=\(n) dim=\(d)  candidates C=\(C)  target=exact top-\(K0)")
+
+    let X = MLXArray(data.vectors, [n, d]).asType(.float32)
+    // Queries: real text, embedded - not sampled corpus rows, which would flatter every arm.
+    let terms = ["beach sunset", "invoice pdf", "porsche", "team photo", "memory profiling",
+                 "embedding quantization", "screen recording", "paper figure", "roadmap",
+                 "gantt chart", "trajectory checkpoint", "metal kernel", "swift concurrency",
+                 "index compaction", "cat", "receipt", "slide deck", "arxiv paper"]
+    var qv: [Float] = []
+    for i in 0 ..< nq { qv.append(contentsOf: engine.embedQuery(terms[i % terms.count] + (i >= terms.count ? " \(i)" : ""))) }
+    let Q = MLXArray(qv, [nq, d]).asType(.float32)
+
+    // Ground truth: exact fp32 top-K0 per query.
+    let exactS = MLX.matmul(Q, X.transposed(1, 0))
+    let gtIdx = MLX.argPartition(MLX.negative(exactS), kth: K0, axis: 1)[0..., 0 ..< K0]
+    MLX.eval(gtIdx)
+    let gt = gtIdx.asType(.int32).asArray(Int32.self)
+
+    // PCA basis learned on a HELD-OUT half (even rows), so the score is not fitted to what it scores.
+    let train = X[MLXArray(Array(stride(from: 0, to: n, by: 2)).map { Int32($0) })]
+    let mean = MLX.mean(train, axis: 0, keepDims: true)
+    let Xc = train - mean
+    let cov = MLX.matmul(Xc.transposed(1, 0), Xc) / Float(Xc.dim(0))
+    let (_, _, Vt) = MLXLinalg.svd(cov.asType(.float32), stream: .cpu)
+    MLX.eval(Vt, mean)
+
+    func rowBytes(_ k: Int, bits: Int) -> Int { k * bits / 8 + (k / 64) * 4 }
+    /// Containment is reported at TWO candidate widths. C=3840 is what ships, but on this 62k-row
+    /// sample that is 6% of the corpus, where the real index selects 0.085% - so the wide number is
+    /// optimistic by construction. The narrow one is the same job at ~10x the selectivity and is
+    /// the honest guide to how an arm behaves at index scale.
+    enum Mode { case pca, matryoshka, full }
+    func arm(_ k: Int, bits: Int, mode: Mode, label: String) {
+        let Xp: MLXArray, Qp: MLXArray
+        switch mode {
+        case .full:
+            Xp = X; Qp = Q
+        case .pca:
+            let comps = Vt[0 ..< k]                     // [k, d]
+            Xp = MLX.matmul(X - mean, comps.transposed(1, 0))
+            Qp = MLX.matmul(Q - mean, comps.transposed(1, 0))
+        case .matryoshka:
+            // The model's OWN dimensionality reduction: jina-v5 is matryoshka-trained, so a prefix
+            // is a self-sufficient embedding - but only after re-normalizing, which is what makes
+            // the truncated inner product a cosine again. Nothing is learned from the corpus here.
+            func trunc(_ a: MLXArray) -> MLXArray {
+                let p = a[0..., 0 ..< k]
+                return p / MLX.sqrt(MLX.sum(p * p, axis: 1, keepDims: true) + 1e-12)
+            }
+            Xp = trunc(X); Qp = trunc(Q)
+        }
+        // Simulate storing the tier at `bits`, group-64 affine - the representation quantizedMM reads.
+        let q = MLX.quantized(Xp.asType(.bfloat16), groupSize: 64, bits: bits)
+        let deq = MLX.dequantized(q.wq, scales: q.scales, biases: q.biases, groupSize: 64, bits: bits).asType(.float32)
+        let s = MLX.matmul(Qp, deq.transposed(1, 0))
+        var kepts: [Double] = []
+        for width0 in [C, 384] {
+            let width = Swift.min(width0, n)
+            let cIdx = MLX.argPartition(MLX.negative(s), kth: Swift.min(width, n - 1), axis: 1)[0..., 0 ..< width]
+            MLX.eval(cIdx)
+            let cand = cIdx.asType(.int32).asArray(Int32.self)
+            var kept = 0.0
+            for qi in 0 ..< nq {
+                var set = Set<Int32>(); set.reserveCapacity(width)
+                for j in 0 ..< width { set.insert(cand[qi * width + j]) }
+                var hit = 0
+                for j in 0 ..< K0 where set.contains(gt[qi * K0 + j]) { hit += 1 }
+                kept += Double(hit) / Double(K0)
+            }
+            kepts.append(kept / Double(nq))
+        }
+        let b = rowBytes(k, bits: bits)
+        print(String(format: "  %-24@ dims=%-4d bits=%d  %4d B/row (%.2fx)   kept@%d = %.4f   kept@384 = %.4f",
+                     label, k, bits, b, Double(rowBytes(d, bits: 4)) / Double(b), C, kepts[0], kepts[1]))
+    }
+    for bits in [4, 3, 2] { arm(d, bits: bits, mode: .full, label: bits == 4 ? "affine (shipped)" : "affine") }
+    for k in [384, 256, 192, 128] { arm(k, bits: 4, mode: .pca, label: "learned PCA + affine") }
+    for k in [512, 256, 128, 64] { arm(k, bits: 4, mode: .matryoshka, label: "matryoshka + affine") }
+    for k in [512, 256, 128] { arm(k, bits: 8, mode: .matryoshka, label: "matryoshka + affine") }
+    for k in [512, 256] { arm(k, bits: 3, mode: .matryoshka, label: "matryoshka + affine") }
+    for k in [512, 256] { arm(k, bits: 2, mode: .matryoshka, label: "matryoshka + affine") }
+    store.close()
+    exit(0)
+}
+
+// WHY the Hadamard preconditioner does or does not help this data:
+//   omni-verify quantdist <modelDir> [nTexts]
+// The rotation earns its keep only when a 64-wide quantization group contains outliers - affine
+// quant spends its levels on [min, max], so one large coordinate costs the other 63 their
+// precision. That is the situation in LLM weights (the setting TurboQuant was written for). This
+// measures whether it is the situation in OUR embeddings, by reporting per-group crest factor
+// (max|x| / rms) and excess kurtosis before and after the rotation. A Gaussian group sits at
+// kurtosis 0 and crest ~3; if the raw vectors are already there, the rotation has nothing to fix.
+if args.count >= 3 && args[1] == "quantdist" {
+    let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    let n = (args.count >= 4 ? Int(args[3]) : nil) ?? 256
+    let d = engine.dim, group = 64
+    guard VectorStore.hadamardCompatible(d) else { print("dim \(d) not Hadamard-compatible"); exit(1) }
+    // Real passages, not synthetic: the question is about the encoder's output distribution.
+    let seeds = ["The quarterly invoice was issued on the fifteenth.", "def forward(self, x): return self.norm(x)",
+                 "A photograph of a beach at sunset with long shadows.", "Memory profiling shows the fold dominates.",
+                 "SELECT path, score FROM chunks ORDER BY score DESC", "Meeting notes: roadmap, staffing, Q3 targets.",
+                 "The cat sat on the mat, unimpressed.", "Metal kernel dispatch overhead at small shapes."]
+    var texts: [String] = []
+    for i in 0 ..< n { texts.append(seeds[i % seeds.count] + " (\(i))") }
+    var vecs: [[Float]] = []
+    for b in stride(from: 0, to: n, by: 32) {
+        vecs.append(contentsOf: engine.embedTextBatch(Array(texts[b ..< Swift.min(b + 32, n)]), as: .passage))
+    }
+    var signs = [Float](repeating: 0, count: d)
+    var rng: UInt64 = 0x9E37_79B9_7F4A_7C15 &+ UInt64(d)
+    for i in 0 ..< d { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; signs[i] = (rng >> 40) & 1 == 0 ? -1 : 1 }
+    let sg = MLXArray(signs, [d])
+    let X = MLXArray(vecs.flatMap { $0 }, [vecs.count, d])
+    let R = MLX.hadamardTransform(X * sg, scale: 1.0 / Float(d).squareRoot())
+    MLX.eval(X, R)
+
+    func stats(_ a: MLXArray, _ label: String) {
+        let h = a.asArray(Float.self)
+        let rowsN = vecs.count, groups = d / group
+        var crest = [Double](), kurt = [Double]()
+        for r in 0 ..< rowsN {
+            for g in 0 ..< groups {
+                let lo = r * d + g * group
+                var s2 = 0.0, s4 = 0.0, mx = 0.0
+                for i in lo ..< lo + group { let v = Double(h[i]); s2 += v * v; s4 += v * v * v * v; mx = Swift.max(mx, abs(v)) }
+                let m2 = s2 / Double(group), m4 = s4 / Double(group)
+                guard m2 > 0 else { continue }
+                crest.append(mx / m2.squareRoot())
+                kurt.append(m4 / (m2 * m2) - 3.0)
+            }
+        }
+        crest.sort(); kurt.sort()
+        print(String(format: "  %-9@ crest(max/rms) p50=%.2f p99=%.2f max=%.2f     excess kurtosis p50=%+.2f p99=%+.2f",
+                     label, crest[crest.count/2], crest[Int(Double(crest.count) * 0.99)], crest.last ?? 0,
+                     kurt[kurt.count/2], kurt[Int(Double(kurt.count) * 0.99)]))
+    }
+    print("quantdist dim=\(d) group=\(group) rows=\(vecs.count)   (Gaussian reference: crest ~3.0, excess kurtosis 0)")
+    stats(X, "raw")
+    stats(R, "rotated")
+    exit(0)
+}
+
+// Is the Hadamard preconditioner actually inner-product preserving?
+//   omni-verify hadamardcheck [dim]
+// Everything downstream assumes <Rx, Rq> == <x, q> for R = (H/sqrt(d)).diag(s). If MLX's transform
+// normalizes differently than assumed, recall numbers would silently be measuring a broken ranking
+// rather than a quantizer, so this is checked before any of them are believed.
+if args.count >= 2 && args[1] == "hadamardcheck" {
+    let d = (args.count >= 3 ? Int(args[2]) : nil) ?? 768
+    guard VectorStore.hadamardCompatible(d) else { print("hadamardcheck dim=\(d): not Hadamard-compatible"); exit(1) }
+    var rng: UInt64 = 0x9E37_79B9_7F4A_7C15 &+ UInt64(d)
+    func nextF() -> Float { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return Float(rng >> 40) / Float(1 << 24) - 0.5 }
+    var signs = [Float](repeating: 0, count: d)
+    for i in 0 ..< d { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; signs[i] = (rng >> 40) & 1 == 0 ? -1 : 1 }
+    let sg = MLXArray(signs, [d])
+    func rot(_ a: MLXArray) -> MLXArray { MLX.hadamardTransform(a * sg, scale: 1.0 / Float(d).squareRoot()) }
+    let nq = 64
+    var xs = [Float](), qs = [Float]()
+    for _ in 0 ..< nq * d { xs.append(nextF()) }
+    for _ in 0 ..< d { qs.append(nextF()) }
+    let X = MLXArray(xs, [nq, d]), Q = MLXArray(qs, [1, d])
+    let plain = MLX.matmul(X, Q.transposed(1, 0))
+    let rotated = MLX.matmul(rot(X), rot(Q).transposed(1, 0))
+    MLX.eval(plain, rotated)
+    let a = plain.reshaped([nq]).asArray(Float.self), b = rotated.reshaped([nq]).asArray(Float.self)
+    var maxAbs = 0.0, maxRel = 0.0, scale = 0.0
+    for i in 0 ..< nq {
+        maxAbs = Swift.max(maxAbs, Double(abs(a[i] - b[i])))
+        scale = Swift.max(scale, Double(abs(a[i])))
+        if abs(a[i]) > 1e-6 { maxRel = Swift.max(maxRel, Double(abs(a[i] - b[i]) / abs(a[i]))) }
+    }
+    print(String(format: "hadamardcheck dim=%d  |<x,q>| up to %.4f   max abs err=%.3e   max rel err=%.3e   %@",
+                 d, scale, maxAbs, maxRel, maxRel < 1e-4 ? "PASS (orthogonal)" : "FAIL"))
+    exit(maxRel < 1e-4 ? 0 : 1)
+}
+
+// What the exact half of the search funnel is worth, on a REAL index:
+//   omni-verify quantrecall <modelDir> <dbPath> [nQueries]
+// Search today is a funnel - coarse scan over a 4-bit group-quantized replica, then an exact bf16
+// rerank of the top-C candidates gathered from the mmap'd vectors. This prices the second half by
+// running three arms over the same queries and the same store, in the same process:
+//   exact   OMNI_QUANT_BASE=0  full bf16 scan. Ground truth for recall.
+//   funnel  ship behaviour     4-bit coarse + exact rerank.
+//   coarse  OMNI_QUANT_RERANK=0  4-bit scores taken as final - "all the way 4-bit".
+// Recall is measured on FILE PATHS at 10 and at topK, which is what the user sees, not on row ids.
+// Run each arm in its own process (the levers are read once); this prints one arm per invocation.
+struct GT: Codable { var paths: [[String]]; var scores: [[Float]] }
+if args.count >= 4 && args[1] == "quantrecall" {
+    let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    let nq = (args.count >= 5 ? Int(args[4]) : nil) ?? 40
+    let topK = 50
+    omniSetMemoryLimit(6_000_000_000)
+    let store = try VectorStore(dbURL: URL(fileURLWithPath: args[3]))
+    let arm = ProcessInfo.processInfo.environment["OMNI_QUANT_BASE"] == "0" ? "exact"
+            : (ProcessInfo.processInfo.environment["OMNI_QUANT_RERANK"] == "0" ? "coarse" : "funnel")
+    // QUERY SOURCE. OMNI_QRC_SOURCE=seed keeps the original 20-term list (kept only so older
+    // numbers stay reproducible); `corpus` is the default and the honest one - real excerpts from
+    // the user's own indexed text files, so the queries carry the corpus's actual vocabulary and
+    // span hundreds of distinct topics instead of ~20 semantic clusters; `image` embeds real
+    // indexed images through the vision tower, which is a different output distribution entirely
+    // and was never covered by any earlier measurement.
+    let source = ProcessInfo.processInfo.environment["OMNI_QRC_SOURCE"] ?? "corpus"
+    // Optional filter arm: every earlier measurement took the UNFILTERED gpu-candidate fast path,
+    // leaving rerankLocked (the host path filtered queries take) unmeasured at any bit width.
+    var filter = SearchFilter()
+    switch ProcessInfo.processInfo.environment["OMNI_QRC_FILTER"] ?? "" {
+    case "kind":   filter.kinds = ["text"]
+    case "folder": filter.folderPrefix = "/Users/hanxiao/Documents"
+    case "since":  filter.since = Date().timeIntervalSince1970 - 86400 * 90
+    case "ext":    filter.ext = "pdf"
+    default: break
+    }
+    let filterTag = ProcessInfo.processInfo.environment["OMNI_QRC_FILTER"] ?? "none"
+
+    var vecs: [[Float]] = []
+    switch source {
+    case "seed":
+        let terms = ["beach sunset", "invoice pdf", "porsche", "team photo", "memory profiling",
+                     "embedding quantization", "screen recording", "paper figure", "roadmap",
+                     "gantt chart", "trajectory checkpoint", "metal kernel", "swift concurrency",
+                     "index compaction", "cat", "receipt", "slide deck", "arxiv paper",
+                     "training loss curve", "dockerfile"]
+        for i in 0 ..< nq { vecs.append(engine.embedQuery(terms[i % terms.count] + (i >= terms.count ? " \(i)" : ""))) }
+    case "image":
+        var made = 0
+        for p in store.allIndexedPaths() where made < nq {
+            guard ["png", "jpg", "jpeg", "heic"].contains((p as NSString).pathExtension.lowercased()) else { continue }
+            guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: p) as CFURL, nil),
+                  let img = CGImageSourceCreateImageAtIndex(src, 0, nil),
+                  let v = engine.embedImage(img) else { continue }
+            vecs.append(v); made += 1
+        }
+    default:
+        // Real excerpts, deterministic: stride the indexed text paths and take a mid-file window.
+        let exts = ["txt", "md", "swift", "py", "json", "html", "csv", "tex"]
+        var made = 0
+        for p in store.allIndexedPaths() where made < nq {
+            guard exts.contains((p as NSString).pathExtension.lowercased()) else { continue }
+            guard let d = FileManager.default.contents(atPath: p), d.count > 2000,
+                  let text = String(data: d[(d.count / 3) ..< Swift.min(d.count, d.count / 3 + 1200)], encoding: .utf8)
+            else { continue }
+            let words: [String] = text.split(separator: " ").map(String.init).filter { $0.count > 1 }
+            guard words.count > 12 else { continue }
+            vecs.append(engine.embedQuery(words.prefix(18).joined(separator: " ")))
+            made += 1
+        }
+    }
+    guard vecs.count >= 10 else { print("quantrecall: only \(vecs.count) \(source) queries available"); store.close(); exit(1) }
+    _ = store.search(vecs[0], filter: filter, topK: topK, markActive: false)   // fold + warm
+
+    var lat: [Double] = []
+    var out: [[String]] = []
+    var outScore: [[Float]] = []
+    for v in vecs {
+        let t = Date()
+        let hits = store.search(v, filter: filter, topK: topK, markActive: false)
+        lat.append(-t.timeIntervalSinceNow * 1000)
+        out.append(hits.map(\.path))
+        outScore.append(hits.map(\.score))
+    }
+    lat.sort()
+    let gtPath = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("omni-quantrecall-gt-\(source)-\(filterTag).json")
+    if arm == "exact" {
+        try? JSONEncoder().encode(GT(paths: out, scores: outScore)).write(to: gtPath)
+        print(String(format: "quantrecall arm=exact  src=%-6@ filter=%-6@ n=%d rows=%d  p50=%6.2f ms   (ground truth written)",
+                     source, filterTag, vecs.count, store.count, lat[vecs.count/2]))
+    } else {
+        guard let d = try? Data(contentsOf: gtPath), let gtAll = try? JSONDecoder().decode(GT.self, from: d),
+              gtAll.paths.count == out.count else {
+            print("quantrecall: run the exact arm first (OMNI_QUANT_BASE=0) to write ground truth"); store.close(); exit(1)
+        }
+        let gt = gtAll.paths, gtS = gtAll.scores
+        // PER-QUERY, not just the mean. A mean recall of 1.0000 can hide a query shape that fails
+        // systematically; the p5 and the worst case are what say whether that is happening.
+        var per: [Double] = []
+        var rK = 0.0, top1 = 0.0
+        for (i, o) in out.enumerated() {
+            per.append(Double(Set(o.prefix(10)).intersection(Set(gt[i].prefix(10))).count) / 10.0)
+            rK += Double(Set(o).intersection(Set(gt[i])).count) / Double(max(1, gt[i].count))
+            if o.first != nil, o.first == gt[i].first { top1 += 1 }
+        }
+        // SCORE equivalence. Path-set recall counts a tie reshuffle as a total miss: near-duplicate
+        // files score identically, so two arms can return disjoint top-10s of equal quality. This
+        // asks the question the user actually cares about - are the scores as good - by comparing
+        // the arm's top-10 score sum against exact's.
+        var scoreRatio: [Double] = []
+        for (i, sc) in outScore.enumerated() {
+            let a = sc.prefix(10).reduce(0.0) { $0 + Double($1) }
+            let b = gtS[i].prefix(10).reduce(0.0) { $0 + Double($1) }
+            scoreRatio.append(b > 0 ? a / b : 1.0)
+        }
+        let m = vecs.count
+        let sorted = per.sorted()
+        let sortedR = scoreRatio.sorted()
+        let below = per.filter { $0 < 1.0 }.count
+        print(String(format: "quantrecall arm=%-6@ src=%-6@ filter=%-6@ n=%d  p50=%6.2f ms   recall@10 mean=%.4f p5=%.4f min=%.4f  (<1.0: %d/%d)   recall@%d=%.4f  top1=%.3f",
+                     arm, source, filterTag, m, lat[m/2],
+                     per.reduce(0, +) / Double(m), sorted[max(0, Int(Double(m) * 0.05))], sorted[0],
+                     below, m, topK, rK / Double(m), top1 / Double(m))
+              + String(format: "   score-ratio mean=%.5f min=%.5f", scoreRatio.reduce(0,+) / Double(m), sortedR[0]))
+    }
+    store.close()
+    exit(0)
+}
+
+// Startup warm-up breakdown: omni-verify warmbench <modelDir> [dbPath]
+// The launch path claims the first query lands on warm kernels because warmText() runs in the
+// background, and that gating readiness on it made an M2 look hung. This splits that warm-up into
+// its two halves and times each COLD (first call in this process) against WARM (same call again),
+// so the cold delta is the one-time cost and the warm figure is the steady-state work:
+//
+//   (a) query graph  - the B==1 whole-forward, i.e. Metal pipeline states + the compiled graph trace
+//   (b) passage batch - the B>1 indexing shape, a different set of pipelines
+//   (c) base fold     - store.search over the resident matrix, which materializes the index on the GPU
+//
+// Run it TWICE against the same model to see whether any of the cold cost survives process exit:
+// the Metal kernels ship precompiled in default.metallib, but turning that AIR into device code is
+// still per-process work unless something caches it.
+if args.count >= 3 && args[1] == "warmbench" {
+    let t0 = Date()
+    let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    let loadMs = -t0.timeIntervalSinceNow * 1000
+    omniSetMemoryLimit(6_000_000_000)
+    print(String(format: "warmbench model=%@ dim=%d  load=%.0f ms", args[2], engine.dim, loadMs))
+
+    func timed(_ label: String, reps: Int = 4, _ body: () -> Void) {
+        var ms: [Double] = []
+        for _ in 0 ..< reps { let t = Date(); body(); ms.append(-t.timeIntervalSinceNow * 1000) }
+        let warm = ms.dropFirst()
+        print(String(format: "  %-14@ cold=%8.1f ms   warm=%7.1f ms (min of %d)   cold-warm=%8.1f ms",
+                     label, ms[0], warm.min() ?? 0, warm.count, ms[0] - (warm.min() ?? 0)))
+    }
+    timed("query graph") { _ = engine.embedQuery("warm up the query path now") }
+    timed("passage batch") { _ = engine.embedTextBatch(["warm up the passage forward", "a second short passage"], as: .passage) }
+
+    if args.count >= 4 {
+        let tOpen = Date()
+        let store = try VectorStore(dbURL: URL(fileURLWithPath: args[3]))
+        // Store OPEN is a separate cost from the first search and is easy to miss: adopting the
+        // persisted 4-bit replica (read + checksum + upload) happens in init, not in the fold.
+        print(String(format: "  store open=%.0f ms  rows=%d", -tOpen.timeIntervalSinceNow * 1000, store.count))
+        let zero = [Float](repeating: 0, count: engine.dim)
+        timed("base fold", reps: 3) { _ = store.search(zero, topK: 10, markActive: false) }
+        store.close()
+    }
+    exit(0)
+}
+
 // ===== benchmark harness: querybreak (auto-integrated) =====
 // Query-latency breakdown: omni-verify querybreak <modelDir> [nIters] [N] [topK]
 // Splits END-TO-END query latency into its stages at the REAL store size and reports where the time
