@@ -909,7 +909,7 @@ public final class VectorStore: @unchecked Sendable {
     /// a deleted file back to life.
     private func resetTombstonesLocked() { deadRows.removeAll(); deadIdxCache = nil }
 
-    private func invalidateBase() { baseDirty = true; mlxBase = nil; mlxFileID = nil; mlxKindCode = nil; mlxKindCodeRows = 0; quantBase = nil; baseRows = 0 }
+    private func invalidateBase() { baseDirty = true; mlxBase = nil; mlxFileID = nil; mlxFileIDRows = 0; mlxKindCode = nil; mlxKindCodeRows = 0; quantBase = nil; baseRows = 0 }
     // Membership index of the paths currently in `rows`. Lets replace() know in O(1) whether a
     // path pre-exists, so a brand-new file skips removeRowsLocked entirely (no O(N) scan per file
     // during a full index). Rebuilt from the surviving rows whenever removeRowsLocked compacts.
@@ -2913,15 +2913,26 @@ public final class VectorStore: @unchecked Sendable {
                 // reduceTopKGPULocked already uses, and a file is exactly one kind so a per-row
                 // mask is a per-file mask.
                 let C = min(baseRows, Self.candidateCount(topK: topK))
-                let kindOnly = onlyKindFiltered(filter)
+                // `since` is the one filter that cannot be masked here - it needs per-row
+                // `modified`, which is not resident - so it keeps the host path. Everything else
+                // (kind via the kind code, folder/ext/tag via the per-file path table) becomes a
+                // GPU mask, and the query then takes the same candidate selection a plain one does.
+                let pathFilter = filter.folderPrefix != nil || (filter.ext?.isEmpty == false)
+                    || filter.tagAllow != nil || filter.tagDeny != nil
+                let maskable = filter.since == nil
                     && (filter.kinds.isEmpty || kindCodeGPULocked() != nil)
-                if kindOnly, baseRows > C {
+                    && (!pathFilter || (fileIDGPULocked() != nil && pathAllowGPULocked(filter) != nil))
+                if maskable, baseRows > C {
                     var selectScore = baseScore
                     if !filter.kinds.isEmpty, let kc = kindCodeGPULocked() {
                         var allow = [Float](repeating: 0, count: 256)
                         for k in filter.kinds { if let id = kindID[k] { allow[Int(id)] = 1 } }
                         let mask = MLXArray(allow)[kc].reshaped(baseScore.shape)
-                        selectScore = MLX.which(mask .> 0.5, baseScore, MLXArray(-Float.infinity))
+                        selectScore = MLX.which(mask .> 0.5, selectScore, MLXArray(-Float.infinity))
+                    }
+                    if pathFilter, let fid = fileIDGPULocked(), let pa = pathAllowGPULocked(filter) {
+                        let mask = pa[fid].reshaped(baseScore.shape)
+                        selectScore = MLX.which(mask .> 0.5, selectScore, MLXArray(-Float.infinity))
                     }
                     let result = fillSnippetsLocked(searchCandidatesLocked(
                         coarse: selectScore, qv: qv, n: n, candidateCount: C, query: query,
@@ -3167,9 +3178,14 @@ public final class VectorStore: @unchecked Sendable {
             for k in filter.kinds { if let id = kindID[k] { a[Int(id)] = true } }
             kindAllowed = a
         }
+        // Path filters, per file, for the same reason: the delta was scored on the host and never
+        // saw the GPU mask. Bounded work - at most C + delta offers, not a pass over the index.
+        let pathFiltered = filter.folderPrefix != nil || (filter.ext?.isEmpty == false)
+            || filter.tagAllow != nil || filter.tagDeny != nil
         func offer(_ row: Int32, _ score: Float) {
             guard score.isFinite, !deadRows.contains(row) else { return }
             if let ka = kindAllowed, Int(row) < kindCode.count, !ka[Int(kindCode[Int(row)])] { return }
+            if pathFiltered, !filter.acceptsPath(rows[Int(row)].path) { return }
             let f = fileID[Int(row)]
             if let cur = best[f], cur.score >= score { return }
             best[f] = (score, row)
@@ -3369,6 +3385,45 @@ public final class VectorStore: @unchecked Sendable {
         return kc
     }
 
+    /// GPU fileID for the current base, built on demand and sized to baseRows. Same contract as
+    /// kindCodeGPULocked: full mode builds one eagerly, quant mode never did.
+    private var mlxFileIDRows = 0
+    private func fileIDGPULocked() -> MLXArray? {
+        guard baseRows > 0, fileID.count >= baseRows else { return nil }
+        if let f = mlxFileID, mlxFileIDRows == baseRows { return f }
+        let f = fileID.withUnsafeBufferPointer { fp in
+            MLXArray(Array(UnsafeBufferPointer(rebasing: fp[0 ..< baseRows])))
+        }
+        MLX.eval(f)
+        mlxFileID = f
+        mlxFileIDRows = baseRows
+        return f
+    }
+
+    /// Per-FILE path-filter decision, as a [fileCount] 1/0 table on the GPU, cached across queries.
+    ///
+    /// Gathered by fileID it becomes a per-ROW mask, which is what lets a folder/ext/tag-filtered
+    /// query use the same GPU candidate selection a plain one does instead of a host heap pass over
+    /// every row. Cached because instant-search re-runs the SAME filter on every keystroke: the
+    /// table is a function of (folderPrefix, ext, tag sets) and the path intern table, so only a
+    /// row mutation can change it - and that already clears the tag cache, so it clears this too.
+    private var pathAllowKey: String? = nil
+    private var pathAllowGPU: MLXArray? = nil
+    private func pathAllowGPULocked(_ f: SearchFilter) -> MLXArray? {
+        let nGlobal = max(1, fileChunkCount.count)
+        guard nGlobal > 1, idPath.count >= nGlobal else { return nil }
+        let key = "\(f.folderPrefix ?? "")|\(f.ext ?? "")|\(f.tagAllow?.count ?? -1)|\(f.tagDeny?.count ?? -1)|\(nGlobal)"
+        if key == pathAllowKey, let g = pathAllowGPU { return g }
+        var allow = [Float](repeating: 0, count: nGlobal)
+        for gid in 0 ..< nGlobal where f.acceptsPath(idPath[gid]) { allow[gid] = 1 }
+        let g = MLXArray(allow)
+        MLX.eval(g)
+        pathAllowKey = key
+        pathAllowGPU = g
+        return g
+    }
+    func invalidatePathAllowCacheLocked() { pathAllowKey = nil; pathAllowGPU = nil }
+
     private func onlyKindFiltered(_ f: SearchFilter) -> Bool {
         f.folderPrefix == nil && (f.ext?.isEmpty ?? true) && f.since == nil
             && f.tagTerms.isEmpty && f.tagExcludeTerms.isEmpty
@@ -3383,7 +3438,10 @@ public final class VectorStore: @unchecked Sendable {
     /// file is immediately findable through `tag:`.
     private var tagFilterCache: [String: Set<String>] = [:]
     private static let tagFilterCacheCap = 8
-    func invalidateTagFilterCacheLocked() { if !tagFilterCache.isEmpty { tagFilterCache.removeAll(keepingCapacity: true) } }
+    func invalidateTagFilterCacheLocked() {
+        if !tagFilterCache.isEmpty { tagFilterCache.removeAll(keepingCapacity: true) }
+        invalidatePathAllowCacheLocked()   // the path table is keyed off idPath, which moves with the rows
+    }
 
     /// Resolve `tagTerms`/`tagExcludeTerms` into resident path sets (locked; called at search
     /// entry). Whole-tag, case-insensitive match against the ", "-joined tag snippets of media
@@ -4318,6 +4376,7 @@ public final class VectorStore: @unchecked Sendable {
         mlxFileID = nil
         mlxKindCode = nil
         mlxKindCodeRows = 0
+        mlxFileIDRows = 0
         quantBase = nil
         if bits > 0, dim % Self.quantGroup == 0 {
             let (wqs, scs, bss) = quantizeRowsLocked(0 ..< rowCount, bits: bits)
@@ -4348,6 +4407,7 @@ public final class VectorStore: @unchecked Sendable {
                 MLXArray(Array(UnsafeBufferPointer(rebasing: fp[0 ..< rowCount])))
             }
             mlxFileID = fid
+            mlxFileIDRows = rowCount
             // GPU kind code in lockstep (Int32 [rowCount], ~4 bytes/row): lets a kind-filtered query
             // mask disallowed-kind rows to -inf on the GPU and stay on the fast reduce path. kindCode
             // is UInt8 (<=256 kinds); widen to Int32 for use as a gather index into the 256-slot mask.

@@ -6283,6 +6283,19 @@ if args.count >= 4 && args[1] == "quantrecall" {
         out.append(hits.map(\.path))
         outScore.append(hits.map(\.score))
     }
+    // FILTER SOUNDNESS. The fast path masks on the GPU; a wrong mask returns out-of-scope files
+    // quickly, which no latency or recall number would catch - recall is measured against a
+    // ground truth built with the same filter, so both arms could be wrong together.
+    var violations = 0
+    for hits in out {
+        for path in hits {
+            if let f = filter.folderPrefix, !(path == f || path.hasPrefix(f + "/")) { violations += 1 }
+            if let e = filter.ext, !e.isEmpty, (path as NSString).pathExtension.lowercased() != e.lowercased() { violations += 1 }
+        }
+    }
+    if filter.folderPrefix != nil || (filter.ext?.isEmpty == false) {
+        print("  filter soundness: \(violations) out-of-scope results  \(violations == 0 ? "PASS" : "FAIL")")
+    }
     lat.sort()
     let gtPath = URL(fileURLWithPath: NSTemporaryDirectory())
         .appendingPathComponent("omni-quantrecall-gt-\(source)-\(filterTag).json")
