@@ -743,7 +743,32 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     /// real interactive searches never hit (typing/history/filter all route through noteInteractive). So
     /// defaulting it off reclaims ~1.9% indexing throughput everywhere. OMNI_INDEX_GATE_BATCHES still
     /// caps it for a no-keystroke workload (e.g. the serving API searching during a heavy index pass).
-    static let indexGateWindow: Int = (ProcessInfo.processInfo.environment["OMNI_INDEX_GATE_BATCHES"].flatMap { Int($0) }) ?? Int.max
+    ///
+    /// DEVICE-AWARE, because the reasoning above holds only where a flush is short. The claim that
+    /// noteInteractive() alone suffices assumes a keystroke can put the indexer in per-batch mode
+    /// BEFORE the flush the query has to wait for begins - but the window is chosen once, when the
+    /// flush takes the gate, so a keystroke arriving mid-flush cannot preempt it. The query then
+    /// waits out the whole flush: ~0.3 s on an M3 Ultra, and ~1.7 s on an M2 Air, where a flush is
+    /// 12 forwards at 0.6 flushes/s. Measured on M2 (searchunderindex, 2 rounds, OMNI_PERF_LOG
+    /// splitting the wait out of the embed):
+    ///
+    ///                     gate-wait p90   cold embed p50   cold embed p95   index throughput
+    ///   uncapped (Int.max)   839/997 ms       446/446 ms     1378/1344 ms      0.6 flushes/s
+    ///   capped at 2          183/112 ms       125/ 98 ms      231/ 288 ms      0.6 flushes/s
+    ///   capped at 1          116/120 ms        96/ 93 ms      143/ 185 ms      0.6 flushes/s
+    ///
+    /// So the cap is what bounds the TAIL on a narrow GPU, and the ~1.9% throughput the Ultra sweep
+    /// charged for it is not visible here at all. 2 rather than 1 keeps double-buffering inside the
+    /// window while still bounding the wait at two short forwards. Wide parts keep the uncapped
+    /// whole-flush hold, where the wait it would bound is already ~0.3 s and the 1.9% is real.
+    /// An unknown device caps: the cost of capping is a couple of percent of indexing throughput,
+    /// the cost of not capping on a part that needed it is a multi-second search.
+    static func defaultGateWindow(gpuCores: Int?) -> Int {
+        guard let cores = gpuCores else { return 2 }
+        return cores < 16 ? 2 : Int.max
+    }
+    static let indexGateWindow: Int = (ProcessInfo.processInfo.environment["OMNI_INDEX_GATE_BATCHES"].flatMap { Int($0) })
+        ?? defaultGateWindow(gpuCores: SystemProbe.gpuCores())
     /// Carve a multi-image embed into one-image gate holds while a query is active (see embedImages).
     /// OMNI_MEDIA_CARVE=0 reverts to one whole-batch hold (the old behavior) for A/B.
     static let mediaCarve = ProcessInfo.processInfo.environment["OMNI_MEDIA_CARVE"] != "0"
