@@ -414,17 +414,51 @@ struct FolderEmbeddingVisualization: View {
                 var mx = SIMD2<Float>(-.greatestFiniteMagnitude, -.greatestFiniteMagnitude)
                 let fallback = SIMD4<Float>(0.5, 0.5, 0.5, alpha)
                 var kindsSeen = Set<String>()
+                // Colour is a PURE function of (kind, extension), and a real corpus has a few
+                // hundred distinct extensions - not one per file. The per-point form produced 20
+                // distinct colours from 260k NSString bridges and 260k HSB conversions. Measured
+                // (omni-verify vizbuildbench, 260k points): 75.4 ms -> 12.1 ms, byte-identical.
+                //
+                // Note WHERE the cost was: memoising the shade alone buys nothing (78.8 ms - the
+                // String key costs what the maths did). It is `(path as NSString).pathExtension`
+                // that dominates, bridging and allocating once per point, so the extension is read
+                // straight out of the UTF-8 and the memo is keyed by an integer.
+                var shadeMemo = [Int64: SIMD4<Float>](minimumCapacity: 512)
                 for p in pts {
                     pos.append(p.position)
                     kindsSeen.insert(p.kind)
                     if p.position.x.isFinite, p.position.y.isFinite {
                         mn = pointwiseMin(mn, p.position); mx = pointwiseMax(mx, p.position)
                     }
-                    if let base = baseHSB[p.kind] {
-                        col.append(FileKind.vizShadeRGBA(base: base, ext: (p.path as NSString).pathExtension, alpha: alpha))
-                    } else {
-                        col.append(fallback)
+                    guard let base = baseHSB[p.kind] else { col.append(fallback); continue }
+                    // Extension without NSString: walk the UTF-8 back to the dot, stopping at the
+                    // last path separator so a dotted directory name cannot be read as one.
+                    let u = p.path.utf8
+                    var extStart = u.endIndex
+                    var seenDot = false
+                    var idx = u.endIndex
+                    while idx > u.startIndex {
+                        let prev = u.index(before: idx)
+                        let c = u[prev]
+                        if c == UInt8(ascii: "/") { break }
+                        if c == UInt8(ascii: ".") {
+                            // A dot that STARTS the last component is not an extension separator -
+                            // NSString gives ".gitignore" an empty pathExtension, and without this
+                            // every dotfile would take a different shade than it used to.
+                            if prev == u.startIndex || u[u.index(before: prev)] == UInt8(ascii: "/") { break }
+                            extStart = idx; seenDot = true; break
+                        }
+                        idx = prev
                     }
+                    var key: Int64 = 1469598103934665603 &* -1
+                    for b in p.kind.utf8 { key = (key ^ Int64(b)) &* 16777619 }
+                    key = (key ^ 0x5F) &* 16777619
+                    if seenDot { for b in u[extStart...] { key = (key ^ Int64(b)) &* 16777619 } }
+                    if let c = shadeMemo[key] { col.append(c); continue }
+                    let ext = seenDot ? String(decoding: u[extStart...], as: UTF8.self) : ""
+                    let c = FileKind.vizShadeRGBA(base: base, ext: ext, alpha: alpha)
+                    shadeMemo[key] = c
+                    col.append(c)
                 }
                 if pts.isEmpty { mn = .zero; mx = .zero }
                 // Optional overlap removal, applied to the FINISHED layout (display-only, so the

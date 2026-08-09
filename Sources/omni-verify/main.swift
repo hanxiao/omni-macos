@@ -2921,7 +2921,11 @@ if args.count >= 2 && args[1] == "gridbench" {
         for k in 0 ..< dim { v[i * dim + k] *= inv }
         paths.append("/f\(i)"); kinds.append("text")
     }
-    let data = FolderVectors(paths: paths, kinds: kinds, vectors: v, dim: dim)
+    // Landmark split, so a 258k-point run costs what the APP pays rather than a quadratic layout
+    // over every point. gridify's cost is a function of the point count alone, but the layout has
+    // to finish first for the positions to be realistic.
+    let lm = (args.count >= 5 ? Int(args[4]) : nil) ?? Swift.min(n, 15_000)
+    let data = FolderVectors(paths: paths, kinds: kinds, vectors: v, dim: dim, landmarkCount: lm)
     let pts = ProjectionEngine.layout(data, k: 15, epochs: 300)
     var pos = [Float](repeating: 0, count: n * 2)
     for (i, p) in pts.enumerated() { pos[2*i] = p.position.x; pos[2*i+1] = p.position.y }
@@ -5932,6 +5936,146 @@ if args.count >= 3 && args[1] == "compilebench" {
     exit(0)
 }
 
+
+// The folder map's per-point rebuild: omni-verify vizbuildbench [n]
+// Between the fit landing and the dots appearing, the view walks every point to derive a colour -
+// extension out of the path, FNV hash, HSB->RGB. That was measured at 60k points and the total-dot
+// cap has since been removed, so it now runs at 260k. The shade is a PURE function of (kind, ext),
+// and a real corpus has a few hundred distinct extensions, not one per file - so this times the
+// per-point form against a memoised one. vizShadeRGBA lives in the app target; it is replicated
+// here verbatim (it is pure, so the copy is exact) rather than moved just to be benchmarked.
+if args.count >= 2 && args[1] == "vizbuildbench" {
+    let n = (args.count >= 3 ? Int(args[2]) : nil) ?? 260_000
+    func hsb2rgb(_ h: Float, _ s: Float, _ b: Float) -> (Float, Float, Float) {
+        if s <= 0 { return (b, b, b) }
+        let h6 = (h - h.rounded(.down)) * 6
+        let i = Int(h6), f = h6 - Float(i)
+        let p = b * (1 - s), q = b * (1 - s * f), t = b * (1 - s * (1 - f))
+        switch i % 6 {
+        case 0: return (b, t, p)
+        case 1: return (q, b, p)
+        case 2: return (p, b, t)
+        case 3: return (p, q, b)
+        case 4: return (t, p, b)
+        default: return (b, p, q)
+        }
+    }
+    func shade(base: (h: Float, s: Float, b: Float), ext: String, alpha: Float) -> SIMD4<Float> {
+        var h = base.h, s = base.s, b = base.b
+        let e = ext.lowercased()
+        if !e.isEmpty {
+            var hash: UInt64 = 1469598103934665603
+            for byte in e.utf8 { hash = (hash ^ UInt64(byte)) &* 1099511628211 }
+            let t = Float(hash % 997) / 997.0
+            h = (h + (t - 0.5) * 0.04 + 1).truncatingRemainder(dividingBy: 1)
+            s = Swift.min(1, Swift.max(0.55, s * (0.80 + 0.28 * t)))
+            b = Swift.min(1, Swift.max(0.62, b * (0.84 + 0.24 * (1 - t))))
+        }
+        let (r, g, bl) = hsb2rgb(h, s, b)
+        return SIMD4<Float>(r, g, bl, alpha)
+    }
+    // Realistic path shapes: a long directory prefix and a small extension vocabulary.
+    let exts = ["txt", "md", "swift", "py", "json", "jsonl", "png", "jpg", "pdf", "html", "csv",
+                "tex", "log", "yaml", "sh", "mp4", "heic", "zip", "c", "h"]
+    let kinds = ["text", "image", "video", "audio", "scan"]
+    var paths: [String] = []; var pkind: [String] = []
+    paths.reserveCapacity(n); pkind.reserveCapacity(n)
+    for i in 0 ..< n {
+        // Deliberately includes the shapes NSString.pathExtension treats specially: a dotfile
+        // (".gitignore" has NO extension), a dotted DIRECTORY with an extensionless leaf, a
+        // trailing dot, and a double extension. A synthetic corpus of file<N>.<ext> would let a
+        // wrong hand-rolled scan pass.
+        switch i % 40 {
+        case 7:  paths.append("/Users/hanxiao/Documents/deeper/folder/.gitignore")
+        case 13: paths.append("/Users/hanxiao/Documents/v1.2.3/folder/README")
+        case 19: paths.append("/Users/hanxiao/Documents/deeper/folder/trailing.")
+        case 23: paths.append("/Users/hanxiao/Documents/deeper/folder/archive\(i).tar.gz")
+        case 29: paths.append("/Users/hanxiao/Documents/deeper/folder/noext\(i)")
+        default: paths.append("/Users/hanxiao/Documents/some/deeper/folder/structure/file\(i).\(exts[i % exts.count])")
+        }
+        pkind.append(kinds[i % kinds.count])
+    }
+    let base: [String: (h: Float, s: Float, b: Float)] = [
+        "text": (0.33, 0.7, 0.8), "image": (0.6, 0.7, 0.85), "video": (0.85, 0.7, 0.8),
+        "audio": (0.09, 0.8, 0.9), "scan": (0.05, 0.75, 0.75)]
+    let alpha: Float = 0.75
+
+    var out = [SIMD4<Float>](repeating: .zero, count: n)
+    var best = Double.infinity
+    for _ in 0 ..< 3 {
+        let t = Date()
+        for i in 0 ..< n {
+            let e = (paths[i] as NSString).pathExtension
+            out[i] = shade(base: base[pkind[i]] ?? (0, 0, 0.5), ext: e, alpha: alpha)
+        }
+        best = Swift.min(best, -t.timeIntervalSinceNow * 1000)
+    }
+    print(String(format: "vizbuildbench n=%d   per-point (NSString ext + shade) = %6.1f ms", n, best))
+
+    var out2 = [SIMD4<Float>](repeating: .zero, count: n)
+    var bestM = Double.infinity
+    var distinct = 0
+    for _ in 0 ..< 3 {
+        var memo: [Int64: SIMD4<Float>] = [:]
+        memo.reserveCapacity(512)
+        let t = Date()
+        for i in 0 ..< n {
+            // Extension without an NSString: scan the UTF-8 back to the dot, stopping at a slash.
+            let u = paths[i].utf8
+            var extStart = u.endIndex, seenDot = false
+            var idx = u.endIndex
+            while idx > u.startIndex {
+                let prev = u.index(before: idx)
+                let c = u[prev]
+                if c == UInt8(ascii: "/") { break }
+                if c == UInt8(ascii: ".") {
+                    // A dot that STARTS the last component is not an extension separator:
+                    // NSString gives ".gitignore" an empty pathExtension.
+                    if prev == u.startIndex || u[u.index(before: prev)] == UInt8(ascii: "/") { break }
+                    extStart = idx; seenDot = true; break
+                }
+                idx = prev
+            }
+            let ext = seenDot ? String(decoding: u[extStart...], as: UTF8.self) : ""
+            var key: Int64 = Int64(pkind[i].utf8.first ?? 0) &* 1_000_003
+            for b in ext.utf8 { key = (key ^ Int64(b)) &* 16777619 }
+            if let c = memo[key] { out2[i] = c; continue }
+            let c = shade(base: base[pkind[i]] ?? (0, 0, 0.5), ext: ext, alpha: alpha)
+            memo[key] = c
+            out2[i] = c
+        }
+        bestM = Swift.min(bestM, -t.timeIntervalSinceNow * 1000)
+        distinct = memo.count
+    }
+    // Third arm: keep the NSString extension, memoise only the shade. Says whether the win is in
+    // the bridging or in the repeated HSB maths - i.e. how invasive the app-side change has to be.
+    var out3 = [SIMD4<Float>](repeating: .zero, count: n)
+    var bestS = Double.infinity
+    for _ in 0 ..< 3 {
+        var memo: [String: SIMD4<Float>] = [:]
+        memo.reserveCapacity(512)
+        let t = Date()
+        for i in 0 ..< n {
+            let e = (paths[i] as NSString).pathExtension
+            let key = pkind[i] + "|" + e
+            if let c = memo[key] { out3[i] = c; continue }
+            let c = shade(base: base[pkind[i]] ?? (0, 0, 0.5), ext: e, alpha: alpha)
+            memo[key] = c
+            out3[i] = c
+        }
+        bestS = Swift.min(bestS, -t.timeIntervalSinceNow * 1000)
+    }
+    var diff3 = 0
+    for i in 0 ..< n where out[i] != out3[i] { diff3 += 1 }
+    print(String(format: "                     NSString ext + memo shade = %6.1f ms   %.1fx   mismatches=%d",
+                 bestS, best / bestS, diff3))
+
+    var diff = 0
+    for i in 0 ..< n where out[i] != out2[i] { diff += 1 }
+    print(String(format: "                     memoised by (kind, ext)   = %6.1f ms   %.1fx   distinct=%d   mismatches=%d",
+                 bestM, best / bestM, distinct, diff))
+    exit(diff == 0 ? 0 : 1)
+}
 
 // Why is a NARROWER quantized scan slower? omni-verify qmmbench [N] [dim]
 // The funnel measured 2-bit slower than 3-bit end to end, which no bandwidth argument explains -
