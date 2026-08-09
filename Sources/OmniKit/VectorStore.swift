@@ -303,6 +303,57 @@ final class Vec16Buffer {
     /// is exactly the kind of memory a user hunts for and cannot see.
     var anonymousBytes: Int { isMapped ? max(0, count * 2 - fileBytes) : count * 2 }
 
+    // PAGING ADVICE FOR THE VECTOR MAPPING.
+    //
+    // The exact tier is read two ways, and the kernel's default readahead is right for one of them
+    // and badly wrong for the other:
+    //
+    //   scattered   the rerank gathers ~C rows of dim*2 bytes at unrelated offsets. Rows are far
+    //               smaller than a 16 KB page, so every row is its own fault, and the default
+    //               clusters readahead around each one - pages nothing else in the query will use.
+    //   sequential  a full re-quantise (rebuildBaseLocked) and the compaction memmove walk the
+    //               whole mapping in order, which is exactly what readahead exists for.
+    //
+    // Measured directly against the shipped 5.44 GB index.sqlite.vecs, mapped read-only, 3840
+    // scattered rows, 5 repeats with rotated arm order and an independent row set each time. Pages
+    // faulted are COUNTED with mincore(), not inferred from the clock:
+    //
+    //                      gather (median)   faulted for 5.9 MB requested
+    //     default             1183 ms            185 MB   (31x amplification)
+    //     MADV_RANDOM          280 ms             49 MB   (one page per touched row: the floor)
+    //
+    // and warm, i.e. what a machine that holds the whole tier sees, the advice is free:
+    // 96 ms against 95 ms for the default, because there are no faults left for it to change.
+    // That is why this is on everywhere rather than gated on a small machine - it cannot cost
+    // anything where it has nothing to do.
+    //
+    // So the advice is SCOPED, not blanket: RANDOM is the steady state, and a full-file sequential
+    // pass restores the default around itself. Getting that backwards is not free - RANDOM measured
+    // ~2x SLOWER than the default on the sequential pass, which is the same mistake in reverse.
+    //
+    // Free where it does nothing: advice only changes FAULT behavior, so on a machine whose page
+    // cache holds the whole tier there are no faults to change and it costs a single syscall.
+    // MADV_WILLNEED is deliberately not used anywhere - on Darwin it faults the range in
+    // synchronously (measured in SECONDS for multi-GB ranges), which is a stall, not a hint.
+    enum PageAdvice { case random, normal }
+    /// OMNI_VECS_MADVISE=0 disables, for A/B against the pre-advice behavior.
+    nonisolated(unsafe) static let madviseEnabled =
+        ProcessInfo.processInfo.environment["OMNI_VECS_MADVISE"] != "0"
+    private var currentAdvice: PageAdvice = .normal
+    func advise(_ mode: PageAdvice) {
+        guard Self.madviseEnabled, let base, fileBytes > 0 else { return }
+        madvise(base, fileBytes, mode == .random ? MADV_RANDOM : MADV_NORMAL)
+        currentAdvice = mode
+    }
+    /// Run `body` with the default (readahead) behavior restored, then put the steady-state advice
+    /// back. For the full-file sequential passes.
+    func withSequentialAdvice<T>(_ body: () throws -> T) rethrows -> T {
+        let prior = currentAdvice
+        advise(.normal)
+        defer { advise(prior) }
+        return try body()
+    }
+
     private func unmapScratch() {
         if let base { munmap(base, reserveBytes); self.base = nil; reserveBytes = 0 }
         if fd >= 0 { close(fd); fd = -1 }   // also releases the flock in persistent mode
@@ -377,6 +428,7 @@ final class Vec16Buffer {
         fd = newFD                                        // kept open so growFileCoverage can extend
         fileBytes = newFileBytes
         count = logical
+        advise(.random)                                   // steady state is the scattered rerank gather
     }
 
     /// Extend the file-backed prefix over the anonymous append tail up to the current count, so
@@ -410,6 +462,7 @@ final class Vec16Buffer {
                            PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, off_t(fileBytes)),
               m != MAP_FAILED else { return }
         fileBytes = newFileBytes
+        advise(currentAdvice)   // MAP_FIXED over the tail resets that region's advice
     }
 
     /// Stamp-time coverage extension: make the file back every live element. Returns false when it
@@ -500,6 +553,7 @@ final class Vec16Buffer {
         fileBytes = newFileBytes
         isPersistent = true
         count = logical
+        advise(.random)
         return true
     }
 
@@ -4433,6 +4487,16 @@ public final class VectorStore: @unchecked Sendable {
     private func quantizeRowsLocked(_ range: Range<Int>, bits: Int) -> (wqs: [MLXArray], scs: [MLXArray], bss: [MLXArray]) {
         // Halved when rotating: the rotation runs in fp32, so the transient slab is 2x the bf16 one
         // and this pass already sizes that transient for the tightest machine the mode serves.
+        // A FULL re-quantise walks the whole tier in order, which is what readahead is for, so the
+        // steady-state RANDOM advice is lifted for the duration. Only when the range is actually
+        // most of the mapping: an incremental fold quantises a small tail, where the syscall pair
+        // would be pure overhead and the delta is likely resident anyway.
+        let wholeFile = range.count * 2 > rows.count
+        return wholeFile ? flat16.withSequentialAdvice({ quantizeSlabsLocked(range, bits: bits) })
+                         : quantizeSlabsLocked(range, bits: bits)
+    }
+
+    private func quantizeSlabsLocked(_ range: Range<Int>, bits: Int) -> (wqs: [MLXArray], scs: [MLXArray], bss: [MLXArray]) {
         let slab = Self.quantRotate ? 65_536 : 131_072
         var wqs: [MLXArray] = [], scs: [MLXArray] = [], bss: [MLXArray] = []
         var off = range.lowerBound
