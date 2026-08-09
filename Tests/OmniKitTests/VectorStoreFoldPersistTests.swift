@@ -364,6 +364,60 @@ final class VectorStoreFoldPersistTests: XCTestCase {
         }
     }
 
+    /// A build that prefers a DIFFERENT scan width must adopt the existing replica at its own
+    /// width, not delete it. Rejecting it made the first search after an update re-quantise the
+    /// whole index - 572 ms on an M3 Ultra, and reportedly minutes on a base M-chip - landing on
+    /// whichever search arrived first. The width the index actually wants is picked up later, off
+    /// the search path, so no user ever waits for it.
+    func testWidthMismatchAdoptsInsteadOfRebuilding() throws {
+        let url = tempDB()
+        let dim = 64
+        var rng = Rng(s: 11)
+        let q = randUnit(dim, &rng)
+        var shadow: [String: [[Float]]] = [:]
+        try withCap(quantCap) {
+            VectorStore.quantBaseOverride = 4
+            defer { VectorStore.quantBaseOverride = nil }
+            let store = try VectorStore(dbURL: url)
+            var batch: [(String, [IndexedChunk])] = []
+            for i in 0 ..< 3000 {
+                let p = "/w/f\(i).txt"
+                let v = randUnit(dim, &rng)
+                shadow[p] = [v]
+                batch.append((p, [chunk(p, 0, v)]))
+            }
+            try store.replaceMany(batch)
+            _ = store.search(q, topK: 10)
+            store.close()
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: quantURL(url).path),
+                      "precondition: a 4-bit replica was persisted")
+        let before = try Data(contentsOf: quantURL(url)).count
+
+        // Reopen on a build that prefers 3 bits. The 4-bit file must survive and still answer.
+        try withCap(quantCap) {
+            VectorStore.quantBaseOverride = 3
+            defer { VectorStore.quantBaseOverride = nil }
+            let store = try VectorStore(dbURL: url)
+            let hits = store.search(q, topK: 10)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: quantURL(url).path),
+                          "a width mismatch must NOT delete the replica")
+            XCTAssertEqual(try? Data(contentsOf: quantURL(url)).count, before,
+                           "the adopted replica must be served as-is, not re-quantised on the search path")
+            assertMatchesShadow(hits, shadow, q, "adopted 4-bit replica on a 3-bit build")
+            store.close()
+        }
+
+        // A flip to full bf16 mode is still a rejection: bits == 0 is not a width.
+        try withCap(64 << 30) {
+            let store = try VectorStore(dbURL: url)
+            _ = store.search(q, topK: 10)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: quantURL(url).path),
+                           "a flip to bf16 mode must still reject the replica")
+            store.close()
+        }
+    }
+
     func testModeFlipRejectsReplica() throws {
         let url = tempDB()
         let dim = 64

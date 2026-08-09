@@ -178,6 +178,18 @@ public struct SearchFilter: Sendable {
 
     public init() {}
 
+    /// The PATH-derived half of `accepts`, split out so a caller can resolve it once per FILE
+    /// instead of once per ROW. Every clause here is a function of the path alone, so the answer is
+    /// identical for every chunk row of a file - and at ~7 rows per file on a 4.5M-row index that
+    /// is the difference between 258k String tests and 4.5M of them, each retaining a path String.
+    func acceptsPath(_ path: String) -> Bool {
+        if let f = folderPrefix, !(path == f || path.hasPrefix(f + "/")) { return false }
+        if let e = ext, !e.isEmpty, !Self.hasExtensionCI(path, e) { return false }
+        if let allow = tagAllow, !allow.contains(path) { return false }
+        if let deny = tagDeny, deny.contains(path) { return false }
+        return true
+    }
+
     func accepts(path: String, kind: String, modified: Double) -> Bool {
         if !kinds.isEmpty && !kinds.contains(kind) { return false }
         if let f = folderPrefix, !(path == f || path.hasPrefix(f + "/")) { return false }
@@ -897,7 +909,7 @@ public final class VectorStore: @unchecked Sendable {
     /// a deleted file back to life.
     private func resetTombstonesLocked() { deadRows.removeAll(); deadIdxCache = nil }
 
-    private func invalidateBase() { baseDirty = true; mlxBase = nil; mlxFileID = nil; mlxKindCode = nil; quantBase = nil; baseRows = 0 }
+    private func invalidateBase() { baseDirty = true; mlxBase = nil; mlxFileID = nil; mlxKindCode = nil; mlxKindCodeRows = 0; quantBase = nil; baseRows = 0 }
     // Membership index of the paths currently in `rows`. Lets replace() know in O(1) whether a
     // path pre-exists, so a brand-new file skips removeRowsLocked entirely (no O(N) scan per file
     // during a full index). Rebuilt from the surviving rows whenever removeRowsLocked compacts.
@@ -2890,10 +2902,30 @@ public final class VectorStore: @unchecked Sendable {
                 // candidates and reduce over candidates + delta only - O(C + delta) host work after
                 // the scan instead of O(N). Filtered queries keep the host path below (its candidate
                 // selection applies the filter prefilters).
+                // A KIND-ONLY filter rides this path too. It used to fall to the host reducer,
+                // which in quant mode costs THREE O(rows) host passes (score readback, the rerank
+                // heap, then the dense reduce) where the plain path costs none - measured on a
+                // 4.5M-row index at 18.5 ms against 15.3 ms for the exact bf16 scan, i.e. the
+                // funnel was a pessimisation for exactly the queries a filter narrows. Masking
+                // disallowed kinds to -inf BEFORE selection is what makes it correct: the
+                // candidates are then the filter's own top-C, not the global top-C intersected
+                // with it, so a match outside the global top-C cannot be lost. Same technique
+                // reduceTopKGPULocked already uses, and a file is exactly one kind so a per-row
+                // mask is a per-file mask.
                 let C = min(baseRows, Self.candidateCount(topK: topK))
-                if filter.isEmpty, baseRows > C {
+                let kindOnly = onlyKindFiltered(filter)
+                    && (filter.kinds.isEmpty || kindCodeGPULocked() != nil)
+                if kindOnly, baseRows > C {
+                    var selectScore = baseScore
+                    if !filter.kinds.isEmpty, let kc = kindCodeGPULocked() {
+                        var allow = [Float](repeating: 0, count: 256)
+                        for k in filter.kinds { if let id = kindID[k] { allow[Int(id)] = 1 } }
+                        let mask = MLXArray(allow)[kc].reshaped(baseScore.shape)
+                        selectScore = MLX.which(mask .> 0.5, baseScore, MLXArray(-Float.infinity))
+                    }
                     let result = fillSnippetsLocked(searchCandidatesLocked(
-                        coarse: baseScore, qv: qv, n: n, candidateCount: C, query: query, topK: topK))
+                        coarse: selectScore, qv: qv, n: n, candidateCount: C, query: query,
+                        topK: topK, filter: filter))
                     if let t0 {
                         print(String(format: "[search] n=%d gpu-candidate path total=%.1fms", n, -t0.timeIntervalSinceNow * 1000))
                     }
@@ -3074,7 +3106,8 @@ public final class VectorStore: @unchecked Sendable {
     /// plus the (already exact) delta rows. chunkCount comes from the lockstep fileChunkCount, so
     /// nothing here touches all N rows. Unfiltered only - the caller guarantees filter.isEmpty.
     private func searchCandidatesLocked(coarse: MLXArray, qv: MLXArray, n: Int,
-                                        candidateCount C: Int, query: [Float], topK: Int) -> [SearchHit] {
+                                        candidateCount C: Int, query: [Float], topK: Int,
+                                        filter: SearchFilter = SearchFilter()) -> [SearchHit] {
         // Top-C base candidates on the GPU; delta rows are exact and all enter the reduce.
         let flat = coarse.reshaped([baseRows])
         let topIdx = Self.topCIndices(flat, rows: baseRows, C: C)
@@ -3123,8 +3156,20 @@ public final class VectorStore: @unchecked Sendable {
         // Best chunk per file over candidates + delta (small dictionary - C + delta entries max).
         var best: [Int32: (score: Float, row: Int32)] = [:]
         best.reserveCapacity(cand.count + deltaScores.count)
+        // Kind allow-table for the DELTA rows. The base rows were masked on the GPU before
+        // selection, but the delta is scored on the host and never saw that mask, so without this
+        // a kind-filtered query would return delta rows of the wrong kind. Base candidates are
+        // re-checked too: it is one array lookup and it makes the guarantee local to this function
+        // rather than dependent on the caller having masked correctly.
+        var kindAllowed: [Bool]? = nil
+        if !filter.kinds.isEmpty {
+            var a = [Bool](repeating: false, count: 256)
+            for k in filter.kinds { if let id = kindID[k] { a[Int(id)] = true } }
+            kindAllowed = a
+        }
         func offer(_ row: Int32, _ score: Float) {
             guard score.isFinite, !deadRows.contains(row) else { return }
+            if let ka = kindAllowed, Int(row) < kindCode.count, !ka[Int(kindCode[Int(row)])] { return }
             let f = fileID[Int(row)]
             if let cur = best[f], cur.score >= score { return }
             best[f] = (score, row)
@@ -3182,6 +3227,21 @@ public final class VectorStore: @unchecked Sendable {
             || filter.tagAllow != nil || filter.tagDeny != nil
         var kindAllowed = [Bool](repeating: false, count: 256)
         if hasKind { for k in kinds { if let id = kindID[k] { kindAllowed[Int(id)] = true } } }
+        // Path filters resolved ONCE PER FILE against the path intern table, then read by file id
+        // in the row loop below. The per-row form called filter.accepts on rows[i].path for every
+        // row that cleared the heap gate - a hasPrefix plus an ARC retain of the path String - and
+        // with a folder filter most high-scoring rows are OUT of scope, so nearly every row paid
+        // it. Measured on a 4.5M-row index: a folder-filtered query ran 43.8 ms against 24.9 ms for
+        // the exact bf16 scan, i.e. the funnel lost to not quantising at all. Exact, not an
+        // approximation: every clause in acceptsPath is a function of the path, and a row's path IS
+        // the canonical idPath instance its fileID indexes.
+        var pathAllow: [Bool]? = nil
+        if pathFiltered {
+            let nGlobal = max(1, fileChunkCount.count)
+            var a = [Bool](repeating: false, count: nGlobal)
+            for (gid, p) in idPath.enumerated() where gid < nGlobal { a[gid] = filter.acceptsPath(p) }
+            pathAllow = a
+        }
 
         // Size-C min-heap over (coarse score, row index) of the FILTER-PASSING base rows.
         var hScore = [Float](); hScore.reserveCapacity(C)
@@ -3206,7 +3266,10 @@ public final class VectorStore: @unchecked Sendable {
                     if hScore.count >= C && sc <= hScore[0] { continue }
                     if hasKind && !kindAllowed[Int(kc[i])] { continue }
                     if let since, rows[i].modified < since { continue }
-                    if pathFiltered, !filter.accepts(path: rows[i].path, kind: rows[i].kind, modified: rows[i].modified) { continue }
+                    if let pa = pathAllow {
+                        let gid = Int(fileID[i])
+                        if gid >= pa.count || !pa[gid] { continue }
+                    }
                     if hScore.count < C { hScore.append(sc); hIdx.append(Int32(i)); siftUp(hScore.count - 1) }
                     else { hScore[0] = sc; hIdx[0] = Int32(i); siftDown(0) }
                 }
@@ -3285,6 +3348,27 @@ public final class VectorStore: @unchecked Sendable {
     /// filter passes too - this is a superset of `isEmpty`. A kind-only filter is the common toolbar
     /// case (type:image, type:scan, ...), so routing it through the GPU reduce closes the gap where a
     /// single kind toggle dropped the query onto the O(N) host scan.
+    /// Rows `mlxKindCode` currently covers. The array must be exactly [baseRows] to be usable as a
+    /// mask against a [baseRows] score vector, and baseRows moves under an incremental fold, an
+    /// adopted replica, and a full rebuild - three places that would each have to remember. Sizing
+    /// it here instead means it cannot go stale: a shape mismatch is a crash, not a wrong answer,
+    /// and this is the kind of invariant that should not depend on every writer being careful.
+    private var mlxKindCodeRows = 0
+    /// GPU kind code for the current base, built on demand. ~4 bytes/row (18 MB at 4.5M) against a
+    /// 1.4 GB replica. Quant mode never built this eagerly, which is why kind-filtered queries
+    /// silently fell to the host reducer.
+    private func kindCodeGPULocked() -> MLXArray? {
+        guard baseRows > 0, kindCode.count >= baseRows else { return nil }
+        if let kc = mlxKindCode, mlxKindCodeRows == baseRows { return kc }
+        let kc = kindCode.withUnsafeBufferPointer { kp in
+            MLXArray(UnsafeBufferPointer(rebasing: kp[0 ..< baseRows]).map { Int32($0) })
+        }
+        MLX.eval(kc)
+        mlxKindCode = kc
+        mlxKindCodeRows = baseRows
+        return kc
+    }
+
     private func onlyKindFiltered(_ f: SearchFilter) -> Bool {
         f.folderPrefix == nil && (f.ext?.isEmpty ?? true) && f.since == nil
             && f.tagTerms.isEmpty && f.tagExcludeTerms.isEmpty
@@ -3772,8 +3856,17 @@ public final class VectorStore: @unchecked Sendable {
         guard let headChunk = try? fh.read(upToCount: 4096), let nl = headChunk.firstIndex(of: 0x0A),
               let header = try? JSONDecoder().decode(QuantReplicaHeader.self, from: headChunk[headChunk.startIndex ..< nl])
         else { reject(); return }
+        // WIDTH MISMATCH IS NOT A REJECTION. A replica written by a build with a different scan
+        // width is still valid data - it just is not the width this build prefers. Rejecting it
+        // deleted the file and made the FIRST SEARCH after an update rebuild 4.5M rows from
+        // flat16: 572 ms on this machine, and rebuildBaseLocked's own note reports "~minutes at
+        // 3.8M rows on a base M-chip". That lands on whichever search arrives first, which is
+        // exactly the startup stall the launch path was restructured to avoid in 0.3.8. So adopt
+        // it at its own width, serve from it immediately, and re-quantise to the preferred width
+        // when the store is next idle (scheduleWidthUpgradeLocked).
         guard header.magic == "omni-quant-1", header.rows > 0, header.rows <= n,
-              header.dim == dim, header.group == Self.quantGroup, header.bits == bits,
+              header.dim == dim, header.group == Self.quantGroup,
+              [2, 3, 4, 5, 6, 8].contains(header.bits),
               (header.rotate ?? false) == (Self.quantRotate && Self.hadamardCompatible(dim)),
               header.rows == baseRows || baseRows == 0,   // baseRows is 0 fresh out of loadIntoMemory
               flat16.count >= header.rows * dim,
@@ -3809,11 +3902,15 @@ public final class VectorStore: @unchecked Sendable {
         if let biArr { toEval.append(biArr) }
         MLX.eval(toEval)
         quantBase = (wq, sc, biArr)
-        quantBits = bits
+        quantBits = header.bits
         baseRows = header.rows
         baseDirty = false
         lastPersistedBaseRows = header.rows
-        if Self.searchTiming { print("[search] ADOPT quant replica rows=\(header.rows) of \(n)") }
+        if Self.searchTiming {
+            print("[search] ADOPT quant replica rows=\(header.rows) of \(n) bits=\(header.bits)"
+                  + (header.bits == bits ? "" : " (prefers \(bits) - upgrade deferred to idle)"))
+        }
+        if header.bits != bits { scheduleWidthUpgradeLocked() }
     }
 
     // MARK: - Row-table sidecar (skip the O(N) SQLite open scan)
@@ -4220,6 +4317,7 @@ public final class VectorStore: @unchecked Sendable {
         mlxBase = nil
         mlxFileID = nil
         mlxKindCode = nil
+        mlxKindCodeRows = 0
         quantBase = nil
         if bits > 0, dim % Self.quantGroup == 0 {
             let (wqs, scs, bss) = quantizeRowsLocked(0 ..< rowCount, bits: bits)
@@ -4257,6 +4355,7 @@ public final class VectorStore: @unchecked Sendable {
                 MLXArray(UnsafeBufferPointer(rebasing: kp[0 ..< rowCount]).map { Int32($0) })
             }
             mlxKindCode = kc
+            mlxKindCodeRows = rowCount
             MLX.eval(mlxBase!, fid, kc)
             quantBits = 0
         }
@@ -4299,6 +4398,34 @@ public final class VectorStore: @unchecked Sendable {
             }
         }
     }
+
+    /// Re-quantise the adopted replica to this build's preferred width, once the store is quiet.
+    /// Deliberately NOT on the search path: the whole point is that the user never waits for it.
+    /// Re-checked at fire time - a search in the last 2 s, an in-flight delta, or a dirtied base
+    /// all defer it, and the next write's idle fold picks the width up for free anyway.
+    private func scheduleWidthUpgradeLocked(after delay: TimeInterval = 20) {
+        guard Self.idleFold else { return }
+        widthUpgradeToken += 1
+        let token = widthUpgradeToken
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.queue.sync {
+                guard self.widthUpgradeToken == token, !self.searchRecentlyActiveLocked() else {
+                    self.scheduleWidthUpgradeLocked(after: 30)   // still busy: come back later
+                    return
+                }
+                let n = self.rows.count
+                guard n > 0, self.dim > 0, self.flat16.count == n * self.dim, self.quantBase != nil else { return }
+                let want = Self.quantBitsFor(baseBytes: n * self.dim * MemoryLayout<UInt16>.size, rowCount: n)
+                guard want > 0, want != self.quantBits else { return }
+                if Self.searchTiming { print("[search] WIDTH UPGRADE \(self.quantBits) -> \(want) rows=\(n)") }
+                self.baseDirty = true          // force the full rebuild path, not the incremental fold
+                self.rebuildBaseLocked(rowCount: n)
+                self.persistQuantReplicaLocked(sync: false)
+            }
+        }
+    }
+    private var widthUpgradeToken = 0
 
     private func proactiveRefoldLocked() {
         guard Self.proactiveFold, searchRecentlyActiveLocked() else { return }
