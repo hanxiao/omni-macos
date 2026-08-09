@@ -6364,6 +6364,13 @@ if args.count >= 2 && args[1] == "vizbuildbench" {
     exit(diff == 0 ? 0 : 1)
 }
 
+// Is a 1-bit XOR+popcount scan faster than the shipped 3-bit one? omni-verify bitscanbench [N] [dim]
+if args.count >= 2 && args[1] == "bitscanbench" {
+    BitScanBench.run(rows: (args.count >= 3 ? Int(args[2]) : nil) ?? 4_500_000,
+                     dim: (args.count >= 4 ? Int(args[3]) : nil) ?? 768)
+    exit(0)
+}
+
 // Why is a NARROWER quantized scan slower? omni-verify qmmbench [N] [dim]
 // The funnel measured 2-bit slower than 3-bit end to end, which no bandwidth argument explains -
 // fewer bytes should scan faster. This times MLX.quantizedMM alone, at the exact shape search uses
