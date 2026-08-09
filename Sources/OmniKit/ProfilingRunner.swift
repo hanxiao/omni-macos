@@ -54,6 +54,22 @@ public func runProfilingPass(engine: OmniEngine, targetURL: URL, settings: Index
             let store = try VectorStore(dbURL: dir.appendingPathComponent("index.sqlite"))
             let indexer = Indexer(store: store, embedder: engine)
 
+            // CROSS-FILE CHUNK REUSE IS OFF FOR THIS PASS, and that is the point of the benchmark.
+            //
+            // The workload is frozen so results compare MACHINES. Reuse makes the work a function
+            // of how duplicated the DATASET is instead: measured on profiling-v2-300, leaving it on
+            // took the pass from 41.7 s to 24.7 s and dropped tokens/sec from ~47,300 to ~17,000,
+            // because two thirds of the text tokens in that dataset are repeats and the remaining
+            // time is the media half, which reuse never touches. The machine did not change; the
+            // amount of work did - so every result before 0.4.10 became incomparable with every
+            // result after it, which is exactly what freezing the settings exists to prevent.
+            //
+            // Improvements that GENERALISE (batch shape, kernel efficiency) are deliberately still
+            // measured here. Reuse is corpus-dependent, so it is not.
+            let savedReuse = Indexer.globalChunkReuse
+            Indexer.globalChunkReuse = false
+            defer { Indexer.globalChunkReuse = savedReuse }
+
             // VRAM baseline: drop recyclable buffers and reset the high-water mark to the current
             // (loaded-model) residency, so peakMemory afterwards reflects only what THIS pass added.
             MLX.GPU.clearCache()
