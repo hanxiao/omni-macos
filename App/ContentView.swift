@@ -117,9 +117,19 @@ struct ContentView: View {
     @ViewBuilder private var detail: some View {
         switch model.phase {
         case .loadingModel:
-            // No subtitle: it repeated the title ("Starting the on-device model..." under "Loading
-            // the Omni model"), and the determinate bar already communicates the wait.
-            CenteredStatus(symbol: "brain", title: "Loading the Omni model", subtitle: "", showSpinner: true, progress: model.loadingProgress)
+            // The subtitle sets expectations for something that happens AFTER this screen is gone:
+            // going .ready does not await the warm-up (see AppModel - gating readiness on it made
+            // launch look hung on an M2), so a search fired in that window queues behind it.
+            //
+            // It says "loads into memory", not "compiles", because that is where the time measured
+            // as: omni-verify warmbench <model> <db>, 4.5M rows / 6.9 GB of bf16. Metal pipelines
+            // cost 4 ms (they ship precompiled in default.metallib); the first search costs 621 ms
+            // with the vector file cold and 17 ms once the page cache holds it. It is paging, so no
+            // duration is promised - a Mac that cannot cache 6.9 GB pays it on every launch.
+            CenteredStatus(symbol: "brain",
+                           title: "Loading the Omni model",
+                           subtitle: "Your first search may be slower while the index loads into memory.",
+                           showSpinner: true, progress: model.loadingProgress)
         case .noModel:
             OnboardingView()
         case .failed(let msg):

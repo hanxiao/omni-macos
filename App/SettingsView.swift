@@ -609,10 +609,12 @@ private struct MemoryBreakdown: View {
     /// Order matters: biggest and most stable first, catch-all last, so the bar doesn't reshuffle
     /// as values move. Grey for the remainder mirrors the free-space slice in System Settings.
     private var slices: [(name: String, color: Color, bytes: Int, help: String)] {
+        // The folder map is NOT a slice here. It retains tens of MB - a sliver next to Model and
+        // Index - so a fifth colour bought a legend row the eye cannot find in the bar. It stays in
+        // `Other`, and `sample.viz` still carries the number for the OMNI_MEM_LOG trace.
         [("Model", .blue, sample.model, "Weights and activations held by MLX"),
          ("Cache", .teal, sample.cache, "Freed MLX buffers kept for reuse - reclaimed under memory pressure"),
          ("Index", .purple, sample.index, "Vectors and row table the search reads"),
-         ("Visualization", .orange, sample.viz, "Folder-map layouts: the one on screen plus any kept for instant revisits"),
          ("Other", Color(nsColor: .systemGray), sample.other, "App, thumbnails, database cache, frameworks")]
     }
 

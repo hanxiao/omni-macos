@@ -989,6 +989,10 @@ final class AppModel {
         /// it is drawn - roughly 100 B per dot. It is deliberately NOT the peak: showing a map also
         /// bursts through GPU tiles and (before streaming) a whole-folder vector buffer, and those
         /// are transient MLX allocations that land in `cache`/`other` while they are alive.
+        ///
+        /// LOG ONLY. It is a sliver next to Model and Index, so the Settings breakdown folds it into
+        /// `Other` rather than spending a fifth colour on it; this stays to answer "is the map
+        /// holding on to something" from OMNI_MEM_LOG without a screenshot.
         var viz = 0
         /// How long the sample took (mach + MLX counters only - the store is read off-thread).
         /// `indexFresh` is false when the store queue was busy and the previous index numbers
@@ -1065,8 +1069,11 @@ final class AppModel {
             // Clamp before subtracting: the three measured parts come from different clocks (MLX
             // can allocate between the footprint read and its own), so a momentary overshoot must
             // shrink a slice rather than produce a negative remainder that breaks the bar.
+            // Measured and logged, but NOT subtracted: the breakdown does not show a Visualization
+            // slice (see MemoryBreakdown.slices), so taking it out of `other` here would leave the
+            // capacity bar's slices summing to less than the total it is drawn against.
             s.viz = vizBytes
-            let parts = s.model + s.cache + s.index + s.viz
+            let parts = s.model + s.cache + s.index
             if parts > s.total { s.total = parts }
             s.other = s.total - parts
             s.sampleUs = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1000
@@ -2339,10 +2346,16 @@ final class AppModel {
             }
             refreshIndexStats(store)
             // Warm the text-query Metal kernels + the compiled query graph + the GPU reduce/base-fold
-            // in the BACKGROUND, and go .ready immediately - do NOT await it. On a low-end GPU the cold
-            // Metal compile plus the first base-fold (folding the whole resident vector matrix into GPU
-            // memory) can take many seconds to a minute; gating .ready behind that made launch look hung
-            // on an M2 (regressed in 0.3.8). Going ready right away restores the fast 0.3.7 startup on
+            // in the BACKGROUND, and go .ready immediately - do NOT await it.
+            //
+            // WHERE THE TIME ACTUALLY GOES, measured on this box (omni-verify warmbench, 4.5M rows):
+            // the Metal compile is 4 ms - the kernels ship precompiled in default.metallib, so all a
+            // process does is build pipeline states. The base fold is 621 ms with the bf16 sidecar
+            // cold and 17 ms once the OS page cache holds it, i.e. it is 6.9 GB of file-backed pages
+            // being faulted in, not GPU work. That is why it is per-launch and why it hurts a small
+            // Mac: 6.9 GB does not stay cached next to a 1.9 GB model on 8-16 GB, so the fault is
+            // paid again and again. Gating .ready behind it made launch look hung on an M2
+            // (regressed in 0.3.8). Going ready right away restores the fast 0.3.7 startup on
             // every machine, high- and low-end alike. The first user query still lands on warm kernels:
             // warmText grabs the serialized GPU gate within milliseconds of launch - long before a human
             // can click into the search box and submit a query - so a query fired during startup queues
