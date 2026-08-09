@@ -8,6 +8,7 @@ let package = Package(
         .library(name: "OmniKit", targets: ["OmniKit"]),
         .executable(name: "omni-verify", targets: ["omni-verify"]),
         .executable(name: "profbench", targets: ["profbench"]),
+        .executable(name: "filterbench", targets: ["filterbench"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.31.3"),
@@ -32,6 +33,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "profbench",
+            dependencies: ["OmniKit"]
+        ),
+        .executableTarget(
+            name: "filterbench",
             dependencies: ["OmniKit"]
         ),
         .testTarget(
