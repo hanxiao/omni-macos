@@ -6286,19 +6286,32 @@ if args.count >= 4 && args[1] == "quantrecall" {
     // FILTER SOUNDNESS. The fast path masks on the GPU; a wrong mask returns out-of-scope files
     // quickly, which no latency or recall number would catch - recall is measured against a
     // ground truth built with the same filter, so both arms could be wrong together.
-    var violations = 0
-    for hits in out {
-        for path in hits {
-            if let f = filter.folderPrefix, !(path == f || path.hasPrefix(f + "/")) { violations += 1 }
-            if let e = filter.ext, !e.isEmpty, (path as NSString).pathExtension.lowercased() != e.lowercased() { violations += 1 }
-        }
-    }
-    if filter.folderPrefix != nil || (filter.ext?.isEmpty == false) {
-        print("  filter soundness: \(violations) out-of-scope results  \(violations == 0 ? "PASS" : "FAIL")")
-    }
     lat.sort()
     let gtPath = URL(fileURLWithPath: NSTemporaryDirectory())
         .appendingPathComponent("omni-quantrecall-gt-\(source)-\(filterTag).json")
+    var violations = 0
+    var missed = 0
+    for (qi, hits) in out.enumerated() {
+        for path in hits {
+            if let f = filter.folderPrefix, !(path == f || path.hasPrefix(f + "/")) { violations += 1 }
+            if let e = filter.ext, !e.isEmpty, (path as NSString).pathExtension.lowercased() != e.lowercased() { violations += 1 }
+            if let s = filter.since {
+                let m = (try? FileManager.default.attributesOfItem(atPath: path)[.modificationDate] as? Date)??
+                    .timeIntervalSince1970
+                if let m, m < s - 1 { violations += 1 }
+            }
+        }
+        _ = qi
+    }
+    // COMPLETENESS, the other half: a mask that is too NARROW drops results it should keep, which
+    // no soundness check sees. Compare the arm's result count against the ground truth's.
+    if arm != "exact", let d = try? Data(contentsOf: gtPath),
+       let gtAll = try? JSONDecoder().decode(GT.self, from: d), gtAll.paths.count == out.count {
+        for (i, o) in out.enumerated() where o.count < gtAll.paths[i].count { missed += gtAll.paths[i].count - o.count }
+    }
+    if !filterTag.isEmpty && filterTag != "none" {
+        print("  filter soundness: \(violations) out-of-scope  \(missed) fewer results than exact  \(violations == 0 && missed == 0 ? "PASS" : "CHECK")")
+    }
     if arm == "exact" {
         try? JSONEncoder().encode(GT(paths: out, scores: outScore)).write(to: gtPath)
         print(String(format: "quantrecall arm=exact  src=%-6@ filter=%-6@ n=%d rows=%d  p50=%6.2f ms   (ground truth written)",

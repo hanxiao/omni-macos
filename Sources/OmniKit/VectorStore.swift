@@ -909,7 +909,7 @@ public final class VectorStore: @unchecked Sendable {
     /// a deleted file back to life.
     private func resetTombstonesLocked() { deadRows.removeAll(); deadIdxCache = nil }
 
-    private func invalidateBase() { baseDirty = true; mlxBase = nil; mlxFileID = nil; mlxFileIDRows = 0; mlxKindCode = nil; mlxKindCodeRows = 0; quantBase = nil; baseRows = 0 }
+    private func invalidateBase() { baseDirty = true; mlxBase = nil; mlxFileID = nil; mlxFileIDRows = 0; mlxKindCode = nil; mlxKindCodeRows = 0; mlxModified = nil; mlxModifiedRows = 0; quantBase = nil; baseRows = 0 }
     // Membership index of the paths currently in `rows`. Lets replace() know in O(1) whether a
     // path pre-exists, so a brand-new file skips removeRowsLocked entirely (no O(N) scan per file
     // during a full index). Rebuilt from the surviving rows whenever removeRowsLocked compacts.
@@ -2919,7 +2919,7 @@ public final class VectorStore: @unchecked Sendable {
                 // GPU mask, and the query then takes the same candidate selection a plain one does.
                 let pathFilter = filter.folderPrefix != nil || (filter.ext?.isEmpty == false)
                     || filter.tagAllow != nil || filter.tagDeny != nil
-                let maskable = filter.since == nil
+                let maskable = (filter.since == nil || modifiedGPULocked() != nil)
                     && (filter.kinds.isEmpty || kindCodeGPULocked() != nil)
                     && (!pathFilter || (fileIDGPULocked() != nil && pathAllowGPULocked(filter) != nil))
                 if maskable, baseRows > C {
@@ -2933,6 +2933,11 @@ public final class VectorStore: @unchecked Sendable {
                     if pathFilter, let fid = fileIDGPULocked(), let pa = pathAllowGPULocked(filter) {
                         let mask = pa[fid].reshaped(baseScore.shape)
                         selectScore = MLX.which(mask .> 0.5, selectScore, MLXArray(-Float.infinity))
+                    }
+                    if let since = filter.since, let md = modifiedGPULocked() {
+                        let cut = Int32(clamping: Int((since - Self.modifiedEpochBase).rounded(.down)))
+                        selectScore = MLX.which((md .>= MLXArray(cut)).reshaped(baseScore.shape),
+                                                selectScore, MLXArray(-Float.infinity))
                     }
                     let result = fillSnippetsLocked(searchCandidatesLocked(
                         coarse: selectScore, qv: qv, n: n, candidateCount: C, query: query,
@@ -3186,6 +3191,7 @@ public final class VectorStore: @unchecked Sendable {
             guard score.isFinite, !deadRows.contains(row) else { return }
             if let ka = kindAllowed, Int(row) < kindCode.count, !ka[Int(kindCode[Int(row)])] { return }
             if pathFiltered, !filter.acceptsPath(rows[Int(row)].path) { return }
+            if let s = filter.since, rows[Int(row)].modified < s { return }
             let f = fileID[Int(row)]
             if let cur = best[f], cur.score >= score { return }
             best[f] = (score, row)
@@ -3423,6 +3429,33 @@ public final class VectorStore: @unchecked Sendable {
         return g
     }
     func invalidatePathAllowCacheLocked() { pathAllowKey = nil; pathAllowGPU = nil }
+
+    /// Per-row `modified` as Int32 seconds since 2000-01-01, on the GPU, sized to baseRows.
+    ///
+    /// Int32 and not Float32 deliberately: epoch seconds today are ~8.3e8, well past float32's
+    /// 2^24 exact-integer range, so a float mask would quantise the boundary to ~64-second steps
+    /// and a file modified near it could fall on the wrong side. Int32 is exact to 2068.
+    ///
+    /// Built from `rows`, which is the one lockstep array with no primitive twin - kindCode and
+    /// fileID have one, `modified` does not - so this pass touches the Row structs once and then
+    /// caches. Only the first date-filtered query after a fold pays it.
+    private static let modifiedEpochBase = 946_684_800.0   // 2000-01-01T00:00:00Z
+    private var mlxModified: MLXArray? = nil
+    private var mlxModifiedRows = 0
+    private func modifiedGPULocked() -> MLXArray? {
+        guard baseRows > 0, rows.count >= baseRows else { return nil }
+        if let m = mlxModified, mlxModifiedRows == baseRows { return m }
+        var v = [Int32](repeating: 0, count: baseRows)
+        rows.withUnsafeBufferPointer { rp in
+            for i in 0 ..< baseRows { v[i] = Int32(clamping: Int((rp[i].modified - Self.modifiedEpochBase).rounded(.down))) }
+        }
+        let m = MLXArray(v)
+        MLX.eval(m)
+        mlxModified = m
+        mlxModifiedRows = baseRows
+        return m
+    }
+    private func invalidateModifiedGPULocked() { mlxModified = nil; mlxModifiedRows = 0 }
 
     private func onlyKindFiltered(_ f: SearchFilter) -> Bool {
         f.folderPrefix == nil && (f.ext?.isEmpty ?? true) && f.since == nil
@@ -4377,6 +4410,8 @@ public final class VectorStore: @unchecked Sendable {
         mlxKindCode = nil
         mlxKindCodeRows = 0
         mlxFileIDRows = 0
+        mlxModified = nil
+        mlxModifiedRows = 0
         quantBase = nil
         if bits > 0, dim % Self.quantGroup == 0 {
             let (wqs, scs, bss) = quantizeRowsLocked(0 ..< rowCount, bits: bits)
