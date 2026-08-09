@@ -272,14 +272,26 @@ public final class Indexer: @unchecked Sendable {
         ProcessInfo.processInfo.environment["OMNI_CHUNK_REUSE_GLOBAL"] != "0"
     private let chunkVecLock = NSLock()
     private var chunkVecCache: [String: [Float]] = [:]
-    private var chunkVecOrder: [String] = []          // FIFO, oldest first
+    private var chunkVecOrder: [String] = []          // FIFO, oldest first, live range is [head...]
+    /// Read head into `chunkVecOrder`. Eviction advances this instead of calling removeFirst(),
+    /// which is O(count) on an Array: at steady state the cache is FULL, so every unique chunk
+    /// after the first `cap` evicts one, and each removeFirst() memmoved the whole order array.
+    /// That is O(uniqueChunks * cap) of pure host memmove, under the lock, and `cap` scales with
+    /// the user's memory setting - so the bigger the machine, the worse it got. At the 6 GB
+    /// default and dim 768 that is 19.5k entries; with the setting on "Unlimited" it is 1% of
+    /// PHYSICAL memory, i.e. 1.67M entries and ~27 MB memmoved per evicted key on a 512 GB Mac.
+    private var chunkVecHead = 0
     /// ~1% of the memory cap, so it scales down with the user's setting like every other budget.
     private var chunkVecCap: Int {
         let bytesPer = Swift.max(1, embedder.dim * MemoryLayout<Float>.size)
         return Swift.max(2_048, Int(Double(OmniMemoryBudget.capBytes) * 0.01) / bytesPer)
     }
     func resetChunkVecCache() {
-        chunkVecLock.withLock { chunkVecCache.removeAll(keepingCapacity: false); chunkVecOrder.removeAll(keepingCapacity: false) }
+        chunkVecLock.withLock {
+            chunkVecCache.removeAll(keepingCapacity: false)
+            chunkVecOrder.removeAll(keepingCapacity: false)
+            chunkVecHead = 0
+        }
     }
 
     /// Embed length-bucketed groups, reusing any vector already computed for the same chunk key in
@@ -337,9 +349,16 @@ public final class Indexer: @unchecked Sendable {
             }
         }
         let cap = chunkVecCap
-        while chunkVecOrder.count > cap {
-            let old = chunkVecOrder.removeFirst()
-            chunkVecCache[old] = nil
+        while chunkVecOrder.count - chunkVecHead > cap {
+            chunkVecCache[chunkVecOrder[chunkVecHead]] = nil
+            chunkVecHead += 1
+        }
+        // Compact once the dead prefix outgrows the live range, so the array stays O(cap) rather
+        // than growing for the length of the pass. Amortised O(1) per eviction: each compaction
+        // moves `cap` elements and cannot recur until another `cap` keys have been evicted.
+        if chunkVecHead > cap {
+            chunkVecOrder.removeFirst(chunkVecHead)
+            chunkVecHead = 0
         }
         chunkVecLock.unlock()
         return out
