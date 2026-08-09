@@ -151,7 +151,13 @@ public struct FileIndexStatus: Sendable {
 /// here: the view fetches unfiltered-by-score and splits, so it can offer "show all".
 public struct SearchFilter: Sendable {
     public var kinds: Set<String> = []        // empty = all kinds
-    public var folderPrefix: String? = nil    // restrict to a folder (path-boundary aware)
+    /// Restrict to a folder (path-boundary aware). `folderSlash` is the boundary form kept in
+    /// lockstep, because `acceptsPath` is called once per FILE while the path table is rebuilt -
+    /// 750k times at 750k files - and `hasPrefix(f + "/")` allocated a fresh String on every one
+    /// of those calls. Computed once per assignment instead; the comparison itself is unchanged,
+    /// so folder matching keeps String's Unicode semantics rather than a byte-wise shortcut.
+    public var folderPrefix: String? = nil { didSet { folderSlash = folderPrefix.map { $0 + "/" } } }
+    private(set) var folderSlash: String? = nil
     public var ext: String? = nil             // restrict to a file extension (no dot)
     public var since: Double? = nil           // modified >= since (epoch seconds)
     /// Content-tag terms (`tag:bear` / `-tag:cat`): the file's generated tag snippet must
@@ -183,7 +189,7 @@ public struct SearchFilter: Sendable {
     /// identical for every chunk row of a file - and at ~7 rows per file on a 4.5M-row index that
     /// is the difference between 258k String tests and 4.5M of them, each retaining a path String.
     func acceptsPath(_ path: String) -> Bool {
-        if let f = folderPrefix, !(path == f || path.hasPrefix(f + "/")) { return false }
+        if let f = folderPrefix, !(path == f || path.hasPrefix(folderSlash ?? (f + "/"))) { return false }
         if let e = ext, !e.isEmpty, !Self.hasExtensionCI(path, e) { return false }
         if let allow = tagAllow, !allow.contains(path) { return false }
         if let deny = tagDeny, deny.contains(path) { return false }
@@ -192,7 +198,7 @@ public struct SearchFilter: Sendable {
 
     func accepts(path: String, kind: String, modified: Double) -> Bool {
         if !kinds.isEmpty && !kinds.contains(kind) { return false }
-        if let f = folderPrefix, !(path == f || path.hasPrefix(f + "/")) { return false }
+        if let f = folderPrefix, !(path == f || path.hasPrefix(folderSlash ?? (f + "/"))) { return false }
         if let e = ext, !e.isEmpty, !Self.hasExtensionCI(path, e) { return false }
         if let s = since, modified < s { return false }
         if let allow = tagAllow, !allow.contains(path) { return false }
@@ -2919,24 +2925,21 @@ public final class VectorStore: @unchecked Sendable {
                 // GPU mask, and the query then takes the same candidate selection a plain one does.
                 let pathFilter = filter.folderPrefix != nil || (filter.ext?.isEmpty == false)
                     || filter.tagAllow != nil || filter.tagDeny != nil
-                let maskable = (filter.since == nil || modifiedGPULocked() != nil)
-                    && (filter.kinds.isEmpty || kindCodeGPULocked() != nil)
-                    && (!pathFilter || (fileIDGPULocked() != nil && pathAllowGPULocked(filter) != nil))
+                // The mask itself decides whether this path is usable, rather than a separate
+                // predicate that could disagree with it. FAILING CLOSED MATTERS: a filter with a
+                // clause the mask could not express must fall to the host reducer, because an
+                // unmasked candidate selection would pick the GLOBAL top-C and silently drop every
+                // in-scope match outside it - the `offer` re-check keeps such results sound, so the
+                // loss would show up as missing results and nothing else.
+                let needsMask = !filter.kinds.isEmpty || pathFilter || filter.since != nil
+                let selectMask = needsMask ? selectMaskLocked(filter, pathFilter: pathFilter) : nil
+                let maskable = !needsMask || selectMask != nil
                 if maskable, baseRows > C {
+                    // ONE `which` against the cached combined mask, not one per filter clause with
+                    // its gathers rebuilt on every keystroke.
                     var selectScore = baseScore
-                    if !filter.kinds.isEmpty, let kc = kindCodeGPULocked() {
-                        var allow = [Float](repeating: 0, count: 256)
-                        for k in filter.kinds { if let id = kindID[k] { allow[Int(id)] = 1 } }
-                        let mask = MLXArray(allow)[kc].reshaped(baseScore.shape)
-                        selectScore = MLX.which(mask .> 0.5, selectScore, MLXArray(-Float.infinity))
-                    }
-                    if pathFilter, let fid = fileIDGPULocked(), let pa = pathAllowGPULocked(filter) {
-                        let mask = pa[fid].reshaped(baseScore.shape)
-                        selectScore = MLX.which(mask .> 0.5, selectScore, MLXArray(-Float.infinity))
-                    }
-                    if let since = filter.since, let md = modifiedGPULocked() {
-                        let cut = Int32(clamping: Int((since - Self.modifiedEpochBase).rounded(.down)))
-                        selectScore = MLX.which((md .>= MLXArray(cut)).reshaped(baseScore.shape),
+                    if let selectMask {
+                        selectScore = MLX.which(selectMask.reshaped(baseScore.shape) .> 0.5,
                                                 selectScore, MLXArray(-Float.infinity))
                     }
                     let result = fillSnippetsLocked(searchCandidatesLocked(
@@ -3413,22 +3416,105 @@ public final class VectorStore: @unchecked Sendable {
     /// every row. Cached because instant-search re-runs the SAME filter on every keystroke: the
     /// table is a function of (folderPrefix, ext, tag sets) and the path intern table, so only a
     /// row mutation can change it - and that already clears the tag cache, so it clears this too.
+    ///
+    /// THE KEY MUST IDENTIFY THE TAG SETS, NOT COUNT THEM. It used to summarise them as
+    /// `...|\(f.tagAllow?.count ?? -1)|\(f.tagDeny?.count ?? -1)|...`, so two DIFFERENT tag
+    /// filters whose resolved path sets happened to be the same SIZE shared one mask - and any two
+    /// tags matching one file each are the same size. The second query then selected its
+    /// candidates through the first tag's mask. Soundness survived, because
+    /// searchCandidatesLocked re-checks every candidate against the real filter and no
+    /// out-of-scope file could be returned; completeness did not, because the in-scope file was
+    /// never offered as a candidate at all - `tag:b` after `tag:a` returned NOTHING.
+    /// Covered by PathAllowCacheKeyTests.
+    ///
+    /// The sets are a pure function of the TERMS: resolveTagFilterLocked is their only writer, it
+    /// derives them from tagTerms/tagExcludeTerms against the rows, and any row change clears this
+    /// cache. So the terms identify them exactly, at O(#terms) - where keying on the set CONTENTS
+    /// would hash every matched path on every keystroke.
     private var pathAllowKey: String? = nil
     private var pathAllowGPU: MLXArray? = nil
     private func pathAllowGPULocked(_ f: SearchFilter) -> MLXArray? {
         let nGlobal = max(1, fileChunkCount.count)
         guard nGlobal > 1, idPath.count >= nGlobal else { return nil }
-        let key = "\(f.folderPrefix ?? "")|\(f.ext ?? "")|\(f.tagAllow?.count ?? -1)|\(f.tagDeny?.count ?? -1)|\(nGlobal)"
-        if key == pathAllowKey, let g = pathAllowGPU { return g }
+        let cacheKey = Self.pathAllowKey(f, nGlobal: nGlobal)
+        if let key = cacheKey, key == pathAllowKey, let g = pathAllowGPU { return g }
         var allow = [Float](repeating: 0, count: nGlobal)
         for gid in 0 ..< nGlobal where f.acceptsPath(idPath[gid]) { allow[gid] = 1 }
         let g = MLXArray(allow)
         MLX.eval(g)
+        guard let key = cacheKey else { return g }
         pathAllowKey = key
         pathAllowGPU = g
         return g
     }
-    func invalidatePathAllowCacheLocked() { pathAllowKey = nil; pathAllowGPU = nil }
+    /// Identity of the path table `f` produces, or nil when it cannot be identified - which happens
+    /// only for resolved tag sets with no terms behind them (see above), and means "do not cache".
+    static func pathAllowKey(_ f: SearchFilter, nGlobal: Int) -> String? {
+        if (f.tagAllow != nil || f.tagDeny != nil), f.tagTerms.isEmpty, f.tagExcludeTerms.isEmpty {
+            return nil
+        }
+        let terms = f.tagTerms.map { $0.lowercased() }.sorted().joined(separator: ",")
+        let exTerms = f.tagExcludeTerms.map { $0.lowercased() }.sorted().joined(separator: ",")
+        return "\(f.folderPrefix ?? "")|\(f.ext ?? "")|\(terms)|\(exTerms)"
+            + "|\(f.tagAllow?.count ?? -1)|\(f.tagDeny?.count ?? -1)|\(nGlobal)"
+    }
+    func invalidatePathAllowCacheLocked() {
+        pathAllowKey = nil; pathAllowGPU = nil
+        selectMaskKey = nil; selectMaskGPU = nil
+    }
+
+    /// The COMBINED per-row keep mask for a filtered query, cached across keystrokes.
+    ///
+    /// Every filtered query used to rebuild its mask from scratch: a 256-entry gather by kind code,
+    /// a [fileCount] gather by fileID, an Int32 compare on `modified`, and one `MLX.which` per
+    /// clause - up to nine [baseRows] arrays materialised per query, on a path instant search
+    /// re-runs on every keystroke with an IDENTICAL filter. The mask is a pure function of
+    /// (kinds, path table, since, baseRows) and every input it reads is already cached per base,
+    /// so it caches too: a filtered query then costs the plain query plus a single `which`.
+    ///
+    /// Measured on M2 at 1M rows, filtered p50 against plain 9.2 ms: kind 14.1, folder 18.3,
+    /// ext 17.6, since 18.2 - i.e. the rebuild, not the scan, was most of a filtered query's cost
+    /// on a narrow GPU. (On an M3 Ultra every arm already read ~4 ms, which is why it never showed.)
+    /// A/B lever: 0 rebuilds the mask on every query (the pre-cache behavior), so the cache can be
+    /// measured in one process instead of across two builds.
+    static let selectMaskCache = ProcessInfo.processInfo.environment["OMNI_SELECT_MASK_CACHE"] != "0"
+    private var selectMaskKey: String? = nil
+    private var selectMaskGPU: MLXArray? = nil
+    /// Flat [baseRows] Float32, 1 = keep. Nil when `f` has no GPU-maskable clause.
+    private func selectMaskLocked(_ f: SearchFilter, pathFilter: Bool) -> MLXArray? {
+        let hasKind = !f.kinds.isEmpty
+        guard hasKind || pathFilter || f.since != nil else { return nil }
+        let sinceCut = f.since.map { Int32(clamping: Int(($0 - Self.modifiedEpochBase).rounded(.down))) }
+        // A nil path key means "not identifiable", so this mask must not be cached either.
+        let pathKey: String? = pathFilter ? Self.pathAllowKey(f, nGlobal: max(1, fileChunkCount.count)) : ""
+        let key: String? = (!Self.selectMaskCache || (pathFilter && pathKey == nil)) ? nil
+            : "\(f.kinds.sorted().joined(separator: ","))|\(sinceCut.map(String.init) ?? "")"
+              + "|\(pathKey ?? "")|\(baseRows)"
+        if let key, key == selectMaskKey, let m = selectMaskGPU { return m }
+
+        var keep: MLXArray? = nil
+        func combine(_ m: MLXArray) { keep = keep.map { $0 * m } ?? m }
+        if hasKind {
+            guard let kc = kindCodeGPULocked() else { return nil }
+            var allow = [Float](repeating: 0, count: 256)
+            for k in f.kinds { if let id = kindID[k] { allow[Int(id)] = 1 } }
+            combine(MLXArray(allow)[kc].reshaped([baseRows]))
+        }
+        if pathFilter {
+            guard let fid = fileIDGPULocked(), let pa = pathAllowGPULocked(f) else { return nil }
+            combine(pa[fid].reshaped([baseRows]))
+        }
+        if let cut = sinceCut {
+            guard let md = modifiedGPULocked() else { return nil }
+            combine((md .>= MLXArray(cut)).asType(Float.self).reshaped([baseRows]))
+        }
+        guard let mask = keep else { return nil }
+        MLX.eval(mask)
+        guard let key else { return mask }
+        selectMaskKey = key
+        selectMaskGPU = mask
+        return mask
+    }
 
     /// Per-row `modified` as Int32 seconds since 2000-01-01, on the GPU, sized to baseRows.
     ///
