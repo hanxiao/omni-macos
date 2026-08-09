@@ -57,6 +57,45 @@ enum BitScanBench {
         }
         _ = scanOnce(); MLX.eval(scanOnce())        // warm
 
+        // ASYMMETRIC form - the one the recall measurement says you would actually ship. The query
+        // stays float, so the kernel must unpack each bit and accumulate +/-q[j] instead of doing 24
+        // popcounts. Same 96 B/row read, far more ALU: this is the number that decides the idea.
+        let asymSource = """
+            uint row = thread_position_in_grid.x;
+            if (row >= (uint)nrows[0]) return;
+            uint w = (uint)nwords[0];
+            float acc = 0.0f;
+            for (uint k = 0; k < w; ++k) {
+                uint bits = codes[row * w + k];
+                uint base = k * 32u;
+                for (uint b = 0; b < 32u; ++b) {
+                    float qv = qf[base + b];
+                    acc += ((bits >> b) & 1u) ? qv : -qv;
+                }
+            }
+            out[row] = acc;
+            """
+        let asymKernel = MLXFast.metalKernel(
+            name: "asym_bit_scan",
+            inputNames: ["codes", "qf", "nrows", "nwords"],
+            outputNames: ["out"],
+            source: asymSource)
+        var qf = [Float](repeating: 0, count: dim)
+        for i in 0 ..< dim { qf[i] = Float(next() % 2048) / 2048 - 0.5 }
+        let QF = MLXArray(qf, [dim])
+        MLX.eval(QF)
+        func asymOnce() -> MLXArray {
+            asymKernel([W, QF, MLXArray([Int32(N)]), MLXArray([Int32(words)])],
+                       grid: (N, 1, 1), threadGroup: (256, 1, 1),
+                       outputShapes: [[N]], outputDTypes: [.float32])[0]
+        }
+        MLX.eval(asymOnce())
+        var asymMs = Double.infinity
+        for _ in 0 ..< 8 {
+            let t = Date(); let s = asymOnce(); MLX.eval(s)
+            asymMs = Swift.min(asymMs, -t.timeIntervalSinceNow * 1000)
+        }
+
         var bitMs = Double.infinity
         for _ in 0 ..< 8 {
             let t = Date(); let s = scanOnce(); MLX.eval(s)
@@ -95,6 +134,9 @@ enum BitScanBench {
         print(String(format: "  3-bit affine quantizedMM (shipped)  %6.2f ms  %4d B/row  %.2f GB  -> %5.0f GB/s",
                      qmmMs, qmmBytes / full.dim(0), Double(qmmBytes) / 1_073_741_824,
                      Double(qmmBytes) / 1_073_741_824 / (qmmMs / 1000)))
+        print(String(format: "  1-bit ASYMMETRIC (shippable form)   %6.2f ms  %4d B/row  %.2f GB  -> %5.0f GB/s",
+                     asymMs, bitBytes / N, Double(bitBytes) / 1_073_741_824,
+                     Double(bitBytes) / 1_073_741_824 / (asymMs / 1000)))
         print(String(format: "  bytes %.2fx smaller, scan %.2fx %@",
                      Double(qmmBytes) / Double(bitBytes), Swift.max(bitMs, qmmMs) / Swift.min(bitMs, qmmMs),
                      bitMs < qmmMs ? "FASTER" : "SLOWER"))

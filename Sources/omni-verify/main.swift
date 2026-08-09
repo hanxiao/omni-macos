@@ -6364,6 +6364,97 @@ if args.count >= 2 && args[1] == "vizbuildbench" {
     exit(diff == 0 ? 0 : 1)
 }
 
+// What does a 1-bit tier COST in recall? omni-verify bitrecall <modelDir> <dbPath> <folder> [nq]
+// bitscanbench showed the 1-bit primitive is 2.1-2.4x faster and 3.1x smaller. That only matters if
+// the coarse tier still does its one job: putting the true top-K inside the top-C the exact rerank
+// then reorders. Measured on REAL vectors from the user's index against a real exact ground truth,
+// at the shipped candidate width and at a harsher one, with the shipped 3-bit affine as the control.
+//
+// Two 1-bit estimators, because they cost different amounts to implement:
+//   symmetric   sign(Rx) . sign(Rq)  - the pure popcount bitscanbench timed
+//   asymmetric  sign(Rx) . Rq        - RaBitQ's actual form; keeps the query in float, still reads
+//                                      96 B/row (unpack bits in-kernel), more ALU than popcount
+// R is the randomized Hadamard rotation already verified orthogonal by `hadamardcheck`, which is
+// what makes the sign code informative: without it a coordinate basis wastes bits on whatever axes
+// the encoder happens to load.
+if args.count >= 5 && args[1] == "bitrecall" {
+    let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    let store = try VectorStore(dbURL: URL(fileURLWithPath: args[3]))
+    let folder = args[4]
+    let nq = (args.count >= 6 ? Int(args[5]) : nil) ?? 60
+    omniSetMemoryLimit(6_000_000_000)
+    let d = engine.dim
+    let data = store.vectorsUnderFolder(folder, cap: 200_000, landmarkCap: 200_000)
+    let n = data.count
+    guard n > 5000, VectorStore.hadamardCompatible(d) else {
+        print("bitrecall: need >5000 rows under that folder and a Hadamard-compatible dim (got \(n), \(d))")
+        store.close(); exit(1)
+    }
+    let K0 = 50
+    print("bitrecall folder=\(folder) rows=\(n) dim=\(d) queries=\(nq) target=exact top-\(K0)")
+
+    let X = MLXArray(data.vectors, [n, d]).asType(.float32)
+    let terms = ["beach sunset", "invoice pdf", "porsche", "team photo", "memory profiling",
+                 "embedding quantization", "screen recording", "paper figure", "roadmap",
+                 "gantt chart", "trajectory checkpoint", "metal kernel", "swift concurrency",
+                 "index compaction", "cat", "receipt", "slide deck", "arxiv paper"]
+    var qv: [Float] = []
+    for i in 0 ..< nq { qv.append(contentsOf: engine.embedQuery(terms[i % terms.count] + (i >= terms.count ? " \(i)" : ""))) }
+    let Q = MLXArray(qv, [nq, d]).asType(.float32)
+
+    // Exact fp32 ground truth.
+    let gtIdx = MLX.argPartition(MLX.negative(MLX.matmul(Q, X.transposed(1, 0))), kth: K0, axis: 1)[0..., 0 ..< K0]
+    MLX.eval(gtIdx)
+    let gt = gtIdx.asType(.int32).asArray(Int32.self)
+
+    // Randomized Hadamard rotation, same construction VectorStore uses for the (rejected) affine
+    // preconditioner - orthogonal, so it changes no inner product, only the basis the signs see.
+    var signs = [Float](repeating: 0, count: d)
+    var rng: UInt64 = 0x9E37_79B9_7F4A_7C15 &+ UInt64(d)
+    for i in 0 ..< d { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; signs[i] = (rng >> 40) & 1 == 0 ? -1 : 1 }
+    let sg = MLXArray(signs, [d])
+    func rot(_ a: MLXArray) -> MLXArray { MLX.hadamardTransform(a * sg, scale: 1.0 / Float(d).squareRoot()) }
+    let Xr = rot(X), Qr = rot(Q)
+    let Xs = MLX.which(Xr .>= MLXArray(Float(0)), MLXArray(Float(1)), MLXArray(Float(-1)))   // sign codes
+    let Qs = MLX.which(Qr .>= MLXArray(Float(0)), MLXArray(Float(1)), MLXArray(Float(-1)))
+    MLX.eval(Xs, Qs)
+
+    func report(_ scores: MLXArray, _ label: String, bytesPerRow: Int) {
+        var line = String(format: "  %-26@ %4d B/row  ", label, bytesPerRow)
+        for width0 in [3840, 384] {
+            let width = Swift.min(width0, n)
+            let cIdx = MLX.argPartition(MLX.negative(scores), kth: Swift.min(width, n - 1), axis: 1)[0..., 0 ..< width]
+            MLX.eval(cIdx)
+            let cand = cIdx.asType(.int32).asArray(Int32.self)
+            var kept = 0.0, kept10 = 0.0
+            for qi in 0 ..< nq {
+                var set = Set<Int32>(); set.reserveCapacity(width)
+                for j in 0 ..< width { set.insert(cand[qi * width + j]) }
+                var hit = 0, hit10 = 0
+                for j in 0 ..< K0 where set.contains(gt[qi * K0 + j]) { hit += 1 }
+                // The user-visible number. The exact rerank scores every candidate correctly, so a
+                // true top-10 file that reaches the candidate set ranks where it belongs: final
+                // recall@10 IS the containment of the true top-10, and top-50 containment overstates
+                // the damage because ranks 11-50 never reach the screen.
+                for j in 0 ..< Swift.min(10, K0) where set.contains(gt[qi * K0 + j]) { hit10 += 1 }
+                kept += Double(hit) / Double(K0)
+                kept10 += Double(hit10) / 10.0
+            }
+            line += String(format: "@%d: top50=%.4f top10=%.4f   ", width, kept / Double(nq), kept10 / Double(nq))
+        }
+        print(line)
+    }
+
+    // Shipped control: 3-bit affine, group 64.
+    let q3 = MLX.quantized(X.asType(.bfloat16), groupSize: 64, bits: 3)
+    let deq3 = MLX.dequantized(q3.wq, scales: q3.scales, biases: q3.biases, groupSize: 64, bits: 3).asType(.float32)
+    report(MLX.matmul(Q, deq3.transposed(1, 0)), "3-bit affine (shipped)", bytesPerRow: d * 3 / 8 + (d / 64) * 4)
+    report(MLX.matmul(Qs, Xs.transposed(1, 0)), "1-bit symmetric", bytesPerRow: d / 8)
+    report(MLX.matmul(Qr, Xs.transposed(1, 0)), "1-bit asymmetric (RaBitQ)", bytesPerRow: d / 8)
+    store.close()
+    exit(0)
+}
+
 // Is a 1-bit XOR+popcount scan faster than the shipped 3-bit one? omni-verify bitscanbench [N] [dim]
 if args.count >= 2 && args[1] == "bitscanbench" {
     BitScanBench.run(rows: (args.count >= 3 ? Int(args[2]) : nil) ?? 4_500_000,
