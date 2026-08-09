@@ -3155,6 +3155,14 @@ if args.count >= 2 && args[1] == "sdpabench" {
 //       a .utility task (E-core biased) - benches that run on the main thread overstate the app.
 //   OMNI_BENCH_WIRED=1   wire the model's weights for the run (MLX wired-limit ticket)
 //   MLX_MAX_OPS_PER_BUFFER / MLX_MAX_MB_PER_BUFFER   MLX command-buffer batching (read by MLX at init)
+//
+// BOTH OF THOSE MEASURED NULL on an M3 Ultra (batch 8, 15 s, nano), recorded so they are not
+// re-derived: wired 0 -> 1 moved 85,105 -> 85,194 tok/s (0.1%), and ops-per-buffer
+// default/64/256/1024 spanned 85,061 -> 85,117 tok/s (0.07%). Neither is surprising on THIS
+// machine and neither result transfers: wiring can only matter where the page cache actually
+// evicts (512 GB never does), and command-buffer batching can only matter where dispatch is a
+// visible share, which it is not at chunk-length shapes that are compute-bound. Re-run both on a
+// memory-constrained Mac before concluding they are dead ends there too.
 func embbenchRun(_ engine: OmniEngine, _ corpus: [String], _ secs: Double, _ batchSize: Int,
                  _ qos: DispatchQoS.QoSClass) -> (chunks: Int, toks: Int, wall: Double) {
     let done = DispatchSemaphore(value: 0)
