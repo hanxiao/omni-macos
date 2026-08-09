@@ -2347,7 +2347,19 @@ if args.count >= 3 && args[1] == "searchunderindex" {
         while s.count < chars { s += words[i % words.count] + " "; i += 1 }
         return String(s.prefix(chars))
     }
-    let flushBatches: [[String]] = (0 ..< 6).map { b in (0 ..< 16).map { chunkText($0 * 7 + b * 13, 180 + (($0 * 53 + b * 97) % 1500)) } }
+    // The flush WINDOW is held at 96 chunks and only the carve width varies, so the two arms do the
+    // same total GPU work and differ solely in how long one command buffer is - which is exactly
+    // what this bench exists to measure. OMNI_TEXT_BATCH selects the width, matching the indexer.
+    let carveW = (ProcessInfo.processInfo.environment["OMNI_TEXT_BATCH"].flatMap { Int($0) }) ?? 16
+    let windowChunks = 96
+    let texts96: [String] = (0 ..< windowChunks).map { i in chunkText(i * 7 + (i / 16) * 13, 180 + ((i * 53 + (i / 16) * 97) % 1500)) }
+    var flushBatches: [[String]] = []
+    var ci = 0
+    while ci < texts96.count {
+        let e = Swift.min(ci + Swift.max(1, carveW), texts96.count)
+        flushBatches.append(Array(texts96[ci ..< e])); ci = e
+    }
+    print("  (indexing flush: \(windowChunks) chunks carved at width \(carveW) -> \(flushBatches.count) forwards)")
 
     var embedMs: [Double] = [], searchMs: [Double] = []   // per-call breakdown (cold pattern)
     func sample(_ q: String, breakdown: Bool = false) -> Double {

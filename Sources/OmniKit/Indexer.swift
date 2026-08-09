@@ -387,8 +387,22 @@ public final class Indexer: @unchecked Sendable {
     // does not - 8 is 5-6% FASTER than 16, reproducible to 0.1 s on two unrelated corpus shapes
     // (jsonl agent logs 26.2 -> 24.8 s, Swift source 8.0 -> 7.5 s; omni-verify reusecheck). The
     // forward is compute-bound at chunk lengths, so a bigger batch amortises a fixed weight read
-    // over work that was never the constraint and only adds memory pressure. So 8 wins on BOTH
-    // axes this knob trades between rather than trading one for the other.
+    // over work that was never the constraint and only adds memory pressure.
+    //
+    // It is still a TRADE, not a free win on both axes - `searchunderindex` at a fixed 96-chunk
+    // flush window, 3 runs per arm, only the carve width varying:
+    //
+    //                       batch 16      batch 8
+    //   index throughput    5.2 fl/s      5.8 fl/s      +11.5%   (reproducible to 0.0)
+    //   warm p50 (typing)   65 ms         33 ms         2x better
+    //   warm p95            197 ms        178 ms        -10%
+    //   cold p50 (pause)    97 ms         105 ms        +8% WORSE
+    //   cold p95            150 ms        153 ms        wash
+    //
+    // Taken because the regression lands where it is least felt: `warm` is the actively-typing
+    // cadence, which halves, while `cold` is one query after a pause and costs 8 ms. The likely
+    // mechanism for the cold cost is simply that 8 indexes 11.5% faster, so a query arriving in a
+    // quiet window contends with more in-flight work, not that shorter buffers hurt.
     //
     // Vectors are unchanged, checked not assumed (omni-verify batchidentity): 4, 8 and 32 are
     // BIT-IDENTICAL to 16. Only 64 moves at all, by max 1.3e-4 (cosine 0.99999999) - its own small
