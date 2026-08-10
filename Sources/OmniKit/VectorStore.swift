@@ -1474,10 +1474,15 @@ public final class VectorStore: @unchecked Sendable {
     /// Open-time progress (0...1 over the row load, sidecar or full scan), for the launch UI.
     /// Called on the opening thread, at coarse strides - never per row. nil = no reporting.
     private let onLoadProgress: (@Sendable (Double) -> Void)?
+    /// What the store is doing, for the launch screen. The one-time upgrade takes tens of seconds
+    /// on a large index and looks identical to a hang without it.
+    private let onStatus: (@Sendable (String) -> Void)?
 
-    public init(dbURL: URL, onLoadProgress: (@Sendable (Double) -> Void)? = nil) throws {
+    public init(dbURL: URL, onLoadProgress: (@Sendable (Double) -> Void)? = nil,
+                onStatus: (@Sendable (String) -> Void)? = nil) throws {
         self.dbURL = dbURL
         self.onLoadProgress = onLoadProgress
+        self.onStatus = onStatus
         try FileManager.default.createDirectory(at: dbURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         guard sqlite3_open(dbURL.path, &db) == SQLITE_OK else {
             throw OmniError.store("open failed: \(String(cString: sqlite3_errmsg(db)))")
@@ -6914,19 +6919,37 @@ public final class VectorStore: @unchecked Sendable {
                 PRIMARY KEY(file_id, chunk_index)
             );
             """,
-            // ORDER BY c.rowid is load-bearing, not tidiness: see the note above.
-            """
-            INSERT INTO chunks_v3(file_id, modified, size, kind, chunk_index, snippet, dim, vec,
-                                  width, height, duration, locator, indexed_at, chunk_key)
-              SELECT f.id, c.modified, c.size, c.kind, c.chunk_index, c.snippet, c.dim, \(vecExpr),
-                     c.width, c.height, c.duration, c.locator, c.indexed_at, c.chunk_key
-                FROM chunks c JOIN files f ON f.path = c.path
-               ORDER BY c.rowid;
-            """,
+
         ]
         for sql in steps where !execChecked(sql) {
             exec("ROLLBACK;")
             return nil
+        }
+        // The copy, in slices - inside the SAME transaction, so it is still all-or-nothing, but
+        // reportable. As one statement it was 31 seconds of a launch screen with no bar moving,
+        // which is indistinguishable from a hang. ORDER BY c.rowid within each slice and slices in
+        // rowid order together preserve the global order the coverage claim depends on.
+        onStatus?("Upgrading your index")
+        let total = Swift.max(1, scalarQuery("SELECT COUNT(*) FROM chunks"))
+        var lastRowid: Int64 = 0
+        var copied = 0
+        while copied < total {
+            let slice = 250_000
+            let next = Int64(scalarQuery("SELECT COALESCE(MAX(rid), 0) FROM (SELECT rowid AS rid FROM chunks WHERE rowid > \(lastRowid) ORDER BY rowid LIMIT \(slice))"))
+            guard next > lastRowid else { break }
+            let ok = execChecked("""
+                INSERT INTO chunks_v3(file_id, modified, size, kind, chunk_index, snippet, dim, vec,
+                                      width, height, duration, locator, indexed_at, chunk_key)
+                  SELECT f.id, c.modified, c.size, c.kind, c.chunk_index, c.snippet, c.dim, \(vecExpr),
+                         c.width, c.height, c.duration, c.locator, c.indexed_at, c.chunk_key
+                    FROM chunks c JOIN files f ON f.path = c.path
+                   WHERE c.rowid > \(lastRowid) AND c.rowid <= \(next)
+                   ORDER BY c.rowid;
+                """)
+            guard ok else { exec("ROLLBACK;"); return nil }
+            lastRowid = next
+            copied = scalarQuery("SELECT COUNT(*) FROM chunks_v3")
+            onLoadProgress?(Double(copied) / Double(total))
         }
         // Prove the copy before destroying the original, inside the same transaction, so a failure
         // leaves the old table untouched rather than a half-converted index.

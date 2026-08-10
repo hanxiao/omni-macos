@@ -944,6 +944,9 @@ final class AppModel {
     // Index storage info (for the Settings > Model tab).
     var dbPath = ""
     var dbSizeBytes: Int64 = 0
+    /// Set while the store is doing one-time upgrade work, so the launch screen can say so rather
+    /// than showing a model-loading message during a database rewrite.
+    var storeStatus: String? = nil
     /// One-time storage migration: rows already converted, rows total, bytes still to reclaim.
     /// nil when there is nothing to do, so a finished index shows no banner at all.
     var storageMigration: (done: Int, total: Int, bytesToReclaim: Int64)? = nil
@@ -2302,6 +2305,8 @@ final class AppModel {
             // critical path. VectorStore/OmniEngine are Sendable; neither touches MainActor state here.
             async let storeC = try VectorStore(dbURL: try Self.indexURL(), onLoadProgress: { [weak self] f in
                 Task { @MainActor in self?.noteStoreLoadFrac(f) }
+            }, onStatus: { [weak self] msg in
+                Task { @MainActor in self?.storeStatus = msg }
             })
             // loadValidated self-tests the media embedding path and reloads weights if the first
             // (cold) load hit the MLX uninitialized-memory NaN, so media indexes reliably. Only load

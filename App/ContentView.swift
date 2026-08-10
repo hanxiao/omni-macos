@@ -126,10 +126,20 @@ struct ContentView: View {
             // cost 4 ms (they ship precompiled in default.metallib); the first search costs 621 ms
             // with the vector file cold and 17 ms once the page cache holds it. It is paging, so no
             // duration is promised - a Mac that cannot cache 6.9 GB pays it on every launch.
-            CenteredStatus(symbol: "brain",
-                           title: "Loading the Omni model",
-                           subtitle: "Your first search may be slower while the index loads into memory.",
-                           showSpinner: true, progress: model.loadingProgress)
+            // A one-time index upgrade is a different thing from loading the model, and takes tens
+            // of seconds on a large index - saying "loading the model" through a database rewrite
+            // is how a working upgrade reads as a hang.
+            if let status = model.storeStatus {
+                CenteredStatus(symbol: "internaldrive",
+                               title: status,
+                               subtitle: "One-time change to make search faster and the index smaller.",
+                               showSpinner: true, progress: model.loadingProgress)
+            } else {
+                CenteredStatus(symbol: "brain",
+                               title: "Loading the Omni model",
+                               subtitle: "Your first search may be slower while the index loads into memory.",
+                               showSpinner: true, progress: model.loadingProgress)
+            }
         case .noModel:
             OnboardingView()
         case .failed(let msg):
