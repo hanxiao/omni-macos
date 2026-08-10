@@ -226,4 +226,39 @@ final class VecSlotTests: XCTestCase {
         assertEveryFileFindsItself(store, expect, "rebuilt from coverage")
         XCTAssertEqual(store.count, expect.count, "row count after rebuilding from coverage")
     }
+
+    /// A LOCKED index must not read as an empty one.
+    ///
+    /// The vector file is flock'd by whichever store mapped it, so a second store on the same index
+    /// cannot map it - and once coverage means the file is the only copy of those vectors, "cannot
+    /// map" means "cannot load". Returning an empty store there is not neutral: the app reads it as
+    /// "nothing indexed yet" and starts re-embedding every file, hours of GPU work, over an index
+    /// that is completely intact. Refusing is recoverable; that is not.
+    func testSecondStoreOnACoveredIndexRefusesRatherThanLooksEmpty() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("covlock-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appendingPathComponent("test.sqlite")
+
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            for f in 0 ..< 25 {
+                let p = "/k/f\(f).txt"
+                try store.replace(path: p, chunks: chunks(p, 1, seed: f * 31 + 5))
+            }
+            store.close()
+        }
+        do { let s = try VectorStore(dbURL: dbURL); s.close() }
+        do { let s = try VectorStore(dbURL: dbURL); s.close() }
+        XCTAssertGreaterThan(dbState(dbURL).clearedBlobs, 0, "nothing was covered, so this proves nothing")
+
+        // The row sidecar is what a second store would otherwise adopt; without it the second store
+        // has to go through the coverage claim, which needs the file it cannot map.
+        try FileManager.default.removeItem(at: dir.appendingPathComponent("test.sqlite.rows"))
+
+        let holder = try VectorStore(dbURL: dbURL)   // holds the flock on the vector file
+        defer { holder.close() }
+        XCTAssertThrowsError(try VectorStore(dbURL: dbURL),
+                             "a store that cannot read the covered vectors must refuse, not open empty")
+    }
 }

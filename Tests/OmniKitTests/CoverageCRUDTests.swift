@@ -673,7 +673,22 @@ final class CoverageCRUDTests: XCTestCase {
             store.close()
         }
         XCTAssertEqual(dbState(dbURL).covered, covered,
-                       "a repeated delete restored the blobs and stood coverage down")
+                       "a repeated folder delete restored the blobs and stood coverage down")
+
+        // And by PATH, which is the commoner event: two notifications for one deleted file. The id
+        // mask cannot tell the second one apart - pathID keeps a removed path's id - so only the
+        // victim list can say there is nothing live left to remove.
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            store.deletePaths(["/r/keep/f8.txt"])
+            store.deletePaths(["/r/keep/f8.txt"])   // the duplicate event
+            store.deletePaths(["/r/gone/f0.txt"])   // and one already taken by the folder delete
+            audit(store, "after repeated path delete")
+            store.close()
+        }
+        live.removeAll { $0.0 == "/r/keep/f8.txt" }
+        XCTAssertEqual(dbState(dbURL).covered, covered,
+                       "a repeated path delete restored the blobs and stood coverage down")
 
         try reopen(dbURL) { store in
             self.audit(store, "reopened after repeated folder delete")

@@ -100,7 +100,10 @@ enum DateRange: String, CaseIterable, Identifiable {
 @MainActor
 @Observable
 final class AppModel {
-    enum Phase: Equatable { case loadingModel, noModel, ready, failed(String) }
+    /// `failed` carries WHICH half could not start. A store failure - the index needs disk space to
+    /// finish its one-time upgrade, say - used to render as "Omni can't load its model" with a
+    /// button to go pick a model folder, which is the wrong diagnosis and a remedy that cannot help.
+    enum Phase: Equatable { case loadingModel, noModel, ready, failed(String), failedIndex(String) }
 
     /// Determinate launch progress (0...1) while phase == .loadingModel; nil once ready/failed
     /// (or before bootstrap has begun). Combined 50/50 from the store's row-load fraction and the
@@ -2416,7 +2419,15 @@ final class AppModel {
                 if self.canIndex { self.startIndexing() }
             }
         } catch {
-            self.phase = .failed("\(error)")
+            // OmniError.store is the index refusing to open (it could not be upgraded, or the
+            // upgrade needs disk it does not have). Everything else is the model.
+            if case OmniError.store(let why) = error {
+                // The failure screen offers Reveal, and dbPath is normally set by refreshIndexStats
+                // - which needs the store that just refused to open. Resolve it directly.
+                if self.dbPath.isEmpty { self.dbPath = (try? Self.indexURL())?.path ?? "" }
+                self.phase = .failedIndex(why)
+            }
+            else { self.phase = .failed("\(error)") }
         }
     }
 

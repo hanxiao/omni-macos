@@ -1481,6 +1481,9 @@ public final class VectorStore: @unchecked Sendable {
     /// interned queries are the only ones that exist, so an index that fails to convert cannot be
     /// served, and a silent half-working store is the worst outcome available.
     private(set) var migrationBlockedReason: String?
+    /// Set when the coverage claim could not be read but the vector file is still there - see
+    /// reportCoverageUnreadableLocked. Makes init throw instead of returning an empty store.
+    private var coverageUnreadable: String?
 
     public init(dbURL: URL, onLoadProgress: (@Sendable (Double) -> Void)? = nil,
                 onStatus: (@Sendable (String) -> Void)? = nil) throws {
@@ -1629,6 +1632,9 @@ public final class VectorStore: @unchecked Sendable {
         // still legacy here the conversion did not happen, and carrying on would give a store whose
         // searches work (they score in memory) while snippets, filters and stats quietly fail. Say
         // so instead, so the app can show a real message rather than behaving strangely.
+        if let why = queue.sync(execute: { coverageUnreadable }) {
+            throw OmniError.store(why)
+        }
         if queue.sync(execute: { legacyLayout }) {
             let why = migrationBlockedReason ?? "The index could not be upgraded to the new format."
             throw OmniError.store(why)
@@ -1727,10 +1733,9 @@ public final class VectorStore: @unchecked Sendable {
     /// synchronous checkpoint + close runs off the main actor instead of at the @MainActor ref-drop site.
     public func close() {
         queue.sync {
-            // Before the stamp, not after it. stampRowSidecarLocked starts with ensureCompactLocked,
-            // which physically compacts and shifts every row index; running that on an
-            // already-closed store is pure work whose result nothing can persist, and it used to
-            // happen on every repeat close() because the only `closed` check sat three lines below.
+            // Before the stamp, not after it: stamping an already-closed store is pure work whose
+            // result nothing can persist, and it used to happen on every repeat close() because the
+            // only `closed` check sat three lines below.
             guard !closed else { return }
             stampVectorCoverageLocked(budget: Self.coverageSliceOnClose)   // smaller slice: a quit must not stall
             stampRowSidecarLocked(sync: true)       // durable row table; no-op if current
@@ -3437,12 +3442,19 @@ public final class VectorStore: @unchecked Sendable {
         return scores
     }
 
-    /// Drop the tombstones for real. Called before any path that walks `rows` without going through
-    /// a score, and by the full base rebuild, so those paths never have to know tombstones exist.
-    private func ensureCompactLocked() {
-        guard !deadRows.isEmpty else { return }
-        _ = compactRowsLocked { _ in false }
-    }
+    // ensureCompactLocked USED TO LIVE HERE - "drop the tombstones for real", called by every reader
+    // that walked `rows` without going through a score. Under coverage it cannot exist: compaction
+    // moves vectors, and a covered row's vector cannot move until its cleared blob is written back,
+    // so a reader that triggered one would pay gigabytes of writes on the store queue. Every one of
+    // those readers filters dead rows instead (indexedFiles, listMatching, vectorsUnderFolder), and
+    // the sidecar carries the tombstones rather than compacting them away.
+    //
+    // The consequence is deliberate and worth stating plainly: while coverage is active NOTHING
+    // collects tombstones, so a churning index accumulates dead rows - each holding its slot in the
+    // vector file - and neither the file nor the row table ever shrinks. Measured on the shipped
+    // index, 95,709 holes against 4.53M live rows (2.1%, ~147 MB) after the first days of use.
+    // Reclaiming them needs a compaction that is crash-safe WITHOUT the blob restore (the file and
+    // the claim have to change together, and they are two objects), which is a design, not a patch.
 
     /// Rows per tile for two-level selection, and the lever that turns it off for A/B.
     private static let selectTile = 32
@@ -4940,6 +4952,11 @@ public final class VectorStore: @unchecked Sendable {
     private func reportCoverageUnreadableLocked() {
         FileHandle.standardError.write(Data(
             "[omni] vector coverage unreadable (covered=\(coveredRows) holes=\(vecHoles.count)); index not loaded, nothing modified\n".utf8))
+        // And say so to the CALLER, so it can refuse to open rather than hand back an empty store.
+        // An empty store is not neutral here: the app reads it as "nothing indexed yet" and starts
+        // re-embedding every file, hours of GPU work, over an index that is completely intact and
+        // merely locked by another copy of Omni. Refusing is recoverable; that is not.
+        coverageUnreadable = "The vector file could not be read. Another copy of Omni may have the index open."
     }
 
     /// Append a tombstone that exists only to hold its slot, for a vector the file still carries but
@@ -6439,9 +6456,16 @@ public final class VectorStore: @unchecked Sendable {
         var tombstoned = false
         // The caller already computed exactly these rows, bounded to the files' row windows, so the
         // tombstone pass takes them rather than walking the index a second time to rediscover them.
-        if let pre = victims, let r = tombstoneOnlyLocked(victims: pre) {
-            removed = r; tombstoned = true
-        } else if victims == nil {
+        if let pre = victims {
+            // An EMPTY list means no live row matches, which the id mask above cannot say: pathID
+            // keeps a deleted path's id forever, so `any` is true for a path that was already
+            // removed. Falling through then ran a physical compaction - under coverage, a restore
+            // of every cleared blob - for a delete with nothing to delete. Same shape as the
+            // repeated folder delete, and reachable from the more common event: a second
+            // notification for a file that is already gone.
+            guard !pre.isEmpty else { dropFromPresentLocked(paths); return }
+            if let r = tombstoneOnlyLocked(victims: pre) { removed = r; tombstoned = true }
+        } else {
             idMask.withUnsafeBufferPointer { m in
                 fileID.withUnsafeBufferPointer { fid in
                     if let r = tombstoneOnlyLocked({ m[Int(fid[$0])] }) { removed = r; tombstoned = true }
@@ -6829,6 +6853,15 @@ public final class VectorStore: @unchecked Sendable {
                 FileHandle.standardError.write(Data(
                     "[omni] stale vector coverage claim (covered=\(coveredRows)); every row has its blob, reloading from SQLite\n".utf8))
                 // Falls through to the scan below, which resets the claim before it starts.
+            } else if !FileManager.default.fileExists(atPath: vecSidecarURL.path) {
+                // The vectors are GONE, not unavailable - the file the claim describes does not
+                // exist. Nothing can bring those vectors back, so refusing to open would only trap
+                // the user in a failure screen with no way to the one remedy that works. Stand the
+                // claim down and open empty; the reconcile pass re-indexes, which is exactly what a
+                // user who deleted the file wants and the only thing that can help.
+                FileHandle.standardError.write(Data(
+                    "[omni] vector file missing (covered=\(coveredRows)); index will be rebuilt by the next pass\n".utf8))
+                resetCoverageLocked()
             } else {
                 // Could not read the coverage, and rows DO depend on it. The scan below would read
                 // vectors from blobs that covered rows no longer have, AND mapPersistent would
@@ -6955,13 +6988,12 @@ public final class VectorStore: @unchecked Sendable {
     // copy is what guarantees it, and internPathsVerifyLocked is what proves it rather than
     // assuming it.
     //
-    // Gated behind OMNI_INTERN_PATHS while the 22 query sites that still name `chunks.path` are
-    // migrated. Nothing reads the interned tables until that lands, so an index cannot be left half
-    // converted: the migration either completes inside its transaction or is rolled back whole.
+    // OMNI_INTERN_PATHS gated this while the 22 query sites that still named `chunks.path` were
+    // migrated. They all landed, so the conversion is unconditional and the lever is gone - keeping
+    // it would have implied a choice that no longer exists, since every statement below the load
+    // speaks the interned schema and only that. `internPathsOverride` stays for the tests and
+    // omni-verify, which call the rewrite directly.
     nonisolated(unsafe) public static var internPathsOverride: Bool? = nil
-    static var internPaths: Bool {
-        internPathsOverride ?? (ProcessInfo.processInfo.environment["OMNI_INTERN_PATHS"] == "1")
-    }
 
     /// Test entry point: run the rewrite on the store queue.
     public func internPathsForTest() -> Int64? { queue.sync { internPathsLocked() } }

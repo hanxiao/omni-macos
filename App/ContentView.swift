@@ -144,6 +144,8 @@ struct ContentView: View {
             OnboardingView()
         case .failed(let msg):
             EngineFailedView(message: msg)
+        case .failedIndex(let why):
+            IndexFailedView(message: why)
         case .ready:
             ready
         }
@@ -869,6 +871,34 @@ struct EngineFailedView: View {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true; panel.canChooseFiles = false
         if panel.runModal() == .OK, let url = panel.url { model.setModelDir(url) }
+    }
+}
+
+/// The INDEX could not be opened - which is a different problem from the model failing to load, and
+/// has different remedies. The one that ships is disk: the one-time 0.5.0 upgrade rewrites the
+/// chunk table and declines to start when the volume cannot hold the copy, so the message is
+/// actionable ("needs 5.6 GB free, 1.2 GB available") and the only useful button is Retry once the
+/// user has freed some. Reveal is there because the next question is always "where is it?".
+struct IndexFailedView: View {
+    @Environment(AppModel.self) private var model: AppModel
+    let message: String
+    var body: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "internaldrive").font(.system(size: 44, weight: .light)).foregroundStyle(.tertiary)
+            Text("Omni can't open its index").font(.title)
+            Text(message).foregroundStyle(.secondary)
+                .multilineTextAlignment(.center).frame(maxWidth: 460)
+            HStack {
+                Button("Retry") { model.retryBootstrap() }.buttonStyle(.borderedProminent)
+                Button("Reveal in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.dbPath)])
+                }
+                .disabled(model.dbPath.isEmpty)
+            }
+            .controlSize(.large)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding()
     }
 }
 
