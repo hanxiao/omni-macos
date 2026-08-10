@@ -1409,6 +1409,17 @@ public final class VectorStore: @unchecked Sendable {
         // and lazy like the columns above: pre-existing rows carry '' and simply get no reuse
         // until their file is next embedded. Never read by search; not resident.
         addColumnIfMissing("chunk_key", "TEXT NOT NULL DEFAULT ''")
+        // WHERE this row's vector lives in the .vecs sidecar, or -1 for "nowhere durable yet, the
+        // blob in `vec` is the only copy". See recordVecSlotsLocked for why the mapping has to be
+        // written down rather than implied. Additive and lazy exactly like the columns above: every
+        // pre-existing row starts at -1 and earns a slot at the first stamp, so adopting an existing
+        // index costs nothing and old app versions (which never name this column) are unaffected.
+        addColumnIfMissing("vec_slot", "INTEGER NOT NULL DEFAULT -1")
+        // PARTIAL index over the un-slotted rows alone. The stamp's job is "give a slot to whatever
+        // arrived since last time", and in steady state that is a handful of rows out of millions;
+        // without this it is a full table scan (measured 1.67s at 4.5M rows against 14ms with it).
+        // Partial on a predicate that is almost always false, so the index itself stays tiny.
+        exec("CREATE INDEX IF NOT EXISTS idx_vec_unslotted ON chunks(vec_slot) WHERE vec_slot < 0;")
         // Content-dedup sidecar: one row per indexed file, mapping a content key (hash of the
         // embedding-relevant bytes + the preprocess settings) to the path whose chunks realized it.
         // ADDITIVE and self-healing, so index compatibility holds in BOTH directions: an old app
@@ -2054,6 +2065,7 @@ public final class VectorStore: @unchecked Sendable {
             fileRowLo = []; fileRowHi = []; rowWindowCovered = 0   // same reason: release, not removeAll
             try? FileManager.default.removeItem(at: quantReplicaURL); lastPersistedBaseRows = -1   // replica is of wiped rows
             removeRowSidecarFiles()   // sidecar caches the wiped rows; releaseAll() above dropped the mapping
+            resetVecSlotsLocked()     // no file, so no slots: the next stamp numbers from scratch
             resetAggregatesLocked()
             invalidateTagFilterCacheLocked()   // wipe bypasses fileChunkDec; keep the invariant
             dim = 0
@@ -4177,6 +4189,34 @@ public final class VectorStore: @unchecked Sendable {
     private var lastStampedGen: Int64 = -1
     private var stampToken: UInt64 = 0
 
+    // MARK: - Vector slots (where each row's vector lives in the .vecs file)
+    //
+    // The sidecar's row<->vector correspondence has always been IMPLIED: "row i of .vecs is the
+    // i-th row of chunks in rowid order". That is true while the two move in lockstep and false the
+    // moment they do not, and nothing in the file can tell the difference - a row deleted after a
+    // stamp leaves the file one row longer than the table, and from the hole onward every row reads
+    // its NEIGHBOUR's vector. Size and COUNT(*) checks cannot see it; the 32-row sample can only see
+    // it by luck. Recording the slot per row turns that implication into a fact the loader can check.
+    //
+    // Written only by the stamp, which runs after ensureCompactLocked() (no tombstones standing, so
+    // in-memory row i really is rowid rank i) and after the file demonstrably covers every row.
+    /// Rows [0, vecsCoveredRows) have a recorded slot AND durable bytes behind it. 0 = nothing yet.
+    private var vecsCoveredRows = 0
+    /// Set when a physical compaction moved rows: every recorded slot is stale, so the next stamp
+    /// must renumber all of them rather than just appending. Compaction is the only thing that
+    /// invalidates a slot - appends only ever add rows past the end.
+    private var vecSlotsDirty = false
+    /// Meta keys for the durable claim about the vector file. In `meta`, so they commit inside a
+    /// SQLite transaction alongside the slots they describe.
+    private static let vecsRowsKey = "vecs_rows"
+    private static let vecsGenKey = "vecs_gen"
+    /// OMNI_VEC_SLOTS=0 stops recording slots, for A/B and as an escape hatch. Recording them is
+    /// pure bookkeeping while the `vec` blobs are still written, so off is the old behaviour exactly.
+    nonisolated(unsafe) public static var vecSlots = ProcessInfo.processInfo.environment["OMNI_VEC_SLOTS"] != "0"
+    /// Largest index this will renumber in one go. 300k rows is ~2.3s at the measured 7.5us/row,
+    /// which is the most that may be spent holding the store queue inside close().
+    static let vecSlotFullBudget = 300_000
+
     private struct RowSidecarHeader: Codable, Sendable {
         var magic: String, gen: Int64, dim: Int, rowCount: Int, pathCount: Int, kindCount: Int
         var recordBytes: Int, locatorBytes: Int, pathOffBytes: Int, pathBlobBytes: Int, kindOffBytes: Int, kindBlobBytes: Int
@@ -4196,6 +4236,102 @@ public final class VectorStore: @unchecked Sendable {
                 self.stampRowSidecarLocked(sync: false)
             }
         }
+    }
+
+    /// Write down which slot of the .vecs file holds each row's vector, and record how far the file
+    /// is durable. Returns false if it could not, leaving the previous claim intact.
+    ///
+    /// Correctness rests on two facts that hold HERE and nowhere else, which is why this is private
+    /// to the stamp: ensureCompactLocked() has just run, so no tombstone stands and in-memory row i
+    /// is rowid rank i; and flat16 IS the mapping, so in-memory row i is file slot i. Together those
+    /// make "slot = rank" true rather than assumed, and the numbering below is a transcription of
+    /// the file rather than a guess about it.
+    ///
+    /// The whole thing commits in ONE transaction with the meta claim, so a crash can leave the
+    /// claim and the slots agreeing or neither of them, never a claim about slots that were not
+    /// written. Deliberately does NOT bump mutationGen: it records where existing vectors already
+    /// are and changes no logical content, exactly as VACUUM's rowid renumbering does not bump it.
+    /// A bump here would also invalidate the very sidecar header the caller is about to write.
+    ///
+    /// KNOWN LIMIT, and the reason large indexes are excluded rather than served badly. A slot here
+    /// is a dense RANK, so deleting one row restates the slot of every row after it: the work is
+    /// proportional to the index, not to the edit, and it cannot be sliced into background-sized
+    /// pieces. Measured, that is 33.8s on 4.5M rows. The fix is STABLE slots - a row keeps its slot
+    /// for life and a delete leaves a HOLE the scan already knows how to skip (that is exactly what
+    /// the tombstones above are), so nothing is ever renumbered. That needs delta rows to be
+    /// tombstonable too, which today they are not: tombstoneOnlyLocked bails on `deltaHits` because
+    /// only the base score is masked. Until that lands this earns its keep below the budget and
+    /// stays honestly silent above it.
+
+    /// Forget the slot record because the file it describes is gone or is about to be rebuilt.
+    /// Clears the durable claim as well: a promise about a file that no longer holds what it says
+    /// is worse than no promise, and the window before the next stamp can contain a crash.
+    private func resetVecSlotsLocked() {
+        vecsCoveredRows = 0
+        vecSlotsDirty = true
+        guard dbOpen() else { return }
+        exec("DELETE FROM meta WHERE key IN ('\(Self.vecsRowsKey)','\(Self.vecsGenKey)');")
+    }
+
+    @discardableResult
+    private func recordVecSlotsLocked() -> Bool {
+        guard Self.vecSlots, dbOpen(), dim > 0, !rows.isEmpty, deadRows.isEmpty else { return false }
+        let n = rows.count
+        // Lockstep check. If the table and the row array disagree, the two are not describing the
+        // same set of rows and ANY numbering derived from one would libel the other.
+        guard scalarQuery("SELECT COUNT(*) FROM chunks") == n else { vecsCoveredRows = 0; return false }
+        // Cheap via the partial index. Rows still at -1 are the ones that arrived since last time;
+        // everything else must be exactly the prefix we claimed last time, or the shortcut is void.
+        //
+        // TWO INDEPENDENT GUARDS, deliberately. The count is the load-bearing one: any deletion
+        // leaves fewer slotted rows than we claimed, so it catches every case where a row moved.
+        // vecSlotsDirty catches the same cases from the other side, by asking whether anything
+        // ACTUALLY moved rather than inferring it. Either alone is sufficient today; removing both
+        // makes VecSlotTests fail from the deletion point onward, with every row reading its
+        // neighbour's vector - which is the exact corruption this whole mechanism exists to stop.
+        let unslotted = scalarQuery("SELECT COUNT(*) FROM chunks WHERE vec_slot < 0")
+        let full = vecSlotsDirty || vecsCoveredRows == 0 || n - unslotted != vecsCoveredRows
+        // BOUNDED, because this runs on the store queue and close() calls it synchronously. The
+        // incremental form touches only what arrived (14ms for 2000 rows at 4.5M); the full form
+        // renumbers everything, measured at 33.8s on a 4.5M-row index - a quit that hangs for half
+        // a minute and a search queue held for just as long. Renumbering cannot be sliced while
+        // slots are dense RANKS (deleting one row restates every slot after it), so above the
+        // budget this records nothing rather than claiming a prefix it has not written. See the
+        // note on stable slots in recordVecSlotsLocked's header for why that limit is temporary.
+        guard !full || n <= Self.vecSlotFullBudget else { vecsCoveredRows = 0; return false }
+        guard execChecked("BEGIN;") else { return false }
+        let numbered = full
+            ? execChecked("""
+                UPDATE chunks SET vec_slot = s.k
+                  FROM (SELECT rowid AS rid, row_number() OVER (ORDER BY rowid) - 1 AS k FROM chunks) AS s
+                 WHERE chunks.rowid = s.rid AND chunks.vec_slot <> s.k;
+                """)
+            // INDEXED BY is not a hint here, it is the difference between 14ms and 1.67s: the
+            // planner materializes the window-function subquery with a full SCAN of chunks
+            // otherwise, and the whole point of the incremental form is to touch only the arrivals.
+            : execChecked("""
+                UPDATE chunks SET vec_slot = \(vecsCoveredRows) + s.k
+                  FROM (SELECT rowid AS rid, row_number() OVER (ORDER BY rowid) - 1 AS k
+                          FROM chunks INDEXED BY idx_vec_unslotted WHERE vec_slot < 0) AS s
+                 WHERE chunks.rowid = s.rid;
+                """)
+        guard numbered,
+              // Every row must now have a slot, and the slots must be exactly 0..<n once each.
+              // COUNT(DISTINCT) over an un-indexed column is a scan, so this rides only the full
+              // path, which is already the rare one; the incremental path checks the cheap half.
+              scalarQuery("SELECT COUNT(*) FROM chunks WHERE vec_slot < 0") == 0,
+              !full || scalarQuery("SELECT COUNT(DISTINCT vec_slot) FROM chunks") == n,
+              execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.vecsRowsKey)','\(n)');"),
+              execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.vecsGenKey)','\(mutationGen)');"),
+              execChecked("COMMIT;")
+        else {
+            exec("ROLLBACK;")
+            vecsCoveredRows = 0   // the claim on disk is whatever it was; ours did not land
+            return false
+        }
+        vecsCoveredRows = n
+        vecSlotsDirty = false
+        return true
     }
 
     /// Serialize the resident row table and stamp it with the current generation. The vectors are
@@ -4222,6 +4358,7 @@ public final class VectorStore: @unchecked Sendable {
             guard flat16.extendFileCoverage() else { return }
         }
         flat16.msyncFile()
+        recordVecSlotsLocked()   // durable bytes first, then the record of where they are
         let n = rows.count
         // Pre-sized [UInt8] buffers, not Data: appending millions of few-byte chunks through
         // Data's COW machinery measured 21s at 3.8M rows on the store queue; the same build into
@@ -4328,7 +4465,7 @@ public final class VectorStore: @unchecked Sendable {
         try? fm.removeItem(at: rowSidecarURL.deletingLastPathComponent()
             .appendingPathComponent(rowSidecarURL.lastPathComponent + ".tmp"))   // _exit stranded write
         guard fm.fileExists(atPath: rowSidecarURL.path), fm.fileExists(atPath: vecSidecarURL.path) else { return false }
-        func reject() -> Bool { flat16.removeAll(); removeRowSidecarFiles(); return false }
+        func reject() -> Bool { flat16.removeAll(); removeRowSidecarFiles(); resetVecSlotsLocked(); return false }
         guard let fh = try? FileHandle(forReadingFrom: rowSidecarURL) else { return reject() }
         defer { try? fh.close() }
         guard let headChunk = try? fh.read(upToCount: 4096), let nl = headChunk.firstIndex(of: 0x0A),
@@ -5311,6 +5448,11 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     private func compactRowsLocked(_ shouldRemove: (Int) -> Bool) -> Set<String> {
+        // Physical compaction is the ONLY thing that moves a row's vector within the file - appends
+        // only ever add past the end - so it is the only thing that can falsify a recorded slot.
+        // Marked before the pass, not after: an early return below still means the caller intended
+        // to move rows, and a stale-but-unmarked slot table is the one failure this must not have.
+        vecSlotsDirty = true
         // Every physical compaction also collects the standing tombstones - they are rows nothing
         // may return, and this is the one pass that can drop them for free. Their bookkeeping was
         // done when they were marked, so they must NOT be counted again here: `fileChunkDec` twice
@@ -5424,7 +5566,22 @@ public final class VectorStore: @unchecked Sendable {
         idPath.removeAll(); fileChunkCount.removeAll(); kindCode.removeAll(); kindID.removeAll(); idKind.removeAll(); dim = 0
         resetAggregatesLocked()
         resetRowWindowsLocked()
-        if tryAdoptRowSidecarLocked() { return }   // validated cache of everything below; SQLite stays truth
+        // What the last stamp claimed about the vector file. Read BEFORE the adopt attempt so the
+        // adopt path can inherit a still-valid claim, and so the scan path below can see that it is
+        // about to invalidate one.
+        vecsCoveredRows = scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.vecsRowsKey)'")
+        let claimedGen = Int64(scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.vecsGenKey)'"))
+        if tryAdoptRowSidecarLocked() {
+            // The file was adopted byte-for-byte, so the slots recorded against it still describe
+            // it. Anything less than an exact match on both halves of the claim means the next
+            // stamp renumbers from scratch rather than appending to a prefix it cannot vouch for.
+            vecSlotsDirty = !(claimedGen == mutationGen && vecsCoveredRows == rows.count)
+            if vecSlotsDirty { vecsCoveredRows = 0 }
+            return   // validated cache of everything below; SQLite stays truth
+        }
+        // The scan path re-truncates and refills .vecs from the blobs (mapPersistent below), so
+        // whatever slots were recorded describe a file that is about to stop existing.
+        resetVecSlotsLocked()
         // Pre-size the buffers to the final row/element count so the bf16 buffer is filled in place
         // rather than grown through ~log2(N) reallocations. One COUNT(*) + one dim read up front.
         let total = scalarQuery("SELECT COUNT(*) FROM chunks")
@@ -5533,6 +5690,9 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     private func exec(_ sql: String) { sqlite3_exec(db, sql, nil, nil, nil) }
+    /// exec that reports. Used where a silent failure would leave a durable claim describing work
+    /// that did not happen - the slot bookkeeping, where "it probably worked" is not good enough.
+    private func execChecked(_ sql: String) -> Bool { sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK }
 }
 
 public enum OmniError: Error, CustomStringConvertible {
