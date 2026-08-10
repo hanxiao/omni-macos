@@ -1516,7 +1516,19 @@ public final class VectorStore: @unchecked Sendable {
                 PRIMARY KEY(path, chunk_index)
             );
         """)
-        exec("CREATE INDEX IF NOT EXISTS idx_path ON chunks(path);")
+        // idx_path USED TO BE HERE. It indexed (path) - which is exactly the leading column of the
+        // primary key (path, chunk_index), so SQLite's own autoindex already answered every query
+        // it served, with the identical access shape and sometimes as a COVERING index. Verified on
+        // the real schema: point lookups, the aggregate stat probe, the delete, and the folder range
+        // all plan to sqlite_autoindex_chunks_1 once it is gone.
+        //
+        // It cost 573.5 MB on a 4.5M-row index - 17.6% of the whole database - plus a second B-tree
+        // to maintain on every insert and delete. Dropped on open where present; the space comes
+        // back with the next repack, which the drop arms.
+        if hasIndexLocked("idx_path") {
+            exec("DROP INDEX IF EXISTS idx_path;")
+            exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.vacuumPendingKey)','1');")
+        }
         // Partial COVERING index for the tag: search filter - the term scan reads only media
         // rows' (kind, snippet, path) from ~MBs of index pages instead of dragging the whole
         // chunks B-tree (whose leaves carry the ~1.5KB vec blobs, gigabytes of I/O) through the
@@ -6760,6 +6772,16 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     private func setUserVersion(_ v: Int32) { exec("PRAGMA user_version = \(v);") }
+
+    /// Does this index exist? Used to make a one-time DROP idempotent without relying on the
+    /// statement's own error, which exec() swallows.
+    private func hasIndexLocked(_ name: String) -> Bool {
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?;", -1, &stmt, nil) == SQLITE_OK else { return false }
+        sqlite3_bind_text(stmt, 1, name, -1, SQLITE_TRANSIENT)
+        return sqlite3_step(stmt) == SQLITE_ROW
+    }
 
     /// Idempotently add a column to `chunks` if it is not already present (SQLite has no
     /// ADD COLUMN IF NOT EXISTS). Used for additive, no-reindex schema migrations.
