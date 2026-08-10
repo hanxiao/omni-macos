@@ -42,9 +42,42 @@ final class PathInterningTests: XCTestCase {
         return out
     }
 
-    /// Build a store the ordinary way, with interleaved edits and deletes so the rowid sequence has
-    /// the gaps and reuse a real index accumulates - a rewrite that only works on a pristine table
-    /// is not a migration.
+    /// A LEGACY index - path written per chunk - which is what an existing user has and what the
+    /// migration must convert. Fresh indexes are born interned now, so the fixture has to be built
+    /// by hand rather than by the store, or this would be testing the migration against a database
+    /// that had never needed it.
+    private func makeLegacyIndex(_ dbURL: URL) -> [String] {
+        let db = open(dbURL)
+        defer { sqlite3_close(db) }
+        exec(db, """
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE chunks(path TEXT NOT NULL, modified REAL NOT NULL, size INTEGER NOT NULL DEFAULT 0,
+                kind TEXT NOT NULL, chunk_index INTEGER NOT NULL, snippet TEXT NOT NULL,
+                dim INTEGER NOT NULL, vec BLOB NOT NULL, width INTEGER NOT NULL DEFAULT 0,
+                height INTEGER NOT NULL DEFAULT 0, duration REAL NOT NULL DEFAULT 0,
+                locator TEXT NOT NULL DEFAULT '', indexed_at REAL NOT NULL DEFAULT 0,
+                chunk_key TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY(path, chunk_index));
+            CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            PRAGMA user_version = 2;
+            """)
+        // Interleaved inserts and deletes, so the rowid sequence carries the gaps a real index
+        // accumulates - a rewrite that only works on a pristine table is not a migration.
+        for f in 0 ..< 60 {
+            for i in 0 ..< 3 {
+                exec(db, "INSERT INTO chunks(path,modified,size,kind,chunk_index,snippet,dim,vec) VALUES('/i/f\(f).txt',1,10,'text',\(i),'s\(f)-\(i)',64,x'00');")
+            }
+        }
+        for f in stride(from: 0, to: 60, by: 7) {
+            exec(db, "DELETE FROM chunks WHERE path='/i/f\(f).txt';")
+            for i in 0 ..< 2 {
+                exec(db, "INSERT INTO chunks(path,modified,size,kind,chunk_index,snippet,dim,vec) VALUES('/i/f\(f).txt',2,20,'text',\(i),'edited\(f)-\(i)',64,x'00');")
+            }
+        }
+        exec(db, "DELETE FROM chunks WHERE path IN ('/i/f3.txt','/i/f11.txt');")
+        return orderedRows(db, interned: false)
+    }
+
     private func makeIndex(_ dbURL: URL) throws -> [String] {
         let saved = VectorStore.quantBaseOverride
         VectorStore.quantBaseOverride = VectorStore.scanBits
@@ -80,17 +113,16 @@ final class PathInterningTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: dir) }
         let dbURL = dir.appendingPathComponent("test.sqlite")
 
-        let before = try makeIndex(dbURL)
+        let before = makeLegacyIndex(dbURL)
         XCTAssertGreaterThan(before.count, 100, "fixture did not build")
 
         let saved = VectorStore.internPathsOverride
         VectorStore.internPathsOverride = true
         defer { VectorStore.internPathsOverride = saved }
 
+        // Opening the store converts a legacy index, before any query runs against it.
         let store = try VectorStore(dbURL: dbURL)
-        let freed = store.internPathsForTest()
         store.close()
-        XCTAssertNotNil(freed, "migration declined to run")
 
         let db = open(dbURL)
         defer { sqlite3_close(db) }
@@ -113,7 +145,7 @@ final class PathInterningTests: XCTestCase {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let dbURL = dir.appendingPathComponent("test.sqlite")
-        let before = try makeIndex(dbURL)
+        let before = makeLegacyIndex(dbURL)
 
         // A pre-existing `files` table with a conflicting shape makes the rewrite fail partway.
         do {
@@ -122,11 +154,7 @@ final class PathInterningTests: XCTestCase {
             exec(db, "CREATE TABLE files(wrong INTEGER);")
         }
 
-        let saved = VectorStore.internPathsOverride
-        VectorStore.internPathsOverride = true
-        defer { VectorStore.internPathsOverride = saved }
         let store = try VectorStore(dbURL: dbURL)
-        _ = store.internPathsForTest()
         store.close()
 
         let db = open(dbURL)
