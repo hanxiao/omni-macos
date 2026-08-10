@@ -2375,7 +2375,15 @@ final class AppModel {
             // Reclaim space left by a previously-emptied or heavily-pruned index. compact()
             // self-skips unless a large fraction of the file is free, so a healthy index is
             // untouched; a mostly-empty one compacts fast (cost scales with live data).
-            Task.detached { if store.compact(minFreeRatio: 0.5) > 0 { await MainActor.run { self.refreshIndexStats(store) } } }
+            Task.detached {
+                // Two different reclaims. compact() handles the ordinary case (a pruned index with
+                // free pages). reclaimAfterCoverageMigration handles the one the free-page gate
+                // cannot see: migrating off the duplicate vectors rewrites rows shorter without
+                // freeing a single page, so it is owed a repack that no ratio would ever trigger.
+                var freed = store.reclaimAfterCoverageMigration()
+                freed += store.compact(minFreeRatio: 0.5)
+                if freed > 0 { await MainActor.run { self.refreshIndexStats(store) } }
+            }
             // Indexing is invisible to the user: kick a background pass on every launch so the
             // index catches up (finishes an interrupted crawl, picks up files added while the
             // app was closed, rebuilds after a model switch) and stays current. It is

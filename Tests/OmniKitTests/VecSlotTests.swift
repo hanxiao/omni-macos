@@ -2,34 +2,32 @@ import XCTest
 import SQLite3
 @testable import OmniKit
 
-/// The recorded mapping from a chunks row to its vector's slot in the .vecs sidecar.
+/// VECTOR COVERAGE: the mechanism that stops index.sqlite storing every vector a second time.
 ///
-/// The mapping used to be implied - "row i of the file is the i-th row in rowid order" - which is
-/// true only while the two move in lockstep, and unobservably false afterwards: a row deleted after
-/// a stamp leaves the file one row longer than the table, and from that hole onward every row reads
-/// its NEIGHBOUR's vector. No size or COUNT(*) check can see that. These tests hold the recorded
-/// slots to the standard the implication could not meet: for EVERY row, the bytes at its slot are
-/// the bytes of its own vector, across appends, deletes and the compaction that follows them.
+/// Once a row is covered, its `vec` blob is cleared and index.sqlite.vecs is the only copy of that
+/// vector. Everything here is about the correspondence that makes that safe - a covered row's slot
+/// in the file is its rank in rowid order counted THROUGH the holes that deleted rows leave. Get
+/// that wrong by one and every row after the first hole silently returns its neighbour's vector,
+/// which no count or size check can see. So these tests do not check the bookkeeping; they check the
+/// vectors that come back out, across appends, deletes, reopens and a lost row sidecar.
 final class VecSlotTests: XCTestCase {
-    private static let dim = 64   // multiple of quantGroup, so the store takes the quant/mmap path
+    private static let dim = 64
 
-    private var savedQuantOverride: Int?
+    private var savedQuant: Int?
 
     override func setUp() {
         super.setUp()
-        // The vector sidecar only exists for quant-mode indexes, and mode is chosen by size. A test
-        // index is tiny, so force the mode rather than manufacture millions of rows for it.
-        savedQuantOverride = VectorStore.quantBaseOverride
-        VectorStore.quantBaseOverride = VectorStore.scanBits
+        savedQuant = VectorStore.quantBaseOverride
+        VectorStore.quantBaseOverride = VectorStore.scanBits   // the sidecar only exists in quant mode
     }
 
     override func tearDown() {
-        VectorStore.quantBaseOverride = savedQuantOverride
+        VectorStore.quantBaseOverride = savedQuant
         super.tearDown()
     }
 
-    /// Distinct per row, never all-zero, and L2-NORMALIZED - the store scores with a dot product,
-    /// so unnormalized vectors would rank by magnitude and a self-query would not score 1.0.
+    /// Distinct per row, never all-zero, L2-normalized - so a self-query scores 1.0 and a wrong
+    /// slot cannot accidentally look right.
     private func vec(_ seed: Int) -> [Float] {
         var s = UInt64(seed &* 2_654_435_761 &+ 12_345)
         var v = [Float](repeating: 0, count: Self.dim)
@@ -48,119 +46,184 @@ final class VecSlotTests: XCTestCase {
         }
     }
 
-    /// Read every (vec_slot, vec) pair straight out of SQLite and check each against the file.
-    /// Deliberately does NOT go through VectorStore: the point is to audit what was persisted, and
-    /// a reader that shares the writer's assumptions cannot do that.
-    private func auditSlots(_ dbURL: URL, expectRows: Int, file: StaticString = #filePath, line: UInt = #line) throws {
-        let vecsURL = dbURL.deletingLastPathComponent()
-            .appendingPathComponent(dbURL.lastPathComponent + ".vecs")
-        let blob = try Data(contentsOf: vecsURL)
-
+    private func dbState(_ dbURL: URL) -> (covered: Int, holes: Int, clearedBlobs: Int, rows: Int) {
         var db: OpaquePointer?
-        XCTAssertEqual(sqlite3_open_v2(dbURL.path, &db, SQLITE_OPEN_READONLY, nil), SQLITE_OK, file: file, line: line)
+        guard sqlite3_open_v2(dbURL.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { return (0, 0, 0, 0) }
         defer { sqlite3_close(db) }
-
-        var stmt: OpaquePointer?
-        XCTAssertEqual(sqlite3_prepare_v2(db, "SELECT vec_slot, vec, dim FROM chunks;", -1, &stmt, nil),
-                       SQLITE_OK, file: file, line: line)
-        defer { sqlite3_finalize(stmt) }
-
-        var seen = Set<Int>()
-        var checked = 0
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            let slot = Int(sqlite3_column_int64(stmt, 0))
-            let d = Int(sqlite3_column_int(stmt, 2))
-            XCTAssertGreaterThanOrEqual(slot, 0, "row left unslotted after a stamp", file: file, line: line)
-            XCTAssertTrue(seen.insert(slot).inserted, "slot \(slot) claimed by two rows", file: file, line: line)
-            guard let raw = sqlite3_column_blob(stmt, 1) else { XCTFail("null vec", file: file, line: line); return }
-            let want = Data(bytes: raw, count: Int(sqlite3_column_bytes(stmt, 1)))
-            let off = slot * d * 2
-            XCTAssertLessThanOrEqual(off + want.count, blob.count,
-                                     "slot \(slot) points past the end of the file", file: file, line: line)
-            XCTAssertEqual(blob.subdata(in: off ..< off + want.count), want,
-                           "slot \(slot) holds a different vector than its row", file: file, line: line)
-            checked += 1
+        func scalar(_ sql: String) -> Int {
+            var st: OpaquePointer?
+            defer { sqlite3_finalize(st) }
+            guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { return 0 }
+            return sqlite3_step(st) == SQLITE_ROW ? Int(sqlite3_column_int64(st, 0)) : 0
         }
-        XCTAssertEqual(checked, expectRows, file: file, line: line)
-        // Dense 0..<n: a gap would mean the file carries a vector no row owns, which is exactly the
-        // state that lets a later renumbering hand it to the wrong row.
-        XCTAssertEqual(seen, Set(0 ..< expectRows), "slots are not a dense 0..<\(expectRows)", file: file, line: line)
+        return (scalar("SELECT CAST(value AS INTEGER) FROM meta WHERE key='vecs_covered_rows'"),
+                scalar("SELECT COUNT(*) FROM vec_holes"),
+                scalar("SELECT COUNT(*) FROM chunks WHERE length(vec) = 0"),
+                scalar("SELECT COUNT(*) FROM chunks"))
     }
 
-    /// Insert, then reopen (which maps the persistent sidecar), then close (which stamps).
-    private func stampedStore(_ dbURL: URL, _ build: (VectorStore) throws -> Void) throws {
-        let store = try VectorStore(dbURL: dbURL)
-        try build(store)
-        store.close()
-        // A fresh store fills the heap; the mapping over the named file is established at open.
-        // Reopen so the sidecar exists, then close so the stamp runs synchronously.
-        let mapped = try VectorStore(dbURL: dbURL)
-        mapped.close()
+    /// Every stored file must still be findable by its own vector, at ~1.0. This is the assertion
+    /// that a slot mistake cannot survive: a wrong slot returns some other file's vector, so the
+    /// query stops matching its own path.
+    private func assertEveryFileFindsItself(_ store: VectorStore, _ expect: [(String, Int)],
+                                            _ label: String, file: StaticString = #filePath, line: UInt = #line) {
+        for (path, seed) in expect {
+            let hits = store.search(vec(seed), filter: SearchFilter(), topK: 3)
+            XCTAssertEqual(hits.first?.path, path, "\(label): \(path) did not find itself", file: file, line: line)
+            XCTAssertEqual(hits.first?.score ?? 0, 1.0, accuracy: 0.02,
+                           "\(label): \(path) came back with the wrong vector", file: file, line: line)
+        }
     }
 
-    func testSlotsSurviveAppendsDeletesAndCompaction() throws {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("vecslot-\(UUID().uuidString)")
+    /// Coverage advances, blobs actually go away, and every vector still reads back correctly
+    /// across appends, mid-index deletes, and reopens.
+    func testCoverageClearsBlobsAndKeepsEveryVectorCorrect() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("cov-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let dbURL = dir.appendingPathComponent("test.sqlite")
 
-        // 1. Plain appends.
-        try stampedStore(dbURL) { store in
-            for f in 0 ..< 20 {
-                try store.replace(path: "/tmp/f\(f).txt", chunks: chunks("/tmp/f\(f).txt", 3, seed: f * 100))
+        var expect: [(String, Int)] = []
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            for f in 0 ..< 40 {
+                let p = "/c/f\(f).txt"
+                try store.replace(path: p, chunks: chunks(p, 1, seed: f * 100))
+                expect.append((p, f * 100))
+            }
+            store.close()
+        }
+        // Reopen establishes the mapped sidecar; close stamps it and advances coverage.
+        do { let s = try VectorStore(dbURL: dbURL); s.close() }
+        do { let s = try VectorStore(dbURL: dbURL); s.close() }
+
+        var st = dbState(dbURL)
+        XCTAssertGreaterThan(st.covered, 0, "coverage never advanced, so no duplication was removed")
+        XCTAssertGreaterThan(st.clearedBlobs, 0, "coverage advanced but no blob was actually cleared")
+
+        // Read everything back with the blobs gone.
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            defer { store.close() }
+            assertEveryFileFindsItself(store, expect, "after coverage")
+        }
+
+        // Delete from the MIDDLE: this is what puts holes in the covered prefix, and every row
+        // after a hole is where an off-by-one would show up.
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            store.deletePaths(["/c/f5.txt", "/c/f6.txt", "/c/f17.txt"])
+            store.close()
+        }
+        expect.removeAll { ["/c/f5.txt", "/c/f6.txt", "/c/f17.txt"].contains($0.0) }
+        st = dbState(dbURL)
+        XCTAssertGreaterThan(st.holes, 0, "a covered row was deleted but left no hole recorded")
+
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            defer { store.close() }
+            assertEveryFileFindsItself(store, expect, "after mid-index deletes")
+            for gone in ["/c/f5.txt", "/c/f6.txt", "/c/f17.txt"] {
+                let hits = store.search(vec(Int(gone.dropFirst(4).dropLast(4))! * 100), filter: SearchFilter(), topK: 5)
+                XCTAssertFalse(hits.contains { $0.path == gone }, "deleted \(gone) came back")
             }
         }
-        try auditSlots(dbURL, expectRows: 60)
 
-        // 2. More appends onto an already-slotted index: exercises the incremental numbering, which
-        //    trusts that the existing prefix is untouched and only numbers what is new.
-        try stampedStore(dbURL) { store in
-            for f in 20 ..< 25 {
-                try store.replace(path: "/tmp/f\(f).txt", chunks: chunks("/tmp/f\(f).txt", 3, seed: f * 100))
+        // Append AFTER the holes exist: new rows are uncovered and keep their blobs, so this mixes
+        // both kinds of row in one index - the state the loader has to get right.
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            for f in 100 ..< 108 {
+                let p = "/c/n\(f).txt"
+                try store.replace(path: p, chunks: chunks(p, 1, seed: f * 100))
+                expect.append((p, f * 100))
             }
+            store.close()
         }
-        try auditSlots(dbURL, expectRows: 75)
-
-        // 3. Deletes from the MIDDLE. This is the case the implied mapping got wrong: every row
-        //    after the hole shifts in the file, so every slot after it must be renumbered.
-        try stampedStore(dbURL) { store in
-            store.deletePaths(["/tmp/f5.txt", "/tmp/f6.txt", "/tmp/f7.txt"])
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            defer { store.close() }
+            assertEveryFileFindsItself(store, expect, "mixed covered and uncovered")
         }
-        try auditSlots(dbURL, expectRows: 66)
-
-        // 4. Delete and re-add interleaved, so the survivors are not a prefix of the old order.
-        try stampedStore(dbURL) { store in
-            store.deletePaths(["/tmp/f0.txt", "/tmp/f12.txt"])
-            try store.replace(path: "/tmp/new.txt", chunks: chunks("/tmp/new.txt", 4, seed: 9_000))
-        }
-        try auditSlots(dbURL, expectRows: 64)
     }
 
-    /// The slots must describe the index a reader actually gets. Reopening after each mutation
-    /// above proves the file matches the table; this proves the store built from that file returns
-    /// the same vectors it stored, which is the property a user can observe.
-    func testReopenedStoreReturnsTheVectorsItStored() throws {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("vecslot-rt-\(UUID().uuidString)")
+    /// The OMNI_VEC_COVERAGE lever must never cost data.
+    ///
+    /// It exists as an escape hatch: stop advancing coverage. An earlier version also gated the
+    /// READ path on it, so flipping it on an already-migrated index made every covered row
+    /// unreadable - and the recovery path then deleted all of them. This holds the line that the
+    /// lever only stops coverage growing, and that an unreadable claim never mutates the database.
+    func testCoverageLeverOffStillReadsExistingCoverage() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("covlever-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let dbURL = dir.appendingPathComponent("test.sqlite")
 
-        try stampedStore(dbURL) { store in
-            for f in 0 ..< 12 {
-                try store.replace(path: "/tmp/g\(f).txt", chunks: chunks("/tmp/g\(f).txt", 2, seed: f * 50))
+        var expect: [(String, Int)] = []
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            for f in 0 ..< 25 {
+                let p = "/l/f\(f).txt"
+                try store.replace(path: p, chunks: chunks(p, 1, seed: f * 13 + 1))
+                expect.append((p, f * 13 + 1))
             }
-            store.deletePaths(["/tmp/g3.txt"])
+            store.close()
         }
-        try auditSlots(dbURL, expectRows: 22)
+        do { let s = try VectorStore(dbURL: dbURL); s.close() }
+        do { let s = try VectorStore(dbURL: dbURL); s.close() }
+        let before = dbState(dbURL)
+        XCTAssertGreaterThan(before.clearedBlobs, 0, "nothing was covered, so this proves nothing")
+
+        let savedLever = VectorStore.vecCoverage
+        VectorStore.vecCoverage = false
+        defer { VectorStore.vecCoverage = savedLever }
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            defer { store.close() }
+            assertEveryFileFindsItself(store, expect, "coverage lever off")
+            XCTAssertEqual(store.count, expect.count, "rows with the lever off")
+        }
+        let after = dbState(dbURL)
+        XCTAssertEqual(after.rows, before.rows, "the lever must not delete rows")
+    }
+
+    /// Losing the ROW sidecar is the routine failure (a crash inside the 90s stamp debounce). With
+    /// the blobs cleared, this is the path that has to reconstruct slot order from the coverage
+    /// claim alone - and it must be lossless.
+    func testRowSidecarLossIsRecoveredFromCoverage() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("covload-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appendingPathComponent("test.sqlite")
+
+        var expect: [(String, Int)] = []
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            for f in 0 ..< 30 {
+                let p = "/r/f\(f).txt"
+                try store.replace(path: p, chunks: chunks(p, 1, seed: f * 7 + 3))
+                expect.append((p, f * 7 + 3))
+            }
+            store.close()
+        }
+        do { let s = try VectorStore(dbURL: dbURL); s.close() }
+        do { let s = try VectorStore(dbURL: dbURL); s.close() }
+        // Holes, so the reconstruction has to count through them rather than assume rank == slot.
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            store.deletePaths(["/r/f2.txt", "/r/f11.txt"])
+            store.close()
+        }
+        expect.removeAll { ["/r/f2.txt", "/r/f11.txt"].contains($0.0) }
+
+        XCTAssertGreaterThan(dbState(dbURL).clearedBlobs, 0, "nothing was covered, so this proves nothing")
+
+        // Lose the row table, keep the vectors.
+        try FileManager.default.removeItem(at: dir.appendingPathComponent("test.sqlite.rows"))
 
         let store = try VectorStore(dbURL: dbURL)
         defer { store.close() }
-        // Query with one stored vector: it must find its own path first, at ~1.0. A slot that
-        // pointed at a neighbour would still return SOME answer, just not this one.
-        for f in [0, 4, 11] {
-            let hits = store.search(vec(f * 50), filter: SearchFilter(), topK: 3)
-            XCTAssertEqual(hits.first?.path, "/tmp/g\(f).txt", "wrong file for g\(f)")
-            XCTAssertEqual(hits.first?.score ?? 0, 1.0, accuracy: 0.01, "wrong vector for g\(f)")
-        }
+        assertEveryFileFindsItself(store, expect, "rebuilt from coverage")
+        XCTAssertEqual(store.count, expect.count, "row count after rebuilding from coverage")
     }
 }

@@ -1129,6 +1129,48 @@ public final class VectorStore: @unchecked Sendable {
         rowWindowCovered += 1
     }
 
+    /// The live row indices a removal of `paths` is about to take out.
+    ///
+    /// Computed BEFORE the transaction that deletes them, because the holes they leave have to be
+    /// committed alongside that delete: a hole recorded afterwards leaves a window in which SQLite
+    /// has one fewer row than the file has slots and nothing records which slot lost its row - and
+    /// from that slot on, every row would resolve to its neighbour's vector. Nothing mutates between
+    /// this call and the removal (the queue is held throughout), so the two see identical rows.
+    private func victimRowsForPathsLocked(_ paths: Set<String>) -> [Int32] {
+        guard dim > 0, !fileChunkCount.isEmpty else { return [] }
+        var idMask = [Bool](repeating: false, count: fileChunkCount.count)
+        var any = false
+        for p in paths { if let id = pathID[p] { let i = Int(id); if i < idMask.count { idMask[i] = true; any = true } } }
+        guard any else { return [] }
+        var out: [Int32] = []
+        for i in 0 ..< rows.count where !deadRows.contains(Int32(i)) {
+            let f = Int(fileID[i])
+            if f < idMask.count, idMask[f] { out.append(Int32(i)) }
+        }
+        return out
+    }
+
+    /// Predicate form of the above, for the folder/kind removals that do not go by path set.
+    private func victimRowsMatchingLocked(_ predicate: (Row) -> Bool) -> [Int32] {
+        guard dim > 0 else { return [] }
+        var out: [Int32] = []
+        for i in 0 ..< rows.count where !deadRows.contains(Int32(i)) && predicate(rows[i]) { out.append(Int32(i)) }
+        return out
+    }
+
+    /// Slot-holding sibling of appendRowMetaLocked, for a row that is already a TOMBSTONE.
+    ///
+    /// Keeps the lockstep arrays the same length as `rows` - the row still occupies its index, and
+    /// its vector still occupies the matching slot in the file, which is the whole point of a
+    /// tombstone - while contributing nothing to its file's chunk count and nothing to its file's
+    /// row window. A dead row is not one of the file's live rows, so widening the window for it
+    /// would only make the window's containment claim looser for no gain.
+    private func appendDeadRowMetaLocked(_ fid: Int32, kindCode kc: UInt8) {
+        fileID.append(fid)
+        kindCode.append(kc)
+        rowWindowCovered += 1
+    }
+
     /// Recompute every window from `fileID`. One O(rows) integer pass (~2ms at 4.5M rows), for the
     /// paths that move rows rather than append them. Only compactRowsLocked needs it, and that pass
     /// is already O(rows) and orders of magnitude more expensive.
@@ -1414,17 +1456,16 @@ public final class VectorStore: @unchecked Sendable {
         // and lazy like the columns above: pre-existing rows carry '' and simply get no reuse
         // until their file is next embedded. Never read by search; not resident.
         addColumnIfMissing("chunk_key", "TEXT NOT NULL DEFAULT ''")
-        // WHERE this row's vector lives in the .vecs sidecar, or -1 for "nowhere durable yet, the
-        // blob in `vec` is the only copy". See recordVecSlotsLocked for why the mapping has to be
-        // written down rather than implied. Additive and lazy exactly like the columns above: every
-        // pre-existing row starts at -1 and earns a slot at the first stamp, so adopting an existing
-        // index costs nothing and old app versions (which never name this column) are unaffected.
-        addColumnIfMissing("vec_slot", "INTEGER NOT NULL DEFAULT -1")
-        // NOTE: the partial index over un-slotted rows is NOT created here. Its whole economy is
-        // that `vec_slot < 0` is almost always false, and on an index that predates the column it
-        // is true for every row - a full-size index, on precisely the large indexes that do not get
-        // slotted at all yet. It is built at the end of the first successful full numbering, where
-        // that predicate has just become almost-always-false. See recordVecSlotsLocked.
+        // WHERE A ROW'S VECTOR LIVES, recorded rather than implied. See the VECTOR COVERAGE note on
+        // coveredRows for the whole scheme; the short version is that a row's slot in the .vecs file
+        // is its rank in rowid order, counted THROUGH the holes that deleted rows leave behind, and
+        // this table is that hole list. It is written inside the same transaction as the delete that
+        // creates each hole, so it can never describe a set of rows the table does not have.
+        //
+        // Bounded by deadBudget (5% of rows), and emptied every time the vectors are compacted, so
+        // it is a handful of integers in practice - not a per-row column. That is the point: a
+        // compaction then costs two metadata writes instead of restating millions of row numbers.
+        exec("CREATE TABLE IF NOT EXISTS vec_holes(slot INTEGER PRIMARY KEY);")
         // Content-dedup sidecar: one row per indexed file, mapping a content key (hash of the
         // embedding-relevant bytes + the preprocess settings) to the path whose chunks realized it.
         // ADDITIVE and self-healing, so index compatibility holds in BOTH directions: an old app
@@ -1556,6 +1597,7 @@ public final class VectorStore: @unchecked Sendable {
             // already-closed store is pure work whose result nothing can persist, and it used to
             // happen on every repeat close() because the only `closed` check sat three lines below.
             guard !closed else { return }
+            stampVectorCoverageLocked(budget: Self.coverageSliceOnClose)   // smaller slice: a quit must not stall
             stampRowSidecarLocked(sync: true)       // durable row table; no-op if current
             persistQuantReplicaLocked(sync: true)   // durable before the handle goes away; no-op if current
             flat16.releaseFileLock()                // successor stores may now adopt the vec sidecar
@@ -1589,7 +1631,11 @@ public final class VectorStore: @unchecked Sendable {
             // Dimension guard: all vectors must share the index dimension. Validated BEFORE `dim` is
             // assigned - see validateDimLocked for why a rejected write must not leave it set.
             try validateDimLocked(chunks)
+            // Holes first: this path's existing rows become tombstones after the commit below, and
+            // the slots they keep have to be recorded inside the same transaction as their delete.
+            let victims = presentPaths.contains(path) ? victimRowsForPathsLocked([path]) : []
             exec("BEGIN;")
+            recordHolesLocked(victims)
             deletePathLocked(path)
             let bfs = chunks.map { bf16Row($0.embedding) }   // fp32 -> bf16 once, reused for blob + memory
             let now = Date().timeIntervalSince1970           // one indexed_at stamp for the whole call
@@ -1694,7 +1740,11 @@ public final class VectorStore: @unchecked Sendable {
             let bfs = work.map { $0.chunks.map { bf16Row($0.embedding) } }   // fp32 -> bf16 once
             let now = Date().timeIntervalSince1970                           // one indexed_at stamp per batch
             let tSql = Self.searchTiming ? Date() : nil
+            // Same reason as replace(): the rows these paths already have become tombstones after
+            // the commit, and the slots they hold on to must be recorded inside it.
+            let victims = victimRowsForPathsLocked(Set(work.map { $0.path }.filter { presentPaths.contains($0) }))
             exec("BEGIN;")
+            recordHolesLocked(victims)
             let sql = "INSERT INTO chunks(path, modified, size, kind, chunk_index, snippet, dim, vec, width, height, duration, locator, indexed_at, chunk_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?);"
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -1763,7 +1813,9 @@ public final class VectorStore: @unchecked Sendable {
     public func deletePath(_ path: String) {
         queue.sync {
             guard dbOpen() else { return }
+            let victims = victimRowsForPathsLocked([path])
             exec("BEGIN;")
+            recordHolesLocked(victims)
             deletePathLocked(path)
             bumpGenLocked()
             exec("COMMIT;")
@@ -1919,7 +1971,9 @@ public final class VectorStore: @unchecked Sendable {
         guard !paths.isEmpty else { return }
         queue.sync {
             guard dbOpen() else { return }
+            let victims = victimRowsForPathsLocked(paths)
             exec("BEGIN;")
+            recordHolesLocked(victims)
             var stmt: OpaquePointer?
             if sqlite3_prepare_v2(db, "DELETE FROM chunks WHERE path = ?;", -1, &stmt, nil) == SQLITE_OK {
                 for p in paths {
@@ -1953,7 +2007,10 @@ public final class VectorStore: @unchecked Sendable {
         guard !folder.isEmpty, folder != "/" else { return }
         queue.sync {
             guard dbOpen() else { return }
+            let prefix = folder + "/"
+            let victims = victimRowsMatchingLocked { $0.path == folder || $0.path.hasPrefix(prefix) }
             exec("BEGIN;")
+            recordHolesLocked(victims)
             var stmt: OpaquePointer?
             // Range form of `path LIKE folder||'/%'`: SQLite's default case-insensitive LIKE (plus
             // the OR) defeats idx_path and scans the whole table; `>= '<folder>/' AND < '<folder>0'`
@@ -2070,7 +2127,7 @@ public final class VectorStore: @unchecked Sendable {
             fileRowLo = []; fileRowHi = []; rowWindowCovered = 0   // same reason: release, not removeAll
             try? FileManager.default.removeItem(at: quantReplicaURL); lastPersistedBaseRows = -1   // replica is of wiped rows
             removeRowSidecarFiles()   // sidecar caches the wiped rows; releaseAll() above dropped the mapping
-            resetVecSlotsLocked()     // no file, so no slots: the next stamp numbers from scratch
+            resetCoverageLocked()     // no file, so nothing is covered: coverage restarts at 0
             resetAggregatesLocked()
             invalidateTagFilterCacheLocked()   // wipe bypasses fileChunkDec; keep the invariant
             dim = 0
@@ -2088,13 +2145,19 @@ public final class VectorStore: @unchecked Sendable {
     /// form kept them stale forever.
     public func indexedFiles() -> [String: StoredFile] {
         queue.sync {
-            ensureCompactLocked()
+            // Filters tombstones rather than collecting them. Compaction MOVES vectors, and a row
+            // whose blob has been cleared cannot move without that blob coming back first - so a
+            // cold reader must not be able to trigger one. Skipping dead rows costs one Set lookup
+            // per row on a path that already walks every row, and it is empty in the common case.
             guard dbOpen() else { return [:] }
             let n = pathID.count
             var modified = [Double](repeating: -.greatestFiniteMagnitude, count: n)
             var size = [Int](repeating: Int.min, count: n)
             var kind = [String?](repeating: nil, count: n)
+            let dead = deadRows
+            let hasDead = !dead.isEmpty
             for i in 0 ..< rows.count {
+                if hasDead, dead.contains(Int32(i)) { continue }
                 let f = Int(fileID[i])
                 let r = rows[i]
                 if r.modified > modified[f] { modified[f] = r.modified }
@@ -2239,11 +2302,13 @@ public final class VectorStore: @unchecked Sendable {
     /// the winners' snippet fill - no GPU, no embedding.
     public func listMatching(filter: SearchFilter, topK: Int = 60) -> [SearchHit] {
         queue.sync {
-            ensureCompactLocked()
             guard dbOpen(), !rows.isEmpty else { return [] }
             let f = resolveTagFilterLocked(filter)
+            let dead = deadRows
+            let hasDead = !dead.isEmpty
             var firstRow: [Int32: Int] = [:]   // fid -> first row index (carries the file's metadata)
             for i in rows.indices {
+                if hasDead, dead.contains(Int32(i)) { continue }   // see indexedFiles: filter, never compact
                 let r = rows[i]
                 guard f.accepts(path: r.path, kind: r.kind, modified: r.modified) else { continue }
                 let fid = fileID[i]
@@ -2635,7 +2700,6 @@ public final class VectorStore: @unchecked Sendable {
     public func vectorsUnderFolder(_ folder: String, cap: Int = .max, landmarkCap: Int = .max,
                                    streaming: Bool = false) -> FolderVectors {
         queue.sync {
-            ensureCompactLocked()
             guard dim > 0, !folder.isEmpty, folder != "/" else { return FolderVectors(paths: [], kinds: [], vectors: [], dim: dim) }
             let empty = FolderVectors(paths: [], kinds: [], vectors: [], dim: dim)
             let prefix = folder + "/"
@@ -2674,10 +2738,16 @@ public final class VectorStore: @unchecked Sendable {
             // Streaming pools per tile from freshly-resolved row windows, so it needs no row list
             // at all - and at 4 bytes per matching row that list is ~18 MB on a whole-index folder.
             var matchRows: [Int32] = []
-            // deadRows is empty here: ensureCompactLocked() above collected every tombstone, which
-            // is also why this reader alone never has to filter dead rows out of the walk.
-            for range in provenRowRangesLocked(scopedIds, dead: deadRows) {
+            // This reader used to compact first and so never had to think about tombstones. It
+            // cannot any more: compaction moves vectors, and a row whose blob has been cleared must
+            // not move without that blob coming back. So it filters, like every other reader here.
+            // Dropping a dead row matters twice over - it must not contribute a vector to the map,
+            // and it must not be the row that introduces a file into `allPaths`.
+            let dead = deadRows
+            let hasDead = !dead.isEmpty
+            for range in provenRowRangesLocked(scopedIds, dead: dead) {
                 for i in range.lowerBound ..< range.upperBound {
+                    if hasDead, dead.contains(Int32(i)) { continue }
                     let gid = Int(fileID[i])
                     // gid < nGlobal is belt and braces: the id tables only diverge from idPath if a
                     // sidecar path table ever carried a duplicate, and this loop can run over the
@@ -4210,37 +4280,62 @@ public final class VectorStore: @unchecked Sendable {
     private var lastStampedGen: Int64 = -1
     private var stampToken: UInt64 = 0
 
-    // MARK: - Vector slots (where each row's vector lives in the .vecs file)
+    // MARK: - VECTOR COVERAGE (which rows no longer need their blob in SQLite)
     //
-    // The sidecar's row<->vector correspondence has always been IMPLIED: "row i of .vecs is the
-    // i-th row of chunks in rowid order". That is true while the two move in lockstep and false the
-    // moment they do not, and nothing in the file can tell the difference - a row deleted after a
-    // stamp leaves the file one row longer than the table, and from the hole onward every row reads
-    // its NEIGHBOUR's vector. Size and COUNT(*) checks cannot see it; the 32-row sample can only see
-    // it by luck. Recording the slot per row turns that implication into a fact the loader can check.
+    // index.sqlite stored every vector a second time: 6.47 GB of bf16 blobs that index.sqlite.vecs
+    // already holds byte for byte. The blobs were not dead weight - they are what let loadIntoMemory
+    // rebuild the sidecar whenever it is rejected, and rejection is routine. Dropping them means the
+    // file has to become recoverable on its own terms.
     //
-    // Written only by the stamp, which runs after ensureCompactLocked() (no tombstones standing, so
-    // in-memory row i really is rowid rank i) and after the file demonstrably covers every row.
-    /// Rows [0, vecsCoveredRows) have a recorded slot AND durable bytes behind it. 0 = nothing yet.
-    private var vecsCoveredRows = 0
-    /// Set when a physical compaction moved rows: every recorded slot is stale, so the next stamp
-    /// must renumber all of them rather than just appending. Compaction is the only thing that
-    /// invalidates a slot - appends only ever add rows past the end.
-    private var vecSlotsDirty = false
-    /// Meta keys for the durable claim about the vector file. In `meta`, so they commit inside a
-    /// SQLite transaction alongside the slots they describe.
-    private static let vecsRowsKey = "vecs_rows"
-    private static let vecsGenKey = "vecs_gen"
-    /// OMNI_VEC_SLOTS=0 stops recording slots, for A/B and as an escape hatch. Recording them is
-    /// pure bookkeeping while the `vec` blobs are still written, so off is the old behaviour exactly.
-    nonisolated(unsafe) public static var vecSlots = ProcessInfo.processInfo.environment["OMNI_VEC_SLOTS"] != "0"
-    /// Largest index this will renumber in one go. 300k rows is ~2.3s at the measured 7.5us/row,
-    /// which is the most that may be spent holding the store queue inside close().
-    static let vecSlotFullBudget = 300_000
+    // The scheme is one number and one small list:
+    //
+    //   coveredRows  the first C slots of .vecs are durable, and the rows that own them have had
+    //                their blob cleared. Rows past C keep their blob and are the only copy.
+    //   vec_holes    slots below C whose row has since been deleted. A tombstone leaves the vector
+    //                in place, so the file keeps a slot the table no longer has a row for.
+    //
+    // A covered row's slot is therefore its rank in rowid order counted THROUGH the holes, which is
+    // recoverable from SQLite alone - hence the hole list committing inside the delete that creates
+    // it. The correspondence used to be implied ("row i of the file is the i-th row in rowid order"),
+    // which is true only while the two move in lockstep and unobservably false afterwards: from the
+    // first hole onward, every row reads its NEIGHBOUR's vector, and no size or COUNT(*) check can
+    // see it.
+    //
+    // Why a hole list and not a slot column: compaction renumbers everything. Per row that is a
+    // 4.5M-row UPDATE, measured at 33.8s, which cannot run inside close(). As a hole list it is
+    // "holes = none, C = n" - two metadata writes. That is the whole reason this shape was chosen.
+    //
+    // C only ever advances at a stamp, in bounded slices, so an existing index migrates a piece at a
+    // time with no reindex and no long pause - and an index that never finishes migrating is simply
+    // one with fewer covered rows, which is a correct state, not a broken one.
+    /// Slots [0, coveredRows) are durable and their rows' blobs are cleared. 0 = nothing yet.
+    private var coveredRows = 0
+    /// Holes below `coveredRows`, mirrored from the vec_holes table so the hot paths need no query.
+    private var vecHoles = Set<Int32>()
+    /// Meta key for the coverage claim. In `meta`, so it commits with the rows it describes.
+    private static let coveredRowsKey = "vecs_covered_rows"
+    /// Set once when coverage completes: a repack is owed. See reclaimAfterCoverageMigration.
+    private static let vacuumPendingKey = "vecs_vacuum_pending"
+    /// OMNI_VEC_COVERAGE=0 keeps every blob, which is the pre-migration behaviour exactly. The
+    /// escape hatch for a user who hits trouble: coverage stops advancing, nothing already cleared
+    /// is lost (the file still holds it), and the index keeps working.
+    nonisolated(unsafe) public static var vecCoverage = ProcessInfo.processInfo.environment["OMNI_VEC_COVERAGE"] != "0"
+    /// Rows whose blobs one stamp may clear. Sized so the UPDATE stays well under the time a stamp
+    /// may hold the store queue: measured ~7.5us/row, so 100k is ~0.75s, and a 4.5M-row index
+    /// migrates over ~45 stamps rather than in one 34s pause.
+    static let coverageSlice = ProcessInfo.processInfo.environment["OMNI_COVERAGE_SLICE"].flatMap(Int.init) ?? 100_000
+    /// Smaller slice when the store is closing. Measured on a 4.5M-row index, a 100k slice costs
+    /// ~2.2s inside close(), which is a visible pause on quit; the idle stamp can afford the full
+    /// slice because nothing is waiting on it but a background search.
+    static let coverageSliceOnClose = ProcessInfo.processInfo.environment["OMNI_COVERAGE_SLICE_CLOSE"].flatMap(Int.init) ?? 25_000
 
     private struct RowSidecarHeader: Codable, Sendable {
         var magic: String, gen: Int64, dim: Int, rowCount: Int, pathCount: Int, kindCount: Int
         var recordBytes: Int, locatorBytes: Int, pathOffBytes: Int, pathBlobBytes: Int, kindOffBytes: Int, kindBlobBytes: Int
+        /// Tombstones carried in the record block. OPTIONAL on purpose: a sidecar written before the
+        /// stamp stopped compacting has no such key, and nil is exactly right for it - it was
+        /// compacted, so it had none. Lets an existing sidecar keep being adopted after an upgrade.
+        var deadCount: Int?
     }
     /// Fixed-width per-row record; see stampRowSidecarLocked for the field layout.
     private static let rowRecordSize = 56
@@ -4254,118 +4349,329 @@ public final class VectorStore: @unchecked Sendable {
             guard let self else { return }
             self.queue.sync {
                 guard self.stampToken == token else { return }   // superseded: more mutations arrived
+                self.stampVectorCoverageLocked()
                 self.stampRowSidecarLocked(sync: false)
             }
         }
     }
 
-    /// Write down which slot of the .vecs file holds each row's vector, and record how far the file
-    /// is durable. Returns false if it could not, leaving the previous claim intact.
-    ///
-    /// Correctness rests on two facts that hold HERE and nowhere else, which is why this is private
-    /// to the stamp: ensureCompactLocked() has just run, so no tombstone stands and in-memory row i
-    /// is rowid rank i; and flat16 IS the mapping, so in-memory row i is file slot i. Together those
-    /// make "slot = rank" true rather than assumed, and the numbering below is a transcription of
-    /// the file rather than a guess about it.
-    ///
-    /// The whole thing commits in ONE transaction with the meta claim, so a crash can leave the
-    /// claim and the slots agreeing or neither of them, never a claim about slots that were not
-    /// written. Deliberately does NOT bump mutationGen: it records where existing vectors already
-    /// are and changes no logical content, exactly as VACUUM's rowid renumbering does not bump it.
-    /// A bump here would also invalidate the very sidecar header the caller is about to write.
-    ///
-    /// KNOWN LIMIT, and the reason large indexes are excluded rather than served badly. A slot here
-    /// is a dense RANK, so deleting one row restates the slot of every row after it: the work is
-    /// proportional to the index, not to the edit, and it cannot be sliced into background-sized
-    /// pieces. Measured, that is 33.8s on 4.5M rows. The fix is STABLE slots - a row keeps its slot
-    /// for life and a delete leaves a HOLE the scan already knows how to skip (that is exactly what
-    /// the tombstones above are), so nothing is ever renumbered. That needs delta rows to be
-    /// tombstonable too, which today they are not: tombstoneOnlyLocked bails on `deltaHits` because
-    /// only the base score is masked. Until that lands this earns its keep below the budget and
-    /// stays honestly silent above it.
-
-    /// Forget the slot record because the file it describes is gone or is about to be rebuilt.
-    /// Clears the durable claim as well: a promise about a file that no longer holds what it says
-    /// is worse than no promise, and the window before the next stamp can contain a crash.
-    private func resetVecSlotsLocked() {
-        vecsCoveredRows = 0
-        vecSlotsDirty = true
+    /// Forget the coverage claim because the file it describes is gone or is about to be rebuilt.
+    /// Clears the hole list with it: holes are slot numbers, and they mean nothing once the slots
+    /// they index stop existing. A promise about a file that no longer holds what it says is worse
+    /// than no promise, and the window before the next stamp can contain a crash.
+    private func resetCoverageLocked() {
+        coveredRows = 0
+        vecHoles.removeAll()
         guard dbOpen() else { return }
-        exec("DELETE FROM meta WHERE key IN ('\(Self.vecsRowsKey)','\(Self.vecsGenKey)');")
+        exec("DELETE FROM meta WHERE key = '\(Self.coveredRowsKey)';")
+        exec("DELETE FROM vec_holes;")
     }
 
-    @discardableResult
-    private func recordVecSlotsLocked() -> Bool {
-        guard Self.vecSlots, dbOpen(), dim > 0, !rows.isEmpty, deadRows.isEmpty else { return false }
-        let n = rows.count
-        // Lockstep check. If the table and the row array disagree, the two are not describing the
-        // same set of rows and ANY numbering derived from one would libel the other.
-        guard scalarQuery("SELECT COUNT(*) FROM chunks") == n else { vecsCoveredRows = 0; return false }
-        // Cheap via the partial index. Rows still at -1 are the ones that arrived since last time;
-        // everything else must be exactly the prefix we claimed last time, or the shortcut is void.
-        //
-        // TWO INDEPENDENT GUARDS, deliberately. The count is the load-bearing one: any deletion
-        // leaves fewer slotted rows than we claimed, so it catches every case where a row moved.
-        // vecSlotsDirty catches the same cases from the other side, by asking whether anything
-        // ACTUALLY moved rather than inferring it. Either alone is sufficient today; removing both
-        // makes VecSlotTests fail from the deletion point onward, with every row reading its
-        // neighbour's vector - which is the exact corruption this whole mechanism exists to stop.
-        let unslotted = scalarQuery("SELECT COUNT(*) FROM chunks WHERE vec_slot < 0")
-        let full = vecSlotsDirty || vecsCoveredRows == 0 || n - unslotted != vecsCoveredRows
-        // BOUNDED, because this runs on the store queue and close() calls it synchronously. The
-        // incremental form touches only what arrived (14ms for 2000 rows at 4.5M); the full form
-        // renumbers everything, measured at 33.8s on a 4.5M-row index - a quit that hangs for half
-        // a minute and a search queue held for just as long. Renumbering cannot be sliced while
-        // slots are dense RANKS (deleting one row restates every slot after it), so above the
-        // budget this records nothing rather than claiming a prefix it has not written. See the
-        // note on stable slots in recordVecSlotsLocked's header for why that limit is temporary.
-        guard !full || n <= Self.vecSlotFullBudget else { vecsCoveredRows = 0; return false }
+    /// Load the coverage claim from SQLite into memory. Called at open, before anything reads it.
+    private func loadCoverageLocked() {
+        coveredRows = 0
+        vecHoles.removeAll()
+        guard dbOpen() else { return }
+        coveredRows = scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.coveredRowsKey)'")
+        guard coveredRows > 0 else { return }
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, "SELECT slot FROM vec_holes;", -1, &stmt, nil) == SQLITE_OK {
+            while sqlite3_step(stmt) == SQLITE_ROW { vecHoles.insert(sqlite3_column_int(stmt, 0)) }
+        }
+        sqlite3_finalize(stmt)
+    }
+
+    /// Record, inside the caller's OPEN transaction, that these slots no longer have a row.
+    ///
+    /// Must be called from within the same transaction as the DELETE that orphans them, which is the
+    /// entire point: a hole committed separately leaves a window where SQLite has one fewer row than
+    /// the file has slots and nothing says which slot went missing - and from that slot onward every
+    /// row would resolve to its neighbour's vector. Slots at or above `coveredRows` are ignored:
+    /// those rows still carry their own blob, so the file's copy of them is not load-bearing.
+    private func recordHolesLocked(_ slots: [Int32], coveredOverride: Int? = nil) {
+        let limit = coveredOverride ?? coveredRows
+        guard dbOpen(), limit > 0 else { return }
+        let fresh = slots.filter { Int($0) < limit && !vecHoles.contains($0) }
+        guard !fresh.isEmpty else { return }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO vec_holes(slot) VALUES(?);", -1, &stmt, nil) == SQLITE_OK else { return }
+        for s in fresh {
+            sqlite3_reset(stmt); sqlite3_bind_int(stmt, 1, s); sqlite3_step(stmt)
+        }
+        sqlite3_finalize(stmt)
+        for s in fresh { vecHoles.insert(s) }
+    }
+
+    /// Write every covered row's vector back into its SQLite blob, and stand the coverage claim
+    /// down. The inverse of advanceCoverageLocked, and the precondition for moving any row.
+    ///
+    /// Pairing is by ORDER, which is the same fact the whole scheme rests on: in-memory rows are in
+    /// slot order, SQLite rows are in rowid order, and skipping the tombstones on one side leaves
+    /// two sequences of equal length that correspond element for element. Anything that breaks that
+    /// correspondence is caught by the count check before a single byte is written.
+    private func restoreCoveredBlobsLocked() -> Bool {
+        guard dbOpen(), dim > 0 else { return false }
+        guard coveredRows > 0 else { return true }
+        var slots: [Int32] = []
+        slots.reserveCapacity(coveredRows)
+        for i in 0 ..< Swift.min(coveredRows, rows.count) where !deadRows.contains(Int32(i)) {
+            slots.append(Int32(i))
+        }
+        // The covered prefix must account for exactly this many of SQLite's rows. If it does not,
+        // the two are not describing the same index and writing vectors by position would corrupt
+        // every row from the first divergence on.
+        guard scalarQuery("SELECT COUNT(*) FROM chunks") >= slots.count,
+              flat16.count >= Swift.min(coveredRows, rows.count) * dim else { return false }
         guard execChecked("BEGIN;") else { return false }
-        let numbered = full
-            ? execChecked("""
-                UPDATE chunks SET vec_slot = s.k
-                  FROM (SELECT rowid AS rid, row_number() OVER (ORDER BY rowid) - 1 AS k FROM chunks) AS s
-                 WHERE chunks.rowid = s.rid AND chunks.vec_slot <> s.k;
-                """)
-            // INDEXED BY is not a hint here, it is the difference between 14ms and 1.67s: the
-            // planner materializes the window-function subquery with a full SCAN of chunks
-            // otherwise, and the whole point of the incremental form is to touch only the arrivals.
-            : execChecked("""
-                UPDATE chunks SET vec_slot = \(vecsCoveredRows) + s.k
-                  FROM (SELECT rowid AS rid, row_number() OVER (ORDER BY rowid) - 1 AS k
-                          FROM chunks INDEXED BY idx_vec_unslotted WHERE vec_slot < 0) AS s
-                 WHERE chunks.rowid = s.rid;
-                """)
-        guard numbered,
-              // Every row must now have a slot, and the slots must be exactly 0..<n once each.
-              // COUNT(DISTINCT) over an un-indexed column is a scan, so this rides only the full
-              // path, which is already the rare one; the incremental path checks the cheap half.
-              scalarQuery("SELECT COUNT(*) FROM chunks WHERE vec_slot < 0") == 0,
-              !full || scalarQuery("SELECT COUNT(DISTINCT vec_slot) FROM chunks") == n,
-              execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.vecsRowsKey)','\(n)');"),
-              execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.vecsGenKey)','\(mutationGen)');"),
+        var sel: OpaquePointer?, upd: OpaquePointer?
+        defer { sqlite3_finalize(sel); sqlite3_finalize(upd) }
+        guard sqlite3_prepare_v2(db, "SELECT rowid FROM chunks ORDER BY rowid LIMIT \(slots.count);", -1, &sel, nil) == SQLITE_OK,
+              sqlite3_prepare_v2(db, "UPDATE chunks SET vec = ? WHERE rowid = ?;", -1, &upd, nil) == SQLITE_OK
+        else { exec("ROLLBACK;"); return false }
+        var written = 0
+        var ok = true
+        let bytesPerRow = dim * MemoryLayout<UInt16>.size
+        flat16.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { ok = false; return }
+            while written < slots.count, sqlite3_step(sel) == SQLITE_ROW {
+                let rid = sqlite3_column_int64(sel, 0)
+                let off = Int(slots[written]) * bytesPerRow
+                guard off + bytesPerRow <= raw.count else { ok = false; break }
+                sqlite3_reset(upd)
+                sqlite3_bind_blob(upd, 1, base.advanced(by: off), Int32(bytesPerRow), SQLITE_TRANSIENT)
+                sqlite3_bind_int64(upd, 2, rid)
+                guard sqlite3_step(upd) == SQLITE_DONE else { ok = false; break }
+                written += 1
+            }
+        }
+        guard ok, written == slots.count,
+              execChecked("DELETE FROM meta WHERE key = '\(Self.coveredRowsKey)';"),
+              execChecked("DELETE FROM vec_holes;"),
+              execChecked("COMMIT;")
+        else { exec("ROLLBACK;"); return false }
+        coveredRows = 0
+        vecHoles.removeAll()
+        if Self.searchTiming { print("[store] restored \(written) blobs; coverage stood down") }
+        return true
+    }
+
+    /// Rebuild the resident state when the row sidecar was NOT adopted but the vector file still
+    /// holds rows whose blobs are gone. This is the path that makes dropping the blobs survivable:
+    /// without it, a rejected sidecar plus a cleared blob is a lost vector.
+    ///
+    /// Reconstructs slot order rather than compacting it away. Slot i of the file belongs to row i,
+    /// holes included - so the tombstones are recreated in place and the file is not touched at all.
+    /// Touching it would be the bug: the coverage claim describes THIS layout, and rewriting the
+    /// layout before a new claim is durable is exactly the window a crash turns into wrong vectors.
+    private func loadFromCoverageLocked() -> Bool {
+        // NOT gated on Self.vecCoverage. That lever stops coverage from ADVANCING; it must never
+        // stop coverage from being READ, because a covered row's blob is already gone and the file
+        // is its only copy. Gating this was a one-line way to turn the safety valve into total data
+        // loss - flipping the lever on a migrated index dropped all 4.5M rows.
+        guard dbOpen(), coveredRows > 0 else { return false }
+        let d0 = scalarQuery("SELECT dim FROM chunks LIMIT 1")
+        let live = scalarQuery("SELECT COUNT(*) FROM chunks")
+        let holes = vecHoles.count
+        // The claim and the table have to agree on how many of the file's slots still have a row.
+        guard d0 > 0, live > 0, holes < coveredRows, coveredRows - holes <= live else { return false }
+        // Sized for the WHOLE index, not just the covered prefix. The uncovered rows are appended
+        // below, and a reservation cut to the adopted prefix overflows on the first of them - at
+        // which point the buffer silently falls back to the heap, stops being persistent, and every
+        // later stamp declines to run. Coverage then never advances again: the migration stalls at
+        // one slice forever, which is exactly what it did. precommit only grows the file (ftruncate
+        // upward preserves the adopted bytes); adoptElements is still what says how much of it is
+        // real content.
+        let expectedRows = live + holes
+        guard flat16.mapPersistent(url: vecSidecarURL, tailSlackElements: Self.foldThreshold * d0,
+                                   precommitElements: expectedRows * d0,
+                                   adoptElements: coveredRows * d0) else { return false }
+        dim = d0
+        rows.reserveCapacity(live + holes)
+        presentPaths.reserveCapacity(live)
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, """
+            SELECT path, kind, chunk_index, dim, vec, modified, width, height, duration, locator, size
+            FROM chunks ORDER BY rowid;
+            """, -1, &stmt, nil) == SQLITE_OK else { flat16.removeAll(); return false }
+        var slot = 0
+        var covered = 0
+        var ok = true
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            // Re-create the holes at the positions the claim says they occupy, so that every row
+            // after them keeps the slot its vector actually sits at.
+            while slot < coveredRows, vecHoles.contains(Int32(slot)) {
+                appendHoleRowLocked()
+                slot += 1
+            }
+            let path = canonicalPath(String(cString: sqlite3_column_text(stmt, 0)))
+            let kind = canonicalKind(String(cString: sqlite3_column_text(stmt, 1)))
+            let d = Int(sqlite3_column_int(stmt, 3))
+            guard d == dim else { continue }
+            let bytes = Int(sqlite3_column_bytes(stmt, 4))
+            if slot < coveredRows {
+                // Covered: the file already holds this row's vector, at exactly this slot.
+                guard bytes == 0 || bytes >= d * MemoryLayout<UInt16>.size else { ok = false; break }
+                covered += 1
+            } else {
+                // Uncovered: the blob is the only copy, and it appends past the covered prefix.
+                guard let blob = sqlite3_column_blob(stmt, 4), bytes >= d * MemoryLayout<UInt16>.size else { ok = false; break }
+                flat16.append(contentsOf: UnsafeBufferPointer(start: blob.assumingMemoryBound(to: UInt16.self), count: d))
+            }
+            rows.append(Row(path: path, kind: kind, chunkIndex: Int(sqlite3_column_int(stmt, 2)),
+                            modified: sqlite3_column_double(stmt, 5),
+                            size: Int(sqlite3_column_int64(stmt, 10)),
+                            width: Int(sqlite3_column_int(stmt, 6)), height: Int(sqlite3_column_int(stmt, 7)),
+                            duration: sqlite3_column_double(stmt, 8),
+                            locator: sqlite3_column_text(stmt, 9).map { String(cString: $0) } ?? ""))
+            let fid = internPath(path)
+            appendRowMetaLocked(fid, kindCode: internKind(kind), kind: kind, path: path)
+            presentPaths.insert(path)
+            slot += 1
+        }
+        // Trailing holes: a run of tombstones at the end of the covered prefix has no row after it
+        // to trigger the loop above.
+        while ok, slot < coveredRows, vecHoles.contains(Int32(slot)) {
+            appendHoleRowLocked()
+            slot += 1
+        }
+        // Every covered slot must have been claimed by a row or a hole, and the file must hold a
+        // vector for every row we just built. Either failing means falling back to the blob scan,
+        // which is only possible because nothing above wrote to the file.
+        guard ok, covered == coveredRows - holes, flat16.count == rows.count * dim else {
+            rows.removeAll(); flat16.removeAll(); presentPaths.removeAll()
+            fileID.removeAll(); pathID.removeAll(); idPath.removeAll(); fileChunkCount.removeAll()
+            kindCode.removeAll(); kindID.removeAll(); idKind.removeAll()
+            resetTombstonesLocked(); resetAggregatesLocked(); resetRowWindowsLocked()
+            dim = 0
+            return false
+        }
+        invalidateBase()
+        onLoadProgress?(1)
+        rowWindowAuditLocked("loadFromCoverage")
+        scheduleRowStampLocked(after: 120)
+        if Self.searchTiming { print("[store] LOAD from coverage rows=\(rows.count) covered=\(covered) holes=\(holes)") }
+        return true
+    }
+
+    /// The coverage claim could not be read. Says so loudly and changes NOTHING on disk.
+    ///
+    /// An earlier version deleted the rows the file could no longer answer for, reasoning that the
+    /// reconcile pass would re-index them. It deleted all 4.5M rows of a healthy index the first
+    /// time the read declined for a reason that had nothing to do with the data. Recovery paths
+    /// that mutate are how a recoverable problem becomes an unrecoverable one; this one reports.
+    private func reportCoverageUnreadableLocked() {
+        FileHandle.standardError.write(Data(
+            "[omni] vector coverage unreadable (covered=\(coveredRows) holes=\(vecHoles.count)); index not loaded, nothing modified\n".utf8))
+    }
+
+    /// Append a tombstone that exists only to hold its slot, for a vector the file still carries but
+    /// no row owns. Its path/kind are the empty intern entries, and it is dead from birth, so no
+    /// reader can reach it and no file counts it.
+    private func appendHoleRowLocked() {
+        let i = rows.count
+        rows.append(Row(path: "", kind: "", chunkIndex: 0, modified: 0))
+        appendDeadRowMetaLocked(internPath(""), kindCode: internKind(""))
+        deadRows.insert(Int32(i))
+        deadIdxCache = nil
+    }
+
+    /// Advance coverage: clear the SQLite blob for rows whose vector the file now demonstrably holds.
+    ///
+    /// This is the step that actually removes the duplication, and it is deliberately incremental.
+    /// One slice per stamp keeps every pause bounded, and makes the migration identical in kind for
+    /// a brand new index and a 4.5M-row one that predates the whole scheme: coverage starts at 0 and
+    /// walks forward. An index that stops half way is not broken - it is one with some rows covered
+    /// and some not, which is a state every reader here already handles.
+    ///
+    /// Ordering is the safety property: the bytes are msync'd by the caller BEFORE this runs, so a
+    /// blob is only ever dropped once the file can answer for it.
+    @discardableResult
+    private func advanceCoverageLocked(budget: Int = VectorStore.coverageSlice) -> Bool {
+        guard Self.vecCoverage, dbOpen(), dim > 0, !rows.isEmpty, flat16.isPersistent else { return false }
+        // Coverage counts SLOTS, so it advances only over rows that are physically in the file, and
+        // the file is only known good up to what the caller just made durable.
+        let target = Swift.min(rows.count, coveredRows + Swift.max(1, budget))
+        guard target > coveredRows else { return false }
+        // The covered prefix must correspond, row for row, to the live rows SQLite has in rowid
+        // order. Holes are exactly the slots below `coveredRows` with no row, so this is the
+        // arithmetic that has to balance - and if it does not, the claim is not extended.
+        let live = scalarQuery("SELECT COUNT(*) FROM chunks")
+        let deadBelow = deadRows.filter { Int($0) < target }.count
+        guard live == rows.count - deadRows.count, target - deadBelow <= live else { return false }
+        guard execChecked("BEGIN;") else { return false }
+        // A row that is already a tombstone when its slot becomes covered IS a hole from the moment
+        // coverage reaches it: the file holds a vector there that no row owns. Recorded in the same
+        // transaction as the clearing, so the claim and the hole list can never disagree.
+        recordHolesLocked((coveredRows ..< target).map { Int32($0) }.filter { deadRows.contains($0) },
+                          coveredOverride: target)
+        // Clear the blob for every covered row. Addressed by rowid rank, which is the covered rows'
+        // own order: the k-th live row in rowid order owns the k-th non-hole slot.
+        let clearUpTo = target - deadBelow            // how many live rows the prefix accounts for
+        let ok = execChecked("""
+            UPDATE chunks SET vec = x''
+              FROM (SELECT rowid AS rid FROM chunks ORDER BY rowid LIMIT \(clearUpTo)) AS s
+             WHERE chunks.rowid = s.rid AND length(chunks.vec) > 0;
+            """)
+        guard ok,
+              execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.coveredRowsKey)','\(target)');"),
               execChecked("COMMIT;")
         else {
             exec("ROLLBACK;")
-            vecsCoveredRows = 0   // the claim on disk is whatever it was; ours did not land
             return false
         }
-        // Now that every row carries a slot, `vec_slot < 0` is false for all of them and the partial
-        // index costs almost nothing while making the next stamp's lookup O(arrivals) rather than a
-        // full scan. Created here rather than at open for exactly that reason: before this point the
-        // predicate matches EVERY row, and the index would be a full-size one built for nobody.
-        if full { exec("CREATE INDEX IF NOT EXISTS idx_vec_unslotted ON chunks(vec_slot) WHERE vec_slot < 0;") }
-        vecsCoveredRows = n
-        vecSlotsDirty = false
+        let justCompleted = target == rows.count
+        coveredRows = target
+        if justCompleted {
+            // Clearing a blob SHORTENS its row; it does not free a page. Measured on a migrated
+            // 4.5M-row index, freelist_count is 0 while 7.8 GB of the file is slack that only a
+            // repack can return - so the generic free-ratio gate in compact() never fires and the
+            // space would sit there forever. Record that a one-shot repack is owed instead.
+            exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.vacuumPendingKey)','1');")
+        }
         return true
+    }
+
+    /// One-shot repack after the coverage migration finishes. Returns bytes reclaimed.
+    ///
+    /// Separate from compact() because compact() gates on the free-page ratio, and the migration
+    /// leaves none: it rewrites rows shorter rather than freeing pages. Runs once, records that it
+    /// ran, and is safe to call on every launch - it is a meta lookup when there is nothing owed.
+    @discardableResult
+    public func reclaimAfterCoverageMigration() -> Int64 {
+        let owed = queue.sync { dbOpen() && scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.vacuumPendingKey)'") == 1 }
+        guard owed else { return 0 }
+        let freed = compact(minFreeRatio: 0)
+        queue.sync { exec("DELETE FROM meta WHERE key = '\(Self.vacuumPendingKey)';") }
+        return freed
     }
 
     /// Serialize the resident row table and stamp it with the current generation. The vectors are
     /// already on disk (persistent scratch) - msync makes them durable first, so the stamp never
     /// describes vector bytes that could still be lost. Metadata build runs on the queue (~1s at
     /// 3.8M rows, at idle); the file write happens on persistIO.
+    /// The VECTOR half of a stamp: make the file cover every live row, make it durable, and let
+    /// coverage advance one slice. Runs whether or not the row table needs rewriting.
+    ///
+    /// Split out because the row-table stamp returns early when nothing has changed since last
+    /// time - which is the common case for a session that only searches. Coverage was wired behind
+    /// that guard and so never advanced without a mutation: an index migrated one slice and then
+    /// stopped forever. Migration has to make progress on ordinary launches, not only on busy ones.
+    private func stampVectorCoverageLocked(budget: Int = VectorStore.coverageSlice) {
+        guard Self.vecCoverage, Self.rowSidecarEnabled, dbOpen(), flat16.isPersistent,
+              dim > 0, !rows.isEmpty, coveredRows < rows.count else { return }
+        guard flat16.extendFileCoverage() else { return }
+        flat16.msyncFile()
+        advanceCoverageLocked(budget: budget)
+    }
+
     private func stampRowSidecarLocked(sync: Bool) {
-        ensureCompactLocked()   // the sidecar is the row table; it must not carry tombstones
+        // NO ensureCompactLocked() here any more. It used to collect the tombstones so the sidecar
+        // could describe a compact row table - but compaction MOVES rows, and once a row's blob has
+        // been cleared its vector cannot move without that blob coming back first. Every stamp
+        // following a delete would have had to restore gigabytes of blobs just to compact them
+        // away. The sidecar carries the tombstones instead (record byte 49), which is also what
+        // keeps a delete O(edit) rather than O(index).
         guard Self.rowSidecarEnabled, dbOpen(), flat16.isPersistent, dim > 0, !rows.isEmpty,
               mutationGen != lastStampedGen, flat16.count == rows.count * dim else { return }
         let t0 = omniPerfEnabled ? Date() : nil
@@ -4384,12 +4690,12 @@ public final class VectorStore: @unchecked Sendable {
             guard flat16.extendFileCoverage() else { return }
         }
         flat16.msyncFile()
-        recordVecSlotsLocked()   // durable bytes first, then the record of where they are
         let n = rows.count
         // Pre-sized [UInt8] buffers, not Data: appending millions of few-byte chunks through
         // Data's COW machinery measured 21s at 3.8M rows on the store queue; the same build into
         // raw arrays is ~1s. Converted to Data once, by move, at the end.
         var locBytes = [UInt8]()
+        let hasDeadRows = !deadRows.isEmpty
         var records = [UInt8](repeating: 0, count: n * Self.rowRecordSize)
         records.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
             for i in 0 ..< n {
@@ -4412,6 +4718,12 @@ public final class VectorStore: @unchecked Sendable {
                     raw.storeBytes(of: UInt32(locBytes.count - before), toByteOffset: o + 44, as: UInt32.self)
                 }
                 raw.storeBytes(of: kindCode[i], toByteOffset: o + 48, as: UInt8.self)
+                // Tombstone flag, into one of the record's spare bytes. The block is zero-filled and
+                // offsets 49..55 were never written, so this costs nothing and an older binary
+                // reading a newer sidecar simply ignores it.
+                if hasDeadRows, deadRows.contains(Int32(i)) {
+                    raw.storeBytes(of: UInt8(1), toByteOffset: o + 49, as: UInt8.self)
+                }
             }
         }
         let locBlob = Data(locBytes)
@@ -4432,7 +4744,8 @@ public final class VectorStore: @unchecked Sendable {
             pathCount: idPath.count, kindCount: idKind.count,
             recordBytes: records.count, locatorBytes: locBlob.count,
             pathOffBytes: paths.offsets.count, pathBlobBytes: paths.blob.count,
-            kindOffBytes: kinds.offsets.count, kindBlobBytes: kinds.blob.count)
+            kindOffBytes: kinds.offsets.count, kindBlobBytes: kinds.blob.count,
+            deadCount: deadRows.count)
         lastStampedGen = mutationGen
         let url = rowSidecarURL
         let tmp = url.deletingLastPathComponent().appendingPathComponent(url.lastPathComponent + ".tmp")
@@ -4464,9 +4777,9 @@ public final class VectorStore: @unchecked Sendable {
         if sync { persistIO.sync(execute: job) } else { persistIO.async(execute: job) }
     }
 
-    private func removeRowSidecarFiles() {
+    private func removeRowSidecarFiles(keepVectors: Bool = false) {
         try? FileManager.default.removeItem(at: rowSidecarURL)
-        try? FileManager.default.removeItem(at: vecSidecarURL)
+        if !keepVectors { try? FileManager.default.removeItem(at: vecSidecarURL) }
         lastStampedGen = -1
     }
 
@@ -4491,7 +4804,11 @@ public final class VectorStore: @unchecked Sendable {
         try? fm.removeItem(at: rowSidecarURL.deletingLastPathComponent()
             .appendingPathComponent(rowSidecarURL.lastPathComponent + ".tmp"))   // _exit stranded write
         guard fm.fileExists(atPath: rowSidecarURL.path), fm.fileExists(atPath: vecSidecarURL.path) else { return false }
-        func reject() -> Bool { flat16.removeAll(); removeRowSidecarFiles(); resetVecSlotsLocked(); return false }
+        // Rejecting the ROW table must not take the VECTOR file with it. The two were always
+        // deleted together, which was harmless while every vector also sat in a SQLite blob - and
+        // is data loss the moment coverage means the file is the only copy. Rejection here falls
+        // through to loadFromCoverageLocked, which needs both the file and the claim intact.
+        func reject() -> Bool { flat16.removeAll(); removeRowSidecarFiles(keepVectors: coveredRows > 0); return false }
         guard let fh = try? FileHandle(forReadingFrom: rowSidecarURL) else { return reject() }
         defer { try? fh.close() }
         guard let headChunk = try? fh.read(upToCount: 4096), let nl = headChunk.firstIndex(of: 0x0A),
@@ -4504,7 +4821,7 @@ public final class VectorStore: @unchecked Sendable {
               header.pathCount > 0, header.kindCount > 0,
               header.pathOffBytes == (header.pathCount + 1) * 4,
               header.kindOffBytes == (header.kindCount + 1) * 4,
-              scalarQuery("SELECT COUNT(*) FROM chunks") == header.rowCount
+              scalarQuery("SELECT COUNT(*) FROM chunks") == header.rowCount - (header.deadCount ?? 0)
         else { return reject() }
         guard flat16.mapPersistent(url: vecSidecarURL, tailSlackElements: Self.foldThreshold * header.dim,
                                    adoptElements: header.rowCount * header.dim) else { return reject() }
@@ -4568,6 +4885,10 @@ public final class VectorStore: @unchecked Sendable {
                       let blob = sqlite3_column_blob(stmt, 0)
                 else { sampleOK = false; break }
                 let blobBytes = Int(sqlite3_column_bytes(stmt, 0))
+                // A covered row has no blob left to compare against - the file IS its vector - so
+                // the sample checks its metadata and moves on. Without this every launch after the
+                // first coverage slice rejected the sidecar and did the full scan instead.
+                if blobBytes == 0 { i += stride; continue }
                 let ok: Bool = flat16.withUnsafeBufferPointer { fb in
                     let row = UnsafeBufferPointer(rebasing: fb[i * header.dim ..< (i + 1) * header.dim])
                     if blobBytes == header.dim * 2 {
@@ -4619,6 +4940,7 @@ public final class VectorStore: @unchecked Sendable {
                         ? String(decoding: UnsafeRawBufferPointer(rebasing: lb[locOff ..< locOff + locLen]), as: UTF8.self) : ""
                     let path = idPath[Int(fid)]
                     let kind = idKind[Int(kc)]
+                    let isDead = raw.loadUnaligned(fromByteOffset: o + 49, as: UInt8.self) != 0
                     rows.append(Row(path: path, kind: kind,
                                     chunkIndex: Int(raw.loadUnaligned(fromByteOffset: o + 4, as: Int32.self)),
                                     modified: raw.loadUnaligned(fromByteOffset: o + 16, as: Double.self),
@@ -4627,10 +4949,18 @@ public final class VectorStore: @unchecked Sendable {
                                     height: Int(raw.loadUnaligned(fromByteOffset: o + 12, as: Int32.self)),
                                     duration: raw.loadUnaligned(fromByteOffset: o + 24, as: Double.self),
                                     locator: locator))
-                    appendRowMetaLocked(fid, kindCode: kc, kind: kind, path: path)
+                    if isDead {
+                        // Holds the row's SLOT without counting toward its file: the vector stays
+                        // where it is (that is the point of a tombstone) but nothing may return it.
+                        appendDeadRowMetaLocked(fid, kindCode: kc)
+                        deadRows.insert(Int32(i))
+                    } else {
+                        appendRowMetaLocked(fid, kindCode: kc, kind: kind, path: path)
+                    }
                 }
             }
         }
+        deadIdxCache = nil
         presentPaths = Set(idPath.enumerated().compactMap { fileChunkCount[$0.offset] > 0 ? $0.element : nil })
         lastStampedGen = mutationGen
         invalidateBase()
@@ -5453,14 +5783,18 @@ public final class VectorStore: @unchecked Sendable {
         // DELTA ROWS TOMBSTONE TOO. They used to force a physical compaction, on the grounds that
         // the delta is bounded by foldThreshold so moving it is cheap. Moving it is cheap; what it
         // is not is FREE, because moving any row rewrites the vector file under the slot recorded
-        // for it (see recordVecSlotsLocked). Every place a delta score reaches a reducer now drops
+        // for it (see the VECTOR COVERAGE note). Every place a delta score reaches a reducer drops
         // dead rows the same way the base mask does, so there is nothing left that a tombstone in
         // the delta can leak through - and with this, an ordinary save moves no vector at all.
         var hits: [Int32] = []
         for i in 0 ..< rows.count where shouldRemove(i) {
             if !deadRows.contains(Int32(i)) { hits.append(Int32(i)) }
         }
-        guard !hits.isEmpty, deadRows.count + hits.count <= deadBudget else {
+        // Over budget, a removal used to fall through to a physical compaction. It must not while
+        // coverage is active: the holes for this removal were already committed by the caller, and a
+        // compaction would move every vector out from under them. Compaction is deferred to the
+        // maintenance pass instead, which restores the blobs first and can afford to.
+        guard !hits.isEmpty, coveredRows > 0 || deadRows.count + hits.count <= deadBudget else {
             return nil
         }
         var removedPaths = Set<String>()
@@ -5475,11 +5809,19 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     private func compactRowsLocked(_ shouldRemove: (Int) -> Bool) -> Set<String> {
-        // Physical compaction is the ONLY thing that moves a row's vector within the file - appends
-        // only ever add past the end - so it is the only thing that can falsify a recorded slot.
-        // Marked before the pass, not after: an early return below still means the caller intended
-        // to move rows, and a stale-but-unmarked slot table is the one failure this must not have.
-        vecSlotsDirty = true
+        // Physical compaction is the ONLY thing that moves a row's vector within the file, so it is
+        // the only thing that can falsify the coverage claim. Covered rows have no blob in SQLite -
+        // the file IS their only copy - so their bytes have to be written back BEFORE they move.
+        // Returns the store to "nothing covered, every row carries its own vector", which is the
+        // state this whole scheme migrates away from, and coverage then re-advances slice by slice.
+        //
+        // Rare by construction: with tombstones covering the delta too, nothing reaches here except
+        // a removal that has run past deadBudget. If the restore cannot be completed the compaction
+        // is abandoned rather than run on rows whose vectors would become unrecoverable.
+        if coveredRows > 0, !restoreCoveredBlobsLocked() {
+            if Self.searchTiming { print("[store] compaction abandoned: could not restore blobs") }
+            return []
+        }
         // Every physical compaction also collects the standing tombstones - they are rows nothing
         // may return, and this is the one pass that can drop them for free. Their bookkeeping was
         // done when they were marked, so they must NOT be counted again here: `fileChunkDec` twice
@@ -5596,19 +5938,25 @@ public final class VectorStore: @unchecked Sendable {
         // What the last stamp claimed about the vector file. Read BEFORE the adopt attempt so the
         // adopt path can inherit a still-valid claim, and so the scan path below can see that it is
         // about to invalidate one.
-        vecsCoveredRows = scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.vecsRowsKey)'")
-        let claimedGen = Int64(scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.vecsGenKey)'"))
+        loadCoverageLocked()
         if tryAdoptRowSidecarLocked() {
-            // The file was adopted byte-for-byte, so the slots recorded against it still describe
-            // it. Anything less than an exact match on both halves of the claim means the next
-            // stamp renumbers from scratch rather than appending to a prefix it cannot vouch for.
-            vecSlotsDirty = !(claimedGen == mutationGen && vecsCoveredRows == rows.count)
-            if vecSlotsDirty { vecsCoveredRows = 0 }
             return   // validated cache of everything below; SQLite stays truth
         }
-        // The scan path re-truncates and refills .vecs from the blobs (mapPersistent below), so
-        // whatever slots were recorded describe a file that is about to stop existing.
-        resetVecSlotsLocked()
+        // The scan path below rebuilds .vecs, so the coverage claim is about to stop being true.
+        // It is consumed first (loadIntoMemoryFromCoverageLocked) and only then cleared: for a
+        // covered row the file IS the only copy, so this is the one path that must read it.
+        if coveredRows > 0 {
+            if loadFromCoverageLocked() { return }
+            // Could not read the coverage. The scan below would read vectors from blobs that
+            // covered rows no longer have, AND mapPersistent would truncate the very file that
+            // does have them - turning a bad state into an unrecoverable one. So: touch nothing.
+            // SQLite keeps its rows, the file keeps its bytes, and the next launch can try again
+            // (the file may simply have been unavailable). An empty in-memory store means the
+            // reconcile pass re-indexes, which is recoverable; deleting rows here would not be.
+            reportCoverageUnreadableLocked()
+            return
+        }
+        resetCoverageLocked()
         // Pre-size the buffers to the final row/element count so the bf16 buffer is filled in place
         // rather than grown through ~log2(N) reallocations. One COUNT(*) + one dim read up front.
         let total = scalarQuery("SELECT COUNT(*) FROM chunks")

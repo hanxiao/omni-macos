@@ -6473,6 +6473,74 @@ if args.count >= 5 && args[1] == "bitrecall" {
 }
 
 // Is a 1-bit XOR+popcount scan faster than the shipped 3-bit one? omni-verify bitscanbench [N] [dim]
+// Does a migrated index answer identically? omni-verify covverify <origDb> <migDb> <modelDir> [n]
+// The migration deletes 6.47 GB of vectors from SQLite on the strength of the sidecar holding the
+// same bytes. This is the check that the claim is true END TO END: same queries against the
+// original index and the migrated one, and every hit must match by path AND by score. Anything the
+// slot arithmetic got wrong shows up here as a different file or a different number.
+if args.count >= 5 && args[1] == "covverify" {
+    let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[4]))
+    let n = (args.count >= 6 ? Int(args[5]) : nil) ?? 40
+    let a = try VectorStore(dbURL: URL(fileURLWithPath: args[2]))
+    let b = try VectorStore(dbURL: URL(fileURLWithPath: args[3]))
+    let terms = ["invoice", "beach sunset", "metal kernel", "quarterly report", "cat photo",
+                 "swift concurrency", "arxiv paper", "screen recording", "roadmap", "receipt",
+                 "embedding quantization", "gantt chart", "memory profiling", "slide deck",
+                 "porsche", "team photo", "index compaction", "trajectory checkpoint"]
+    var pathMismatch = 0, scoreMismatch = 0, checked = 0, emptyA = 0
+    for i in 0 ..< n {
+        let q = engine.embedQuery(terms[i % terms.count] + (i >= terms.count ? " \(i)" : ""))
+        let ha = a.search(q, filter: SearchFilter(), topK: 20)
+        let hb = b.search(q, filter: SearchFilter(), topK: 20)
+        if ha.isEmpty { emptyA += 1 }
+        if ha.count != hb.count { pathMismatch += 1; continue }
+        for (x, y) in zip(ha, hb) {
+            checked += 1
+            if x.path != y.path { pathMismatch += 1 }
+            else if abs(x.score - y.score) > 1e-4 { scoreMismatch += 1 }
+        }
+    }
+    print("covverify queries=\(n) comparedHits=\(checked) emptyBaseline=\(emptyA)")
+    print("  path mismatches  \(pathMismatch)")
+    print("  score mismatches \(scoreMismatch)")
+    print("  RESULT: \(pathMismatch == 0 && scoreMismatch == 0 && checked > 0 ? "PASS" : "FAIL")")
+    a.close(); b.close()
+    exit(pathMismatch == 0 && scoreMismatch == 0 && checked > 0 ? 0 : 1)
+}
+
+// How does an EXISTING index migrate off its duplicate vectors? omni-verify covmigrate <db> [cycles]
+// The migration has to be generic: every user, every index size, no reindex, and no launch that
+// pauses. Coverage advances one bounded slice per stamp, so this drives open/close cycles - each
+// one is a launch and quit - and reports how far coverage got, how long the quit took, and what the
+// files weigh. The interesting numbers are the per-cycle close time (must stay small) and the point
+// at which index.sqlite starts shrinking.
+if args.count >= 3 && args[1] == "covmigrate" {
+    let dbURL = URL(fileURLWithPath: args[2])
+    let cycles = (args.count >= 4 ? Int(args[3]) : nil) ?? 4
+    func size(_ suffix: String) -> Int64 {
+        let p = dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + suffix).path
+        return ((try? FileManager.default.attributesOfItem(atPath: p)[.size]) as? Int64) ?? 0
+    }
+    func gb(_ b: Int64) -> String { String(format: "%.2f GB", Double(b) / 1_073_741_824) }
+    print("covmigrate db=\(dbURL.lastPathComponent) cycles=\(cycles)")
+    for c in 1 ... cycles {
+        let tOpen = Date()
+        let store = try VectorStore(dbURL: dbURL)
+        let openMs = -tOpen.timeIntervalSinceNow * 1000
+        let rows = store.count
+        let reclaimedPre = store.reclaimAfterCoverageMigration()
+        let tClose = Date()
+        store.close()
+        let closeMs = -tClose.timeIntervalSinceNow * 1000
+        let reclaimed = reclaimedPre
+        print(String(format: "  cycle %d  open %7.0f ms  close %7.0f ms  rows %d  sqlite %@  vecs %@%@",
+                     c, openMs, closeMs, rows, gb(size("")), gb(size(".vecs")),
+                     reclaimed > 0 ? "  reclaimed \(gb(reclaimed))" : ""))
+        fflush(stdout)
+    }
+    exit(0)
+}
+
 // What does the filename sidecar cost on disk? omni-verify lexwal <dbPath>
 // The sidecar's own database is small (171 MB for 172k files) but its write-ahead log was found at
 // 3.1 GB beside it - seventeen times the database, and pure duplication: WAL frames that have
