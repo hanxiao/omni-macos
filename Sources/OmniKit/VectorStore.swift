@@ -2,6 +2,7 @@ import Foundation
 import SQLite3
 import Accelerate
 import MLX
+import MLXFast
 
 /// A single indexed chunk: one file may produce several chunks.
 public struct IndexedChunk: Sendable {
@@ -678,7 +679,10 @@ public final class VectorStore: @unchecked Sendable {
     static let candidateOverride: Int? = ProcessInfo.processInfo.environment["OMNI_CANDIDATES"].flatMap(Int.init)
     static func candidateCount(topK: Int) -> Int {
         if let c = candidateOverride { return max(topK, c) }
-        return min(4096, max(1024, topK * 32))
+        let base = min(4096, max(1024, topK * 32))
+        // The 1-bit tier's coarse ranking is looser, so it needs a wider net for the exact rerank
+        // to find the same answers in. This is the cost side of that tier, made explicit.
+        return scanBits == 1 ? base * max(1, bitCandidateMultiplier) : base
     }
 
     /// A/B lever: 0 skips the exact rerank so the coarse 4-bit scores are final. See search().
@@ -859,7 +863,19 @@ public final class VectorStore: @unchecked Sendable {
     /// is 572 ms on an M3 Ultra, but the comment on rebuildBaseLocked reports "~minutes at 3.8M
     /// rows on a base M-chip" for a full rebuild, and it lands on whichever search arrives first.
     /// The launch warm-up normally absorbs it; a user who searches immediately does not.
-    static let scanBits = 3
+    /// OMNI_SCAN_BITS selects the coarse tier: 3 = affine quantizedMM (default), 1 = the asymmetric
+    /// sign-code tier below. 1 is 3.1x smaller resident and scans faster, but needs a wider
+    /// candidate set to hold recall and is a net latency loss at equal quality - see the tier's own
+    /// note. It is a lever, not a default, so the trade can be measured on a real index either way.
+    /// Test/A-B override, checked before the env default. `var` for the same reason the paper
+    /// levers are: setenv after first touch is either a no-op or a permanent change to the app.
+    nonisolated(unsafe) public static var scanBitsOverride: Int? = nil
+    static var scanBits: Int {
+        scanBitsOverride ?? ProcessInfo.processInfo.environment["OMNI_SCAN_BITS"].flatMap(Int.init) ?? 3
+    }
+    /// The 1-bit tier gives up recall at equal candidate width, and buys it back with width. 2x is
+    /// what the measurement says is needed (top10 0.9792 at 2x against 3-bit's 0.9783 at 1x).
+    static let bitCandidateMultiplier = ProcessInfo.processInfo.environment["OMNI_BIT_CAND_MULT"].flatMap(Int.init) ?? 2
     // MARK: - Tombstones
     //
     // Removing a file's rows used to compact the whole store: every row after the first removed one
@@ -974,7 +990,7 @@ public final class VectorStore: @unchecked Sendable {
     /// a deleted file back to life.
     private func resetTombstonesLocked() { deadRows.removeAll(); deadIdxCache = nil }
 
-    private func invalidateBase() { baseDirty = true; mlxBase = nil; mlxFileID = nil; mlxFileIDRows = 0; mlxKindCode = nil; mlxKindCodeRows = 0; mlxModified = nil; mlxModifiedRows = 0; quantBase = nil; baseRows = 0 }
+    private func invalidateBase() { baseDirty = true; mlxBase = nil; mlxFileID = nil; mlxFileIDRows = 0; mlxKindCode = nil; mlxKindCodeRows = 0; mlxModified = nil; mlxModifiedRows = 0; quantBase = nil; bitBase = nil; baseRows = 0 }
     // Membership index of the paths currently in `rows`. Lets replace() know in O(1) whether a
     // path pre-exists, so a brand-new file skips removeRowsLocked entirely (no O(N) scan per file
     // during a full index). Rebuilt from the surviving rows whenever removeRowsLocked compacts.
@@ -2882,13 +2898,13 @@ public final class VectorStore: @unchecked Sendable {
         let hits: [SearchHit]? = prelimFusible ? queue.sync { () -> [SearchHit]? in
             lastSearchAt = Date()
             let n = rows.count
-            let fusible = quantBase == nil && mlxFileID != nil && baseRows > 0 && !baseDirty
+            let fusible = quantBase == nil && bitBase == nil && mlxFileID != nil && baseRows > 0 && !baseDirty
                 && (filter.kinds.isEmpty || mlxKindCode != nil)
                 && (n - baseRows) <= Self.foldThreshold
                 && queryGraph.size == dim   // dim is shared state - read under the lock (self-review fix)
             guard fusible else { needClassic = true; return nil }
             guard n > 0, dim > 0, flat16.count == n * dim else { return [] }
-            if baseDirty || (mlxBase == nil && quantBase == nil) || (n - baseRows) > Self.foldThreshold { rebuildBaseLocked(rowCount: n) }
+            if baseDirty || (mlxBase == nil && quantBase == nil && bitBase == nil) || (n - baseRows) > Self.foldThreshold { rebuildBaseLocked(rowCount: n) }
             // A rebuild can flip the base to quant mode (mlxBase stays nil); the fused GPU path no
             // longer applies, so fall back to the classic quant-capable path after the lock.
             guard let base = mlxBase, let fid = mlxFileID else { needClassic = true; return nil }
@@ -3024,7 +3040,7 @@ public final class VectorStore: @unchecked Sendable {
             let n = rows.count
             guard n > 0, dim > 0, query.count == dim, flat16.count == n * dim else { return [] }
             if markActive { lastSearchAt = Date() }   // stamp AFTER the guard so an empty/invalid query never fakes a search window
-            if baseDirty || (mlxBase == nil && quantBase == nil) || (n - baseRows) > Self.foldThreshold {
+            if baseDirty || (mlxBase == nil && quantBase == nil && bitBase == nil) || (n - baseRows) > Self.foldThreshold {
                 rebuildBaseLocked(rowCount: n)
             }
             let t0 = Self.searchTiming ? Date() : nil
@@ -3032,7 +3048,9 @@ public final class VectorStore: @unchecked Sendable {
             // Full mode: exact bf16 scores. Quant mode: COARSE scores from the 4-bit replica
             // (x @ w.T via quantizedMM wants x as [1, dim]); exact rerank happens below.
             let baseScore: MLXArray
-            if let qb = quantBase {
+            if quantBits == 1, let bb = bitBase {
+                baseScore = maskDeadLocked(bitScanLocked(bb, query: query, rows: baseRows))
+            } else if let qb = quantBase {
                 // The replica is stored rotated when the preconditioner is on, so the query must be
                 // rotated by the SAME orthogonal R to score against it. `qv` stays unrotated - every
                 // exact path below reads the untouched bf16 rows and must not see a rotated query.
@@ -3153,7 +3171,7 @@ public final class VectorStore: @unchecked Sendable {
             // A/B LEVER, measurement only: OMNI_QUANT_RERANK=0 returns the coarse 4-bit scores as
             // final, so the exact half of the funnel can be priced (recall AND latency) against the
             // funnel and against an exact bf16 scan on a real index. Ship behaviour is unchanged.
-            if quantBase != nil, Self.quantRerank {
+            if quantBase != nil || bitBase != nil, Self.quantRerank {
                 scores = rerankLocked(coarse: scores, n: n, query: query, filter: filter, topK: topK)
             }
             let t1 = Self.searchTiming ? Date() : nil
@@ -4106,7 +4124,7 @@ public final class VectorStore: @unchecked Sendable {
     /// rewrite the file mid-session: a launch adopts the persisted prefix and scores the tail as
     /// delta, then folds it incrementally.
     private func quantReplicaChangedLocked() {
-        guard Self.quantPersistEnabled, quantBase != nil, !replicaLaunchPersistScheduled else { return }
+        guard Self.quantPersistEnabled, quantBase != nil || bitBase != nil, !replicaLaunchPersistScheduled else { return }
         replicaLaunchPersistScheduled = true
         guard baseRows != lastPersistedBaseRows else { return }   // adopted replica already covers this
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 10) { [weak self] in
@@ -4115,15 +4133,58 @@ public final class VectorStore: @unchecked Sendable {
                 self.persistQuantReplicaLocked(sync: false)
                 // A structural change can invalidate the base in the window before this fires; the
                 // write is then skipped, so re-arm and let the next rebuild schedule a fresh attempt.
-                if self.quantBase == nil { self.replicaLaunchPersistScheduled = false }
+                if self.quantBase == nil && self.bitBase == nil { self.replicaLaunchPersistScheduled = false }
             }
         }
+    }
+
+    /// Write the 1-bit tier's codes through the shared replica file. Same header, same checksum of
+    /// the bf16 prefix it was derived from, `bits: 1` and an empty scales/biases payload.
+    private func persistBitReplicaLocked(_ codes: MLXArray, sync: Bool) {
+        let wqData = codes.asData(access: .copy).data
+        let empty = Data()
+        let header = QuantReplicaHeader(
+            magic: "omni-quant-1", rows: baseRows, dim: dim, group: Self.quantGroup, bits: 1,
+            wqShape: codes.shape, wqDType: "uint32", wqBytes: wqData.count, wqSum: Self.blobChecksum(wqData),
+            scShape: [0], scDType: "float32", scBytes: 0, scSum: Self.blobChecksum(empty),
+            biShape: nil, biDType: nil, biBytes: nil, biSum: nil,
+            checksum: String(prefixChecksumLocked(rows: baseRows), radix: 16),
+            rotate: true)   // the sign tier always rotates; see its note
+        lastPersistedBaseRows = baseRows
+        let url = quantReplicaURL
+        let tmp = url.deletingLastPathComponent().appendingPathComponent(url.lastPathComponent + ".tmp")
+        let job: @Sendable () -> Void = {
+            guard var head = try? JSONEncoder().encode(header) else { return }
+            head.append(0x0A)
+            let fm = FileManager.default
+            guard fm.createFile(atPath: tmp.path, contents: nil),
+                  let fh = try? FileHandle(forWritingTo: tmp) else { return }
+            do {
+                try fh.write(contentsOf: head)
+                try fh.write(contentsOf: wqData)
+                try fh.close()
+                try? fm.removeItem(at: url)
+                try fm.moveItem(at: tmp, to: url)
+            } catch {
+                try? fh.close(); try? fm.removeItem(at: tmp)
+            }
+        }
+        if sync { persistIO.sync(execute: job) } else { persistIO.async(execute: job) }
     }
 
     /// Snapshot (arrays -> Data, checksum) on the store queue; file write on persistIO. `sync`
     /// (the close path) blocks until the file is durably renamed; async leaves only the write
     /// off-queue. No-op when the on-disk replica already covers the current prefix.
     private func persistQuantReplicaLocked(sync: Bool) {
+        // The 1-bit tier persists through the SAME file and header: its packed codes ride the `wq`
+        // slot and `bits: 1` is what tells them apart. A binary that does not know the tier sees a
+        // bits mismatch and rebuilds, which is the existing width-change path - so an upgrade or a
+        // downgrade costs a background replica rebuild and never a reindex.
+        if quantBits == 1, let bb = bitBase, baseRows > 0, dim > 0, Self.quantPersistEnabled,
+           baseRows != lastPersistedBaseRows, flat16.count >= baseRows * dim {
+            persistBitReplicaLocked(bb, sync: sync)
+            return
+        }
         guard Self.quantPersistEnabled, let qb = quantBase, baseRows > 0, dim > 0,
               baseRows != lastPersistedBaseRows, flat16.count >= baseRows * dim else { return }
         guard let wqTag = Self.dtypeTag(qb.wq.dtype), let scTag = Self.dtypeTag(qb.scales.dtype) else { return }
@@ -4198,17 +4259,24 @@ public final class VectorStore: @unchecked Sendable {
         // exactly the startup stall the launch path was restructured to avoid in 0.3.8. So adopt
         // it at its own width, serve from it immediately, and re-quantise to the preferred width
         // when the store is next idle (scheduleWidthUpgradeLocked).
+        // The 1-bit tier shares this file but not its payload shape: codes in the wq slot, nothing
+        // in scales or biases, and a rotation that is intrinsic to the tier rather than the
+        // (separate, off-by-default) affine preconditioner. Validating it against the affine rules
+        // rejected every replica it wrote - and rejection DELETES the file, so the tier silently
+        // repacked the whole base on every launch.
+        let isBitTier = header.bits == 1
         guard header.magic == "omni-quant-1", header.rows > 0, header.rows <= n,
               header.dim == dim, header.group == Self.quantGroup,
-              [2, 3, 4, 5, 6, 8].contains(header.bits),
-              (header.rotate ?? false) == (Self.quantRotate && Self.hadamardCompatible(dim)),
+              isBitTier || [2, 3, 4, 5, 6, 8].contains(header.bits),
+              isBitTier || (header.rotate ?? false) == (Self.quantRotate && Self.hadamardCompatible(dim)),
+              !isBitTier || ((header.rotate ?? false) && Self.hadamardCompatible(dim) && dim % 32 == 0),
               header.rows == baseRows || baseRows == 0,   // baseRows is 0 fresh out of loadIntoMemory
               flat16.count >= header.rows * dim,
               let wqT = Self.tagDType(header.wqDType), let scT = Self.tagDType(header.scDType),
               header.wqShape.count == 2, header.wqShape[0] == header.rows,
-              header.scShape.count == 2, header.scShape[0] == header.rows,
+              isBitTier || (header.scShape.count == 2 && header.scShape[0] == header.rows),
               header.wqBytes == header.wqShape.reduce(1, *) * wqT.size,
-              header.scBytes == header.scShape.reduce(1, *) * scT.size,
+              isBitTier || header.scBytes == header.scShape.reduce(1, *) * scT.size,
               header.checksum == String(prefixChecksumLocked(rows: header.rows), radix: 16)
         else { reject(); return }
         var biT: (dtype: DType, size: Int)? = nil
@@ -4229,6 +4297,22 @@ public final class VectorStore: @unchecked Sendable {
             guard let biData = try? fh.read(upToCount: biBytes), biData.count == biBytes,
                   Self.blobChecksum(biData) == header.biSum else { reject(); return }
             biArr = MLXArray(biData, biShape, dtype: biT.dtype)
+        }
+        if header.bits == 1 {
+            // Sign codes: [rows, dim/32] uint32 in the wq slot, nothing in the others.
+            guard header.wqShape.count == 2, header.wqShape[0] == header.rows,
+                  header.wqShape[1] == header.dim / 32, wqT.dtype == .uint32 else { reject(); return }
+            let codes = MLXArray(wqData, header.wqShape, dtype: .uint32)
+            MLX.eval(codes)
+            bitBase = codes
+            quantBase = nil
+            quantBits = 1
+            baseRows = header.rows
+            baseDirty = false
+            lastPersistedBaseRows = header.rows
+            if Self.searchTiming { print("[search] ADOPT 1-bit replica rows=\(header.rows)") }
+            if header.bits != bits { scheduleWidthUpgradeLocked() }
+            return
         }
         let wq = MLXArray(wqData, header.wqShape, dtype: wqT.dtype)
         let sc = MLXArray(scData, header.scShape, dtype: scT.dtype)
@@ -4977,6 +5061,114 @@ public final class VectorStore: @unchecked Sendable {
     /// are independently packed), so the result is identical to a one-shot quantize - and,
     /// for the same reason, quantizing only a DELTA range and concatenating onto an existing
     /// replica is bit-identical to re-quantizing everything.
+    // MARK: - 1-bit asymmetric scan tier (RaBitQ-style)
+    //
+    // A sign code per dimension instead of a 3-bit affine quantization: 96 B/row against 336, so the
+    // resident scan replica goes 1.25 GB -> 0.40 GB on a 4.5M-row index. That is the reason it is
+    // here. It is NOT faster end to end, and the numbers are recorded rather than hoped for:
+    //
+    //   scan itself      2.26 ms -> 1.39 ms   at 4.5M rows (bitscanbench)
+    //   but it needs 2x the candidate width to hold recall (bitrecall, 120 queries, real vectors):
+    //     3-bit  top10 0.9783 at 1x      1-bit  top10 0.9642 at 1x, 0.9792 at 2x
+    //   and doubling the candidate width costs more than the scan saves (querybreak).
+    //
+    // ASYMMETRIC means only the DATABASE side is binarized; the query stays float and the kernel
+    // accumulates +-q[j] per bit. Binarizing the query too (pure XOR+popcount) is much faster and
+    // measurably worse - it gives up ~7 points of top10 at the shipped width - so the fast form is
+    // deliberately not the shipped one.
+    //
+    // The rotation is not optional here. A sign code in the raw coordinate basis spends its bits on
+    // whatever axes the encoder happens to load; the randomized Hadamard spreads the information
+    // across dimensions first, which is what makes one bit per dimension informative at all. It is
+    // orthogonal, so it changes no inner product - only the basis the signs are taken in.
+    private var bitBase: MLXArray? = nil            // [rows, dim/32] packed sign bits
+    private var bitWords: Int { dim / 32 }
+    /// Signs for the 1-bit tier's rotation. Independent of `quantSignsLocked`, which is gated on an
+    /// off-by-default experiment; this tier always rotates, so it always has them.
+    private var bitSigns: MLXArray? = nil
+
+    private func bitSignsLocked() -> MLXArray? {
+        guard dim > 0, Self.hadamardCompatible(dim) else { return nil }
+        if let s = bitSigns { return s }
+        // Host xorshift, not MLX.random: a different sign vector silently mis-scores an existing
+        // replica, so it must not be able to change under an MLX version bump.
+        var rng: UInt64 = 0x243F_6A88_85A3_08D3 &+ UInt64(dim)
+        var s = [Float](repeating: 0, count: dim)
+        for i in 0 ..< dim {
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17
+            s[i] = (rng >> 40) & 1 == 0 ? -1 : 1
+        }
+        let a = MLXArray(s, [dim])
+        MLX.eval(a)
+        bitSigns = a
+        return a
+    }
+
+    private func rotateForBitsLocked(_ x: MLXArray) -> MLXArray {
+        guard let s = bitSignsLocked() else { return x.asType(.float32) }
+        return MLX.hadamardTransform(x.asType(.float32) * s, scale: 1.0 / Float(dim).squareRoot())
+    }
+
+    /// Pack rows into sign bits, in slabs so the fp32 rotation transient stays bounded.
+    private func packSignBitsLocked(_ range: Range<Int>) -> MLXArray? {
+        guard dim > 0, dim % 32 == 0, !range.isEmpty else { return nil }
+        let words = bitWords
+        let pow2 = MLXArray((0 ..< 32).map { UInt32(1) << UInt32($0) }, [1, 1, 32])
+        var parts: [MLXArray] = []
+        let slab = 65_536
+        var off = range.lowerBound
+        flat16.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            while off < range.upperBound {
+                let count = Swift.min(slab, range.upperBound - off)
+                let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: base.advanced(by: off * dim * MemoryLayout<UInt16>.size)),
+                                count: count * dim * MemoryLayout<UInt16>.size, deallocator: .none)
+                let r = rotateForBitsLocked(MLXArray(data, [count, dim], dtype: .bfloat16))
+                let bit = MLX.which(r .>= MLXArray(Float(0)), MLXArray(UInt32(1)), MLXArray(UInt32(0)))
+                let packed = (bit.reshaped([count, words, 32]) * pow2).sum(axis: 2).asType(.uint32)
+                MLX.eval(packed)
+                parts.append(packed)
+                off += count
+            }
+        }
+        guard !parts.isEmpty else { return nil }
+        let out = parts.count == 1 ? parts[0] : MLX.concatenated(parts, axis: 0)
+        MLX.eval(out)
+        return out
+    }
+
+    /// One thread per row: unpack each bit and accumulate +-q[j]. Reads 96 B/row.
+    private static let bitScanKernel = MLXFast.metalKernel(
+        name: "omni_asym_bit_scan",
+        inputNames: ["codes", "qf", "nrows", "nwords"],
+        outputNames: ["out"],
+        source: """
+            uint row = thread_position_in_grid.x;
+            if (row >= (uint)nrows[0]) return;
+            uint w = (uint)nwords[0];
+            float acc = 0.0f;
+            for (uint k = 0; k < w; ++k) {
+                uint bits = codes[row * w + k];
+                uint base = k * 32u;
+                for (uint b = 0; b < 32u; ++b) {
+                    float qv = qf[base + b];
+                    acc += ((bits >> b) & 1u) ? qv : -qv;
+                }
+            }
+            out[row] = acc;
+            """)
+
+    /// Coarse scores for every base row from the packed sign codes. Same shape and meaning as the
+    /// quantizedMM path it replaces: larger is better, and the exact rerank fixes the order after.
+    private func bitScanLocked(_ codes: MLXArray, query: [Float], rows n: Int) -> MLXArray {
+        let qr = rotateForBitsLocked(MLXArray(query, [1, dim])).reshaped([dim])
+        let out = Self.bitScanKernel(
+            [codes, qr, MLXArray([Int32(n)]), MLXArray([Int32(bitWords)])],
+            grid: (n, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[n]], outputDTypes: [DType.float32])
+        return out[0]
+    }
+
     private func quantizeRowsLocked(_ range: Range<Int>, bits: Int) -> (wqs: [MLXArray], scs: [MLXArray], bss: [MLXArray]) {
         // Halved when rotating: the rotation runs in fp32, so the transient slab is 2x the bf16 one
         // and this pass already sizes that transient for the tightest machine the mode serves.
@@ -5023,7 +5215,24 @@ public final class VectorStore: @unchecked Sendable {
         // preserves row order. Anything else - structural dirty, mode flip, bits change, biases
         // arity mismatch - falls through to the full rebuild below, which stays byte-identical to
         // the historical behavior.
-        if bits > 0, bits == quantBits, let qb = quantBase, !baseDirty,
+        // Same incremental shape for the sign-code tier: a row's code depends only on that row, so
+        // packing the delta and concatenating is bit-identical to repacking everything. Without this
+        // every fold repacks the whole index, which is both slow and observably different from a
+        // full rebuild (testIncrementalFoldBitIdenticalToFullRebuild catches exactly that).
+        if bits == 1, quantBits == 1, let bb = bitBase, !baseDirty,
+           rowCount > baseRows, flat16.count >= rowCount * dim,
+           let add = packSignBitsLocked(baseRows ..< rowCount) {
+            let deltaRows = rowCount - baseRows
+            let merged = MLX.concatenated([bb, add], axis: 0)
+            MLX.eval(merged)
+            bitBase = merged
+            baseRows = rowCount
+            ensureVecScratchLocked()
+            quantReplicaChangedLocked()
+            if let tR { print(String(format: "[search] FOLD(1bit) delta=%d rows=%d %.1fms", deltaRows, rowCount, -tR.timeIntervalSinceNow * 1000)) }
+            return
+        }
+        if bits > 0, bits != 1, bits == quantBits, let qb = quantBase, !baseDirty,
            rowCount > baseRows, dim % Self.quantGroup == 0, flat16.count >= rowCount * dim {
             let deltaRows = rowCount - baseRows
             let (wqs, scs, bss) = quantizeRowsLocked(baseRows ..< rowCount, bits: bits)
@@ -5056,7 +5265,16 @@ public final class VectorStore: @unchecked Sendable {
         mlxModified = nil
         mlxModifiedRows = 0
         quantBase = nil
-        if bits > 0, dim % Self.quantGroup == 0 {
+        bitBase = nil
+        if bits == 1, dim % 32 == 0, Self.hadamardCompatible(dim) {
+            bitBase = packSignBitsLocked(0 ..< rowCount)
+            if bitBase != nil {
+                quantBits = 1
+                ensureVecScratchLocked()   // the exact rerank still reads bf16 out of the mapping
+                quantReplicaChangedLocked()
+            }
+        }
+        if bitBase == nil, bits > 0, bits != 1, dim % Self.quantGroup == 0 {
             let (wqs, scs, bss) = quantizeRowsLocked(0 ..< rowCount, bits: bits)
             let wq = wqs.count == 1 ? wqs[0] : MLX.concatenated(wqs, axis: 0)
             let sc = scs.count == 1 ? scs[0] : MLX.concatenated(scs, axis: 0)
@@ -5074,7 +5292,7 @@ public final class VectorStore: @unchecked Sendable {
             // resumes automatically if the mapping ever fails.
             ensureVecScratchLocked()
             quantReplicaChangedLocked()
-        } else {
+        } else if bitBase == nil {
             flat16.withUnsafeBytes { raw in
                 let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!),
                                 count: byteCount, deallocator: .none)
@@ -5896,6 +6114,24 @@ public final class VectorStore: @unchecked Sendable {
     /// historical path) in bf16 mode - its rebuild is a cheap host copy - or when the base is
     /// already dirty.
     private func compactQuantBaseLocked(_ baseSurvivors: [Int32]?) -> Bool {
+        // Sign codes gather exactly the same way - one row of codes per row of vectors - so a
+        // compaction keeps the 1-bit replica live instead of dropping it and forcing a full repack
+        // on the next search. Without this branch a delete left the tier with no base to refresh
+        // and close() persisted nothing.
+        if quantBits == 1, let bb = bitBase, !baseDirty, let survivors = baseSurvivors {
+            guard !survivors.isEmpty else {
+                bitBase = nil; baseRows = 0; baseDirty = true
+                return false
+            }
+            let gathered = bb.take(MLXArray(survivors), axis: 0)
+            MLX.eval(gathered)
+            bitBase = gathered
+            baseRows = survivors.count
+            lastPersistedBaseRows = -1
+            replicaLaunchPersistScheduled = false
+            if Self.searchTiming { print("[search] GATHER 1-bit survivors=\(survivors.count)") }
+            return true
+        }
         guard let qb = quantBase, !baseDirty, quantBits > 0, let survivors = baseSurvivors else { return false }
         guard !survivors.isEmpty else {
             // Every base row was removed; drop the replica and let the next search rebuild over
