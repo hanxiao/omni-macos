@@ -1737,7 +1737,7 @@ public final class VectorStore: @unchecked Sendable {
             // result nothing can persist, and it used to happen on every repeat close() because the
             // only `closed` check sat three lines below.
             guard !closed else { return }
-            stampVectorCoverageLocked(budget: Self.coverageSliceOnClose)   // smaller slice: a quit must not stall
+            stampVectorCoverageLocked(budget: Self.coverageSliceOnClose, reclaim: false)   // a quit must not stall
             stampRowSidecarLocked(sync: true)       // durable row table; no-op if current
             persistQuantReplicaLocked(sync: true)   // durable before the handle goes away; no-op if current
             flat16.releaseFileLock()                // successor stores may now adopt the vec sidecar
@@ -4578,6 +4578,9 @@ public final class VectorStore: @unchecked Sendable {
     nonisolated(unsafe) static var idleFold = ProcessInfo.processInfo.environment["OMNI_IDLE_FOLD"] != "0"
     private var rowSidecarURL: URL { dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".rows") }
     private var vecSidecarURL: URL { dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".vecs") }
+    /// The compacted copy, before it becomes the vector file. Named beside it so the switch is a
+    /// same-directory rename, which is the only kind POSIX promises is atomic.
+    private var vecCompactURL: URL { dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".vecs.new") }
     private var lastStampedGen: Int64 = -1
     private var stampToken: UInt64 = 0
 
@@ -4622,6 +4625,67 @@ public final class VectorStore: @unchecked Sendable {
     /// as one - the app indexes continuously, so a few rows are almost always uncovered and a
     /// progress row keyed on "coverage < rows" sits at 99% forever.
     private static let migratedKey = "vecs_migrated"
+    // MARK: - RECLAIMING THE SLOTS TOMBSTONES HOLD
+    //
+    // A tombstone keeps its slot in the vector file - that is the whole point, it is what makes a
+    // delete cost nothing - and until now nothing ever took those slots back. Every deleted or
+    // re-embedded chunk left dim*2 bytes stranded, so a churning index grew a hole per edit and
+    // neither the file nor the row table ever shrank. Measured on a real index after days of use:
+    // 96,256 holes against 4.53M live rows, 2.1% and rising.
+    //
+    // The obvious fix is the wrong one. compactRowsLocked moves vectors WITHIN the file, which
+    // falsifies the claim describing them, so it first writes every cleared blob back into SQLite -
+    // 91 seconds on the real index, for something that is supposed to be maintenance.
+    //
+    // So this compacts without the restore, by never mutating the live file at all: the live rows
+    // are copied into a second file and the switch is a rename(2). The claim and the file are two
+    // objects that must change together, and a rename is the only operation available that flips
+    // one of them atomically - so it is made the commit point, with a marker in `meta` recording
+    // the intent on either side of it:
+    //
+    //   write .vecs.new (live rows only), fsync
+    //   commit  vecs_compact_pending = N        <- intent durable, nothing observable has changed
+    //   rename .vecs.new -> .vecs, fsync dir    <- THE COMMIT POINT
+    //   commit  covered = N, holes = {}, marker gone
+    //
+    // Recovery reads the marker and asks ONE question: does .vecs.new still exist? It exists
+    // exactly until the rename completes, so its presence is the state bit and it flips WITH the
+    // file content rather than after it:
+    //
+    //   marker + .vecs.new present -> the rename did not happen. Delete the copy, drop the marker;
+    //                                 the old file and the old claim still describe each other.
+    //   marker + .vecs.new gone    -> the rename happened. Adopt N as the claim, empty the hole
+    //                                 list, drop the marker; the new file is what is on disk.
+    //
+    // Deciding that backwards is not a subtle bug - it makes every row after the first hole return
+    // its neighbour's vector - so both directions are tested, and the test is verified to fail when
+    // the decision is inverted.
+    //
+    // Only runs once coverage has caught up (covered == rows), which is the steady state at idle.
+    // That is not a convenience: it means every live row's blob is already cleared, so the switch
+    // needs no UPDATE over the chunk table at all, just two small writes to `meta`.
+    private static let compactPendingKey = "vecs_compact_pending"
+    /// Reclaim once the holes are worth the copy - which is what the threshold really chooses: the
+    /// copy rewrites the whole live file whatever it reclaims, so a low threshold spends gigabytes
+    /// of writes on megabytes of space. Measured on the shipped 4.5M-row index: 4.8s to rewrite
+    /// 6.96 GB, with searches during it seeing p50 11 ms and max 64 ms because the copy yields the
+    /// queue between chunks. At 10% that is a 7 GB rewrite roughly every ten days of heavy churn -
+    /// ~365 GB/year, a rounding error against any SSD's endurance - and it bounds what a user can
+    /// ever see wasted at a tenth of their vector file. OMNI_HOLE_RECLAIM sets it, 0 disables.
+    nonisolated(unsafe) public static var holeReclaimFractionOverride: Double? = nil
+    static var holeReclaimFraction: Double {
+        holeReclaimFractionOverride
+            ?? ProcessInfo.processInfo.environment["OMNI_HOLE_RECLAIM"].flatMap(Double.init) ?? 0.10
+    }
+    /// And never for a handful of rows, whatever the fraction says: the copy has a fixed cost.
+    nonisolated(unsafe) public static var holeReclaimFloorOverride: Int? = nil
+    static var holeReclaimFloor: Int {
+        holeReclaimFloorOverride
+            ?? ProcessInfo.processInfo.environment["OMNI_HOLE_RECLAIM_FLOOR"].flatMap(Int.init) ?? 20_000
+    }
+    /// TEST ONLY: stop after a named step, leaving the on-disk state a crash there would leave.
+    /// "marker" = after the marker commit, before the rename. "rename" = after it, before the claim.
+    nonisolated(unsafe) public static var compactStopAfter: String? = nil
     /// OMNI_VEC_COVERAGE=0 keeps every blob, which is the pre-migration behaviour exactly. The
     /// escape hatch for a user who hits trouble: coverage stops advancing, nothing already cleared
     /// is lost (the file still holds it), and the index keeps working.
@@ -4667,7 +4731,11 @@ public final class VectorStore: @unchecked Sendable {
     /// Fixed cadence, immune to mutations: the migration's work is incremental and safe to do while
     /// indexing, so it must not wait for the index to go quiet.
     private func scheduleCoverageStampLocked(after delay: TimeInterval = coverageIdleGap) {
-        guard Self.vecCoverage, Self.rowSidecarEnabled, coveredRows < rows.count else { return }
+        // Also while there are slots worth taking back: once coverage has caught up this was the
+        // only thing still scheduling a stamp, so without the second clause the reclaim would have
+        // had no timer to run on at all.
+        guard Self.vecCoverage, Self.rowSidecarEnabled,
+              coveredRows < rows.count || shouldReclaimHolesLocked() else { return }
         coverageToken += 1
         let token = coverageToken
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) { [weak self] in
@@ -5092,9 +5160,216 @@ public final class VectorStore: @unchecked Sendable {
     /// time - which is the common case for a session that only searches. Coverage was wired behind
     /// that guard and so never advanced without a mutation: an index migrated one slice and then
     /// stopped forever. Migration has to make progress on ordinary launches, not only on busy ones.
-    private func stampVectorCoverageLocked(budget: Int = VectorStore.coverageSlice) {
-        guard Self.vecCoverage, Self.rowSidecarEnabled, dbOpen(),
-              dim > 0, !rows.isEmpty, coveredRows < rows.count else { return }
+    /// Test entry point: run the reclaim now rather than waiting for the idle stamp.
+    @discardableResult
+    public func reclaimVectorHolesForTest() -> Bool { reclaimVectorHoles() }
+
+    /// Are the holes worth a copy of the live file?
+    private func shouldReclaimHolesLocked() -> Bool {
+        guard Self.vecCoverage, Self.holeReclaimFraction > 0, dbOpen(), dim > 0, !rows.isEmpty,
+              flat16.isPersistent, flat16.count == rows.count * dim,
+              // Only with coverage caught up: then every live row's blob is already cleared, so the
+              // switch is two writes to `meta` instead of an UPDATE over millions of rows.
+              coveredRows == rows.count, vecHoles.count == deadRows.count, !vecHoles.isEmpty
+        else { return false }
+        let threshold = Swift.max(Self.holeReclaimFloor, Int(Double(rows.count) * Self.holeReclaimFraction))
+        return vecHoles.count >= threshold
+    }
+
+    /// One chunk of the copy, under the queue: verify nothing has moved, then write it.
+    ///
+    /// The mapping's base pointer is re-taken every time rather than captured once - a mutation can
+    /// remap or grow it, and a stale pointer would be read, not rejected.
+    private func writeVectorChunkLocked(_ fh: FileHandle, srcOffset: Int, length: Int, gen: Int64) -> Bool {
+        guard mutationGen == gen else { return false }   // the plan describes rows that have moved
+        var ok = true
+        flat16.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress, srcOffset >= 0, srcOffset + length <= raw.count else { ok = false; return }
+            let d = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: base.advanced(by: srcOffset)),
+                         count: length, deallocator: .none)
+            do { try fh.write(contentsOf: d) } catch {
+                ok = false
+                FileHandle.standardError.write(Data(
+                    "[omni] slot reclaim: write failed at \(srcOffset)+\(length): \(error)\n".utf8))
+            }
+        }
+        return ok
+    }
+
+    /// Take back the slots the tombstones hold. See the note on compactPendingKey for the protocol.
+    ///
+    /// RUNS OFF THE QUEUE, one chunk of the copy per turn. Holding the queue for the whole copy was
+    /// measured at 5.6s warm and 22.9s with the page cache cold, and the queue is what a search
+    /// waits on - so an idle-time reclaim could have met a user returning to the app with a
+    /// twenty-second stall. The queue is serial, so releasing it between chunks IS the yield: any
+    /// waiting search runs in the gap, and the worst a query can wait is one 64 MB chunk.
+    ///
+    /// Preemption is free because nothing durable changes until the marker: a plan that goes stale
+    /// (any mutation at all, checked by generation) just drops the copy and tries again next time.
+    @discardableResult
+    public func reclaimVectorHoles() -> Bool {
+        // PHASE 1 - the plan, under the queue.
+        struct Plan { var writes: [(off: Int, len: Int)]; var newCount: Int; var deadCount: Int; var gen: Int64 }
+        let plan: Plan? = queue.sync {
+            guard shouldReclaimHolesLocked() else { return nil }
+            let dead = deadRows
+            let bytesPerRow = dim * MemoryLayout<UInt16>.size
+            let chunkBytes = 64 << 20   // one write(2) cannot exceed INT_MAX on Darwin anyway
+            var writes: [(off: Int, len: Int)] = []
+            var newCount = 0
+            var runStart = -1, runLen = 0
+            func flushRun() {
+                guard runStart >= 0, runLen > 0 else { return }
+                var written = 0
+                let total = runLen * bytesPerRow
+                while written < total {
+                    let n = Swift.min(chunkBytes, total - written)
+                    writes.append((runStart * bytesPerRow + written, n))
+                    written += n
+                }
+                runStart = -1; runLen = 0
+            }
+            for i in 0 ..< rows.count {
+                if dead.contains(Int32(i)) { flushRun(); continue }
+                if runStart < 0 { runStart = i }
+                runLen += 1
+                newCount += 1
+            }
+            flushRun()
+            guard newCount > 0, newCount < rows.count else { return nil }
+            // The row sidecar describes the OLD layout, tombstones and all, and it is adopted in
+            // preference to everything else at open. Deleting it now means no crash from here on can
+            // leave a cache that would map the new file with the old row count - which would read
+            // every vector after the first hole from the wrong place. It is a cache; losing it
+            // costs one load from coverage.
+            removeRowSidecarFiles(keepVectors: true)
+            return Plan(writes: writes, newCount: newCount, deadCount: dead.count, gen: mutationGen)
+        }
+        guard let plan else { return false }
+        let t0 = Date()
+
+        // PHASE 2 - the copy, one chunk per queue turn.
+        let fm = FileManager.default
+        try? fm.removeItem(at: vecCompactURL)
+        guard fm.createFile(atPath: vecCompactURL.path, contents: nil),
+              let fh = FileHandle(forWritingAtPath: vecCompactURL.path) else { return false }
+        var ok = true
+        for w in plan.writes {
+            ok = queue.sync { writeVectorChunkLocked(fh, srcOffset: w.off, length: w.len, gen: plan.gen) }
+            if !ok { break }
+        }
+        // Durable BEFORE the marker says it exists, so "marker present" can never mean "half a file".
+        if ok, fsync(fh.fileDescriptor) != 0 {
+            FileHandle.standardError.write(Data("[omni] slot reclaim: fsync failed errno \(errno)\n".utf8))
+            ok = false
+        }
+        try? fh.close()
+        guard ok else {
+            try? fm.removeItem(at: vecCompactURL)   // nothing durable changed; next idle tries again
+            return false
+        }
+
+        // PHASE 3 - the switch. Short, and one turn of the queue.
+        return queue.sync { commitReclaimLocked(plan.newCount, deadCount: plan.deadCount, gen: plan.gen, since: t0) }
+    }
+
+    private func commitReclaimLocked(_ newCount: Int, deadCount: Int, gen: Int64, since t0: Date) -> Bool {
+        // A mutation during the copy invalidates the plan: the file describes rows that have moved.
+        guard mutationGen == gen else {
+            try? FileManager.default.removeItem(at: vecCompactURL)
+            return false
+        }
+        guard execChecked("BEGIN;"),
+              execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.compactPendingKey)','\(newCount)');"),
+              execChecked("COMMIT;")
+        else {
+            exec("ROLLBACK;")
+            try? FileManager.default.removeItem(at: vecCompactURL)
+            return false
+        }
+        if Self.compactStopAfter == "marker" { return false }   // TEST: crash before the rename
+
+        // THE COMMIT POINT. Drop our mapping first - it holds the flock on the file about to be
+        // replaced - and rebuild from the claim afterwards, which is what a launch does anyway.
+        flat16.releaseAll()
+        guard rename(vecCompactURL.path, vecSidecarURL.path) == 0 else {
+            FileHandle.standardError.write(Data("[omni] slot reclaim: rename failed, index unchanged\n".utf8))
+            exec("DELETE FROM meta WHERE key = '\(Self.compactPendingKey)';")
+            try? FileManager.default.removeItem(at: vecCompactURL)
+            loadIntoMemory()   // the mapping is gone; the claim still holds, so rebuild from it
+            return false
+        }
+        // A rename is atomic but not durable by itself: without this the directory entry can still
+        // be the old one after a power loss while the claim below says otherwise.
+        let dirFD = open(dbURL.deletingLastPathComponent().path, O_RDONLY)
+        if dirFD >= 0 { fsync(dirFD); Darwin.close(dirFD) }
+        if Self.compactStopAfter == "rename" { return false }   // TEST: crash before the claim
+
+        guard execChecked("BEGIN;"),
+              execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.coveredRowsKey)','\(newCount)');"),
+              execChecked("DELETE FROM vec_holes;"),
+              execChecked("DELETE FROM meta WHERE key = '\(Self.compactPendingKey)';"),
+              execChecked("COMMIT;")
+        else {
+            // The file is already the compacted one, so the claim MUST follow it. Leaving the marker
+            // in place is what makes the next open finish the job instead of guessing.
+            exec("ROLLBACK;")
+            loadIntoMemory()
+            return false
+        }
+        coveredRows = newCount
+        vecHoles.removeAll()
+
+        // Rebuild the resident state from what is now on disk. The compacted file is exactly the
+        // live rows in order, which is what loading from the claim expects - so this is the same
+        // path a launch takes rather than a special case.
+        loadIntoMemory()
+        let reclaimed = Int64(deadCount) * Int64(dim * MemoryLayout<UInt16>.size)
+        FileHandle.standardError.write(Data(String(format:
+            "[omni] reclaimed %d vector slots (%.1f MB) in %.1fs; rows %d -> %d\n",
+            deadCount, Double(reclaimed) / 1_048_576, -t0.timeIntervalSinceNow,
+            newCount + deadCount, rows.count).utf8))
+        return true
+    }
+
+    /// Finish or abandon a reclaim that a crash interrupted. Called at open, before anything reads
+    /// the claim. One file test decides it - see the note on compactPendingKey.
+    private func resumeVectorCompactionLocked() {
+        guard dbOpen() else { return }
+        let pending = scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.compactPendingKey)'")
+        guard pending > 0 else { return }
+        if FileManager.default.fileExists(atPath: vecCompactURL.path) {
+            // The rename never happened: the vector file and the claim still describe each other.
+            try? FileManager.default.removeItem(at: vecCompactURL)
+            exec("DELETE FROM meta WHERE key = '\(Self.compactPendingKey)';")
+            FileHandle.standardError.write(Data("[omni] abandoned an interrupted slot reclaim; index unchanged\n".utf8))
+            return
+        }
+        // The rename happened, so the file on disk IS the compacted one and the claim has to catch
+        // up with it. Nothing can have mutated the table in between - the crash stopped everything.
+        exec("BEGIN;")
+        exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.coveredRowsKey)','\(pending)');")
+        exec("DELETE FROM vec_holes;")
+        exec("DELETE FROM meta WHERE key = '\(Self.compactPendingKey)';")
+        exec("COMMIT;")
+        removeRowSidecarFiles(keepVectors: true)
+        FileHandle.standardError.write(Data("[omni] finished an interrupted slot reclaim at \(pending) rows\n".utf8))
+    }
+
+    /// `reclaim` is false on the close path: taking the tombstoned slots back copies the live
+    /// vector file, and a quit must not wait for that.
+    private func stampVectorCoverageLocked(budget: Int = VectorStore.coverageSlice, reclaim: Bool = true) {
+        guard Self.vecCoverage, Self.rowSidecarEnabled, dbOpen(), dim > 0, !rows.isEmpty else { return }
+        // COVERAGE CAUGHT UP is the steady state, and it is where the other half of the work lives:
+        // the slots the tombstones hold. Checked here rather than on a timer of its own because
+        // "writes have gone quiet" is exactly the condition it needs, and this is what runs then.
+        guard coveredRows < rows.count else {
+            // Off the queue: the reclaim takes it one chunk at a time, and this call is holding it.
+            if reclaim, !searchRecentlyActiveLocked(), shouldReclaimHolesLocked() {
+                DispatchQueue.global(qos: .utility).async { [weak self] in self?.reclaimVectorHoles() }
+            }
+            return
+        }
         // RE-ARM WHATEVER HAPPENS BELOW. One slice per stamp only migrates an index if stamps keep
         // arriving, and a quiet app produces none - so the migration drives itself from here rather
         // than waiting for the user to edit a file or quit. The re-arm used to sit after the work,
@@ -6824,6 +7099,9 @@ public final class VectorStore: @unchecked Sendable {
         // What the last stamp claimed about the vector file. Read BEFORE the adopt attempt so the
         // adopt path can inherit a still-valid claim, and so the scan path below can see that it is
         // about to invalidate one.
+        // BEFORE the claim is read: an interrupted reclaim leaves the claim and the file describing
+        // different things, and this is what makes them agree again.
+        resumeVectorCompactionLocked()
         loadCoverageLocked()
         if tryAdoptRowSidecarLocked() {
             // Arm the coverage stamp HERE too. It used to be armed only at the end of the scan path
