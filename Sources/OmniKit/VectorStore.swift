@@ -3047,9 +3047,49 @@ public final class VectorStore: @unchecked Sendable {
             let qv = MLXArray(query, [dim, 1]).asType(.bfloat16)
             // Full mode: exact bf16 scores. Quant mode: COARSE scores from the 4-bit replica
             // (x @ w.T via quantizedMM wants x as [1, dim]); exact rerank happens below.
+            // SHARED between the coarse tiers. It used to live inside the affine branch, so the
+            // 1-bit tier fell straight past it to the host reducer - reading back and scanning all
+            // 4.5M scores per query (measured 15.5ms score + 8.6ms reduce) instead of selecting
+            // top-C on the GPU. Same funnel, whichever tier produced the coarse scores.
+            func coarseFastPathLocked(_ baseScore: MLXArray) -> [SearchHit]? {
+            let C = min(baseRows, Self.candidateCount(topK: topK))
+            // `since` is the one filter that cannot be masked here - it needs per-row
+            // `modified`, which is not resident - so it keeps the host path. Everything else
+            // (kind via the kind code, folder/ext/tag via the per-file path table) becomes a
+            // GPU mask, and the query then takes the same candidate selection a plain one does.
+            let pathFilter = filter.folderPrefix != nil || (filter.ext?.isEmpty == false)
+                || filter.tagAllow != nil || filter.tagDeny != nil
+            // The mask itself decides whether this path is usable, rather than a separate
+            // predicate that could disagree with it. FAILING CLOSED MATTERS: a filter with a
+            // clause the mask could not express must fall to the host reducer, because an
+            // unmasked candidate selection would pick the GLOBAL top-C and silently drop every
+            // in-scope match outside it - the `offer` re-check keeps such results sound, so the
+            // loss would show up as missing results and nothing else.
+            let needsMask = !filter.kinds.isEmpty || pathFilter || filter.since != nil
+            let selectMask = needsMask ? selectMaskLocked(filter, pathFilter: pathFilter) : nil
+            let maskable = !needsMask || selectMask != nil
+            if maskable, baseRows > C {
+                // ONE `which` against the cached combined mask, not one per filter clause with
+                // its gathers rebuilt on every keystroke.
+                var selectScore = baseScore
+                if let selectMask {
+                    selectScore = MLX.which(selectMask.reshaped(baseScore.shape) .> 0.5,
+                                            selectScore, MLXArray(-Float.infinity))
+                }
+                let result = fillSnippetsLocked(searchCandidatesLocked(
+                    coarse: selectScore, qv: qv, n: n, candidateCount: C, query: query,
+                    topK: topK, filter: filter))
+                if let t0 {
+                    print(String(format: "[search] n=%d gpu-candidate path total=%.1fms", n, -t0.timeIntervalSinceNow * 1000))
+                }
+                return result
+            }
+                return nil
+            }
             let baseScore: MLXArray
             if quantBits == 1, let bb = bitBase {
                 baseScore = maskDeadLocked(bitScanLocked(bb, query: query, rows: baseRows))
+                if let r = coarseFastPathLocked(baseScore) { return r }
             } else if let qb = quantBase {
                 // The replica is stored rotated when the preconditioner is on, so the query must be
                 // rotated by the SAME orthogonal R to score against it. `qv` stays unrotated - every
@@ -3077,38 +3117,7 @@ public final class VectorStore: @unchecked Sendable {
                 // with it, so a match outside the global top-C cannot be lost. Same technique
                 // reduceTopKGPULocked already uses, and a file is exactly one kind so a per-row
                 // mask is a per-file mask.
-                let C = min(baseRows, Self.candidateCount(topK: topK))
-                // `since` is the one filter that cannot be masked here - it needs per-row
-                // `modified`, which is not resident - so it keeps the host path. Everything else
-                // (kind via the kind code, folder/ext/tag via the per-file path table) becomes a
-                // GPU mask, and the query then takes the same candidate selection a plain one does.
-                let pathFilter = filter.folderPrefix != nil || (filter.ext?.isEmpty == false)
-                    || filter.tagAllow != nil || filter.tagDeny != nil
-                // The mask itself decides whether this path is usable, rather than a separate
-                // predicate that could disagree with it. FAILING CLOSED MATTERS: a filter with a
-                // clause the mask could not express must fall to the host reducer, because an
-                // unmasked candidate selection would pick the GLOBAL top-C and silently drop every
-                // in-scope match outside it - the `offer` re-check keeps such results sound, so the
-                // loss would show up as missing results and nothing else.
-                let needsMask = !filter.kinds.isEmpty || pathFilter || filter.since != nil
-                let selectMask = needsMask ? selectMaskLocked(filter, pathFilter: pathFilter) : nil
-                let maskable = !needsMask || selectMask != nil
-                if maskable, baseRows > C {
-                    // ONE `which` against the cached combined mask, not one per filter clause with
-                    // its gathers rebuilt on every keystroke.
-                    var selectScore = baseScore
-                    if let selectMask {
-                        selectScore = MLX.which(selectMask.reshaped(baseScore.shape) .> 0.5,
-                                                selectScore, MLXArray(-Float.infinity))
-                    }
-                    let result = fillSnippetsLocked(searchCandidatesLocked(
-                        coarse: selectScore, qv: qv, n: n, candidateCount: C, query: query,
-                        topK: topK, filter: filter))
-                    if let t0 {
-                        print(String(format: "[search] n=%d gpu-candidate path total=%.1fms", n, -t0.timeIntervalSinceNow * 1000))
-                    }
-                    return result
-                }
+                if let r = coarseFastPathLocked(baseScore) { return r }
             } else {
                 baseScore = maskDeadLocked(gemvSafe(mlxBase!, qv, rows: baseRows))
                 // PLAIN-QUERY FAST PATH (full mode): best-chunk-per-file reduction ON the GPU.
@@ -4287,22 +4296,19 @@ public final class VectorStore: @unchecked Sendable {
             biT = t
         }
         guard (try? fh.seek(toOffset: UInt64(nl - headChunk.startIndex + 1))) != nil else { reject(); return }
-        guard let wqData = try? fh.read(upToCount: header.wqBytes), wqData.count == header.wqBytes,
-              Self.blobChecksum(wqData) == header.wqSum,
-              let scData = try? fh.read(upToCount: header.scBytes), scData.count == header.scBytes,
-              Self.blobChecksum(scData) == header.scSum
-        else { reject(); return }
-        var biArr: MLXArray? = nil
-        if let biT, let biShape = header.biShape, let biBytes = header.biBytes {
-            guard let biData = try? fh.read(upToCount: biBytes), biData.count == biBytes,
-                  Self.blobChecksum(biData) == header.biSum else { reject(); return }
-            biArr = MLXArray(biData, biShape, dtype: biT.dtype)
-        }
-        if header.bits == 1 {
-            // Sign codes: [rows, dim/32] uint32 in the wq slot, nothing in the others.
+        // BIT TIER FIRST, before anything reads the scales/biases sections - it does not have any.
+        // scBytes is 0, and FileHandle.read(upToCount: 0) at EOF returns nil rather than empty
+        // Data, so the shared read below fails its guard and REJECTS - which deletes the replica.
+        // That is what made the tier silently repack its whole base on every single launch.
+        if isBitTier {
             guard header.wqShape.count == 2, header.wqShape[0] == header.rows,
-                  header.wqShape[1] == header.dim / 32, wqT.dtype == .uint32 else { reject(); return }
-            let codes = MLXArray(wqData, header.wqShape, dtype: .uint32)
+                  header.wqShape[1] == header.dim / 32, wqT.dtype == .uint32,
+                  let codeData = try? fh.read(upToCount: header.wqBytes), codeData.count == header.wqBytes,
+                  // Same content check the affine path applies. Without it a corrupted replica is
+                  // adopted and every coarse score is silently wrong (testCorruptReplicaBlobRejected).
+                  Self.blobChecksum(codeData) == header.wqSum
+            else { reject(); return }
+            let codes = MLXArray(codeData, header.wqShape, dtype: .uint32)
             MLX.eval(codes)
             bitBase = codes
             quantBase = nil
@@ -4313,6 +4319,17 @@ public final class VectorStore: @unchecked Sendable {
             if Self.searchTiming { print("[search] ADOPT 1-bit replica rows=\(header.rows)") }
             if header.bits != bits { scheduleWidthUpgradeLocked() }
             return
+        }
+        guard let wqData = try? fh.read(upToCount: header.wqBytes), wqData.count == header.wqBytes,
+              Self.blobChecksum(wqData) == header.wqSum,
+              let scData = try? fh.read(upToCount: header.scBytes), scData.count == header.scBytes,
+              Self.blobChecksum(scData) == header.scSum
+        else { reject(); return }
+        var biArr: MLXArray? = nil
+        if let biT, let biShape = header.biShape, let biBytes = header.biBytes {
+            guard let biData = try? fh.read(upToCount: biBytes), biData.count == biBytes,
+                  Self.blobChecksum(biData) == header.biSum else { reject(); return }
+            biArr = MLXArray(biData, biShape, dtype: biT.dtype)
         }
         let wq = MLXArray(wqData, header.wqShape, dtype: wqT.dtype)
         let sc = MLXArray(scData, header.scShape, dtype: scT.dtype)
@@ -5158,10 +5175,85 @@ public final class VectorStore: @unchecked Sendable {
             out[row] = acc;
             """)
 
+    // BIT-PLANE QUERY DECOMPOSITION. The unpack kernel above is ALU-bound, not bandwidth-bound:
+    // 301 GB/s against the 422 GB/s the same bytes reach with popcounts, because it does 768
+    // unpack-and-add steps per row where a popcount kernel does 24. The fix is not to binarize the
+    // query (that costs ~7 points of top10) but to QUANTIZE it to B bits and split it into planes.
+    //
+    // With s_j in {-1,+1}, code bit c_j = [s_j == +1], and q_j ~= a + d * sum_b 2^b p_bj:
+    //
+    //   s.q = a * (2 popcount(c) - dim) + d * SUM_b 2^b (2 popcount(c & p_b) - popcount(p_b))
+    //
+    // Every term is a popcount. Per row that is (1 + B) * words popcounts - 120 at B=4, dim 768 -
+    // instead of 768 unpacks, and the planes themselves are 384 bytes that stay in cache. The
+    // row-independent part is folded into one scalar so the kernel adds it once.
+    private static let bitPlanes = ProcessInfo.processInfo.environment["OMNI_BIT_PLANES"].flatMap(Int.init) ?? 4
+
+    private static let bitPlaneKernel = MLXFast.metalKernel(
+        name: "omni_bitplane_scan",
+        inputNames: ["codes", "planes", "scal", "dims"],
+        outputNames: ["out"],
+        source: """
+            uint row = thread_position_in_grid.x;
+            if (row >= (uint)dims[0]) return;
+            uint w = (uint)dims[1];
+            uint B = (uint)dims[2];
+            uint pcCode = 0;
+            float weighted = 0.0f;
+            for (uint k = 0; k < w; ++k) {
+                uint c = codes[row * w + k];
+                pcCode += popcount(c);
+                float planeAcc = 0.0f;
+                for (uint b = 0; b < B; ++b) {
+                    planeAcc += (float)(1u << b) * (float)popcount(c & planes[b * w + k]);
+                }
+                weighted += planeAcc;
+            }
+            // scal[0] = a, scal[1] = d, scal[2] = the row-independent remainder.
+            out[row] = 2.0f * scal[0] * (float)pcCode + 2.0f * scal[1] * weighted + scal[2];
+            """)
+
+    /// Quantize the rotated query into `B` bit-planes plus the two scalars that reconstruct it.
+    /// Returns nil when the query is degenerate (all one value), where the plane form has no signal.
+    private func buildQueryPlanesLocked(_ qr: MLXArray, words: Int, planes B: Int) -> (planes: MLXArray, scalars: MLXArray)? {
+        let q = qr.asType(.float32).asArray(Float.self)
+        guard q.count == dim else { return nil }
+        let lo = q.min() ?? 0, hi = q.max() ?? 0
+        let levels = Float((1 << B) - 1)
+        let d = (hi - lo) / levels
+        guard d > 0, d.isFinite else { return nil }
+        var planeWords = [UInt32](repeating: 0, count: B * words)
+        var planePopcount = [Int](repeating: 0, count: B)
+        for j in 0 ..< dim {
+            // Round-to-nearest, clamped: the reconstruction error is what the exact rerank cleans up.
+            let v = Int(((q[j] - lo) / d).rounded())
+            let level = Swift.max(0, Swift.min(Int(levels), v))
+            for b in 0 ..< B where (level >> b) & 1 == 1 {
+                planeWords[b * words + j / 32] |= (UInt32(1) << UInt32(j % 32))
+                planePopcount[b] += 1
+            }
+        }
+        // Row-independent remainder: -(a*dim + d*SUM_b 2^b popcount(p_b)).
+        var rest = -lo * Float(dim)
+        for b in 0 ..< B { rest -= d * Float(1 << b) * Float(planePopcount[b]) }
+        let planesArr = MLXArray(planeWords, [B * words])
+        let scalars = MLXArray([lo, d, rest], [3])
+        MLX.eval(planesArr, scalars)
+        return (planesArr, scalars)
+    }
+
     /// Coarse scores for every base row from the packed sign codes. Same shape and meaning as the
     /// quantizedMM path it replaces: larger is better, and the exact rerank fixes the order after.
     private func bitScanLocked(_ codes: MLXArray, query: [Float], rows n: Int) -> MLXArray {
         let qr = rotateForBitsLocked(MLXArray(query, [1, dim])).reshaped([dim])
+        if Self.bitPlanes > 0, let qp = buildQueryPlanesLocked(qr, words: bitWords, planes: Self.bitPlanes) {
+            let out = Self.bitPlaneKernel(
+                [codes, qp.planes, qp.scalars,
+                 MLXArray([Int32(n), Int32(bitWords), Int32(Self.bitPlanes)])],
+                grid: (n, 1, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[n]], outputDTypes: [DType.float32])
+            return out[0]
+        }
         let out = Self.bitScanKernel(
             [codes, qr, MLXArray([Int32(n)]), MLXArray([Int32(bitWords)])],
             grid: (n, 1, 1), threadGroup: (256, 1, 1),
