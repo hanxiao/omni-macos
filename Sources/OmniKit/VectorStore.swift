@@ -1534,10 +1534,7 @@ public final class VectorStore: @unchecked Sendable {
         // It cost 573.5 MB on a 4.5M-row index - 17.6% of the whole database - plus a second B-tree
         // to maintain on every insert and delete. Dropped on open where present; the space comes
         // back with the next repack, which the drop arms.
-        if hasIndexLocked("idx_path") {
-            exec("DROP INDEX IF EXISTS idx_path;")
-            exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.vacuumPendingKey)','1');")
-        }
+        if hasIndexLocked("idx_path") { exec("DROP INDEX IF EXISTS idx_path;") }
         // Partial COVERING index for the tag: search filter - the term scan reads only media
         // rows' (kind, snippet, path) from ~MBs of index pages instead of dragging the whole
         // chunks B-tree (whose leaves carry the ~1.5KB vec blobs, gigabytes of I/O) through the
@@ -1595,7 +1592,7 @@ public final class VectorStore: @unchecked Sendable {
         // Legacy layout -> interned, before a single query runs against it. Verified against the
         // original inside its own transaction, so a failure leaves the old table in place and the
         // queries below keep working on it.
-        internLegacySchemaLocked()
+        // NOTE: the legacy conversion runs AFTER loadIntoMemory, below - see internLegacySchemaLocked.
         migrateScanKind()   // bumps the gen inside its txn when it rewrites kinds
         setUserVersion(Self.schemaVersion)
         // UNDER THE QUEUE, because init does NOT have exclusive access the way it looks like it
@@ -1610,6 +1607,13 @@ public final class VectorStore: @unchecked Sendable {
         // queue-serialized, which is what the rest of the class already assumes.
         queue.sync {
             loadIntoMemory()
+            // ONE PASS, and it has to be here rather than before the load. Converting first meant
+            // copying the table while the duplicate vectors were still in it: measured on a real
+            // 0.4.x index, 147s and a database that swelled to 18.56 GB holding two fat copies at
+            // once - for an index that ends at 1.5 GB. Loading first puts every vector in the
+            // mapped file, after which the same rewrite that interns the paths can drop the blobs
+            // as it goes, and the whole upgrade becomes a single short rewrite.
+            internLegacySchemaLocked()
             tryAdoptQuantReplicaLocked()   // every failure mode falls back to build-on-first-search
         }
     }
@@ -4837,8 +4841,9 @@ public final class VectorStore: @unchecked Sendable {
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
         guard sqlite3_prepare_v2(db, """
-            SELECT f.path, c.kind, c.chunk_index, c.dim, c.vec, c.modified, c.width, c.height, c.duration, c.locator, c.size
-            FROM chunks c JOIN files f ON f.id = c.file_id ORDER BY c.rowid;
+            \(legacyLayout
+              ? "SELECT path, kind, chunk_index, dim, vec, modified, width, height, duration, locator, size FROM chunks ORDER BY rowid"
+              : "SELECT f.path, c.kind, c.chunk_index, c.dim, c.vec, c.modified, c.width, c.height, c.duration, c.locator, c.size FROM chunks c JOIN files f ON f.id = c.file_id ORDER BY c.rowid");
             """, -1, &stmt, nil) == SQLITE_OK else { flat16.removeAll(); return false }
         var slot = 0
         var covered = 0
@@ -4978,18 +4983,10 @@ public final class VectorStore: @unchecked Sendable {
         }
         let justCompleted = target == rows.count
         coveredRows = target
-        // FIRST completion only. `justCompleted` is true whenever a slice catches up with the row
-        // table, which on a continuously-indexing app is often - and the repack is a whole-database
-        // rewrite. Without this gate, finishing the migration would arm a VACUUM every time coverage
-        // drew level with indexing.
-        let alreadyMigrated = scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.migratedKey)'") == 1
-        if justCompleted, !alreadyMigrated {
-            // Clearing a blob SHORTENS its row; it does not free a page. Measured on a migrated
-            // 4.5M-row index, freelist_count is 0 while 7.8 GB of the file is slack that only a
-            // repack can return - so the generic free-ratio gate in compact() never fires and the
-            // space would sit there forever. Record that a one-shot repack is owed instead.
-            exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.vacuumPendingKey)','1');")
-            exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.migratedKey)','1');")
+        // `justCompleted` is true whenever a slice draws level with the row table, which on a
+        // continuously-indexing app is often; finishMigrationIfDoneLocked is what makes the repack
+        // happen exactly once, and only when EVERY phase of the upgrade has finished.
+        if justCompleted, finishMigrationIfDoneLocked() {
             // And do it NOW, not at the next launch. The size a user watches does not move for the
             // whole migration - clearing a blob shortens its row without freeing a page, so 6.5 GB
             // can be gone from the rows with the file still its original size and the freelist still
@@ -5002,6 +4999,29 @@ public final class VectorStore: @unchecked Sendable {
                 if freed > 0, Self.searchTiming { print("[store] migration complete: reclaimed \(freed) bytes") }
             }
         }
+        return true
+    }
+
+    /// ONE MIGRATION, ONE REPACK. Upgrading from 0.4.x runs three conversions - the redundant index
+    /// dropped, paths interned, and the duplicate vectors removed a slice at a time - and each used
+    /// to arm its own repack. That meant VACUUMing the still-11 GB database right after the two
+    /// fast ones and again twenty minutes later when the slow one finished; the first pass rewrote
+    /// 11 GB to reclaim almost nothing, because the bytes it existed to return had not been freed
+    /// yet. Clearing a blob shortens its row without freeing a PAGE, so the space only becomes
+    /// reclaimable once every phase is done.
+    ///
+    /// No individual step arms anything now. This asks whether all of them are finished, and only
+    /// then records the migration complete and owes the single repack. Returns true the once.
+    @discardableResult
+    private func finishMigrationIfDoneLocked() -> Bool {
+        guard dbOpen(), !rows.isEmpty, dim > 0 else { return false }
+        guard scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.migratedKey)'") != 1 else { return false }
+        guard !hasColumnLocked("chunks", "path"),       // paths interned
+              !hasIndexLocked("idx_path"),              // redundant index gone
+              coveredRows >= rows.count                 // duplicate vectors removed
+        else { return false }
+        exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.migratedKey)','1');")
+        exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.vacuumPendingKey)','1');")
         return true
     }
 
@@ -6679,6 +6699,10 @@ public final class VectorStore: @unchecked Sendable {
         sqlite3_finalize(stmt)
     }
 
+    /// True while the index still carries a path per chunk. Only the load scan needs to know: it
+    /// runs before the conversion, and every other query runs after it.
+    private var legacyLayout: Bool { hasColumnLocked("chunks", "path") }
+
     private func loadIntoMemory() {
         rows.removeAll(); flat16.removeAll(); presentPaths.removeAll(); fileID.removeAll(); pathID.removeAll()
         resetTombstonesLocked()
@@ -6752,7 +6776,9 @@ public final class VectorStore: @unchecked Sendable {
         // is the invariant the persisted quant replica depends on: appends always take rowid
         // max+1 (inserted last), deletes preserve relative order on both sides. Free on a rowid
         // table (the scan already walks the B-tree in rowid order - no sort step).
-        if sqlite3_prepare_v2(db, "SELECT f.path, c.kind, c.chunk_index, c.dim, c.vec, c.modified, c.width, c.height, c.duration, c.locator, c.size FROM chunks c JOIN files f ON f.id = c.file_id ORDER BY c.rowid;", -1, &stmt, nil) == SQLITE_OK {
+        if sqlite3_prepare_v2(db, legacyLayout
+            ? "SELECT path, kind, chunk_index, dim, vec, modified, width, height, duration, locator, size FROM chunks ORDER BY rowid;"
+            : "SELECT f.path, c.kind, c.chunk_index, c.dim, c.vec, c.modified, c.width, c.height, c.duration, c.locator, c.size FROM chunks c JOIN files f ON f.id = c.file_id ORDER BY c.rowid;", -1, &stmt, nil) == SQLITE_OK {
             while sqlite3_step(stmt) == SQLITE_ROW {
                 if let onLoadProgress, total > 0, rows.count % 65536 == 0 {
                     onLoadProgress(Double(rows.count) / Double(total))
@@ -6843,13 +6869,22 @@ public final class VectorStore: @unchecked Sendable {
         guard dbOpen(), hasTableLocked("chunks") else { return }
         // The legacy table is the one with a `path` column; the interned one has `file_id`.
         guard hasColumnLocked("chunks", "path") else { return }
-        if internPathsLocked(allowUnloaded: true) != nil {
-            FileHandle.standardError.write(Data("[omni] index converted to interned paths\n".utf8))
+        // The vectors have to be in the FILE before their blobs can be dropped, and durably, since
+        // the rewrite below removes the only other copy. This is the same ordering the sliced
+        // coverage migration observes every time it advances - msync first, drop second - just
+        // done once for the whole index instead of a slice at a time.
+        let vectorsSafe = flat16.isPersistent && !rows.isEmpty && dim > 0
+            && flat16.count == rows.count * dim
+            && flat16.extendFileCoverage()
+        if vectorsSafe { flat16.msyncFile() }
+        if let freed = internPathsLocked(allowUnloaded: true, dropVectorBlobs: vectorsSafe) {
+            FileHandle.standardError.write(Data(
+                "[omni] storage upgraded: paths interned\(vectorsSafe ? ", duplicate vectors removed" : ""), \(freed) bytes to reclaim\n".utf8))
         }
     }
 
     @discardableResult
-    func internPathsLocked(allowUnloaded: Bool = false) -> Int64? {
+    func internPathsLocked(allowUnloaded: Bool = false, dropVectorBlobs: Bool = false) -> Int64? {
         guard dbOpen() else { return nil }
         // Legacy is decided by the CHUNKS table carrying a `path` column - NOT by `files` existing.
         // The schema step above creates `files` for fresh indexes before this runs, so keying on
@@ -6861,6 +6896,9 @@ public final class VectorStore: @unchecked Sendable {
         // store could not open, because that is exactly when its other invariants are unknown.
         guard allowUnloaded || (!rows.isEmpty && dim > 0) else { return nil }
         let before = onDiskBytes()
+        // x'' where the mapped file is already the authority: the same thing the sliced migration
+        // does, for every row at once, inside the rewrite that was going to touch each row anyway.
+        let vecExpr = dropVectorBlobs ? "x''" : "c.vec"
         guard execChecked("BEGIN IMMEDIATE;") else { return nil }
         let steps = [
             "CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);",
@@ -6880,7 +6918,7 @@ public final class VectorStore: @unchecked Sendable {
             """
             INSERT INTO chunks_v3(file_id, modified, size, kind, chunk_index, snippet, dim, vec,
                                   width, height, duration, locator, indexed_at, chunk_key)
-              SELECT f.id, c.modified, c.size, c.kind, c.chunk_index, c.snippet, c.dim, c.vec,
+              SELECT f.id, c.modified, c.size, c.kind, c.chunk_index, c.snippet, c.dim, \(vecExpr),
                      c.width, c.height, c.duration, c.locator, c.indexed_at, c.chunk_key
                 FROM chunks c JOIN files f ON f.path = c.path
                ORDER BY c.rowid;
@@ -6897,15 +6935,22 @@ public final class VectorStore: @unchecked Sendable {
             FileHandle.standardError.write(Data("[omni] path interning verification failed; index unchanged\n".utf8))
             return nil
         }
+        if dropVectorBlobs {
+            // Claimed here, with the drop, so the two can never disagree: every row is covered and
+            // no slot is a hole, because nothing has been deleted since the load that built the file.
+            exec("DELETE FROM vec_holes;")
+            exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.coveredRowsKey)','\(rows.count)');")
+        }
         guard execChecked("DROP TABLE chunks;"),
               execChecked("ALTER TABLE chunks_v3 RENAME TO chunks;"),
               execChecked("CREATE INDEX IF NOT EXISTS idx_media_snippet ON chunks(kind, snippet, file_id) WHERE kind IN ('image','scan','video');"),
-              execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.vacuumPendingKey)','1');"),
               execChecked("COMMIT;")
         else {
             exec("ROLLBACK;")
             return nil
         }
+        if dropVectorBlobs { coveredRows = rows.count; vecHoles.removeAll() }
+        finishMigrationIfDoneLocked()
         return before - onDiskBytes()
     }
 
