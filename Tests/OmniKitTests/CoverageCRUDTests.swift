@@ -240,6 +240,77 @@ final class CoverageCRUDTests: XCTestCase {
         }
     }
 
+    /// MUTATIONS WHILE THE MIGRATION IS RUNNING. This is the state a user is actually in for the
+    /// first few minutes: part of the index covered (blob cleared, the file is the only copy) and
+    /// part not (blob still present), with the boundary moving under them while they edit files.
+    ///
+    /// Three cases have to hold at once, and they are handled in three different places:
+    ///   - a row BELOW the watermark is deleted -> its slot must be recorded as a hole, inside the
+    ///     delete's own transaction
+    ///   - a row ABOVE it is deleted -> no hole, because that slot is not part of the durable claim
+    ///     yet, and its blob is still the authority
+    ///   - the watermark then advances PAST a row already tombstoned while uncovered -> that slot
+    ///     becomes a hole at the moment coverage reaches it, not before
+    /// The last one is the subtle one: nothing records it at delete time because it was not covered
+    /// then, so advanceCoverage has to notice it on the way past.
+    func testMutationsInterleavedWithAdvancingCoverage() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("crud-mid-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appendingPathComponent("test.sqlite")
+
+        // A small slice, so coverage genuinely creeps and every mutation below lands mid-migration.
+        let savedSlice = VectorStore.coverageSliceOverride
+        VectorStore.coverageSliceOverride = 40
+        defer { VectorStore.coverageSliceOverride = savedSlice }
+
+        var live: [(String, Int)] = []
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            for f in 0 ..< 300 {
+                let p = "/m/f\(f).txt"
+                try store.replace(path: p, chunks: [chunk(p, 0, 40_000 + f)])
+                live.append((p, 40_000 + f))
+            }
+            store.close()
+        }
+
+        // Advance a slice, mutate, advance, mutate - auditing after every step, and re-opening so
+        // the assertions see what persisted rather than what happens to be in memory.
+        for round in 0 ..< 8 {
+            try settle(dbURL, rounds: 1)
+            try reopen(dbURL) { s in audit(s, "mid-migration round \(round): after slice") }
+
+            let store = try VectorStore(dbURL: dbURL)
+            // Edit a LOW-numbered file: by now its rows are below the watermark.
+            let lowP = "/m/f\(round).txt"
+            try store.replace(path: lowP, chunks: [chunk(lowP, 0, 50_000 + round)])
+            live.removeAll { $0.0 == lowP }; live.append((lowP, 50_000 + round))
+            // Delete a HIGH-numbered file: its rows are still uncovered.
+            let highP = "/m/f\(299 - round).txt"
+            store.deletePath(highP)
+            live.removeAll { $0.0 == highP }
+            // And add a new one, which lands past the end entirely.
+            let newP = "/m/new\(round).txt"
+            try store.replace(path: newP, chunks: [chunk(newP, 0, 60_000 + round)])
+            live.append((newP, 60_000 + round))
+            store.close()
+
+            try reopen(dbURL) { s in
+                audit(s, "mid-migration round \(round): after mutations")
+                assertFinds(s, live, "mid-migration round \(round)")
+            }
+        }
+
+        // Finish the migration with all of that history behind it.
+        try settle(dbURL, rounds: 12)
+        try reopen(dbURL) { s in
+            audit(s, "mid-migration: settled")
+            assertFinds(s, live, "mid-migration: settled")
+            XCTAssertEqual(s.count, live.count, "row count after interleaved migration")
+        }
+    }
+
     /// Wiping the index has to take the coverage claim with it. A claim that outlives the rows it
     /// describes is a promise about a file that no longer holds what it says - and the next launch
     /// would try to read vectors out of it for rows that are gone.

@@ -4547,7 +4547,12 @@ public final class VectorStore: @unchecked Sendable {
     /// Rows whose blobs one stamp may clear. Sized so the UPDATE stays well under the time a stamp
     /// may hold the store queue: measured ~7.5us/row, so 100k is ~0.75s, and a 4.5M-row index
     /// migrates over ~45 stamps rather than in one 34s pause.
-    static let coverageSlice = ProcessInfo.processInfo.environment["OMNI_COVERAGE_SLICE"].flatMap(Int.init) ?? 50_000
+    /// Test override, checked before the env default, so a test can make coverage creep a few rows
+    /// at a time and put mutations genuinely mid-migration.
+    nonisolated(unsafe) public static var coverageSliceOverride: Int? = nil
+    static var coverageSlice: Int {
+        coverageSliceOverride ?? ProcessInfo.processInfo.environment["OMNI_COVERAGE_SLICE"].flatMap(Int.init) ?? 50_000
+    }
     /// Smaller slice when the store is closing. Measured on a 4.5M-row index, a 100k slice costs
     /// ~2.2s inside close(), which is a visible pause on quit; the idle stamp can afford the full
     /// slice because nothing is waiting on it but a background search.
@@ -4929,6 +4934,17 @@ public final class VectorStore: @unchecked Sendable {
             // repack can return - so the generic free-ratio gate in compact() never fires and the
             // space would sit there forever. Record that a one-shot repack is owed instead.
             exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.vacuumPendingKey)','1');")
+            // And do it NOW, not at the next launch. The size a user watches does not move for the
+            // whole migration - clearing a blob shortens its row without freeing a page, so 6.5 GB
+            // can be gone from the rows with the file still its original size and the freelist still
+            // empty - and the repack is the one step that turns that into disk. Making them restart
+            // the app to see it would be the wrong end of an already long wait.
+            let url = dbURL
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5) { [weak self] in
+                guard let self, self.dbURL == url else { return }
+                let freed = self.reclaimAfterCoverageMigration()
+                if freed > 0, Self.searchTiming { print("[store] migration complete: reclaimed \(freed) bytes") }
+            }
         }
         return true
     }
