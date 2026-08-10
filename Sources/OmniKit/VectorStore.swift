@@ -5060,20 +5060,66 @@ public final class VectorStore: @unchecked Sendable {
         return true
     }
 
+    /// Repair a coverage claim that merely lags the blobs, and only when that is unambiguous.
+    ///
+    /// The claim counts SLOTS: covered = (live rows whose blob is cleared) + (holes below it). With
+    /// no holes recorded the second term is zero, so the claim is exactly the cleared-blob count -
+    /// derivable, checkable against the file's size, and with no placement decision to get wrong.
+    /// Returns the before/after when it repaired something, nil when it did not.
+    private func repairDerivableCoverageClaimLocked() -> (from: Int, to: Int)? {
+        // `dim` is read from the TABLE, not the instance: a failed load resets the resident state,
+        // including dim, so by the time this runs the field is 0 and the store knows nothing.
+        guard dbOpen(), vecHoles.isEmpty, coveredRows > 0 else { return nil }
+        let d = scalarQuery("SELECT dim FROM chunks LIMIT 1")
+        guard d > 0 else { return nil }
+        let cleared = scalarQuery("SELECT COUNT(*) FROM chunks WHERE length(vec) = 0")
+        guard cleared > 0, cleared != coveredRows else { return nil }
+        // The file has to actually hold that many slots, or the claim would describe bytes that
+        // are not there.
+        let need = cleared * d * MemoryLayout<UInt16>.size
+        guard let size = (try? FileManager.default.attributesOfItem(atPath: vecSidecarURL.path)[.size]) as? Int,
+              size >= need else { return nil }
+        guard execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.coveredRowsKey)','\(cleared)');")
+        else { return nil }
+        let was = coveredRows
+        coveredRows = cleared
+        return (was, cleared)
+    }
+
+    /// What the numbers say, for the refusal message. Reported rather than guessed at: this is the
+    /// difference between "your index is fine, the bookkeeping is off by N" and a wild goose chase
+    /// after a second copy of the app.
+    private func coverageMismatchDetailLocked() -> String {
+        guard dbOpen() else { return "" }
+        let cleared = scalarQuery("SELECT COUNT(*) FROM chunks WHERE length(vec) = 0")
+        let accounted = coveredRows - vecHoles.count
+        guard cleared != accounted else { return "" }
+        let n = abs(cleared - accounted)
+        return "the vector slot bookkeeping is off by \(n) row\(n == 1 ? "" : "s") "
+             + "(\(cleared) vectors live in the file, the index accounts for \(accounted))."
+    }
+
     /// The coverage claim could not be read. Says so loudly and changes NOTHING on disk.
     ///
     /// An earlier version deleted the rows the file could no longer answer for, reasoning that the
     /// reconcile pass would re-index them. It deleted all 4.5M rows of a healthy index the first
     /// time the read declined for a reason that had nothing to do with the data. Recovery paths
     /// that mutate are how a recoverable problem becomes an unrecoverable one; this one reports.
-    private func reportCoverageUnreadableLocked() {
+    private func reportCoverageUnreadableLocked(_ detail: String = "") {
         FileHandle.standardError.write(Data(
-            "[omni] vector coverage unreadable (covered=\(coveredRows) holes=\(vecHoles.count)); index not loaded, nothing modified\n".utf8))
+            "[omni] vector coverage unreadable (covered=\(coveredRows) holes=\(vecHoles.count))\(detail.isEmpty ? "" : "; " + detail); index not loaded, nothing modified\n".utf8))
         // And say so to the CALLER, so it can refuse to open rather than hand back an empty store.
         // An empty store is not neutral here: the app reads it as "nothing indexed yet" and starts
         // re-embedding every file, hours of GPU work, over an index that is completely intact and
         // merely locked by another copy of Omni. Refusing is recoverable; that is not.
-        coverageUnreadable = "The vector file could not be read. Another copy of Omni may have the index open."
+        // NAME THE ACTUAL CAUSE. This used to say "Another copy of Omni may have the index open",
+        // which is only one of the ways to get here and was the wrong one every time it was hit:
+        // the common cause is the slot bookkeeping disagreeing with the table, and that guess sends
+        // whoever reads it hunting for a second process that does not exist.
+        coverageUnreadable = detail.isEmpty
+            ? "The vector file could not be read. Another copy of Omni may have the index open."
+            : "This index cannot be opened safely: \(detail) Your files and vectors are intact - "
+              + "nothing has been changed. Re-indexing rebuilds it."
     }
 
     /// Append a tombstone that exists only to hold its slot, for a vector the file still carries but
@@ -6923,6 +6969,27 @@ public final class VectorStore: @unchecked Sendable {
         return applyTombstonesLocked(hits)
     }
 
+    /// Is the row at this slot really absent from the chunk table?
+    ///
+    /// The question a hole answers is "the file holds a vector here that no row owns". Asking the
+    /// table directly is the only way to know that, and it is what stops this from recording a hole
+    /// for a delete that did not happen.
+    private func rowIsGoneFromTableLocked(_ slot: Int) -> Bool {
+        guard dbOpen(), slot >= 0, slot < rows.count else { return false }
+        let r = rows[slot]
+        guard !r.path.isEmpty else { return true }   // already a hole row; it owns nothing
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        let sql = legacyLayout
+            ? "SELECT EXISTS(SELECT 1 FROM chunks WHERE path = ? AND chunk_index = ?);"
+            : "SELECT EXISTS(SELECT 1 FROM chunks c JOIN files f ON f.id = c.file_id WHERE f.path = ? AND c.chunk_index = ?);"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
+        sqlite3_bind_text(stmt, 1, r.path, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int(stmt, 2, Int32(r.chunkIndex))
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return false }
+        return sqlite3_column_int(stmt, 0) == 0
+    }
+
     /// Mark these rows dead and do their per-file bookkeeping.
     ///
     /// LAST LINE OF DEFENCE, at the exact point the damage would be done: a row inside the covered
@@ -6941,9 +7008,24 @@ public final class VectorStore: @unchecked Sendable {
             let unrecorded = hits.filter { Int($0) < coveredRows && !vecHoles.contains($0) }
             if !unrecorded.isEmpty {
                 assertionFailure("removal reached tombstoning with \(unrecorded.count) unrecorded covered slots - the caller must recordHolesLocked inside its transaction")
+                // RECORD ONLY WHAT IS REALLY GONE. This net writes outside the delete's
+                // transaction, so a hole it records for a row that is still in SQLite outlives a
+                // delete that never committed - and a hole with a live row behind it is not a
+                // cosmetic leak. It shifts every row after it by a slot, so the counts stop
+                // agreeing and the NEXT launch refuses to open the index ("the vector file could
+                // not be read") on an index where nothing is actually wrong with the data.
+                //
+                // Checking the row is cheap here because this path only runs when a caller has
+                // already gone wrong, and it converts an unrecoverable accounting error into a
+                // bounded one: a slot that leaks is wasted space the reclaim can be taught about,
+                // where a bogus hole is an index that will not open.
+                let gone = unrecorded.filter { rowIsGoneFromTableLocked(Int($0)) }
+                let skipped = unrecorded.count - gone.count
+                let note = skipped == 0 ? ""
+                    : " (\(skipped) skipped - their rows are still in the table)"
                 FileHandle.standardError.write(Data(
-                    "[omni] recovering \(unrecorded.count) unrecorded vector slots; a removal path is missing recordHolesLocked\n".utf8))
-                recordHolesLocked(unrecorded)
+                    "[omni] recovering \(gone.count) unrecorded vector slots; a removal path is missing recordHolesLocked\(note)\n".utf8))
+                recordHolesLocked(gone)
             }
         }
         var removedPaths = Set<String>()
@@ -7197,7 +7279,22 @@ public final class VectorStore: @unchecked Sendable {
                 // bytes, and the next launch can try again (the file may simply have been
                 // unavailable). An empty in-memory store means the reconcile pass re-indexes,
                 // which is recoverable; deleting rows here would not be.
-                reportCoverageUnreadableLocked()
+                // Before refusing: the claim is DERIVABLE from two things that are physically
+                // true - how many rows have had their blob cleared, and how many slots are
+                // recorded as holes. A claim that merely lags those is repairable, and repairing
+                // it is provably safe WHEN THERE ARE NO HOLES: with no holes the covered prefix is
+                // a straight 1:1 with the first N live rows in rowid order, so there is no
+                // placement to get wrong. With holes present the same counters are produced by two
+                // different states - a claim that is behind, and a hole recorded for a row that is
+                // still live - which need opposite repairs and give different row-to-slot
+                // mappings. Guessing there would hand back each row its neighbour's vector with no
+                // error, so it refuses and says why instead.
+                if let repaired = repairDerivableCoverageClaimLocked() {
+                    FileHandle.standardError.write(Data(
+                        "[omni] coverage claim repaired \(repaired.from) -> \(repaired.to) from the cleared-blob count\n".utf8))
+                    if loadFromCoverageLocked() { return }
+                }
+                reportCoverageUnreadableLocked(coverageMismatchDetailLocked())
                 return
             }
         }
@@ -7324,6 +7421,9 @@ public final class VectorStore: @unchecked Sendable {
 
     /// Test entry point: run the rewrite on the store queue.
     public func internPathsForTest() -> Int64? { queue.sync { internPathsLocked() } }
+    /// Coverage state, for tests that have to build a specific on-disk claim.
+    var coveredRowsForTest: Int { queue.sync { coveredRows } }
+    func advanceCoverageForTest(budget: Int = Int.max) { queue.sync { while advanceCoverageLocked(budget: budget) {} } }
 
     /// Rewrite `chunks` to carry a file id instead of a repeated path. One transaction: it either
     /// happens or it does not. Returns the bytes the following repack will be able to reclaim, or
