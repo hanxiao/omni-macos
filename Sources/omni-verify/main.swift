@@ -6473,6 +6473,32 @@ if args.count >= 5 && args[1] == "bitrecall" {
 }
 
 // Is a 1-bit XOR+popcount scan faster than the shipped 3-bit one? omni-verify bitscanbench [N] [dim]
+// What does the filename sidecar cost on disk? omni-verify lexwal <dbPath>
+// The sidecar's own database is small (171 MB for 172k files) but its write-ahead log was found at
+// 3.1 GB beside it - seventeen times the database, and pure duplication: WAL frames that have
+// already been folded back and are only still on disk because a passive checkpoint reuses the file
+// rather than shortening it. Builds the sidecar against a real index and reports every file it
+// leaves behind, so the claim is a measurement rather than a reading of the code.
+if args.count >= 3 && args[1] == "lexwal" {
+    let dbURL = URL(fileURLWithPath: args[2])
+    func size(_ suffix: String) -> Int64 {
+        let p = dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + suffix).path
+        return (try? FileManager.default.attributesOfItem(atPath: p)[.size] as? Int64) as? Int64 ?? 0
+    }
+    func mb(_ b: Int64) -> String { String(format: "%.1f MB", Double(b) / 1_048_576) }
+    let store = try VectorStore(dbURL: dbURL)
+    print("lexwal db=\(dbURL.lastPathComponent) files=\(store.fileCount)")
+    let t = Date()
+    store.prepareLexicalIndex()
+    let secs = -t.timeIntervalSinceNow
+    // Peak matters as much as the residue: the WAL is what the user's disk has to hold DURING a
+    // rebuild, and a rebuild happens whenever the index changes enough to stale the stamp.
+    print(String(format: "  rebuild %.2fs   names=%@  names-wal=%@  names-shm=%@",
+                 secs, mb(size(".names")), mb(size(".names-wal")), mb(size(".names-shm"))))
+    store.close()
+    exit(0)
+}
+
 if args.count >= 2 && args[1] == "bitscanbench" {
     BitScanBench.run(rows: (args.count >= 3 ? Int(args[2]) : nil) ?? 4_500_000,
                      dim: (args.count >= 4 ? Int(args[3]) : nil) ?? 768)

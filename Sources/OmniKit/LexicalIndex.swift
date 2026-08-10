@@ -57,6 +57,13 @@ final class LexicalIndex: @unchecked Sendable {
         if db == nil { sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) }
         guard let db else { return }
         exec("PRAGMA journal_mode=WAL;"); exec("PRAGMA synchronous=OFF;")
+        // RECLAIM ON OPEN. A passive checkpoint (which is all autocheckpoint ever runs) copies WAL
+        // frames back into the database and then REUSES the file - it never shortens it. So the
+        // sidecar's WAL only ever ratchets up to the largest rebuild it has ever done and stays
+        // there: measured at 3.1 GB against a 171 MB database, seventeen times the size of the thing
+        // it journals. TRUNCATE is the mode that actually returns the space, and it is cheap here
+        // (single connection, no other reader, and the database itself is small).
+        exec("PRAGMA wal_checkpoint(TRUNCATE);")
         exec("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);")
         // contentless (content='') plus columnsize=0: we never read the text back, only the rowid,
         // so FTS5 stores the term index and nothing else. This is what keeps it at 2.4 MB.
@@ -96,10 +103,23 @@ final class LexicalIndex: @unchecked Sendable {
             sqlite3_bind_text(ins, 2, terms, -1, T); sqlite3_step(ins)
             sqlite3_reset(insMap); sqlite3_bind_int64(insMap, 1, Int64(i + 1))
             sqlite3_bind_text(insMap, 2, p, -1, T); sqlite3_step(insMap)
+            // COMMIT IN BATCHES so the WAL cannot grow to hold the whole rebuild. One transaction
+            // around 172k inserts is what produced the 3.1 GB file: FTS5 merges its b-tree several
+            // times over the course of a build, and every rewrite of a page inside an open
+            // transaction is another WAL frame that cannot be checkpointed until COMMIT. Committing
+            // periodically lets autocheckpoint fold them back as we go.
+            //
+            // Safe to interrupt: `stamp` is written only at the very end, so a partial rebuild is
+            // simply "stale" and the next open redoes it from the DELETEs above. `lock` is held for
+            // the whole function, so no reader can observe a half-built index either.
+            if (i + 1) % 20_000 == 0 { exec("COMMIT;"); exec("BEGIN;") }
         }
         sqlite3_finalize(ins); sqlite3_finalize(insMap)
         exec("INSERT OR REPLACE INTO meta(k,v) VALUES('stamp','\(stamp)');")
         exec("COMMIT;")
+        // And return the high-water mark to the filesystem now that the build is done, rather than
+        // leaving a multi-GB file parked next to a small database until the next open.
+        exec("PRAGMA wal_checkpoint(TRUNCATE);")
         fileCount = all.count
         ready = true
     }
