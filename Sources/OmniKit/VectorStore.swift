@@ -863,15 +863,27 @@ public final class VectorStore: @unchecked Sendable {
     /// is 572 ms on an M3 Ultra, but the comment on rebuildBaseLocked reports "~minutes at 3.8M
     /// rows on a base M-chip" for a full rebuild, and it lands on whichever search arrives first.
     /// The launch warm-up normally absorbs it; a user who searches immediately does not.
-    /// OMNI_SCAN_BITS selects the coarse tier: 3 = affine quantizedMM (default), 1 = the asymmetric
-    /// sign-code tier below. 1 is 3.1x smaller resident and scans faster, but needs a wider
-    /// candidate set to hold recall and is a net latency loss at equal quality - see the tier's own
-    /// note. It is a lever, not a default, so the trade can be measured on a real index either way.
+    /// OMNI_SCAN_BITS selects the coarse tier: 1 = the asymmetric sign-code tier (default), 3 = the
+    /// affine quantizedMM tier it replaced.
+    ///
+    /// Measured on the real 4.5M-row index against an EXACT bf16 ground truth, 60 corpus queries:
+    ///
+    ///                      p50      recall@10   queries <1.0   resident replica
+    ///   3-bit C=1600     4.40 ms      0.8617        12/60          1.25 GB     <- was shipped
+    ///   1-bit C=3200     3.87 ms      0.9133         6/60          0.40 GB     <- now
+    ///
+    /// Read that carefully, because the tier is not the whole story. At EQUAL candidate width 3-bit
+    /// is the more accurate scan (C=3200: 0.9583 against 0.9133; C=6400: 0.9950 against 0.9567) and
+    /// 1-bit is ~1.3 ms faster. At ISO-QUALITY they are a wash, 1-bit fractionally behind (3-bit
+    /// C=3200 0.9583 at 5.25 ms; 1-bit C=6400 0.9567 at 5.43 ms). What makes 1 bit the better
+    /// DEFAULT is that its cheaper scan pays for a wider candidate net inside the same latency
+    /// budget, and the net is what drives quality - the shipped width was simply too narrow.
+    /// Widening C is the dominant lever here; the tier is what makes widening it affordable.
     /// Test/A-B override, checked before the env default. `var` for the same reason the paper
     /// levers are: setenv after first touch is either a no-op or a permanent change to the app.
     nonisolated(unsafe) public static var scanBitsOverride: Int? = nil
     static var scanBits: Int {
-        scanBitsOverride ?? ProcessInfo.processInfo.environment["OMNI_SCAN_BITS"].flatMap(Int.init) ?? 3
+        scanBitsOverride ?? ProcessInfo.processInfo.environment["OMNI_SCAN_BITS"].flatMap(Int.init) ?? 1
     }
     /// The 1-bit tier gives up recall at equal candidate width, and buys it back with width. 2x is
     /// what the measurement says is needed (top10 0.9792 at 2x against 3-bit's 0.9783 at 1x).
@@ -2470,6 +2482,12 @@ public final class VectorStore: @unchecked Sendable {
     /// Bits of the CURRENTLY resident scan matrix (0 = full bf16 base, 4/8 = quantized replica).
     /// Stamped by the paper suite so the exported scan row says which representation it measured.
     public var baseModeBits: Int { queue.sync { quantBits } }
+    /// Rows actually covered by the resident coarse replica, and the candidate width a query of
+    /// this topK would use. Exposed so a measurement can RECORD what ran instead of asserting it
+    /// from the lever it set - an arm that silently scored with another tier's replica is exactly
+    /// how a 1-bit measurement got reported as a 3-bit one.
+    public var baseRowsResident: Int { queue.sync { baseRows } }
+    public static func candidateWidth(topK: Int) -> Int { candidateCount(topK: topK) }
 
     /// PAPER SUITE ONLY: drop the resident scan matrix so the next search rebuilds it under the
     /// arm's base policy, without touching a single row of data. Table 3's scan columns need both

@@ -6858,6 +6858,13 @@ if args.count >= 4 && args[1] == "quantrecall" {
     let store = try VectorStore(dbURL: URL(fileURLWithPath: args[3]))
     let arm = ProcessInfo.processInfo.environment["OMNI_QUANT_BASE"] == "0" ? "exact"
             : (ProcessInfo.processInfo.environment["OMNI_QUANT_RERANK"] == "0" ? "coarse" : "funnel")
+    // PROVENANCE, not intent. `arm` above is only what the LEVERS asked for; it says nothing about
+    // what the store actually did. A replica on disk is adopted at its own width even when it
+    // disagrees with the requested one (deliberately - a width mismatch is not a rejection), so an
+    // arm labelled 1-bit can quietly score with 3-bit codes. That is not hypothetical: it is how a
+    // 1-bit tier got measured, and reported, as indistinguishable from 3-bit. Every run now states
+    // the width it really scanned at and the candidate width it really used, and refuses to print
+    // a comparable line if the two disagree with what was asked for.
     // QUERY SOURCE. OMNI_QRC_SOURCE=seed keeps the original 20-term list (kept only so older
     // numbers stay reproducible); `corpus` is the default and the honest one - real excerpts from
     // the user's own indexed text files, so the queries carry the corpus's actual vocabulary and
@@ -6958,11 +6965,27 @@ if args.count >= 4 && args[1] == "quantrecall" {
     // and anything below 1.0000 means the change moved a result it had no business moving. It also
     // avoids running the exact arm against a REAL index, which forces full bf16 mode and leaves the
     // persisted quant replica needing a rebuild the user would pay for at next launch.
+    // What ACTUALLY ran, read off the store rather than off the levers.
+    let ranBits = store.baseModeBits
+    let ranC = VectorStore.candidateWidth(topK: topK)
+    let askedBits = ProcessInfo.processInfo.environment["OMNI_QUANT_BASE"].flatMap(Int.init)
+        ?? ProcessInfo.processInfo.environment["OMNI_SCAN_BITS"].flatMap(Int.init)
+    let prov = String(format: "ranBits=%d C=%d baseRows=%d", ranBits, ranC, store.baseRowsResident)
+    if let asked = askedBits, asked != ranBits {
+        // Refuse rather than print a number that will be read as the arm it is labelled. This is
+        // the exact failure that made a 3-bit replica get reported as a 1-bit result.
+        print("quantrecall MISMATCH: asked for bits=\(asked) but the store scanned at bits=\(ranBits) (\(prov)).")
+        print("  A replica already on disk is adopted at its own width. Delete <db>.quant and re-run,")
+        print("  or let this run rebuild first - this arm is NOT comparable and is not being reported.")
+        store.close()
+        exit(3)
+    }
     if arm == "exact" || ProcessInfo.processInfo.environment["OMNI_QRC_WRITE_GT"] == "1" {
         try? JSONEncoder().encode(GT(paths: out, scores: outScore)).write(to: gtPath)
         print(String(format: "quantrecall arm=%-6@ src=%-6@ filter=%-6@ n=%d rows=%d  p50=%6.2f ms  p95=%6.2f ms  (ground truth written)",
                      arm, source, filterTag, vecs.count, store.count,
-                     lat[vecs.count/2], lat[Swift.min(lat.count - 1, Int(Double(lat.count) * 0.95))]))
+                     lat[vecs.count/2], lat[Swift.min(lat.count - 1, Int(Double(lat.count) * 0.95))])
+              + "  " + prov)
     } else {
         guard let d = try? Data(contentsOf: gtPath), let gtAll = try? JSONDecoder().decode(GT.self, from: d),
               gtAll.paths.count == out.count else {
@@ -6990,13 +7013,15 @@ if args.count >= 4 && args[1] == "quantrecall" {
         }
         let m = vecs.count
         let sorted = per.sorted()
+        _ = m
         let sortedR = scoreRatio.sorted()
         let below = per.filter { $0 < 1.0 }.count
         print(String(format: "quantrecall arm=%-6@ src=%-6@ filter=%-6@ n=%d  p50=%6.2f ms   recall@10 mean=%.4f p5=%.4f min=%.4f  (<1.0: %d/%d)   recall@%d=%.4f  top1=%.3f",
                      arm, source, filterTag, m, lat[m/2],
                      per.reduce(0, +) / Double(m), sorted[max(0, Int(Double(m) * 0.05))], sorted[0],
                      below, m, topK, rK / Double(m), top1 / Double(m))
-              + String(format: "   score-ratio mean=%.5f min=%.5f", scoreRatio.reduce(0,+) / Double(m), sortedR[0]))
+              + String(format: "   score-ratio mean=%.5f min=%.5f", scoreRatio.reduce(0,+) / Double(m), sortedR[0])
+              + "  " + prov)
     }
     store.close()
     exit(0)
