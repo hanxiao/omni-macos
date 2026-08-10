@@ -1420,11 +1420,11 @@ public final class VectorStore: @unchecked Sendable {
         // pre-existing row starts at -1 and earns a slot at the first stamp, so adopting an existing
         // index costs nothing and old app versions (which never name this column) are unaffected.
         addColumnIfMissing("vec_slot", "INTEGER NOT NULL DEFAULT -1")
-        // PARTIAL index over the un-slotted rows alone. The stamp's job is "give a slot to whatever
-        // arrived since last time", and in steady state that is a handful of rows out of millions;
-        // without this it is a full table scan (measured 1.67s at 4.5M rows against 14ms with it).
-        // Partial on a predicate that is almost always false, so the index itself stays tiny.
-        exec("CREATE INDEX IF NOT EXISTS idx_vec_unslotted ON chunks(vec_slot) WHERE vec_slot < 0;")
+        // NOTE: the partial index over un-slotted rows is NOT created here. Its whole economy is
+        // that `vec_slot < 0` is almost always false, and on an index that predates the column it
+        // is true for every row - a full-size index, on precisely the large indexes that do not get
+        // slotted at all yet. It is built at the end of the first successful full numbering, where
+        // that predicate has just become almost-always-false. See recordVecSlotsLocked.
         // Content-dedup sidecar: one row per indexed file, mapping a content key (hash of the
         // embedding-relevant bytes + the preprocess settings) to the path whose chunks realized it.
         // ADDITIVE and self-healing, so index compatibility holds in BOTH directions: an old app
@@ -4350,6 +4350,11 @@ public final class VectorStore: @unchecked Sendable {
             vecsCoveredRows = 0   // the claim on disk is whatever it was; ours did not land
             return false
         }
+        // Now that every row carries a slot, `vec_slot < 0` is false for all of them and the partial
+        // index costs almost nothing while making the next stamp's lookup O(arrivals) rather than a
+        // full scan. Created here rather than at open for exactly that reason: before this point the
+        // predicate matches EVERY row, and the index would be a full-size one built for nobody.
+        if full { exec("CREATE INDEX IF NOT EXISTS idx_vec_unslotted ON chunks(vec_slot) WHERE vec_slot < 0;") }
         vecsCoveredRows = n
         vecSlotsDirty = false
         return true

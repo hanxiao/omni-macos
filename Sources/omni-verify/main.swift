@@ -6382,9 +6382,13 @@ if args.count >= 5 && args[1] == "bitrecall" {
     let store = try VectorStore(dbURL: URL(fileURLWithPath: args[3]))
     let folder = args[4]
     let nq = (args.count >= 6 ? Int(args[5]) : nil) ?? 60
-    omniSetMemoryLimit(6_000_000_000)
+    let rowsCap = (args.count >= 7 ? Int(args[6]) : nil) ?? 200_000
+    // X, Xr and Xs are each n*dim fp32, so the default 6GB ceiling pins this at a few hundred
+    // thousand rows - and that is precisely the regime whose answer did not transfer. Scale the
+    // ceiling with the request so the measurement can reach the selectivity that actually ships.
+    omniSetMemoryLimit(max(6_000_000_000, rowsCap * 768 * 4 * 5))
     let d = engine.dim
-    let data = store.vectorsUnderFolder(folder, cap: 200_000, landmarkCap: 200_000)
+    let data = store.vectorsUnderFolder(folder, cap: rowsCap, landmarkCap: rowsCap)
     let n = data.count
     guard n > 5000, VectorStore.hadamardCompatible(d) else {
         print("bitrecall: need >5000 rows under that folder and a Hadamard-compatible dim (got \(n), \(d))")
@@ -6419,9 +6423,22 @@ if args.count >= 5 && args[1] == "bitrecall" {
     let Qs = MLX.which(Qr .>= MLXArray(Float(0)), MLXArray(Float(1)), MLXArray(Float(-1)))
     MLX.eval(Xs, Qs)
 
+    // SELECTIVITY, not an absolute width, is what a candidate tier is judged on. C=3840 out of the
+    // 200k this bench used to read is 1.9%; the same 3840 out of the real 4,522,818-row index is
+    // 0.0849%, twenty-two times harsher. Measuring at fixed C and reading the answer across scales
+    // compares two different questions. These widths hold selectivity constant instead: the shipped
+    // one, and two progressively harsher, so the trend is visible rather than extrapolated.
+    let shippedSelectivity = 3840.0 / 4_522_818.0
+    // 1x is the shipped selectivity. 2x and 4x are the OVERSAMPLING question: a 1-bit tier reads
+    // 3.5x fewer bytes and scans 1.69x faster, so it can afford a wider candidate set than the
+    // 3-bit tier it would replace. What matters is not whether 1-bit matches 3-bit at equal C, but
+    // whether it matches at the C its own speed pays for - the rerank behind it is exact either way.
+    let widths: [(String, Int)] = [1.0, 2.0, 4.0].map { mult in
+        (String(format: "%.0fx", mult), Swift.max(16, Swift.min(n, Int(Double(n) * shippedSelectivity * mult))))
+    }
     func report(_ scores: MLXArray, _ label: String, bytesPerRow: Int) {
         var line = String(format: "  %-26@ %4d B/row  ", label, bytesPerRow)
-        for width0 in [3840, 384] {
+        for (wLabel, width0) in widths {
             let width = Swift.min(width0, n)
             let cIdx = MLX.argPartition(MLX.negative(scores), kth: Swift.min(width, n - 1), axis: 1)[0..., 0 ..< width]
             MLX.eval(cIdx)
@@ -6440,7 +6457,7 @@ if args.count >= 5 && args[1] == "bitrecall" {
                 kept += Double(hit) / Double(K0)
                 kept10 += Double(hit10) / 10.0
             }
-            line += String(format: "@%d: top50=%.4f top10=%.4f   ", width, kept / Double(nq), kept10 / Double(nq))
+            line += String(format: "%@ (C=%d): top50=%.4f top10=%.4f   ", wLabel, width, kept / Double(nq), kept10 / Double(nq))
         }
         print(line)
     }
