@@ -139,7 +139,8 @@ final class PathInterningTests: XCTestCase {
     }
 
     /// A failed rewrite must leave the index exactly as it was, not half converted - the whole
-    /// thing runs in one transaction and verifies itself before dropping the original.
+    /// thing runs in one transaction and verifies itself before dropping the original - AND the
+    /// store must refuse to open rather than serve an index it cannot query.
     func testFailedMigrationLeavesIndexUntouched() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("intern-fail-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -154,8 +155,11 @@ final class PathInterningTests: XCTestCase {
             exec(db, "CREATE TABLE files(wrong INTEGER);")
         }
 
-        let store = try VectorStore(dbURL: dbURL)
-        store.close()
+        // Opening must FAIL rather than serve a legacy index: every statement below the load speaks
+        // the interned schema only, so carrying on would give a store whose searches work (they
+        // score in memory) while snippets, filters and stats quietly fail.
+        XCTAssertThrowsError(try VectorStore(dbURL: dbURL),
+                             "a store that could not convert its index must refuse to open")
 
         let db = open(dbURL)
         defer { sqlite3_close(db) }

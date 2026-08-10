@@ -2314,6 +2314,7 @@ final class AppModel {
             let towers = enabledKindTowers
             async let engineC = OmniEngine.loadValidated(modelDir: dir, keepVision: towers.vision, keepAudio: towers.audio)
             let store = try await storeC
+            await MainActor.run { self.storeStatus = nil }
             let engine = try await engineC
             // On a model/db switch, close the PREVIOUS store off the main actor: dropping its last ref
             // here would run a synchronous WAL checkpoint(TRUNCATE) + sqlite_close in deinit on @MainActor

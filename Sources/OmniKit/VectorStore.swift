@@ -1477,6 +1477,10 @@ public final class VectorStore: @unchecked Sendable {
     /// What the store is doing, for the launch screen. The one-time upgrade takes tens of seconds
     /// on a large index and looks identical to a hang without it.
     private let onStatus: (@Sendable (String) -> Void)?
+    /// Why the one-time upgrade could not run, if it could not. Surfaced rather than swallowed: the
+    /// interned queries are the only ones that exist, so an index that fails to convert cannot be
+    /// served, and a silent half-working store is the worst outcome available.
+    private(set) var migrationBlockedReason: String?
 
     public init(dbURL: URL, onLoadProgress: (@Sendable (Double) -> Void)? = nil,
                 onStatus: (@Sendable (String) -> Void)? = nil) throws {
@@ -1620,6 +1624,14 @@ public final class VectorStore: @unchecked Sendable {
             // as it goes, and the whole upgrade becomes a single short rewrite.
             internLegacySchemaLocked()
             tryAdoptQuantReplicaLocked()   // every failure mode falls back to build-on-first-search
+        }
+        // Every statement below the load speaks the interned schema and only that. If the index is
+        // still legacy here the conversion did not happen, and carrying on would give a store whose
+        // searches work (they score in memory) while snippets, filters and stats quietly fail. Say
+        // so instead, so the app can show a real message rather than behaving strangely.
+        if queue.sync(execute: { legacyLayout }) {
+            let why = migrationBlockedReason ?? "The index could not be upgraded to the new format."
+            throw OmniError.store(why)
         }
     }
 
@@ -6874,6 +6886,18 @@ public final class VectorStore: @unchecked Sendable {
         guard dbOpen(), hasTableLocked("chunks") else { return }
         // The legacy table is the one with a `path` column; the interned one has `file_id`.
         guard hasColumnLocked("chunks", "path") else { return }
+        // The rewrite holds the new table alongside the old until it commits. Measured on a real
+        // 0.4.x index: 10.29 GB start, 13.27 GB peak, so ~30% of the database in headroom. Asking
+        // for half of it leaves margin for the WAL and for the index still growing underneath.
+        // Checked BEFORE starting, because a rollback halfway is safe but tells the user nothing.
+        let dbBytes = onDiskBytes()
+        let needed = dbBytes / 2
+        let free = (try? FileManager.default.attributesOfFileSystem(forPath: dbURL.path)[.systemFreeSize] as? Int64) as? Int64 ?? .max
+        guard free > needed else {
+            migrationBlockedReason = "Needs \(ByteCountFormatter.string(fromByteCount: needed, countStyle: .file)) free to upgrade the index; \(ByteCountFormatter.string(fromByteCount: free, countStyle: .file)) available."
+            FileHandle.standardError.write(Data("[omni] index upgrade postponed: \(migrationBlockedReason ?? "")\n".utf8))
+            return
+        }
         // The vectors have to be in the FILE before their blobs can be dropped, and durably, since
         // the rewrite below removes the only other copy. This is the same ordering the sliced
         // coverage migration observes every time it advances - msync first, drop second - just
