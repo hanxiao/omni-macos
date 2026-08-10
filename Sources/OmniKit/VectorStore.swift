@@ -879,12 +879,17 @@ public final class VectorStore: @unchecked Sendable {
     nonisolated(unsafe) public static var tombstones =
         ProcessInfo.processInfo.environment["OMNI_TOMBSTONE"] != "0"
     private var deadRows = Set<Int32>()
-    /// Resident int32 index list for the GPU mask, rebuilt only when `deadRows` changes.
+    /// Resident int32 index list for the GPU mask, rebuilt when `deadRows` OR the base boundary changes.
     private var deadIdxCache: MLXArray?
+    /// The `baseRows` the cache above was filtered for. -1 forces a rebuild.
+    private var deadIdxCacheRows = -1
     /// Past this many tombstones the next base build collects them: 5% of the base, never fewer
     /// than 4096, so a small store does not compact on every save and a large one cannot accumulate
     /// a scan whose rows are mostly discarded.
-    private var deadBudget: Int { Swift.min(Swift.max(4_096, baseRows / 20), baseRows / 4) }
+    /// Sized off the WHOLE row table, not the base. Tombstones now cover the delta as well, and a
+    /// budget derived from `baseRows` is zero until the first fold - which sent every delete on a
+    /// not-yet-folded store down the physical compaction it is the budget's job to avoid.
+    private var deadBudget: Int { Swift.min(Swift.max(4_096, rows.count / 20), rows.count / 4) }
 
     private var baseRows = 0
     private var baseDirty = true
@@ -3060,6 +3065,10 @@ public final class VectorStore: @unchecked Sendable {
                 MLX.eval(baseScore, ds)   // one fused GPU sync for both matmuls (was two)
                 scores = baseScore.reshaped([baseRows]).asType(.float32).asArray(Float.self)
                 scores.append(contentsOf: ds.reshaped([deltaCount]).asType(.float32).asArray(Float.self))
+                // maskDeadLocked covered [0, baseRows) on the GPU; the delta was just appended raw.
+                // Now that a tombstone can sit in the delta, mask that half here - a scatter over
+                // the dead rows alone, which is empty on the overwhelmingly common path.
+                for r in deadRows where Int(r) >= baseRows && Int(r) < scores.count { scores[Int(r)] = -.infinity }
             } else {
                 MLX.eval(baseScore)
                 scores = baseScore.reshaped([baseRows]).asType(.float32).asArray(Float.self)
@@ -3128,9 +3137,17 @@ public final class VectorStore: @unchecked Sendable {
     /// Returns the argument untouched when there is nothing dead, which is the usual case.
     private func maskDeadLocked(_ scores: MLXArray) -> MLXArray {
         guard !deadRows.isEmpty else { return scores }
-        if deadIdxCache == nil {
-            deadIdxCache = MLXArray(deadRows.sorted())
+        // BASE ROWS ONLY. `scores` is [baseRows], and tombstones now reach the delta as well, so
+        // scattering the raw dead set would index past the end of the array it is masking - a write
+        // MLX does not bounds-check into whatever that resolves to, silently. The delta half is
+        // masked by its own consumers (the two reducers), which is where the delta scores live.
+        // Cached against baseRows too, not just against the dead set: a fold changes the boundary
+        // without touching deadRows, and a cache keyed only on the latter would outlive its shape.
+        if deadIdxCache == nil || deadIdxCacheRows != baseRows {
+            deadIdxCache = MLXArray(deadRows.filter { Int($0) < baseRows }.sorted())
+            deadIdxCacheRows = baseRows
         }
+        guard deadIdxCache!.size > 0 else { return scores }
         scores[deadIdxCache!] = MLXArray(-Float.infinity)
         return scores
     }
@@ -3757,9 +3774,13 @@ public final class VectorStore: @unchecked Sendable {
         // ties break to the lower fileID. And the gate must come BEFORE the dictionary lookup -
         // gating after it only saves the insert, while the hash lookup is the bulk of the loop.
         let gate: Float = (Self.cantWinGate && candScore.count >= topK) ? (candScore.values.min() ?? -.infinity) : -.infinity
+        let hasDead = !deadRows.isEmpty
         for (i, dot) in deltaScores.enumerated() {
             guard dot.isFinite, dot >= gate else { continue }
             let ri = baseRows + i
+            // Tombstones reach the delta now, and unlike the base rows above (masked to -inf on the
+            // GPU before selection) a dead delta row arrives here with a perfectly good score.
+            if hasDead, deadRows.contains(Int32(ri)) { continue }
             if let ka = kindAllowed, !ka[Int(kindCode[ri])] { continue }   // disallowed-kind delta row
             let f = fileID[ri]
             if let cur = candScore[f] {
@@ -5423,21 +5444,22 @@ public final class VectorStore: @unchecked Sendable {
     /// the caller must fall back to a physical compaction. Mutates nothing the predicate may be
     /// reading through a buffer pointer.
     private func tombstoneOnlyLocked(_ shouldRemove: (Int) -> Bool) -> Set<String>? {
-        guard Self.tombstones, dim > 0, baseRows > 0 else { return nil }
-        var inBase: [Int32] = []
-        var deltaHits = false
+        guard Self.tombstones, dim > 0, !rows.isEmpty else { return nil }
+        // DELTA ROWS TOMBSTONE TOO. They used to force a physical compaction, on the grounds that
+        // the delta is bounded by foldThreshold so moving it is cheap. Moving it is cheap; what it
+        // is not is FREE, because moving any row rewrites the vector file under the slot recorded
+        // for it (see recordVecSlotsLocked). Every place a delta score reaches a reducer now drops
+        // dead rows the same way the base mask does, so there is nothing left that a tombstone in
+        // the delta can leak through - and with this, an ordinary save moves no vector at all.
+        var hits: [Int32] = []
         for i in 0 ..< rows.count where shouldRemove(i) {
-            if i < baseRows {
-                if !deadRows.contains(Int32(i)) { inBase.append(Int32(i)) }
-            } else {
-                deltaHits = true
-            }
+            if !deadRows.contains(Int32(i)) { hits.append(Int32(i)) }
         }
-        guard !inBase.isEmpty, !deltaHits, deadRows.count + inBase.count <= deadBudget else {
+        guard !hits.isEmpty, deadRows.count + hits.count <= deadBudget else {
             return nil
         }
         var removedPaths = Set<String>()
-        for i in inBase {
+        for i in hits {
             let r = rows[Int(i)]
             removedPaths.insert(r.path)
             fileChunkDec(fileID[Int(i)], r.kind, r.path)
