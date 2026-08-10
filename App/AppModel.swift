@@ -944,6 +944,9 @@ final class AppModel {
     // Index storage info (for the Settings > Model tab).
     var dbPath = ""
     var dbSizeBytes: Int64 = 0
+    /// One-time storage migration: rows already converted, rows total, bytes still to reclaim.
+    /// nil when there is nothing to do, so a finished index shows no banner at all.
+    var storageMigration: (done: Int, total: Int, bytesToReclaim: Int64)? = nil
     var lastIndexed: Date?
     var indexObsolete = false
     var indexStoredDim = 0                  // actual vector dim of the current index (0 if empty)
@@ -2441,6 +2444,7 @@ final class AppModel {
             let size = store.sizeBytes()
             let path = store.dbURL.path
             let lastTs = store.metaGet("last_indexed").flatMap { Double($0) }
+            let migration = store.storageMigration
             let stampedVersion = store.metaGet("embedding_version")
             let storedDim = store.vectorDim   // ACTUAL stored vector dim - ground truth
             let builtVariant = store.metaGet("index_model_variant")
@@ -2473,6 +2477,7 @@ final class AppModel {
                 self.refreshDeniedRoots()
                 self.dbPath = path
                 self.dbSizeBytes = size
+                self.storageMigration = migration
                 if let lastTs { self.lastIndexed = Date(timeIntervalSince1970: lastTs) }
                 // Require engineDim > 0: before the engine reports its dimension the fingerprint is
                 // "...|dim0|model0-0", which would spuriously flag obsolete and wipe a valid index.

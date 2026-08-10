@@ -2575,6 +2575,23 @@ public final class VectorStore: @unchecked Sendable {
     /// from the lever it set - an arm that silently scored with another tier's replica is exactly
     /// how a 1-bit measurement got reported as a 3-bit one.
     public var baseRowsResident: Int { queue.sync { baseRows } }
+
+    /// How far the one-time storage migration has got, for the UI. nil once there is nothing left
+    /// to do, so a finished index shows nothing rather than a permanent 100% bar.
+    ///
+    /// Deliberately NOT something the app can wait on. The migration rewrites rows a slice at a
+    /// time precisely so it never gates readiness - blocking launch on background maintenance is
+    /// what made 0.3.8 hang a base M-chip - so this reports, and the app keeps working throughout.
+    public var storageMigration: (done: Int, total: Int, bytesToReclaim: Int64)? {
+        queue.sync {
+            guard Self.vecCoverage, dbOpen(), dim > 0, !rows.isEmpty else { return nil }
+            let total = rows.count
+            guard coveredRows < total else { return nil }
+            // Each remaining row still carries a bf16 blob that the vector file already holds.
+            let remaining = Int64(total - coveredRows) * Int64(dim * MemoryLayout<UInt16>.size)
+            return (coveredRows, total, remaining)
+        }
+    }
     public static func candidateWidth(topK: Int) -> Int { candidateCount(topK: topK) }
 
     /// PAPER SUITE ONLY: drop the resident scan matrix so the next search rebuilds it under the
@@ -4530,11 +4547,17 @@ public final class VectorStore: @unchecked Sendable {
     /// Rows whose blobs one stamp may clear. Sized so the UPDATE stays well under the time a stamp
     /// may hold the store queue: measured ~7.5us/row, so 100k is ~0.75s, and a 4.5M-row index
     /// migrates over ~45 stamps rather than in one 34s pause.
-    static let coverageSlice = ProcessInfo.processInfo.environment["OMNI_COVERAGE_SLICE"].flatMap(Int.init) ?? 100_000
+    static let coverageSlice = ProcessInfo.processInfo.environment["OMNI_COVERAGE_SLICE"].flatMap(Int.init) ?? 50_000
     /// Smaller slice when the store is closing. Measured on a 4.5M-row index, a 100k slice costs
     /// ~2.2s inside close(), which is a visible pause on quit; the idle stamp can afford the full
     /// slice because nothing is waiting on it but a background search.
     static let coverageSliceOnClose = ProcessInfo.processInfo.environment["OMNI_COVERAGE_SLICE_CLOSE"].flatMap(Int.init) ?? 25_000
+    /// Gap between slices when nothing is being searched. A 50k slice is ~0.5s of queue time at the
+    /// measured 10us/row, so this is roughly a 20% duty cycle - the migration finishes in minutes
+    /// instead of the twenty a 20s gap produced, and an idle app is exactly when it should hurry.
+    static let coverageIdleGap: TimeInterval = 2
+    /// And when someone IS searching, get out of the way and look again shortly.
+    static let coverageBusyGap: TimeInterval = 5
 
     private struct RowSidecarHeader: Codable, Sendable {
         var magic: String, gen: Int64, dim: Int, rowCount: Int, pathCount: Int, kindCount: Int
@@ -4546,6 +4569,28 @@ public final class VectorStore: @unchecked Sendable {
     }
     /// Fixed-width per-row record; see stampRowSidecarLocked for the field layout.
     private static let rowRecordSize = 56
+
+    /// Token for the coverage cadence. Deliberately SEPARATE from stampToken: that one is bumped by
+    /// every mutation so the row sidecar is written once writes go quiet, which is right for a cache
+    /// and fatal for a migration. An app doing its launch catch-up pass mutates continuously, so the
+    /// shared debounce never elapsed and coverage sat at 125,000 of 4.5M rows indefinitely - observed
+    /// live, with the stamp closure superseded every time before its deadline.
+    private var coverageToken: UInt64 = 0
+
+    /// Fixed cadence, immune to mutations: the migration's work is incremental and safe to do while
+    /// indexing, so it must not wait for the index to go quiet.
+    private func scheduleCoverageStampLocked(after delay: TimeInterval = coverageIdleGap) {
+        guard Self.vecCoverage, Self.rowSidecarEnabled, coveredRows < rows.count else { return }
+        coverageToken += 1
+        let token = coverageToken
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.queue.sync {
+                guard self.coverageToken == token else { return }
+                self.stampVectorCoverageLocked()
+            }
+        }
+    }
 
     /// Debounced from bumpGenLocked (i.e. from every mutation): stamp once writes go quiet.
     private func scheduleRowStampLocked(after delay: TimeInterval = 90) {
@@ -4796,6 +4841,7 @@ public final class VectorStore: @unchecked Sendable {
         onLoadProgress?(1)
         rowWindowAuditLocked("loadFromCoverage")
         scheduleRowStampLocked(after: 120)
+        scheduleCoverageStampLocked()
         if Self.searchTiming { print("[store] LOAD from coverage rows=\(rows.count) covered=\(covered) holes=\(holes)") }
         return true
     }
@@ -4851,8 +4897,17 @@ public final class VectorStore: @unchecked Sendable {
         // transaction as the clearing, so the claim and the hole list can never disagree.
         recordHolesLocked((coveredRows ..< target).map { Int32($0) }.filter { deadRows.contains($0) },
                           coveredOverride: target)
-        // Clear the blob for every covered row. Addressed by rowid rank, which is the covered rows'
+        // Clear the blob for every covered row. Addressed by rowid RANK, which is the covered rows'
         // own order: the k-th live row in rowid order owns the k-th non-hole slot.
+        //
+        // This re-walks the prefix each slice - O(covered), not O(slice) - and that is a known cost,
+        // not an oversight. A rowid watermark that seeks straight to the slice makes it O(slice) and
+        // took the migration from 20 minutes to 100 seconds when I tried it, but the arithmetic tying
+        // the watermark to the slot count was wrong: the claim advanced past rows whose blobs were
+        // never cleared (live, 4,528,560 claimed against 2,675,000 actually cleared). Nothing was
+        // lost - every vector was still in both places - but the bookkeeping stopped describing the
+        // work, which is the one property this whole scheme exists to keep. Correct and slow beats
+        // fast and wrong; the watermark can come back with a test that pins claim to cleared.
         let clearUpTo = target - deadBelow            // how many live rows the prefix accounts for
         let ok = execChecked("""
             UPDATE chunks SET vec = x''
@@ -4904,9 +4959,25 @@ public final class VectorStore: @unchecked Sendable {
     /// that guard and so never advanced without a mutation: an index migrated one slice and then
     /// stopped forever. Migration has to make progress on ordinary launches, not only on busy ones.
     private func stampVectorCoverageLocked(budget: Int = VectorStore.coverageSlice) {
-        guard Self.vecCoverage, Self.rowSidecarEnabled, dbOpen(), flat16.isPersistent,
+        guard Self.vecCoverage, Self.rowSidecarEnabled, dbOpen(),
               dim > 0, !rows.isEmpty, coveredRows < rows.count else { return }
-        guard flat16.extendFileCoverage() else { return }
+        // RE-ARM WHATEVER HAPPENS BELOW. One slice per stamp only migrates an index if stamps keep
+        // arriving, and a quiet app produces none - so the migration drives itself from here rather
+        // than waiting for the user to edit a file or quit. The re-arm used to sit after the work,
+        // which meant any early return - the mapping not persistent this instant, coverage not
+        // extendable yet - scheduled nothing and stalled the migration for the entire session.
+        // Observed live: stuck at 125,000 of 4,527,177 rows with the app idle and nothing retrying.
+        // YIELD TO THE USER, don't just wait out a clock. A slice takes the serial queue that
+        // searches also wait on, so the gap between slices exists to keep typing responsive - but a
+        // fixed 20s gap turned ~45s of actual work into ~20 minutes of elapsed time for no reason.
+        // Pacing on search activity instead means the migration runs at full tilt while the app is
+        // idle and backs off the moment someone is using it.
+        if searchRecentlyActiveLocked() {
+            scheduleCoverageStampLocked(after: Self.coverageBusyGap)
+            return
+        }
+        defer { scheduleCoverageStampLocked() }
+        guard flat16.isPersistent, flat16.extendFileCoverage() else { return }
         flat16.msyncFile()
         advanceCoverageLocked(budget: budget)
     }
@@ -6455,6 +6526,12 @@ public final class VectorStore: @unchecked Sendable {
         // about to invalidate one.
         loadCoverageLocked()
         if tryAdoptRowSidecarLocked() {
+            // Arm the coverage stamp HERE too. It used to be armed only at the end of the scan path
+            // below and by bumpGenLocked, so on a launch that adopted the sidecar and then sat idle,
+            // nothing ever scheduled one: coverage advanced a single slice per QUIT and otherwise
+            // never moved. On a 4.5M-row index that is 181 quits to migrate, and none at all for
+            // someone who leaves the app open.
+            scheduleCoverageStampLocked()
             return   // validated cache of everything below; SQLite stays truth
         }
         // The scan path below rebuilds .vecs, so the coverage claim is about to stop being true.
@@ -6554,6 +6631,7 @@ public final class VectorStore: @unchecked Sendable {
         // once the open settles. Mutations reschedule via bumpGenLocked as usual.
         rowWindowAuditLocked("loadIntoMemory")
         scheduleRowStampLocked(after: 120)
+        scheduleCoverageStampLocked()
     }
 
     private func userVersion() -> Int32 {

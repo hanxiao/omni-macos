@@ -767,6 +767,26 @@ private struct IndexTab: View {
                 LabeledContent("Indexed files", value: "\(model.indexedFiles)")
                 LabeledContent("Indexed chunks", value: "\(model.indexedChunks)")
                 LabeledContent("Size", value: ByteCountFormatter.string(fromByteCount: model.dbSizeBytes, countStyle: .file))
+                // The size above does NOT fall while this runs, and saying so is the whole point of
+                // showing it: converting a row rewrites it shorter without freeing a page, so the
+                // file holds its size until the conversion finishes and the space is reclaimed in
+                // one step. Without this line the number looks stuck and the work looks broken.
+                if let m = model.storageMigration, m.total > 0 {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text("Optimizing storage")
+                            Spacer()
+                            Text("\(Int(Double(m.done) / Double(m.total) * 100))%")
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
+                        ProgressView(value: Double(m.done), total: Double(m.total))
+                            .progressViewStyle(.linear)
+                        Text("Frees \(ByteCountFormatter.string(fromByteCount: m.bytesToReclaim, countStyle: .file)) when it finishes.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 if let last = model.lastIndexed {
                     LabeledContent("Last indexed", value: last.formatted(.relative(presentation: .named)))
                 }
