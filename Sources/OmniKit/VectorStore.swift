@@ -2585,6 +2585,9 @@ public final class VectorStore: @unchecked Sendable {
     public var storageMigration: (done: Int, total: Int, bytesToReclaim: Int64)? {
         queue.sync {
             guard Self.vecCoverage, dbOpen(), dim > 0, !rows.isEmpty else { return nil }
+            // Once the one-time pass has completed, there is nothing to report ever again: rows
+            // added later are covered by the same machinery, but that is indexing, not migrating.
+            guard scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.migratedKey)'") != 1 else { return nil }
             let total = rows.count
             guard coveredRows < total else { return nil }
             // Each remaining row still carries a bf16 blob that the vector file already holds.
@@ -4540,6 +4543,11 @@ public final class VectorStore: @unchecked Sendable {
     private static let coveredRowsKey = "vecs_covered_rows"
     /// Set once when coverage completes: a repack is owed. See reclaimAfterCoverageMigration.
     private static let vacuumPendingKey = "vecs_vacuum_pending"
+    /// Set once the ONE-TIME migration has finished, and never cleared. Covering the rows that
+    /// arrive afterwards is ordinary steady-state work, not a migration, and must not be reported
+    /// as one - the app indexes continuously, so a few rows are almost always uncovered and a
+    /// progress row keyed on "coverage < rows" sits at 99% forever.
+    private static let migratedKey = "vecs_migrated"
     /// OMNI_VEC_COVERAGE=0 keeps every blob, which is the pre-migration behaviour exactly. The
     /// escape hatch for a user who hits trouble: coverage stops advancing, nothing already cleared
     /// is lost (the file still holds it), and the index keeps working.
@@ -4928,12 +4936,18 @@ public final class VectorStore: @unchecked Sendable {
         }
         let justCompleted = target == rows.count
         coveredRows = target
-        if justCompleted {
+        // FIRST completion only. `justCompleted` is true whenever a slice catches up with the row
+        // table, which on a continuously-indexing app is often - and the repack is a whole-database
+        // rewrite. Without this gate, finishing the migration would arm a VACUUM every time coverage
+        // drew level with indexing.
+        let alreadyMigrated = scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.migratedKey)'") == 1
+        if justCompleted, !alreadyMigrated {
             // Clearing a blob SHORTENS its row; it does not free a page. Measured on a migrated
             // 4.5M-row index, freelist_count is 0 while 7.8 GB of the file is slack that only a
             // repack can return - so the generic free-ratio gate in compact() never fires and the
             // space would sit there forever. Record that a one-shot repack is owed instead.
             exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.vacuumPendingKey)','1');")
+            exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.migratedKey)','1');")
             // And do it NOW, not at the next launch. The size a user watches does not move for the
             // whole migration - clearing a blob shortens its row without freeing a page, so 6.5 GB
             // can be gone from the rows with the file still its original size and the freelist still
