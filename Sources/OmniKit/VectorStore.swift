@@ -157,8 +157,19 @@ public struct SearchFilter: Sendable {
     /// 750k times at 750k files - and `hasPrefix(f + "/")` allocated a fresh String on every one
     /// of those calls. Computed once per assignment instead; the comparison itself is unchanged,
     /// so folder matching keeps String's Unicode semantics rather than a byte-wise shortcut.
-    public var folderPrefix: String? = nil { didSet { folderSlash = folderPrefix.map { $0 + "/" } } }
+    public var folderPrefix: String? = nil {
+        didSet {
+            folderSlash = folderPrefix.map { $0 + "/" }
+            folderSlashBytes = folderSlash.map { Array($0.utf8) }
+        }
+    }
     private(set) var folderSlash: String? = nil
+    /// The same boundary as UTF-8 BYTES. `hasPrefix` compares grapheme clusters, so a path whose
+    /// first character after the separator is a combining mark clusters that mark onto the "/" and
+    /// reads as NOT under the folder - while SQLite's byte range says it is. macOS stores filenames
+    /// NFD, so those paths are ordinary. Precomputed for the same reason folderSlash is: this runs
+    /// once per FILE while the path table is rebuilt, hundreds of thousands of times.
+    private(set) var folderSlashBytes: [UInt8]? = nil
     public var ext: String? = nil             // restrict to a file extension (no dot)
     public var since: Double? = nil           // modified >= since (epoch seconds)
     /// Content-tag terms (`tag:bear` / `-tag:cat`): the file's generated tag snippet must
@@ -189,8 +200,13 @@ public struct SearchFilter: Sendable {
     /// instead of once per ROW. Every clause here is a function of the path alone, so the answer is
     /// identical for every chunk row of a file - and at ~7 rows per file on a 4.5M-row index that
     /// is the difference between 258k String tests and 4.5M of them, each retaining a path String.
+    /// Byte-wise prefix, no allocation: `starts(with:)` over the UTF-8 view walks both sequences.
+    @inline(__always) static func underFolderBytes(_ path: String, _ prefix: [UInt8]) -> Bool {
+        path.utf8.starts(with: prefix)
+    }
+
     func acceptsPath(_ path: String) -> Bool {
-        if let f = folderPrefix, !(path == f || path.hasPrefix(folderSlash ?? (f + "/"))) { return false }
+        if let f = folderPrefix, !(path == f || Self.underFolderBytes(path, folderSlashBytes ?? Array((f + "/").utf8))) { return false }
         if let e = ext, !e.isEmpty, !Self.hasExtensionCI(path, e) { return false }
         if let allow = tagAllow, !allow.contains(path) { return false }
         if let deny = tagDeny, deny.contains(path) { return false }
@@ -199,7 +215,7 @@ public struct SearchFilter: Sendable {
 
     func accepts(path: String, kind: String, modified: Double) -> Bool {
         if !kinds.isEmpty && !kinds.contains(kind) { return false }
-        if let f = folderPrefix, !(path == f || path.hasPrefix(folderSlash ?? (f + "/"))) { return false }
+        if let f = folderPrefix, !(path == f || Self.underFolderBytes(path, folderSlashBytes ?? Array((f + "/").utf8))) { return false }
         if let e = ext, !e.isEmpty, !Self.hasExtensionCI(path, e) { return false }
         if let s = since, modified < s { return false }
         if let allow = tagAllow, !allow.contains(path) { return false }
@@ -1157,6 +1173,28 @@ public final class VectorStore: @unchecked Sendable {
         rowWindowCovered += 1
     }
 
+    /// Does `path` sit under `folder`, judged the way SQLITE judges it?
+    ///
+    /// deleteUnderFolder removes rows with a byte range (`path >= folder||'/' AND path < folder||'0'`,
+    /// BINARY collation) and then removes the same rows from memory with a Swift predicate. Those
+    /// two do not always agree: Swift compares GRAPHEME CLUSTERS, so a path whose first character
+    /// after the separator is a combining mark - "/b/" + U+0301 - clusters that mark onto the "/"
+    /// and `hasPrefix("/b/")` is FALSE while the byte range is TRUE. macOS normalizes filenames to
+    /// NFD, so combining marks in paths are ordinary here, not exotic.
+    ///
+    /// The row would then be deleted from SQLite and kept in memory, with no hole recorded for a
+    /// slot that no longer has a row - the exact divergence coverage cannot survive. Comparing
+    /// UTF-8 bytes makes the in-memory side answer the same question the DELETE asked.
+    @inline(__always) static func pathUnderFolderBytes(_ path: String, _ folder: String) -> Bool {
+        if path == folder { return true }
+        var f = Array(folder.utf8)
+        f.append(UInt8(ascii: "/"))
+        let p = Array(path.utf8)
+        guard p.count > f.count else { return false }
+        for i in 0 ..< f.count where p[i] != f[i] { return false }
+        return true
+    }
+
     /// The live row indices a removal of `paths` is about to take out.
     ///
     /// Computed BEFORE the transaction that deletes them, because the holes they leave have to be
@@ -2035,8 +2073,7 @@ public final class VectorStore: @unchecked Sendable {
         guard !folder.isEmpty, folder != "/" else { return }
         queue.sync {
             guard dbOpen() else { return }
-            let prefix = folder + "/"
-            let victims = victimRowsMatchingLocked { $0.path == folder || $0.path.hasPrefix(prefix) }
+            let victims = victimRowsMatchingLocked { Self.pathUnderFolderBytes($0.path, folder) }
             exec("BEGIN;")
             recordHolesLocked(victims)
             var stmt: OpaquePointer?
@@ -2056,7 +2093,7 @@ public final class VectorStore: @unchecked Sendable {
             sqlite3_finalize(kstmt)
             bumpGenLocked()
             exec("COMMIT;")
-            removeRowsLocked { $0.path == folder || $0.path.hasPrefix(folder + "/") }
+            removeRowsLocked { Self.pathUnderFolderBytes($0.path, folder) }   // byte-wise, like the DELETE above
             proactiveRefoldLocked()
             checkpointIfDueLocked(forceStat: true)   // deletes carry no byte estimate (F17)
         }

@@ -240,6 +240,98 @@ final class CoverageCRUDTests: XCTestCase {
         }
     }
 
+    /// Wiping the index has to take the coverage claim with it. A claim that outlives the rows it
+    /// describes is a promise about a file that no longer holds what it says - and the next launch
+    /// would try to read vectors out of it for rows that are gone.
+    func testWipeClearsCoverage() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("crud-wipe-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appendingPathComponent("test.sqlite")
+
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            for f in 0 ..< 50 {
+                let p = "/w/f\(f).txt"
+                try store.replace(path: p, chunks: [chunk(p, 0, 30_000 + f)])
+            }
+            store.close()
+        }
+        try settle(dbURL)
+        try reopen(dbURL) { s in audit(s, "wipe: before") }
+
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            store.wipeChunks()
+            audit(store, "wipe: immediately after")
+            XCTAssertEqual(store.count, 0, "wipe left rows behind")
+            store.close()
+        }
+        try reopen(dbURL) { s in
+            audit(s, "wipe: after reopen")
+            XCTAssertEqual(s.count, 0, "wiped index came back with rows")
+        }
+
+        // And the store is usable again afterwards: re-index and re-cover from scratch.
+        var live: [(String, Int)] = []
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            for f in 0 ..< 20 {
+                let p = "/w2/f\(f).txt"
+                try store.replace(path: p, chunks: [chunk(p, 0, 31_000 + f)])
+                live.append((p, 31_000 + f))
+            }
+            store.close()
+        }
+        try settle(dbURL)
+        try reopen(dbURL) { s in
+            audit(s, "wipe: after re-index")
+            assertFinds(s, live, "wipe: after re-index")
+        }
+    }
+
+    /// A folder delete removes rows with a byte range in SQL and then removes them from memory with
+    /// a Swift predicate. Those two disagree when a path's first character after the separator is a
+    /// combining mark: Swift clusters it onto the "/" and hasPrefix is false, the byte range is
+    /// true. SQLite would drop the row, memory would keep it live, and no hole would be recorded -
+    /// which is exactly the divergence coverage cannot survive. macOS stores filenames NFD, so this
+    /// is an ordinary filename here, not a contrived one.
+    func testFolderDeleteAgreesWithSQLOnCombiningMarks() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("crud-nfd-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appendingPathComponent("test.sqlite")
+
+        let tricky = "/nfd/\u{0301}accent.txt"     // combining acute immediately after the separator
+        let plain  = "/nfd/plain.txt"
+        let outside = "/other/keep.txt"
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            for f in 0 ..< 40 {   // bulk so coverage has something to cover
+                let p = "/nfd/bulk\(f).txt"
+                try store.replace(path: p, chunks: [chunk(p, 0, 20_000 + f)])
+            }
+            try store.replace(path: tricky, chunks: [chunk(tricky, 0, 21_001)])
+            try store.replace(path: plain, chunks: [chunk(plain, 0, 21_002)])
+            try store.replace(path: outside, chunks: [chunk(outside, 0, 21_003)])
+            store.close()
+        }
+        try settle(dbURL)
+        try reopen(dbURL) { s in audit(s, "nfd: after create") }
+
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            store.deleteUnderFolder("/nfd")
+            store.close()
+        }
+        try settle(dbURL, rounds: 2)
+        try reopen(dbURL) { s in
+            audit(s, "nfd: after folder delete")
+            assertGone(s, [(tricky, 21_001), (plain, 21_002)], "nfd: after folder delete")
+            assertFinds(s, [(outside, 21_003)], "nfd: after folder delete")
+        }
+    }
+
     /// A removal big enough to blow the tombstone budget forces a physical compaction, which MOVES
     /// vectors - and covered rows have no blob to move back from. The store has to restore them
     /// first and stand coverage down; if it does not, every covered row silently shifts.
