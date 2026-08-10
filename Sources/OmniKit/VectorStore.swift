@@ -1205,13 +1205,32 @@ public final class VectorStore: @unchecked Sendable {
     private func victimRowsForPathsLocked(_ paths: Set<String>) -> [Int32] {
         guard dim > 0, !fileChunkCount.isEmpty else { return [] }
         var idMask = [Bool](repeating: false, count: fileChunkCount.count)
-        var any = false
-        for p in paths { if let id = pathID[p] { let i = Int(id); if i < idMask.count { idMask[i] = true; any = true } } }
-        guard any else { return [] }
+        var ids: [Int32] = []
+        for p in paths {
+            guard let id = pathID[p] else { continue }
+            let i = Int(id)
+            if i < idMask.count, !idMask[i] { idMask[i] = true; ids.append(id) }
+        }
+        guard !ids.isEmpty else { return [] }
+        // OVER THE FILES' OWN ROW WINDOWS, not the whole index. The first version of this walked
+        // every row and asked a Set<Int32> whether it was dead - on a 1M-row index that put saving
+        // one file back to 11.6 ms and made it scale with the INDEX again, undoing the whole point
+        // of tombstoning. provenRowRangesLocked already answers "where can this file's rows be",
+        // and falls back to the full range only when the windows cannot prove containment.
+        let dead = deadRows
+        let hasDead = !dead.isEmpty
         var out: [Int32] = []
-        for i in 0 ..< rows.count where !deadRows.contains(Int32(i)) {
-            let f = Int(fileID[i])
-            if f < idMask.count, idMask[f] { out.append(Int32(i)) }
+        idMask.withUnsafeBufferPointer { m in
+            fileID.withUnsafeBufferPointer { fid in
+                for range in provenRowRangesLocked(ids, dead: dead) {
+                    for i in range.lowerBound ..< range.upperBound {
+                        let f = Int(fid[i])
+                        guard f < m.count, m[f] else { continue }
+                        if hasDead, dead.contains(Int32(i)) { continue }
+                        out.append(Int32(i))
+                    }
+                }
+            }
         }
         return out
     }
@@ -1219,8 +1238,12 @@ public final class VectorStore: @unchecked Sendable {
     /// Predicate form of the above, for the folder/kind removals that do not go by path set.
     private func victimRowsMatchingLocked(_ predicate: (Row) -> Bool) -> [Int32] {
         guard dim > 0 else { return [] }
+        // Unavoidably O(rows) - a kind or folder predicate has no per-file index to narrow it - but
+        // the dead check is skipped entirely when nothing is dead, which is the usual case.
+        let dead = deadRows
+        let hasDead = !dead.isEmpty
         var out: [Int32] = []
-        for i in 0 ..< rows.count where !deadRows.contains(Int32(i)) && predicate(rows[i]) { out.append(Int32(i)) }
+        for i in 0 ..< rows.count where (!hasDead || !dead.contains(Int32(i))) && predicate(rows[i]) { out.append(Int32(i)) }
         return out
     }
 
@@ -1741,7 +1764,7 @@ public final class VectorStore: @unchecked Sendable {
             // Only rebuild the in-memory buffer if this path already had rows. For a new file
             // (the dominant indexing case) there is nothing to remove, so skip the O(N) scan and
             // just append. `append` grows flat16/rows geometrically (amortized O(1)).
-            if presentPaths.contains(path) { removeRowsByPathsLocked([path]) }
+            if presentPaths.contains(path) { removeRowsByPathsLocked([path], victims: victims) }
             for (i, c) in chunks.enumerated() {
                 rows.append(Row(path: canonicalPath(c.path), kind: canonicalKind(c.kind), chunkIndex: c.chunkIndex, modified: c.modified,
                                 size: c.size, width: c.width, height: c.height, duration: c.duration, locator: c.locator))
@@ -1850,7 +1873,7 @@ public final class VectorStore: @unchecked Sendable {
             let tRm = Self.searchTiming ? Date() : nil
             let affected = Set(work.map { $0.path })
             if affected.contains(where: { presentPaths.contains($0) }) {
-                removeRowsByPathsLocked(affected)   // one rebuild for the whole batch (id-mask, no path hashing)
+                removeRowsByPathsLocked(affected, victims: victims)   // one rebuild for the whole batch
             }
             for (wi, it) in work.enumerated() {
                 for (ci, c) in it.chunks.enumerated() {
@@ -2060,7 +2083,7 @@ public final class VectorStore: @unchecked Sendable {
             sqlite3_finalize(kstmt)
             bumpGenLocked()
             exec("COMMIT;")
-            removeRowsByPathsLocked(paths)   // one rebuild for the whole set (id-mask, no path hashing)
+            removeRowsByPathsLocked(paths, victims: victims)   // one rebuild for the whole set
             proactiveRefoldLocked()
             checkpointIfDueLocked(forceStat: true)   // deletes carry no byte estimate (F17)
         }
@@ -2088,7 +2111,12 @@ public final class VectorStore: @unchecked Sendable {
         guard !folder.isEmpty, folder != "/" else { return }
         queue.sync {
             guard dbOpen() else { return }
-            let victims = victimRowsMatchingLocked { Self.pathUnderFolderBytes($0.path, folder) }
+            // Prefix bytes hoisted: victimRowsMatchingLocked calls this once per ROW, and building
+            // the array inside the predicate allocated once per row across the whole index.
+            var prefixBytes = Array(folder.utf8); prefixBytes.append(UInt8(ascii: "/"))
+            let victims = victimRowsMatchingLocked {
+                $0.path == folder || SearchFilter.underFolderBytes($0.path, prefixBytes)
+            }
             exec("BEGIN;")
             recordHolesLocked(victims)
             var stmt: OpaquePointer?
@@ -2108,7 +2136,7 @@ public final class VectorStore: @unchecked Sendable {
             sqlite3_finalize(kstmt)
             bumpGenLocked()
             exec("COMMIT;")
-            removeRowsLocked { Self.pathUnderFolderBytes($0.path, folder) }   // byte-wise, like the DELETE above
+            removeRowsLocked { $0.path == folder || SearchFilter.underFolderBytes($0.path, prefixBytes) }
             proactiveRefoldLocked()
             checkpointIfDueLocked(forceStat: true)   // deletes carry no byte estimate (F17)
         }
@@ -5099,14 +5127,16 @@ public final class VectorStore: @unchecked Sendable {
                       sqlite3_column_double(stmt, 1) == modified,
                       sqlite3_column_int64(stmt, 2) == size,
                       String(cString: sqlite3_column_text(stmt, 3)) == kindTable[kc],
-                      Int(sqlite3_column_int(stmt, 4)) == header.dim,
-                      let blob = sqlite3_column_blob(stmt, 0)
+                      Int(sqlite3_column_int(stmt, 4)) == header.dim
                 else { sampleOK = false; break }
+                // BEFORE asking for the blob pointer, not after. A covered row has no blob left to
+                // compare against - the file IS its vector - and sqlite3_column_blob returns NULL
+                // for a zero-length value, so binding it first failed the guard and rejected the
+                // sidecar. Every launch on a migrated index then did the full SQLite scan instead
+                // of adopting: 5.4 s against 0.6 s at 4.5M rows, with nothing visibly wrong.
                 let blobBytes = Int(sqlite3_column_bytes(stmt, 0))
-                // A covered row has no blob left to compare against - the file IS its vector - so
-                // the sample checks its metadata and moves on. Without this every launch after the
-                // first coverage slice rejected the sidecar and did the full scan instead.
                 if blobBytes == 0 { i += stride; continue }
+                guard let blob = sqlite3_column_blob(stmt, 0) else { sampleOK = false; break }
                 let ok: Bool = flat16.withUnsafeBufferPointer { fb in
                     let row = UnsafeBufferPointer(rebasing: fb[i * header.dim ..< (i + 1) * header.dim])
                     if blobBytes == header.dim * 2 {
@@ -6101,7 +6131,7 @@ public final class VectorStore: @unchecked Sendable {
     /// (the in-place memmove is only ~5ms), and that whole window holds the serial queue a concurrent
     /// search waits on. A path maps to exactly one dense file-id covering all its rows, so the mask is
     /// exact. Folder/kind removals (prefix / kind predicates) keep the generic `removeRowsLocked`.
-    private func removeRowsByPathsLocked(_ paths: Set<String>) {
+    private func removeRowsByPathsLocked(_ paths: Set<String>, victims: [Int32]? = nil) {
         guard dim > 0 else { removeRowsLocked { paths.contains($0.path) }; return }
         // Map the (small) removed set to file-ids -> a bool mask indexed by id. Only currently-present
         // paths have an id and any rows; new paths in the set (a reconcile batch mixes add+modify) are
@@ -6124,9 +6154,15 @@ public final class VectorStore: @unchecked Sendable {
         // still materializes per-row flags first, which are immune to its own writes.
         var removed = Set<String>()
         var tombstoned = false
-        idMask.withUnsafeBufferPointer { m in
-            fileID.withUnsafeBufferPointer { fid in
-                if let r = tombstoneOnlyLocked({ m[Int(fid[$0])] }) { removed = r; tombstoned = true }
+        // The caller already computed exactly these rows, bounded to the files' row windows, so the
+        // tombstone pass takes them rather than walking the index a second time to rediscover them.
+        if let pre = victims, let r = tombstoneOnlyLocked(victims: pre) {
+            removed = r; tombstoned = true
+        } else if victims == nil {
+            idMask.withUnsafeBufferPointer { m in
+                fileID.withUnsafeBufferPointer { fid in
+                    if let r = tombstoneOnlyLocked({ m[Int(fid[$0])] }) { removed = r; tombstoned = true }
+                }
             }
         }
         if !tombstoned {
@@ -6205,6 +6241,14 @@ public final class VectorStore: @unchecked Sendable {
     /// Tombstone every matching row, or return nil when this removal cannot be served that way and
     /// the caller must fall back to a physical compaction. Mutates nothing the predicate may be
     /// reading through a buffer pointer.
+    /// Precomputed form: the caller has already resolved exactly which live rows to remove, so this
+    /// skips the O(rows) predicate pass entirely. Same budget rule and same bookkeeping.
+    private func tombstoneOnlyLocked(victims: [Int32]) -> Set<String>? {
+        guard Self.tombstones, dim > 0, !rows.isEmpty, !victims.isEmpty else { return nil }
+        guard coveredRows > 0 || deadRows.count + victims.count <= deadBudget else { return nil }
+        return applyTombstonesLocked(victims)
+    }
+
     private func tombstoneOnlyLocked(_ shouldRemove: (Int) -> Bool) -> Set<String>? {
         guard Self.tombstones, dim > 0, !rows.isEmpty else { return nil }
         // DELTA ROWS TOMBSTONE TOO. They used to force a physical compaction, on the grounds that
@@ -6224,16 +6268,23 @@ public final class VectorStore: @unchecked Sendable {
         guard !hits.isEmpty, coveredRows > 0 || deadRows.count + hits.count <= deadBudget else {
             return nil
         }
-        // LAST LINE OF DEFENCE, at the exact point the damage would be done. A row inside the
-        // covered prefix that is about to become a tombstone MUST already have its slot recorded -
-        // its caller was supposed to do that inside the same transaction as the DELETE. Three
-        // separate removal paths have been found forgetting, and each one was invisible until an
-        // invariant caught it, so this stops trusting the enumeration and checks the thing itself.
-        //
-        // DEBUG trips immediately, so a new removal path fails the first test that exercises it. In
-        // release the hole is recorded anyway rather than dropped: it lands outside the delete's
-        // transaction, which narrows the exposure to a crash inside this call instead of leaving
-        // the file holding a slot no row owns for the rest of the index's life.
+        return applyTombstonesLocked(hits)
+    }
+
+    /// Mark these rows dead and do their per-file bookkeeping.
+    ///
+    /// LAST LINE OF DEFENCE, at the exact point the damage would be done: a row inside the covered
+    /// prefix about to become a tombstone MUST already have its slot recorded, by its caller, inside
+    /// the same transaction as the DELETE. Three separate removal paths have been found forgetting,
+    /// each invisible until an invariant caught it, so this checks the thing itself rather than
+    /// trusting an enumeration of callers. Shared by both tombstone entry points so the check and
+    /// the accounting cannot drift apart.
+    ///
+    /// DEBUG trips immediately, so a new removal path fails the first test that exercises it. In
+    /// release the hole is recorded anyway rather than dropped: it lands outside the delete's
+    /// transaction, which narrows the exposure to a crash inside this call instead of leaving the
+    /// file holding a slot no row owns for the rest of the index's life.
+    private func applyTombstonesLocked(_ hits: [Int32]) -> Set<String> {
         if coveredRows > 0 {
             let unrecorded = hits.filter { Int($0) < coveredRows && !vecHoles.contains($0) }
             if !unrecorded.isEmpty {
