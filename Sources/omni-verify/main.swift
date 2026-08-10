@@ -227,6 +227,12 @@ func churnbenchRun(_ nFiles: Int, _ secs: Double) throws -> Int32 {
     print(String(format: "  memory: post-init floor %.0f MB -> peak %.0f MB (store bf16 ~%.1f MB; burst over floor %.2fx)",
                  m1, peakMB, Double(indexed.count * 64 * 2) / 1_048_576, peakMB / max(m1, 1)))
     print(String(format: "  consistency: onDisk=%d indexed=%d  missing=%d orphan=%d", onDisk.count, indexed.count, missing.count, orphan.count))
+    // The coverage bookkeeping, after thousands of random creates, edits and deletes. The shaped
+    // CRUD tests cover the mutations someone thought to write down; this covers the sequences
+    // nobody did. A removal that forgets to record the slots it orphans shows up here as a broken
+    // invariant rather than as wrong search results months later.
+    let coverageBad = store.coverageAudit()
+    print("  coverage invariant: \(coverageBad ?? "consistent")")
 
     // Search correctness: after the chaos converges, NO query may return a path that is not on disk.
     // This is the check a deferred-compaction/tombstone scheme must never break - a stale (deleted or
@@ -249,6 +255,7 @@ func churnbenchRun(_ nFiles: Int, _ secs: Double) throws -> Int32 {
 
     try? FileManager.default.removeItem(at: root)
     let ok = !hung && missing.count == 0 && orphan.count == 0 && ghost == 0 && cleanClose
+        && coverageBad == nil
     print("  RESULT: \(ok ? "PASS" : "FAIL")")
     return ok ? 0 : 1
 }

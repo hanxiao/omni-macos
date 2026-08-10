@@ -2084,7 +2084,13 @@ public final class VectorStore: @unchecked Sendable {
             guard dbOpen() else { return }
             let set = Set(kinds)
             let marks = Array(repeating: "?", count: kinds.count).joined(separator: ",")
+            // Holes for the rows this is about to orphan, inside the same transaction - the same
+            // rule every other removal follows. A settings toggle that purges a whole kind is a
+            // bulk delete like any other, and skipping it here would leave the vector file holding
+            // slots no row owns with nothing recording which.
+            let victims = victimRowsMatchingLocked { set.contains($0.kind) }
             exec("BEGIN;")
+            recordHolesLocked(victims)
             var stmt: OpaquePointer?
             // Key rows first (the subquery needs the chunks rows still present).
             if sqlite3_prepare_v2(db, "DELETE FROM content_keys WHERE path IN (SELECT DISTINCT path FROM chunks WHERE kind IN (\(marks)));", -1, &stmt, nil) == SQLITE_OK {
@@ -2115,7 +2121,9 @@ public final class VectorStore: @unchecked Sendable {
             func disabled(_ path: String) -> Bool { lower.contains((path as NSString).pathExtension.lowercased()) }
             let victims = Set(rows.filter { disabled($0.path) }.map { $0.path })
             guard !victims.isEmpty else { return }
+            let victimRows = victimRowsMatchingLocked { disabled($0.path) }
             exec("BEGIN;")
+            recordHolesLocked(victimRows)
             var stmt: OpaquePointer?
             if sqlite3_prepare_v2(db, "DELETE FROM chunks WHERE path = ?;", -1, &stmt, nil) == SQLITE_OK {
                 for path in victims {
@@ -4471,6 +4479,45 @@ public final class VectorStore: @unchecked Sendable {
                 self.stampVectorCoverageLocked()
                 self.stampRowSidecarLocked(sync: false)
             }
+        }
+    }
+
+    /// Check the coverage bookkeeping against reality. Returns nil when consistent, else what broke.
+    ///
+    /// This exists because "did every mutation path record its holes?" cannot be answered by
+    /// reading the code - it is answered by an invariant that any missed path violates. A removal
+    /// that deletes rows without recording the slots it orphaned leaves the file holding vectors no
+    /// row owns, and from the first such slot onward every row resolves to its NEIGHBOUR's vector.
+    /// Nothing downstream can notice that; this can.
+    public func coverageAudit() -> String? {
+        queue.sync {
+            guard dbOpen() else { return nil }
+            guard coveredRows > 0 else {
+                // Nothing claimed: there must be nothing recorded either, and no blob may be gone.
+                if !vecHoles.isEmpty { return "no coverage but \(vecHoles.count) holes recorded" }
+                let cleared = scalarQuery("SELECT COUNT(*) FROM chunks WHERE length(vec) = 0")
+                return cleared == 0 ? nil : "no coverage but \(cleared) rows have no blob"
+            }
+            if coveredRows > rows.count { return "coverage \(coveredRows) exceeds rows \(rows.count)" }
+            // 1. Every recorded hole must actually be a dead row inside the covered prefix.
+            for h in vecHoles {
+                if Int(h) >= coveredRows { return "hole \(h) at or past coverage \(coveredRows)" }
+                if !deadRows.contains(h) { return "hole \(h) is not a dead row" }
+            }
+            // 2. And every dead row inside the prefix must be a recorded hole. This is the half a
+            //    missed removal breaks: the row is gone from SQLite, dead in memory, and unrecorded.
+            for d in deadRows where Int(d) < coveredRows {
+                if !vecHoles.contains(d) { return "dead row \(d) inside coverage is not a recorded hole" }
+            }
+            // 3. The covered prefix must account for exactly the SQLite rows whose blob is gone.
+            let liveCovered = coveredRows - vecHoles.count
+            let cleared = scalarQuery("SELECT COUNT(*) FROM chunks WHERE length(vec) = 0")
+            if cleared != liveCovered { return "coverage accounts for \(liveCovered) rows but \(cleared) have no blob" }
+            // 4. And the vector buffer must still hold a vector for every row.
+            if dim > 0, flat16.count != rows.count * dim {
+                return "vector buffer holds \(flat16.count / Swift.max(1, dim)) rows, table has \(rows.count)"
+            }
+            return nil
         }
     }
 
