@@ -1,4 +1,5 @@
 import XCTest
+import SQLite3
 @testable import OmniKit
 
 /// Every way a file or folder can change, against the coverage bookkeeping.
@@ -309,6 +310,102 @@ final class CoverageCRUDTests: XCTestCase {
             assertFinds(s, live, "mid-migration: settled")
             XCTAssertEqual(s.count, live.count, "row count after interleaved migration")
         }
+    }
+
+    /// THE MIGRATION HAPPENS ONCE. Everything after it - indexing, editing, deleting, searching -
+    /// runs in the new regime and must never re-enter the one-time pass. Two things could break
+    /// that: the completion flag being re-armed (which would re-run the whole-database repack every
+    /// time coverage drew level with indexing), and coverage resetting to 0 while blobs are already
+    /// cleared (which would be data loss, not just repeated work).
+    func testMigrationRunsOnceAndNeverAgain() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("crud-once-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appendingPathComponent("test.sqlite")
+
+        var live: [(String, Int)] = []
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            for f in 0 ..< 120 {
+                let p = "/o/f\(f).txt"
+                try store.replace(path: p, chunks: [chunk(p, 0, 70_000 + f)])
+                live.append((p, 70_000 + f))
+            }
+            store.close()
+        }
+        try settle(dbURL, rounds: 6)
+
+        // Migration complete: the flag is set and there is nothing left to report.
+        try reopen(dbURL) { s in
+            audit(s, "once: after migration")
+            XCTAssertNil(s.storageMigration, "migration still reporting after it finished")
+        }
+        XCTAssertEqual(dbState(dbURL).covered > 0, true, "coverage never advanced")
+
+        // Consume the one repack the migration owes, the way the app's launch task does. After
+        // this it must never be owed again - it is a whole-database rewrite, and re-arming it on
+        // every catch-up would mean VACUUMing repeatedly for the life of the index.
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            XCTAssertEqual(pendingRepack(dbURL), 1, "migration did not owe a repack")
+            _ = store.reclaimAfterCoverageMigration()
+            store.close()
+        }
+        XCTAssertEqual(pendingRepack(dbURL), 0, "repack still owed after it ran")
+
+        // Now do everything a user does, repeatedly, and demand it never re-enters the pass.
+        for round in 0 ..< 5 {
+            let store = try VectorStore(dbURL: dbURL)
+            let add = "/o/added\(round).txt"
+            try store.replace(path: add, chunks: [chunk(add, 0, 80_000 + round)])
+            live.append((add, 80_000 + round))
+            let edit = "/o/f\(round).txt"
+            try store.replace(path: edit, chunks: [chunk(edit, 0, 90_000 + round)])
+            live.removeAll { $0.0 == edit }; live.append((edit, 90_000 + round))
+            store.deletePath("/o/f\(100 + round).txt")
+            live.removeAll { $0.0 == "/o/f\(100 + round).txt" }
+            _ = store.search(vec(70_000), filter: SearchFilter(), topK: 5)
+            store.close()
+            try settle(dbURL, rounds: 2)
+
+            try reopen(dbURL) { s in
+                audit(s, "once: round \(round)")
+                // The one-time pass must stay finished: no progress to report, ever again.
+                XCTAssertNil(s.storageMigration, "round \(round): migration re-armed itself")
+                assertFinds(s, live, "once: round \(round)")
+            }
+            // And the repack must not be owed again - it is a whole-database rewrite.
+            XCTAssertEqual(pendingRepack(dbURL), 0, "round \(round): repack re-armed")
+        }
+
+        // New rows still get covered - that is steady state, not migration - so the database does
+        // not quietly refill with the duplicate blobs the migration removed.
+        let st = dbState(dbURL)
+        XCTAssertGreaterThan(st.clearedBlobs, 0, "new rows never got covered")
+    }
+
+    private func dbState(_ dbURL: URL) -> (covered: Int, clearedBlobs: Int) {
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(dbURL.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { return (0, 0) }
+        defer { sqlite3_close(db) }
+        func scalar(_ sql: String) -> Int {
+            var st: OpaquePointer?
+            defer { sqlite3_finalize(st) }
+            guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { return 0 }
+            return sqlite3_step(st) == SQLITE_ROW ? Int(sqlite3_column_int64(st, 0)) : 0
+        }
+        return (scalar("SELECT CAST(value AS INTEGER) FROM meta WHERE key='vecs_covered_rows'"),
+                scalar("SELECT COUNT(*) FROM chunks WHERE length(vec) = 0"))
+    }
+
+    private func pendingRepack(_ dbURL: URL) -> Int {
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(dbURL.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { return -1 }
+        defer { sqlite3_close(db) }
+        var st: OpaquePointer?
+        defer { sqlite3_finalize(st) }
+        guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM meta WHERE key='vecs_vacuum_pending';", -1, &st, nil) == SQLITE_OK else { return -1 }
+        return sqlite3_step(st) == SQLITE_ROW ? Int(sqlite3_column_int(st, 0)) : -1
     }
 
     /// Wiping the index has to take the coverage claim with it. A claim that outlives the rows it

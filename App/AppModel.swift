@@ -947,6 +947,9 @@ final class AppModel {
     /// One-time storage migration: rows already converted, rows total, bytes still to reclaim.
     /// nil when there is nothing to do, so a finished index shows no banner at all.
     var storageMigration: (done: Int, total: Int, bytesToReclaim: Int64)? = nil
+    /// On-disk cost per file. The index is not one file, and a single number for it reads as though
+    /// it were - after the migration the database is the smallest of the three that matter.
+    var diskUse: [VectorStore.DiskUse.Entry] = []
     var lastIndexed: Date?
     var indexObsolete = false
     var indexStoredDim = 0                  // actual vector dim of the current index (0 if empty)
@@ -2383,7 +2386,8 @@ final class AppModel {
                 // free pages). reclaimAfterCoverageMigration handles the one the free-page gate
                 // cannot see: migrating off the duplicate vectors rewrites rows shorter without
                 // freeing a single page, so it is owed a repack that no ratio would ever trigger.
-                var freed = store.reclaimAfterCoverageMigration()
+                var freed = store.removeLegacyFiles()
+                freed += store.reclaimAfterCoverageMigration()
                 freed += store.compact(minFreeRatio: 0.5)
                 if freed > 0 { await MainActor.run { self.refreshIndexStats(store) } }
             }
@@ -2445,6 +2449,7 @@ final class AppModel {
             let path = store.dbURL.path
             let lastTs = store.metaGet("last_indexed").flatMap { Double($0) }
             let migration = store.storageMigration
+            let disk = store.diskUse().entries
             let stampedVersion = store.metaGet("embedding_version")
             let storedDim = store.vectorDim   // ACTUAL stored vector dim - ground truth
             let builtVariant = store.metaGet("index_model_variant")
@@ -2478,6 +2483,7 @@ final class AppModel {
                 self.dbPath = path
                 self.dbSizeBytes = size
                 self.storageMigration = migration
+                self.diskUse = disk
                 if let lastTs { self.lastIndexed = Date(timeIntervalSince1970: lastTs) }
                 // Require engineDim > 0: before the engine reports its dimension the fingerprint is
                 // "...|dim0|model0-0", which would spuriously flag obsolete and wipe a valid index.

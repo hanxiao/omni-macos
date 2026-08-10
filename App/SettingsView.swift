@@ -684,6 +684,77 @@ private struct MemoryBreakdown: View {
     }
 }
 
+/// What the index costs on disk, drawn the same way memory is - because the same mistake is
+/// available in both places. "Size: 3.27 GB" reads as the whole index, and after the migration the
+/// SQLite database is the SMALLEST of the three files that matter: the vectors are another 6.5 GB
+/// sitting beside it. A bar makes the proportion obvious at a glance, and the legend says which
+/// files would cost a reindex if lost and which the app simply rebuilds.
+private struct DiskBreakdown: View {
+    let entries: [VectorStore.DiskUse.Entry]
+
+    /// Warm for the files that ARE the index, cool for everything derived from them. The split is
+    /// the one fact a user needs here, so it is carried by hue rather than by a footnote.
+    private func color(_ e: VectorStore.DiskUse.Entry) -> Color {
+        switch e.name {
+        case "Vectors":         return .orange
+        case "Database":        return .pink
+        case "Scan replica":    return .teal
+        case "Row table":       return .blue
+        case "Filename search": return .indigo
+        case "Image tags":      return .mint
+        default:                return .gray
+        }
+    }
+
+    private func fmt(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+
+    private var total: Int64 { max(1, entries.reduce(0) { $0 + $1.bytes }) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Size")
+                Spacer()
+                Text(fmt(entries.reduce(0) { $0 + $1.bytes }))
+                    .foregroundStyle(.secondary).monospacedDigit()
+            }
+            GeometryReader { geo in
+                HStack(spacing: 0) {
+                    ForEach(Array(entries.enumerated()), id: \.offset) { i, e in
+                        // Last slice absorbs the rounding, so several roundings cannot leave a
+                        // hairline gap at the trailing edge.
+                        let w = i == entries.count - 1
+                            ? nil
+                            : (geo.size.width * CGFloat(e.bytes) / CGFloat(total)).rounded(.down)
+                        Rectangle().fill(color(e))
+                            .frame(width: w)
+                            .frame(maxWidth: w == nil ? .infinity : nil)
+                    }
+                }
+            }
+            .frame(height: 16)
+            .background(Color(nsColor: .quaternaryLabelColor))
+            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+
+            LazyVGrid(columns: [GridItem(.flexible(), alignment: .leading),
+                                GridItem(.flexible(), alignment: .leading)], spacing: 4) {
+                ForEach(Array(entries.enumerated()), id: \.offset) { _, e in
+                    HStack(spacing: 5) {
+                        Circle().fill(color(e)).frame(width: 7, height: 7)
+                        Text(e.name)
+                        Spacer(minLength: 4)
+                        Text(fmt(e.bytes)).foregroundStyle(.secondary).monospacedDigit()
+                    }
+                    .help(e.irreplaceable ? e.detail : "\(e.detail) - rebuilt automatically if deleted")
+                }
+            }
+            .font(.caption)
+        }
+    }
+}
+
 /// Search History preferences - what gets remembered, for how long, and a way to clear it.
 /// Mirrors how macOS surfaces recents/Smart Folders: an explicit recording mode, a time window,
 /// and a destructive clear that spares the user's explicit bookmarks.
@@ -766,7 +837,11 @@ private struct IndexTab: View {
             Section("Index") {
                 LabeledContent("Indexed files", value: "\(model.indexedFiles)")
                 LabeledContent("Indexed chunks", value: "\(model.indexedChunks)")
-                LabeledContent("Size", value: ByteCountFormatter.string(fromByteCount: model.dbSizeBytes, countStyle: .file))
+                if model.diskUse.isEmpty {
+                    LabeledContent("Size", value: ByteCountFormatter.string(fromByteCount: model.dbSizeBytes, countStyle: .file))
+                } else {
+                    DiskBreakdown(entries: model.diskUse)
+                }
                 // The size above does NOT fall while this runs, and saying so is the whole point of
                 // showing it: converting a row rewrites it shorter without freeing a page, so the
                 // file holds its size until the conversion finishes and the space is reclaimed in

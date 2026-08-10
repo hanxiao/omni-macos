@@ -6021,6 +6021,94 @@ public final class VectorStore: @unchecked Sendable {
 
     public func sizeBytes() -> Int64 { queue.sync { onDiskBytes() } }
 
+    /// What the index costs on disk, split by the file that holds it.
+    ///
+    /// A single "Size" number is actively misleading here, because the index is not one file: after
+    /// the migration the SQLite database is the SMALLEST of the three that matter, and a user
+    /// reading 3 GB has no way to know the vectors are another 7. The split also carries the
+    /// distinction that governs everything else - what is authoritative and what is derived - so a
+    /// reader can see which files would cost them a reindex and which regenerate themselves.
+    ///
+    /// `other` sweeps up anything in the folder that is not accounted for, which is how a stray
+    /// file from an older version becomes visible rather than mysterious.
+    public struct DiskUse: Sendable {
+        public struct Entry: Sendable {
+            public let name: String
+            public let bytes: Int64
+            /// False for anything the store can rebuild by itself.
+            public let irreplaceable: Bool
+            public let detail: String
+        }
+        public let entries: [Entry]
+        public var total: Int64 { entries.reduce(0) { $0 + $1.bytes } }
+    }
+
+    public func diskUse() -> DiskUse {
+        let dir = dbURL.deletingLastPathComponent()
+        let base = dbURL.lastPathComponent
+        let fm = FileManager.default
+        func size(_ name: String) -> Int64 {
+            ((try? fm.attributesOfItem(atPath: dir.appendingPathComponent(name).path)[.size]) as? Int64) ?? 0
+        }
+        // The database plus its journal: one logical thing, and the WAL is transient enough that
+        // listing it separately would just look like a leak.
+        let dbBytes = size(base) + size(base + "-wal") + size(base + "-shm")
+        var entries: [DiskUse.Entry] = [
+            .init(name: "Vectors", bytes: size(base + ".vecs"), irreplaceable: true,
+                  detail: "the embeddings themselves"),
+            .init(name: "Database", bytes: dbBytes, irreplaceable: true,
+                  detail: "paths, text excerpts, structure"),
+            .init(name: "Scan replica", bytes: size(base + ".quant"), irreplaceable: false,
+                  detail: "compressed copy for fast search"),
+            .init(name: "Row table", bytes: size(base + ".rows"), irreplaceable: false,
+                  detail: "skips a slow scan at launch"),
+            .init(name: "Filename search", bytes: size(base + ".names") + size(base + ".names-wal") + size(base + ".names-shm"),
+                  irreplaceable: false, detail: "match by name as you type"),
+            .init(name: "Image tags", bytes: size("tags-d\(dim).cache") + size("tags-d\(dim).prior"),
+                  irreplaceable: false, detail: "generated labels for images"),
+        ]
+        // Anything else in the folder, so nothing is invisible. The model directory is excluded:
+        // it is not the index, and it is reported in its own right elsewhere.
+        let known = Set(entries.flatMap { _ in [String]() }
+            + [base, base + "-wal", base + "-shm", base + ".vecs", base + ".quant", base + ".rows",
+               base + ".names", base + ".names-wal", base + ".names-shm",
+               "tags-d\(dim).cache", "tags-d\(dim).prior", "nano", "query-images", ".omniignore"])
+        var otherBytes: Int64 = 0
+        var otherNames: [String] = []
+        for n in (try? fm.contentsOfDirectory(atPath: dir.path)) ?? [] where !known.contains(n) {
+            var isDir: ObjCBool = false
+            fm.fileExists(atPath: dir.appendingPathComponent(n).path, isDirectory: &isDir)
+            guard !isDir.boolValue else { continue }
+            otherBytes += size(n)
+            otherNames.append(n)
+        }
+        if !otherNames.isEmpty {
+            entries.append(.init(name: "Other files", bytes: otherBytes, irreplaceable: false,
+                                 detail: otherNames.sorted().joined(separator: ", ")))
+        }
+        return DiskUse(entries: entries.filter { $0.bytes > 0 })
+    }
+
+    /// Delete files an older version left behind that nothing reads any more. Conservative on
+    /// purpose: only names this app is known to have created itself, never anything that could be
+    /// the user's own (a hand-written .omniignore backup, say). Returns bytes reclaimed.
+    @discardableResult
+    public func removeLegacyFiles() -> Int64 {
+        let dir = dbURL.deletingLastPathComponent()
+        let fm = FileManager.default
+        var freed: Int64 = 0
+        // index.sqlite3 was a stray path from an early build and is always empty; .demo was a
+        // sample database shipped before the onboarding flow existed.
+        for name in ["index.sqlite3", "index.sqlite.demo"] {
+            let u = dir.appendingPathComponent(name)
+            guard fm.fileExists(atPath: u.path) else { continue }
+            let bytes = ((try? fm.attributesOfItem(atPath: u.path)[.size]) as? Int64) ?? 0
+            if name == "index.sqlite3", bytes > 0 { continue }   // not the empty stray; leave it
+            if (try? fm.removeItem(at: u)) != nil { freed += bytes }
+        }
+        return freed
+    }
+
     /// What the SEARCH DATA costs in memory right now, split by where it lives. Feeds the Settings
     /// breakdown, which would otherwise file both halves under the wrong heading: the quantized
     /// base is MLXArrays, so it shows up inside MLX's active total and reads as "the model", when
