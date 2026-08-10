@@ -109,13 +109,10 @@ final class MutationLifecycleTests: XCTestCase {
         return indexed
     }
 
-    /// The index matches the filesystem exactly. Asserted only where the system actually promises
-    /// it. A FILE event names the file, so update() resolves it immediately; a DIRECTORY event
-    /// names only the directory, and a vanished directory has no stored rows of its own - the files
-    /// beneath it are reconciled by the next full pass instead. That is pre-existing behaviour (the
-    /// app calls deleteUnderFolder for folders it removes from the sidebar, and runs a catch-up
-    /// pass at launch), so the tests hold folder events to eventual agreement and file events to
-    /// immediate agreement, rather than pretending both are the same.
+    /// The index matches the filesystem exactly, immediately after the event that changed it -
+    /// for FILE and FOLDER events alike. A vanished directory names no rows of its own, so it used
+    /// to leave every file beneath it indexed under a path that no longer existed until the next
+    /// full pass; update() now removes those by prefix in the same call.
     private func assertMatchesDisk(_ dbURL: URL, _ root: URL, _ label: String,
                                    file: StaticString = #filePath, line: UInt = #line) throws {
         let indexed = try assertInvariant(dbURL, label, file: file, line: line)
@@ -127,11 +124,8 @@ final class MutationLifecycleTests: XCTestCase {
         XCTAssertEqual(onDisk.subtracting(indexed), [], "\(label): files on disk that are not indexed", file: file, line: line)
     }
 
-    /// A folder-level change reaches the store either as deleteUnderFolder (the sidebar path) or as
-    /// a reconcile pass (the watcher path). This is the latter.
-    private func reconcile(_ dbURL: URL, _ root: URL) throws {
-        try indexAndSettle(dbURL, root, rounds: 2)
-    }
+    /// A folder-level change now resolves in the SAME update() the watcher delivers, so these are
+    /// held to the same immediate agreement as file events - no reconcile pass in between.
 
     func testAddEditRenameMoveDeleteAtFileAndFolderLevel() throws {
         let root = try makeRoot()
@@ -179,8 +173,6 @@ final class MutationLifecycleTests: XCTestCase {
         let newDir = root.appendingPathComponent("dir3-renamed")
         try FileManager.default.moveItem(at: oldDir, to: newDir)
         try update(dbURL, [oldDir.path, newDir.path])
-        try assertInvariant(dbURL, "after folder rename (pre-reconcile)")
-        try reconcile(dbURL, root)
         try assertMatchesDisk(dbURL, root, "after folder rename")
 
         // MOVE A FOLDER INSIDE ANOTHER.
@@ -188,8 +180,6 @@ final class MutationLifecycleTests: XCTestCase {
         let nestTo = root.appendingPathComponent("dir0/nested2")
         try FileManager.default.moveItem(at: nestFrom, to: nestTo)
         try update(dbURL, [nestFrom.path, nestTo.path])
-        try assertInvariant(dbURL, "after folder move (pre-reconcile)")
-        try reconcile(dbURL, root)
         try assertMatchesDisk(dbURL, root, "after folder move")
 
         // DELETE A FILE.
@@ -202,8 +192,6 @@ final class MutationLifecycleTests: XCTestCase {
         let goneDir = root.appendingPathComponent("dir3-renamed")
         try FileManager.default.removeItem(at: goneDir)
         try update(dbURL, [goneDir.path])
-        try assertInvariant(dbURL, "after folder delete (pre-reconcile)")
-        try reconcile(dbURL, root)
         try assertMatchesDisk(dbURL, root, "after folder delete")
 
         // ADD BACK at a path that was deleted: its old slot is a hole and the new rows append past
@@ -247,8 +235,6 @@ final class MutationLifecycleTests: XCTestCase {
         let docs = root.appendingPathComponent("docs")
         try FileManager.default.removeItem(at: docs)
         try update(dbURL, [docs.path])
-        try assertInvariant(dbURL, "nfd: after folder delete (pre-reconcile)")
-        try reconcile(dbURL, root)
         try assertMatchesDisk(dbURL, root, "nfd: after folder delete")
     }
 }

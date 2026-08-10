@@ -2066,6 +2066,21 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
+    /// Does anything under `folder` have rows? Index-driven range probe on idx_path, so it is a
+    /// lookup rather than a scan - which is what makes it safe to ask before every folder-shaped
+    /// removal, including the ones that will turn out to have nothing to remove.
+    public func hasRowsUnder(_ folder: String) -> Bool {
+        guard !folder.isEmpty, folder != "/" else { return false }
+        return queue.sync {
+            guard dbOpen() else { return false }
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_prepare_v2(db, "SELECT 1 FROM chunks WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0') LIMIT 1;", -1, &stmt, nil) == SQLITE_OK else { return false }
+            sqlite3_bind_text(stmt, 1, folder, -1, SQLITE_TRANSIENT)
+            return sqlite3_step(stmt) == SQLITE_ROW
+        }
+    }
+
     /// Delete every chunk whose path is under `folder` (path-boundary aware).
     public func deleteUnderFolder(_ folder: String) {
         // Destructive-op guard: an empty (or root "/") folder would match every absolute path and

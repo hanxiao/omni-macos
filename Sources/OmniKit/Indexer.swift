@@ -931,7 +931,21 @@ public final class Indexer: @unchecked Sendable {
             catch { Self.log.error("update: replaceMany(\(toReplace.count, privacy: .public)) failed: \(String(describing: error), privacy: .public)") }
             toReplace.removeAll(keepingCapacity: true)
         }
-        for path in deletedTop where known[path] != nil { toDelete.insert(path) }   // deleted / moved away
+        // A vanished path that has stored rows OF ITS OWN is a file: batch it with the others.
+        // A vanished path with none is a DIRECTORY (renamed, moved or deleted), and its files are
+        // still indexed under the old prefix. Those used to survive until the next full pass - the
+        // watcher only ever names the directory, and a directory has no rows to match - so a folder
+        // rename left every file beneath it searchable under a path that no longer existed.
+        //
+        // Deleting by prefix is sound for either kind: the path itself is gone, so nothing beneath
+        // it can exist either. For a file the prefix range matches nothing extra, which is why this
+        // does not need to know which it was. hasRowsUnder keeps it to an index probe when there is
+        // nothing to do, which is the common case for an ordinary file event.
+        var vanishedPrefixes: [String] = []
+        for path in deletedTop {
+            if known[path] != nil { toDelete.insert(path) }         // deleted / moved away
+            else if store.hasRowsUnder(path) { vanishedPrefixes.append(path) }
+        }
         // Resolve which files actually need (re)embedding - stat-level checks only, no decode.
         var work: [CrawledFile] = []
         for url in files {
@@ -1115,6 +1129,10 @@ public final class Indexer: @unchecked Sendable {
         // chunk set would permanently truncate the file under its current mtime, so never store them.
         for (_, a) in tAcc where a.done.count == a.total { acceptCompleted(a.path, a.done) }
         if !toDelete.isEmpty { store.deletePaths(toDelete) }
+        // AFTER the exact-path deletions and BEFORE the re-embeds are flushed: a rename's new path
+        // is a different prefix, so this cannot reach the rows flushReplace is about to write, and
+        // doing it first keeps the old rows from lingering for the width of the batch.
+        for prefix in vanishedPrefixes { store.deleteUnderFolder(prefix) }
         flushReplace()
         let dedupHits = takeDedupHits()
         if dedupHits > 0 { Self.log.info("content dedup (update): \(dedupHits, privacy: .public) file(s) reused stored vectors") }
