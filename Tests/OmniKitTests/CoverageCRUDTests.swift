@@ -633,4 +633,53 @@ final class CoverageCRUDTests: XCTestCase {
             XCTAssertEqual(s.count, live.count, "live row count after mass delete")
         }
     }
+
+
+    /// A REPEATED removal must be free, not catastrophic.
+    ///
+    /// A tombstoned row keeps its path, so the predicate a folder delete matched on still matched
+    /// rows that were already tombstoned - the second of two watcher events for one rename found
+    /// "matches", had nothing live to tombstone, and fell through to a physical compaction. Under
+    /// coverage a compaction first writes every cleared blob back into SQLite, so a no-op delete
+    /// cost gigabytes of writes and stood the whole migration back down.
+    ///
+    /// Coverage surviving the second delete is the observable: a compaction resets it to zero.
+    func testRepeatedFolderDeleteDoesNotUndoCoverage() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("crud-repeat-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appendingPathComponent("test.sqlite")
+
+        var live: [(String, Int)] = []
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            for f in 0 ..< 20 {
+                let p = f < 8 ? "/r/gone/f\(f).txt" : "/r/keep/f\(f).txt"
+                try store.replace(path: p, chunks: [chunk(p, 0, f + 500)])
+                if f >= 8 { live.append((p, f + 500)) }
+            }
+            store.close()
+        }
+        try settle(dbURL)
+        let covered = dbState(dbURL).covered
+        XCTAssertGreaterThan(covered, 0, "nothing was covered, so this proves nothing")
+
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            store.deleteUnderFolder("/r/gone")
+            store.deleteUnderFolder("/r/gone")   // the duplicate event
+            store.deleteUnderFolder("/r/gone")
+            audit(store, "after repeated folder delete")
+            store.close()
+        }
+        XCTAssertEqual(dbState(dbURL).covered, covered,
+                       "a repeated delete restored the blobs and stood coverage down")
+
+        try reopen(dbURL) { store in
+            self.audit(store, "reopened after repeated folder delete")
+            self.assertFinds(store, live, "reopened after repeated folder delete")
+            self.assertGone(store, [("/r/gone/f0.txt", 500), ("/r/gone/f7.txt", 507)],
+                            "reopened after repeated folder delete")
+        }
+    }
 }

@@ -15,14 +15,15 @@ let reps = args.count >= 4 ? (Int(args[3]) ?? 5) : 5
 omniSetMemoryLimit(6_000_000_000)
 let store = try VectorStore(dbURL: url)
 print("mutbench rows=\(store.count)")
-var ms: [Double] = []
-for _ in 0 ..< reps {
+// Per rep, not a median: rep 1 may have rows to remove and the rest are repeats of a removal with
+// nothing left, which is a different cost and the one a duplicate watcher event pays.
+for r in 0 ..< reps {
+    let before = store.count
     let t = Date()
     store.deleteUnderFolder(folder)
-    ms.append(-t.timeIntervalSinceNow * 1000)
+    print(String(format: "  deleteUnderFolder rep %d  %7.1f ms  rows %d -> %d", r + 1,
+                 -t.timeIntervalSinceNow * 1000, before, store.count))
 }
-ms.sort()
-print(String(format: "  deleteUnderFolder (no match)  p50 %6.1f ms  min %6.1f  max %6.1f", ms[ms.count / 2], ms[0], ms[ms.count - 1]))
 var hs: [Double] = []
 for _ in 0 ..< reps {
     let t = Date()

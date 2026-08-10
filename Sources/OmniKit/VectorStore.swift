@@ -2195,7 +2195,7 @@ public final class VectorStore: @unchecked Sendable {
                                       bindFolder: folder)
             bumpGenLocked()
             exec("COMMIT;")
-            removeRowsLocked { $0.path == folder || SearchFilter.underFolderBytes($0.path, prefixBytes) }
+            removeRowsLocked(victims: victims) { $0.path == folder || SearchFilter.underFolderBytes($0.path, prefixBytes) }
             proactiveRefoldLocked()
             checkpointIfDueLocked(forceStat: true)   // deletes carry no byte estimate (F17)
         }
@@ -2246,7 +2246,7 @@ public final class VectorStore: @unchecked Sendable {
             bumpGenLocked()
             pruneOrphanFileRowsLocked()   // whole-table sweep: a kind purge names no path range
             exec("COMMIT;")
-            removeRowsLocked { set.contains($0.kind) }
+            removeRowsLocked(victims: victims) { set.contains($0.kind) }
             checkpointIfDueLocked(forceStat: true)   // bulk delete inflates the WAL; fold it (self-review fix)
         }
     }
@@ -2283,7 +2283,7 @@ public final class VectorStore: @unchecked Sendable {
             pruneFileRowsLocked(victims)
             bumpGenLocked()
             exec("COMMIT;")
-            removeRowsLocked { disabled($0.path) }
+            removeRowsLocked(victims: victimRows) { disabled($0.path) }
             checkpointIfDueLocked(forceStat: true)   // bulk delete inflates the WAL; fold it (self-review fix)
         }
     }
@@ -6479,7 +6479,19 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
-    private func removeRowsLocked(_ predicate: (Row) -> Bool) {
+    /// `victims` is the caller's already-resolved list of live rows to remove - the same list it had
+    /// to compute BEFORE its transaction in order to record the vector slots they leave behind. Given
+    /// it, this walks no rows at all: the membership test and the tombstone pass both read it
+    /// directly. Nothing mutates `rows` between the two (the queue is held throughout), so the list
+    /// and the predicate describe the same set by construction - the property removeRowsByPathsLocked
+    /// already relies on.
+    ///
+    /// It also fixes a case the predicate got wrong. A tombstoned row KEEPS its path and kind, so a
+    /// predicate still matches it - and a folder deleted twice (two watcher events for one rename)
+    /// therefore found "matches", tombstoned none of them, and fell through to a physical
+    /// compaction. Under coverage that means restoring every cleared blob first: gigabytes of writes
+    /// for a removal with nothing left to remove. An empty victim list says that plainly.
+    private func removeRowsLocked(victims: [Int32]? = nil, _ predicate: (Row) -> Bool) {
         // dim==0 means no vectors stored yet, but `rows` may still hold metadata - keep fileID and
         // the base in sync if anything is actually removed (the base was previously left stale here).
         guard dim > 0 else {
@@ -6500,8 +6512,14 @@ public final class VectorStore: @unchecked Sendable {
         // case - replace() calls this before appending a NEW file's chunks, where there is no
         // prior row to remove. Without it, every stored file rebuilt the entire ~dim*rows.count
         // buffer (a multi-GB memmove on a large index), making indexing and reconcile O(N^2).
-        guard rows.contains(where: predicate) else { return }
-        let removed = removeRowsFastLocked { predicate(rows[$0]) }
+        // dim > 0 here, so a victim list is the caller's real answer and not the empty one
+        // victimRowsMatchingLocked returns for a store with no vectors.
+        if let victims {
+            guard !victims.isEmpty else { return }
+        } else {
+            guard rows.contains(where: predicate) else { return }
+        }
+        let removed = removeRowsFastLocked(victims: victims) { predicate(rows[$0]) }
         dropFromPresentLocked(removed)
         rowWindowAuditLocked("removeRows")
     }
@@ -6517,8 +6535,11 @@ public final class VectorStore: @unchecked Sendable {
     /// Remove rows without moving the index: what falls inside the resident base is tombstoned,
     /// what falls in the delta compacts as before. Falls back to a full compaction when the
     /// tombstones would pass `deadBudget`, which also collects the ones already standing.
-    private func removeRowsFastLocked(_ shouldRemove: (Int) -> Bool) -> Set<String> {
-        tombstoneOnlyLocked(shouldRemove) ?? compactRowsLocked(shouldRemove)
+    /// The compaction fallback still takes the PREDICATE, not the list: it collects the standing
+    /// tombstones as well, which are rows the list deliberately excludes.
+    private func removeRowsFastLocked(victims: [Int32]? = nil, _ shouldRemove: (Int) -> Bool) -> Set<String> {
+        let tombstoned = victims.map { tombstoneOnlyLocked(victims: $0) } ?? tombstoneOnlyLocked(shouldRemove)
+        return tombstoned ?? compactRowsLocked(shouldRemove)
     }
 
     /// Tombstone every matching row, or return nil when this removal cannot be served that way and
