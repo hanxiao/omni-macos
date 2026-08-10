@@ -408,6 +408,101 @@ final class CoverageCRUDTests: XCTestCase {
         return sqlite3_step(st) == SQLITE_ROW ? Int(sqlite3_column_int(st, 0)) : -1
     }
 
+    /// EVERY MUTATION, ON A CONVERTED INDEX. The rest of this suite builds stores through the store
+    /// API, which now creates the interned schema directly - so it tests the layout an new user
+    /// gets, never the one an EXISTING user arrives with. This seeds the legacy layout by hand,
+    /// lets the open convert it, and then runs the same battery against the result. That is the
+    /// path every existing index actually takes, and the only one where the conversion's output
+    /// meets the CRUD paths.
+    func testConvertedLegacyIndexSurvivesEveryMutation() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("crud-conv-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appendingPathComponent("test.sqlite")
+
+        // Seed the LEGACY schema: path written per chunk, user_version 2, real bf16 vectors so the
+        // search assertions below mean something.
+        var live: [(String, Int)] = []
+        do {
+            var db: OpaquePointer?
+            XCTAssertEqual(sqlite3_open_v2(dbURL.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil), SQLITE_OK)
+            defer { sqlite3_close(db) }
+            sqlite3_exec(db, """
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE chunks(path TEXT NOT NULL, modified REAL NOT NULL, size INTEGER NOT NULL DEFAULT 0,
+                  kind TEXT NOT NULL, chunk_index INTEGER NOT NULL, snippet TEXT NOT NULL,
+                  dim INTEGER NOT NULL, vec BLOB NOT NULL, width INTEGER NOT NULL DEFAULT 0,
+                  height INTEGER NOT NULL DEFAULT 0, duration REAL NOT NULL DEFAULT 0,
+                  locator TEXT NOT NULL DEFAULT '', indexed_at REAL NOT NULL DEFAULT 0,
+                  chunk_key TEXT NOT NULL DEFAULT '',
+                  PRIMARY KEY(path, chunk_index));
+                CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE content_keys(path TEXT PRIMARY KEY, key TEXT NOT NULL, modified REAL NOT NULL, size INTEGER NOT NULL);
+                PRAGMA user_version = 2;
+                """, nil, nil, nil)
+            var ins: OpaquePointer?
+            XCTAssertEqual(sqlite3_prepare_v2(db, "INSERT INTO chunks(path,modified,size,kind,chunk_index,snippet,dim,vec) VALUES(?,1,10,'text',0,?,?,?);", -1, &ins, nil), SQLITE_OK)
+            defer { sqlite3_finalize(ins) }
+            let T = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+            for f in 0 ..< 80 {
+                let p = "/v/f\(f).txt"
+                let seed = 90_000 + f
+                // fp32 -> bf16 by keeping the high half, which is what the store stores.
+                let bf: [UInt16] = vec(seed).map { UInt16(truncatingIfNeeded: $0.bitPattern >> 16) }
+                sqlite3_reset(ins)
+                sqlite3_bind_text(ins, 1, p, -1, T)
+                sqlite3_bind_text(ins, 2, "s\(f)", -1, T)
+                sqlite3_bind_int(ins, 3, Int32(Self.dim))
+                bf.withUnsafeBytes { raw in _ = sqlite3_bind_blob(ins, 4, raw.baseAddress, Int32(raw.count), T) }
+                XCTAssertEqual(sqlite3_step(ins), SQLITE_DONE)
+                live.append((p, seed))
+            }
+        }
+
+        // Opening converts it. Everything from here is the ordinary battery.
+        try reopen(dbURL) { s in
+            audit(s, "converted: after conversion")
+            XCTAssertEqual(s.count, 80, "conversion lost rows")
+            assertFinds(s, live, "converted: after conversion")
+        }
+        try settle(dbURL, rounds: 4)
+        try reopen(dbURL) { s in audit(s, "converted: after coverage") }
+
+        // Edit, delete, folder-delete, kind-purge, re-add - the same shapes the rest of this suite
+        // runs, but against rows that came through the conversion rather than being born interned.
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            for f in 0 ..< 5 {
+                let p = "/v/f\(f).txt"
+                try store.replace(path: p, chunks: [chunk(p, 0, 91_000 + f)])
+                live.removeAll { $0.0 == p }; live.append((p, 91_000 + f))
+            }
+            store.deletePaths(Set((10 ... 14).map { "/v/f\($0).txt" }))
+            live.removeAll { p, _ in (10 ... 14).contains(Int(p.dropFirst(4).dropLast(4)) ?? -1) }
+            let added = "/v/new.txt"
+            try store.replace(path: added, chunks: [chunk(added, 0, 92_000)])
+            live.append((added, 92_000))
+            store.close()
+        }
+        try settle(dbURL, rounds: 2)
+        try reopen(dbURL) { s in
+            audit(s, "converted: after mutations")
+            assertFinds(s, live, "converted: after mutations")
+            assertGone(s, (10 ... 14).map { ("/v/f\($0).txt", 90_000 + $0) }, "converted: after mutations")
+        }
+
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            store.deleteUnderFolder("/v")
+            store.close()
+        }
+        try settle(dbURL, rounds: 2)
+        try reopen(dbURL) { s in
+            audit(s, "converted: after folder delete")
+            XCTAssertEqual(s.count, 0, "folder delete left rows behind on a converted index")
+        }
+    }
+
     /// Wiping the index has to take the coverage claim with it. A claim that outlives the rows it
     /// describes is a promise about a file that no longer holds what it says - and the next launch
     /// would try to read vectors out of it for rows that are gone.

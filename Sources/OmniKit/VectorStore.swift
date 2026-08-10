@@ -596,7 +596,12 @@ final class Vec16Buffer {
 
 /// Accelerate GEMV (cblas_sgemv) per query; SQLite is the durable source of truth.
 public final class VectorStore: @unchecked Sendable {
-    private static let schemaVersion: Int32 = 2
+    /// 3 = paths interned into `files`. An index at 2 is converted on open; an index at 3 opened by
+    /// a binary that only knows 2 is DROPPED and rebuilt by that binary, which is the safe direction
+    /// - it would otherwise query a `chunks.path` column that no longer exists and quietly return
+    /// nothing. Both are accepted here so an upgrade never forces a reindex.
+    private static let schemaVersion: Int32 = 3
+    private static let compatibleSchemaVersions: Set<Int32> = [2, 3]
 
     private var db: OpaquePointer?
     private let queue = DispatchQueue(label: "omni.vectorstore")
@@ -1496,13 +1501,17 @@ public final class VectorStore: @unchecked Sendable {
         exec("PRAGMA wal_autocheckpoint=\(autoCkpt);")
         exec("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);")
         // The index is a rebuildable cache: on a schema change, drop and recreate.
-        if userVersion() != Self.schemaVersion {
+        if !Self.compatibleSchemaVersions.contains(userVersion()) {
             exec("DROP TABLE IF EXISTS chunks;")
             exec("DROP TABLE IF EXISTS content_keys;")
         }
+        // A path is written once, in `files`, and carried as a 4-byte id. It used to be written
+        // once per CHUNK - 17 times for the average file, in the table and again in the primary
+        // key - which measured 51% of the database on a real index.
+        exec("CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);")
         exec("""
             CREATE TABLE IF NOT EXISTS chunks(
-                path TEXT NOT NULL,
+                file_id INTEGER NOT NULL,
                 modified REAL NOT NULL,
                 size INTEGER NOT NULL DEFAULT 0,
                 kind TEXT NOT NULL,
@@ -1513,7 +1522,7 @@ public final class VectorStore: @unchecked Sendable {
                 width INTEGER NOT NULL DEFAULT 0,
                 height INTEGER NOT NULL DEFAULT 0,
                 duration REAL NOT NULL DEFAULT 0,
-                PRIMARY KEY(path, chunk_index)
+                PRIMARY KEY(file_id, chunk_index)
             );
         """)
         // idx_path USED TO BE HERE. It indexed (path) - which is exactly the leading column of the
@@ -1535,7 +1544,7 @@ public final class VectorStore: @unchecked Sendable {
         // page cache: measured 450-1050ms cold -> tens of ms. Partial (media kinds only) keeps
         // it small; additive and invisible to older app versions; built once at open.
         exec("""
-            CREATE INDEX IF NOT EXISTS idx_media_snippet ON chunks(kind, snippet, path)
+            CREATE INDEX IF NOT EXISTS idx_media_snippet ON chunks(kind, snippet, file_id)
             WHERE kind IN ('image','scan','video');
             """)
         // Additive, lazy migration for indexes created before the display-metadata columns existed:
@@ -1583,6 +1592,10 @@ public final class VectorStore: @unchecked Sendable {
         """)
         exec("CREATE INDEX IF NOT EXISTS idx_content_key ON content_keys(key);")
         mutationGen = Int64(scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='mutation_gen'"))
+        // Legacy layout -> interned, before a single query runs against it. Verified against the
+        // original inside its own transaction, so a failure leaves the old table in place and the
+        // queries below keep working on it.
+        internLegacySchemaLocked()
         migrateScanKind()   // bumps the gen inside its txn when it rewrites kinds
         setUserVersion(Self.schemaVersion)
         // UNDER THE QUEUE, because init does NOT have exclusive access the way it looks like it
@@ -1640,7 +1653,7 @@ public final class VectorStore: @unchecked Sendable {
         // All text-kind chunks of .pdf files (LIKE is ASCII case-insensitive, so .PDF matches too).
         var ok = true
         var allChunksSigned: [String: Bool] = [:]
-        if sqlite3_prepare_v2(db, "SELECT path, snippet FROM chunks WHERE kind = 'text' AND path LIKE '%.pdf';", -1, &stmt, nil) == SQLITE_OK {
+        if sqlite3_prepare_v2(db, "SELECT f.path, c.snippet FROM chunks c JOIN files f ON f.id = c.file_id WHERE c.kind = 'text' AND f.path LIKE '%.pdf';", -1, &stmt, nil) == SQLITE_OK {
             var rc = sqlite3_step(stmt)
             while rc == SQLITE_ROW {
                 if let p = sqlite3_column_text(stmt, 0), let s = sqlite3_column_text(stmt, 1) {
@@ -1656,7 +1669,7 @@ public final class VectorStore: @unchecked Sendable {
         guard ok else { return }   // flag stays unset; the next open retries
         let scanned = allChunksSigned.filter { $0.value }.map { $0.key }
         guard sqlite3_exec(db, "BEGIN IMMEDIATE;", nil, nil, nil) == SQLITE_OK else { return }
-        if sqlite3_prepare_v2(db, "UPDATE chunks SET kind = ? WHERE path = ?;", -1, &stmt, nil) == SQLITE_OK {
+        if sqlite3_prepare_v2(db, "UPDATE chunks SET kind = ? WHERE file_id = (SELECT id FROM files WHERE path = ?);", -1, &stmt, nil) == SQLITE_OK {
             for path in scanned {
                 sqlite3_reset(stmt); sqlite3_clear_bindings(stmt)
                 sqlite3_bind_text(stmt, 1, FileKind.scan.rawValue, -1, SQLITE_TRANSIENT)
@@ -1740,7 +1753,11 @@ public final class VectorStore: @unchecked Sendable {
             deletePathLocked(path)
             let bfs = chunks.map { bf16Row($0.embedding) }   // fp32 -> bf16 once, reused for blob + memory
             let now = Date().timeIntervalSince1970           // one indexed_at stamp for the whole call
-            let sql = "INSERT INTO chunks(path, modified, size, kind, chunk_index, snippet, dim, vec, width, height, duration, locator, indexed_at, chunk_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?);"
+            let sql = "INSERT INTO chunks(file_id, modified, size, kind, chunk_index, snippet, dim, vec, width, height, duration, locator, indexed_at, chunk_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?);"
+            guard let fid = fileRowIDLocked(path) else {
+                exec("ROLLBACK;")
+                throw OmniError.store("file id failed")
+            }
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                 exec("ROLLBACK;")
@@ -1749,7 +1766,7 @@ public final class VectorStore: @unchecked Sendable {
             defer { sqlite3_finalize(stmt) }
             for (i, c) in chunks.enumerated() {
                 sqlite3_reset(stmt)
-                sqlite3_bind_text(stmt, 1, c.path, -1, SQLITE_TRANSIENT)
+                sqlite3_bind_int64(stmt, 1, fid)
                 sqlite3_bind_double(stmt, 2, c.modified)
                 sqlite3_bind_int64(stmt, 3, Int64(c.size))
                 sqlite3_bind_text(stmt, 4, c.kind, -1, SQLITE_TRANSIENT)
@@ -1846,7 +1863,7 @@ public final class VectorStore: @unchecked Sendable {
             let victims = victimRowsForPathsLocked(Set(work.map { $0.path }.filter { presentPaths.contains($0) }))
             exec("BEGIN;")
             recordHolesLocked(victims)
-            let sql = "INSERT INTO chunks(path, modified, size, kind, chunk_index, snippet, dim, vec, width, height, duration, locator, indexed_at, chunk_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?);"
+            let sql = "INSERT INTO chunks(file_id, modified, size, kind, chunk_index, snippet, dim, vec, width, height, duration, locator, indexed_at, chunk_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?);"
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                 exec("ROLLBACK;")
@@ -1854,10 +1871,14 @@ public final class VectorStore: @unchecked Sendable {
             }
             defer { sqlite3_finalize(stmt) }
             for (wi, it) in work.enumerated() {
+                guard let fid = fileRowIDLocked(it.path) else {
+                    exec("ROLLBACK;")
+                    throw OmniError.store("file id failed")
+                }
                 deletePathLocked(it.path)
                 for (ci, c) in it.chunks.enumerated() {
                     sqlite3_reset(stmt)
-                    sqlite3_bind_text(stmt, 1, c.path, -1, SQLITE_TRANSIENT)
+                    sqlite3_bind_int64(stmt, 1, fid)
                     sqlite3_bind_double(stmt, 2, c.modified)
                     sqlite3_bind_int64(stmt, 3, Int64(c.size))
                     sqlite3_bind_text(stmt, 4, c.kind, -1, SQLITE_TRANSIENT)
@@ -1973,7 +1994,7 @@ public final class VectorStore: @unchecked Sendable {
             guard dbOpen(), wantDim > 0 else { return [:] }
             var out: [String: [Float]] = [:]
             var stmt: OpaquePointer?
-            let sql = "SELECT chunk_key, dim, vec FROM chunks WHERE path = ? AND chunk_key <> '' LIMIT ?;"
+            let sql = "SELECT chunk_key, dim, vec FROM chunks WHERE file_id = (SELECT id FROM files WHERE path = ?) AND chunk_key <> '' LIMIT ?;"
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [:] }
             defer { sqlite3_finalize(stmt) }
             sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT)
@@ -2024,7 +2045,7 @@ public final class VectorStore: @unchecked Sendable {
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, """
             SELECT modified, size, kind, chunk_index, snippet, dim, vec, width, height, duration, locator, chunk_key
-            FROM chunks WHERE path = ? ORDER BY chunk_index;
+            FROM chunks WHERE file_id = (SELECT id FROM files WHERE path = ?) ORDER BY chunk_index;
             """, -1, &stmt, nil) == SQLITE_OK else { return nil }
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT)
@@ -2076,7 +2097,7 @@ public final class VectorStore: @unchecked Sendable {
             exec("BEGIN;")
             recordHolesLocked(victims)
             var stmt: OpaquePointer?
-            if sqlite3_prepare_v2(db, "DELETE FROM chunks WHERE path = ?;", -1, &stmt, nil) == SQLITE_OK {
+            if sqlite3_prepare_v2(db, "DELETE FROM chunks WHERE file_id = (SELECT id FROM files WHERE path = ?);", -1, &stmt, nil) == SQLITE_OK {
                 for p in paths {
                     sqlite3_reset(stmt)
                     sqlite3_bind_text(stmt, 1, p, -1, SQLITE_TRANSIENT)
@@ -2110,7 +2131,7 @@ public final class VectorStore: @unchecked Sendable {
             guard dbOpen() else { return false }
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
-            guard sqlite3_prepare_v2(db, "SELECT 1 FROM chunks WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0') LIMIT 1;", -1, &stmt, nil) == SQLITE_OK else { return false }
+            guard sqlite3_prepare_v2(db, "SELECT 1 FROM chunks WHERE file_id IN (SELECT id FROM files WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')) LIMIT 1;", -1, &stmt, nil) == SQLITE_OK else { return false }
             sqlite3_bind_text(stmt, 1, folder, -1, SQLITE_TRANSIENT)
             return sqlite3_step(stmt) == SQLITE_ROW
         }
@@ -2135,7 +2156,7 @@ public final class VectorStore: @unchecked Sendable {
             // Range form of `path LIKE folder||'/%'`: SQLite's default case-insensitive LIKE (plus
             // the OR) defeats idx_path and scans the whole table; `>= '<folder>/' AND < '<folder>0'`
             // is index-driven ('0' is the successor of '/' in ASCII; no path byte sorts between).
-            if sqlite3_prepare_v2(db, "DELETE FROM chunks WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0');", -1, &stmt, nil) == SQLITE_OK {
+            if sqlite3_prepare_v2(db, "DELETE FROM chunks WHERE file_id IN (SELECT id FROM files WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0'));", -1, &stmt, nil) == SQLITE_OK {
                 sqlite3_bind_text(stmt, 1, folder, -1, SQLITE_TRANSIENT)
                 sqlite3_step(stmt)
             }
@@ -2185,7 +2206,7 @@ public final class VectorStore: @unchecked Sendable {
             recordHolesLocked(victims)
             var stmt: OpaquePointer?
             // Key rows first (the subquery needs the chunks rows still present).
-            if sqlite3_prepare_v2(db, "DELETE FROM content_keys WHERE path IN (SELECT DISTINCT path FROM chunks WHERE kind IN (\(marks)));", -1, &stmt, nil) == SQLITE_OK {
+            if sqlite3_prepare_v2(db, "DELETE FROM content_keys WHERE path IN (SELECT f.path FROM chunks c JOIN files f ON f.id = c.file_id WHERE c.kind IN (\(marks)));", -1, &stmt, nil) == SQLITE_OK {
                 for (i, kind) in kinds.enumerated() { sqlite3_bind_text(stmt, Int32(i + 1), kind, -1, SQLITE_TRANSIENT) }
                 sqlite3_step(stmt)
             }
@@ -2217,7 +2238,7 @@ public final class VectorStore: @unchecked Sendable {
             exec("BEGIN;")
             recordHolesLocked(victimRows)
             var stmt: OpaquePointer?
-            if sqlite3_prepare_v2(db, "DELETE FROM chunks WHERE path = ?;", -1, &stmt, nil) == SQLITE_OK {
+            if sqlite3_prepare_v2(db, "DELETE FROM chunks WHERE file_id = (SELECT id FROM files WHERE path = ?);", -1, &stmt, nil) == SQLITE_OK {
                 for path in victims {
                     sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT)
                     sqlite3_step(stmt); sqlite3_reset(stmt)
@@ -2310,7 +2331,7 @@ public final class VectorStore: @unchecked Sendable {
             guard dbOpen() else { return [:] }
             var out: [String: StoredFile] = [:]
             var stmt: OpaquePointer?
-            guard sqlite3_prepare_v2(db, "SELECT MAX(modified), MAX(size), MAX(kind) FROM chunks WHERE path = ?;", -1, &stmt, nil) == SQLITE_OK else { return out }
+            guard sqlite3_prepare_v2(db, "SELECT MAX(modified), MAX(size), MAX(kind) FROM chunks WHERE file_id = (SELECT id FROM files WHERE path = ?);", -1, &stmt, nil) == SQLITE_OK else { return out }
             defer { sqlite3_finalize(stmt) }
             for p in paths where presentPaths.contains(p) {   // not present -> definitely not stored, skip the query
                 sqlite3_reset(stmt); sqlite3_clear_bindings(stmt)
@@ -2344,7 +2365,7 @@ public final class VectorStore: @unchecked Sendable {
                 var stmt: OpaquePointer?
                 guard sqlite3_prepare_v2(db, """
                     SELECT MAX(modified), MAX(size), MAX(kind), MAX(indexed_at), COUNT(*)
-                    FROM chunks WHERE path = ?;
+                    FROM chunks WHERE file_id = (SELECT id FROM files WHERE path = ?);
                     """, -1, &stmt, nil) == SQLITE_OK else { return }
                 defer { sqlite3_finalize(stmt) }
                 for p in group where presentPaths.contains(p) {
@@ -2397,7 +2418,7 @@ public final class VectorStore: @unchecked Sendable {
                 var stmt: OpaquePointer?
                 guard sqlite3_prepare_v2(db, """
                     SELECT snippet FROM chunks
-                    WHERE path = ? AND kind IN ('image','scan','video')
+                    WHERE file_id = (SELECT id FROM files WHERE path = ?) AND kind IN ('image','scan','video')
                     ORDER BY chunk_index;
                     """, -1, &stmt, nil) == SQLITE_OK else { return }
                 defer { sqlite3_finalize(stmt) }
@@ -2505,7 +2526,7 @@ public final class VectorStore: @unchecked Sendable {
             guard dbOpen() else { return [] }
             var out: [String] = []; out.reserveCapacity(liveFiles)
             var st: OpaquePointer?
-            guard sqlite3_prepare_v2(db, "SELECT DISTINCT path FROM chunks;", -1, &st, nil) == SQLITE_OK else { return [] }
+            guard sqlite3_prepare_v2(db, "SELECT path FROM files WHERE EXISTS(SELECT 1 FROM chunks WHERE chunks.file_id = files.id);", -1, &st, nil) == SQLITE_OK else { return [] }
             defer { sqlite3_finalize(st) }
             while sqlite3_step(st) == SQLITE_ROW {
                 if let c = sqlite3_column_text(st, 0) { out.append(String(cString: c)) }
@@ -2536,7 +2557,7 @@ public final class VectorStore: @unchecked Sendable {
             let sql = """
                 SELECT modified, size, kind, chunk_index, snippet, width, height, duration, locator,
                        dim, vec
-                FROM chunks WHERE path = ? ORDER BY chunk_index;
+                FROM chunks WHERE file_id = (SELECT id FROM files WHERE path = ?) ORDER BY chunk_index;
                 """
             guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { return [] }
             defer { sqlite3_finalize(st) }
@@ -3657,7 +3678,7 @@ public final class VectorStore: @unchecked Sendable {
         // inside the lock concurrent searches and indexing writes wait on. Only ever runs on `queue`,
         // so a single cached handle is race-free. (F3)
         if snippetStmt == nil {
-            guard sqlite3_prepare_v2(db, "SELECT snippet, size FROM chunks WHERE path = ? AND chunk_index = ?;", -1, &snippetStmt, nil) == SQLITE_OK else { return hits }
+            guard sqlite3_prepare_v2(db, "SELECT snippet, size FROM chunks WHERE file_id = (SELECT id FROM files WHERE path = ?) AND chunk_index = ?;", -1, &snippetStmt, nil) == SQLITE_OK else { return hits }
         }
         let stmt = snippetStmt
         var out = hits
@@ -3906,12 +3927,12 @@ public final class VectorStore: @unchecked Sendable {
         // One pass over the media rows; per-term OR of whole-tag LIKEs on the normalized list.
         // The snippet-equals-filename guard excludes untagged fallback rows: a filename like
         // "Beach, Sunset.JPG" must not make an untagged file answer to tag:beach.
-        let clauses = norm.map { _ in "(',' || REPLACE(LOWER(snippet), ', ', ',') || ',') LIKE ('%,' || ? || ',%')" }
+        let clauses = norm.map { _ in "(',' || REPLACE(LOWER(c.snippet), ', ', ',') || ',') LIKE ('%,' || ? || ',%')" }
             .joined(separator: " OR ")
         let sql = """
-            SELECT DISTINCT path FROM chunks
-            WHERE kind IN ('image','scan','video')
-              AND substr(path, -length(snippet)) <> snippet
+            SELECT DISTINCT f.path FROM chunks c JOIN files f ON f.id = c.file_id
+            WHERE c.kind IN ('image','scan','video')
+              AND substr(f.path, -length(c.snippet)) <> c.snippet
               AND (\(clauses));
             """
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
@@ -4690,6 +4711,15 @@ public final class VectorStore: @unchecked Sendable {
         guard dbOpen() else { return }
         coveredRows = scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.coveredRowsKey)'")
         guard coveredRows > 0 else { return }
+        // An EMPTIED index: the claim describes slots for rows that no longer exist, and no row
+        // needs a vector, so it is vacuous rather than dangerous. Clearing it here is the only
+        // safe place to do so - a claim that merely looks too large elsewhere may mean the rows
+        // failed to load, where discarding it would turn a recoverable state into data loss.
+        // Reached by any removal that takes the last row: deleting the last watched folder does it.
+        if scalarQuery("SELECT COUNT(*) FROM chunks") == 0 {
+            resetCoverageLocked()
+            return
+        }
         var stmt: OpaquePointer?
         if sqlite3_prepare_v2(db, "SELECT slot FROM vec_holes;", -1, &stmt, nil) == SQLITE_OK {
             while sqlite3_step(stmt) == SQLITE_ROW { vecHoles.insert(sqlite3_column_int(stmt, 0)) }
@@ -4807,8 +4837,8 @@ public final class VectorStore: @unchecked Sendable {
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
         guard sqlite3_prepare_v2(db, """
-            SELECT path, kind, chunk_index, dim, vec, modified, width, height, duration, locator, size
-            FROM chunks ORDER BY rowid;
+            SELECT f.path, c.kind, c.chunk_index, c.dim, c.vec, c.modified, c.width, c.height, c.duration, c.locator, c.size
+            FROM chunks c JOIN files f ON f.id = c.file_id ORDER BY c.rowid;
             """, -1, &stmt, nil) == SQLITE_OK else { flat16.removeAll(); return false }
         var slot = 0
         var covered = 0
@@ -5222,7 +5252,7 @@ public final class VectorStore: @unchecked Sendable {
         var sampleOK = true
         records.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             var stmt: OpaquePointer?
-            guard sqlite3_prepare_v2(db, "SELECT vec, modified, size, kind, dim FROM chunks WHERE path = ? AND chunk_index = ?;", -1, &stmt, nil) == SQLITE_OK else { sampleOK = false; return }
+            guard sqlite3_prepare_v2(db, "SELECT vec, modified, size, kind, dim FROM chunks WHERE file_id = (SELECT id FROM files WHERE path = ?) AND chunk_index = ?;", -1, &stmt, nil) == SQLITE_OK else { sampleOK = false; return }
             defer { sqlite3_finalize(stmt) }
             var i = 0
             while i < header.rowCount, sampleOK {
@@ -5811,7 +5841,7 @@ public final class VectorStore: @unchecked Sendable {
             var snippets: [Int: String] = [:]
             if dbOpen() {
                 var sStmt: OpaquePointer?
-                if sqlite3_prepare_v2(db, "SELECT chunk_index, snippet FROM chunks WHERE path = ?;", -1, &sStmt, nil) == SQLITE_OK {
+                if sqlite3_prepare_v2(db, "SELECT chunk_index, snippet FROM chunks WHERE file_id = (SELECT id FROM files WHERE path = ?);", -1, &sStmt, nil) == SQLITE_OK {
                     sqlite3_bind_text(sStmt, 1, path, -1, SQLITE_TRANSIENT)
                     while sqlite3_step(sStmt) == SQLITE_ROW {
                         if let c = sqlite3_column_text(sStmt, 1) { snippets[Int(sqlite3_column_int(sStmt, 0))] = String(cString: c) }
@@ -5965,7 +5995,7 @@ public final class VectorStore: @unchecked Sendable {
             var snippetOf: [Int: String] = [:]
             if dbOpen() {
                 var sStmt: OpaquePointer?
-                if sqlite3_prepare_v2(db, "SELECT snippet FROM chunks WHERE path = ? AND chunk_index = ?;", -1, &sStmt, nil) == SQLITE_OK {
+                if sqlite3_prepare_v2(db, "SELECT snippet FROM chunks WHERE file_id = (SELECT id FROM files WHERE path = ?) AND chunk_index = ?;", -1, &sStmt, nil) == SQLITE_OK {
                     for (i, _) in winners {
                         let r = rows[i]
                         sqlite3_reset(sStmt)
@@ -6065,17 +6095,19 @@ public final class VectorStore: @unchecked Sendable {
         // The database plus its journal: one logical thing, and the WAL is transient enough that
         // listing it separately would just look like a leak.
         let dbBytes = size(base) + size(base + "-wal") + size(base + "-shm")
+        // FOUR slices. Seven was an inventory of the implementation; a reader needs the shape, and
+        // every derived file answers the same question ("can I lose this?") the same way, so they
+        // group. The two that are irreplaceable stay separate because that is the distinction the
+        // chart exists to show.
+        let searchIndexes = size(base + ".quant") + size(base + ".rows")
+            + size(base + ".names") + size(base + ".names-wal") + size(base + ".names-shm")
         var entries: [DiskUse.Entry] = [
             .init(name: "Vectors", bytes: size(base + ".vecs"), irreplaceable: true,
                   detail: "the embeddings themselves"),
             .init(name: "Database", bytes: dbBytes, irreplaceable: true,
                   detail: "paths, text excerpts, structure"),
-            .init(name: "Scan replica", bytes: size(base + ".quant"), irreplaceable: false,
-                  detail: "compressed copy for fast search"),
-            .init(name: "Row table", bytes: size(base + ".rows"), irreplaceable: false,
-                  detail: "skips a slow scan at launch"),
-            .init(name: "Filename search", bytes: size(base + ".names") + size(base + ".names-wal") + size(base + ".names-shm"),
-                  irreplaceable: false, detail: "match by name as you type"),
+            .init(name: "Search indexes", bytes: searchIndexes, irreplaceable: false,
+                  detail: "fast scan, fast launch, filename matching"),
             .init(name: "Image tags", bytes: size("tags-d\(dim).cache") + size("tags-d\(dim).prior"),
                   irreplaceable: false, detail: "generated labels for images"),
         ]
@@ -6094,9 +6126,11 @@ public final class VectorStore: @unchecked Sendable {
             otherBytes += size(n)
             otherNames.append(n)
         }
-        if !otherNames.isEmpty {
-            entries.append(.init(name: "Other files", bytes: otherBytes, irreplaceable: false,
-                                 detail: otherNames.sorted().joined(separator: ", ")))
+        if !otherNames.isEmpty, let i = entries.firstIndex(where: { $0.name == "Image tags" }) {
+            // Anything unrecognised joins the last slice rather than earning its own: it is almost
+            // always nothing, and a permanent near-zero segment is noise.
+            entries[i] = .init(name: "Other", bytes: entries[i].bytes + otherBytes, irreplaceable: false,
+                               detail: "image tags, plus " + otherNames.sorted().joined(separator: ", "))
         }
         return DiskUse(entries: entries.filter { $0.bytes > 0 })
     }
@@ -6638,7 +6672,7 @@ public final class VectorStore: @unchecked Sendable {
 
     private func deletePathLocked(_ path: String) {
         var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, "DELETE FROM chunks WHERE path = ?;", -1, &stmt, nil) == SQLITE_OK {
+        if sqlite3_prepare_v2(db, "DELETE FROM chunks WHERE file_id = (SELECT id FROM files WHERE path = ?);", -1, &stmt, nil) == SQLITE_OK {
             sqlite3_bind_text(stmt, 1, path, -1, SQLITE_TRANSIENT)
             sqlite3_step(stmt)
         }
@@ -6718,7 +6752,7 @@ public final class VectorStore: @unchecked Sendable {
         // is the invariant the persisted quant replica depends on: appends always take rowid
         // max+1 (inserted last), deletes preserve relative order on both sides. Free on a rowid
         // table (the scan already walks the B-tree in rowid order - no sort step).
-        if sqlite3_prepare_v2(db, "SELECT path, kind, chunk_index, dim, vec, modified, width, height, duration, locator, size FROM chunks ORDER BY rowid;", -1, &stmt, nil) == SQLITE_OK {
+        if sqlite3_prepare_v2(db, "SELECT f.path, c.kind, c.chunk_index, c.dim, c.vec, c.modified, c.width, c.height, c.duration, c.locator, c.size FROM chunks c JOIN files f ON f.id = c.file_id ORDER BY c.rowid;", -1, &stmt, nil) == SQLITE_OK {
             while sqlite3_step(stmt) == SQLITE_ROW {
                 if let onLoadProgress, total > 0, rows.count % 65536 == 0 {
                     onLoadProgress(Double(rows.count) / Double(total))
@@ -6772,6 +6806,176 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     private func setUserVersion(_ v: Int32) { exec("PRAGMA user_version = \(v);") }
+
+    // MARK: - PATH INTERNING (schema v3)
+    //
+    // dbstat on a migrated 4.5M-row index: paths account for 51% of what is left, stored three
+    // times over - 512 MB in the table, 585 MB in the primary key, 573 MB in idx_path (since
+    // dropped) - for 259,682 distinct paths whose unique text is about 29 MB. A file with 17 chunks
+    // writes its full path 17 times, in each place.
+    //
+    // Interning moves the strings to a `files` table and carries a 4-byte id on the chunk. Measured
+    // end to end on the real index: files table 0.5s, chunk rewrite 12.9s, swap 0.6s, VACUUM 5.8s,
+    // and 2,685,988,864 -> 1,611,399,168 bytes. 1.07 GB, 40% of the remaining database.
+    //
+    // THE PROPERTY THAT MATTERS is not the size. Coverage addresses a vector by its row's RANK in
+    // rowid order, so the rewrite must preserve that order exactly or every covered row after the
+    // first divergence resolves to its neighbour's vector - silently. `ORDER BY c.rowid` on the
+    // copy is what guarantees it, and internPathsVerifyLocked is what proves it rather than
+    // assuming it.
+    //
+    // Gated behind OMNI_INTERN_PATHS while the 22 query sites that still name `chunks.path` are
+    // migrated. Nothing reads the interned tables until that lands, so an index cannot be left half
+    // converted: the migration either completes inside its transaction or is rolled back whole.
+    nonisolated(unsafe) public static var internPathsOverride: Bool? = nil
+    static var internPaths: Bool {
+        internPathsOverride ?? (ProcessInfo.processInfo.environment["OMNI_INTERN_PATHS"] == "1")
+    }
+
+    /// Test entry point: run the rewrite on the store queue.
+    public func internPathsForTest() -> Int64? { queue.sync { internPathsLocked() } }
+
+    /// Rewrite `chunks` to carry a file id instead of a repeated path. One transaction: it either
+    /// happens or it does not. Returns the bytes the following repack will be able to reclaim, or
+    /// nil if it did not run.
+    /// Convert a legacy (path-per-chunk) index in place, at open. No-op on an already-interned one.
+    private func internLegacySchemaLocked() {
+        guard dbOpen(), hasTableLocked("chunks") else { return }
+        // The legacy table is the one with a `path` column; the interned one has `file_id`.
+        guard hasColumnLocked("chunks", "path") else { return }
+        if internPathsLocked(allowUnloaded: true) != nil {
+            FileHandle.standardError.write(Data("[omni] index converted to interned paths\n".utf8))
+        }
+    }
+
+    @discardableResult
+    func internPathsLocked(allowUnloaded: Bool = false) -> Int64? {
+        guard dbOpen() else { return nil }
+        // Legacy is decided by the CHUNKS table carrying a `path` column - NOT by `files` existing.
+        // The schema step above creates `files` for fresh indexes before this runs, so keying on
+        // its presence made the migration conclude every legacy index was already converted.
+        guard hasColumnLocked("chunks", "path") else { return nil }
+        // Only on a store that actually loaded. Observed while testing: a database copied without
+        // its vector sidecar reports "coverage unreadable" and loads nothing, and the rewrite ran
+        // anyway - harmless for a pure SQL copy, but a migration must not proceed on an index the
+        // store could not open, because that is exactly when its other invariants are unknown.
+        guard allowUnloaded || (!rows.isEmpty && dim > 0) else { return nil }
+        let before = onDiskBytes()
+        guard execChecked("BEGIN IMMEDIATE;") else { return nil }
+        let steps = [
+            "CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);",
+            "INSERT OR IGNORE INTO files(path) SELECT DISTINCT path FROM chunks;",
+            """
+            CREATE TABLE chunks_v3(
+                file_id INTEGER NOT NULL, modified REAL NOT NULL, size INTEGER NOT NULL DEFAULT 0,
+                kind TEXT NOT NULL, chunk_index INTEGER NOT NULL, snippet TEXT NOT NULL,
+                dim INTEGER NOT NULL, vec BLOB NOT NULL,
+                width INTEGER NOT NULL DEFAULT 0, height INTEGER NOT NULL DEFAULT 0,
+                duration REAL NOT NULL DEFAULT 0, locator TEXT NOT NULL DEFAULT '',
+                indexed_at REAL NOT NULL DEFAULT 0, chunk_key TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY(file_id, chunk_index)
+            );
+            """,
+            // ORDER BY c.rowid is load-bearing, not tidiness: see the note above.
+            """
+            INSERT INTO chunks_v3(file_id, modified, size, kind, chunk_index, snippet, dim, vec,
+                                  width, height, duration, locator, indexed_at, chunk_key)
+              SELECT f.id, c.modified, c.size, c.kind, c.chunk_index, c.snippet, c.dim, c.vec,
+                     c.width, c.height, c.duration, c.locator, c.indexed_at, c.chunk_key
+                FROM chunks c JOIN files f ON f.path = c.path
+               ORDER BY c.rowid;
+            """,
+        ]
+        for sql in steps where !execChecked(sql) {
+            exec("ROLLBACK;")
+            return nil
+        }
+        // Prove the copy before destroying the original, inside the same transaction, so a failure
+        // leaves the old table untouched rather than a half-converted index.
+        guard internPathsVerifyLocked() else {
+            exec("ROLLBACK;")
+            FileHandle.standardError.write(Data("[omni] path interning verification failed; index unchanged\n".utf8))
+            return nil
+        }
+        guard execChecked("DROP TABLE chunks;"),
+              execChecked("ALTER TABLE chunks_v3 RENAME TO chunks;"),
+              execChecked("CREATE INDEX IF NOT EXISTS idx_media_snippet ON chunks(kind, snippet, file_id) WHERE kind IN ('image','scan','video');"),
+              execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.vacuumPendingKey)','1');"),
+              execChecked("COMMIT;")
+        else {
+            exec("ROLLBACK;")
+            return nil
+        }
+        return before - onDiskBytes()
+    }
+
+    /// Does the copy say the same thing as the original? Checked while both still exist.
+    ///
+    /// Row count, and - the one that matters - ROW ORDER: the k-th row of the copy must be the k-th
+    /// row of the original. Coverage addresses vectors by rank, so an order change is not a cosmetic
+    /// difference, it is every covered row pointing at its neighbour. Compares the full ordered
+    /// sequence by checksum rather than sampling, because sampling is exactly how an off-by-one in
+    /// the middle survives.
+    private func internPathsVerifyLocked() -> Bool {
+        let oldCount = scalarQuery("SELECT COUNT(*) FROM chunks")
+        let newCount = scalarQuery("SELECT COUNT(*) FROM chunks_v3")
+        guard oldCount > 0, oldCount == newCount else { return false }
+        guard scalarQuery("SELECT COUNT(*) FROM files") == scalarQuery("SELECT COUNT(DISTINCT path) FROM chunks") else { return false }
+        // Every row must map to the same file, at the same chunk index, with the same payload, in
+        // the same position. A positional join over both sequences catches order, identity and
+        // content in one pass.
+        let mismatches = scalarQuery("""
+            SELECT COUNT(*) FROM (
+              SELECT o.path AS op, o.chunk_index AS oc, o.modified AS om, o.snippet AS os,
+                     n.path AS np, n.chunk_index AS nc, n.modified AS nm, n.snippet AS ns
+                FROM (SELECT ROW_NUMBER() OVER (ORDER BY rowid) k, path, chunk_index, modified, snippet FROM chunks) o
+                JOIN (SELECT ROW_NUMBER() OVER (ORDER BY v.rowid) k, f.path AS path, v.chunk_index, v.modified, v.snippet
+                        FROM chunks_v3 v JOIN files f ON f.id = v.file_id) n
+                  ON o.k = n.k
+               WHERE o.path IS NOT n.path OR o.chunk_index IS NOT n.chunk_index
+                  OR o.modified IS NOT n.modified OR o.snippet IS NOT n.snippet
+            )
+            """)
+        return mismatches == 0
+    }
+
+    /// The row id `files` holds for this path, creating it if new.
+    ///
+    /// Resolved ONCE PER FILE by the insert paths, never per chunk: a file averages 17 chunks, and
+    /// paying an index probe for each of them would hand back the write cost that interning is
+    /// supposed to save. Rows for a deleted file keep their entry, which is deliberate - a re-added
+    /// path reuses its id, exactly as the in-memory intern table already does.
+    private func fileRowIDLocked(_ path: String) -> Int64? {
+        var ins: OpaquePointer?
+        if sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO files(path) VALUES(?);", -1, &ins, nil) == SQLITE_OK {
+            sqlite3_bind_text(ins, 1, path, -1, SQLITE_TRANSIENT)
+            sqlite3_step(ins)
+        }
+        sqlite3_finalize(ins)
+        var sel: OpaquePointer?
+        defer { sqlite3_finalize(sel) }
+        guard sqlite3_prepare_v2(db, "SELECT id FROM files WHERE path = ?;", -1, &sel, nil) == SQLITE_OK else { return nil }
+        sqlite3_bind_text(sel, 1, path, -1, SQLITE_TRANSIENT)
+        return sqlite3_step(sel) == SQLITE_ROW ? sqlite3_column_int64(sel, 0) : nil
+    }
+
+    private func hasColumnLocked(_ table: String, _ column: String) -> Bool {
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, "PRAGMA table_info(\(table));", -1, &stmt, nil) == SQLITE_OK else { return false }
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let c = sqlite3_column_text(stmt, 1), String(cString: c) == column { return true }
+        }
+        return false
+    }
+
+    private func hasTableLocked(_ name: String) -> Bool {
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?;", -1, &stmt, nil) == SQLITE_OK else { return false }
+        sqlite3_bind_text(stmt, 1, name, -1, SQLITE_TRANSIENT)
+        return sqlite3_step(stmt) == SQLITE_ROW
+    }
 
     /// Does this index exist? Used to make a one-time DROP idempotent without relying on the
     /// statement's own error, which exec() swallows.

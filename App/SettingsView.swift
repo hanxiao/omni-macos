@@ -698,10 +698,9 @@ private struct DiskBreakdown: View {
         switch e.name {
         case "Vectors":         return .orange
         case "Database":        return .pink
-        case "Scan replica":    return .teal
-        case "Row table":       return .blue
-        case "Filename search": return .indigo
-        case "Image tags":      return .mint
+        case "Search indexes":  return .teal
+        case "Image tags",
+             "Other":           return .mint
         default:                return .gray
         }
     }
