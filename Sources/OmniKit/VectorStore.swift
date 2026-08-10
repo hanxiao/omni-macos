@@ -6773,6 +6773,133 @@ public final class VectorStore: @unchecked Sendable {
 
     private func setUserVersion(_ v: Int32) { exec("PRAGMA user_version = \(v);") }
 
+    // MARK: - PATH INTERNING (schema v3)
+    //
+    // dbstat on a migrated 4.5M-row index: paths account for 51% of what is left, stored three
+    // times over - 512 MB in the table, 585 MB in the primary key, 573 MB in idx_path (since
+    // dropped) - for 259,682 distinct paths whose unique text is about 29 MB. A file with 17 chunks
+    // writes its full path 17 times, in each place.
+    //
+    // Interning moves the strings to a `files` table and carries a 4-byte id on the chunk. Measured
+    // end to end on the real index: files table 0.5s, chunk rewrite 12.9s, swap 0.6s, VACUUM 5.8s,
+    // and 2,685,988,864 -> 1,611,399,168 bytes. 1.07 GB, 40% of the remaining database.
+    //
+    // THE PROPERTY THAT MATTERS is not the size. Coverage addresses a vector by its row's RANK in
+    // rowid order, so the rewrite must preserve that order exactly or every covered row after the
+    // first divergence resolves to its neighbour's vector - silently. `ORDER BY c.rowid` on the
+    // copy is what guarantees it, and internPathsVerifyLocked is what proves it rather than
+    // assuming it.
+    //
+    // Gated behind OMNI_INTERN_PATHS while the 22 query sites that still name `chunks.path` are
+    // migrated. Nothing reads the interned tables until that lands, so an index cannot be left half
+    // converted: the migration either completes inside its transaction or is rolled back whole.
+    nonisolated(unsafe) public static var internPathsOverride: Bool? = nil
+    static var internPaths: Bool {
+        internPathsOverride ?? (ProcessInfo.processInfo.environment["OMNI_INTERN_PATHS"] == "1")
+    }
+
+    /// Test entry point: run the rewrite on the store queue.
+    public func internPathsForTest() -> Int64? { queue.sync { internPathsLocked() } }
+
+    /// Rewrite `chunks` to carry a file id instead of a repeated path. One transaction: it either
+    /// happens or it does not. Returns the bytes the following repack will be able to reclaim, or
+    /// nil if it did not run.
+    @discardableResult
+    func internPathsLocked() -> Int64? {
+        guard Self.internPaths, dbOpen() else { return nil }
+        guard !hasTableLocked("files") else { return nil }          // already interned
+        // Only on a store that actually loaded. Observed while testing: a database copied without
+        // its vector sidecar reports "coverage unreadable" and loads nothing, and the rewrite ran
+        // anyway - harmless for a pure SQL copy, but a migration must not proceed on an index the
+        // store could not open, because that is exactly when its other invariants are unknown.
+        guard !rows.isEmpty, dim > 0 else { return nil }
+        let before = onDiskBytes()
+        guard execChecked("BEGIN IMMEDIATE;") else { return nil }
+        let steps = [
+            "CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);",
+            "INSERT INTO files(path) SELECT DISTINCT path FROM chunks;",
+            """
+            CREATE TABLE chunks_v3(
+                file_id INTEGER NOT NULL, modified REAL NOT NULL, size INTEGER NOT NULL DEFAULT 0,
+                kind TEXT NOT NULL, chunk_index INTEGER NOT NULL, snippet TEXT NOT NULL,
+                dim INTEGER NOT NULL, vec BLOB NOT NULL,
+                width INTEGER NOT NULL DEFAULT 0, height INTEGER NOT NULL DEFAULT 0,
+                duration REAL NOT NULL DEFAULT 0, locator TEXT NOT NULL DEFAULT '',
+                indexed_at REAL NOT NULL DEFAULT 0, chunk_key TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY(file_id, chunk_index)
+            );
+            """,
+            // ORDER BY c.rowid is load-bearing, not tidiness: see the note above.
+            """
+            INSERT INTO chunks_v3(file_id, modified, size, kind, chunk_index, snippet, dim, vec,
+                                  width, height, duration, locator, indexed_at, chunk_key)
+              SELECT f.id, c.modified, c.size, c.kind, c.chunk_index, c.snippet, c.dim, c.vec,
+                     c.width, c.height, c.duration, c.locator, c.indexed_at, c.chunk_key
+                FROM chunks c JOIN files f ON f.path = c.path
+               ORDER BY c.rowid;
+            """,
+        ]
+        for sql in steps where !execChecked(sql) {
+            exec("ROLLBACK;")
+            return nil
+        }
+        // Prove the copy before destroying the original, inside the same transaction, so a failure
+        // leaves the old table untouched rather than a half-converted index.
+        guard internPathsVerifyLocked() else {
+            exec("ROLLBACK;")
+            FileHandle.standardError.write(Data("[omni] path interning verification failed; index unchanged\n".utf8))
+            return nil
+        }
+        guard execChecked("DROP TABLE chunks;"),
+              execChecked("ALTER TABLE chunks_v3 RENAME TO chunks;"),
+              execChecked("CREATE INDEX IF NOT EXISTS idx_media_snippet ON chunks(kind, snippet, file_id) WHERE kind IN ('image','scan','video');"),
+              execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.vacuumPendingKey)','1');"),
+              execChecked("COMMIT;")
+        else {
+            exec("ROLLBACK;")
+            return nil
+        }
+        return before - onDiskBytes()
+    }
+
+    /// Does the copy say the same thing as the original? Checked while both still exist.
+    ///
+    /// Row count, and - the one that matters - ROW ORDER: the k-th row of the copy must be the k-th
+    /// row of the original. Coverage addresses vectors by rank, so an order change is not a cosmetic
+    /// difference, it is every covered row pointing at its neighbour. Compares the full ordered
+    /// sequence by checksum rather than sampling, because sampling is exactly how an off-by-one in
+    /// the middle survives.
+    private func internPathsVerifyLocked() -> Bool {
+        let oldCount = scalarQuery("SELECT COUNT(*) FROM chunks")
+        let newCount = scalarQuery("SELECT COUNT(*) FROM chunks_v3")
+        guard oldCount > 0, oldCount == newCount else { return false }
+        guard scalarQuery("SELECT COUNT(*) FROM files") == scalarQuery("SELECT COUNT(DISTINCT path) FROM chunks") else { return false }
+        // Every row must map to the same file, at the same chunk index, with the same payload, in
+        // the same position. A positional join over both sequences catches order, identity and
+        // content in one pass.
+        let mismatches = scalarQuery("""
+            SELECT COUNT(*) FROM (
+              SELECT o.path AS op, o.chunk_index AS oc, o.modified AS om, o.snippet AS os,
+                     n.path AS np, n.chunk_index AS nc, n.modified AS nm, n.snippet AS ns
+                FROM (SELECT ROW_NUMBER() OVER (ORDER BY rowid) k, path, chunk_index, modified, snippet FROM chunks) o
+                JOIN (SELECT ROW_NUMBER() OVER (ORDER BY v.rowid) k, f.path AS path, v.chunk_index, v.modified, v.snippet
+                        FROM chunks_v3 v JOIN files f ON f.id = v.file_id) n
+                  ON o.k = n.k
+               WHERE o.path IS NOT n.path OR o.chunk_index IS NOT n.chunk_index
+                  OR o.modified IS NOT n.modified OR o.snippet IS NOT n.snippet
+            )
+            """)
+        return mismatches == 0
+    }
+
+    private func hasTableLocked(_ name: String) -> Bool {
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?;", -1, &stmt, nil) == SQLITE_OK else { return false }
+        sqlite3_bind_text(stmt, 1, name, -1, SQLITE_TRANSIENT)
+        return sqlite3_step(stmt) == SQLITE_ROW
+    }
+
     /// Does this index exist? Used to make a one-time DROP idempotent without relying on the
     /// statement's own error, which exec() swallows.
     private func hasIndexLocked(_ name: String) -> Bool {

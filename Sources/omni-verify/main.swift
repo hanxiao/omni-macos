@@ -6515,6 +6515,29 @@ if args.count >= 5 && args[1] == "covverify" {
     exit(pathMismatch == 0 && scoreMismatch == 0 && checked > 0 ? 0 : 1)
 }
 
+// Path interning on a real index: omni-verify intern <dbPath>
+// Paths are 51% of a migrated database, written once per CHUNK rather than once per file. This runs
+// the rewrite, which verifies itself against the original inside its own transaction before
+// dropping it, and reports what it reclaimed.
+if args.count >= 3 && args[1] == "intern" {
+    let dbURL = URL(fileURLWithPath: args[2])
+    VectorStore.internPathsOverride = true
+    func size() -> Int64 {
+        ((try? FileManager.default.attributesOfItem(atPath: dbURL.path)[.size]) as? Int64) ?? 0
+    }
+    print(String(format: "intern db=%@  before %.2f GB", dbURL.lastPathComponent, Double(size()) / 1_073_741_824))
+    let store = try VectorStore(dbURL: dbURL)
+    let t = Date()
+    let freed = store.internPathsForTest()
+    let secs = -t.timeIntervalSinceNow
+    let reclaimed = store.compact(minFreeRatio: 0)
+    store.close()
+    print(String(format: "  rewrite %.1fs  verified=%@  repack freed %.2f GB  after %.2f GB",
+                 secs, freed != nil ? "yes" : "NO (declined)",
+                 Double(reclaimed) / 1_073_741_824, Double(size()) / 1_073_741_824))
+    exit(freed != nil ? 0 : 1)
+}
+
 // How does an EXISTING index migrate off its duplicate vectors? omni-verify covmigrate <db> [cycles]
 // The migration has to be generic: every user, every index size, no reindex, and no launch that
 // pauses. Coverage advances one bounded slice per stamp, so this drives open/close cycles - each
