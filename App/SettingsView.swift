@@ -2,18 +2,18 @@ import SwiftUI
 import AppKit
 import OmniKit
 
-private enum SettingsTab: Hashable { case indexing, content, performance, storage, history, serving }
+private enum SettingsTab: Hashable { case files, content, performance, storage, history, serving }
 
 struct SettingsView: View {
     // Selection is BOUND, not left to the TabView, purely so the live memory sampler can be gated
     // on "Performance is the visible tab". A SwiftUI TabView keeps a pane alive once it has been
     // visited, so .onAppear/.task alone would keep sampling forever after one visit.
-    @State private var tab: SettingsTab = .indexing
+    @State private var tab: SettingsTab = .files
 
     var body: some View {
         TabView(selection: $tab) {
-            ActivityTab().tabItem { Label("Indexing", systemImage: "arrow.triangle.2.circlepath") }
-                .tag(SettingsTab.indexing)
+            ActivityTab().tabItem { Label("Files", systemImage: "folder") }
+                .tag(SettingsTab.files)
             ContentTypesTab().tabItem { Label("Content", systemImage: "square.grid.2x2") }
                 .tag(SettingsTab.content)
             PerformanceTab(isVisible: tab == .performance).tabItem { Label("Performance", systemImage: "speedometer") }
@@ -33,9 +33,10 @@ struct SettingsView: View {
     }
 }
 
-/// Live indexing status and the manual Index / Reindex / Pause controls. This is the
-/// single home for the detail that used to clutter the sidebar.
-private struct ActivityTab: View {
+/// Live indexing status and the manual Index / Pause / Update control. It sits at the top of
+/// Storage > Index, next to the file and chunk counts it is changing - one place to see what the
+/// index holds and whether it is still growing.
+private struct IndexStatusRow: View {
     @Environment(AppModel.self) private var model: AppModel
 
     private var overall: Double {
@@ -62,81 +63,82 @@ private struct ActivityTab: View {
     }
 
     var body: some View {
-        Form {
-            Section {
-                switch model.indexState {
-                case .indexing:
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            ProgressView().controlSize(.small)
-                            Text(model.isPreparing ? "Preparing\u{2026}" : "Indexing\u{2026}").fontWeight(.medium)
-                            Spacer()
-                            if !model.isPreparing, let rateLabel {
-                                Text(rateLabel).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                            }
-                            Button("Pause") { model.pauseIndexing() }.controlSize(.small)
-                        }
-                        if model.isPreparing {
-                            // No file processed yet: scanning folders / warming up the model. Show an
-                            // explanation rather than a 0% bar that looks frozen.
-                            Text("Scanning folders, warming up the model\u{2026}")
-                                .font(.caption).foregroundStyle(.secondary)
-                        } else {
-                            ProgressView(value: overall)
-                            HStack {
-                                Text("\(model.progress.embedded) added")
-                                if model.progress.unchanged > 0 { Text("\u{00B7} \(model.progress.unchanged) up to date") }
-                                if model.progress.skipped > 0 { Text("\u{00B7} \(model.progress.skipped) skipped") }
-                                if model.progress.failed > 0 { Text("\u{00B7} \(model.progress.failed) failed") }
-                            }
-                            .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                            Text(URL(fileURLWithPath: model.progress.currentPath).lastPathComponent)
-                                .font(.caption2).foregroundStyle(.tertiary).lineLimit(1).truncationMode(.middle)
-                        }
+        switch model.indexState {
+        case .indexing:
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text(model.isPreparing ? "Preparing\u{2026}" : "Indexing\u{2026}").fontWeight(.medium)
+                    Spacer()
+                    if !model.isPreparing, let rateLabel {
+                        Text(rateLabel).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                     }
-                case .paused:
-                    HStack(spacing: 8) {
-                        Image(systemName: "pause.circle.fill").foregroundStyle(.orange)
-                        Text("Paused \u{00B7} \(model.indexedFiles.formatted()) file\(model.indexedFiles == 1 ? "" : "s") indexed")
+                    Button("Pause") { model.pauseIndexing() }.controlSize(.small)
+                }
+                if model.isPreparing {
+                    // No file processed yet: scanning folders / warming up the model. Show an
+                    // explanation rather than a 0% bar that looks frozen.
+                    Text("Scanning folders, warming up the model\u{2026}")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    ProgressView(value: overall)
+                    HStack {
+                        Text("\(model.progress.embedded) added")
+                        if model.progress.unchanged > 0 { Text("\u{00B7} \(model.progress.unchanged) up to date") }
+                        if model.progress.skipped > 0 { Text("\u{00B7} \(model.progress.skipped) skipped") }
+                        if model.progress.failed > 0 { Text("\u{00B7} \(model.progress.failed) failed") }
+                    }
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    Text(URL(fileURLWithPath: model.progress.currentPath).lastPathComponent)
+                        .font(.caption2).foregroundStyle(.tertiary).lineLimit(1).truncationMode(.middle)
+                }
+            }
+        case .paused:
+            HStack(spacing: 8) {
+                Image(systemName: "pause.circle.fill").foregroundStyle(.orange)
+                Text("Paused")
+                Spacer()
+                Button("Resume") { model.startIndexing() }.controlSize(.small)
+            }
+        case .idle:
+            if !model.activeRoots.isEmpty {
+                // A newly added folder (or a background reconcile) is embedding right now.
+                // It tracks per-root totals just like a full pass, so show the same progress.
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        ProgressView().controlSize(.small)
+                        Text("Updating\u{2026}").fontWeight(.medium)
                         Spacer()
-                        Button("Resume") { model.startIndexing() }.controlSize(.small)
+                        if let rateLabel {
+                            Text(rateLabel).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                        }
                     }
-                case .idle:
-                    if !model.activeRoots.isEmpty {
-                        // A newly added folder (or a background reconcile) is embedding right now.
-                        // It tracks per-root totals just like a full pass, so show the same progress.
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack {
-                                ProgressView().controlSize(.small)
-                                Text("Updating\u{2026}").fontWeight(.medium)
-                                Spacer()
-                                if let rateLabel {
-                                    Text(rateLabel).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                                }
-                            }
-                            if activeCounts.total > 0 {
-                                ProgressView(value: overall)
-                                Text("\(activeCounts.done.formatted()) / \(activeCounts.total.formatted()) files")
-                                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                            }
-                        }
-                    } else {
-                        HStack(spacing: 8) {
-                            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                            Text(model.indexedFiles == 0 ? "Nothing indexed yet" : "Up to date \u{00B7} \(model.indexedFiles.formatted()) file\(model.indexedFiles == 1 ? "" : "s")")
-                            Spacer()
-                            Button(model.indexedFiles == 0 ? "Index" : "Update") { model.startIndexing() }
-                                .controlSize(.small).disabled(!model.canIndex)
-                        }
+                    if activeCounts.total > 0 {
+                        ProgressView(value: overall)
+                        Text("\(activeCounts.done.formatted()) / \(activeCounts.total.formatted()) files")
+                            .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                     }
                 }
-            } header: {
-                Text("Status")
-            } footer: {
-                Text("Updates automatically as files change.")
-                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                    // No count here: the Indexed files row sits directly below.
+                    Text(model.indexedFiles == 0 ? "Nothing indexed yet" : "Up to date")
+                    Spacer()
+                    Button(model.indexedFiles == 0 ? "Index" : "Update") { model.startIndexing() }
+                        .controlSize(.small).disabled(!model.canIndex)
+                }
             }
+        }
+    }
+}
 
+/// What Omni watches: which file types are indexed, tagging, and the folder list.
+private struct ActivityTab: View {
+    @Environment(AppModel.self) private var model: AppModel
+
+    var body: some View {
+        Form {
             Section {
                 ForEach(model.kindOrder, id: \.self) { kind in
                     orderRow(kind)
@@ -191,7 +193,7 @@ private struct ActivityTab: View {
         // The kind on/off toggles live in THIS tab (orderRow). A confirmationDialog only presents
         // while its host view is on screen, so the disable-confirmation must be attached HERE, next
         // to the toggles - when it lived on the Content tab, disabling a kind-with-files from the
-        // Indexing tab set pendingDisable but the dialog never showed, so applyKind was never called
+        // Files tab set pendingDisable but the dialog never showed, so applyKind was never called
         // and the toggle silently did nothing.
         .confirmationDialog(
             model.pendingDisable.map { "Stop indexing \($0.kind.title.lowercased())?" } ?? "",
@@ -697,10 +699,9 @@ private struct DiskBreakdown: View {
     private func color(_ e: VectorStore.DiskUse.Entry) -> Color {
         switch e.name {
         case "Vectors":         return .orange
-        case "Database":        return .pink
-        case "Search indexes":  return .teal
-        case "Image tags",
-             "Other":           return .mint
+        case "Snippets":        return .pink
+        case "Scan codes":      return .teal
+        case "Filename index":  return .mint
         default:                return .gray
         }
     }
@@ -834,8 +835,9 @@ private struct IndexTab: View {
                 }
             }
             Section("Index") {
-                LabeledContent("Indexed files", value: "\(model.indexedFiles)")
-                LabeledContent("Indexed chunks", value: "\(model.indexedChunks)")
+                IndexStatusRow()
+                LabeledContent("Indexed files", value: model.indexedFiles.formatted())
+                LabeledContent("Indexed chunks", value: model.indexedChunks.formatted())
                 if model.diskUse.isEmpty {
                     LabeledContent("Size", value: ByteCountFormatter.string(fromByteCount: model.dbSizeBytes, countStyle: .file))
                 } else {

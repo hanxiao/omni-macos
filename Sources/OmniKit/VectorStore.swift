@@ -1960,6 +1960,7 @@ public final class VectorStore: @unchecked Sendable {
             exec("BEGIN;")
             recordHolesLocked(victims)
             deletePathLocked(path)
+            pruneFileRowsLocked([path])
             bumpGenLocked()
             exec("COMMIT;")
             removeRowsByPathsLocked([path])
@@ -2135,6 +2136,7 @@ public final class VectorStore: @unchecked Sendable {
                 }
             }
             sqlite3_finalize(kstmt)
+            pruneFileRowsLocked(paths)
             bumpGenLocked()
             exec("COMMIT;")
             removeRowsByPathsLocked(paths, victims: victims)   // one rebuild for the whole set
@@ -2143,9 +2145,10 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
-    /// Does anything under `folder` have rows? Index-driven range probe on idx_path, so it is a
-    /// lookup rather than a scan - which is what makes it safe to ask before every folder-shaped
-    /// removal, including the ones that will turn out to have nothing to remove.
+    /// Does anything under `folder` have rows? Index-driven: the byte range resolves on the unique
+    /// index over `files.path` and each candidate id is a probe into the chunks primary key, so it
+    /// is a lookup rather than a scan - which is what makes it safe to ask before every
+    /// folder-shaped removal, including the ones that will turn out to have nothing to remove.
     public func hasRowsUnder(_ folder: String) -> Bool {
         guard !folder.isEmpty, folder != "/" else { return false }
         return queue.sync {
@@ -2188,6 +2191,8 @@ public final class VectorStore: @unchecked Sendable {
                 sqlite3_step(kstmt)
             }
             sqlite3_finalize(kstmt)
+            pruneOrphanFileRowsLocked(where: "path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')",
+                                      bindFolder: folder)
             bumpGenLocked()
             exec("COMMIT;")
             removeRowsLocked { $0.path == folder || SearchFilter.underFolderBytes($0.path, prefixBytes) }
@@ -2239,6 +2244,7 @@ public final class VectorStore: @unchecked Sendable {
             }
             sqlite3_finalize(stmt)
             bumpGenLocked()
+            pruneOrphanFileRowsLocked()   // whole-table sweep: a kind purge names no path range
             exec("COMMIT;")
             removeRowsLocked { set.contains($0.kind) }
             checkpointIfDueLocked(forceStat: true)   // bulk delete inflates the WAL; fold it (self-review fix)
@@ -2274,6 +2280,7 @@ public final class VectorStore: @unchecked Sendable {
                 }
             }
             sqlite3_finalize(kstmt)
+            pruneFileRowsLocked(victims)
             bumpGenLocked()
             exec("COMMIT;")
             removeRowsLocked { disabled($0.path) }
@@ -2288,6 +2295,7 @@ public final class VectorStore: @unchecked Sendable {
             exec("BEGIN;")
             exec("DELETE FROM chunks;")
             exec("DELETE FROM content_keys;")
+            exec("DELETE FROM files;")   // every path row is an orphan now
             bumpGenLocked()
             exec("COMMIT;")
             // Release the backing buffers (a wipe will not refill to the same size immediately),
@@ -6132,21 +6140,23 @@ public final class VectorStore: @unchecked Sendable {
         // The database plus its journal: one logical thing, and the WAL is transient enough that
         // listing it separately would just look like a leak.
         let dbBytes = size(base) + size(base + "-wal") + size(base + "-shm")
-        // FOUR slices. Seven was an inventory of the implementation; a reader needs the shape, and
-        // every derived file answers the same question ("can I lose this?") the same way, so they
-        // group. The two that are irreplaceable stay separate because that is the distinction the
-        // chart exists to show.
-        let searchIndexes = size(base + ".quant") + size(base + ".rows")
-            + size(base + ".names") + size(base + ".names-wal") + size(base + ".names-shm")
+        // FOUR slices, each named for what the bytes ARE rather than for the layer they belong to:
+        // "Database" and "Search indexes" were true of half the folder and told a reader nothing.
+        // Grouping is by content, so the two scan-tier files sit together and the two lookup
+        // caches sit together, and the irreplaceable pair stays separate because that is the
+        // distinction the chart exists to show.
+        let scanCodes = size(base + ".quant") + size(base + ".rows")
+        let lookups = size(base + ".names") + size(base + ".names-wal") + size(base + ".names-shm")
+            + size("tags-d\(dim).cache") + size("tags-d\(dim).prior")
         var entries: [DiskUse.Entry] = [
             .init(name: "Vectors", bytes: size(base + ".vecs"), irreplaceable: true,
-                  detail: "the embeddings themselves"),
-            .init(name: "Database", bytes: dbBytes, irreplaceable: true,
-                  detail: "paths, text excerpts, structure"),
-            .init(name: "Search indexes", bytes: searchIndexes, irreplaceable: false,
-                  detail: "fast scan, fast launch, filename matching"),
-            .init(name: "Image tags", bytes: size("tags-d\(dim).cache") + size("tags-d\(dim).prior"),
-                  irreplaceable: false, detail: "generated labels for images"),
+                  detail: "one fp16 vector per chunk, the only copy"),
+            .init(name: "Snippets", bytes: dbBytes, irreplaceable: true,
+                  detail: "text excerpts, file paths, chunk records"),
+            .init(name: "Scan codes", bytes: scanCodes, irreplaceable: false,
+                  detail: "1-bit codes the first-stage scan reads, plus the slot map"),
+            .init(name: "Filename index", bytes: lookups, irreplaceable: false,
+                  detail: "filename search, image labels"),
         ]
         // Anything else in the folder, so nothing is invisible. The model directory is excluded:
         // it is not the index, and it is reported in its own right elsewhere.
@@ -6163,11 +6173,12 @@ public final class VectorStore: @unchecked Sendable {
             otherBytes += size(n)
             otherNames.append(n)
         }
-        if !otherNames.isEmpty, let i = entries.firstIndex(where: { $0.name == "Image tags" }) {
+        if !otherNames.isEmpty, let i = entries.firstIndex(where: { $0.name == "Filename index" }) {
             // Anything unrecognised joins the last slice rather than earning its own: it is almost
-            // always nothing, and a permanent near-zero segment is noise.
-            entries[i] = .init(name: "Other", bytes: entries[i].bytes + otherBytes, irreplaceable: false,
-                               detail: "image tags, plus " + otherNames.sorted().joined(separator: ", "))
+            // always nothing, and a permanent near-zero segment is noise. The name does not change
+            // for it - the tooltip names the files, so the legend stays four stable labels.
+            entries[i] = .init(name: entries[i].name, bytes: entries[i].bytes + otherBytes, irreplaceable: false,
+                               detail: entries[i].detail + ", plus " + otherNames.sorted().joined(separator: ", "))
         }
         return DiskUse(entries: entries.filter { $0.bytes > 0 })
     }
@@ -6707,6 +6718,45 @@ public final class VectorStore: @unchecked Sendable {
         return true
     }
 
+    /// Drop `files` entries that no chunk refers to any more.
+    ///
+    /// Interning made the path table durable state of its own, and nothing was removing from it: a
+    /// deleted or renamed file left its row behind forever, so the table only ever grew - slowly
+    /// (about 120 bytes per path ever seen, plus its unique index) but without bound, on an index
+    /// whose whole point is that it no longer stores paths repeatedly.
+    ///
+    /// Scoped to the paths a removal just touched, so it costs one index probe each rather than a
+    /// scan. NEVER call it from replace(): that deletes a path's rows and immediately re-inserts
+    /// them, and dropping the entry in between would churn a fresh id for every save.
+    private func pruneFileRowsLocked(_ paths: Set<String>) {
+        guard dbOpen(), !paths.isEmpty else { return }
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, """
+            DELETE FROM files WHERE path = ?
+              AND NOT EXISTS(SELECT 1 FROM chunks WHERE chunks.file_id = files.id);
+            """, -1, &stmt, nil) == SQLITE_OK else { return }
+        for p in paths {
+            sqlite3_reset(stmt)
+            sqlite3_bind_text(stmt, 1, p, -1, SQLITE_TRANSIENT)
+            sqlite3_step(stmt)
+        }
+    }
+
+    /// Same, for the removals that name a range or a predicate instead of a path set. `where` is
+    /// SQL over `files` (`path` in scope); empty means every orphan.
+    private func pruneOrphanFileRowsLocked(where clause: String = "1", bindFolder: String? = nil) {
+        guard dbOpen() else { return }
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, """
+            DELETE FROM files WHERE (\(clause))
+              AND NOT EXISTS(SELECT 1 FROM chunks WHERE chunks.file_id = files.id);
+            """, -1, &stmt, nil) == SQLITE_OK else { return }
+        if let f = bindFolder { sqlite3_bind_text(stmt, 1, f, -1, SQLITE_TRANSIENT) }
+        sqlite3_step(stmt)
+    }
+
     private func deletePathLocked(_ path: String) {
         var stmt: OpaquePointer?
         if sqlite3_prepare_v2(db, "DELETE FROM chunks WHERE file_id = (SELECT id FROM files WHERE path = ?);", -1, &stmt, nil) == SQLITE_OK {
@@ -6744,14 +6794,31 @@ public final class VectorStore: @unchecked Sendable {
         // covered row the file IS the only copy, so this is the one path that must read it.
         if coveredRows > 0 {
             if loadFromCoverageLocked() { return }
-            // Could not read the coverage. The scan below would read vectors from blobs that
-            // covered rows no longer have, AND mapPersistent would truncate the very file that
-            // does have them - turning a bad state into an unrecoverable one. So: touch nothing.
-            // SQLite keeps its rows, the file keeps its bytes, and the next launch can try again
-            // (the file may simply have been unavailable). An empty in-memory store means the
-            // reconcile pass re-indexes, which is recoverable; deleting rows here would not be.
-            reportCoverageUnreadableLocked()
-            return
+            // A claim nothing DEPENDS on is not a claim worth refusing over. If every row still
+            // carries its own blob then no row's vector lives only in the file, so the claim is
+            // stale rather than load-bearing and the ordinary scan below rebuilds everything.
+            //
+            // Reached by downgrade-then-upgrade: a 0.4.x binary opening a v3 index drops and
+            // rebuilds `chunks` (schema mismatch, by design) but leaves `meta` alone, so the next
+            // 0.5.0 launch reads a claim describing rows that no longer exist. Without this the
+            // store refused to load a perfectly intact index and the user saw nothing indexed.
+            // EXISTS, not COUNT: it stops at the first cleared row, so a genuinely migrated index
+            // pays one row and only this rare recovery path pays a scan.
+            if scalarQuery("SELECT EXISTS(SELECT 1 FROM chunks WHERE length(vec) = 0);") == 0 {
+                FileHandle.standardError.write(Data(
+                    "[omni] stale vector coverage claim (covered=\(coveredRows)); every row has its blob, reloading from SQLite\n".utf8))
+                // Falls through to the scan below, which resets the claim before it starts.
+            } else {
+                // Could not read the coverage, and rows DO depend on it. The scan below would read
+                // vectors from blobs that covered rows no longer have, AND mapPersistent would
+                // truncate the very file that does have them - turning a bad state into an
+                // unrecoverable one. So: touch nothing. SQLite keeps its rows, the file keeps its
+                // bytes, and the next launch can try again (the file may simply have been
+                // unavailable). An empty in-memory store means the reconcile pass re-indexes,
+                // which is recoverable; deleting rows here would not be.
+                reportCoverageUnreadableLocked()
+                return
+            }
         }
         resetCoverageLocked()
         // Pre-size the buffers to the final row/element count so the bf16 buffer is filled in place
@@ -6983,9 +7050,22 @@ public final class VectorStore: @unchecked Sendable {
             return nil
         }
         if dropVectorBlobs {
-            // Claimed here, with the drop, so the two can never disagree: every row is covered and
-            // no slot is a hole, because nothing has been deleted since the load that built the file.
+            // Claimed here, with the drop, so the two can never disagree: the claim covers every
+            // SLOT the vector file holds, which is one per in-memory row - and a row that is
+            // already a tombstone is a slot with no row, i.e. a hole. Rewriting the list from
+            // `deadRows` rather than emptying it is what keeps the two halves consistent: an empty
+            // list under a claim of rows.count says the file has a live row for every slot, and the
+            // next launch would read one fewer row than the claim promises and refuse to load.
+            // Nothing here touches the in-memory copy - a rollback below must not leave it ahead
+            // of the table.
             exec("DELETE FROM vec_holes;")
+            var hstmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO vec_holes(slot) VALUES(?);", -1, &hstmt, nil) == SQLITE_OK {
+                for d in deadRows.sorted() where Int(d) < rows.count {
+                    sqlite3_reset(hstmt); sqlite3_bind_int(hstmt, 1, d); sqlite3_step(hstmt)
+                }
+            }
+            sqlite3_finalize(hstmt)
             exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.coveredRowsKey)','\(rows.count)');")
         }
         guard execChecked("DROP TABLE chunks;"),
@@ -6996,7 +7076,10 @@ public final class VectorStore: @unchecked Sendable {
             exec("ROLLBACK;")
             return nil
         }
-        if dropVectorBlobs { coveredRows = rows.count; vecHoles.removeAll() }
+        if dropVectorBlobs {
+            coveredRows = rows.count
+            vecHoles = Set(deadRows.filter { Int($0) < rows.count })
+        }
         finishMigrationIfDoneLocked()
         return before - onDiskBytes()
     }

@@ -166,4 +166,86 @@ final class PathInterningTests: XCTestCase {
         XCTAssertEqual(orderedRows(db, interned: false), before,
                        "a declined or failed migration modified the index")
     }
+
+    /// DOWNGRADE, THEN UPGRADE. A 0.4.x binary opening a v3 index drops and rebuilds `chunks` on the
+    /// schema mismatch - by design, it is a rebuildable cache - but it leaves `meta` alone, so the
+    /// coverage claim survives describing rows that no longer exist. The next 0.5.0 launch then read
+    /// a claim it could not satisfy and refused to load the index at all: the user saw an empty
+    /// index and a full reindex, with nothing actually wrong with their data.
+    ///
+    /// A claim is only load-bearing while some row's vector lives ONLY in the file. When every row
+    /// still carries its blob the claim is stale, and the ordinary scan is both available and right.
+    func testStaleCoverageClaimWithIntactBlobsStillLoads() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("intern-stale-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appendingPathComponent("test.sqlite")
+        _ = try makeIndex(dbURL)   // ordinary v3 index, every row carrying its blob
+
+        // What the downgrade leaves behind: a claim (and holes) for rows that were rewritten by a
+        // different binary, plus the vector file gone, which is exactly what 0.4.x's sidecar
+        // rejection does.
+        do {
+            let db = open(dbURL)
+            defer { sqlite3_close(db) }
+            exec(db, "INSERT OR REPLACE INTO meta(key,value) VALUES('vecs_covered_rows','999999');")
+            exec(db, "CREATE TABLE IF NOT EXISTS vec_holes(slot INTEGER PRIMARY KEY);")
+            exec(db, "INSERT OR REPLACE INTO vec_holes(slot) VALUES(7);")
+        }
+        try? FileManager.default.removeItem(at: dir.appendingPathComponent("test.sqlite.vecs"))
+        try? FileManager.default.removeItem(at: dir.appendingPathComponent("test.sqlite.rows"))
+
+        let rowsInDB: Int
+        do {
+            let db = open(dbURL)
+            defer { sqlite3_close(db) }
+            rowsInDB = scalar(db, "SELECT COUNT(*) FROM chunks;")
+        }
+        XCTAssertGreaterThan(rowsInDB, 0, "fixture is empty, so this proves nothing")
+
+        let store = try VectorStore(dbURL: dbURL)
+        defer { store.close() }
+        XCTAssertEqual(store.count, rowsInDB, "a stale claim over intact blobs must not cost the index")
+        XCTAssertNil(store.coverageAudit(), "coverage bookkeeping after recovering from a stale claim")
+    }
+
+    /// Interning made the path table durable state of its own, and the first version never removed
+    /// from it: every deleted or renamed file left its row behind, so the one table whose reason for
+    /// existing is "write each path once" grew forever on an index with churn.
+    func testRemovalsDropTheirPathRows() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("intern-orphan-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appendingPathComponent("test.sqlite")
+        _ = try makeIndex(dbURL)
+
+        func fileRows() -> Int {
+            let db = open(dbURL); defer { sqlite3_close(db) }
+            return scalar(db, "SELECT COUNT(*) FROM files;")
+        }
+        func orphans() -> Int {
+            let db = open(dbURL); defer { sqlite3_close(db) }
+            return scalar(db, "SELECT COUNT(*) FROM files WHERE NOT EXISTS(SELECT 1 FROM chunks WHERE chunks.file_id = files.id);")
+        }
+        let before = fileRows()
+        XCTAssertGreaterThan(before, 10, "fixture is too small to show a leak")
+
+        let store = try VectorStore(dbURL: dbURL)
+        store.deletePaths(["/i/f1.txt", "/i/f2.txt"])
+        store.deletePath("/i/f4.txt")
+        store.deleteUnderFolder("/i/sub")          // matches nothing here, must not remove live rows
+        store.close()
+
+        XCTAssertEqual(orphans(), 0, "a removed file left its path row behind")
+        XCTAssertEqual(fileRows(), before - 3, "path rows removed does not match files removed")
+
+        // And the rows that survived are still whole - a prune that took a live path with it would
+        // be far worse than the leak it fixes.
+        let reopened = try VectorStore(dbURL: dbURL)
+        defer { reopened.close() }
+        XCTAssertNil(reopened.coverageAudit(), "coverage bookkeeping after pruning path rows")
+        let listed = Set(reopened.indexedFiles().keys)
+        XCTAssertTrue(listed.contains("/i/f6.txt"), "a live file lost its path row")
+        XCTAssertFalse(listed.contains("/i/f1.txt"), "a deleted file is still listed")
+    }
 }
