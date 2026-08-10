@@ -109,26 +109,46 @@ final class AppModel {
     /// (or before bootstrap has begun). Combined 50/50 from the store's row-load fraction and the
     /// engine's GPU materialization fraction - both real measurements (see bootstrap). Monotonic:
     /// only ever moves forward within one launch.
+    ///
+    /// NIL ALSO MEANS "NO HONEST TOTAL", and the launch screen then shows the indeterminate bar.
+    /// The engine half is a fraction of a denominator read off the filesystem before loading
+    /// starts; when that denominator cannot be established there is no position to draw, and a bar
+    /// placed anyway is just an animation that happens to look like information. A spinner says "I
+    /// am working and I do not know how long", which is the truth in that case.
     var loadingProgress: Double? = nil
     @ObservationIgnored private var storeLoadFrac = 0.0
     @ObservationIgnored private var engineLoadFrac = 0.0
+    /// Denominator for the engine half, or nil when it could not be read - see expectedGPULoadBytes.
+    @ObservationIgnored private var engineTotalBytes: Int? = nil
+    /// The bar may APPROACH but never REACH the end while work is still running. The engine
+    /// denominator is an estimate: it counts the weights and the persisted quant replica, but a
+    /// store that materializes a bf16 base instead has no replica to count, so the real allocation
+    /// can exceed it and the fraction clamps to 1. A bar sitting at exactly 100% through live work
+    /// is the same defect this screen already had once, so the ceiling keeps it visibly short until
+    /// the work is genuinely finished and the screen goes away.
+    private static let launchBarCeiling = 0.99
     private func noteStoreLoadFrac(_ f: Double) { storeLoadFrac = max(storeLoadFrac, min(1, f)); refreshLoadingProgress() }
     private func noteEngineLoadFrac(_ f: Double) { engineLoadFrac = max(engineLoadFrac, min(1, f)); refreshLoadingProgress() }
     private func refreshLoadingProgress() {
-        guard phase == .loadingModel else { return }
-        loadingProgress = max(loadingProgress ?? 0, 0.5 * storeLoadFrac + 0.5 * engineLoadFrac)
+        // No trustworthy denominator: leave it nil so the screen stays indeterminate.
+        guard phase == .loadingModel, engineTotalBytes != nil else { return }
+        let combined = min(Self.launchBarCeiling, 0.5 * storeLoadFrac + 0.5 * engineLoadFrac)
+        loadingProgress = max(loadingProgress ?? 0, combined)
     }
     /// Total GPU bytes this launch will materialize: the weights file plus the persisted quant
-    /// replica (both known before loading starts). The denominator for the engine-side fraction.
-    private static func expectedGPULoadBytes(modelDir: URL) -> Int {
-        func size(_ url: URL) -> Int {
-            ((try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? Int) ?? 0
+    /// replica. The denominator for the engine-side fraction.
+    ///
+    /// Nil when the weights cannot be sized. Returning 0 and letting the caller `max(1, ...)` it
+    /// made the fraction `min(1, bytes / 1)`, i.e. 100% on the first sample - a full bar before any
+    /// work had happened. An unknown total is not a total of one.
+    private static func expectedGPULoadBytes(modelDir: URL) -> Int? {
+        func size(_ url: URL) -> Int? {
+            ((try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? Int).flatMap { $0 > 0 ? $0 : nil }
         }
-        var total = size(modelDir.appendingPathComponent("model.safetensors"))
-        if let idx = try? Self.indexURL() {
-            total += size(idx.deletingLastPathComponent().appendingPathComponent(idx.lastPathComponent + ".quant"))
-        }
-        return total
+        guard let weights = size(modelDir.appendingPathComponent("model.safetensors")) else { return nil }
+        guard let idx = try? Self.indexURL() else { return weights }
+        let replica = size(idx.deletingLastPathComponent().appendingPathComponent(idx.lastPathComponent + ".quant"))
+        return weights + (replica ?? 0)
     }
 
     static let defaultMinScore = 0.0   // show all matches by default; users can raise the bar in Search settings
@@ -947,9 +967,28 @@ final class AppModel {
     // Index storage info (for the Settings > Model tab).
     var dbPath = ""
     var dbSizeBytes: Int64 = 0
-    /// Set while the store is doing one-time upgrade work, so the launch screen can say so rather
-    /// than showing a model-loading message during a database rewrite.
-    var storeStatus: String? = nil
+    /// What the store is doing while it opens, or nil when it is not doing anything slow enough to
+    /// name. ONE bar (`loadingProgress`) spans the whole launch; this only decides what the launch
+    /// screen CALLS the phase it is in, so the words track the work instead of saying "loading the
+    /// model" through a database rewrite.
+    var storePhase: StoreOpenPhase? = nil
+    /// Title for the launch screen. The store's phase when it has one, because that is the part
+    /// that can take tens of seconds; the model otherwise, which is what a normal launch is doing.
+    var launchTitle: String {
+        switch storePhase {
+        case .upgradingIndex: return "Upgrading your index"
+        case .loadingIndex:   return "Loading your index"
+        case nil:             return "Loading the Omni model"
+        }
+    }
+    var launchSubtitle: String {
+        switch storePhase {
+        case .upgradingIndex: return "One-time change to make search faster and the index smaller."
+        case .loadingIndex:   return "Reading your index into memory. The model is loading alongside it."
+        case nil:             return "Your first search may be slower while the index loads into memory."
+        }
+    }
+    var launchSymbol: String { storePhase == .upgradingIndex ? "internaldrive" : "brain" }
     /// One-time storage migration: rows already converted, rows total, bytes still to reclaim.
     /// nil when there is nothing to do, so a finished index shows no banner at all.
     var storageMigration: (done: Int, total: Int, bytesToReclaim: Int64)? = nil
@@ -2292,11 +2331,15 @@ final class AppModel {
         // REAL launch progress, not an animation: the store reports its row-load fraction directly,
         // and the engine side is MLX's live GPU allocation against the total bytes KNOWN up front
         // (weights file + persisted quant replica - everything that must materialize before ready).
-        storeLoadFrac = 0; engineLoadFrac = 0; loadingProgress = 0
-        let gpuTotal = Double(max(1, Self.expectedGPULoadBytes(modelDir: dir)))
-        let progressSampler = Task { [weak self] in
+        storeLoadFrac = 0; engineLoadFrac = 0
+        engineTotalBytes = Self.expectedGPULoadBytes(modelDir: dir)
+        // nil until there is something real to show: with no denominator the screen stays on the
+        // indeterminate bar rather than starting a determinate one at zero and never moving it.
+        loadingProgress = engineTotalBytes == nil ? nil : 0
+        let progressSampler = Task { [weak self, gpuTotal = engineTotalBytes] in
+            guard let gpuTotal else { return }   // nothing to divide by; the spinner covers this launch
             while !Task.isCancelled {
-                let frac = min(1, Double(omniGPUActiveMemory()) / gpuTotal)
+                let frac = min(1, Double(omniGPUActiveMemory()) / Double(gpuTotal))
                 await MainActor.run { self?.noteEngineLoadFrac(frac) }
                 try? await Task.sleep(nanoseconds: 200_000_000)
             }
@@ -2308,8 +2351,8 @@ final class AppModel {
             // critical path. VectorStore/OmniEngine are Sendable; neither touches MainActor state here.
             async let storeC = try VectorStore(dbURL: try Self.indexURL(), onLoadProgress: { [weak self] f in
                 Task { @MainActor in self?.noteStoreLoadFrac(f) }
-            }, onStatus: { [weak self] msg in
-                Task { @MainActor in self?.storeStatus = msg }
+            }, onPhase: { [weak self] p in
+                Task { @MainActor in self?.storePhase = p }
             })
             // loadValidated self-tests the media embedding path and reloads weights if the first
             // (cold) load hit the MLX uninitialized-memory NaN, so media indexes reliably. Only load
@@ -2317,7 +2360,7 @@ final class AppModel {
             let towers = enabledKindTowers
             async let engineC = OmniEngine.loadValidated(modelDir: dir, keepVision: towers.vision, keepAudio: towers.audio)
             let store = try await storeC
-            await MainActor.run { self.storeStatus = nil }
+            await MainActor.run { self.storePhase = nil }   // store done; only the model can be left
             let engine = try await engineC
             // On a model/db switch, close the PREVIOUS store off the main actor: dropping its last ref
             // here would run a synchronous WAL checkpoint(TRUNCATE) + sqlite_close in deinit on @MainActor

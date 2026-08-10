@@ -129,17 +129,13 @@ struct ContentView: View {
             // A one-time index upgrade is a different thing from loading the model, and takes tens
             // of seconds on a large index - saying "loading the model" through a database rewrite
             // is how a working upgrade reads as a hang.
-            if let status = model.storeStatus {
-                CenteredStatus(symbol: "internaldrive",
-                               title: status,
-                               subtitle: "One-time change to make search faster and the index smaller.",
-                               showSpinner: true, progress: model.loadingProgress)
-            } else {
-                CenteredStatus(symbol: "brain",
-                               title: "Loading the Omni model",
-                               subtitle: "Your first search may be slower while the index loads into memory.",
-                               showSpinner: true, progress: model.loadingProgress)
-            }
+            // ONE bar for the whole launch - the store now scales its load and its one-time
+            // upgrade into a single fraction, so this keeps moving through both. Only the WORDS
+            // change with the phase, so a database rewrite is never described as loading the model.
+            CenteredStatus(symbol: model.launchSymbol,
+                           title: model.launchTitle,
+                           subtitle: model.launchSubtitle,
+                           showSpinner: true, progress: model.loadingProgress)
         case .noModel:
             OnboardingView()
         case .failed(let msg):

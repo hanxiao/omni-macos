@@ -148,6 +148,15 @@ public struct FileIndexStatus: Sendable {
     public let indexedAt: Double
 }
 
+/// What a store is doing while it opens, for a launch screen. Only the phases that take long
+/// enough to be worth naming: a fast open reports nothing and the app keeps its own default.
+public enum StoreOpenPhase: Sendable {
+    /// Reading the index into memory. Announced only for indexes big enough that it is visible.
+    case loadingIndex
+    /// The one-time 0.4.x -> 0.5.0 rewrite. Tens of seconds on a large index.
+    case upgradingIndex
+}
+
 /// Constraints applied to search results. Score thresholding is intentionally NOT
 /// here: the view fetches unfiltered-by-score and splits, so it can offer "show all".
 public struct SearchFilter: Sendable {
@@ -1475,8 +1484,42 @@ public final class VectorStore: @unchecked Sendable {
     /// Called on the opening thread, at coarse strides - never per row. nil = no reporting.
     private let onLoadProgress: (@Sendable (Double) -> Void)?
     /// What the store is doing, for the launch screen. The one-time upgrade takes tens of seconds
-    /// on a large index and looks identical to a hang without it.
-    private let onStatus: (@Sendable (String) -> Void)?
+    /// on a large index and looks identical to a hang without it. A typed phase rather than a
+    /// string: the store has no business naming the model, and the app should not be matching on
+    /// prose to decide which icon to draw.
+    private let onPhase: (@Sendable (StoreOpenPhase) -> Void)?
+    /// Rows per slice of the upgrade copy. Sized for a multi-million-row index; settable so a
+    /// test-sized index still produces more than one progress report.
+    nonisolated(unsafe) static var upgradeSliceRows = 250_000
+
+    // ONE BAR, SHARED BY THE LOAD AND THE UPGRADE.
+    //
+    // The upgrade runs AFTER loadIntoMemory - loading first is what lets the rewrite drop the
+    // duplicate vector blobs as it goes, and is why 0.5.0 converts in one short pass - and the load
+    // ended by reporting 1. The app's consumer is monotonic so the bar cannot jump backwards
+    // mid-launch, so every value the upgrade reported afterwards was already <= the value held: the
+    // bar sat at exactly 100% for the entire rewrite, which is how a working upgrade read as a hang.
+    //
+    // The fix is not a second bar. It is for the store to know its OWN total before it starts:
+    // whether an upgrade is needed is a column check (`legacyLayout`), readable before the load. So
+    // the load is scaled into the first slice of the store's share and the upgrade into the rest,
+    // and both report through the one channel. Nothing jumps, nothing saturates early, and a normal
+    // launch is bit-for-bit unchanged because loadShare is 1 when there is nothing to upgrade.
+    //
+    // The split is the measured one: on a real 0.4.x index the load was 9.3 s against 31.4 s of
+    // migration, so the load is ~23% of the store's work. Rounded to a quarter.
+    private var upgradePending = false
+    private var loadShare: Double { upgradePending ? 0.25 : 1.0 }
+    private func reportLoadProgress(_ f: Double) {
+        onLoadProgress?(Swift.max(0, Swift.min(1, f)) * loadShare)
+    }
+    private func reportUpgradeProgress(_ f: Double) {
+        onLoadProgress?(loadShare + Swift.max(0, Swift.min(1, f)) * (1 - loadShare))
+    }
+    /// Rows below which the load is too quick to be worth naming: announcing it would flash a label
+    /// for a few hundred milliseconds and then replace it, which reads as a glitch rather than as
+    /// information. Large indexes, where the load is seconds, do get named.
+    private static let announceLoadAboveRows = 200_000
     /// Why the one-time upgrade could not run, if it could not. Surfaced rather than swallowed: the
     /// interned queries are the only ones that exist, so an index that fails to convert cannot be
     /// served, and a silent half-working store is the worst outcome available.
@@ -1486,10 +1529,10 @@ public final class VectorStore: @unchecked Sendable {
     private var coverageUnreadable: String?
 
     public init(dbURL: URL, onLoadProgress: (@Sendable (Double) -> Void)? = nil,
-                onStatus: (@Sendable (String) -> Void)? = nil) throws {
+                onPhase: (@Sendable (StoreOpenPhase) -> Void)? = nil) throws {
         self.dbURL = dbURL
         self.onLoadProgress = onLoadProgress
-        self.onStatus = onStatus
+        self.onPhase = onPhase
         try FileManager.default.createDirectory(at: dbURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         guard sqlite3_open(dbURL.path, &db) == SQLITE_OK else {
             throw OmniError.store("open failed: \(String(cString: sqlite3_errmsg(db)))")
@@ -1618,6 +1661,12 @@ public final class VectorStore: @unchecked Sendable {
         // queue here makes the timer wait, and makes every access to the resident state
         // queue-serialized, which is what the rest of the class already assumes.
         queue.sync {
+            // Decide the store's OWN total before any of it runs, so the one bar can span both
+            // phases without saturating on the load and without jumping when the upgrade starts.
+            // `legacyLayout` is a column check, so this costs nothing.
+            upgradePending = legacyLayout
+            let rowsToLoad = scalarQuery("SELECT COUNT(*) FROM chunks")
+            if upgradePending || rowsToLoad > Self.announceLoadAboveRows { onPhase?(.loadingIndex) }
             loadIntoMemory()
             // ONE PASS, and it has to be here rather than before the load. Converting first meant
             // copying the table while the duplicate vectors were still in it: measured on a real
@@ -5003,7 +5052,7 @@ public final class VectorStore: @unchecked Sendable {
             return false
         }
         invalidateBase()
-        onLoadProgress?(1)
+        reportLoadProgress(1)
         rowWindowAuditLocked("loadFromCoverage")
         scheduleRowStampLocked(after: 120)
         scheduleCoverageStampLocked()
@@ -5633,7 +5682,7 @@ public final class VectorStore: @unchecked Sendable {
             }
         }
         guard sampleOK else { return reject() }
-        onLoadProgress?(0.25)   // files read + validated; the row rebuild below is the bulk
+        reportLoadProgress(0.25)   // files read + validated; the row rebuild below is the bulk
 
         // Commit: rebuild the derived structures exactly as loadIntoMemory would have.
         dim = header.dim
@@ -5656,8 +5705,8 @@ public final class VectorStore: @unchecked Sendable {
         records.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             locBlob.withUnsafeBytes { (lb: UnsafeRawBufferPointer) in
                 for i in 0 ..< header.rowCount {
-                    if let onLoadProgress, i % 262_144 == 0 {
-                        onLoadProgress(0.25 + 0.75 * Double(i) / Double(header.rowCount))
+                    if onLoadProgress != nil, i % 262_144 == 0 {
+                        reportLoadProgress(0.25 + 0.75 * Double(i) / Double(header.rowCount))
                     }
                     let o = i * Self.rowRecordSize
                     let fid = raw.loadUnaligned(fromByteOffset: o, as: Int32.self)
@@ -5692,7 +5741,7 @@ public final class VectorStore: @unchecked Sendable {
         presentPaths = Set(idPath.enumerated().compactMap { fileChunkCount[$0.offset] > 0 ? $0.element : nil })
         lastStampedGen = mutationGen
         invalidateBase()
-        onLoadProgress?(1)
+        reportLoadProgress(1)
         if Self.searchTiming { print("[search] ADOPT row sidecar rows=\(header.rowCount) files=\(idPath.count)") }
         return true
     }
@@ -7196,8 +7245,8 @@ public final class VectorStore: @unchecked Sendable {
             ? "SELECT path, kind, chunk_index, dim, vec, modified, width, height, duration, locator, size FROM chunks ORDER BY rowid;"
             : "SELECT f.path, c.kind, c.chunk_index, c.dim, c.vec, c.modified, c.width, c.height, c.duration, c.locator, c.size FROM chunks c JOIN files f ON f.id = c.file_id ORDER BY c.rowid;", -1, &stmt, nil) == SQLITE_OK {
             while sqlite3_step(stmt) == SQLITE_ROW {
-                if let onLoadProgress, total > 0, rows.count % 65536 == 0 {
-                    onLoadProgress(Double(rows.count) / Double(total))
+                if onLoadProgress != nil, total > 0, rows.count % 65536 == 0 {
+                    reportLoadProgress(Double(rows.count) / Double(total))
                 }
                 let path = canonicalPath(String(cString: sqlite3_column_text(stmt, 0)))
                 let kind = canonicalKind(String(cString: sqlite3_column_text(stmt, 1)))
@@ -7232,7 +7281,7 @@ public final class VectorStore: @unchecked Sendable {
         }
         sqlite3_finalize(stmt)
         invalidateBase()
-        onLoadProgress?(1)
+        reportLoadProgress(1)
         // A read-only session (open, search, quit) would otherwise never earn a sidecar; stamp
         // once the open settles. Mutations reschedule via bumpGenLocked as usual.
         rowWindowAuditLocked("loadIntoMemory")
@@ -7351,12 +7400,13 @@ public final class VectorStore: @unchecked Sendable {
         // reportable. As one statement it was 31 seconds of a launch screen with no bar moving,
         // which is indistinguishable from a hang. ORDER BY c.rowid within each slice and slices in
         // rowid order together preserve the global order the coverage claim depends on.
-        onStatus?("Upgrading your index")
+        onPhase?(.upgradingIndex)
+        reportUpgradeProgress(0)
         let total = Swift.max(1, scalarQuery("SELECT COUNT(*) FROM chunks"))
         var lastRowid: Int64 = 0
         var copied = 0
         while copied < total {
-            let slice = 250_000
+            let slice = Self.upgradeSliceRows
             let next = Int64(scalarQuery("SELECT COALESCE(MAX(rid), 0) FROM (SELECT rowid AS rid FROM chunks WHERE rowid > \(lastRowid) ORDER BY rowid LIMIT \(slice))"))
             guard next > lastRowid else { break }
             let ok = execChecked("""
@@ -7370,9 +7420,12 @@ public final class VectorStore: @unchecked Sendable {
                 """)
             guard ok else { exec("ROLLBACK;"); return nil }
             lastRowid = next
-            copied = scalarQuery("SELECT COUNT(*) FROM chunks_v3")
-            onLoadProgress?(Double(copied) / Double(total))
+            // sqlite3_changes, not COUNT(*) over the growing copy: the count was an O(rows) scan per
+            // slice, on the launch path, purely to drive a progress bar.
+            copied += Int(sqlite3_changes(db))
+            reportUpgradeProgress(Double(copied) / Double(total))
         }
+        reportUpgradeProgress(1)
         // Prove the copy before destroying the original, inside the same transaction, so a failure
         // leaves the old table untouched rather than a half-converted index.
         guard internPathsVerifyLocked() else {
