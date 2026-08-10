@@ -6209,6 +6209,25 @@ public final class VectorStore: @unchecked Sendable {
         guard !hits.isEmpty, coveredRows > 0 || deadRows.count + hits.count <= deadBudget else {
             return nil
         }
+        // LAST LINE OF DEFENCE, at the exact point the damage would be done. A row inside the
+        // covered prefix that is about to become a tombstone MUST already have its slot recorded -
+        // its caller was supposed to do that inside the same transaction as the DELETE. Three
+        // separate removal paths have been found forgetting, and each one was invisible until an
+        // invariant caught it, so this stops trusting the enumeration and checks the thing itself.
+        //
+        // DEBUG trips immediately, so a new removal path fails the first test that exercises it. In
+        // release the hole is recorded anyway rather than dropped: it lands outside the delete's
+        // transaction, which narrows the exposure to a crash inside this call instead of leaving
+        // the file holding a slot no row owns for the rest of the index's life.
+        if coveredRows > 0 {
+            let unrecorded = hits.filter { Int($0) < coveredRows && !vecHoles.contains($0) }
+            if !unrecorded.isEmpty {
+                assertionFailure("removal reached tombstoning with \(unrecorded.count) unrecorded covered slots - the caller must recordHolesLocked inside its transaction")
+                FileHandle.standardError.write(Data(
+                    "[omni] recovering \(unrecorded.count) unrecorded vector slots; a removal path is missing recordHolesLocked\n".utf8))
+                recordHolesLocked(unrecorded)
+            }
+        }
         var removedPaths = Set<String>()
         for i in hits {
             let r = rows[Int(i)]
