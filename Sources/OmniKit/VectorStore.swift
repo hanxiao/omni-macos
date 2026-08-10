@@ -4711,6 +4711,15 @@ public final class VectorStore: @unchecked Sendable {
         guard dbOpen() else { return }
         coveredRows = scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.coveredRowsKey)'")
         guard coveredRows > 0 else { return }
+        // An EMPTIED index: the claim describes slots for rows that no longer exist, and no row
+        // needs a vector, so it is vacuous rather than dangerous. Clearing it here is the only
+        // safe place to do so - a claim that merely looks too large elsewhere may mean the rows
+        // failed to load, where discarding it would turn a recoverable state into data loss.
+        // Reached by any removal that takes the last row: deleting the last watched folder does it.
+        if scalarQuery("SELECT COUNT(*) FROM chunks") == 0 {
+            resetCoverageLocked()
+            return
+        }
         var stmt: OpaquePointer?
         if sqlite3_prepare_v2(db, "SELECT slot FROM vec_holes;", -1, &stmt, nil) == SQLITE_OK {
             while sqlite3_step(stmt) == SQLITE_ROW { vecHoles.insert(sqlite3_column_int(stmt, 0)) }
