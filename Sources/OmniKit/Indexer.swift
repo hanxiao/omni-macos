@@ -490,41 +490,108 @@ public final class Indexer: @unchecked Sendable {
         }
         var seen = Set<String>()
 
-        // Single crawl: walk each root ONCE, collecting its files and setting the determinate
-        // progress total as that root finishes. (Previously this was two full walks - a stat-only
-        // count pass followed by a collect pass - which doubled the directory traversal before the
-        // first embed and slowed cold start. The per-root total is now published as each root's
-        // walk completes; the ring is indeterminate for a root only until its own walk finishes.)
+        // STREAMING CRAWL. The walk used to complete - every root, every file - before anything was
+        // embedded, so a large library spent minutes on a launch screen with the GPU idle. Measured
+        // on a real set of roots: 127s before the fast walker, ~27s after, and in both cases the
+        // FIRST indexable file was known in under 50ms.
         //
-        // The pipeline below feeds a concurrent-decode -> serial-embed stage. Files are interleaved
-        // round-robin across roots so every folder makes progress from the start - draining a large
-        // first root (e.g. Documents) before the others would starve them, leaving a paused run with
-        // later folders (Downloads, Desktop) unindexed.
-        var perRootFiles: [(key: String, files: [CrawledFile])] = []
-        for root in roots {
-            if isCancelled { break }
-            var files: [CrawledFile] = []
-            FileCrawler(roots: [root], ignore: settings.ignore, enabledKinds: settings.enabledKinds)
-                .walk(shouldContinue: { !self.isCancelled }) { files.append($0) }
-            perRootFiles.append((root.path, files))
-            var rp = RootProgress(); rp.total = files.count
-            p.perRoot[root.path] = rp
-            onProgress(p)
+        // So the walk produces into per-root queues on its own thread, and the pass below consumes
+        // WAVES from them: round-robin across roots (a big first root must not starve the others),
+        // each wave grouped by modality exactly as one whole pass was, so cross-file text batching
+        // still fills the GPU. First embed starts as soon as the first wave exists.
+        //
+        // What must NOT stream is the deletion sweep at the end: it removes rows for files it did
+        // not see, and a partial `seen` means "nobody looked yet", not "deleted". It stays gated on
+        // the walk having COMPLETED, which is what `walkFinished` records.
+        final class WalkFeed: @unchecked Sendable {
+            let lock = NSCondition()
+            var pending: [String: [CrawledFile]] = [:]
+            var cursor: [String: Int] = [:]          // read head per root; removeFirst is O(n)
+            var totals: [String: Int] = [:]          // published as each root's walk completes
+            var finished: Set<String> = []
+            var walking = true
+            var announced: Set<String> = []          // totals already handed to onProgress
+        }
+        let passStart = Date()
+        let feed = WalkFeed()
+        // RESOLVED, like the crawler resolves them. The walk returns paths with the root's symlinks
+        // already followed (/var -> /private/var), and the containment tests below - which root a
+        // file belongs to, and the deletion sweep's "is this under a root this pass crawled" - have
+        // to ask the same question of the same strings. The app canonicalises roots before it gets
+        // here, so this only ever showed up for a caller that did not.
+        let rootPaths: [String] = roots.map { r in
+            var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
+            return realpath(r.path, &buf) != nil ? String(cString: buf) : r.path
+        }
+        // @Sendable: the producer thread calls this for every file it finds, and it only reads
+        // an immutable list of strings.
+        let rootOf: @Sendable (String) -> String? = { path in
+            rootPaths.first { path == $0 || path.hasPrefix($0 + "/") }
+        }
+        // ONE walk over ALL roots, not one per root in sequence. The walker pools directories from a
+        // single stack, so every root's queue fills together and the consumer's round-robin has
+        // something from each to take - walking them one at a time meant a paused run indexed the
+        // first root and nothing else, which is the starvation the interleaving exists to prevent.
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            var counts: [String: Int] = [:]
+            FileCrawler(roots: roots, ignore: settings.ignore, enabledKinds: settings.enabledKinds)
+                .walk(shouldContinue: { !self.isCancelled }) { f in
+                    guard let r = rootOf(f.path) else { return }
+                    feed.lock.lock()
+                    feed.pending[r, default: []].append(f)
+                    counts[r, default: 0] += 1
+                    feed.lock.broadcast()
+                    feed.lock.unlock()
+                }
+            feed.lock.lock()
+            // A root that yielded nothing still needs a total, or the sweep cannot tell "empty"
+            // from "unreadable" - blindRoots is what protects an unreadable root from deletion.
+            for r in rootPaths { feed.totals[r] = counts[r] ?? 0 }
+            feed.walking = false
+            feed.lock.broadcast()
+            feed.lock.unlock()
         }
 
-        var interleaved: [CrawledFile] = []
-        interleaved.reserveCapacity(perRootFiles.reduce(0) { $0 + $1.files.count })
-        let maxLen = perRootFiles.map { $0.files.count }.max() ?? 0
-        for i in 0 ..< maxLen {
-            for pr in perRootFiles where i < pr.files.count { interleaved.append(pr.files[i]) }
+        /// One wave: up to `max` files, taken round-robin so every root advances together. Blocks
+        /// while the walk is still producing and nothing is ready; returns empty only when the walk
+        /// is done and the queues are drained.
+        func takeWave(max: Int) -> (files: [CrawledFile], newTotals: [String: Int]) {
+            feed.lock.lock()
+            defer { feed.lock.unlock() }
+            while !isCancelled, feed.walking,
+                  rootPaths.allSatisfy({ (feed.pending[$0]?.count ?? 0) <= (feed.cursor[$0] ?? 0) }) {
+                feed.lock.wait()
+            }
+            var wave: [CrawledFile] = []
+            var progress = true
+            while wave.count < max, progress {
+                progress = false
+                for r in rootPaths {
+                    let head = feed.cursor[r] ?? 0
+                    guard let q = feed.pending[r], head < q.count else { continue }
+                    wave.append(q[head])
+                    feed.cursor[r] = head + 1
+                    progress = true
+                    if wave.count >= max { break }
+                }
+            }
+            // Drop the consumed prefix once it dominates, so the queue stays O(pending).
+            for r in rootPaths {
+                let head = feed.cursor[r] ?? 0
+                if head > 4096, head * 2 > (feed.pending[r]?.count ?? 0) {
+                    feed.pending[r]?.removeFirst(head)
+                    feed.cursor[r] = 0
+                }
+            }
+            var newTotals: [String: Int] = [:]
+            for (r, t) in feed.totals where !feed.announced.contains(r) {
+                newTotals[r] = t
+                feed.announced.insert(r)
+            }
+            return (wave, newTotals)
         }
 
-        // Group the interleaved files by modality and process one kind fully before the next
-        // (text, image, audio, video). A uniform phase lets text chunks be embedded in
-        // cross-file batches (one GPU forward for many files) instead of a tiny per-file
-        // forward, which keeps the GPU fed. Decode stays concurrent within each phase.
-        var byKind: [FileKind: [CrawledFile]] = [:]
-        for f in interleaved { byKind[FileExtractor.kind(for: f.url) ?? .text, default: []].append(f) }
 
         knownReady.wait()             // join the concurrently-computed indexedFiles() before its first use (F6)
         let known = knownBox.v
@@ -567,6 +634,33 @@ public final class Indexer: @unchecked Sendable {
         // order could omit one).
         var kindOrder = settings.kindOrder
         for k in [FileKind.text, .image, .audio, .video] where !kindOrder.contains(k) { kindOrder.append(k) }
+
+        // ONE WAVE AT A TIME. The body below is the whole pass as it was - kind phases, cross-file
+        // text batching, staged stores - run against a slice of the crawl instead of all of it. Its
+        // buffers are scoped per kind inside, so each wave starts clean and nothing leaks across.
+        // 20k files is large enough that the text staging window (batch * 6) still fills.
+        var byKind: [FileKind: [CrawledFile]] = [:]
+        var walkFinished = false
+        while !isCancelled {
+            let wave = takeWave(max: 20_000)
+            // Totals arrive as each root's walk ends; until then its ring stays indeterminate,
+            // which is exactly what the sidebar's empty circle means.
+            for (r, total) in wave.newTotals {
+                var rp = p.perRoot[r] ?? RootProgress()
+                rp.total = total
+                p.perRoot[r] = rp
+                onProgress(p)
+            }
+            if wave.files.isEmpty {
+                walkFinished = true
+                break
+            }
+            if omniPerfEnabled, p.scanned == 0 {
+                omniPerfLog(String(format: "first-wave=%d files at %.2fs after pass start", wave.files.count, -passStart.timeIntervalSinceNow))
+            }
+            byKind.removeAll(keepingCapacity: true)
+            for f in wave.files { byKind[FileExtractor.kind(for: f.url) ?? .text, default: []].append(f) }
+
         for kind in kindOrder {
             guard !isCancelled, let files = byKind[kind], !files.isEmpty else { continue }
             if kind == .text {
@@ -819,16 +913,22 @@ public final class Indexer: @unchecked Sendable {
                 }
             }
         }
-        if !isCancelled {
-            for pr in perRootFiles {
-                if var rp = p.perRoot[pr.key] { rp.done = rp.total; p.perRoot[pr.key] = rp }
+        }   // end of the wave loop
+
+        if !isCancelled, walkFinished {
+            for (r, total) in feed.totals {
+                var rp = p.perRoot[r] ?? RootProgress()
+                rp.done = total; rp.total = total
+                p.perRoot[r] = rp
             }
         }
 
         // Only reconcile deletions on a complete pass. A paused (cancelled) run has
         // not seen every file yet, so it must not delete "unseen" files - that would
         // corrupt the index and break resume.
-        let wasCancelled = isCancelled
+        // COMPLETE, not merely uncancelled: with a streaming crawl a pass can end early with the
+        // walk still running, and `seen` would then be missing files nobody has looked at yet.
+        let wasCancelled = isCancelled || !walkFinished
         if !wasCancelled {
             // Reconcile deletions, with three guards so we only remove files genuinely gone from
             // disk - never files that were merely OUT OF SCOPE this pass:
@@ -846,11 +946,8 @@ public final class Indexer: @unchecked Sendable {
             //     explicitly via deleteKind/deleteExtensions, so reconcile must stay out of it.
             //  3. Blind root: a root that crawled zero files is almost certainly unreadable
             //     (permission revoked, volume offline), not emptied. Skip its paths too.
-            let passRoots = roots.map { $0.path }
-            func underPassRoots(_ path: String) -> Bool {
-                passRoots.contains { path == $0 || path.hasPrefix($0 + "/") }
-            }
-            let blindRoots = perRootFiles.filter { $0.files.isEmpty }.map { $0.key }
+            func underPassRoots(_ path: String) -> Bool { rootOf(path) != nil }
+            let blindRoots = feed.totals.filter { $0.value == 0 }.map { $0.key }
             func inBlindRoot(_ path: String) -> Bool {
                 blindRoots.contains { path == $0 || path.hasPrefix($0 + "/") }
             }
