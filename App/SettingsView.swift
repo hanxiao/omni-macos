@@ -771,7 +771,8 @@ private struct MinimumField: View {
                 .textFieldStyle(.plain)
                 .multilineTextAlignment(.trailing)
                 .padding(.horizontal, 6)
-                .frame(width: 56, height: 18)
+                .padding(.vertical, 1)
+                .frame(width: 56)
                 .background(RoundedRectangle(cornerRadius: 5).fill(Color(nsColor: .textBackgroundColor)))
                 .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(Color(nsColor: .separatorColor)))
             // Fixed width so the fields line up in a column ("px", "sec" and "chars" are different
