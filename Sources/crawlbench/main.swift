@@ -15,6 +15,7 @@ import OmniKit
 let args = CommandLine.arguments
 guard args.count >= 2 else { print("usage: crawlbench [--arms] <root>..."); exit(2) }
 let allArms = args.contains("--arms")
+let statMode = args.contains("--stat")
 let roots = args.dropFirst().filter { !$0.hasPrefix("--") }.map { URL(fileURLWithPath: $0) }
 
 struct Entry { var path: String; var isDir: Bool; var size: Int; var mtime: Double }
@@ -351,4 +352,55 @@ for root in roots {
         for p in onlyNew.sorted().prefix(4) { print("    only in bulk:       \(p)") }
         for e in examples { print(e) }
     }
+}
+
+
+// MARK: - the WATCHER's per-file check
+//
+// A watcher event names a FILE (FSEvents runs with kFSEventStreamCreateFlagFileEvents), and
+// update() answers two questions about each one: does it still exist, and has its (mtime, size)
+// changed. Today that is fileExists + resourceValues - two Foundation round trips. One lstat(2)
+// answers both. getattrlistbulk works per DIRECTORY, so it can only help when many changed files
+// share a parent, which is what a bulk copy looks like; this measures all three so the answer is
+// not a guess.
+if statMode, let dir = roots.first?.path {
+    var paths: [String] = []
+    var buf = [UInt8](repeating: 0, count: 128 * 1024)
+    for e in bulkList(dir) where !e.isDir { paths.append(e.path) }
+    _ = buf
+    guard paths.count > 50 else { print("--stat needs a directory with files; \(dir) has \(paths.count)"); exit(0) }
+    print("\n\(dir): \(paths.count) files")
+
+    for _ in 0 ..< 2 {   // warm
+        for p in paths { var st = stat(); _ = lstat(p, &st) }
+    }
+
+    var t = Date()
+    var live = 0
+    for p in paths {
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: p, isDirectory: &isDir) {
+            if let v = try? URL(fileURLWithPath: p).resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]) {
+                live += (v.fileSize ?? 0) > 0 ? 1 : 0
+            }
+        }
+    }
+    let a = -t.timeIntervalSinceNow
+
+    t = Date()
+    var live2 = 0
+    for p in paths {
+        var st = stat()
+        if lstat(p, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG { live2 += st.st_size > 0 ? 1 : 0 }
+    }
+    let b = -t.timeIntervalSinceNow
+
+    t = Date()
+    var live3 = 0
+    for e in bulkList(dir) where !e.isDir { live3 += e.size > 0 ? 1 : 0 }
+    let c = -t.timeIntervalSinceNow
+
+    print(String(format: "  fileExists + resourceValues (now)  %7.1f ms   %.1f us/file   (%d)", a * 1000, a * 1e6 / Double(paths.count), live))
+    print(String(format: "  one lstat(2)                       %7.1f ms   %.1f us/file   (%d)   %.1fx", b * 1000, b * 1e6 / Double(paths.count), live2, a / max(b, 1e-9)))
+    print(String(format: "  getattrlistbulk, whole directory   %7.1f ms   %.1f us/file   (%d)   %.1fx", c * 1000, c * 1e6 / Double(paths.count), live3, a / max(c, 1e-9)))
 }
