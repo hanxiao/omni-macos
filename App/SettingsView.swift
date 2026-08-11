@@ -252,14 +252,14 @@ private struct ContentTypesTab: View {
             // The header states it, so each row is just a modality and a number and no footer is
             // needed to explain which way it cuts.
             Section("Skip files smaller than") {
-                MinimumField(label: "Images", unit: "px",
+                MinimumField(kind: .image, label: "Images", unit: "px",
                              value: Binding(get: { Double(model.minImageDimension) },
                                             set: { model.minImageDimension = Int($0.rounded()) }))
-                MinimumField(label: "Audio", unit: "sec", decimals: 1,
+                MinimumField(kind: .audio, label: "Audio", unit: "sec", decimals: 1,
                              value: Binding(get: { model.minAudioSeconds }, set: { model.minAudioSeconds = $0 }))
-                MinimumField(label: "Video", unit: "sec", decimals: 1,
+                MinimumField(kind: .video, label: "Video", unit: "sec", decimals: 1,
                              value: Binding(get: { model.minVideoSeconds }, set: { model.minVideoSeconds = $0 }))
-                MinimumField(label: "Text", unit: "chars",
+                MinimumField(kind: .text, label: "Text", unit: "chars",
                              value: Binding(get: { Double(model.minTextChars) },
                                             set: { model.minTextChars = Int($0.rounded()) }))
             }
@@ -746,6 +746,7 @@ private struct DiskBreakdown: View {
 /// rejecting - a typed "-5" becomes 0, which is a real setting (index everything) instead of an
 /// error nobody can act on.
 private struct MinimumField: View {
+    let kind: FileKind
     let label: String
     let unit: String
     var decimals: Int = 0
@@ -759,17 +760,26 @@ private struct MinimumField: View {
         // Explicit HStack rather than LabeledContent: the label and the field are centred on each
         // other here, which a label column does not promise once the row holds a bordered control.
         HStack(alignment: .center, spacing: 6) {
-            Text(label)
+            // Same symbols as the File types list, so a modality looks the same wherever it appears.
+            Label(label, systemImage: kind.symbol)
             Spacer(minLength: 8)
+            // BORDERED, AND THE STANDARD ROW HEIGHT. Both stock styles fail one of those: the
+            // default draws no border (the number reads as static text, not something you can
+            // type in) and .squareBorder/.roundedBorder are 45pt rows against the 37pt every
+            // other row in Settings uses. A plain field in a drawn box is both.
             TextField("", value: clamped, format: .number.precision(.fractionLength(0 ... decimals)))
-                .textFieldStyle(.roundedBorder)
+                .textFieldStyle(.plain)
                 .multilineTextAlignment(.trailing)
-                .frame(width: 72)
-            // Fixed width, leading-aligned: "px", "sec" and "chars" are different lengths, and
-            // without this each row's field starts at its own x - the controls have to line up in a
-            // column the way every other macOS form does.
+                .padding(.horizontal, 6)
+                .frame(width: 56, height: 18)
+                .background(RoundedRectangle(cornerRadius: 5).fill(Color(nsColor: .textBackgroundColor)))
+                .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(Color(nsColor: .separatorColor)))
+            // Fixed width so the fields line up in a column ("px", "sec" and "chars" are different
+            // lengths), and CENTRED in it - a leading-aligned unit sat hard against the box on one
+            // row and adrift on the next. Vertical centring comes from the HStack, so the unit, the
+            // number and the label all sit on one line.
             Text(unit).foregroundStyle(.secondary)
-                .frame(width: 38, alignment: .leading)
+                .frame(width: 40, alignment: .center)
         }
     }
 }

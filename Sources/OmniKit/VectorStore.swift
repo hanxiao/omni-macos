@@ -155,6 +155,9 @@ public enum StoreOpenPhase: Sendable {
     case loadingIndex
     /// The one-time 0.4.x -> 0.5.0 rewrite. Tens of seconds on a large index.
     case upgradingIndex
+    /// Rewriting a database that has become mostly empty space. Not one-time: clearing vector
+    /// blobs shrinks rows without freeing pages, so an index hollows out as it is used.
+    case compactingIndex
 }
 
 /// Constraints applied to search results. Score thresholding is intentionally NOT
@@ -1675,6 +1678,12 @@ public final class VectorStore: @unchecked Sendable {
             // mapped file, after which the same rewrite that interns the paths can drop the blobs
             // as it goes, and the whole upgrade becomes a single short rewrite.
             internLegacySchemaLocked()
+            // BEFORE THE APP IS READY, and in the same breath as the upgrade: opening the store
+            // already runs concurrently with the model load, so a repack here costs launch time
+            // only if it outlasts the weights - and it leaves a user whose index is mostly air
+            // with a working, right-sized one instead of waiting for a background pass they may
+            // quit before.
+            repackIfHollowLocked()
             tryAdoptQuantReplicaLocked()   // every failure mode falls back to build-on-first-search
         }
         // Every statement below the load speaks the interned schema and only that. If the index is
@@ -5420,6 +5429,95 @@ public final class VectorStore: @unchecked Sendable {
         return true
     }
 
+    // MARK: - A DATABASE THAT IS MOSTLY AIR
+    //
+    // Clearing a row's vec blob shrinks the ROW, not the FILE: the freed bytes stay inside a page
+    // that is still allocated, so the database keeps its size while its contents fall away.
+    // Measured on a real index: 4.46 GB holding 370 MB of payload - the chunks table 13% used, and
+    // `freelist_count` ZERO, because there are no free pages, only nearly-empty ones.
+    //
+    // That is why compact()'s free-page ratio never fires for this, and it is not a one-time
+    // migration artifact: coverage clears blobs for as long as the app indexes, so EVERY index
+    // hollows out over time. The one-shot repack that follows the 0.5.0 migration covers the first
+    // few gigabytes and nothing covers the rest - and on an index whose `vecs_migrated` flag
+    // survived from a previous life (a 0.4.x downgrade), not even that one runs.
+    //
+    // The signal is already in `meta` and costs nothing to read: every cleared blob is exactly
+    // dim*2 bytes that went missing from inside a page, and `covered - holes` counts them. Compare
+    // the bytes cleared SINCE THE LAST REPACK against the file, and the check is two integers - no
+    // dbstat walk, no table scan.
+    private static let repackedAtKey = "vecs_repacked_at"
+    /// Repack once a quarter of the file is air, but never for less than this - a small index would
+    /// otherwise rewrite itself for a few megabytes. OMNI_REPACK_MB overrides, for testing.
+    static var repackFloorBytes: Int64 {
+        Int64(ProcessInfo.processInfo.environment["OMNI_REPACK_MB"].flatMap(Int.init) ?? 256) * 1_048_576
+    }
+    /// `var`, not `let`: a stored constant reads the environment ONCE, so a test that sets the
+    /// lever after any other test has touched this type gets the default and silently measures
+    /// nothing. Same reason every other lever here is computed.
+    static var repackFraction: Double {
+        ProcessInfo.processInfo.environment["OMNI_REPACK_FRACTION"].flatMap(Double.init) ?? 0.25
+    }
+
+    /// Bytes that have been cleared out of rows since the last repack.
+    private func hollowBytesLocked() -> Int64 {
+        guard dim > 0, coveredRows > 0 else { return 0 }
+        let clearedNow = Int64(Swift.max(0, coveredRows - vecHoles.count))
+        let at = Int64(scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.repackedAtKey)'"))
+        return Swift.max(0, clearedNow - at) * Int64(dim * MemoryLayout<UInt16>.size)
+    }
+
+    /// Rewrite the database when enough of it has become empty space. Returns bytes reclaimed.
+    ///
+    /// SAFE BY CONSTRUCTION, because the failure the caller fears - a repair that breaks the index -
+    /// has two candidates and neither survives contact:
+    ///
+    ///   Running out of disk. VACUUM writes a complete second copy before swapping, so it needs the
+    ///   file's size again. Checked first, and skipped (not attempted and failed) when it is not
+    ///   there. A failed VACUUM is itself harmless - SQLite keeps the original until the new file is
+    ///   complete - but "skipped" beats "rolled back" for something running at launch.
+    ///
+    ///   Row order. Coverage addresses a vector by its row's RANK in rowid order, and VACUUM is
+    ///   documented to change rowid VALUES for tables without an explicit INTEGER PRIMARY KEY -
+    ///   which `chunks` is. What it does not change is their ORDER: it copies rows in rowid order
+    ///   into the new file. The distinction is the whole safety argument here, so it is tested
+    ///   rather than asserted (DatabaseRepackTests).
+    @discardableResult
+    private func repackIfHollowLocked() -> Int64 {
+        guard Self.repackFraction > 0, dbOpen(), dim > 0 else { return 0 }
+        let hollow = hollowBytesLocked()
+        let fileBytes = onDiskBytes()
+        if ProcessInfo.processInfo.environment["OMNI_REPACK_DEBUG"] != nil {
+            FileHandle.standardError.write(Data("[repack] hollow=\(hollow) file=\(fileBytes) floor=\(Self.repackFloorBytes) frac=\(Self.repackFraction) covered=\(coveredRows) holes=\(vecHoles.count) dim=\(dim)\n".utf8))
+        }
+        guard fileBytes > 0,
+              hollow >= Self.repackFloorBytes,
+              Double(hollow) >= Self.repackFraction * Double(fileBytes)
+        else { return 0 }
+
+        let free = ((try? FileManager.default.attributesOfFileSystem(forPath: dbURL.path)[.systemFreeSize]) as? Int64) ?? .max
+        guard free > fileBytes + (fileBytes / 10) else {
+            FileHandle.standardError.write(Data(
+                "[omni] index is \(hollow / 1_048_576) MB of empty space; needs \(fileBytes / 1_048_576) MB free to reclaim it\n".utf8))
+            return 0
+        }
+
+        onPhase?(.compactingIndex)
+        let freed = vacuumLocked()
+        // Record WHAT WAS CLEARED, not the coverage number: holes move independently, and the next
+        // check has to measure only the blobs cleared after this point.
+        let clearedNow = Swift.max(0, coveredRows - vecHoles.count)
+        exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.repackedAtKey)','\(clearedNow)');")
+        FileHandle.standardError.write(Data(
+            "[omni] compacted the index: \(freed / 1_048_576) MB reclaimed\n".utf8))
+        return freed
+    }
+
+    /// Called after the store is up, for the case the launch check declined (no disk at the time,
+    /// or the waste crossed the line later in the session).
+    @discardableResult
+    public func reclaimHollowDatabase() -> Int64 { queue.sync { repackIfHollowLocked() } }
+
     /// One-shot repack after the coverage migration finishes. Returns bytes reclaimed.
     ///
     /// Separate from compact() because compact() gates on the free-page ratio, and the migration
@@ -6931,31 +7029,41 @@ public final class VectorStore: @unchecked Sendable {
             let total = intPragma("page_count")
             let free = intPragma("freelist_count")
             guard total > 0, Double(free) / Double(total) >= minFreeRatio else { return 0 }
-            let before = onDiskBytes()
-            // VACUUM rewrites the whole database through this connection, and it does that with
-            // the connection's page cache, which is sized for bulk insert (256MB at the default
-            // 6GB cap). Measured on a 398MB index with 40% free pages, phys_footprint rose 522MB
-            // during compact; shrinking the cache to 2MB for the duration takes that to 0MB at no
-            // wall-clock cost (0.43s vs 0.42s). It runs with the model weights and the vector base
-            // already resident, and at the default 0.15 gate the live data can be 85% of the file,
-            // so on a small machine that spike is a plausible swap trigger.
-            //
-            // NOT temp_store. VACUUM's transient database does honour temp_store, and in isolation
-            // the pragma is worth 257MB (sqlite3 CLI, 392MB db: 430MB peak in MEMORY mode against
-            // 173MB in FILE mode) - but on THIS connection it changes nothing at the default cache
-            // (522MB either way), and once the cache is shrunk, FILE mode is strictly worse:
-            // +167MB and 0.69s against +0MB and 0.42s. The page cache was the whole effect.
-            let restoreCache = OmniMemoryBudget.scaled(anchor6GB: 262_144, floor: 65_536, ceiling: 262_144)
-            if Self.vacuumSmallCache { exec("PRAGMA cache_size=-2000;") }
-            let rc = sqlite3_exec(db, "VACUUM;", nil, nil, nil)
-            // exec() ignores return codes; this one matters. A silently failing VACUUM means space
-            // is never reclaimed again, and the caller would report 0 bytes freed forever.
-            if rc != SQLITE_OK { print("[store] VACUUM failed (rc=\(rc)); no space reclaimed") }
-            exec("PRAGMA cache_size=-\(restoreCache);")
-            exec("PRAGMA wal_checkpoint(TRUNCATE);")
-            return max(0, before - onDiskBytes())
+            return vacuumLocked()
         }
     }
+
+    /// The rewrite itself, callable from inside the queue. Everything below was the body of
+    /// compact(); it is factored out because the free-page ratio is not the only thing worth
+    /// vacuuming for - see repackIfHollowLocked.
+    @discardableResult
+    private func vacuumLocked() -> Int64 {
+        guard dbOpen() else { return 0 }
+    let before = onDiskBytes()
+        // VACUUM rewrites the whole database through this connection, and it does that with
+        // the connection's page cache, which is sized for bulk insert (256MB at the default
+        // 6GB cap). Measured on a 398MB index with 40% free pages, phys_footprint rose 522MB
+        // during compact; shrinking the cache to 2MB for the duration takes that to 0MB at no
+        // wall-clock cost (0.43s vs 0.42s). It runs with the model weights and the vector base
+        // already resident, and at the default 0.15 gate the live data can be 85% of the file,
+        // so on a small machine that spike is a plausible swap trigger.
+        //
+        // NOT temp_store. VACUUM's transient database does honour temp_store, and in isolation
+        // the pragma is worth 257MB (sqlite3 CLI, 392MB db: 430MB peak in MEMORY mode against
+        // 173MB in FILE mode) - but on THIS connection it changes nothing at the default cache
+        // (522MB either way), and once the cache is shrunk, FILE mode is strictly worse:
+        // +167MB and 0.69s against +0MB and 0.42s. The page cache was the whole effect.
+        let restoreCache = OmniMemoryBudget.scaled(anchor6GB: 262_144, floor: 65_536, ceiling: 262_144)
+        if Self.vacuumSmallCache { exec("PRAGMA cache_size=-2000;") }
+        let rc = sqlite3_exec(db, "VACUUM;", nil, nil, nil)
+        // exec() ignores return codes; this one matters. A silently failing VACUUM means space
+        // is never reclaimed again, and the caller would report 0 bytes freed forever.
+        if rc != SQLITE_OK { print("[store] VACUUM failed (rc=\(rc)); no space reclaimed") }
+        exec("PRAGMA cache_size=-\(restoreCache);")
+        exec("PRAGMA wal_checkpoint(TRUNCATE);")
+        return max(0, before - onDiskBytes())
+    }
+
 
     // MARK: - Internals
 

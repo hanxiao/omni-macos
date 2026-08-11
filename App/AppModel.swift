@@ -1038,6 +1038,7 @@ final class AppModel {
     var launchTitle: String {
         switch storePhase {
         case .upgradingIndex: return "Upgrading your index"
+        case .compactingIndex: return "Compacting your index"
         case .loadingIndex:   return "Loading your index"
         case nil:             return "Loading the Omni model"
         }
@@ -1045,6 +1046,7 @@ final class AppModel {
     var launchSubtitle: String {
         switch storePhase {
         case .upgradingIndex: return "One-time change to make search faster and the index smaller."
+        case .compactingIndex: return "Reclaiming space the index no longer needs."
         case .loadingIndex:   return "Reading your index into memory. The model is loading alongside it."
         case nil:             return "Your first search may be slower while the index loads into memory."
         }
@@ -2501,6 +2503,9 @@ final class AppModel {
                 // freeing a single page, so it is owed a repack that no ratio would ever trigger.
                 var freed = store.removeLegacyFiles()
                 freed += store.reclaimAfterCoverageMigration()
+                // The launch check may have declined (not enough disk at the time), or the waste
+                // may cross the line during a long session - a reconcile clears blobs for hours.
+                freed += store.reclaimHollowDatabase()
                 freed += store.compact(minFreeRatio: 0.5)
                 if freed > 0 { await MainActor.run { self.refreshIndexStats(store) } }
             }

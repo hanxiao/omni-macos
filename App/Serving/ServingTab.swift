@@ -8,7 +8,6 @@ import OmniKit
 /// Binding(get:set:) pattern as the other tabs - never $model, since AppModel is @Observable.
 struct ServingTab: View {
     @Environment(AppModel.self) private var model: AppModel
-    @State private var revealToken = false
     @State private var exampleKind: ExampleKind = .search
     @State private var embedSchema: EmbedSchema = .openai
     @State private var showMCPSheet = false
@@ -28,7 +27,6 @@ struct ServingTab: View {
     var body: some View {
         Form {
             serverSection
-            accessSection
             exampleSection
             requestsSection
         }
@@ -56,6 +54,48 @@ struct ServingTab: View {
             ))
             .toggleStyle(.switch)
 
+            // WHO CAN REACH IT and WITH WHAT - directly under the switch that turns it on, because
+            // they are the same decision. As their own "Access" section they read as a separate
+            // subject, and a reader had to hold the toggle in mind while scrolling past it.
+            Picker("Reachable from", selection: Binding(
+                get: { model.serving.scope },
+                set: { model.serving.scope = $0 }
+            )) {
+                Text("This Mac only").tag(ServingScope.local)
+                Text("Local network").tag(ServingScope.public)
+            }
+
+            TextField("Port", value: Binding(
+                get: { model.serving.port },
+                set: { model.serving.port = min(65535, max(1, $0)) }   // valid TCP port range
+            ), format: .number.grouping(.never))
+            .frame(width: 90)
+
+            HStack(spacing: 6) {
+                let token = Binding(
+                    get: { model.serving.bearerToken },
+                    set: { model.serving.bearerToken = $0 }
+                )
+                // Shown, not masked. A reveal toggle guards against shoulder-surfing a password;
+                // this is a local API token the user has to read to paste into a client, so hiding
+                // it by default only added a click before every useful thing you can do with it.
+                // Default font, like every other field here - the monospaced treatment made one row
+                // of a settings form look like a code sample.
+                TextField("Bearer token", text: token)
+                Button {
+                    let pb = NSPasteboard.general
+                    pb.clearContents()
+                    pb.setString(model.serving.bearerToken, forType: .string)
+                } label: { Image(systemName: "doc.on.doc") }
+                .buttonStyle(.borderless).foregroundStyle(.secondary)
+                .help("Copy").disabled(model.serving.bearerToken.isEmpty)
+                Button {
+                    model.serving.bearerToken = ServingController.generateToken()
+                } label: { Image(systemName: "arrow.clockwise") }
+                .buttonStyle(.borderless).foregroundStyle(.secondary)
+                .help("Replace the token with a new one")
+            }
+
             // One row: live status on the left, the agent hand-off buttons on the right
             // (enabled only while serving - they configure clients for a running server).
             HStack(spacing: 8) {
@@ -81,7 +121,7 @@ struct ServingTab: View {
         } header: {
             Text("Server")
         } footer: {
-            Text("A local HTTP API for search, tags, and embeddings. MCP and SKILL.md set up agents.")
+            Text("A local HTTP API for search, tags, and embeddings. Local network needs a token; changes restart the server.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }
@@ -100,64 +140,6 @@ struct ServingTab: View {
         case .stopped: return "Stopped"
         case .portInUse: return "Port in use"
         case .failed(let m): return m.isEmpty ? "Failed" : m
-        }
-    }
-
-    // MARK: - Access
-
-    @ViewBuilder private var accessSection: some View {
-        Section {
-            Picker("Reachable from", selection: Binding(
-                get: { model.serving.scope },
-                set: { model.serving.scope = $0 }
-            )) {
-                Text("This Mac only").tag(ServingScope.local)
-                Text("Local network").tag(ServingScope.public)
-            }
-
-            TextField("Port", value: Binding(
-                get: { model.serving.port },
-                set: { model.serving.port = min(65535, max(1, $0)) }   // valid TCP port range
-            ), format: .number.grouping(.never))
-            .frame(width: 90)
-
-            HStack(spacing: 6) {
-                let token = Binding(
-                    get: { model.serving.bearerToken },
-                    set: { model.serving.bearerToken = $0 }
-                )
-                Group {
-                    if revealToken {
-                        TextField("Bearer token", text: token).font(.callout.monospaced())
-                    } else {
-                        SecureField("Bearer token", text: token)
-                    }
-                }
-                Button { revealToken.toggle() } label: {
-                    Image(systemName: revealToken ? "eye.slash" : "eye")
-                }
-                .buttonStyle(.borderless).foregroundStyle(.secondary)
-                .help(revealToken ? "Hide" : "Show")
-                .disabled(model.serving.bearerToken.isEmpty)
-                Button {
-                    let pb = NSPasteboard.general
-                    pb.clearContents()
-                    pb.setString(model.serving.bearerToken, forType: .string)
-                } label: { Image(systemName: "doc.on.doc") }
-                .buttonStyle(.borderless).foregroundStyle(.secondary)
-                .help("Copy").disabled(model.serving.bearerToken.isEmpty)
-                Button("Renew") {
-                    model.serving.bearerToken = ServingController.generateToken()
-                    revealToken = true   // show it so it can be copied
-                }
-                .help("Replace the token with a new one")
-                .buttonStyle(.link)
-            }
-        } header: {
-            Text("Access")
-        } footer: {
-            Text("Local network requires a token, generated if empty. Changes restart the server.")
-                .font(.caption).foregroundStyle(.secondary)
         }
     }
 
