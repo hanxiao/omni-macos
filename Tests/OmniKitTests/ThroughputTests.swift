@@ -62,6 +62,41 @@ final class ThroughputTests: XCTestCase {
         XCTAssertEqual(store.fileCount, N)
     }
 
+    /// The shape the INDEXER actually writes, which the single-chunk loop above is not: batched
+    /// through replaceMany, several chunks per file, files arriving a directory at a time. Those
+    /// three differences all bear on storage cost - the per-file work amortizes over the chunks,
+    /// and consecutive files share a directory - so this is the number to compare across layouts.
+    func testBatchedStoreThroughput() throws {
+        let fm = FileManager.default
+        let dbURL = fm.temporaryDirectory.appendingPathComponent("store-batch-\(UUID().uuidString).sqlite")
+        defer { try? fm.removeItem(at: dbURL) }
+        let store = try VectorStore(dbURL: dbURL)
+        let dim = 768
+        var vec = [Float](repeating: 0, count: dim); for i in 0 ..< dim { vec[i] = Float(i) / 768 }
+        let files = 2_000, perFile = 3          // 3.16 chunks/file on the measured real index
+        let snippet = String(repeating: "the quarterly revenue report shows growth ", count: 5)
+        var batches: [[(path: String, chunks: [IndexedChunk])]] = []
+        for b in 0 ..< 20 {
+            var batch: [(path: String, chunks: [IndexedChunk])] = []
+            for f in 0 ..< files / 20 {
+                let path = "/corpus/dir\(b)/sub\(f % 4)/doc\(b)-\(f).txt"
+                batch.append((path, (0 ..< perFile).map {
+                    IndexedChunk(path: path, modified: 1, size: 4096, kind: "text", chunkIndex: $0,
+                                 snippet: snippet, embedding: vec, locator: "Line \($0 * 40)",
+                                 chunkKey: String(format: "%032x", b * 10_000 + f * 10 + $0))
+                }))
+            }
+            batches.append(batch)
+        }
+        let t0 = Date()
+        for batch in batches { try store.replaceMany(batch) }
+        let sec = Date().timeIntervalSince(t0)
+        print(String(format: "STORE-BATCHED: %d files (%d chunks) in %.3fs = %.3f ms/file = %.0f files/s",
+                     files, files * perFile, sec, sec / Double(files) * 1000, Double(files) / sec))
+        XCTAssertEqual(store.fileCount, files)
+        XCTAssertEqual(store.count, files * perFile)
+    }
+
     func testDecodeOnlyThroughput() throws {
         let fm = FileManager.default
         let root = fm.temporaryDirectory.appendingPathComponent("decode-\(UUID().uuidString)")

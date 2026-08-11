@@ -395,7 +395,7 @@ final class CoverageCRUDTests: XCTestCase {
             return sqlite3_step(st) == SQLITE_ROW ? Int(sqlite3_column_int64(st, 0)) : 0
         }
         return (scalar("SELECT CAST(value AS INTEGER) FROM meta WHERE key='vecs_covered_rows'"),
-                scalar("SELECT COUNT(*) FROM chunks WHERE length(vec) = 0"))
+                scalar("SELECT (SELECT COUNT(*) FROM chunks) - (SELECT COUNT(*) FROM pending_vecs)"))
     }
 
     private func pendingRepack(_ dbURL: URL) -> Int {

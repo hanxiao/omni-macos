@@ -58,7 +58,7 @@ final class VecSlotTests: XCTestCase {
         }
         return (scalar("SELECT CAST(value AS INTEGER) FROM meta WHERE key='vecs_covered_rows'"),
                 scalar("SELECT COUNT(*) FROM vec_holes"),
-                scalar("SELECT COUNT(*) FROM chunks WHERE length(vec) = 0"),
+                scalar("SELECT (SELECT COUNT(*) FROM chunks) - (SELECT COUNT(*) FROM pending_vecs)"),
                 scalar("SELECT COUNT(*) FROM chunks"))
     }
 

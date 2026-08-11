@@ -52,7 +52,7 @@ final class CoverageClaimRepairTests: XCTestCase {
         scalar(db, "SELECT CAST(value AS INTEGER) FROM meta WHERE key='vecs_covered_rows'")
     }
     private func clearedBlobs(_ db: URL) -> Int {
-        scalar(db, "SELECT COUNT(*) FROM chunks WHERE length(vec)=0")
+        scalar(db, "SELECT (SELECT COUNT(*) FROM chunks) - (SELECT COUNT(*) FROM pending_vecs)")
     }
 
     /// Build an index whose blobs are cleared and whose vector file is the only copy.

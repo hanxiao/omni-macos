@@ -28,8 +28,21 @@ final class PathInterningTests: XCTestCase {
     }
 
     /// The ordered sequence of (path, chunk_index), which is what coverage indexes into.
+    ///
+    /// Reads whichever shape the database is actually in. That is the point of these tests now:
+    /// a legacy index passes through TWO conversions on its way to the current layout (paths
+    /// interned, then directories interned and the row narrowed), and the sequence has to survive
+    /// both - the vector file is addressed by a row's rank in this order and nothing else.
     private func orderedRows(_ db: OpaquePointer?, interned: Bool) -> [String] {
-        let sql = interned
+        let v4 = scalar(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='chunk_text'") == 1
+        let sql = v4
+            ? """
+              SELECT (CASE WHEN d.path = '/' THEN '/' || f.name ELSE d.path || '/' || f.name END)
+                     || '#' || c.chunk_index
+                FROM chunks c JOIN files f ON f.id = c.file_id JOIN dirs d ON d.id = f.dir_id
+               ORDER BY c.id;
+              """
+            : interned
             ? "SELECT f.path || '#' || c.chunk_index FROM chunks c JOIN files f ON f.id = c.file_id ORDER BY c.rowid;"
             : "SELECT path || '#' || chunk_index FROM chunks ORDER BY rowid;"
         var st: OpaquePointer?
@@ -292,7 +305,7 @@ final class PathInterningTests: XCTestCase {
         XCTAssertEqual(scalar(db, "SELECT COUNT(*) FROM files;"),
                        scalar(db, "SELECT COUNT(DISTINCT file_id) FROM chunks;"),
                        "the previous life's path rows were carried forward")
-        XCTAssertEqual(scalar(db, "SELECT COUNT(*) FROM files WHERE path LIKE '/previous/life/%';"), 0,
+        XCTAssertEqual(scalar(db, "SELECT COUNT(*) FROM files f JOIN dirs d ON d.id = f.dir_id WHERE d.path LIKE '/previous/life%';"), 0,
                        "a path row referencing nothing survived the conversion")
     }
 

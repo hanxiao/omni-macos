@@ -2,23 +2,30 @@ import XCTest
 import SQLite3
 @testable import OmniKit
 
-/// A DATABASE THAT IS MOSTLY AIR.
+/// A DATABASE THAT NO LONGER BECOMES MOSTLY AIR.
 ///
-/// Clearing a row's vec blob shrinks the ROW, not the FILE: the bytes are freed inside a page that
-/// stays allocated. Measured on a real index, 4.46 GB holding 370 MB - the chunks table 13% used -
-/// with `freelist_count` at ZERO, which is why compact()'s free-page gate never fires for it. And it
-/// is not a migration artifact: coverage clears blobs for as long as the app indexes, so every index
-/// hollows out over time.
+/// This suite was written for a defect. In v3 a vector was written into the chunk row and later
+/// cleared in place once the `.vecs` file covered it - which shrinks the ROW, not the FILE: the
+/// freed bytes stay inside a page that stays allocated. Measured on a real index: 4.46 GB holding
+/// 370 MB, the chunks table 13% used, with `freelist_count` at ZERO, which is why compact()'s
+/// free-page gate never fired for it. And it was not a migration artifact - coverage clears blobs
+/// for as long as the app indexes, so every index hollowed out over its whole life. The remedy was
+/// a whole-database VACUUM at launch: overclaim, reclaim, repeat.
 ///
-/// The repack that fixes it runs at OPEN, before the app is ready, on a database the user cannot
-/// afford to have broken. Two things could break it, and both are pinned here:
+/// v4 removes the cause. The pending vectors live in their own table, so clearing one is a DELETE
+/// that frees whole pages onto the freelist - which the next batch of pending vectors takes back,
+/// and which compact() can see and reclaim if they are not.
 ///
-///   ROW ORDER. Coverage addresses a vector by its row's RANK in rowid order. VACUUM is documented
-///   to change rowid VALUES for a table without an explicit INTEGER PRIMARY KEY - which `chunks` is.
-///   It does not change their ORDER, and that distinction is the entire safety argument, so it is
-///   tested rather than believed.
+/// So the tests now pin the property rather than the workaround:
 ///
-///   OVER-EAGERNESS. A repack that fires on a healthy index rewrites gigabytes at every launch.
+///   INDEXING MORE DOES NOT INFLATE THE FILE. The pages a covered batch releases are reused by the
+///   batch after it, instead of being stranded inside half-empty pages forever.
+///
+///   NOTHING IS OWED AT LAUNCH. The repack must not arm itself on an index that has no such waste,
+///   or every launch pays a gigabyte rewrite for nothing.
+///
+///   AND EVERY VECTOR STILL ANSWERS TO ITS OWN QUERY, which is the only way a row-to-slot mistake
+///   ever shows up at all.
 final class DatabaseRepackTests: XCTestCase {
     private static let dim = 64
 
@@ -54,7 +61,7 @@ final class DatabaseRepackTests: XCTestCase {
                      snippet: "s\(seed)", embedding: vec(seed))
     }
 
-    /// The ordered sequence coverage depends on: the k-th row in rowid order.
+    /// The ordered sequence coverage depends on: the k-th row in id order.
     private func orderedRows(_ dbURL: URL) -> [String] {
         var db: OpaquePointer?
         guard sqlite3_open_v2(dbURL.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { return [] }
@@ -63,8 +70,10 @@ final class DatabaseRepackTests: XCTestCase {
         defer { sqlite3_finalize(st) }
         var out: [String] = []
         guard sqlite3_prepare_v2(db, """
-            SELECT f.path || '#' || c.chunk_index FROM chunks c JOIN files f ON f.id = c.file_id
-            ORDER BY c.rowid;
+            SELECT (CASE WHEN d.path = '/' THEN '/' || f.name ELSE d.path || '/' || f.name END)
+                   || '#' || c.chunk_index
+              FROM chunks c JOIN files f ON f.id = c.file_id JOIN dirs d ON d.id = f.dir_id
+             ORDER BY c.id;
             """, -1, &st, nil) == SQLITE_OK else { return out }
         while sqlite3_step(st) == SQLITE_ROW { out.append(String(cString: sqlite3_column_text(st, 0))) }
         return out
@@ -84,106 +93,116 @@ final class DatabaseRepackTests: XCTestCase {
         return sqlite3_step(st) == SQLITE_ROW ? Int(sqlite3_column_int64(st, 0)) : -1
     }
 
-    /// Build an index, let it settle, then INDEX MORE INTO IT - because the waste this is about
-    /// only exists after the one-shot repack has already happened.
-    ///
-    /// A fresh index vacuums itself once, the first time coverage catches up (finishMigrationIfDone
-    /// arms it). Everything cleared after that point - every file indexed for the rest of the
-    /// index's life - shrinks its row inside a page that stays allocated, and nothing was watching
-    /// for it. Building only the first batch produced a tidy database and a test that proved
-    /// nothing, which is how this was found.
-    private func makeHollowIndex(_ dbURL: URL) throws -> [(String, Int)] {
-        // Built with the repack OFF, or it fires during these very open/close cycles and the test
-        // measures a database that has already been cleaned - which is how the first version of
-        // this test passed nothing and failed everything.
-        setenv("OMNI_REPACK_FRACTION", "0", 1)
-        defer { unsetenv("OMNI_REPACK_FRACTION") }
+    /// Write `range` as files of one chunk each, then open and close a few times so coverage
+    /// catches up and the vectors move into the `.vecs` file.
+    @discardableResult
+    private func write(_ dbURL: URL, _ range: Range<Int>) throws -> [(String, Int)] {
         var expect: [(String, Int)] = []
-        func write(_ range: Range<Int>) throws {
-            let store = try VectorStore(dbURL: dbURL)
-            var batch: [(path: String, chunks: [IndexedChunk])] = []
-            for f in range {
-                let p = "/h/f\(f).txt"
-                batch.append((p, [chunk(p, 0, f * 7 + 1)]))
-                expect.append((p, f * 7 + 1))
-            }
-            try store.replaceMany(batch)
-            store.close()
+        let store = try VectorStore(dbURL: dbURL)
+        var batch: [(path: String, chunks: [IndexedChunk])] = []
+        for f in range {
+            let p = "/h/f\(f).txt"
+            batch.append((p, [chunk(p, 0, f * 7 + 1)]))
+            expect.append((p, f * 7 + 1))
         }
-        try write(0 ..< 2_000)
-        for _ in 0 ..< 3 { let s = try VectorStore(dbURL: dbURL); s.close() }   // coverage + the one-shot
-        try write(2_000 ..< 8_000)
-        for _ in 0 ..< 3 { let s = try VectorStore(dbURL: dbURL); s.close() }   // clears, and nothing repacks
+        try store.replaceMany(batch)
+        store.close()
+        for _ in 0 ..< 3 { let s = try VectorStore(dbURL: dbURL); s.close() }
         return expect
     }
 
-    /// The whole point: OPENING a hollow database reclaims it, and every vector still answers to
-    /// its own query - which is the only way a rank mistake shows up at all.
-    func testOpeningAHollowDatabaseReclaimsItAndKeepsEveryVectorCorrect() throws {
+    /// THE PROPERTY THE REDESIGN BUYS. Index a batch, let it be covered, then index MORE - which is
+    /// the case the old design got wrong, because the one-shot repack ran once and everything
+    /// cleared afterwards accumulated untouched for the life of the index.
+    ///
+    /// The second batch must largely fit in the pages the first one released. The bound is loose on
+    /// purpose (the point is "reuse happens", not a page-exact prediction) but it fails outright on
+    /// the old behaviour, where nothing was ever released to reuse.
+    func testCoveredVectorsReleasePagesTheNextBatchReuses() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("repack-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let dbURL = dir.appendingPathComponent("test.sqlite")
-        let expect = try makeHollowIndex(dbURL)
 
-        XCTAssertGreaterThan(scalar(dbURL, "SELECT COUNT(*) FROM chunks WHERE length(vec) = 0"), 0,
-                             "nothing was cleared, so there is no empty space to reclaim")
-        XCTAssertEqual(scalar(dbURL, "SELECT freelist_count FROM pragma_freelist_count()"), 0,
-                       "the waste must be INSIDE pages - free pages are what compact() already handles")
-        let orderBefore = orderedRows(dbURL)
-        let bytesBefore = fileBytes(dbURL)
+        var expect = try write(dbURL, 0 ..< 2_000)
+        let afterFirst = fileBytes(dbURL)
+        XCTAssertGreaterThan(afterFirst, 0, "the fixture wrote nothing")
+        // The vectors are in the file now, so SQLite is holding none of them.
+        XCTAssertEqual(scalar(dbURL, "SELECT COUNT(*) FROM pending_vecs"), 0,
+                       "coverage never caught up, so there are no released pages to reuse")
+        let freeAfterFirst = scalar(dbURL, "SELECT freelist_count FROM pragma_freelist_count()")
+        XCTAssertGreaterThan(freeAfterFirst, 0,
+                             "clearing the covered vectors freed no PAGES - the bytes went missing inside them")
 
-        // Just opening it is the fix: the repack runs at open, concurrently with the model load.
-        do { let s = try VectorStore(dbURL: dbURL); s.close() }
+        expect += try write(dbURL, 2_000 ..< 4_000)
+        let afterSecond = fileBytes(dbURL)
+        XCTAssertLessThan(afterSecond, afterFirst * 2,
+                          "a second batch the same size doubled the file: released pages are not being reused")
 
-        XCTAssertLessThan(fileBytes(dbURL), bytesBefore, "opening a hollow database did not reclaim it")
-
-        // ROW ORDER SURVIVED. VACUUM may renumber rowids; coverage only cares that their ORDER is
-        // the same, because a vector is found by rank. If this ever fails, every row after the
-        // first difference reads its neighbour's vector.
-        XCTAssertEqual(orderedRows(dbURL), orderBefore, "VACUUM changed the row order coverage depends on")
-
+        // And nothing was traded away for it.
         let store = try VectorStore(dbURL: dbURL)
         defer { store.close() }
-        XCTAssertNil(store.coverageAudit(), "coverage bookkeeping after the repack")
-        XCTAssertEqual(store.count, expect.count, "rows lost in the repack")
+        XCTAssertNil(store.coverageAudit(), "coverage bookkeeping after reusing freed pages")
+        XCTAssertEqual(store.count, expect.count, "rows lost")
         for (path, seed) in expect {
             let hits = store.search(vec(seed), filter: SearchFilter(), topK: 3)
-            XCTAssertEqual(hits.first?.path, path, "\(path) did not find itself after the repack")
+            XCTAssertEqual(hits.first?.path, path, "\(path) did not find itself")
             XCTAssertEqual(hits.first?.score ?? 0, 1.0, accuracy: 0.02,
-                           "\(path) came back with the wrong vector after the repack")
+                           "\(path) came back with the wrong vector")
         }
     }
 
-    /// It must not fire twice for the same waste, or every launch rewrites the database.
-    func testSecondOpenDoesNotRepackAgain() throws {
+    /// The launch-time repack must not fire on an index with no in-page waste to reclaim. It is a
+    /// whole-database VACUUM; arming it on a signal that no longer means anything would cost every
+    /// launch a rewrite of the entire index.
+    func testLaunchOwesNoRepackAndTheFileIsStable() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("repack-once-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let dbURL = dir.appendingPathComponent("test.sqlite")
-        _ = try makeHollowIndex(dbURL)
+        try write(dbURL, 0 ..< 4_000)
 
-        let bloated = fileBytes(dbURL)
-        do { let s = try VectorStore(dbURL: dbURL); s.close() }
-        let repacked = fileBytes(dbURL)
-        XCTAssertLessThan(repacked, bloated, "the first open reclaimed nothing, so this proves nothing")
+        let before = fileBytes(dbURL)
+        let orderBefore = orderedRows(dbURL)
+        XCTAssertFalse(orderBefore.isEmpty, "the fixture is empty, so this proves nothing")
 
-        do { let s = try VectorStore(dbURL: dbURL); s.close() }
-        XCTAssertEqual(fileBytes(dbURL), repacked, "the repack ran again for waste it had already reclaimed")
+        // Repeated opens: each one asks whether a repack is owed, and each must answer no.
+        for _ in 0 ..< 3 {
+            let s = try VectorStore(dbURL: dbURL)
+            XCTAssertEqual(s.reclaimHollowDatabase(), 0, "a repack was owed on an index with no in-page waste")
+            s.close()
+        }
+        XCTAssertEqual(fileBytes(dbURL), before, "opening the index rewrote it")
+        // Row ORDER is what addresses a vector in the file. If maintenance ever moves it, every row
+        // after the first difference reads its neighbour's vector, and nothing else would notice.
+        XCTAssertEqual(orderedRows(dbURL), orderBefore, "row order changed across a plain open")
     }
 
-    /// And it must leave a small index alone: the floor exists so a few megabytes of waste never
-    /// costs a rewrite at launch.
-    func testSmallWasteIsLeftAlone() throws {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("repack-small-\(UUID().uuidString)")
+    /// Deleting in bulk is the case that DOES strand pages, and compact() is what reclaims them -
+    /// on the free-page ratio, which is a measurement of the file rather than a running total kept
+    /// in `meta`. This is the path the retired repack used to be needed alongside.
+    func testBulkDeleteIsReclaimedByCompact() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("repack-del-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let dbURL = dir.appendingPathComponent("test.sqlite")
-        _ = try makeHollowIndex(dbURL)
-
-        unsetenv("OMNI_REPACK_MB")   // the shipped 256 MB floor
+        try write(dbURL, 0 ..< 4_000)
         let before = fileBytes(dbURL)
-        do { let s = try VectorStore(dbURL: dbURL); s.close() }
-        XCTAssertEqual(fileBytes(dbURL), before, "a few hundred kilobytes of waste triggered a rewrite")
+
+        let store = try VectorStore(dbURL: dbURL)
+        store.deletePaths(Set((0 ..< 3_500).map { "/h/f\($0).txt" }))
+        store.compact()
+        XCTAssertNil(store.coverageAudit(), "coverage bookkeeping after a bulk delete and compaction")
+        store.close()
+
+        XCTAssertLessThan(fileBytes(dbURL), before, "a bulk delete left the file its original size")
+        let after = try VectorStore(dbURL: dbURL)
+        defer { after.close() }
+        XCTAssertEqual(after.count, 500, "the wrong number of rows survived")
+        for f in 3_500 ..< 4_000 {
+            let seed = f * 7 + 1
+            XCTAssertEqual(after.search(vec(seed), filter: SearchFilter(), topK: 1).first?.path,
+                           "/h/f\(f).txt", "a surviving row lost its vector across the compaction")
+        }
     }
 }

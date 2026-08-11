@@ -101,8 +101,15 @@ final class UpgradeProgressTests: XCTestCase {
     func testTheBarKeepsMovingThroughTheUpgrade() throws {
         let bar = try runUpgrade(files: 400, slice: 200)
 
-        XCTAssertEqual(bar.phases, [.loadingIndex, .upgradingIndex],
-                       "the launch screen was never told what the store was doing")
+        // TWO upgrades, because a legacy index has two to make: paths interned into a file table,
+        // then directories interned and the chunk row narrowed. Both report the same phase, and
+        // the assertion is about what the launch screen is TOLD, not how many rewrites it took.
+        XCTAssertEqual(bar.phases.first, .loadingIndex,
+                       "the launch screen was never told the store was loading")
+        XCTAssertTrue(bar.phases.dropFirst().allSatisfy { $0 == .upgradingIndex },
+                      "unexpected phases during the upgrade: \(bar.phases)")
+        XCTAssertGreaterThanOrEqual(bar.phases.count, 2,
+                                    "the launch screen was never told the store was upgrading")
 
         // THE DEFECT: the bar used to be full before the upgrade even started, so nothing it
         // reported could move it. It must now have headroom left at that moment.
