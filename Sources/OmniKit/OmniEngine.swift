@@ -115,7 +115,13 @@ public let omniMLXVersion = "0.31.3"
 /// value only shifts a batch boundary.
 public enum OmniMemoryBudget {
     nonisolated(unsafe) public internal(set) static var capBytes: Int = Int(ProcessInfo.processInfo.physicalMemory)
-    public static var capGB: Double { Double(capBytes) / 1_073_741_824 }
+    /// DECIMAL GB, matching every producer of this number: the app sets the cap as
+    /// `maxMemoryGB * 1_000_000_000` and reports physical memory as `bytes / 1_000_000_000`.
+    /// Dividing by 2^30 here made `capGB` 0.9313x the number the user picked, so `scaled` returned
+    /// 0.9313x its anchor and Int() truncation turned that into a 25% shortfall on small anchors
+    /// (anchor 4 -> 3) - against a comment two lines below promising byte-identical batching for
+    /// anyone who never opens Settings.
+    public static var capGB: Double { Double(capBytes) / 1_000_000_000 }
     /// Linear scale anchored so the DEFAULT 6GB cap reproduces the historical tuned value - users
     /// who never touch Settings see byte-identical batching; raising the cap scales budgets up.
     public static func scaled(anchor6GB: Int, floor: Int, ceiling: Int) -> Int {

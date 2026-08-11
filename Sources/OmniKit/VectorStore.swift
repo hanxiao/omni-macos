@@ -1001,6 +1001,28 @@ public final class VectorStore: @unchecked Sendable {
     private var lastSearchAt = Date.distantPast
     private static let searchActiveWindow: TimeInterval = 2.0
     private func searchRecentlyActiveLocked() -> Bool { -lastSearchAt.timeIntervalSinceNow < Self.searchActiveWindow }
+
+    /// When maintenance first stood aside for a searcher, or nil if it is not currently standing aside.
+    private var yieldingSince: Date?
+    /// How long maintenance may be held off by continuous searching before it goes ahead anyway.
+    private static let maxYieldToSearch: TimeInterval = 120
+
+    /// Should background maintenance stand aside right now? Yes while someone is searching - and NO
+    /// once that has been true for two minutes without a break.
+    ///
+    /// The bare activity check is a pure back-off, which is fine for a human (who stops typing) and
+    /// open-ended for an agent (which does not). A client polling the server more often than the
+    /// 2 s activity window keeps `lastSearchAt` fresh for ever, and with it switches off coverage,
+    /// hole reclaim and the scan-width upgrade for the whole session. checkpointIfDueLocked already
+    /// had the right shape - back off UNLESS the WAL has grown past a hard cap - and this is the
+    /// same idea with time as the bound instead of bytes.
+    private func yieldToSearchLocked() -> Bool {
+        guard searchRecentlyActiveLocked() else { yieldingSince = nil; return false }
+        let since = yieldingSince ?? Date()
+        yieldingSince = since
+        guard -since.timeIntervalSinceNow < Self.maxYieldToSearch else { yieldingSince = nil; return false }
+        return true
+    }
     /// PAPER LEVER (var, not let): see the block near cantWinGate.
     nonisolated(unsafe) static var proactiveFold = ProcessInfo.processInfo.environment["OMNI_PROACTIVE_FOLD"] != "0"
 
@@ -1870,24 +1892,24 @@ public final class VectorStore: @unchecked Sendable {
             // Holes first: this path's existing rows become tombstones after the commit below, and
             // the slots they keep have to be recorded inside the same transaction as their delete.
             let victims = presentPaths.contains(path) ? victimRowsForPathsLocked([path]) : []
-            exec("BEGIN;")
+            beginTxnLocked()
             recordHolesLocked(victims)
             deletePathLocked(path)
             let bfs = chunks.map { bf16Row($0.embedding) }   // fp32 -> bf16 once, reused for blob + memory
             let now = Date().timeIntervalSince1970           // one indexed_at stamp for the whole call
             setStoredDimLocked(dim)
             guard let w = prepareChunkInsertLocked() else {
-                exec("ROLLBACK;")
+                rollbackTxnLocked()
                 throw OmniError.store("prepare insert failed")
             }
             defer { w.finalize() }
             guard let first = chunks.first,
                   let fid = upsertFileLocked(path: path, from: first, indexedAt: now, w: w) else {
-                exec("ROLLBACK;")
+                rollbackTxnLocked()
                 throw OmniError.store("file id failed")
             }
             guard writeChunksLocked(fileID: fid, chunks: chunks, bfs: bfs, w: w) else {
-                exec("ROLLBACK;")
+                rollbackTxnLocked()
                 throw OmniError.store("insert step failed")
             }
             bumpGenLocked()
@@ -1963,23 +1985,23 @@ public final class VectorStore: @unchecked Sendable {
             // Same reason as replace(): the rows these paths already have become tombstones after
             // the commit, and the slots they hold on to must be recorded inside it.
             let victims = victimRowsForPathsLocked(Set(work.map { $0.path }.filter { presentPaths.contains($0) }))
-            exec("BEGIN;")
+            beginTxnLocked()
             recordHolesLocked(victims)
             setStoredDimLocked(dim)
             guard let w = prepareChunkInsertLocked() else {
-                exec("ROLLBACK;")
+                rollbackTxnLocked()
                 throw OmniError.store("prepare insert failed")
             }
             defer { w.finalize() }
             for (wi, it) in work.enumerated() {
                 guard let first = it.chunks.first,
                       let fid = upsertFileLocked(path: it.path, from: first, indexedAt: now, w: w) else {
-                    exec("ROLLBACK;")
+                    rollbackTxnLocked()
                     throw OmniError.store("file id failed")
                 }
                 deleteChunksOfFileLocked(fid)
                 guard writeChunksLocked(fileID: fid, chunks: it.chunks, bfs: bfs[wi], w: w) else {
-                    exec("ROLLBACK;")
+                    rollbackTxnLocked()
                     throw OmniError.store("insert step failed")
                 }
             }
@@ -2018,7 +2040,7 @@ public final class VectorStore: @unchecked Sendable {
         queue.sync {
             guard dbOpen() else { return }
             let victims = victimRowsForPathsLocked([path])
-            exec("BEGIN;")
+            beginTxnLocked()
             recordHolesLocked(victims)
             deleteFileContentLocked(path)   // a removal drops the dedup entry; a replace keeps it
             pruneFileRowsLocked([path])
@@ -2039,7 +2061,7 @@ public final class VectorStore: @unchecked Sendable {
         guard !entries.isEmpty else { return }
         queue.sync {
             guard dbOpen() else { return }
-            exec("BEGIN;")
+            beginTxnLocked()
             var stmt: OpaquePointer?
             if sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO dedup(file_id, key, modified, size) VALUES(?,?,?,?);", -1, &stmt, nil) == SQLITE_OK {
                 for e in entries {
@@ -2234,7 +2256,7 @@ public final class VectorStore: @unchecked Sendable {
         queue.sync {
             guard dbOpen() else { return }
             let victims = victimRowsForPathsLocked(paths)
-            exec("BEGIN;")
+            beginTxnLocked()
             recordHolesLocked(victims)
             for p in paths { deleteFileContentLocked(p) }
             pruneFileRowsLocked(paths)
@@ -2275,7 +2297,7 @@ public final class VectorStore: @unchecked Sendable {
             let victims = victimRowsMatchingLocked {
                 $0.path == folder || SearchFilter.underFolderBytes($0.path, prefixBytes)
             }
-            exec("BEGIN;")
+            beginTxnLocked()
             recordHolesLocked(victims)
             var stmt: OpaquePointer?
             // Range form of `path LIKE folder||'/%'`: SQLite's default case-insensitive LIKE (plus
@@ -2301,7 +2323,7 @@ public final class VectorStore: @unchecked Sendable {
             }
             sqlite3_finalize(stmt); stmt = nil
             guard built else {
-                exec("ROLLBACK;")
+                rollbackTxnLocked()
                 FileHandle.standardError.write(Data("[omni] folder delete aborted: could not resolve the files under \(folder)\n".utf8))
                 return
             }
@@ -2348,7 +2370,7 @@ public final class VectorStore: @unchecked Sendable {
             // bulk delete like any other, and skipping it here would leave the vector file holding
             // slots no row owns with nothing recording which.
             let victims = victimRowsMatchingLocked { set.contains($0.kind) }
-            exec("BEGIN;")
+            beginTxnLocked()
             recordHolesLocked(victims)
             // Kinds are codes on the row now, so the predicate is a small IN over integers.
             let codes = kinds.map { String(kindCodeLocked($0)) }.joined(separator: ",")
@@ -2378,7 +2400,7 @@ public final class VectorStore: @unchecked Sendable {
             let victims = Set(rows.filter { disabled($0.path) }.map { $0.path })
             guard !victims.isEmpty else { return }
             let victimRows = victimRowsMatchingLocked { disabled($0.path) }
-            exec("BEGIN;")
+            beginTxnLocked()
             recordHolesLocked(victimRows)
             for path in victims { deleteFileContentLocked(path) }
             pruneFileRowsLocked(victims)
@@ -2393,7 +2415,7 @@ public final class VectorStore: @unchecked Sendable {
     public func wipeChunks() {
         queue.sync {
             guard dbOpen() else { return }
-            exec("BEGIN;")
+            beginTxnLocked()
             for t in StoreSchema.tables { exec("DELETE FROM \(t);") }   // every row is an orphan now
             bumpGenLocked()
             exec("COMMIT;")
@@ -5007,6 +5029,31 @@ public final class VectorStore: @unchecked Sendable {
     /// the file has slots and nothing says which slot went missing - and from that slot onward every
     /// row would resolve to its neighbour's vector. Slots at or above `coveredRows` are ignored:
     /// those rows still carry their own blob, so the file's copy of them is not load-bearing.
+    /// Slots this transaction has added to `vecHoles`, so a ROLLBACK can take them back out.
+    ///
+    /// recordHolesLocked writes the hole to SQLite AND to the resident set, inside the caller's
+    /// transaction - which is right, because the two must commit together. But nothing undid the
+    /// resident half when the transaction rolled back, and nothing re-reads `vec_holes` afterwards:
+    /// the only SELECT is at open. A rolled-back replace() therefore left a phantom hole that made
+    /// `coveredRows - vecHoles.count` understate the covered rows for the rest of the session, which
+    /// the coverage advance answers by refusing every slice.
+    private var holesAddedInTxn: [Int32] = []
+
+    /// Start a chunk-mutating transaction. The hole list is per-transaction, and clearing it HERE
+    /// rather than at each commit is what makes a later rollback unable to undo an earlier
+    /// transaction's holes.
+    private func beginTxnLocked() {
+        holesAddedInTxn.removeAll(keepingCapacity: true)
+        exec("BEGIN;")
+    }
+
+    /// Roll back, and take the resident hole additions with it.
+    private func rollbackTxnLocked() {
+        exec("ROLLBACK;")
+        for s in holesAddedInTxn { vecHoles.remove(s) }
+        holesAddedInTxn.removeAll(keepingCapacity: true)
+    }
+
     private func recordHolesLocked(_ slots: [Int32], coveredOverride: Int? = nil) {
         let limit = coveredOverride ?? coveredRows
         guard dbOpen(), limit > 0 else { return }
@@ -5019,6 +5066,7 @@ public final class VectorStore: @unchecked Sendable {
         }
         sqlite3_finalize(stmt)
         for s in fresh { vecHoles.insert(s) }
+        holesAddedInTxn.append(contentsOf: fresh)
     }
 
     /// Write every covered row's vector back into its SQLite blob, and stand the coverage claim
@@ -5049,7 +5097,7 @@ public final class VectorStore: @unchecked Sendable {
         // hollowing the database.
         guard sqlite3_prepare_v2(db, "SELECT id FROM chunks ORDER BY id LIMIT \(slots.count);", -1, &sel, nil) == SQLITE_OK,
               sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO pending_vecs(chunk_id, vec) VALUES(?,?);", -1, &upd, nil) == SQLITE_OK
-        else { exec("ROLLBACK;"); return false }
+        else { rollbackTxnLocked(); return false }
         var written = 0
         var ok = true
         let bytesPerRow = dim * MemoryLayout<UInt16>.size
@@ -5074,7 +5122,7 @@ public final class VectorStore: @unchecked Sendable {
               execChecked("DELETE FROM meta WHERE key = '\(Self.coveredUpToIDKey)';"),
               execChecked("DELETE FROM vec_holes;"),
               execChecked("COMMIT;")
-        else { exec("ROLLBACK;"); return false }
+        else { rollbackTxnLocked(); return false }
         coveredRows = 0
         coveredUpToID = 0
         vecHoles.removeAll()
@@ -5508,7 +5556,7 @@ public final class VectorStore: @unchecked Sendable {
         if advanceBy > 0 {
             boundary = Int64(scalarQuery(
                 "SELECT id FROM chunks WHERE id > \(coveredUpToID) ORDER BY id LIMIT 1 OFFSET \(advanceBy - 1)"))
-            guard boundary > coveredUpToID else { exec("ROLLBACK;"); return false }
+            guard boundary > coveredUpToID else { rollbackTxnLocked(); return false }
         }
         guard execChecked("DELETE FROM pending_vecs WHERE chunk_id <= \(boundary);"),
               scalarQuery("SELECT COUNT(*) FROM pending_vecs") == live - clearUpTo,
@@ -5516,7 +5564,7 @@ public final class VectorStore: @unchecked Sendable {
               execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.coveredUpToIDKey)','\(boundary)');"),
               execChecked("COMMIT;")
         else {
-            exec("ROLLBACK;")
+            rollbackTxnLocked()
             return false
         }
         coveredUpToID = boundary
@@ -5808,11 +5856,19 @@ public final class VectorStore: @unchecked Sendable {
             try? FileManager.default.removeItem(at: vecCompactURL)
             return false
         }
+        // FULL, for this one commit. The whole protocol rests on the marker being on disk before
+        // the rename, and the store runs at synchronous=NORMAL - which does not fsync the WAL. Lose
+        // power in the window and recovery sees the rename done (it is fsync'd) with no marker,
+        // reads that as "nothing to resume", and leaves the OLD claim describing the NEW compacted
+        // file: every row past the first hole then returns its neighbour's vector, silently. One
+        // fsync, once per reclaim, is the price of the ordering the comments already claim.
+        exec("PRAGMA synchronous=FULL;")
+        defer { exec("PRAGMA synchronous=NORMAL;") }
         guard execChecked("BEGIN;"),
               execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.compactPendingKey)','\(newCount)');"),
               execChecked("COMMIT;")
         else {
-            exec("ROLLBACK;")
+            rollbackTxnLocked()
             try? FileManager.default.removeItem(at: vecCompactURL)
             return false
         }
@@ -5842,7 +5898,7 @@ public final class VectorStore: @unchecked Sendable {
         else {
             // The file is already the compacted one, so the claim MUST follow it. Leaving the marker
             // in place is what makes the next open finish the job instead of guessing.
-            exec("ROLLBACK;")
+            rollbackTxnLocked()
             loadIntoMemory()
             return false
         }
@@ -5876,7 +5932,7 @@ public final class VectorStore: @unchecked Sendable {
         }
         // The rename happened, so the file on disk IS the compacted one and the claim has to catch
         // up with it. Nothing can have mutated the table in between - the crash stopped everything.
-        exec("BEGIN;")
+        beginTxnLocked()
         exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.coveredRowsKey)','\(pending)');")
         exec("DELETE FROM vec_holes;")
         exec("DELETE FROM meta WHERE key = '\(Self.compactPendingKey)';")
@@ -5894,7 +5950,7 @@ public final class VectorStore: @unchecked Sendable {
         // "writes have gone quiet" is exactly the condition it needs, and this is what runs then.
         guard coveredRows < rows.count else {
             // Off the queue: the reclaim takes it one chunk at a time, and this call is holding it.
-            if reclaim, !searchRecentlyActiveLocked(), shouldReclaimHolesLocked() {
+            if reclaim, !yieldToSearchLocked(), shouldReclaimHolesLocked() {
                 DispatchQueue.global(qos: .utility).async { [weak self] in self?.reclaimVectorHoles() }
             }
             return
@@ -5910,7 +5966,7 @@ public final class VectorStore: @unchecked Sendable {
         // fixed 20s gap turned ~45s of actual work into ~20 minutes of elapsed time for no reason.
         // Pacing on search activity instead means the migration runs at full tilt while the app is
         // idle and backs off the moment someone is using it.
-        if searchRecentlyActiveLocked() {
+        if yieldToSearchLocked() {
             scheduleCoverageStampLocked(after: Self.coverageBusyGap)
             return
         }
@@ -6576,7 +6632,7 @@ public final class VectorStore: @unchecked Sendable {
             guard let self else { return }
             self.queue.sync {
                 guard self.idleFoldToken == token else { return }      // more writes arrived
-                guard !self.searchRecentlyActiveLocked() else { return }
+                guard !self.yieldToSearchLocked() else { return }
                 let n = self.rows.count
                 guard n > 0, self.dim > 0, self.flat16.count == n * self.dim, n > self.baseRows else { return }
                 if Self.searchTiming { print("[search] IDLE FOLD rows=\(n) delta=\(n - self.baseRows)") }
@@ -6596,7 +6652,7 @@ public final class VectorStore: @unchecked Sendable {
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
             self.queue.sync {
-                guard self.widthUpgradeToken == token, !self.searchRecentlyActiveLocked() else {
+                guard self.widthUpgradeToken == token, !self.yieldToSearchLocked() else {
                     self.scheduleWidthUpgradeLocked(after: 30)   // still busy: come back later
                     return
                 }
@@ -8413,7 +8469,7 @@ public final class VectorStore: @unchecked Sendable {
                 if i == 0, ok { copied += Int(sqlite3_changes(db)) }   // the chunk rows drive the bar
             }
             guard ok, execChecked("COMMIT;") else {
-                exec("ROLLBACK;")
+                rollbackTxnLocked()
                 failV4("could not copy the chunk table")
                 return
             }
@@ -8430,7 +8486,7 @@ public final class VectorStore: @unchecked Sendable {
               sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO dedup_new(file_id, key, modified, size) VALUES(?,?,?,?);", -1, &ins, nil) == SQLITE_OK,
               sqlite3_prepare_v2(db, "SELECT f.id, ck.key, ck.modified, ck.size FROM content_keys ck JOIN files f ON f.path = ck.path;", -1, &sel, nil) == SQLITE_OK
         else {
-            sqlite3_finalize(ins); sqlite3_finalize(sel); exec("ROLLBACK;")
+            sqlite3_finalize(ins); sqlite3_finalize(sel); rollbackTxnLocked()
             failV4("could not rebuild the dedup table")
             return
         }
@@ -8444,7 +8500,7 @@ public final class VectorStore: @unchecked Sendable {
             sqlite3_step(ins)
         }
         sqlite3_finalize(ins); sqlite3_finalize(sel)
-        guard execChecked("COMMIT;") else { exec("ROLLBACK;"); failV4("could not rebuild the dedup table"); return }
+        guard execChecked("COMMIT;") else { rollbackTxnLocked(); failV4("could not rebuild the dedup table"); return }
 
         // Phase 5. Prove it, then swap. Both copies still exist for the length of this check, and
         // every number here is one a wrong copy cannot fake: row counts, and - the one that matters -
@@ -8467,11 +8523,11 @@ public final class VectorStore: @unchecked Sendable {
         for t in StoreSchema.tables { swap.append("ALTER TABLE \(t)_new RENAME TO \(t);") }
         swap.append("PRAGMA user_version = \(Self.schemaVersion);")
         for sql in swap where !execChecked(sql) {
-            exec("ROLLBACK;")
+            rollbackTxnLocked()
             failV4("could not swap in the upgraded tables")
             return
         }
-        guard execChecked("COMMIT;") else { exec("ROLLBACK;"); failV4("could not commit the upgrade"); return }
+        guard execChecked("COMMIT;") else { rollbackTxnLocked(); failV4("could not commit the upgrade"); return }
 
         migrationBlockedReason = nil
         seedKindsLocked()
@@ -8566,7 +8622,7 @@ public final class VectorStore: @unchecked Sendable {
 
         ]
         for sql in steps where !execChecked(sql) {
-            exec("ROLLBACK;")
+            rollbackTxnLocked()
             return nil
         }
         // The copy, in slices - inside the SAME transaction, so it is still all-or-nothing, but
@@ -8591,7 +8647,7 @@ public final class VectorStore: @unchecked Sendable {
                    WHERE c.rowid > \(lastRowid) AND c.rowid <= \(next)
                    ORDER BY c.rowid;
                 """)
-            guard ok else { exec("ROLLBACK;"); return nil }
+            guard ok else { rollbackTxnLocked(); return nil }
             lastRowid = next
             // sqlite3_changes, not COUNT(*) over the growing copy: the count was an O(rows) scan per
             // slice, on the launch path, purely to drive a progress bar.
@@ -8602,7 +8658,7 @@ public final class VectorStore: @unchecked Sendable {
         // Prove the copy before destroying the original, inside the same transaction, so a failure
         // leaves the old table untouched rather than a half-converted index.
         guard internPathsVerifyLocked() else {
-            exec("ROLLBACK;")
+            rollbackTxnLocked()
             FileHandle.standardError.write(Data("[omni] path interning verification failed; index unchanged\n".utf8))
             return nil
         }
@@ -8630,7 +8686,7 @@ public final class VectorStore: @unchecked Sendable {
               execChecked("CREATE INDEX IF NOT EXISTS idx_media_snippet ON chunks(kind, snippet, file_id) WHERE kind IN ('image','scan','video');"),
               execChecked("COMMIT;")
         else {
-            exec("ROLLBACK;")
+            rollbackTxnLocked()
             return nil
         }
         if dropVectorBlobs {
