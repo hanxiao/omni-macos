@@ -793,33 +793,25 @@ private struct HistoryTab: View {
     @Environment(AppModel.self) private var model: AppModel
     @State private var confirmClear = false
     var body: some View {
+        // ONE GROUP. Five rows that all answer "what does Omni remember" do not need four boxes
+        // and four paragraphs between them - that is more explaining than setting. Each row's
+        // detail moves to its tooltip, where it is there when wanted and silent when not.
         Form {
             Section {
                 Picker("Add searches to History", selection: Binding(get: { model.historyMode }, set: { model.historyMode = $0 })) {
                     ForEach(HistoryMode.allCases) { Text($0.title).tag($0) }
                 }
-            } footer: {
-                Text(model.historyMode.detail).font(.caption).foregroundStyle(.secondary)
-            }
-            Section {
+                .help(model.historyMode.detail)
                 Toggle("Save serving history", isOn: Binding(get: { model.saveServingHistory },
                                                             set: { model.saveServingHistory = $0 }))
-            } footer: {
-                Text("Searches that reach Omni over the server, from an agent or a script, are kept too.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            Section {
+                .help("Searches that reach Omni over the server, from an agent or a script, are kept too")
                 Picker("Keep history for", selection: Binding(get: { model.historyRetentionDays }, set: { model.historyRetentionDays = $0 })) {
                     Text("3 days").tag(3)
                     Text("7 days").tag(7)
                     Text("14 days").tag(14)
                     Text("31 days").tag(31)
                 }
-            } footer: {
-                Text("Older searches are removed automatically. Bookmarks are kept.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            Section {
+                .help("Older searches are removed automatically; bookmarks are kept")
                 LabeledContent("Saved searches") {
                     Text("\(model.recentHistoryCount) recent \u{00B7} \(model.bookmarkCount) bookmarked")
                         .foregroundStyle(.secondary).monospacedDigit()
