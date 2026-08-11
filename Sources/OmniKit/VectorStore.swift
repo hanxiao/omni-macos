@@ -5111,6 +5111,51 @@ public final class VectorStore: @unchecked Sendable {
         case needsReindex(String)
     }
 
+    /// Delete the index and everything derived from it, so the next open starts from nothing.
+    ///
+    /// The last resort behind Repair: when the bookkeeping cannot be proven, re-indexing is the only
+    /// honest answer, and it needs the broken files GONE rather than repaired around. Static and
+    /// connection-free for the same reason repairIndex is - the store would not open.
+    ///
+    /// Deliberately spares two things. `.omniignore` is the user's own file, not ours to delete. The
+    /// image-tag cache is keyed by content, so it survives a reindex intact and saves re-tagging
+    /// every picture - and unlike the index it cannot be inconsistent with anything, since it maps
+    /// content to labels rather than rows to slots.
+    @discardableResult
+    public static func deleteIndexFiles(at dbURL: URL) -> Int64 {
+        let dir = dbURL.deletingLastPathComponent()
+        let base = dbURL.lastPathComponent
+        let fm = FileManager.default
+        var freed: Int64 = 0
+        for suffix in ["", "-wal", "-shm", ".vecs", ".vecs.new", ".quant", ".rows", ".rows.tmp",
+                       ".quant.tmp", ".names", ".names-wal", ".names-shm"] {
+            let u = dir.appendingPathComponent(base + suffix)
+            guard fm.fileExists(atPath: u.path) else { continue }
+            let bytes = ((try? fm.attributesOfItem(atPath: u.path)[.size]) as? Int64) ?? 0
+            if (try? fm.removeItem(at: u)) != nil { freed += bytes }
+        }
+        return freed
+    }
+
+    /// Schema probes for the repair path, which has no store and so cannot use the locked forms.
+    private static func tableExists(_ db: OpaquePointer, _ name: String) -> Bool {
+        var st: OpaquePointer?
+        defer { sqlite3_finalize(st) }
+        guard sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?;", -1, &st, nil) == SQLITE_OK else { return false }
+        sqlite3_bind_text(st, 1, name, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        return sqlite3_step(st) == SQLITE_ROW
+    }
+
+    private static func tableHasColumn(_ db: OpaquePointer, _ table: String, _ column: String) -> Bool {
+        var st: OpaquePointer?
+        defer { sqlite3_finalize(st) }
+        guard sqlite3_prepare_v2(db, "PRAGMA table_info(\(table));", -1, &st, nil) == SQLITE_OK else { return false }
+        while sqlite3_step(st) == SQLITE_ROW {
+            if let c = sqlite3_column_text(st, 1), String(cString: c) == column { return true }
+        }
+        return false
+    }
+
     /// Repair the vector bookkeeping of an index that will not open, without a store.
     ///
     /// The store refuses when the claim, the holes and the cleared blobs stop agreeing, because the
@@ -5139,6 +5184,29 @@ public final class VectorStore: @unchecked Sendable {
                   sqlite3_step(st) == SQLITE_ROW else { return -1 }
             return Int(sqlite3_column_int64(st, 0))
         }
+        // FIRST, THE OTHER WAY AN INDEX REFUSES TO OPEN: it is still legacy because the one-time
+        // upgrade could not complete. The upgrade is all-or-nothing inside a transaction, so a
+        // failure leaves the old table intact and every launch retries it and fails the same way.
+        //
+        // In a LEGACY index, `files` is not load-bearing: `chunks` carries a path per row and has
+        // no file_id, so nothing references it. That is what makes this repairable rather than a
+        // guess - the table can be dropped and rebuilt by the upgrade with nothing lost. It is
+        // load-bearing the moment the layout is interned, which is why this is gated on legacy.
+        if tableHasColumn(db, "chunks", "path"), tableExists(db, "files") {
+            let stale = scalar("SELECT COUNT(*) FROM (SELECT path FROM files EXCEPT SELECT DISTINCT path FROM chunks)")
+            // A `files` table of the wrong SHAPE fails the query above, which is itself the answer:
+            // it is not a path table this app can use.
+            let unusable = !tableHasColumn(db, "files", "path")
+            if unusable || stale > 0 {
+                guard sqlite3_exec(db, "DROP TABLE files;", nil, nil, nil) == SQLITE_OK else {
+                    return .needsReindex("The index database is read-only.")
+                }
+                return .repaired(unusable
+                    ? "Removed an unusable path table so the index can finish upgrading. Nothing was re-embedded."
+                    : "Removed \(stale) path entries left over from a previous index. Nothing was re-embedded.")
+            }
+        }
+
         let claim = scalar("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(coveredRowsKey)'")
         guard claim > 0 else { return .nothingToDo }
         let holes = scalar("SELECT COUNT(*) FROM vec_holes")

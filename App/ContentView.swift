@@ -878,6 +878,7 @@ struct EngineFailedView: View {
 struct IndexFailedView: View {
     @Environment(AppModel.self) private var model: AppModel
     let message: String
+    @State private var confirmReindex = false
     var body: some View {
         VStack(spacing: 12) {
             Image(systemName: "internaldrive").font(.system(size: 44, weight: .light)).foregroundStyle(.tertiary)
@@ -893,7 +894,17 @@ struct IndexFailedView: View {
                 // Repair corrects the vector bookkeeping when the mapping is provable, and says so
                 // plainly when it is not - it never guesses, because a wrong guess here returns
                 // rows their neighbour's vector with no error at all.
-                Button(model.repairRunning ? "Repairing..." : "Repair") { model.repairIndex() }
+                Button(model.repairRunning ? "Repairing\u{2026}" : "Repair") { model.repairIndex() }
+                    .disabled(model.repairRunning || model.dbPath.isEmpty)
+                // And the way out of the cases Repair refuses. Destructive, so it is red and asks
+                // first: everything it deletes is derived from the user's files, but rebuilding it
+                // is hours of embedding on a large index.
+                // .tint, not just role: on macOS a destructive ROLE only colours the button inside
+                // menus and dialogs - in a plain row it renders identically to its neighbours, which
+                // is the one thing this button must not do.
+                Button("Reindex", role: .destructive) { confirmReindex = true }
+                    .buttonStyle(.bordered)
+                    .tint(.red)
                     .disabled(model.repairRunning || model.dbPath.isEmpty)
                 Button("Reveal in Finder") {
                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.dbPath)])
@@ -904,6 +915,12 @@ struct IndexFailedView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding()
+        .confirmationDialog("Delete the index and start over?", isPresented: $confirmReindex) {
+            Button("Delete and reindex", role: .destructive) { model.reindexFromScratch() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Your files are not touched. Omni reads them again, which can take a while on a large library.")
+        }
     }
 }
 

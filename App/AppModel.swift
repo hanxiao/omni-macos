@@ -179,6 +179,30 @@ final class AppModel {
         }
     }
 
+    /// LAST RESORT, and destructive: delete the index and rebuild it from the user's files.
+    ///
+    /// Offered next to Repair because Repair deliberately refuses the cases it cannot prove, and
+    /// without this the only way out of one of those is deleting files in Finder. Everything it
+    /// removes is derived from the user's own files - nothing here is a source of truth - but it
+    /// costs a full re-embed, which is why it is red and behind a confirmation.
+    func reindexFromScratch() {
+        guard !repairRunning, let url = try? Self.indexURL() else { return }
+        repairRunning = true
+        repairMessage = nil
+        Task {
+            let freed = await Task.detached(priority: .userInitiated) {
+                VectorStore.deleteIndexFiles(at: url)
+            }.value
+            await MainActor.run {
+                self.repairRunning = false
+                self.repairMessage = "Removed the old index ("
+                    + ByteCountFormatter.string(fromByteCount: freed, countStyle: .file)
+                    + "). Your files are being indexed again."
+                self.retryBootstrap()
+            }
+        }
+    }
+
     static let defaultMinScore = 0.0   // show all matches by default; users can raise the bar in Search settings
 
     /// Cosine similarity is -1...1; the UI presents it as a 0...100% relevance, clamping the

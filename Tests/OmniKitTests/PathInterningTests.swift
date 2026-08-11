@@ -295,4 +295,69 @@ final class PathInterningTests: XCTestCase {
         XCTAssertEqual(scalar(db, "SELECT COUNT(*) FROM files WHERE path LIKE '/previous/life/%';"), 0,
                        "a path row referencing nothing survived the conversion")
     }
+
+    /// REPAIR, for the shape that blocks the upgrade rather than the vector bookkeeping.
+    ///
+    /// A `files` table that is not the one this app writes - the wrong columns entirely - makes
+    /// every conversion attempt roll back, so the store refuses to open on every launch with no way
+    /// forward but deleting the index. In a LEGACY index nothing references `files` (chunks carries
+    /// its own path and has no file_id), so the table is pure derived state and dropping it is
+    /// lossless - which is what makes this repairable rather than a guess. Gated on legacy, because
+    /// the moment the layout is interned that table IS the paths.
+    func testRepairDropsAPathTableThatBlocksTheUpgrade() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("intern-repair-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appendingPathComponent("test.sqlite")
+        let before = makeLegacyIndex(dbURL)
+        do {
+            let db = open(dbURL)
+            defer { sqlite3_close(db) }
+            exec(db, "CREATE TABLE files(wrong INTEGER);")
+        }
+        XCTAssertThrowsError(try VectorStore(dbURL: dbURL), "the fixture does not reproduce a blocked upgrade")
+
+        switch VectorStore.repairIndex(at: dbURL) {
+        case .repaired(let what):
+            XCTAssertTrue(what.contains("path table"), "the repair did not name what it fixed: \(what)")
+        case .nothingToDo:
+            XCTFail("repair found nothing to do on an index that cannot open")
+        case .needsReindex(let why):
+            XCTFail("repair refused a case it can prove: \(why)")
+        }
+
+        // And the whole point of a repair: it opens now, with the rows it always had.
+        let store = try VectorStore(dbURL: dbURL)
+        defer { store.close() }
+        XCTAssertEqual(store.count, before.count, "rows changed while repairing the path table")
+        let db = open(dbURL)
+        defer { sqlite3_close(db) }
+        XCTAssertEqual(orderedRows(db, interned: true), before, "the repair changed the rows or their order")
+    }
+
+    /// The same repair must NEVER fire on an interned index, where `files` holds the only copy of
+    /// every path. A repair that drops it there does not fix an index, it destroys one.
+    func testRepairLeavesTheInternedPathTableAlone() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("intern-repair-safe-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appendingPathComponent("test.sqlite")
+        _ = try makeIndex(dbURL)
+
+        // Orphan path rows exist on a healthy interned index too - a deleted file leaves one until
+        // it is pruned - so "stale rows" must not be enough on its own to drop the table.
+        do {
+            let db = open(dbURL)
+            defer { sqlite3_close(db) }
+            exec(db, "INSERT OR IGNORE INTO files(path) VALUES('/orphan/not-in-chunks.txt');")
+        }
+        _ = VectorStore.repairIndex(at: dbURL)
+
+        let db = open(dbURL)
+        defer { sqlite3_close(db) }
+        XCTAssertGreaterThan(scalar(db, "SELECT COUNT(*) FROM files;"), 0, "repair dropped an interned index's path table")
+        let store = try VectorStore(dbURL: dbURL)
+        defer { store.close() }
+        XCTAssertGreaterThan(store.count, 0, "the index lost its rows to a repair")
+    }
 }
