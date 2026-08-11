@@ -85,6 +85,22 @@ for p in paths.prefix(200) {
 }
 report("rankChunks", rank)
 
+// TAG FILTER, which is the one query shape that still reads a B-TREE rather than memory: the
+// generated media labels moved from the chunk row to chunk_text, and with them the partial index
+// that serves `tag:`. In v3 that scan dragged the vec blobs through the page cache (450-1050 ms
+// cold, measured); the index it uses now covers a table with no vectors in it at all.
+for term in ["screenshot", "invoice", "diagram", "portrait"] {
+    var tf = SearchFilter(); tf.tagTerms = [term]
+    let t = Date()
+    let hits = store.listMatching(filter: tf, topK: 40)
+    let ms = -t.timeIntervalSinceNow * 1000
+    // Second call is served from the resolved-term cache; report both so the number is honest.
+    let t2 = Date()
+    _ = store.listMatching(filter: tf, topK: 40)
+    print(String(format: "  tag:%-12s %7.1f ms cold  %5.1f ms cached  %d files",
+                 (term as NSString).utf8String!, ms, -t2.timeIntervalSinceNow * 1000, hits.count))
+}
+
 // CORRECTNESS, not speed: the snippet and locator moved to a side table, and an empty string is
 // what a wrong join returns. A silent regression here shows up as blank result rows, not an error.
 var shown = 0, blankSnippet = 0, withLocator = 0

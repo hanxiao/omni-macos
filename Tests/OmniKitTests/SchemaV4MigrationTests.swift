@@ -342,6 +342,35 @@ final class SchemaV4MigrationTests: XCTestCase {
         assertIntact(store, expect, "indexed after the upgrade")
     }
 
+    /// REPAIR MUST NOT FIRE ON A HEALTHY v4 INDEX.
+    ///
+    /// The repair path reads the database directly, through its own connection, in the shapes it
+    /// knows - and it gained a v4 spelling for every one of them. A repair that mistakes a healthy
+    /// index for a broken one does not fix anything; it drops tables. This is the direction that
+    /// matters, because the button is right there in Settings and a user who has just seen one
+    /// error message will press it.
+    func testRepairLeavesAHealthyV4IndexAlone() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("v4-repair-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appendingPathComponent("test.sqlite")
+        let expect = try makeV3Index(dbURL, files: 40)
+        do { let s = try VectorStore(dbURL: dbURL); s.close() }        // converts
+        for _ in 0 ..< 3 { let s = try VectorStore(dbURL: dbURL); s.close() }   // and settles
+
+        let orderBefore = orderedRows(dbURL)
+        switch VectorStore.repairIndex(at: dbURL) {
+        case .nothingToDo: break
+        case .repaired(let what): XCTFail("repair changed a healthy v4 index: \(what)")
+        case .needsReindex(let why): XCTFail("repair called a healthy v4 index unrecoverable: \(why)")
+        }
+        XCTAssertEqual(orderedRows(dbURL), orderBefore, "repair moved the rows of a healthy index")
+
+        let store = try VectorStore(dbURL: dbURL)
+        defer { store.close() }
+        assertIntact(store, expect, "after a no-op repair")
+    }
+
     /// COVERAGE MUST KEEP UP WITH A LONG SESSION, not just catch up at the next launch.
     ///
     /// The stamp returns early once coverage has drawn level - that IS the steady state - and the
