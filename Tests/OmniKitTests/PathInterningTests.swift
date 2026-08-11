@@ -248,4 +248,51 @@ final class PathInterningTests: XCTestCase {
         XCTAssertTrue(listed.contains("/i/f6.txt"), "a live file lost its path row")
         XCTAssertFalse(listed.contains("/i/f1.txt"), "a deleted file is still listed")
     }
+
+    /// THE PATH TABLE CAN OUTLIVE THE CHUNKS IT DESCRIBED.
+    ///
+    /// A 0.4.x binary opening a v3 index drops `chunks` and rebuilds it in the legacy shape - by
+    /// design, the index is a rebuildable cache - but `files` is not its to drop, so it survives
+    /// holding the paths of the index that used to be there. The next 0.5.x launch then met a path
+    /// table with far more rows than the chunk table had paths, failed a verification that compared
+    /// the two COUNTS, rolled the whole conversion back, and refused to open with "the index could
+    /// not be upgraded to the new format" - over an index that was perfectly intact.
+    ///
+    /// Observed on a real index at 260,079 file rows against 68,079 distinct chunk paths. What the
+    /// verification must check is that nothing is MISSING; extra rows are orphans to be removed.
+    func testConversionSurvivesAPathTableFromAPreviousLife() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("intern-stale-files-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appendingPathComponent("test.sqlite")
+        let before = makeLegacyIndex(dbURL)
+
+        // What the downgrade leaves: a `files` table describing an index that no longer exists,
+        // with none of the current chunk paths among the extras.
+        do {
+            let db = open(dbURL)
+            defer { sqlite3_close(db) }
+            exec(db, "CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);")
+            for i in 0 ..< 500 {
+                exec(db, "INSERT OR IGNORE INTO files(path) VALUES('/previous/life/f\(i).txt');")
+            }
+            XCTAssertGreaterThan(scalar(db, "SELECT COUNT(*) FROM files;"),
+                                 scalar(db, "SELECT COUNT(DISTINCT path) FROM chunks;"),
+                                 "the fixture does not reproduce the state it is testing")
+        }
+
+        // It must OPEN - that is the whole bug - and convert.
+        let store = try VectorStore(dbURL: dbURL)
+        defer { store.close() }
+        XCTAssertEqual(store.count, before.count, "row count after converting alongside a stale path table")
+
+        let db = open(dbURL)
+        defer { sqlite3_close(db) }
+        XCTAssertEqual(orderedRows(db, interned: true), before, "conversion changed the rows or their order")
+        XCTAssertEqual(scalar(db, "SELECT COUNT(*) FROM files;"),
+                       scalar(db, "SELECT COUNT(DISTINCT file_id) FROM chunks;"),
+                       "the previous life's path rows were carried forward")
+        XCTAssertEqual(scalar(db, "SELECT COUNT(*) FROM files WHERE path LIKE '/previous/life/%';"), 0,
+                       "a path row referencing nothing survived the conversion")
+    }
 }

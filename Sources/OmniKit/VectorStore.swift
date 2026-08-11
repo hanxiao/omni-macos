@@ -7479,6 +7479,11 @@ public final class VectorStore: @unchecked Sendable {
         let steps = [
             "CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);",
             "INSERT OR IGNORE INTO files(path) SELECT DISTINCT path FROM chunks;",
+            // A path table can outlive the chunks it described: a 0.4.x binary opening a v3 index
+            // drops `chunks` and rebuilds it legacy, and `files` is not its to drop. Those rows
+            // reference nothing, and carrying them forward means the new index starts life with a
+            // path table describing an index that no longer exists.
+            "DELETE FROM files WHERE path NOT IN (SELECT DISTINCT path FROM chunks);",
             """
             CREATE TABLE chunks_v3(
                 file_id INTEGER NOT NULL, modified REAL NOT NULL, size INTEGER NOT NULL DEFAULT 0,
@@ -7579,7 +7584,18 @@ public final class VectorStore: @unchecked Sendable {
         let oldCount = scalarQuery("SELECT COUNT(*) FROM chunks")
         let newCount = scalarQuery("SELECT COUNT(*) FROM chunks_v3")
         guard oldCount > 0, oldCount == newCount else { return false }
-        guard scalarQuery("SELECT COUNT(*) FROM files") == scalarQuery("SELECT COUNT(DISTINCT path) FROM chunks") else { return false }
+        // EVERY CHUNK PATH HAS A FILE ROW - not "the two counts are equal", which is a proxy that is
+        // only true when `files` was built by THIS migration. It is not always: a 0.4.x binary
+        // opening a v3 index drops `chunks` and rebuilds it legacy but leaves `files` alone, so the
+        // next upgrade meets a path table that still holds the paths of the index it used to be.
+        // Observed on a real index: 260,079 file rows against 68,079 distinct chunk paths, which
+        // failed this check, rolled the conversion back, and left the store refusing to open with
+        // "the index could not be upgraded to the new format" - over an index that was fine.
+        //
+        // The property that actually matters is that nothing is MISSING; extra rows are orphans,
+        // and the statement below removes them rather than treating them as a mismatch.
+        guard scalarQuery("SELECT COUNT(*) FROM (SELECT DISTINCT path FROM chunks EXCEPT SELECT path FROM files)") == 0
+        else { return false }
         // Every row must map to the same file, at the same chunk index, with the same payload, in
         // the same position. A positional join over both sequences catches order, identity and
         // content in one pass.
