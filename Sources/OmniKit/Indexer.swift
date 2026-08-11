@@ -507,12 +507,19 @@ public final class Indexer: @unchecked Sendable {
             let lock = NSCondition()
             var pending: [String: [CrawledFile]] = [:]
             var cursor: [String: Int] = [:]          // read head per root; removeFirst is O(n)
-            var totals: [String: Int] = [:]          // published as each root's walk completes
-            var finished: Set<String> = []
+            /// Files discovered SO FAR, per root. Published continuously, not at the end: while the
+            /// crawl streams, both halves of "x / y" move - the walk keeps finding files while the
+            /// pipeline works through them - and a ring that fills against a rising total is a
+            /// truer picture of that than an indeterminate spinner.
+            var discovered: [String: Int] = [:]
+            var totals: [String: Int] = [:]          // final, once the walk has finished
             var walking = true
-            var announced: Set<String> = []          // totals already handed to onProgress
         }
         let passStart = Date()
+        // A ROW FOR EVERY ROOT, IMMEDIATELY. The sidebar draws its ring from this entry, and with a
+        // streaming crawl the TOTAL is not known until the walk ends - so seeding it here is what
+        // makes a folder look like it is being worked on from the first second. Without it the
+        // rings vanished for the whole crawl, which is the opposite of what streaming is for.
         let feed = WalkFeed()
         // RESOLVED, like the crawler resolves them. The walk returns paths with the root's symlinks
         // already followed (/var -> /private/var), and the containment tests below - which root a
@@ -528,6 +535,13 @@ public final class Indexer: @unchecked Sendable {
         let rootOf: @Sendable (String) -> String? = { path in
             rootPaths.first { path == $0 || path.hasPrefix($0 + "/") }
         }
+        // A ROW FOR EVERY ROOT, IMMEDIATELY, keyed the way tick() will write it. The sidebar draws
+        // its ring from this entry, and with a streaming crawl the TOTAL is not known until the walk
+        // ends - so seeding it here is what makes a folder look worked-on from the first second.
+        // Without it the rings vanished for the whole crawl, which is the opposite of the point.
+        for r in rootPaths { p.perRoot[r] = RootProgress() }
+        onProgress(p)
+
         // ONE walk over ALL roots, not one per root in sequence. The walker pools directories from a
         // single stack, so every root's queue fills together and the consumer's round-robin has
         // something from each to take - walking them one at a time meant a paused run indexed the
@@ -541,6 +555,7 @@ public final class Indexer: @unchecked Sendable {
                     feed.lock.lock()
                     feed.pending[r, default: []].append(f)
                     counts[r, default: 0] += 1
+                    feed.discovered[r] = counts[r]
                     feed.lock.broadcast()
                     feed.lock.unlock()
                 }
@@ -551,6 +566,12 @@ public final class Indexer: @unchecked Sendable {
             feed.walking = false
             feed.lock.broadcast()
             feed.lock.unlock()
+        }
+
+        /// What the walk has found so far, for the progress ring. One lock, five integers.
+        let discoveredSoFar: () -> [String: Int] = {
+            feed.lock.lock(); defer { feed.lock.unlock() }
+            return feed.discovered
         }
 
         /// One wave: up to `max` files, taken round-robin so every root advances together. Blocks
@@ -584,12 +605,7 @@ public final class Indexer: @unchecked Sendable {
                     feed.cursor[r] = 0
                 }
             }
-            var newTotals: [String: Int] = [:]
-            for (r, t) in feed.totals where !feed.announced.contains(r) {
-                newTotals[r] = t
-                feed.announced.insert(r)
-            }
-            return (wave, newTotals)
+            return (wave, feed.discovered)
         }
 
 
@@ -599,8 +615,23 @@ public final class Indexer: @unchecked Sendable {
         var doneByRoot: [String: Int] = [:]
         func tick(_ path: String) {
             seen.insert(path); p.scanned += 1; p.currentPath = path
-            if let rk = roots.first(where: { path == $0.path || path.hasPrefix($0.path + "/") })?.path {
-                doneByRoot[rk, default: 0] += 1; p.perRoot[rk]?.done = doneByRoot[rk]!
+            // The RESOLVED root, for the same reason the deletion sweep uses it: the crawl returns
+            // paths with the root's symlinks followed, and matching them against the raw root finds
+            // nothing - the per-folder progress would sit at zero for the whole pass.
+            if let rk = rootOf(path) {
+                doneByRoot[rk, default: 0] += 1
+                var rp = p.perRoot[rk] ?? RootProgress()
+                rp.done = doneByRoot[rk]!
+                p.perRoot[rk] = rp
+            }
+            // The denominator moves too, so refresh it alongside the numerator - rarely enough
+            // that it costs one lock per few hundred files.
+            if p.scanned % 200 == 0 {
+                for (r, n) in discoveredSoFar() where n > (p.perRoot[r]?.total ?? 0) {
+                    var rp = p.perRoot[r] ?? RootProgress()
+                    rp.total = n
+                    p.perRoot[r] = rp
+                }
             }
             if p.scanned % 10 == 0 { onProgress(p) }
         }

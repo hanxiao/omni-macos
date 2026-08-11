@@ -188,7 +188,8 @@ private struct ActivityTab: View {
                            model.isIndexing || model.activeRoots.contains(url.path) {
                             Text("\(rp.done.formatted()) / \(rp.total.formatted())")
                                 .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                        } else if (model.activeRoots.contains(url.path) || model.isFolderQueued(url))
+                        } else if (model.activeRoots.contains(url.path) || model.isFolderQueued(url)
+                                    || (model.isIndexing && (rp?.total ?? 0) == 0))
                                     && !((rp?.total ?? 0) > 0 && (rp?.done ?? 0) >= (rp?.total ?? 0)) {
                             // Counting, or waiting its turn behind another pass. There is no total
                             // to show yet, and the stored count for a folder nothing has crawled is

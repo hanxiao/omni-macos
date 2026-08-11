@@ -167,7 +167,12 @@ struct Sidebar: View {
         // read as stuck. The pie is for work in flight; the number is for work done.
         if let rp = model.progress.perRoot[url.path], rp.total > 0, rp.done >= rp.total { return false }
         if model.activeRoots.contains(url.path) { return true }
-        if model.isIndexing, let rp = model.progress.perRoot[url.path], rp.total > 0, rp.done < rp.total { return true }
+        // total == 0 means the walk has not finished counting this root yet - which, with a
+        // streaming crawl, is most of the pass. Requiring total > 0 made the rings disappear for
+        // exactly the period they exist to cover.
+        if model.isIndexing, let rp = model.progress.perRoot[url.path] {
+            return rp.total == 0 || rp.done < rp.total
+        }
         return false
     }
 

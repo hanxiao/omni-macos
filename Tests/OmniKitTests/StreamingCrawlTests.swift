@@ -158,4 +158,41 @@ final class StreamingCrawlTests: XCTestCase {
         XCTAssertFalse(Set(store.indexedFiles().keys).contains { $0.hasSuffix("d0/f0.txt") },
                        "a deleted file survived a complete pass")
     }
+
+    /// THE RING HAS TO HAVE NUMBERS TO DRAW. With a streaming crawl the total is not known when the
+    /// pass starts, and the sidebar's progress needs both halves of "x / y" while the work is
+    /// happening - not a denominator that appears at the end. Seeding an entry per root and
+    /// refreshing it as the walk discovers files is what keeps the ring on screen; the first
+    /// version of this published totals only when the walk finished, and the rings vanished for
+    /// exactly the period they exist to cover.
+    func testPerRootProgressIsReportedWhileTheCrawlIsStillRunning() throws {
+        let a = try makeRoot("alpha", files: 600)
+        let b = try makeRoot("beta", files: 600)
+        let store = try VectorStore(dbURL: dir.appendingPathComponent("i.sqlite"))
+        defer { store.close() }
+        let indexer = Indexer(store: store, embedder: RecordingEmbedder())
+
+        let lock = NSLock()
+        var sawRisingTotal = false
+        var sawPartialProgress = false
+        var lastTotal = 0
+
+        let done = XCTestExpectation(description: "pass")
+        indexer.index(roots: [a, b], settings: IndexSettings(enabledKinds: [.text]), force: true) { p in
+            lock.lock()
+            let total = p.perRoot.values.reduce(0) { $0 + $1.total }
+            let doneCount = p.perRoot.values.reduce(0) { $0 + $1.done }
+            if !p.done {
+                if total > lastTotal { sawRisingTotal = true; lastTotal = total }
+                // A ring can only be drawn from an entry that exists and is not yet complete.
+                if total > 0, doneCount > 0, doneCount < total { sawPartialProgress = true }
+            }
+            lock.unlock()
+            if p.done { done.fulfill() }
+        }
+        wait(for: [done], timeout: 120)
+
+        XCTAssertTrue(sawRisingTotal, "the total never grew during the pass: the ring has no denominator")
+        XCTAssertTrue(sawPartialProgress, "no in-flight x/y was ever reported: the ring cannot fill")
+    }
 }
