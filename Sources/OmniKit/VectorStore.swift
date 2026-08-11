@@ -984,6 +984,13 @@ public final class VectorStore: @unchecked Sendable {
         exec("INSERT OR REPLACE INTO meta(key, value) VALUES('mutation_gen','\(mutationGen)');")
         scheduleRowStampLocked()   // debounced: the sidecar re-stamps once writes go quiet
         scheduleIdleFoldLocked()   // debounced: fold the delta once writes go quiet
+        // AND COVERAGE, because nothing else re-arms it once it has caught up. The stamp returns
+        // early in that state - deliberately, it is the steady state - and the timer chain ends
+        // there, so every row written afterwards kept its vector in SQLite until the app quit.
+        // Watched live: coverage frozen while `pending_vecs` climbed past 17,000 rows in three
+        // minutes of indexing. Not new in v4 (v3 held the same bytes in the chunk row, just as
+        // invisibly), but v4 is where it is cheap to see and cheap to fix.
+        scheduleCoverageStampLocked()
     }
     private static let foldThreshold = 50_000
     // Last interactive search time (queue-guarded). When a write invalidates the base WHILE the user is
@@ -4788,27 +4795,31 @@ public final class VectorStore: @unchecked Sendable {
     /// Fixed-width per-row record; see stampRowSidecarLocked for the field layout.
     private static let rowRecordSize = 48
 
-    /// Token for the coverage cadence. Deliberately SEPARATE from stampToken: that one is bumped by
-    /// every mutation so the row sidecar is written once writes go quiet, which is right for a cache
-    /// and fatal for a migration. An app doing its launch catch-up pass mutates continuously, so the
-    /// shared debounce never elapsed and coverage sat at 125,000 of 4.5M rows indefinitely - observed
-    /// live, with the stamp closure superseded every time before its deadline.
-    private var coverageToken: UInt64 = 0
+    /// True while a stamp is already scheduled. See below for why this is arm-once rather than
+    /// the supersede-the-previous-one shape every other debounce here uses.
+    private var coverageArmed = false
 
     /// Fixed cadence, immune to mutations: the migration's work is incremental and safe to do while
     /// indexing, so it must not wait for the index to go quiet.
+    ///
+    /// ARM ONCE, DO NOT SUPERSEDE. Every other timer in this file is a debounce - each call pushes
+    /// the deadline out, so the work happens after things go quiet. That is right for a cache and
+    /// wrong here, because this is called from every mutation: a sustained indexing pass would push
+    /// the deadline out for ever and coverage would never run. Arming once means the first write
+    /// after a quiet period sets a deadline that then actually arrives.
     private func scheduleCoverageStampLocked(after delay: TimeInterval = coverageIdleGap) {
-        // Also while there are slots worth taking back: once coverage has caught up this was the
-        // only thing still scheduling a stamp, so without the second clause the reclaim would have
-        // had no timer to run on at all.
-        guard Self.vecCoverage, Self.rowSidecarEnabled,
-              coveredRows < rows.count || shouldReclaimHolesLocked() else { return }
-        coverageToken += 1
-        let token = coverageToken
+        // NO "is there work?" TEST HERE, deliberately. The obvious guard - `coveredRows <
+        // rows.count` - reads the resident row table, and the caller that matters most is
+        // bumpGenLocked, which runs INSIDE the write transaction, before the new rows are appended
+        // to it. The guard was therefore false at exactly the moment a write needed to arm the
+        // timer, and armed it only for work that was already visible. Cost of dropping it: one
+        // timer fires, stampVectorCoverageLocked finds nothing to do and does not re-arm.
+        guard Self.vecCoverage, Self.rowSidecarEnabled, !coverageArmed else { return }
+        coverageArmed = true
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
             self.queue.sync {
-                guard self.coverageToken == token else { return }
+                self.coverageArmed = false
                 self.stampVectorCoverageLocked()
             }
         }
@@ -4909,13 +4920,32 @@ public final class VectorStore: @unchecked Sendable {
         // the last of them is where it ends. One O(n) index walk, once, on an index that has never
         // recorded it.
         coveredUpToID = Int64(scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.coveredUpToIDKey)'"))
-        if coveredUpToID == 0, coveredRows > vecHoles.count {
-            coveredUpToID = Int64(scalarQuery(
-                "SELECT id FROM chunks ORDER BY id LIMIT 1 OFFSET \(coveredRows - vecHoles.count - 1)"))
-            if coveredUpToID > 0 {
-                exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.coveredUpToIDKey)','\(coveredUpToID)');")
-            }
-        }
+        ensureCoveredUpToIDLocked()
+    }
+
+    /// Derive the coverage watermark when it is missing, and persist it.
+    ///
+    /// LAZY, AND CHECKED AGAINST THE LAYOUT, because there is exactly one moment it has to survive
+    /// and it is not the obvious one. The claim is read during loadIntoMemory, which runs BEFORE
+    /// the v3 -> v4 conversion - so at that point `chunks` is still the old table with no `id`
+    /// column, the derivation returns 0, and nothing ever asks again.
+    ///
+    /// The failure that causes is quiet and total: the advance computes its boundary from a
+    /// watermark of 0, which points at the START of the table rather than the end of the covered
+    /// prefix, so the pending count never matches and every slice rolls back. Coverage stops
+    /// moving for the life of the index and `pending_vecs` grows without bound - observed on the
+    /// live index, where it climbed past 59,000 rows in five minutes while `covered` did not
+    /// change once. Nothing looked wrong: the self-check refused rather than corrupting, which is
+    /// the right failure, but a refusal repeated forever is still a broken index.
+    private func ensureCoveredUpToIDLocked() {
+        guard dbOpen(), coveredUpToID == 0, coveredRows > vecHoles.count,
+              layoutLocked() == .v4 else { return }
+        // The k-th live row in id order, where k is how many live rows the prefix accounts for.
+        let id = Int64(scalarQuery(
+            "SELECT id FROM chunks ORDER BY id LIMIT 1 OFFSET \(coveredRows - vecHoles.count - 1)"))
+        guard id > 0 else { return }
+        coveredUpToID = id
+        exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.coveredUpToIDKey)','\(id)');")
     }
 
     /// Record, inside the caller's OPEN transaction, that these slots no longer have a row.
@@ -5381,6 +5411,9 @@ public final class VectorStore: @unchecked Sendable {
         let live = scalarQuery("SELECT COUNT(*) FROM chunks")
         let deadBelow = deadRows.filter { Int($0) < target }.count
         guard live == rows.count - deadRows.count, target - deadBelow <= live else { return false }
+        // The watermark, derived now if the claim predates it - see ensureCoveredUpToIDLocked for
+        // why this cannot be left to the point where the claim is first read.
+        ensureCoveredUpToIDLocked()
         // How many live rows the prefix accounted for BEFORE this slice, and after it. Read before
         // recordHolesLocked, which is about to change the hole count under us.
         let clearedBefore = coveredRows - vecHoles.count
@@ -7800,7 +7833,9 @@ public final class VectorStore: @unchecked Sendable {
     public func internPathsForTest() -> Int64? { queue.sync { internPathsLocked() } }
     /// Coverage state, for tests that have to build a specific on-disk claim.
     var coveredRowsForTest: Int { queue.sync { coveredRows } }
-    func advanceCoverageForTest(budget: Int = Int.max) { queue.sync { while advanceCoverageLocked(budget: budget) {} } }
+    /// Drive coverage to completion. The budget is a SLICE SIZE, and it is added to the current
+    /// claim - so the old `Int.max` default trapped on overflow the moment anyone used it.
+    func advanceCoverageForTest(budget: Int = 1_000_000) { queue.sync { while advanceCoverageLocked(budget: budget) {} } }
 
     // MARK: - Layout, and the v3 -> v4 conversion
 

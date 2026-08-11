@@ -197,11 +197,17 @@ final class SchemaV4MigrationTests: XCTestCase {
         exec(db, "ALTER TABLE chunks_old RENAME TO chunks;")
         exec(db, "ALTER TABLE files_old RENAME TO files;")
         exec(db, "PRAGMA user_version = 3;")
-        // A GENUINE v3 INDEX, including what it does NOT have. `dim` as a meta row is a v4 idea;
-        // leaving the one the v4 writer put there made this fixture answer a question a real v3
-        // database cannot, and hid a load failure that only turned up when the conversion was
-        // replayed on a live index.
-        exec(db, "DELETE FROM meta WHERE key = 'dim';")
+        // A GENUINE v3 INDEX, INCLUDING WHAT IT DOES NOT HAVE.
+        //
+        // This fixture is built by the v4 writer and then rewritten into the v3 shape, so `meta`
+        // arrives carrying keys that no database written by 0.5.5 could contain. Leaving them in
+        // lets the fixture answer questions a real v3 index cannot, and it hid two separate bugs
+        // that only the live index reproduced: `dim` (the converted index declared itself
+        // unreadable without its row sidecar) and `vecs_covered_id` (coverage never advanced in the
+        // session that did the converting). Anything v4-only goes.
+        for key in ["dim", "vecs_covered_id"] {
+            exec(db, "DELETE FROM meta WHERE key = '\(key)';")
+        }
         // v3 rebuilt its label index over `chunks`; the conversion has to cope with it existing.
         exec(db, """
             CREATE INDEX IF NOT EXISTS idx_media_snippet ON chunks(kind, snippet, file_id)
@@ -271,6 +277,121 @@ final class SchemaV4MigrationTests: XCTestCase {
         let reopened = try VectorStore(dbURL: dbURL)
         defer { reopened.close() }
         assertIntact(reopened, expect, "after upgrade, with no row sidecar")
+    }
+
+    /// AND IT MUST KEEP WORKING AFTERWARDS, which is a different question from "did it convert".
+    ///
+    /// Coverage is what moves a vector out of SQLite and into the file, and it advances from a
+    /// watermark - the chunk id where the covered prefix ends. That watermark is read when the
+    /// claim is read, which happens BEFORE the conversion runs, i.e. against a table that does not
+    /// have the column yet. Getting 0 there is not visibly wrong: the advance's own consistency
+    /// check refuses the slice rather than corrupting anything. It just refuses every slice, for
+    /// ever, and `pending_vecs` grows without bound while the index quietly stops covering.
+    ///
+    /// Observed on the live index - 59,000 pending rows in five minutes with `covered` frozen - so
+    /// this asks the question the conversion tests were not asking: index MORE afterwards, and
+    /// watch it drain.
+    func testCoverageStillAdvancesAfterTheUpgrade() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("v4-cover-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appendingPathComponent("test.sqlite")
+        var expect = try makeV3Index(dbURL, files: 60)
+
+        // ONE STORE INSTANCE, doing the conversion AND the work that follows it - which is what
+        // the app does on the launch that upgrades. Closing and reopening in between hides the bug
+        // entirely: the second open reads the claim against a table that is v4 by then, derives the
+        // watermark correctly, and everything works from there. It is only the session that did the
+        // converting that is stuck, and that session is the whole first launch after an upgrade.
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            XCTAssertEqual(scalar(open(dbURL), "PRAGMA user_version"), 4, "the fixture did not convert")
+            var batch: [(path: String, chunks: [IndexedChunk])] = []
+            for f in 100 ..< 160 {
+                let path = "/v3/after/d\(f % 5)/file\(f).txt"
+                var cs: [IndexedChunk] = []
+                for i in 0 ..< 3 {
+                    let seed = f * 100 + i
+                    expect.append(Expected(path: path, chunkIndex: i, seed: seed,
+                                           snippet: "post-upgrade \(f)/\(i)", locator: "Page \(i + 1)",
+                                           kind: "text"))
+                    cs.append(IndexedChunk(path: path, modified: 2000, size: 20, kind: "text",
+                                           chunkIndex: i, snippet: "post-upgrade \(f)/\(i)",
+                                           embedding: vec(seed), locator: "Page \(i + 1)"))
+                }
+                batch.append((path, cs))
+            }
+            try store.replaceMany(batch)
+            XCTAssertGreaterThan(scalar(open(dbURL), "SELECT COUNT(*) FROM pending_vecs"), 0,
+                                 "the new rows were never pending, so there is nothing to drain")
+            // Advance coverage IN THIS SESSION, which is what the store does on its own timer.
+            store.advanceCoverageForTest()
+            XCTAssertEqual(scalar(open(dbURL), "SELECT COUNT(*) FROM pending_vecs"), 0,
+                           "coverage did not advance in the session that converted the index: "
+                           + "every vector written after the upgrade is still in SQLite")
+            XCTAssertNil(store.coverageAudit(), "coverage bookkeeping in the converting session")
+            store.close()
+        }
+
+        for _ in 0 ..< 2 { let s = try VectorStore(dbURL: dbURL); s.close() }
+        XCTAssertEqual(scalar(open(dbURL), "SELECT COUNT(*) FROM pending_vecs"), 0,
+                       "coverage never advanced after the upgrade: every new vector is still in SQLite")
+        let store = try VectorStore(dbURL: dbURL)
+        defer { store.close() }
+        XCTAssertNil(store.coverageAudit(), "coverage bookkeeping after advancing past the upgrade")
+        assertIntact(store, expect, "indexed after the upgrade")
+    }
+
+    /// COVERAGE MUST KEEP UP WITH A LONG SESSION, not just catch up at the next launch.
+    ///
+    /// The stamp returns early once coverage has drawn level - that IS the steady state - and the
+    /// timer chain used to end there, with nothing re-arming it. Every row written afterwards kept
+    /// its vector in SQLite for the rest of the session. Watched on the live index: coverage frozen
+    /// while `pending_vecs` climbed past 17,000 rows in three minutes of ordinary indexing.
+    ///
+    /// Nothing is lost when that happens - the vectors are durable, which is what the pending table
+    /// is for - so no audit and no count would ever call it wrong. What it costs is a database that
+    /// grows all session and only settles when the app quits. This drives the timer for real
+    /// instead of forcing it, so the thing under test is the SCHEDULING.
+    func testCoverageKeepsUpWithWritesWithinOneSession() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("v4-sched-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appendingPathComponent("test.sqlite")
+
+        let store = try VectorStore(dbURL: dbURL)
+        defer { store.close() }
+
+        // A first batch, then wait for coverage to draw level on its own.
+        func write(_ range: Range<Int>) throws {
+            var batch: [(path: String, chunks: [IndexedChunk])] = []
+            for f in range {
+                let path = "/sched/d\(f % 6)/file\(f).txt"
+                batch.append((path, [IndexedChunk(path: path, modified: 1, size: 10, kind: "text",
+                                                  chunkIndex: 0, snippet: "s\(f)", embedding: vec(f))]))
+            }
+            try store.replaceMany(batch)
+        }
+        func pending() -> Int { scalar(open(dbURL), "SELECT COUNT(*) FROM pending_vecs") }
+        func waitForDrain(_ label: String) {
+            let deadline = Date().addingTimeInterval(20)
+            while Date() < deadline, pending() > 0 { usleep(100_000) }
+            XCTAssertEqual(pending(), 0, "\(label): coverage did not drain the pending vectors")
+        }
+
+        try write(0 ..< 300)
+        waitForDrain("first batch")
+
+        // NOW the interesting part: more work, after coverage has already caught up once. This is
+        // the state in which the timer had stopped and nothing wound it up again.
+        try write(300 ..< 600)
+        waitForDrain("second batch, after coverage had already caught up")
+
+        try write(600 ..< 900)
+        waitForDrain("third batch")
+
+        XCTAssertNil(store.coverageAudit(), "coverage bookkeeping after three batches in one session")
+        XCTAssertEqual(store.count, 900)
     }
 
     /// KILLED MID-CONVERSION. The next launch must continue from where it stopped and land on the
