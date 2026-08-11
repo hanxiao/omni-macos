@@ -887,7 +887,11 @@ final class AppModel {
     private var indexGen = 0
     /// Roots added while a pass was already running; the running pass's completion catches them up, so
     /// we never run a second concurrent index() on the same Indexer.
-    private var pendingCatchUpRoots: [URL] = []
+    /// Roots added but not yet crawled: catch-up passes serialize on one Indexer, so a folder added
+    /// while anything else is indexing waits here. READ BY THE UI - a queued folder has no progress
+    /// and no rows, so without this both views fell through to its stored count, which is a truthful
+    /// `0` that reads as "this folder is empty" for a folder nothing has looked at yet.
+    private(set) var pendingCatchUpRoots: [URL] = []
 
     func isFolderPaused(_ url: URL) -> Bool { pausedRoots.contains(url.path) }
 
@@ -2728,6 +2732,10 @@ final class AppModel {
         }
         return canonical
     }
+
+    /// Is this folder waiting for its turn to be crawled? Distinct from `activeRoots`, which means
+    /// a pass is running for it: both should read as "working", neither as a count.
+    func isFolderQueued(_ url: URL) -> Bool { pendingCatchUpRoots.contains(url) }
 
     func addRoot(_ url: URL) { addRoots([url]) }
 

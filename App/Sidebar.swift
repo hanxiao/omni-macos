@@ -29,9 +29,12 @@ struct Sidebar: View {
                                 Text(c.formatted()).font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
                             }
                             Image(systemName: "pause.circle").foregroundStyle(.tertiary)
-                        } else if isActive(url) {
+                        } else if (isActive(url) || model.isFolderQueued(url)) && !isFinished(url) {
                             // iCloud-Drive-style transfer indicator: a pie that fills as this
                             // folder is indexed (or sweeps when reconciling in the background).
+                            // A QUEUED folder gets the same treatment with no fraction - it has no
+                            // total yet, and falling through to its stored count showed a freshly
+                            // added folder a truthful "0" that reads as "nothing in here".
                             CloudSyncPie(fraction: activeFraction(url))
                         } else if model.deniedRoots.contains(url.path) {
                             // macOS denied Omni access (TCC): without this badge the folder just
@@ -54,7 +57,8 @@ struct Sidebar: View {
                     }
                     // While this folder indexes, the row tooltip shows live progress;
                     // otherwise the full path (useful when the name is truncated).
-                    .help(model.isFolderPaused(url) ? "This folder is paused" : (isActive(url) ? indexingHelp(url) : url.path))
+                    .help(model.isFolderPaused(url) ? "This folder is paused"
+                          : ((isActive(url) || model.isFolderQueued(url)) && !isFinished(url) ? indexingHelp(url) : url.path))
                     // Native source-list management: right-click to act, Delete to remove the
                     // selected folder. No always-on button cluttering the row.
                     .contextMenu {
@@ -157,9 +161,20 @@ struct Sidebar: View {
     /// A folder has background work when it is mid full-index or mid live reconcile of
     /// file-system changes.
     private func isActive(_ url: URL) -> Bool {
+        // FINISHED WINS over "the pass is still running". A root keeps its activeRoots key until the
+        // whole batch completes, so a folder that finished first used to sit at a FULL pie until its
+        // siblings caught up - a 100% pie says nothing its file count does not say better, and it
+        // read as stuck. The pie is for work in flight; the number is for work done.
+        if let rp = model.progress.perRoot[url.path], rp.total > 0, rp.done >= rp.total { return false }
         if model.activeRoots.contains(url.path) { return true }
         if model.isIndexing, let rp = model.progress.perRoot[url.path], rp.total > 0, rp.done < rp.total { return true }
         return false
+    }
+
+    /// A root whose own pass has finished, even though the batch it rode in on has not.
+    private func isFinished(_ url: URL) -> Bool {
+        guard let rp = model.progress.perRoot[url.path] else { return false }
+        return rp.total > 0 && rp.done >= rp.total
     }
 
     /// Real clock progress for a folder being indexed (full index or a freshly added root),
@@ -175,7 +190,8 @@ struct Sidebar: View {
         if let rp = model.progress.perRoot[url.path], rp.total > 0 {
             return "Indexing \(rp.done.formatted()) / \(rp.total.formatted()) files"
         }
-        return "Updating\u{2026}"
+        if model.isFolderQueued(url) { return "Waiting to be indexed" }
+        return "Counting files\u{2026}"
     }
 
     /// Drop the history selection when it no longer matches the active query (text or file), so the
@@ -267,7 +283,12 @@ struct CloudSyncPie: View {
                         .animation(.easeInOut(duration: 0.2), value: fraction)
                 }
             } else {
-                ProgressView().controlSize(.mini)   // .mini renders crisp; scaleEffect rasterized fuzzy
+                // NO TOTAL YET - queued behind another pass, or still being counted. An EMPTY RING
+                // says that: same glyph as the progress it is about to become, at zero, so the row
+                // does not change shape when counting finishes and the wedge starts filling. A
+                // spinner here read as a different kind of activity, and a count read as "empty".
+                Circle().strokeBorder(Color.secondary.opacity(0.4), lineWidth: 1)
+                    .frame(width: 11, height: 11)
             }
         }
         // A solid hover target so the .help tooltip fires anywhere over the glyph (the shapes

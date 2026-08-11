@@ -180,8 +180,13 @@ private struct ActivityTab: View {
                            model.isIndexing || model.activeRoots.contains(url.path) {
                             Text("\(rp.done.formatted()) / \(rp.total.formatted())")
                                 .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                        } else if model.activeRoots.contains(url.path) {
-                            Text("Updating\u{2026}").font(.caption).foregroundStyle(.secondary)
+                        } else if (model.activeRoots.contains(url.path) || model.isFolderQueued(url))
+                                    && !((rp?.total ?? 0) > 0 && (rp?.done ?? 0) >= (rp?.total ?? 0)) {
+                            // Counting, or waiting its turn behind another pass. There is no total
+                            // to show yet, and the stored count for a folder nothing has crawled is
+                            // a truthful "0 files" that reads as "this folder is empty".
+                            ProgressView().controlSize(.small)
+                                .help(model.isFolderQueued(url) ? "Waiting to be indexed" : "Counting files\u{2026}")
                         } else if let c = model.folderFileCounts[url.path] {
                             Text("\(c.formatted()) file\(c == 1 ? "" : "s")").font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
                         }
