@@ -802,6 +802,13 @@ private struct HistoryTab: View {
                 Text(model.historyMode.detail).font(.caption).foregroundStyle(.secondary)
             }
             Section {
+                Toggle("Save serving history", isOn: Binding(get: { model.saveServingHistory },
+                                                            set: { model.saveServingHistory = $0 }))
+            } footer: {
+                Text("Searches that reach Omni over the server, from an agent or a script, are kept too.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section {
                 Picker("Keep history for", selection: Binding(get: { model.historyRetentionDays }, set: { model.historyRetentionDays = $0 })) {
                     Text("3 days").tag(3)
                     Text("7 days").tag(7)

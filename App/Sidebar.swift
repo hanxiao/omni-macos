@@ -208,8 +208,13 @@ struct Sidebar: View {
         let q = model.rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         // Must use the SAME namespaced scheme as HistoryItem.id ("file:<path>" / "query:<text>"),
         // otherwise the active id never matches and the row is wrongly deselected on every change.
-        let activeID: String? = model.fileQuery.map { "file:\($0.url.path)" } ?? (q.isEmpty ? nil : "query:\(q)")
-        if id != activeID { selection = nil }
+        // A served row re-runs as an ordinary query, so its id ("serving:x") never equals the
+        // active one ("query:x") and the row would deselect the instant it was clicked. Both
+        // spellings of the same text count as active.
+        var active: Set<String> = []
+        if let fq = model.fileQuery { active.insert("file:\(fq.url.path)") }
+        else if !q.isEmpty { active.insert("query:\(q)"); active.insert("serving:\(q)") }
+        if !active.contains(id) { selection = nil }
     }
 
     private func remove(_ url: URL) {
@@ -242,6 +247,10 @@ private struct HistorySections: View {
                             // A file query: show its thumbnail (falls back to a generic icon if the
                             // file is gone, so deleted files degrade gracefully).
                             Thumbnail(path: p, side: 16, corner: 3)
+                        } else if item.isServed {
+                            // Same glyph the Serving tab carries, so the sidebar and Settings agree
+                            // about what "this came over the server" looks like.
+                            Image(systemName: "network").foregroundStyle(Color.secondary).frame(width: 16)
                         } else {
                             Image(systemName: "magnifyingglass").foregroundStyle(Color.secondary).frame(width: 16)
                         }

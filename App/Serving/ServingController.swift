@@ -40,6 +40,10 @@ final class ServingController {
 
     // MARK: Private state
 
+    /// Set by AppModel: what to do with the query text of a served search. Kept as a closure so
+    /// Serving stays unaware of AppModel, which is the whole point of the ServingBackend seam.
+    var onServedSearch: ((String) -> Void)?
+
     private var backend: (any ServingBackend)?
     private var server: HTTPServer?
 
@@ -59,7 +63,13 @@ final class ServingController {
     /// enabled. Safe to call again after a model swap - it replaces the backend and, if a
     /// server is running, restarts it against the new backend.
     func attach(engine: OmniEngine, store: VectorStore, modelName: String) {
-        backend = EngineServingBackend(engine: engine, store: store, modelName: modelName)
+        var b = EngineServingBackend(engine: engine, store: store, modelName: modelName)
+        // The hop off the connection's Task and onto the main actor, in one place. `onServedSearch`
+        // is weak-captured through self so a torn-down controller cannot resurrect the model.
+        b.onSearch = { [weak self] q in
+            Task { @MainActor in self?.onServedSearch?(q) }
+        }
+        backend = b
         if isRunning {
             restart()
         } else {

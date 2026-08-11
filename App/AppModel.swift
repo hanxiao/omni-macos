@@ -12,6 +12,11 @@ enum IndexState { case idle, indexing, paused }
 
 /// A past search shown in the sidebar History. Bookmarked items are pinned and never auto-pruned.
 /// The filter/sort context is captured so re-running a history item restores exactly that search.
+/// Where a remembered search came from. A served search is one an agent or script sent over the
+/// HTTP/MCP server, not something the user typed - worth telling apart in the sidebar, and worth
+/// being able to switch off separately.
+enum HistorySource: String, Codable, Sendable { case app, serving }
+
 struct HistoryItem: Codable, Sendable, Identifiable, Equatable {
     var query: String                 // semantic (embedding) text, or "" for a file query
     var bookmarked: Bool
@@ -28,11 +33,20 @@ struct HistoryItem: Codable, Sendable, Identifiable, Equatable {
     var filePath: String? = nil       // set when the query is a file
     var fileKind: String? = nil       // FileKind rawValue, for the row glyph
     var similar: Bool = false         // doc-vs-doc "find similar" vs query-by-file
+    /// Defaulted, so every history item written before serving was remembered decodes unchanged.
+    var source: String = HistorySource.app.rawValue
+    var isServed: Bool { source == HistorySource.serving.rawValue }
     // The string the user actually typed/sees (with qualifiers) drives display, identity, and dedup.
     var displayText: String { rawQuery ?? query }
     // Namespaced so a file path can never collide with a text query of the same string. id is
     // runtime-only (computed, not encoded), so changing the scheme is safe.
-    var id: String { filePath.map { "file:\($0)" } ?? "query:\(displayText)" }
+    //
+    // SERVED SEARCHES GET THEIR OWN NAMESPACE, so the same text arriving from an agent and from the
+    // search box are two rows rather than one that keeps changing its icon under the user.
+    var id: String {
+        if let p = filePath { return "file:\(p)" }
+        return isServed ? "serving:\(displayText)" : "query:\(displayText)"
+    }
     var isFile: Bool { filePath != nil }
     var displayLabel: String { isFile ? ((filePath! as NSString).lastPathComponent) : displayText }
 }
@@ -824,6 +838,15 @@ final class AppModel {
     /// Recent (non-bookmarked) searches older than this many days are pruned. Default 31 (about a
     /// month), so the sidebar's day buckets - Yesterday, Previous 7 Days, Previous 30 Days - actually
     /// fill in. Users who picked a shorter window in Settings keep it.
+    /// Whether searches that arrive over the HTTP/MCP server are remembered too.
+    ///
+    /// SEPARATE from historyMode on purpose. That setting is about when a search the user is TYPING
+    /// settles enough to keep - "automatically", "when I press Return" - and none of those states
+    /// exist for a request that arrives whole over a socket. So this is its own switch rather than
+    /// a fourth case of a question that does not apply.
+    var saveServingHistory: Bool = true {
+        didSet { UserDefaults.standard.set(saveServingHistory, forKey: "omni.saveServingHistory") }
+    }
     var historyRetentionDays: Int = 31 {
         didSet {
             UserDefaults.standard.set(historyRetentionDays, forKey: "omni.historyRetentionDays")
@@ -1245,6 +1268,9 @@ final class AppModel {
         sweepUnsavedQueryImages()   // after loadHistory: keep bookmarked query images, drop the rest
         pruneDeadFileRecents()      // clear dangling file recents (e.g. older temp-path image searches)
         if let raw = UserDefaults.standard.string(forKey: "omni.historyMode"), let m = HistoryMode(rawValue: raw) { historyMode = m }
+        if UserDefaults.standard.object(forKey: "omni.saveServingHistory") != nil {
+            saveServingHistory = UserDefaults.standard.bool(forKey: "omni.saveServingHistory")
+        }
         // Setting historyRetentionDays runs the day-based prune via didSet, so stale recents are
         // cleaned up at launch. integer(forKey:) returns 0 when unset -> keep the 7-day default.
         let retain = UserDefaults.standard.integer(forKey: "omni.historyRetentionDays")
@@ -1358,6 +1384,29 @@ final class AppModel {
                                    kinds: ctx.kinds, folder: ctx.folder, ext: ctx.ext,
                                    dateRange: ctx.dateRange, sortOrder: ctx.sort)
             item.rawQuery = raw
+            searchHistory.insert(item, at: 0)
+        }
+        pruneHistory()
+        persistHistory()
+    }
+
+    /// Remember a search that arrived over the server. Called from the serving backend, which runs
+    /// off the main actor, so the hop happens at the call site.
+    ///
+    /// Deliberately NOT routed through recordCurrentSearchToHistory: that one reads the search box,
+    /// the active filters and the typing state, none of which describe a request that arrived over a
+    /// socket. It also collapses live-typed prefixes ("ca" -> "cat"), which would silently eat an
+    /// agent's genuinely distinct queries.
+    func recordServedSearch(_ raw: String) {
+        guard saveServingHistory else { return }
+        let q = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard q.count >= 2 else { return }
+        if let i = searchHistory.firstIndex(where: { $0.isServed && $0.displayText.caseInsensitiveCompare(q) == .orderedSame }) {
+            searchHistory[i].lastUsed = Date()
+        } else {
+            var item = HistoryItem(query: q, bookmarked: false, lastUsed: Date())
+            item.rawQuery = q
+            item.source = HistorySource.serving.rawValue
             searchHistory.insert(item, at: 0)
         }
         pruneHistory()
@@ -2453,6 +2502,9 @@ final class AppModel {
             // backend and reconciles: it auto-starts the server if serving was enabled last
             // session, and on a variant switch (bootstrap reruns) it replaces the backend under
             // any in-flight server. modelName is reported by /health and /v1/models.
+            // Served searches land in History like the user's own, subject to their own switch.
+            // Set before attach(), so a server that auto-starts inside it is already wired.
+            self.serving.onServedSearch = { [weak self] q in self?.recordServedSearch(q) }
             self.serving.attach(engine: engine, store: store, modelName: "omni-\(modelVariant.rawValue)")
             if let oldStore { Task.detached(priority: .utility) { _ = oldIndexer; oldStore.close() } }
             self.supportsImages = engine.supportsImages

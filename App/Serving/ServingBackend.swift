@@ -47,6 +47,13 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
     let engine: OmniEngine
     let store: VectorStore
     let modelName: String
+    /// Called with the query text of every served search. Set by ServingController; it hops to the
+    /// main actor itself, because this type is called from a connection's detached Task.
+    ///
+    /// Hooked HERE rather than in the adapters because every route that runs a search - /v1/search
+    /// and the MCP search tool alike - converges on `search` below. An adapter-level hook would
+    /// have to be added again for each new provider, and forgotten once.
+    var onSearch: (@Sendable (String) -> Void)? = nil
 
     /// Matches the indexer's forward-pass width so we never exceed the engine's batch
     /// expectations; large client batches are split into groups of this size.
@@ -71,6 +78,7 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
 
     func search(_ query: String, topK: Int, filter: SearchFilter) -> [SearchHit] {
         let vec = engine.embedQuery(query)
+        onSearch?(query)
         return store.search(vec, filter: filter, topK: topK, textQuery: query)
     }
 

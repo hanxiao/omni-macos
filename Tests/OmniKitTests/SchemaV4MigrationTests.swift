@@ -402,10 +402,16 @@ final class SchemaV4MigrationTests: XCTestCase {
             try store.replaceMany(batch)
         }
         func pending() -> Int { scalar(open(dbURL), "SELECT COUNT(*) FROM pending_vecs") }
+        // A REAL TIMER, so the thing under test is the scheduling rather than a forced call - which
+        // means a wall-clock wait, which means this must be generous. The stamp's own gap is 2s;
+        // the ceiling below is 30 of those, and it exists only so a broken scheduler fails the test
+        // instead of hanging it. Seen failing once at 20s while the machine was busy launching the
+        // app and indexing at 500% CPU, which is a flaky test, not a finding.
         func waitForDrain(_ label: String) {
-            let deadline = Date().addingTimeInterval(20)
+            let deadline = Date().addingTimeInterval(60)
             while Date() < deadline, pending() > 0 { usleep(100_000) }
-            XCTAssertEqual(pending(), 0, "\(label): coverage did not drain the pending vectors")
+            XCTAssertEqual(pending(), 0,
+                           "\(label): coverage did not drain the pending vectors within 60s")
         }
 
         try write(0 ..< 300)
