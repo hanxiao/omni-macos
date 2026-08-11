@@ -514,7 +514,24 @@ public final class Indexer: @unchecked Sendable {
             var discovered: [String: Int] = [:]
             var totals: [String: Int] = [:]          // final, once the walk has finished
             var walking = true
+            /// Files sitting in `pending` and not yet taken. Tracked rather than summed, because
+            /// the producer tests it on every file.
+            var queued = 0
         }
+        // BACKPRESSURE, because the two ends of this queue differ by four orders of magnitude: the
+        // walk finds ~10^5 files/s and the pipeline embeds single-digit-to-tens per second. Without
+        // a bound the "queue" is not a queue, it is a full materialisation of the corpus in memory -
+        // one CrawledFile (path String plus a few numbers) per file, which on a 2.6M-file index is
+        // hundreds of megabytes that exist only to be read back slowly.
+        //
+        // The consumed-prefix trim below cannot save it: it needs head*2 > count, and count outruns
+        // head by that same factor for the whole walk.
+        //
+        // 100k files is far more than the consumer can be behind on usefully, and small enough to
+        // be a rounding error on any machine - the point is only that it is BOUNDED. The walk
+        // blocks when it is reached and resumes as the pipeline drains, so streaming is unchanged;
+        // what stops is the runaway read-ahead.
+        let queueCap = ProcessInfo.processInfo.environment["OMNI_CRAWL_QUEUE_CAP"].flatMap(Int.init) ?? 100_000
         let passStart = Date()
         // A ROW FOR EVERY ROOT, IMMEDIATELY. The sidebar draws its ring from this entry, and with a
         // streaming crawl the TOTAL is not known until the walk ends - so seeding it here is what
@@ -553,7 +570,11 @@ public final class Indexer: @unchecked Sendable {
                 .walk(shouldContinue: { !self.isCancelled }) { f in
                     guard let r = rootOf(f.path) else { return }
                     feed.lock.lock()
+                    // Wait for room. Cancellation breaks the wait as well as the walk, or a
+                    // paused pass would leave this thread parked on a queue nobody will drain.
+                    while feed.queued >= queueCap, !self.isCancelled { feed.lock.wait() }
                     feed.pending[r, default: []].append(f)
+                    feed.queued += 1
                     counts[r, default: 0] += 1
                     feed.discovered[r] = counts[r]
                     feed.lock.broadcast()
@@ -593,6 +614,7 @@ public final class Indexer: @unchecked Sendable {
                     guard let q = feed.pending[r], head < q.count else { continue }
                     wave.append(q[head])
                     feed.cursor[r] = head + 1
+                    feed.queued -= 1
                     progress = true
                     if wave.count >= max { break }
                 }
@@ -605,6 +627,7 @@ public final class Indexer: @unchecked Sendable {
                     feed.cursor[r] = 0
                 }
             }
+            feed.lock.broadcast()   // room made: wake the walk if the cap parked it
             return (wave, feed.discovered)
         }
 

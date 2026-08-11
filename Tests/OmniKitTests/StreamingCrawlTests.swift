@@ -159,6 +159,45 @@ final class StreamingCrawlTests: XCTestCase {
                        "a deleted file survived a complete pass")
     }
 
+    /// THE QUEUE BETWEEN THE WALK AND THE PIPELINE IS BOUNDED.
+    ///
+    /// The walk finds files about four orders of magnitude faster than the pipeline embeds them, so
+    /// an unbounded hand-off is not a queue - it is the whole corpus held in memory, one path
+    /// string per file, existing only to be read back slowly. That failure is invisible in every
+    /// way a test usually looks: every file is still indexed, every count still agrees, and the
+    /// only symptom is resident bytes on a machine large enough not to notice.
+    ///
+    /// So this measures the one thing that shows it: with a deliberately slow consumer, the walk
+    /// must NOT run away to completion. It should sit at its cap waiting for room.
+    func testTheCrawlQueueDoesNotRunAwayFromASlowPipeline() throws {
+        let a = try makeRoot("alpha", files: 900)
+        let store = try VectorStore(dbURL: dir.appendingPathComponent("i.sqlite"))
+        defer { store.close() }
+        let emb = RecordingEmbedder()
+        let indexer = Indexer(store: store, embedder: emb)
+        // Small cap, so the test does not need a corpus big enough to hit the shipped one.
+        setenv("OMNI_CRAWL_QUEUE_CAP", "64", 1)
+        defer { unsetenv("OMNI_CRAWL_QUEUE_CAP") }
+
+        var maxDiscoveredWhileBehind = 0
+        let done = XCTestExpectation(description: "pass")
+        indexer.index(roots: [a], settings: IndexSettings(enabledKinds: [.text]), force: true) { p in
+            // While the pipeline is still early, how far has the WALK got? With backpressure the
+            // walk can only be a cap's worth ahead of what has been consumed.
+            if !p.done, p.embedded < 200 {
+                let discovered = p.perRoot.values.reduce(0) { $0 + $1.total }
+                maxDiscoveredWhileBehind = max(maxDiscoveredWhileBehind, discovered)
+            }
+            if p.done { done.fulfill() }
+        }
+        wait(for: [done], timeout: 120)
+
+        XCTAssertEqual(store.count, 900, "backpressure must not cost files")
+        XCTAssertLessThan(maxDiscoveredWhileBehind, 900,
+                          "the walk ran to completion while the pipeline was still at the start: "
+                          + "the hand-off queue is unbounded and holds the whole corpus")
+    }
+
     /// THE RING HAS TO HAVE NUMBERS TO DRAW. With a streaming crawl the total is not known when the
     /// pass starts, and the sidebar's progress needs both halves of "x / y" while the work is
     /// happening - not a denominator that appears at the end. Seeding an entry per root and

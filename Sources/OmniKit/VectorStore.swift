@@ -1480,6 +1480,18 @@ public final class VectorStore: @unchecked Sendable {
 
     /// Single-file form of provenRowRangesLocked. Returns one range: the file's window if it is
     /// proven complete, otherwise the whole row array.
+    /// The window that CONTAINS file `id`'s rows, without paying to prove that it does.
+    ///
+    /// provenRowWindowLocked exists for readers that must not MISS a row - a best-chunk score would
+    /// be silently wrong - so it verifies containment and, failing that, hands back the whole table.
+    /// Readers whose failure direction is merely "do less work" (the dedup and chunk-reuse paths: a
+    /// missed row means that chunk gets re-embedded) want the opposite trade, and they run per file
+    /// during indexing where a whole-table fallback is not affordable.
+    @inline(__always) private func containmentWindowLocked(_ id: Int32) -> Range<Int> {
+        guard rowWindowsUsableLocked, Int(id) < fileRowLo.count else { return 0 ..< rows.count }
+        return rawRowWindowLocked(id)
+    }
+
     @inline(__always) private func provenRowWindowLocked(_ id: Int32, dead: Set<Int32>) -> Range<Int> {
         guard rowWindowsUsableLocked, Int(id) < fileRowLo.count,
               liveRowsInWindowLocked(id, dead: dead) == Int(fileChunkCount[Int(id)]) else {
@@ -1595,6 +1607,20 @@ public final class VectorStore: @unchecked Sendable {
         // reads them - the check is a shape question, so it costs nothing on a normal open.
         if layoutLocked() != .v4, tableExists("chunk_text") {
             for t in StoreSchema.v4OnlyTables { exec("DROP TABLE IF EXISTS \(t);") }
+        }
+        // AND `files` ITSELF, when it is the v4 shape under a chunk table that is not.
+        //
+        // `files` is not in v4OnlyTables because both layouts have one, and dropping it blindly
+        // would destroy the live index (that bug was caught by the round-trip test). But the
+        // combination "chunks is v2/v3 AND files has dir_id" can only be a downgrade round trip:
+        // an older binary drops `chunks`, recreates it in its own shape, and then no-ops on
+        // `CREATE TABLE IF NOT EXISTS files(id, path)` because a table of that name already
+        // exists. It then cannot insert a file row at all - dir_id is NOT NULL - so it indexes
+        // nothing, and coming back here the conversion reads `f.path` off a table that has no such
+        // column and fails on every launch, with Repair unable to help. The table describes an
+        // index that no longer exists, so it goes.
+        if layoutLocked() != .v4, hasTableLocked("files"), hasColumnLocked("files", "dir_id") {
+            exec("DROP TABLE IF EXISTS files;")
         }
         if layoutLocked() == .v4 {
             for sql in StoreSchema.createStatements() { exec(sql) }
@@ -2019,7 +2045,15 @@ public final class VectorStore: @unchecked Sendable {
                 for e in entries {
                     // Keyed by the file, so the entry cannot outlive the file it describes, and
                     // the path is not written a second time.
-                    guard let fid = fileIDLocked(e.path, insert: false) else { continue }
+                    //
+                    // insert: true, and that is load-bearing. The indexer records keys in batches
+                    // of 64 while the CHUNKS are staged in batches of 256, so a key routinely
+                    // arrives before its file has any rows - and `insert: false` dropped it
+                    // silently, taking content dedup with it for most of a pass. v3 keyed this
+                    // table by path and so never noticed. Over-recording is the safe direction and
+                    // always was: a key whose chunks never land fails duplicateChunks' lockstep
+                    // check against `modified`, so it is an unused row, not a wrong vector.
+                    guard let fid = fileIDLocked(e.path, insert: true) else { continue }
                     let digest = StoreSchema.contentKeyDigest(e.key)
                     sqlite3_reset(stmt)
                     sqlite3_bind_int64(stmt, 1, fid)
@@ -2078,7 +2112,13 @@ public final class VectorStore: @unchecked Sendable {
             guard !keyOf.isEmpty else { return [:] }
             var out: [String: [Float]] = [:]
             let dead = deadRows
-            let window = provenRowWindowLocked(id, dead: dead)
+            // The CONTAINMENT window, not the proven one. Proving it costs a scan of the window,
+            // and - the part that matters - an unproven window falls back to 0 ..< rows.count, a
+            // pass over the whole index. This runs per duplicate candidate WHILE INDEXING, so that
+            // fallback would be millions of iterations per file. Containment is all this needs:
+            // the loop filters on fileID anyway, and the failure direction is safe - a row the
+            // window somehow missed is simply a chunk that gets re-embedded.
+            let window = containmentWindowLocked(id)
             flat16.withUnsafeBufferPointer { buf in
                 guard buf.count >= rows.count * wantDim else { return }
                 for i in window where fileID[i] == id && !dead.contains(Int32(i)) {
@@ -2132,7 +2172,8 @@ public final class VectorStore: @unchecked Sendable {
         guard dim > 0, let id = pathID[path] else { return nil }
         var byIndex: [Int: Int] = [:]     // chunk_index -> resident row
         let dead = deadRows
-        for i in provenRowWindowLocked(id, dead: dead) where fileID[i] == id && !dead.contains(Int32(i)) {
+        // Containment, not proof - see chunkVectors for why, and why missing a row is safe here.
+        for i in containmentWindowLocked(id) where fileID[i] == id && !dead.contains(Int32(i)) {
             byIndex[rows[i].chunkIndex] = i
         }
         guard !byIndex.isEmpty else { return nil }
@@ -2248,11 +2289,22 @@ public final class VectorStore: @unchecked Sendable {
             // real index, and paid even by the repeat delete that removes nothing.
             exec("DROP TABLE IF EXISTS temp.victims;")
             stmt = nil
+            // CHECKED, because everything below reads this table by name. If the create fails, the
+            // unchecked deletes that follow each fail too - silently, since exec() swallows errors -
+            // and then removeRowsLocked drops the rows from MEMORY anyway. SQLite would still have
+            // them, so the folder would reappear at the next launch after a whole session of the
+            // in-memory state saying otherwise. Bail before touching anything instead.
+            var built = false
             if sqlite3_prepare_v2(db, "CREATE TEMP TABLE victims AS \(StoreSchema.fileIDsUnderFolder);", -1, &stmt, nil) == SQLITE_OK {
                 sqlite3_bind_text(stmt, 1, folder, -1, SQLITE_TRANSIENT)
-                sqlite3_step(stmt)
+                built = sqlite3_step(stmt) == SQLITE_DONE
             }
             sqlite3_finalize(stmt); stmt = nil
+            guard built else {
+                exec("ROLLBACK;")
+                FileHandle.standardError.write(Data("[omni] folder delete aborted: could not resolve the files under \(folder)\n".utf8))
+                return
+            }
             for sql in ["DELETE FROM chunk_text WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id IN (SELECT id FROM temp.victims));",
                         "DELETE FROM pending_vecs WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id IN (SELECT id FROM temp.victims));",
                         "DELETE FROM dedup WHERE file_id IN (SELECT id FROM temp.victims);",
@@ -5016,10 +5068,15 @@ public final class VectorStore: @unchecked Sendable {
         }
         guard ok, written == slots.count,
               execChecked("DELETE FROM meta WHERE key = '\(Self.coveredRowsKey)';"),
+              // The watermark goes with the claim it belongs to. Leaving it behind is harmless
+              // today - a claim of 0 means nothing reads it - but a fragment of a claim outliving
+              // the claim is precisely the shape of the two bugs this scheme has already produced.
+              execChecked("DELETE FROM meta WHERE key = '\(Self.coveredUpToIDKey)';"),
               execChecked("DELETE FROM vec_holes;"),
               execChecked("COMMIT;")
         else { exec("ROLLBACK;"); return false }
         coveredRows = 0
+        coveredUpToID = 0
         vecHoles.removeAll()
         if Self.searchTiming { print("[store] restored \(written) blobs; coverage stood down") }
         return true
@@ -5273,7 +5330,14 @@ public final class VectorStore: @unchecked Sendable {
         let claim = scalar("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(coveredRowsKey)'")
         guard claim > 0 else { return .nothingToDo }
         let holes = scalar("SELECT COUNT(*) FROM vec_holes")
-        let cleared = Swift.max(0, scalar("SELECT COUNT(*) FROM chunks") - scalar("SELECT COUNT(*) FROM pending_vecs"))
+        // LAYOUT-AWARE, because `scalar` returns -1 when prepare fails and `pending_vecs` does not
+        // exist on a v3 index. That -1 turned into a cleared count one HIGHER than the row count,
+        // which never matches the claim - so Repair, offered next to an error message on exactly
+        // the index whose upgrade was interrupted, answered "reindex" for a database whose next
+        // launch would have converted it cleanly in 26 seconds.
+        let cleared = tableExists(db, "pending_vecs")
+            ? Swift.max(0, scalar("SELECT COUNT(*) FROM chunks") - scalar("SELECT COUNT(*) FROM pending_vecs"))
+            : scalar("SELECT COUNT(*) FROM chunks WHERE length(vec) = 0")
         let dim = scalar("SELECT CAST(value AS INTEGER) FROM meta WHERE key='dim'")
         guard dim > 0, cleared >= 0, holes >= 0 else { return .nothingToDo }
         if cleared == claim - holes { return .nothingToDo }

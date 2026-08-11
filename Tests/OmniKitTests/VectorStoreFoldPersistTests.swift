@@ -170,13 +170,22 @@ final class VectorStoreFoldPersistTests: XCTestCase {
             if !delta.isEmpty { try store.replaceMany(delta) }
             let hitsIncremental = store.search(q, topK: 40)   // incremental fold happens here
 
-            // A second, independent connection full-rebuilds from scratch over the same rows.
+            // A second connection full-rebuilds from scratch over the same rows - AFTER the first
+            // has closed, not alongside it.
+            //
+            // Two live stores on one index is not a supported state: the vector file is held under
+            // an exclusive lock, and a second store that cannot map it refuses to open rather than
+            // present an empty index. This test used to get away with it because coverage never
+            // advanced inside a session, so the second store took the plain SQLite scan and never
+            // reached for the file. Now that a mutation re-arms the coverage stamp, it does - and
+            // the refusal it hit was the guard working, not a fold defect. `hitsIncremental` is
+            // already captured, so closing first costs the test nothing.
+            store.close()
             let fresh = try VectorStore(dbURL: url)
             let hitsFull = fresh.search(q, topK: 40)
 
             assertEquivalentHits(hitsIncremental, hitsFull, "incremental fold vs full rebuild")
             assertMatchesShadow(hitsIncremental, shadow, q, "incremental fold vs ground truth")
-            store.close()
             fresh.close()
         }
     }
@@ -216,12 +225,14 @@ final class VectorStoreFoldPersistTests: XCTestCase {
             try store.replaceMany(mods)
             let hitsGather = store.search(q, topK: 40)
 
+            // Closed before the second connection opens - same reason as the fold test above: two
+            // live stores on one index is not a supported state once coverage has advanced.
+            store.close()
             let fresh = try VectorStore(dbURL: url)
             let hitsFull = fresh.search(q, topK: 40)
             assertEquivalentHits(hitsGather, hitsFull, "gathered base vs full rebuild")
             assertMatchesShadow(hitsGather, shadow, q, "gathered base vs ground truth")
             XCTAssertFalse(hitsGather.contains { dead.contains($0.path) }, "deleted rows must not surface")
-            store.close()
             fresh.close()
         }
     }

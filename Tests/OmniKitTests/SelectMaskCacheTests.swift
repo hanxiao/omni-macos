@@ -10,6 +10,26 @@ import XCTest
 /// Every input the key has to cover gets its own arm here, each compared against the same query
 /// run on a freshly opened store (empty caches, mask built from scratch).
 final class SelectMaskCacheTests: XCTestCase {
+    /// TWO LIVE STORES ON ONE INDEX, which every arm here depends on: each compares a cached-mask
+    /// query against the same query on a freshly opened store, with the first still open. That is
+    /// not a supported state once coverage has advanced - the vector file is held under an
+    /// exclusive lock and a store that cannot map it refuses to open rather than serve an empty
+    /// index - so coverage is switched off for the duration. Nothing here is about coverage; the
+    /// tests got away with it before only because a short-lived store never advanced far enough to
+    /// need the file, and re-arming the coverage stamp on every mutation changed that.
+    private var savedCoverage = true
+
+    override func setUp() {
+        super.setUp()
+        savedCoverage = VectorStore.vecCoverage
+        VectorStore.vecCoverage = false
+    }
+
+    override func tearDown() {
+        VectorStore.vecCoverage = savedCoverage
+        super.tearDown()
+    }
+
     private let dim = 128
     private let files = 20_000
 

@@ -152,6 +152,15 @@ declines (with a message, not an error) when it is not there.
 
 ### Downgrade
 
-An older binary opening a v4 index sees `user_version = 4`, drops `chunks` and rebuilds it in the
-v3 shape, and reindexes - the index has always been a rebuildable cache. Returning to v4 afterwards
-detects the leftover v4 tables and clears them before migrating again.
+An older binary opening a v4 index sees `user_version = 4` and drops `chunks` and `content_keys` -
+but NOT `files`, whose name it shares with a table of an incompatible shape. Its
+`CREATE TABLE IF NOT EXISTS files(id, path)` then no-ops, and it can neither read `f.path` nor
+insert a row (`dir_id` is NOT NULL), so it indexes nothing at all. It does not merely reindex.
+
+Coming back is what has to work, and it is handled explicitly: "chunks is v2/v3 AND files has
+`dir_id`" can only be a downgrade round trip, so that `files` is dropped before the conversion runs.
+Without it, phase 1 selects `f.path` from a v4-shaped table and fails on every launch, with Repair
+unable to help - it only knows how to drop a path table under a LEGACY chunk table.
+
+The lesson is in the table names: reusing `files` and `chunks` for incompatible shapes is what makes
+a downgrade a one-way door rather than a reindex.

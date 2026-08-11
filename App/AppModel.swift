@@ -1409,8 +1409,28 @@ final class AppModel {
             item.source = HistorySource.serving.rawValue
             searchHistory.insert(item, at: 0)
         }
-        pruneHistory()
-        persistHistory()
+        // The in-memory insert is immediate, so the sidebar updates live. The SORT and the JSON
+        // encode are not: prune+persist per request is fine at human typing speed and wasteful at
+        // agent speed, where a burst of searches would each sort 200 items and rewrite the whole
+        // list to UserDefaults on the main actor.
+        scheduleServedHistoryFlush()
+    }
+
+    private var servedFlushScheduled = false
+
+    /// Coalesce the prune+persist behind a burst of served searches. ARM-ONCE, not a debounce: a
+    /// sustained stream of requests would push a reset-on-each-call deadline out for ever, which is
+    /// the same trap the coverage stamp fell into.
+    private func scheduleServedHistoryFlush() {
+        guard !servedFlushScheduled else { return }
+        servedFlushScheduled = true
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard let self else { return }
+            self.servedFlushScheduled = false
+            self.pruneHistory()
+            self.persistHistory()
+        }
     }
 
     /// Re-run a history item: restore its filters + sort (without firing a search per change), set the
