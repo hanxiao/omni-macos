@@ -1002,8 +1002,11 @@ public final class VectorStore: @unchecked Sendable {
     private static let searchActiveWindow: TimeInterval = 2.0
     private func searchRecentlyActiveLocked() -> Bool { -lastSearchAt.timeIntervalSinceNow < Self.searchActiveWindow }
 
-    /// When maintenance first stood aside for a searcher, or nil if it is not currently standing aside.
-    private var yieldingSince: Date?
+    /// When each maintenance path first stood aside, keyed by path. PER PATH, not one shared
+    /// stamp: with a single field, the first path to break through cleared it and the next to ask
+    /// re-armed the clock, so any given path could be held off for a multiple of the bound rather
+    /// than the bound.
+    private var yieldingSince: [String: Date] = [:]
     /// How long maintenance may be held off by continuous searching before it goes ahead anyway.
     private static let maxYieldToSearch: TimeInterval = 120
 
@@ -1016,11 +1019,11 @@ public final class VectorStore: @unchecked Sendable {
     /// hole reclaim and the scan-width upgrade for the whole session. checkpointIfDueLocked already
     /// had the right shape - back off UNLESS the WAL has grown past a hard cap - and this is the
     /// same idea with time as the bound instead of bytes.
-    private func yieldToSearchLocked() -> Bool {
-        guard searchRecentlyActiveLocked() else { yieldingSince = nil; return false }
-        let since = yieldingSince ?? Date()
-        yieldingSince = since
-        guard -since.timeIntervalSinceNow < Self.maxYieldToSearch else { yieldingSince = nil; return false }
+    private func yieldToSearchLocked(_ path: String = #function) -> Bool {
+        guard searchRecentlyActiveLocked() else { yieldingSince[path] = nil; return false }
+        let since = yieldingSince[path] ?? Date()
+        yieldingSince[path] = since
+        guard -since.timeIntervalSinceNow < Self.maxYieldToSearch else { yieldingSince[path] = nil; return false }
         return true
     }
     /// PAPER LEVER (var, not let): see the block near cantWinGate.
@@ -5029,29 +5032,38 @@ public final class VectorStore: @unchecked Sendable {
     /// the file has slots and nothing says which slot went missing - and from that slot onward every
     /// row would resolve to its neighbour's vector. Slots at or above `coveredRows` are ignored:
     /// those rows still carry their own blob, so the file's copy of them is not load-bearing.
-    /// Slots this transaction has added to `vecHoles`, so a ROLLBACK can take them back out.
+    private func beginTxnLocked() { exec("BEGIN;") }
+
+    /// Roll back, and put the resident hole set back in step with the table.
     ///
-    /// recordHolesLocked writes the hole to SQLite AND to the resident set, inside the caller's
-    /// transaction - which is right, because the two must commit together. But nothing undid the
-    /// resident half when the transaction rolled back, and nothing re-reads `vec_holes` afterwards:
-    /// the only SELECT is at open. A rolled-back replace() therefore left a phantom hole that made
-    /// `coveredRows - vecHoles.count` understate the covered rows for the rest of the session, which
-    /// the coverage advance answers by refusing every slice.
-    private var holesAddedInTxn: [Int32] = []
-
-    /// Start a chunk-mutating transaction. The hole list is per-transaction, and clearing it HERE
-    /// rather than at each commit is what makes a later rollback unable to undo an earlier
-    /// transaction's holes.
-    private func beginTxnLocked() {
-        holesAddedInTxn.removeAll(keepingCapacity: true)
-        exec("BEGIN;")
-    }
-
-    /// Roll back, and take the resident hole additions with it.
+    /// recordHolesLocked writes a hole to SQLite AND to the resident set inside the caller's
+    /// transaction - which is right, they must commit together - but nothing undid the resident
+    /// half when the transaction rolled back, and nothing re-reads `vec_holes` afterwards: the only
+    /// other SELECT is at open. A rolled-back replace() left a phantom hole, which makes
+    /// `coveredRows - vecHoles.count` understate the covered rows and the advance refuse slices.
+    ///
+    /// RE-READ, RATHER THAN UNDO A DELTA. The first attempt tracked "slots added by this
+    /// transaction" and subtracted them here, cleared at BEGIN. That is correct only if EVERY
+    /// begin clears - and several transactions open with execChecked("BEGIN;"), which the helper
+    /// never saw. advanceCoverageLocked is one of them, and it both records holes and rolls back:
+    /// its rollback would delete holes a PREVIOUS, COMMITTED transaction had added, leaving the
+    /// resident set short. That direction is far worse than the bug it replaced - a phantom hole
+    /// makes coverage refuse a slice, which stalls visibly, while a MISSING hole makes the slot
+    /// rule count through fewer holes than the file has and hands every row past it its
+    /// neighbour's vector, silently.
+    ///
+    /// After a ROLLBACK the table is authoritative and small (bounded by deadBudget, a handful of
+    /// integers in practice), and rollbacks are rare. So there is no delta to keep, and no way for
+    /// a begin site to be missed.
     private func rollbackTxnLocked() {
         exec("ROLLBACK;")
-        for s in holesAddedInTxn { vecHoles.remove(s) }
-        holesAddedInTxn.removeAll(keepingCapacity: true)
+        guard dbOpen() else { return }
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, "SELECT slot FROM vec_holes;", -1, &stmt, nil) == SQLITE_OK else { return }
+        var fresh = Set<Int32>()
+        while sqlite3_step(stmt) == SQLITE_ROW { fresh.insert(sqlite3_column_int(stmt, 0)) }
+        vecHoles = fresh
     }
 
     private func recordHolesLocked(_ slots: [Int32], coveredOverride: Int? = nil) {
@@ -5066,7 +5078,6 @@ public final class VectorStore: @unchecked Sendable {
         }
         sqlite3_finalize(stmt)
         for s in fresh { vecHoles.insert(s) }
-        holesAddedInTxn.append(contentsOf: fresh)
     }
 
     /// Write every covered row's vector back into its SQLite blob, and stand the coverage claim

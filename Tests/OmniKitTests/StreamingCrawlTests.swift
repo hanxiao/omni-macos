@@ -198,6 +198,35 @@ final class StreamingCrawlTests: XCTestCase {
                           + "the hand-off queue is unbounded and holds the whole corpus")
     }
 
+    /// CANCELLING WHILE THE WALK IS PARKED ON A FULL QUEUE MUST STILL RETURN.
+    ///
+    /// Backpressure parks the producer on a condition that `cancel()` never signals - it sets its
+    /// flag under a different lock entirely. A plain wait() there is a lost wakeup, and because the
+    /// walker delivers under its pool lock, the parked worker takes the other seven and
+    /// concurrentPerform down with it: eight wedged threads, a retained Indexer and the whole queue,
+    /// for the life of the process. Repeat pause/resume and they accumulate.
+    ///
+    /// A cap far below the corpus guarantees the producer IS parked when the cancel lands, which is
+    /// the state the completed-pass test never reaches.
+    func testCancellingWhileTheWalkIsBlockedOnAFullQueueReturns() throws {
+        let a = try makeRoot("alpha", files: 1_200)
+        let store = try VectorStore(dbURL: dir.appendingPathComponent("i.sqlite"))
+        defer { store.close() }
+        setenv("OMNI_CRAWL_QUEUE_CAP", "32", 1)
+        defer { unsetenv("OMNI_CRAWL_QUEUE_CAP") }
+
+        let indexer = Indexer(store: store, embedder: RecordingEmbedder())
+        let done = XCTestExpectation(description: "cancelled pass returns")
+        let t0 = Date()
+        indexer.index(roots: [a], settings: IndexSettings(enabledKinds: [.text]), force: true) { p in
+            if p.embedded >= 40 { indexer.cancel() }
+            if p.done { done.fulfill() }
+        }
+        wait(for: [done], timeout: 30)
+        XCTAssertLessThan(-t0.timeIntervalSinceNow, 25,
+                          "a cancel while the walk was parked on a full queue did not unblock it")
+    }
+
     /// THE RING HAS TO HAVE NUMBERS TO DRAW. With a streaming crawl the total is not known when the
     /// pass starts, and the sidebar's progress needs both halves of "x / y" while the work is
     /// happening - not a denominator that appears at the end. Seeding an entry per root and

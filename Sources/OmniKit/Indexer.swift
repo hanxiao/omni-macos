@@ -570,9 +570,24 @@ public final class Indexer: @unchecked Sendable {
                 .walk(shouldContinue: { !self.isCancelled }) { f in
                     guard let r = rootOf(f.path) else { return }
                     feed.lock.lock()
-                    // Wait for room. Cancellation breaks the wait as well as the walk, or a
-                    // paused pass would leave this thread parked on a queue nobody will drain.
-                    while feed.queued >= queueCap, !self.isCancelled { feed.lock.wait() }
+                    // Wait for room - on a TIMED wait, which is the whole difference between a
+                    // pause and a wedge.
+                    //
+                    // `cancel()` sets its flag under the STORE's queue and never touches this
+                    // condition, so a plain wait() is a lost wakeup: the only broadcast comes from
+                    // the consumer, and the consumer stops the moment it sees the cancel. Re-testing
+                    // `isCancelled` in the loop condition does not help, because the condition is
+                    // only re-tested after a signal that never arrives.
+                    //
+                    // And this thread is not merely leaked. BulkDirWalker calls `deliver` SERIALLY,
+                    // under the pool's own lock, so a parked worker holds that lock, the other seven
+                    // block acquiring it, concurrentPerform never returns, and eight global-pool
+                    // threads wedge for the life of the process - along with a strong self and the
+                    // whole queue. Pause is an ordinary user action, and on any corpus past the cap
+                    // the producer is parked for most of the pass, so this is the common path.
+                    while feed.queued >= queueCap, !self.isCancelled {
+                        feed.lock.wait(until: Date().addingTimeInterval(0.1))
+                    }
                     feed.pending[r, default: []].append(f)
                     feed.queued += 1
                     counts[r, default: 0] += 1
@@ -982,6 +997,11 @@ public final class Indexer: @unchecked Sendable {
         // corrupt the index and break resume.
         // COMPLETE, not merely uncancelled: with a streaming crawl a pass can end early with the
         // walk still running, and `seen` would then be missing files nobody has looked at yet.
+        // THE CONSUMER IS THE ONLY THING THAT BROADCASTS, and this loop exits on `isCancelled`
+        // without taking another wave - so a producer parked on a full queue at that moment is
+        // never signalled again. The timed wait in the producer already bounds that, but this is
+        // the direct half of the fix: whoever stops last tells the other side.
+        feed.lock.lock(); feed.lock.broadcast(); feed.lock.unlock()
         let wasCancelled = isCancelled || !walkFinished
         if !wasCancelled {
             // Reconcile deletions, with three guards so we only remove files genuinely gone from
