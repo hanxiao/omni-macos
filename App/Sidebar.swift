@@ -273,22 +273,19 @@ struct CloudSyncPie: View {
     let fraction: Double?
 
     var body: some View {
-        Group {
+        // ONE ELEMENT, not two. `nil` - queued behind another pass, or still being counted - is the
+        // SAME indicator with no wedge yet: same circle, same size, same stroke, zero progress. It
+        // was briefly a smaller bare circle of its own, which read as a different kind of thing
+        // sitting in the column where progress belongs, and the row visibly changed shape the
+        // moment counting finished. The ring is drawn once, outside the branch, so that cannot
+        // drift again.
+        ZStack {
+            Circle().strokeBorder(Color.secondary.opacity(0.4), lineWidth: 1)
             if let fraction {
-                ZStack {
-                    Circle().strokeBorder(Color.secondary.opacity(0.4), lineWidth: 1)
-                    PieWedge(fraction: max(0.03, min(1, fraction)))
-                        .fill(Color.secondary)
-                        .padding(1)
-                        .animation(.easeInOut(duration: 0.2), value: fraction)
-                }
-            } else {
-                // NO TOTAL YET - queued behind another pass, or still being counted. An EMPTY RING
-                // says that: same glyph as the progress it is about to become, at zero, so the row
-                // does not change shape when counting finishes and the wedge starts filling. A
-                // spinner here read as a different kind of activity, and a count read as "empty".
-                Circle().strokeBorder(Color.secondary.opacity(0.4), lineWidth: 1)
-                    .frame(width: 11, height: 11)
+                PieWedge(fraction: max(0.03, min(1, fraction)))
+                    .fill(Color.secondary)
+                    .padding(1)
+                    .animation(.easeInOut(duration: 0.2), value: fraction)
             }
         }
         // A solid hover target so the .help tooltip fires anywhere over the glyph (the shapes
