@@ -884,8 +884,17 @@ struct IndexFailedView: View {
             Text("Omni can't open its index").font(.title)
             Text(message).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center).frame(maxWidth: 460)
+            if let repair = model.repairMessage {
+                Text(repair).font(.callout).foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center).frame(maxWidth: 460)
+            }
             HStack {
                 Button("Retry") { model.retryBootstrap() }.buttonStyle(.borderedProminent)
+                // Repair corrects the vector bookkeeping when the mapping is provable, and says so
+                // plainly when it is not - it never guesses, because a wrong guess here returns
+                // rows their neighbour's vector with no error at all.
+                Button(model.repairRunning ? "Repairing..." : "Repair") { model.repairIndex() }
+                    .disabled(model.repairRunning || model.dbPath.isEmpty)
                 Button("Reveal in Finder") {
                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.dbPath)])
                 }

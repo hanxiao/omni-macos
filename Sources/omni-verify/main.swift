@@ -1331,6 +1331,18 @@ func storeauditRun(_ path: String) throws -> Int32 {
 }
 if args.count >= 3 && args[1] == "storeaudit" { exit(try storeauditRun(args[2])) }
 
+// Run the Repair button's engine against an index, from the terminal: omni-verify repair <db>
+// Same call the app makes, so what it prints here is what a user would be told - and it writes
+// only in the `repaired` case, so pointing it at a healthy or unrepairable index changes nothing.
+if args.count >= 3 && args[1] == "repair" {
+    let url = URL(fileURLWithPath: args[2])
+    switch VectorStore.repairIndex(at: url) {
+    case .repaired(let what):    print("REPAIRED      \(what)"); exit(0)
+    case .nothingToDo:           print("NOTHING TO DO the vector bookkeeping is already consistent"); exit(0)
+    case .needsReindex(let why): print("CANNOT REPAIR \(why)"); exit(1)
+    }
+}
+
 // What the per-file row window is worth: omni-verify rowwindowbench [rows]
 // Position in the index is the whole story. The readers already stopped once they had the file's
 // chunks, so a file at the FRONT was always cheap; the cost was the rows BEFORE the file, and the

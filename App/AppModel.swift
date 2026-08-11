@@ -151,6 +151,34 @@ final class AppModel {
         return weights + (replica ?? 0)
     }
 
+    /// Try to repair the index the store refused to open, then reload if it worked.
+    ///
+    /// Off the main actor: it opens the database and reads the vector file. Only the provable
+    /// repairs are attempted - see VectorStore.repairIndex - so a "cannot" here is a real answer
+    /// and not a shrug.
+    func repairIndex() {
+        guard !repairRunning, let url = try? Self.indexURL() else { return }
+        repairRunning = true
+        repairMessage = nil
+        Task {
+            let outcome = await Task.detached(priority: .userInitiated) {
+                VectorStore.repairIndex(at: url)
+            }.value
+            await MainActor.run {
+                self.repairRunning = false
+                switch outcome {
+                case .repaired(let what):
+                    self.repairMessage = what
+                    self.retryBootstrap()
+                case .nothingToDo:
+                    self.repairMessage = "The vector bookkeeping is already consistent, so this is a different problem."
+                case .needsReindex(let why):
+                    self.repairMessage = why + " Re-indexing rebuilds the index from your files."
+                }
+            }
+        }
+    }
+
     static let defaultMinScore = 0.0   // show all matches by default; users can raise the bar in Search settings
 
     /// Cosine similarity is -1...1; the UI presents it as a 0...100% relevance, clamping the
@@ -972,6 +1000,11 @@ final class AppModel {
     /// screen CALLS the phase it is in, so the words track the work instead of saying "loading the
     /// model" through a database rewrite.
     var storePhase: StoreOpenPhase? = nil
+    /// Result of the last Repair attempt, shown on the index-failure screen. Repair is offered
+    /// there rather than run automatically: it writes to the index, and an index that refuses to
+    /// open is exactly when the user should be the one to say go.
+    var repairMessage: String? = nil
+    var repairRunning = false
     /// Title for the launch screen. The store's phase when it has one, because that is the part
     /// that can take tens of seconds; the model otherwise, which is what a normal launch is doing.
     var launchTitle: String {

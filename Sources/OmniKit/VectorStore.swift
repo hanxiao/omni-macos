@@ -5099,6 +5099,128 @@ public final class VectorStore: @unchecked Sendable {
              + "(\(cleared) vectors live in the file, the index accounts for \(accounted))."
     }
 
+    // MARK: - Repair (offered to the user when the store refuses to open)
+
+    /// What a repair attempt did, for the UI.
+    public enum RepairOutcome: Sendable {
+        /// The bookkeeping was corrected; reopening should work.
+        case repaired(String)
+        /// Nothing was wrong with the bookkeeping.
+        case nothingToDo
+        /// The state is understood but cannot be corrected without re-indexing, and WHY.
+        case needsReindex(String)
+    }
+
+    /// Repair the vector bookkeeping of an index that will not open, without a store.
+    ///
+    /// The store refuses when the claim, the holes and the cleared blobs stop agreeing, because the
+    /// row-to-slot mapping is then unprovable and guessing returns rows their neighbour's vector.
+    /// This repairs the cases where the mapping IS provable, using the one source of truth that is
+    /// independent of the bookkeeping: the rows that still carry their blob. Their vectors are in
+    /// the file, so finding them says exactly how many holes really precede them.
+    ///
+    ///   offset 0, claim disagrees   the claim merely lags. Derivable, so it is corrected.
+    ///   offset k > 0                k recorded holes are spurious - a delete that never committed
+    ///                               left a hole with a live row behind it. The COUNT is proven but
+    ///                               not WHICH k, and every row after the first spurious entry
+    ///                               shifts by one, so this reports rather than guesses.
+    ///
+    /// Opens its own connection: the whole point is that VectorStore.init threw.
+    public static func repairIndex(at dbURL: URL) -> RepairOutcome {
+        var h: OpaquePointer?
+        guard sqlite3_open(dbURL.path, &h) == SQLITE_OK, let db = h else {
+            return .needsReindex("The index database could not be opened.")
+        }
+        defer { sqlite3_close(db) }
+        func scalar(_ sql: String) -> Int {
+            var st: OpaquePointer?
+            defer { sqlite3_finalize(st) }
+            guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK,
+                  sqlite3_step(st) == SQLITE_ROW else { return -1 }
+            return Int(sqlite3_column_int64(st, 0))
+        }
+        let claim = scalar("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(coveredRowsKey)'")
+        guard claim > 0 else { return .nothingToDo }
+        let holes = scalar("SELECT COUNT(*) FROM vec_holes")
+        let cleared = scalar("SELECT COUNT(*) FROM chunks WHERE length(vec) = 0")
+        let dim = scalar("SELECT dim FROM chunks LIMIT 1")
+        guard dim > 0, cleared >= 0, holes >= 0 else { return .nothingToDo }
+        if cleared == claim - holes { return .nothingToDo }
+
+        let vecURL = dbURL.deletingLastPathComponent()
+            .appendingPathComponent(dbURL.lastPathComponent + ".vecs")
+        guard FileManager.default.fileExists(atPath: vecURL.path) else {
+            return .needsReindex("The vector file is missing, so the vectors it held cannot be recovered.")
+        }
+        // ANCHORS: rows that still carry a blob. Their vector is known, so finding it in the file
+        // says where the row really sits, and the difference from where the bookkeeping SAYS it
+        // sits is the number of recorded holes that are not real.
+        let offset = measureSlotOffset(db: db, vecURL: vecURL, dim: dim, claim: claim, holes: holes, cleared: cleared)
+        switch offset {
+        case .some(0):
+            // The placement is right and only the total is wrong: the claim lags the blobs.
+            let derived = cleared + holes
+            let need = derived * dim * MemoryLayout<UInt16>.size
+            guard let size = (try? FileManager.default.attributesOfItem(atPath: vecURL.path)[.size]) as? Int,
+                  size >= need else {
+                return .needsReindex("The vector file is smaller than the index says it should be.")
+            }
+            guard sqlite3_exec(db, "INSERT OR REPLACE INTO meta(key,value) VALUES('\(coveredRowsKey)','\(derived)');", nil, nil, nil) == SQLITE_OK
+            else { return .needsReindex("The index database is read-only.") }
+            return .repaired("Corrected the vector bookkeeping (\(claim) -> \(derived) slots). Nothing was re-embedded.")
+        case .some(let k) where k > 0:
+            return .needsReindex(
+                "\(k) of the \(holes) recorded vector slots are stale. Which \(k) cannot be "
+                + "determined from the index alone, and every row after the first one would be "
+                + "given its neighbour's vector, so this cannot be corrected safely.")
+        default:
+            return .needsReindex(
+                "The vector file and the index disagree by \(abs(cleared - (claim - holes))) rows "
+                + "in a way that cannot be resolved from what is on disk.")
+        }
+    }
+
+    /// How many slots the bookkeeping is out by, measured against rows that still carry their blob.
+    /// nil when no anchor could be located at all, which means the file is not the one this index
+    /// describes. Probes a bounded window: the drift this repairs is small by construction.
+    private static func measureSlotOffset(db: OpaquePointer, vecURL: URL, dim: Int,
+                                          claim: Int, holes: Int, cleared: Int) -> Int? {
+        guard let fh = try? FileHandle(forReadingFrom: vecURL) else { return nil }
+        defer { try? fh.close() }
+        let rowBytes = dim * MemoryLayout<UInt16>.size
+        var st: OpaquePointer?
+        defer { sqlite3_finalize(st) }
+        // Anchors are the rows past the covered prefix, in rowid order; the k-th of them should sit
+        // at (coveredLive + k) + holes if every recorded hole is real.
+        guard sqlite3_prepare_v2(db, """
+            SELECT rn, vec FROM (SELECT ROW_NUMBER() OVER (ORDER BY rowid) AS rn, length(vec) AS L, vec FROM chunks)
+             WHERE L > 0 ORDER BY rn LIMIT 24;
+            """, -1, &st, nil) == SQLITE_OK else { return nil }
+        var votes: [Int: Int] = [:]
+        while sqlite3_step(st) == SQLITE_ROW {
+            let rn = Int(sqlite3_column_int64(st, 0))
+            guard let raw = sqlite3_column_blob(st, 1) else { continue }
+            let n = Int(sqlite3_column_bytes(st, 1))
+            guard n >= rowBytes else { continue }
+            let want = Data(bytes: raw, count: rowBytes)
+            let predicted = rn - 1 + holes
+            for d in -64 ... 64 {
+                let slot = predicted + d
+                guard slot >= 0 else { continue }
+                try? fh.seek(toOffset: UInt64(slot * rowBytes))
+                guard let got = try? fh.read(upToCount: rowBytes), got == want else { continue }
+                votes[-d, default: 0] += 1     // -d: how many recorded holes are NOT real
+                break
+            }
+        }
+        guard let best = votes.max(by: { $0.value < $1.value }), best.value >= 3 else { return nil }
+        // Every anchor has to agree: a split vote means the file is not laid out the way any single
+        // offset explains, and no repair derived from it would be trustworthy.
+        guard votes.count == 1 else { return nil }
+        _ = (claim, cleared)
+        return best.key
+    }
+
     /// The coverage claim could not be read. Says so loudly and changes NOTHING on disk.
     ///
     /// An earlier version deleted the rows the file could no longer answer for, reasoning that the

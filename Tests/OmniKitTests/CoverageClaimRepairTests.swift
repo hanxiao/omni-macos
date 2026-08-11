@@ -83,6 +83,26 @@ final class CoverageClaimRepairTests: XCTestCase {
         for _ in 0 ..< 4 { let s = try VectorStore(dbURL: db); s.close() }   // stamps take the slices
     }
 
+    /// Append rows that stay UNCOVERED: their vectors go into the file (via the fold) but their
+    /// blobs survive, because coverage is held still while they are written.
+    ///
+    /// These are the anchors the repair measures against - a row whose vector is known AND present
+    /// in the file says where it really sits. A fixture where every row is covered has none, which
+    /// is not what a real index looks like: the reported one had 838 of them.
+    private func addUncoveredRows(_ db: URL, from: Int, count: Int) throws {
+        let saved = VectorStore.vecCoverage
+        VectorStore.vecCoverage = false          // stops coverage ADVANCING, never reading
+        defer { VectorStore.vecCoverage = saved }
+        let s = try VectorStore(dbURL: db)
+        for f in from ..< from + count {
+            let p = "/c/f\(f).txt"
+            try s.replace(path: p, chunks: [IndexedChunk(path: p, modified: 1, size: 1, kind: "text",
+                                                         chunkIndex: 0, snippet: "s\(f)", embedding: vec(f))])
+        }
+        _ = s.search(vec(0), topK: 5)            // fold, so the new vectors reach the file
+        s.close()
+    }
+
     /// Drop the row sidecar, so the next open goes through the COVERAGE path.
     ///
     /// Not a contrivance - it is the state the reported index was in (its `.rows` was gone, only
@@ -166,6 +186,76 @@ final class CoverageClaimRepairTests: XCTestCase {
             XCTAssertEqual(store.count, files)
             XCTAssertEqual(claim(db), before, "a healthy claim was rewritten")
             XCTAssertFalse(store.search(vec(3), topK: 5).isEmpty)
+        }
+    }
+
+    // MARK: - The Repair button's engine (VectorStore.repairIndex)
+
+    /// The provable case: repair corrects the claim and the index opens afterwards.
+    func testRepairFixesALaggingClaimAndTheIndexThenOpens() throws {
+        try withQuantMode {
+            let files = 40
+            let dir = tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+            let db = dir.appendingPathComponent("index.sqlite")
+            try makeCoveredIndex(db, files: files)
+            XCTAssertEqual(claim(db), files, "fixture never reached full coverage")
+            try addUncoveredRows(db, from: files, count: 8)
+            XCTAssertEqual(clearedBlobs(db), files, "the appended rows must keep their blobs")
+            sql(db, "INSERT OR REPLACE INTO meta(key,value) VALUES('vecs_covered_rows','\(files - 3)');")
+            dropRowSidecar(db)
+
+            switch VectorStore.repairIndex(at: db) {
+            case .repaired(let what):
+                XCTAssertTrue(what.contains("Nothing was re-embedded"), "got: \(what)")
+            case .nothingToDo: XCTFail("repair saw nothing to do on a broken index")
+            case .needsReindex(let why): XCTFail("refused a provable repair: \(why)")
+            }
+            XCTAssertEqual(claim(db), files, "repair did not correct the claim")
+            let store = try VectorStore(dbURL: db)      // and it opens now
+            defer { store.close() }
+            XCTAssertEqual(store.count, files + 8)
+        }
+    }
+
+    /// The ambiguous case: repair must REFUSE and explain, not guess. A wrong guess here is silent.
+    func testRepairRefusesWhenTheHolesAreSpurious() throws {
+        try withQuantMode {
+            let files = 40
+            let dir = tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+            let db = dir.appendingPathComponent("index.sqlite")
+            try makeCoveredIndex(db, files: files)
+            let before = claim(db)
+            XCTAssertEqual(before, files, "fixture never reached full coverage")
+            try addUncoveredRows(db, from: files, count: 8)
+            sql(db, "INSERT OR IGNORE INTO vec_holes(slot) VALUES(5);")   // hole with a live row
+            dropRowSidecar(db)
+
+            switch VectorStore.repairIndex(at: db) {
+            case .repaired(let what): XCTFail("guessed at an ambiguous mapping: \(what)")
+            case .nothingToDo: XCTFail("did not notice the inconsistency")
+            case .needsReindex(let why):
+                XCTAssertTrue(why.contains("stale"), "must name what is wrong; got: \(why)")
+            }
+            XCTAssertEqual(claim(db), before, "refused but wrote to the index anyway")
+            XCTAssertEqual(scalar(db, "SELECT COUNT(*) FROM vec_holes"), 1, "refused but changed the holes")
+        }
+    }
+
+    /// A healthy index: repair reports nothing to do and touches nothing.
+    func testRepairIsANoOpOnAHealthyIndex() throws {
+        try withQuantMode {
+            let files = 40
+            let dir = tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+            let db = dir.appendingPathComponent("index.sqlite")
+            try makeCoveredIndex(db, files: files)
+            try addUncoveredRows(db, from: files, count: 8)
+            let before = claim(db)
+            switch VectorStore.repairIndex(at: db) {
+            case .nothingToDo: break
+            case .repaired(let w): XCTFail("repaired a healthy index: \(w)")
+            case .needsReindex(let w): XCTFail("condemned a healthy index: \(w)")
+            }
+            XCTAssertEqual(claim(db), before)
         }
     }
 }
