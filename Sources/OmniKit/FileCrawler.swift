@@ -73,9 +73,84 @@ public struct FileCrawler: Sendable {
             .compactMap { try? fm.url(for: $0, in: .userDomainMask, appropriateFor: nil, create: false) }
     }
 
+    /// Engine selector. OMNI_CRAWLER=legacy restores the FileManager enumerator, so the two can be
+    /// A/B'd in one build - and so a user who hits trouble with the fast walk has a way back.
+    static var useLegacyEngine: Bool {
+        ProcessInfo.processInfo.environment["OMNI_CRAWLER"] == "legacy"
+    }
+
     /// Walk all roots, invoking `onFile` for each supported file. `shouldContinue`
     /// is polled so indexing can be cancelled.
+    ///
+    /// `onFile` is called serially, but NOT necessarily on the calling thread: the fast engine runs
+    /// a pool of readers and hands their results over one directory at a time under its own lock.
+    /// Every caller here appends to a local array, which that guarantee covers.
     public func walk(shouldContinue: () -> Bool = { true }, onFile: (CrawledFile) -> Void) {
+        if Self.useLegacyEngine { walkLegacy(shouldContinue: shouldContinue, onFile: onFile) }
+        else { walkBulk(shouldContinue: shouldContinue, onFile: onFile) }
+    }
+
+    /// The fast engine: getattrlistbulk + a bounded pool. See BulkDirWalker for why it is shaped
+    /// this way and what was measured. The POLICY below - what to descend into, what to keep - is
+    /// identical to the legacy walk, and PackageProbe/hidden/symlink/volume handling exists purely
+    /// so it stays identical; CrawlerParityTests holds the two to the same answer.
+    private func walkBulk(shouldContinue: () -> Bool, onFile: (CrawledFile) -> Void) {
+        // REAL PATHS. FileManager's enumerator hands back paths with every symlink in the ROOT
+        // already resolved (/var/... comes back as /private/var/...), and the fast walk builds its
+        // paths by concatenation, so without this the two engines return the same files under
+        // different names. Those names are the index's keys: a switch would make every file on the
+        // machine look new, and re-embed all of it. Once per root, not per entry.
+        let resolved: [(url: URL, path: String)] = roots.map { r in
+            var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
+            if realpath(r.path, &buf) != nil { return (r, String(cString: buf)) }
+            return (r, r.path)
+        }
+
+        // The device of each root, so the walk stays on one volume the way the enumerator does. A
+        // mount point inside a root (a disk image, a network share) would otherwise be crawled as
+        // part of it - a different volume's worth of files under a root the user never chose.
+        var rootDevice: [String: dev_t] = [:]
+        for r in resolved {
+            var st = stat()
+            if stat(r.path, &st) == 0 { rootDevice[r.path] = st.st_dev }
+        }
+        func rootFor(_ path: String) -> String? {
+            resolved.first { path == $0.path || path.hasPrefix($0.path + "/") }?.path
+        }
+
+        BulkDirWalker.walk(
+            roots: resolved.map { $0.path },
+            shouldContinue: shouldContinue,
+            shouldDescend: { dir, entry in
+                // A root itself is always descended into: the user chose it, hidden or not.
+                if rootDevice[dir] != nil { return true }
+                let name = (dir as NSString).lastPathComponent
+                if name.hasPrefix(".") { return false }            // matches .skipsHiddenFiles
+                if ignore.isIgnored(dir, isDir: true) { return false }
+                // The volume check reads the id the SAME syscall already returned. A mount point
+                // inside a root (a disk image, a share) is a different volume's worth of files
+                // under a root the user never chose.
+                if let e = entry, e.device != 0, let r = rootFor(dir), let want = rootDevice[r], want != e.device {
+                    return false
+                }
+                if PackageProbe.isPackage(dir) { return false }    // .app, .photoslibrary, ...
+                return true
+            },
+            keep: { dir, e -> CrawledFile? in
+                // IN THE WORKER: everything here is per-file and runs on all cores at once.
+                guard !e.isDir, !e.isSymlink, !e.name.hasPrefix(".") else { return nil }
+                // The extension comes from the name the syscall returned - no URL is built.
+                guard let kind = FileExtractor.kind(forExtension: (e.name as NSString).pathExtension),
+                      enabledKinds.contains(kind) else { return nil }
+                if let cap = maxFileSize[kind], e.size > cap { return nil }
+                let path = dir + "/" + e.name
+                guard !ignore.isIgnored(path, isDir: false) else { return nil }
+                return CrawledFile(path: path, modified: e.mtime, size: e.size)
+            },
+            deliver: { batch in for f in batch { onFile(f) } })
+    }
+
+    private func walkLegacy(shouldContinue: () -> Bool, onFile: (CrawledFile) -> Void) {
         let fm = FileManager.default
         let keys: [URLResourceKey] = [.isDirectoryKey, .isRegularFileKey, .contentModificationDateKey, .fileSizeKey, .isPackageKey, .isHiddenKey]
         for root in roots {

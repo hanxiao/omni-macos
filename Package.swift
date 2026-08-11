@@ -11,6 +11,7 @@ let package = Package(
         .executable(name: "filterbench", targets: ["filterbench"]),
         .executable(name: "opentime", targets: ["opentime"]),
         .executable(name: "mutbench", targets: ["mutbench"]),
+        .executable(name: "crawlbench", targets: ["crawlbench"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.31.3"),
@@ -47,6 +48,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "mutbench",
+            dependencies: ["OmniKit"]
+        ),
+        .executableTarget(
+            name: "crawlbench",
             dependencies: ["OmniKit"]
         ),
         .testTarget(

@@ -98,8 +98,13 @@ public enum FileExtractor {
     }
 
     /// File category from extension, or nil if unknown.
-    public static func kind(for url: URL) -> FileKind? {
-        let ext = url.pathExtension.lowercased()
+    public static func kind(for url: URL) -> FileKind? { kind(forExtension: url.pathExtension) }
+
+    /// The same answer from a bare extension. The crawl asks this once per FILE, and building a URL
+    /// to ask it allocated a CFURL and an NSPathStore2 per entry - 63k of them on one root - purely
+    /// to read a suffix the walker already had in hand.
+    public static func kind(forExtension rawExt: String) -> FileKind? {
+        let ext = rawExt.lowercased()
         if imageExtensions.contains(ext) { return .image }
         if videoExtensions.contains(ext) { return .video }
         if audioExtensions.contains(ext) { return .audio }
