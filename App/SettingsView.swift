@@ -249,14 +249,14 @@ private struct ContentTypesTab: View {
     var body: some View {
         Form {
             Section("Skip small files") {
-                MinimumField(label: "Images", unit: "px", step: 16,
+                MinimumField(label: "Images", unit: "px",
                              value: Binding(get: { Double(model.minImageDimension) },
                                             set: { model.minImageDimension = Int($0.rounded()) }))
-                MinimumField(label: "Audio", unit: "sec", step: 1, decimals: 1,
+                MinimumField(label: "Audio", unit: "sec", decimals: 1,
                              value: Binding(get: { model.minAudioSeconds }, set: { model.minAudioSeconds = $0 }))
-                MinimumField(label: "Video", unit: "sec", step: 1, decimals: 1,
+                MinimumField(label: "Video", unit: "sec", decimals: 1,
                              value: Binding(get: { model.minVideoSeconds }, set: { model.minVideoSeconds = $0 }))
-                MinimumField(label: "Text", unit: "chars", step: 16,
+                MinimumField(label: "Text", unit: "chars",
                              value: Binding(get: { Double(model.minTextChars) },
                                             set: { model.minTextChars = Int($0.rounded()) }))
             }
@@ -738,13 +738,13 @@ private struct DiskBreakdown: View {
 /// wrong control for a threshold: the right number depends on what someone keeps in their folders,
 /// and 0 (index everything) has to be reachable in the same place as 300.
 ///
-/// Text field plus stepper is the macOS idiom for a bounded number, and the bound here is one-sided:
-/// nothing below zero exists, so the field clamps rather than rejecting - a typed "-5" becomes 0
-/// instead of an error nobody can act on.
+/// Just the field: a stepper next to it added a control for values nobody arrives at by nudging -
+/// these are typed once and forgotten. The bound is one-sided, so the field clamps rather than
+/// rejecting - a typed "-5" becomes 0, which is a real setting (index everything) instead of an
+/// error nobody can act on.
 private struct MinimumField: View {
     let label: String
     let unit: String
-    let step: Double
     var decimals: Int = 0
     @Binding var value: Double
 
@@ -753,20 +753,20 @@ private struct MinimumField: View {
     }
 
     var body: some View {
-        LabeledContent(label) {
-            HStack(spacing: 6) {
-                TextField("", value: clamped, format: .number.precision(.fractionLength(0 ... decimals)))
-                    .textFieldStyle(.roundedBorder)
-                    .multilineTextAlignment(.trailing)
-                    .frame(width: 68)
-                // Fixed width, leading-aligned: "px", "sec" and "chars" are different lengths, and
-                // without this each row's field starts at its own x - the controls have to line up
-                // in a column the way every other macOS form does.
-                Text(unit).foregroundStyle(.secondary)
-                    .frame(width: 38, alignment: .leading)
-                Stepper("", value: clamped, in: 0 ... 100_000, step: step)
-                    .labelsHidden()
-            }
+        // Explicit HStack rather than LabeledContent: the label and the field are centred on each
+        // other here, which a label column does not promise once the row holds a bordered control.
+        HStack(alignment: .center, spacing: 6) {
+            Text(label)
+            Spacer(minLength: 8)
+            TextField("", value: clamped, format: .number.precision(.fractionLength(0 ... decimals)))
+                .textFieldStyle(.roundedBorder)
+                .multilineTextAlignment(.trailing)
+                .frame(width: 72)
+            // Fixed width, leading-aligned: "px", "sec" and "chars" are different lengths, and
+            // without this each row's field starts at its own x - the controls have to line up in a
+            // column the way every other macOS form does.
+            Text(unit).foregroundStyle(.secondary)
+                .frame(width: 38, alignment: .leading)
         }
     }
 }
