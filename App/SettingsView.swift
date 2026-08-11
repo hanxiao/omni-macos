@@ -169,6 +169,14 @@ private struct ActivityTab: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
+            Section("iCloud") {
+                Picker("Files not downloaded", selection: Binding(get: { model.skipDatalessFiles },
+                                                                 set: { model.skipDatalessFiles = $0 })) {
+                    Text("Skip").tag(true)
+                    Text("Download and index").tag(false)
+                }
+            }
+
             Section("Folders") {
                 ForEach(model.roots, id: \.self) { url in
                     let rp = model.progress.perRoot[url.path]
@@ -240,51 +248,17 @@ private struct ContentTypesTab: View {
 
     var body: some View {
         Form {
-            Section {
-                Picker("Minimum image size", selection: Binding(get: { model.minImageDimension }, set: { model.minImageDimension = $0 })) {
-                    Text("No minimum").tag(0)
-                    Text("64 px").tag(64)
-                    Text("128 px").tag(128)
-                    Text("256 px").tag(256)
-                    Text("512 px").tag(512)
-                }
-                Picker("Minimum audio length", selection: Binding(get: { model.minAudioSeconds }, set: { model.minAudioSeconds = $0 })) {
-                    Text("No minimum").tag(0.0)
-                    Text("1 second").tag(1.0)
-                    Text("3 seconds").tag(3.0)
-                    Text("5 seconds").tag(5.0)
-                    Text("10 seconds").tag(10.0)
-                }
-                Picker("Minimum video length", selection: Binding(get: { model.minVideoSeconds }, set: { model.minVideoSeconds = $0 })) {
-                    Text("No minimum").tag(0.0)
-                    Text("1 second").tag(1.0)
-                    Text("3 seconds").tag(3.0)
-                    Text("5 seconds").tag(5.0)
-                    Text("10 seconds").tag(10.0)
-                }
-                Picker("Minimum text length", selection: Binding(get: { model.minTextChars }, set: { model.minTextChars = $0 })) {
-                    Text("No minimum").tag(0)
-                    Text("16 characters").tag(16)
-                    Text("64 characters").tag(64)
-                    Text("256 characters").tag(256)
-                }
-            } header: {
-                Text("Skip small files")
-            } footer: {
-                Text("Skips icons, thumbnails, and very short clips.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-
-            Section {
-                Picker("Files in iCloud", selection: Binding(get: { model.skipDatalessFiles }, set: { model.skipDatalessFiles = $0 })) {
-                    Text("Skip until downloaded").tag(true)
-                    Text("Download to index").tag(false)
-                }
-            } header: {
-                Text("Cloud files")
-            } footer: {
-                Text("Files kept in the cloud, not on this Mac. Skipped ones are indexed once they download.")
-                    .font(.caption).foregroundStyle(.secondary)
+            Section("Skip small files") {
+                MinimumField(label: "Images", unit: "px", step: 16,
+                             value: Binding(get: { Double(model.minImageDimension) },
+                                            set: { model.minImageDimension = Int($0.rounded()) }))
+                MinimumField(label: "Audio", unit: "sec", step: 1, decimals: 1,
+                             value: Binding(get: { model.minAudioSeconds }, set: { model.minAudioSeconds = $0 }))
+                MinimumField(label: "Video", unit: "sec", step: 1, decimals: 1,
+                             value: Binding(get: { model.minVideoSeconds }, set: { model.minVideoSeconds = $0 }))
+                MinimumField(label: "Text", unit: "chars", step: 16,
+                             value: Binding(get: { Double(model.minTextChars) },
+                                            set: { model.minTextChars = Int($0.rounded()) }))
             }
 
             Section {
@@ -756,6 +730,43 @@ private struct DiskBreakdown: View {
                 }
             }
             .font(.caption)
+        }
+    }
+}
+
+/// A minimum, typed rather than chosen. These were dropdowns of four preset values, which is the
+/// wrong control for a threshold: the right number depends on what someone keeps in their folders,
+/// and 0 (index everything) has to be reachable in the same place as 300.
+///
+/// Text field plus stepper is the macOS idiom for a bounded number, and the bound here is one-sided:
+/// nothing below zero exists, so the field clamps rather than rejecting - a typed "-5" becomes 0
+/// instead of an error nobody can act on.
+private struct MinimumField: View {
+    let label: String
+    let unit: String
+    let step: Double
+    var decimals: Int = 0
+    @Binding var value: Double
+
+    private var clamped: Binding<Double> {
+        Binding(get: { Swift.max(0, value) }, set: { value = Swift.max(0, $0) })
+    }
+
+    var body: some View {
+        LabeledContent(label) {
+            HStack(spacing: 6) {
+                TextField("", value: clamped, format: .number.precision(.fractionLength(0 ... decimals)))
+                    .textFieldStyle(.roundedBorder)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 68)
+                // Fixed width, leading-aligned: "px", "sec" and "chars" are different lengths, and
+                // without this each row's field starts at its own x - the controls have to line up
+                // in a column the way every other macOS form does.
+                Text(unit).foregroundStyle(.secondary)
+                    .frame(width: 38, alignment: .leading)
+                Stepper("", value: clamped, in: 0 ... 100_000, step: step)
+                    .labelsHidden()
+            }
         }
     }
 }
