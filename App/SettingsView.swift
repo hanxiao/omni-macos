@@ -248,7 +248,10 @@ private struct ContentTypesTab: View {
 
     var body: some View {
         Form {
-            Section("Skip small files") {
+            // "Skip small files" left the direction to the reader: is 300 the floor or the ceiling?
+            // The header states it, so each row is just a modality and a number and no footer is
+            // needed to explain which way it cuts.
+            Section("Skip files smaller than") {
                 MinimumField(label: "Images", unit: "px",
                              value: Binding(get: { Double(model.minImageDimension) },
                                             set: { model.minImageDimension = Int($0.rounded()) }))
