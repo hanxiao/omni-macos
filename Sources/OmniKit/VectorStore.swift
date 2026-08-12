@@ -1019,7 +1019,10 @@ public final class VectorStore: @unchecked Sendable {
     /// hole reclaim and the scan-width upgrade for the whole session. checkpointIfDueLocked already
     /// had the right shape - back off UNLESS the WAL has grown past a hard cap - and this is the
     /// same idea with time as the bound instead of bytes.
-    private func yieldToSearchLocked(_ path: String = #function) -> Bool {
+    /// `path` is written out at each call site rather than defaulted to #function: the reclaim
+    /// and coverage calls live in the SAME function, so #function gave them one shared key - which
+    /// is the thing this is supposed to stop.
+    private func yieldToSearchLocked(_ path: String) -> Bool {
         guard searchRecentlyActiveLocked() else { yieldingSince[path] = nil; return false }
         let since = yieldingSince[path] ?? Date()
         yieldingSince[path] = since
@@ -5052,9 +5055,12 @@ public final class VectorStore: @unchecked Sendable {
     /// rule count through fewer holes than the file has and hands every row past it its
     /// neighbour's vector, silently.
     ///
-    /// After a ROLLBACK the table is authoritative and small (bounded by deadBudget, a handful of
-    /// integers in practice), and rollbacks are rare. So there is no delta to keep, and no way for
-    /// a begin site to be missed.
+    /// After a ROLLBACK the table is authoritative, so there is no delta to keep and no way for a
+    /// begin site to be missed. It is not tiny - `vec_holes` is bounded by deadBudget, which is
+    /// rows/20, so ~225,000 slots on a 4.5M-row index, and re-reading it costs on the order of
+    /// 10-20 ms. That is affordable because a ROLLBACK is a failure path, not a routine one; it is
+    /// stated here rather than waved at, because the last two defects in this file both hid under a
+    /// comment claiming a property the code did not have.
     private func rollbackTxnLocked() {
         exec("ROLLBACK;")
         guard dbOpen() else { return }
@@ -5961,7 +5967,7 @@ public final class VectorStore: @unchecked Sendable {
         // "writes have gone quiet" is exactly the condition it needs, and this is what runs then.
         guard coveredRows < rows.count else {
             // Off the queue: the reclaim takes it one chunk at a time, and this call is holding it.
-            if reclaim, !yieldToSearchLocked(), shouldReclaimHolesLocked() {
+            if reclaim, !yieldToSearchLocked("reclaim"), shouldReclaimHolesLocked() {
                 DispatchQueue.global(qos: .utility).async { [weak self] in self?.reclaimVectorHoles() }
             }
             return
@@ -5977,7 +5983,7 @@ public final class VectorStore: @unchecked Sendable {
         // fixed 20s gap turned ~45s of actual work into ~20 minutes of elapsed time for no reason.
         // Pacing on search activity instead means the migration runs at full tilt while the app is
         // idle and backs off the moment someone is using it.
-        if yieldToSearchLocked() {
+        if yieldToSearchLocked("coverage") {
             scheduleCoverageStampLocked(after: Self.coverageBusyGap)
             return
         }
@@ -6643,7 +6649,7 @@ public final class VectorStore: @unchecked Sendable {
             guard let self else { return }
             self.queue.sync {
                 guard self.idleFoldToken == token else { return }      // more writes arrived
-                guard !self.yieldToSearchLocked() else { return }
+                guard !self.yieldToSearchLocked("width-upgrade") else { return }
                 let n = self.rows.count
                 guard n > 0, self.dim > 0, self.flat16.count == n * self.dim, n > self.baseRows else { return }
                 if Self.searchTiming { print("[search] IDLE FOLD rows=\(n) delta=\(n - self.baseRows)") }
@@ -6663,7 +6669,7 @@ public final class VectorStore: @unchecked Sendable {
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
             self.queue.sync {
-                guard self.widthUpgradeToken == token, !self.yieldToSearchLocked() else {
+                guard self.widthUpgradeToken == token, !self.yieldToSearchLocked("width-upgrade") else {
                     self.scheduleWidthUpgradeLocked(after: 30)   // still busy: come back later
                     return
                 }

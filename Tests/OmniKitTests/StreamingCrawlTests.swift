@@ -206,8 +206,17 @@ final class StreamingCrawlTests: XCTestCase {
     /// concurrentPerform down with it: eight wedged threads, a retained Indexer and the whole queue,
     /// for the life of the process. Repeat pause/resume and they accumulate.
     ///
-    /// A cap far below the corpus guarantees the producer IS parked when the cancel lands, which is
-    /// the state the completed-pass test never reaches.
+    /// A cap far below the corpus makes the producer park repeatedly during the pass.
+    ///
+    /// THIS TEST DOES NOT ISOLATE THE LOST WAKEUP, and should not be read as guarding it. Verified:
+    /// it passes with the timed wait reverted. RecordingEmbedder is instant, so the consumer keeps
+    /// taking waves and broadcasting, and is never inside a long embed at the moment it exits - the
+    /// one interleaving where the producer is left parked with nothing left to signal it. Holding
+    /// the consumer on a semaphore to force that state was tried and deadlocked the harness instead.
+    ///
+    /// So this covers cancel-under-backpressure generally, and the wakeup itself rests on the two
+    /// structural fixes (a timed wait, and a broadcast when the consumer stops) rather than on a
+    /// failing-then-passing test. Anyone removing either should know there is no net under them.
     func testCancellingWhileTheWalkIsBlockedOnAFullQueueReturns() throws {
         let a = try makeRoot("alpha", files: 1_200)
         let store = try VectorStore(dbURL: dir.appendingPathComponent("i.sqlite"))
