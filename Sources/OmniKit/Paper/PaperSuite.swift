@@ -249,7 +249,16 @@ public enum PaperSuite {
         levers.pin(.suiteWide)
 
         let originalCap = omniMemoryLimitBytes()
-        if let pin = config.pinMemoryCapBytes { omniSetMemoryLimit(pin) }
+        if let pin = config.pinMemoryCapBytes {
+            omniSetMemoryLimit(pin)
+            // AND through the lever controller, so the run's cap becomes the pinned value the arms
+            // restore to. The levers capture the cap as part of their snapshot, so without this
+            // every arm scope would put the user's own setting back on the way in and the suite
+            // would measure at a cap it did not pin. The cap sweep depends on this: it is the one
+            // case that moves the cap deliberately, and it can only do that if the value it
+            // restores to is the run's pin rather than whatever the app was set to.
+            levers.pin(PaperLeverSet(memoryCapBytes: pin))
+        }
         defer {
             if config.pinMemoryCapBytes != nil {
                 if let restore = config.restoreMemoryCap { restore() } else { omniSetMemoryLimit(originalCap) }

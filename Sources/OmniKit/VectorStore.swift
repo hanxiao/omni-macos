@@ -727,6 +727,11 @@ public final class VectorStore: @unchecked Sendable {
     ///
     /// (1-bit is not reachable here at all: MLX's affine quantize supports 2-8 bits, and a true
     /// binary tier would need a popcount kernel, not quantizedMM.)
+    /// The result count the shipped interface asks for. Declared here rather than in the app so the
+    /// paper suite measures the shortlist the product actually builds: C is a function of this
+    /// number, and a harness that asked for its own top-k measured a net a third the shipped width
+    /// while reporting it as the shipped one.
+    public static let shippedTopK = 120
     static let candidateOverride: Int? = ProcessInfo.processInfo.environment["OMNI_CANDIDATES"].flatMap(Int.init)
     static func candidateCount(topK: Int) -> Int {
         if let c = candidateOverride { return max(topK, c) }
@@ -938,7 +943,11 @@ public final class VectorStore: @unchecked Sendable {
     }
     /// The 1-bit tier gives up recall at equal candidate width, and buys it back with width. 2x is
     /// what the measurement says is needed (top10 0.9792 at 2x against 3-bit's 0.9783 at 1x).
-    static let bitCandidateMultiplier = ProcessInfo.processInfo.environment["OMNI_BIT_CAND_MULT"].flatMap(Int.init) ?? 2
+    /// PAPER LEVER (var, not let): the iso-latency frontier is a sweep over (bits, C), and C is
+    /// this multiplier times the base width. A `let` is initialised on first touch, so an in-process
+    /// sweep that changed the env between points would measure the FIRST point at every rung.
+    nonisolated(unsafe) public static var bitCandidateMultiplier =
+        ProcessInfo.processInfo.environment["OMNI_BIT_CAND_MULT"].flatMap(Int.init) ?? 2
     // MARK: - Tombstones
     //
     // Removing a file's rows used to compact the whole store: every row after the first removed one

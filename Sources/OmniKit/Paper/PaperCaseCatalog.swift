@@ -41,6 +41,13 @@ public enum PaperCaseID: String, Sendable, Codable, CaseIterable {
     /// The live-corpus family: the machine's own files, at its own scale. These do not merge across
     /// machines and are not meant to - see PaperCasesLive.
     case p13_env, p14_query, p15_index, p16_save, p17_tag, p18_liveshape
+    /// Schema 3. Each exists because a claim in the paper could not be identified from schema 2.
+    ///  - p19 varies the ONE candidate cause that is not a fixed property of the machine.
+    ///  - p20 measures accuracy and latency on one grid, so a tier can be judged at iso-latency
+    ///    instead of at iso-shortlist, which is the comparison the design decision actually made.
+    ///  - p21 measures what a deletion costs, which the paper claims is independent of index size
+    ///    and never measured.
+    case p19_capsweep, p20_recall, p21_delete
 }
 
 /// One arm of a case: a name that appears in every key the arm produced, plus the levers it moves.
@@ -82,8 +89,13 @@ public enum PaperCaseCatalog {
     /// Suite identity and schema. Bumped deliberately; two exports that disagree never merge.
     /// v2 adds the live-corpus family (p13-p18) and the p50/p95/p99 distribution contract, so a v1
     /// export has no rows for either and must not be merged with one that does.
-    public static let suiteId = "paper-v2"
-    public static let schema = 2
+    /// v3 changes what is measured, not only how much of it, so a v2 export must not merge with a
+    /// v3 one: the coarse tier is the shipped sign code rather than the retired 4-bit replica, the
+    /// shortlist is the shipped width rather than the harness's own, reuse is three separable layers
+    /// rather than one lever, and every case that touches the store records the representation it
+    /// actually ran under.
+    public static let suiteId = "paper-v3"
+    public static let schema = 3
 
     /// Global wall-clock cap, derived rather than fixed.
     ///
@@ -178,12 +190,18 @@ public enum PaperCaseCatalog {
     public static func specs(memoryBytes: Int, scale: Double = 1.0) -> [PaperCaseSpec] {
         let all = [canary(scale), sdpa(scale), textLever(scale), indexPass(scale),
                    editReuse(scale), gate(scale), scan(memoryBytes, scale),
-                   select(memoryBytes, scale), compact(scale),
+                   capSweep(memoryBytes, scale), recall(memoryBytes, scale),
+                   select(memoryBytes, scale), compact(scale), deleteCost(memoryBytes, scale),
                    liveEnv(scale), liveQuery(scale), liveIndex(scale), liveTag(scale),
                    liveShape(scale), liveSave(memoryBytes, scale)]
         guard let only = onlyCases else { return all }
         return all.filter { only.contains($0.id) }
     }
+
+    /// The shipped shortlist width, from the shipped top-k and the shipped tier. The suite measures
+    /// this rather than a width of its own: C is what decides how much the exact stage sees, so a
+    /// harness that picks its own top-k is measuring a different funnel and reporting it as this one.
+    public static var shippedCandidates: Int { VectorStore.candidateCount(topK: VectorStore.shippedTopK) }
 
     // MARK: - The cases
 
@@ -199,7 +217,7 @@ public enum PaperCaseCatalog {
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p01_sdpa, title: "Fused attention curve",
-            deliverable: "App. A.1 fused-attention curve (fig:latency) and the operand ladder (tab:encoder)",
+            deliverable: "A.1 fig:latency and tab:encoder: where one item sits below saturation, and what bf16 operands buy",
             budgetSeconds: 45,
             arms: [PaperArm("steel_bf16"), PaperArm("steel_fp32")],
             params: p,
@@ -220,7 +238,7 @@ public enum PaperCaseCatalog {
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p02_textlever, title: "Tail-row narrowing",
-            deliverable: "Sec. 4.3 tail-row narrowing row of tab:main",
+            deliverable: "Tab. 3 tab:main, tail-row narrowing row: measured against the 6.25% the architecture predicts",
             budgetSeconds: 150,
             arms: [PaperArm("tail_off", PaperLeverSet(tailRows: false)),
                    PaperArm("tail_on", PaperLeverSet(tailRows: true))],
@@ -238,7 +256,7 @@ public enum PaperCaseCatalog {
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p03_indexpass, title: "Index pass",
-            deliverable: "Sec. 4.3 tab:main first block: occupancy and throughput per GPU core, pinned corpus",
+            deliverable: "Tab. 3 tab:main, first block: occupancy and throughput per GPU core on the pinned corpus",
             budgetSeconds: 330,
             // Dedup is pinned on for the whole suite rather than being an arm here: the corpus is
             // generated with repeated paragraphs on purpose and the off arm would measure the
@@ -270,10 +288,21 @@ public enum PaperCaseCatalog {
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p05_editreuse, title: "Chunk reuse on edits",
-            deliverable: "App. A.2 tab:reuse, and the two reuse rows of tab:main",
-            budgetSeconds: 240,
-            arms: [PaperArm("cache_off", PaperLeverSet(chunkCache: false)),
-                   PaperArm("cache_on", PaperLeverSet(chunkCache: true))],
+            deliverable: "A.2 tab:reuse and the reuse rows of tab:main: the three layers, each against the same on arm",
+            budgetSeconds: 300,
+            // THREE LAYERS, SEPARATELY. `cache_off` used to be the whole ablation, which left the
+            // two cross-corpus layers running underneath both arms: the off arm was not "no reuse",
+            // it was "no per-file reuse", and on a corpus with repeated paragraphs the whole-file
+            // and cross-file layers were quietly absorbing part of the work the row claimed the
+            // per-file layer saved. Each layer is now its own off arm against one shared on arm.
+            arms: [PaperArm("all_off", PaperLeverSet(chunkCache: false, contentDedup: false,
+                                                     globalChunkReuse: false)),
+                   PaperArm("perfile_off", PaperLeverSet(chunkCache: false, contentDedup: true,
+                                                         globalChunkReuse: true)),
+                   PaperArm("crossfile_off", PaperLeverSet(chunkCache: true, contentDedup: true,
+                                                           globalChunkReuse: false)),
+                   PaperArm("all_on", PaperLeverSet(chunkCache: true, contentDedup: true,
+                                                    globalChunkReuse: true))],
             params: p, arithmeticPeakMB: nil,
             requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
     }
@@ -324,7 +353,7 @@ public enum PaperCaseCatalog {
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p07_gate, title: "Can't-win prune and idle fold",
-            deliverable: "Sec. 4.3 prune and idle-fold rows of tab:main",
+            deliverable: "Tab. 3 tab:main, prune and idle-fold rows",
             budgetSeconds: 260,
             // Both pairs run against ONE store, toggled between query sets: rebuilding per arm would
             // spend the budget on inserts and would not even be the same rows.
@@ -346,30 +375,154 @@ public enum PaperCaseCatalog {
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p08_scan, title: "Scan latency through the shipped store",
-            deliverable: "Sec. 4.3 tab:cross funnel crossover, all rungs",
+            deliverable: "A.4 tab:cross: where the shipped funnel overtakes the exact scan, across machines",
             budgetSeconds: 360,
-            // Both representations are forced, never auto-selected: the ship policy's boundary is a
-            // function of the memory CAP, so auto would pick int4 at 500k on CAP-3 and bf16 on
-            // CAP-6 and the two machines' Table-3 rows would silently not be the same measurement.
-            arms: [PaperArm("bf16", PaperLeverSet(quantBase: .bits(0))),
-                   PaperArm("int4", PaperLeverSet(quantBase: .bits(4)))],
+            // Every representation is forced, never auto-selected: the ship policy's boundary is a
+            // function of the memory CAP and of the row count, so auto would put two machines'
+            // same-sized rungs in different representations and the rows would silently not be the
+            // same measurement.
+            //
+            // TWO ARMS: the exact scan, and the tier that ships. A third arm at the width this
+            // suite used to carry would spend wall clock on every machine to document a change,
+            // which is a fact about how the system got here rather than about what it is. Where the
+            // width itself has to be justified, p20 does it as a design space rather than as a
+            // history: recall against latency at both widths, on one machine, once.
+            //
+            // Each arm pins its own candidate width, because `candidateCount` doubles C for the
+            // sign tier and reads the SHIPPED tier rather than the forced one.
+            arms: [PaperArm("bf16", PaperLeverSet(quantBase: .bits(0), bitCandidateMultiplier: 1)),
+                   PaperArm("bit1", PaperLeverSet(quantBase: .bits(1), bitCandidateMultiplier: 2))],
             params: p,
             arithmeticPeakMB: storePeakMB(rows: scaledLadder.max() ?? 0, quantized: true),
             requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
     }
 
+    /// p19. The experiment that identifies the crossover claim.
+    ///
+    /// The paper says the memory budget decides where the funnel overtakes the exhaustive scan.
+    /// Across machines that claim cannot be identified: the five parts are perfectly rank-ordered on
+    /// accelerator width and on memory together, and the cross-machine case pins one cap on all of
+    /// them, so the term the claim is about is held CONSTANT in the experiment the claim is drawn
+    /// from. The budget is a user setting rather than a property of the part, so it is the one
+    /// candidate cause that can be varied with everything else fixed: same machine, same seeded
+    /// vectors, same row counts, same accelerator, three caps.
+    ///
+    /// A machine can only run the caps its memory allows, so the cap ladder is tiered and each cap
+    /// records the rungs it completed. One machine with three caps identifies the claim; five
+    /// machines with one cap each never can.
+    private static func capSweep(_ memoryBytes: Int, _ scale: Double) -> PaperCaseSpec {
+        let caps = capLadder(memoryBytes: memoryBytes)
+        let rungs = [250_000, 500_000]
+        let p = PaperParams([
+            PaperParameter("ladder", .ints(rungs), scaling: .scaled(minimum: 5_000)),
+            PaperParameter("caps_mb", .ints(caps.map { $0 / 1_000_000 })),
+            PaperParameter("dim", .int(768)),
+            PaperParameter("queries_per_rung", .int(40), scaling: .scaled(minimum: 5)),
+        ]).scaled(by: scale)
+        return PaperCaseSpec(
+            id: .p19_capsweep, title: "Funnel crossover against the memory cap",
+            deliverable: "A.4 tab:capsweep: the same crossover against the memory cap on ONE machine, which is the only arrangement that identifies what decides it",
+            // Doubled with the second pass per cell: the alternative to spending it is a cell whose
+            // run-to-run spread is the size of the effect it reports.
+            budgetSeconds: 900,
+            // The cap is the sweep, so it cannot also be an arm: the body opens one arm per
+            // (cap, representation) pair and names it accordingly.
+            arms: [],
+            params: p,
+            arithmeticPeakMB: storePeakMB(rows: scaledInt(rungs.max() ?? 0, scale, minimum: 5_000),
+                                          quantized: true),
+            requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
+    }
+
+    /// p20. Accuracy and latency of the coarse tier on ONE grid.
+    ///
+    /// The paper's accuracy table compares one tier at one shortlist width, which answers "is the
+    /// funnel as accurate as the exact scan" and cannot answer the question the design decision
+    /// actually turned on: at a fixed latency, is it better to scan a wider code or to scan a
+    /// narrower one and rescore more of it. Measuring recall and latency at every (bits, C) point
+    /// puts both arms on one frontier, and the frontier is the transferable result: it is about
+    /// coarse-then-exact retrieval under a memory budget, not about this encoder or this machine.
+    ///
+    /// Recall is against an exact fp32 top-10 over the same rows, computed on the host, so the
+    /// reference cannot inherit an error from the tier being judged.
+    private static func recall(_ memoryBytes: Int, _ scale: Double) -> PaperCaseSpec {
+        let rows = gibibytes(memoryBytes) >= tier16GiB ? 500_000 : 250_000
+        let shipped = shippedCandidates
+        let p = PaperParams([
+            PaperParameter("rows", .int(rows), scaling: .scaled(minimum: 20_000)),
+            PaperParameter("dim", .int(768)),
+            PaperParameter("bits", .ints([1, 4])),
+            // Candidate MULTIPLIERS, not free widths: C is reachable only through the setting the
+            // product exposes, and 2 is what ships, so the shipped point is on the frontier by
+            // construction rather than interpolated onto it.
+            PaperParameter("candidates", .ints([1, 2, 4])),
+            PaperParameter("queries", .int(64), scaling: .scaled(minimum: 8)),
+            PaperParameter("shipped_candidates", .int(shipped)),
+            PaperParameter("shipped_top_k", .int(VectorStore.shippedTopK)),
+        ]).scaled(by: scale)
+        return PaperCaseSpec(
+            id: .p20_recall, title: "Coarse tier accuracy against latency",
+            deliverable: "A.3 fig:frontier and tab:scale: recall against latency over (tier, shortlist), with the shipped point on the grid",
+            budgetSeconds: 600,
+            arms: [],
+            params: p,
+            arithmeticPeakMB: storePeakMB(rows: scaledInt(rows, scale, minimum: 20_000), quantized: true),
+            requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
+    }
+
+    /// p21. What a deletion costs, and whether it depends on the size of the index.
+    ///
+    /// The design says removing a row moves no other row, which is why saving one edited file does
+    /// not cost more as the corpus grows. That is a claim about a slope, and the paper asserts it
+    /// without measuring it. Two index sizes are the minimum that can measure a slope at all.
+    private static func deleteCost(_ memoryBytes: Int, _ scale: Double) -> PaperCaseSpec {
+        let big = gibibytes(memoryBytes) >= tier16GiB ? 500_000 : 200_000
+        let p = PaperParams([
+            PaperParameter("ladder", .ints([big / 4, big]), scaling: .scaled(minimum: 10_000)),
+            PaperParameter("dim", .int(768)),
+            PaperParameter("deletes", .int(40), scaling: .scaled(minimum: 5)),
+            PaperParameter("chunks_per_file", .int(4)),
+        ]).scaled(by: scale)
+        return PaperCaseSpec(
+            id: .p21_delete, title: "Deletion cost against index size",
+            deliverable: "A.7 tab:delete: deletion cost against index size, which is the slope Sec. 3.4 claims and never measured",
+            budgetSeconds: 300,
+            arms: [PaperArm("tombstone_off", PaperLeverSet(tombstones: false)),
+                   PaperArm("tombstone_on", PaperLeverSet(tombstones: true))],
+            params: p,
+            arithmeticPeakMB: storePeakMB(rows: scaledInt(big, scale, minimum: 10_000), quantized: false),
+            requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
+    }
+
+    /// Cap ladder for p19. Every cap the machine can hold without the sweep itself being the reason
+    /// a rung pages: the largest rung has to fit twice over inside the cap being tested.
+    public static func capLadder(memoryBytes: Int) -> [Int] {
+        let gib = gibibytes(memoryBytes)
+        var caps = [3_000_000_000, 6_000_000_000]
+        if gib >= tier24GiB { caps.append(12_000_000_000) }
+        return caps
+    }
+
     private static func select(_ memoryBytes: Int, _ scale: Double) -> PaperCaseSpec {
         let p = PaperParams([
             PaperParameter("ladder", .ints(selectLadder(memoryBytes: memoryBytes)), scaling: .scaled(minimum: 10_000)),
-            PaperParameter("candidates", .int(4096)),
+            // The SHIPPED width. At 4096 the case measured a shortlist the product does not build,
+            // and, worse, one below the row count at which the shipped two-level form engages, so
+            // the arm that ships could not have appeared even if it had been included.
+            PaperParameter("candidates", .int(shippedCandidates)),
+            PaperParameter("two_level_floor_rows", .int(128 * shippedCandidates)),
             PaperParameter("reps", .int(20), scaling: .scaled(minimum: 3)),
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p09_select, title: "Top-k selection floor",
-            deliverable: "App. A.4 selection floor and the two-stage speedup",
-            budgetSeconds: 45,
-            arms: [PaperArm("argpartition"), PaperArm("strided_max"),
-                   PaperArm("twostage_x4"), PaperArm("twostage_x8")],
+            deliverable: "A.5 tab:select: the shipped two-level form against the primitive it replaces and the approximations it rejects",
+            budgetSeconds: 90,
+            // `two_level` is the shipped algorithm and was missing: the case compared the framework
+            // primitive against two strategies the product rejected, so its four arms did not
+            // include the one that runs. `strided_max` stays as the hard floor any selection has to
+            // beat; one of the two rejected two-stage arms pays for the new one.
+            arms: [PaperArm("argpartition"), PaperArm("two_level"),
+                   PaperArm("strided_max"), PaperArm("twostage_x4")],
             // Selection works on the score vector: 4 B/row, so even the 4M rung is single-digit MB.
             params: p, arithmeticPeakMB: nil,
             requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
@@ -385,7 +538,7 @@ public enum PaperCaseCatalog {
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p10_compact, title: "Compaction peak",
-            deliverable: "Sec. 4.3 compaction row of tab:main, and the compaction row of App. A.5 tab:cap",
+            deliverable: "Tab. 3 tab:main compaction row, and A.6 tab:cap compaction rows",
             budgetSeconds: 240,
             arms: [PaperArm("smallcache_off", PaperLeverSet(vacuumSmallCache: false)),
                    PaperArm("smallcache_on", PaperLeverSet(vacuumSmallCache: true))],
@@ -446,7 +599,7 @@ public enum PaperCaseCatalog {
     private static func liveEnv(_ scale: Double) -> PaperCaseSpec {
         PaperCaseSpec(
             id: .p13_env, title: "The machine's own corpus",
-            deliverable: "Sec. 4.1 tab:machines corpus block: files, chunks, index bytes, modality mix",
+            deliverable: "Tab. 1 tab:machines: corpus, storage composition per chunk, and the scan tier each machine actually runs",
             budgetSeconds: 60, arms: [], params: .empty, arithmeticPeakMB: nil,
             requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
     }
@@ -457,12 +610,15 @@ public enum PaperCaseCatalog {
             PaperParameter("media_queries", .int(100), scaling: .scaled(minimum: 4)),
             PaperParameter("warmup_queries", .int(5), scaling: .scaled(minimum: 1)),
             PaperParameter("pivot_files", .int(24), scaling: .scaled(minimum: 4)),
-            PaperParameter("top_k", .int(40)),
+            // The number the interface asks for. At 40 the case built a shortlist a third of the
+            // shipped one and reported the result as the shipped query path.
+            PaperParameter("top_k", .int(VectorStore.shippedTopK)),
+            PaperParameter("filtered_queries", .int(120), scaling: .scaled(minimum: 10)),
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p14_query, title: "Query latency on the live index",
-            deliverable: "Sec. 4.2 tab:tasks: text, filename, find-similar, image, audio and video query rows",
-            budgetSeconds: 600, arms: [], params: p, arithmeticPeakMB: nil,
+            deliverable: "Tab. 2 tab:tasks: text, filename, filtered, find-similar, image, audio and video query rows",
+            budgetSeconds: 720, arms: [], params: p, arithmeticPeakMB: nil,
             requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
     }
 
@@ -472,7 +628,7 @@ public enum PaperCaseCatalog {
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p15_index, title: "Indexing pass over real files",
-            deliverable: "Sec. 4.1 tab:machines third block: files/s, tokens/s, occupancy, peak GPU",
+            deliverable: "Tab. 1 tab:machines, indexing block: files/s, tokens/s, occupancy, peak GPU",
             budgetSeconds: 420, arms: [], params: p, arithmeticPeakMB: nil,
             requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
     }
@@ -496,7 +652,7 @@ public enum PaperCaseCatalog {
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p16_save, title: "Save latency on real files",
-            deliverable: "Sec. 4.2 tab:tasks save row, both reuse arms",
+            deliverable: "Tab. 2 tab:tasks, save row: the marginal cost of one edit, per-file reuse on and off",
             budgetSeconds: 900,
             arms: [PaperArm("cache_off", PaperLeverSet(chunkCache: false)),
                    PaperArm("cache_on", PaperLeverSet(chunkCache: true))],
@@ -513,7 +669,7 @@ public enum PaperCaseCatalog {
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p17_tag, title: "Tagging real images",
-            deliverable: "Sec. 4.2 tab:tasks image-index rows, tags off and on",
+            deliverable: "Tab. 2 tab:tasks, image-index rows, tagging off and on",
             budgetSeconds: 480,
             arms: [PaperArm("tags_off"), PaperArm("tags_on")],
             params: p, arithmeticPeakMB: nil,
@@ -524,14 +680,20 @@ public enum PaperCaseCatalog {
         let p = PaperParams([
             PaperParameter("queries", .int(120), scaling: .scaled(minimum: 10)),
             PaperParameter("load_files", .int(60), scaling: .scaled(minimum: 8)),
-            PaperParameter("top_k", .int(40)),
+            PaperParameter("top_k", .int(VectorStore.shippedTopK)),
             PaperParameter("debounce_s", .double(0.18), unit: .seconds),
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .p18_liveshape, title: "Search under indexing, on the live index",
-            deliverable: "Sec. 4.2 tab:tasks search-under-indexing row, against the idle floor",
+            deliverable: "Tab. 2 tab:tasks, search-under-indexing row: the idle floor, the gate ceiling alone, and shaping",
             budgetSeconds: 600,
-            arms: [PaperArm("unshaped", PaperLeverSet(adaptiveBatch: false)),
+            // THREE ARMS, because the section describes two mechanisms and the pair only measured
+            // one. `unshaped` left the gate ceiling in force on both arms, so on a narrow device the
+            // ceiling was already bounding the wait the shaping arm was credited with. `no_ceiling`
+            // is the uncapped whole-flush hold a wide device ships, which is the arm that isolates
+            // what the ceiling itself is worth.
+            arms: [PaperArm("no_ceiling", PaperLeverSet(adaptiveBatch: false, indexGateWindow: Int.max)),
+                   PaperArm("unshaped", PaperLeverSet(adaptiveBatch: false)),
                    PaperArm("shaped", PaperLeverSet(adaptiveBatch: true))],
             params: p, arithmeticPeakMB: nil,
             requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)

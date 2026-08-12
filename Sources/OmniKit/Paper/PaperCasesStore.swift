@@ -45,6 +45,9 @@ public enum PaperCasesStore {
         case .p08_scan: scanBody
         case .p09_select: selectBody
         case .p10_compact: compactBody
+        case .p19_capsweep: capSweepBody
+        case .p20_recall: recallBody
+        case .p21_delete: deleteBody
         default: nil
         }
     }
@@ -56,9 +59,11 @@ public enum PaperCasesStore {
     /// store skips both. p07 declares it explicitly since its delta arithmetic depends on it.
     static let chunksPerFile = 4
 
-    /// Top-K asked of every timed search. 60 is what the app's result list requests, so the reduce
-    /// and the snippet fill do the same work here as they do in the product.
-    static let searchTopK = 60
+    /// Top-K asked of every timed search, from OmniKit rather than from a copy here. The shortlist
+    /// the funnel builds is derived from this number, so a harness with its own top-k measures a
+    /// different funnel: at 60 against the shipped 120 the net was half as wide, and the rows were
+    /// reported as the shipped query path.
+    static var searchTopK: Int { VectorStore.shippedTopK }
 
     /// Free-page ratio that lets `compact` proceed. 0.05 rather than the shipped 0.15 so a 40%-deleted
     /// store always crosses the gate - the case measures what VACUUM costs, not whether it fires.
@@ -529,14 +534,16 @@ public enum PaperCasesStore {
         let dim = p.int("dim")
         let queries = p.int("queries_per_rung")
         let ladder = p.ints("ladder")
-        // Names only: the bits themselves live in the spec's arms, as the lever set the controller
-        // applies. A second copy here would be a second source of truth for the same setting.
-        let arms = ["bf16", "int4"]
+        // FROM THE SPEC, not a literal. This was a hardcoded ["bf16", "int4"], which is the second
+        // source of truth the comment above warned against: the spec gained the shipped sign tier
+        // and the body kept iterating its own pair, so a full run measured the crossover for two
+        // representations and silently omitted the one that ships.
+        let arms = ctx.spec.arms.map(\.id)
 
         var completed: [Int] = []
         var skippedMemory: [Int] = []
 
-        for target in ladder.map({ ($0 / chunksPerFile) * chunksPerFile }) {
+        for target in orderedUnique(ladder.map { ($0 / chunksPerFile) * chunksPerFile }) {
             try ctx.checkCancel()
             guard ctx.shouldContinue else { out.truncated = true; break }
             // Per-rung gate on top of the runner's whole-case one. The runner sizes its gate on the
@@ -610,11 +617,17 @@ public enum PaperCasesStore {
                 if r.times.count < queries { out.truncated = true }
             }
 
-            if let a = out.metrics.first(where: { $0.key == "n\(target).bf16_p50" })?.value,
-               let b = out.metrics.first(where: { $0.key == "n\(target).int4_p50" })?.value, b > 0 {
-                out.add(PaperMetric.derived("n\(target).speedup", value: a / b, unit: .speedup,
-                                            from: ["n\(target).bf16_p50", "n\(target).int4_p50"],
-                                            note: "exact bf16 scan over the 4-bit funnel, same rows"))
+            // One ratio per funnel arm against the exact scan, so the crossover can be read for the
+            // tier that ships and for the one the published table used, from the same rows.
+            if let exact = out.metrics.first(where: { $0.key == "n\(target).bf16_p50" })?.value {
+                for arm in arms where arm != "bf16" {
+                    guard let v = out.metrics.first(where: { $0.key == "n\(target).\(arm)_p50" })?.value,
+                          v > 0 else { continue }
+                    out.add(PaperMetric.derived("n\(target).\(arm)_speedup", value: exact / v, unit: .speedup,
+                                                from: ["n\(target).bf16_p50", "n\(target).\(arm)_p50"], arm: arm,
+                                                note: "exact bf16 scan over the \(arm) funnel, same rows: "
+                                                    + "above one the funnel is ahead"))
+                }
             }
             if rungOK { completed.append(target) }
             // Discarded before the next rung is built: two rungs resident at once is exactly the
@@ -678,7 +691,7 @@ public enum PaperCasesStore {
             }
 
             var rungTimes: [String: [Double]] = [:]
-            for arm in ["argpartition", "strided_max", "twostage_x4", "twostage_x8"] {
+            for arm in ["argpartition", "two_level", "strided_max", "twostage_x4"] {
                 try ctx.checkCancel()
                 guard ctx.shouldContinue else { out.truncated = true; break }
                 let times = try ctx.withArm(arm) { () -> [Double] in
@@ -689,6 +702,12 @@ public enum PaperCasesStore {
                     case "argpartition":
                         let kth = n - candidates
                         body = { MLX.argPartition(scores, kth: kth)[kth...] }
+                    case "two_level":
+                        // THE SHIPPED SELECTION, called through the product's own entry point so the
+                        // arm cannot drift from what runs: tiles of 32, the C tiles with the highest
+                        // maxima, then an exact select among those. It falls back to the single call
+                        // below its own floor, and the rung records which form it took.
+                        body = { VectorStore.topCIndices(scores, rows: n, C: candidates) }
                     case "strided_max":
                         // One max per residue class: a single read of the score vector, which is the
                         // hard floor any selection has to beat to be worth its complexity.
@@ -738,22 +757,383 @@ public enum PaperCasesStore {
                 if times.count < reps { out.truncated = true }
             }
 
+            // Whether the shipped form took its two-level path at this rung, or fell back to the
+            // single call. Without this a rung below the floor reports the primitive's own time
+            // under the shipped arm's name and reads as "the two are level here".
+            out.add(PaperFact("n\(n).two_level_engaged", n > 128 * candidates))
+
             // Every strategy against the exact selection it replaces.
             if let exact = rungTimes["argpartition"].map({ percentile($0.sorted(), 0.5) }), exact > 0 {
-                for arm in ["strided_max", "twostage_x4", "twostage_x8"] {
+                for arm in ["two_level", "strided_max", "twostage_x4"] {
                     guard let ts = rungTimes[arm] else { continue }
                     let v = percentile(ts.sorted(), 0.5)
                     guard v > 0 else { continue }
+                    let exactNote = "exact: same indices as the primitive, so the speedup costs no recall"
+                    let approxNote = "approximate: buys its speed with recall, which is a property of "
+                        + "the score distribution and is not re-measured per machine. "
+                        + "Cap-sensitive: read against pin.memory_cap_mb"
                     out.add(PaperMetric.derived("n\(n).\(arm)_speedup", value: exact / v, unit: .speedup,
                                                 from: ["n\(n).argpartition_p50", "n\(n).\(arm)_p50"], arm: arm,
-                                                note: "recall cost is a corpus property, carried from the "
-                                                    + "reference run rather than re-measured here. "
-                                                    + "Cap-sensitive: read against pin.memory_cap_gb, since "
-                                                    + "Sec. 4.3's own numbers were taken uncapped (one machine, "
-                                                    + "two-stage at 4M: 4.09x uncapped, 2.30x pinned to 6 GB)"))
+                                                note: arm == "two_level" ? exactNote : approxNote))
                 }
             }
             MLX.Memory.clearCache()
+        }
+        return out
+    }
+
+    // MARK: - p19: the cap sweep that identifies the crossover claim
+
+    /// One machine, one corpus, one accelerator, three memory caps.
+    ///
+    /// The cross-machine crossover table cannot separate memory from accelerator width: the parts
+    /// are rank-ordered on both at once, and that table pins ONE cap on every column, so the term
+    /// the claim is about does not vary in the experiment the claim is drawn from. Here everything
+    /// except the cap is held fixed, which is the only arrangement in which the cap can be shown to
+    /// decide anything. If the crossover moves with the cap on one machine, the claim is identified.
+    /// If it does not move, the claim was about the device all along and the paper has to say so.
+    ///
+    /// The cap moves through the shipped setter, so it reaches the buffer cache, the packing budget
+    /// and the page cache exactly as a user changing the setting would. Rows are the same seeded
+    /// vectors at every cap; the store is rebuilt per cap because the representation it holds is
+    /// what the cap decides.
+    static let capSweepBody: PaperCaseBody = { ctx in
+        var out = PaperCaseOutput()
+        let p = ctx.params
+        let dim = p.int("dim")
+        let queries = p.int("queries_per_rung")
+        let caps = p.ints("caps_mb").map { $0 * 1_000_000 }
+        let ladder = p.ints("ladder")
+        var completed: [String] = []
+
+        for cap in caps {
+            try ctx.checkCancel()
+            guard ctx.shouldContinue else { out.truncated = true; break }
+            let capMB = cap / 1_000_000
+            for target in orderedUnique(ladder.map { ($0 / chunksPerFile) * chunksPerFile }) {
+                try ctx.checkCancel()
+                guard ctx.shouldContinue else { out.truncated = true; break }
+                // The rung has to fit the cap being tested, or the sweep measures paging rather
+                // than the policy. Skipped rungs are recorded, never silently dropped.
+                let peakMB = PaperCaseCatalog.storePeakMB(rows: target, quantized: true)
+                if peakMB > 0.60 * Double(capMB) {
+                    out.add(PaperFact("cap\(capMB).n\(target)", "skipped: rung exceeds the cap under test"))
+                    continue
+                }
+                let name = "p19-c\(capMB)-n\(target).sqlite"
+                let store = try ctx.fs.store(named: name)
+                ctx.progress("cap \(capMB) MB, rung \(target) - building")
+                let built = try PaperVectors.buildStore(
+                    rows: target, into: store, chunksPerFile: chunksPerFile, snippetChars: 0, dim: dim,
+                    deadline: ctx.deadline, cancelled: { ctx.isCancelled },
+                    progress: { ctx.progress("cap \(capMB) - built \($0) rows") })
+                guard built == target else {
+                    ctx.fs.discard(store, named: name)
+                    out.truncated = true
+                    break
+                }
+
+                // TWO PASSES PER POINT, INTERLEAVED BY ARM.
+                //
+                // Repeating the whole suite on one machine moved these cells by up to 18%, against
+                // a total spread of 0.35 to 0.61 across a fourfold cap change: the run-to-run noise
+                // was the size of the effect, so a single pass per cell cannot support a claim in
+                // either direction. Each pass rebuilds the base and re-warms, because that is where
+                // the variance lives; the reported value is the median of the pass medians, and the
+                // export carries both so a reader sees the spread rather than a point estimate.
+                //
+                // Interleaved, not blocked: two passes of one arm followed by two of the other
+                // would attribute any drift during the case to whichever arm ran second.
+                var armPassMedians: [String: [Double]] = ["bf16": [], "bit1": []]
+                var armBits: [String: Int] = [:]
+                let passes = 2
+                for pass in 0 ..< passes {
+                    for (armLabel, bits, mult) in [("bf16", 0, 1), ("bit1", 1, 2)] {
+                        try ctx.checkCancel()
+                        guard ctx.shouldContinue else { out.truncated = true; break }
+                        let arm = "cap\(capMB).\(armLabel)"
+                        let levers = PaperLeverSet(quantBase: .bits(bits),
+                                                   bitCandidateMultiplier: mult,
+                                                   memoryCapBytes: cap)
+                        let r = try ctx.levers.withArm(arm, levers) { () -> (times: [Double], bits: Int) in
+                            store.invalidateBaseForBenchmark()
+                            MLX.Memory.clearCache()
+                            for w in 0 ..< 3 {
+                                _ = store.search(PaperVectors.query(900 + w, dim: dim),
+                                                 filter: SearchFilter(), topK: searchTopK)
+                            }
+                            let t = try timedQueries(store, count: queries, dim: dim,
+                                                     queryBase: pass * queries, ctx: ctx,
+                                                     dumpHits: false,
+                                                     label: "cap\(capMB) n\(target) \(armLabel) pass \(pass + 1)")
+                            return (t.milliseconds, store.baseModeBits)
+                        }
+                        guard !r.times.isEmpty else { out.truncated = true; break }
+                        out.ran(arm)
+                        armPassMedians[armLabel, default: []].append(percentile(r.times.sorted(), 0.5))
+                        armBits[armLabel] = r.bits
+                    }
+                }
+                var armTimes: [String: Double] = [:]
+                for (armLabel, medians) in armPassMedians where !medians.isEmpty {
+                    let arm = "cap\(capMB).\(armLabel)"
+                    out.add("cap\(capMB).n\(target).\(armLabel)_p50", medians, unit: .milliseconds, arm: arm)
+                    // The realised representation, per point. A forcing that did not take would
+                    // otherwise appear as a cap effect.
+                    out.add(PaperFact("cap\(capMB).n\(target).\(armLabel)_base_bits",
+                                      armBits[armLabel] ?? -1, arm: arm))
+                    armTimes[armLabel] = percentile(medians.sorted(), 0.5)
+                }
+                if let a = armTimes["bf16"], let b = armTimes["bit1"], b > 0 {
+                    out.add(PaperMetric.derived("cap\(capMB).n\(target).speedup", value: a / b, unit: .speedup,
+                                                from: ["cap\(capMB).n\(target).bf16_p50",
+                                                       "cap\(capMB).n\(target).bit1_p50"],
+                                                note: "exact scan over the funnel at this cap: "
+                                                    + "above one the funnel is ahead"))
+                    completed.append("c\(capMB)n\(target)")
+                }
+                ctx.fs.discard(store, named: name)
+                MLX.Memory.clearCache()
+            }
+        }
+        out.extraParameters.set("points_completed",
+                                completed.isEmpty ? .text("none") : .texts(completed))
+        out.extraParameters.set("top_k", .int(searchTopK))
+        return out
+    }
+
+    // MARK: - p20: accuracy and latency of the coarse tier, on one grid
+
+    /// The frontier, not a single point.
+    ///
+    /// A tier is chosen against a shortlist width, and the two trade against each other: a wider
+    /// code is more accurate at an equal shortlist, and a narrower one leaves latency to spend on a
+    /// wider shortlist. Measuring one (bits, C) point per tier cannot show that, so this case walks
+    /// the grid and reports recall AND latency at every point. The shipped point is on the grid by
+    /// construction, so it is measured rather than interpolated.
+    ///
+    /// The reference is an exact fp32 top-10 computed on the host from the same rows, so it cannot
+    /// inherit an error from the tier under test.
+    static let recallBody: PaperCaseBody = { ctx in
+        var out = PaperCaseOutput()
+        let p = ctx.params
+        let dim = p.int("dim")
+        let rows = (p.int("rows") / chunksPerFile) * chunksPerFile
+        let queryCount = p.int("queries")
+        let widths = p.ints("candidates")
+        let bitsList = p.ints("bits")
+
+        let name = "p20-recall.sqlite"
+        let store = try ctx.fs.store(named: name)
+        defer { ctx.fs.discard(store, named: name) }
+        ctx.progress("building \(rows) rows")
+        let built = try PaperVectors.buildStore(
+            rows: rows, into: store, chunksPerFile: chunksPerFile, snippetChars: 0, dim: dim,
+            deadline: ctx.deadline, cancelled: { ctx.isCancelled },
+            progress: { ctx.progress("built \($0) rows") })
+        guard built == rows else { throw PaperCaseError("p20 built \(built) of \(rows) rows") }
+
+        // THE REFERENCE: an exact fp32 top-10 per query over the same rows, computed independently
+        // of the store so it cannot inherit an error from the tier under test. In fp32 slabs on the
+        // accelerator rather than on the host, because the host form is rows x dim x queries
+        // multiply-adds and would cost more than the whole rest of the suite.
+        ctx.progress("reference top-10 over \(queryCount) queries")
+        let queryMatrix = MLXArray((0 ..< queryCount).flatMap { PaperVectors.query($0, dim: dim) },
+                                   [queryCount, dim]).asType(.float32).transposed()
+        MLX.eval(queryMatrix)
+        // Per FILE, not per row, because that is the unit a search returns: the store reduces to the
+        // best chunk of each file before it ranks, so a row-level reference would count a row that
+        // lost to its own file's better chunk as a miss.
+        var best: [[(file: Int, score: Float)]] = Array(repeating: [], count: queryCount)
+        let slabRows = (65_536 / chunksPerFile) * chunksPerFile
+        var slabStart = 0
+        while slabStart < rows {
+            try ctx.checkCancel()
+            guard ctx.shouldContinue else { out.truncated = true; break }
+            let slabEnd = min(rows, slabStart + slabRows)
+            let flat = (slabStart ..< slabEnd).flatMap { PaperVectors.vec($0, dim: dim) }
+            let slab = MLXArray(flat, [slabEnd - slabStart, dim]).asType(.float32)
+            let scores = MLX.matmul(slab, queryMatrix)      // [slabRows, queries]
+            let files = (slabEnd - slabStart) / chunksPerFile
+            let perFile = MLX.max(scores.reshaped([files, chunksPerFile, queryCount]), axis: 1)
+            MLX.eval(perFile)
+            let host = perFile.asType(.float32).asArray(Float.self)
+            let fileBase = slabStart / chunksPerFile
+            for f in 0 ..< files {
+                for q in 0 ..< queryCount {
+                    let s = host[f * queryCount + q]
+                    if best[q].count < 10 {
+                        best[q].append((fileBase + f, s))
+                        if best[q].count == 10 { best[q].sort { $0.score > $1.score } }
+                    } else if s > best[q][9].score {
+                        best[q][9] = (fileBase + f, s)
+                        best[q].sort { $0.score > $1.score }
+                    }
+                }
+            }
+            slabStart = slabEnd
+            ctx.progress("reference \(slabStart)/\(rows) rows")
+            MLX.Memory.clearCache()
+        }
+        let reference: [[Int]] = best.map { $0.map(\.file) }
+        guard reference.contains(where: { !$0.isEmpty }) else { out.truncated = true; return out }
+
+        for bits in bitsList {
+            for width in widths {
+                try ctx.checkCancel()
+                guard ctx.shouldContinue else { out.truncated = true; break }
+                // The grid point IS a multiplier, not a free-floating width: C is reachable only
+                // through the setting the product exposes, so every point on the frontier is a
+                // configuration the product can actually be in.
+                let mult = width
+                let arm = "b\(bits)m\(mult)"
+                let r = try ctx.levers.withArm(arm, PaperLeverSet(quantBase: .bits(bits),
+                                                                  bitCandidateMultiplier: mult)) {
+                    () -> (times: [Double], recall: Double, realised: Int, candidates: Int) in
+                    store.invalidateBaseForBenchmark()
+                    MLX.Memory.clearCache()
+                    for w in 0 ..< 2 {
+                        _ = store.search(PaperVectors.query(900 + w, dim: dim),
+                                         filter: SearchFilter(), topK: searchTopK)
+                    }
+                    var times: [Double] = []
+                    var hitSum = 0
+                    for q in 0 ..< reference.count {
+                        try ctx.checkCancel()
+                        guard ctx.shouldContinue else { break }
+                        let qv = PaperVectors.query(q, dim: dim)
+                        let t = Date()
+                        let hits = store.search(qv, filter: SearchFilter(), topK: searchTopK)
+                        times.append(-t.timeIntervalSinceNow * 1000)
+                        // recall@10: how much of the exact top-10 the funnel put in ITS top 10.
+                        // Against the whole returned list it would read near one at every point on
+                        // the grid and the frontier would be flat by construction.
+                        let returned = Set(hits.prefix(10).compactMap { Int($0.path.dropFirst()) })
+                        hitSum += reference[q].filter { returned.contains($0) }.count
+                    }
+                    let recall = times.isEmpty ? 0 : Double(hitSum) / Double(10 * times.count)
+                    // Read INSIDE the arm. Read outside it, every point would report the pinned
+                    // width instead of its own, which is the failure the lever file warns about and
+                    // the one this case exists to avoid.
+                    return (times, recall, store.baseModeBits,
+                            VectorStore.candidateCount(topK: VectorStore.shippedTopK))
+                }
+                guard !r.times.isEmpty else { out.truncated = true; continue }
+                out.ran(arm)
+                out.add("\(arm).query_p50", r.times, unit: .milliseconds, arm: arm)
+                // As a percentage, because that is what the unit says. Held as a fraction it
+                // printed 0.99 under a _pct suffix, which reads as one per cent.
+                out.add(PaperMetric.derived("\(arm).recall_at_10", value: 100 * r.recall, unit: .percent,
+                                            from: ["\(arm).query_p50"], arm: arm,
+                                            note: "share of the exact fp32 top-10 the funnel put in its own top 10"))
+                out.add(PaperFact("\(arm).base_bits", r.realised, arm: arm))
+                out.add(PaperFact("\(arm).candidates", r.candidates, arm: arm))
+                // A shortlist that covers the corpus recalls everything by construction, so the
+                // point is arithmetic rather than a measurement. Recorded per point, because it is
+                // the one thing that would make the whole frontier look flat and mean nothing.
+                out.add(PaperFact("\(arm).rows_over_candidates",
+                                  r.candidates > 0 ? rows / r.candidates : 0, arm: arm))
+                if r.candidates >= rows {
+                    out.add(PaperFact("\(arm).degenerate", "shortlist covers the corpus", arm: arm))
+                }
+            }
+        }
+        out.extraParameters.set("reference_queries", .int(reference.count))
+        out.extraParameters.set("top_k", .int(searchTopK))
+        return out
+    }
+
+    // MARK: - p21: what a deletion costs, against index size
+
+    /// The design says removing a row moves no other row, so the marginal cost of a save does not
+    /// grow with the corpus. That is a claim about a SLOPE, and one index size cannot measure a
+    /// slope. Two sizes a factor of four apart can: if the cost is flat between them the claim
+    /// holds, and if it grows with the row count the mechanism is not doing what the section says.
+    static let deleteBody: PaperCaseBody = { ctx in
+        var out = PaperCaseOutput()
+        let p = ctx.params
+        let dim = p.int("dim")
+        let deletes = p.int("deletes")
+        let perFile = p.int("chunks_per_file")
+
+        // Deduped: under a small `--scale` both rungs clamp to the same minimum, and two rungs of
+        // the same size emit the same key twice. The export dedupes rather than losing a row, but a
+        // slope between a rung and itself is not a slope.
+        let rungs = orderedUnique(p.ints("ladder").map { ($0 / perFile) * perFile })
+        for target in rungs {
+            for arm in ["tombstone_off", "tombstone_on"] {
+                try ctx.checkCancel()
+                guard ctx.shouldContinue else { out.truncated = true; break }
+                let name = "p21-\(arm)-n\(target).sqlite"
+                let store = try ctx.fs.store(named: name)
+                ctx.progress("\(arm) rung \(target) - building")
+                let built = try PaperVectors.buildStore(
+                    rows: target, into: store, chunksPerFile: perFile, snippetChars: 0, dim: dim,
+                    deadline: ctx.deadline, cancelled: { ctx.isCancelled },
+                    progress: { ctx.progress("rung \(target) - built \($0) rows") })
+                guard built == target else {
+                    ctx.fs.discard(store, named: name)
+                    out.truncated = true
+                    break
+                }
+
+                let r = try ctx.withArm(arm) { () -> (removals: [Double], searches: [Double]) in
+                    // One search first, so the resident matrix exists: deleting from a store that
+                    // nothing has scanned would skip the work the claim is about.
+                    _ = store.search(PaperVectors.query(0, dim: dim), filter: SearchFilter(), topK: searchTopK)
+                    var removals: [Double] = []
+                    var searches: [Double] = []
+                    let files = target / perFile
+                    let stride = max(1, files / max(1, deletes))
+                    for i in 0 ..< deletes {
+                        try ctx.checkCancel()
+                        guard ctx.shouldContinue else { break }
+                        // Spread across the row space rather than taken from one end: a delete near
+                        // the front is what a compacting store pays most for, so deleting from the
+                        // tail would measure the cheapest pattern and report it as the cost.
+                        let file = (i * stride) % max(1, files)
+                        let t = Date()
+                        store.deletePath(PaperVectors.path(file: file))
+                        removals.append(-t.timeIntervalSinceNow * 1000)
+                        // A search after each delete: the dead row has to be masked out of every
+                        // scan, and that mask is what the design trades the row copy for.
+                        let s = Date()
+                        _ = store.search(PaperVectors.query(i, dim: dim), filter: SearchFilter(), topK: searchTopK)
+                        searches.append(-s.timeIntervalSinceNow * 1000)
+                        if i % 10 == 0 { ctx.progress("\(arm) rung \(target) - delete \(i + 1)/\(deletes)") }
+                    }
+                    return (removals, searches)
+                }
+                guard !r.removals.isEmpty else { out.truncated = true; ctx.fs.discard(store, named: name); continue }
+                out.ran(arm)
+                out.metrics += PaperMetric.distribution("n\(target).delete", samples: r.removals,
+                                                        unit: .milliseconds, arm: arm, minimumForP99: 100)
+                out.metrics += PaperMetric.distribution("n\(target).search_after_delete",
+                                                        samples: r.searches,
+                                                        unit: .milliseconds, arm: arm, minimumForP99: 100)
+                // The ARM belongs in the key, not only in the arm field: the export composes one key
+                // per fact and renames a collision to .dupN, so two arms emitting one key produced
+                // eight renamed facts rather than eight attributable ones.
+                out.add(PaperFact("\(arm).n\(target).base_bits", store.baseModeBits, arm: arm))
+                out.add(PaperFact("\(arm).n\(target).rows_after", store.count, arm: arm))
+                ctx.fs.discard(store, named: name)
+                MLX.Memory.clearCache()
+            }
+        }
+        // The slope IS the claim: a delete that moves no other row costs the same at both sizes.
+        out.extraParameters.set("rungs_measured", .ints(rungs))
+        if let small = rungs.first, let large = rungs.last, small != large {
+            for arm in ["tombstone_off", "tombstone_on"] {
+                guard let a = out.metrics.first(where: { $0.key == "\(arm).n\(small).delete.p50" })?.value,
+                      let b = out.metrics.first(where: { $0.key == "\(arm).n\(large).delete.p50" })?.value,
+                      a > 0 else { continue }
+                out.add(PaperMetric.derived("\(arm).delete_slope", value: b / a, unit: .speedup,
+                                            from: ["\(arm).n\(small).delete.p50", "\(arm).n\(large).delete.p50"],
+                                            arm: arm,
+                                            note: "cost at the larger index over the smaller, "
+                                                + "\(large / small)x the rows: one means the cost does not "
+                                                + "grow with the index"))
+            }
         }
         return out
     }
@@ -952,6 +1332,13 @@ public enum PaperCasesStore {
 
     /// The percentile convention `searchunderindex` has always used, reproduced so a number here can
     /// be compared with one already recorded in measurements.md.
+    /// Ladder rungs with duplicates removed, order preserved. A scaled run clamps several rungs onto
+    /// the same minimum, and two rungs of the same size are one rung measured twice.
+    static func orderedUnique(_ values: [Int]) -> [Int] {
+        var seen = Set<Int>()
+        return values.filter { seen.insert($0).inserted }
+    }
+
     static func percentile(_ sorted: [Double], _ q: Double) -> Double {
         guard !sorted.isEmpty else { return 0 }
         return sorted[min(sorted.count - 1, max(0, Int(Double(sorted.count) * q)))]

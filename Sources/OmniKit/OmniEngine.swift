@@ -773,7 +773,11 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         guard let cores = gpuCores else { return 2 }
         return cores < 16 ? 2 : Int.max
     }
-    static let indexGateWindow: Int = (ProcessInfo.processInfo.environment["OMNI_INDEX_GATE_BATCHES"].flatMap { Int($0) })
+    /// PAPER LEVER (var, not let): the ceiling is a mechanism the paper describes and therefore one
+    /// the suite has to be able to disable in process. Same reason as the other levers: a `let` is
+    /// read once, so flipping the env between arms measures the first arm twice.
+    nonisolated(unsafe) public static var indexGateWindow: Int =
+        (ProcessInfo.processInfo.environment["OMNI_INDEX_GATE_BATCHES"].flatMap { Int($0) })
         ?? defaultGateWindow(gpuCores: SystemProbe.gpuCores())
     /// Carve a multi-image embed into one-image gate holds while a query is active (see embedImages).
     /// OMNI_MEDIA_CARVE=0 reverts to one whole-batch hold (the old behavior) for A/B.

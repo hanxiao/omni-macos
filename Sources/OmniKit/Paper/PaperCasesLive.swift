@@ -74,6 +74,29 @@ public enum PaperCasesLive {
             PaperFact("index_model_variant", live.modelVariant),
             PaperFact("root_count", live.roots.count),
         ]
+        // WHAT THE INDEX IS MADE OF, per chunk. The machine table reports one storage number, which
+        // cannot support the claims Section 3.4 makes about the layout: that the replica is a
+        // sixteenth of the vectors, that a chunk row is four integers, and that the scan tier is the
+        // part that grows with the corpus. The shipped four-way split answers all three, and
+        // dividing by chunks makes two machines with different corpora comparable.
+        let use = live.store.diskUse()
+        for e in use.entries where e.bytes > 0 {
+            let key = e.name.lowercased().replacingOccurrences(of: " ", with: "_")
+            out.metrics.append(PaperMetric("store_\(key)", runs: [Double(e.bytes)],
+                                           unit: .bytes, aggregate: .single, note: e.detail))
+            if snap.chunks > 0 {
+                out.metrics.append(PaperMetric.derived("store_\(key)_per_chunk",
+                                                       value: Double(e.bytes) / Double(snap.chunks),
+                                                       unit: .bytes, from: ["store_\(key)", "chunks"]))
+            }
+        }
+
+        // The machine table is where the conditionality of the funnel becomes visible: a column
+        // whose corpus is below this device's threshold scans the exact vectors, and every query row
+        // for that column is a different measurement from a column that runs the replica. Stamped
+        // here so one row of the machine table carries it, rather than leaving a reader to infer it
+        // from the row count and a rule stated three sections earlier.
+        stampScanTier(live.store, into: &out)
         return out
     }
 
@@ -131,6 +154,29 @@ public enum PaperCasesLive {
         }
         out.metrics += PaperMetric.distribution("filename_query", samples: filenameSamples, unit: .milliseconds)
 
+        // FILTERED: a kind-restricted query, which is the path that builds the per-row mask columns
+        // Section 3.4 accounts for. Those columns are materialised on the FIRST filtered query and
+        // held afterwards, so the first one is reported separately: rolling it into the
+        // distribution would charge every later query for a one-time build, and dropping it would
+        // hide a cost the user actually waits for once.
+        let filteredCount = p.int("filtered_queries")
+        var filtered: [Double] = []
+        var filteredFirst: Double?
+        for i in 0 ..< filteredCount where ctx.shouldContinue {
+            let text = queryTexts[i % queryTexts.count]
+            var f = SearchFilter(); f.kinds = ["text"]
+            let v = ctx.engine.embedQuery(text)
+            let t = timeMs { _ = live.store.search(v, filter: f, topK: topK, markActive: false) }
+            if i == 0 { filteredFirst = t } else { filtered.append(t) }
+        }
+        if let first = filteredFirst {
+            out.metrics.append(PaperMetric("filtered_query_first", runs: [first], unit: .milliseconds,
+                                           aggregate: .single,
+                                           note: "first kind-filtered query: builds the mask columns"))
+        }
+        out.metrics += PaperMetric.distribution("filtered_query", samples: filtered, unit: .milliseconds,
+                                                note: "kind-filtered, mask columns already built")
+
         // FIND SIMILAR: the pivot's vector is already stored, so this is scan and select with no
         // forward pass, which is the claim Section 3.4 makes for it.
         let pivots = livePaths(live, engine: ctx.engine, limit: p.int("pivot_files"), topK: topK)
@@ -185,7 +231,30 @@ public enum PaperCasesLive {
             out.metrics += PaperMetric.distribution(label, samples: samples, unit: .milliseconds,
                                                     note: "decode plus encode plus search")
         }
+        stampScanTier(live.store, into: &out)
         return out
+    }
+
+    /// WHICH REPRESENTATION ACTUALLY RAN.
+    ///
+    /// Every query row above is a scan, and the store chooses between the exact vectors and the
+    /// compact replica from the memory cap and the row count. That choice is invisible in a latency
+    /// number, so a table of query rows collected on five machines can hold columns that ran
+    /// different scans and read as one measurement. It is not hypothetical: at the shipped 6 GB cap
+    /// a corpus below the device threshold keeps no replica at all, and the paper described the
+    /// funnel as the query path without qualification.
+    ///
+    /// Stamped from the live store after the queries, so it reports what ran rather than what the
+    /// policy would pick.
+    static func stampScanTier(_ store: VectorStore, into out: inout PaperCaseOutput) {
+        let bits = store.baseModeBits
+        out.facts.append(PaperFact("scan_base_bits", bits))
+        out.facts.append(PaperFact("scan_representation",
+                                   bits == 0 ? "exact-bf16" : (bits == 1 ? "sign-replica" : "affine-\(bits)bit")))
+        out.facts.append(PaperFact("funnel_active", bits != 0))
+        out.facts.append(PaperFact("rows_total", store.count))
+        out.facts.append(PaperFact("candidates", VectorStore.candidateCount(topK: VectorStore.shippedTopK)))
+        out.facts.append(PaperFact("memory_cap_mb", OmniMemoryBudget.capBytes / 1_000_000))
     }
 
     // MARK: - p15 what a full indexing pass costs on real files
@@ -381,7 +450,7 @@ public enum PaperCasesLive {
         out.metrics += PaperMetric.distribution("idle", samples: idle, unit: .milliseconds,
                                                 note: "the live index, no indexer running")
 
-        for arm in ["unshaped", "shaped"] {
+        for arm in ["no_ceiling", "unshaped", "shaped"] {
             try ctx.checkCancel()
             guard ctx.shouldContinue else { out.truncated = true; break }
             out.arms.append(arm)
@@ -433,14 +502,26 @@ public enum PaperCasesLive {
                                                         unit: .milliseconds, arm: arm)
             }
         }
+        // Each mechanism against the arm that has it turned off, and the ceiling against the
+        // uncapped hold rather than against the shaped arm: reading shaping off `no_ceiling` would
+        // credit one mechanism with both gains.
         for suffix in ["p50", "p95", "p99"] {
-            guard let off = out.metrics.first(where: { $0.key == "unshaped.loaded.\(suffix)" })?.value,
-                  let on = out.metrics.first(where: { $0.key == "shaped.loaded.\(suffix)" })?.value,
-                  off > 0 else { continue }
-            out.metrics.append(PaperMetric.derived("shaping_gain_\(suffix)", value: 100 * (off - on) / off,
-                                                   unit: .percent,
-                                                   from: ["unshaped.loaded.\(suffix)", "shaped.loaded.\(suffix)"]))
+            func value(_ arm: String) -> Double? {
+                out.metrics.first { $0.key == "\(arm).loaded.\(suffix)" }?.value
+            }
+            if let off = value("unshaped"), let on = value("shaped"), off > 0 {
+                out.metrics.append(PaperMetric.derived("shaping_gain_\(suffix)", value: 100 * (off - on) / off,
+                                                       unit: .percent,
+                                                       from: ["unshaped.loaded.\(suffix)", "shaped.loaded.\(suffix)"]))
+            }
+            if let none = value("no_ceiling"), let capped = value("unshaped"), none > 0 {
+                out.metrics.append(PaperMetric.derived("ceiling_gain_\(suffix)", value: 100 * (none - capped) / none,
+                                                       unit: .percent,
+                                                       from: ["no_ceiling.loaded.\(suffix)", "unshaped.loaded.\(suffix)"],
+                                                       note: "the gate ceiling alone, shaping disarmed in both arms"))
+            }
         }
+        stampScanTier(live.store, into: &out)
         return out
     }
 

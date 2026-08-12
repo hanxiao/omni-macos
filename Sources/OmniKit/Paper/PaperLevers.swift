@@ -38,6 +38,9 @@ public struct PaperLeverSet: Sendable, Codable, Equatable {
     public var tailRows: Bool?
     public var chunkCache: Bool?
     public var contentDedup: Bool?
+    /// The cross-file chunk cache: the third reuse layer, and the one an arm that toggles only
+    /// `chunkCache` leaves running underneath itself.
+    public var globalChunkReuse: Bool?
     public var cantWinGate: Bool?
     public var gemvSlice: Bool?
     public var vacuumSmallCache: Bool?
@@ -45,15 +48,35 @@ public struct PaperLeverSet: Sendable, Codable, Equatable {
     public var proactiveFold: Bool?
     public var lexical: Bool?
     public var quantBase: PaperQuantBase?
+    /// Candidate width multiplier for the sign tier. Moves C without touching top-k, which is what
+    /// separates "a narrower code" from "a wider net" in the iso-latency sweep.
+    public var bitCandidateMultiplier: Int?
+    /// Batches per gate hold. `Int.max` is the uncapped whole-flush hold a wide device ships with.
+    public var indexGateWindow: Int?
+    /// Dead rows are marked and skipped rather than compacted out. Off, a delete moves every row
+    /// after it, which is the cost the design claims to have removed and which no case measured.
+    public var tombstones: Bool?
+    /// The user memory setting, in bytes. THE lever the crossover attribution needs: every other
+    /// candidate cause is a property of the machine and cannot be varied, so a claim that the cap
+    /// decides something can only be identified by varying the cap on one machine.
+    public var memoryCapBytes: Int?
 
     public init(adaptiveBatch: Bool? = nil, tailRows: Bool? = nil, chunkCache: Bool? = nil,
-                contentDedup: Bool? = nil, cantWinGate: Bool? = nil, gemvSlice: Bool? = nil,
+                contentDedup: Bool? = nil, globalChunkReuse: Bool? = nil,
+                cantWinGate: Bool? = nil, gemvSlice: Bool? = nil,
                 vacuumSmallCache: Bool? = nil, idleFold: Bool? = nil, proactiveFold: Bool? = nil,
-                lexical: Bool? = nil, quantBase: PaperQuantBase? = nil) {
+                lexical: Bool? = nil, quantBase: PaperQuantBase? = nil,
+                bitCandidateMultiplier: Int? = nil, indexGateWindow: Int? = nil,
+                tombstones: Bool? = nil, memoryCapBytes: Int? = nil) {
         self.adaptiveBatch = adaptiveBatch; self.tailRows = tailRows; self.chunkCache = chunkCache
-        self.contentDedup = contentDedup; self.cantWinGate = cantWinGate; self.gemvSlice = gemvSlice
+        self.contentDedup = contentDedup; self.globalChunkReuse = globalChunkReuse
+        self.cantWinGate = cantWinGate; self.gemvSlice = gemvSlice
         self.vacuumSmallCache = vacuumSmallCache; self.idleFold = idleFold
         self.proactiveFold = proactiveFold; self.lexical = lexical; self.quantBase = quantBase
+        self.bitCandidateMultiplier = bitCandidateMultiplier
+        self.indexGateWindow = indexGateWindow
+        self.tombstones = tombstones
+        self.memoryCapBytes = memoryCapBytes
     }
 
     /// The suite-wide pins from the plan's settings table. Held for the whole run and restored with
@@ -61,7 +84,8 @@ public struct PaperLeverSet: Sendable, Codable, Equatable {
     /// gemv slicing on (a correctness lever, never an arm), the filename channel off (it is a
     /// corpus statistic and would perturb every search timing), and the quant base left on the ship
     /// policy until a case forces it.
-    public static let suiteWide = PaperLeverSet(contentDedup: true, gemvSlice: true,
+    public static let suiteWide = PaperLeverSet(contentDedup: true, globalChunkReuse: true,
+                                                gemvSlice: true,
                                                 idleFold: true, proactiveFold: true,
                                                 lexical: false, quantBase: .auto)
 
@@ -71,10 +95,15 @@ public struct PaperLeverSet: Sendable, Codable, Equatable {
         func put(_ k: String, _ v: Bool?) { if let v { out[k] = v ? "on" : "off" } }
         put("adaptive_batch", adaptiveBatch); put("tail_rows", tailRows)
         put("chunk_cache", chunkCache); put("content_dedup", contentDedup)
+        put("global_chunk_reuse", globalChunkReuse)
         put("cantwin_gate", cantWinGate); put("gemv_slice", gemvSlice)
         put("vacuum_small_cache", vacuumSmallCache); put("idle_fold", idleFold)
         put("proactive_fold", proactiveFold); put("lexical", lexical)
         if let q = quantBase { out["quant_base"] = { if case .bits(let b) = q { "\(b)" } else { "auto" } }() }
+        if let m = bitCandidateMultiplier { out["bit_cand_mult"] = String(m) }
+        if let w = indexGateWindow { out["index_gate_window"] = w == Int.max ? "unbounded" : String(w) }
+        put("tombstones", tombstones)
+        if let c = memoryCapBytes { out["memory_cap_mb"] = String(c / 1_000_000) }
         return out
     }
 }
@@ -86,6 +115,7 @@ public struct PaperLevers: Sendable, Equatable {
     public var tailRows: Bool
     public var chunkCache: Bool
     public var contentDedup: Bool
+    public var globalChunkReuse: Bool
     public var cantWinGate: Bool
     public var gemvSlice: Bool
     public var vacuumSmallCache: Bool
@@ -93,6 +123,10 @@ public struct PaperLevers: Sendable, Equatable {
     public var proactiveFold: Bool
     public var lexical: Bool
     public var quantBase: PaperQuantBase
+    public var bitCandidateMultiplier: Int
+    public var indexGateWindow: Int
+    public var tombstones: Bool
+    public var memoryCapBytes: Int
 
     public static func capture() -> PaperLevers {
         PaperLevers(
@@ -100,13 +134,18 @@ public struct PaperLevers: Sendable, Equatable {
             tailRows: Qwen3Backbone.tailRowsEnabled,
             chunkCache: Indexer.chunkCache,
             contentDedup: Indexer.contentDedup,
+            globalChunkReuse: Indexer.globalChunkReuse,
             cantWinGate: VectorStore.cantWinGate,
             gemvSlice: VectorStore.gemvSlice,
             vacuumSmallCache: VectorStore.vacuumSmallCache,
             idleFold: VectorStore.idleFold,
             proactiveFold: VectorStore.proactiveFold,
             lexical: LexicalIndex.enabled,
-            quantBase: VectorStore.quantBaseOverride.map { PaperQuantBase.bits($0) } ?? .auto
+            quantBase: VectorStore.quantBaseOverride.map { PaperQuantBase.bits($0) } ?? .auto,
+            bitCandidateMultiplier: VectorStore.bitCandidateMultiplier,
+            indexGateWindow: OmniEngine.indexGateWindow,
+            tombstones: VectorStore.tombstones,
+            memoryCapBytes: OmniMemoryBudget.capBytes
         )
     }
 
@@ -115,6 +154,7 @@ public struct PaperLevers: Sendable, Equatable {
         Qwen3Backbone.tailRowsEnabled = tailRows
         Indexer.chunkCache = chunkCache
         Indexer.contentDedup = contentDedup
+        Indexer.globalChunkReuse = globalChunkReuse
         VectorStore.cantWinGate = cantWinGate
         VectorStore.gemvSlice = gemvSlice
         VectorStore.vacuumSmallCache = vacuumSmallCache
@@ -122,6 +162,12 @@ public struct PaperLevers: Sendable, Equatable {
         VectorStore.proactiveFold = proactiveFold
         LexicalIndex.enabled = lexical
         VectorStore.quantBaseOverride = { if case .bits(let b) = quantBase { b } else { nil } }()
+        VectorStore.bitCandidateMultiplier = bitCandidateMultiplier
+        OmniEngine.indexGateWindow = indexGateWindow
+        VectorStore.tombstones = tombstones
+        // The cap reaches allocators the setting names and several it does not, so it moves through
+        // the shipped setter rather than by assigning the budget directly.
+        if OmniMemoryBudget.capBytes != memoryCapBytes { omniSetMemoryLimit(memoryCapBytes) }
     }
 
     public func applying(_ set: PaperLeverSet) -> PaperLevers {
@@ -130,6 +176,7 @@ public struct PaperLevers: Sendable, Equatable {
         if let v = set.tailRows { out.tailRows = v }
         if let v = set.chunkCache { out.chunkCache = v }
         if let v = set.contentDedup { out.contentDedup = v }
+        if let v = set.globalChunkReuse { out.globalChunkReuse = v }
         if let v = set.cantWinGate { out.cantWinGate = v }
         if let v = set.gemvSlice { out.gemvSlice = v }
         if let v = set.vacuumSmallCache { out.vacuumSmallCache = v }
@@ -137,15 +184,24 @@ public struct PaperLevers: Sendable, Equatable {
         if let v = set.proactiveFold { out.proactiveFold = v }
         if let v = set.lexical { out.lexical = v }
         if let v = set.quantBase { out.quantBase = v }
+        if let v = set.bitCandidateMultiplier { out.bitCandidateMultiplier = v }
+        if let v = set.indexGateWindow { out.indexGateWindow = v }
+        if let v = set.tombstones { out.tombstones = v }
+        if let v = set.memoryCapBytes { out.memoryCapBytes = v }
         return out
     }
 
     /// Everything, as `name=value`, for `pin.*` in the export.
     public var stamped: [String: String] {
         PaperLeverSet(adaptiveBatch: adaptiveBatch, tailRows: tailRows, chunkCache: chunkCache,
-                      contentDedup: contentDedup, cantWinGate: cantWinGate, gemvSlice: gemvSlice,
+                      contentDedup: contentDedup, globalChunkReuse: globalChunkReuse,
+                      cantWinGate: cantWinGate, gemvSlice: gemvSlice,
                       vacuumSmallCache: vacuumSmallCache, idleFold: idleFold,
-                      proactiveFold: proactiveFold, lexical: lexical, quantBase: quantBase).stamped
+                      proactiveFold: proactiveFold, lexical: lexical, quantBase: quantBase,
+                      bitCandidateMultiplier: bitCandidateMultiplier,
+                      indexGateWindow: indexGateWindow,
+                      tombstones: tombstones,
+                      memoryCapBytes: memoryCapBytes).stamped
     }
 }
 

@@ -141,6 +141,28 @@ enum BulkDirWalker {
         init(_ roots: [String]) { stack = roots; pending = roots.count }
     }
 
+    /// ONE PROMPT PER ROOT, NOT ONE PER WORKER.
+    ///
+    /// A root on a removable volume, on an external drive, or in a TCC-protected location is
+    /// permission-gated, and the gate is raised by the first access to it. The pool's first act is
+    /// eight workers reading directories at once, so eight threads reached that gate together and
+    /// macOS raised a prompt for each: the decision is not cached until the user answers, so the
+    /// prompts do not coalesce. Measured on a five-root set with one external volume, that is eight
+    /// identical dialogs to dismiss before the crawl moves, and the watcher and the decode stage add
+    /// more behind them.
+    ///
+    /// Opening each root once, on this thread, before any worker starts raises the gate once and
+    /// waits for the answer. By the time the pool runs, the decision is cached and no worker can
+    /// raise it again. The result is discarded: this exists for its side effect on TCC, not for
+    /// what it reads. Roots that are gone or refused fail here exactly as they would have failed in
+    /// a worker, and the walk proceeds without them.
+    private static func preflight(_ roots: [String]) {
+        for root in roots {
+            let fd = open(root, O_RDONLY | O_DIRECTORY)
+            if fd >= 0 { close(fd) }
+        }
+    }
+
     /// Eight. See the note above: past this the pool buys clock with kernel CPU, and that CPU
     /// belongs to the embedding pipeline. OMNI_CRAWL_WORKERS overrides, for measuring.
     static var workerCount: Int {
@@ -168,6 +190,7 @@ enum BulkDirWalker {
                         deliver: ([T]) -> Void) {
         let live = roots.filter { shouldDescend($0, nil) }
         guard !live.isEmpty else { return }
+        preflight(live)
         let shared = Shared(live)
         let workers = min(workerCount, max(1, live.count * 4))
 

@@ -1611,7 +1611,9 @@ final class AppModel {
     /// are copies of one file would end up with fewer distinct results than the user asked for.
     /// Measured on a 212k-file index: 9.8% of top-60 slots were byte-identical copies of an earlier
     /// hit, up to 33% on one query.
-    nonisolated static let searchTopK = 120
+    /// One definition, in OmniKit, because the paper suite has to ask for the same number the
+    /// interface asks for: the shortlist width is derived from it.
+    nonisolated static let searchTopK = VectorStore.shippedTopK
 
     /// Results above the relevance threshold, sorted by the chosen order. Memoized: recomputed only
     /// when an input (rawResults / minScore / sortOrder) changes, not on every render. The frequent
