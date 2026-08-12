@@ -1019,14 +1019,25 @@ public final class VectorStore: @unchecked Sendable {
     /// hole reclaim and the scan-width upgrade for the whole session. checkpointIfDueLocked already
     /// had the right shape - back off UNLESS the WAL has grown past a hard cap - and this is the
     /// same idea with time as the bound instead of bytes.
-    /// `path` is written out at each call site rather than defaulted to #function: the reclaim
-    /// and coverage calls live in the SAME function, so #function gave them one shared key - which
-    /// is the thing this is supposed to stop.
-    private func yieldToSearchLocked(_ path: String) -> Bool {
-        guard searchRecentlyActiveLocked() else { yieldingSince[path] = nil; return false }
-        let since = yieldingSince[path] ?? Date()
-        yieldingSince[path] = since
-        guard -since.timeIntervalSinceNow < Self.maxYieldToSearch else { yieldingSince[path] = nil; return false }
+    /// The key is the ENCLOSING FUNCTION, with an optional tag that only disambiguates calls
+    /// inside the same one. Both halves are there because each previous shape had a hole.
+    ///
+    /// #function alone collapsed the two calls that share stampVectorCoverageLocked. Replacing it
+    /// with a required hand-written string fixed those two and immediately introduced a worse
+    /// hazard: a raw string is copy-pasteable, and one was - scheduleIdleFoldLocked was labelled
+    /// "width-upgrade", so two INDEPENDENT timers with different cadences shared a clock. That is
+    /// the very failure the per-path split existed to remove, reintroduced by the fix for it.
+    ///
+    /// Composing them makes a cross-function collision impossible to write: the function name is
+    /// supplied by the compiler and cannot be got wrong, and the tag can only collide with another
+    /// call in the same function - where the two are a few lines apart and the tag is the whole
+    /// reason they are there.
+    private func yieldToSearchLocked(_ tag: String = "", function: String = #function) -> Bool {
+        let key = tag.isEmpty ? function : function + "#" + tag
+        guard searchRecentlyActiveLocked() else { yieldingSince[key] = nil; return false }
+        let since = yieldingSince[key] ?? Date()
+        yieldingSince[key] = since
+        guard -since.timeIntervalSinceNow < Self.maxYieldToSearch else { yieldingSince[key] = nil; return false }
         return true
     }
     /// PAPER LEVER (var, not let): see the block near cantWinGate.
@@ -6649,7 +6660,7 @@ public final class VectorStore: @unchecked Sendable {
             guard let self else { return }
             self.queue.sync {
                 guard self.idleFoldToken == token else { return }      // more writes arrived
-                guard !self.yieldToSearchLocked("width-upgrade") else { return }
+                guard !self.yieldToSearchLocked() else { return }
                 let n = self.rows.count
                 guard n > 0, self.dim > 0, self.flat16.count == n * self.dim, n > self.baseRows else { return }
                 if Self.searchTiming { print("[search] IDLE FOLD rows=\(n) delta=\(n - self.baseRows)") }
@@ -6669,7 +6680,7 @@ public final class VectorStore: @unchecked Sendable {
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
             self.queue.sync {
-                guard self.widthUpgradeToken == token, !self.yieldToSearchLocked("width-upgrade") else {
+                guard self.widthUpgradeToken == token, !self.yieldToSearchLocked() else {
                     self.scheduleWidthUpgradeLocked(after: 30)   // still busy: come back later
                     return
                 }
