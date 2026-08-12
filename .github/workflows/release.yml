@@ -206,6 +206,13 @@ jobs:
         env:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+          # THE FILE THE DOWNLOAD BUTTON ACTUALLY POINTS AT. This list used to name "Omni.dmg", an
+          # unversioned path from a scheme that no longer exists (it 404s), so the one URL a release
+          # must invalidate was the one URL never purged. Any request that reaches Cloudflare before
+          # Pages has published the new DMG - a probe, the page's own preload, an eager user - gets a
+          # 404 cached, and nothing clears it: observed on 0.6.2, where the origin served the file
+          # (cache-busted 200) while the plain URL 404'd for everyone.
+          DMG_NAME: Omni-${{ steps.ver.outputs.version }}.dmg
         run: |
           if [ -z "$CF_API_TOKEN" ] || [ -z "$CF_ZONE_ID" ]; then
             echo "no Cloudflare secrets; skipping purge (page is updated at origin, CF will catch up on TTL)"; exit 0
@@ -217,7 +224,7 @@ jobs:
           # when they do CF would otherwise serve the stale copy for the full max-age (4h).
           curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
             -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" \
-            --data '{"files":["https://hanxiao.io/omni/","https://hanxiao.io/omni/index.html","https://hanxiao.io/omni/Omni.dmg","https://hanxiao.io/omni/latest.json","https://hanxiao.io/omni/assets/icon.png","https://hanxiao.io/omni/assets/og-image.png"]}' \
+            --data "{\"files\":[\"https://hanxiao.io/omni/\",\"https://hanxiao.io/omni/index.html\",\"https://hanxiao.io/omni/${DMG_NAME}\",\"https://hanxiao.io/omni/latest.json\",\"https://hanxiao.io/omni/assets/icon.png\",\"https://hanxiao.io/omni/assets/og-image.png\"]}" \
             && echo "purged Cloudflare cache for /omni" || echo "Cloudflare purge failed (non-fatal)"
 
       # Self-hosted hygiene: the cert import adds a temp build.keychain to the user search list -
