@@ -2807,6 +2807,15 @@ public final class VectorStore: @unchecked Sendable {
             // Once the one-time pass has completed, there is nothing to report ever again: rows
             // added later are covered by the same machinery, but that is indexing, not migrating.
             guard scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.migratedKey)'") != 1 else { return nil }
+            // AND ONLY WHEN IT CAN ACTUALLY RUN. Coverage advances only into a named vector file,
+            // and below the quant crossover the buffer is an unlinked scratch mapping - so
+            // `coveredRows` is 0 and stays 0, for as long as the index is small.
+            //
+            // Reported without this, a fresh index showed "Optimizing storage, 0%, frees 1.27 GB"
+            // sitting still - the mirror image of the 99%-forever case the flag above prevents, and
+            // worse than useless: the bytes it promises are not duplicated anywhere yet, so there
+            // is nothing to free. They are the ONLY copy of those vectors until the file exists.
+            guard flat16.isPersistent else { return nil }
             let total = rows.count
             guard coveredRows < total else { return nil }
             // Each remaining row still carries a bf16 blob that the vector file already holds.
