@@ -342,6 +342,103 @@ final class SchemaV4MigrationTests: XCTestCase {
         assertIntact(store, expect, "indexed after the upgrade")
     }
 
+    /// THE FIRST CRAWL AFTER THE UPGRADE MUST NOT MISTAKE THE INDEX'S OWN FILES FOR DELETED.
+    ///
+    /// This is where the conversion and the reconcile sweep meet, and the meeting point is a STRING
+    /// COMPARISON. The sweep asks, of every file the index knows, whether the crawl met it - the
+    /// index's side of that comparison now comes from `dirs.path || '/' || files.name` rebuilt after
+    /// a split, and the crawl's side comes from the filesystem. If the conversion changed a path's
+    /// spelling by so much as a byte, every file in the index looks deleted and the next pass
+    /// removes ALL of them.
+    ///
+    /// Nothing else would catch it: the migration's own tests compare the index against itself, and
+    /// the crawl tests never migrate. So this uses REAL files on disk, converts the index under
+    /// them, and demands the pass that follows delete nothing.
+    func testTheFirstPassAfterTheUpgradeDoesNotSweepItsOwnFiles() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("v4-sweep-\(UUID().uuidString)")
+        let root = dir.appendingPathComponent("live", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appendingPathComponent("test.sqlite")
+
+        // Real files, in nested directories - directory interning is the part that rewrites paths.
+        for i in 0 ..< 60 {
+            let sub = root.appendingPathComponent("d\(i % 5)/s\(i % 3)", isDirectory: true)
+            try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+            try "document \(i) about retrieval and quantization"
+                .write(to: sub.appendingPathComponent("f\(i).txt"), atomically: true, encoding: .utf8)
+        }
+
+        func runPass(_ store: VectorStore) {
+            let indexer = Indexer(store: store, embedder: StubEmbedder(dim: Self.dim))
+            let done = XCTestExpectation(description: "pass")
+            indexer.index(roots: [root], settings: IndexSettings(enabledKinds: [.text]), force: true) { p in
+                if p.done { done.fulfill() }
+            }
+            wait(for: [done], timeout: 120)
+        }
+
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            runPass(store)
+            XCTAssertGreaterThan(store.count, 0, "the fixture indexed nothing")
+            store.close()
+        }
+        for _ in 0 ..< 4 { let s = try VectorStore(dbURL: dbURL); s.close() }   // let coverage settle
+        try downgradeToV3(dbURL)
+
+        do { let s = try VectorStore(dbURL: dbURL); s.close() }   // converts on open
+        XCTAssertEqual(scalar(open(dbURL), "PRAGMA user_version"), 4, "the index did not convert")
+
+        // REOPENED, WITHOUT ITS ROW SIDECAR, and both halves are the point.
+        //
+        // loadIntoMemory runs BEFORE the conversion, so the session that converts builds its
+        // resident paths from the OLD tables and never exercises the v4 spelling at all - only a
+        // later launch reads them back through dirs+name. And close() stamps the row sidecar, which
+        // the next launch adopts, so even reopening reads cached paths rather than SQL. Written
+        // without each of these in turn, and it passed both times with the rejoin deliberately
+        // broken. Removing the sidecar is also the honest case: it is a cache, rejected routinely.
+        try? FileManager.default.removeItem(at: dir.appendingPathComponent("test.sqlite.rows"))
+        let store = try VectorStore(dbURL: dbURL)
+        defer { store.close() }
+        let before = store.count
+        let filesBefore = Set(store.allIndexedPaths())
+        XCTAssertEqual(filesBefore.count, 60, "the converted index lost files before the pass")
+
+        // Every file is still on disk, so a correct pass deletes nothing.
+        runPass(store)
+
+        XCTAssertEqual(store.count, before,
+                       "the first pass after the upgrade deleted rows for files that are still there")
+        // WHAT THIS TEST DOES AND DOES NOT PROVE. It exercises the real sequence - index, convert,
+        // reopen without the row-sidecar cache so the paths come back through dirs+name, then a
+        // full pass over files that are all still present - and demands nothing be deleted. That is
+        // worth having.
+        //
+        // It is NOT a guard on the path spelling. Attempts to break it were tried: rejoining with
+        // '//' makes the path fail the under-pass-roots check, which PROTECTS it from the sweep;
+        // uppercasing the basename makes the sweep mark every file stale, but deletePaths then
+        // resolves those names through the same tables and finds nothing to delete, so the row
+        // count is unchanged either way. A read-only distortion cannot cause the deletion, because
+        // reads and deletes go through the same resolution. Nothing here should be read as evidence
+        // that a genuine split/join regression would be caught.
+    }
+
+    /// Minimal embedder: this suite is about paths and bookkeeping, not vectors.
+    final class StubEmbedder: Embedder, @unchecked Sendable {
+        let dim: Int
+        init(dim: Int) { self.dim = dim }
+        private func unit() -> [Float] { var v = [Float](repeating: 0, count: dim); v[0] = 1; return v }
+        func embedText(_ text: String, as type: OmniInputType) -> [Float] { unit() }
+        func embedTextBatch(_ texts: [String], as type: OmniInputType) -> [[Float]] { texts.map { _ in unit() } }
+        func embedImage(_ image: CGImage) -> [Float]? { nil }
+        func embedImages(_ raws: [OmniVisionPreprocess.RawPatches]) -> [[Float]]? { nil }
+        func embedVideoFrames(_ frames: [CGImage]) -> [Float]? { nil }
+        func embedAudio(_ url: URL) -> [Float]? { nil }
+        func embedAudioMel(_ mel: [Float], frames: Int) -> [Float]? { nil }
+        func embedAudioMelBatch(_ mels: [[Float]], frames: [Int]) -> [[Float]]? { nil }
+    }
+
     /// REPAIR MUST NOT FIRE ON A HEALTHY v4 INDEX.
     ///
     /// The repair path reads the database directly, through its own connection, in the shapes it
