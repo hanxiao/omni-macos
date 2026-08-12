@@ -7044,10 +7044,33 @@ public final class VectorStore: @unchecked Sendable {
         let scanCodes = size(base + ".quant") + size(base + ".rows")
         let lookups = size(base + ".names") + size(base + ".names-wal") + size(base + ".names-shm")
             + size("tags-d\(dim).cache") + size("tags-d\(dim).prior")
+        // VECTORS THE DATABASE IS STILL HOLDING count as vectors, not as snippets.
+        //
+        // A vector is durable in `pending_vecs` until the .vecs file can answer for it, and below
+        // the quant crossover (1M rows on a 32+ core GPU) the buffer never becomes a named file at
+        // all - so a young index has NO .vecs, and every one of its vectors sits inside
+        // index.sqlite. Reporting only the file made the chart say "Vectors 0" while 117 MB of them
+        // were filed under "text excerpts, file paths, chunk records", which is how this was
+        // noticed. The same bytes were mislabelled before v4 too, as `chunks.vec` blobs; what is
+        // new is that they are a table of their own and can be told apart.
+        //
+        // Counted from the resident rows rather than a COUNT(*): this feeds a Settings pane, the
+        // number is the same, and it costs nothing.
+        // live rows minus the live rows the file already covers - the same identity the coverage
+        // audit checks, and it needs no special case for bf16 mode, where covered is simply 0.
+        let pendingVectors = queue.sync { () -> Int64 in
+            guard dim > 0 else { return 0 }
+            let live = Swift.max(0, rows.count - deadRows.count)
+            let coveredLive = Swift.max(0, coveredRows - vecHoles.count)
+            return Int64(Swift.max(0, live - coveredLive)) * Int64(dim * MemoryLayout<UInt16>.size)
+        }
         var entries: [DiskUse.Entry] = [
-            .init(name: "Vectors", bytes: size(base + ".vecs"), irreplaceable: true,
-                  detail: "one fp16 vector per chunk, the only copy"),
-            .init(name: "Snippets", bytes: dbBytes, irreplaceable: true,
+            .init(name: "Vectors", bytes: size(base + ".vecs") + pendingVectors, irreplaceable: true,
+                  detail: size(base + ".vecs") > 0 && pendingVectors > 0
+                      ? "one fp16 vector per chunk, the only copy - some still inside the database"
+                      : (pendingVectors > 0 ? "one fp16 vector per chunk, the only copy - held in the database until the index grows"
+                                            : "one fp16 vector per chunk, the only copy")),
+            .init(name: "Snippets", bytes: Swift.max(0, dbBytes - pendingVectors), irreplaceable: true,
                   detail: "text excerpts, file paths, chunk records"),
             .init(name: "Scan codes", bytes: scanCodes, irreplaceable: false,
                   detail: "1-bit codes the first-stage scan reads, plus the slot map"),
