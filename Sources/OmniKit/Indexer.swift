@@ -488,7 +488,32 @@ public final class Indexer: @unchecked Sendable {
             knownBox.v = store.indexedFiles()
             knownReady.signal()
         }
-        var seen = Set<String>()
+        // WHAT THE CRAWL TOUCHED, as digests rather than paths.
+        //
+        // This set exists for ONE question, asked once at the end of the pass: of the files the
+        // index already knows, which did the crawl not meet? Holding the path strings to answer it
+        // keeps every crawled path alive for the whole pass - the Set retains them long after the
+        // wave that produced them is gone - which measured ~450 MB on a 2M-file corpus against
+        // ~34 MB for the digests. The heap term is the whole difference: a path over 15 UTF-8 bytes
+        // is a separate allocation, and 151 bytes is the average here.
+        //
+        // A COLLISION CAN ONLY FAIL IN ONE DIRECTION, which is what makes this safe. The only query
+        // is `!seen.contains(...)`, so a collision can make an UNCRAWLED path look crawled: that
+        // file is then not swept, and one stale row survives until the next pass - and Swift's
+        // Hasher is seeded per process, so the collision does not recur. The opposite error is
+        // impossible: a file the crawl DID meet always has its digest in the set, so a live file can
+        // never be reported stale and deleted. Spurious deletion would cost a re-embed and silently
+        // drop a file out of results; a skipped deletion is a row that outlives its file by one
+        // pass. At 2M files the expected number of colliding pairs is about 1.1e-7 either way.
+        //
+        // The digest must not escape this pass: Hasher's seed changes per process, so it is
+        // meaningless the moment it is written down.
+        var seen = Set<UInt64>()
+        @inline(__always) func pathDigest(_ p: String) -> UInt64 {
+            var h = Hasher()
+            h.combine(p)
+            return UInt64(bitPattern: Int64(h.finalize()))
+        }
 
         // STREAMING CRAWL. The walk used to complete - every root, every file - before anything was
         // embedded, so a large library spent minutes on a launch screen with the GPU idle. Measured
@@ -652,7 +677,14 @@ public final class Indexer: @unchecked Sendable {
 
         var doneByRoot: [String: Int] = [:]
         func tick(_ path: String) {
-            seen.insert(path); p.scanned += 1; p.currentPath = path
+            // ONLY IF THE INDEX ALREADY KNOWS IT. The single reader iterates `known`, so a digest
+            // for a path that is not in there can never be looked at - it is pure ballast. That is
+            // not a rounding error: on a FIRST index `known` is empty, so the old set grew to the
+            // entire corpus to answer nothing, at exactly the moment the crawl, the encoder and the
+            // store are competing hardest for memory. One dictionary probe per crawled file, on a
+            // path that is about to be hashed anyway.
+            if known[path] != nil { seen.insert(pathDigest(path)) }
+            p.scanned += 1; p.currentPath = path
             // The RESOLVED root, for the same reason the deletion sweep uses it: the crawl returns
             // paths with the root's symlinks followed, and matching them against the raw root finds
             // nothing - the per-folder progress would sit at zero for the whole pass.
@@ -1038,7 +1070,7 @@ public final class Indexer: @unchecked Sendable {
             }
             // Batch the deletion: one transaction + one in-memory rebuild, not one per path.
             let stale = Set(known.compactMap { (path, sf) -> String? in
-                (!seen.contains(path) && underPassRoots(path) && !inBlindRoot(path) && inScope(path, sf.kind)) ? path : nil
+                (!seen.contains(pathDigest(path)) && underPassRoots(path) && !inBlindRoot(path) && inScope(path, sf.kind)) ? path : nil
             })
             if !stale.isEmpty {
                 Self.log.info("reconcile: removing \(stale.count, privacy: .public) stale paths")
