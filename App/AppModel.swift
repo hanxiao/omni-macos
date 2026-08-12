@@ -918,6 +918,27 @@ final class AppModel {
 
     func isFolderPaused(_ url: URL) -> Bool { pausedRoots.contains(url.path) }
 
+    /// "Index now, under the settings that are current" - for the policy changes that widen what
+    /// is indexable (a modality switched on, an extension cap raised, dataless files included).
+    ///
+    /// A bare startIndexing() is wrong for those: its first guard returns silently when a pass is
+    /// already running, and that pass is carrying the OLD settings snapshot - so the newly allowed
+    /// files are not picked up by it, and the request that would have picked them up has been
+    /// dropped. They appear whenever some later pass happens to run, which from the user's side
+    /// looks like the setting did nothing.
+    ///
+    /// Re-scoping a running pass is what setFolderPaused already does for the same reason, and the
+    /// restart is incremental - files already done are mtime-skipped - so the cost is the crawl,
+    /// not the embedding.
+    func requestIndexPass() {
+        if indexState == .indexing {
+            restartAfterPause = true
+            indexer?.cancel()
+        } else {
+            startIndexing()
+        }
+    }
+
     func setFolderPaused(_ url: URL, _ paused: Bool) {
         if paused { pausedRoots.insert(url.path) } else { pausedRoots.remove(url.path) }
         UserDefaults.standard.set(Array(pausedRoots), forKey: "omni.pausedRoots")
@@ -1021,7 +1042,7 @@ final class AppModel {
         didSet {
             guard oldValue != skipDatalessFiles else { return }
             persistPerf()
-            if !skipDatalessFiles { startIndexing() }
+            if !skipDatalessFiles { requestIndexPass() }
         }
     }
 
@@ -1874,7 +1895,7 @@ final class AppModel {
             await MainActor.run {
                 self.refreshIndexStats(store)
                 self.refreshSearchAfterBackgroundChange()
-                self.startIndexing()   // pick up files the new policy now allows
+                self.requestIndexPass()   // pick up files the new policy now allows
             }
         }
     }
@@ -2012,7 +2033,7 @@ final class AppModel {
                 await self.reconcileTowers()
             }
         } else if on {
-            startIndexing()   // tower already resident; just crawl the now-included files
+            requestIndexPass()   // tower already resident; just crawl the now-included files
         }
     }
 
@@ -2036,7 +2057,7 @@ final class AppModel {
         await Task.detached(priority: .userInitiated) { engine.setTowers(keepVision: towers.vision, keepAudio: towers.audio) }.value
         self.supportsImages = engine.supportsImages
         self.audioSupported = engine.supportsAudio
-        self.startIndexing()           // crawl any files the surviving towers now cover
+        self.requestIndexPass()        // crawl any files the surviving towers now cover
         await self.reconcileTowers()   // settings may have changed during the off-actor drop; converge
     }
 
@@ -2844,7 +2865,7 @@ final class AppModel {
         // !isPaperRunning: the paper suite moves process-wide levers (tail rows, chunk cache, the
         // can't-win gate), so a pass starting mid-run would embed the user's files under a
         // benchmark arm. The run's completion resumes indexing, which re-enters here.
-        guard !isTerminating, !isPaperRunning, !indexObsolete, indexState != .indexing, activeRoots.isEmpty,
+        guard !isTerminating, !isPaperRunning, !isProfilingRunning, !indexObsolete, indexState != .indexing, activeRoots.isEmpty,
               !fsReconcileInFlight,
               let indexer, let store, !pendingCatchUpRoots.isEmpty else { return }
         let batch = pendingCatchUpRoots.filter { roots.contains($0) }
@@ -3590,7 +3611,10 @@ final class AppModel {
         // during a 25-minute run (the menu item and the Settings buttons stay live) would otherwise
         // silently do nothing, and the run's resume drains restartAfterPause exactly as a paused
         // pass's completion does.
-        guard !isPaperRunning else { restartAfterPause = true; return }
+        // isProfilingRunning too: the benchmark pauses live indexing and then measures a timed
+        // pass, so a watcher- or catch-up-triggered pass starting underneath it both skews the
+        // measurement and is what leaves `indexState == .indexing` when the resume above runs.
+        guard !isPaperRunning, !isProfilingRunning else { restartAfterPause = true; return }
         // A catch-up pass (added folders) or FS reconcile is mid-flight on the SAME Indexer: starting
         // a full pass now would run two passes concurrently (shared `cancelled` flag, double
         // embedding, racing reconciles). Cancel it and defer; its completion drains the flag.
@@ -4017,7 +4041,18 @@ final class AppModel {
             profilingPhase = ""; profilingDetail = ""; profilingFraction = nil; profilingStartedAt = nil
             profilingShowsTiming = false
             if activeSheet == .progress { activeSheet = nil }
-            if wasIndexing { startIndexing() }   // resume where it left off (incremental)
+            // THE SAME RESUME THE PAPER RUN USES. This was `if wasIndexing { startIndexing() }` -
+            // verbatim the line resumeAfterPaperRun was written to replace, kept here because only
+            // the paper path was fixed at the time.
+            //
+            // A bare startIndexing() is a single unguarded attempt. Its first guard is
+            // `indexState != .indexing`, and the pass this run cancelled may still be unwinding -
+            // the wait above gives up after 5 s, which a large index routinely needs more than - so
+            // the call returns having done nothing, sets no deferred restart, and indexing never
+            // comes back for the rest of the session. Going through the deferred restart instead
+            // means the unwinding pass's own completion drains it. It also drains the folder
+            // removals and catch-ups queued during the run, and refreshes results that went stale.
+            resumeAfterPaperRun(wasIndexing: wasIndexing)
         }
 
         do {
