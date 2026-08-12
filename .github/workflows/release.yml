@@ -117,8 +117,17 @@ jobs:
           git config user.name "Han Xiao"
           git config user.email "han.xiao@jina.ai"
           git add project.yml
-          git commit -m "chore: release v${{ steps.ver.outputs.version }} [skip ci]"
-          git push origin HEAD:main
+          # Tolerate an unchanged version, so the workflow is RETRYABLE. A run that fails after
+          # this step - publishing is a network call to the GitHub API, and a transient TLS
+          # failure took one down - leaves the bump already committed on main. Re-running the same
+          # version then finds nothing to commit, `git commit` exits non-zero, and the retry dies
+          # before it can publish the artifact it just spent ten minutes building.
+          if git diff --cached --quiet; then
+            echo "project.yml already at v${{ steps.ver.outputs.version }}; nothing to commit"
+          else
+            git commit -m "chore: release v${{ steps.ver.outputs.version }} [skip ci]"
+            git push origin HEAD:main
+          fi
 
       - name: Publish GitHub release
         env:
