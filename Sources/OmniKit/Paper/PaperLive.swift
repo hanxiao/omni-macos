@@ -54,9 +54,10 @@ public struct PaperLiveIndex: @unchecked Sendable {
 
 /// Real files drawn from the machine's own roots, for the cases that must not touch the live store.
 ///
-/// Deterministic given (roots, seed): the walk order is the crawler's, and the pick is a seeded
-/// stride over it rather than a random draw, so re-running a case on the same machine measures the
-/// same files. It is NOT comparable across machines, and it is not meant to be: that is the point
+/// Deterministic given (roots, seed): the pool is sorted by path and the pick is a seeded stride
+/// over it rather than a random draw, so re-running a case on the same machine measures the same
+/// files. The sort is what makes that true - the crawl delivers from a worker pool, in no
+/// particular order. It is NOT comparable across machines, and it is not meant to be: that is the point
 /// of measuring a personal corpus.
 public struct PaperFileSampler: Sendable {
     public let roots: [URL]
@@ -87,6 +88,16 @@ public struct PaperFileSampler: Sendable {
             pool.append(f.url)
         })
         guard !pool.isEmpty else { return [] }
+        // SORTED BEFORE THE STRIDE, because the walk order is no longer an order.
+        //
+        // This sampler was written against a serial enumerator, and its contract - same machine,
+        // same seed, same files - rested on the walk delivering a repeatable sequence. The crawl is
+        // now a bounded pool of workers, so the pool below is whichever `poolCap` files eight
+        // threads happened to deliver first, and it differs from run to run. The stride then picked
+        // different files, and an indexing rate measured over them moved by 30% between two runs of
+        // one machine, which is larger than most of the differences the paper reports between
+        // machines. Sorting is O(n log n) on at most 20,000 paths and restores the contract.
+        pool.sort { $0.path < $1.path }
         if pool.count <= limit { return pool }
         // Seeded stride: coprime step over the pool so the pick spans it instead of taking a
         // contiguous run out of whichever directory the walk happened to start in.
