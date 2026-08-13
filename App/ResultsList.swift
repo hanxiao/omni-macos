@@ -270,9 +270,24 @@ struct ResultsList<Footer: View>: View {
             .onChange(of: model.resultsToken, initial: true) { _, _ in
                 guard scrolledForQuery != model.resultsToken else { return }
                 scrolledForQuery = model.resultsToken
-                if let first = results.first?.path { proxy.scrollTo(first, anchor: .top) }
+                // Scrolled on the NEXT turn, not in this one. The token is published in the same
+                // synchronous block that assigns the rows, so this handler runs while the list is
+                // still laid out for the OUTGOING result set: the new first row has no frame yet,
+                // scrollTo has nothing to scroll to, and a new query silently kept the old offset.
+                // One hop lets the rows lay out first, and the gate above still limits this to one
+                // scroll per result set.
+                guard let first = results.first?.path else { return }
+                Task { @MainActor in proxy.scrollTo(first, anchor: .top) }
             }
             .marqueeSelect(space: marqueeSpace)
+            // A new result set gets a NEW scroll view, which is what actually puts the top matches
+            // on screen. Scrolling the existing one to its first row is not enough: switching sets
+            // while scrolled (typing a query, or replaying one from the sidebar) keeps the content
+            // offset, and the lazy stack re-fills at that offset with the new rows, so the list
+            // opened somewhere down the middle of results the user had never seen. The identity is
+            // the result-set token, so a same-query refresh from live indexing does NOT rebuild and
+            // does not throw away a scroll position the user chose.
+            .id(model.resultsToken)
         }
     }
 
@@ -400,9 +415,24 @@ struct ResultsList<Footer: View>: View {
             .onChange(of: model.resultsToken, initial: true) { _, _ in
                 guard scrolledForQuery != model.resultsToken else { return }
                 scrolledForQuery = model.resultsToken
-                if let first = results.first?.path { proxy.scrollTo(first, anchor: .top) }
+                // Scrolled on the NEXT turn, not in this one. The token is published in the same
+                // synchronous block that assigns the rows, so this handler runs while the list is
+                // still laid out for the OUTGOING result set: the new first row has no frame yet,
+                // scrollTo has nothing to scroll to, and a new query silently kept the old offset.
+                // One hop lets the rows lay out first, and the gate above still limits this to one
+                // scroll per result set.
+                guard let first = results.first?.path else { return }
+                Task { @MainActor in proxy.scrollTo(first, anchor: .top) }
             }
             .marqueeSelect(space: marqueeSpace)
+            // A new result set gets a NEW scroll view, which is what actually puts the top matches
+            // on screen. Scrolling the existing one to its first row is not enough: switching sets
+            // while scrolled (typing a query, or replaying one from the sidebar) keeps the content
+            // offset, and the lazy stack re-fills at that offset with the new rows, so the list
+            // opened somewhere down the middle of results the user had never seen. The identity is
+            // the result-set token, so a same-query refresh from live indexing does NOT rebuild and
+            // does not throw away a scroll position the user chose.
+            .id(model.resultsToken)
         }
     }
 
