@@ -481,19 +481,6 @@ private struct PerformanceTab: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
-                Picker("Folder map layout", selection: Binding(get: { model.mapUsesUMAP }, set: { model.mapUsesUMAP = $0 })) {
-                    Text("Fast \u{00B7} PCA").tag(false)
-                    Text("Detailed \u{00B7} UMAP").tag(true)
-                }
-                Toggle("Grid layout", isOn: Binding(get: { model.mapNoOverlap }, set: { model.mapNoOverlap = $0 }))
-                    .help("One file per cell, so every dot stays separately visible; hides density")
-            } header: {
-                Text("Folder map")
-            } footer: {
-                Text("PCA is instant; UMAP separates clusters better and adds click-to-spotlight.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            Section {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
                         Text("Maximum memory")
