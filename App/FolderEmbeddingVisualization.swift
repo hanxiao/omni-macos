@@ -240,6 +240,11 @@ struct FolderEmbeddingVisualization: View {
         .onChange(of: model.projectionGeneration) { clearCursor(); rebuildPoints() }
         .onChange(of: colorScheme) { rebuildPoints() }
         .onAppear { rebuildPoints() }
+        // The map carries its own Quick Look presenter for the dot menu. The results list carries
+        // the other one; the two views are mutually exclusive, so exactly one is ever mounted. The
+        // setter drops a write that changes nothing - see the note on the results-list presenter.
+        .quickLookPreview(Binding(get: { model.previewURL },
+                                  set: { if $0 != model.previewURL { model.previewURL = $0 } }))
     }
 
     // MARK: - Zoom
@@ -524,7 +529,7 @@ struct FolderEmbeddingVisualization: View {
     @ViewBuilder private func dotMenu(_ path: String) -> some View {
         Button("Open") { NSWorkspace.shared.openAsync(URL(fileURLWithPath: path)) }
             .keyboardShortcut("o", modifiers: .command)
-        Button("Quick Look") { model.previewURL = URL(fileURLWithPath: path) }
+        Button("Quick Look") { model.showPreview(URL(fileURLWithPath: path)) }
             .keyboardShortcut("y", modifiers: .command)
         Divider()
         Button("Find similar") { model.setFileQuery(URL(fileURLWithPath: path), similar: true) }

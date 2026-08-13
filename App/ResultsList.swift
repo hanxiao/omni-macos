@@ -77,10 +77,19 @@ struct ResultsList<Footer: View>: View {
             case .grid: gridView
             }
         }
-        // The .quickLookPreview PRESENTER lives one level up, on ContentView's content stack, not
-        // here: this view is mounted only while there are results, so a previewURL written from the
-        // folder map (its dot menu) had no presenter in the hierarchy at all, and the value then sat
-        // set until the next result set mounted this view and popped the panel open by itself.
+        // The presenter sits on the view that owns the results, not on the whole pane. Hoisting it
+        // to ContentView (so the folder map could share it) put it above the focused view instead
+        // of on it, and from there a menu-invoked preview re-entered the panel's own open. The map
+        // carries its own presenter for its dot menu; the two views are never mounted together, so
+        // there is still exactly one in the hierarchy at any time.
+        //
+        // The setter DROPS a write that changes nothing. While it opens the panel,
+        // _QuickLook_SwiftUI writes the current item back through this binding, and publishing that
+        // no-op write re-fires the value action, re-entering -[QLPreviewPanel _openWithEffect:]
+        // while the panel's item list is momentarily empty; the shim then indexes that empty list
+        // and traps (EXC_BREAKPOINT, macOS 26.5.1).
+        .quickLookPreview(Binding(get: { model.previewURL },
+                                  set: { if $0 != model.previewURL { model.previewURL = $0 } }))
         // Space toggles Quick Look in both views regardless of focus, and is left alone while
         // editing text (the search field). The selection drives what is previewed.
         .background(QuickLookKeyMonitor(
@@ -456,7 +465,7 @@ struct ResultsList<Footer: View>: View {
             }
             Button { model.selectSingle(path); open(path) } label: { Label("Open", systemImage: "arrow.up.forward.app") }
                 .keyboardShortcut("o", modifiers: .command)
-            Button { model.selectSingle(path); model.previewURL = URL(fileURLWithPath: path) } label: { Label("Quick Look", systemImage: "eye") }
+            Button { model.selectSingle(path); model.showPreview(URL(fileURLWithPath: path)) } label: { Label("Quick Look", systemImage: "eye") }
                 .keyboardShortcut("y", modifiers: .command)
             // Per-chunk breakdown (pages of a PDF, passages of a long doc) - only for files that
             // actually have several chunks. The list expands inline; the grid opens a popover.

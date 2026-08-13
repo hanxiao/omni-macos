@@ -178,13 +178,6 @@ struct ContentView: View {
         .onChange(of: showsFolderViz) { _, shown in
             if !shown { model.trimProjectionCacheToCurrent() }
         }
-        // The Quick Look presenter belongs to the whole pane, not to the results list. It used to
-        // live inside ResultsList, which is mounted only while there are results - the exact
-        // complement of the folder map above it - so the map's own "Quick Look" action wrote
-        // previewURL with no presenter anywhere in the hierarchy: nothing opened, nothing cleared
-        // it, and the panel then popped open by itself on that file the next time any search put
-        // the results list back on screen.
-        .quickLookPreview(Binding(get: { model.previewURL }, set: { model.previewURL = $0 }))
         // Drag an image, file, or text from anywhere (Finder, a browser, another app) - or paste one
         // (Cmd-V) - to search by it. SwiftUI's .onDrop gives us reachability over the results list and
         // the empty state alike, but a web image dragged from Chrome/Safari arrives as inline encoded

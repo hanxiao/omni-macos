@@ -635,7 +635,23 @@ final class AppModel {
         panel.message = "Choose an image, audio, video, or text file to search by"
         if panel.runModal() == .OK, let url = panel.url { setFileQuery(url) }
     }
+    /// Show Quick Look for `url`, or dismiss it when nil.
+    ///
+    /// The write is deferred to the next main-queue turn ON PURPOSE, and every menu path must go
+    /// through here. Opening the panel from inside a menu action crashes in _QuickLook_SwiftUI: the
+    /// SwiftUI presenter calls -[QLPreviewPanel _openWithEffect:] while the menu is still tracking,
+    /// the panel reloads with nothing to show, sets currentPreviewItemIndex to NSNotFound, and the
+    /// KVO handler inside the shim traps on that value (EXC_BREAKPOINT, macOS 26.5.1). Measured, not
+    /// guessed: a row context menu and the View menu both crash on the first click, the space bar
+    /// never does, and the space bar is the one path that already runs off the menu's turn.
+    func showPreview(_ url: URL?) {
+        Task { @MainActor [weak self] in self?.previewURL = url }
+    }
     /// Finder-style toggle: dismiss the preview if open, else preview the current selection.
+    ///
+    /// Written DIRECTLY, not through showPreview: the space bar arrives on an ordinary runloop turn,
+    /// where the panel opens cleanly, and deferring it there measurably reintroduces the crash the
+    /// deferral exists to prevent in menus. Only menu-invoked previews need the hop.
     func toggleQuickLook() { previewURL = previewURL != nil ? nil : selectedURL }
 
     /// Move the selection by `rowDelta` positions through the visible (filtered, sorted) results.
