@@ -18,6 +18,16 @@ targets:
     dependencies:
       - package: OmniKit
         product: OmniKit
+    # Hardened runtime gates TCC-protected resources on a DECLARED entitlement, sandbox or no
+    # sandbox: tccd refuses to even show the Photos prompt for a hardened binary that does not
+    # carry this one ("Prompting policy for hardened runtime; service: kTCCServicePhotos requires
+    # entitlement ... but it is missing"), and PHPhotoLibrary.requestAuthorization comes straight
+    # back denied with nothing recorded. Read-only access to the user's own library; it needs no
+    # provisioning profile and does not affect notarization.
+    entitlements:
+      path: App/Omni.entitlements
+      properties:
+        com.apple.security.personal-information.photos-library: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.hanxiao.omni
@@ -44,6 +54,9 @@ targets:
         INFOPLIST_KEY_NSDocumentsFolderUsageDescription: "Omni indexes your Documents so you can search them by meaning."
         INFOPLIST_KEY_NSDownloadsFolderUsageDescription: "Omni indexes your Downloads so you can search them by meaning."
         INFOPLIST_KEY_NSDesktopFolderUsageDescription: "Omni indexes your Desktop so you can search them by meaning."
+        # Read-only: Omni embeds your photos and videos locally so you can search them by meaning.
+        # Nothing is exported, copied, or uploaded, and Omni never writes to the library.
+        INFOPLIST_KEY_NSPhotoLibraryUsageDescription: "Omni indexes your Photos library on this Mac so you can search your photos and videos by meaning. Nothing leaves your Mac."
         INFOPLIST_KEY_LSMinimumSystemVersion: "14.0"
 
   OmniUITests:

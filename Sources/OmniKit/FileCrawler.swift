@@ -17,7 +17,20 @@ public struct CrawledFile: Sendable {
 
     /// Materialized per access - deliberately not stored. Callers use it once per file, which is
     /// nothing next to decoding and embedding that file.
+    ///
+    /// ONLY VALID FOR A FILE ON DISK. A Photos asset rides this same struct with a `photos://` path
+    /// (see PhotoLibrary), which is not a filesystem path and must never be turned into a file URL -
+    /// the indexer branches on `isPhoto` before anything reaches here.
     public var url: URL { URL(fileURLWithPath: path) }
+
+    /// The last path component, without building a URL to get it. What the UI calls the file.
+    public var name: String { (path as NSString).lastPathComponent }
+
+    /// The extension, likewise without a URL. Decides the file's kind everywhere.
+    public var ext: String { (path as NSString).pathExtension }
+
+    /// Is this a Photos-library asset rather than a file on disk?
+    public var isPhoto: Bool { PhotoLibrary.isPhotoPath(path) }
 
     public init(path: String, modified: Double, size: Int) {
         self.path = path

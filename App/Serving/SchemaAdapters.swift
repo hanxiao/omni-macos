@@ -404,11 +404,24 @@ enum FileStatusAdapter {
             // contentModificationDate + fileSize via resourceValues - so double-for-double
             // equality against the stored signature mirrors the indexer's own change
             // detection ("prev.modified == mtime, prev.size == size").
-            let vals = try? URL(fileURLWithPath: p).resourceValues(
-                forKeys: [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey])
-            let exists = vals?.isRegularFile ?? false
-            let diskMtime = vals?.contentModificationDate?.timeIntervalSince1970 ?? 0
-            let diskSize = vals?.fileSize ?? 0
+            //
+            // A Photos asset has no file to stat, and the same two numbers come from PhotoKit
+            // instead - the indexer compares exactly these (asset modification date, pixel count),
+            // so "up to date" means here what it means there. Reporting exists:false for one, as a
+            // failed stat would, is simply wrong: the photo is right where the index says it is.
+            let exists: Bool, diskMtime: Double, diskSize: Int
+            if let ref = PhotoLibrary.Ref(p) {
+                let info = PhotoLibrary.assetSignature(ref)
+                exists = info != nil
+                diskMtime = info?.modified ?? 0
+                diskSize = info?.size ?? 0
+            } else {
+                let vals = try? URL(fileURLWithPath: p).resourceValues(
+                    forKeys: [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey])
+                exists = vals?.isRegularFile ?? false
+                diskMtime = vals?.contentModificationDate?.timeIntervalSince1970 ?? 0
+                diskSize = vals?.fileSize ?? 0
+            }
             var row: [String: Any] = [
                 "path": p,
                 "indexed": true,

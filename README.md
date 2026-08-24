@@ -38,6 +38,12 @@ only time it touches the network: after that, both indexing and search run on-de
 nothing leaving your Mac, so you can pull the plug and run it fully airgapped. Point it at
 folders to index (Documents, Downloads, Desktop, or any folder you pick), press Index, then search.
 
+Your Apple Photos library can be indexed directly, without exporting anything: **Add photos** in
+the sidebar, then choose the whole library or particular albums. Omni reads it through PhotoKit,
+so edits, albums and filenames are the ones Photos shows - and iCloud photos that are not
+downloaded to this Mac are skipped rather than pulled down (the same policy as Settings > iCloud
+for files).
+
 Requires an Apple silicon Mac on macOS 14 or later.
 
 ## Architecture

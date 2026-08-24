@@ -256,7 +256,12 @@ public enum FileExtractor {
     /// mediaDuration does - no extra file open. (duration, 0, 0) for audio-only assets;
     /// nil when the duration is unusable.
     public static func mediaInfo(_ url: URL) -> (duration: Double, width: Int, height: Int)? {
-        let asset = AVURLAsset(url: url)
+        mediaInfo(asset: AVURLAsset(url: url))
+    }
+
+    /// The same answer for an asset that is not a file: a Photos video comes back from PhotoKit as
+    /// an AVAsset, and an edited or slow-motion one is a composition with no URL at all.
+    public static func mediaInfo(asset: AVAsset) -> (duration: Double, width: Int, height: Int)? {
         let d = CMTimeGetSeconds(asset.duration)
         guard d.isFinite, d > 0 else { return nil }
         guard let track = asset.tracks(withMediaType: .video).first else { return (d, 0, 0) }
@@ -287,7 +292,13 @@ public enum FileExtractor {
     /// replacements, so kept frames stay uniformly placed.
     static func videoFrames(_ url: URL, maxFrames: Int = 6, maxDimension: Int = 1568,
                             start: Double = 0, end: Double = .infinity) -> [CGImage] {
-        let asset = AVURLAsset(url: url)
+        videoFrames(asset: AVURLAsset(url: url), maxFrames: maxFrames, maxDimension: maxDimension,
+                    start: start, end: end)
+    }
+
+    /// The same sampling for an AVAsset that is not a file (a Photos video; see mediaInfo above).
+    static func videoFrames(asset: AVAsset, maxFrames: Int = 6, maxDimension: Int = 1568,
+                            start: Double = 0, end: Double = .infinity) -> [CGImage] {
         let durationSec = CMTimeGetSeconds(asset.duration)
         guard durationSec.isFinite, durationSec > 0 else { return [] }
         let lo = max(0, start)

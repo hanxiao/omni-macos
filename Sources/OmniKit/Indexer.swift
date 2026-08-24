@@ -2,6 +2,7 @@ import Foundation
 import CoreGraphics
 import CryptoKit
 import PDFKit
+import AVFoundation
 import os
 
 /// What the indexer needs from the embedding engine. OmniEngine conforms.
@@ -151,6 +152,10 @@ final class DecodedItem: @unchecked Sendable {
                    // seek-based and stateless, so the embed stage samples each segment lazily
                    // with a prefetch. Nothing big crosses the decode boundary.
                    videoSegments(duration: Double, maxFrames: Int, maxDimension: Int),
+                   // The same, for a Photos video: PhotoKit hands back an AVAsset (a composition,
+                   // for an edited or slow-motion clip - there may be no file behind it at all),
+                   // so the asset itself rides to the embed stage instead of a path to re-open.
+                   photoVideoSegments(asset: AVAsset, duration: Double, maxFrames: Int, maxDimension: Int),
                    duplicate([IndexedChunk]) }   // content-dedup hit: rows ready to store, no embed needed
     let file: CrawledFile
     let kind: String
@@ -472,7 +477,12 @@ public final class Indexer: @unchecked Sendable {
 
     /// Full incremental pass over `roots`. `onProgress` is called on a background
     /// thread; marshal to the main actor in the UI.
-    public func index(roots: [URL], settings: IndexSettings = .default, force: Bool = false, onProgress: @escaping (IndexProgress) -> Void) {
+    /// - Parameter photos: Apple Photos slices to index alongside the folder roots. Each becomes a
+    ///   root of its own (keyed `photos://<id>`) whose "files" are assets rather than paths on disk;
+    ///   everything past the crawl treats them identically. See PhotoLibrary.
+    public func index(roots: [URL], photos: [PhotoLibrary.Source] = [],
+                      settings: IndexSettings = .default, force: Bool = false,
+                      onProgress: @escaping (IndexProgress) -> Void) {
         beginChunkReuse(settings)
         queue.sync { cancelled = false }
         var p = IndexProgress()
@@ -538,7 +548,11 @@ public final class Indexer: @unchecked Sendable {
             /// truer picture of that than an indeterminate spinner.
             var discovered: [String: Int] = [:]
             var totals: [String: Int] = [:]          // final, once the walk has finished
-            var walking = true
+            /// Producer threads still running. A count, not a flag: the Photos library is walked by
+            /// a SECOND producer alongside the filesystem, and the consumer must not decide the
+            /// crawl is over because one of them finished.
+            var producers = 0
+            var walking: Bool { producers > 0 }
             /// Files sitting in `pending` and not yet taken. Tracked rather than summed, because
             /// the producer tests it on every file.
             var queued = 0
@@ -568,10 +582,14 @@ public final class Indexer: @unchecked Sendable {
         // file belongs to, and the deletion sweep's "is this under a root this pass crawled" - have
         // to ask the same question of the same strings. The app canonicalises roots before it gets
         // here, so this only ever showed up for a caller that did not.
-        let rootPaths: [String] = roots.map { r in
+        let filePaths: [String] = roots.map { r in
             var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
             return realpath(r.path, &buf) != nil ? String(cString: buf) : r.path
         }
+        // Photos sources are roots too - the same `perRoot` progress, the same containment test,
+        // the same stale sweep. Their keys are not filesystem paths, so they are never realpath'd.
+        let photoPaths: [String] = photos.map(\.key)
+        let rootPaths: [String] = filePaths + photoPaths
         // @Sendable: the producer thread calls this for every file it finds, and it only reads
         // an immutable list of strings.
         let rootOf: @Sendable (String) -> String? = { path in
@@ -588,6 +606,7 @@ public final class Indexer: @unchecked Sendable {
         // single stack, so every root's queue fills together and the consumer's round-robin has
         // something from each to take - walking them one at a time meant a paused run indexed the
         // first root and nothing else, which is the starvation the interleaving exists to prevent.
+        feed.producers = photos.isEmpty ? 1 : 2
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             var counts: [String: Int] = [:]
@@ -623,10 +642,47 @@ public final class Indexer: @unchecked Sendable {
             feed.lock.lock()
             // A root that yielded nothing still needs a total, or the sweep cannot tell "empty"
             // from "unreadable" - blindRoots is what protects an unreadable root from deletion.
-            for r in rootPaths { feed.totals[r] = counts[r] ?? 0 }
-            feed.walking = false
+            for r in filePaths { feed.totals[r] = counts[r] ?? 0 }
+            feed.producers -= 1
             feed.lock.broadcast()
             feed.lock.unlock()
+        }
+
+        // THE SECOND PRODUCER: the Photos library, on its own thread for the same reason the file
+        // walk has one - so the first asset is embeddable while the rest are still being listed, and
+        // so a slow library never holds the folder roots up (nor the reverse). It feeds the identical
+        // queue, so the consumer below cannot tell the two apart.
+        if !photos.isEmpty {
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self else { return }
+                var counts: [String: Int] = [:]
+                for source in photos {
+                    if self.isCancelled { break }
+                    let key = source.key
+                    let ok = PhotoLibrary.enumerate(source, kinds: settings.enabledKinds,
+                                                    isCancelled: { self.isCancelled }) { f in
+                        feed.lock.lock()
+                        while feed.queued >= queueCap, !self.isCancelled {
+                            feed.lock.wait(until: Date().addingTimeInterval(0.1))
+                        }
+                        feed.pending[key, default: []].append(f)
+                        feed.queued += 1
+                        counts[key, default: 0] += 1
+                        feed.discovered[key] = counts[key]
+                        feed.lock.broadcast()
+                        feed.lock.unlock()
+                    }
+                    // Not readable (access revoked, album deleted): leave its total at 0 so the
+                    // sweep counts it a BLIND root and keeps its rows, exactly as for a folder
+                    // whose permission was withdrawn.
+                    if !ok { Self.log.error("photos: source \(key, privacy: .public) unreadable; skipping deletion sweep for it") }
+                }
+                feed.lock.lock()
+                for r in photoPaths { feed.totals[r] = counts[r] ?? 0 }
+                feed.producers -= 1
+                feed.lock.broadcast()
+                feed.lock.unlock()
+            }
         }
 
         /// What the walk has found so far, for the progress ring. One lock, five integers.
@@ -760,7 +816,7 @@ public final class Indexer: @unchecked Sendable {
                 omniPerfLog(String(format: "first-wave=%d files at %.2fs after pass start", wave.files.count, -passStart.timeIntervalSinceNow))
             }
             byKind.removeAll(keepingCapacity: true)
-            for f in wave.files { byKind[FileExtractor.kind(for: f.url) ?? .text, default: []].append(f) }
+            for f in wave.files { byKind[FileExtractor.kind(forExtension: f.ext) ?? .text, default: []].append(f) }
 
         for kind in kindOrder {
             guard !isCancelled, let files = byKind[kind], !files.isEmpty else { continue }
@@ -841,18 +897,18 @@ public final class Indexer: @unchecked Sendable {
                         let vecs = vecBatches[gi]
                         for (k, b) in batch.enumerated() {
                             guard var a = acc[b.fid] else { continue }
-                            a.done.append(IndexedChunk(path: a.file.url.path, modified: a.file.modified, size: a.file.size,
+                            a.done.append(IndexedChunk(path: a.file.path, modified: a.file.modified, size: a.file.size,
                                                        kind: a.kind, chunkIndex: b.idx, snippet: b.snippet, embedding: vecs[k],
                                                        locator: b.locator, chunkKey: b.key))
                             acc[b.fid] = a
-                            if a.done.count == a.total { stageStore(a.file.url.path, a.done); acc[b.fid] = nil }
+                            if a.done.count == a.total { stageStore(a.file.path, a.done); acc[b.fid] = nil }
                         }
                         onProgress(p)
                     }
                     flushStagedStores()   // one batched store (replaceMany) per drain
                 }
                 pipeline(files, force: force, known: known, settings: settings) { item in
-                    let path = item.file.url.path
+                    let path = item.file.path
                     defer { tick(path) }
                     if item.unchanged { p.unchanged += 1; return }
                     switch item.payload {
@@ -908,7 +964,7 @@ public final class Indexer: @unchecked Sendable {
                 // last chunk lands, and the drain above embeds everything buffered) - i.e. a cancel
                 // interrupted them. Storing a partial chunk set would mark the file's mtime as fully
                 // indexed and permanently truncate it, so only ever store complete sets.
-                for (_, a) in acc where a.done.count == a.total { stageStore(a.file.url.path, a.done) }
+                for (_, a) in acc where a.done.count == a.total { stageStore(a.file.path, a.done) }
                 flushStagedStores()
             } else if kind == .audio {
                 // Cross-file audio batching: stage decoded mels and embed up to
@@ -923,16 +979,16 @@ public final class Indexer: @unchecked Sendable {
                     let vecs = self.embedder.embedAudioMelBatch(batch.map { $0.mel }, frames: batch.map { $0.frames })
                     for (k, b) in batch.enumerated() {
                         let v = (vecs != nil && k < vecs!.count) ? vecs![k] : nil
-                        guard let vec = v else { storeChunks(b.file.url.path, []); continue }
-                        storeChunks(b.file.url.path, [IndexedChunk(
-                            path: b.file.url.path, modified: b.file.modified, size: b.file.size,
-                            kind: b.kind, chunkIndex: 0, snippet: b.file.url.lastPathComponent, embedding: vec,
+                        guard let vec = v else { storeChunks(b.file.path, []); continue }
+                        storeChunks(b.file.path, [IndexedChunk(
+                            path: b.file.path, modified: b.file.modified, size: b.file.size,
+                            kind: b.kind, chunkIndex: 0, snippet: b.file.name, embedding: vec,
                             duration: b.duration)])
                     }
                     onProgress(p)
                 }
                 pipeline(files, force: force, known: known, settings: settings) { item in
-                    let path = item.file.url.path
+                    let path = item.file.path
                     defer { tick(path) }
                     if item.unchanged { p.unchanged += 1; return }
                     if case .duplicate(let chunks) = item.payload { storeChunks(path, chunks); return }
@@ -973,7 +1029,7 @@ public final class Indexer: @unchecked Sendable {
                     // Tags ride the same forward pass (empty when no tagger is attached); a tagged
                     // image's snippet becomes its content tags instead of the bare filename.
                     guard let (vecs, tags) = self.embedder.embedImagesTagged(allRaws), vecs.count == allRaws.count else {
-                        for b in batch { storeChunks(b.file.url.path, []) }   // vision unavailable/fault
+                        for b in batch { storeChunks(b.file.path, []) }   // vision unavailable/fault
                         return
                     }
                     if self.isCancelled { return }   // mid-batch pause: nothing stored, files redo next pass
@@ -981,21 +1037,21 @@ public final class Indexer: @unchecked Sendable {
                     for b in batch {
                         var out: [IndexedChunk] = []
                         for (i, vec) in vecs[off ..< (off + b.raws.count)].enumerated() {
-                            out.append(IndexedChunk(path: b.file.url.path, modified: b.file.modified, size: b.file.size,
+                            out.append(IndexedChunk(path: b.file.path, modified: b.file.modified, size: b.file.size,
                                                     kind: b.kind, chunkIndex: i,
-                                                    snippet: Self.imageSnippet(tags, at: off + i, fallback: b.file.url),
+                                                    snippet: Self.imageSnippet(tags, at: off + i, fallback: b.file.name),
                                                     embedding: vec,
                                                     width: b.raws.count == 1 ? b.meta.width : 0,
                                                     height: b.raws.count == 1 ? b.meta.height : 0,
                                                     locator: b.raws.count > 1 ? "Page \(i + 1)" : ""))
                         }
-                        storeChunks(b.file.url.path, out)
+                        storeChunks(b.file.path, out)
                         off += b.raws.count
                     }
                     onProgress(p)
                 }
                 pipeline(files, force: force, known: known, settings: settings) { item in
-                    let path = item.file.url.path
+                    let path = item.file.path
                     defer { tick(path) }
                     if item.unchanged { p.unchanged += 1; return }
                     guard case .imagePatches(let raws) = item.payload, !raws.isEmpty else {
@@ -1009,8 +1065,8 @@ public final class Indexer: @unchecked Sendable {
                 flushImages()
             } else {
                 pipeline(files, force: force, known: known, settings: settings) { item in
-                    if item.unchanged { p.unchanged += 1 } else { storeChunks(item.file.url.path, self.embed(item)) }
-                    tick(item.file.url.path)
+                    if item.unchanged { p.unchanged += 1 } else { storeChunks(item.file.path, self.embed(item)) }
+                    tick(item.file.path)
                 }
             }
         }
@@ -1171,8 +1227,7 @@ public final class Indexer: @unchecked Sendable {
         for crawled in files {
             if isCancelled { break }
             let path = crawled.path
-            let url = crawled.url
-            let kind = FileExtractor.kind(for: url)
+            let kind = FileExtractor.kind(forExtension: crawled.ext)
             // Ancestor-aware: an explicit file event for `.../.build/x/y.json` must honor the
             // dirOnly rule on `.build/` - the crawl prunes at the directory, this path never sees it.
             if kind == nil || settings.ignore.isIgnoredIncludingAncestors(path, isDir: false) {
@@ -1271,27 +1326,27 @@ public final class Indexer: @unchecked Sendable {
             }
             guard let (vecs, tags) = self.embedder.embedImagesTaggedHQ(allRaws, crops: allCrops),
                   vecs.count == allRaws.count else {
-                for b in batch { acceptCompleted(b.file.url.path, []) }
+                for b in batch { acceptCompleted(b.file.path, []) }
                 return
             }
             var off = 0
             for b in batch {
                 var out: [IndexedChunk] = []
                 for (i, vec) in vecs[off ..< (off + b.raws.count)].enumerated() {
-                    out.append(IndexedChunk(path: b.file.url.path, modified: b.file.modified, size: b.file.size,
+                    out.append(IndexedChunk(path: b.file.path, modified: b.file.modified, size: b.file.size,
                                             kind: b.kind, chunkIndex: i,
-                                            snippet: Self.imageSnippet(tags, at: off + i, fallback: b.file.url),
+                                            snippet: Self.imageSnippet(tags, at: off + i, fallback: b.file.name),
                                             embedding: vec,
                                             width: b.raws.count == 1 ? b.meta.width : 0,
                                             height: b.raws.count == 1 ? b.meta.height : 0,
                                             locator: b.raws.count > 1 ? "Page \(i + 1)" : ""))
                 }
-                acceptCompleted(b.file.url.path, out)
+                acceptCompleted(b.file.path, out)
                 off += b.raws.count
             }
         }
         pipeline(work, force: true, known: [:], settings: settings) { item in
-            let path = item.file.url.path
+            let path = item.file.path
             switch item.payload {
             case .text(let pieces) where !pieces.isEmpty:
                 let fid = tNextFid; tNextFid += 1
@@ -1395,7 +1450,7 @@ public final class Indexer: @unchecked Sendable {
                 while ready.outstandingBytes > 0 && ready.outstandingBytes + est > byteCap { cond.wait() }
                 ready.outstandingBytes += est; ready.estimates[i] = est
                 cond.unlock()
-                let unchanged = !force && (known[file.url.path].map {
+                let unchanged = !force && (known[file.path].map {
                     $0.modified == file.modified && $0.size == file.size
                 } ?? false)
                 if self.isCancelled || unchanged {
@@ -1433,7 +1488,7 @@ public final class Indexer: @unchecked Sendable {
             if item.abandoned { continue }   // paused: don't consume/count files left unprocessed
             consume(item)
             if let ck = item.contentKey {
-                keyBuf.append((item.file.url.path, ck, item.file.modified, item.file.size))
+                keyBuf.append((item.file.path, ck, item.file.modified, item.file.size))
                 // Flush eagerly (small rows, one txn): keys must be VISIBLE for later files in the
                 // same pass to dedup against - a media phase is often well under a few hundred
                 // items, so a lazy flush would publish keys only after every duplicate already
@@ -1449,7 +1504,7 @@ public final class Indexer: @unchecked Sendable {
     private func estimatedDecodedBytes(_ file: CrawledFile, settings: IndexSettings) -> Int {
         let dim = max(256, settings.maxImageDimension)
         let oneImage = dim * dim * 12   // ~fp32 RGB after the vision preprocess
-        let ext = file.url.pathExtension.lowercased()
+        let ext = file.ext.lowercased()
         // HQ retag decodes also materialize the 5 CWR crop RawPatches (each up to ~image size
         // after smart-resize): budget the item at its real resident weight.
         if FileExtractor.imageExtensions.contains(ext) { return settings.hqMediaTags ? oneImage * 6 : oneImage }
@@ -1470,13 +1525,16 @@ public final class Indexer: @unchecked Sendable {
     /// Also captures display metadata (pixel size / duration) here, on the concurrent stage, so the
     /// serial embed stage never re-opens the file header.
     private func decode(_ file: CrawledFile, settings: IndexSettings) -> DecodedItem {
+        // A Photos asset is not a file: every read below (stat, header, byte hash) would be asking
+        // the filesystem about a path that does not exist there. PhotoKit answers all of it.
+        if let ref = PhotoLibrary.Ref(file.path) { return decodePhoto(file, ref: ref, settings: settings) }
         // Dataless (cloud-evicted) file under the skip policy: reading its body would implicitly
         // DOWNLOAD it. Return an empty item BEFORE any content read - the consume stage counts it
         // skipped, and tick() still marks it `seen`, so reconcile never mistakes it for deleted. An
         // already-indexed file that got evicted does not even reach here (eviction keeps mtime/size,
         // so the unchanged check holds it); when the user materializes the file, the FSEvents
         // reconcile (or the next pass) indexes it normally.
-        if settings.skipDataless, FileExtractor.isDataless(file.url.path) { return DecodedItem(file: file) }
+        if settings.skipDataless, FileExtractor.isDataless(file.path) { return DecodedItem(file: file) }
         let category = FileExtractor.kind(for: file.url) ?? .text
         let kind = category.rawValue
         var meta: (width: Int, height: Int, duration: Double) = (0, 0, 0)
@@ -1559,7 +1617,7 @@ public final class Indexer: @unchecked Sendable {
             if settings.minTextChars > 0, text.count < settings.minTextChars { return DecodedItem(file: file) }
             // Line locators only for REAL text files (code, markdown, logs) - line numbers of an
             // office doc's converted string are meaningless to the user.
-            let ext = file.url.pathExtension.lowercased()
+            let ext = file.ext.lowercased()
             let origin: TextOrigin = FileExtractor.textExtensions.contains(ext) ? .plain : .opaque
             return DecodedItem(file: file, kind: kind, payload: .text(chunk(text, settings: settings, origin: origin)), contentKey: contentKey)
         case .pagedText(let text, let pageStarts):
@@ -1586,6 +1644,85 @@ public final class Indexer: @unchecked Sendable {
         }
     }
 
+    /// The Photos twin of `decode`. Same shape - thresholds, content dedup, then a payload - with
+    /// PhotoKit standing in for every filesystem read.
+    ///
+    /// AN ICLOUD-ONLY ASSET IS A DATALESS FILE, and is treated as exactly that. Embedding it would
+    /// make an index pass silently pull the library down from iCloud, which is what `skipDataless`
+    /// exists to prevent; with the setting off, the download is allowed the same way a read-through
+    /// of an evicted file is. Nothing is deleted either way - an asset skipped here is still marked
+    /// seen by the crawl, so the sweep never mistakes it for removed.
+    private func decodePhoto(_ file: CrawledFile, ref: PhotoLibrary.Ref, settings: IndexSettings) -> DecodedItem {
+        guard let info = PhotoLibrary.info(ref) else { return DecodedItem(file: file) }   // gone from the library
+        let allowNetwork = !settings.skipDataless
+        guard info.isLocal || allowNetwork else { return DecodedItem(file: file) }
+        let category: FileKind = info.isVideo ? .video : .image
+        let kind = category.rawValue
+        var meta = (width: info.width, height: info.height, duration: info.duration)
+
+        if category == .image {
+            if settings.minImageDimension > 0, max(info.width, info.height) < settings.minImageDimension {
+                return DecodedItem(file: file)
+            }
+        } else if settings.minVideoSeconds > 0, info.duration < settings.minVideoSeconds {
+            return DecodedItem(file: file)
+        }
+
+        // Content dedup, keyed on the ASSET rather than its bytes. This is what makes an asset that
+        // belongs to two selected albums cost one forward pass: the second source's path arrives,
+        // finds the first's rows under the same key, and stores them rewritten. Hashing the bytes
+        // instead would mean materializing every asset just to discover that.
+        var contentKey: String? = nil
+        if Self.contentDedup, !settings.forceFreshEmbed {
+            let fp = category == .image
+                ? "d\(settings.maxImageDimension)"
+                : "v2|d\(settings.maxImageDimension)|f\(settings.maxVideoFrames)|s\(Int(Self.mediaSegmentSeconds))"
+            let ck = "2|photo|\(category.rawValue)|m\(embedder.dim)|t\(file.modified)|s\(file.size)|\(fp)|\(ref.localIdentifier)"
+            contentKey = ck
+            if let src = store.duplicateChunks(key: ck) {
+                noteDedupHit()
+                return DecodedItem(file: file, kind: kind, payload: .duplicate(Self.rewrite(src, to: file)),
+                                   meta: meta, contentKey: ck)
+            }
+        }
+
+        if category == .video {
+            guard let asset = PhotoLibrary.video(ref, allowNetwork: allowNetwork) else { return DecodedItem(file: file) }
+            // The asset's real duration and dimensions, now that it is open - PHAsset's are the
+            // ORIGINAL's, and an edit (a trim, a slow-motion ramp) changes both.
+            if let mi = FileExtractor.mediaInfo(asset: asset), mi.duration > 0 {
+                meta = (mi.width > 0 ? mi.width : meta.width, mi.height > 0 ? mi.height : meta.height, mi.duration)
+            }
+            if meta.duration.isFinite, meta.duration > Self.mediaSegmentSeconds {
+                return DecodedItem(file: file, kind: kind,
+                                   payload: .photoVideoSegments(asset: asset, duration: meta.duration,
+                                                                maxFrames: settings.maxVideoFrames,
+                                                                maxDimension: settings.maxImageDimension),
+                                   meta: meta, contentKey: contentKey)
+            }
+            let frames = FileExtractor.videoFrames(asset: asset, maxFrames: settings.maxVideoFrames,
+                                                   maxDimension: settings.maxImageDimension)
+            return frames.isEmpty ? DecodedItem(file: file)
+                                  : DecodedItem(file: file, kind: kind, payload: .images(frames),
+                                                meta: meta, contentKey: contentKey)
+        }
+
+        guard let image = PhotoLibrary.image(ref, maxDimension: settings.maxImageDimension,
+                                             allowNetwork: allowNetwork) else { return DecodedItem(file: file) }
+        // The decoded size is the truth about what the tower will see; PHAsset's pixel dimensions
+        // describe the original, which for an edited photo is a different picture.
+        meta = (image.width, image.height, 0)
+        let item = DecodedItem(file: file, kind: kind,
+                               payload: .imagePatches([OmniVisionPreprocess.preprocessRaw(image)]),
+                               meta: meta, contentKey: contentKey)
+        if settings.hqMediaTags {
+            item.hqCrops = OmniTagger.cwrCropRects(width: image.width, height: image.height)
+                .compactMap { image.cropping(to: $0) }
+                .map { OmniVisionPreprocess.preprocessRaw($0) }
+        }
+        return item
+    }
+
     /// Content key of a file: SHA-256 over the bytes that determine its embedding, qualified by
     /// every setting that changes the vectors for those bytes (and the model dimension). Plain
     /// text extraction truncates at FileExtractor.maxTextBytes, so the hash caps there for those
@@ -1593,7 +1730,7 @@ public final class Indexer: @unchecked Sendable {
     /// The extension is included so equal bytes under different parsers never alias. Nil on read
     /// failure (no dedup; the normal path decides what to do with the file).
     private func contentKey(_ file: CrawledFile, category: FileKind, settings: IndexSettings) -> String? {
-        let ext = file.url.pathExtension.lowercased()
+        let ext = file.ext.lowercased()
         let cap = (category == .text && FileExtractor.textExtensions.contains(ext)) ? FileExtractor.maxTextBytes : Int.max
         guard let digest = Self.sha256(file.url, cap: cap) else { return nil }
         let fp: String
@@ -1637,8 +1774,8 @@ public final class Indexer: @unchecked Sendable {
         let srcName = (src.first?.path as NSString?)?.lastPathComponent
         return src.map { c in
             var n = c
-            n.path = file.url.path; n.modified = file.modified; n.size = file.size
-            if c.snippet == srcName { n.snippet = file.url.lastPathComponent }
+            n.path = file.path; n.modified = file.modified; n.size = file.size
+            if c.snippet == srcName { n.snippet = file.name }
             return n
         }
     }
@@ -1665,7 +1802,7 @@ public final class Indexer: @unchecked Sendable {
                 let group = Array(pieces[i ..< min(i + textBatchSize, pieces.count)])
                 let vecs = embedder.embedTextBatch(group.map { $0.text }, as: .passage)
                 for (j, vec) in vecs.enumerated() {
-                    out.append(IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
+                    out.append(IndexedChunk(path: file.path, modified: file.modified, size: file.size, kind: kind,
                                             chunkIndex: i + j, snippet: snippet(group[j].text), embedding: vec,
                                             locator: group[j].locator))
                 }
@@ -1674,14 +1811,14 @@ public final class Indexer: @unchecked Sendable {
             return out
         case .audioMel(let mel, let frames):
             guard let vec = embedder.embedAudioMel(mel, frames: frames) else { return [] }
-            return [IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
-                                 chunkIndex: 0, snippet: file.url.lastPathComponent, embedding: vec, duration: meta.duration)]
+            return [IndexedChunk(path: file.path, modified: file.modified, size: file.size, kind: kind,
+                                 chunkIndex: 0, snippet: file.name, embedding: vec, duration: meta.duration)]
         case .images(let images):
             // Only video frames reach here now (one temporal clip -> one embedding).
             if kind == FileKind.video.rawValue {
                 guard let (vec, tags) = embedder.embedVideoFramesTagged(images) else { return [] }
-                return [IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
-                                     chunkIndex: 0, snippet: Self.imageSnippet([tags], at: 0, fallback: file.url),
+                return [IndexedChunk(path: file.path, modified: file.modified, size: file.size, kind: kind,
+                                     chunkIndex: 0, snippet: Self.imageSnippet([tags], at: 0, fallback: file.name),
                                      embedding: vec,
                                      width: meta.width, height: meta.height, duration: meta.duration)]
             }
@@ -1690,8 +1827,8 @@ public final class Indexer: @unchecked Sendable {
             for (i, img) in images.enumerated() {
                 if isCancelled { return [] }
                 guard let vec = embedder.embedImage(img) else { continue }
-                out.append(IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
-                                        chunkIndex: i, snippet: file.url.lastPathComponent, embedding: vec,
+                out.append(IndexedChunk(path: file.path, modified: file.modified, size: file.size, kind: kind,
+                                        chunkIndex: i, snippet: file.name, embedding: vec,
                                         width: meta.width, height: meta.height,
                                         locator: images.count > 1 ? "Page \(i + 1)" : ""))
             }
@@ -1709,8 +1846,8 @@ public final class Indexer: @unchecked Sendable {
             if isCancelled { return [] }
             var out: [IndexedChunk] = []
             for (i, vec) in vecs.enumerated() {
-                out.append(IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: kind,
-                                        chunkIndex: i, snippet: Self.imageSnippet(tags, at: i, fallback: file.url),
+                out.append(IndexedChunk(path: file.path, modified: file.modified, size: file.size, kind: kind,
+                                        chunkIndex: i, snippet: Self.imageSnippet(tags, at: i, fallback: file.name),
                                         embedding: vec,
                                         width: raws.count == 1 ? meta.width : 0, height: raws.count == 1 ? meta.height : 0,
                                         locator: raws.count > 1 ? "Page \(i + 1)" : ""))
@@ -1725,6 +1862,10 @@ public final class Indexer: @unchecked Sendable {
             return embedStreamedVideo(file: file, kind: kind, duration: duration,
                                       maxFrames: maxFrames, maxDimension: maxDimension,
                                       width: meta.width, height: meta.height)
+        case .photoVideoSegments(let asset, let duration, let maxFrames, let maxDimension):
+            return embedStreamedVideo(file: file, kind: kind, duration: duration,
+                                      maxFrames: maxFrames, maxDimension: maxDimension,
+                                      width: meta.width, height: meta.height, asset: asset)
         }
     }
 
@@ -1732,15 +1873,26 @@ public final class Indexer: @unchecked Sendable {
     /// segment's frames on a background queue while the GPU embeds the current one - the video
     /// twin of embedStreamedAudio. Frame extraction is stateless keyframe seeks, so peak memory
     /// is two segments' frames regardless of duration. Chunks carry start-timestamp locators.
+    /// - Parameter asset: sample from this AVAsset instead of opening `file` - the Photos path,
+    ///   where the clip may be a composition with no URL. AVAsset reads are thread-safe, which is
+    ///   what lets the prefetch queue share it with this thread.
     func embedStreamedVideo(file: CrawledFile, kind: String, duration: Double,
                             maxFrames: Int, maxDimension: Int,
-                            width: Int = 0, height: Int = 0) -> [IndexedChunk] {   // internal for tests
+                            width: Int = 0, height: Int = 0,
+                            asset: AVAsset? = nil) -> [IndexedChunk] {   // internal for tests
         final class Box: @unchecked Sendable { var frames: [CGImage] = [] }
         let seg = Self.mediaSegmentSeconds
         let count = max(1, Int(ceil(duration / seg)))
+        nonisolated(unsafe) let source = asset
         func sample(_ k: Int) -> [CGImage] {
-            isCancelled ? [] : FileExtractor.videoFrames(file.url, maxFrames: maxFrames, maxDimension: maxDimension,
-                                                         start: Double(k) * seg, end: Swift.min(duration, Double(k + 1) * seg))
+            let lo = Double(k) * seg, hi = Swift.min(duration, Double(k + 1) * seg)
+            if isCancelled { return [] }
+            if let source {
+                return FileExtractor.videoFrames(asset: source, maxFrames: maxFrames,
+                                                 maxDimension: maxDimension, start: lo, end: hi)
+            }
+            return FileExtractor.videoFrames(file.url, maxFrames: maxFrames, maxDimension: maxDimension,
+                                             start: lo, end: hi)
         }
         let prefetchQ = DispatchQueue(label: "omni.indexer.video-prefetch")
         var out: [IndexedChunk] = []
@@ -1763,9 +1915,9 @@ public final class Indexer: @unchecked Sendable {
                 }
                 // Per-segment tags: a 3-hour recording's snippet describes what each 240 s
                 // window shows, not just the whole file.
-                out.append(IndexedChunk(path: file.url.path, modified: file.modified, size: file.size,
+                out.append(IndexedChunk(path: file.path, modified: file.modified, size: file.size,
                                         kind: kind, chunkIndex: k,
-                                        snippet: Self.imageSnippet([tags], at: 0, fallback: file.url),
+                                        snippet: Self.imageSnippet([tags], at: 0, fallback: file.name),
                                         embedding: vec, width: width, height: height, duration: duration,
                                         locator: Self.timeLocator(Double(k) * seg)))
             }
@@ -1810,8 +1962,8 @@ public final class Indexer: @unchecked Sendable {
                     sync.wait()
                     return []   // audio path unavailable: nothing to index
                 }
-                out.append(IndexedChunk(path: file.url.path, modified: file.modified, size: file.size,
-                                        kind: kind, chunkIndex: seg, snippet: file.url.lastPathComponent,
+                out.append(IndexedChunk(path: file.path, modified: file.modified, size: file.size,
+                                        kind: kind, chunkIndex: seg, snippet: file.name,
                                         embedding: vec, duration: duration, locator: locator(seg)))
             }
             sync.wait()
@@ -1868,8 +2020,8 @@ public final class Indexer: @unchecked Sendable {
                     // scan-specific processing (OCR). Old rows are re-labeled by the store's
                     // one-time migration (migrateScanKind), which matches THIS write pattern.
                     // Per-PAGE tags as the snippet ("invoice, table, signature") when available.
-                    out.append(IndexedChunk(path: file.url.path, modified: file.modified, size: file.size, kind: FileKind.scan.rawValue,
-                                            chunkIndex: page, snippet: Self.imageSnippet(tags, at: k, fallback: file.url),
+                    out.append(IndexedChunk(path: file.path, modified: file.modified, size: file.size, kind: FileKind.scan.rawValue,
+                                            chunkIndex: page, snippet: Self.imageSnippet(tags, at: k, fallback: file.name),
                                             embedding: vec,
                                             locator: pageCount > 1 ? "Page \(page + 1)" : ""))
                 }
@@ -1922,8 +2074,8 @@ public final class Indexer: @unchecked Sendable {
     /// Snippet for an image chunk: its open-vocabulary content tags when the tagger produced
     /// them ("cat, couch, crib"), else the filename - the pre-tagging behavior, and the
     /// fallback while the label cache is still building or tagging is off.
-    static func imageSnippet(_ tags: [[String]], at i: Int, fallback url: URL) -> String {
-        guard i < tags.count, !tags[i].isEmpty else { return url.lastPathComponent }
+    static func imageSnippet(_ tags: [[String]], at i: Int, fallback name: String) -> String {
+        guard i < tags.count, !tags[i].isEmpty else { return name }
         return tags[i].joined(separator: ", ")
     }
 

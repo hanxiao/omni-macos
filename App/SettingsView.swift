@@ -89,7 +89,7 @@ private struct IndexStatusRow: View {
                         if model.progress.failed > 0 { Text("\u{00B7} \(model.progress.failed) failed") }
                     }
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                    Text(URL(fileURLWithPath: model.progress.currentPath).lastPathComponent)
+                    Text((model.progress.currentPath as NSString).lastPathComponent)
                         .font(.caption2).foregroundStyle(.tertiary).lineLimit(1).truncationMode(.middle)
                 }
             }
@@ -198,6 +198,30 @@ private struct ActivityTab: View {
                                 .help(model.isFolderQueued(url) ? "Waiting to be indexed" : "Counting files\u{2026}")
                         } else if let c = model.folderFileCounts[url.path] {
                             Text("\(c.formatted()) file\(c == 1 ? "" : "s")").font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
+                        }
+                    }
+                }
+            }
+
+            if !model.photoSources.isEmpty {
+                Section("Photos") {
+                    ForEach(model.photoSources) { source in
+                        let rp = model.progress.perRoot[source.key]
+                        HStack {
+                            Image(systemName: source.isAll ? "photo.on.rectangle.angled" : "rectangle.stack")
+                                .foregroundStyle(.secondary)
+                            Text(source.title).lineLimit(1).truncationMode(.middle)
+                            Spacer()
+                            if let rp, rp.total > 0, rp.done < rp.total,
+                               model.isIndexing || model.activeRoots.contains(source.key) {
+                                Text("\(rp.done.formatted()) / \(rp.total.formatted())")
+                                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                            } else if model.activeRoots.contains(source.key) || model.isPhotoSourceQueued(source) {
+                                ProgressView().controlSize(.small)
+                                    .help(model.isPhotoSourceQueued(source) ? "Waiting to be indexed" : "Counting items\u{2026}")
+                            } else if let c = model.folderFileCounts[source.key] {
+                                Text("\(c.formatted()) item\(c == 1 ? "" : "s")").font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
+                            }
                         }
                     }
                 }

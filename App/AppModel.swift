@@ -4,6 +4,7 @@ import AppKit
 import CryptoKit
 import os
 import OmniKit
+import Photos
 
 enum ResultViewMode: String, CaseIterable { case list, grid }
 
@@ -260,7 +261,9 @@ final class AppModel {
             // the visible list) left the panel previewing a file that is no longer in the list -
             // and left previewURL non-nil, which re-opened the panel by itself the next time a
             // presenter mounted. Following the selection to nil closes it instead, in one place.
-            if previewURL != nil { previewURL = selection.map { URL(fileURLWithPath: $0) } }
+            if previewURL != nil {
+                if let p = selection { showPreview(path: p) } else { previewURL = nil }
+            }
         }
     }
     /// The full multi-selection (result paths). `selection` is the active item within it; the set
@@ -428,7 +431,7 @@ final class AppModel {
         return max(mapPointBudget, n)
     }
 
-    var canIndex: Bool { phase == .ready && !roots.isEmpty }
+    var canIndex: Bool { phase == .ready && !(roots.isEmpty && photoSources.isEmpty) }
 
     // MARK: - Selected-result actions (shared by the context menu, the File menu, and key handlers)
 
@@ -444,17 +447,40 @@ final class AppModel {
     /// share picker shares the whole selection, the same set Open/Reveal/Copy/Trash act on.
     var selectedURLsOrdered: [URL] { selectedPathsOrdered.map { URL(fileURLWithPath: $0) } }
     /// Open every selected result - Finder opens a whole selection on Return / double-click.
-    func openSelected() { for p in selectedPathsOrdered { NSWorkspace.shared.openAsync(URL(fileURLWithPath: p)) } }
-    /// Reveal every selected result in Finder, all highlighted in one window.
-    func revealSelected() {
-        let urls = selectedPathsOrdered.map { URL(fileURLWithPath: $0) }
-        guard !urls.isEmpty else { return }
-        NSWorkspace.shared.activateFileViewerSelecting(urls)
+    /// A Photos asset opens in Photos.app; there is nothing else to open it with.
+    func openSelected() { for p in selectedPathsOrdered { PhotoActions.open(p) } }
+    /// Reveal every selected result, all highlighted in one window (in Photos for an asset).
+    func revealSelected() { PhotoActions.reveal(paths: selectedPathsOrdered) }
+    func findSimilarSelected() { if let p = selection { searchBySimilar(to: p) } }
+
+    /// Search by a result, whichever kind it is. A Photos asset has to be written out first - the
+    /// query path embeds a FILE - so this is async; a plain file runs straight through.
+    func searchBySimilar(to path: String) {
+        if !PhotoLibrary.isPhotoPath(path) { setFileQuery(URL(fileURLWithPath: path), similar: true); return }
+        Task { @MainActor in
+            guard let url = await PhotoActions.materialized(path) else {
+                queryError = "That photo could not be read from your Photos library."
+                return
+            }
+            setFileQuery(url, similar: true)
+        }
     }
-    func findSimilarSelected() { if let u = selectedURL { setFileQuery(u, similar: true) } }
+
+    /// Quick Look a result. Photos assets are exported to a temp file first (Quick Look needs a
+    /// real file), which is why this is not just a `previewURL` write.
+    func showPreview(path: String) {
+        if !PhotoLibrary.isPhotoPath(path) { showPreview(URL(fileURLWithPath: path)); return }
+        Task { @MainActor in
+            guard let url = await PhotoActions.materialized(path) else { return }
+            showPreview(url)
+        }
+    }
     /// Move files to the Trash (reversible). Drops them from the visible results at once; the index
     /// catches the deletion through the file-system watcher.
     func moveToTrash(_ paths: [String]) {
+        // A Photos asset is not a file Omni may move: deleting it means deleting it from the
+        // library (and from every synced device). That belongs in Photos.app, not here.
+        let paths = paths.filter { !PhotoLibrary.isPhotoPath($0) }
         guard !paths.isEmpty else { return }
         let set = Set(paths)
         NSWorkspace.shared.recycle(paths.map { URL(fileURLWithPath: $0) }, completionHandler: nil)
@@ -652,7 +678,10 @@ final class AppModel {
     /// Written DIRECTLY, not through showPreview: the space bar arrives on an ordinary runloop turn,
     /// where the panel opens cleanly, and deferring it there measurably reintroduces the crash the
     /// deferral exists to prevent in menus. Only menu-invoked previews need the hop.
-    func toggleQuickLook() { previewURL = previewURL != nil ? nil : selectedURL }
+    func toggleQuickLook() {
+        if previewURL != nil { previewURL = nil; return }
+        if let p = selection { showPreview(path: p) }
+    }
 
     /// Move the selection by `rowDelta` positions through the visible (filtered, sorted) results.
     /// `rowDelta == ±1` is left/right in the gallery or up/down in the list; `±columns` is a grid
@@ -898,6 +927,12 @@ final class AppModel {
     var audioSupported = false
 
     var roots: [URL] = []
+    /// Apple Photos slices the user chose to index (see PhotoLibrary). Deliberately NOT in `roots`:
+    /// they are not filesystem paths, so they must never reach the FSEvents watcher, the root
+    /// canonicalizer, or anything that stats a path. Everything past the crawl treats them as roots.
+    var photoSources: [PhotoLibrary.Source] = []
+    /// Photos authorization as of the last time it was asked. Drives the sidebar's add flow.
+    var photoAccess: PHAuthorizationStatus = PhotoLibrary.authorization
     var settings = IndexSettings.default
     /// In-memory text of the central `.omniignore` (gitignore syntax) - the single source of truth for
     /// the crawl's EXCLUDE policy. Migrated on first launch from the legacy kind/extension settings plus
@@ -931,8 +966,17 @@ final class AppModel {
     /// and no rows, so without this both views fell through to its stored count, which is a truthful
     /// `0` that reads as "this folder is empty" for a folder nothing has looked at yet.
     private(set) var pendingCatchUpRoots: [URL] = []
+    /// The Photos twin of the above: sources added (or re-queued by a library change) but not yet
+    /// enumerated. Same serialization on the one Indexer.
+    private(set) var pendingCatchUpPhotos: [PhotoLibrary.Source] = []
+    /// Live Photos-library change subscription (the FSEvents watcher cannot see inside the library).
+    fileprivate var photoObserver: PhotoChangeObserver?
+    fileprivate var photoChangeDebounce: DispatchWorkItem?
 
-    func isFolderPaused(_ url: URL) -> Bool { pausedRoots.contains(url.path) }
+    func isFolderPaused(_ url: URL) -> Bool { isFolderPaused(path: url.path) }
+    /// By root KEY - a folder path, or a `photos://` source key. Pausing means the same for both:
+    /// indexing skips it, its already-indexed rows stay searchable.
+    func isFolderPaused(path: String) -> Bool { pausedRoots.contains(path) }
 
     /// "Index now, under the settings that are current" - for the policy changes that widen what
     /// is indexable (a modality switched on, an extension cap raised, dataless files included).
@@ -955,8 +999,10 @@ final class AppModel {
         }
     }
 
-    func setFolderPaused(_ url: URL, _ paused: Bool) {
-        if paused { pausedRoots.insert(url.path) } else { pausedRoots.remove(url.path) }
+    func setFolderPaused(_ url: URL, _ paused: Bool) { setFolderPaused(path: url.path, paused) }
+
+    func setFolderPaused(path: String, _ paused: Bool) {
+        if paused { pausedRoots.insert(path) } else { pausedRoots.remove(path) }
         UserDefaults.standard.set(Array(pausedRoots), forKey: "omni.pausedRoots")
         if indexState == .indexing {
             // Re-scope the running pass. Restart is incremental (mtime-skips done files), so the
@@ -970,7 +1016,10 @@ final class AppModel {
 
     /// The configured root that `path` lives under, if any.
     func rootKey(for path: String) -> String? {
-        roots.first { path == $0.path || path.hasPrefix($0.path + "/") }?.path
+        if let key = PhotoLibrary.sourceKey(ofPath: path) {
+            return photoSources.contains { $0.key == key } ? key : nil
+        }
+        return roots.first { path == $0.path || path.hasPrefix($0.path + "/") }?.path
     }
 
     // Search filters + presentation. NOT persisted across launches: a filter is a refinement of a live
@@ -1298,6 +1347,7 @@ final class AppModel {
         // being closed is exactly the case where nothing else would ever clean up.
         DispatchQueue.global(qos: .utility).async { PaperFS.sweepAbandonedRuns() }
         loadRoots()
+        loadPhotoSources()
         loadSettings()
         loadIgnore()
         loadPerf()
@@ -1923,6 +1973,10 @@ final class AppModel {
     /// indexed root: excluding a whole root is "remove the folder" (a sidebar action with its own
     /// confirmation), not a quiet ignore rule from a context menu.
     func canIgnoreEnclosingFolder(ofPath path: String) -> Bool {
+        // A Photos asset has no enclosing folder to exclude - the level above it is one asset's
+        // identifier, and .omniignore is a filesystem policy. Removing a Photos source is the
+        // sidebar's job, exactly as removing a root is.
+        guard !PhotoLibrary.isPhotoPath(path) else { return false }
         let folder = (path as NSString).deletingLastPathComponent
         return !roots.contains { $0.path == folder }
     }
@@ -2604,6 +2658,8 @@ final class AppModel {
             }
             self.phase = .ready
             restartWatcher()
+            PhotoLibrary.cleanExportScratch()
+            startPhotoLibraryObserver()
             // Reclaim space left by a previously-emptied or heavily-pruned index. compact()
             // self-skips unless a large fraction of the file is free, so a healthy index is
             // untouched; a mostly-empty one compacts fast (cost scales with live data).
@@ -2673,7 +2729,7 @@ final class AppModel {
         // scan in front of it would add tens of ms to that query's tail on a large index. Stats are
         // a progress nicety - skip this tick, the next one (1.5s) catches up.
         if searching { return }
-        let rootPaths = roots.map(\.path)
+        let rootPaths = roots.map(\.path) + photoSources.map(\.key)
         let fp = fingerprint
         let dimReady = engineDim > 0
         Task.detached(priority: .utility) {
@@ -2700,6 +2756,8 @@ final class AppModel {
                 // Invalidate any cached embedding-map layout for a folder whose indexed file count
                 // changed (its vectors moved), so the next selection refits instead of showing stale.
                 for (path, count) in folders where self.folderFileCounts[path] != count {
+                    // A Photos source is not a folder: it has no filesystem URL and no folder map.
+                    if PhotoLibrary.isPhotoPath(path) { continue }
                     let u = URL(fileURLWithPath: path)
                     self.projectionCache[u] = nil
                     self.projectionCacheOrder.removeAll { $0 == u }
@@ -2829,6 +2887,129 @@ final class AppModel {
     }
     private func saveRoots() { UserDefaults.standard.set(roots.map { $0.path }, forKey: "omni.roots") }
 
+    // MARK: - Apple Photos sources
+
+    private func loadPhotoSources() {
+        guard let data = UserDefaults.standard.data(forKey: "omni.photoSources"),
+              let saved = try? JSONDecoder().decode([PhotoLibrary.Source].self, from: data) else { return }
+        photoSources = canonicalizePhotoSources(saved)
+    }
+    private func savePhotoSources() {
+        UserDefaults.standard.set(try? JSONEncoder().encode(photoSources), forKey: "omni.photoSources")
+    }
+
+    /// The folder rule, for Photos: "All Photos" contains every album, so selecting it absorbs them
+    /// exactly as an ancestor folder absorbs a nested one. Without this an asset in a selected album
+    /// would be indexed twice under two keys - correct, but paid for twice on disk.
+    private func canonicalizePhotoSources(_ sources: [PhotoLibrary.Source]) -> [PhotoLibrary.Source] {
+        var seen = Set<String>()
+        let unique = sources.filter { seen.insert($0.id).inserted }
+        return unique.contains(where: \.isAll) ? [.all] : unique
+    }
+
+    /// Ask for library access if it has not been decided yet. Returns whether Omni can read it.
+    @discardableResult
+    func ensurePhotoAccess() async -> Bool {
+        Logger(subsystem: "io.hanxiao.omni", category: "photos").info("authorization status \(PhotoLibrary.authorization.rawValue, privacy: .public)")
+        if PhotoLibrary.isAuthorized { photoAccess = PhotoLibrary.authorization; return true }
+        // .notDetermined is the only status a request can move; asking again once denied silently
+        // returns the same answer, so the UI sends the user to System Settings instead.
+        guard PhotoLibrary.authorization == .notDetermined else {
+            photoAccess = PhotoLibrary.authorization
+            return false
+        }
+        let answer = await PhotoLibrary.requestAuthorization()
+        // TRUST THE STATUS, NOT THE REPLY. A request made while ANOTHER TCC prompt is already on
+        // screen (the folder-access prompts Omni raises at launch) comes straight back `.denied`
+        // without the system having asked the user or recorded anything - the live status is still
+        // `.notDetermined`, and clicking again works. Reporting that as a refusal sends the user to
+        // System Settings to undo a decision nobody made. Observed, not theorised: it is what the
+        // first run of this flow did.
+        photoAccess = PhotoLibrary.authorization == .notDetermined ? .notDetermined : answer
+        return PhotoLibrary.isAuthorized
+    }
+
+    func addPhotoSources(_ sources: [PhotoLibrary.Source]) {
+        let merged = canonicalizePhotoSources(photoSources + sources)
+        let new = merged.filter { m in !photoSources.contains { $0.id == m.id } }
+        // Adding "All Photos" drops the albums it absorbs: their rows are now unreachable from any
+        // source, so remove them the same way removePhotoSource would.
+        let dropped = photoSources.filter { old in !merged.contains { $0.id == old.id } }
+        guard !new.isEmpty || !dropped.isEmpty else { return }
+        photoSources = merged
+        savePhotoSources()
+        for d in dropped { deleteRowsUnder(d.key) }
+        pendingCatchUpPhotos.append(contentsOf: new)
+        startPhotoLibraryObserver()
+        catchUpPendingRoots()
+    }
+
+    func removePhotoSource(_ source: PhotoLibrary.Source) {
+        guard photoSources.contains(where: { $0.id == source.id }) else { return }
+        photoSources.removeAll { $0.id == source.id }
+        pendingCatchUpPhotos.removeAll { $0.id == source.id }
+        if pausedRoots.remove(source.key) != nil {
+            UserDefaults.standard.set(Array(pausedRoots), forKey: "omni.pausedRoots")
+        }
+        savePhotoSources()
+        if photoSources.isEmpty { stopPhotoLibraryObserver() }
+        deleteRowsUnder(source.key)
+    }
+
+    /// Drop every row under a root key, deferring when a pass is mid-flight - the same contract
+    /// removeRoot uses, and for the same reason: deleting now would only race the pass's re-insert.
+    private func deleteRowsUnder(_ key: String) {
+        guard let store else { return }
+        if indexState == .indexing || !activeRoots.isEmpty || fsReconcileInFlight {
+            pendingRootRemovals.insert(key)
+            indexer?.cancel()
+            return
+        }
+        Task.detached {
+            store.deleteUnderFolder(key)
+            store.compact()
+            await MainActor.run {
+                self.refreshIndexStats(store)
+                self.refreshSearchAfterBackgroundChange()
+            }
+        }
+    }
+
+    /// The library changed under us (a photo imported on the iPhone, an edit, a deletion). FSEvents
+    /// cannot see any of it - the bytes are inside a package Photos owns - so PhotoKit's own change
+    /// notification takes its place. The response is deliberately the SAME as a folder catch-up:
+    /// re-enumerate the sources, which is incremental (unchanged assets are skipped on mtime) and
+    /// sweeps rows for assets that are gone.
+    private func startPhotoLibraryObserver() {
+        guard photoObserver == nil, PhotoLibrary.isAuthorized, !photoSources.isEmpty else { return }
+        let obs = PhotoChangeObserver { [weak self] in
+            Task { @MainActor in self?.photoLibraryDidChange() }
+        }
+        PHPhotoLibrary.shared().register(obs)
+        photoObserver = obs
+    }
+    private func stopPhotoLibraryObserver() {
+        guard let obs = photoObserver else { return }
+        PHPhotoLibrary.shared().unregisterChangeObserver(obs)
+        photoObserver = nil
+    }
+    private func photoLibraryDidChange() {
+        guard !isTerminating, !indexObsolete, !photoSources.isEmpty else { return }
+        // Coalesce: an import or an iCloud sync fires this repeatedly, and each pass would otherwise
+        // re-enumerate the whole library. One pass, 5 s after the last change.
+        photoChangeDebounce?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                guard let self, !self.isTerminating else { return }
+                let queued = Set(self.pendingCatchUpPhotos.map(\.id))
+                self.pendingCatchUpPhotos.append(contentsOf: self.photoSources.filter { !queued.contains($0.id) })
+                self.catchUpPendingRoots()
+            }
+        }
+        photoChangeDebounce = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: work)
+    }
+
     /// Collapse roots so none is nested inside another - overlapping roots would crawl, embed, and
     /// count the same files twice. Each root is first mapped to its filesystem canonical path (e.g.
     /// /tmp -> /private/tmp) so it matches the paths the crawler indexes; otherwise per-folder counts
@@ -2852,6 +3033,10 @@ final class AppModel {
     /// Is this folder waiting for its turn to be crawled? Distinct from `activeRoots`, which means
     /// a pass is running for it: both should read as "working", neither as a count.
     func isFolderQueued(_ url: URL) -> Bool { pendingCatchUpRoots.contains(url) }
+    /// The same question for a Photos source.
+    func isPhotoSourceQueued(_ source: PhotoLibrary.Source) -> Bool {
+        pendingCatchUpPhotos.contains { $0.id == source.id }
+    }
 
     func addRoot(_ url: URL) { addRoots([url]) }
 
@@ -2885,17 +3070,21 @@ final class AppModel {
         // benchmark arm. The run's completion resumes indexing, which re-enters here.
         guard !isTerminating, !isPaperRunning, !isProfilingRunning, !indexObsolete, indexState != .indexing, activeRoots.isEmpty,
               !fsReconcileInFlight,
-              let indexer, let store, !pendingCatchUpRoots.isEmpty else { return }
+              let indexer, let store, !(pendingCatchUpRoots.isEmpty && pendingCatchUpPhotos.isEmpty) else { return }
         let batch = pendingCatchUpRoots.filter { roots.contains($0) }
         pendingCatchUpRoots.removeAll()
-        guard !batch.isEmpty else { return }
+        let photoBatch = pendingCatchUpPhotos.filter { p in
+            photoSources.contains { $0.id == p.id } && !pausedRoots.contains(p.key)
+        }
+        pendingCatchUpPhotos.removeAll()
+        guard !batch.isEmpty || !photoBatch.isEmpty else { return }
         let settings = effectiveSettings()
-        let keys = batch.map { $0.path }
+        let keys = batch.map { $0.path } + photoBatch.map(\.key)
         let gen = indexGen
         for k in keys { activeRoots.insert(k); progress.perRoot[k] = RootProgress() }   // drive the pies from 0
         Task.detached(priority: .utility) {
             var statsClock = 0.0
-            indexer.index(roots: batch, settings: settings, force: false) { p in
+            indexer.index(roots: batch, photos: photoBatch, settings: settings, force: false) { p in
                 let now = CFAbsoluteTimeGetCurrent()
                 // Time-gate the stats refresh (was every 24 scanned files = dozens of full-store scans/sec
                 // on a fast crawl of a large index), matching the main pass's 1.5s cadence.
@@ -2917,6 +3106,9 @@ final class AppModel {
                             // pass may have stopped before finishing its roots. Re-queue the survivors
                             // (incremental, so already-embedded files are skipped on the re-run).
                             self.pendingCatchUpRoots.append(contentsOf: batch.filter { self.roots.contains($0) })
+                            self.pendingCatchUpPhotos.append(contentsOf: photoBatch.filter { p in
+                                self.photoSources.contains { $0.id == p.id }
+                            })
                         }
                         self.refreshIndexStats(store)
                         self.refreshSearchAfterBackgroundChange()
@@ -3644,7 +3836,8 @@ final class AppModel {
         // Paused folders are excluded from the pass; if every folder is paused (or there are
         // none), there is nothing to index.
         let activeRootsToIndex = roots.filter { !pausedRoots.contains($0.path) }
-        guard !activeRootsToIndex.isEmpty else { return }
+        let activePhotoSources = photoSources.filter { !pausedRoots.contains($0.key) }
+        guard !activeRootsToIndex.isEmpty || !activePhotoSources.isEmpty else { return }
         // An out-of-date index is in a different vector space: rebuild it, don't top up.
         let force = indexObsolete
         let fp = fingerprint
@@ -3667,6 +3860,7 @@ final class AppModel {
         // cancel means "pause/supersede THIS pass", which that check exists to honor.
         indexer.resetCancelled()
         let roots = activeRootsToIndex
+        let photos = activePhotoSources
         let settings = effectiveSettings()
         Task.detached(priority: .utility) {
             // Index-lifecycle store writes OFF the main actor: wipeChunks (a multi-GB buffer free + a
@@ -3698,7 +3892,7 @@ final class AppModel {
             // progress at most ~12x/sec and the heavy stats at most ~every 1.5s. (These clocks are
             // local to this single producer thread, so no cross-actor isolation is involved.)
             var progressClock = 0.0, statsClock = 0.0
-            indexer.index(roots: roots, settings: settings, force: force) { p in
+            indexer.index(roots: roots, photos: photos, settings: settings, force: force) { p in
                 let now = CFAbsoluteTimeGetCurrent()
                 guard p.done || now - progressClock >= 0.08 else { return }
                 progressClock = now
@@ -4141,4 +4335,12 @@ final class AppModel {
         let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
         if let data = try? enc.encode(report) { try? data.write(to: url) }
     }
+}
+
+/// PhotoKit's change notification needs an NSObject; AppModel is an @Observable class that cannot
+/// be one. A one-line shim keeps the model free of the inheritance.
+final class PhotoChangeObserver: NSObject, PHPhotoLibraryChangeObserver {
+    private let onChange: @Sendable () -> Void
+    init(onChange: @escaping @Sendable () -> Void) { self.onChange = onChange }
+    func photoLibraryDidChange(_ changeInstance: PHChange) { onChange() }
 }

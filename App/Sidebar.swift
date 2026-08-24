@@ -6,6 +6,7 @@ import OmniKit
 /// List's native selection (focus highlight, arrow keys, Delete).
 enum SidebarSelection: Hashable {
     case folder(URL)
+    case photos(String)   // a Photos source, by its root key
     case history(String)
 }
 
@@ -13,6 +14,8 @@ struct Sidebar: View {
     @Environment(AppModel.self) private var model: AppModel
     @State private var dropTargeted = false
     @State private var selection: SidebarSelection?
+    @State private var showPhotoPicker = false
+    @State private var showPhotoDenied = false
 
     var body: some View {
         List(selection: $selection) {
@@ -96,6 +99,50 @@ struct Sidebar: View {
                     .buttonStyle(.plain)
             }
 
+            // The Apple Photos library, kept in its own section rather than mixed in with folders:
+            // it is not a folder, it is not removed the same way, and it has no path to reveal.
+            Section("Photos") {
+                ForEach(model.photoSources) { source in
+                    HStack(spacing: 7) {
+                        Image(systemName: source.isAll ? "photo.on.rectangle.angled" : "rectangle.stack")
+                            .foregroundStyle(.secondary).frame(width: 16)
+                        Text(source.title).lineLimit(1).truncationMode(.middle)
+                        Spacer()
+                        if model.isFolderPaused(path: source.key) {
+                            if let c = model.folderFileCounts[source.key], c > 0 {
+                                Text(c.formatted()).font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
+                            }
+                            Image(systemName: "pause.circle").foregroundStyle(.tertiary)
+                        } else if (isActive(key: source.key) || model.isPhotoSourceQueued(source)) && !isFinished(key: source.key) {
+                            CloudSyncPie(fraction: activeFraction(key: source.key))
+                        } else if model.indexedFiles > 0, let c = model.folderFileCounts[source.key] {
+                            Text(c.formatted())
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(c == 0 ? .tertiary : .secondary)
+                                .help(c == 0 ? "Nothing indexed from this source yet" : "\(c) item\(c == 1 ? "" : "s") indexed")
+                        }
+                    }
+                    .help(model.isFolderPaused(path: source.key) ? "This source is paused" : indexingHelp(key: source.key))
+                    .contextMenu {
+                        if model.isFolderPaused(path: source.key) {
+                            Button("Resume this source") { model.setFolderPaused(path: source.key, false) }
+                        } else {
+                            Button("Pause this source") { model.setFolderPaused(path: source.key, true) }
+                        }
+                        Button("Open in Photos") {
+                            NSWorkspace.shared.openApplication(
+                                at: URL(fileURLWithPath: "/System/Applications/Photos.app"),
+                                configuration: NSWorkspace.OpenConfiguration())
+                        }
+                        Divider()
+                        Button("Remove from Omni") { removePhotos(source) }
+                    }
+                    .tag(SidebarSelection.photos(source.key))
+                }
+                Button { addPhotos() } label: { Label("Add photos\u{2026}", systemImage: "plus") }
+                    .buttonStyle(.plain)
+            }
+
             // Past searches, grouped by time. Extracted into its own view so it re-renders only when
             // searchHistory changes - NOT on every indexing-progress publish (~12x/sec), which would
             // otherwise re-run the historyGroups date-bucketing on the main thread and jank the sidebar.
@@ -132,8 +179,12 @@ struct Sidebar: View {
         // is why re-running a file history item sometimes did nothing.
         .onChange(of: model.rawQuery) { _, _ in reconcileSelection() }
         .onChange(of: model.fileQuery) { _, _ in reconcileSelection() }
+        .sheet(isPresented: $showPhotoPicker) { PhotoSourcePicker() }
+        .sheet(isPresented: $showPhotoDenied) { PhotoAccessDenied() }
         .onDeleteCommand {
             switch selection {
+            case .photos(let key):
+                if let s = model.photoSources.first(where: { $0.key == key }) { removePhotos(s) }
             case .folder(let url): remove(url)
             case .history(let id):
                 if let item = model.searchHistory.first(where: { $0.id == id }) { model.removeHistory(item) }
@@ -160,32 +211,39 @@ struct Sidebar: View {
 
     /// A folder has background work when it is mid full-index or mid live reconcile of
     /// file-system changes.
-    private func isActive(_ url: URL) -> Bool {
+    private func isActive(_ url: URL) -> Bool { isActive(key: url.path) }
+    private func isFinished(_ url: URL) -> Bool { isFinished(key: url.path) }
+    private func activeFraction(_ url: URL) -> Double? { activeFraction(key: url.path) }
+
+    /// The same four questions, asked of a ROOT KEY - which is a folder path for a folder and a
+    /// `photos://` key for a Photos source. The progress map has always been keyed by string; only
+    /// these helpers assumed the string was a path.
+    private func isActive(key: String) -> Bool {
         // FINISHED WINS over "the pass is still running". A root keeps its activeRoots key until the
         // whole batch completes, so a folder that finished first used to sit at a FULL pie until its
         // siblings caught up - a 100% pie says nothing its file count does not say better, and it
         // read as stuck. The pie is for work in flight; the number is for work done.
-        if let rp = model.progress.perRoot[url.path], rp.total > 0, rp.done >= rp.total { return false }
-        if model.activeRoots.contains(url.path) { return true }
+        if let rp = model.progress.perRoot[key], rp.total > 0, rp.done >= rp.total { return false }
+        if model.activeRoots.contains(key) { return true }
         // total == 0 means the walk has not finished counting this root yet - which, with a
         // streaming crawl, is most of the pass. Requiring total > 0 made the rings disappear for
         // exactly the period they exist to cover.
-        if model.isIndexing, let rp = model.progress.perRoot[url.path] {
+        if model.isIndexing, let rp = model.progress.perRoot[key] {
             return rp.total == 0 || rp.done < rp.total
         }
         return false
     }
 
     /// A root whose own pass has finished, even though the batch it rode in on has not.
-    private func isFinished(_ url: URL) -> Bool {
-        guard let rp = model.progress.perRoot[url.path] else { return false }
+    private func isFinished(key: String) -> Bool {
+        guard let rp = model.progress.perRoot[key] else { return false }
         return rp.total > 0 && rp.done >= rp.total
     }
 
     /// Real clock progress for a folder being indexed (full index or a freshly added root),
     /// or nil for a brief background reconcile (FSEvents) where there is no countable total.
-    private func activeFraction(_ url: URL) -> Double? {
-        if let rp = model.progress.perRoot[url.path], rp.total > 0 { return rp.fraction }
+    private func activeFraction(key: String) -> Double? {
+        if let rp = model.progress.perRoot[key], rp.total > 0 { return rp.fraction }
         return nil
     }
 
@@ -197,6 +255,14 @@ struct Sidebar: View {
         }
         if model.isFolderQueued(url) { return "Waiting to be indexed" }
         return "Counting files\u{2026}"
+    }
+
+    private func indexingHelp(key: String) -> String {
+        if let rp = model.progress.perRoot[key], rp.total > 0 {
+            return "Indexing \(rp.done.formatted()) / \(rp.total.formatted()) items"
+        }
+        if !isActive(key: key) { return "" }
+        return "Counting items\u{2026}"
     }
 
     /// Drop the history selection when it no longer matches the active query (text or file), so the
@@ -220,6 +286,23 @@ struct Sidebar: View {
     private func remove(_ url: URL) {
         if selection == .folder(url) { selection = nil }
         model.removeRoot(url)
+    }
+
+    private func removePhotos(_ source: PhotoLibrary.Source) {
+        if selection == .photos(source.key) { selection = nil }
+        model.removePhotoSource(source)
+    }
+
+    /// Ask for library access (once), then offer the picker - or, if macOS already said no, the
+    /// only thing that can change that answer.
+    private func addPhotos() {
+        Task { @MainActor in
+            if await model.ensurePhotoAccess() { showPhotoPicker = true }
+            // Still undecided (the request was deferred behind another permission prompt): say
+            // nothing and let the click be repeated. The "go to System Settings" sheet is only
+            // honest once macOS has actually recorded a refusal.
+            else if model.photoAccess != .notDetermined { showPhotoDenied = true }
+        }
     }
 
     private func pickFolder() {

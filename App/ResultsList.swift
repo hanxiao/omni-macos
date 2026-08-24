@@ -495,7 +495,7 @@ struct ResultsList<Footer: View>: View {
             }
             Button { model.selectSingle(path); open(path) } label: { Label("Open", systemImage: "arrow.up.forward.app") }
                 .keyboardShortcut("o", modifiers: .command)
-            Button { model.selectSingle(path); model.showPreview(URL(fileURLWithPath: path)) } label: { Label("Quick Look", systemImage: "eye") }
+            Button { model.selectSingle(path); model.showPreview(path: path) } label: { Label("Quick Look", systemImage: "eye") }
                 .keyboardShortcut("y", modifiers: .command)
             // Per-chunk breakdown (pages of a PDF, passages of a long doc) - only for files that
             // actually have several chunks. The list expands inline; the grid opens a popover.
@@ -527,14 +527,14 @@ struct ResultsList<Footer: View>: View {
             }
             Divider()
             // Use this file itself as the query - doc-vs-doc "more like this" across all modalities.
-            Button { model.setFileQuery(URL(fileURLWithPath: path), similar: true) } label: { Label("Find similar", systemImage: "sparkle.magnifyingglass") }
+            Button { model.searchBySimilar(to: path) } label: { Label("Find similar", systemImage: "sparkle.magnifyingglass") }
                 .keyboardShortcut("f", modifiers: [.command, .option])
             // (Re)generate this file's content tags - explicit request, HQ quality. Media only:
             // a text file's snippet is a real excerpt, tags would be a downgrade.
             if model.canGenerateTags, taggableKinds.contains(hit.kind) {
                 Button { model.selectSingle(path); model.requestTags([path]) } label: { Label("Generate Tags", systemImage: "tag") }
             }
-            Button { model.selectSingle(path); reveal(path) } label: { Label("Reveal in Finder", systemImage: "folder") }
+            Button { model.selectSingle(path); reveal(path) } label: { Label(PhotoActions.revealTitle(path), systemImage: "folder") }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
             Button {
                 NSPasteboard.general.clearContents()
@@ -542,10 +542,20 @@ struct ResultsList<Footer: View>: View {
             } label: { Label("Copy path", systemImage: "doc.on.doc") }
             .keyboardShortcut("c", modifiers: .command)
             // Native macOS share picker for this file - the same system sheet Finder's Share opens.
-            ShareLink(item: URL(fileURLWithPath: path)) { Label("Share\u{2026}", systemImage: "square.and.arrow.up") }
+            // A Photos asset has no file to share until it is exported, so that one goes through a
+            // button that exports first and then opens the same picker.
+            if PhotoLibrary.isPhotoPath(path) {
+                Button { sharePhoto(path) } label: { Label("Share\u{2026}", systemImage: "square.and.arrow.up") }
+            } else {
+                ShareLink(item: URL(fileURLWithPath: path)) { Label("Share\u{2026}", systemImage: "square.and.arrow.up") }
+            }
             Divider()
-            Button(role: .destructive) { model.moveToTrash([path]) } label: { Label("Move to Trash", systemImage: "trash") }
-                .keyboardShortcut(.delete, modifiers: .command)
+            // Deleting a Photos asset means deleting it from the library and every synced device -
+            // Photos.app's decision to offer, not Omni's.
+            if !PhotoLibrary.isPhotoPath(path) {
+                Button(role: .destructive) { model.moveToTrash([path]) } label: { Label("Move to Trash", systemImage: "trash") }
+                    .keyboardShortcut(.delete, modifiers: .command)
+            }
             Button { model.selectAllResults() } label: { Label("Select all", systemImage: "checkmark.circle") }
                 .keyboardShortcut("a", modifiers: .command)
             // Exclude this result's folder from indexing - the "stop showing me this build/cache
@@ -561,8 +571,19 @@ struct ResultsList<Footer: View>: View {
         }
     }
 
-    private func open(_ path: String) { NSWorkspace.shared.openAsync(URL(fileURLWithPath: path)) }
-    private func reveal(_ path: String) { NSWorkspace.shared.revealAsync(URL(fileURLWithPath: path)) }
+    private func open(_ path: String) { PhotoActions.open(path) }
+    private func reveal(_ path: String) { PhotoActions.reveal(path) }
+
+    /// Export the asset, then hand the file to the system share sheet - the same sheet ShareLink
+    /// puts up for a file, minus the file that does not exist yet.
+    private func sharePhoto(_ path: String) {
+        Task { @MainActor in
+            guard let url = await PhotoActions.materialized(path),
+                  let view = NSApp.keyWindow?.contentView else { return }
+            NSSharingServicePicker(items: [url])
+                .show(relativeTo: .zero, of: view, preferredEdge: .minY)
+        }
+    }
 
     /// Click selection with Finder modifiers: Cmd toggles a row, Shift extends the range from the
     /// anchor, plain click replaces the selection.
@@ -580,6 +601,7 @@ struct ResultsList<Footer: View>: View {
 struct ResultRow: View {
     let hit: SearchHit
     var selected: Bool = false
+    @Environment(AppModel.self) private var model: AppModel
     @Environment(\.controlActiveState) private var controlActive
     var expandable: Bool = false
     var expanded: Bool = false
@@ -612,7 +634,8 @@ struct ResultRow: View {
                         Text(hit.locator)
                         Text("\u{00B7}")
                     }
-                    Text(prettyDir(url)).lineLimit(1).truncationMode(.middle)
+                    Text(PhotoActions.location(hit.path, sources: model.photoSources))
+                        .lineLimit(1).truncationMode(.middle)
                     if hit.modified > 0 {
                         Text("·")
                         Text(Date(timeIntervalSince1970: hit.modified), format: .relative(presentation: .named))
@@ -917,7 +940,11 @@ struct MediaInfoLabel: View {
     }
     // scan excluded like text: a scanned-PDF row has no media header to read, so the legacy
     // disk fallback would spawn a wasted task per row.
-    private var isMedia: Bool { FileKind(rawValue: kind).map { $0 != .text && $0 != .scan } ?? false }
+    // A Photos row is excluded too: its dimensions/duration are always stored, and the fallback
+    // would try to read a header from a path that is not a file.
+    private var isMedia: Bool {
+        !PhotoLibrary.isPhotoPath(path) && (FileKind(rawValue: kind).map { $0 != .text && $0 != .scan } ?? false)
+    }
 
     var body: some View {
         if let text = stored ?? loaded {
@@ -967,11 +994,7 @@ struct KindGlyph: View {
 
 private func scoreText(_ score: Float) -> String { String(format: "%.0f%%", max(0, min(1, score)) * 100) }
 
-private func prettyDir(_ url: URL) -> String {
-    let dir = url.deletingLastPathComponent().path
-    let home = FileManager.default.homeDirectoryForCurrentUser.path
-    return dir.hasPrefix(home) ? "~" + dir.dropFirst(home.count) : dir
-}
+
 
 // MARK: - Marquee (rubber-band) selection
 

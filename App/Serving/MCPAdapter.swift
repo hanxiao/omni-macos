@@ -544,6 +544,12 @@ enum MCPAdapter {
     }
 
     private static func imageThumbnail(path: String) -> String? {
+        // A Photos asset has no file to open; PhotoKit renders it at the same edge cap. Network
+        // access stays off - a search response must not trigger an iCloud download.
+        if let ref = PhotoLibrary.Ref(path) {
+            guard let cg = PhotoLibrary.image(ref, maxDimension: inlineImageMaxEdge, allowNetwork: false) else { return nil }
+            return jpegBase64(cg)
+        }
         let url = URL(fileURLWithPath: path)
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let opts: [CFString: Any] = [

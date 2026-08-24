@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import QuickLookThumbnailing
+import UniformTypeIdentifiers
 import ImageIO
 import OmniKit
 
@@ -39,7 +40,12 @@ final class ThumbnailCache: @unchecked Sendable {
         let ext = (path as NSString).pathExtension.lowercased()
         let key = (ext.isEmpty ? "\u{1}none" : ext) as NSString
         if let cached = icons.object(forKey: key) { return cached }
-        let img = NSWorkspace.shared.icon(forFile: path)
+        // From the TYPE, not the path. The cache is keyed by extension, so asking about a specific
+        // file would let the first one seen decide the icon for every file of that type - and a
+        // Photos row's path does not exist on disk at all, so it would answer with the generic
+        // blank document and poison the entry for real files of the same kind.
+        let img = UTType(filenameExtension: ext).map { NSWorkspace.shared.icon(for: $0) }
+            ?? NSWorkspace.shared.icon(for: .item)
         icons.setObject(img, forKey: key)
         return img
     }
@@ -90,9 +96,28 @@ struct Thumbnail: View {
         // This view is reused for a new path on scroll (the cell is the same struct, `path` changes);
         // drop the prior file's thumbnail so a cache miss shows the fallback icon, not a stale image.
         if image != nil { image = nil }
-        let url = URL(fileURLWithPath: path)
         let scale = NSScreen.main?.backingScaleFactor ?? 2
         let maxPixel = Swift.max(32, Int((side * scale).rounded()))
+
+        // A Photos asset has no file to read: PhotoKit serves the thumbnail, from the same local
+        // cache Photos.app draws its own grid from. Network access stays OFF - scrolling results
+        // must never start an iCloud download - so an asset that is not on this Mac falls through
+        // to the type icon, exactly as an evicted file does below.
+        if let ref = PhotoLibrary.Ref(path) {
+            let cg = await Self.decodeBounded {
+                PhotoLibrary.image(ref, maxDimension: maxPixel, allowNetwork: false)
+            }
+            if Task.isCancelled { return }
+            if let cg {
+                let img = NSImage(cgImage: cg, size: NSSize(width: CGFloat(cg.width) / scale,
+                                                            height: CGFloat(cg.height) / scale))
+                ThumbnailCache.shared.store(img, key, cost: cg.bytesPerRow * cg.height)
+                image = img
+            }
+            return
+        }
+
+        let url = URL(fileURLWithPath: path)
         let ext = (path as NSString).pathExtension.lowercased()
 
         // Images and PDFs: decode DIRECTLY off the main thread (ImageIO / PDFKit), not via QuickLook.

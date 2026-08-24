@@ -41,7 +41,11 @@ enum ChunkPreview {
         let url = URL(fileURLWithPath: path)
         var made: NSImage?
         if kind == "video", let t = seconds(fromTimeLocator: locator) {
-            let asset = AVURLAsset(url: url)
+            // A Photos video has no file to open; PhotoKit hands back the same AVAsset the index
+            // sampled. Network access stays off - a preview must not start an iCloud download.
+            let asset: AVAsset? = PhotoLibrary.Ref(path).map { PhotoLibrary.video($0, allowNetwork: false) }
+                ?? AVURLAsset(url: url)
+            guard let asset else { return nil }
             let dur = CMTimeGetSeconds(asset.duration)
             guard dur.isFinite, dur > 0 else { return nil }
             let gen = AVAssetImageGenerator(asset: asset)

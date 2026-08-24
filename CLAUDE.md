@@ -29,6 +29,17 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
 - Needs: `model.safetensors`, `adapters/retrieval/adapter_model.safetensors`, `tokenizer.json`, `config.json`.
 - Retrieval LoRA: alpha=32, r=32 -> scale 1.0, targets all 7 linear modules in `language_model`.
 
+## Apple Photos (OmniKit/PhotosSource.swift)
+- Photos assets ride the file pipeline under `photos://<source>/<escaped localIdentifier>/<name>`
+  paths. They are NOT filesystem paths: never build a file URL from one (CrawledFile.isPhoto).
+- HARDENED RUNTIME GATES TCC. The app is unsandboxed, but tccd still refuses to show the Photos
+  prompt for a hardened binary that does not DECLARE
+  `com.apple.security.personal-information.photos-library` (App/Omni.entitlements) - the request
+  returns denied with nothing recorded, and the log line is "Prompting policy for hardened
+  runtime; service: kTCCServicePhotos requires entitlement ... but it is missing".
+- A request made while ANOTHER TCC prompt is on screen also returns denied without asking; trust
+  `authorizationStatus`, not the reply.
+
 ## Signing (no Apple creds in the repo - it is public)
 - Local: `export OMNI_TEAM_ID=<10-char team>` before `xcodegen generate` (project.yml reads it).
 - CI: Team ID is the `APPLE_TEAM_ID` secret; cert/notary/deploy creds are GitHub Actions secrets
