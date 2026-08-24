@@ -2929,7 +2929,19 @@ final class AppModel {
         return PhotoLibrary.isAuthorized
     }
 
+    /// Are the modalities a Photos library actually contains turned on? A library holds nothing but
+    /// images and videos, so with both off, adding a source would index exactly zero assets and
+    /// look broken.
+    var photoKindsEnabled: Bool { kindEnabled(.image) || kindEnabled(.video) }
+
     func addPhotoSources(_ sources: [PhotoLibrary.Source]) {
+        // Turning them on is what the user just asked for by adding a photo library, and the toggle
+        // is only ever moved in the permissive direction here - a modality the user switched off
+        // stays off everywhere else, and nothing already indexed is touched.
+        if !photoKindsEnabled {
+            applyKind(.image, on: true, purge: false)
+            applyKind(.video, on: true, purge: false)
+        }
         let merged = canonicalizePhotoSources(photoSources + sources)
         let new = merged.filter { m in !photoSources.contains { $0.id == m.id } }
         // Adding "All Photos" drops the albums it absorbs: their rows are now unreachable from any

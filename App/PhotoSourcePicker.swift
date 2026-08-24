@@ -21,6 +21,11 @@ struct PhotoSourcePicker: View {
 
     private var alreadyAdded: Set<String> { Set(model.photoSources.map(\.id)) }
 
+    /// Is the whole library already a source? Then EVERY album is already covered - the model
+    /// absorbs an album into All Photos on add (canonicalizePhotoSources), so offering one here
+    /// would be an Add button that silently does nothing.
+    private var libraryCovered: Bool { alreadyAdded.contains(PhotoLibrary.Source.allID) }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
@@ -68,22 +73,15 @@ struct PhotoSourcePicker: View {
                 }
             }
             .listStyle(.inset)
-            // Picking the whole library makes every album redundant - the same rule the model
-            // applies when the sources are saved, shown here so the choice is not a surprise.
+            // Redundant while the whole library is picked: dimmed rather than hidden, so the
+            // albums that ARE there stay visible. The footer says why.
             .disabled(wholeLibrary)
             .opacity(wholeLibrary ? 0.45 : 1)
-            .overlay(alignment: .top) {
-                if wholeLibrary && !albums.isEmpty {
-                    Text("All Photos already covers every album.")
-                        .font(.caption).foregroundStyle(.secondary)
-                        .padding(.top, 8)
-                }
-            }
         }
     }
 
     private func albumRow(_ album: PhotoLibrary.Album) -> some View {
-        let added = alreadyAdded.contains(album.id)
+        let added = libraryCovered || alreadyAdded.contains(album.id)
         return Toggle(isOn: Binding(
             get: { chosen.contains(album.id) || added },
             set: { on in if on { chosen.insert(album.id) } else { chosen.remove(album.id) } }
@@ -116,14 +114,21 @@ struct PhotoSourcePicker: View {
     }
 
     private var canAdd: Bool {
-        if loading { return false }
-        if wholeLibrary { return !alreadyAdded.contains(PhotoLibrary.Source.allID) }
+        if loading || libraryCovered { return false }
+        if wholeLibrary { return true }
         return !chosen.subtracting(alreadyAdded).isEmpty
     }
 
     private var summary: String {
         if loading { return "Reading your library\u{2026}" }
-        if wholeLibrary { return "\(libraryCount.formatted()) photos and videos" }
+        if libraryCovered { return "Your whole library is already indexed." }
+        if !model.photoKindsEnabled { return "Images and Videos will be turned on" }
+        // Picking the whole library makes every album redundant - the same rule the model applies
+        // when the sources are saved, said here so the greyed-out album list is not a mystery.
+        if wholeLibrary {
+            let n = "\(libraryCount.formatted()) photos and videos"
+            return albums.isEmpty ? n : n + " \u{00B7} covers every album"
+        }
         let picked = chosen.subtracting(alreadyAdded)
         guard !picked.isEmpty else { return "Nothing selected" }
         let n = albums.filter { picked.contains($0.id) }.reduce(0) { $0 + $1.count }

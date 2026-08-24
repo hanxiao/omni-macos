@@ -292,7 +292,12 @@ public enum PhotoLibrary {
         let opts = PHImageRequestOptions()
         opts.isSynchronous = true          // called from the indexer's decode stage / a detached task
         opts.deliveryMode = .highQualityFormat
-        opts.resizeMode = .fast            // "at least this size"; the preprocess resizes exactly
+        // .exact, NOT .fast: `.fast` is documented to answer with a size merely CLOSE to the target,
+        // which it is free to satisfy from a cached derivative smaller than what was asked for -
+        // and an image the tower sees at less than maxImageDimension is a quietly worse embedding
+        // than the same picture would get as a file on disk. `.exact` costs one resize of an image
+        // the preprocess is about to resize anyway, which is nothing beside the vision forward.
+        opts.resizeMode = .exact
         opts.isNetworkAccessAllowed = allowNetwork
         opts.version = .current            // the photo as the user edited it, not the original
         var out: CGImage?
