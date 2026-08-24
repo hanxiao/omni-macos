@@ -26,6 +26,10 @@ struct PhotoSourcePicker: View {
     /// would be an Add button that silently does nothing.
     private var libraryCovered: Bool { alreadyAdded.contains(PhotoLibrary.Source.allID) }
 
+    /// Albums cannot be chosen while something already covers them - either the whole library is
+    /// picked in this sheet, or it is already a source.
+    private var albumsInert: Bool { wholeLibrary || libraryCovered }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
@@ -34,7 +38,9 @@ struct PhotoSourcePicker: View {
             Divider()
             footer
         }
-        .frame(width: 460, height: 460)
+        // Resizable rather than pinned: a library with fifty albums is a scroll-in-a-box at a
+        // fixed height, and macOS sheets are expected to take a drag on their edge.
+        .frame(minWidth: 460, idealWidth: 460, minHeight: 400, idealHeight: 480)
         .task { await load() }
     }
 
@@ -60,23 +66,22 @@ struct PhotoSourcePicker: View {
                     }
                     .disabled(alreadyAdded.contains(PhotoLibrary.Source.allID))
                 }
-                if !albums.isEmpty {
-                    Section("Albums") {
-                        ForEach(albums.filter { !$0.isSmart }) { album in albumRow(album) }
-                    }
-                    let smart = albums.filter(\.isSmart)
-                    if !smart.isEmpty {
-                        Section("Smart Albums") {
-                            ForEach(smart) { album in albumRow(album) }
-                        }
-                    }
+                // Each section renders only if it HAS rows: a library with nothing but smart
+                // albums was drawing an "Albums" header over empty space.
+                let own = albums.filter { !$0.isSmart }
+                if !own.isEmpty {
+                    Section("Albums") { ForEach(own) { album in albumRow(album) } }
+                }
+                let smart = albums.filter(\.isSmart)
+                if !smart.isEmpty {
+                    Section("Smart Albums") { ForEach(smart) { album in albumRow(album) } }
                 }
             }
             .listStyle(.inset)
-            // Redundant while the whole library is picked: dimmed rather than hidden, so the
+            // Redundant while the whole library covers them: dimmed rather than hidden, so the
             // albums that ARE there stay visible. The footer says why.
-            .disabled(wholeLibrary)
-            .opacity(wholeLibrary ? 0.45 : 1)
+            .disabled(albumsInert)
+            .opacity(albumsInert ? 0.45 : 1)
         }
     }
 
@@ -173,7 +178,10 @@ struct PhotoAccessDenied: View {
                 .font(.callout).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
             HStack {
-                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                Spacer()
+                // "Not Now", not "Cancel": nothing is being cancelled - the sheet only explains a
+                // decision macOS already recorded. Trailing-aligned, as every macOS dialog is.
+                Button("Not Now") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button("Open System Settings") {
                     if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Photos") {
                         NSWorkspace.shared.open(url)

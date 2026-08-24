@@ -2618,6 +2618,7 @@ final class AppModel {
             // Served searches land in History like the user's own, subject to their own switch.
             // Set before attach(), so a server that auto-starts inside it is already wired.
             self.serving.onServedSearch = { [weak self] q in self?.recordServedSearch(q) }
+            self.serving.sources = self.makeSourcesControl()
             self.serving.attach(engine: engine, store: store, modelName: "omni-\(modelVariant.rawValue)")
             if let oldStore { Task.detached(priority: .utility) { _ = oldIndexer; oldStore.close() } }
             self.supportsImages = engine.supportsImages
@@ -2887,6 +2888,127 @@ final class AppModel {
     }
     private func saveRoots() { UserDefaults.standard.set(roots.map { $0.path }, forKey: "omni.roots") }
 
+    // MARK: - Serving: what Omni indexes, over the API
+
+    /// THE API IS THE SIDEBAR. Every closure here calls the very method the sidebar button calls -
+    /// addRoots, addPhotoSources, setFolderPaused, removeRoot, removePhotoSource - so an
+    /// API-managed source is canonicalized, persisted, watched, queued and preempted identically,
+    /// and there is no second implementation of "add a folder" to keep in step with the first.
+    ///
+    /// Every closure hops to the main actor: the serving layer calls them from a connection's
+    /// detached Task, and all of this state is main-actor-isolated.
+    private func makeSourcesControl() -> SourcesControl {
+        SourcesControl(
+            snapshot: { await MainActor.run { AppModel.shared?.sourcesSnapshot() ?? .empty } },
+            addFolder: { p in await MainActor.run { AppModel.shared?.apiAddFolder(p) ?? .fail("Omni is not ready") } },
+            addAlbum: { a in await MainActor.run { AppModel.shared?.apiAddAlbum(a) ?? .fail("Omni is not ready") } },
+            setPaused: { k, on in await MainActor.run { AppModel.shared?.apiSetPaused(k, on) ?? .fail("Omni is not ready") } },
+            remove: { k in await MainActor.run { AppModel.shared?.apiRemove(k) ?? .fail("Omni is not ready") } }
+        )
+    }
+
+    private func sourcesSnapshot() -> SourcesSnapshot {
+        // Named apart from `progress` itself - a local function shadowing the property made the
+        // property unreachable from inside it.
+        func rootProgress(_ key: String) -> (done: Int, total: Int) {
+            guard let rp = progress.perRoot[key] else { return (0, 0) }
+            return (rp.done, rp.total)
+        }
+        let folders = roots.map { url -> ServedSource in
+            let p = rootProgress(url.path)
+            return ServedSource(key: url.path, kind: "folder", name: url.lastPathComponent,
+                                paused: isFolderPaused(path: url.path),
+                                indexing: activeRoots.contains(url.path) || (isIndexing && !isFolderPaused(path: url.path)),
+                                queued: isFolderQueued(url),
+                                indexedFiles: folderFileCounts[url.path] ?? 0,
+                                done: p.done, total: p.total)
+        }
+        let photos = photoSources.map { src -> ServedSource in
+            let p = rootProgress(src.key)
+            return ServedSource(key: src.key, kind: "photos", name: src.title,
+                                paused: isFolderPaused(path: src.key),
+                                indexing: activeRoots.contains(src.key) || (isIndexing && !isFolderPaused(path: src.key)),
+                                queued: isPhotoSourceQueued(src),
+                                indexedFiles: folderFileCounts[src.key] ?? 0,
+                                done: p.done, total: p.total)
+        }
+        // Albums the caller has NOT added. Reading them walks the library, so it is skipped
+        // entirely when access was never granted (which is also the honest answer: none).
+        let albums: [ServedAlbum] = PhotoLibrary.isAuthorized
+            ? PhotoLibrary.albums()
+                .filter { a in !photoSources.contains { $0.id == a.id } }
+                .map { ServedAlbum(id: $0.id, title: $0.title, count: $0.count, smart: $0.isSmart) }
+            : []
+        return SourcesSnapshot(sources: folders + photos, albums: albums,
+                               photosAuthorized: PhotoLibrary.isAuthorized,
+                               indexing: isIndexing || !activeRoots.isEmpty)
+    }
+
+    private func apiAddFolder(_ raw: String) -> SourceMutation {
+        let path = (raw as NSString).expandingTildeInPath
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir) else {
+            return .fail("no such folder: \(path)")
+        }
+        guard isDir.boolValue else { return .fail("not a folder: \(path)") }
+        // Readability is checked HERE rather than left to the crawl: a folder Omni cannot open
+        // would be added, persisted, and then sit at zero forever with the reason nowhere visible.
+        guard FileManager.default.isReadableFile(atPath: path) else {
+            return .fail("Omni cannot read \(path). Grant access under Privacy & Security > Files and Folders.")
+        }
+        let url = URL(fileURLWithPath: path)
+        addRoots([url])
+        // The key the caller must use afterwards is the CANONICAL one (symlinks resolved, and the
+        // folder may have been absorbed by a parent root that was already there).
+        let key = roots.first { $0.path == url.path }?.path
+            ?? rootKey(for: (try? url.resourceValues(forKeys: [.canonicalPathKey]))?.canonicalPath ?? path)
+        guard let key else { return .fail("\(path) is already covered by an indexed parent folder") }
+        return .ok(key)
+    }
+
+    private func apiAddAlbum(_ id: String) -> SourceMutation {
+        guard PhotoLibrary.isAuthorized else {
+            return .fail("Omni does not have access to your Photos library. Grant it in the app (sidebar > Add photos), or under Privacy & Security > Photos.")
+        }
+        let source: PhotoLibrary.Source
+        if id == PhotoLibrary.Source.allID {
+            source = .all
+        } else if let album = PhotoLibrary.albums().first(where: { $0.id == id }) {
+            source = PhotoLibrary.Source(id: album.id, title: album.title)
+        } else {
+            return .fail("no album with id \(id) (list them with GET /v1/sources)")
+        }
+        addPhotoSources([source])
+        // Absorbed by All Photos rather than added? Say so instead of reporting a key the caller
+        // will not find in the next listing.
+        guard photoSources.contains(where: { $0.id == source.id }) else {
+            return .fail("\(source.title) is already covered by All Photos")
+        }
+        return .ok(source.key)
+    }
+
+    private func apiSetPaused(_ key: String, _ paused: Bool) -> SourceMutation {
+        guard knownSourceKey(key) else { return .fail("no indexed source with key \(key)") }
+        setFolderPaused(path: key, paused)
+        return .ok(key)
+    }
+
+    private func apiRemove(_ key: String) -> SourceMutation {
+        guard knownSourceKey(key) else { return .fail("no indexed source with key \(key)") }
+        if let src = photoSources.first(where: { $0.key == key }) {
+            removePhotoSource(src)
+        } else {
+            removeRoot(URL(fileURLWithPath: key))
+        }
+        return .ok(key)
+    }
+
+    /// Is this the key of something Omni currently indexes? Guards the mutating calls so a typo
+    /// silently does nothing instead of, say, pausing a key nothing owns.
+    private func knownSourceKey(_ key: String) -> Bool {
+        roots.contains { $0.path == key } || photoSources.contains { $0.key == key }
+    }
+
     // MARK: - Apple Photos sources
 
     private func loadPhotoSources() {
@@ -2910,7 +3032,6 @@ final class AppModel {
     /// Ask for library access if it has not been decided yet. Returns whether Omni can read it.
     @discardableResult
     func ensurePhotoAccess() async -> Bool {
-        Logger(subsystem: "io.hanxiao.omni", category: "photos").info("authorization status \(PhotoLibrary.authorization.rawValue, privacy: .public)")
         if PhotoLibrary.isAuthorized { photoAccess = PhotoLibrary.authorization; return true }
         // .notDetermined is the only status a request can move; asking again once denied silently
         // returns the same answer, so the UI sends the user to System Settings instead.
@@ -2951,9 +3072,8 @@ final class AppModel {
         photoSources = merged
         savePhotoSources()
         for d in dropped { deleteRowsUnder(d.key) }
-        pendingCatchUpPhotos.append(contentsOf: new)
         startPhotoLibraryObserver()
-        catchUpPendingRoots()
+        indexNewSourcesFirst { self.pendingCatchUpPhotos.append(contentsOf: new) }
     }
 
     func removePhotoSource(_ source: PhotoLibrary.Source) {
@@ -2992,8 +3112,11 @@ final class AppModel {
     /// notification takes its place. The response is deliberately the SAME as a folder catch-up:
     /// re-enumerate the sources, which is incremental (unchanged assets are skipped on mtime) and
     /// sweeps rows for assets that are gone.
+    static let photoLog = Logger(subsystem: "io.hanxiao.omni", category: "photos")
+
     private func startPhotoLibraryObserver() {
         guard photoObserver == nil, PhotoLibrary.isAuthorized, !photoSources.isEmpty else { return }
+        Self.photoLog.info("live library updates on for \(self.photoSources.count, privacy: .public) source(s)")
         let obs = PhotoChangeObserver { [weak self] in
             Task { @MainActor in self?.photoLibraryDidChange() }
         }
@@ -3064,8 +3187,32 @@ final class AppModel {
         // FSEvents only sees future changes, so pre-existing files would never be indexed without a
         // manual reindex. Queue the new roots and kick the catch-up, which runs ONE pass at a time so
         // we never start concurrent index() calls racing the same Indexer.
-        pendingCatchUpRoots.append(contentsOf: new)
-        catchUpPendingRoots()
+        indexNewSourcesFirst { self.pendingCatchUpRoots.append(contentsOf: new) }
+    }
+
+    /// PUT A JUST-ADDED SOURCE AT THE FRONT OF THE QUEUE.
+    ///
+    /// A catch-up waits for whatever is already running, which is correct and, on a large index,
+    /// indistinguishable from a hang: the user drops a folder in and its sidebar row sits at an
+    /// indeterminate ring for as long as a 2.6M-file pass takes. Nothing is broken, but nothing
+    /// says so either, and "did it even register my folder?" is the reasonable conclusion.
+    ///
+    /// So a full pass is RE-SCOPED rather than waited on - cancel it and start again with the new
+    /// source included. The wave consumer round-robins across every root, so the new one starts
+    /// filling its ring within seconds of being added, next to the roots that are still going. The
+    /// restart is incremental (already-embedded files are skipped on mtime), so the cost is the
+    /// crawl, not the embedding - the same trade setFolderPaused already makes to re-scope a pass.
+    ///
+    /// The queue is only used when nothing big is running; the restarted pass covers the new source
+    /// itself, and queueing it as well would just add a redundant no-op catch-up behind it.
+    private func indexNewSourcesFirst(_ queue: () -> Void) {
+        if indexState == .indexing {
+            restartAfterPause = true
+            indexer?.cancel()
+        } else {
+            queue()
+            catchUpPendingRoots()
+        }
     }
 
     /// Index the roots queued by addRoot, one incremental catch-up pass at a time. Runs only when no

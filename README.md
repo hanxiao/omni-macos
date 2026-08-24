@@ -101,6 +101,37 @@ final scores are exact either way, and recall is gated against the full-precisio
 baseline. Results reduce to the best chunk per file, filtered by kind, folder,
 extension, and recency. Idle search is a few milliseconds.
 
+## Serving: search and manage the index from anything
+
+Omni serves an HTTP API on `127.0.0.1:51234` (Settings > Serving; LAN scope and a bearer token are
+optional), including an MCP endpoint at `/mcp` so an agent can use it as a tool server.
+
+Searching is `POST /v1/search`, plus OpenAI-, Jina- and Gemini-shaped embedding routes. Managing
+what gets indexed is `/v1/sources`, which is the sidebar's four actions over HTTP - the API calls
+the same code the buttons do, so an API-added folder is canonicalized, persisted, watched and
+queued exactly like a dropped one.
+
+```bash
+# What is indexed, what is still indexing, and which photo albums could be added
+curl -s localhost:51234/v1/sources
+
+# Index a folder, the whole Apple Photos library, or one album
+curl -sX POST localhost:51234/v1/sources/add  -d '{"path": "~/Projects"}'
+curl -sX POST localhost:51234/v1/sources/add  -d '{"album": "all"}'
+
+# Pause one without losing what it already indexed (paused defaults to true), then resume
+curl -sX POST localhost:51234/v1/sources/pause -d '{"key": "/Users/me/Projects"}'
+curl -sX POST localhost:51234/v1/sources/pause -d '{"key": "/Users/me/Projects", "paused": false}'
+
+# Stop indexing it and drop its rows. Files on disk are never touched.
+curl -sX POST localhost:51234/v1/sources/remove -d '{"key": "/Users/me/Projects"}'
+```
+
+Every mutation answers with the full new source list, because the caller's next question is always
+"so what is indexed now" - and because a key is canonicalized on the way in, so echoing the request
+back would often be a lie. The same four operations are MCP tools (`list_sources`, `add_source`,
+`pause_source`, `remove_source`) alongside `search`, `search_inline`, `file_status` and `tag_image`.
+
 ## Build from source
 
 ```

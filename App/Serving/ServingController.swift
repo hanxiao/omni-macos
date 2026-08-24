@@ -44,6 +44,11 @@ final class ServingController {
     /// Serving stays unaware of AppModel, which is the whole point of the ServingBackend seam.
     var onServedSearch: ((String) -> Void)?
 
+    /// What Omni indexes, and how to change it - supplied by AppModel, for the same reason
+    /// `onServedSearch` is: Serving must not know what AppModel is. Set before attach(); a running
+    /// server picks it up on the next restart, which attach() already performs.
+    var sources: SourcesControl?
+
     private var backend: (any ServingBackend)?
     private var server: HTTPServer?
 
@@ -128,7 +133,7 @@ final class ServingController {
             return false
         }
 
-        let router = Router(backend: backend, auth: auth, appVersion: AppModel.appVersion)
+        let router = Router(backend: backend, auth: auth, appVersion: AppModel.appVersion, sources: sources)
         let sink: @Sendable (LogEntry) -> Void = { [weak self] entry in
             Task { @MainActor in self?.ingest(entry) }
         }

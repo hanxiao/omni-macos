@@ -122,17 +122,19 @@ struct Sidebar: View {
                                 .help(c == 0 ? "Nothing indexed from this source yet" : "\(c) item\(c == 1 ? "" : "s") indexed")
                         }
                     }
-                    .help(model.isFolderPaused(path: source.key) ? "This source is paused" : indexingHelp(key: source.key))
+                    .help(photoHelp(source))
                     .contextMenu {
                         if model.isFolderPaused(path: source.key) {
                             Button("Resume this source") { model.setFolderPaused(path: source.key, false) }
                         } else {
                             Button("Pause this source") { model.setFolderPaused(path: source.key, true) }
                         }
+                        // By bundle id, not by path: /System/Applications is Apple's to rearrange,
+                        // and a hardcoded path silently stops working when they do.
                         Button("Open in Photos") {
-                            NSWorkspace.shared.openApplication(
-                                at: URL(fileURLWithPath: "/System/Applications/Photos.app"),
-                                configuration: NSWorkspace.OpenConfiguration())
+                            if let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Photos") {
+                                NSWorkspace.shared.openApplication(at: app, configuration: NSWorkspace.OpenConfiguration())
+                            }
                         }
                         Divider()
                         Button("Remove from Omni") { removePhotos(source) }
@@ -257,12 +259,17 @@ struct Sidebar: View {
         return "Counting files\u{2026}"
     }
 
-    private func indexingHelp(key: String) -> String {
-        if let rp = model.progress.perRoot[key], rp.total > 0 {
+    /// Tooltip for a Photos row. The folder twin falls back to the folder's PATH when idle; a
+    /// source has none, so it falls back to what it is - an empty help string draws an empty
+    /// tooltip, which reads as a glitch.
+    private func photoHelp(_ source: PhotoLibrary.Source) -> String {
+        if model.isFolderPaused(path: source.key) { return "This source is paused" }
+        if let rp = model.progress.perRoot[source.key], rp.total > 0, rp.done < rp.total {
             return "Indexing \(rp.done.formatted()) / \(rp.total.formatted()) items"
         }
-        if !isActive(key: key) { return "" }
-        return "Counting items\u{2026}"
+        if model.isPhotoSourceQueued(source) { return "Waiting to be indexed" }
+        if isActive(key: source.key) { return "Counting items\u{2026}" }
+        return source.isAll ? "Your whole Apple Photos library" : "Apple Photos album"
     }
 
     /// Drop the history selection when it no longer matches the active query (text or file), so the

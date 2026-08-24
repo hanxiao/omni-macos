@@ -9,6 +9,9 @@ struct Router: Sendable {
     let auth: @Sendable (HTTPRequest) -> Bool
     /// Reported by the MCP initialize handshake as serverInfo.version.
     var appVersion: String = ""
+    /// What Omni indexes, and how to change it. Optional because it is wired from AppModel after
+    /// the store loads; a request that arrives first gets a 503 rather than a wrong answer.
+    var sources: SourcesControl? = nil
 
     func handle(_ req: HTTPRequest) async -> HTTPResponse {
         let route = req.routePath
@@ -26,7 +29,12 @@ struct Router: Sendable {
         // MCP: JSON-RPC over streamable HTTP. Auth-gated like everything else (loopback scope
         // never requires a token; LAN scope always does, sent as a normal Authorization header).
         if route == "/mcp" {
-            return MCPAdapter.handle(req, backend, appVersion: appVersion)
+            return await MCPAdapter.handle(req, backend, appVersion: appVersion, sources: sources)
+        }
+
+        // What Omni indexes (folders + Photos sources), and the four things the sidebar can do to it.
+        if SourcesAdapter.owns(route) {
+            return await SourcesAdapter.handle(req, route: route, sources)
         }
 
         switch (req.method, route) {

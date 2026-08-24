@@ -26,7 +26,8 @@ enum MCPAdapter {
     /// client's context with base64. Image hits past this are still returned as links/text.
     private static let maxInlineImages = 10
 
-    static func handle(_ req: HTTPRequest, _ backend: any ServingBackend, appVersion: String) -> HTTPResponse {
+    static func handle(_ req: HTTPRequest, _ backend: any ServingBackend, appVersion: String,
+                       sources: SourcesControl? = nil) async -> HTTPResponse {
         // GET is the SSE stream in the full spec; this server has no server-initiated
         // messages, and the spec allows refusing it.
         guard req.method == "POST" else {
@@ -60,15 +61,22 @@ enum MCPAdapter {
                 "capabilities": ["tools": [:] as [String: Any]],
                 "serverInfo": ["name": "omni", "title": "Omni - local semantic file search",
                                "version": appVersion],
-                "instructions": "Search the user's local files by meaning. Files of every kind - text, code, PDFs, images, audio, video - share one embedding space, so describe the CONTENT you want in natural language (any language). `search` finds files across the whole index; `search_inline` ranks the best passages WITHIN a specific set of files or folders you already know; `file_status` reports whether given files are indexed and whether the index is still fresh for them. Results are file paths with scores, snippets, and media metadata (resolution, duration, size); read the files yourself if you need their full contents."
+                "instructions": "Search the user's local files by meaning. Files of every kind - text, code, PDFs, images, audio, video - share one embedding space, so describe the CONTENT you want in natural language (any language). `search` finds files across the whole index; `search_inline` ranks the best passages WITHIN a specific set of files or folders you already know; `file_status` reports whether given files are indexed and whether the index is still fresh for them. Results are file paths with scores, snippets, and media metadata (resolution, duration, size); read the files yourself if you need their full contents.\n\nOmni only finds what it has indexed. If a search comes back empty for something the user says is on their Mac, check `list_sources` before concluding the file is not there - the folder may simply not be a source yet. `list_sources` also reports what is still indexing, which explains a result set that looks incomplete. `add_source` adds a folder (or the Apple Photos library, whole or by album) and indexing starts immediately; `pause_source` stops work on one without losing what it already indexed; `remove_source` drops it and its rows. These change what the user sees in the app, so treat add and especially remove as actions to take on request rather than on your own initiative."
             ])
 
         case "ping":
             return result(id: id, [:])
 
         case "tools/list":
-            return result(id: id, ["tools": [searchToolDescriptor(), searchInlineToolDescriptor(),
-                                             fileStatusToolDescriptor(), tagImageToolDescriptor()]])
+            var tools = [searchToolDescriptor(), searchInlineToolDescriptor(),
+                         fileStatusToolDescriptor(), tagImageToolDescriptor()]
+            // Only advertised when the app has wired the control: a tool a client can see but not
+            // call is worse than one that is absent.
+            if sources != nil {
+                tools += [listSourcesDescriptor(), addSourceDescriptor(),
+                          pauseSourceDescriptor(), removeSourceDescriptor()]
+            }
+            return result(id: id, ["tools": tools])
 
         case "tools/call":
             guard let name = params["name"] as? String else {
@@ -80,6 +88,11 @@ enum MCPAdapter {
             case "search_inline": return callSearchInline(id: id, args: args, backend: backend)
             case "file_status":   return callFileStatus(id: id, args: args, backend: backend)
             case "tag_image":     return callTagImage(id: id, args: args, backend: backend)
+            case "list_sources", "add_source", "pause_source", "remove_source":
+                guard let sources else {
+                    return toolError(id: id, "\(name) failed: indexing control is unavailable (the index is still loading)")
+                }
+                return await callSources(id: id, tool: name, args: args, sources: sources)
             default:
                 return HTTPResponse.json(jsonRPCError(id: id, code: -32602, message: "unknown tool: \(name)"))
             }
@@ -608,4 +621,157 @@ enum MCPAdapter {
     private static func jsonRPCError(id: Any, code: Int, message: String) -> [String: Any] {
         ["jsonrpc": "2.0", "id": id, "error": ["code": code, "message": message]]
     }
+
+    // MARK: - Managing what Omni indexes
+    //
+    // These four mirror the sidebar one-for-one (add / pause / resume / remove) and go through the
+    // same AppModel methods it does - see SourcesAdapter. They are the only MCP tools that CHANGE
+    // anything, which is why each description says plainly what the user will see happen.
+
+    private static func listSourcesDescriptor() -> [String: Any] {
+        [
+            "name": "list_sources",
+            "title": "List what Omni indexes",
+            "description": "The folders and Apple Photos sources Omni currently indexes, with how many files each holds, whether it is paused, and live progress while it is being indexed. Also lists the Photos albums that could be added but have not been. Call this before concluding that a file is not on the Mac: search only ever covers what is listed here.",
+            "inputSchema": ["type": "object", "properties": [:] as [String: Any]] as [String: Any],
+            "annotations": ["readOnlyHint": true],
+        ]
+    }
+
+    private static func addSourceDescriptor() -> [String: Any] {
+        [
+            "name": "add_source",
+            "title": "Index a folder or photo album",
+            "description": "Add a folder, or the user's Apple Photos library, to what Omni indexes. Indexing starts right away and the source appears in the app's sidebar. Give EITHER 'path' (an absolute folder path) OR 'album' ('all' for the whole Photos library, or an album id from list_sources) - not both. A folder already covered by an indexed parent is reported as such rather than added twice.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "path": ["type": "string", "description": "Absolute path of a folder to index, e.g. /Users/me/Projects. '~' is expanded."],
+                    "album": ["type": "string", "description": "'all' for the whole Apple Photos library, or an album id from list_sources. Requires that the user has granted Omni access to Photos in the app."],
+                ] as [String: Any],
+            ] as [String: Any],
+        ]
+    }
+
+    private static func pauseSourceDescriptor() -> [String: Any] {
+        [
+            "name": "pause_source",
+            "title": "Pause or resume a source",
+            "description": "Stop indexing one folder or Photos source without losing what it has already indexed - its files stay searchable, and new or changed files are ignored until it is resumed. Pass paused=false to resume. Use 'key' exactly as list_sources reports it.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "key": ["type": "string", "description": "The source's key from list_sources (a folder path, or 'photos://<id>')."],
+                    "paused": ["type": "boolean", "description": "true to pause (the default), false to resume."],
+                ] as [String: Any],
+                "required": ["key"],
+            ] as [String: Any],
+        ]
+    }
+
+    private static func removeSourceDescriptor() -> [String: Any] {
+        [
+            "name": "remove_source",
+            "title": "Stop indexing a source and drop its results",
+            "description": "Remove a folder or Photos source from Omni. Its files stop appearing in search and their index entries are deleted. THE FILES THEMSELVES ARE NOT TOUCHED - nothing is deleted from disk or from the Photos library - but re-adding the source means indexing it again from scratch, which can take a long time. Ask the user before calling this.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "key": ["type": "string", "description": "The source's key from list_sources (a folder path, or 'photos://<id>')."],
+                ] as [String: Any],
+                "required": ["key"],
+            ] as [String: Any],
+            "annotations": ["destructiveHint": true],
+        ]
+    }
+
+    private static func callSources(id: Any, tool: String, args: [String: Any],
+                                    sources: SourcesControl) async -> HTTPResponse {
+        func done(_ m: SourceMutation, _ verb: String) async -> HTTPResponse {
+            if let err = m.error { return toolError(id: id, "\(tool) failed: \(err)") }
+            let snap = await sources.snapshot()
+            return sourcesResult(id: id, snap, headline: "\(verb) \(m.key ?? "")")
+        }
+
+        switch tool {
+        case "list_sources":
+            return sourcesResult(id: id, await sources.snapshot(), headline: nil)
+
+        case "add_source":
+            let path = (args["path"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let album = (args["album"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            switch (path?.isEmpty == false ? path : nil, album?.isEmpty == false ? album : nil) {
+            case (let p?, nil): return await done(await sources.addFolder(p), "now indexing")
+            case (nil, let a?): return await done(await sources.addAlbum(a), "now indexing")
+            case (nil, nil):
+                return toolError(id: id, "add_source failed: give 'path' (a folder) or 'album' ('all', or an album id from list_sources)")
+            default:
+                return toolError(id: id, "add_source failed: give 'path' or 'album', not both")
+            }
+
+        case "pause_source":
+            guard let key = (args["key"] as? String), !key.isEmpty else {
+                return toolError(id: id, "pause_source failed: 'key' is required (from list_sources)")
+            }
+            let paused = (args["paused"] as? Bool) ?? true
+            return await done(await sources.setPaused(key, paused), paused ? "paused" : "resumed")
+
+        case "remove_source":
+            guard let key = (args["key"] as? String), !key.isEmpty else {
+                return toolError(id: id, "remove_source failed: 'key' is required (from list_sources)")
+            }
+            return await done(await sources.remove(key), "removed")
+
+        default:
+            return toolError(id: id, "unknown tool: \(tool)")
+        }
+    }
+
+    /// One rendering for all four: the caller's next question after any of them is "so what is
+    /// indexed now", and answering it in the same turn saves a round trip.
+    private static func sourcesResult(id: Any, _ snap: SourcesSnapshot, headline: String?) -> HTTPResponse {
+        var lines: [String] = []
+        if let headline { lines.append(headline) }
+        if snap.sources.isEmpty {
+            lines.append("Omni is not indexing anything yet.")
+        } else {
+            for s in snap.sources {
+                var state: [String] = ["\(s.indexedFiles.formatted()) indexed"]
+                if s.paused { state.append("PAUSED") }
+                else if s.queued { state.append("waiting to be indexed") }
+                else if s.total > 0, s.done < s.total { state.append("indexing \(s.done.formatted())/\(s.total.formatted())") }
+                lines.append("- [\(s.kind)] \(s.name)  \(s.key)  (\(state.joined(separator: ", ")))")
+            }
+        }
+        if !snap.albums.isEmpty {
+            lines.append("Photo albums that can be added: " +
+                         snap.albums.map { "\($0.title) (id \($0.id), \($0.count))" }.joined(separator: "; "))
+        } else if !snap.photosAuthorized {
+            lines.append("Omni has no access to the Apple Photos library; the user grants it in the app.")
+        }
+
+        let structured: [String: Any] = [
+            "indexing": snap.indexing,
+            "photos_authorized": snap.photosAuthorized,
+            "sources": snap.sources.map { s -> [String: Any] in
+                var row: [String: Any] = ["key": s.key, "kind": s.kind, "name": s.name,
+                                          "paused": s.paused, "indexing": s.indexing,
+                                          "queued": s.queued, "indexed_files": s.indexedFiles]
+                if s.total > 0 { row["progress"] = ["done": s.done, "total": s.total] }
+                return row
+            },
+            "available_photo_albums": snap.albums.map {
+                ["id": $0.id, "title": $0.title, "count": $0.count, "smart": $0.smart]
+            },
+        ]
+        return result(id: id, [
+            "content": [["type": "text", "text": lines.joined(separator: "\n")]],
+            "structuredContent": structured,
+        ])
+    }
+
+    private static func toolError(id: Any, _ message: String) -> HTTPResponse {
+        result(id: id, ["content": [["type": "text", "text": message]], "isError": true])
+    }
+
 }
