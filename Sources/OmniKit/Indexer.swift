@@ -1524,52 +1524,51 @@ public final class Indexer: @unchecked Sendable {
     /// CPU-only decode: extraction, thresholds, frame sampling, audio mel. No GPU/MLX.
     /// Also captures display metadata (pixel size / duration) here, on the concurrent stage, so the
     /// serial embed stage never re-opens the file header.
+    ///
+    /// ONE PATH FOR EVERY INGESTION CHANNEL. What is source-specific (can this be read, how big is
+    /// it, hand me its bytes) is behind `ContentSource`; everything below - thresholds, dedup,
+    /// payload shape, HQ crops - is policy, and lives here exactly once so a new channel cannot
+    /// quietly acquire its own version of it. That is precisely how issue #13 happened.
     private func decode(_ file: CrawledFile, settings: IndexSettings) -> DecodedItem {
-        // A Photos asset is not a file: every read below (stat, header, byte hash) would be asking
-        // the filesystem about a path that does not exist there. PhotoKit answers all of it.
-        if let ref = PhotoLibrary.Ref(file.path) { return decodePhoto(file, ref: ref, settings: settings) }
-        // Dataless (cloud-evicted) file under the skip policy: reading its body would implicitly
-        // DOWNLOAD it. Return an empty item BEFORE any content read - the consume stage counts it
-        // skipped, and tick() still marks it `seen`, so reconcile never mistakes it for deleted. An
-        // already-indexed file that got evicted does not even reach here (eviction keeps mtime/size,
-        // so the unchanged check holds it); when the user materializes the file, the FSEvents
-        // reconcile (or the next pass) indexes it normally.
-        if settings.skipDataless, FileExtractor.isDataless(file.path) { return DecodedItem(file: file) }
-        let category = FileExtractor.kind(for: file.url) ?? .text
-        let kind = category.rawValue
-        var meta: (width: Int, height: Int, duration: Double) = (0, 0, 0)
+        let source = ContentSources.source(for: file)
 
-        switch category {
-        case .image:
-            if let s = FileExtractor.imagePixelSize(file.url) {
-                meta = (s.width, s.height, 0)
-                if settings.minImageDimension > 0, max(s.width, s.height) < settings.minImageDimension {
+        // Nil probe = produce nothing for this item right now: it is gone, or its content could
+        // only be reached by an implicit download under `skipDataless`. Not a deletion - the
+        // consume stage counts it skipped and tick() still marks it `seen`, so reconcile never
+        // mistakes it for removed, and it indexes once the user materializes it.
+        guard let probe = source.probe(file, settings: settings) else { return DecodedItem(file: file) }
+        let category = probe.kind
+        let kind = category.rawValue
+        var meta = probe.meta
+
+        // Index-time minimums, applied only to metrics the source actually measured: an item whose
+        // header could not be parsed has never been held to a threshold.
+        if probe.measured {
+            switch category {
+            case .image:
+                if settings.minImageDimension > 0, max(probe.width, probe.height) < settings.minImageDimension {
                     return DecodedItem(file: file)
                 }
-            }
-        case .video, .audio:
-            if let info = FileExtractor.mediaInfo(file.url) {
-                // Video rows carry the file's ORIGINAL resolution (a quality signal for the
-                // serving layer), not the downscaled frame size fed to the encoder.
-                meta = (info.width, info.height, info.duration)
+            case .video, .audio:
                 let minS = category == .video ? settings.minVideoSeconds : settings.minAudioSeconds
-                if minS > 0, info.duration < minS { return DecodedItem(file: file) }
+                if minS > 0, probe.duration < minS { return DecodedItem(file: file) }
+            case .text, .scan:
+                break
             }
-        case .text, .scan:   // .scan never comes from detection (extraction-time only)
-            break
         }
 
-        // Content dedup: if the store already holds the chunks for these exact bytes (same
+        // Content dedup: if the store already holds the chunks for this exact content (same
         // preprocess settings, same model), reuse them - no decode, no GPU forward. Measured on
         // a real home-folder corpus: 16% of images, 9% of audio, 8% of video and 6% of text
         // files are byte-level duplicates of an already-indexed file; a touched-but-identical
         // file (git checkout, re-save without changes) otherwise re-embeds for nothing. The key
         // is recorded once the file's chunks land (see pipeline()), and reuse is exact by
-        // construction: same input bytes + same settings produce the same vectors, so copying
-        // the stored rows is the embedding, minus the work.
+        // construction: same input + same settings produce the same vectors, so copying the
+        // stored rows is the embedding, minus the work.
         var contentKey: String? = nil
         if Self.contentDedup, !settings.forceFreshEmbed {
-            contentKey = self.contentKey(file, category: category, settings: settings)
+            contentKey = source.contentKey(file, kind: category, dim: embedder.dim,
+                                           chunkOverlap: chunkOverlap, settings: settings)
             if let ck = contentKey, let src = store.duplicateChunks(key: ck) {
                 noteDedupHit()
                 return DecodedItem(file: file, kind: kind, payload: .duplicate(Self.rewrite(src, to: file)),
@@ -1578,39 +1577,15 @@ public final class Indexer: @unchecked Sendable {
         }
 
         if category == .video {
-            // A video longer than one segment streams per 240 s window in the embed stage
-            // (one embedding + timestamp locator per window), mirroring long audio - a 3-hour
-            // recording becomes fully searchable instead of compressing into one start-biased
-            // vector. Frame extraction is stateless seeks, so the payload carries parameters
-            // only. Videos within one segment keep the single-clip path.
-            if meta.duration.isFinite, meta.duration > Self.mediaSegmentSeconds {
-                return DecodedItem(file: file, kind: kind,
-                                   payload: .videoSegments(duration: meta.duration,
-                                                           maxFrames: settings.maxVideoFrames,
-                                                           maxDimension: settings.maxImageDimension),
-                                   meta: meta, contentKey: contentKey)
-            }
-            let frames = FileExtractor.videoFrames(file.url, maxFrames: settings.maxVideoFrames, maxDimension: settings.maxImageDimension)
-            return frames.isEmpty ? DecodedItem(file: file) : DecodedItem(file: file, kind: kind, payload: .images(frames), meta: meta, contentKey: contentKey)
+            guard let out = source.video(file, probe: probe, settings: settings) else { return DecodedItem(file: file) }
+            return DecodedItem(file: file, kind: kind, payload: out.payload, meta: out.meta, contentKey: contentKey)
         }
         if category == .audio {
-            // Stream-decode in bounded segments (issue #7: a whole-file PCM buffer for a
-            // multi-hour file overflows AudioToolbox's 32-bit byte count and killed the scan).
-            // One segment (the overwhelmingly common case, <= 240 s) keeps the exact old
-            // .audioMel path - byte-identical mel, cross-file batching preserved. Longer files
-            // carry the open reader to the embed stage, which streams one embedding per segment.
-            guard let reader = OmniAudioPreprocess.AudioSegmentReader(url: file.url),
-                  let first = reader.nextMelSegment(), first.frames > 0 else { return DecodedItem(file: file) }
-            guard let second = reader.nextMelSegment() else {
-                return DecodedItem(file: file, kind: kind, payload: .audioMel(first.mel, first.frames), meta: meta, contentKey: contentKey)
-            }
-            reader.pushBack(second)
-            return DecodedItem(file: file, kind: kind,
-                               payload: .audioSegments(mel: first.mel, frames: first.frames, reader: reader),
-                               meta: meta, contentKey: contentKey)
+            guard let out = source.audio(file, probe: probe, settings: settings) else { return DecodedItem(file: file) }
+            return DecodedItem(file: file, kind: kind, payload: out.payload, meta: out.meta, contentKey: contentKey)
         }
-        let content = (try? FileExtractor.extract(file.url, maxImageDimension: settings.maxImageDimension, maxVideoFrames: settings.maxVideoFrames)) ?? .empty
-        switch content {
+
+        switch source.content(file, kind: category, settings: settings) {
         case .empty:
             return DecodedItem(file: file)
         case .text(let text):
@@ -1628,6 +1603,12 @@ public final class Indexer: @unchecked Sendable {
                                payload: .pdfScan(pageCount: pageCount, maxDimension: settings.maxImageDimension), meta: meta, contentKey: contentKey)
         case .images(let images):
             if images.isEmpty { return DecodedItem(file: file) }
+            // The decode is normally a pure downscale, so the row keeps the ORIGINAL's dimensions
+            // (a quality signal for the UI and the serving layer). A source overrides this when its
+            // decode can legitimately reframe the picture - see PhotosContentSource on edits.
+            if let first = images.first, images.count == 1 {
+                meta = source.metaAfterImageDecode(probe: probe, decoded: first)
+            }
             // Still images: run the CPU preprocess (resize + parallel patchify) HERE, in the
             // concurrent decode stage, so the serialized GPU thread only does the tower.
             let raws = images.map { OmniVisionPreprocess.preprocessRaw($0) }
@@ -1644,105 +1625,17 @@ public final class Indexer: @unchecked Sendable {
         }
     }
 
-    /// The Photos twin of `decode`. Same shape - thresholds, content dedup, then a payload - with
-    /// PhotoKit standing in for every filesystem read.
-    ///
-    /// AN ICLOUD-ONLY ASSET IS A DATALESS FILE, and is treated as exactly that. Embedding it would
-    /// make an index pass silently pull the library down from iCloud, which is what `skipDataless`
-    /// exists to prevent; with the setting off, the download is allowed the same way a read-through
-    /// of an evicted file is. Nothing is deleted either way - an asset skipped here is still marked
-    /// seen by the crawl, so the sweep never mistakes it for removed.
-    private func decodePhoto(_ file: CrawledFile, ref: PhotoLibrary.Ref, settings: IndexSettings) -> DecodedItem {
-        guard let info = PhotoLibrary.info(ref) else { return DecodedItem(file: file) }   // gone from the library
-        let allowNetwork = !settings.skipDataless
-        guard info.isLocal || allowNetwork else { return DecodedItem(file: file) }
-        let category: FileKind = info.isVideo ? .video : .image
-        let kind = category.rawValue
-        var meta = (width: info.width, height: info.height, duration: info.duration)
-
-        if category == .image {
-            if settings.minImageDimension > 0, max(info.width, info.height) < settings.minImageDimension {
-                return DecodedItem(file: file)
-            }
-        } else if settings.minVideoSeconds > 0, info.duration < settings.minVideoSeconds {
-            return DecodedItem(file: file)
-        }
-
-        // Content dedup, keyed on the ASSET rather than its bytes. This is what makes an asset that
-        // belongs to two selected albums cost one forward pass: the second source's path arrives,
-        // finds the first's rows under the same key, and stores them rewritten. Hashing the bytes
-        // instead would mean materializing every asset just to discover that.
-        var contentKey: String? = nil
-        if Self.contentDedup, !settings.forceFreshEmbed {
-            let fp = category == .image
-                ? "d\(settings.maxImageDimension)"
-                : "v2|d\(settings.maxImageDimension)|f\(settings.maxVideoFrames)|s\(Int(Self.mediaSegmentSeconds))"
-            let ck = "2|photo|\(category.rawValue)|m\(embedder.dim)|t\(file.modified)|s\(file.size)|\(fp)|\(ref.localIdentifier)"
-            contentKey = ck
-            if let src = store.duplicateChunks(key: ck) {
-                noteDedupHit()
-                return DecodedItem(file: file, kind: kind, payload: .duplicate(Self.rewrite(src, to: file)),
-                                   meta: meta, contentKey: ck)
-            }
-        }
-
-        if category == .video {
-            guard let asset = PhotoLibrary.video(ref, allowNetwork: allowNetwork) else { return DecodedItem(file: file) }
-            // The asset's real duration and dimensions, now that it is open - PHAsset's are the
-            // ORIGINAL's, and an edit (a trim, a slow-motion ramp) changes both.
-            if let mi = FileExtractor.mediaInfo(asset: asset), mi.duration > 0 {
-                meta = (mi.width > 0 ? mi.width : meta.width, mi.height > 0 ? mi.height : meta.height, mi.duration)
-            }
-            if meta.duration.isFinite, meta.duration > Self.mediaSegmentSeconds {
-                return DecodedItem(file: file, kind: kind,
-                                   payload: .photoVideoSegments(asset: asset, duration: meta.duration,
-                                                                maxFrames: settings.maxVideoFrames,
-                                                                maxDimension: settings.maxImageDimension),
-                                   meta: meta, contentKey: contentKey)
-            }
-            let frames = FileExtractor.videoFrames(asset: asset, maxFrames: settings.maxVideoFrames,
-                                                   maxDimension: settings.maxImageDimension)
-            return frames.isEmpty ? DecodedItem(file: file)
-                                  : DecodedItem(file: file, kind: kind, payload: .images(frames),
-                                                meta: meta, contentKey: contentKey)
-        }
-
-        guard let image = PhotoLibrary.image(ref, maxDimension: settings.maxImageDimension,
-                                             allowNetwork: allowNetwork) else { return DecodedItem(file: file) }
-        // A row's width/height is the asset's OWN resolution, the same quality signal a file row
-        // carries (the file path stores the original's pixel size, not the downscaled decode).
-        // The decode is normally a pure downscale to maxImageDimension, and under Optimize Mac
-        // Storage it can be a smaller resident derivative still - reporting either as the photo's
-        // size would tell the UI and the serving layer that a 4000 px photo is a 1024 px one.
-        //
-        // The exception is an EDIT: a crop changes the framing, so the decoded aspect ratio stops
-        // matching the asset's and the decoded numbers are the ones describing the real picture.
-        let assetAR = info.height > 0 ? Double(info.width) / Double(info.height) : 0
-        let decodedAR = image.height > 0 ? Double(image.width) / Double(image.height) : 0
-        let sameFraming = assetAR > 0 && decodedAR > 0 && abs(assetAR - decodedAR) <= 0.01 * assetAR
-        meta = sameFraming ? (max(info.width, image.width), max(info.height, image.height), 0)
-                           : (image.width, image.height, 0)
-        let item = DecodedItem(file: file, kind: kind,
-                               payload: .imagePatches([OmniVisionPreprocess.preprocessRaw(image)]),
-                               meta: meta, contentKey: contentKey)
-        if settings.hqMediaTags {
-            item.hqCrops = OmniTagger.cwrCropRects(width: image.width, height: image.height)
-                .compactMap { image.cropping(to: $0) }
-                .map { OmniVisionPreprocess.preprocessRaw($0) }
-        }
-        return item
-    }
-
     /// Content key of a file: SHA-256 over the bytes that determine its embedding, qualified by
     /// every setting that changes the vectors for those bytes (and the model dimension). Plain
     /// text extraction truncates at FileExtractor.maxTextBytes, so the hash caps there for those
     /// extensions - exact, because chunks can only depend on bytes extract() actually reads.
     /// The extension is included so equal bytes under different parsers never alias. Nil on read
     /// failure (no dedup; the normal path decides what to do with the file).
-    private func contentKey(_ file: CrawledFile, category: FileKind, settings: IndexSettings) -> String? {
+    static func fileContentKey(_ file: CrawledFile, category: FileKind, dim: Int,
+                               chunkOverlap: Int, settings: IndexSettings) -> String? {
         let ext = file.ext.lowercased()
         let cap = (category == .text && FileExtractor.textExtensions.contains(ext)) ? FileExtractor.maxTextBytes : Int.max
-        guard let digest = Self.sha256(file.url, cap: cap) else { return nil }
+        guard let digest = sha256(file.url, cap: cap) else { return nil }
         let fp: String
         switch category {
         // .scan grouped for exhaustiveness only - contentKey is always called with the
@@ -1750,7 +1643,7 @@ public final class Indexer: @unchecked Sendable {
         case .text, .scan:  fp = "c\(settings.maxCharsPerChunk)|o\(chunkOverlap)|d\(settings.maxImageDimension)"   // d: scanned-PDF render size
         case .image: fp = "d\(settings.maxImageDimension)"
         // v2: uniform frame sampling + 240 s segmentation (pre-upgrade rows must not alias).
-        case .video: fp = "v2|d\(settings.maxImageDimension)|f\(settings.maxVideoFrames)|s\(Int(Self.mediaSegmentSeconds))"
+        case .video: fp = "v2|d\(settings.maxImageDimension)|f\(settings.maxVideoFrames)|s\(Int(mediaSegmentSeconds))"
         case .audio: fp = "s\(OmniAudioPreprocess.segmentMelFrames)"   // segmenting changes long-audio chunking
         }
         // SIZE is part of the identity, and the version is 2 because of it. The digest covers only
@@ -1759,7 +1652,7 @@ public final class Indexer: @unchecked Sendable {
         // other. Measured on a 212k-file index: 9 key groups / 35 files aliased that way, all
         // append-only session logs from 4.2 MB to 18.0 MB carrying one embedding between them.
         // Genuinely identical copies still dedup - equal bytes implies equal size.
-        return "2|\(category.rawValue)|\(ext)|m\(embedder.dim)|s\(file.size)|\(fp)|\(digest)"
+        return "2|\(category.rawValue)|\(ext)|m\(dim)|s\(file.size)|\(fp)|\(digest)"
     }
 
     /// Streaming SHA-256 of a file's first `cap` bytes (whole file when cap covers it).
