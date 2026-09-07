@@ -1709,9 +1709,19 @@ public final class Indexer: @unchecked Sendable {
 
         guard let image = PhotoLibrary.image(ref, maxDimension: settings.maxImageDimension,
                                              allowNetwork: allowNetwork) else { return DecodedItem(file: file) }
-        // The decoded size is the truth about what the tower will see; PHAsset's pixel dimensions
-        // describe the original, which for an edited photo is a different picture.
-        meta = (image.width, image.height, 0)
+        // A row's width/height is the asset's OWN resolution, the same quality signal a file row
+        // carries (the file path stores the original's pixel size, not the downscaled decode).
+        // The decode is normally a pure downscale to maxImageDimension, and under Optimize Mac
+        // Storage it can be a smaller resident derivative still - reporting either as the photo's
+        // size would tell the UI and the serving layer that a 4000 px photo is a 1024 px one.
+        //
+        // The exception is an EDIT: a crop changes the framing, so the decoded aspect ratio stops
+        // matching the asset's and the decoded numbers are the ones describing the real picture.
+        let assetAR = info.height > 0 ? Double(info.width) / Double(info.height) : 0
+        let decodedAR = image.height > 0 ? Double(image.width) / Double(image.height) : 0
+        let sameFraming = assetAR > 0 && decodedAR > 0 && abs(assetAR - decodedAR) <= 0.01 * assetAR
+        meta = sameFraming ? (max(info.width, image.width), max(info.height, image.height), 0)
+                           : (image.width, image.height, 0)
         let item = DecodedItem(file: file, kind: kind,
                                payload: .imagePatches([OmniVisionPreprocess.preprocessRaw(image)]),
                                meta: meta, contentKey: contentKey)
