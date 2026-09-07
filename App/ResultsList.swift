@@ -168,7 +168,7 @@ struct ResultsList<Footer: View>: View {
                             // fire), the chevron is gone - don't strand an open expansion either.
                             if expanded.contains(hit.path), hit.chunkCount > 1 {
                                 PassagesView(passages: passagesCache[hit.path],
-                                             fileName: URL(fileURLWithPath: hit.path).lastPathComponent,
+                                             fileName: (hit.path as NSString).lastPathComponent,
                                              path: hit.path, kind: hit.kind)
                                     .padding(10)
                                     // A flat elevated fill, not vibrancy: blur belongs on sidebars and
@@ -204,7 +204,7 @@ struct ResultsList<Footer: View>: View {
                                             .reportResultFrame(member.path, in: marqueeSpace)
                                         if expanded.contains(member.path), member.chunkCount > 1 {
                                             PassagesView(passages: passagesCache[member.path],
-                                                         fileName: URL(fileURLWithPath: member.path).lastPathComponent,
+                                                         fileName: (member.path as NSString).lastPathComponent,
                                                          path: member.path, kind: member.kind)
                                                 .padding(10)
                                                 .background(Color(.controlBackgroundColor), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
@@ -330,7 +330,7 @@ struct ResultsList<Footer: View>: View {
                             ), arrowEdge: .bottom) {
                                 ScrollView {
                                     PassagesView(passages: passagesCache[hit.path],
-                                                 fileName: URL(fileURLWithPath: hit.path).lastPathComponent,
+                                                 fileName: (hit.path as NSString).lastPathComponent,
                                                  path: hit.path, kind: hit.kind)
                                         .padding(12)
                                 }
@@ -358,7 +358,7 @@ struct ResultsList<Footer: View>: View {
                                     ), arrowEdge: .bottom) {
                                         ScrollView {
                                             PassagesView(passages: passagesCache[member.path],
-                                                         fileName: URL(fileURLWithPath: member.path).lastPathComponent,
+                                                         fileName: (member.path as NSString).lastPathComponent,
                                                          path: member.path, kind: member.kind)
                                                 .padding(12)
                                         }
@@ -547,7 +547,7 @@ struct ResultsList<Footer: View>: View {
             if PhotoLibrary.isPhotoPath(path) {
                 Button { sharePhoto(path) } label: { Label("Share\u{2026}", systemImage: "square.and.arrow.up") }
             } else {
-                ShareLink(item: URL(fileURLWithPath: path)) { Label("Share\u{2026}", systemImage: "square.and.arrow.up") }
+                ShareLink(item: URL(fileURLWithPath: path, isDirectory: false)) { Label("Share\u{2026}", systemImage: "square.and.arrow.up") }
             }
             Divider()
             // Deleting a Photos asset means deleting it from the library and every synced device -
@@ -610,7 +610,11 @@ struct ResultRow: View {
     var stack: (count: Int, reason: ResultGroup.Reason)? = nil
     var stackOpen: Bool = false
     var onToggleStack: (() -> Void)? = nil
-    private var url: URL { URL(fileURLWithPath: hit.path) }
+    /// The display name, taken from the STRING. `URL(fileURLWithPath:)` stats the path to decide
+    /// whether it is a directory, and this is read from `body` - on a row whose file lives on a
+    /// network share that is a blocking round trip on the main thread (7 ms warm, seconds cold),
+    /// paid again for every row on every redraw. NSString does it purely lexically.
+    private var fileName: String { (hit.path as NSString).lastPathComponent }
     /// Emphasized = selected AND the window is key: the state that earns the solid accent fill and
     /// white text. A non-key window falls back to the unemphasized grey, like every native list.
     private var emphasized: Bool { selected && controlActive == .key }
@@ -620,10 +624,10 @@ struct ResultRow: View {
             StackedThumbnail(path: hit.path, side: 40, corner: 6, depth: stack.map { min(2, $0.count - 1) } ?? 0)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
-                    Text(url.lastPathComponent).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
+                    Text(fileName).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
                     if let stack { stackBadge(stack) }
                 }
-                if !hit.snippet.isEmpty, hit.snippet != url.lastPathComponent {
+                if !hit.snippet.isEmpty, hit.snippet != fileName {
                     Text(hit.snippet).font(.body).foregroundStyle(.secondary).lineLimit(1)
                 }
                 HStack(spacing: 5) {
@@ -756,7 +760,8 @@ struct ResultGridItem: View {
     var stackOpen: Bool = false
     var onToggleStack: (() -> Void)? = nil
     @Environment(\.controlActiveState) private var controlActive
-    private var url: URL { URL(fileURLWithPath: hit.path) }
+    /// Lexical, not filesystem - see the note on ResultRow.fileName.
+    private var fileName: String { (hit.path as NSString).lastPathComponent }
 
     var body: some View {
         VStack(spacing: 6) {
@@ -815,7 +820,7 @@ struct ResultGridItem: View {
             // empty reserved line. Top-aligned, like Finder: the name starts right under the icon.
             ZStack(alignment: .top) {
                 Text(verbatim: "X\nX").font(.caption).padding(.vertical, 1).hidden()
-                Text(url.lastPathComponent).font(.caption).lineLimit(2)
+                Text(fileName).font(.caption).lineLimit(2)
                     .multilineTextAlignment(.center)
                     .foregroundStyle(selected && controlActive == .key ? .white : .primary)
                     .padding(.horizontal, 6).padding(.vertical, 1)
@@ -830,7 +835,7 @@ struct ResultGridItem: View {
             // the name above, so cells without a snippet keep the row's thumbnails aligned.
             ZStack {
                 Text(verbatim: "0").font(.caption2).hidden()
-                if !hit.snippet.isEmpty, hit.snippet != url.lastPathComponent {
+                if !hit.snippet.isEmpty, hit.snippet != fileName {
                     Text(hit.snippet).font(.caption2).foregroundStyle(.secondary)
                         .lineLimit(1).truncationMode(.tail)
                         .multilineTextAlignment(.center)
