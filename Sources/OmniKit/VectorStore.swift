@@ -3348,9 +3348,17 @@ public final class VectorStore: @unchecked Sendable {
         for (i, p) in names.enumerated() {
             let bt = LexicalIndex.terms((p as NSString).lastPathComponent)
             guard !bt.isEmpty else { continue }
-            // fraction of the basename the query accounts for, and vice versa
-            let covered = Double(bt.filter { qt.contains($0) }.count) / Double(bt.count)
-            let used = Double(qt.filter { t in bt.contains(t) }.count) / Double(Swift.max(1, qt.count))
+            // fraction of the basename the query accounts for, and vice versa.
+            //
+            // Equality is the rule for letters. It is not sufficient for CJK: those scripts write
+            // without spaces, so a basename term is a whole RUN ("会议记录") while the query is one
+            // word inside it ("记录"). Under plain equality such a hit scores 0 coverage and is
+            // dropped at ranking time even though the sidecar retrieved it - so the containment
+            // case is what makes the CJK retrieval fix actually reach the user.
+            let covered = Double(bt.filter { b in qt.contains(where: { LexicalIndex.termMatches(query: $0, basename: b) }) }.count)
+                        / Double(bt.count)
+            let used = Double(qt.filter { q in bt.contains(where: { LexicalIndex.termMatches(query: q, basename: $0) }) }.count)
+                     / Double(Swift.max(1, qt.count))
             let strength = Swift.min(covered, used)
             // Explicit intent: the channel leads. Implicit: it may only nudge.
             lexRank[p] = strength / Double((explicit ? 5 : 120) + i + 1)
