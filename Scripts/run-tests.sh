@@ -40,8 +40,10 @@ BUNDLE="$PROD/OmniKitTests.xctest"
 codesign --force --deep --sign - "$BUNDLE" >/dev/null
 
 # Optional class/method filter passed through as -XCTest (e.g. OmniKitTests.VectorStoreTests).
-FILTER=()
-[ "$#" -gt 0 ] && FILTER=(-XCTest "$1")
-
-OMNI_MODEL_DIR="$MODEL" DYLD_FRAMEWORK_PATH="$PROD" DYLD_LIBRARY_PATH="$PROD" \
-  xcrun xctest "${FILTER[@]}" "$BUNDLE"
+if [ "$#" -gt 0 ]; then
+  OMNI_MODEL_DIR="$MODEL" DYLD_FRAMEWORK_PATH="$PROD" DYLD_LIBRARY_PATH="$PROD" \
+    xcrun xctest -XCTest "$1" "$BUNDLE"
+else
+  OMNI_MODEL_DIR="$MODEL" DYLD_FRAMEWORK_PATH="$PROD" DYLD_LIBRARY_PATH="$PROD" \
+    xcrun xctest "$BUNDLE"
+fi
