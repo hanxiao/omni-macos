@@ -84,7 +84,7 @@ enum MCPAdapter {
             }
             let args = params["arguments"] as? [String: Any] ?? [:]
             switch name {
-            case "search":        return callSearch(id: id, args: args, backend: backend)
+            case "search":        return await callSearch(id: id, args: args, backend: backend, sources: sources)
             case "search_inline": return callSearchInline(id: id, args: args, backend: backend)
             case "file_status":   return callFileStatus(id: id, args: args, backend: backend)
             case "tag_image":     return callTagImage(id: id, args: args, backend: backend)
@@ -145,11 +145,53 @@ enum MCPAdapter {
                     ]
                 ] as [String: Any],
                 "required": ["query"]
-            ] as [String: Any]
+            ] as [String: Any],
+            "annotations": ["readOnlyHint": true, "destructiveHint": false,
+                            "idempotentHint": true, "openWorldHint": false]
         ]
     }
 
-    private static func callSearch(id: Any, args: [String: Any], backend: any ServingBackend) -> HTTPResponse {
+    // MARK: - Filter input validation
+    //
+    // `folderPrefix` matching is `path == f || path.hasPrefix(f + "/")` (SearchFilter.acceptsPath),
+    // so a trailing slash builds the prefix "…//" and a "~" or relative path matches nothing at
+    // all. Both used to come back as an empty result set, which an agent reasonably reads as
+    // "not on this Mac". Normalize what we can and reject what we cannot, with the corrected
+    // value in the message so the next call is right.
+
+    /// nil when the folder is usable (or absent); a ready-to-return error response otherwise.
+    private static func normalizedFolder(_ raw: String) -> (value: String?, error: String?) {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return (nil, nil) }
+        let expanded = (trimmed as NSString).expandingTildeInPath
+        guard expanded.hasPrefix("/") else {
+            return (nil, "'folder' must be an absolute path (got \"\(trimmed)\"). "
+                       + "Use a path like /Users/you/Documents, or omit it to search everywhere.")
+        }
+        return (normalizeStorePath(expanded), nil)
+    }
+
+    /// Validates against FileKind, returning the expanded set (text implies scan) or an error.
+    private static func normalizedKinds(_ raw: [String]) -> (value: Set<String>?, error: String?) {
+        let cleaned = raw.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                         .filter { !$0.isEmpty }
+        guard !cleaned.isEmpty else { return (nil, nil) }
+        let valid = Set(FileKind.allCases.map(\.rawValue))
+        let unknown = cleaned.filter { !valid.contains($0) }
+        guard unknown.isEmpty else {
+            let known = FileKind.allCases.map(\.rawValue).sorted().joined(separator: ", ")
+            return (nil, "unknown kind\(unknown.count == 1 ? "" : "s") "
+                       + unknown.map { "\"\($0)\"" }.joined(separator: ", ")
+                       + ". Valid kinds are: \(known).")
+        }
+        var set = Set(cleaned)
+        // Same superset rule as the app: text includes scanned PDFs ('scan').
+        if set.contains(FileKind.text.rawValue) { set.insert(FileKind.scan.rawValue) }
+        return (set, nil)
+    }
+
+    private static func callSearch(id: Any, args: [String: Any], backend: any ServingBackend,
+                                   sources: SourcesControl?) async -> HTTPResponse {
         guard let query = args["query"] as? String, !query.isEmpty else {
             // Tool-level (not protocol-level) failure: isError true with a readable message.
             return result(id: id, [
@@ -163,13 +205,23 @@ enum MCPAdapter {
         maxSnippet = max(0, min(maxSnippet, 2000))
         let includeImages = (args["include_images"] as? Bool) ?? false
         var filter = SearchFilter()
-        if let kinds = args["kinds"] as? [String], !kinds.isEmpty {
-            var set = Set(kinds)
-            // Same superset rule as the app: text includes scanned PDFs ('scan').
-            if set.contains(FileKind.text.rawValue) { set.insert(FileKind.scan.rawValue) }
-            filter.kinds = set
+        if let kinds = args["kinds"] as? [String] {
+            let (set, err) = normalizedKinds(kinds)
+            if let err { return toolError(id: id, "search failed: \(err)") }
+            if let set { filter.kinds = set }
         }
-        if let folder = args["folder"] as? String, !folder.isEmpty { filter.folderPrefix = folder }
+        if let folder = args["folder"] as? String {
+            let (value, err) = normalizedFolder(folder)
+            if let err { return toolError(id: id, "search failed: \(err)") }
+            filter.folderPrefix = value
+        }
+
+        // INDEX STATE, FETCHED CONCURRENTLY. An agent cannot tell an empty result set caused by
+        // "not on this Mac" from one caused by "not indexed yet", and the second reading is the
+        // one that makes it stop trusting the tool. The snapshot is a main-actor hop, so it is
+        // started BEFORE the blocking scan and awaited after: the hop overlaps the search rather
+        // than adding to it.
+        async let snapshot: SourcesSnapshot? = { if let sources { return await sources.snapshot() }; return nil }()
 
         // Same duplicate collapsing as the HTTP endpoint and the app's own list. Copies cost an
         // agent more than they cost a human - every one is context spent re-reading a file it has
@@ -186,9 +238,24 @@ enum MCPAdapter {
         // `resource_link` (a file:// URI the client can open or render directly). Capable
         // clients show a list of openable files; dumb ones still read every text block in
         // order. `structuredContent` carries the full machine-readable rows regardless.
+        let snap = await snapshot
+        let building = indexStateLine(snap)
+
         var content: [[String: Any]] = []
+        if let building { content.append(["type": "text", "text": building]) }
         if hits.isEmpty {
-            content.append(["type": "text", "text": "No results for \"\(query)\"."])
+            // Say WHICH kind of nothing this is, so the agent's next move is right.
+            var text = "No results for \"\(query)\"."
+            if let snap {
+                if snap.sources.isEmpty {
+                    text += " Omni has no sources yet, so nothing is searchable"
+                        + " - add_source indexes a folder or the Photos library."
+                } else if snap.indexing {
+                    text += " Indexing is still running, so this is not yet evidence the file is absent"
+                        + " - retry, or call list_sources for progress."
+                }
+            }
+            content.append(["type": "text", "text": text])
         } else {
             var inlined = 0          // thumbnails emitted so far (capped)
             var cappedSkips = 0      // media hits skipped specifically because the cap was already reached
@@ -256,6 +323,13 @@ enum MCPAdapter {
             if h.duration > 0 { row["duration"] = h.duration }
             if h.size > 0 { row["bytes"] = h.size }
             if let ck = contentKeys[h.path], ck.modified == h.modified { row["content_key"] = ck.key }
+            // Same signature file_status compares. Present only when the file has actually drifted
+            // or vanished, so an unchanged result set is byte-for-byte what it was before.
+            switch diskState(of: h) {
+            case .upToDate: break
+            case .changed:  row["stale"] = true
+            case .missing:  row["missing"] = true
+            }
             return row
         }
         return result(id: id, [
@@ -296,7 +370,9 @@ enum MCPAdapter {
                     ]
                 ] as [String: Any],
                 "required": ["query", "paths"]
-            ] as [String: Any]
+            ] as [String: Any],
+            "annotations": ["readOnlyHint": true, "destructiveHint": false,
+                            "idempotentHint": true, "openWorldHint": false]
         ]
     }
 
@@ -370,7 +446,9 @@ enum MCPAdapter {
                     ] as [String: Any]
                 ] as [String: Any],
                 "required": ["paths"]
-            ] as [String: Any]
+            ] as [String: Any],
+            "annotations": ["readOnlyHint": true, "destructiveHint": false,
+                            "idempotentHint": true, "openWorldHint": false]
         ]
     }
 
@@ -440,7 +518,9 @@ enum MCPAdapter {
                     ] as [String: Any]
                 ] as [String: Any],
                 "required": ["paths"]
-            ] as [String: Any]
+            ] as [String: Any],
+            "annotations": ["readOnlyHint": true, "destructiveHint": false,
+                            "idempotentHint": true, "openWorldHint": false]
         ]
     }
 
@@ -634,7 +714,8 @@ enum MCPAdapter {
             "title": "List what Omni indexes",
             "description": "The folders and Apple Photos sources Omni currently indexes, with how many files each holds, whether it is paused, and live progress while it is being indexed. Also lists the Photos albums that could be added but have not been. Call this before concluding that a file is not on the Mac: search only ever covers what is listed here.",
             "inputSchema": ["type": "object", "properties": [:] as [String: Any]] as [String: Any],
-            "annotations": ["readOnlyHint": true],
+            "annotations": ["readOnlyHint": true, "destructiveHint": false,
+                            "idempotentHint": true, "openWorldHint": false],
         ]
     }
 
@@ -650,6 +731,8 @@ enum MCPAdapter {
                     "album": ["type": "string", "description": "'all' for the whole Apple Photos library, or an album id from list_sources. Requires that the user has granted Omni access to Photos in the app."],
                 ] as [String: Any],
             ] as [String: Any],
+            "annotations": ["readOnlyHint": false, "destructiveHint": false,
+                            "idempotentHint": true, "openWorldHint": false],
         ]
     }
 
@@ -666,6 +749,8 @@ enum MCPAdapter {
                 ] as [String: Any],
                 "required": ["key"],
             ] as [String: Any],
+            "annotations": ["readOnlyHint": false, "destructiveHint": false,
+                            "idempotentHint": true, "openWorldHint": false],
         ]
     }
 
@@ -681,7 +766,8 @@ enum MCPAdapter {
                 ] as [String: Any],
                 "required": ["key"],
             ] as [String: Any],
-            "annotations": ["destructiveHint": true],
+            "annotations": ["readOnlyHint": false, "destructiveHint": true,
+                            "idempotentHint": true, "openWorldHint": false],
         ]
     }
 
@@ -768,6 +854,44 @@ enum MCPAdapter {
             "content": [["type": "text", "text": lines.joined(separator: "\n")]],
             "structuredContent": structured,
         ])
+    }
+
+    // MARK: - Freshness
+
+    /// One line describing why a result set may be incomplete, or nil when the index is settled.
+    /// Kept to a single short sentence: it is prepended to every search response, so it has to
+    /// earn its tokens.
+    private static func indexStateLine(_ snap: SourcesSnapshot?) -> String? {
+        guard let snap else { return nil }
+        if snap.sources.isEmpty {
+            return "index: empty - no folders or photo sources are indexed yet (see list_sources / add_source)."
+        }
+        guard snap.indexing else { return nil }
+        let active = snap.sources.filter { $0.indexing }
+        let done = active.reduce(0) { $0 + $1.done }
+        let total = active.reduce(0) { $0 + $1.total }
+        let scope = total > 0 ? " (\(done) of \(total) files in this pass)" : ""
+        return "index: still building\(scope) - results may be incomplete, and an empty result is not proof a file is absent."
+    }
+
+    private enum DiskState { case upToDate, changed, missing }
+
+    /// Whether the file on disk still matches the version the index holds. Same comparison as
+    /// file_status's `up_to_date`, so the two tools can never disagree. One stat per returned hit
+    /// (at most top_k, capped at 50); Photos assets go through PhotoKit rather than the filesystem.
+    private static func diskState(of hit: SearchHit) -> DiskState {
+        if let ref = PhotoLibrary.Ref(hit.path) {
+            guard let info = PhotoLibrary.assetSignature(ref) else { return .missing }
+            return (info.modified == hit.modified && info.size == hit.size) ? .upToDate : .changed
+        }
+        guard let vals = try? URL(fileURLWithPath: hit.path).resourceValues(
+                forKeys: [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey]),
+              vals.isRegularFile == true else { return .missing }
+        let mtime = vals.contentModificationDate?.timeIntervalSince1970 ?? 0
+        let bytes = vals.fileSize ?? 0
+        // A row written before the size column exists carries size 0; do not call that a change.
+        if hit.size > 0 && bytes != hit.size { return .changed }
+        return mtime == hit.modified ? .upToDate : .changed
     }
 
     private static func toolError(id: Any, _ message: String) -> HTTPResponse {
