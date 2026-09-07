@@ -238,9 +238,15 @@ public enum PhotoLibrary {
         public let height: Int
         public let duration: Double
         public let isVideo: Bool
-        /// Is the asset's content on this Mac? False for an iCloud-only ("Optimize Mac Storage")
-        /// asset, whose bytes would have to be DOWNLOADED to be embedded - the Photos twin of a
-        /// dataless file, and gated by the same setting.
+        /// Is SOME renderable version of this asset on this Mac? True when Photos can produce an
+        /// image with the network off, whether that is the full-size original or the downscaled
+        /// derivative that "Optimize Mac Storage" leaves resident. False only for an asset with
+        /// nothing local at all, which is the true twin of a dataless file.
+        ///
+        /// The distinction matters because the embedding is computed from a <= maxImageDimension
+        /// resize either way: a resident preview is usually ALREADY above that, so it produces the
+        /// same vectors the original would. Gating on "is the original here" instead skipped a
+        /// whole optimized library that Omni could read without a single byte of download.
         public let isLocal: Bool
     }
 
@@ -264,6 +270,12 @@ public enum PhotoLibrary {
     /// for the smallest possible image with the network SHUT OFF: `PHImageResultIsInCloudKey` is
     /// set exactly when the request would have needed a download. Cheap (a cached thumbnail read),
     /// and honest - deriving it from resource flags misses the optimized-storage case.
+    ///
+    /// `.fastFormat` is deliberate and is what makes this the RIGHT question: it accepts a degraded
+    /// answer, so it succeeds for any asset with a resident derivative and fails only when there is
+    /// genuinely nothing to read without a download. It must stay in step with the delivery mode
+    /// `image(_:maxDimension:allowNetwork:)` uses - a probe more permissive than the decode would
+    /// wave through assets that then embed as nil, which is how #13 produced skipped photos.
     private static func isLocal(_ asset: PHAsset) -> Bool {
         let opts = PHImageRequestOptions()
         opts.isSynchronous = true
@@ -278,11 +290,22 @@ public enum PhotoLibrary {
         return local
     }
 
+    /// The long edge to ask PhotoKit for: `maxDimension`, but never more than the asset already
+    /// has. `.exact` delivers the size it is asked for, so requesting 1568 for a 640 px asset
+    /// would hand back an upscaled 1568 px image - more vision tokens carrying no more information.
+    /// The file pipeline cannot do this (`kCGImageSourceThumbnailMaxPixelSize` is a cap, never an
+    /// enlargement), so capping here is what keeps the two paths producing the same embedding for
+    /// the same picture. Pure, so it is unit-testable without a photo library.
+    static func targetSide(maxDimension: Int, pixelWidth: Int, pixelHeight: Int) -> Int {
+        let cap = max(64, maxDimension)
+        let longest = max(pixelWidth, pixelHeight)
+        return longest > 0 ? min(cap, longest) : cap
+    }
+
     /// A decoded still, no larger than `maxDimension` on its long edge.
     ///
     /// `allowNetwork == false` is the default posture: it keeps an index pass from silently pulling
-    /// a library down from iCloud, and costs nothing in quality - Photos keeps a local derivative
-    /// well above the 1568 px the vision tower resizes to anyway.
+    /// a library down from iCloud.
     public static func image(_ ref: Ref, maxDimension: Int, allowNetwork: Bool) -> CGImage? {
         guard let a = asset(ref) else { return nil }
         return image(a, maxDimension: maxDimension, allowNetwork: allowNetwork)
@@ -291,17 +314,27 @@ public enum PhotoLibrary {
     private static func image(_ asset: PHAsset, maxDimension: Int, allowNetwork: Bool) -> CGImage? {
         let opts = PHImageRequestOptions()
         opts.isSynchronous = true          // called from the indexer's decode stage / a detached task
-        opts.deliveryMode = .highQualityFormat
+        // THE SAME CONTRACT THE FILE PIPELINE HAS: "the best representation available here, capped
+        // at maxDimension" - never "this exact size or nothing". `.highQualityFormat` is the second
+        // one: it promises a result "as asked or better", so with the network off it has to REFUSE
+        // an asset whose only local copy is a smaller derivative, and returns nil. Under Optimize
+        // Mac Storage that is nearly the whole library - the user in #13 had 40 GB of resident
+        // previews for 40,000 photos and got about 150 of them indexed.
+        //
+        // `.opportunistic` with isSynchronous is documented to deliver exactly one result, the best
+        // it can do under the other options - the local derivative when that is all there is, the
+        // full-size render when the asset is materialized. That is what FileExtractor.loadImage
+        // already does for a file on disk, and a 1024 px embedding of a photo beats no row for it.
+        opts.deliveryMode = .opportunistic
         // .exact, NOT .fast: `.fast` is documented to answer with a size merely CLOSE to the target,
-        // which it is free to satisfy from a cached derivative smaller than what was asked for -
-        // and an image the tower sees at less than maxImageDimension is a quietly worse embedding
-        // than the same picture would get as a file on disk. `.exact` costs one resize of an image
-        // the preprocess is about to resize anyway, which is nothing beside the vision forward.
+        // so it can overshoot into a needlessly large decode. The target is capped to the asset's
+        // own pixels (see targetSide), so exact never means upscaled.
         opts.resizeMode = .exact
         opts.isNetworkAccessAllowed = allowNetwork
         opts.version = .current            // the photo as the user edited it, not the original
         var out: CGImage?
-        let side = CGFloat(max(64, maxDimension))
+        let side = CGFloat(targetSide(maxDimension: maxDimension,
+                                      pixelWidth: asset.pixelWidth, pixelHeight: asset.pixelHeight))
         PHImageManager.default().requestImage(for: asset, targetSize: CGSize(width: side, height: side),
                                               contentMode: .aspectFit, options: opts) { image, _ in
             guard let image else { return }
@@ -319,7 +352,12 @@ public enum PhotoLibrary {
     public static func video(_ ref: Ref, allowNetwork: Bool) -> AVAsset? {
         guard let a = asset(ref), a.mediaType == .video else { return nil }
         let opts = PHVideoRequestOptions()
-        opts.deliveryMode = .highQualityFormat
+        // `.automatic` for the same reason `image` uses `.opportunistic`: take the best local
+        // representation rather than insist on the top one. PhotoKit documents automatic as
+        // defaulting to the high-quality format whenever the video IS locally available, so a
+        // materialized clip is sampled exactly as before; an optimized-storage one now yields its
+        // resident derivative instead of nothing.
+        opts.deliveryMode = .automatic
         opts.isNetworkAccessAllowed = allowNetwork
         opts.version = .current
         // No synchronous form exists for video; the decode stage is already off the main thread.
