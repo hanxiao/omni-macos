@@ -11,7 +11,8 @@ import SQLite3
 /// 2,666,141-file sidecar that had rebuilt once: 90.4% of returned rows were the wrong file.
 ///
 /// These tests pin the two properties that failure violated: a rebuild forgets what it dropped,
-/// and a rebuild does not grow the file by a copy each time.
+/// and a rebuild does not grow the file by a copy each time. The sidecar's schema is unchanged -
+/// the fix is in how the tables are cleared, not in how they are shaped.
 final class LexicalIndexRebuildTests: XCTestCase {
 
     private var dir: URL!
@@ -90,71 +91,72 @@ final class LexicalIndexRebuildTests: XCTestCase {
         }
     }
 
-    /// The path map interns its directory, so every returned path is reassembled from two columns.
-    /// `NSString`'s path API cannot be used for that split: it collapses "//", which would turn
-    /// every `photos://` asset into an unusable "photos:/..." and a root-level "/foo.txt" into
-    /// "//foo.txt". These are the shapes that would break silently.
-    func testPathsRoundTripThroughTheInternedDirectory() throws {
-        let (lex, _) = makeIndex()
-        let paths = [
-            "/Users/me/Documents/annual-widget-report.pdf",
-            "/rootlevel-gizmo.txt",                                  // dir is "" after the split
-            "photos://library/2A9C1F30-ABCD-4E5F/beach-sunset.heic",  // "//" must survive verbatim
-            "photos://library/7B3D2E41-1234-4A6B/beach-sunset.heic",  // same name, different asset
-            "/Users/me/Documents/subdir/annual-widget-report.pdf",    // same name, different dir
-        ]
-        lex.rebuildIfStale(paths: paths, stamp: 1)
+    /// A sidecar the shipped 0.7.2 wrote has pathmap(id, dir_id, name) and a dirs table. Every
+    /// lookup here selects m.path, so without a repair that file would answer nothing for good -
+    /// CREATE IF NOT EXISTS leaves a wrongly-shaped table alone. Only that shape is touched.
+    func testSidecarFrom072IsRepairedInPlace() throws {
+        let (_, sidecar) = makeIndex()
 
-        XCTAssertEqual(lex.match("gizmo", limit: 10), ["/rootlevel-gizmo.txt"])
-        XCTAssertEqual(Set(lex.match("sunset", limit: 10)), Set([paths[2], paths[3]]),
-                       "photos:// paths must come back with their double slash intact")
-        XCTAssertEqual(Set(lex.match("widget", limit: 10)), Set([paths[0], paths[4]]),
-                       "two files sharing a basename must resolve to their own directories")
-        // Nothing may be mangled: every path the channel can return must be one we put in.
-        for term in ["report", "gizmo", "sunset", "heic", "pdf", "txt", "beach", "annual"] {
-            for hit in lex.match(term, limit: 20) {
-                XCTAssertTrue(paths.contains(hit), "\(term) produced a path that was never indexed: \(hit)")
-            }
-        }
-    }
-
-    /// `dirs` ids restart at 1 on every rebuild, so a surviving row from the previous build would
-    /// make the insert a primary-key conflict and leave rows pointing at the OLD directory - the
-    /// same stale-id failure the term index had. A second rebuild with different directories pins it.
-    func testRebuildReassignsDirectoryIdsCleanly() throws {
-        let (lex, _) = makeIndex()
-        lex.rebuildIfStale(paths: ["/first/place/alpha-widget.txt",
-                                   "/first/place/beta-widget.txt"], stamp: 1)
-        XCTAssertEqual(lex.match("alpha", limit: 10), ["/first/place/alpha-widget.txt"])
-
-        // Entirely different directories, so a reused dir id would surface the old ones.
-        let second = ["/second/elsewhere/gamma-widget.txt", "/third/other/delta-widget.txt"]
-        lex.rebuildIfStale(paths: second, stamp: 2)
-        XCTAssertEqual(lex.match("gamma", limit: 10), ["/second/elsewhere/gamma-widget.txt"])
-        XCTAssertEqual(lex.match("delta", limit: 10), ["/third/other/delta-widget.txt"])
-        for hit in lex.match("widget", limit: 10) {
-            XCTAssertTrue(second.contains(hit), "rebuild resolved a path through a stale directory id: \(hit)")
-        }
-    }
-
-    /// A sidecar written by an older build carries no layout key, so it must be rebuilt even when
-    /// its stamp still matches the store. Without this the fix would never reach existing users.
-    func testOlderLayoutIsRebuiltEvenWhenTheStampMatches() throws {
-        let (lex, _) = makeIndex()
-        lex.rebuildIfStale(paths: ["/Users/me/a-widget.txt"], stamp: 7)
-        XCTAssertEqual(lex.match("widget", limit: 10), ["/Users/me/a-widget.txt"])
-
-        // Simulate the pre-fix file: same stamp, no layout key.
-        let (stale, sidecar) = makeIndex()
+        // Build the 0.7.2 file by hand, including a matching stamp so a stamp-only gate would
+        // adopt it untouched.
         var db: OpaquePointer?
         XCTAssertEqual(sqlite3_open(sidecar.path, &db), SQLITE_OK)
-        sqlite3_exec(db, "DELETE FROM meta WHERE k='layout';", nil, nil, nil)
+        for sql in ["CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);",
+                    "CREATE VIRTUAL TABLE names USING fts5(name, content='', columnsize=0);",
+                    "CREATE TABLE dirs(id INTEGER PRIMARY KEY, path TEXT NOT NULL);",
+                    "CREATE TABLE pathmap(id INTEGER PRIMARY KEY, dir_id INTEGER NOT NULL, name TEXT NOT NULL);",
+                    "INSERT INTO dirs(id, path) VALUES(1, '/Users/me/Documents');",
+                    "INSERT INTO pathmap(id, dir_id, name) VALUES(1, 1, 'legacy-widget.txt');",
+                    "INSERT INTO names(rowid, name) VALUES(1, 'legacy widget txt');",
+                    "INSERT INTO meta(k,v) VALUES('stamp','9');",
+                    "INSERT INTO meta(k,v) VALUES('layout','2');"] {
+            XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK, "setup failed: \(sql)")
+        }
+
         sqlite3_close(db)
 
-        // Same stamp as the store: a stamp-only gate would adopt the file untouched.
-        stale.rebuildIfStale(paths: ["/Users/me/b-gadget.txt"], stamp: 7)
-        XCTAssertEqual(stale.match("widget", limit: 10), [],
-                       "an older-layout sidecar must be rebuilt, not adopted")
-        XCTAssertEqual(stale.match("gadget", limit: 10), ["/Users/me/b-gadget.txt"])
+        // Open it with the shipping code at the SAME stamp the file claims.
+        let (lex, _) = makeIndex()
+        lex.rebuildIfStale(paths: ["/Users/me/Documents/current-gadget.txt"], stamp: 9)
+
+        XCTAssertEqual(lex.match("gadget", limit: 10), ["/Users/me/Documents/current-gadget.txt"],
+                       "a 0.7.2-shaped sidecar must be repaired and rebuilt, not left dead")
+        XCTAssertEqual(lex.match("legacy", limit: 10), [],
+                       "the stale row from the old file must not survive the repair")
+
+        // The table is back to the shape this code reads, and the stray dirs table is gone.
+        var check: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(sidecar.path, &check), SQLITE_OK)
+        var st: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(check,
+            "SELECT count(*) FROM pragma_table_info('pathmap') WHERE name='path';", -1, &st, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_step(st), SQLITE_ROW)
+        XCTAssertEqual(sqlite3_column_int(st, 0), 1, "pathmap must carry a path column again")
+        sqlite3_finalize(st)
+
+        var st2: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(check,
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='dirs';", -1, &st2, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_step(st2), SQLITE_ROW)
+        XCTAssertEqual(sqlite3_column_int(st2, 0), 0, "the stray dirs table must be dropped")
+        sqlite3_finalize(st2)
+        sqlite3_close(check)
+    }
+
+    /// A sidecar written by 0.7.1 or earlier already has the right shape and must be left exactly
+    /// alone: no forced rebuild, no file replacement, no migration.
+    func testExistingSidecarIsAdoptedUnchanged() throws {
+        let (lex, sidecar) = makeIndex()
+        lex.rebuildIfStale(paths: ["/Users/me/Documents/a-widget.txt"], stamp: 7)
+        let builtSize = size(sidecar)
+        let builtMtime = (try? FileManager.default.attributesOfItem(atPath: sidecar.path)[.modificationDate]) as? Date
+
+        // Reopen at the SAME stamp: the sidecar is current, so nothing should run.
+        let (again, _) = makeIndex()
+        again.rebuildIfStale(paths: ["/Users/me/Documents/a-widget.txt"], stamp: 7)
+        XCTAssertEqual(again.match("widget", limit: 10), ["/Users/me/Documents/a-widget.txt"])
+        XCTAssertEqual(size(sidecar), builtSize, "an up-to-date sidecar must not be rewritten")
+        let afterMtime = (try? FileManager.default.attributesOfItem(atPath: sidecar.path)[.modificationDate]) as? Date
+        XCTAssertEqual(builtMtime, afterMtime, "an up-to-date sidecar must not be touched at all")
     }
 }
