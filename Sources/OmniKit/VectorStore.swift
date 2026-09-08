@@ -5378,6 +5378,121 @@ public final class VectorStore: @unchecked Sendable {
         return false
     }
 
+    /// Remove file rows that were indexed a second time under another Unicode spelling of the same
+    /// name, when the vector file PROVES the removal loses nothing.
+    ///
+    /// The shape this repairs (0.7.0 - 0.7.3, see storedSpellingLocked): a watcher event re-embedded
+    /// a file whose row was stored NFD under its NFC spelling. replaceMany found the old rows
+    /// through pathID (canonical equality), tombstoned them and recorded their slots as holes; the
+    /// byte-keyed SQL delete missed, so the old chunk rows stayed live with their blobs already
+    /// cleared. The next open then places those rows INSIDE the covered prefix, shifts every later
+    /// row by one slot, and the count check refuses. 59 rows out of 3.8M, and the only remedy
+    /// offered was a full re-index.
+    ///
+    /// The proof, per orphan chunk: the vector file holds, at a slot recorded as a HOLE, exactly the
+    /// bytes its twin still carries as a pending blob. That says three things at once - the hole is
+    /// the orphan's own slot, the twin is the same content, and deleting the orphan discards a row
+    /// whose vector survives in the twin. Anything short of byte equality is not proof, and the
+    /// row is left alone: this never guesses, and never touches a store without such twins.
+    ///
+    /// Static and connection-only, so both the open path and the Repair button share it. Returns the
+    /// number of chunk rows removed; 0 means nothing was written.
+    static func deleteProvenOrphanTwins(db: OpaquePointer, vecURL: URL, dim: Int) -> Int {
+        guard dim > 0, tableExists(db, "pending_vecs"), tableExists(db, "vec_holes"),
+              let fh = try? FileHandle(forReadingFrom: vecURL) else { return 0 }
+        defer { try? fh.close() }
+        let rowBytes = dim * MemoryLayout<UInt16>.size
+        func prepare(_ sql: String) -> OpaquePointer? {
+            var st: OpaquePointer?
+            return sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK ? st : nil
+        }
+        // Candidates first, so an index with no twins reads nothing else. Only a non-ASCII path can
+        // have a second spelling, and only two DISTINCT byte strings can share a canonical key.
+        guard let files = prepare("SELECT f.id, d.path || '/' || f.name FROM files f JOIN dirs d ON d.id = f.dir_id;")
+        else { return 0 }
+        var groups: [String: [Int64]] = [:]
+        while sqlite3_step(files) == SQLITE_ROW {
+            guard let c = sqlite3_column_text(files, 1) else { continue }
+            var ascii = true
+            var p = c
+            while p.pointee != 0 { if p.pointee >= 0x80 { ascii = false; break }; p += 1 }
+            if ascii { continue }
+            groups[String(cString: c), default: []].append(sqlite3_column_int64(files, 0))
+        }
+        sqlite3_finalize(files)
+        let twins = groups.values.filter { $0.count >= 2 }
+        guard !twins.isEmpty else { return 0 }
+
+        // The vectors sitting in recorded holes, by bytes. Bounded by the hole count, which the
+        // reclaim keeps small; read once, matched many times.
+        var holeVectors = Set<Data>()
+        if let holes = prepare("SELECT slot FROM vec_holes;") {
+            while sqlite3_step(holes) == SQLITE_ROW {
+                let slot = Int(sqlite3_column_int64(holes, 0))
+                guard slot >= 0, (try? fh.seek(toOffset: UInt64(slot * rowBytes))) != nil,
+                      let d = try? fh.read(upToCount: rowBytes), d.count == rowBytes else { continue }
+                holeVectors.insert(d)
+            }
+            sqlite3_finalize(holes)
+        }
+        guard !holeVectors.isEmpty else { return 0 }
+
+        guard let chunksOf = prepare("""
+            SELECT c.id, c.chunk_index, p.vec FROM chunks c
+              LEFT JOIN pending_vecs p ON p.chunk_id = c.id WHERE c.file_id = ? ORDER BY c.chunk_index;
+            """) else { return 0 }
+        defer { sqlite3_finalize(chunksOf) }
+        struct Chunk { let id: Int64; let index: Int; let blob: Data? }
+        func chunks(_ fid: Int64) -> [Chunk] {
+            sqlite3_reset(chunksOf); sqlite3_bind_int64(chunksOf, 1, fid)
+            var out: [Chunk] = []
+            while sqlite3_step(chunksOf) == SQLITE_ROW {
+                var blob: Data?
+                if let raw = sqlite3_column_blob(chunksOf, 2) {
+                    blob = Data(bytes: raw, count: Int(sqlite3_column_bytes(chunksOf, 2)))
+                }
+                out.append(Chunk(id: sqlite3_column_int64(chunksOf, 0), index: Int(sqlite3_column_int64(chunksOf, 1)), blob: blob))
+            }
+            return out
+        }
+        var doomed: [Int64] = []
+        var doomedChunks = 0
+        for group in twins {
+            let members = group.map { (fid: $0, chunks: chunks($0)) }
+            // The survivor: a twin whose every chunk still carries its blob. It is what the orphan's
+            // slots are checked against, and what keeps the file searchable after the orphan goes.
+            let survivors = members.filter { !$0.chunks.isEmpty && $0.chunks.allSatisfy { $0.blob != nil } }
+            guard let survivor = survivors.first else { continue }
+            let byIndex = Dictionary(survivor.chunks.map { ($0.index, $0.blob!) }, uniquingKeysWith: { a, _ in a })
+            for m in members where m.fid != survivor.fid {
+                // An orphan: every chunk cleared (the file is its only copy), and for each one the
+                // survivor's blob for the same chunk index sits in a recorded hole.
+                guard !m.chunks.isEmpty, m.chunks.allSatisfy({ $0.blob == nil }),
+                      m.chunks.allSatisfy({ c in byIndex[c.index].map { $0.count == rowBytes && holeVectors.contains($0) } ?? false })
+                else { continue }
+                doomed.append(m.fid)
+                doomedChunks += m.chunks.count
+            }
+        }
+        guard !doomed.isEmpty else { return 0 }
+        let list = doomed.map(String.init).joined(separator: ",")
+        let statements = [
+            "BEGIN;",
+            "DELETE FROM chunk_text WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id IN (\(list)));",
+            "DELETE FROM dedup WHERE file_id IN (\(list));",
+            "DELETE FROM chunks WHERE file_id IN (\(list));",
+            "DELETE FROM files WHERE id IN (\(list));",
+            "COMMIT;",
+        ]
+        for sql in statements where sqlite3_exec(db, sql, nil, nil, nil) != SQLITE_OK {
+            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+            return 0
+        }
+        FileHandle.standardError.write(Data(
+            "[omni] removed \(doomedChunks) chunk rows of \(doomed.count) files indexed twice under two spellings of one name; the vector file proved each slot\n".utf8))
+        return doomedChunks
+    }
+
     /// Repair the vector bookkeeping of an index that will not open, without a store.
     ///
     /// The store refuses when the claim, the holes and the cleared blobs stop agreeing, because the
@@ -5471,6 +5586,14 @@ public final class VectorStore: @unchecked Sendable {
                 + "determined from the index alone, and every row after the first one would be "
                 + "given its neighbour's vector, so this cannot be corrected safely.")
         default:
+            // Before giving up: rows indexed twice under two spellings of one name, provable
+            // against the vector file. The open path tries the same, so reaching this from the
+            // UI means an older build refused first; the Repair button then finishes the job.
+            let removed = deleteProvenOrphanTwins(db: db, vecURL: vecURL, dim: dim)
+            if removed > 0 {
+                return .repaired("Removed \(removed) rows that were indexed twice under two spellings "
+                    + "of the same file name. Nothing was re-embedded.")
+            }
             return .needsReindex(
                 "The vector file and the index disagree by \(abs(cleared - (claim - holes))) rows "
                 + "in a way that cannot be resolved from what is on disk.")
@@ -7904,6 +8027,12 @@ public final class VectorStore: @unchecked Sendable {
                         "[omni] coverage claim repaired \(repaired.from) -> \(repaired.to) from the cleared-blob count\n".utf8))
                     if loadFromCoverageLocked() { return }
                 }
+                // The one mismatch WITH holes that is provable: a file stored twice under two
+                // spellings, the older copy's slots recorded as holes while its rows stayed live.
+                // The vector file settles it byte for byte (see deleteProvenOrphanTwins), so this
+                // is a repair, not a guess - and the user never sees a screen for 59 rows in 3.8M.
+                if let db, Self.deleteProvenOrphanTwins(db: db, vecURL: vecSidecarURL, dim: storedDimLocked()) > 0,
+                   loadFromCoverageLocked() { return }
                 reportCoverageUnreadableLocked(coverageMismatchDetailLocked())
                 return
             }
