@@ -9,7 +9,9 @@ import UniformTypeIdentifiers
 
 /// An 8-bit RGB image, planar-free (`r,g,b` interleaved), which is the only pixel container this
 /// path uses. Everything below reproduces the reference processor's Pillow arithmetic on it.
-public struct OCRImage {
+/// `Sendable` because it is exactly three value-type fields - two Ints and a byte array. That
+/// matters: the page pipeline hands a rendered page across threads, and this is the boundary.
+public struct OCRImage: Sendable {
     public var width: Int
     public var height: Int
     public var rgb: [UInt8]        // width * height * 3

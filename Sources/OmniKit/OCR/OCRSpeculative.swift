@@ -59,7 +59,7 @@ extension OCRModel {
     /// positions 0/1/2 on a mixed page set), so past k = 4 each extra draft costs more than the
     /// tokens it wins back: mean decode runs 173 / 196 / 200 / 199 / 190 / 183 / 148 tok/s at
     /// k = 1..6, 8 against 183 greedy. k = 1 is a LOSS - one draft cannot pay for its own step.
-    public func transcribeAuto(image: OCRImage, prompt: String? = nil, maxNewTokens: Int = 1024,
+    public func transcribeAuto(image: OCRImage, prompt: String? = nil, maxNewTokens: Int = 0,
                                draftLength: Int = 3, loopGuard: Bool = true,
                                loopReps: Int = 24, loopGrace: Int = 96) throws -> Result {
         if llm.mtp != nil && draftLength > 1 {
@@ -72,7 +72,7 @@ extension OCRModel {
                               loopGuard: loopGuard, loopReps: loopReps, loopGrace: loopGrace)
     }
 
-    public func transcribeAuto(imageAt url: URL, prompt: String? = nil, maxNewTokens: Int = 1024,
+    public func transcribeAuto(imageAt url: URL, prompt: String? = nil, maxNewTokens: Int = 0,
                                draftLength: Int = 3) throws -> Result {
         try transcribeAuto(image: OCRPreprocess.load(contentsOf: url), prompt: prompt,
                            maxNewTokens: maxNewTokens, draftLength: draftLength)
@@ -80,24 +80,41 @@ extension OCRModel {
 
     /// Greedy transcription via MTP speculation. `draftLength` is K.
     public func transcribeSpeculative(image: OCRImage, prompt: String? = nil,
-                                      maxNewTokens: Int = 1024, draftLength k: Int = 3,
+                                      maxNewTokens: Int = 0, draftLength k: Int = 3,
                                       loopGuard: Bool = true, loopReps: Int = 24,
                                       loopGrace: Int = 96)
         throws -> (result: Result, stats: SpeculativeStats) {
         guard llm.mtp != nil else {
             throw OmniError.model("this build carries no MTP head; rebuild with convert.py --mtp")
         }
+        let t0 = Date()
+        let ready = try preparePage(image: image, prompt: prompt)
+        let prepareSeconds = Date().timeIntervalSince(t0)
+        return try decodePrepared(ready, prepareSeconds: prepareSeconds, startedAt: t0,
+                                  maxNewTokens: maxNewTokens, draftLength: k,
+                                  loopGuard: loopGuard, loopReps: loopReps, loopGrace: loopGrace)
+    }
+
+    /// The GPU half of a request, given pixels that have already been through the vision tower.
+    ///
+    /// Split out so a document can run page n+1's vision on a second MLX stream while page n
+    /// decodes on the first. Decode is bound by fixed per-launch latency and leaves the GPU
+    /// largely idle between kernels, which is exactly the gap a compute-heavy vision pass fills.
+    func decodePrepared(_ ready: PreparedPage, prepareSeconds: Double, startedAt t0: Date,
+                        maxNewTokens requested: Int, draftLength k: Int,
+                        loopGuard: Bool, loopReps: Int, loopGrace: Int)
+        throws -> (result: Result, stats: SpeculativeStats) {
         var stats = SpeculativeStats()
         stats.acceptedAt = [Int](repeating: 0, count: k)
-
-        let t0 = Date()
-        let prep = try prepare(image: image, prompt: prompt)
-        let visual = visualFeatures(prep)
+        let prep: Prepared = ready.prep
+        let visual: MLXArray = ready.visual
         let embeddings = try embedPrompt(prep, visual: visual, table: nil)
         let caches = llm.newCaches()
         let mtpCache = OCRKVCache()
 
         let n = prep.ids.count
+        let maxNewTokens = requested > 0 ? requested
+            : OCRTokenBudget.maxNewTokens(promptTokens: n, modelBytes: weightBytes)
         var (hidden, logits) = llm.forward(embeddings, positions: Array(0 ..< n), caches: caches)
         eval(logits)
 
@@ -218,7 +235,7 @@ extension OCRModel {
 
         return (Result(text: text, tokens: tokens, promptTokens: n, ttft: ttft,
                        decodeTokensPerSecond: Double(max(tokens.count - 1, 0)) / max(decodeSeconds, 1e-9),
-                       stoppedBy: stop, tiles: prep.grid),
+                       stoppedBy: stop, tiles: prep.grid, prepareSeconds: prepareSeconds),
                 stats)
     }
 }

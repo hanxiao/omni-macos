@@ -144,6 +144,61 @@ speculation on both corpora (0.0087 -> 0.0044 on the shipped build).
 `norm` (max|d| = 0.000e+00 on all three), and building with or without them gives the same
 acceptance to the individual count. The converter omits them; the artifact is 662 MB smaller.
 
+## Long documents
+
+A document is **N independent single-page requests**, not one request with N images. The model
+accepts several `<image>` markers and doing so is a trap: the chat template places them adjacent
+with no delimiter, and the model transcribes the LAST one. The predecessor established this
+against torch - identical N-image path in PyTorch, byte-identical output from both, in both page
+orders - so it is the model's behaviour, not a port artefact.
+
+`OCRModel.transcribe(pdfAt:)` rasterises one page at a time through `FileExtractor.renderPDFPage`,
+so peak memory is one page of pixels plus the model regardless of document length.
+
+Measured on a 40-page synthetic scanned PDF (`Tools/ocr/make_long_pdf.py`: ruled ledger tables,
+prose, cursive field notes, each JPEG-compressed, blurred, noised, skewed and shadowed):
+
+| | 40 pages | per page | aggregate |
+|---|---|---|---|
+| balanced, workers=2 | **132.9 s** | 3.32 s | 179 tok/s |
+
+All 40 page markers recovered in place; page 1's 22-row table came back with its `PAGE TOTAL`
+(59899.00) exactly right.
+
+**Parallelism does not pay in-process.** Three overlap strategies, 9-12 pages each:
+
+| strategy | time | vs sequential |
+|---|---|---|
+| sequential | 30.6 s | - |
+| host prefetch (rasterise+resample a page ahead) | 30.5 s | +0.3% |
+| vision prefetch (also run the vision tower ahead, own MLX stream) | 30.0 s | +2% |
+| 2 concurrent page lanes, own MLX streams | 38.8 s / 12p | +5% |
+| 3, 4, 6 lanes | 38.8-40.0 s / 12p | no further gain |
+
+Concurrency saturates at 2 lanes for +5%. That is far short of the **1.8x the predecessor measured
+with 6 worker PROCESSES**, and the gap is the interesting part: separate processes each get their
+own Metal command queue, while streams inside one process still serialise on submission. So
+multi-process is the only route to real page parallelism here, and it costs N x 4.5 GB of weights
+- which is why it is not the default. `transcribeConcurrent(workers:)` exists, defaults to 1, and
+is byte-identical to sequential (same document digest at 1, 2 and 4 lanes).
+
+**Output length is derived, not guessed.** The old fixed 1024-token cap silently truncated a fifth
+of every ledger page - they need 1309 tokens and stopped with `stopped_by = cap`. `OCRTokenBudget`
+now computes the cap from the model's 32768-token context window and this machine's Metal working
+set: 65.0 KB of KV per token, so the full window costs ~2.1 GB and every Mac that can hold the
+4.5 GB model is context-bound rather than memory-bound. On this machine that is **31753 tokens per
+page** instead of 1024. Runaway output is the loop guard's job, not the cap's, and the guard costs
+nothing measurable (175 vs 175 tok/s with it on and off).
+
+Raising the cap exposed an O(n^2) term: the KV cache grew by fixed 256-token blocks and each
+growth concatenated the whole cache, which at 30k tokens is ~115 GB of copying across 117
+reallocations. It now doubles.
+
+**Exact vs torch is not the same as correct.** On the cursive field-note pages the port matches
+torch exactly (CER 0.0000) and torch reads "depth 7.8 metres" where the page says 4.3, and
+"G-008-69" where it says C-003-69. The port is faithful; the model cannot read this script face.
+Every fidelity number in this document measures the former.
+
 ## An MLX bug this work uncovered
 
 `quantizedMM(x, w, transpose: false)` in mlx-swift 0.31.3 returns unrelated numbers - relative

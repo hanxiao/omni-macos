@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 import MLX
 import MLXFast
 
@@ -19,6 +20,55 @@ enum OCRLanguageConfig {
     static let ropeTheta: Double = 1_000_000
     static let rmsEps: Float = 1e-6
     static let experts = 64
+    /// `max_position_embeddings` from the checkpoint config. The rope table is built per request,
+    /// so nothing precomputes 32k positions - this is the point past which positions are untrained.
+    static let contextWindow = 32768
+}
+
+/// How many tokens a request may generate, derived from the model's context window and this
+/// machine, not from a round number.
+///
+/// The previous default was 1024 and it SILENTLY TRUNCATED real pages: a 22-row ruled table in
+/// the long-scan fixture needs 1309 tokens, so every such page lost a fifth of its content with
+/// `stopped_by = cap` as the only trace. A cap is a safety bound, not a quality setting; the
+/// runaway protection is the loop guard, which is separate and measured free.
+///
+/// KV cost is exact, not estimated: 12 layers x (K and V) x 10 heads x 128 dims x 2 bytes is
+/// 60 KB per token, plus 5 KB for the single-layer draft cache. At the full 32k window that is
+/// ~2.1 GB - which every Mac that can hold the 4.5 GB model can also hold, so in practice the
+/// context window binds first and memory only matters on the smallest machines.
+/// Metal's recommended working-set size, i.e. what the GPU says it can hold before it starts
+/// evicting. On unified memory this is the number that matters, not `physicalMemory`.
+func omniMetalWorkingSetBytes() -> Int? {
+    MTLCreateSystemDefaultDevice().map { Int($0.recommendedMaxWorkingSetSize) }
+}
+
+public enum OCRTokenBudget {
+    public static let bytesPerToken =
+        OCRLanguageConfig.layers * 2 * OCRLanguageConfig.heads * OCRLanguageConfig.headDim * 2
+        + 1 * 2 * OCRLanguageConfig.heads * OCRLanguageConfig.headDim * 2      // draft cache
+
+    /// Tokens available for generation after a prompt of `promptTokens`.
+    ///
+    /// - Parameter availableBytes: budget for the KV caches. Defaults to what Metal reports it
+    ///   can hold, minus the weights already resident and a working margin for the vision tower.
+    public static func maxNewTokens(promptTokens: Int, modelBytes: Int = 0,
+                                    availableBytes: Int? = nil) -> Int {
+        let byContext = max(OCRLanguageConfig.contextWindow - promptTokens - 8, 64)
+        let budget = availableBytes ?? defaultAvailableBytes(modelBytes: modelBytes)
+        let byMemory = max(budget / bytesPerToken, 64)
+        return min(byContext, byMemory)
+    }
+
+    static func defaultAvailableBytes(modelBytes: Int) -> Int {
+        let physical = Int(ProcessInfo.processInfo.physicalMemory)
+        // Metal's recommended working set is the honest ceiling on a unified-memory Mac; fall
+        // back to physical memory when it is unavailable.
+        let ceiling = min(omniMetalWorkingSetBytes() ?? physical, physical)
+        // Leave the weights plus ~1.5 GB: the vision tower's decomposed rel-pos mask is the
+        // largest transient in the model and is itself capped (see SAMAttention.maskBudgetBytes).
+        return max(ceiling - modelBytes - 1_500_000_000, 256_000_000)
+    }
 }
 
 /// Per-layer KV cache: one preallocated `(heads, cap, dim)` buffer grown in blocks, written in
@@ -44,14 +94,17 @@ final class OCRKVCache {
         let fresh = k.dim(1)
         if keys == nil || previous + fresh > keys!.dim(1) {
             let h = k.dim(0), d = k.dim(2)
-            let steps = (Self.step + fresh - 1) / Self.step
-            let newK = MLXArray.zeros([h, steps * Self.step, d], dtype: k.dtype)
-            let newV = MLXArray.zeros([h, steps * Self.step, v.dim(2)], dtype: v.dtype)
-            if var oldK = keys, var oldV = values {
-                if previous % Self.step != 0 {
-                    oldK = oldK[0..., 0 ..< previous, 0...]
-                    oldV = oldV[0..., 0 ..< previous, 0...]
-                }
+            // Grow GEOMETRICALLY, not by a fixed block. Each growth concatenates the whole
+            // existing cache, so fixed-size blocks make the total copying O(n^2 / step): a 30k
+            // token generation would copy ~115 GB through 117 reallocations. Doubling makes it
+            // O(n) over O(log n) reallocations, which is what raising the token cap requires.
+            let needed = previous + fresh
+            let current = keys?.dim(1) ?? 0
+            let target = max(needed, max(current * 2, Self.step))
+            let grow = target - current
+            let newK = MLXArray.zeros([h, grow, d], dtype: k.dtype)
+            let newV = MLXArray.zeros([h, grow, v.dim(2)], dtype: v.dtype)
+            if let oldK = keys, let oldV = values {
                 keys = concatenated([oldK, newK], axis: 1)
                 values = concatenated([oldV, newV], axis: 1)
             } else {

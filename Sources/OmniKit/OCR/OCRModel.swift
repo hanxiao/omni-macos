@@ -20,6 +20,10 @@ public final class OCRModel: @unchecked Sendable {
         public let decodeTokensPerSecond: Double
         public let stoppedBy: StopReason
         public let tiles: (w: Int, h: Int)
+        /// Host-side preprocessing only: decode, Pillow-exact resample, tensor build. Separated
+        /// from `ttft` because it is CPU work that a page pipeline could overlap with the GPU,
+        /// and whether that is worth doing depends entirely on this number.
+        public var prepareSeconds: Double = 0
     }
 
     public enum StopReason: String, Sendable {
@@ -27,7 +31,12 @@ public final class OCRModel: @unchecked Sendable {
     }
 
     /// Everything a request needs from the image side, computed once.
-    struct Prepared {
+    ///
+    /// `@unchecked Sendable` because MLXArray is a reference type the compiler cannot reason
+    /// about. Sound here by ownership, not by hope: a prepared page is produced by exactly one
+    /// prefetch task, `eval`d there so nothing is left pending, and then handed to the page loop
+    /// which is the only reader. No two tasks ever hold the same one.
+    struct Prepared: @unchecked Sendable {
         let global: MLXArray            // (1, 1024, 1024, 3)
         let tiles: MLXArray?            // (n, 640, 640, 3)
         let grid: (w: Int, h: Int)
@@ -54,6 +63,8 @@ public final class OCRModel: @unchecked Sendable {
     let eosID: Int
     public let modelDir: URL
     public private(set) var loadSeconds: Double = 0
+    /// Resident weight bytes, so the token budget can subtract them from the GPU's working set.
+    public let weightBytes: Int
 
     public init(modelDir: URL, tokenizerDir: URL? = nil) async throws {
         let t0 = Date()
@@ -63,6 +74,7 @@ public final class OCRModel: @unchecked Sendable {
         self.llm = OCRLanguageModel(weights)
         self.imageNewline = weights.array("image_newline")
         self.viewSeparator = weights.array("view_seperator")
+        self.weightBytes = weights.inventory().bytes
         self.tokenizer = try await AutoTokenizer.from(directory: tokenizerDir ?? modelDir)
         // generation_config.json ships eos_token_id = [1]; the literal is the model's, not a guess.
         self.eosID = 1
@@ -117,6 +129,28 @@ public final class OCRModel: @unchecked Sendable {
         return Prepared(global: OCRPreprocess.tensorNHWC(globalView),
                         tiles: tiles.isEmpty ? nil : OCRPreprocess.tensorNHWC(tiles),
                         grid: grid, ids: ids)
+    }
+
+    /// Pixels plus their visual features: everything a page needs before the language model runs.
+    struct PreparedPage: @unchecked Sendable {
+        var prep: Prepared! = nil
+        var visual: MLXArray! = nil
+        /// Set when only the PIXELS were prepared ahead and the vision tower still has to run.
+        var pending: OCRImage? = nil
+
+        init(prep: Prepared, visual: MLXArray) { self.prep = prep; self.visual = visual }
+        init(pending: OCRImage) { self.pending = pending }
+    }
+
+    /// Preprocess and run the vision tower. Safe to call on a background task inside
+    /// `Stream.withNewDefaultStream`; `eval` here forces the features to materialise on THAT
+    /// stream, so what crosses back to the caller is a finished tensor rather than a graph node
+    /// still pointing at another stream's work.
+    func preparePage(image: OCRImage, prompt: String?) throws -> PreparedPage {
+        let prep = try prepare(image: image, prompt: prompt)
+        let visual = visualFeatures(prep)
+        eval(visual)
+        return PreparedPage(prep: prep, visual: visual)
     }
 
     // MARK: - visual assembly
@@ -213,17 +247,22 @@ public final class OCRModel: @unchecked Sendable {
         return nil
     }
 
-    public func transcribe(imageAt url: URL, prompt: String? = nil, maxNewTokens: Int = 1024,
+    public func transcribe(imageAt url: URL, prompt: String? = nil, maxNewTokens: Int = 0,
                            loopGuard: Bool = true, loopReps: Int = 24, loopGrace: Int = 96) throws -> Result {
         try transcribe(image: OCRPreprocess.load(contentsOf: url), prompt: prompt,
                        maxNewTokens: maxNewTokens, loopGuard: loopGuard,
                        loopReps: loopReps, loopGrace: loopGrace)
     }
 
-    public func transcribe(image: OCRImage, prompt: String? = nil, maxNewTokens: Int = 1024,
+    /// `maxNewTokens = 0` means "as many as this model and this machine allow" - see
+    /// `OCRTokenBudget`. That is the default because a fixed cap silently truncates real pages.
+    public func transcribe(image: OCRImage, prompt: String? = nil, maxNewTokens: Int = 0,
                            loopGuard: Bool = true, loopReps: Int = 24, loopGrace: Int = 96) throws -> Result {
         let t0 = Date()
         let prep = try prepare(image: image, prompt: prompt)
+        let prepareSeconds = Date().timeIntervalSince(t0)
+        let maxNewTokens = maxNewTokens > 0 ? maxNewTokens
+            : OCRTokenBudget.maxNewTokens(promptTokens: prep.ids.count, modelBytes: weightBytes)
         let embeddings = try embedPrompt(prep)
         let caches = llm.newCaches()
         var (_, logits) = llm.forward(embeddings, positions: Array(0 ..< prep.ids.count), caches: caches)
@@ -267,7 +306,7 @@ public final class OCRModel: @unchecked Sendable {
 
         return Result(text: text, tokens: tokens, promptTokens: prep.ids.count, ttft: ttft,
                       decodeTokensPerSecond: Double(max(tokens.count - 1, 0)) / max(decodeSeconds, 1e-9),
-                      stoppedBy: stop, tiles: prep.grid)
+                      stoppedBy: stop, tiles: prep.grid, prepareSeconds: prepareSeconds)
     }
 }
 

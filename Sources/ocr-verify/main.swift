@@ -47,6 +47,13 @@ struct CaseResult {
     var skipped: String?
 }
 
+/// A cheap content digest, so two runs can be compared without dumping megabytes of Markdown.
+func digest(_ text: String) -> String {
+    var h: UInt64 = 0xcbf29ce484222325
+    for byte in text.utf8 { h = (h ^ UInt64(byte)) &* 0x100000001b3 }
+    return String(h, radix: 16)
+}
+
 func die(_ message: String) -> Never {
     FileHandle.standardError.write(Data(("ocr-verify: " + message + "\n").utf8))
     exit(2)
@@ -105,6 +112,64 @@ if args.contains("--probe-qmm") {
             print(line + (bad.isEmpty ? "   all OK" : "   WRONG at M=\(bad)"))
         }
     }
+    exit(0)
+}
+
+// Long-document mode: transcribe a PDF page by page and report the pipeline's behaviour.
+if let i = args.firstIndex(of: "--pdf") {
+    let pdf = URL(fileURLWithPath: args[i + 1])
+    let modelPath = args.first { !$0.hasPrefix("--") && $0 != args[i + 1] }
+        ?? { die("usage: ocr-verify <modelDir> --pdf <file.pdf> [--pages N] [--no-pipeline] [--tokenizer DIR]") }()
+    let limit = args.firstIndex(of: "--pages").flatMap { Int(args[$0 + 1]) }
+    let pipelined = !args.contains("--no-pipeline")
+    let tokDir = args.firstIndex(of: "--tokenizer").map { URL(fileURLWithPath: args[$0 + 1]) }
+
+    let model = try await OCRModel(modelDir: URL(fileURLWithPath: modelPath), tokenizerDir: tokDir)
+    print("model  \(modelPath)  loaded in \(String(format: "%.1f", model.loadSeconds))s")
+    print("pdf    \(pdf.lastPathComponent)  pipelined=\(pipelined)")
+    // 0 = let OCRTokenBudget decide from the context window and this machine's memory.
+    let cap = args.firstIndex(of: "--max-new").flatMap { Int(args[$0 + 1]) } ?? 0
+    print(String(format: "budget %d tok/page for a 1007-token prompt (%.1f KB KV per token, %.2f GB weights)",
+                 OCRTokenBudget.maxNewTokens(promptTokens: 1007, modelBytes: model.weightBytes),
+                 Double(OCRTokenBudget.bytesPerToken) / 1024,
+                 Double(model.weightBytes) / 1e9))
+    OCRRuntimeFlags.loopGuardForPDF = !args.contains("--no-loop-guard")
+    OCRRuntimeFlags.visionPrefetch = args.contains("--vision-prefetch")
+    let workers = args.firstIndex(of: "--workers").flatMap { Int(args[$0 + 1]) } ?? 1
+    let printText = args.contains("--print-text")
+    if workers > 1 {
+        let out = try model.transcribeConcurrent(pdfAt: pdf, maxNewTokens: cap,
+                                                 pageRange: limit.map { 0 ..< $0 }, workers: workers)
+        var found = 0
+        for page in out.pages where page.text.contains(String(format: "PAGE %03d", page.page)) { found += 1 }
+        print(String(format: "\n%d pages in %.1f s = %.2f s/page, %.0f aggregate tok/s  (workers=%d)",
+                     out.pages.count, out.totalSeconds,
+                     out.totalSeconds / Double(max(out.pages.count, 1)), out.tokensPerSecond, workers))
+        print("page markers recovered in place: \(found)/\(out.pages.count)")
+        print("document digest: \(digest(out.markdown()))  chars \(out.markdown().count)")
+        exit(0)
+    }
+    let out = try model.transcribe(pdfAt: pdf, maxNewTokens: cap, pageRange: limit.map { 0 ..< $0 },
+                                   pipelined: pipelined) { page in
+        if printText { print("----- page \(page.page)\n\(page.text)\n") }
+        print(String(format: "  page %3d  %5d tok  prep %5.0f ms  ttft %5.0f ms  %6.1f tok/s  %5.2f s  %@",
+                     page.page, page.tokenCount, page.prepareSeconds * 1000, page.ttft * 1000,
+                     page.decodeTokensPerSecond, page.totalSeconds, page.stoppedBy.rawValue))
+    }
+    let prep = out.pages.reduce(0) { $0 + $1.prepareSeconds }
+    print(String(format: "\n%d pages in %.1f s = %.2f s/page, %.0f aggregate tok/s",
+                 out.pages.count, out.totalSeconds,
+                 out.totalSeconds / Double(max(out.pages.count, 1)), out.tokensPerSecond))
+    print(String(format: "host prep %.1f s total (%.0f%% of wall clock), GPU stalled on it %.1f s (%.0f%%)",
+                 prep, 100 * prep / out.totalSeconds, out.stalledSeconds,
+                 100 * out.stalledSeconds / out.totalSeconds))
+
+    // Coverage: every page prints its own number, so a dropped or duplicated page is countable
+    // rather than a matter of reading the output and forming an impression.
+    var found = 0
+    for page in out.pages where page.text.contains(String(format: "PAGE %03d", page.page)) { found += 1 }
+    print("page markers recovered in place: \(found)/\(out.pages.count)")
+    print("document digest: \(digest(out.markdown()))  chars \(out.markdown().count)")
     exit(0)
 }
 

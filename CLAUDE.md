@@ -47,6 +47,12 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   separated the builds and reversed a shipping decision.
 - MLX 0.31.3 `quantizedMM(transpose: false)` is WRONG at exactly M=2 and M=3 (rel err ~1.5).
   `safeQuantizedMM` pads to 4. Reproduce with `ocr-verify --probe-qmm`.
+- Documents are N single-page requests. Multi-image prompts make the model transcribe only the
+  LAST image (measured against torch by the predecessor). Never batch pages into one prompt.
+- Do NOT cap output tokens with a constant. `OCRTokenBudget` derives it from the 32k context
+  window and Metal's working set (31753/page here); a fixed 1024 silently truncated real pages.
+- In-process page concurrency saturates at 2 lanes for +5%. The predecessor's 1.8x needed separate
+  PROCESSES (own Metal command queue each). Don't re-derive this from stream counts.
 - Two primitives are measured-and-rejected: `MLXFast.rope` (faster and numerically WRONG - the
   checkpoint is Llama split-half, MLX is interleaved) and half-precision qkv/mask inside the
   fused vision SDPA (slower and it drifts). Do not re-adopt without new numbers.

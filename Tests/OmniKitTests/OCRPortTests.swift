@@ -172,6 +172,32 @@ final class OCRPortTests: XCTestCase {
         }
     }
 
+    /// The output cap is derived from the context window and this machine, never a constant.
+    ///
+    /// A fixed 1024 silently truncated a fifth of every ledger page in the long-document fixture
+    /// (they need 1309 tokens) and left `stopped_by = cap` as the only trace.
+    func testTokenBudgetUsesTheContextWindow() {
+        // Plenty of memory: the 32k context window is what binds.
+        let roomy = OCRTokenBudget.maxNewTokens(promptTokens: 1007, modelBytes: 4_500_000_000,
+                                                availableBytes: 64_000_000_000)
+        XCTAssertGreaterThan(roomy, 30_000)
+        XCTAssertLessThanOrEqual(roomy, OCRLanguageConfig.contextWindow - 1007)
+
+        // A longer prompt leaves less room, one for one.
+        let longer = OCRTokenBudget.maxNewTokens(promptTokens: 9007, modelBytes: 4_500_000_000,
+                                                 availableBytes: 64_000_000_000)
+        XCTAssertEqual(roomy - longer, 8000)
+
+        // A memory-starved machine degrades instead of overcommitting, and never to zero.
+        let tight = OCRTokenBudget.maxNewTokens(promptTokens: 1007, modelBytes: 4_500_000_000,
+                                                availableBytes: 200_000_000)
+        XCTAssertLessThan(tight, roomy)
+        XCTAssertGreaterThanOrEqual(tight, 64)
+
+        // 12 layers x K and V x 10 heads x 128 dims x 2 bytes, plus the 1-layer draft cache.
+        XCTAssertEqual(OCRTokenBudget.bytesPerToken, (12 + 1) * 2 * 10 * 128 * 2)
+    }
+
     /// Each variant names a policy that `Tools/ocr/convert.py` actually defines. The pairing is
     /// how a published artifact is traced back to how it was built.
     func testVariantPolicies() {
