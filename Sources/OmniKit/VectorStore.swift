@@ -7764,7 +7764,7 @@ public final class VectorStore: @unchecked Sendable {
         // A directory row outlives its last file the same way a file row used to outlive its last
         // chunk - so it is swept too, but ONLY for the directories these paths named. Sweeping the
         // whole table is a scan of every directory in the index on every removal, however small.
-        for dir in Set(paths.map { StoreSchema.splitPath($0).dir }) {
+        for dir in Set(paths.map { StoreSchema.splitPath(storedSpellingLocked($0)).dir }) {
             pruneEmptyDirsLocked(where: "path = ?1", bind: dir)
         }
     }
@@ -8225,8 +8225,34 @@ public final class VectorStore: @unchecked Sendable {
 
     /// Bind a path as the (directory, basename) pair StoreSchema.fileIDByPath expects. One call, so
     /// the halves cannot be bound in the wrong order or the wrong number of them skipped.
+    /// The spelling SQLite actually holds for `path`.
+    ///
+    /// Swift's String equality is CANONICAL: "Eigentümer" written NFC (U+00FC) and NFD (u +
+    /// U+0308) compare equal, hash equal, and are ONE key in pathID and presentPaths. SQLite
+    /// compares BYTES, so those same two spellings are TWO rows. Every in-memory map therefore
+    /// answers "present" for a spelling the SQL lookup then misses.
+    ///
+    /// That divergence is not cosmetic. Before 0.7.0 the indexer stored file.url.path, and
+    /// URL(fileURLWithPath:).path DECOMPOSES - measured: it returns NFD for an NFC input as
+    /// readily as for an NFD one - so every non-ASCII path indexed then is NFD on disk. Since
+    /// 9ca0817 the crawler's raw string is stored instead (photos:// paths cannot go through URL),
+    /// and that is the filesystem's own form, usually NFC. A watcher event on such a file then
+    /// took the worst of both: storedFiles() cleared the presentPaths guard and missed in SQL, so
+    /// the file looked new and was re-embedded, while replaceMany's victim lookup found the OLD
+    /// row through pathID and released its vector slots as holes - holes over rows the byte-keyed
+    /// DELETE had failed to remove. The result is a duplicate file row plus bookkeeping that
+    /// claims a slot is free while a live chunk still points at it.
+    ///
+    /// Resolving through pathID hands SQL the exact bytes the row was written with. pathID's key
+    /// IS the stored spelling, so this needs no migration, rewrites nothing, and leaves a store
+    /// with no such collision byte-for-byte unchanged.
+    func storedSpellingLocked(_ path: String) -> String {
+        guard let i = pathID.index(forKey: path) else { return path }
+        return pathID[i].key
+    }
+
     @inline(__always) func bindPath(_ stmt: OpaquePointer?, _ i: Int32, _ path: String) {
-        let (dir, name) = StoreSchema.splitPath(path)
+        let (dir, name) = StoreSchema.splitPath(storedSpellingLocked(path))
         sqlite3_bind_text(stmt, i, dir, -1, SQLITE_TRANSIENT)
         sqlite3_bind_text(stmt, i + 1, name, -1, SQLITE_TRANSIENT)
     }
@@ -8235,7 +8261,10 @@ public final class VectorStore: @unchecked Sendable {
     /// the write path (replace/replaceMany); every read path passes insert: false and treats a
     /// missing row as "not indexed".
     func fileIDLocked(_ path: String, insert: Bool) -> Int64? {
-        let (dir, name) = StoreSchema.splitPath(path)
+        // Same resolution as bindPath: a lookup must find the row under the spelling it was
+        // written with, and an insert for a path pathID already knows must reuse that spelling
+        // rather than create a second row that differs only by normalization.
+        let (dir, name) = StoreSchema.splitPath(storedSpellingLocked(path))
         var stmt: OpaquePointer?
         if insert {
             if sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO dirs(path) VALUES(?);", -1, &stmt, nil) == SQLITE_OK {
@@ -8347,7 +8376,10 @@ public final class VectorStore: @unchecked Sendable {
     /// file whose mtime moved but whose content did not is now one UPDATE of one row, where v3 had
     /// to rewrite the same seven columns on every chunk the file owns.
     func upsertFileLocked(path: String, from c: IndexedChunk, indexedAt: Double, w: ChunkInsert) -> Int64? {
-        let (dir, name) = StoreSchema.splitPath(path)
+        // Resolve to the spelling already on disk, so a rewrite of a file whose row was written
+        // under the other normalization UPDATES that row instead of inserting a second one beside
+        // it. This is the write half of the fix; bindPath and fileIDLocked are the read half.
+        let (dir, name) = StoreSchema.splitPath(storedSpellingLocked(path))
         var dirID = w.lastDir == dir ? w.lastDirID : 0
         if dirID == 0 {
             sqlite3_reset(w.dirIns)
