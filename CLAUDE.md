@@ -29,6 +29,22 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
 - Needs: `model.safetensors`, `adapters/retrieval/adapter_model.safetensors`, `tokenizer.json`, `config.json`.
 - Retrieval LoRA: alpha=32, r=32 -> scale 1.0, targets all 7 linear modules in `language_model`.
 
+## OCR add-on (OmniKit/OCR/, docs/OCR.md)
+- Optional jina-ocr-v1 port. NOT downloaded unless the user asks, NOT on the index/search path.
+- The numeric oracle is the ORIGINAL HF checkpoint at its shipped bfloat16, via torch/MPS - not
+  the MLX python port and not an fp32 upcast. `Tools/ocr/ref_dump.py` produces it.
+- Grade with `ocr-verify` on COMPLETE pages (natural EOS), and always against the HORIZON: the
+  first character where torch's own bf16 and fp32 runs disagree. Beyond it there is no canonical
+  text, so "exact" claims must state the compared range.
+- Report prefix-exactness AND CER. They disagree: a build can "diverge at char 482 of 690" over
+  one letter inside an HTML attribute (CER 0.0014).
+- 4-bit is not a speed lever here. Decode is fixed-per-launch-latency bound at these skinny
+  shapes, so the big win came from the fused gather-matmul MoE dispatch (+17%) and from 8-bit
+  shared-expert/dense-MLP packs (+12%), not from narrowing the routed experts.
+- Two primitives are measured-and-rejected: `MLXFast.rope` (faster and numerically WRONG - the
+  checkpoint is Llama split-half, MLX is interleaved) and half-precision qkv/mask inside the
+  fused vision SDPA (slower and it drifts). Do not re-adopt without new numbers.
+
 ## Apple Photos (OmniKit/PhotosSource.swift)
 - Photos assets ride the file pipeline under `photos://<source>/<escaped localIdentifier>/<name>`
   paths. They are NOT filesystem paths: never build a file URL from one (CrawledFile.isPhoto).

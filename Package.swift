@@ -7,6 +7,7 @@ let package = Package(
     products: [
         .library(name: "OmniKit", targets: ["OmniKit"]),
         .executable(name: "omni-verify", targets: ["omni-verify"]),
+        .executable(name: "ocr-verify", targets: ["ocr-verify"]),
         .executable(name: "profbench", targets: ["profbench"]),
         .executable(name: "filterbench", targets: ["filterbench"]),
         .executable(name: "opentime", targets: ["opentime"]),
@@ -33,6 +34,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "omni-verify",
+            dependencies: ["OmniKit"]
+        ),
+        .executableTarget(
+            name: "ocr-verify",
             dependencies: ["OmniKit"]
         ),
         .executableTarget(

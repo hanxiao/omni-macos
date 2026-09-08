@@ -1,0 +1,523 @@
+import Foundation
+import MLX
+import MLXFast
+
+/// DeepSeek-V2 style sparse decoder (12 layers, 64 routed experts top-6 + 2 shared) plus the
+/// recursive FastMTP draft head, in MLX-Swift.
+///
+/// Shape convention throughout is `(heads, n, dim)` for attention and `(n, hidden)` for the
+/// residual stream - no batch axis. Batching independent documents belongs at the process level
+/// (see `OCRModel.transcribe(pages:)`), not here: a batch dimension would mean rewriting the
+/// primitives this port is verified against, and it re-pays the fixed masked-SDPA cost that
+/// already makes multi-token forwards 2.7x a single-token one.
+enum OCRLanguageConfig {
+    static let layers = 12
+    static let headDim = 128            // hidden 1280 / 10 heads
+    static let heads = 10
+    static let topK = 6                 // num_experts_per_tok
+    static let normTopK = false         // norm_topk_prob in the shipped config
+    static let ropeTheta: Double = 1_000_000
+    static let rmsEps: Float = 1e-6
+    static let experts = 64
+}
+
+/// Per-layer KV cache: one preallocated `(heads, cap, dim)` buffer grown in blocks, written in
+/// place, read as a view.
+///
+/// A chunk-list cache is O(n^2) over a generation because every step concatenates; this is O(1)
+/// per step. `truncate` is a pointer rewind, which is what rejecting a speculative draft needs.
+///
+/// The one bug worth remembering from the python original: `keys` and `values` were assigned the
+/// SAME freshly allocated buffer, so writing V clobbered K on every step in every layer. It
+/// produced deterministic degenerate text, and a cached-vs-full-context self-consistency test
+/// passed 6/6 on it because both paths read the same corrupted cache. Self-consistency proves
+/// nothing; the reference dumps are the oracle.
+final class OCRKVCache {
+    static let step = 256
+
+    private(set) var keys: MLXArray?
+    private(set) var values: MLXArray?
+    private(set) var offset = 0
+
+    func append(_ k: MLXArray, _ v: MLXArray) {
+        let previous = offset
+        let fresh = k.dim(1)
+        if keys == nil || previous + fresh > keys!.dim(1) {
+            let h = k.dim(0), d = k.dim(2)
+            let steps = (Self.step + fresh - 1) / Self.step
+            let newK = MLXArray.zeros([h, steps * Self.step, d], dtype: k.dtype)
+            let newV = MLXArray.zeros([h, steps * Self.step, v.dim(2)], dtype: v.dtype)
+            if var oldK = keys, var oldV = values {
+                if previous % Self.step != 0 {
+                    oldK = oldK[0..., 0 ..< previous, 0...]
+                    oldV = oldV[0..., 0 ..< previous, 0...]
+                }
+                keys = concatenated([oldK, newK], axis: 1)
+                values = concatenated([oldV, newV], axis: 1)
+            } else {
+                keys = newK
+                values = newV
+            }
+        }
+        keys![0..., previous ..< (previous + fresh), 0...] = k
+        values![0..., previous ..< (previous + fresh), 0...] = v
+        offset = previous + fresh
+    }
+
+    func truncate(keep: Int) { offset = min(max(keep, 0), offset) }
+
+    var view: (keys: MLXArray, values: MLXArray)? {
+        guard let k = keys, let v = values else { return nil }
+        return (k[0..., 0 ..< offset, 0...], v[0..., 0 ..< offset, 0...])
+    }
+}
+
+@inline(__always)
+func ocrSiLU(_ x: MLXArray) -> MLXArray { x * sigmoid(x) }
+
+/// `DeepseekV2RMSNorm`. The fused Metal kernel is used where it is equivalent; on a bf16 build
+/// it is NOT equivalent to the reference, which upcasts to fp32 for the variance and rounds back
+/// once. That difference is small but it moves argmax on near-tie logits, so the explicit form
+/// is available and the choice is a measured one rather than a default.
+@inline(__always)
+func ocrRMSNorm(_ x: MLXArray, _ w: MLXArray, eps: Float = OCRLanguageConfig.rmsEps) -> MLXArray {
+    if OCRRuntime.fastRMSNorm { return MLXFast.rmsNorm(x, weight: w, eps: eps) }
+    let dt = x.dtype
+    let xf = x.asType(.float32)
+    let inv = rsqrt(mean(xf * xf, axis: -1, keepDims: true) + eps)
+    return (w.asType(.float32) * (xf * inv)).asType(dt)
+}
+
+/// Runtime switches. Every one of these defaults to the configuration the port is certified in;
+/// they exist so a measurement can be reproduced, not because the non-defaults are useful.
+enum OCRRuntime {
+    static let fastRMSNorm = ProcessInfo.processInfo.environment["OMNI_OCR_FAST_RMSNORM"] != "0"
+    static let fusedAttention = ProcessInfo.processInfo.environment["OMNI_OCR_LM_SDPA"] != "0"
+    /// Token count up to which the MoE uses the FUSED gather-matmul dispatch. Default: always.
+    ///
+    /// Measured on `doc_dense` (766 output tokens, one process per setting, two runs each):
+    ///     never fused    138.9 tok/s   ttft 666 ms
+    ///     fused at n<=16 152.3 tok/s   ttft 665 ms
+    ///     always fused   162.1 tok/s   ttft 736 ms
+    /// Fused computes `n * topK` expert rows where grouped computes `active * busiest`, so
+    /// fusing the ~1000-token prefill costs ~70 ms of TTFT. It buys 6.4% of decode back, and the
+    /// break-even is ~180 output tokens - below every real page in the reference set (215-766).
+    /// So it is on everywhere and the knob exists to reproduce the table, not because the other
+    /// settings are useful.
+    ///
+    /// One caveat kept honest: why the PREFILL dispatch changes DECODE throughput at all (both
+    /// settings decode at n = 1 through the same code) is not attributed. Allocator pool state
+    /// is the obvious suspect and it has not been measured, so it is not claimed.
+    static let fusedMoEMaxTokens = ProcessInfo.processInfo.environment["OMNI_OCR_FUSED_MOE"]
+        .flatMap { Int($0) } ?? Int.max
+}
+
+// MARK: - attention
+
+final class OCRAttention: @unchecked Sendable {
+    private let wqkv: OCRWeight
+    private let wo: OCRWeight
+    private let nHeads: Int
+
+    init(_ w: OCRWeights, _ prefix: String) {
+        wqkv = w["\(prefix).wqkv"]
+        wo = w["\(prefix).o"]
+        nHeads = wqkv.outputWidth / (3 * OCRLanguageConfig.headDim)
+    }
+
+    /// Llama `rotate_half` rope: cos/sin have each half DUPLICATED, and the rotation swaps the
+    /// two halves. Not interleaved.
+    ///
+    /// `MLXFast.rope` is measurably faster at these exact shapes (1.24-1.44x) and measurably
+    /// WRONG here: its non-traditional path is interleaved and its traditional path pairs
+    /// `(i, i + dims/2)` differently, so a drop-in corrupts every attention score by ~1.4e+01
+    /// against values of order 8 while reporting a speedup. Matching it would need a fixed
+    /// dimension permutation of q and k on both sides of the kernel - two extra gathers per
+    /// layer to save ~45 us/step inside an attention that costs ~0.47 ms/layer. Do not adopt it.
+    @inline(__always)
+    private func applyRope(_ x: MLXArray, cos: MLXArray, sin: MLXArray) -> MLXArray {
+        let d = x.dim(-1)
+        let half = d / 2
+        let x1 = x[.ellipsis, 0 ..< half]
+        let x2 = x[.ellipsis, half ..< d]
+        let rotated = concatenated([-x2, x1], axis: -1)
+        return x * cos.expandedDimensions(axis: 0) + rotated * sin.expandedDimensions(axis: 0)
+    }
+
+    func callAsFunction(_ x: MLXArray, cos: MLXArray, sin: MLXArray, cache: OCRKVCache?) -> MLXArray {
+        let n = x.dim(0)
+        let d = OCRLanguageConfig.headDim
+        let h = nHeads
+        let qkv = ocrProj(x, wqkv)
+        var q = qkv[0..., 0 ..< (h * d)].reshaped([n, h, d]).transposed(1, 0, 2)
+        var k = qkv[0..., (h * d) ..< (2 * h * d)].reshaped([n, h, d]).transposed(1, 0, 2)
+        let v = qkv[0..., (2 * h * d)...].reshaped([n, h, d]).transposed(1, 0, 2)
+        q = applyRope(q.asType(.float32), cos: cos, sin: sin).asType(x.dtype)
+        k = applyRope(k.asType(.float32), cos: cos, sin: sin).asType(x.dtype)
+
+        var keysAll = k, valuesAll = v
+        if let cache {
+            cache.append(k, v)
+            let view = cache.view!
+            keysAll = view.keys
+            valuesAll = view.values
+        }
+
+        let scale = 1.0 / Float(d).squareRoot()
+        let nq = q.dim(1)
+        if OCRRuntime.fusedAttention {
+            // n == 1: the single query attends every cached key, so no mask is needed and the
+            // fused kernel takes its fastest path. n > 1: the engine's own causal mode, which
+            // never materialises an (n, n) score matrix.
+            let y = MLXFast.scaledDotProductAttention(
+                queries: q.expandedDimensions(axis: 0),
+                keys: keysAll.expandedDimensions(axis: 0),
+                values: valuesAll.expandedDimensions(axis: 0),
+                scale: scale, mask: nq == 1 ? .none : .causal)
+            let out = y[0].transposed(1, 0, 2).reshaped([n, h * d])
+            return ocrProj(out, wo).asType(x.dtype)
+        }
+
+        let nk = keysAll.dim(1)
+        let past = nk - nq
+        var scores = matmul(q.asType(.float32), keysAll.asType(.float32).swappedAxes(-1, -2)) * scale
+        if nq > 1 || past > 0 {
+            let idxQ = MLXArray(Int32(0) ..< Int32(nq)).reshaped([nq, 1]) + Int32(past)
+            let idxK = MLXArray(Int32(0) ..< Int32(nk)).reshaped([1, nk])
+            let causal = (idxK .<= idxQ).expandedDimensions(axis: 0)
+            scores = MLX.where(causal, scores, MLXArray(Float(-1e38)))
+        }
+        let p = softMax(scores, axis: -1).asType(x.dtype)
+        let out = matmul(p, valuesAll.asType(x.dtype)).transposed(1, 0, 2).reshaped([n, h * d])
+        return ocrProj(out, wo).asType(x.dtype)
+    }
+}
+
+// MARK: - MLPs
+
+/// Dense SwiGLU MLP: decoder layer 0, and the MTP draft block.
+final class OCRDenseMLP: @unchecked Sendable {
+    private let gateUp: OCRWeight
+    private let down: OCRWeight
+
+    init(_ w: OCRWeights, _ prefix: String) {
+        gateUp = w["\(prefix).gate_up"]
+        down = w["\(prefix).down"]
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let gu = ocrProj(x, gateUp)
+        let inter = gu.dim(-1) / 2
+        let y = ocrSiLU(gu[.ellipsis, 0 ..< inter]) * gu[.ellipsis, inter ..< gu.dim(-1)]
+        return ocrProj(y, down).asType(x.dtype)
+    }
+}
+
+/// Sparse MoE layer: softmax router, greedy top-6 of 64, plus a shared expert every token uses.
+///
+/// Two dispatch paths, and the difference between them is most of this model's decode speed:
+///   n == 1  gather ONLY the 6 routed packs and run them as a 6-row batch. The naive form pads
+///           the token across all 64 experts and reads ~36.7 MB of expert weights per layer per
+///           token to use ~2.6 MB of it.
+///   n > 1   group slots by expert, pad to the busiest, and run `(A, tmax, ·)` batched matmuls
+///           over only the A experts the batch actually touches.
+final class OCRMoE: @unchecked Sendable {
+    private let gate: MLXArray
+    private let gateUp: OCRWeight
+    private let down: OCRWeight
+    private let sharedGateUp: OCRWeight
+    private let sharedDown: OCRWeight
+    private let expertCount: Int
+
+    init(_ w: OCRWeights, _ prefix: String) {
+        gate = w.array("\(prefix).gate")
+        gateUp = w["\(prefix).gate_up"]
+        down = w["\(prefix).down"]
+        sharedGateUp = w["\(prefix).shared.gate_up"]
+        sharedDown = w["\(prefix).shared.down"]
+        expertCount = gate.dim(-1)
+    }
+
+    /// The shared expert. Its intermediate width is `moe_intermediate * n_shared_experts`, i.e.
+    /// WIDER than a routed expert (1344 vs 896) - deriving it from the routed width was a real
+    /// bug, so it is read from this weight's own shape and nowhere else.
+    private func shared(_ x: MLXArray) -> MLXArray {
+        let gu = ocrProj(x, sharedGateUp)
+        let inter = gu.dim(-1) / 2
+        let y = ocrSiLU(gu[.ellipsis, 0 ..< inter]) * gu[.ellipsis, inter ..< gu.dim(-1)]
+        return ocrProj(y, sharedDown).asType(x.dtype)
+    }
+
+    /// Both expert projections over a stacked `(E, T, hidden)` batch.
+    private func experts(_ xs: MLXArray, gu w1: OCRWeight, dn w2: OCRWeight) -> MLXArray {
+        let gu = ocrProj(xs, w1)
+        let inter = gu.dim(-1) / 2
+        let y = ocrSiLU(gu[.ellipsis, 0 ..< inter]) * gu[.ellipsis, inter ..< gu.dim(-1)]
+        return ocrProj(y, w2)
+    }
+
+    /// Set to capture the routed expert ids for one forward pass. Diagnostics only - a MoE
+    /// divergence is either smooth rounding or a different expert set, and only the ids say which.
+    nonisolated(unsafe) static var routerSink: ((MLXArray) -> Void)?
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let n = x.dim(0)
+        let hidden = x.dim(1)
+        let k = OCRLanguageConfig.topK
+
+        // MoEGate: raw fp32 router logits (no 1/sqrt(hidden)), softmax over experts, greedy
+        // top-k, and `norm_topk_prob = false` so the selected probabilities are used AS-IS.
+        // Renormalising them is the single most common way to get this family subtly wrong.
+        let logits = matmul(x.asType(.float32), gate.asType(.float32))
+        let probs = softMax(logits, axis: -1)
+        let order = argSort(-probs, axis: -1)
+        let topIdx = order[0..., 0 ..< k].asType(.int32)
+        var selected = takeAlong(probs, topIdx, axis: -1)
+        if OCRLanguageConfig.normTopK {
+            selected = selected / maximum(selected.sum(axis: -1, keepDims: true), MLXArray(Float(1e-20)))
+        }
+
+        Self.routerSink?(topIdx)
+
+        if n <= OCRRuntime.fusedMoEMaxTokens {
+            // One fused call per projection, for every n. The expert gather rides inside the
+            // matmul, so there is no sort, no padding to the busiest expert, and - the part that
+            // matters most - no host sync to size that padding. The grouped path below needs the
+            // expert assignment on the CPU, which at decode would be one GPU stall per layer per
+            // token, i.e. twelve per token.
+            let gu = ocrExpertMatmul(x, gateUp, indices: topIdx)          // (n, k, 2*inter)
+            let inter = gu.dim(-1) / 2
+            let act = ocrSiLU(gu[.ellipsis, 0 ..< inter]) * gu[.ellipsis, inter ..< gu.dim(-1)]
+            let routed = ocrExpertMatmulRows(act, down, indices: topIdx)  // (n, k, hidden)
+            let weighted = routed * selected.expandedDimensions(axis: -1).asType(routed.dtype)
+            return weighted.sum(axis: 1).asType(x.dtype) + shared(x)
+        }
+
+        if n == 1 { return decodeStep(x, topIdx: topIdx, selected: selected) }
+
+        // Grouped dispatch. The permutation is built on the HOST: the expert assignment has to
+        // be read back anyway to size the padded batch, and doing the bookkeeping in Swift turns
+        // what would be scatter-adds into two plain gathers.
+        let assignment = topIdx.asArray(Int32.self)                  // n * k, slot -> expert
+        var counts = [Int](repeating: 0, count: expertCount)
+        for e in assignment { counts[Int(e)] += 1 }
+        var activeExperts: [Int32] = []
+        var slotOfExpert = [Int](repeating: -1, count: expertCount)
+        for e in 0 ..< expertCount where counts[e] > 0 {
+            slotOfExpert[e] = activeExperts.count
+            activeExperts.append(Int32(e))
+        }
+        let a = activeExperts.count
+        let tmax = counts.max() ?? 0
+
+        // `n` indexes a zero row appended to x, so padded slots contribute zeros without a
+        // scatter and without their results ever being gathered back.
+        var gatherIn = [Int32](repeating: Int32(n), count: a * tmax)
+        var slotPosition = [Int32](repeating: 0, count: n * k)
+        var rank = [Int](repeating: 0, count: expertCount)
+        for slot in 0 ..< (n * k) {
+            let e = Int(assignment[slot])
+            let row = slotOfExpert[e] * tmax + rank[e]
+            gatherIn[row] = Int32(slot / k)
+            slotPosition[slot] = Int32(row)
+            rank[e] += 1
+        }
+
+        let padded = concatenated([x, MLXArray.zeros([1, hidden], dtype: x.dtype)], axis: 0)
+        let xs = padded[MLXArray(gatherIn)].reshaped([a, tmax, hidden])
+        let activeIdx = MLXArray(activeExperts)
+        let y = experts(xs, gu: ocrGatherExperts(gateUp, activeIdx), dn: ocrGatherExperts(down, activeIdx))
+        let picked = y.reshaped([a * tmax, hidden])[MLXArray(slotPosition)]
+        let weighted = picked.reshaped([n, k, hidden]) * selected.expandedDimensions(axis: -1).asType(x.dtype)
+        return weighted.sum(axis: 1) + shared(x)
+    }
+
+    /// n == 1. `topIdx` stays an MLXArray on purpose: reading it to the host would cost a GPU
+    /// sync per layer per token (12 per token), which inverts the sign of every kernel win in
+    /// this file.
+    private func decodeStep(_ x: MLXArray, topIdx: MLXArray, selected: MLXArray) -> MLXArray {
+        let ids = topIdx.reshaped([-1])
+        let k = ids.dim(0)
+        let guW = ocrGatherExperts(gateUp, ids)
+        let dnW = ocrGatherExperts(down, ids)
+        let rows = broadcast(x, to: [k, 1, x.dim(-1)])
+        let out = experts(rows, gu: guW, dn: dnW).reshaped([k, -1])
+        let weights = selected.asType(x.dtype).reshaped([-1, 1])
+        return (out * weights).sum(axis: 0, keepDims: true) + shared(x)
+    }
+}
+
+// MARK: - layers
+
+final class OCRDecoderLayer: @unchecked Sendable {
+    private let inLN: MLXArray
+    private let postLN: MLXArray
+    private let attn: OCRAttention
+    private let dense: OCRDenseMLP?
+    private let moe: OCRMoE?
+
+    init(_ w: OCRWeights, _ prefix: String, sparse: Bool) {
+        inLN = w.array("\(prefix).input_layernorm")
+        postLN = w.array("\(prefix).post_attention_layernorm")
+        attn = OCRAttention(w, "\(prefix).attn")
+        if sparse {
+            moe = OCRMoE(w, "\(prefix).mlp"); dense = nil
+        } else {
+            dense = OCRDenseMLP(w, "\(prefix).mlp"); moe = nil
+        }
+    }
+
+    func callAsFunction(_ x: MLXArray, cos: MLXArray, sin: MLXArray, cache: OCRKVCache?) -> MLXArray {
+        var h = x + attn(ocrRMSNorm(x, inLN), cos: cos, sin: sin, cache: cache)
+        let normed = ocrRMSNorm(h, postLN)
+        h = h + (moe?(normed) ?? dense!(normed))
+        return h
+    }
+}
+
+/// FastMTP draft head: `enorm(token embedding) + hnorm(previous hidden) -> eh_proj -> one dense block`.
+///
+/// This checkpoint ships the SELF-CONTAINED head format - the draft owns its embedding, its norm
+/// and its output projection (`mtp_embed_tokens`, `shared_head.norm`, `shared_head.local_head`) -
+/// which is decided by `mtp_share_*` being false in the weight map, NOT by the config's
+/// `mtp_share_*` flags. Feeding the main model's tensors instead is silently wrong: verification
+/// still makes the output exact, so the only symptom is that acceptance collapses.
+final class OCRMTPHead: @unchecked Sendable {
+    private let enorm: MLXArray
+    private let hnorm: MLXArray
+    private let ehProj: OCRWeight
+    private let inLN: MLXArray
+    private let postLN: MLXArray
+    private let attn: OCRAttention
+    private let mlp: OCRDenseMLP
+    private let sharedNorm: MLXArray
+
+    let embed: MLXArray?
+    let head: OCRWeight?
+
+    init(_ w: OCRWeights) {
+        enorm = w.array("mtp.enorm")
+        hnorm = w.array("mtp.hnorm")
+        ehProj = w["mtp.eh_proj"]
+        inLN = w.array("mtp.block.input_layernorm")
+        postLN = w.array("mtp.block.post_attention_layernorm")
+        attn = OCRAttention(w, "mtp.block.attn")
+        mlp = OCRDenseMLP(w, "mtp.block.mlp")
+        sharedNorm = w.array("mtp.norm.weight")
+        embed = w.has("mtp.embed_tokens") ? w.array("mtp.embed_tokens") : nil
+        head = w.has("mtp.head") ? w["mtp.head"] : nil
+    }
+
+    /// Returns POST-norm hidden states, because that is what the reference feeds back as
+    /// `previous_hidden_states` for draft step k+1 ("so FastMTP step k+1 matches training").
+    /// The caller must not norm it again.
+    func step(tokenEmbedding e0: MLXArray, previousHidden: MLXArray,
+              cos: MLXArray, sin: MLXArray, cache: OCRKVCache?) -> MLXArray {
+        let e = ocrRMSNorm(e0, enorm)
+        let h = ocrRMSNorm(previousHidden, hnorm)
+        let joined = concatenated([e.asType(.float32), h.asType(.float32)], axis: -1)
+        var x = ocrProj(joined, ehProj).asType(e0.dtype)
+        x = x + attn(ocrRMSNorm(x, inLN), cos: cos, sin: sin, cache: cache)
+        return ocrRMSNorm(x + mlp(ocrRMSNorm(x, postLN)), sharedNorm)
+    }
+}
+
+// MARK: - model
+
+final class OCRLanguageModel: @unchecked Sendable {
+    let embedTokens: MLXArray
+    let normW: MLXArray
+    let lmHead: OCRWeight
+    let layers: [OCRDecoderLayer]
+    let mtp: OCRMTPHead?
+
+    let hidden: Int
+    private var ropeCache: [String: (MLXArray, MLXArray)] = [:]
+    private let ropeLock = NSLock()
+    private let invFreq: [Float]
+
+    init(_ w: OCRWeights) {
+        embedTokens = w.array("embed_tokens")
+        normW = w.array("norm.weight")
+        lmHead = w["lm_head"]
+        layers = (0 ..< OCRLanguageConfig.layers).map {
+            OCRDecoderLayer(w, "layers.\($0)", sparse: $0 >= 1)
+        }
+        mtp = w.has("mtp.enorm") ? OCRMTPHead(w) : nil
+        hidden = embedTokens.dim(1)
+        let d = OCRLanguageConfig.headDim
+        invFreq = (0 ..< d / 2).map {
+            Float(pow(OCRLanguageConfig.ropeTheta, -(Double($0 * 2) / Double(d))))
+        }
+    }
+
+    func newCaches() -> [OCRKVCache] { (0 ..< OCRLanguageConfig.layers).map { _ in OCRKVCache() } }
+
+    func embed(_ ids: [Int]) -> MLXArray {
+        embedTokens[MLXArray(ids.map { Int32($0) })]
+    }
+
+    /// `(cos, sin)` of shape `(n, headDim)` with each half duplicated, built in fp32 on the host
+    /// so the table matches the reference's float32 rotary exactly. Cached by the position span,
+    /// which is what a decode loop reuses.
+    func rope(positions: [Int]) -> (MLXArray, MLXArray) {
+        let key = "\(positions.first ?? 0)-\(positions.last ?? 0)-\(positions.count)"
+        ropeLock.lock(); defer { ropeLock.unlock() }
+        if let hit = ropeCache[key] { return hit }
+        let d = OCRLanguageConfig.headDim
+        let half = d / 2
+        var cosBuf = [Float](repeating: 0, count: positions.count * d)
+        var sinBuf = [Float](repeating: 0, count: positions.count * d)
+        for (row, p) in positions.enumerated() {
+            for j in 0 ..< half {
+                let angle = Float(p) * invFreq[j]
+                let c = cosf(angle), s = sinf(angle)
+                cosBuf[row * d + j] = c; cosBuf[row * d + half + j] = c
+                sinBuf[row * d + j] = s; sinBuf[row * d + half + j] = s
+            }
+        }
+        let result = (MLXArray(cosBuf, [positions.count, d]), MLXArray(sinBuf, [positions.count, d]))
+        // The cache is keyed by span, and a decode loop walks one new position per step; cap it
+        // so a long generation cannot grow it without bound.
+        if ropeCache.count > 4096 { ropeCache.removeAll(keepingCapacity: true) }
+        ropeCache[key] = result
+        return result
+    }
+
+    /// `(n, hidden)` embeddings -> pre-lm_head hidden and fp32 logits.
+    func forward(_ embeddings: MLXArray, positions: [Int], caches: [OCRKVCache]) -> (hidden: MLXArray, logits: MLXArray) {
+        let (cos, sin) = rope(positions: positions)
+        var x = embeddings
+        for (layer, cache) in zip(layers, caches) {
+            x = layer(x, cos: cos, sin: sin, cache: cache)
+        }
+        let h = ocrRMSNorm(x, normW)
+        // No weight up-cast. `h.asType(.float32) @ lm_head` would materialise a full fp32 copy of
+        // the 331 MB head EVERY token; matching the activation to the weight dtype and up-casting
+        // only the (small) logits keeps the largest per-token read at its stored width.
+        let logits = ocrProj(h.asType(lmHead.computeDType), lmHead).asType(.float32)
+        return (h, logits)
+    }
+
+    /// One MTP draft step, including its own embedding and output projection when the checkpoint
+    /// carries them.
+    func draftLogits(hiddenState: MLXArray) -> MLXArray {
+        guard let mtp, let head = mtp.head else {
+            return ocrProj(hiddenState.asType(lmHead.computeDType), lmHead).asType(.float32)
+        }
+        return ocrProj(hiddenState.asType(head.computeDType), head).asType(.float32)
+    }
+
+    func draftEmbed(_ ids: [Int]) -> MLXArray {
+        if let table = mtp?.embed { return table[MLXArray(ids.map { Int32($0) })] }
+        return embed(ids)
+    }
+
+    func mtpStep(tokenEmbedding: MLXArray, previousHidden: MLXArray,
+                 positions: [Int], cache: OCRKVCache) -> MLXArray? {
+        guard let mtp else { return nil }
+        let (cos, sin) = rope(positions: positions)
+        return mtp.step(tokenEmbedding: tokenEmbedding, previousHidden: previousHidden,
+                        cos: cos, sin: sin, cache: cache)
+    }
+}

@@ -991,8 +991,60 @@ private struct IndexTab: View {
                 Text("Picking a variant switches to it, or downloads it. Switching rebuilds the index.")
                     .font(.caption).foregroundStyle(.secondary)
             }
+
+            // Optional add-on, deliberately its own section: it is a different model, it is not
+            // downloaded unless asked for, and nothing else in the app depends on it.
+            Section {
+                Picker("Build", selection: Binding(
+                    get: { model.ocrVariant },
+                    set: { model.ocrVariant = $0 }
+                )) {
+                    ForEach(OCRModelCatalog.Variant.allCases, id: \.self) { v in
+                        Text(v.title).tag(v)
+                    }
+                }
+                .disabled(model.isOCRDownloading)
+
+                LabeledContent("Size and speed", value: model.ocrVariant.summary)
+
+                if model.isOCRDownloading {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ProgressView(value: model.ocrDownloadFraction)
+                        HStack {
+                            Text(model.ocrDownloadLabel)
+                                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Cancel") { model.cancelOCRDownload() }.controlSize(.small)
+                        }
+                    }
+                } else {
+                    HStack(spacing: 8) {
+                        if model.ocrInstalled.contains(model.ocrVariant) {
+                            Text("Installed").font(.caption).foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Remove") { model.removeOCRModel(model.ocrVariant) }
+                        } else {
+                            if model.ocrDownloadFailed {
+                                Text(model.ocrDownloadLabel).font(.caption).foregroundStyle(.red)
+                                    .lineLimit(2)
+                            } else {
+                                Text("Not downloaded").font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button("Download\u{2026}") { model.downloadOCRModel(model.ocrVariant) }
+                        }
+                    }
+                    .controlSize(.small)
+                }
+            } header: {
+                Text("OCR model")
+            } footer: {
+                Text("Optional. Transcribes document images to Markdown on this Mac. Not downloaded until you ask, and not used by search.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
+        .task { model.refreshOCRInstalled() }
     }
     private func pickModel() {
         let panel = NSOpenPanel()

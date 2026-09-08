@@ -1079,6 +1079,17 @@ final class AppModel {
     var downloadFailed = false   // explicit error state; the view branches on this, not on label text
     private var downloader: ModelDownloader?
 
+    // Optional OCR model (jina-ocr-v1). Separate from the embedding variants in every way that
+    // matters: a different model family, ~4 GB, not on the indexing path, and NEVER fetched
+    // unless the user asks for it. Nothing in launch or indexing touches these.
+    var ocrVariant: OCRModelCatalog.Variant = .balanced
+    var ocrInstalled: [OCRModelCatalog.Variant] = []
+    var isOCRDownloading = false
+    var ocrDownloadFraction: Double = 0
+    var ocrDownloadLabel = ""
+    var ocrDownloadFailed = false
+    private var ocrDownloader: OCRModelDownloader?
+
     // The index is always kept fresh in the background (FSEvents).
     private var watcher: FSWatcher?
     // File-system changes that arrive while a full index is running are buffered here and
@@ -2525,6 +2536,74 @@ final class AppModel {
                 }
             }
         }
+    }
+
+    // MARK: - OCR model (optional add-on)
+
+    /// Refresh which OCR variants are on disk. Called from Settings, never at launch: it stats a
+    /// handful of files, but the point is that an add-on nobody enabled costs nothing.
+    func refreshOCRInstalled() {
+        Task.detached {
+            let installed = OCRModelCatalog.installedVariants()
+            await MainActor.run { self.ocrInstalled = installed }
+        }
+    }
+
+    func downloadOCRModel(_ variant: OCRModelCatalog.Variant) {
+        guard !isOCRDownloading, let dest = OCRModelCatalog.installDir(for: variant) else { return }
+        isOCRDownloading = true
+        ocrDownloadFraction = 0
+        ocrDownloadLabel = "Preparing\u{2026}"
+        ocrDownloadFailed = false
+        let dl = OCRModelDownloader(); ocrDownloader = dl
+        Task {
+            do {
+                try await dl.download(variant: variant, to: dest) { p in
+                    Task { @MainActor in
+                        // Per-file fraction, with the file position in the label: the shards are
+                        // ~1.9 GB each, so a single overall bar would sit still for minutes.
+                        self.ocrDownloadFraction = p.total > 0 ? Double(p.received) / Double(p.total) : 0
+                        if p.file.hasSuffix(".safetensors") {
+                            let gb = Double(p.received) / 1_000_000_000
+                            let total = Double(p.total) / 1_000_000_000
+                            self.ocrDownloadLabel = p.total > 0
+                                ? String(format: "Part %d of %d  %.2f / %.2f GB",
+                                         p.fileIndex + 1, p.fileCount, gb, total)
+                                : "Downloading\u{2026}"
+                        } else {
+                            self.ocrDownloadLabel = "Preparing\u{2026}"
+                        }
+                    }
+                }
+                await MainActor.run {
+                    self.isOCRDownloading = false
+                    self.ocrDownloadLabel = ""
+                    self.ocrVariant = variant
+                    self.refreshOCRInstalled()
+                }
+            } catch {
+                await MainActor.run {
+                    self.isOCRDownloading = false
+                    if (error as? URLError)?.code == .cancelled {
+                        self.ocrDownloadFailed = false
+                        self.ocrDownloadLabel = ""
+                    } else {
+                        self.ocrDownloadFailed = true
+                        self.ocrDownloadLabel = "Download failed: \(error.localizedDescription)"
+                    }
+                    self.refreshOCRInstalled()
+                }
+            }
+        }
+    }
+
+    func cancelOCRDownload() { ocrDownloader?.cancel() }
+
+    /// Delete an installed OCR variant. Reclaiming 4 GB is always an explicit action.
+    func removeOCRModel(_ variant: OCRModelCatalog.Variant) {
+        guard !isOCRDownloading else { return }
+        try? OCRModelDownloader.remove(variant)
+        refreshOCRInstalled()
     }
 
     /// Cancel the in-flight model download (the onboarding Cancel button). Partial files stay on
