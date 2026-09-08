@@ -76,3 +76,53 @@ extension OCRModel {
         return out
     }
 }
+
+
+extension OCRModel {
+    /// Does a multi-token forward agree with feeding the same tokens one at a time?
+    ///
+    /// Speculative decoding rests entirely on this equivalence: verifying k drafts in one pass is
+    /// only sound if slot j of an n-token forward predicts exactly what the sequential decoder
+    /// would. This probe answers that with no speculation machinery in the way - decode a short
+    /// greedy stream, then replay the SAME tokens through a fresh cache in chunks of `chunk` and
+    /// compare per-slot argmax.
+    public func probeBatchEquivalence(image: OCRImage, tokens count: Int, chunk: Int) throws
+        -> (sequential: [Int], batched: [Int]) {
+        let prep = try prepare(image: image, prompt: nil)
+        let embeddings = try embedPrompt(prep)
+        let n = prep.ids.count
+
+        // Sequential reference.
+        let caches = llm.newCaches()
+        var (_, logits) = llm.forward(embeddings, positions: Array(0 ..< n), caches: caches)
+        eval(logits)
+        var stream = [logits[-1].argMax().item(Int.self)]
+        var position = n
+        while stream.count < count + 1 {
+            let step = llm.forward(llm.embed([stream.last!]), positions: [position], caches: caches)
+            eval(step.logits)
+            stream.append(step.logits[-1].argMax().item(Int.self))
+            position += 1
+        }
+
+        // Replay through a fresh cache in fixed-size chunks.
+        let fresh = llm.newCaches()
+        let re = llm.forward(embeddings, positions: Array(0 ..< n), caches: fresh)
+        eval(re.logits)
+        var batched: [Int] = []
+        var fed = 0
+        var pos = n
+        let feed = Array(stream[0 ..< count])
+        while fed < feed.count {
+            let take = Swift.min(chunk, feed.count - fed)
+            let slice = Array(feed[fed ..< (fed + take)])
+            let step = llm.forward(llm.embed(slice), positions: Array(pos ..< (pos + take)), caches: fresh)
+            eval(step.logits)
+            batched.append(contentsOf: step.logits.argMax(axis: -1).asArray(Int32.self).map(Int.init))
+            fed += take
+            pos += take
+        }
+        // `stream[i+1]` is what the sequential decoder produced after consuming `stream[i]`.
+        return (Array(stream[1...]), batched)
+    }
+}

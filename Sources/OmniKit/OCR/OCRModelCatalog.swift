@@ -14,6 +14,10 @@ public enum OCRModelCatalog {
     /// pages (each generated to its natural EOS) against the torch bfloat16 reference on M3 Ultra,
     /// one process per build. `CER` is Levenshtein distance over reference length.
     ///
+    /// Every variant carries the FastMTP draft head (~70 MB), so decoding speculates by default:
+    /// draft 3 tokens, verify them in one target pass, commit what the target agrees with. That
+    /// is worth +13-23% and costs nothing in quality.
+    ///
     /// The ordering is not the usual one and it is worth stating plainly: 4 bits is NOT free
     /// speed here. Decode on this MoE is bound by fixed per-launch latency at these skinny
     /// shapes rather than by weight bytes, so most of `balanced`'s gain over `fidelity` comes
@@ -22,16 +26,19 @@ public enum OCRModelCatalog {
     /// for it in accuracy.
     public enum Variant: String, CaseIterable, Sendable {
         /// Routed MoE expert stacks at 8 bits, everything else bf16.
-        /// 4.55 GB, 163 tok/s, mean CER 0.0159, 3 of 7 pages character-exact.
+        /// 4.62 GB, 198 tok/s, mean CER 0.0082 on the hard corpus, 8 of 10 pages exact.
         case fidelity
-        /// Adds 8-bit shared-expert and dense-MLP packs. Still nothing at 4 bits.
-        /// 4.46 GB, 185 tok/s, mean CER 0.0321, 3 of 7 pages character-exact.
+        /// Adds 8-bit shared-expert and dense-MLP packs. Still nothing at 4 bits, and the best
+        /// measured quality-per-byte of the three.
+        /// 4.53 GB, 205 tok/s, mean CER 0.0044 on the hard corpus, 9 of 10 pages exact.
         case balanced
         /// Dynamic 4-bit: expert `down` projections and attention at 4 bits (group size 32),
         /// expert `gate_up`, shared expert and dense MLP at 8 bits, router / lm_head / embeddings
         /// / vision left wide. Smallest and fastest, and the accuracy cost is real and lands on
         /// small-print and mixed-script pages rather than on ordinary documents.
-        /// 4.06 GB, 186 tok/s, mean CER 0.0469, 2 of 7 pages character-exact.
+        /// 4.13 GB, 203 tok/s, mean CER 0.0465 on the hard corpus, 2 of 10 pages exact - and
+        /// handwriting is where it breaks down (CER 0.25 on a clean handwritten page that every
+        /// other build transcribes exactly).
         case compact
 
         public var title: String {
@@ -45,9 +52,9 @@ public enum OCRModelCatalog {
         /// What the user is actually choosing between, in one line each.
         public var summary: String {
             switch self {
-            case .fidelity: return "4.6 GB, ~163 tok/s, CER 0.016"
-            case .balanced: return "4.5 GB, ~185 tok/s, CER 0.032"
-            case .compact: return "4.1 GB, ~186 tok/s, CER 0.047"
+            case .fidelity: return "4.6 GB, ~198 tok/s, CER 0.008"
+            case .balanced: return "4.5 GB, ~205 tok/s, CER 0.004"
+            case .compact: return "4.1 GB, ~203 tok/s, CER 0.047"
             }
         }
 

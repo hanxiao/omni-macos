@@ -38,7 +38,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "ocr-verify",
-            dependencies: ["OmniKit"]
+            dependencies: [
+                "OmniKit",
+                .product(name: "MLXRandom", package: "mlx-swift"),
+            ]
         ),
         .executableTarget(
             name: "profbench",
@@ -66,7 +69,10 @@ let package = Package(
         ),
         .testTarget(
             name: "OmniKitTests",
-            dependencies: ["OmniKit"],
+            dependencies: [
+                "OmniKit",
+                .product(name: "MLXRandom", package: "mlx-swift"),
+            ],
             resources: [
                 .copy("Resources/text_fixtures.json"),
                 .copy("Resources/text_fixtures_nano.json"),

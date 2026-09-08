@@ -17,7 +17,9 @@ search path.
 | `Sources/OmniKit/OCR/OCRVision.swift` | SAM + CLIP + projector |
 | `Sources/OmniKit/OCR/OCRLanguage.swift` | MoE decoder, KV cache, MTP head |
 | `Sources/OmniKit/OCR/OCRModel.swift` | prompt, visual assembly, generation |
+| `Sources/OmniKit/OCR/OCRSpeculative.swift` | FastMTP draft/verify decoding |
 | `Sources/ocr-verify/` | the numeric gate and benchmark |
+| `Tools/ocr/make_hard_pages.py` | the hard-page corpus generator |
 | `Tools/ocr/ref_dump.py` | torch reference dumps |
 | `Tools/ocr/convert.py` | HF checkpoint -> sharded, dynamically quantized MLX build |
 
@@ -49,17 +51,35 @@ swift build -c release --product ocr-verify
 Seven pages, every one generated to its natural EOS (complete documents, not prefixes), graded
 against the torch bf16 reference. `CER` is Levenshtein distance over reference length.
 
-| build | size | exact | mean CER | decode | vs torch |
-|---|---|---|---|---|---|
-| torch bf16, MPS (reference) | 7.4 GB | - | - | 38.3 tok/s | 1.0x |
-| bf16, no quantization | 6.67 GB | 3/7 | 0.0231 | 161.3 tok/s | 4.2x |
-| **fidelity** (`q8`) | 4.55 GB | 3/7 | 0.0159 | 163.5 tok/s | 4.3x |
-| **balanced** (`dyn-k`) | 4.46 GB | 3/7 | 0.0321 | 184.7 tok/s | 4.8x |
-| **compact** (`dyn-j`, dynamic 4-bit) | 4.06 GB | 2/7 | 0.0469 | 186.1 tok/s | 4.9x |
+Two corpora. The **easy** set is seven clean synthetic pages; the **hard** set is ten pages built
+by `make_hard_pages.py` - handwriting, a ruled financial grid, a thermal receipt, a boxed form,
+7pt two-column body text, each also in a damaged variant (JPEG 18-30, blur, sensor noise, skew,
+illumination gradient, reverse-side bleed-through, perspective keystone). The hard set is the one
+that discriminates: on the easy set every build agrees, which is exactly why it cannot be trusted
+alone.
 
-TTFT on M3 Ultra: 191-233 ms single-view, 481-749 ms multi-crop (2x3 tiles, 1007 prompt tokens);
-the quantized builds pay ~25% more TTFT than bf16 because the fused MoE prefill is slower on
-packs, and win it back several times over in decode.
+Decode figures include FastMTP speculation (k=3, on by default), measured in isolation, two runs
+per build, spread under 1%.
+
+| build | size | hard exact | hard CER | easy CER | decode | vs torch |
+|---|---|---|---|---|---|---|
+| torch bf16, MPS (reference) | 7.4 GB | - | - | - | 38.3 tok/s | 1.0x |
+| bf16, no quantization | 6.67 GB | 8/10 | 0.0039 | 0.0231 | 160 tok/s | 4.2x |
+| **fidelity** (`q8`) | 4.62 GB | 8/10 | 0.0082 | 0.0159 | 198 tok/s | 5.2x |
+| **balanced** (`dyn-k`) | 4.53 GB | **9/10** | **0.0044** | 0.0285 | **205 tok/s** | **5.4x** |
+| **compact** (`dyn-j`, dynamic 4-bit) | 4.13 GB | 2/10 | 0.0465 | 0.0469 | 203 tok/s | 5.3x |
+
+`balanced` is the recommended build on the evidence: it matches the unquantized model's accuracy
+on hard pages (CER 0.0044 vs 0.0039) at a third less size and 28% more throughput.
+
+**The hard corpus changed the answer.** On the easy set `compact` looked like a reasonable
+trade - CER 0.047 against 0.032. On the hard set it collapses where it matters: CER **0.25 on a
+clean handwritten page** every other build transcribes exactly. Handwriting is the content 4-bit
+routed experts cannot hold, and no amount of clean printed text would ever have shown that.
+
+TTFT on M3 Ultra: 191-233 ms single-view, 440-750 ms multi-crop; the quantized builds pay ~25%
+more TTFT than bf16 because the fused MoE prefill is slower on packs, and win it back several
+times over in decode.
 
 `fidelity` scoring a lower CER than unquantized bf16 is not a claim that quantization improves
 the model. The two differ only in which way a handful of greedy near-ties fall, and both are
@@ -89,6 +109,58 @@ fully determinate 1312). The fp32 build moves it to 278, so it is precision-driv
 logic defect, and the divergence is a formatting mode flip: the reference emits
 `$A = \text{softmax}(...)$` and the port emits the same content without the LaTeX wrapper. Every
 build in the ladder, including unquantized bf16, flips at exactly this character.
+
+## Speculative decoding (FastMTP)
+
+The draft head is one transformer block, ~70 MB, and it is included in every shipped variant. It
+drafts k tokens; the target verifies all of them in a single forward; the accepted prefix commits.
+
+Draft-length sweep, mean decode over three pages against 183 tok/s greedy:
+
+| k | 1 | 2 | **3** | 4 | 5 | 6 | 8 |
+|---|---|---|---|---|---|---|---|
+| tok/s | 173 | 196 | **200** | 199 | 190 | 183 | 148 |
+| acceptance | 0.82 | 0.69 | 0.58 | 0.51 | 0.46 | 0.41 | 0.32 |
+
+k=3 is the peak. k=1 is a net LOSS - one draft cannot pay for its own forward. Acceptance at
+draft position 0 is 0.79-0.89, which is the healthy FastMTP regime; the earlier python port sat
+at 0.12-0.20 and concluded speculation "does not pay off on this stack". It was right about its
+own numbers and wrong about the model: the defect was an off-by-one in what the head consumes.
+
+**The contract, from the reference.** At position j the head takes the token AT j paired with the
+target hidden from `j - 1` (EAGLE-style), returns POST-norm hidden, and feeds that same tensor
+back as the next step's `previous_hidden_states`. Pairing token j with hidden j instead - which
+is what the python port did - has identical shapes, produces correct output (the target verifies
+everything), and quietly costs 4x acceptance. Nothing but a measurement can catch it.
+
+**Not bit-identical to greedy, and the difference is characterised.** A verify pass computes k+1
+logits at once with a different reduction order than a one-token forward, so a near-tie argmax can
+fall the other way. Measured over 17 pages: 14 token-identical, 3 differ by exactly one token,
+deterministically. Aggregate quality does not regress - mean CER is equal or better with
+speculation on both corpora (0.0087 -> 0.0044 on the shipped build).
+
+**The checkpoint's "self-contained" draft tensors are duplicates.** `mtp_embed_tokens`,
+`shared_head.local_head` and `shared_head.norm` are bit-identical to `embed_tokens`, `lm_head` and
+`norm` (max|d| = 0.000e+00 on all three), and building with or without them gives the same
+acceptance to the individual count. The converter omits them; the artifact is 662 MB smaller.
+
+## An MLX bug this work uncovered
+
+`quantizedMM(x, w, transpose: false)` in mlx-swift 0.31.3 returns unrelated numbers - relative
+error ~1.5, not a precision loss - when the row count is exactly 2 or 3. M=1 and M>=4 are correct
+to ~1e-6, at 4 and 8 bits and group size 32 and 64 alike. Reproduce with `ocr-verify --probe-qmm`:
+
+```
+bits=4 gs=64:  M1 2.4e-07  M2 1.2e+00!  M3 1.5e+00!  M4 1.3e-06 ... M8 1.2e-06
+```
+
+Nothing shipped before this was affected - greedy decode runs at M=1 and prefill at M in the
+hundreds. It surfaced only when speculative verification started forwarding k+1 tokens, where
+k=1 and k=2 land exactly on the broken widths, and it surfaced as plausible wrong tokens rather
+than an error. `safeQuantizedMM` pads the row dimension to 4 and slices back;
+`OCRPortTests.testQuantizedMatmulIsCorrectAtEveryBatchWidth` pins it.
+
+Worth reporting upstream: the repro is model-free and three lines long.
 
 ## The quantization ladder
 
@@ -128,9 +200,8 @@ Rejected, with the reason recorded so they are not re-derived:
 * **`dyn-f`** (all routed experts 4-bit, attention wide): same runaway on `doc_multiling`.
 * **Keeping the shared expert wide to rescue 4-bit routed experts**: does not work. A build
   differing from plain 4-bit only in shared-expert precision diverges at the identical character.
-* **The FastMTP draft head**: 734 MB, and speculative decoding measured slower than greedy at
-  every draft length. Verifying k tokens activates ~k x top_k distinct experts, and cost here
-  scales with active experts, not tokens. `--mtp` includes it; the default does not.
+* **Uniform 4-bit on handwriting**: `compact` scores CER 0.25 on a clean handwritten page. Do not
+  ship a 4-bit routed-expert build for anything but printed text.
 
 Quantization is not a free speed lever on this model. `fidelity` is only 1% faster than
 unquantized bf16 while being a third smaller, and under the earlier unfused MoE dispatch it was

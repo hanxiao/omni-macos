@@ -39,8 +39,14 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
 - Report prefix-exactness AND CER. They disagree: a build can "diverge at char 482 of 690" over
   one letter inside an HTML attribute (CER 0.0014).
 - 4-bit is not a speed lever here. Decode is fixed-per-launch-latency bound at these skinny
-  shapes, so the big win came from the fused gather-matmul MoE dispatch (+17%) and from 8-bit
-  shared-expert/dense-MLP packs (+12%), not from narrowing the routed experts.
+  shapes, so the wins came from the fused gather-matmul MoE dispatch (+17%), 8-bit
+  shared-expert/dense-MLP packs (+12%) and FastMTP speculation (+13-23%), not from narrowing
+  the routed experts. 4-bit routed experts score CER 0.25 on handwriting - do not ship them.
+- GRADE ON bench/hard2 (Tools/ocr/make_hard_pages.py), not on clean synthetic type. Easy pages
+  agree whatever you do to the weights; the handwriting/receipt/spreadsheet/degraded set is what
+  separated the builds and reversed a shipping decision.
+- MLX 0.31.3 `quantizedMM(transpose: false)` is WRONG at exactly M=2 and M=3 (rel err ~1.5).
+  `safeQuantizedMM` pads to 4. Reproduce with `ocr-verify --probe-qmm`.
 - Two primitives are measured-and-rejected: `MLXFast.rope` (faster and numerically WRONG - the
   checkpoint is Llama split-half, MLX is interleaved) and half-precision qkv/mask inside the
   fused vision SDPA (slower and it drifts). Do not re-adopt without new numbers.

@@ -1,4 +1,6 @@
 import XCTest
+import MLX
+import MLXRandom
 @testable import OmniKit
 
 /// The parts of the OCR port that can be wrong WITHOUT the 4 GB weights being present, and that
@@ -140,6 +142,34 @@ final class OCRPortTests: XCTestCase {
         XCTAssertEqual(url.absoluteString,
                        "https://github.com/\(OCRModelCatalog.repository)/releases/download/"
                        + "\(OCRModelCatalog.releaseTag)/jina-ocr-v1-mlx-compact-omni-ocr.json")
+    }
+
+    /// MLX 0.31.3's `quantizedMM` is WRONG at exactly two row counts, and the port pads around
+    /// it. This pins the workaround: a regression here returns plausible wrong tokens rather than
+    /// an error, which is the worst possible failure shape.
+    ///
+    /// Reproduce the underlying defect with `ocr-verify --probe-qmm`:
+    ///   bits=4 gs=64:  M1 2.4e-07  M2 1.2e+00!  M3 1.5e+00!  M4 1.3e-06 ... M8 1.2e-06
+    func testQuantizedMatmulIsCorrectAtEveryBatchWidth() {
+        let (k, n) = (256, 128)
+        for bits in [4, 8] {
+            for groupSize in [32, 64] {
+                let w = MLXRandom.normal([k, n]) * 0.05
+                let (wq, scales, biases) = quantized(w, groupSize: groupSize, bits: bits)
+                let pack = OCRWeight.Pack(w: wq, scales: scales, biases: biases,
+                                          groupSize: groupSize, bits: bits)
+                let reference = dequantized(wq, scales: scales, biases: biases,
+                                            groupSize: groupSize, bits: bits)
+                for m in 1 ... 8 {
+                    let x = MLXRandom.normal([m, k])
+                    let got = ocrProj(x, .pack(pack))
+                    let want = matmul(x, reference)
+                    let err = (MLX.abs(got - want).max() / MLX.abs(want).max()).item(Float.self)
+                    XCTAssertLessThan(err, 1e-3,
+                                      "quantized matmul wrong at M=\(m), bits=\(bits), gs=\(groupSize)")
+                }
+            }
+        }
     }
 
     /// Each variant names a policy that `Tools/ocr/convert.py` actually defines. The pairing is

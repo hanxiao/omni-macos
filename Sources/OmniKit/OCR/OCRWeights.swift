@@ -62,9 +62,39 @@ func ocrProj(_ x: MLXArray, _ w: OCRWeight) -> MLXArray {
     case .plain(let m):
         return matmul(x.asType(m.dtype), m)
     case .pack(let p):
-        return quantizedMM(x.asType(p.scales.dtype), p.w, scales: p.scales, biases: p.biases,
+        return safeQuantizedMM(x.asType(p.scales.dtype), p)
+    }
+}
+
+/// `quantizedMM` with a workaround for an MLX kernel defect at exactly two row counts.
+///
+/// MEASURED, mlx-swift 0.31.3 (`ocr-verify --probe-qmm` reproduces it in isolation, no model
+/// involved): `quantizedMM(x, w, transpose: false)` returns garbage - relative error ~1.5, i.e.
+/// unrelated numbers rather than a precision loss - when the row dimension is exactly 2 or 3.
+/// M = 1 and M >= 4 are correct to ~1e-6, at 4 and 8 bits and at group size 32 and 64 alike.
+///
+///     bits=4 gs=64:  M1 2.4e-07  M2 1.2e+00!  M3 1.5e+00!  M4 1.3e-06 ... M8 1.2e-06
+///
+/// Nothing shipped before this was affected: greedy decode runs at M = 1 and prefill at M in the
+/// hundreds. It surfaced only when speculative decoding began verifying k+1 tokens at once, where
+/// a draft length of 1 or 2 lands exactly on the broken widths - and it surfaced as plausible
+/// wrong tokens, not as an error.
+///
+/// The fix pads the row dimension out to 4 and slices the result back. That costs one or two
+/// wasted rows on a matmul this small, and it is applied centrally so no call site has to know.
+@inline(__always)
+func safeQuantizedMM(_ x: MLXArray, _ p: OCRWeight.Pack) -> MLXArray {
+    let rows = x.ndim >= 2 ? x.dim(-2) : 1
+    guard x.ndim >= 2, rows == 2 || rows == 3 else {
+        return quantizedMM(x, p.w, scales: p.scales, biases: p.biases,
                            transpose: false, groupSize: p.groupSize, bits: p.bits)
     }
+    var widths = [IntOrPair](repeating: IntOrPair(0), count: x.ndim)
+    widths[x.ndim - 2] = IntOrPair((0, 4 - rows))
+    let padded = MLX.padded(x, widths: widths)
+    let y = quantizedMM(padded, p.w, scales: p.scales, biases: p.biases,
+                        transpose: false, groupSize: p.groupSize, bits: p.bits)
+    return y.ndim == 2 ? y[0 ..< rows] : y[.ellipsis, 0 ..< rows, 0...]
 }
 
 /// `x @ W[idx]` for a STACK of experts, fused: the gather happens inside the matmul kernel.

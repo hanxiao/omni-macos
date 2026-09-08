@@ -62,6 +62,7 @@ final class OCRKVCache {
         keys![0..., previous ..< (previous + fresh), 0...] = k
         values![0..., previous ..< (previous + fresh), 0...] = v
         offset = previous + fresh
+        if OCRRuntime.evalCacheWrites { eval(keys!, values!) }
     }
 
     func truncate(keep: Int) { offset = min(max(keep, 0), offset) }
@@ -108,6 +109,9 @@ enum OCRRuntime {
     /// One caveat kept honest: why the PREFILL dispatch changes DECODE throughput at all (both
     /// settings decode at n = 1 through the same code) is not attributed. Allocator pool state
     /// is the obvious suspect and it has not been measured, so it is not claimed.
+    /// Force the in-place KV write to materialise before anything reads the view.
+    static let evalCacheWrites = ProcessInfo.processInfo.environment["OMNI_OCR_EVAL_CACHE"] == "1"
+    static let specDebug = ProcessInfo.processInfo.environment["OMNI_OCR_SPEC_DEBUG"] == "1"
     static let fusedMoEMaxTokens = ProcessInfo.processInfo.environment["OMNI_OCR_FUSED_MOE"]
         .flatMap { Int($0) } ?? Int.max
 }
@@ -403,7 +407,9 @@ final class OCRMTPHead: @unchecked Sendable {
         postLN = w.array("mtp.block.post_attention_layernorm")
         attn = OCRAttention(w, "mtp.block.attn")
         mlp = OCRDenseMLP(w, "mtp.block.mlp")
-        sharedNorm = w.array("mtp.norm.weight")
+        // Absent in the "shared" checkpoint format, where the draft is meant to reuse the main
+        // model's final norm. Falling back keeps such a build loadable; it does not make it good.
+        sharedNorm = w.has("mtp.norm.weight") ? w.array("mtp.norm.weight") : w.array("norm.weight")
         embed = w.has("mtp.embed_tokens") ? w.array("mtp.embed_tokens") : nil
         head = w.has("mtp.head") ? w["mtp.head"] : nil
     }

@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXRandom
 import OmniKit
 
 /// Numeric gate + benchmark for the Swift/MLX jina-ocr-v1 port.
@@ -36,6 +37,13 @@ struct CaseResult {
     var ttft: Double = 0
     var decodeTPS: Double = 0
     var stoppedBy: String = ""
+    var acceptance: Double = 0
+    var tokensPerCycle: Double = 0
+    var acceptedAt: [Int] = []
+    /// Speculation is lossless BY CONSTRUCTION, so this is not a quality metric - it is the
+    /// check that the construction holds. Any difference from the greedy run of the same build
+    /// is a bookkeeping bug in the draft/verify/rollback path, not a precision effect.
+    var matchesGreedy: Bool?
     var skipped: String?
 }
 
@@ -52,6 +60,8 @@ var onlyCases: [String] = []
 var runStages = true, runGreedy = true, asJSON = false
 var maxNew = 1024
 var horizonRoot: String?
+var specK = 0
+var probeChunk = 0
 var repeats = 1
 var positional: [String] = []
 var i = 0
@@ -64,11 +74,40 @@ while i < args.count {
     case "--json": asJSON = true
     case "--max-new": i += 1; maxNew = Int(args[i]) ?? 1024
     case "--horizon": i += 1; horizonRoot = args[i]
+    case "--spec": i += 1; specK = Int(args[i]) ?? 0
+    case "--probe-batch": i += 1; probeChunk = Int(args[i]) ?? 0
     case "--repeat": i += 1; repeats = max(1, Int(args[i]) ?? 1)
     default: positional.append(args[i])
     }
     i += 1
 }
+// Minimal, model-free check of MLX's quantized matmul across batch sizes. It exists because a
+// whole-model symptom (speculative verification wrong at some batch sizes and right at others)
+// has to be reduced to one op before it can be called an upstream bug rather than a port bug.
+if args.contains("--probe-qmm") {
+    let K = 1280, N = 896
+    for bits in [4, 8] {
+        for gs in [32, 64] {
+            let w = MLXRandom.normal([K, N]) * 0.05
+            let (wq, scales, biases) = quantized(w, groupSize: gs, bits: bits)
+            let deq = dequantized(wq, scales: scales, biases: biases, groupSize: gs, bits: bits)
+            var bad: [Int] = []
+            var line = "bits=\(bits) gs=\(gs):"
+            for m in 1 ... 8 {
+                let x = MLXRandom.normal([m, K])
+                let a = quantizedMM(x, wq, scales: scales, biases: biases, transpose: false,
+                                    groupSize: gs, bits: bits)
+                let b = matmul(x, deq)
+                let err = (MLX.abs(a - b).max() / MLX.abs(b).max()).item(Float.self)
+                if err > 1e-3 { bad.append(m) }
+                line += String(format: "  M%d %.1e%@", m, err, err > 1e-3 ? "!" : "")
+            }
+            print(line + (bad.isEmpty ? "   all OK" : "   WRONG at M=\(bad)"))
+        }
+    }
+    exit(0)
+}
+
 guard positional.count >= 2 else {
     die("usage: ocr-verify <modelDir> <refRoot> [--tokenizer DIR] [--case NAME] [--stages-only|--greedy-only] [--max-new N] [--repeat N] [--json]")
 }
@@ -190,6 +229,15 @@ for ref in references {
         continue
     }
     let image = try OCRPreprocess.load(contentsOf: URL(fileURLWithPath: ref.imagePath))
+    if probeChunk > 0 {
+        for c in [1, 2, 3, 4, 5, 8] where c <= probeChunk || probeChunk == 99 {
+            let (seq, bat) = try model.probeBatchEquivalence(image: image, tokens: 8, chunk: c)
+            let agree = zip(seq, bat).prefix { $0 == $1 }.count
+            print("  chunk=\(c)  sequential \(seq)")
+            print("            batched    \(bat)   agree \(agree)/\(seq.count)")
+        }
+        continue
+    }
     var oursStages: [String: MLXArray] = [:]
     var refStages: [String: MLXArray] = [:]
 
@@ -252,13 +300,41 @@ for ref in references {
 
     if runGreedy {
         var best: OCRModel.Result?
+        var stats: OCRModel.SpeculativeStats?
         for _ in 0 ..< repeats {
             // Loop guard OFF: the certified claim is that unguarded decode reproduces the
             // reference token for token. The guard is a product behaviour layered on top.
-            let out = try model.transcribe(image: image, maxNewTokens: maxNew, loopGuard: false)
-            if best == nil || out.decodeTokensPerSecond > best!.decodeTokensPerSecond { best = out }
+            if specK > 0 {
+                let (out, st) = try model.transcribeSpeculative(
+                    image: image, maxNewTokens: maxNew, draftLength: specK, loopGuard: false)
+                if best == nil || out.decodeTokensPerSecond > best!.decodeTokensPerSecond {
+                    best = out; stats = st
+                }
+            } else {
+                let out = try model.transcribe(image: image, maxNewTokens: maxNew, loopGuard: false)
+                if best == nil || out.decodeTokensPerSecond > best!.decodeTokensPerSecond { best = out }
+            }
         }
         let out = best!
+        if let stats {
+            result.acceptance = stats.acceptanceRate
+            result.tokensPerCycle = stats.tokensPerCycle
+            result.acceptedAt = stats.acceptedAt
+            // Same build, greedy, same page: the token streams must be identical.
+            let greedy = try model.transcribe(image: image, maxNewTokens: maxNew, loopGuard: false)
+            result.matchesGreedy = greedy.tokens == out.tokens
+            if greedy.tokens != out.tokens {
+                let at = zip(greedy.tokens, out.tokens).prefix { $0 == $1 }.count
+                let g = at < greedy.tokens.count ? String(greedy.tokens[at]) : "-"
+                let o = at < out.tokens.count ? String(out.tokens[at]) : "-"
+                // Re-run speculation to separate a numeric tie-flip (deterministic) from a race
+                // (non-deterministic). They need completely different responses.
+                let again = try model.transcribeSpeculative(
+                    image: image, maxNewTokens: maxNew, draftLength: specK, loopGuard: false).result
+                print("     spec != greedy at token \(at)/\(greedy.tokens.count): greedy \(g) vs spec \(o)"
+                      + "  deterministic=\(again.tokens == out.tokens)")
+            }
+        }
         result.ttft = out.ttft
         result.decodeTPS = out.decodeTokensPerSecond
         result.stoppedBy = out.stoppedBy.rawValue
@@ -301,6 +377,12 @@ for ref in references {
     if runGreedy {
         line += String(format: "CER %.4f  ttft %.0f ms  %.1f tok/s  %@",
                        result.cer, result.ttft * 1000, result.decodeTPS, result.stoppedBy)
+        if specK > 0 {
+            line += String(format: "  accept %.2f  %.2f tok/cycle  %@",
+                           result.acceptance, result.tokensPerCycle,
+                           result.matchesGreedy == true ? "== greedy" : "*** DIFFERS FROM GREEDY ***")
+            line += "  by-position \(result.acceptedAt)"
+        }
     }
     print(line)
     if let w = result.worstStage, w.2 > 1e-2 || !runGreedy {

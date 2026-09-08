@@ -51,7 +51,7 @@ public final class OCRModel: @unchecked Sendable {
     let tokenizer: Tokenizer
     private let imageNewline: MLXArray
     private let viewSeparator: MLXArray
-    private let eosID: Int
+    let eosID: Int
     public let modelDir: URL
     public private(set) var loadSeconds: Double = 0
 
@@ -164,7 +164,14 @@ public final class OCRModel: @unchecked Sendable {
     /// is shorter than the sequence, so a masked broadcast cannot express it, and a gather is one
     /// kernel with no zero-fill pass.
     func embedPrompt(_ prep: Prepared) throws -> MLXArray {
-        let visual = visualFeatures(prep)
+        try embedPrompt(prep, visual: visualFeatures(prep), table: nil)
+    }
+
+    /// `table == nil` uses the target's embedding matrix; passing the draft head's own table
+    /// builds the same sequence for the MTP head, which in this checkpoint owns a SEPARATE input
+    /// embedding (`mtp_embed_tokens`). The visual block is shared - there is no draft-side vision
+    /// tower, and the image slots carry projected features rather than token embeddings either way.
+    func embedPrompt(_ prep: Prepared, visual: MLXArray, table: MLXArray?) throws -> MLXArray {
         let n = prep.ids.count
         var gather = [Int32](repeating: 0, count: n)
         var next = n
@@ -176,7 +183,7 @@ public final class OCRModel: @unchecked Sendable {
         guard visualCount == visual.dim(0) else {
             throw OmniError.model("visual token mismatch: block \(visual.dim(0)) vs \(visualCount) <image> slots")
         }
-        let text = llm.embed(prep.ids)
+        let text = table.map { $0[MLXArray(prep.ids.map { Int32($0) })] } ?? llm.embed(prep.ids)
         let combined = concatenated([text, visual.asType(text.dtype)], axis: 0)
         return combined[MLXArray(gather)]
     }
