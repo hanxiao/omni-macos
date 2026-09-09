@@ -18,15 +18,15 @@ import UniformTypeIdentifiers
 struct OCRView: View {
     @Environment(OCRSession.self) private var session
     @State private var dropTargeted = false
-    /// Drives Quick Look, exactly as the results list does.
-    @State private var previewURL: URL?
 
     var body: some View {
         @Bindable var session = session
         Group {
             switch session.phase {
             case .empty:
-                DropZone(targeted: dropTargeted) { chooseFiles() }
+                SearchWaysPrompt(title: "Drop a document to transcribe",
+                                 symbol: "text.viewfinder",
+                                 ways: SearchWaysPrompt.transcribeWays)
                     .accessibilityIdentifier("ocr.dropzone")
             case .needsModel:
                 ModelMissing().accessibilityIdentifier("ocr.needsmodel")
@@ -40,16 +40,14 @@ struct OCRView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .inspector(isPresented: railBinding) {
-            PageRail(onPreview: { previewURL = session.previewURL(for: $0) })
-                .inspectorColumnWidth(min: 132, ideal: 168, max: 280)
-        }
         .dropDestination(for: URL.self) { urls, _ in
             session.open(urls: urls)
             return true
         } isTargeted: { dropTargeted = $0 }
         .overlay(alignment: .top) {
-            if dropTargeted && session.phase != .empty { DropOverlay() }
+            // In every state, including the empty one: the drop zone that used to carry its own
+            // targeting is gone, so this chip is the only feedback a drag gets.
+            if dropTargeted { DropOverlay() }
         }
         .overlay(alignment: .top) {
             if let notice = session.notice {
@@ -60,27 +58,20 @@ struct OCRView: View {
         // Escape is the system's "stop what you are doing". It reaches here because the workspace
         // is the focused content of the window.
         .onExitCommand { if session.isBusy { session.cancel() } }
-        .quickLookPreview($previewURL)
+        .quickLookPreview(Binding(get: { session.previewing }, set: { session.previewing = $0 }))
         // Space previews the current page, the way it does in Finder and in the results list. A
         // focus-based key handler is not enough: the navigator List swallows the space key before
         // an ancestor sees it, which is the same reason the results list uses this monitor.
         .background(QuickLookKeyMonitor(
             onSpace: { previewCurrentPage() },
             onPreviewArrow: { vertical, forward in
-                guard previewURL != nil, vertical else { return false }
+                guard session.previewing != nil, vertical else { return false }
                 session.step(by: forward ? 1 : -1)
                 previewCurrentPage(force: true)
                 return true
             },
-            isPreviewOpen: { previewURL != nil }))
+            isPreviewOpen: { session.previewing != nil }))
         .toolbar { toolbar }
-    }
-
-    /// The navigator is only meaningful once there are pages; `railVisible` remembers whether the
-    /// user closed it so it stays closed across documents.
-    private var railBinding: Binding<Bool> {
-        Binding(get: { session.railVisible && !session.pages.isEmpty },
-                set: { session.railVisible = $0 })
     }
 
     // MARK: - Workspace
@@ -133,9 +124,9 @@ struct OCRView: View {
 
     /// Space toggles; an arrow inside an open preview replaces it with the next page.
     private func previewCurrentPage(force: Bool = false) {
-        if previewURL != nil && !force { previewURL = nil; return }
+        if session.previewing != nil && !force { session.previewing = nil; return }
         guard let id = session.visibleIndex else { return }
-        previewURL = session.previewURL(for: id)
+        session.previewing = session.previewURL(for: id)
     }
 
     // MARK: - Toolbar
@@ -221,8 +212,7 @@ struct OCRView: View {
 /// The pages, as a real `List` with a selection binding: arrow keys, focus ring, selection colour
 /// and VoiceOver come from the platform. The previous version was a `LazyVStack` of tap gestures,
 /// which had none of those and could not be driven from the keyboard at all.
-private struct PageRail: View {
-    var onPreview: (Int) -> Void
+struct PageRail: View {
     @Environment(OCRSession.self) private var session
 
     var body: some View {
@@ -230,7 +220,7 @@ private struct PageRail: View {
             List(selection: Binding<Int?>(get: { session.visibleIndex },
                                           set: { if let id = $0 { session.select(id) } })) {
                 ForEach(session.visiblePages) { page in
-                    PageThumb(page: page, onPreview: { onPreview(page.id) })
+                    PageThumb(page: page, onPreview: { session.previewing = session.previewURL(for: page.id) })
                         .id(page.id)
                         .tag(page.id)
                         .listRowInsets(EdgeInsets(top: 3, leading: 4, bottom: 3, trailing: 4))
@@ -798,37 +788,6 @@ private struct ProgressReadout: View {
 }
 
 // MARK: - Empty and error states
-
-private struct DropZone: View {
-    let targeted: Bool
-    var onChoose: () -> Void
-
-    var body: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "text.viewfinder")
-                .font(.system(size: 44, weight: .light))
-                .foregroundStyle(targeted ? Color.accentColor : .secondary)
-            Text("Drop a document to transcribe")
-                .font(.title3.weight(.medium))
-            Text("PDFs and images become Markdown on this Mac.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            // Dragging is the fast path, not the only one: a file already open in another app, or
-            // one reached through the sidebar, has no window to drag from.
-            Button("Choose Document\u{2026}", action: onChoose)
-                .buttonStyle(.borderedProminent)
-                .padding(.top, 4)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background {
-            RoundedRectangle(cornerRadius: 14)
-                .strokeBorder(style: StrokeStyle(lineWidth: 1.5, dash: [7, 5]))
-                .foregroundStyle(targeted ? Color.accentColor : Color.secondary.opacity(0.35))
-                .padding(28)
-        }
-        .animation(.easeOut(duration: 0.15), value: targeted)
-    }
-}
 
 private struct DropOverlay: View {
     var body: some View {

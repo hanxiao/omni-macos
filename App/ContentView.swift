@@ -125,6 +125,16 @@ struct ContentView: View {
             .toolbar { toolbar }
             .background(WindowTitleHider(onSearchByFile: { model.searchByFilePanel() }))
         }
+        // The page navigator belongs to the SPLIT VIEW, not to the detail's content. Applied
+        // inside the detail it made SwiftUI build a second split group, and the system's sidebar
+        // toggle is placed relative to whichever split owns it - so the toggle jumped 300pt to the
+        // right the moment OCR mode was entered, measured at x=874 against x=1174.
+        .inspector(isPresented: Binding(
+            get: { model.ocrMode && ocr.railVisible && !ocr.pages.isEmpty },
+            set: { ocr.railVisible = $0 }
+        )) {
+            PageRail().inspectorColumnWidth(min: 132, ideal: 168, max: 280)
+        }
     }
 
     // MARK: - Detail
@@ -852,9 +862,14 @@ struct CenteredStatus: View {
 struct SearchWaysPrompt: View {
     let title: String
     var showSpinner: Bool = false
+    /// The empty state is ONE view whose contents cross-fade between searching and transcribing.
+    /// Both modes want the same thing said the same way - an icon, what this pane is for, and the
+    /// handful of ways in - so building a second layout for OCR only made the window restructure
+    /// itself for no gain.
+    var symbol: String = "sparkle.magnifyingglass"
+    var ways: [(icon: String, text: String)] = SearchWaysPrompt.searchWays
 
-    // (icon, text). Icons mirror the toolbar/menu/chip controls they describe.
-    private let ways: [(icon: String, text: String)] = [
+    static let searchWays: [(icon: String, text: String)] = [
         ("character.cursor.ibeam", "Type a phrase, ranked by meaning"),
         ("arrow.down.doc", "Drag in an image, file, or text"),
         ("doc.on.clipboard", "Paste an image or text  \u{2318}V"),
@@ -862,9 +877,18 @@ struct SearchWaysPrompt: View {
         ("square.on.square", "Right-click a result for Find Similar"),
     ]
 
+    static let transcribeWays: [(icon: String, text: String)] = [
+        ("arrow.down.doc", "Drop a PDF or images"),
+        ("folder", "Choose a document  \u{2318}O"),
+        ("magnifyingglass", "Find in the transcript, then \u{2318}G"),
+        ("doc.on.doc", "Copy as Markdown  \u{21E7}\u{2318}C"),
+        ("square.and.arrow.down", "Save as .md  \u{2318}S"),
+    ]
+
     var body: some View {
         VStack(spacing: 16) {
-            Image(systemName: "sparkle.magnifyingglass").font(.system(size: 44, weight: .light)).foregroundStyle(.tertiary)
+            Image(systemName: symbol).font(.system(size: 44, weight: .light)).foregroundStyle(.tertiary)
+                .contentTransition(.symbolEffect(.replace))
             Text(title).font(.title)
             VStack(alignment: .leading, spacing: 10) {
                 ForEach(ways, id: \.icon) { w in
@@ -875,6 +899,7 @@ struct SearchWaysPrompt: View {
                 }
             }
             .font(.callout).foregroundStyle(.secondary)   // content-width block; the outer VStack centers it
+            .id(symbol)                                   // a new set of ways fades in, not swaps
             if showSpinner { ProgressView().controlSize(.small).padding(.top, 4) }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

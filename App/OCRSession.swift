@@ -163,6 +163,9 @@ final class OCRSession {
 
     var mode: ViewMode = .rendered
     var railVisible = true
+    /// Drives Quick Look. On the session rather than in a view because the page navigator and the
+    /// preview now live in different views - see the inspector's placement in ContentView.
+    var previewing: URL?
     /// The user's revision of the WHOLE document's Markdown, once they have made one.
     ///
     /// Not per page. The panes render one continuous document, so the thing a person edits and the
