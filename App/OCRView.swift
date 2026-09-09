@@ -93,6 +93,9 @@ struct OCRView: View {
             }
             content
         }
+            .overlay(alignment: .top) {
+                if !session.find.isEmpty { FindBar() }
+            }
             .overlay(alignment: .bottom) {
                 if session.readoutVisible { ProgressReadout() }
             }
@@ -448,7 +451,7 @@ private struct RenderedSection: View {
         let blocks = MarkdownBlock.parse(session.sectionText(id))
         VStack(alignment: .leading, spacing: 10) {
             ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                block.view.transition(StreamFade.transition)
+                block.view(highlighting: session.find).transition(StreamFade.transition)
             }
             if state == .running { TypingCaret() }
             if state == .failed { PageFailed() }
@@ -600,7 +603,7 @@ private struct RawSection: View {
     @Environment(OCRSession.self) private var session
 
     var body: some View {
-        Text(MarkdownSource.highlighted(session.sectionText(id)))
+        Text(FindHighlight.mark(session.find, in: MarkdownSource.highlighted(session.sectionText(id))))
             .font(.system(.body, design: .monospaced))
             .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -647,6 +650,12 @@ private struct DocumentScroll<Content: View>: View {
             // well past the fold, and a reader watching it transcribe should not have to chase it
             // down the window. Unanimated on purpose: a 24 Hz animated scroll never settles, and
             // the whole point is that the last line stays where the eye already is.
+            // Stepping through find matches moves the document to the section holding the match,
+            // the way Preview scrolls to what it found.
+            .onChange(of: session.activeMatchSection) { _, id in
+                guard let id else { return }
+                withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(id, anchor: .center) }
+            }
             .onChange(of: session.streamTick) { _, _ in
                 guard session.isFollowingRun else { return }
                 proxy.scrollTo(documentTailID, anchor: .bottom)
@@ -856,6 +865,43 @@ struct TranscriptFile: Transferable {
             Data(file.markdown.utf8)
         }
         .suggestedFileName { $0.name }
+    }
+}
+
+/// Match count and step controls for find.
+///
+/// It cannot live in the search field's prompt, which is the obvious place: a prompt is only shown
+/// while the field is EMPTY, so the count would disappear at the exact moment there is one. This is
+/// Safari's answer - a small bar that says where you are among the matches and lets you walk them.
+private struct FindBar: View {
+    @Environment(OCRSession.self) private var session
+
+    var body: some View {
+        GlassGroup(spacing: 10) {
+            HStack(spacing: 8) {
+                Text(session.matchCount == 0
+                     ? "No matches"
+                     : "\(session.activeMatch + 1) of \(session.matchCount)")
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(session.matchCount == 0 ? .secondary : .primary)
+
+                Button { session.stepMatch(by: -1) } label: { Image(systemName: "chevron.left") }
+                    .help("Previous match  \u{21e7}\u{2318}G")
+                    .accessibilityLabel("Previous match")
+                Button { session.stepMatch(by: 1) } label: { Image(systemName: "chevron.right") }
+                    .help("Next match  \u{2318}G")
+                    .accessibilityLabel("Next match")
+            }
+            .buttonStyle(.borderless)
+            .disabled(session.matchCount == 0)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .glassChip(interactive: session.matchCount > 0)
+        }
+        .shadow(color: .black.opacity(0.14), radius: 8, y: 2)
+        .padding(.top, 12)
+        .transition(.move(edge: .top).combined(with: .opacity))
+        .accessibilityIdentifier("ocr.findbar")
     }
 }
 

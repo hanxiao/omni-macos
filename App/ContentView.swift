@@ -36,7 +36,17 @@ struct ContentView: View {
 
     var body: some View {
         Group {
-            if showsSearch {
+            if model.ocrMode {
+                // The same field, a different question. Searching the vector index while reading a
+                // transcript answers something nobody asked; what a reader wants here is Preview's
+                // find - matches marked where they are, with a way to step through them. No
+                // suggestions: there is nothing to complete against one document.
+                split
+                    .searchable(text: Binding(get: { ocr.find }, set: { ocr.find = $0 }),
+                                placement: .toolbar,
+                                prompt: "Find in document")
+                    .onSubmit(of: .search) { ocr.stepMatch(by: 1) }
+            } else if showsSearch {
                 split
                     .searchable(text: Binding(get: { model.rawQuery }, set: { handleQueryEdit($0) }),
                                 placement: .toolbar, prompt: "Search by meaning") {

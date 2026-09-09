@@ -141,6 +141,13 @@ struct OmniApp: App {
                         Text("Share\u{2026}")
                     }
                     .disabled(ocr.completedPages == 0)
+                    // Find navigation, on the chords every Mac app uses for it.
+                    Button("Find Next") { ocr.stepMatch(by: 1) }
+                        .keyboardShortcut("g", modifiers: .command)
+                        .disabled(ocr.matchCount == 0)
+                    Button("Find Previous") { ocr.stepMatch(by: -1) }
+                        .keyboardShortcut("g", modifiers: [.command, .shift])
+                        .disabled(ocr.matchCount == 0)
                     Button("Stop Transcribing") { ocr.cancel() }
                         .keyboardShortcut(".", modifiers: .command)
                         .disabled(!ocr.isBusy)

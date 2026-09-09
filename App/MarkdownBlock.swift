@@ -1,6 +1,5 @@
 import Foundation
 import SwiftUI
-@_spi(Textual) import SwiftUIMath
 
 /// A minimal block-level Markdown renderer for transcription output.
 ///
@@ -21,20 +20,20 @@ enum MarkdownBlock {
     case code(String)
     case rule
     case table(rows: [[String]], hasHeader: Bool)
-    /// Display maths: `$$ … $$`, which this model is asked to emit for block formulas.
-    case math(String)
 
-    // Main actor because it is only ever built from a SwiftUI body, and because SwiftUIMath's
-    // modifiers are main-actor isolated - which Release did not flag and Debug did.
-    @MainActor @ViewBuilder var view: some View {
+    // Main actor because it is only ever built from a SwiftUI body.
+    /// `highlighting` marks find matches. It is applied to the RENDERED text rather than to the
+    /// Markdown source: the source has markers the reader never sees, so a range mapped from it
+    /// would land in the wrong place, and what a reader is looking for is what is on screen.
+    @MainActor @ViewBuilder func view(highlighting find: String = "") -> some View {
         switch self {
         case .heading(let level, let text):
-            Text(inline(text))
+            Text(inline(text, find))
                 .font(Self.headingFont(level))
                 .padding(.top, level <= 2 ? 8 : 4)
 
         case .paragraph(let text):
-            Text(inline(text))
+            Text(inline(text, find))
                 .font(.body)
                 .fixedSize(horizontal: false, vertical: true)
 
@@ -43,7 +42,7 @@ enum MarkdownBlock {
                 ForEach(Array(items.enumerated()), id: \.offset) { _, item in
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Text("•").foregroundStyle(.secondary)
-                        Text(inline(item)).fixedSize(horizontal: false, vertical: true)
+                        Text(inline(item, find)).fixedSize(horizontal: false, vertical: true)
                     }
                 }
             }
@@ -53,13 +52,13 @@ enum MarkdownBlock {
                 ForEach(Array(items.enumerated()), id: \.offset) { index, item in
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Text("\(index + 1).").foregroundStyle(.secondary).monospacedDigit()
-                        Text(inline(item)).fixedSize(horizontal: false, vertical: true)
+                        Text(inline(item, find)).fixedSize(horizontal: false, vertical: true)
                     }
                 }
             }
 
         case .code(let body):
-            Text(body)
+            Text(FindHighlight.mark(find, in: AttributedString(body)))
                 .font(.system(.callout, design: .monospaced))
                 .padding(10)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -68,17 +67,9 @@ enum MarkdownBlock {
         case .rule:
             Divider().padding(.vertical, 6)
 
-        case .math(let latex):
-            // Display maths is properly typeset, not approximated: a block equation is the one
-            // place a stacked fraction, a radical with a bar, and limits set above and below
-            // actually matter, and it is a standalone block so nothing is lost by rendering it as
-            // a view rather than as flowing text. Inline maths stays in `MathText`, where being
-            // selectable, copyable text that reflows with the paragraph is worth more than
-            // perfect typesetting.
-            MathBlock(latex: latex)
 
         case .table(let rows, let hasHeader):
-            TableBlock(rows: rows, hasHeader: hasHeader)
+            TableBlock(rows: rows, hasHeader: hasHeader, find: find)
         }
     }
 
@@ -93,11 +84,8 @@ enum MarkdownBlock {
 
     /// Inline Markdown only. `.inlineOnlyPreservingWhitespace` is deliberate: the full parser
     /// would swallow leading `#` and `-` markers that this splitter has already claimed.
-    /// Maths is resolved BEFORE the Markdown parser sees the line: `$x^2$` and `$a_i$` contain the
-    /// characters that parser treats as emphasis, so it would eat the exponent and hand back the
-    /// wrong text with no way to tell.
-    private func inline(_ text: String) -> AttributedString {
-        MathText.inline(text) { InlineCache.attributed($0) }
+    private func inline(_ text: String, _ find: String) -> AttributedString {
+        FindHighlight.mark(find, in: InlineCache.attributed(text))
     }
 }
 
@@ -165,29 +153,6 @@ extension MarkdownBlock {
                     index += 1
                 }
                 if let table = parseHTMLTable(body) { blocks.append(table) }
-                continue
-            }
-
-            if trimmed.hasPrefix("$$") {
-                flushParagraph()
-                var body = trimmed.dropFirst(2)
-                if let end = body.range(of: "$$") {          // opened and closed on one line
-                    blocks.append(.math(String(body[..<end.lowerBound])))
-                    index += 1
-                    continue
-                }
-                index += 1
-                while index < lines.count {
-                    let line = lines[index]
-                    if let end = line.range(of: "$$") {
-                        body += "\n" + line[..<end.lowerBound]
-                        index += 1
-                        break
-                    }
-                    body += "\n" + line
-                    index += 1
-                }
-                blocks.append(.math(String(body)))
                 continue
             }
 
@@ -329,37 +294,26 @@ extension MarkdownBlock {
     }
 }
 
-/// A display equation, typeset if it can be and legible if it cannot.
+/// Marks find matches in text that is already laid out.
 ///
-/// `Math` draws NOTHING when the LaTeX fails to parse - the equation simply disappears, which on a
-/// transcript is the one outcome worse than setting it plainly. Real OCR output earns that often
-/// enough to matter: a scan of "x_i^(1/n)" comes back with `\wedge` and `..` in it.
-///
-/// So the LaTeX is checked first through the same measurement the layout uses (`typographicBounds`
-/// returns `.zero` when the display could not be built) and falls back to the Unicode setting in
-/// `MathText`, which never fails. The API is `@_spi(Textual)` - Textual, by the same author, uses
-/// it for exactly this measurement - so it is exported for use, not a private detail being prised
-/// open.
-private struct MathBlock: View {
-    let latex: String
-
-    private var typesettable: Bool {
-        Math.typographicBounds(for: latex, fitting: .unspecified,
-                               font: .init(name: .latinModern, size: 20),
-                               style: .display).width > 0
-    }
-
-    var body: some View {
-        Group {
-            if typesettable {
-                Math(latex).mathTypesettingStyle(.display)
-            } else {
-                Text(MathText.render(latex)).font(.title3)
+/// The system's own find tint, so a match here looks like a match anywhere else on the Mac, and it
+/// follows the appearance rather than being a fixed yellow that turns muddy in dark mode.
+enum FindHighlight {
+    static func mark(_ find: String, in text: AttributedString) -> AttributedString {
+        guard !find.isEmpty else { return text }
+        var out = text
+        let plain = String(out.characters)
+        var from = plain.startIndex
+        while let r = plain.range(of: find, options: .caseInsensitive, range: from ..< plain.endIndex) {
+            if let lower = AttributedString.Index(r.lowerBound, within: out),
+               let upper = AttributedString.Index(r.upperBound, within: out) {
+                out[lower ..< upper].backgroundColor = Color(nsColor: .findHighlightColor)
+                out[lower ..< upper].foregroundColor = Color(nsColor: .black)
             }
+            from = r.upperBound
+            if r.upperBound == plain.endIndex { break }
         }
-        .frame(maxWidth: .infinity, alignment: .center)
-        .padding(.vertical, 8)
-        .textSelection(.enabled)
+        return out
     }
 }
 
@@ -387,6 +341,7 @@ struct StreamFade: ViewModifier {
 private struct TableBlock: View {
     let rows: [[String]]
     let hasHeader: Bool
+    var find: String = ""
 
     private var columns: Int { rows.map(\.count).max() ?? 0 }
 
@@ -397,7 +352,7 @@ private struct TableBlock: View {
                     GridRow {
                         ForEach(0 ..< columns, id: \.self) { column in
                             let value = column < row.count ? row[column] : ""
-                            Text(value)
+                            Text(FindHighlight.mark(find, in: AttributedString(value)))
                                 // Numerics right-align, which is what makes a ledger readable and
                                 // what a plain grid gets wrong by default.
                                 .font(isNumeric(value) ? .system(.callout, design: .monospaced) : .callout)

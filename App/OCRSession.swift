@@ -197,6 +197,56 @@ final class OCRSession {
     /// text itself, so the scroller does not have to observe a string that changes 24 times a
     /// second just to know that it did.
     private(set) var streamTick = 0
+    // MARK: - Find in document
+    //
+    // The toolbar's search field means something different here. Searching the vector index while
+    // looking at a transcript is answering a question nobody asked; what a reader wants is Preview's
+    // find - the matches marked where they are, and a way to step through them.
+
+    /// The find query. Plain substring, case-insensitive: this is find-in-page, not the semantic
+    /// search the same field runs everywhere else, and a reader looking for "P022" means that text.
+    var find = "" {
+        didSet {
+            guard find != oldValue else { return }
+            activeMatch = 0
+            rebuildMatches()
+        }
+    }
+    /// Section id and the count of matches in it, in reading order.
+    private(set) var matchSections: [Int] = []
+    private(set) var matchCount = 0
+    private(set) var activeMatch = 0
+
+    /// Which section the active match is in, so the panes can scroll to it.
+    var activeMatchSection: Int? {
+        guard matchCount > 0, activeMatch < matchSections.count else { return nil }
+        return matchSections[activeMatch]
+    }
+
+    func stepMatch(by delta: Int) {
+        guard matchCount > 0 else { return }
+        activeMatch = (activeMatch + delta + matchCount) % matchCount
+    }
+
+    /// Recomputed when the query changes and as sections finish, so a match in a page that is
+    /// still decoding appears the moment its text does.
+    func rebuildMatches() {
+        guard !find.isEmpty else { matchSections = []; matchCount = 0; return }
+        var sections: [Int] = []
+        for id in sectionIDs {
+            let text = sectionText(id)
+            var from = text.startIndex
+            while let r = text.range(of: find, options: .caseInsensitive, range: from ..< text.endIndex) {
+                sections.append(id)
+                from = r.upperBound
+                if r.upperBound == text.endIndex { break }
+            }
+        }
+        matchSections = sections
+        matchCount = sections.count
+        if activeMatch >= matchCount { activeMatch = 0 }
+    }
+
     /// A problem that should not cost the user the document they are looking at - an unsupported
     /// drop, say. Shown as a transient chip; `phase` only goes to `.failed` when there is nothing
     /// left to show.
@@ -365,6 +415,7 @@ final class OCRSession {
         documentEdit = nil
         editSections = []
         previewCache = [:]
+        find = ""
         notice = nil
 
         guard let installed = Self.installedModel() else {
@@ -628,6 +679,7 @@ final class OCRSession {
                         self.pages[index].tokensPerSecond = result.decodeTokensPerSecond
                         self.pages[index].state = .done
                         self.lastDoneIndex = index
+                        if !self.find.isEmpty { self.rebuildMatches() }
                         self.currentTokensPerSecond = result.decodeTokensPerSecond
                     } else {
                         self.pages[index].state = .failed
