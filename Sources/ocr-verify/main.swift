@@ -197,11 +197,14 @@ if let i = args.firstIndex(of: "--pdf") {
         ?? { die("usage: ocr-verify <modelDir> --pdf <file.pdf> [--pages N] [--no-pipeline] [--tokenizer DIR]") }()
     let limit = args.firstIndex(of: "--pages").flatMap { Int(args[$0 + 1]) }
     let pipelined = !args.contains("--no-pipeline")
+    // Draft length for the document path. It had none, so `--draft N` here silently measured the
+    // default on every run - a sweep that could only ever report a flat line.
+    let pdfDraft = args.firstIndex(of: "--draft").flatMap { $0 + 1 < args.count ? Int(args[$0 + 1]) : nil } ?? 3
     let tokDir = args.firstIndex(of: "--tokenizer").map { URL(fileURLWithPath: args[$0 + 1]) }
 
     let model = try await OCRModel(modelDir: URL(fileURLWithPath: modelPath), tokenizerDir: tokDir)
     print("model  \(modelPath)  loaded in \(String(format: "%.1f", model.loadSeconds))s")
-    print("pdf    \(pdf.lastPathComponent)  pipelined=\(pipelined)")
+    print("pdf    \(pdf.lastPathComponent)  pipelined=\(pipelined)  draft=\(pdfDraft)")
     // 0 = let OCRTokenBudget decide from the context window and this machine's memory.
     let cap = args.firstIndex(of: "--max-new").flatMap { Int(args[$0 + 1]) } ?? 0
     print(String(format: "budget %d tok/page for a 1007-token prompt (%.1f KB KV per token, %.2f GB weights)",
@@ -252,7 +255,7 @@ if let i = args.firstIndex(of: "--pdf") {
         exit(0)
     }
     let out = try model.transcribe(pdfAt: pdf, maxNewTokens: cap, pageRange: limit.map { 0 ..< $0 },
-                                   pipelined: pipelined) { page in
+                                   draftLength: pdfDraft, pipelined: pipelined) { page in
         if printText { print("----- page \(page.page)\n\(page.text)\n") }
         print(String(format: "  page %3d  %5d tok  prep %5.0f ms  ttft %5.0f ms  %6.1f tok/s  %5.2f s  %@",
                      page.page, page.tokenCount, page.prepareSeconds * 1000, page.ttft * 1000,

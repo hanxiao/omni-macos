@@ -55,6 +55,28 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   a 40-page doc) because MLX submits through one command queue per process. OCRWorkerPool does
   this, sized from Metal's working set. Pull pages from a QUEUE - round-robin lands periodic page
   types on one lane (measured 1.14x vs 1.41x).
+- The draft chain runs WITHOUT returning to the CPU. `.item()` on each drafted token forced an
+  evaluate-and-synchronise per draft; the id is only needed to look up an embedding, which can be
+  done with it still on the GPU. k+2 blocking round trips per cycle became one. +7% and the
+  document digest is unchanged (e6193a48ab3e331e): 201/271/215 -> 214/291/227 tok/s.
+- `ocr-verify --pdf` IGNORED `--draft` until 2026-09-09, so any k sweep run through the document
+  path before that measured the default every time and could only report a flat line.
+- k curve RE-MEASURED after the sync removal (long_scan, aggregate): 174/185/188/180/181 at
+  k=2..6. On bench/hard2 k=3 and k=4 tie at 169. Default stays 3 - one synthetic document is not
+  grounds to move it, per the grading rule above.
+- k=5 CHANGES THE OUTPUT on hard2 (digest 61dd84f8 vs d2d17e6a, 4318 vs 4310 chars) where every
+  other k is identical. Speculation is exact by construction, so this is a real defect - most
+  likely the loop guard firing at a different index because block boundaries move with k.
+  Unresolved; do not raise k past 4 until it is understood.
+- Where the remaining time is (long page, 1309 tok): greedy 177.5 tok/s, speculative 213.9 - only
+  1.20x, against 1.49x on a 352-token page. At ~2.9 tokens/cycle the draft chain is about half the
+  cycle, and its cost is dominated by the MTP head's projection over the full 129k vocabulary,
+  three or four times per cycle. That is the lever for anything past ~250 tok/s. FR-Spec measured
+  only +1.8%, which is hard to reconcile with that share - worth checking whether the shortlist
+  actually reduces the weight READ or merely slices a quantized matrix lazily.
+- Measured and rejected: `MLX_METAL_PREALLOCATE=1` (noise: 214.8/290.4/229.0 against
+  214.4/290.6/227.0). Fused MoE dispatch is still right at n=5 (188 aggregate, against 132 never
+  fused and 183 fused only at n<=16).
 - Measured and rejected, do not re-derive: FR-Spec draft-vocab shortlist (+1.8% hard, 0% easy),
   adaptive draft length (+0.8% and worse CER), mlx-swift 0.31.4 (same qmm bug; 0.31.5+ needs
   Swift 6.3). DFlash/EAGLE trees need a draft model we cannot train here; ViT token merging breaks
