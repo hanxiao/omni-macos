@@ -28,6 +28,9 @@ public final class OCRModel: @unchecked Sendable {
 
     public enum StopReason: String, Sendable {
         case eos, cap, loopGuard
+        /// The caller asked to stop mid-page. Whatever had decoded is returned rather than thrown
+        /// away, so a stopped page still shows what it got.
+        case cancelled
     }
 
     /// A live view of a page being transcribed.
@@ -270,9 +273,14 @@ public final class OCRModel: @unchecked Sendable {
 
     /// `maxNewTokens = 0` means "as many as this model and this machine allow" - see
     /// `OCRTokenBudget`. That is the default because a fixed cap silently truncates real pages.
+    ///
+    /// `shouldContinue` is polled once per decode step. Without it a cancelled request keeps the
+    /// GPU busy to the token budget - up to ~31k tokens - because nothing inside this loop can see
+    /// that the caller has gone away.
     public func transcribe(image: OCRImage, prompt: String? = nil, maxNewTokens: Int = 0,
                            loopGuard: Bool = true, loopReps: Int = 24, loopGrace: Int = 96,
-                           onStream: (@Sendable (StreamUpdate) -> Void)? = nil) throws -> Result {
+                           onStream: (@Sendable (StreamUpdate) -> Void)? = nil,
+                           shouldContinue: (@Sendable () -> Bool)? = nil) throws -> Result {
         let t0 = Date()
         let prep = try prepare(image: image, prompt: prompt)
         let prepareSeconds = Date().timeIntervalSince(t0)
@@ -292,6 +300,7 @@ public final class OCRModel: @unchecked Sendable {
 
         while tokens.count < maxNewTokens {
             if tokens.last == eosID { stop = .eos; break }
+            if let shouldContinue, !shouldContinue() { stop = .cancelled; break }
             let step = llm.forward(llm.embed([tokens[tokens.count - 1]]), positions: [position], caches: caches)
             logits = step.logits
             eval(logits)

@@ -9,8 +9,10 @@ struct ContentView: View {
     @State private var historyDebounce: Task<Void, Never>?
     @State private var fileDropTargeted = false
     /// The OCR workspace owns its own state so a document survives toggling back to search and
-    /// returning - closing it is an explicit action, not a side effect of looking away.
-    @State private var ocr = OCRSession()
+    /// returning - closing it is an explicit action, not a side effect of looking away. It is
+    /// created by the App, not here, because the File menu's OCR commands have to reach it: a key
+    /// equivalent declared only on a toolbar button never fires on macOS.
+    @Environment(OCRSession.self) private var ocr
 
     // Progressive disclosure: only offer search once there is something to search. During model
     // loading, onboarding, and the no-folders state the search field stays hidden (not dimmed).
@@ -122,7 +124,7 @@ struct ContentView: View {
     /// different app, and a separate window would strand it from the sidebar and the index.
     @ViewBuilder private var detailOrOCR: some View {
         if model.ocrMode {
-            OCRView().environment(ocr)
+            OCRView()
         } else {
             detail
         }

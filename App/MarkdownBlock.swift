@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 
 /// A minimal block-level Markdown renderer for transcription output.
@@ -78,10 +79,36 @@ enum MarkdownBlock {
 
     /// Inline Markdown only. `.inlineOnlyPreservingWhitespace` is deliberate: the full parser
     /// would swallow leading `#` and `-` markers that this splitter has already claimed.
-    private func inline(_ text: String) -> AttributedString {
-        (try? AttributedString(markdown: text,
-                               options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
-            ?? AttributedString(text)
+    private func inline(_ text: String) -> AttributedString { InlineCache.attributed(text) }
+}
+
+/// Memoises inline parsing across renders.
+///
+/// A streaming page redraws 24 times a second and every redraw re-runs `AttributedString(markdown:)`
+/// for every block on the page - on a long page that is hundreds of full Markdown parses per second
+/// for text that has not changed since the last token. Only the final block is ever new, so a
+/// straight cache turns that back into one parse per frame.
+///
+/// Bounded and cleared wholesale rather than evicted one entry at a time: the keys are page text
+/// that goes out of scope when the document does, so precise eviction would cost more than it saves.
+private final class InlineCache: @unchecked Sendable {
+    private static let shared = InlineCache()
+    private let lock = NSLock()
+    private var entries: [String: AttributedString] = [:]
+
+    static func attributed(_ text: String) -> AttributedString { shared.lookup(text) }
+
+    private func lookup(_ text: String) -> AttributedString {
+        lock.withLock {
+            if let hit = entries[text] { return hit }
+            let parsed = (try? AttributedString(
+                markdown: text,
+                options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
+                ?? AttributedString(text)
+            if entries.count > 4_000 { entries.removeAll(keepingCapacity: true) }
+            entries[text] = parsed
+            return parsed
+        }
     }
 }
 
@@ -260,6 +287,25 @@ extension MarkdownBlock {
     }
 }
 
+// MARK: - Streaming arrival
+
+/// How newly decoded content arrives: it fades up rather than snapping in.
+///
+/// Driven purely by INSERTION - a block, a table row or a bullet that was not there on the last
+/// frame. Nothing already on screen moves, dims or re-animates, which is what keeps a page
+/// readable while it is still being written; an effect applied to the whole growing text would
+/// make the reader chase it. Off entirely under Reduce Motion.
+struct StreamFade: ViewModifier {
+    let count: Int
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    static let transition: AnyTransition = .opacity.combined(with: .offset(y: 4))
+
+    func body(content: Content) -> some View {
+        content.animation(reduceMotion ? nil : .easeOut(duration: 0.28), value: count)
+    }
+}
+
 // MARK: - Table
 
 private struct TableBlock: View {
@@ -287,8 +333,10 @@ private struct TableBlock: View {
                         }
                     }
                     .background(rowBackground(index))
+                    .transition(StreamFade.transition)
                 }
             }
+            .modifier(StreamFade(count: rows.count))
             .clipShape(RoundedRectangle(cornerRadius: Design.cornerSmall))
             .overlay {
                 RoundedRectangle(cornerRadius: Design.cornerSmall)

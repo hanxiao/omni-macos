@@ -69,16 +69,18 @@ extension OCRModel {
     public func transcribeAuto(image: OCRImage, prompt: String? = nil, maxNewTokens: Int = 0,
                                draftLength: Int = 3, loopGuard: Bool = true,
                                loopReps: Int = 24, loopGrace: Int = 96,
-                               onStream: (@Sendable (StreamUpdate) -> Void)? = nil) throws -> Result {
+                               onStream: (@Sendable (StreamUpdate) -> Void)? = nil,
+                               shouldContinue: (@Sendable () -> Bool)? = nil) throws -> Result {
         if llm.mtp != nil && draftLength > 1 {
             return try transcribeSpeculative(image: image, prompt: prompt,
                                              maxNewTokens: maxNewTokens, draftLength: draftLength,
                                              loopGuard: loopGuard, loopReps: loopReps,
-                                             loopGrace: loopGrace, onStream: onStream).result
+                                             loopGrace: loopGrace, onStream: onStream,
+                                             shouldContinue: shouldContinue).result
         }
         return try transcribe(image: image, prompt: prompt, maxNewTokens: maxNewTokens,
                               loopGuard: loopGuard, loopReps: loopReps, loopGrace: loopGrace,
-                              onStream: onStream)
+                              onStream: onStream, shouldContinue: shouldContinue)
     }
 
     public func transcribeAuto(imageAt url: URL, prompt: String? = nil, maxNewTokens: Int = 0,
@@ -92,7 +94,8 @@ extension OCRModel {
                                       maxNewTokens: Int = 0, draftLength k: Int = 3,
                                       loopGuard: Bool = true, loopReps: Int = 24,
                                       loopGrace: Int = 96,
-                                      onStream: (@Sendable (StreamUpdate) -> Void)? = nil)
+                                      onStream: (@Sendable (StreamUpdate) -> Void)? = nil,
+                                      shouldContinue: (@Sendable () -> Bool)? = nil)
         throws -> (result: Result, stats: SpeculativeStats) {
         guard llm.mtp != nil else {
             throw OmniError.model("this build carries no MTP head; rebuild with convert.py --mtp")
@@ -103,7 +106,7 @@ extension OCRModel {
         return try decodePrepared(ready, prepareSeconds: prepareSeconds, startedAt: t0,
                                   maxNewTokens: maxNewTokens, draftLength: k,
                                   loopGuard: loopGuard, loopReps: loopReps, loopGrace: loopGrace,
-                                  onStream: onStream)
+                                  onStream: onStream, shouldContinue: shouldContinue)
     }
 
     /// The GPU half of a request, given pixels that have already been through the vision tower.
@@ -114,7 +117,8 @@ extension OCRModel {
     func decodePrepared(_ ready: PreparedPage, prepareSeconds: Double, startedAt t0: Date,
                         maxNewTokens requested: Int, draftLength k: Int,
                         loopGuard: Bool, loopReps: Int, loopGrace: Int,
-                        onStream: (@Sendable (StreamUpdate) -> Void)? = nil)
+                        onStream: (@Sendable (StreamUpdate) -> Void)? = nil,
+                        shouldContinue: (@Sendable () -> Bool)? = nil)
         throws -> (result: Result, stats: SpeculativeStats) {
         var stats = SpeculativeStats()
         stats.acceptedAt = [Int](repeating: 0, count: Self.maxAdaptiveDraft + 1)
@@ -155,6 +159,7 @@ extension OCRModel {
 
         while tokens.count < maxNewTokens {
             if current == eosID { stop = .eos; break }
+            if let shouldContinue, !shouldContinue() { stop = .cancelled; break }
 
             // ---- draft K tokens, recursively ----
             // Adaptive draft length. Acceptance is a property of the CONTENT, not the model:

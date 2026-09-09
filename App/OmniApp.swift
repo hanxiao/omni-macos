@@ -52,11 +52,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct OmniApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var model = AppModel()
+    /// Owned by the App rather than by ContentView so the File menu can act on it. Menu commands
+    /// are the only place a keyboard shortcut actually fires on macOS.
+    @State private var ocr = OCRSession()
 
     var body: some Scene {
         Window("Omni", id: "main") {
             ContentView()
                 .environment(model)
+                .environment(ocr)
                 .frame(minWidth: 820, minHeight: 520)
                 .task { Updater.checkOnLaunchIfDue() }   // silent once-a-day check; prompts only if newer
         }
@@ -100,14 +104,33 @@ struct OmniApp: App {
                     model.ocrMode.toggle()
                 }
                 .keyboardShortcut("o", modifiers: [.command, .option])
+                if model.ocrMode {
+                    Button("Open Document\u{2026}") { ocr.chooseAndOpen() }
+                        .keyboardShortcut("o", modifiers: .command)
+                    Button("Save Markdown\u{2026}") { ocr.exportMarkdown() }
+                        .keyboardShortcut("s", modifiers: .command)
+                        .disabled(ocr.completedPages == 0)
+                    Button("Copy Markdown") { ocr.copyMarkdownToPasteboard() }
+                        .keyboardShortcut("c", modifiers: [.command, .shift])
+                        .disabled(ocr.completedPages == 0)
+                    Button("Stop Transcribing") { ocr.cancel() }
+                        .keyboardShortcut(".", modifiers: .command)
+                        .disabled(!ocr.isBusy)
+                    Button("Close Document") { ocr.clear() }
+                        .keyboardShortcut("w", modifiers: [.command, .shift])
+                        .disabled(ocr.pages.isEmpty)
+                }
                 Divider()
                 // Open / Reveal / Copy / Move to Trash act on the WHOLE selection. Quick Look and
                 // Find similar are single-item, so they are disabled when several results are selected
                 // (the context menu hides them outright there).
                 let multi = model.selectedPaths.count > 1
+                // Cmd-O has one owner at a time: in OCR mode it opens a document to transcribe
+                // (above), so the results version stands down. Two enabled items on one chord is
+                // a coin toss, not a shortcut.
                 Button("Open") { model.openSelected() }
                     .keyboardShortcut("o", modifiers: .command)
-                    .disabled(!model.hasSelection)
+                    .disabled(!model.hasSelection || model.ocrMode)
                 Button("Quick Look") { model.toggleQuickLook() }
                     .keyboardShortcut("y", modifiers: .command)
                     .disabled(!model.hasSelection || multi)
