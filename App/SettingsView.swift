@@ -987,10 +987,13 @@ private struct IndexTab: View {
                         .controlSize(.small)
                     }
                 }
+                OCRModelRow()
             } header: {
                 Text("Model")
             } footer: {
-                Text("Picking a variant switches to it, or downloads it. Switching rebuilds the index.")
+                Text("Picking a variant switches to it, or downloads it. Switching rebuilds the index. "
+                     + "The OCR model is optional, transcribes document images to Markdown on this "
+                     + "Mac, and is not used by search.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -1011,119 +1014,77 @@ private struct IndexTab: View {
     }
 }
 
-/// Everything about the OCR add-on in one place: which build is installed, how fast it runs, and
-/// what it is asked to do. It is a separate model that nothing else in the app depends on, so it
-/// gets a tab rather than a corner of Storage.
-private struct OCRTab: View {
+/// The optional OCR model, in the Storage tab beside the embedding model - it is another few
+/// gigabytes in the same folder, which is where someone goes looking for them.
+///
+/// One build. There were three, with their sizes, throughputs and character error rates on the
+/// row: numbers nobody outside this repository can act on, offering a choice whose wrong answers
+/// are measurably worse (the 4-bit build scores CER 0.25 on handwriting). The app picks.
+private struct OCRModelRow: View {
     @Environment(AppModel.self) private var model
-    @State private var draftLength = OCRSession.Settings.draftLength
-    @State private var loopGuard = OCRSession.Settings.loopGuard
-    @State private var promptStyle = OCRSession.Settings.promptStyle
-    @State private var customPrompt = OCRSession.Settings.customPrompt
+    private let variant = OCRModelCatalog.Variant.balanced
+
+    var body: some View {
+        Group {
+            if model.isOCRDownloading {
+                VStack(alignment: .leading, spacing: 4) {
+                    ProgressView(value: model.ocrDownloadFraction)
+                    HStack {
+                        Text(model.ocrDownloadLabel)
+                            .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Cancel") { model.cancelOCRDownload() }.controlSize(.small)
+                    }
+                }
+            } else if model.ocrInstalled.contains(variant) {
+                HStack(spacing: 8) {
+                    Text("OCR model")
+                    Spacer()
+                    Text("ocr-v1").foregroundStyle(.secondary)
+                    Button("Remove") { model.removeOCRModel(variant) }.controlSize(.small)
+                }
+            } else {
+                HStack(spacing: 8) {
+                    Text("OCR model")
+                    if model.ocrDownloadFailed {
+                        Text(model.ocrDownloadLabel).font(.caption).foregroundStyle(.red).lineLimit(2)
+                    }
+                    Spacer()
+                    Button("Download\u{2026}") { model.downloadOCRModel(variant) }.controlSize(.small)
+                }
+            }
+        }
+        .task { model.refreshOCRInstalled() }
+    }
+}
+
+/// What the OCR model is asked to do. The model itself lives in Storage, beside the embedding
+/// model, because that is where its four and a half gigabytes are.
+private struct OCRTab: View {
+    @State private var prompt = OCRSession.Settings.customPrompt
 
     var body: some View {
         Form {
-            // Optional add-on, deliberately its own section: it is a different model, it is not
-            // downloaded unless asked for, and nothing else in the app depends on it.
             Section {
-                Picker("Build", selection: Binding(
-                    get: { model.ocrVariant },
-                    set: { model.ocrVariant = $0 }
-                )) {
-                    ForEach(OCRModelCatalog.Variant.allCases, id: \.self) { v in
-                        Text(v.title).tag(v)
-                    }
-                }
-                .disabled(model.isOCRDownloading)
-
-                LabeledContent("Size and speed", value: model.ocrVariant.summary)
-
-                if model.isOCRDownloading {
-                    VStack(alignment: .leading, spacing: 4) {
-                        ProgressView(value: model.ocrDownloadFraction)
-                        HStack {
-                            Text(model.ocrDownloadLabel)
-                                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                            Spacer()
-                            Button("Cancel") { model.cancelOCRDownload() }.controlSize(.small)
-                        }
-                    }
-                } else {
-                    HStack(spacing: 8) {
-                        if model.ocrInstalled.contains(model.ocrVariant) {
-                            Text("Installed").font(.caption).foregroundStyle(.secondary)
-                            Spacer()
-                            Button("Remove") { model.removeOCRModel(model.ocrVariant) }
-                        } else {
-                            if model.ocrDownloadFailed {
-                                Text(model.ocrDownloadLabel).font(.caption).foregroundStyle(.red)
-                                    .lineLimit(2)
-                            } else {
-                                Text("Not downloaded").font(.caption).foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Button("Download\u{2026}") { model.downloadOCRModel(model.ocrVariant) }
-                        }
-                    }
-                    .controlSize(.small)
-                }
-            } header: {
-                Text("OCR model")
-            } footer: {
-                Text("Optional. Transcribes document images to Markdown on this Mac. Not downloaded until you ask, and not used by search.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-
-            Section {
-                Stepper(value: $draftLength, in: 1 ... 8) {
-                    LabeledContent("Speculative drafts", value: "\(draftLength)")
-                }
-                .onChange(of: draftLength) { _, new in OCRSession.Settings.draftLength = new }
-
-                Toggle("Stop runaway repetition", isOn: $loopGuard)
-                    .onChange(of: loopGuard) { _, new in OCRSession.Settings.loopGuard = new }
-            } header: {
-                Text("Speed")
-            } footer: {
-                Text("The draft head proposes this many tokens per step and the model verifies them "
-                     + "in one pass. Three is the measured peak here: one draft cannot pay for its "
-                     + "own step, and past four each extra draft costs more than it wins back.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-
-            Section {
-                Picker("Instruction", selection: $promptStyle) {
-                    ForEach(OCRSession.Settings.PromptStyle.allCases) { style in
-                        Text(style.title).tag(style)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .onChange(of: promptStyle) { _, new in OCRSession.Settings.promptStyle = new }
-
-                if promptStyle == .custom {
-                    TextEditor(text: $customPrompt)
-                        .font(.system(.callout, design: .monospaced))
-                        .frame(height: 110)
-                        .onChange(of: customPrompt) { _, new in OCRSession.Settings.customPrompt = new }
-                } else {
-                    Text(promptStyle == .concise
-                         ? OCRSession.Settings.concisePrompt
-                         : OCRModel.defaultPrompt)
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                TextEditor(text: $prompt)
+                    .font(.system(.callout, design: .monospaced))
+                    .frame(height: 200)
+                    .onChange(of: prompt) { _, new in OCRSession.Settings.customPrompt = new }
+                HStack {
+                    Spacer()
+                    Button("Restore Default") { prompt = OCRModel.defaultPrompt }
+                        .controlSize(.small)
+                        .disabled(prompt == OCRModel.defaultPrompt)
                 }
             } header: {
                 Text("Prompt")
             } footer: {
-                Text("Concise is the model authors' current recommendation and a fifth the length, "
-                     + "but it drops the LaTeX, HTML-table and header/footer rules - it changes the "
-                     + "shape of the output, not only what it costs.")
+                Text("The instruction sent with every page. It decides the shape of the output - "
+                     + "whether formulas come back as LaTeX, tables as HTML, and what happens to "
+                     + "headers and footers.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
-        .task { model.refreshOCRInstalled() }
     }
 }

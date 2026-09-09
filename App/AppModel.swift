@@ -1362,6 +1362,10 @@ final class AppModel {
         // it is a $TMPDIR scan and can delete hundreds of MB. Unconditional by design - the gate
         // being closed is exactly the case where nothing else would ever clean up.
         DispatchQueue.global(qos: .utility).async { PaperFS.sweepAbandonedRuns() }
+        // At launch, not when Settings is opened: the workspace asks whether the OCR model is
+        // installed long before anyone visits a settings tab, and a model still sitting at the old
+        // path would read as missing.
+        DispatchQueue.global(qos: .utility).async { OCRModelCatalog.migrateLegacyInstall() }
         loadRoots()
         loadPhotoSources()
         loadSettings()
@@ -2603,6 +2607,7 @@ final class AppModel {
     /// handful of files, but the point is that an add-on nobody enabled costs nothing.
     func refreshOCRInstalled() {
         Task.detached {
+            OCRModelCatalog.migrateLegacyInstall()
             let installed = OCRModelCatalog.installedVariants()
             await MainActor.run { self.ocrInstalled = installed }
         }

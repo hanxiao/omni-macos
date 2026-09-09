@@ -89,7 +89,29 @@ public enum OCRModelCatalog {
         guard let appSupport = try? FileManager.default.url(
             for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
         else { return nil }
-        return appSupport.appendingPathComponent("Omni/ocr/\(variant.rawValue)")
+        // Beside the embedding model rather than inside an `ocr/` of its own: one folder holds
+        // everything this app has downloaded, which is what someone looking for 4.5 GB expects.
+        return appSupport.appendingPathComponent("Omni/ocr-v1-\(variant.rawValue)")
+    }
+
+    /// Move an install made before the folders were flattened. One rename, and only when there is
+    /// nothing at the new path - never a copy, never a delete.
+    public static func migrateLegacyInstall() {
+        let fm = FileManager.default
+        guard let appSupport = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                           appropriateFor: nil, create: false) else { return }
+        let legacyRoot = appSupport.appendingPathComponent("Omni/ocr")
+        guard fm.fileExists(atPath: legacyRoot.path) else { return }
+        for variant in Variant.allCases {
+            let from = legacyRoot.appendingPathComponent(variant.rawValue)
+            guard fm.fileExists(atPath: from.path), let to = installDir(for: variant),
+                  !fm.fileExists(atPath: to.path) else { continue }
+            try? fm.moveItem(at: from, to: to)
+        }
+        // Only if it is now empty; a directory with anything left in it is not ours to remove.
+        if let left = try? fm.contentsOfDirectory(atPath: legacyRoot.path), left.isEmpty {
+            try? fm.removeItem(at: legacyRoot)
+        }
     }
 
     /// True when every file the manifest names is present and non-empty.

@@ -193,6 +193,18 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   nothing to show for it, and the half-decoded page would have to be discarded or resumed from a
   partial transcript. The chip says "Finishing this page" until the loop actually reaches the hold.
 
+## OCR settings
+- ONE build is offered, and the weights live at `Application Support/Omni/ocr-v1-<variant>` beside
+  the embedding model, not in an `ocr/` of their own. `OCRModelCatalog.migrateLegacyInstall()`
+  renames an older install once, at LAUNCH - not when Settings opens, because the workspace asks
+  whether the model is installed long before anyone visits a tab.
+- The build picker, its size/throughput/CER line and the speculative-decoding controls are GONE.
+  Those are numbers nobody outside this repository can act on, offering a choice whose wrong
+  answers are measurably worse (4-bit scores CER 0.25 on handwriting) - the app picks. The k curve
+  and the variant measurements stay recorded above; they belong here, not in a settings pane.
+- The prompt is one editable box. Presets that drop the LaTeX, HTML-table and header/footer rules
+  change the SHAPE of the output, which is not something a reader can judge from a preset's name.
+
 ## UI tests (UITests/, Scripts/ui-test.sh)
 - XCUITest, not synthetic events. `./Scripts/ui-test.sh [Class[/test]]` - never a bare
   `xcodebuild test`, same SE-0482 tokenizers artifact reason as Scripts/build-app.sh.

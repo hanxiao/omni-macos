@@ -89,33 +89,9 @@ final class OCRSession {
             set { UserDefaults.standard.set(newValue, forKey: "omni.ocr.loopGuard") }
         }
 
-        /// The instruction the model is given. The concise one is jina's current recommendation
-        /// and is 19 tokens against 98, but it drops the LaTeX, HTML-table and header/footer
-        /// rules, so it changes the shape of the output rather than just its cost.
-        enum PromptStyle: String, CaseIterable, Identifiable {
-            case detailed, concise, custom
-            var id: String { rawValue }
-            var title: String {
-                switch self {
-                case .detailed: return "Detailed"
-                case .concise: return "Concise"
-                case .custom: return "Custom"
-                }
-            }
-        }
-
-        static let concisePrompt =
-            "Transcribe the provided document image into a clean Markdown format, "
-            + "preserving the natural reading order."
-
-        static var promptStyle: PromptStyle {
-            get {
-                PromptStyle(rawValue: UserDefaults.standard.string(forKey: "omni.ocr.promptStyle") ?? "")
-                    ?? .detailed
-            }
-            set { UserDefaults.standard.set(newValue.rawValue, forKey: "omni.ocr.promptStyle") }
-        }
-
+        /// The instruction the model is given, editable in Settings. One box rather than a set of
+        /// presets: a preset that changes the LaTeX, table and header rules changes the SHAPE of
+        /// the output, which is not a setting a reader can judge from its name.
         static var customPrompt: String {
             get { UserDefaults.standard.string(forKey: "omni.ocr.customPrompt") ?? OCRModel.defaultPrompt }
             set { UserDefaults.standard.set(newValue, forKey: "omni.ocr.customPrompt") }
@@ -123,13 +99,8 @@ final class OCRSession {
 
         /// nil means "the model's own default", which is what `transcribeAuto` expects.
         static var prompt: String? {
-            switch promptStyle {
-            case .detailed: return nil
-            case .concise: return concisePrompt
-            case .custom:
-                let text = customPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-                return text.isEmpty ? nil : text
-            }
+            let text = customPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+            return text.isEmpty || text == OCRModel.defaultPrompt ? nil : text
         }
     }
 
