@@ -30,6 +30,20 @@ public final class OCRModel: @unchecked Sendable {
         case eos, cap, loopGuard
     }
 
+    /// A live view of a page being transcribed.
+    public struct StreamUpdate: Sendable {
+        /// Everything decoded so far. The WHOLE text, not a delta: byte-level BPE splits
+        /// multi-byte characters across tokens, so a per-token delta would hand the UI a
+        /// half-formed glyph. Decoding the full list each time always yields valid text.
+        public let text: String
+        public let tokens: Int
+        public let tokensPerSecond: Double
+    }
+
+    /// How often a running transcription reports progress. 24 Hz is under a display frame and far
+    /// under what a reader can follow, and it bounds the cost of re-decoding the token list.
+    static let streamInterval: TimeInterval = 1.0 / 24.0
+
     /// Everything a request needs from the image side, computed once.
     ///
     /// `@unchecked Sendable` because MLXArray is a reference type the compiler cannot reason
@@ -257,7 +271,8 @@ public final class OCRModel: @unchecked Sendable {
     /// `maxNewTokens = 0` means "as many as this model and this machine allow" - see
     /// `OCRTokenBudget`. That is the default because a fixed cap silently truncates real pages.
     public func transcribe(image: OCRImage, prompt: String? = nil, maxNewTokens: Int = 0,
-                           loopGuard: Bool = true, loopReps: Int = 24, loopGrace: Int = 96) throws -> Result {
+                           loopGuard: Bool = true, loopReps: Int = 24, loopGrace: Int = 96,
+                           onStream: (@Sendable (StreamUpdate) -> Void)? = nil) throws -> Result {
         let t0 = Date()
         let prep = try prepare(image: image, prompt: prompt)
         let prepareSeconds = Date().timeIntervalSince(t0)
@@ -273,6 +288,7 @@ public final class OCRModel: @unchecked Sendable {
         var position = prep.ids.count
         var stop = StopReason.cap
         let tDecode = Date()
+        var lastEmit = Date.distantPast
 
         while tokens.count < maxNewTokens {
             if tokens.last == eosID { stop = .eos; break }
@@ -281,6 +297,7 @@ public final class OCRModel: @unchecked Sendable {
             eval(logits)
             tokens.append(logits[-1].argMax().item(Int.self))
             position += 1
+            emit(tokens, since: tDecode, last: &lastEmit, onStream)
             if loopGuard, tokens.count > loopGrace, let period = Self.loopPeriod(tokens, reps: loopReps) {
                 // Back off to the block's FIRST occurrence and keep exactly one copy; cutting at
                 // the last occurrence would retain dozens of copies of the loop debris.
@@ -307,6 +324,22 @@ public final class OCRModel: @unchecked Sendable {
         return Result(text: text, tokens: tokens, promptTokens: prep.ids.count, ttft: ttft,
                       decodeTokensPerSecond: Double(max(tokens.count - 1, 0)) / max(decodeSeconds, 1e-9),
                       stoppedBy: stop, tiles: prep.grid, prepareSeconds: prepareSeconds)
+    }
+}
+
+extension OCRModel {
+    /// Throttled progress callback. Decoding the whole token list is what keeps multi-byte
+    /// characters intact, so it is rate-limited rather than run per token.
+    func emit(_ tokens: [Int], since start: Date, last: inout Date,
+              _ onStream: (@Sendable (StreamUpdate) -> Void)?) {
+        guard let onStream else { return }
+        let now = Date()
+        guard now.timeIntervalSince(last) >= Self.streamInterval else { return }
+        last = now
+        let elapsed = now.timeIntervalSince(start)
+        let text = (try? tokenizer.decode(tokenIds: tokens, skipSpecialTokens: true)) ?? ""
+        onStream(StreamUpdate(text: text, tokens: tokens.count,
+                              tokensPerSecond: elapsed > 0 ? Double(tokens.count) / elapsed : 0))
     }
 }
 

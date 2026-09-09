@@ -98,8 +98,9 @@ public enum OCRModelCatalog {
         guard let dir = installDir(for: variant),
               let manifest = try? readManifest(at: dir) else { return false }
         let fm = FileManager.default
+        let resolved = dir.resolvingSymlinksInPath()
         for file in manifest.files {
-            let path = dir.appendingPathComponent(file).path
+            let path = resolved.appendingPathComponent(file).path
             guard let size = try? fm.attributesOfItem(atPath: path)[.size] as? Int64, size > 0 else {
                 return false
             }
@@ -113,7 +114,7 @@ public enum OCRModelCatalog {
 
     /// Read the manifest a completed download left behind.
     static func readManifest(at dir: URL) throws -> Manifest {
-        let url = dir.appendingPathComponent("omni-ocr.json")
+        let url = dir.resolvingSymlinksInPath().appendingPathComponent("omni-ocr.json")
         let data = try Data(contentsOf: url)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let shards = json["shards"] as? Int else {

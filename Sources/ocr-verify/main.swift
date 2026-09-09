@@ -55,6 +55,24 @@ func digest(_ text: String) -> String {
     return String(h, radix: 16)
 }
 
+final class StreamCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var count = 0
+    private(set) var empties = 0
+    private(set) var lastChars = 0
+    private(set) var firstText = ""
+    private(set) var lastText = ""
+    func record(_ update: OCRModel.StreamUpdate) {
+        lock.withLock {
+            count += 1
+            if update.text.isEmpty { empties += 1 }
+            if firstText.isEmpty { firstText = update.text }
+            lastText = update.text
+            lastChars = update.text.count
+        }
+    }
+}
+
 func die(_ message: String) -> Never {
     FileHandle.standardError.write(Data(("ocr-verify: " + message + "\n").utf8))
     exit(2)
@@ -115,6 +133,25 @@ if args.contains("--probe-qmm") {
             print(line + (bad.isEmpty ? "   all OK" : "   WRONG at M=\(bad)"))
         }
     }
+    exit(0)
+}
+
+// Stream check: does the incremental callback actually deliver text?
+if let i = args.firstIndex(of: "--stream") {
+    let modelPath = args[0]
+    let imagePath = args[i + 1]
+    let tokDir = args.firstIndex(of: "--tokenizer").map { URL(fileURLWithPath: args[$0 + 1]) }
+    let model = try await OCRModel(modelDir: URL(fileURLWithPath: modelPath), tokenizerDir: tokDir)
+    let image = try OCRPreprocess.load(contentsOf: URL(fileURLWithPath: imagePath))
+    let counter = StreamCounter()
+    let out = try model.transcribeAuto(image: image, maxNewTokens: 220) { update in
+        counter.record(update)
+    }
+    print("updates: \(counter.count), last streamed chars: \(counter.lastChars), "
+          + "empty updates: \(counter.empties)")
+    print("final chars: \(out.text.count), tokens: \(out.tokens.count)")
+    print("first update text: \(counter.firstText.prefix(80).debugDescription)")
+    print("last  update text: \(counter.lastText.suffix(80).debugDescription)")
     exit(0)
 }
 

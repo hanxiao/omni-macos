@@ -181,6 +181,11 @@ public struct OCRWeights: @unchecked Sendable {
 
     public init(modelDir: URL) throws {
         let fm = FileManager.default
+        // Resolve symlinks first. A 4.5 GB model is exactly the thing a user parks on an external
+        // volume and links into Application Support, and `contentsOfDirectory` on an unresolved
+        // symlink fails with ENOTDIR - an error that reads like a corrupt download rather than a
+        // link that needs following.
+        let modelDir = modelDir.resolvingSymlinksInPath()
         let shards = try fm.contentsOfDirectory(at: modelDir, includingPropertiesForKeys: nil)
             .filter { $0.pathExtension == "safetensors" }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }

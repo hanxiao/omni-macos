@@ -1079,6 +1079,10 @@ final class AppModel {
     var downloadFailed = false   // explicit error state; the view branches on this, not on label text
     private var downloader: ModelDownloader?
 
+    /// Content area shows the OCR workspace instead of search results. Not persisted: it is a
+    /// mode you step into for a task, and a relaunch should land back in search.
+    var ocrMode = false
+
     // Optional OCR model (jina-ocr-v1). Separate from the embedding variants in every way that
     // matters: a different model family, ~4 GB, not on the indexing path, and NEVER fetched
     // unless the user asks for it. Nothing in launch or indexing touches these.

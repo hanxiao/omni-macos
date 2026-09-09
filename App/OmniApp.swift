@@ -93,6 +93,14 @@ struct OmniApp: App {
             // The primary actions on the selected result, reachable from the menu bar and keyboard
             // with visible shortcut hints (previously double-click / context-menu only).
             CommandGroup(after: .newItem) {
+                // The OCR toggle's tooltip names this chord, so the menu bar has to own it:
+                // a key equivalent declared only on a toolbar button never fires on macOS, and
+                // an advertised-but-dead shortcut is worse than none.
+                Button(model.ocrMode ? "Back to Search" : "Transcribe a Document\u{2026}") {
+                    model.ocrMode.toggle()
+                }
+                .keyboardShortcut("o", modifiers: [.command, .option])
+                Divider()
                 // Open / Reveal / Copy / Move to Trash act on the WHOLE selection. Quick Look and
                 // Find similar are single-item, so they are disabled when several results are selected
                 // (the context menu hides them outright there).

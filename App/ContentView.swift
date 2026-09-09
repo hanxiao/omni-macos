@@ -8,6 +8,9 @@ struct ContentView: View {
     @State private var debounce: Task<Void, Never>?
     @State private var historyDebounce: Task<Void, Never>?
     @State private var fileDropTargeted = false
+    /// The OCR workspace owns its own state so a document survives toggling back to search and
+    /// returning - closing it is an explicit action, not a side effect of looking away.
+    @State private var ocr = OCRSession()
 
     // Progressive disclosure: only offer search once there is something to search. During model
     // loading, onboarding, and the no-folders state the search field stays hidden (not dimmed).
@@ -102,9 +105,9 @@ struct ContentView: View {
             // which is the known-good state there.
             Group {
                 if #available(macOS 26.0, *) {
-                    detail.toolbar(removing: .title)
+                    detailOrOCR.toolbar(removing: .title)
                 } else {
-                    detail
+                    detailOrOCR
                 }
             }
             .toolbar { toolbar }
@@ -113,6 +116,17 @@ struct ContentView: View {
     }
 
     // MARK: - Detail
+
+    /// Search results or the OCR workspace. The toggle replaces the content area rather than
+    /// opening a window: this is a different way of looking at documents on this Mac, not a
+    /// different app, and a separate window would strand it from the sidebar and the index.
+    @ViewBuilder private var detailOrOCR: some View {
+        if model.ocrMode {
+            OCRView().environment(ocr)
+        } else {
+            detail
+        }
+    }
 
     @ViewBuilder private var detail: some View {
         switch model.phase {
@@ -470,9 +484,27 @@ struct ContentView: View {
         // WindowTitleHider's tuner - magnifier left, upload right), not as a separate toolbar
         // button. The File menu owns the Shift-Cmd-O shortcut; the in-field button is the click
         // target naming the same chord.
+        // OCR mode. Sits at the head of the trailing cluster, immediately right of the search
+        // field, because it switches what the content area IS - it is not another filter on the
+        // results, and grouping it with sort/view would read as one.
+        //
+        // Deliberately NOT gated on `phase == .ready`: transcription reads a dropped file and
+        // writes Markdown, and touches neither the vector index nor the embedding model. Gating
+        // it on the index would strand the feature exactly when it is most useful - while a large
+        // index loads, or when another copy of Omni holds it open.
+        ToolbarItem(placement: .primaryAction) {
+                Button {
+                    withAnimation(.easeOut(duration: 0.2)) { model.ocrMode.toggle() }
+                } label: {
+                    Image(systemName: model.ocrMode ? "text.viewfinder" : "text.viewfinder")
+                        .foregroundStyle(model.ocrMode ? Color.accentColor : Color.primary)
+                }
+                .help(model.ocrMode ? "Back to search  \u{2318}\u{2325}O" : "Transcribe a document  \u{2318}\u{2325}O")
+                .accessibilityLabel(model.ocrMode ? "Back to search" : "Transcribe a document")
+        }
         // Bookmark the current search. The only way into History when recording is set to "Only when
         // I bookmark", and a quick save otherwise. Appears once there's a search to keep.
-        if model.phase == .ready, model.hasActiveSearch {
+        if model.phase == .ready, !model.ocrMode, model.hasActiveSearch {
             ToolbarItem(placement: .primaryAction) {
                 Button { model.toggleBookmarkCurrentSearch() } label: {
                     // No explicit color in the unbookmarked state, so the toolbar can dim it like every
@@ -495,7 +527,7 @@ struct ContentView: View {
         // to act on - hidden, not greyed out, during onboarding and the idle/empty states.
         // Exception: keep the filter menu reachable whenever a filter is active, so a filter that
         // hides every result can still be cleared (otherwise the menu vanishes with the results).
-        if model.phase == .ready, !model.rawResults.isEmpty || model.filtersActive {
+        if model.phase == .ready, !model.ocrMode, !model.rawResults.isEmpty || model.filtersActive {
         // Filter joins sort/view in the trailing placement so on Tahoe the three result controls
         // share ONE Liquid Glass pill (search-by-file + bookmark form the other). filterPlacement
         // keeps filter leading on pre-26 so the Sequoia toolbar layout is unchanged.
@@ -504,7 +536,7 @@ struct ContentView: View {
         }
         }
         // Result presentation - sort + view. Only meaningful with results.
-        if model.phase == .ready, !model.rawResults.isEmpty {
+        if model.phase == .ready, !model.ocrMode, !model.rawResults.isEmpty {
         ToolbarItem(placement: .primaryAction) {
             if #available(macOS 26.0, *) {
                 // Tahoe: the inline sort menu + segmented view toggle render and overflow cleanly.

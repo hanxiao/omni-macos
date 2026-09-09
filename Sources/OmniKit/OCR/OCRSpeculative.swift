@@ -68,15 +68,17 @@ extension OCRModel {
     /// k = 1..6, 8 against 183 greedy. k = 1 is a LOSS - one draft cannot pay for its own step.
     public func transcribeAuto(image: OCRImage, prompt: String? = nil, maxNewTokens: Int = 0,
                                draftLength: Int = 3, loopGuard: Bool = true,
-                               loopReps: Int = 24, loopGrace: Int = 96) throws -> Result {
+                               loopReps: Int = 24, loopGrace: Int = 96,
+                               onStream: (@Sendable (StreamUpdate) -> Void)? = nil) throws -> Result {
         if llm.mtp != nil && draftLength > 1 {
             return try transcribeSpeculative(image: image, prompt: prompt,
                                              maxNewTokens: maxNewTokens, draftLength: draftLength,
                                              loopGuard: loopGuard, loopReps: loopReps,
-                                             loopGrace: loopGrace).result
+                                             loopGrace: loopGrace, onStream: onStream).result
         }
         return try transcribe(image: image, prompt: prompt, maxNewTokens: maxNewTokens,
-                              loopGuard: loopGuard, loopReps: loopReps, loopGrace: loopGrace)
+                              loopGuard: loopGuard, loopReps: loopReps, loopGrace: loopGrace,
+                              onStream: onStream)
     }
 
     public func transcribeAuto(imageAt url: URL, prompt: String? = nil, maxNewTokens: Int = 0,
@@ -89,7 +91,8 @@ extension OCRModel {
     public func transcribeSpeculative(image: OCRImage, prompt: String? = nil,
                                       maxNewTokens: Int = 0, draftLength k: Int = 3,
                                       loopGuard: Bool = true, loopReps: Int = 24,
-                                      loopGrace: Int = 96)
+                                      loopGrace: Int = 96,
+                                      onStream: (@Sendable (StreamUpdate) -> Void)? = nil)
         throws -> (result: Result, stats: SpeculativeStats) {
         guard llm.mtp != nil else {
             throw OmniError.model("this build carries no MTP head; rebuild with convert.py --mtp")
@@ -99,7 +102,8 @@ extension OCRModel {
         let prepareSeconds = Date().timeIntervalSince(t0)
         return try decodePrepared(ready, prepareSeconds: prepareSeconds, startedAt: t0,
                                   maxNewTokens: maxNewTokens, draftLength: k,
-                                  loopGuard: loopGuard, loopReps: loopReps, loopGrace: loopGrace)
+                                  loopGuard: loopGuard, loopReps: loopReps, loopGrace: loopGrace,
+                                  onStream: onStream)
     }
 
     /// The GPU half of a request, given pixels that have already been through the vision tower.
@@ -109,7 +113,8 @@ extension OCRModel {
     /// largely idle between kernels, which is exactly the gap a compute-heavy vision pass fills.
     func decodePrepared(_ ready: PreparedPage, prepareSeconds: Double, startedAt t0: Date,
                         maxNewTokens requested: Int, draftLength k: Int,
-                        loopGuard: Bool, loopReps: Int, loopGrace: Int)
+                        loopGuard: Bool, loopReps: Int, loopGrace: Int,
+                        onStream: (@Sendable (StreamUpdate) -> Void)? = nil)
         throws -> (result: Result, stats: SpeculativeStats) {
         var stats = SpeculativeStats()
         stats.acceptedAt = [Int](repeating: 0, count: Self.maxAdaptiveDraft + 1)
@@ -146,6 +151,7 @@ extension OCRModel {
         let tDecode = Date()
         let adaptiveDraft = OCRLanguageModel.adaptiveDraft
         var liveK = k
+        var lastEmit = Date.distantPast
 
         while tokens.count < maxNewTokens {
             if current == eosID { stop = .eos; break }
@@ -226,6 +232,7 @@ extension OCRModel {
                             previousHidden: refillHidden,
                             positions: Array(position ... (position + accepted)), cache: mtpCache)
 
+            emit(tokens, since: tDecode, last: &lastEmit, onStream)
             previousHidden = step.hidden[accepted ..< (accepted + 1)]
             position += accepted + 1
             current = committed.last!
