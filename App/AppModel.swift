@@ -2583,7 +2583,7 @@ final class AppModel {
                         if p.file == "model.safetensors" {
                             self.downloadFraction = p.total > 0 ? Double(p.received) / Double(p.total) : 0
                             let gb = Double(p.received) / 1_000_000_000, tgb = Double(p.total) / 1_000_000_000
-                            self.downloadLabel = p.total > 0 ? String(format: "Downloading model  %.2f / %.2f GB", gb, tgb) : "Downloading model\u{2026}"
+                            self.downloadLabel = p.total > 0 ? String(format: "%.2f / %.2f GB", gb, tgb) : "Downloading\u{2026}"
                         } else {
                             self.downloadLabel = "Preparing\u{2026}"
                         }
@@ -2639,20 +2639,17 @@ final class AppModel {
             do {
                 try await dl.download(variant: variant, to: dest) { p in
                     Task { @MainActor in
-                        // Per-file fraction, with the file position in the label: the shards are
-                        // ~1.9 GB each, so a single overall bar would sit still for minutes.
-                        self.ocrDownloadFraction = p.total > 0 ? Double(p.received) / Double(p.total) : 0
-                        self.noteOCRSpeed(received: p.received)
-                        if p.file.hasSuffix(".safetensors") {
-                            let gb = Double(p.received) / 1_000_000_000
-                            let total = Double(p.total) / 1_000_000_000
-                            self.ocrDownloadLabel = p.total > 0
-                                ? String(format: "Part %d of %d  %.2f / %.2f GB",
-                                         p.fileIndex + 1, p.fileCount, gb, total)
-                                : "Downloading\u{2026}"
-                        } else {
-                            self.ocrDownloadLabel = "Preparing\u{2026}"
-                        }
+                        // The whole download, not the shard in flight: how the weights are
+                        // packaged is not the reader's business, and a per-file bar could only be
+                        // read next to a "part k of n" that said so.
+                        let whole = Double(p.documentTotal)
+                        self.ocrDownloadFraction = whole > 0
+                            ? min(1, Double(p.documentReceived) / whole) : 0
+                        self.noteOCRSpeed(received: p.documentReceived)
+                        self.ocrDownloadLabel = p.documentTotal > 0
+                            ? String(format: "%.2f / %.2f GB",
+                                     Double(p.documentReceived) / 1_000_000_000, whole / 1_000_000_000)
+                            : "Preparing\u{2026}"
                     }
                 }
                 await MainActor.run {

@@ -93,7 +93,8 @@ struct OnboardingView: View {
             Image(systemName: "arrow.down.circle")
             VStack(alignment: .leading, spacing: 1) {
                 Text(title).fontWeight(.medium)
-                Text(size).foregroundStyle(.secondary)
+                // Smaller than the action it qualifies: a size and a tag are not the decision.
+                Text(size).font(.caption).foregroundStyle(.secondary)
             }
         }
         .font(.callout)

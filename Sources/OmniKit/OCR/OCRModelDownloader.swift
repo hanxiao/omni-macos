@@ -16,11 +16,20 @@ public final class OCRModelDownloader: NSObject, URLSessionDownloadDelegate, @un
         public let fileCount: Int
         public let received: Int64
         public let total: Int64          // -1 when the server does not say
+        /// The WHOLE download, not the file in flight. Reporting per-file progress meant a bar
+        /// that emptied and refilled once per shard, which only made sense next to a "part k of n"
+        /// counter - a number about how the weights happen to be packaged, which is not the
+        /// reader's business.
+        public let documentReceived: Int64
+        public let documentTotal: Int64  // 0 until the manifest lands
     }
 
     private var session: URLSession!
     private let lock = NSLock()
     private var perFile: (@Sendable (Int64, Int64) -> Void)?
+    /// Bytes of files already on disk, and what the manifest says the whole download weighs.
+    private var completedBytes: Int64 = 0
+    private var documentTotal: Int64 = 0
     private var continuation: CheckedContinuation<URL, Error>?
     private var currentTask: URLSessionDownloadTask?
     private var isCancelled = false
@@ -37,10 +46,14 @@ public final class OCRModelDownloader: NSObject, URLSessionDownloadDelegate, @un
         let fm = FileManager.default
         try fm.createDirectory(at: destination, withIntermediateDirectories: true)
 
-        // The manifest first - it is what names everything else.
+        lock.withLock { completedBytes = 0; documentTotal = 0 }
+
+        // The manifest first - it is what names everything else, and what says how big the whole
+        // download is.
         try await fetch(variant: variant, file: OCRModelCatalog.manifestFile, into: destination,
                         index: 0, count: 1, onProgress: onProgress)
         let manifest = try OCRModelCatalog.readManifest(at: destination)
+        lock.withLock { completedBytes = 0; documentTotal = manifest.bytes }
 
         for (index, file) in manifest.files.enumerated() where file != OCRModelCatalog.manifestFile {
             if lock.withLock({ isCancelled }) { throw URLError(.cancelled) }
@@ -55,22 +68,31 @@ public final class OCRModelDownloader: NSObject, URLSessionDownloadDelegate, @un
         let target = destination.appendingPathComponent(file)
         let fm = FileManager.default
         if let size = try? fm.attributesOfItem(atPath: target.path)[.size] as? Int64, size > 0 {
+            let done = lock.withLock { completedBytes += size; return completedBytes }
+            let whole = lock.withLock { documentTotal }
             onProgress(Progress(file: file, fileIndex: index, fileCount: count,
-                                received: size, total: size))
+                                received: size, total: size,
+                                documentReceived: done, documentTotal: whole))
             return
         }
         guard let url = OCRModelCatalog.assetURL(variant: variant, file: file) else {
             throw OmniError.model("bad asset URL for \(file)")
         }
+        let base = lock.withLock { completedBytes }
+        let whole = lock.withLock { documentTotal }
         lock.withLock {
             perFile = { received, total in
                 onProgress(Progress(file: file, fileIndex: index, fileCount: count,
-                                    received: received, total: total))
+                                    received: received, total: total,
+                                    documentReceived: base + received, documentTotal: whole))
             }
         }
         let staged = try await downloadOne(url)
         try? fm.removeItem(at: target)
         try fm.moveItem(at: staged, to: target)
+        if let size = try? fm.attributesOfItem(atPath: target.path)[.size] as? Int64 {
+            lock.withLock { completedBytes += size }
+        }
     }
 
     private func downloadOne(_ url: URL) async throws -> URL {
