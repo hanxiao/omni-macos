@@ -515,8 +515,14 @@ final class OCRLanguageModel: @unchecked Sendable {
     func newCaches() -> [OCRKVCache] { (0 ..< OCRLanguageConfig.layers).map { _ in OCRKVCache() } }
 
     func embed(_ ids: [Int]) -> MLXArray {
-        embedTokens[MLXArray(ids.map { Int32($0) })]
+        embed(MLXArray(ids.map { Int32($0) }))
     }
+
+    /// Embed ids that are still ON the GPU.
+    ///
+    /// This is what lets the draft chain run without a CPU round trip: the id a step produces is
+    /// an argmax that never has to become a Swift Int before the next step can look it up.
+    func embed(_ ids: MLXArray) -> MLXArray { embedTokens[ids] }
 
     /// `(cos, sin)` of shape `(n, headDim)` with each half duplicated, built in fp32 on the host
     /// so the table matches the reference's float32 rotary exactly. Cached by the position span,
@@ -596,7 +602,11 @@ final class OCRLanguageModel: @unchecked Sendable {
     }
 
     func draftEmbed(_ ids: [Int]) -> MLXArray {
-        if let table = mtp?.embed { return table[MLXArray(ids.map { Int32($0) })] }
+        draftEmbed(MLXArray(ids.map { Int32($0) }))
+    }
+
+    func draftEmbed(_ ids: MLXArray) -> MLXArray {
+        if let table = mtp?.embed { return table[ids] }
         return embed(ids)
     }
 

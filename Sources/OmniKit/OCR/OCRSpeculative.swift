@@ -109,6 +109,13 @@ extension OCRModel {
                                   onStream: onStream, shouldContinue: shouldContinue)
     }
 
+    /// Bisect control: with every draft rejected, speculation must reduce to EXACT greedy. If it
+    /// does not, the defect is in verify/rollback rather than in the draft.
+    ///
+    /// Read ONCE. `ProcessInfo.environment` materialises the whole environment dictionary on every
+    /// access, and this used to sit inside the verify loop where it ran on every cycle.
+    static let rejectAllDrafts = ProcessInfo.processInfo.environment["OMNI_OCR_SPEC_REJECT_ALL"] == "1"
+
     /// The GPU half of a request, given pixels that have already been through the vision tower.
     ///
     /// Split out so a document can run page n+1's vision on a second MLX stream while page n
@@ -168,38 +175,47 @@ extension OCRModel {
             // A fixed k has to be wrong on one of them, so the length follows recent acceptance:
             // a fully accepted block earns one more draft, a fully rejected one gives one back.
             let k = adaptiveDraft ? liveK : k
-            var drafts: [Int] = []
+
+            // ---- draft K tokens, recursively, WITHOUT coming back to the CPU ----
+            //
+            // Each step's token is an argmax that the next step only needs in order to look up an
+            // embedding, and that lookup can be done with the id still on the GPU. Reading it back
+            // with `.item()` forced a full evaluate-and-synchronise per draft - k blocking round
+            // trips per cycle on a decode that is bound by exactly this kind of fixed per-step
+            // latency. Left lazy, the whole k-step chain is one graph evaluated once, below.
+            var draftIDs: [MLXArray] = []
             var draftHidden = previousHidden
-            var draftToken = current
+            var draftToken = MLXArray([Int32(current)])
             let mtpBase = mtpCache.offset
             for step in 0 ..< k {
-                let embedding = llm.draftEmbed([draftToken])
+                let embedding = llm.draftEmbed(draftToken)
                 guard let out = llm.mtpStep(tokenEmbedding: embedding, previousHidden: draftHidden,
                                             positions: [position + step], cache: mtpCache) else { break }
-                let draftLogits = llm.draftLogits(hiddenState: out)
-                let next = draftLogits[-1].argMax().item(Int.self)
-                stats.draftedOutsideShortlist += (OCRLanguageModel.draftVocab > 0
-                                                  && next >= OCRLanguageModel.draftVocab) ? 1 : 0
-                drafts.append(next)
+                let next = llm.draftLogits(hiddenState: out)[-1].argMax().reshaped([1]).asType(.int32)
+                draftIDs.append(next)
                 draftHidden = out
                 draftToken = next
             }
-            guard !drafts.isEmpty else { break }
+            guard !draftIDs.isEmpty else { break }
 
             // ---- verify: one target forward over [current, drafts...] ----
             // Slot j predicts the token at position + j + 1, so K + 1 slots cover every draft
             // plus a bonus token when all of them are accepted.
-            let verifyTokens = [current] + drafts
-            let verifyPositions = Array(position ... (position + drafts.count))
-            let step = llm.forward(llm.embed(verifyTokens), positions: verifyPositions, caches: caches)
-            eval(step.logits)
+            let draftBlock = concatenated(draftIDs, axis: 0)
+            let verifyIDs = concatenated([MLXArray([Int32(current)]), draftBlock], axis: 0)
+            let verifyPositions = Array(position ... (position + draftIDs.count))
+            let step = llm.forward(llm.embed(verifyIDs), positions: verifyPositions, caches: caches)
+            // ONE synchronisation for the cycle: the drafts and the target's predictions come back
+            // together, so k + 2 blocking round trips become one.
+            eval(step.logits, draftBlock)
             let predictions = step.logits.argMax(axis: -1).asArray(Int32.self).map(Int.init)
+            let drafts = draftBlock.asArray(Int32.self).map(Int.init)
+            if OCRLanguageModel.draftVocab > 0 {
+                stats.draftedOutsideShortlist += drafts.filter { $0 >= OCRLanguageModel.draftVocab }.count
+            }
 
             var accepted = 0
-            // Bisect control: with every draft rejected, speculation must reduce to EXACT greedy.
-            // If it does not, the defect is in verify/rollback rather than in the draft.
-            let rejectAll = ProcessInfo.processInfo.environment["OMNI_OCR_SPEC_REJECT_ALL"] == "1"
-            while !rejectAll && accepted < drafts.count && predictions[accepted] == drafts[accepted] {
+            while !Self.rejectAllDrafts && accepted < drafts.count && predictions[accepted] == drafts[accepted] {
                 stats.acceptedAt[accepted] += 1
                 accepted += 1
             }
