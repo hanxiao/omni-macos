@@ -149,14 +149,13 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   renumbered "page 13 of 40" into "page 13 of 41" under the reader while they watched.
 - Thumbnails cast a shadow and are NOT stroked. Preview's pages read as paper because of the
   shadow; a hairline on top of it is the frame a page rail is not supposed to have.
-- The page navigator is a `List` with `.listRowBackground(Color.clear)`. The system's row
-  selection greys out the moment the text pane takes focus, and here the selection means "the page
-  you are looking at", not "the focused row" - so the row draws nothing and the thumbnail draws the
-  accent fill itself, around the page AND its number, as Preview does. The List stays because it is
-  the only container that can scroll to a row it has not built. Its selection binding needs a
-  `simultaneousGesture(TapGesture(count: 1))` alongside the high-priority double tap: the
-  high-priority gesture is the only way a row inside a List sees a double click, and it swallows
-  the single click the binding was relying on.
+- The page navigator is an EAGER `ScrollView`, not a `List`. A sidebar list draws its own row
+  chrome - the system selection, which greys out the moment the text pane takes focus, and a hover
+  fill on top of it - so the accent mark this rail needs sat inside a second background.
+  `.listRowBackground(Color.clear)` does not remove either. The only thing the List was still
+  buying was scrolling to a row it had not built, and an eager stack does not have that problem.
+  Selection means "the page you are looking at", not "the focused row", and is drawn once, by the
+  thumbnail: the accent fill around the page AND its number, as Preview does.
 - The editable source pane is an `NSTextView`, not `TextEditor`: the navigator has to scroll it to
   a page, which needs a character offset and a scroll call `TextEditor` does not expose. The
   offsets are built WITH the string (`documentSource()`) rather than found in it, because a page's

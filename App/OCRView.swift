@@ -210,27 +210,35 @@ struct PageRail: View {
 
     var body: some View {
         ScrollViewReader { proxy in
-            List(selection: Binding<Int?>(get: { session.railSelection },
-                                          set: { if let id = $0 { session.select(id) } })) {
-                ForEach(session.visiblePages) { page in
-                    PageThumb(page: page,
-                              selected: session.railSelection == page.id,
-                              onPreview: { session.previewing = session.previewURL(for: page.id) })
-                        .id(page.id)
-                        .tag(page.id)
-                        .listRowInsets(EdgeInsets(top: 2, leading: 4, bottom: 2, trailing: 4))
-                        .listRowSeparator(.hidden)
-                        // The system's row highlight greys out the moment the text pane takes
-                        // focus, and here the selection means "the page you are looking at", not
-                        // "the focused row" - so the row draws nothing and `PageThumb` draws the
-                        // accent itself. The List stays because it is the only container that can
-                        // scroll to a row it has not built: a `LazyVStack` cannot, so following a
-                        // run stalled a page or two behind exactly as the transcript once did.
-                        .listRowBackground(Color.clear)
+            ScrollView {
+                // Eager, like the transcript's sections and for the same reason: `scrollTo` cannot
+                // reach a row a lazy stack has not built, which is exactly the row a run is moving
+                // towards. One small view per page is tens of views, not thousands.
+                VStack(spacing: 2) {
+                    ForEach(session.visiblePages) { page in
+                        PageThumb(page: page,
+                                  selected: session.railSelection == page.id,
+                                  onPreview: { session.previewing = session.previewURL(for: page.id) })
+                            .id(page.id)
+                    }
+                }
+                .padding(.horizontal, 6)
+                .padding(.vertical, 6)
+            }
+            // Not a `List`. A sidebar list draws its own row highlight - the system selection,
+            // which greys out the moment the text pane takes focus, and a hover fill on top of it -
+            // so the accent mark this rail needs ended up sitting inside a second background. Here
+            // the selection means "the page you are looking at", not "the focused row", and it is
+            // drawn once, by the thumbnail.
+            .focusable()
+            .focusEffectDisabled()
+            .onMoveCommand { direction in
+                switch direction {
+                case .up: session.step(by: -1)
+                case .down: session.step(by: 1)
+                default: break
                 }
             }
-            .listStyle(.sidebar)
-            .scrollContentBackground(.hidden)
             // The rail follows the page being decoded. Once nothing is running it belongs to the
             // reader: scrolling it back to the selection under their hands is how a navigator
             // stops being usable.
@@ -267,12 +275,8 @@ private struct PageThumb: View {
             if selected { RoundedRectangle(cornerRadius: 8).fill(Color.accentColor) }
         }
         .contentShape(Rectangle())
-        // A high-priority double tap is the only way a row inside a List ever sees one - but it
-        // also swallows the single click the List's selection binding was relying on, so the row
-        // selects itself as well. Both fire on a double click, which is what should happen: the
-        // page you preview is the page you are on.
-        .highPriorityGesture(TapGesture(count: 2).onEnded { onPreview() })
-        .simultaneousGesture(TapGesture(count: 1).onEnded { session.select(page.id) })
+        .onTapGesture(count: 2) { onPreview() }
+        .onTapGesture { session.select(page.id) }
         // The app's existing file actions, on the file this page came from - not a second set of
         // them. Reveal and Open are the same `PhotoActions` calls the results list makes, so a
         // page behaves like any other file the app knows about.
