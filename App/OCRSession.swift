@@ -61,6 +61,9 @@ final class OCRSession {
         /// Where the page came from, so Quick Look can show the original at full size.
         var source: Source = .none
         var state: PageState = .pending
+        /// Which drop this page arrived in. The readout counts within a batch, so opening a second
+        /// file does not renumber the run the reader is watching.
+        var batch: Int = 0
         var tokens: Int = 0
         var seconds: Double = 0
         var tokensPerSecond: Double = 0
@@ -267,8 +270,25 @@ final class OCRSession {
     private(set) var notice: String?
     private(set) var noticeSymbol = "exclamationmark.triangle"
 
+    /// The drop being transcribed. Not the whole workspace: a file opened while a run is in flight
+    /// joins the queue behind it, and counting it into the run already on screen turned "page 13 of
+    /// 40" into "page 13 of 41" under the reader's eyes.
+    private var activeBatch: Int {
+        if let index = runningIndex, pages.indices.contains(index) { return pages[index].batch }
+        return pages.last?.batch ?? 0
+    }
+
+    var batchTotal: Int { pages.reduce(0) { $1.batch == activeBatch ? $0 + 1 : $0 } }
+
+    var batchCompleted: Int {
+        let batch = activeBatch
+        return pages.reduce(0) { $1.batch == batch && $1.state != .pending && $1.state != .running
+            ? $0 + 1 : $0 }
+    }
+
     var progress: Double {
-        pages.isEmpty ? 0 : Double(completedPages) / Double(pages.count)
+        let total = batchTotal
+        return total == 0 ? 0 : Double(batchCompleted) / Double(total)
     }
     var isBusy: Bool { phase == .loading || phase == .running }
 
@@ -431,6 +451,8 @@ final class OCRSession {
     /// under way when the button was pressed.
     private(set) var isHolding = false
     @ObservationIgnored private var previewCache: [Int: URL] = [:]
+    /// Bumped by every drop, so pages carry the batch they came in with.
+    private var batchCount = 0
 
     // MARK: - Input
 
@@ -463,6 +485,8 @@ final class OCRSession {
         // 200-page PDF must not be rasterised here - only counted.
         let firstNewPage = pages.count
         let firstNewDocument = documents.count
+        batchCount += 1
+        let batch = batchCount
         var enumerated: [Page] = []
         var added: [PageJob] = []
         var docs: [Document] = []
@@ -474,14 +498,16 @@ final class OCRSession {
                     enumerated.append(Page(id: firstNewPage + enumerated.count,
                                            label: "Page \(index + 1)",
                                            caption: "\(index + 1)",
-                                           source: .pdfPage(url, index)))
+                                           source: .pdfPage(url, index),
+                                           batch: batch))
                     added.append(.pdfPage(url: url, index: index))
                 }
             } else {
                 enumerated.append(Page(id: firstNewPage + enumerated.count,
                                        label: url.lastPathComponent,
                                        caption: url.lastPathComponent,
-                                       source: .file(url)))
+                                       source: .file(url),
+                                       batch: batch))
                 added.append(.image(url: url))
             }
             let last = firstNewPage + enumerated.count
@@ -546,6 +572,7 @@ final class OCRSession {
         documentEdits = [:]
         editSectionsByDocument = [:]
         previewCache = [:]
+        batchCount = 0
         find = ""
         notice = nil
     }

@@ -219,7 +219,7 @@ struct PageRail: View {
                             .id(page.id)
                     }
                 }
-                .padding(.horizontal, 8)
+                .padding(.horizontal, 6)
                 .padding(.vertical, 6)
             }
             // A scroller and not a `List`. A sidebar list draws the SYSTEM's row selection, which
@@ -264,7 +264,7 @@ private struct PageThumb: View {
                 .foregroundStyle(selected ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
         }
         .frame(maxWidth: .infinity)
-        .padding(6)
+        .padding(4)
         // The selection encloses the page AND its number, in the accent colour, the way Preview
         // marks the page you are on.
         .background {
@@ -320,8 +320,10 @@ private struct PageThumb: View {
                 Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
             }
         }
-        .overlay(Rectangle().strokeBorder(Color.primary.opacity(0.15), lineWidth: 0.5))
-        .shadow(color: .black.opacity(0.18), radius: 1.5, y: 1)
+        // A shadow and no drawn line. Preview's pages read as paper because they cast one, not
+        // because anything is stroked around them; a hairline on top of it is the frame the rail
+        // is not supposed to have.
+        .shadow(color: .black.opacity(0.16), radius: 1.5, y: 0.5)
         // Unprocessed pages are dimmed rather than hidden: the rail doubles as the progress
         // display, so the shape of what is left has to stay visible. Never the selected page,
         // whatever its state: a translucent sheet over the accent fill turns the paper blue.
@@ -792,7 +794,7 @@ private struct ProgressReadout: View {
     @ViewBuilder private var indicator: some View {
         if !session.isBusy {
             Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-        } else if session.pages.count > 1 {
+        } else if session.batchTotal > 1 {
             CloudSyncPie(fraction: session.progress)
         } else {
             ProgressView().progressViewStyle(.circular).controlSize(.small)
@@ -801,8 +803,8 @@ private struct ProgressReadout: View {
 
     private var headline: String {
         session.isBusy
-            ? "Page \(min(session.completedPages + 1, session.pages.count)) of \(session.pages.count)"
-            : "\(session.completedPages) of \(session.pages.count) pages"
+            ? "Page \(min(session.batchCompleted + 1, session.batchTotal)) of \(session.batchTotal)"
+            : "\(session.batchCompleted) of \(session.batchTotal) pages"
     }
 
     private var detail: String {

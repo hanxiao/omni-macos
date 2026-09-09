@@ -138,6 +138,11 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   page navigator went blank the moment a run finished, which is how it was found. It also numbered
   logical lines, which a soft-wrapping editor does not lay out one to a row, and `Text("\(line)")`
   is a LocalizedStringKey, so past 999 it rendered "1,300" into a column sized for four digits.
+- The readout counts within a DROP BATCH, not across the workspace. Pages carry the batch they
+  arrived in; the chip reports the batch containing the running page. Summing the whole queue
+  renumbered "page 13 of 40" into "page 13 of 41" under the reader while they watched.
+- Thumbnails cast a shadow and are NOT stroked. Preview's pages read as paper because of the
+  shadow; a hairline on top of it is the frame a page rail is not supposed to have.
 - The page navigator is a `ScrollView`, NOT a `List`. A sidebar list draws the SYSTEM's row
   selection, which greys out the moment the text pane takes focus - but here the selection means
   "the page you are looking at", not "the focused row", so it has to stay lit. Preview's own
