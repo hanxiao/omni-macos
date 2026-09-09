@@ -69,6 +69,17 @@ struct OmniApp: App {
                 // The toggle is what loads and offloads the model: it is a 4.53 GB add-on that
                 // should not be resident while the user is searching.
                 .onChange(of: model.ocrMode) { _, on in on ? ocr.activate() : ocr.deactivate() }
+                // A test seam, not a feature. XCUITest passes `-omni.ocrOpen <path>[:<path>…]` so a
+                // UI test can put a document in front of the workspace without driving an open
+                // panel across a process boundary. Launch arguments land in NSUserDefaults'
+                // ARGUMENT domain, which is process-local and never written back, so a normal
+                // launch never sees this.
+                .task {
+                    let key = UserDefaults.standard.string(forKey: "omni.ocrOpen") ?? ""
+                    guard !key.isEmpty else { return }
+                    model.ocrMode = true
+                    ocr.open(urls: key.split(separator: ":").map { URL(fileURLWithPath: String($0)) })
+                }
                 .frame(minWidth: 820, minHeight: 520)
                 .task { Updater.checkOnLaunchIfDue() }   // silent once-a-day check; prompts only if newer
         }

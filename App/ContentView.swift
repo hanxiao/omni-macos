@@ -505,6 +505,7 @@ struct ContentView: View {
                 }
                 .help(model.ocrMode ? "Back to search  \u{2318}\u{2325}O" : "Transcribe a document  \u{2318}\u{2325}O")
                 .accessibilityLabel(model.ocrMode ? "Back to search" : "Transcribe a document")
+                .accessibilityIdentifier("ocr.toggle")
         }
         // Bookmark the current search. The only way into History when recording is set to "Only when
         // I bookmark", and a quick save otherwise. Appears once there's a search to keep.

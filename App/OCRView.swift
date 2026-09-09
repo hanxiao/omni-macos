@@ -27,8 +27,9 @@ struct OCRView: View {
             switch session.phase {
             case .empty:
                 DropZone(targeted: dropTargeted) { chooseFiles() }
+                    .accessibilityIdentifier("ocr.dropzone")
             case .needsModel:
-                ModelMissing()
+                ModelMissing().accessibilityIdentifier("ocr.needsmodel")
             case .failed(let message):
                 // Explicitly, not via `default`: a failed run used to fall through to the
                 // workspace and render as "Preparing" forever, which is the worst possible
@@ -195,6 +196,7 @@ struct OCRView: View {
                     Label("Pages", systemImage: "sidebar.trailing")
                 }
                 .help("Show or hide the page list")
+                .accessibilityIdentifier("ocr.rail.toggle")
             }
         }
     }
@@ -396,6 +398,10 @@ private struct DocumentTabs: View {
         // made a long name crowd every other tab out.
         .frame(maxWidth: .infinity)
         .contentShape(Rectangle())
+        // A container element: without this the tab is only its children (a close button and a
+        // label) and nothing answers to the tab itself - for VoiceOver or for a test.
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("ocr.tab.\(doc.id)")
         .onTapGesture { session.selectDocument(doc.id) }
         .onHover { hovered = $0 ? doc.id : (hovered == doc.id ? nil : hovered) }
         .help(doc.name)
@@ -449,6 +455,7 @@ private struct RenderedSection: View {
         }
         .modifier(StreamFade(count: blocks.count))
         .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityIdentifier("ocr.section.\(id)")
     }
 }
 
@@ -713,6 +720,7 @@ private struct ProgressReadout: View {
             .glassChip(interactive: session.isBusy)
         }
         .shadow(color: .black.opacity(0.16), radius: 10, y: 3)
+        .accessibilityIdentifier("ocr.readout")
         .padding(.bottom, 18)
         .transition(.move(edge: .bottom).combined(with: .opacity))
         .accessibilityElement(children: .contain)

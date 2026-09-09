@@ -71,6 +71,21 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   checkpoint is Llama split-half, MLX is interleaved) and half-precision qkv/mask inside the
   fused vision SDPA (slower and it drifts). Do not re-adopt without new numbers.
 
+## UI tests (UITests/, Scripts/ui-test.sh)
+- XCUITest, not synthetic events. `./Scripts/ui-test.sh [Class[/test]]` - never a bare
+  `xcodebuild test`, same SE-0482 tokenizers artifact reason as Scripts/build-app.sh.
+- CGEvent key PRESSES from an external tool (cliclick `kp:`) never reach the app; typed TEXT does.
+  A harness built on them proves nothing about Space/Return/Escape - that is why these exist.
+- The runner is SANDBOXED: `.applicationSupportDirectory` inside it resolves to
+  `~/Library/Containers/io.hanxiao.omni.uitests.xctrunner/Data/...`, so a filesystem check made in
+  a test looks in the wrong place and skips every run while appearing to pass. Ask the APP (it
+  draws `ocr.needsmodel` when the optional model is absent).
+- `.accessibilityIdentifier` on a container OVERRIDES its children. An id on the tab strip made
+  every tab answer to the strip's id and none to its own.
+- `-omni.ocrOpen <path>[:<path>]` opens documents in the OCR workspace; launch arguments land in
+  NSUserDefaults' ARGUMENT domain, so a run cannot touch the real index, roots or settings.
+- "Timed out while enabling automation mode" = a stale OmniUITests-Runner, or the display asleep.
+
 ## Apple Photos (OmniKit/PhotosSource.swift)
 - Photos assets ride the file pipeline under `photos://<source>/<escaped localIdentifier>/<name>`
   paths. They are NOT filesystem paths: never build a file URL from one (CrawledFile.isPhoto).
