@@ -149,6 +149,11 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   renumbered "page 13 of 40" into "page 13 of 41" under the reader while they watched.
 - Thumbnails cast a shadow and are NOT stroked. Preview's pages read as paper because of the
   shadow; a hairline on top of it is the frame a page rail is not supposed to have.
+- The drawer is narrower in OCR mode, and it is the MAX that does it: a split view remembers the
+  divider where it was left, so an `ideal` below the search sidebar's stored width is ignored. A
+  smaller maximum clamps it on the way in and the search sidebar's own minimum pushes it back out
+  on the way out. The leading toolbar items move with the divider, which is the price of the
+  narrower drawer, not the inspector bug that moved them 300pt.
 - The page navigator is an EAGER `ScrollView`, not a `List`. A sidebar list draws its own row
   chrome - the system selection, which greys out the moment the text pane takes focus, and a hover
   fill on top of it - so the accent mark this rail needs sat inside a second background.

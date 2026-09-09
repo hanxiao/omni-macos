@@ -100,10 +100,22 @@ struct ContentView: View {
             // growing a second column on the trailing edge: the window keeps its shape, the system
             // sidebar toggle shows and hides it like any sidebar, and there is no inspector to
             // restructure the split - which is what moved the toolbar 300pt.
+            // The drawer is sized to what is in it. A page navigator needs the width of a page
+            // thumbnail and no more, where a list of folders and history needs room for names, so
+            // the search sidebar's 260 left a portrait scan swimming in margin.
             Group {
-                if model.ocrMode { PageRail() } else { Sidebar() }
+                if model.ocrMode {
+                    PageRail()
+                        // The MAX is what does the work. A split view remembers the divider where it was
+                        // left, so an `ideal` narrower than the search sidebar's stored width is
+                        // simply ignored; a smaller maximum clamps it on the way in, and the search
+                        // sidebar's own minimum pushes it back out on the way out.
+                        .navigationSplitViewColumnWidth(min: 120, ideal: 150, max: 180)
+                } else {
+                    Sidebar()
+                        .navigationSplitViewColumnWidth(min: 230, ideal: 260, max: 320)
+                }
             }
-            .navigationSplitViewColumnWidth(min: 230, ideal: 260, max: 320)
         } detail: {
             // No navigationTitle/navigationSubtitle: either one claims the leading toolbar slot
             // and pushes back/forward to its right.
