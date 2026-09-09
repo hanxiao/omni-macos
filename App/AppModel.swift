@@ -1092,6 +1092,13 @@ final class AppModel {
     var isOCRDownloading = false
     var ocrDownloadFraction: Double = 0
     var ocrDownloadLabel = ""
+    /// Throughput, smoothed. Sampled from the bytes the downloader reports rather than timed
+    /// inside it: a rate computed per callback swings between 0 and the link speed.
+    var ocrDownloadSpeed = ""
+    @ObservationIgnored private var ocrSpeedMark: (at: Date, bytes: Int64)?
+    @ObservationIgnored private var ocrSpeedRate: Double = 0
+    @ObservationIgnored private var ocrFolderWatch: DispatchSourceFileSystemObject?
+    @ObservationIgnored private var ocrRefreshPending = false
     var ocrDownloadFailed = false
     private var ocrDownloader: OCRModelDownloader?
 
@@ -1366,6 +1373,7 @@ final class AppModel {
         // installed long before anyone visits a settings tab, and a model still sitting at the old
         // path would read as missing.
         DispatchQueue.global(qos: .utility).async { OCRModelCatalog.migrateLegacyInstall() }
+        watchModelFolder()
         loadRoots()
         loadPhotoSources()
         loadSettings()
@@ -2618,6 +2626,9 @@ final class AppModel {
         isOCRDownloading = true
         ocrDownloadFraction = 0
         ocrDownloadLabel = "Preparing\u{2026}"
+        ocrDownloadSpeed = ""
+        ocrSpeedMark = nil
+        ocrSpeedRate = 0
         ocrDownloadFailed = false
         let dl = OCRModelDownloader(); ocrDownloader = dl
         Task {
@@ -2627,6 +2638,7 @@ final class AppModel {
                         // Per-file fraction, with the file position in the label: the shards are
                         // ~1.9 GB each, so a single overall bar would sit still for minutes.
                         self.ocrDownloadFraction = p.total > 0 ? Double(p.received) / Double(p.total) : 0
+                        self.noteOCRSpeed(received: p.received)
                         if p.file.hasSuffix(".safetensors") {
                             let gb = Double(p.received) / 1_000_000_000
                             let total = Double(p.total) / 1_000_000_000
@@ -2642,12 +2654,14 @@ final class AppModel {
                 await MainActor.run {
                     self.isOCRDownloading = false
                     self.ocrDownloadLabel = ""
+                    self.ocrDownloadSpeed = ""
                     self.ocrVariant = variant
                     self.refreshOCRInstalled()
                 }
             } catch {
                 await MainActor.run {
                     self.isOCRDownloading = false
+                    self.ocrDownloadSpeed = ""
                     if (error as? URLError)?.code == .cancelled {
                         self.ocrDownloadFailed = false
                         self.ocrDownloadLabel = ""
@@ -2663,11 +2677,66 @@ final class AppModel {
 
     func cancelOCRDownload() { ocrDownloader?.cancel() }
 
-    /// Delete an installed OCR variant. Reclaiming 4 GB is always an explicit action.
-    func removeOCRModel(_ variant: OCRModelCatalog.Variant) {
-        guard !isOCRDownloading else { return }
-        try? OCRModelDownloader.remove(variant)
-        refreshOCRInstalled()
+    /// Bytes per second, sampled at half-second intervals and smoothed. `received` is per FILE, so
+    /// it goes backwards when the downloader moves to the next shard; that restarts the sample
+    /// rather than reporting a negative rate.
+    private func noteOCRSpeed(received: Int64) {
+        let now = Date()
+        guard let mark = ocrSpeedMark, received >= mark.bytes else {
+            ocrSpeedMark = (now, received)
+            return
+        }
+        let elapsed = now.timeIntervalSince(mark.at)
+        guard elapsed >= 0.5 else { return }
+        let rate = Double(received - mark.bytes) / elapsed
+        ocrSpeedRate = ocrSpeedRate == 0 ? rate : ocrSpeedRate * 0.6 + rate * 0.4
+        ocrDownloadSpeed = String(format: "%.1f MB/s", ocrSpeedRate / 1_000_000)
+        ocrSpeedMark = (now, received)
+    }
+
+    /// Notice the model folder being emptied from the Finder.
+    ///
+    /// There is no Remove button: deleting four gigabytes is something a person does where they can
+    /// see what they are deleting, and an app that offers its own button then has to be trusted to
+    /// have used it. Watching the folder means the settings row is right either way. Debounced,
+    /// because the index database lives in the same folder and writes to it continuously.
+    private func watchModelFolder() {
+        guard ocrFolderWatch == nil,
+              let base = try? FileManager.default.url(for: .applicationSupportDirectory,
+                                                      in: .userDomainMask,
+                                                      appropriateFor: nil, create: true)
+        else { return }
+        ocrFolderWatch = Self.makeFolderWatch(
+            base.appendingPathComponent("Omni", isDirectory: true).path) {
+                Task { @MainActor in AppModel.shared?.modelFolderChanged() }
+            }
+    }
+
+    /// `nonisolated` on purpose: a dispatch source's handler runs on its own queue, and a closure
+    /// written inside a `@MainActor` method inherits that isolation - which makes the runtime
+    /// assert it is on the main queue the first time the handler fires, and crash.
+    private nonisolated static func makeFolderWatch(
+        _ path: String, onChange: @escaping @Sendable () -> Void
+    ) -> DispatchSourceFileSystemObject? {
+        let descriptor = open(path, O_EVTONLY)
+        guard descriptor >= 0 else { return nil }
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: descriptor, eventMask: [.write, .delete, .rename],
+            queue: DispatchQueue.global(qos: .utility))
+        source.setEventHandler { onChange() }
+        source.setCancelHandler { close(descriptor) }
+        source.resume()
+        return source
+    }
+
+    private func modelFolderChanged() {
+        guard !ocrRefreshPending else { return }
+        ocrRefreshPending = true
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1))
+            self.ocrRefreshPending = false
+            self.refreshOCRInstalled()
+        }
     }
 
     /// Cancel the in-flight model download (the onboarding Cancel button). Partial files stay on

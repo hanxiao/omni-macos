@@ -1030,20 +1030,20 @@ private struct OCRModelRow: View {
             if model.isOCRDownloading {
                 VStack(alignment: .leading, spacing: 4) {
                     ProgressView(value: model.ocrDownloadFraction)
-                    HStack {
+                    HStack(spacing: 8) {
                         Text(model.ocrDownloadLabel)
                             .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                         Spacer()
+                        Text(model.ocrDownloadSpeed)
+                            .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                         Button("Cancel") { model.cancelOCRDownload() }.controlSize(.small)
                     }
                 }
             } else if model.ocrInstalled.contains(variant) {
-                HStack(spacing: 8) {
-                    Text("OCR model")
-                    Spacer()
-                    Text("ocr-v1").foregroundStyle(.secondary)
-                    Button("Remove") { model.removeOCRModel(variant) }.controlSize(.small)
-                }
+                // No Remove button. Deleting four gigabytes is something a person does where they
+                // can see what they are deleting; the folder is watched, so this row is right
+                // whether it goes from here or from the Finder.
+                LabeledContent("OCR model", value: "ocr-v1")
             } else {
                 HStack(spacing: 8) {
                     Text("OCR model")

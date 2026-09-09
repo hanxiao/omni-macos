@@ -21,6 +21,10 @@ struct ContentView: View {
     // loading, onboarding, and the no-folders state the search field stays hidden (not dimmed).
     private var showsSearch: Bool { model.phase == .ready && !model.roots.isEmpty }
 
+    /// Whether the drawer has anything to show: the search sidebar always does, the page rail only
+    /// once a document is open.
+    private var ocrDrawerWanted: Bool { !model.ocrMode || !ocr.pages.isEmpty }
+
     /// Apply a user edit of the search box: parse it into the semantic query + qualifiers, apply the
     /// filters, clear a file query if real text was typed, and schedule the (debounced) search. The
     /// box binds to the RAW typed string; `set` (user edits only) routes here.
@@ -65,6 +69,13 @@ struct ContentView: View {
             } else {
                 split
             }
+        }
+        // An empty page rail is a column of nothing: fold it when OCR mode opens with no document
+        // and unfold it the moment one arrives. On the BODY, not on the split - the split is a
+        // branch of the Group above, so flipping the mode replaces it and takes any `onChange`
+        // declared there with it, which is why the drawer stayed open.
+        .onChange(of: ocrDrawerWanted, initial: true) { _, wanted in
+            withAnimation(.easeOut(duration: 0.2)) { columns = wanted ? .all : .detailOnly }
         }
         // Spotlight-style: put the caret in the search field as soon as the app can search.
         .onChange(of: showsSearch, initial: true) { _, shows in if shows { focusSearchField() } }

@@ -193,6 +193,15 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   nothing to show for it, and the half-decoded page would have to be discarded or resumed from a
   partial transcript. The chip says "Finishing this page" until the loop actually reaches the hold.
 
+## OCR weights (published)
+- The `balanced` build is LIVE at github.com/hanxiao/omni-macos/releases/tag/ocr-weights-v1, and
+  the in-app download was verified end to end against it: 4.3 GB at ~22 MB/s, model loads, page
+  transcribes. `special_tokens_map.json` is NOT published and is not needed - the manifest names
+  the three shards, both tokenizer files and `omni-ocr.json`, and that is what the loader reads.
+- `gh release upload file#name` sets the asset's LABEL, not its NAME. The asset keeps the file's
+  basename, so every URL `assetURL(variant:file:)` builds 404s. `Tools/ocr/publish.sh` now renames
+  each asset through the API after upload, which is in place and does not re-send gigabytes.
+
 ## OCR settings
 - ONE build is offered, and the weights live at `Application Support/Omni/ocr-v1-<variant>` beside
   the embedding model, not in an `ocr/` of their own. `OCRModelCatalog.migrateLegacyInstall()`
@@ -202,6 +211,12 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   Those are numbers nobody outside this repository can act on, offering a choice whose wrong
   answers are measurably worse (4-bit scores CER 0.25 on handwriting) - the app picks. The k curve
   and the variant measurements stay recorded above; they belong here, not in a settings pane.
+- There is NO Remove button for the OCR model. Deleting four gigabytes is something a person does
+  where they can see what they are deleting; `Application Support/Omni` is watched with a debounced
+  `DispatchSource`, so the settings row is right whether the folder goes from the Finder or not.
+  The watch handler MUST be built in a `nonisolated static` helper: a closure written inside a
+  `@MainActor` method inherits that isolation and the runtime traps the first time it fires on the
+  dispatch queue (EXC_BREAKPOINT in `swift_task_isCurrentExecutor`).
 - The prompt is one editable box. Presets that drop the LaTeX, HTML-table and header/footer rules
   change the SHAPE of the output, which is not something a reader can judge from a preset's name.
 

@@ -4,6 +4,10 @@
 # The app fetches from https://github.com/<repo>/releases/download/<tag>/<variant>-<file>, so the
 # asset names encode the variant: release assets are a flat namespace with no directories.
 #
+# `gh release upload file#name` sets the asset's LABEL, not its name - the asset keeps the file's
+# basename, and every URL the app builds 404s. The name is set afterwards through the API, which
+# renames in place rather than re-uploading gigabytes.
+#
 # A single asset is capped at 2 GiB, which is why the converter shards under 1.9 GB. Nothing here
 # re-shards; it uploads what convert.py produced.
 #
@@ -35,14 +39,15 @@ for variant in "${VARIANTS[@]}"; do
   # omni-ocr.json is what the downloader fetches FIRST to learn the shard count, so it has to be
   # present for any of the rest to be reachable. Upload it last so a half-finished upload never
   # advertises shards that are not there yet.
-  for f in "$dir"/*.safetensors "$dir"/tokenizer.json "$dir"/tokenizer_config.json; do
+  for f in "$dir"/*.safetensors "$dir"/tokenizer.json "$dir"/tokenizer_config.json "$dir"/omni-ocr.json; do
     [ -f "$f" ] || continue
-    name="jina-ocr-v1-mlx-$variant-$(basename "$f")"
+    base="$(basename "$f")"
+    name="jina-ocr-v1-mlx-$variant-$base"
     echo "   $name"
-    gh release upload "$TAG" "$f#$name" --repo "$REPO" --clobber
+    gh release upload "$TAG" "$f" --repo "$REPO" --clobber
+    id=$(gh api "/repos/$REPO/releases/tags/$TAG" -q ".assets[] | select(.name == \"$base\") | .id")
+    [ -n "$id" ] && gh api -X PATCH "/repos/$REPO/releases/assets/$id" -f name="$name" -q '.name' >/dev/null
   done
-  name="jina-ocr-v1-mlx-$variant-omni-ocr.json"
-  gh release upload "$TAG" "$dir/omni-ocr.json#$name" --repo "$REPO" --clobber
 done
 
 echo "done: https://github.com/$REPO/releases/tag/$TAG"
