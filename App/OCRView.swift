@@ -512,6 +512,17 @@ private struct SourceEditor: View {
     @State private var plain = ""
 
     var body: some View {
+        HStack(alignment: .top, spacing: 0) {
+            LineNumberGutter(text: plain)
+            editor
+        }
+        .onAppear {
+            plain = session.documentMarkdown
+            attributed = MarkdownSource.highlighted(plain)
+        }
+    }
+
+    @ViewBuilder private var editor: some View {
         Group {
             if #available(macOS 26.0, *) {
                 TextEditor(text: $attributed)
@@ -539,10 +550,48 @@ private struct SourceEditor: View {
         .padding(.horizontal, 8)
         .padding(.top, 24)
         .padding(.bottom, 8)
-        .onAppear {
-            plain = session.documentMarkdown
-            attributed = MarkdownSource.highlighted(plain)
+    }
+}
+
+/// A gutter of line numbers beside the source.
+///
+/// Hand-rolled because the packages that provide one do not fit: STTextView is GPL v3 (or a paid
+/// commercial licence), which an Apache-2.0 notarised app cannot take, and CodeEditSourceEditor
+/// says of itself that it is not ready for production and would pull tree-sitter and its grammars
+/// in for the sake of a number column. This is the whole feature.
+///
+/// It scrolls WITH the editor because both are laid out from the same string in the same
+/// coordinate space and the pair scrolls as one - no scroll-position syncing to drift.
+private struct LineNumberGutter: View {
+    let text: String
+
+    private var lineCount: Int {
+        max(1, text.reduce(into: 1) { count, c in if c == "\n" { count += 1 } })
+    }
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 0) {
+            ForEach(1 ... lineCount, id: \.self) { line in
+                Text("\(line)")
+                    .font(.system(.body, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .monospacedDigit()
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            }
+            Spacer(minLength: 0)
         }
+        .padding(.top, 24)
+        .padding(.trailing, 6)
+        .padding(.leading, 8)
+        .frame(width: gutterWidth)
+        .background(.background.tertiary)
+        .accessibilityHidden(true)          // a number column is noise to a screen reader
+    }
+
+    /// Widens with the document rather than being fixed, so a 1000-line transcript does not clip.
+    private var gutterWidth: CGFloat {
+        let digits = max(2, String(lineCount).count)
+        return CGFloat(digits) * 9 + 16
     }
 }
 

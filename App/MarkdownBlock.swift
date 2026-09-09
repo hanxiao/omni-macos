@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+@_spi(Textual) import SwiftUIMath
 
 /// A minimal block-level Markdown renderer for transcription output.
 ///
@@ -23,7 +24,9 @@ enum MarkdownBlock {
     /// Display maths: `$$ … $$`, which this model is asked to emit for block formulas.
     case math(String)
 
-    @ViewBuilder var view: some View {
+    // Main actor because it is only ever built from a SwiftUI body, and because SwiftUIMath's
+    // modifiers are main-actor isolated - which Release did not flag and Debug did.
+    @MainActor @ViewBuilder var view: some View {
         switch self {
         case .heading(let level, let text):
             Text(inline(text))
@@ -66,11 +69,13 @@ enum MarkdownBlock {
             Divider().padding(.vertical, 6)
 
         case .math(let latex):
-            Text(MathText.render(latex))
-                .font(.title3)
-                .frame(maxWidth: .infinity, alignment: .center)
-                .padding(.vertical, 6)
-                .textSelection(.enabled)
+            // Display maths is properly typeset, not approximated: a block equation is the one
+            // place a stacked fraction, a radical with a bar, and limits set above and below
+            // actually matter, and it is a standalone block so nothing is lost by rendering it as
+            // a view rather than as flowing text. Inline maths stays in `MathText`, where being
+            // selectable, copyable text that reflows with the paragraph is worth more than
+            // perfect typesetting.
+            MathBlock(latex: latex)
 
         case .table(let rows, let hasHeader):
             TableBlock(rows: rows, hasHeader: hasHeader)
@@ -321,6 +326,40 @@ extension MarkdownBlock {
             .replacingOccurrences(of: "&gt;", with: ">")
             .replacingOccurrences(of: "&nbsp;", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+/// A display equation, typeset if it can be and legible if it cannot.
+///
+/// `Math` draws NOTHING when the LaTeX fails to parse - the equation simply disappears, which on a
+/// transcript is the one outcome worse than setting it plainly. Real OCR output earns that often
+/// enough to matter: a scan of "x_i^(1/n)" comes back with `\wedge` and `..` in it.
+///
+/// So the LaTeX is checked first through the same measurement the layout uses (`typographicBounds`
+/// returns `.zero` when the display could not be built) and falls back to the Unicode setting in
+/// `MathText`, which never fails. The API is `@_spi(Textual)` - Textual, by the same author, uses
+/// it for exactly this measurement - so it is exported for use, not a private detail being prised
+/// open.
+private struct MathBlock: View {
+    let latex: String
+
+    private var typesettable: Bool {
+        Math.typographicBounds(for: latex, fitting: .unspecified,
+                               font: .init(name: .latinModern, size: 20),
+                               style: .display).width > 0
+    }
+
+    var body: some View {
+        Group {
+            if typesettable {
+                Math(latex).mathTypesettingStyle(.display)
+            } else {
+                Text(MathText.render(latex)).font(.title3)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.vertical, 8)
+        .textSelection(.enabled)
     }
 }
 

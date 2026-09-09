@@ -107,6 +107,23 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   checkpoint is Llama split-half, MLX is interleaved) and half-precision qkv/mask inside the
   fused vision SDPA (slower and it drifts). Do not re-adopt without new numbers.
 
+## Markdown/maths packages, surveyed 2026-09-09
+- ADOPTED `gonzalezreal/swiftui-math` (MIT, macOS 14 = our floor, no runtime deps, bundles its own
+  fonts) for DISPLAY maths. It is the engine Textual uses, without Textual's macOS 15 floor.
+- `Math` draws NOTHING when the LaTeX fails to parse, and real OCR output earns that often (a
+  scanned `x_i^(1/n)` comes back with `\wedge` and `..` in it). Validate with the `@_spi(Textual)`
+  `Math.typographicBounds`, which returns `.zero` on failure, and fall back to `MathText`'s Unicode
+  setting. A silently vanished equation is worse than a plainly set one.
+- INLINE maths stays in `MathText`: selectable, copyable, reflows with the paragraph. A view-based
+  renderer inline would need image attachments and stop being text.
+- REJECTED, with reasons: `krzyzanowskim/STTextView` is GPL v3 or a paid commercial licence - an
+  Apache-2.0 notarised app cannot take it, however good its line-number gutter is.
+  `CodeEditSourceEditor` (MIT) says of itself it is not production ready and drags tree-sitter plus
+  grammars in. `gonzalezreal/Textual` (MIT) is the right shape - Markdown, maths, syntax
+  highlighting, selection in one - but requires macOS 15; revisit if the floor ever moves.
+  `swift-markdown-ui` is in MAINTENANCE MODE, superseded by Textual. `swiftlang/swift-markdown`
+  (Apache-2.0, Apple) is the parser to use if the hand-rolled block splitter ever needs replacing.
+
 ## UI tests (UITests/, Scripts/ui-test.sh)
 - XCUITest, not synthetic events. `./Scripts/ui-test.sh [Class[/test]]` - never a bare
   `xcodebuild test`, same SE-0482 tokenizers artifact reason as Scripts/build-app.sh.

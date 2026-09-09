@@ -6,6 +6,9 @@ options:
   createIntermediateGroups: true
 
 packages:
+  swiftui-math:
+    url: https://github.com/gonzalezreal/swiftui-math
+    from: 0.1.0
   OmniKit:
     path: .
 
@@ -18,6 +21,11 @@ targets:
     dependencies:
       - package: OmniKit
         product: OmniKit
+      # Native math typesetting for the transcription's LaTeX. MIT, macOS 14+ (our floor exactly),
+      # no runtime dependencies of its own, and vector-rendered rather than a WebView. It is also
+      # the engine Textual uses, so this is the same typesetting without Textual's macOS 15 floor.
+      - package: swiftui-math
+        product: SwiftUIMath
     # Hardened runtime gates TCC-protected resources on a DECLARED entitlement, sandbox or no
     # sandbox: tccd refuses to even show the Photos prompt for a hardened binary that does not
     # carry this one ("Prompting policy for hardened runtime; service: kTCCServicePhotos requires

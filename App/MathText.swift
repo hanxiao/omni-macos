@@ -233,7 +233,8 @@ enum MathText {
         "Sigma": "Σ", "Upsilon": "Υ", "Phi": "Φ", "Psi": "Ψ", "Omega": "Ω",
         // Operators and relations
         "times": "×", "div": "÷", "pm": "±", "mp": "∓", "cdot": "·", "ast": "∗", "star": "⋆",
-        "leq": "≤", "le": "≤", "geq": "≥", "ge": "≥", "neq": "≠", "ne": "≠", "approx": "≈",
+        "leq": "≤", "le": "≤", "geq": "≥", "ge": "≥", "leqslant": "≤", "geqslant": "≥",
+        "wedge": "∧", "vee": "∨", "cong": "≅", "propto2": "∝", "neq": "≠", "ne": "≠", "approx": "≈",
         "equiv": "≡", "sim": "∼", "simeq": "≃", "propto": "∝", "ll": "≪", "gg": "≫",
         "subset": "⊂", "supset": "⊃", "subseteq": "⊆", "supseteq": "⊇", "in": "∈", "notin": "∉",
         "cup": "∪", "cap": "∩", "setminus": "∖", "emptyset": "∅", "varnothing": "∅",
