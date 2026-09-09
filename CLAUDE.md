@@ -149,6 +149,12 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   renumbered "page 13 of 40" into "page 13 of 41" under the reader while they watched.
 - Thumbnails cast a shadow and are NOT stroked. Preview's pages read as paper because of the
   shadow; a hairline on top of it is the frame a page rail is not supposed to have.
+- The sidebar toggle is OURS, not the system's. The automatic one lives in the sidebar's own
+  toolbar section and goes away with it, so folding the drawer left no way to unfold it but the
+  View menu. `NavigationSplitView(columnVisibility:)` plus `.toolbar(removing: .sidebarToggle)` on
+  the sidebar content, and a button in `.navigation`.
+- The in-field search-by-file button is hidden in OCR mode: the field finds text inside the open
+  transcript there, and picking a file to search by is not something it can do.
 - The drawer is narrower in OCR mode, and it is the MAX that does it: a split view remembers the
   divider where it was left, so an `ideal` below the search sidebar's stored width is ignored. A
   smaller maximum clamps it on the way in and the search sidebar's own minimum pushes it back out

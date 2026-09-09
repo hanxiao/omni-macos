@@ -8,6 +8,9 @@ struct ContentView: View {
     @State private var debounce: Task<Void, Never>?
     @State private var historyDebounce: Task<Void, Never>?
     @State private var fileDropTargeted = false
+    /// Owned rather than left to the system, so the toggle that hides the drawer can also bring it
+    /// back - see `sidebarToggleButton`.
+    @State private var columns: NavigationSplitViewVisibility = .automatic
     /// The OCR workspace owns its own state so a document survives toggling back to search and
     /// returning - closing it is an explicit action, not a side effect of looking away. It is
     /// created by the App, not here, because the File menu's OCR commands have to reach it: a key
@@ -95,7 +98,7 @@ struct ContentView: View {
     }
 
     private var split: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columns) {
             // ONE drawer. In OCR mode the sidebar becomes the page navigator rather than the app
             // growing a second column on the trailing edge: the window keeps its shape, the system
             // sidebar toggle shows and hides it like any sidebar, and there is no inspector to
@@ -116,6 +119,10 @@ struct ContentView: View {
                         .navigationSplitViewColumnWidth(min: 230, ideal: 260, max: 320)
                 }
             }
+            // The system toggle lives in the SIDEBAR's toolbar section and goes away with it, so
+            // folding the drawer left no way to unfold it but the View menu. Ours is in the window
+            // toolbar and stays.
+            .toolbar(removing: .sidebarToggle)
         } detail: {
             // No navigationTitle/navigationSubtitle: either one claims the leading toolbar slot
             // and pushes back/forward to its right.
@@ -141,7 +148,8 @@ struct ContentView: View {
                 }
             }
             .toolbar { toolbar }
-            .background(WindowTitleHider(onSearchByFile: { model.searchByFilePanel() }))
+            .background(WindowTitleHider(onSearchByFile: { model.searchByFilePanel() },
+                                        showsSearchByFile: !model.ocrMode))
         }
     }
 
@@ -475,6 +483,19 @@ struct ContentView: View {
         }
     }
 
+    private var sidebarToggleButton: some View {
+        Button {
+            withAnimation(.easeOut(duration: 0.2)) {
+                columns = columns == .detailOnly ? .all : .detailOnly
+            }
+        } label: {
+            Image(systemName: "sidebar.leading")
+        }
+        .help("Hide or show the sidebar")
+        .accessibilityLabel("Hide or show the sidebar")
+        .accessibilityIdentifier("sidebar.toggle")
+    }
+
     private var ocrToggleButton: some View {
         Button {
             // No `withAnimation`: the two modes are different content, not a moved view, and
@@ -507,6 +528,7 @@ struct ContentView: View {
         // writes Markdown, and touches neither the vector index nor the embedding model. Gating
         // it on the index would strand the feature exactly when it is most useful - while a large
         // index loads, or when another copy of Omni holds it open.
+        ToolbarItem(id: "sidebar.mode", placement: .navigation) { sidebarToggleButton }
         ToolbarItem(id: "ocr.mode", placement: .navigation) {
             // On is a FILLED accent circle with a white glyph, the way Preview draws Markup while
             // it is on - a mode you are inside of, not a tinted glyph you might have moused over.
@@ -1018,6 +1040,9 @@ struct IndexFailedView: View {
 private struct WindowTitleHider: NSViewRepresentable {
     /// Called when the in-field search-by-file button is clicked.
     var onSearchByFile: () -> Void
+    /// False in OCR mode: the field finds text inside the open transcript there, and starting a
+    /// similarity search by picking a file is not something it can do.
+    var showsSearchByFile: Bool = true
 
     /// Toolbar tuner (an invisible background view holding coalesced observers; despite the
     /// legacy name it no longer touches the window title - stock Sequoia titlebar chrome, i.e.
@@ -1033,6 +1058,7 @@ private struct WindowTitleHider: NSViewRepresentable {
     /// toolbar notification, where mutations mid-SwiftUI-commit are unsafe.
     final class TunerView: NSView {
         var onSearchByFile: (() -> Void)?
+        var showsSearchByFile = true { didSet { if showsSearchByFile != oldValue { scheduleApply() } } }
         // nonisolated(unsafe): deinit is nonisolated under strict concurrency; the view lives and
         // dies on the main thread, so the unregistration is race-free in practice.
         nonisolated(unsafe) private var observers: [NSObjectProtocol] = []
@@ -1083,6 +1109,10 @@ private struct WindowTitleHider: NSViewRepresentable {
         /// construction: if any expectation fails the button simply does not appear - the field
         /// itself is never altered.
         private func installAccessory(in field: NSSearchField) {
+            guard showsSearchByFile else {
+                field.viewWithTag(Self.accessoryTag)?.isHidden = true
+                return
+            }
             let side: CGFloat = 20   // hit target + hover-highlight capsule; the glyph inside is 11pt
             let hasText = !field.stringValue.isEmpty
             // Anchor to the CELL's cancel-button rect - the pill's true inner trailing edge. The
@@ -1147,9 +1177,11 @@ private struct WindowTitleHider: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         let v = TunerView()
         v.onSearchByFile = onSearchByFile
+        v.showsSearchByFile = showsSearchByFile
         return v
     }
     func updateNSView(_ nsView: NSView, context: Context) {
         (nsView as? TunerView)?.onSearchByFile = onSearchByFile
+        (nsView as? TunerView)?.showsSearchByFile = showsSearchByFile
     }
 }
