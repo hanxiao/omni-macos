@@ -20,6 +20,8 @@ enum MarkdownBlock {
     case code(String)
     case rule
     case table(rows: [[String]], hasHeader: Bool)
+    /// Display maths: `$$ … $$`, which this model is asked to emit for block formulas.
+    case math(String)
 
     @ViewBuilder var view: some View {
         switch self {
@@ -63,6 +65,13 @@ enum MarkdownBlock {
         case .rule:
             Divider().padding(.vertical, 6)
 
+        case .math(let latex):
+            Text(MathText.render(latex))
+                .font(.title3)
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.vertical, 6)
+                .textSelection(.enabled)
+
         case .table(let rows, let hasHeader):
             TableBlock(rows: rows, hasHeader: hasHeader)
         }
@@ -79,7 +88,12 @@ enum MarkdownBlock {
 
     /// Inline Markdown only. `.inlineOnlyPreservingWhitespace` is deliberate: the full parser
     /// would swallow leading `#` and `-` markers that this splitter has already claimed.
-    private func inline(_ text: String) -> AttributedString { InlineCache.attributed(text) }
+    /// Maths is resolved BEFORE the Markdown parser sees the line: `$x^2$` and `$a_i$` contain the
+    /// characters that parser treats as emphasis, so it would eat the exponent and hand back the
+    /// wrong text with no way to tell.
+    private func inline(_ text: String) -> AttributedString {
+        MathText.inline(text) { InlineCache.attributed($0) }
+    }
 }
 
 /// Memoises inline parsing across renders.
@@ -146,6 +160,29 @@ extension MarkdownBlock {
                     index += 1
                 }
                 if let table = parseHTMLTable(body) { blocks.append(table) }
+                continue
+            }
+
+            if trimmed.hasPrefix("$$") {
+                flushParagraph()
+                var body = trimmed.dropFirst(2)
+                if let end = body.range(of: "$$") {          // opened and closed on one line
+                    blocks.append(.math(String(body[..<end.lowerBound])))
+                    index += 1
+                    continue
+                }
+                index += 1
+                while index < lines.count {
+                    let line = lines[index]
+                    if let end = line.range(of: "$$") {
+                        body += "\n" + line[..<end.lowerBound]
+                        index += 1
+                        break
+                    }
+                    body += "\n" + line
+                    index += 1
+                }
+                blocks.append(.math(String(body)))
                 continue
             }
 

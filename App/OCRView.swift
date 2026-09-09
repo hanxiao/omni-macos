@@ -284,8 +284,20 @@ private struct PageThumb: View {
         // ordinary and simultaneous tap gestures before they arrive, so neither `.onTapGesture`
         // nor `.simultaneousGesture` on the row ever fires.
         .highPriorityGesture(TapGesture(count: 2).onEnded { onPreview() })
+        // The app's existing file actions, on the file this page came from - not a second set of
+        // them. Reveal and Open are the same `PhotoActions` calls the results list makes, so a
+        // page behaves like any other file the app knows about.
         .contextMenu {
             Button("Quick Look") { onPreview() }
+            if let url = session.sourceURL(for: page.id) {
+                Divider()
+                Button("Open in Preview") { PhotoActions.open(url.path) }
+                Button("Reveal in Finder") { PhotoActions.reveal(paths: [url.path]) }
+                Button("Copy Path") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(url.path, forType: .string)
+                }
+            }
         }
         // Content OUT. A transcribed page drags into Notes, Mail, TextEdit or any editor as its
         // Markdown; the whole document goes to disk through Save.

@@ -761,6 +761,18 @@ final class OCRSession {
         }
     }
 
+    /// The file a page came from, if it has one: the image itself, or the PDF a page belongs to.
+    /// What the rail's context menu acts on, so Reveal and Open mean the same here as anywhere
+    /// else in the app.
+    func sourceURL(for id: Int) -> URL? {
+        guard pages.indices.contains(id) else { return nil }
+        switch pages[id].source {
+        case .none: return nil
+        case .file(let url): return url
+        case .pdfPage(let url, _): return url
+        }
+    }
+
     /// A file Quick Look can show for this page.
     ///
     /// An image drop previews the original file, at its own resolution and with its own metadata.

@@ -28,6 +28,7 @@ enum MarkdownSource {
     private static let code = Color(nsColor: .systemGreen)
     private static let link = Color(nsColor: .systemBrown)
     private static let rule = Color(nsColor: .secondaryLabelColor)
+    private static let math = Color(nsColor: .systemIndigo)
 
     /// Ordered because later rules paint over earlier ones: a `<td>` inside a fenced block should
     /// read as code, not as a tag.
@@ -42,6 +43,8 @@ enum MarkdownSource {
         ("</?[A-Za-z][^>]*>",                     .init(color: tag)),
         ("\\s([A-Za-z-]+)=\"[^\"]*\"",            .init(color: attribute)),
         ("`[^`\\n]+`",                            .init(color: code)),
+        // Maths, so the source view shows where a formula is even though it is not set here.
+        ("\\$\\$?[^$\\n]+\\$\\$?",                 .init(color: math)),
         ("\\*\\*[^*\\n]+\\*\\*",                  .init(bold: true)),
         ("(?<![*\\w])\\*[^*\\n]+\\*(?![*\\w])",   .init(italic: true)),
         ("\\[[^\\]\\n]*\\]\\([^)\\n]*\\)",        .init(color: link, underline: true)),
