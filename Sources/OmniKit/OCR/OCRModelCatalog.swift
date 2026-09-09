@@ -30,7 +30,9 @@ public enum OCRModelCatalog {
         case fidelity
         /// Adds 8-bit shared-expert and dense-MLP packs. Still nothing at 4 bits, and the best
         /// measured quality-per-byte of the three.
-        /// 4.53 GB, 205 tok/s, mean CER 0.0044 on the hard corpus, 9 of 10 pages exact.
+        /// 4.53 GB, mean CER 0.0044 on the hard corpus, 9 of 10 pages exact. 236-298 tok/s
+        /// depending on page length since the draft chain stopped syncing per token and the
+        /// vocabulary shortlist began working; the quoted ~240 is a dense page, not a best case.
         case balanced
         /// Dynamic 4-bit: expert `down` projections and attention at 4 bits (group size 32),
         /// expert `gate_up`, shared expert and dense MLP at 8 bits, router / lm_head / embeddings
@@ -53,7 +55,7 @@ public enum OCRModelCatalog {
         public var summary: String {
             switch self {
             case .fidelity: return "4.6 GB, ~198 tok/s, CER 0.008"
-            case .balanced: return "4.5 GB, ~205 tok/s, CER 0.004"
+            case .balanced: return "4.5 GB, ~240 tok/s, CER 0.004"
             case .compact: return "4.1 GB, ~203 tok/s, CER 0.047"
             }
         }
