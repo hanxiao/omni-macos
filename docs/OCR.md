@@ -165,7 +165,8 @@ prose, cursive field notes, each JPEG-compressed, blurred, noised, skewed and sh
 All 40 page markers recovered in place; page 1's 22-row table came back with its `PAGE TOTAL`
 (59899.00) exactly right.
 
-**Parallelism does not pay in-process.** Three overlap strategies, 9-12 pages each:
+**Parallelism pays, but only across PROCESSES.** Three in-process overlap strategies first,
+9-12 pages each:
 
 | strategy | time | vs sequential |
 |---|---|---|
@@ -175,12 +176,30 @@ All 40 page markers recovered in place; page 1's 22-row table came back with its
 | 2 concurrent page lanes, own MLX streams | 38.8 s / 12p | +5% |
 | 3, 4, 6 lanes | 38.8-40.0 s / 12p | no further gain |
 
-Concurrency saturates at 2 lanes for +5%. That is far short of the **1.8x the predecessor measured
-with 6 worker PROCESSES**, and the gap is the interesting part: separate processes each get their
-own Metal command queue, while streams inside one process still serialise on submission. So
-multi-process is the only route to real page parallelism here, and it costs N x 4.5 GB of weights
-- which is why it is not the default. `transcribeConcurrent(workers:)` exists, defaults to 1, and
-is byte-identical to sequential (same document digest at 1, 2 and 4 lanes).
+In-process concurrency saturates at 2 lanes for +5%. Separate processes do not:
+
+| processes | 20 pages | speedup |
+|---|---|---|
+| 1 (in-process) | 70.3 s | 1.00x |
+| 2 | 49.8 s | 1.41x |
+| 3 | 44.7 s | 1.57x |
+| 4 | 42.9 s | **1.64x** |
+
+The whole 40-page document: **83.6 s against 132.9 s sequential, 1.59x**, 2.09 s/page, and the
+document digest is identical to the single-process run. `OCRWorkerPool` implements this; the
+worker body lives in OmniKit (`OCRWorker.runIfRequested`) so a host can re-exec ITSELF as a
+worker rather than shipping a second binary.
+
+The mechanism is the interesting part: MLX submits through one command queue per process, so
+extra streams inside a process still serialise, while extra processes each get their own queue and
+the GPU interleaves them. The cost is one full copy of the weights per worker, so
+`recommendedWorkers(modelBytes:)` derives the count from Metal's working set - 4 on a large Mac,
+1 on a 16 GB one, which loses nothing it ever had.
+
+**Pages are pulled from a queue, not dealt out round-robin.** Static assignment looks fine and
+measured badly: on a document whose page types repeat with period 3, three lanes each got every
+page of one kind, and the lane holding the 8-second ledger pages ran alone. That scored 1.14x
+where two lanes scored 1.41x. Real documents have periodic structure.
 
 **Output length is derived, not guessed.** The old fixed 1024-token cap silently truncated a fifth
 of every ledger page - they need 1309 tokens and stopped with `stopped_by = cap`. `OCRTokenBudget`
@@ -198,6 +217,39 @@ reallocations. It now doubles.
 torch exactly (CER 0.0000) and torch reads "depth 7.8 metres" where the page says 4.3, and
 "G-008-69" where it says C-003-69. The port is faithful; the model cannot read this script face.
 Every fidelity number in this document measures the former.
+
+## Levers measured and rejected
+
+Kept here so they are not re-derived. All were implemented and measured on the full corpora, not
+reasoned about.
+
+**FR-Spec vocabulary compression** (`--draft-vocab N`). The draft's output projection is 331 MB of
+the ~396 MB a draft step reads, so restricting the draft's candidate set to the first N token ids
+should be most of that cost. It is lossless - a shortlisted draft still faces full-vocabulary
+verification - and the shortlist is a plain prefix of the id space because this tokenizer is
+byte-level BPE in merge order (`Ġthe` is id 270, `Ġof` 294, digits 18-27), so no remapping is
+needed. Measured on 3 pages it looked like +5%; on the full corpora it is **+1.8% on hard and 0%
+on easy**, with acceptance falling 0.55 -> 0.50. The three-page sample was the misleading part.
+Default off.
+
+**Adaptive draft length** (`--adaptive-draft`). Acceptance is a property of content, not the
+model - 0.89 on a repetitive ledger page against 0.46 on cursive - so a fixed k must be wrong for
+one of them. Growing k after a fully accepted block and shrinking it after a full rejection gives
+**+0.8% and moves mean CER 0.0044 -> 0.0086**. Default off.
+
+**mlx-swift 0.31.4.** Tested specifically for the quantized-matmul defect below: it is still
+wrong at M=2 and M=3. 0.31.5+ needs a Swift 6.3 toolchain (this machine has 6.2.3), and its
+release notes list optimizers and a Device fix, no quantized-matmul change - so the upgrade is
+gated on tooling and unlikely to help. Pinned at 0.31.3, where every number here was measured.
+
+**DFlash / block-diffusion drafting** and **EAGLE-style tree drafts** both need a draft model or
+head that does not exist for this checkpoint and cannot be produced without training. Recorded as
+out of scope rather than untried.
+
+**Vision token merging / pruning (ToMe and friends).** Not applicable: the visual token count is
+fixed by the prompt layout (16x16 global plus 10x10 per tile, with newline and separator
+embeddings interleaved at exact offsets), so dropping tokens breaks the contract between the
+image block and the `<image>` slots rather than just costing accuracy.
 
 ## An MLX bug this work uncovered
 

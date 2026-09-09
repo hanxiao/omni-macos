@@ -2,6 +2,7 @@ import Foundation
 import MLX
 import MLXRandom
 import OmniKit
+import PDFKit
 
 /// Numeric gate + benchmark for the Swift/MLX jina-ocr-v1 port.
 ///
@@ -82,6 +83,8 @@ while i < args.count {
     case "--max-new": i += 1; maxNew = Int(args[i]) ?? 1024
     case "--horizon": i += 1; horizonRoot = args[i]
     case "--spec": i += 1; specK = Int(args[i]) ?? 0
+    case "--draft-vocab": i += 1; OCRRuntimeFlags.draftVocab = Int(args[i]) ?? 0
+    case "--adaptive-draft": OCRRuntimeFlags.adaptiveDraft = true
     case "--probe-batch": i += 1; probeChunk = Int(args[i]) ?? 0
     case "--repeat": i += 1; repeats = max(1, Int(args[i]) ?? 1)
     default: positional.append(args[i])
@@ -115,6 +118,9 @@ if args.contains("--probe-qmm") {
     exit(0)
 }
 
+// Worker mode: this binary re-executed as one lane of an OCRWorkerPool.
+if await OCRWorker.runIfRequested(CommandLine.arguments) { exit(0) }
+
 // Long-document mode: transcribe a PDF page by page and report the pipeline's behaviour.
 if let i = args.firstIndex(of: "--pdf") {
     let pdf = URL(fileURLWithPath: args[i + 1])
@@ -137,6 +143,33 @@ if let i = args.firstIndex(of: "--pdf") {
     OCRRuntimeFlags.visionPrefetch = args.contains("--vision-prefetch")
     let workers = args.firstIndex(of: "--workers").flatMap { Int(args[$0 + 1]) } ?? 1
     let printText = args.contains("--print-text")
+
+    // Process pool: the only page parallelism that actually scales here.
+    if args.contains("--processes") {
+        let requested = args.firstIndex(of: "--processes").flatMap { Int(args[$0 + 1]) }
+        let lanes = requested ?? OCRWorkerPool.recommendedWorkers(modelBytes: model.weightBytes)
+        let pageCount = limit ?? PDFDocument(url: pdf)?.pageCount ?? 0
+        let pool = OCRWorkerPool(executable: URL(fileURLWithPath: CommandLine.arguments[0]),
+                                 modelDir: URL(fileURLWithPath: modelPath),
+                                 tokenizerDir: tokDir, pdf: pdf)
+        print("process pool: \(lanes) worker(s) "
+              + "(recommended \(OCRWorkerPool.recommendedWorkers(modelBytes: model.weightBytes)) "
+              + "for \(String(format: "%.1f", Double(model.weightBytes) / 1e9)) GB of weights)")
+        let started = Date()
+        let replies = try pool.run(pages: Array(0 ..< pageCount), workers: lanes)
+        let elapsed = Date().timeIntervalSince(started)
+        let text = replies.map(\.text).joined(separator: "\n\n---\n\n")
+        var found = 0
+        for reply in replies where reply.text.contains(String(format: "PAGE %03d", reply.page + 1)) {
+            found += 1
+        }
+        print(String(format: "\n%d pages in %.1f s = %.2f s/page, %.0f aggregate tok/s (processes=%d)",
+                     replies.count, elapsed, elapsed / Double(max(replies.count, 1)),
+                     Double(replies.reduce(0) { $0 + $1.tokens }) / elapsed, lanes))
+        print("page markers recovered in place: \(found)/\(replies.count)")
+        print("document digest: \(digest(text))  chars \(text.count)")
+        exit(0)
+    }
     if workers > 1 {
         let out = try model.transcribeConcurrent(pdfAt: pdf, maxNewTokens: cap,
                                                  pageRange: limit.map { 0 ..< $0 }, workers: workers)

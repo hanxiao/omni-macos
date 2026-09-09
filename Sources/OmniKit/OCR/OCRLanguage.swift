@@ -491,6 +491,8 @@ final class OCRLanguageModel: @unchecked Sendable {
     let mtp: OCRMTPHead?
 
     let hidden: Int
+    private var cachedDraftHead: OCRWeight?
+    private var cachedDraftHeadLimit = 0
     private var ropeCache: [String: (MLXArray, MLXArray)] = [:]
     private let ropeLock = NSLock()
     private let invFreq: [Float]
@@ -558,12 +560,38 @@ final class OCRLanguageModel: @unchecked Sendable {
         return (h, logits)
     }
 
+    /// FR-Spec vocabulary compression: the draft projects over only the first `draftVocab` token
+    /// ids instead of all 129280.
+    ///
+    /// The output projection is by far the largest read in a draft step - 331 MB of bf16 against
+    /// ~65 MB for the whole rest of the MTP block - and it is paid once per draft, so at k=3 the
+    /// draft heads alone move ~1 GB per cycle. Restricting the draft's candidate set shrinks that
+    /// proportionally.
+    ///
+    /// It is LOSSLESS: a drafted token still has to survive the target's full-vocabulary
+    /// verification, so a shortlist can only lower acceptance, never change the output.
+    ///
+    /// The shortlist is a PREFIX of the id space, which needs no remapping, because this
+    /// tokenizer is byte-level BPE with ids in merge order - i.e. roughly frequency order.
+    /// Verified rather than assumed: `Ġthe` is id 270, `Ġof` 294, the digits 18-27 and ASCII
+    /// punctuation 3-32, while the tail holds rare merges. EOS is id 1, so it is always in range.
+    nonisolated(unsafe) static var draftVocab = 0        // 0 = full vocabulary
+    nonisolated(unsafe) static var adaptiveDraft = false
+
+    private var draftHeadSlice: OCRWeight? {
+        let limit = Self.draftVocab
+        guard limit > 0, case .plain(let m) = lmHead, limit < m.dim(-1) else { return nil }
+        if let cached = cachedDraftHead, cachedDraftHeadLimit == limit { return cached }
+        let sliced = OCRWeight.plain(MLX.contiguous(m[0..., 0 ..< limit]))
+        cachedDraftHead = sliced
+        cachedDraftHeadLimit = limit
+        return sliced
+    }
+
     /// One MTP draft step, including its own embedding and output projection when the checkpoint
     /// carries them.
     func draftLogits(hiddenState: MLXArray) -> MLXArray {
-        guard let mtp, let head = mtp.head else {
-            return ocrProj(hiddenState.asType(lmHead.computeDType), lmHead).asType(.float32)
-        }
+        let head = draftHeadSlice ?? mtp?.head ?? lmHead
         return ocrProj(hiddenState.asType(head.computeDType), head).asType(.float32)
     }
 

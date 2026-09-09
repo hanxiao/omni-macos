@@ -29,6 +29,17 @@ public enum OCRRuntimeFlags {
     /// Run the vision tower a page ahead on its own MLX stream. Measured worth ~0 over host-only
     /// prefetch, because total GPU work is conserved - kept switchable so that stays checkable.
     nonisolated(unsafe) public static var visionPrefetch = false
+    /// FR-Spec shortlist size for the draft head; 0 = full vocabulary. See
+    /// `OCRLanguageModel.draftVocab` for why a prefix of the id space is the right shortlist.
+    /// Let the draft length follow measured acceptance instead of being fixed.
+    public static var adaptiveDraft: Bool {
+        get { OCRLanguageModel.adaptiveDraft }
+        set { OCRLanguageModel.adaptiveDraft = newValue }
+    }
+    public static var draftVocab: Int {
+        get { OCRLanguageModel.draftVocab }
+        set { OCRLanguageModel.draftVocab = newValue }
+    }
 }
 
 extension OCRModel {

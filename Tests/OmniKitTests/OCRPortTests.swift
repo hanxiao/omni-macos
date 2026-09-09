@@ -198,6 +198,26 @@ final class OCRPortTests: XCTestCase {
         XCTAssertEqual(OCRTokenBudget.bytesPerToken, (12 + 1) * 2 * 10 * 128 * 2)
     }
 
+    /// The worker pool is sized from memory, because every worker is another full copy of the
+    /// weights. A machine that can hold one copy must run exactly one.
+    func testWorkerPoolSizing() {
+        // Large Mac: capped at 4, where the measured gains have already flattened.
+        XCTAssertEqual(OCRWorkerPool.recommendedWorkers(modelBytes: 4_500_000_000,
+                                                        availableBytes: 512_000_000_000), 4)
+        // A 16 GB Mac (Metal reports ~10.6 GB) cannot hold two copies of a 4.5 GB build plus its
+        // working set, so it must run exactly one worker rather than thrash.
+        XCTAssertEqual(OCRWorkerPool.recommendedWorkers(modelBytes: 4_500_000_000,
+                                                        availableBytes: 10_600_000_000), 1)
+        // A 36 GB Mac affords a few.
+        let mid = OCRWorkerPool.recommendedWorkers(modelBytes: 4_500_000_000,
+                                                   availableBytes: 25_000_000_000)
+        XCTAssertGreaterThan(mid, 1)
+        XCTAssertLessThanOrEqual(mid, 4)
+        // Never zero, whatever the arithmetic says.
+        XCTAssertGreaterThanOrEqual(
+            OCRWorkerPool.recommendedWorkers(modelBytes: 900_000_000_000), 1)
+    }
+
     /// Each variant names a policy that `Tools/ocr/convert.py` actually defines. The pairing is
     /// how a published artifact is traced back to how it was built.
     func testVariantPolicies() {

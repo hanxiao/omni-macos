@@ -40,6 +40,10 @@ import MLX
 /// (`torch.where(positions == 0, 0, inputs_embeds)`); the slot still exists in the cache.
 extension OCRModel {
 
+    /// Ceiling on the adaptive draft length. Past this, acceptance decay outruns the extra
+    /// tokens on every page measured - k=8 costs 20% against k=3.
+    static let maxAdaptiveDraft = 6
+
     public struct SpeculativeStats: Sendable {
         public var cycles = 0
         public var drafted = 0
@@ -47,6 +51,9 @@ extension OCRModel {
         /// How often draft position k was accepted. Acceptance decays with k, and the shape of
         /// that decay is what decides the useful draft length - not a guess at K.
         public var acceptedAt: [Int] = []
+        /// Drafts the shortlist could not have produced. Diagnostic only - the target verifies
+        /// every token either way.
+        public var draftedOutsideShortlist = 0
         public var acceptanceRate: Double { drafted == 0 ? 0 : Double(accepted) / Double(drafted) }
         /// Mean tokens committed per verify pass, including the target's own bonus token.
         public var tokensPerCycle: Double { cycles == 0 ? 0 : Double(accepted + cycles) / Double(cycles) }
@@ -105,7 +112,7 @@ extension OCRModel {
                         loopGuard: Bool, loopReps: Int, loopGrace: Int)
         throws -> (result: Result, stats: SpeculativeStats) {
         var stats = SpeculativeStats()
-        stats.acceptedAt = [Int](repeating: 0, count: k)
+        stats.acceptedAt = [Int](repeating: 0, count: Self.maxAdaptiveDraft + 1)
         let prep: Prepared = ready.prep
         let visual: MLXArray = ready.visual
         let embeddings = try embedPrompt(prep, visual: visual, table: nil)
@@ -137,11 +144,19 @@ extension OCRModel {
         var previousHidden = hidden[(n - 1) ..< n]    // target hidden at position - 1
         var stop = StopReason.cap
         let tDecode = Date()
+        let adaptiveDraft = OCRLanguageModel.adaptiveDraft
+        var liveK = k
 
         while tokens.count < maxNewTokens {
             if current == eosID { stop = .eos; break }
 
             // ---- draft K tokens, recursively ----
+            // Adaptive draft length. Acceptance is a property of the CONTENT, not the model:
+            // measured 0.89 on a repetitive ledger page and 0.46 on cursive handwriting, and the
+            // best fixed k differs accordingly (a dense page peaks at k=5, a sparse one at k=3).
+            // A fixed k has to be wrong on one of them, so the length follows recent acceptance:
+            // a fully accepted block earns one more draft, a fully rejected one gives one back.
+            let k = adaptiveDraft ? liveK : k
             var drafts: [Int] = []
             var draftHidden = previousHidden
             var draftToken = current
@@ -152,6 +167,8 @@ extension OCRModel {
                                             positions: [position + step], cache: mtpCache) else { break }
                 let draftLogits = llm.draftLogits(hiddenState: out)
                 let next = draftLogits[-1].argMax().item(Int.self)
+                stats.draftedOutsideShortlist += (OCRLanguageModel.draftVocab > 0
+                                                  && next >= OCRLanguageModel.draftVocab) ? 1 : 0
                 drafts.append(next)
                 draftHidden = out
                 draftToken = next
@@ -183,6 +200,10 @@ extension OCRModel {
             stats.cycles += 1
             stats.drafted += drafts.count
             stats.accepted += accepted
+            if adaptiveDraft {
+                if accepted == drafts.count { liveK = min(liveK + 1, Self.maxAdaptiveDraft) }
+                else if accepted == 0 { liveK = max(liveK - 1, 2) }
+            }
 
             // Commit the agreed prefix plus the target's own token at the first disagreement
             // (or the bonus token when every draft was accepted).

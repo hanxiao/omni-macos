@@ -51,8 +51,14 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   LAST image (measured against torch by the predecessor). Never batch pages into one prompt.
 - Do NOT cap output tokens with a constant. `OCRTokenBudget` derives it from the 32k context
   window and Metal's working set (31753/page here); a fixed 1024 silently truncated real pages.
-- In-process page concurrency saturates at 2 lanes for +5%. The predecessor's 1.8x needed separate
-  PROCESSES (own Metal command queue each). Don't re-derive this from stream counts.
+- In-process page concurrency saturates at 2 lanes for +5%; PROCESSES scale (1.64x at 4, 1.59x on
+  a 40-page doc) because MLX submits through one command queue per process. OCRWorkerPool does
+  this, sized from Metal's working set. Pull pages from a QUEUE - round-robin lands periodic page
+  types on one lane (measured 1.14x vs 1.41x).
+- Measured and rejected, do not re-derive: FR-Spec draft-vocab shortlist (+1.8% hard, 0% easy),
+  adaptive draft length (+0.8% and worse CER), mlx-swift 0.31.4 (same qmm bug; 0.31.5+ needs
+  Swift 6.3). DFlash/EAGLE trees need a draft model we cannot train here; ViT token merging breaks
+  the fixed visual-token/prompt-slot contract.
 - Two primitives are measured-and-rejected: `MLXFast.rope` (faster and numerically WRONG - the
   checkpoint is Llama split-half, MLX is interleaved) and half-precision qkv/mask inside the
   fused vision SDPA (slower and it drifts). Do not re-adopt without new numbers.
