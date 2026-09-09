@@ -79,29 +79,28 @@ struct OCRView: View {
     }
 
     @ViewBuilder private var content: some View {
-        if let index = session.visibleIndex {
-            let page = session.pages[index]
+        if session.transcribedPages.isEmpty {
+            CenteredHint(symbol: "text.viewfinder", title: "Preparing",
+                         detail: "Rendering pages and loading the model.")
+        } else {
             switch session.mode {
             case .rendered:
-                MarkdownPane(index: index, streaming: page.state == .running)
+                RenderedDocument()
             case .raw:
-                RawPane(index: index, page: page)
+                RawDocument()
             case .split:
                 // A plain proportional split, not HSplitView. HSplitView propagates its children's
                 // minimum widths up as its own, and inside a NavigationSplitView detail pane that
                 // squeezes the app's sidebar past its own minimum - the sidebar labels start
                 // clipping. Halves that simply divide what is available cannot do that.
                 HStack(spacing: 0) {
-                    MarkdownPane(index: index, streaming: page.state == .running)
+                    RenderedDocument()
                         .frame(maxWidth: .infinity)
                     Divider()
-                    RawPane(index: index, page: page)
+                    RawDocument()
                         .frame(maxWidth: .infinity)
                 }
             }
-        } else {
-            CenteredHint(symbol: "text.viewfinder", title: "Preparing",
-                         detail: "Rendering pages and loading the model.")
         }
     }
 
@@ -248,7 +247,7 @@ private struct PageThumb: View {
         .contentShape(Rectangle())
         // Content OUT. A transcribed page drags into Notes, Mail, TextEdit or any editor as its
         // Markdown; the whole document goes to disk through Save.
-        .draggable(page.state == .done ? session.displayText(at: page.id) : "")
+        .draggable(page.state == .done ? session.pageText(at: page.id) : "")
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(page.label)
         .accessibilityValue(stateDescription)
@@ -267,65 +266,84 @@ private struct PageThumb: View {
 
 // MARK: - Panes
 
-/// Reads the page text itself rather than taking it as a parameter. Passing it down would make
-/// `OCRView`'s body - and with it the toolbar and the inspector - re-evaluate on every streamed
-/// token; here the 24 Hz write reaches only the view that draws it.
-private struct MarkdownPane: View {
-    let index: Int
-    let streaming: Bool
+/// The transcription as ONE document: every page in order, separated by a dim rule.
+///
+/// Pages are sections of a document, not screens to page through. A reader scrolls a scan the way
+/// they scroll the PDF it came from, and a transcript that only ever shows page k of n cannot be
+/// read straight through, searched with one Find, or selected across a page break - which is most
+/// of what anyone wants from a transcript. The navigator scrolls this view; it does not swap it.
+///
+/// `LazyVStack` is load-bearing, not tidiness: a 200-page document eagerly builds tens of thousands
+/// of block views, and each visible section reads `texts`, so keeping the built set to what is on
+/// screen is also what keeps the 24 Hz stream write cheap.
+private struct RenderedDocument: View {
     @Environment(OCRSession.self) private var session
 
     var body: some View {
-        let blocks = MarkdownBlock.parse(session.displayText(at: index))
-        ScrollView {
-            VStack(alignment: .leading, spacing: 10) {
-                ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                    block.view.transition(StreamFade.transition)
+        DocumentScroll { pages in
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(pages) { page in
+                    if page.id != pages.first?.id { PageBreak() }
+                    RenderedPage(index: page.id, state: page.state)
+                        .id(page.id)
                 }
-                if streaming { TypingCaret() }
             }
-            .modifier(StreamFade(count: blocks.count))
-            .frame(maxWidth: 760, alignment: .leading)
-            .padding(.horizontal, 28)
-            .padding(.top, 24)
-            // Room for the floating readout, so the last line of a page is never parked underneath it.
-            .padding(.bottom, 72)
-            .frame(maxWidth: .infinity, alignment: .center)
             .textSelection(.enabled)
         }
     }
 }
 
-/// Raw Markdown. Editable only once the page has finished decoding.
-///
-/// That is not a policy choice, it is a correctness one. A `TextEditor` bound to a getter that
-/// reads streaming text and a setter that writes state mutates state during view update, and
-/// SwiftUI responds by wedging the subtree - the whole side-by-side pane stopped refreshing while
-/// the formatted view beside it kept streaming. Editing text that the next token is about to
-/// overwrite was never meaningful anyway.
-private struct RawPane: View {
+/// One page's blocks. Reads its own text rather than taking it as a parameter, so a streamed token
+/// invalidates this section alone - not the document, the toolbar, or the pages above it.
+private struct RenderedPage: View {
     let index: Int
-    let page: OCRSession.Page
+    let state: OCRSession.PageState
     @Environment(OCRSession.self) private var session
 
-    private var editable: Bool { page.state == .done }
+    var body: some View {
+        let blocks = MarkdownBlock.parse(session.pageText(at: index))
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                block.view.transition(StreamFade.transition)
+            }
+            if state == .running { TypingCaret() }
+            if state == .failed { PageFailed() }
+        }
+        .modifier(StreamFade(count: blocks.count))
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// The same document as Markdown source.
+///
+/// Read-only while any page is still decoding, then editable as a whole. That split is a
+/// correctness one, not a policy: a `TextEditor` whose getter reads streaming text and whose setter
+/// writes state mutates state during view update, and SwiftUI answers by wedging the subtree - the
+/// side-by-side pane stopped refreshing while the formatted view beside it kept streaming. The
+/// streaming form is also per-page sections so it stays lazy; the editable form is the single
+/// string that Copy and Save produce, so what is edited is exactly what leaves the app.
+private struct RawDocument: View {
+    @Environment(OCRSession.self) private var session
+
+    private var editable: Bool { !session.isBusy && session.completedPages > 0 }
 
     var body: some View {
         Group {
             if editable {
-                TextEditor(text: Binding(get: { session.displayText(at: index) },
-                                         set: { session.setEdit($0, at: index) }))
+                TextEditor(text: Binding(get: { session.documentMarkdown },
+                                         set: { session.setDocumentEdit($0) }))
                     .font(.system(.body, design: .monospaced))
                     .scrollContentBackground(.hidden)
+                    .padding(.bottom, 8)
             } else {
-                ScrollView {
-                    Text(session.displayText(at: index))
-                        .font(.system(.body, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 5)
-                        .padding(.top, 8)
-                        .padding(.bottom, 72)
+                DocumentScroll(width: nil) { pages in
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(pages) { page in
+                            if page.id != pages.first?.id { PageBreak() }
+                            RawPage(index: page.id)
+                                .id(page.id)
+                        }
+                    }
                 }
             }
         }
@@ -338,6 +356,97 @@ private struct RawPane: View {
                     .padding(6)
             }
         }
+    }
+}
+
+private struct RawPage: View {
+    let index: Int
+    @Environment(OCRSession.self) private var session
+
+    var body: some View {
+        Text(session.pageText(at: index))
+            .font(.system(.body, design: .monospaced))
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// The scroller both panes share: page sections, the reading measure, room for the floating
+/// readout, and the one place that follows the run.
+private struct DocumentScroll<Content: View>: View {
+    var width: CGFloat? = 760
+    @ViewBuilder var content: ([OCRSession.Page]) -> Content
+    @Environment(OCRSession.self) private var session
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                content(session.transcribedPages)
+                    .frame(maxWidth: width ?? .infinity, alignment: .leading)
+                    .padding(.horizontal, width == nil ? 12 : 28)
+                    .padding(.top, 24)
+                    // Room for the floating readout, so the end of the document is never parked
+                    // underneath it.
+                    .padding(.bottom, 72)
+                    .frame(maxWidth: .infinity, alignment: .center)
+            }
+            // Follows the run, and follows the navigator, through the same value: `visibleIndex` is
+            // the running page until the user picks one. It does NOT change while a page decodes,
+            // so the document never scrolls out from under someone mid-read.
+            .onChange(of: session.visibleIndex) { _, id in
+                guard let id else { return }
+                withAnimation(.easeOut(duration: 0.25)) { proxy.scrollTo(id, anchor: .top) }
+            }
+            // Switching Formatted/Side by Side/Markdown builds a NEW scroller, which starts at the
+            // top. Without this you land on page 1 of a document whose run is on page 13, and
+            // `visibleIndex` has not changed so nothing above would put you back.
+            .task {
+                try? await Task.sleep(for: .milliseconds(40))   // let the lazy stack lay out first
+                if let id = session.visibleIndex { proxy.scrollTo(id, anchor: .top) }
+            }
+            .modifier(YieldFollowOnScroll())
+        }
+    }
+}
+
+/// Hands the document back to the reader the moment they scroll it themselves.
+///
+/// Only user-driven phases count - `.animating` is this view's own scroll-to and would otherwise
+/// switch following off the instant it turned on. On macOS 14, where scroll phases do not exist,
+/// following stays on until a thumbnail is clicked; that is the behaviour without this, not a
+/// regression from it.
+private struct YieldFollowOnScroll: ViewModifier {
+    @Environment(OCRSession.self) private var session
+
+    func body(content: Content) -> some View {
+        if #available(macOS 15.0, *) {
+            content.onScrollPhaseChange { _, phase in
+                if phase == .tracking || phase == .interacting { session.stopFollowing() }
+            }
+        } else {
+            content
+        }
+    }
+}
+
+/// The page boundary. A dim rule and air, which is how a printed document marks one - not a
+/// heading, and not a label repeating what the navigator already shows.
+private struct PageBreak: View {
+    var body: some View {
+        Rectangle()
+            .fill(Color.secondary.opacity(0.2))
+            .frame(height: 1)
+            .padding(.vertical, 26)
+    }
+}
+
+/// A page that could not be transcribed still occupies its place in the document. Skipping it
+/// silently would make the pages either side read as continuous when they are not.
+private struct PageFailed: View {
+    var body: some View {
+        Label("This page could not be transcribed.", systemImage: "exclamationmark.triangle")
+            .font(.callout)
+            .foregroundStyle(.secondary)
     }
 }
 
@@ -382,6 +491,16 @@ private struct ProgressReadout: View {
                         .foregroundStyle(.secondary)
                 }
 
+                if session.isBusy && !session.isFollowingRun {
+                    // The way back to the live end of a document you have scrolled away from.
+                    // Without it, following is a door that only locks.
+                    Button { session.follow() } label: {
+                        Image(systemName: "arrow.down.to.line")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Jump to the page being transcribed")
+                    .accessibilityLabel("Jump to the page being transcribed")
+                }
                 if session.isBusy {
                     Button { session.cancel() } label: {
                         Image(systemName: "stop.fill")

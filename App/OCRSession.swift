@@ -77,12 +77,16 @@ final class OCRSession {
 
     var mode: ViewMode = .rendered
     var railVisible = true
-    /// Per-page edits to the raw Markdown, keyed by page index. Cleared with the document, because
-    /// index 0 of the next document is a different page.
-    private(set) var edits: [Int: String] = [:]
+    /// The user's revision of the WHOLE document's Markdown, once they have made one.
+    ///
+    /// Not per page. The panes render one continuous document, so the thing a person edits and the
+    /// thing they copy are the same string; a per-page dictionary would mean the raw pane showed a
+    /// document that no single buffer corresponded to.
+    private(set) var documentEdit: String?
 
-    /// Index of the page whose text the main view shows. Follows the running page until the user
-    /// picks one, then stays put - a view that jumps under the cursor is not readable.
+    /// The current page: what the navigator highlights and what the panes scroll to. It follows
+    /// the page being decoded until the user picks one, then stays put - a document that scrolls
+    /// itself out from under the reader is not readable.
     private(set) var selection: Int?
     private(set) var userPinnedSelection = false
     private var runningIndex: Int?
@@ -105,8 +109,8 @@ final class OCRSession {
     }
     var isBusy: Bool { phase == .loading || phase == .running }
 
-    /// Which page the main view shows. O(1): scanning `pages` for the running page here made this
-    /// O(n) per thumbnail per stream update, which is O(n^2) at 24 Hz on a long document.
+    /// The current page. O(1): scanning `pages` for the running page here made this O(n) per
+    /// thumbnail per stream update, which is O(n^2) at 24 Hz on a long document.
     var visibleIndex: Int? {
         for candidate in [selection, runningIndex, lastDoneIndex] {
             if let candidate, pages.indices.contains(candidate) { return candidate }
@@ -115,23 +119,29 @@ final class OCRSession {
     }
     var visiblePage: Page? { visibleIndex.map { pages[$0] } }
 
-    /// What the raw and formatted panes render: the user's edit if there is one, else the model's
-    /// output. Both panes and the clipboard read through here, so a copy cannot disagree with what
-    /// is on screen.
-    func displayText(at index: Int) -> String {
-        guard texts.indices.contains(index) else { return "" }
-        return edits[index] ?? texts[index]
+    /// One page's Markdown as the model produced it. Used by the panes, which render pages as
+    /// sections of one document, and by a page's drag payload.
+    func pageText(at index: Int) -> String {
+        texts.indices.contains(index) ? texts[index] : ""
     }
 
-    func setEdit(_ text: String, at index: Int) { edits[index] = text }
+    /// The pages that have something to show, in order. Pending pages contribute nothing to the
+    /// document - rendering them would stack empty sections and their rules at the end of it.
+    var transcribedPages: [Page] {
+        pages.filter { $0.state != .pending }
+    }
 
-    /// Markdown for the whole document, pages separated by a rule.
+    /// Markdown for the whole document, pages separated by a rule. `---` is the source form of the
+    /// divider the panes draw between pages, so what is copied matches what is read.
     var documentMarkdown: String {
-        pages.indices
+        if let documentEdit { return documentEdit }
+        return pages.indices
             .filter { pages[$0].state == .done }
-            .map { displayText(at: $0) }
+            .map { texts[$0] }
             .joined(separator: "\n\n---\n\n")
     }
+
+    func setDocumentEdit(_ text: String) { documentEdit = text }
 
     var elapsedText: String {
         let total = Int(elapsed.rounded())
@@ -174,7 +184,7 @@ final class OCRSession {
         completedPages = 0
         elapsed = 0
         currentTokensPerSecond = 0
-        edits = [:]
+        documentEdit = nil
         notice = nil
 
         guard let installed = Self.installedModel() else {
@@ -237,7 +247,7 @@ final class OCRSession {
         readoutTimer?.cancel(); readoutTimer = nil
         pages = []
         texts = []
-        edits = [:]
+        documentEdit = nil
         documentName = ""
         selection = nil
         userPinnedSelection = false
@@ -259,6 +269,23 @@ final class OCRSession {
         }
         guard pages[index].state != .pending else { return }
         selection = index
+        userPinnedSelection = true
+    }
+
+    /// True while the document tracks the page being decoded. Clicking that page's thumbnail, or
+    /// the readout's jump button, turns it back on.
+    var isFollowingRun: Bool { !userPinnedSelection }
+
+    func follow() {
+        selection = nil
+        userPinnedSelection = false
+    }
+
+    /// The reader took over. Freeze the navigator where it is and stop the document scrolling
+    /// itself: a page boundary arriving every few seconds must not move text someone is reading.
+    func stopFollowing() {
+        guard !userPinnedSelection else { return }
+        selection = visibleIndex
         userPinnedSelection = true
     }
 
