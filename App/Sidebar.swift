@@ -345,10 +345,28 @@ struct Sidebar: View {
 /// Folders section reads - keeping the date-bucketing off the 12x/sec progress path.
 private struct HistorySections: View {
     @Environment(AppModel.self) private var model: AppModel
+    @State private var hovered: String?
+
     var body: some View {
         ForEach(model.historyGroups, id: \.title) { group in
-            Section(group.title) {
+            Section {
                 ForEach(group.items) { item in
+                    row(item)
+                    .help(item.isFile ? (item.filePath ?? item.displayLabel) : item.displayText)
+                    .contextMenu {
+                        Button(item.bookmarked ? "Remove bookmark" : "Bookmark") { model.toggleHistoryBookmark(item) }
+                        Divider()
+                        Button("Remove") { model.removeHistory(item) }
+                    }
+                    .tag(SidebarSelection.history(item.id))
+                }
+            } header: {
+                header(group.title, items: group.items)
+            }
+        }
+    }
+
+    @ViewBuilder private func row(_ item: HistoryItem) -> some View {
                     HStack(spacing: 7) {
                         if item.bookmarked {
                             Image(systemName: "star.fill").foregroundStyle(Color.yellow).frame(width: 16)
@@ -374,16 +392,34 @@ private struct HistorySections: View {
                             Image(systemName: "tag").font(.caption2).foregroundStyle(.tertiary)
                         }
                     }
-                    .help(item.isFile ? (item.filePath ?? item.displayLabel) : item.displayText)
-                    .contextMenu {
-                        Button(item.bookmarked ? "Remove bookmark" : "Bookmark") { model.toggleHistoryBookmark(item) }
-                        Divider()
-                        Button("Remove") { model.removeHistory(item) }
-                    }
-                    .tag(SidebarSelection.history(item.id))
+    }
+
+    /// The section title with a trash that appears under the pointer.
+    ///
+    /// On the trailing edge: the title is left-aligned, so a button that appears over there moves
+    /// nothing, and it sits inside the header's own bounds rather than hanging in the margin where
+    /// it draws but cannot be clicked. Bookmarks is the one group someone curated deliberately, so
+    /// it does not get one.
+    @ViewBuilder private func header(_ title: String, items: [HistoryItem]) -> some View {
+        let shows = title != "Bookmarks" && hovered == title
+        HStack(spacing: 4) {
+            Text(title)
+            Spacer(minLength: 0)
+            if shows {
+                Button { model.removeHistory(items) } label: {
+                    Image(systemName: "trash")
+                        .font(.system(size: 10))
+                        .frame(width: 16, height: 16)
+                        .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Delete these searches")
+                .accessibilityLabel("Delete the searches under \(title)")
             }
         }
+        .contentShape(Rectangle())
+        .onHover { hovered = $0 ? title : (hovered == title ? nil : hovered) }
     }
 }
 

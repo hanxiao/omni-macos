@@ -1611,6 +1611,14 @@ final class AppModel {
         persistHistory()
     }
 
+    /// Drop a whole date group at once - what the trash on a sidebar section header does.
+    func removeHistory(_ items: [HistoryItem]) {
+        let ids = Set(items.map(\.id))
+        guard !ids.isEmpty else { return }
+        searchHistory.removeAll { ids.contains($0.id) }
+        persistHistory()
+    }
+
     // MARK: - Bookmark / clear (the explicit, mode-independent entry points)
 
     /// Is the search currently shown already saved as a bookmark?
