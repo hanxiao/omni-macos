@@ -97,7 +97,10 @@ struct OCRView: View {
 
     @ViewBuilder private var content: some View {
         if session.sectionIDs.isEmpty {
-            CenteredHint(symbol: "text.viewfinder", title: "Preparing", detail: "")
+            // A tab opened while another document is still decoding is waiting its turn, and
+            // saying so is the difference between a queue and a stall.
+            CenteredHint(symbol: "text.viewfinder",
+                         title: session.isBusy ? "Queued" : "Preparing", detail: "")
         } else {
             switch session.mode {
             case .rendered:
@@ -146,7 +149,7 @@ struct OCRView: View {
                 }
                 .pickerStyle(.segmented)
                 .labelStyle(.iconOnly)
-                .help("Switch between formatted Markdown, side by side, and raw text")
+                .help("Raw text, Markdown, or both")
             }
             if #available(macOS 26.0, *) { ToolbarSpacer(.fixed) }
             // Closing lives in the File menu only (Shift-Cmd-W). It is rare, it is undone by
@@ -218,8 +221,11 @@ struct PageRail: View {
                 }
             }
             .listStyle(.sidebar)
+            // The rail follows the page being decoded. Once nothing is running it belongs to the
+            // reader: scrolling it back to the selection under their hands is how a navigator
+            // stops being usable.
             .onChange(of: session.visibleIndex) { _, id in
-                guard let id else { return }
+                guard let id, session.isBusy else { return }
                 withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(id, anchor: .center) }
             }
         }
@@ -493,6 +499,12 @@ private struct RawDocument: View {
 
 /// The editable Markdown source, highlighted.
 ///
+/// No line-number gutter. The hand-rolled one built a `Text` per line in an eager `VStack`, and on
+/// a real transcript that view tree left the window's sidebar drawing NOTHING and unscrollable -
+/// the page navigator went blank the moment a run finished. It also numbered logical lines, which
+/// a soft-wrapping editor does not lay out one to a row. A number column is not worth a broken
+/// navigator, and the packages that provide a real one do not fit (see CLAUDE.md).
+///
 /// Tahoe's `TextEditor` takes an `AttributedString` binding, so the syntax colouring survives
 /// editing instead of being a read-only decoration; on macOS 14-15 the same text is edited plain,
 /// which is what those systems offer. Re-highlighting is debounced rather than run per keystroke:
@@ -504,11 +516,11 @@ private struct SourceEditor: View {
     @State private var plain = ""
 
     var body: some View {
-        HStack(alignment: .top, spacing: 0) {
-            LineNumberGutter(text: plain)
-            editor
-        }
-        .onAppear {
+        editor
+        // Keyed on the TAB, not on appearance. Loading in `onAppear` meant the editor kept the
+        // first document it was ever shown: selecting another tab moved the navigator and the
+        // title and left the text where it was.
+        .task(id: session.visibleDocument?.id) {
             plain = session.documentMarkdown
             attributed = MarkdownSource.highlighted(plain)
         }
@@ -545,47 +557,6 @@ private struct SourceEditor: View {
     }
 }
 
-/// A gutter of line numbers beside the source.
-///
-/// Hand-rolled because the packages that provide one do not fit: STTextView is GPL v3 (or a paid
-/// commercial licence), which an Apache-2.0 notarised app cannot take, and CodeEditSourceEditor
-/// says of itself that it is not ready for production and would pull tree-sitter and its grammars
-/// in for the sake of a number column. This is the whole feature.
-///
-/// It scrolls WITH the editor because both are laid out from the same string in the same
-/// coordinate space and the pair scrolls as one - no scroll-position syncing to drift.
-private struct LineNumberGutter: View {
-    let text: String
-
-    private var lineCount: Int {
-        max(1, text.reduce(into: 1) { count, c in if c == "\n" { count += 1 } })
-    }
-
-    var body: some View {
-        VStack(alignment: .trailing, spacing: 0) {
-            ForEach(1 ... lineCount, id: \.self) { line in
-                Text("\(line)")
-                    .font(.system(.body, design: .monospaced))
-                    .foregroundStyle(.tertiary)
-                    .monospacedDigit()
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(.top, 24)
-        .padding(.trailing, 6)
-        .padding(.leading, 8)
-        .frame(width: gutterWidth)
-        .background(.background.tertiary)
-        .accessibilityHidden(true)          // a number column is noise to a screen reader
-    }
-
-    /// Widens with the document rather than being fixed, so a 1000-line transcript does not clip.
-    private var gutterWidth: CGFloat {
-        let digits = max(2, String(lineCount).count)
-        return CGFloat(digits) * 9 + 16
-    }
-}
 
 private struct RawSection: View {
     let id: Int
@@ -773,7 +744,7 @@ private struct ProgressReadout: View {
         // The file name is the one thing here a reader already knows - it is in the tab bar and in
         // the window title - so it costs width in the chip and earns it back only when a document
         // is ambiguous. Hovering asks.
-        .help(session.documentName)
+        .help(session.runningDocumentName)
     }
 
     /// The same ring the document tabs use, so progress means one thing everywhere in the app. A

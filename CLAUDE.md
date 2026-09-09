@@ -133,6 +133,15 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   drag stops at every paragraph. Finished sections merge their contiguous prose into a single
   `AttributedString`; a section still decoding stays per-block, because the arrival fade is driven
   by insertion and text appended inside one string cannot animate.
+- The hand-rolled LINE-NUMBER GUTTER is gone. A `Text` per line in an eager `VStack` beside the
+  editor left the window's SIDEBAR drawing nothing and unscrollable on any real transcript - the
+  page navigator went blank the moment a run finished, which is how it was found. It also numbered
+  logical lines, which a soft-wrapping editor does not lay out one to a row, and `Text("\(line)")`
+  is a LocalizedStringKey, so past 999 it rendered "1,300" into a column sized for four digits.
+- A drop ADDS a tab. The decode queue lives on the session and the run loop reads it by index, so a
+  file opened mid-run extends the queue instead of interrupting it; the new tab comes forward and
+  is pinned, so the run behind it does not pull the view back. Document edits are keyed by tab for
+  the same reason - one buffer showed one tab's edit under another's name.
 - Pause holds at a PAGE boundary, not mid-decode: holding mid-page pins the GPU working set with
   nothing to show for it, and the half-decoded page would have to be discarded or resumed from a
   partial transcript. The chip says "Finishing this page" until the loop actually reaches the hold.

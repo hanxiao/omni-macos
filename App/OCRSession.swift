@@ -131,22 +131,24 @@ final class OCRSession {
     /// toggling back to search: `OCRView` is torn down when the mode flips, and any `@State` in it
     /// goes with it.
     enum ViewMode: String, CaseIterable, Identifiable {
-        case rendered, split, raw
+        // Source, formatted, both - in that order, because that is the order of the work: read
+        // what the model wrote, check how it sets, put them side by side when they disagree.
+        case raw, rendered, split
         var id: String { rawValue }
         var label: String {
             switch self {
-            case .rendered: return "Formatted"
-            case .split: return "Side by Side"
-            case .raw: return "Markdown"
+            case .raw: return "Raw Text"
+            case .rendered: return "Markdown"
+            case .split: return "Dual"
             }
         }
         var symbol: String {
             switch self {
-            // A matched semantic triple: rich text, a split, plain text. The raw pane shows the
+            // A matched semantic triple: plain text, rich text, a split. The raw pane shows the
             // document's plain-text source, not a code listing, so `</>` was the wrong idea.
+            case .raw: return "doc.plaintext"
             case .rendered: return "doc.richtext"
             case .split: return "rectangle.split.2x1"
-            case .raw: return "doc.plaintext"
             }
         }
     }
@@ -167,15 +169,20 @@ final class OCRSession {
     /// Drives Quick Look. On the session rather than in a view because the page navigator and the
     /// preview now live in different views - see the inspector's placement in ContentView.
     var previewing: URL?
-    /// The user's revision of the WHOLE document's Markdown, once they have made one.
+    /// The user's revision of a document's Markdown, once they have made one.
     ///
-    /// Not per page. The panes render one continuous document, so the thing a person edits and the
-    /// thing they copy are the same string; a per-page dictionary would mean the raw pane showed a
-    /// document that no single buffer corresponded to.
-    private(set) var documentEdit: String?
-    /// The edited document already split on its page rules, so the panes do not re-split it on
-    /// every frame.
-    private var editSections: [String] = []
+    /// Keyed by TAB, not by page. The panes render one continuous document, so the thing a person
+    /// edits and the thing they copy are the same string; a per-page dictionary would mean the raw
+    /// pane showed a document that no single buffer corresponded to. Per tab because tabs are now
+    /// how documents accumulate - a single buffer would have shown one tab's edit under another's
+    /// name the moment a second file was dropped.
+    private var documentEdits: [Int: String] = [:]
+    /// Each edited document already split on its page rules, so the panes do not re-split on every
+    /// frame.
+    private var editSectionsByDocument: [Int: [String]] = [:]
+
+    var documentEdit: String? { visibleDocument.flatMap { documentEdits[$0.id] } }
+    private var editSections: [String] { visibleDocument.flatMap { editSectionsByDocument[$0.id] } ?? [] }
 
     /// The current page: what the navigator highlights and what the panes scroll to. It follows
     /// the page being decoded until the user picks one, then stays put - a document that scrolls
@@ -298,6 +305,16 @@ final class OCRSession {
         return visibleDocument?.pageIDs.filter { pages[$0].state != .pending } ?? []
     }
 
+    /// The name of the document being transcribed, which is not necessarily the one on screen: a
+    /// file opened while a run is in flight comes forward as a tab while the run carries on behind
+    /// it.
+    var runningDocumentName: String {
+        guard let index = runningIndex,
+              let doc = documents.first(where: { $0.pageIDs.contains(index) })
+        else { return documentName }
+        return doc.name
+    }
+
     var visibleDocument: Document? {
         documents.indices.contains(selectedDocument) ? documents[selectedDocument] : documents.first
     }
@@ -363,8 +380,9 @@ final class OCRSession {
     }
 
     func setDocumentEdit(_ text: String) {
-        documentEdit = text
-        editSections = text.components(separatedBy: "\n---\n")
+        guard let id = visibleDocument?.id else { return }
+        documentEdits[id] = text
+        editSectionsByDocument[id] = text.components(separatedBy: "\n---\n")
             .map { $0.trimmingCharacters(in: .newlines) }
     }
 
@@ -382,7 +400,11 @@ final class OCRSession {
     private var model: OCRModel?
     private var work: Task<Void, Never>?
     private var ticker: Task<Void, Never>?
-    private var thumbs: Task<Void, Never>?
+    /// One per drop: a later drop must not cancel the render of an earlier document's pages.
+    private var thumbs: [Task<Void, Never>] = []
+    /// The decode queue, parallel to `pages`. Held here rather than captured by the run so a drop
+    /// can extend it while the run is in flight.
+    @ObservationIgnored private var jobs: [PageJob] = []
     private var readoutTimer: Task<Void, Never>?
     /// Bumped on every `open`/`cancel`/`clear`. Async work carries the token it started under and
     /// drops its result if the token has moved on, so a decode or a thumbnail belonging to the
@@ -400,7 +422,12 @@ final class OCRSession {
 
     // MARK: - Input
 
-    /// Accept a drop of PDFs and/or images. Multiple files become one document, in the order given.
+    /// Accept a drop of PDFs and/or images. Each file becomes a TAB.
+    ///
+    /// A drop onto a workspace that already holds something ADDS to it. Dropping a second file used
+    /// to throw the first away, which made tabs a property of how many files happened to arrive in
+    /// one gesture rather than of what is open - the opposite of how every document app on the Mac
+    /// behaves, and a way to lose a finished transcript by aiming a drag badly.
     func open(urls: [URL]) {
         let sources = urls.filter { Self.isSupported($0) }
         guard !sources.isEmpty else {
@@ -410,14 +437,91 @@ final class OCRSession {
             if pages.isEmpty { phase = .failed(message) } else { post(notice: message) }
             return
         }
-        cancel()
-        runToken += 1
-        let token = runToken
-        gate = OCRRunGate()
-        isPaused = false
-        isHolding = false
+
+        guard let installed = Self.installedModel() else {
+            if pages.isEmpty { pages = []; texts = [] }
+            phase = .needsModel
+            return
+        }
+
+        let adding = !pages.isEmpty
+        if !adding { reset() }
+
+        // Enumerate pages first so the sidebar has something to show while the model loads. A
+        // 200-page PDF must not be rasterised here - only counted.
+        let firstNewPage = pages.count
+        let firstNewDocument = documents.count
+        var enumerated: [Page] = []
+        var added: [PageJob] = []
+        var docs: [Document] = []
+        for url in sources {
+            let first = firstNewPage + enumerated.count
+            if url.pathExtension.lowercased() == "pdf" {
+                guard let document = PDFDocument(url: url), document.pageCount > 0 else { continue }
+                for index in 0 ..< document.pageCount {
+                    enumerated.append(Page(id: firstNewPage + enumerated.count,
+                                           label: "Page \(index + 1)",
+                                           source: .pdfPage(url, index)))
+                    added.append(.pdfPage(url: url, index: index))
+                }
+            } else {
+                enumerated.append(Page(id: firstNewPage + enumerated.count,
+                                       label: url.lastPathComponent,
+                                       source: .file(url)))
+                added.append(.image(url: url))
+            }
+            let last = firstNewPage + enumerated.count
+            if last > first {
+                docs.append(Document(id: firstNewDocument + docs.count, name: url.lastPathComponent,
+                                     pageIDs: Array(first ..< last)))
+            }
+        }
+        guard !enumerated.isEmpty else {
+            let message = "Could not read any pages from that drop."
+            if adding { post(notice: message) } else { phase = .failed(message) }
+            return
+        }
 
         documentName = sources.count == 1 ? sources[0].lastPathComponent : "\(sources.count) files"
+        pages.append(contentsOf: enumerated)
+        texts.append(contentsOf: Array(repeating: "", count: enumerated.count))
+        jobs.append(contentsOf: added)
+        documents.append(contentsOf: docs)
+        // A dropped file is a file the user wants to look at, so its tab comes forward - and
+        // pinning it stops the run they were already watching from pulling the view back.
+        selectedDocument = firstNewDocument
+        userPinnedDocument = adding
+        selection = nil
+        userPinnedSelection = false
+
+        renderThumbnails(from: firstNewPage, token: runToken)
+
+        // A run already in flight picks the new jobs up on its own: the loop reads `jobs` by index
+        // and the array only ever grows. Only a workspace with nothing running needs starting.
+        if !isBusy {
+            gate = OCRRunGate()
+            isPaused = false
+            isHolding = false
+            elapsed = 0
+            currentTokensPerSecond = 0
+            phase = .loading
+            readoutVisible = true
+            willRun?()
+            run(modelDir: installed.dir, variant: installed.variant, token: runToken)
+        }
+    }
+
+    /// Everything a fresh drop throws away. Bumping the token first is what stops the previous
+    /// run's writes from landing in the new document.
+    private func reset() {
+        cancel()
+        runToken += 1
+        pages = []
+        texts = []
+        jobs = []
+        documents = []
+        selectedDocument = 0
+        userPinnedDocument = false
         selection = nil
         userPinnedSelection = false
         runningIndex = nil
@@ -425,57 +529,13 @@ final class OCRSession {
         completedPages = 0
         elapsed = 0
         currentTokensPerSecond = 0
-        documentEdit = nil
-        editSections = []
+        documentEdits = [:]
+        editSectionsByDocument = [:]
         previewCache = [:]
         find = ""
         notice = nil
-
-        guard let installed = Self.installedModel() else {
-            pages = []; texts = []
-            phase = .needsModel
-            return
-        }
-
-        // Enumerate pages first so the sidebar has something to show while the model loads. A
-        // 200-page PDF must not be rasterised here - only counted.
-        var enumerated: [Page] = []
-        var jobs: [PageJob] = []
-        var docs: [Document] = []
-        for url in sources {
-            let first = enumerated.count
-            if url.pathExtension.lowercased() == "pdf" {
-                guard let document = PDFDocument(url: url), document.pageCount > 0 else { continue }
-                for index in 0 ..< document.pageCount {
-                    enumerated.append(Page(id: enumerated.count, label: "Page \(index + 1)",
-                                           source: .pdfPage(url, index)))
-                    jobs.append(.pdfPage(url: url, index: index))
-                }
-            } else {
-                enumerated.append(Page(id: enumerated.count, label: url.lastPathComponent,
-                                       source: .file(url)))
-                jobs.append(.image(url: url))
-            }
-            if enumerated.count > first {
-                docs.append(Document(id: docs.count, name: url.lastPathComponent,
-                                     pageIDs: Array(first ..< enumerated.count)))
-            }
-        }
-        guard !enumerated.isEmpty else {
-            phase = .failed("Could not read any pages from that drop.")
-            return
-        }
-        pages = enumerated
-        documents = docs
-        selectedDocument = 0
-        userPinnedDocument = false
-        texts = Array(repeating: "", count: enumerated.count)
-        phase = .loading
-        readoutVisible = true
-        willRun?()
-        renderThumbnails(jobs, token: token)
-        run(jobs: jobs, modelDir: installed.dir, variant: installed.variant, token: token)
     }
+
 
     /// Hold the run at the next page boundary. Mid-page would be the wrong place: it pins the
     /// GPU's working set with nothing to show for it, and the half-decoded page would have to be
@@ -503,7 +563,7 @@ final class OCRSession {
         isPaused = false
         isHolding = false
         ticker?.cancel(); ticker = nil
-        thumbs?.cancel(); thumbs = nil
+        thumbs.forEach { $0.cancel() }; thumbs = []
         if phase == .running || phase == .loading { phase = pages.isEmpty ? .empty : .finished }
         scheduleReadoutDismissal()
     }
@@ -529,8 +589,8 @@ final class OCRSession {
         readoutTimer?.cancel(); readoutTimer = nil
         pages = []
         texts = []
-        documentEdit = nil
-        editSections = []
+        documentEdits = [:]
+        editSectionsByDocument = [:]
         documentName = ""
         selection = nil
         userPinnedSelection = false
@@ -617,8 +677,13 @@ final class OCRSession {
         case image(url: URL)
     }
 
-    private func run(jobs: [PageJob], modelDir: URL, variant installed: OCRModelCatalog.Variant,
-                     token: Int) {
+
+    /// Decode every page that is still pending, in order.
+    ///
+    /// The queue is `self.jobs`, read by index rather than captured: a drop that lands while this
+    /// is running appends to it and the loop picks the new pages up on its next turn, which is what
+    /// lets a second file open as a tab instead of interrupting the first.
+    private func run(modelDir: URL, variant installed: OCRModelCatalog.Variant, token: Int) {
         let started = Date()
         // Read once per run, so changing a setting mid-document cannot make page 12 disagree with
         // page 11 about how it was produced.
@@ -664,8 +729,18 @@ final class OCRSession {
                 // pure overhead before a single pixel is rendered.
                 let documents = PDFCache()
 
-                for (index, job) in jobs.enumerated() {
+                var next = 0
+                while next < self.jobs.count {
+                    // An immutable binding per turn: the stream callback captures it, and a
+                    // captured `var` is not something an escaping closure may carry.
+                    let index = next
+                    next += 1
                     if gate.isStopped || self.runToken != token { break }
+                    // Pages a previous run already transcribed stay as they are; only the queue's
+                    // pending tail is work.
+                    guard self.pages.indices.contains(index),
+                          self.pages[index].state == .pending else { continue }
+                    let job = self.jobs[index]
 
                     // A pause holds here, between pages, and nowhere else.
                     if gate.isPaused {
@@ -746,10 +821,12 @@ final class OCRSession {
 
     /// Thumbnails are rendered off the main actor and land as they finish, so a long document
     /// fills its sidebar progressively instead of blocking the drop.
-    private func renderThumbnails(_ jobs: [PageJob], token: Int) {
-        thumbs = Task.detached(priority: .utility) {
+    private func renderThumbnails(from start: Int, token: Int) {
+        let pending = Array(jobs[start...])
+        thumbs.append(Task.detached(priority: .utility) {
             let documents = PDFCache()
-            for (index, job) in jobs.enumerated() {
+            for (offset, job) in pending.enumerated() {
+                let index = start + offset
                 if Task.isCancelled { return }
                 let image = Self.thumbnail(job, documents: documents)
                 await MainActor.run { [weak self] in
@@ -760,7 +837,7 @@ final class OCRSession {
                     self.pages[index].thumbnail = image
                 }
             }
-        }
+        })
     }
 
     private nonisolated static func thumbnail(_ job: PageJob, documents: PDFCache) -> NSImage? {
