@@ -480,6 +480,28 @@ struct ContentView: View {
         // disclosure: the chevrons show only once there's somewhere to go, so the idle state is empty
         // here. Cmd-[ / Cmd-] match Finder and Safari; each chevron disables independently at the end of
         // its trail. Grouped so on Tahoe they share one Liquid Glass pill.
+        // OCR mode sits next to the sidebar toggle, at the leading edge. It switches what the
+        // content area IS - the same class of thing as showing or hiding the sidebar - rather
+        // than acting on results, and in the trailing cluster it drifted with the search field's
+        // width and stranded itself mid-toolbar whenever the sidebar was collapsed.
+        //
+        // Deliberately NOT gated on `phase == .ready`: transcription reads a dropped file and
+        // writes Markdown, and touches neither the vector index nor the embedding model. Gating
+        // it on the index would strand the feature exactly when it is most useful - while a large
+        // index loads, or when another copy of Omni holds it open.
+        ToolbarItem(id: "ocr.mode", placement: .navigation) {
+            Button {
+                // No `withAnimation`: the two modes are different content, not a moved view, and
+                // animating the swap made the whole pane slide in from the window's leading edge.
+                model.ocrMode.toggle()
+            } label: {
+                Image(systemName: "text.viewfinder")
+                    .foregroundStyle(model.ocrMode ? Color.accentColor : Color.primary)
+            }
+            .help(model.ocrMode ? "Back to search  \u{2318}\u{2325}O" : "Transcribe a document  \u{2318}\u{2325}O")
+            .accessibilityLabel(model.ocrMode ? "Back to search" : "Transcribe a document")
+            .accessibilityIdentifier("ocr.toggle")
+        }
         if #available(macOS 26.0, *) {
             // Tahoe draws a Liquid Glass capsule behind every toolbar item, including this one when
             // it holds nothing but the 1pt fillers - which rendered as a thin white vertical bar
@@ -506,27 +528,6 @@ struct ContentView: View {
         // WindowTitleHider's tuner - magnifier left, upload right), not as a separate toolbar
         // button. The File menu owns the Shift-Cmd-O shortcut; the in-field button is the click
         // target naming the same chord.
-        // OCR mode. Sits at the head of the trailing cluster, immediately right of the search
-        // field, because it switches what the content area IS - it is not another filter on the
-        // results, and grouping it with sort/view would read as one.
-        //
-        // Deliberately NOT gated on `phase == .ready`: transcription reads a dropped file and
-        // writes Markdown, and touches neither the vector index nor the embedding model. Gating
-        // it on the index would strand the feature exactly when it is most useful - while a large
-        // index loads, or when another copy of Omni holds it open.
-        // Carries an explicit id, like the workspace's own items: an identified toolbar item is
-        // what the customization sheet and the app's SIGUSR2 UI dump can both name.
-        ToolbarItem(id: "ocr.mode", placement: .primaryAction) {
-                Button {
-                    withAnimation(.easeOut(duration: 0.2)) { model.ocrMode.toggle() }
-                } label: {
-                    Image(systemName: model.ocrMode ? "text.viewfinder" : "text.viewfinder")
-                        .foregroundStyle(model.ocrMode ? Color.accentColor : Color.primary)
-                }
-                .help(model.ocrMode ? "Back to search  \u{2318}\u{2325}O" : "Transcribe a document  \u{2318}\u{2325}O")
-                .accessibilityLabel(model.ocrMode ? "Back to search" : "Transcribe a document")
-                .accessibilityIdentifier("ocr.toggle")
-        }
         // Bookmark the current search. The only way into History when recording is set to "Only when
         // I bookmark", and a quick save otherwise. Appears once there's a search to keep.
         if model.phase == .ready, !model.ocrMode, model.hasActiveSearch {
@@ -888,7 +889,6 @@ struct SearchWaysPrompt: View {
     var body: some View {
         VStack(spacing: 16) {
             Image(systemName: symbol).font(.system(size: 44, weight: .light)).foregroundStyle(.tertiary)
-                .contentTransition(.symbolEffect(.replace))
             Text(title).font(.title)
             VStack(alignment: .leading, spacing: 10) {
                 ForEach(ways, id: \.icon) { w in
@@ -899,7 +899,6 @@ struct SearchWaysPrompt: View {
                 }
             }
             .font(.callout).foregroundStyle(.secondary)   // content-width block; the outer VStack centers it
-            .id(symbol)                                   // a new set of ways fades in, not swaps
             if showSpinner { ProgressView().controlSize(.small).padding(.top, 4) }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
