@@ -416,6 +416,9 @@ private struct HistorySections: View {
                 .foregroundStyle(.secondary)
                 .help("Delete these searches")
                 .accessibilityLabel("Delete the searches under \(title)")
+                // A sidebar List insets its section headers less than its rows, so without this
+                // the trash sat further right than the file counts it lines up beneath.
+                .padding(.trailing, 11)
             }
         }
         .contentShape(Rectangle())
