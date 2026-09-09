@@ -2,7 +2,7 @@ import SwiftUI
 import AppKit
 import OmniKit
 
-private enum SettingsTab: Hashable { case files, content, performance, storage, history, serving }
+private enum SettingsTab: Hashable { case files, content, performance, storage, ocr, history, serving }
 
 struct SettingsView: View {
     // Selection is BOUND, not left to the TabView, purely so the live memory sampler can be gated
@@ -20,6 +20,8 @@ struct SettingsView: View {
                 .tag(SettingsTab.performance)
             IndexTab().tabItem { Label("Storage", systemImage: "externaldrive") }
                 .tag(SettingsTab.storage)
+            OCRTab().tabItem { Label("OCR", systemImage: "text.viewfinder") }
+                .tag(SettingsTab.ocr)
             HistoryTab().tabItem { Label("History", systemImage: "clock.arrow.circlepath") }
                 .tag(SettingsTab.history)
             ServingTab().tabItem { Label("Serving", systemImage: "network") }
@@ -992,6 +994,35 @@ private struct IndexTab: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
+        }
+        .formStyle(.grouped)
+    }
+    private func pickModel() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true; panel.canChooseFiles = false
+        panel.message = "Choose the model folder (model.safetensors, config.json, tokenizer.json)"
+        if panel.runModal() == .OK, let url = panel.url { model.setModelDir(url) }
+    }
+    private func pickDatabase() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true; panel.canChooseFiles = false
+        panel.message = "Choose a folder to store the search index"
+        if panel.runModal() == .OK, let url = panel.url { model.setDatabaseDir(url) }
+    }
+}
+
+/// Everything about the OCR add-on in one place: which build is installed, how fast it runs, and
+/// what it is asked to do. It is a separate model that nothing else in the app depends on, so it
+/// gets a tab rather than a corner of Storage.
+private struct OCRTab: View {
+    @Environment(AppModel.self) private var model
+    @State private var draftLength = OCRSession.Settings.draftLength
+    @State private var loopGuard = OCRSession.Settings.loopGuard
+    @State private var promptStyle = OCRSession.Settings.promptStyle
+    @State private var customPrompt = OCRSession.Settings.customPrompt
+
+    var body: some View {
+        Form {
             // Optional add-on, deliberately its own section: it is a different model, it is not
             // downloaded unless asked for, and nothing else in the app depends on it.
             Section {
@@ -1042,20 +1073,57 @@ private struct IndexTab: View {
                 Text("Optional. Transcribes document images to Markdown on this Mac. Not downloaded until you ask, and not used by search.")
                     .font(.caption).foregroundStyle(.secondary)
             }
+
+            Section {
+                Stepper(value: $draftLength, in: 1 ... 8) {
+                    LabeledContent("Speculative drafts", value: "\(draftLength)")
+                }
+                .onChange(of: draftLength) { _, new in OCRSession.Settings.draftLength = new }
+
+                Toggle("Stop runaway repetition", isOn: $loopGuard)
+                    .onChange(of: loopGuard) { _, new in OCRSession.Settings.loopGuard = new }
+            } header: {
+                Text("Speed")
+            } footer: {
+                Text("The draft head proposes this many tokens per step and the model verifies them "
+                     + "in one pass. Three is the measured peak here: one draft cannot pay for its "
+                     + "own step, and past four each extra draft costs more than it wins back.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            Section {
+                Picker("Instruction", selection: $promptStyle) {
+                    ForEach(OCRSession.Settings.PromptStyle.allCases) { style in
+                        Text(style.title).tag(style)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: promptStyle) { _, new in OCRSession.Settings.promptStyle = new }
+
+                if promptStyle == .custom {
+                    TextEditor(text: $customPrompt)
+                        .font(.system(.callout, design: .monospaced))
+                        .frame(height: 110)
+                        .onChange(of: customPrompt) { _, new in OCRSession.Settings.customPrompt = new }
+                } else {
+                    Text(promptStyle == .concise
+                         ? OCRSession.Settings.concisePrompt
+                         : OCRModel.defaultPrompt)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            } header: {
+                Text("Prompt")
+            } footer: {
+                Text("Concise is the model authors' current recommendation and a fifth the length, "
+                     + "but it drops the LaTeX, HTML-table and header/footer rules - it changes the "
+                     + "shape of the output, not only what it costs.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
         .task { model.refreshOCRInstalled() }
-    }
-    private func pickModel() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true; panel.canChooseFiles = false
-        panel.message = "Choose the model folder (model.safetensors, config.json, tokenizer.json)"
-        if panel.runModal() == .OK, let url = panel.url { model.setModelDir(url) }
-    }
-    private func pickDatabase() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true; panel.canChooseFiles = false
-        panel.message = "Choose a folder to store the search index"
-        if panel.runModal() == .OK, let url = panel.url { model.setDatabaseDir(url) }
     }
 }

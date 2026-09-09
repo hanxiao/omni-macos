@@ -59,6 +59,14 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   adaptive draft length (+0.8% and worse CER), mlx-swift 0.31.4 (same qmm bug; 0.31.5+ needs
   Swift 6.3). DFlash/EAGLE trees need a draft model we cannot train here; ViT token merging breaks
   the fixed visual-token/prompt-slot contract.
+- The OCR model does NOT live inside the app's MLX memory cap. It is loaded when the OCR toggle
+  goes on and dropped when it goes off, and while it is loaded the compute cap is lifted. Charging
+  4.53 GB of weights to a 6 GB budget whose buffer cache is a quarter of it costs more than half
+  the throughput - measured in-app on the same pages: 92/136/101 tok/s capped against 202/274/218
+  uncapped, where the same model outside the app does 201/271/215.
+- `omniSetMemoryLimit(0)` did not reset `MLX.Memory.memoryLimit`, only the cache limit, so
+  "Unlimited" never lifted a cap that had already been applied. Fixed; it is why the first attempt
+  at the above changed nothing.
 - Two primitives are measured-and-rejected: `MLXFast.rope` (faster and numerically WRONG - the
   checkpoint is Llama split-half, MLX is interleaved) and half-precision qkv/mask inside the
   fused vision SDPA (slower and it drifts). Do not re-adopt without new numbers.

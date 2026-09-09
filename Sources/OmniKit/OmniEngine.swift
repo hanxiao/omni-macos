@@ -161,6 +161,13 @@ public func omniSetMemoryLimit(_ bytes: Int) {
         // "Unlimited" = no compute cap, but STILL bound the reclaimable buffer cache. Otherwise
         // sustained variable-shape work (folder maps + query embeds of changing sizes) lets MLX's
         // buffer cache creep toward physical RAM, which reads as the app slowly eating memory.
+        //
+        // The memoryLimit RESET is load-bearing and was missing: this branch only ever widened the
+        // cache, so going from a cap back to Unlimited left the old compute limit in force. Nobody
+        // noticed while the setting was chosen once at launch; it surfaced the moment something
+        // needed the cap lifted at runtime, and cost more than half the OCR decode throughput
+        // (92 tok/s against 193 on the same page) because MLX was still evicting against 6 GB.
+        MLX.Memory.memoryLimit = Int(ProcessInfo.processInfo.physicalMemory)
         MLX.Memory.cacheLimit = max(Int(ProcessInfo.processInfo.physicalMemory) / 3, 512 * 1024 * 1024)
     }
 }

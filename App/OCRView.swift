@@ -18,7 +18,8 @@ import UniformTypeIdentifiers
 struct OCRView: View {
     @Environment(OCRSession.self) private var session
     @State private var dropTargeted = false
-    @State private var copied = false
+    /// Drives Quick Look, exactly as the results list does.
+    @State private var previewURL: URL?
 
     var body: some View {
         @Bindable var session = session
@@ -39,7 +40,7 @@ struct OCRView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .inspector(isPresented: railBinding) {
-            PageRail()
+            PageRail(onPreview: { previewURL = session.previewURL(for: $0) })
                 .inspectorColumnWidth(min: 132, ideal: 168, max: 280)
         }
         .dropDestination(for: URL.self) { urls, _ in
@@ -50,12 +51,27 @@ struct OCRView: View {
             if dropTargeted && session.phase != .empty { DropOverlay() }
         }
         .overlay(alignment: .top) {
-            if let notice = session.notice { NoticeChip(text: notice) }
+            if let notice = session.notice {
+                NoticeChip(text: notice, symbol: session.noticeSymbol)
+            }
         }
         .animation(.easeOut(duration: 0.2), value: session.notice)
         // Escape is the system's "stop what you are doing". It reaches here because the workspace
         // is the focused content of the window.
         .onExitCommand { if session.isBusy { session.cancel() } }
+        .quickLookPreview($previewURL)
+        // Space previews the current page, the way it does in Finder and in the results list. A
+        // focus-based key handler is not enough: the navigator List swallows the space key before
+        // an ancestor sees it, which is the same reason the results list uses this monitor.
+        .background(QuickLookKeyMonitor(
+            onSpace: { previewCurrentPage() },
+            onPreviewArrow: { vertical, forward in
+                guard previewURL != nil, vertical else { return false }
+                session.step(by: forward ? 1 : -1)
+                previewCurrentPage(force: true)
+                return true
+            },
+            isPreviewOpen: { previewURL != nil }))
         .toolbar { toolbar }
     }
 
@@ -69,7 +85,13 @@ struct OCRView: View {
     // MARK: - Workspace
 
     private var workspace: some View {
-        content
+        VStack(spacing: 0) {
+            if session.documents.count > 1 {
+                DocumentTabs()
+                Divider()
+            }
+            content
+        }
             .overlay(alignment: .bottom) {
                 if session.readoutVisible { ProgressReadout() }
             }
@@ -79,7 +101,7 @@ struct OCRView: View {
     }
 
     @ViewBuilder private var content: some View {
-        if session.transcribedPages.isEmpty {
+        if session.sectionIDs.isEmpty {
             CenteredHint(symbol: "text.viewfinder", title: "Preparing",
                          detail: "Rendering pages and loading the model.")
         } else {
@@ -106,6 +128,13 @@ struct OCRView: View {
 
     private func chooseFiles() { session.chooseAndOpen() }
 
+    /// Space toggles; an arrow inside an open preview replaces it with the next page.
+    private func previewCurrentPage(force: Bool = false) {
+        if previewURL != nil && !force { previewURL = nil; return }
+        guard let id = session.visibleIndex else { return }
+        previewURL = session.previewURL(for: id)
+    }
+
     // MARK: - Toolbar
 
     /// Three groups, which is the HIG's stated maximum: how the text is shown, what to do with it,
@@ -126,15 +155,13 @@ struct OCRView: View {
                 .help("Switch between formatted Markdown, side by side, and raw text")
             }
             if #available(macOS 26.0, *) { ToolbarSpacer(.fixed) }
-            ToolbarItem(id: "ocr.copy", placement: .primaryAction) {
-                Button {
-                    copyMarkdown()
-                } label: {
-                    Label(copied ? "Copied" : "Copy Markdown",
-                          systemImage: copied ? "checkmark" : "doc.on.doc")
+            // Closing lives in the File menu only (Shift-Cmd-W). It is rare, it is undone by
+            // reopening, and a toolbar earns its density from what people reach for often.
+            ToolbarItem(id: "ocr.open", placement: .primaryAction) {
+                Button { chooseFiles() } label: {
+                    Label("Open Document", systemImage: "folder")
                 }
-                .help("Copy the whole document as Markdown  \u{21e7}\u{2318}C")
-                .disabled(session.completedPages == 0)
+                .help("Open another document  \u{2318}O")
             }
             ToolbarItem(id: "ocr.export", placement: .primaryAction) {
                 Button { exportMarkdown() } label: {
@@ -143,14 +170,23 @@ struct OCRView: View {
                 .help("Save the transcription as a .md file  \u{2318}S")
                 .disabled(session.completedPages == 0)
             }
-            ToolbarItem(id: "ocr.open", placement: .primaryAction) {
-                Button { chooseFiles() } label: {
-                    Label("Open Document", systemImage: "folder")
+            ToolbarItem(id: "ocr.copy", placement: .primaryAction) {
+                Button { session.copyMarkdownToPasteboard() } label: {
+                    Label("Copy Markdown", systemImage: "doc.on.doc")
                 }
-                .help("Open another document  \u{2318}O")
+                .help("Copy the whole document as Markdown  \u{21e7}\u{2318}C")
+                .disabled(session.completedPages == 0)
             }
-            // Closing lives in the File menu only (Shift-Cmd-W). It is rare, it is undone by
-            // reopening, and a toolbar earns its density from what people reach for often.
+            ToolbarItem(id: "ocr.share", placement: .primaryAction) {
+                // The system share sheet, not a menu of our own: AirDrop, Mail, Messages, Notes
+                // and every service the user has enabled come from the platform and stay current
+                // without this app knowing about any of them.
+                ShareLink(item: transcript,
+                          preview: SharePreview(session.documentName,
+                                                image: Image(systemName: "doc.plaintext")))
+                    .help("Share the transcription")
+                    .disabled(session.completedPages == 0)
+            }
             if #available(macOS 26.0, *) { ToolbarSpacer(.fixed) }
             ToolbarItem(id: "ocr.rail", placement: .primaryAction) {
                 Button {
@@ -163,18 +199,14 @@ struct OCRView: View {
         }
     }
 
-    private var hasDocument: Bool {
-        session.phase != .empty && session.phase != .needsModel && !session.pages.isEmpty
+    /// What the share sheet hands over: a Markdown FILE, so a service that wants an attachment
+    /// gets one and a service that wants text still gets the text.
+    private var transcript: TranscriptFile {
+        TranscriptFile(name: session.suggestedFileName, markdown: session.documentMarkdown)
     }
 
-    private func copyMarkdown() {
-        session.copyMarkdownToPasteboard()
-        // Every action needs feedback; a copy that changes nothing on screen reads as a no-op.
-        withAnimation(.easeOut(duration: 0.15)) { copied = true }
-        Task {
-            try? await Task.sleep(for: .seconds(1.6))
-            withAnimation(.easeOut(duration: 0.2)) { copied = false }
-        }
+    private var hasDocument: Bool {
+        session.phase != .empty && session.phase != .needsModel && !session.pages.isEmpty
     }
 
     private func exportMarkdown() { session.exportMarkdown() }
@@ -186,14 +218,15 @@ struct OCRView: View {
 /// and VoiceOver come from the platform. The previous version was a `LazyVStack` of tap gestures,
 /// which had none of those and could not be driven from the keyboard at all.
 private struct PageRail: View {
+    var onPreview: (Int) -> Void
     @Environment(OCRSession.self) private var session
 
     var body: some View {
         ScrollViewReader { proxy in
             List(selection: Binding<Int?>(get: { session.visibleIndex },
                                           set: { if let id = $0 { session.select(id) } })) {
-                ForEach(session.pages) { page in
-                    PageThumb(page: page)
+                ForEach(session.visiblePages) { page in
+                    PageThumb(page: page, onPreview: { onPreview(page.id) })
                         .id(page.id)
                         .tag(page.id)
                         .listRowInsets(EdgeInsets(top: 3, leading: 4, bottom: 3, trailing: 4))
@@ -212,6 +245,8 @@ private struct PageRail: View {
 
 private struct PageThumb: View {
     let page: OCRSession.Page
+    /// Open the page itself, the way double-clicking a Finder icon does.
+    var onPreview: () -> Void
     @Environment(OCRSession.self) private var session
 
     var body: some View {
@@ -245,13 +280,20 @@ private struct PageThumb: View {
         }
         .padding(.vertical, 2)
         .contentShape(Rectangle())
+        // High priority, on the row's own content: a List with a selection binding consumes
+        // ordinary and simultaneous tap gestures before they arrive, so neither `.onTapGesture`
+        // nor `.simultaneousGesture` on the row ever fires.
+        .highPriorityGesture(TapGesture(count: 2).onEnded { onPreview() })
+        .contextMenu {
+            Button("Quick Look") { onPreview() }
+        }
         // Content OUT. A transcribed page drags into Notes, Mail, TextEdit or any editor as its
         // Markdown; the whole document goes to disk through Save.
         .draggable(page.state == .done ? session.pageText(at: page.id) : "")
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(page.label)
         .accessibilityValue(stateDescription)
-        .help("\(page.label) - \(stateDescription)")
+        .help("\(page.label) - \(stateDescription).  Space or double-click to preview")
     }
 
     private var stateDescription: String {
@@ -265,6 +307,57 @@ private struct PageThumb: View {
 }
 
 // MARK: - Panes
+
+/// One tab per dropped file, the way Preview opens several documents at once. A multi-page PDF is
+/// a single tab whose pages run continuously inside it - the page rule separates pages, the tab
+/// separates FILES, and conflating the two is what made a four-file drop read as one 40-page
+/// document with no way to tell where one ended.
+///
+/// The ring is the same `CloudSyncPie` the folder sidebar uses for indexing progress: the app
+/// already has one way of saying "this much of this thing is done", and a second one would be a
+/// second thing to learn.
+private struct DocumentTabs: View {
+    @Environment(OCRSession.self) private var session
+
+    var body: some View {
+        ScrollView(.horizontal) {
+            HStack(spacing: 6) {
+                ForEach(session.documents) { doc in
+                    let selected = session.visibleDocument?.id == doc.id
+                    HStack(spacing: 6) {
+                        CloudSyncPie(fraction: session.progress(ofDocument: doc.id))
+                        Text(doc.name)
+                            .font(.callout)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Button {
+                            session.closeDocument(doc.id)
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.caption2.weight(.semibold))
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("Close \(doc.name)")
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .frame(maxWidth: 240)
+                    .background(selected ? AnyShapeStyle(.selection) : AnyShapeStyle(.clear),
+                                in: RoundedRectangle(cornerRadius: Design.cornerSmall))
+                    .contentShape(Rectangle())
+                    .onTapGesture { session.selectDocument(doc.id) }
+                    .help(doc.name)
+                    .accessibilityAddTraits(selected ? [.isSelected, .isButton] : .isButton)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+        }
+        .scrollIndicators(.never)
+        .background(.background.secondary)
+    }
+}
 
 /// The transcription as ONE document: every page in order, separated by a dim rule.
 ///
@@ -280,12 +373,12 @@ private struct RenderedDocument: View {
     @Environment(OCRSession.self) private var session
 
     var body: some View {
-        DocumentScroll { pages in
+        DocumentScroll { ids in
             LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(pages) { page in
-                    if page.id != pages.first?.id { PageBreak() }
-                    RenderedPage(index: page.id, state: page.state)
-                        .id(page.id)
+                ForEach(ids, id: \.self) { id in
+                    if id != ids.first { PageBreak() }
+                    RenderedSection(id: id, state: session.sectionState(id))
+                        .id(id)
                 }
             }
             .textSelection(.enabled)
@@ -293,15 +386,16 @@ private struct RenderedDocument: View {
     }
 }
 
-/// One page's blocks. Reads its own text rather than taking it as a parameter, so a streamed token
-/// invalidates this section alone - not the document, the toolbar, or the pages above it.
-private struct RenderedPage: View {
-    let index: Int
+
+/// One section's blocks. Reads its own text rather than taking it as a parameter, so a streamed
+/// token invalidates this section alone - not the document, the toolbar, or the sections above it.
+private struct RenderedSection: View {
+    let id: Int
     let state: OCRSession.PageState
     @Environment(OCRSession.self) private var session
 
     var body: some View {
-        let blocks = MarkdownBlock.parse(session.pageText(at: index))
+        let blocks = MarkdownBlock.parse(session.sectionText(id))
         VStack(alignment: .leading, spacing: 10) {
             ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
                 block.view.transition(StreamFade.transition)
@@ -330,18 +424,13 @@ private struct RawDocument: View {
     var body: some View {
         Group {
             if editable {
-                TextEditor(text: Binding(get: { session.documentMarkdown },
-                                         set: { session.setDocumentEdit($0) }))
-                    .font(.system(.body, design: .monospaced))
-                    .scrollContentBackground(.hidden)
-                    .padding(.bottom, 8)
+                SourceEditor()
             } else {
-                DocumentScroll(width: nil) { pages in
+                DocumentScroll(width: nil) { ids in
                     LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(pages) { page in
-                            if page.id != pages.first?.id { PageBreak() }
-                            RawPage(index: page.id)
-                                .id(page.id)
+                        ForEach(ids, id: \.self) { id in
+                            if id != ids.first { PageBreak() }
+                            RawSection(id: id).id(id)
                         }
                     }
                 }
@@ -359,12 +448,59 @@ private struct RawDocument: View {
     }
 }
 
-private struct RawPage: View {
-    let index: Int
+/// The editable Markdown source, highlighted.
+///
+/// Tahoe's `TextEditor` takes an `AttributedString` binding, so the syntax colouring survives
+/// editing instead of being a read-only decoration; on macOS 14-15 the same text is edited plain,
+/// which is what those systems offer. Re-highlighting is debounced rather than run per keystroke:
+/// rebuilding the attributed text under a live caret on every character is what makes a
+/// hand-rolled highlighter feel wrong, and 200 ms after the typing stops is invisible.
+private struct SourceEditor: View {
+    @Environment(OCRSession.self) private var session
+    @State private var attributed = AttributedString()
+    @State private var plain = ""
+
+    var body: some View {
+        Group {
+            if #available(macOS 26.0, *) {
+                TextEditor(text: $attributed)
+                    .onChange(of: attributed) { _, new in
+                        let text = String(new.characters)
+                        guard text != plain else { return }   // our own re-highlight, not a keystroke
+                        plain = text
+                        session.setDocumentEdit(text)
+                    }
+                    .task(id: plain) {
+                        try? await Task.sleep(for: .milliseconds(200))
+                        guard !Task.isCancelled else { return }
+                        let coloured = MarkdownSource.highlighted(plain)
+                        if String(coloured.characters) == plain { attributed = coloured }
+                    }
+            } else {
+                TextEditor(text: Binding(get: { session.documentMarkdown },
+                                         set: { session.setDocumentEdit($0) }))
+            }
+        }
+        .font(.system(.body, design: .monospaced))
+        .scrollContentBackground(.hidden)
+        // The same insets the read-only sections use. Without the top one the first line of the
+        // document sits under the translucent toolbar when scrolled to the top.
+        .padding(.horizontal, 8)
+        .padding(.top, 24)
+        .padding(.bottom, 8)
+        .onAppear {
+            plain = session.documentMarkdown
+            attributed = MarkdownSource.highlighted(plain)
+        }
+    }
+}
+
+private struct RawSection: View {
+    let id: Int
     @Environment(OCRSession.self) private var session
 
     var body: some View {
-        Text(session.pageText(at: index))
+        Text(MarkdownSource.highlighted(session.sectionText(id)))
             .font(.system(.body, design: .monospaced))
             .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -375,13 +511,13 @@ private struct RawPage: View {
 /// readout, and the one place that follows the run.
 private struct DocumentScroll<Content: View>: View {
     var width: CGFloat? = 760
-    @ViewBuilder var content: ([OCRSession.Page]) -> Content
+    @ViewBuilder var content: ([Int]) -> Content
     @Environment(OCRSession.self) private var session
 
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                content(session.transcribedPages)
+                content(session.sectionIDs)
                     .frame(maxWidth: width ?? .infinity, alignment: .leading)
                     .padding(.horizontal, width == nil ? 12 : 28)
                     .padding(.top, 24)
@@ -591,12 +727,26 @@ private struct DropOverlay: View {
     }
 }
 
+/// The transcription as something the share sheet can hand to another app.
+struct TranscriptFile: Transferable {
+    let name: String
+    let markdown: String
+
+    static var transferRepresentation: some TransferRepresentation {
+        DataRepresentation(exportedContentType: OCRSession.markdownType) { file in
+            Data(file.markdown.utf8)
+        }
+        .suggestedFileName { $0.name }
+    }
+}
+
 /// A problem worth saying out loud that is not worth losing the document over.
 private struct NoticeChip: View {
     let text: String
+    let symbol: String
 
     var body: some View {
-        Label(text, systemImage: "exclamationmark.triangle")
+        Label(text, systemImage: symbol)
             .font(.callout)
             .padding(.horizontal, 14)
             .padding(.vertical, 9)

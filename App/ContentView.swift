@@ -494,7 +494,9 @@ struct ContentView: View {
         // writes Markdown, and touches neither the vector index nor the embedding model. Gating
         // it on the index would strand the feature exactly when it is most useful - while a large
         // index loads, or when another copy of Omni holds it open.
-        ToolbarItem(placement: .primaryAction) {
+        // Carries an explicit id, like the workspace's own items: an identified toolbar item is
+        // what the customization sheet and the app's SIGUSR2 UI dump can both name.
+        ToolbarItem(id: "ocr.mode", placement: .primaryAction) {
                 Button {
                     withAnimation(.easeOut(duration: 0.2)) { model.ocrMode.toggle() }
                 } label: {

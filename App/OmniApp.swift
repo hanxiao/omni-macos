@@ -61,6 +61,14 @@ struct OmniApp: App {
             ContentView()
                 .environment(model)
                 .environment(ocr)
+                .onAppear {
+                    ocr.willRun = { [weak model] in model?.beginOCRRun() }
+                    ocr.didFinishRun = { [weak model] in model?.endOCRRun() }
+                    ocr.onModelResident = { [weak model] on in model?.setOCRResident(on) }
+                }
+                // The toggle is what loads and offloads the model: it is a 4.53 GB add-on that
+                // should not be resident while the user is searching.
+                .onChange(of: model.ocrMode) { _, on in on ? ocr.activate() : ocr.deactivate() }
                 .frame(minWidth: 820, minHeight: 520)
                 .task { Updater.checkOnLaunchIfDue() }   // silent once-a-day check; prompts only if newer
         }
@@ -113,6 +121,15 @@ struct OmniApp: App {
                     Button("Copy Markdown") { ocr.copyMarkdownToPasteboard() }
                         .keyboardShortcut("c", modifiers: [.command, .shift])
                         .disabled(ocr.completedPages == 0)
+                    // Same system share sheet the results carry, and like Finder's Share it takes
+                    // no key equivalent.
+                    ShareLink(item: TranscriptFile(name: ocr.suggestedFileName,
+                                                   markdown: ocr.documentMarkdown),
+                              preview: SharePreview(ocr.documentName,
+                                                    image: Image(systemName: "doc.plaintext"))) {
+                        Text("Share\u{2026}")
+                    }
+                    .disabled(ocr.completedPages == 0)
                     Button("Stop Transcribing") { ocr.cancel() }
                         .keyboardShortcut(".", modifiers: .command)
                         .disabled(!ocr.isBusy)
@@ -126,10 +143,12 @@ struct OmniApp: App {
                 // (the context menu hides them outright there).
                 let multi = model.selectedPaths.count > 1
                 // Cmd-O has one owner at a time: in OCR mode it opens a document to transcribe
-                // (above), so the results version stands down. Two enabled items on one chord is
-                // a coin toss, not a shortcut.
+                // (above), so the results version gives the chord up - it does not merely disable
+                // itself. A DISABLED item still owns its key equivalent, and AppKit resolves the
+                // duplicate by stripping the equivalent from the other one, which showed up as
+                // "Open Document..." rendering with no shortcut at all and Cmd-O doing nothing.
                 Button("Open") { model.openSelected() }
-                    .keyboardShortcut("o", modifiers: .command)
+                    .keyboardShortcut(model.ocrMode ? nil : KeyboardShortcut("o", modifiers: .command))
                     .disabled(!model.hasSelection || model.ocrMode)
                 Button("Quick Look") { model.toggleQuickLook() }
                     .keyboardShortcut("y", modifiers: .command)

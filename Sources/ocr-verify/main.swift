@@ -155,6 +155,38 @@ if let i = args.firstIndex(of: "--stream") {
     exit(0)
 }
 
+// Reproduce the app's memory budget. The app caps MLX (default 6 GB, buffer cache a quarter of
+// that) to stay polite while indexing; this flag exists so the effect of that cap on OCR decode is
+// measurable rather than argued about.
+if let i = args.firstIndex(of: "--memcap"), let gb = Double(args[i + 1]) {
+    omniSetMemoryLimit(gb > 0 ? Int(gb * 1_000_000_000) : 0)
+    print(String(format: "memory cap %.1f GB", gb))
+}
+
+// What the progress callback costs.
+//
+// `emit` detokenizes the WHOLE token list every time it fires, because byte-level BPE splits
+// multi-byte characters across token boundaries and decoding incrementally turns split glyphs into
+// U+FFFD. That is O(n) per emit and O(n^2) over a page, ON the decode thread - so the honest
+// question is how much throughput a live view costs, measured rather than assumed.
+if let i = args.firstIndex(of: "--streamcost") {
+    let modelPath = args[0]
+    let imagePath = args[i + 1]
+    let tokDir = args.firstIndex(of: "--tokenizer").map { URL(fileURLWithPath: args[$0 + 1]) }
+    let model = try await OCRModel(modelDir: URL(fileURLWithPath: modelPath), tokenizerDir: tokDir)
+    let image = try OCRPreprocess.load(contentsOf: URL(fileURLWithPath: imagePath))
+    _ = try model.transcribeAuto(image: image, maxNewTokens: 64)          // warm the pipelines
+    let quiet = try model.transcribeAuto(image: image)
+    let counter = StreamCounter()
+    let noisy = try model.transcribeAuto(image: image, onStream: { counter.record($0) })
+    print(String(format: "quiet   %5d tok  %6.1f tok/s", quiet.tokens.count, quiet.decodeTokensPerSecond))
+    print(String(format: "stream  %5d tok  %6.1f tok/s   (%d updates)",
+                 noisy.tokens.count, noisy.decodeTokensPerSecond, counter.count))
+    let loss = (1 - noisy.decodeTokensPerSecond / quiet.decodeTokensPerSecond) * 100
+    print(String(format: "cost of the live view: %.1f%%", loss))
+    exit(0)
+}
+
 // Worker mode: this binary re-executed as one lane of an OCRWorkerPool.
 if await OCRWorker.runIfRequested(CommandLine.arguments) { exit(0) }
 

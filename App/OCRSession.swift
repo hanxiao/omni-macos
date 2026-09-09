@@ -36,15 +36,95 @@ final class OCRSession {
 
     enum PageState: Equatable { case pending, running, done, failed }
 
+    /// One dropped file. A multi-page PDF is ONE tab whose pages run continuously inside it;
+    /// several files are several tabs, the way Preview opens them.
+    struct Document: Identifiable, Equatable {
+        let id: Int
+        var name: String
+        var pageIDs: [Int]
+    }
+
+    enum Source: Equatable {
+        case none
+        case file(URL)
+        case pdfPage(URL, Int)
+    }
+
     /// Everything about a page EXCEPT its text - see the note on `texts` above.
     struct Page: Identifiable, Equatable {
         let id: Int                    // 0-based index within the run
         var label: String              // "Page 3" or a file name for image drops
         var thumbnail: NSImage?
+        /// Where the page came from, so Quick Look can show the original at full size.
+        var source: Source = .none
         var state: PageState = .pending
         var tokens: Int = 0
         var seconds: Double = 0
         var tokensPerSecond: Double = 0
+    }
+
+    /// Tunables the OCR settings tab writes and a run reads.
+    ///
+    /// Defaults are the measured ones, not conservative guesses: k = 3 is the peak of the
+    /// speculation curve (173/196/200/199/190/183 tok/s at k = 1..6) and the loop guard is what
+    /// stops a degraded page decoding to the token budget. The settings exist so those can be
+    /// checked on a particular document, not because another value is expected to be better.
+    enum Settings {
+        static var draftLength: Int {
+            get {
+                let stored = UserDefaults.standard.integer(forKey: "omni.ocr.draftLength")
+                return stored == 0 ? 3 : min(max(stored, 1), 8)
+            }
+            set { UserDefaults.standard.set(newValue, forKey: "omni.ocr.draftLength") }
+        }
+
+        static var loopGuard: Bool {
+            get { UserDefaults.standard.object(forKey: "omni.ocr.loopGuard") as? Bool ?? true }
+            set { UserDefaults.standard.set(newValue, forKey: "omni.ocr.loopGuard") }
+        }
+
+        /// The instruction the model is given. The concise one is jina's current recommendation
+        /// and is 19 tokens against 98, but it drops the LaTeX, HTML-table and header/footer
+        /// rules, so it changes the shape of the output rather than just its cost.
+        enum PromptStyle: String, CaseIterable, Identifiable {
+            case detailed, concise, custom
+            var id: String { rawValue }
+            var title: String {
+                switch self {
+                case .detailed: return "Detailed"
+                case .concise: return "Concise"
+                case .custom: return "Custom"
+                }
+            }
+        }
+
+        static let concisePrompt =
+            "Transcribe the provided document image into a clean Markdown format, "
+            + "preserving the natural reading order."
+
+        static var promptStyle: PromptStyle {
+            get {
+                PromptStyle(rawValue: UserDefaults.standard.string(forKey: "omni.ocr.promptStyle") ?? "")
+                    ?? .detailed
+            }
+            set { UserDefaults.standard.set(newValue.rawValue, forKey: "omni.ocr.promptStyle") }
+        }
+
+        static var customPrompt: String {
+            get { UserDefaults.standard.string(forKey: "omni.ocr.customPrompt") ?? OCRModel.defaultPrompt }
+            set { UserDefaults.standard.set(newValue, forKey: "omni.ocr.customPrompt") }
+        }
+
+        /// nil means "the model's own default", which is what `transcribeAuto` expects.
+        static var prompt: String? {
+            switch promptStyle {
+            case .detailed: return nil
+            case .concise: return concisePrompt
+            case .custom:
+                let text = customPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                return text.isEmpty ? nil : text
+            }
+        }
     }
 
     /// How the transcription is displayed. Lives here rather than in the view so it survives
@@ -62,15 +142,21 @@ final class OCRSession {
         }
         var symbol: String {
             switch self {
+            // A matched semantic triple: rich text, a split, plain text. The raw pane shows the
+            // document's plain-text source, not a code listing, so `</>` was the wrong idea.
             case .rendered: return "doc.richtext"
             case .split: return "rectangle.split.2x1"
-            case .raw: return "chevron.left.forwardslash.chevron.right"
+            case .raw: return "doc.plaintext"
             }
         }
     }
 
     private(set) var phase: Phase = .empty
     private(set) var pages: [Page] = []
+    private(set) var documents: [Document] = []
+    /// Which tab is on screen. Follows the file being transcribed until the user picks one.
+    private(set) var selectedDocument = 0
+    private(set) var userPinnedDocument = false
     /// Decoded Markdown per page, parallel to `pages`.
     private(set) var texts: [String] = []
     private(set) var documentName: String = ""
@@ -83,6 +169,9 @@ final class OCRSession {
     /// thing they copy are the same string; a per-page dictionary would mean the raw pane showed a
     /// document that no single buffer corresponded to.
     private(set) var documentEdit: String?
+    /// The edited document already split on its page rules, so the panes do not re-split it on
+    /// every frame.
+    private var editSections: [String] = []
 
     /// The current page: what the navigator highlights and what the panes scroll to. It follows
     /// the page being decoded until the user picks one, then stays put - a document that scrolls
@@ -103,6 +192,7 @@ final class OCRSession {
     /// drop, say. Shown as a transient chip; `phase` only goes to `.failed` when there is nothing
     /// left to show.
     private(set) var notice: String?
+    private(set) var noticeSymbol = "exclamationmark.triangle"
 
     var progress: Double {
         pages.isEmpty ? 0 : Double(completedPages) / Double(pages.count)
@@ -125,28 +215,104 @@ final class OCRSession {
         texts.indices.contains(index) ? texts[index] : ""
     }
 
-    /// The pages that have something to show, in order. Pending pages contribute nothing to the
-    /// document - rendering them would stack empty sections and their rules at the end of it.
-    var transcribedPages: [Page] {
-        pages.filter { $0.state != .pending }
+    // MARK: - The document, as sections
+    //
+    // Both panes read the document through `sectionIDs` / `sectionText`, and so do Copy and Save.
+    // That single source is the point: when the user edits the Markdown, the formatted view has to
+    // show what they typed. Rendering pages straight from `texts` while the clipboard carried the
+    // edit meant the two disagreed, silently, for exactly the person who had just made a change.
+    //
+    // Ids rather than an array of strings so a streamed token does not rebuild the list: the ids
+    // change when a page starts or finishes, the text changes 24 times a second, and only the
+    // section that draws it should see that.
+
+    /// Sections in reading order: one per transcribed page, or - once the document has been edited
+    /// - the pieces the user's own text is divided into by the page rules they left in it.
+    /// Pending pages contribute nothing; rendering them would stack empty sections and their rules
+    /// at the end of the document.
+    var sectionIDs: [Int] {
+        if documentEdit != nil { return Array(editSections.indices) }
+        return visibleDocument?.pageIDs.filter { pages[$0].state != .pending } ?? []
+    }
+
+    var visibleDocument: Document? {
+        documents.indices.contains(selectedDocument) ? documents[selectedDocument] : documents.first
+    }
+
+    /// The pages the navigator shows: this tab's, not the whole drop's.
+    var visiblePages: [Page] {
+        visibleDocument.map { $0.pageIDs.compactMap { id in pages.indices.contains(id) ? pages[id] : nil } } ?? []
+    }
+
+    func selectDocument(_ index: Int) {
+        guard documents.indices.contains(index) else { return }
+        selectedDocument = index
+        userPinnedDocument = true
+        selection = nil
+        userPinnedSelection = false
+    }
+
+    func closeDocument(_ index: Int) {
+        guard documents.indices.contains(index), documents.count > 1 else { clear(); return }
+        let removed = Set(documents[index].pageIDs)
+        // Only the tab's presence is removed. Its pages keep their ids so nothing that captured an
+        // index - a running decode, a thumbnail render - can write into the wrong page.
+        documents.remove(at: index)
+        for id in removed where pages.indices.contains(id) { pages[id].state = .failed }
+        selectedDocument = min(selectedDocument, documents.count - 1)
+    }
+
+    /// How far through its pages a tab is, for its progress ring.
+    func progress(ofDocument index: Int) -> Double? {
+        guard documents.indices.contains(index) else { return nil }
+        let ids = documents[index].pageIDs
+        guard !ids.isEmpty else { return nil }
+        let done = ids.filter { pages.indices.contains($0) && pages[$0].state != .pending && pages[$0].state != .running }.count
+        return Double(done) / Double(ids.count)
+    }
+
+    func sectionText(_ id: Int) -> String {
+        if documentEdit != nil {
+            return editSections.indices.contains(id) ? editSections[id] : ""
+        }
+        return pageText(at: id)
+    }
+
+    /// A section's state, for the caret and the failure note. An edited document has no page
+    /// running, so its sections are simply settled text.
+    func sectionState(_ id: Int) -> PageState {
+        guard documentEdit == nil, pages.indices.contains(id) else { return .done }
+        return pages[id].state
     }
 
     /// Markdown for the whole document, pages separated by a rule. `---` is the source form of the
     /// divider the panes draw between pages, so what is copied matches what is read.
+    /// The Markdown of the tab on screen. Per tab, not per drop: what Copy, Save and Share hand
+    /// over is what the window is showing.
     var documentMarkdown: String {
         if let documentEdit { return documentEdit }
-        return pages.indices
-            .filter { pages[$0].state == .done }
+        return (visibleDocument?.pageIDs ?? [])
+            .filter { pages.indices.contains($0) && pages[$0].state == .done }
             .map { texts[$0] }
             .joined(separator: "\n\n---\n\n")
     }
 
-    func setDocumentEdit(_ text: String) { documentEdit = text }
+    func setDocumentEdit(_ text: String) {
+        documentEdit = text
+        editSections = text.components(separatedBy: "\n---\n")
+            .map { $0.trimmingCharacters(in: .newlines) }
+    }
 
     var elapsedText: String {
         let total = Int(elapsed.rounded())
         return total < 60 ? "\(total)s" : String(format: "%d:%02d", total / 60, total % 60)
     }
+
+    /// Hooks the host uses to stand background GPU work down for the duration of a run, and to
+    /// take the OCR weights in and out of the app's memory budget - see `AppModel.setOCRResident`.
+    var willRun: (() -> Void)?
+    var didFinishRun: (() -> Void)?
+    var onModelResident: ((Bool) -> Void)?
 
     private var model: OCRModel?
     private var work: Task<Void, Never>?
@@ -158,6 +324,7 @@ final class OCRSession {
     /// previous document cannot write into this one.
     private var runToken = 0
     @ObservationIgnored private var stopFlag = OCRStopFlag()
+    @ObservationIgnored private var previewCache: [Int: URL] = [:]
 
     // MARK: - Input
 
@@ -185,6 +352,8 @@ final class OCRSession {
         elapsed = 0
         currentTokensPerSecond = 0
         documentEdit = nil
+        editSections = []
+        previewCache = [:]
         notice = nil
 
         guard let installed = Self.installedModel() else {
@@ -197,19 +366,24 @@ final class OCRSession {
         // 200-page PDF must not be rasterised here - only counted.
         var enumerated: [Page] = []
         var jobs: [PageJob] = []
+        var docs: [Document] = []
         for url in sources {
+            let first = enumerated.count
             if url.pathExtension.lowercased() == "pdf" {
                 guard let document = PDFDocument(url: url), document.pageCount > 0 else { continue }
                 for index in 0 ..< document.pageCount {
-                    enumerated.append(Page(id: enumerated.count,
-                                           label: sources.count == 1
-                                               ? "Page \(index + 1)"
-                                               : "\(url.deletingPathExtension().lastPathComponent) \(index + 1)"))
+                    enumerated.append(Page(id: enumerated.count, label: "Page \(index + 1)",
+                                           source: .pdfPage(url, index)))
                     jobs.append(.pdfPage(url: url, index: index))
                 }
             } else {
-                enumerated.append(Page(id: enumerated.count, label: url.lastPathComponent))
+                enumerated.append(Page(id: enumerated.count, label: url.lastPathComponent,
+                                       source: .file(url)))
                 jobs.append(.image(url: url))
+            }
+            if enumerated.count > first {
+                docs.append(Document(id: docs.count, name: url.lastPathComponent,
+                                     pageIDs: Array(first ..< enumerated.count)))
             }
         }
         guard !enumerated.isEmpty else {
@@ -217,9 +391,13 @@ final class OCRSession {
             return
         }
         pages = enumerated
+        documents = docs
+        selectedDocument = 0
+        userPinnedDocument = false
         texts = Array(repeating: "", count: enumerated.count)
         phase = .loading
         readoutVisible = true
+        willRun?()
         renderThumbnails(jobs, token: token)
         run(jobs: jobs, modelDir: installed.dir, token: token)
     }
@@ -238,6 +416,18 @@ final class OCRSession {
         scheduleReadoutDismissal()
     }
 
+    /// Entering and leaving OCR mode. The model is loaded on first use and dropped on the way out,
+    /// so 4.53 GB is only resident while the user is actually transcribing something.
+    func activate() { onModelResident?(true) }
+
+    func deactivate() {
+        cancel()
+        work = nil
+        runToken += 1
+        model = nil
+        onModelResident?(false)
+    }
+
     func clear() {
         cancel()
         work?.cancel(); work = nil
@@ -248,6 +438,7 @@ final class OCRSession {
         pages = []
         texts = []
         documentEdit = nil
+        editSections = []
         documentName = ""
         selection = nil
         userPinnedSelection = false
@@ -298,10 +489,15 @@ final class OCRSession {
         }
     }
 
-    private func post(notice message: String) {
+    /// A transient chip. Also the place a successful action says so: an action that changes
+    /// nothing on screen reads as a no-op, and confirming it by swapping a toolbar icon resizes
+    /// that item and shoves its neighbours sideways for as long as the confirmation lasts.
+    func post(notice message: String, symbol: String = "exclamationmark.triangle",
+              seconds: Double = 4) {
         notice = message
+        noticeSymbol = symbol
         Task { [weak self] in
-            try? await Task.sleep(for: .seconds(4))
+            try? await Task.sleep(for: .seconds(seconds))
             guard let self, self.notice == message else { return }
             self.notice = nil
         }
@@ -325,6 +521,10 @@ final class OCRSession {
 
     private func run(jobs: [PageJob], modelDir: URL, token: Int) {
         let started = Date()
+        // Read once per run, so changing a setting mid-document cannot make page 12 disagree with
+        // page 11 about how it was produced.
+        let settings = (prompt: Settings.prompt, draftLength: Settings.draftLength,
+                        loopGuard: Settings.loopGuard)
         let flag = stopFlag
         ticker = Task { [weak self] in
             while !Task.isCancelled {
@@ -355,6 +555,11 @@ final class OCRSession {
                     if flag.stopped || self.runToken != token { break }
                     self.pages[index].state = .running
                     self.runningIndex = index
+                    if !self.userPinnedDocument,
+                       let doc = self.documents.firstIndex(where: { $0.pageIDs.contains(index) }),
+                       doc != self.selectedDocument {
+                        self.selectedDocument = doc
+                    }
                     if !self.userPinnedSelection { self.selection = nil }
 
                     // The decode runs off the main actor; updates come back through a Sendable
@@ -364,6 +569,9 @@ final class OCRSession {
                         guard let image = Self.load(job, documents: documents) else { return nil }
                         return try? loaded.transcribeAuto(
                             image: image,
+                            prompt: settings.prompt,
+                            draftLength: settings.draftLength,
+                            loopGuard: settings.loopGuard,
                             onStream: { update in
                                 Task { @MainActor [weak self] in
                                     // The token check is what stops a decode belonging to the
@@ -397,12 +605,14 @@ final class OCRSession {
                 }
                 self.ticker?.cancel()
                 self.runningIndex = nil
+                self.didFinishRun?()
                 if self.runToken == token {
                     self.phase = .finished
                     self.scheduleReadoutDismissal()
                 }
             } catch {
                 self.ticker?.cancel()
+                self.didFinishRun?()
                 guard self.runToken == token else { return }
                 self.phase = .failed("Loading \(modelDir.lastPathComponent): \(error)")
             }
@@ -466,6 +676,10 @@ final class OCRSession {
     // These live on the session, not in the view, because both the toolbar and the File menu
     // invoke them and the menu is the only place a keyboard shortcut actually fires.
 
+    /// Both panels are presented as SHEETS on the document's own window rather than as app-modal
+    /// windows, which is how macOS attaches a file operation to the document it belongs to. Neither
+    /// carries a `message`: the system dialog already says what it is, and a sentence of our own
+    /// inside it is chrome the platform does not use.
     func chooseAndOpen() {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
@@ -473,25 +687,75 @@ final class OCRSession {
         // Kept in step with `isSupported` - a panel that refuses a file the drop target accepts
         // reads as a bug in the feature, not as a filter.
         panel.allowedContentTypes = [.pdf, .png, .jpeg, .tiff, .heic, .bmp, .gif, .webP, .image]
-        panel.message = "Choose a PDF or images to transcribe"
-        if panel.runModal() == .OK { open(urls: panel.urls) }
+        present(panel) { [weak self] in self?.open(urls: panel.urls) }
     }
 
     func copyMarkdownToPasteboard() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(documentMarkdown, forType: .string)
+        post(notice: "Copied", symbol: "checkmark.circle.fill", seconds: 1.6)
     }
 
     func exportMarkdown() {
         let panel = NSSavePanel()
-        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
-        panel.nameFieldStringValue = (documentName as NSString).deletingPathExtension + ".md"
-        panel.message = "Save the transcription"
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            try documentMarkdown.write(to: url, atomically: true, encoding: .utf8)
-        } catch {
-            post(notice: "Could not save: \(error.localizedDescription)")
+        panel.allowedContentTypes = [Self.markdownType]
+        panel.nameFieldStringValue = suggestedFileName
+        present(panel) { [weak self] in
+            guard let self, let url = panel.url else { return }
+            do {
+                try self.documentMarkdown.write(to: url, atomically: true, encoding: .utf8)
+            } catch {
+                self.post(notice: "Could not save: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    nonisolated static let markdownType = UTType(filenameExtension: "md") ?? .plainText
+
+    var suggestedFileName: String {
+        let base = visibleDocument?.name ?? documentName
+        return (base as NSString).deletingPathExtension + ".md"
+    }
+
+    private func present(_ panel: NSSavePanel, onOK: @escaping () -> Void) {
+        guard let window = NSApp.keyWindow ?? NSApp.windows.first(where: { $0.isVisible }) else {
+            if panel.runModal() == .OK { onOK() }
+            return
+        }
+        panel.beginSheetModal(for: window) { response in
+            guard response == .OK else { return }
+            onOK()
+        }
+    }
+
+    /// A file Quick Look can show for this page.
+    ///
+    /// An image drop previews the original file, at its own resolution and with its own metadata.
+    /// A PDF page has no file of its own, so one is rendered once into the caches directory and
+    /// reused - previewing the whole PDF instead would open it at page 1, which is the wrong page
+    /// every time but the first.
+    func previewURL(for id: Int) -> URL? {
+        guard pages.indices.contains(id) else { return nil }
+        switch pages[id].source {
+        case .none:
+            return nil
+        case .file(let url):
+            return url
+        case .pdfPage(let url, let index):
+            if let cached = previewCache[id] { return cached }
+            guard let document = PDFDocument(url: url),
+                  let cg = FileExtractor.renderPDFPage(document, index: index, maxDimension: 2048)
+            else { return nil }
+            let rep = NSBitmapImageRep(cgImage: cg)
+            guard let data = rep.representation(using: .png, properties: [:]) else { return nil }
+            let name = "\(url.deletingPathExtension().lastPathComponent)-p\(index + 1).png"
+            let out = FileManager.default.temporaryDirectory
+                .appendingPathComponent("omni-ocr-preview", isDirectory: true)
+            try? FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+            let file = out.appendingPathComponent(name)
+            guard (try? data.write(to: file)) != nil else { return nil }
+            previewCache[id] = file
+            return file
         }
     }
 

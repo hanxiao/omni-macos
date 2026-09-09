@@ -113,6 +113,14 @@ public enum OCRModelCatalog {
     }
 
     /// Read the manifest a completed download left behind.
+    /// Bytes an installed build occupies, from its own manifest. Callers size a memory budget
+    /// from this: the OCR weights are the single largest thing the app can be asked to hold.
+    public static func installedBytes(_ variant: Variant) -> Int {
+        guard let dir = installDir(for: variant),
+              let manifest = try? readManifest(at: dir) else { return 0 }
+        return Int(manifest.bytes)
+    }
+
     static func readManifest(at dir: URL) throws -> Manifest {
         let url = dir.resolvingSymlinksInPath().appendingPathComponent("omni-ocr.json")
         let data = try Data(contentsOf: url)

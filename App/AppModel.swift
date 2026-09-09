@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import AppKit
 import CryptoKit
+import MLX
 import os
 import OmniKit
 import Photos
@@ -2485,6 +2486,60 @@ final class AppModel {
 
     // MARK: - Bootstrap
 
+    /// The OCR model is loaded on demand and does NOT live inside the memory cap.
+    ///
+    /// The cap exists to bound what the app holds all the time - the embedding towers and the
+    /// index's working set. The OCR model is neither: it is 4.53 GB that appears when the user
+    /// turns OCR on and goes away when they turn it off. Charging it to that budget was measured,
+    /// on the same pages of the same PDF, to cost more than half the throughput:
+    ///
+    ///     6 GB cap (the default)    92 / 136 / 101 tok/s
+    ///     cap lifted while loaded  193 / 257 / 204 tok/s
+    ///     the same model, no app   201 / 271 / 215 tok/s
+    ///
+    /// MLX spends the difference evicting and re-allocating: the weights alone are most of a 6 GB
+    /// budget whose buffer cache is a quarter of it, so nearly every step misses.
+    private var indexingPausedForOCR = false
+    private var ocrHoldsMemory = false
+
+    /// Called when OCR mode is entered and left. Entering lifts the compute cap (the reclaimable
+    /// buffer cache stays bounded); leaving restores it and drops the weights' buffers, so the
+    /// 4.53 GB is actually returned rather than lingering in MLX's cache.
+    func setOCRResident(_ resident: Bool) {
+        guard resident != ocrHoldsMemory else { return }
+        ocrHoldsMemory = resident
+        if resident {
+            omniSetMemoryLimit(0)
+        } else {
+            applyMemoryLimit()
+            MLX.GPU.clearCache()
+        }
+    }
+    /// True for the whole of an OCR run. A one-shot `pauseIndexing()` is not enough: a run
+    /// usually starts at launch, BEFORE the crawl has begun, so there is nothing to pause yet and
+    /// indexing simply starts a moment later and runs underneath it. The flag is what keeps it
+    /// stood down for the duration.
+    private(set) var ocrRunActive = false
+
+    /// The cancel is deliberately not awaited. A run that blocked until the indexer had left MLX
+    /// would sit there doing nothing; instead OCR starts immediately - slower while the pass winds
+    /// down - and reaches full speed the moment it does.
+    func beginOCRRun() {
+        ocrRunActive = true
+        if isIndexing {
+            indexingPausedForOCR = true
+            pauseIndexing()
+        }
+    }
+
+    func endOCRRun() {
+        ocrRunActive = false
+        if indexingPausedForOCR {
+            indexingPausedForOCR = false
+            startIndexing()
+        }
+    }
+
     private func applyMemoryLimit() {
         omniSetMemoryLimit(maxMemoryGB > 0 ? Int(maxMemoryGB * 1_000_000_000) : 0)
     }
@@ -4057,6 +4112,8 @@ final class AppModel {
     /// Start or resume indexing. Indexing is incremental - already-embedded files are
     /// skipped by modification time, so resuming simply continues where it left off.
     func startIndexing() {
+        // An OCR run owns the GPU while it lasts; see beginOCRRun. endOCRRun kicks this again.
+        guard !ocrRunActive else { indexingPausedForOCR = true; return }
         guard !isTerminating, let indexer, let store, indexState != .indexing else { return }
         // !isPaperRunning: same reason as catchUpPendingRoots - the suite owns the engine and the
         // levers for the duration. REMEMBERED, not dropped: a Reindex/Update/Resume that arrives
