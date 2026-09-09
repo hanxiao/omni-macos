@@ -138,6 +138,15 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   page navigator went blank the moment a run finished, which is how it was found. It also numbered
   logical lines, which a soft-wrapping editor does not lay out one to a row, and `Text("\(line)")`
   is a LocalizedStringKey, so past 999 it rendered "1,300" into a column sized for four digits.
+- The page navigator is a `ScrollView`, NOT a `List`. A sidebar list draws the SYSTEM's row
+  selection, which greys out the moment the text pane takes focus - but here the selection means
+  "the page you are looking at", not "the focused row", so it has to stay lit. Preview's own
+  navigator is a collection view for the same reason. Selection is the accent fill around the page
+  AND its number; the thumbnail keeps its own proportions on no plate at all (the old grey plate
+  letterboxed portrait scans and drew a second edge around a bordered page).
+- The tab bar uses `windowBackgroundColor` for the track and `controlColor` for the selected
+  capsule. Two shades of `.background` left them the same colour in light mode, so nothing read as
+  raised; the semantic pair keeps the capsule lighter than the track in both appearances.
 - A drop ADDS a tab. The decode queue lives on the session and the run loop reads it by index, so a
   file opened mid-run extends the queue instead of interrupting it; the new tab comes forward and
   is pinned, so the run behind it does not pull the view back. Document edits are keyed by tab for

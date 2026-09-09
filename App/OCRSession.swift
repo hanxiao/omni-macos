@@ -54,6 +54,9 @@ final class OCRSession {
     struct Page: Identifiable, Equatable {
         let id: Int                    // 0-based index within the run
         var label: String              // "Page 3" or a file name for image drops
+        /// What the navigator prints under the thumbnail. A page rail is already a list of pages,
+        /// so it says "3" the way Preview's does; `label` stays the spoken form.
+        var caption: String = ""
         var thumbnail: NSImage?
         /// Where the page came from, so Quick Look can show the original at full size.
         var source: Source = .none
@@ -305,6 +308,15 @@ final class OCRSession {
         return visibleDocument?.pageIDs.filter { pages[$0].state != .pending } ?? []
     }
 
+    /// What the navigator marks. `visibleIndex` is global, so on a tab whose pages nothing has
+    /// touched it names a page in another document and the rail highlighted nothing at all; a
+    /// navigator always marks the page you are on, so it falls back to this tab's first page.
+    var railSelection: Int? {
+        guard let doc = visibleDocument else { return nil }
+        if let index = visibleIndex, doc.pageIDs.contains(index) { return index }
+        return doc.pageIDs.first
+    }
+
     /// The name of the document being transcribed, which is not necessarily the one on screen: a
     /// file opened while a run is in flight comes forward as a tab while the run carries on behind
     /// it.
@@ -461,12 +473,14 @@ final class OCRSession {
                 for index in 0 ..< document.pageCount {
                     enumerated.append(Page(id: firstNewPage + enumerated.count,
                                            label: "Page \(index + 1)",
+                                           caption: "\(index + 1)",
                                            source: .pdfPage(url, index)))
                     added.append(.pdfPage(url: url, index: index))
                 }
             } else {
                 enumerated.append(Page(id: firstNewPage + enumerated.count,
                                        label: url.lastPathComponent,
+                                       caption: url.lastPathComponent,
                                        source: .file(url)))
                 added.append(.image(url: url))
             }

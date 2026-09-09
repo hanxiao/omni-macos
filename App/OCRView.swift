@@ -210,17 +210,31 @@ struct PageRail: View {
 
     var body: some View {
         ScrollViewReader { proxy in
-            List(selection: Binding<Int?>(get: { session.visibleIndex },
-                                          set: { if let id = $0 { session.select(id) } })) {
-                ForEach(session.visiblePages) { page in
-                    PageThumb(page: page, onPreview: { session.previewing = session.previewURL(for: page.id) })
-                        .id(page.id)
-                        .tag(page.id)
-                        .listRowInsets(EdgeInsets(top: 3, leading: 4, bottom: 3, trailing: 4))
-                        .listRowSeparator(.hidden)
+            ScrollView {
+                LazyVStack(spacing: 2) {
+                    ForEach(session.visiblePages) { page in
+                        PageThumb(page: page,
+                                  selected: session.railSelection == page.id,
+                                  onPreview: { session.previewing = session.previewURL(for: page.id) })
+                            .id(page.id)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+            }
+            // A scroller and not a `List`. A sidebar list draws the SYSTEM's row selection, which
+            // greys out the moment the text pane takes focus - and here the selection means "the
+            // page you are looking at", not "the focused row", so it has to stay lit. Preview's own
+            // navigator is a collection view for the same reason.
+            .focusable()
+            .focusEffectDisabled()
+            .onMoveCommand { direction in
+                switch direction {
+                case .up: session.step(by: -1)
+                case .down: session.step(by: 1)
+                default: break
                 }
             }
-            .listStyle(.sidebar)
             // The rail follows the page being decoded. Once nothing is running it belongs to the
             // reader: scrolling it back to the selection under their hands is how a navigator
             // stops being usable.
@@ -235,45 +249,30 @@ struct PageRail: View {
 
 private struct PageThumb: View {
     let page: OCRSession.Page
+    let selected: Bool
     /// Open the page itself, the way double-clicking a Finder icon does.
     var onPreview: () -> Void
     @Environment(OCRSession.self) private var session
 
     var body: some View {
-        VStack(spacing: 4) {
-            ZStack {
-                RoundedRectangle(cornerRadius: Design.cornerSmall)
-                    .fill(.background.tertiary)
-                if let thumbnail = page.thumbnail {
-                    Image(nsImage: thumbnail)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .clipShape(RoundedRectangle(cornerRadius: Design.cornerSmall))
-                }
-                if page.state == .running {
-                    ProgressView().controlSize(.small)
-                }
-                if page.state == .failed {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
-                }
-            }
-            .frame(height: 132)
-            // Unprocessed pages are dimmed rather than hidden: the rail doubles as the progress
-            // display, so the shape of what is left has to stay visible.
-            .opacity(page.state == .done ? 1 : (page.state == .running ? 0.85 : 0.4))
-            .animation(.easeOut(duration: 0.25), value: page.state)
-
-            Text(page.label)
-                .font(.caption2)
+        VStack(spacing: 5) {
+            sheet
+            Text(page.caption.isEmpty ? page.label : page.caption)
+                .font(.caption)
                 .lineLimit(1)
+                .truncationMode(.middle)
+                .foregroundStyle(selected ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
         }
-        .padding(.vertical, 2)
+        .frame(maxWidth: .infinity)
+        .padding(6)
+        // The selection encloses the page AND its number, in the accent colour, the way Preview
+        // marks the page you are on.
+        .background {
+            if selected { RoundedRectangle(cornerRadius: 8).fill(Color.accentColor) }
+        }
         .contentShape(Rectangle())
-        // High priority, on the row's own content: a List with a selection binding consumes
-        // ordinary and simultaneous tap gestures before they arrive, so neither `.onTapGesture`
-        // nor `.simultaneousGesture` on the row ever fires.
-        .highPriorityGesture(TapGesture(count: 2).onEnded { onPreview() })
+        .onTapGesture(count: 2) { onPreview() }
+        .onTapGesture { session.select(page.id) }
         // The app's existing file actions, on the file this page came from - not a second set of
         // them. Reveal and Open are the same `PhotoActions` calls the results list makes, so a
         // page behaves like any other file the app knows about.
@@ -296,6 +295,38 @@ private struct PageThumb: View {
         .accessibilityLabel(page.label)
         .accessibilityValue(stateDescription)
         .help("\(page.label) - \(stateDescription).  Space or double-click to preview")
+    }
+
+    /// The page itself, at its own proportions.
+    ///
+    /// It used to sit on a grey plate the width of the rail, which letterboxed every portrait scan
+    /// and drew a second edge around one that already had a border - two rectangles reading as a
+    /// frame around a frame. A hairline and a soft drop shadow instead: a sheet of paper lying on
+    /// the sidebar, which is what Preview draws and what makes a white page legible on a light
+    /// background.
+    @ViewBuilder private var sheet: some View {
+        let placeholder = Color(nsColor: .textBackgroundColor)
+        Group {
+            if let thumbnail = page.thumbnail {
+                Image(nsImage: thumbnail).resizable().aspectRatio(contentMode: .fit)
+            } else {
+                placeholder.aspectRatio(1 / 1.414, contentMode: .fit)   // A4, so rows do not jump
+            }
+        }
+        .frame(maxHeight: 132)
+        .overlay {
+            if page.state == .running { ProgressView().controlSize(.small) }
+            if page.state == .failed {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+            }
+        }
+        .overlay(Rectangle().strokeBorder(Color.primary.opacity(0.15), lineWidth: 0.5))
+        .shadow(color: .black.opacity(0.18), radius: 1.5, y: 1)
+        // Unprocessed pages are dimmed rather than hidden: the rail doubles as the progress
+        // display, so the shape of what is left has to stay visible. Never the selected page,
+        // whatever its state: a translucent sheet over the accent fill turns the paper blue.
+        .opacity(page.state == .pending && !selected ? 0.45 : 1)
+        .animation(.easeOut(duration: 0.25), value: page.state)
     }
 
     private var stateDescription: String {
@@ -329,22 +360,31 @@ private struct DocumentTabs: View {
             }
         }
         .frame(height: 28)
-        .padding(.horizontal, 6)
-        .padding(.vertical, 4)
-        .background(.background.secondary)
+        .padding(3)
+        // An explicit window grey under an explicit control face, rather than two shades of
+        // `.background`: the semantic pair is the one that keeps the selected tab LIGHTER than the
+        // track in both appearances, which is the whole shape of a macOS tab bar. Two background
+        // tints left the capsule and its track the same colour in light mode, so nothing read as
+        // raised.
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 
     @ViewBuilder private func tab(_ doc: OCRSession.Document, at index: Int) -> some View {
         let selected = session.visibleDocument?.id == doc.id
-        let showsClose = hovered == doc.id || selected
+        // On hover only, as Preview does. A close button parked on the active tab is Safari's
+        // idiom, not this one, and it competes with the title for a narrow tab.
+        let showsClose = hovered == doc.id
         ZStack {
             // The selected tab is a raised light capsule on the track; the others are flat on it,
             // separated by a hairline. That is the macOS document-tab shape - a selection FILL
             // behind every tab, which is what this had, is the list-row idiom, not the tab one.
             if selected {
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(.background)
-                    .shadow(color: .black.opacity(0.12), radius: 0.5, y: 0.5)
+                RoundedRectangle(cornerRadius: 7)
+                    .fill(Color(nsColor: .controlColor))
+                    .overlay(RoundedRectangle(cornerRadius: 7)
+                        .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5))
+                    .shadow(color: .black.opacity(0.14), radius: 1, y: 0.5)
+                    .padding(.horizontal, 1)
             } else if index > 0, session.documents[index - 1].id != session.visibleDocument?.id {
                 HStack {
                     Divider().frame(height: 14)
