@@ -10,6 +10,17 @@ enum SidebarSelection: Hashable {
     case history(String)
 }
 
+/// Drops the List's own background on Tahoe so the window's sidebar material is what shows.
+private struct SidebarMaterial: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            content.scrollContentBackground(.hidden)
+        } else {
+            content
+        }
+    }
+}
+
 struct Sidebar: View {
     @Environment(AppModel.self) private var model: AppModel
     @State private var dropTargeted = false
@@ -151,6 +162,14 @@ struct Sidebar: View {
             HistorySections()
         }
         .listStyle(.sidebar)
+        // Let the window's own sidebar material show through instead of the List's opaque fill.
+        // The trailing inspector gets that for free because the system draws its background; a
+        // sidebar List paints its own on top of it, which is what made this column read as a flat
+        // panel next to a translucent one.
+        //
+        // Gated to macOS 26 for the same reason `toolbar(removing: .title)` is: Tahoe is the only
+        // system this was looked at on, and the sidebar is chrome that has broken here before.
+        .modifier(SidebarMaterial())
         // Selecting a history row runs it (native "smart folder" behavior). Folder selection just
         // highlights (folders are acted on via context menu / Delete).
         .onChange(of: selection) { _, sel in

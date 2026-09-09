@@ -188,6 +188,15 @@ final class OCRSession {
     /// The readout is a status toast, not permanent chrome: it stays for the run and a few seconds
     /// after, then gets out of the way of the text it was reporting on.
     private(set) var readoutVisible = false
+    /// Determinate progress while the OCR weights materialise, sampled the same way the launch
+    /// screen samples the embedding model: live GPU allocation against the bytes the build's own
+    /// manifest says it will take. Nil when there is no honest denominator, which leaves the
+    /// indeterminate spinner rather than drawing a bar that is only an animation.
+    private(set) var loadProgress: Double?
+    /// Bumped on every streamed update. The panes follow the tail off this rather than off the
+    /// text itself, so the scroller does not have to observe a string that changes 24 times a
+    /// second just to know that it did.
+    private(set) var streamTick = 0
     /// A problem that should not cost the user the document they are looking at - an unsupported
     /// drop, say. Shown as a transient chip; `phase` only goes to `.failed` when there is nothing
     /// left to show.
@@ -268,7 +277,9 @@ final class OCRSession {
         let ids = documents[index].pageIDs
         guard !ids.isEmpty else { return nil }
         let done = ids.filter { pages.indices.contains($0) && pages[$0].state != .pending && pages[$0].state != .running }.count
-        return Double(done) / Double(ids.count)
+        // A finished tab shows no ring at all. A full circle is still a progress indicator, and
+        // one sitting at 100% next to a filename is a thing to read rather than an answer.
+        return done == ids.count ? nil : Double(done) / Double(ids.count)
     }
 
     func sectionText(_ id: Int) -> String {
@@ -399,7 +410,7 @@ final class OCRSession {
         readoutVisible = true
         willRun?()
         renderThumbnails(jobs, token: token)
-        run(jobs: jobs, modelDir: installed.dir, token: token)
+        run(jobs: jobs, modelDir: installed.dir, variant: installed.variant, token: token)
     }
 
     /// Stop the run. The decode loop polls `stopFlag` once per step, so this actually frees the
@@ -492,6 +503,12 @@ final class OCRSession {
     /// A transient chip. Also the place a successful action says so: an action that changes
     /// nothing on screen reads as a no-op, and confirming it by swapping a toolbar icon resizes
     /// that item and shoves its neighbours sideways for as long as the confirmation lasts.
+    /// Monotonic: a bar that moves backwards reads as a bug even when every sample is honest.
+    private func noteLoadProgress(_ fraction: Double) {
+        guard phase == .loading else { return }
+        loadProgress = max(loadProgress ?? 0, fraction)
+    }
+
     func post(notice message: String, symbol: String = "exclamationmark.triangle",
               seconds: Double = 4) {
         notice = message
@@ -519,7 +536,8 @@ final class OCRSession {
         case image(url: URL)
     }
 
-    private func run(jobs: [PageJob], modelDir: URL, token: Int) {
+    private func run(jobs: [PageJob], modelDir: URL, variant installed: OCRModelCatalog.Variant,
+                     token: Int) {
         let started = Date()
         // Read once per run, so changing a setting mid-document cannot make page 12 disagree with
         // page 11 about how it was produced.
@@ -540,8 +558,22 @@ final class OCRSession {
                 if let model = self.model {
                     loaded = model
                 } else {
+                    let expected = OCRModelCatalog.installedBytes(installed)
+                    let baseline = omniGPUActiveMemory()
+                    self.loadProgress = expected > 0 ? 0 : nil
+                    let sampler = Task { [weak self] in
+                        guard expected > 0 else { return }
+                        while !Task.isCancelled {
+                            let grown = max(0, omniGPUActiveMemory() - baseline)
+                            let frac = min(0.99, Double(grown) / Double(expected))
+                            await MainActor.run { self?.noteLoadProgress(frac) }
+                            try? await Task.sleep(for: .milliseconds(200))
+                        }
+                    }
+                    defer { sampler.cancel() }
                     loaded = try await OCRModel(modelDir: modelDir)
                     self.model = loaded
+                    self.loadProgress = nil
                 }
                 guard self.runToken == token else { return }
                 self.phase = .running
@@ -583,6 +615,7 @@ final class OCRSession {
                                     self.texts[index] = update.text
                                     self.pages[index].tokens = update.tokens
                                     self.currentTokensPerSecond = update.tokensPerSecond
+                                    self.streamTick &+= 1
                                 }
                             },
                             shouldContinue: { !flag.stopped })

@@ -318,44 +318,76 @@ private struct PageThumb: View {
 /// second thing to learn.
 private struct DocumentTabs: View {
     @Environment(OCRSession.self) private var session
+    @State private var hovered: Int?
 
     var body: some View {
-        ScrollView(.horizontal) {
-            HStack(spacing: 6) {
-                ForEach(session.documents) { doc in
-                    let selected = session.visibleDocument?.id == doc.id
-                    HStack(spacing: 6) {
-                        CloudSyncPie(fraction: session.progress(ofDocument: doc.id))
-                        Text(doc.name)
-                            .font(.callout)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                        Button {
-                            session.closeDocument(doc.id)
-                        } label: {
-                            Image(systemName: "xmark")
-                                .font(.caption2.weight(.semibold))
-                        }
-                        .buttonStyle(.borderless)
-                        .foregroundStyle(.secondary)
-                        .accessibilityLabel("Close \(doc.name)")
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .frame(maxWidth: 240)
-                    .background(selected ? AnyShapeStyle(.selection) : AnyShapeStyle(.clear),
-                                in: RoundedRectangle(cornerRadius: Design.cornerSmall))
-                    .contentShape(Rectangle())
-                    .onTapGesture { session.selectDocument(doc.id) }
-                    .help(doc.name)
-                    .accessibilityAddTraits(selected ? [.isSelected, .isButton] : .isButton)
+        HStack(spacing: 0) {
+            ForEach(Array(session.documents.enumerated()), id: \.element.id) { index, doc in
+                tab(doc, at: index)
+            }
+        }
+        .frame(height: 28)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 4)
+        .background(.background.secondary)
+    }
+
+    @ViewBuilder private func tab(_ doc: OCRSession.Document, at index: Int) -> some View {
+        let selected = session.visibleDocument?.id == doc.id
+        let showsClose = hovered == doc.id || selected
+        ZStack {
+            // The selected tab is a raised light capsule on the track; the others are flat on it,
+            // separated by a hairline. That is the macOS document-tab shape - a selection FILL
+            // behind every tab, which is what this had, is the list-row idiom, not the tab one.
+            if selected {
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(.background)
+                    .shadow(color: .black.opacity(0.12), radius: 0.5, y: 0.5)
+            } else if index > 0, session.documents[index - 1].id != session.visibleDocument?.id {
+                HStack {
+                    Divider().frame(height: 14)
+                    Spacer()
                 }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
+
+            HStack(spacing: 4) {
+                // Close sits on the leading edge and appears on hover, as it does in Preview and
+                // Safari. Reserved space rather than inserted space: a button that appears by
+                // widening the row makes the title jump under the pointer.
+                Button { session.closeDocument(doc.id) } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 8, weight: .bold))
+                        .frame(width: 14, height: 14)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .opacity(showsClose ? 1 : 0)
+                .accessibilityLabel("Close \(doc.name)")
+                .accessibilityHidden(!showsClose)
+
+                Spacer(minLength: 0)
+                if let fraction = session.progress(ofDocument: doc.id) {
+                    CloudSyncPie(fraction: fraction).frame(width: 11, height: 11)
+                }
+                Text(doc.name)
+                    .font(.system(size: 12))
+                    .foregroundStyle(selected ? .primary : .secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 0)
+                Color.clear.frame(width: 14, height: 14)   // balances the close button
+            }
+            .padding(.horizontal, 4)
         }
-        .scrollIndicators(.never)
-        .background(.background.secondary)
+        // Equal widths, the way a tab bar divides its track - not sized to the file name, which
+        // made a long name crowd every other tab out.
+        .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
+        .onTapGesture { session.selectDocument(doc.id) }
+        .onHover { hovered = $0 ? doc.id : (hovered == doc.id ? nil : hovered) }
+        .help(doc.name)
+        .accessibilityAddTraits(selected ? [.isSelected, .isButton] : .isButton)
     }
 }
 
@@ -507,6 +539,10 @@ private struct RawSection: View {
     }
 }
 
+/// The anchor the tail-follow scrolls to. File scope because `DocumentScroll` is generic and a
+/// generic type cannot hold a static stored property.
+private let documentTailID = "ocr.tail"
+
 /// The scroller both panes share: page sections, the reading measure, room for the floating
 /// readout, and the one place that follows the run.
 private struct DocumentScroll<Content: View>: View {
@@ -517,14 +553,20 @@ private struct DocumentScroll<Content: View>: View {
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                content(session.sectionIDs)
-                    .frame(maxWidth: width ?? .infinity, alignment: .leading)
-                    .padding(.horizontal, width == nil ? 12 : 28)
-                    .padding(.top, 24)
-                    // Room for the floating readout, so the end of the document is never parked
-                    // underneath it.
-                    .padding(.bottom, 72)
-                    .frame(maxWidth: .infinity, alignment: .center)
+                VStack(spacing: 0) {
+                    content(session.sectionIDs)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    // The anchor the tail-follow scrolls to. Inside the padding so "the bottom"
+                    // means the bottom of the text, clear of the floating readout.
+                    Color.clear.frame(height: 1).id(documentTailID)
+                }
+                .frame(maxWidth: width ?? .infinity, alignment: .leading)
+                .padding(.horizontal, width == nil ? 12 : 28)
+                .padding(.top, 24)
+                // Room for the floating readout, so the end of the document is never parked
+                // underneath it.
+                .padding(.bottom, 72)
+                .frame(maxWidth: .infinity, alignment: .center)
             }
             // Follows the run, and follows the navigator, through the same value: `visibleIndex` is
             // the running page until the user picks one. It does NOT change while a page decodes,
@@ -532,6 +574,14 @@ private struct DocumentScroll<Content: View>: View {
             .onChange(of: session.visibleIndex) { _, id in
                 guard let id else { return }
                 withAnimation(.easeOut(duration: 0.25)) { proxy.scrollTo(id, anchor: .top) }
+            }
+            // Follow the text as it is written, not just when the page turns. A long page grows
+            // well past the fold, and a reader watching it transcribe should not have to chase it
+            // down the window. Unanimated on purpose: a 24 Hz animated scroll never settles, and
+            // the whole point is that the last line stays where the eye already is.
+            .onChange(of: session.streamTick) { _, _ in
+                guard session.isFollowingRun else { return }
+                proxy.scrollTo(documentTailID, anchor: .bottom)
             }
             // Switching Formatted/Side by Side/Markdown builds a NEW scroller, which starts at the
             // top. Without this you land on page 1 of a document whose run is on page 13, and
