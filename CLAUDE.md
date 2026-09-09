@@ -155,11 +155,16 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   the sidebar content, and a button in `.navigation`.
 - The in-field search-by-file button is hidden in OCR mode: the field finds text inside the open
   transcript there, and picking a file to search by is not something it can do.
-- The drawer is narrower in OCR mode, and it is the MAX that does it: a split view remembers the
-  divider where it was left, so an `ideal` below the search sidebar's stored width is ignored. A
-  smaller maximum clamps it on the way in and the search sidebar's own minimum pushes it back out
-  on the way out. The leading toolbar items move with the divider, which is the price of the
-  narrower drawer, not the inspector bug that moved them 300pt.
+- The drawer is narrower in OCR mode, and `navigationSplitViewColumnWidth` alone CANNOT do it: the
+  window restores the divider it was last left at and that restoration wins, so a declared width
+  only took effect when the mode was toggled and a cold launch straight into OCR opened the rail at
+  the search sidebar's width. Declaring the range is still right, but the width is corrected in
+  AppKit (`WindowTitleHider`'s tuner sets the divider once per wanted value - never on every window
+  update, which would fight a drag). The leading toolbar items move with the divider, which is the
+  price of the narrower drawer, not the inspector bug that moved them 300pt.
+- The OCR toggle's "on" fill is drawn INSIDE its label, not with `.borderedProminent`: a prominent
+  button takes a background of its own and broke the item out of the glass capsule it shares with
+  the sidebar toggle, so OCR mode had two separate toolbar surfaces where every other mode had one.
 - The page navigator is an EAGER `ScrollView`, not a `List`. A sidebar list draws its own row
   chrome - the system selection, which greys out the moment the text pane takes focus, and a hover
   fill on top of it - so the accent mark this rail needs sat inside a second background.

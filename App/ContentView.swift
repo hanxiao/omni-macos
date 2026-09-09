@@ -107,18 +107,17 @@ struct ContentView: View {
             // thumbnail and no more, where a list of folders and history needs room for names, so
             // the search sidebar's 260 left a portrait scan swimming in margin.
             Group {
-                if model.ocrMode {
-                    PageRail()
-                        // The MAX is what does the work. A split view remembers the divider where it was
-                        // left, so an `ideal` narrower than the search sidebar's stored width is
-                        // simply ignored; a smaller maximum clamps it on the way in, and the search
-                        // sidebar's own minimum pushes it back out on the way out.
-                        .navigationSplitViewColumnWidth(min: 120, ideal: 150, max: 180)
-                } else {
-                    Sidebar()
-                        .navigationSplitViewColumnWidth(min: 230, ideal: 260, max: 320)
-                }
+                if model.ocrMode { PageRail() } else { Sidebar() }
             }
+            // On the COLUMN ROOT, not on the branch inside it: SwiftUI reads this from the sidebar
+            // view itself, and a width declared one level down was ignored. The MAXIMUM is what
+            // does the work - a split view restores the divider where it was left, over any
+            // `ideal` - so the OCR maximum clamps the rail on the way in and the search sidebar's
+            // minimum pushes it back out on the way out.
+            .navigationSplitViewColumnWidth(
+                min: model.ocrMode ? 120 : 230,
+                ideal: model.ocrMode ? 168 : 260,
+                max: model.ocrMode ? 190 : 320)
             // The system toggle lives in the SIDEBAR's toolbar section and goes away with it, so
             // folding the drawer left no way to unfold it but the View menu. Ours is in the window
             // toolbar and stays.
@@ -149,7 +148,8 @@ struct ContentView: View {
             }
             .toolbar { toolbar }
             .background(WindowTitleHider(onSearchByFile: { model.searchByFilePanel() },
-                                        showsSearchByFile: !model.ocrMode))
+                                        showsSearchByFile: !model.ocrMode,
+                                        sidebarWidth: model.ocrMode ? 168 : 260))
         }
     }
 
@@ -503,6 +503,9 @@ struct ContentView: View {
             model.ocrMode.toggle()
         } label: {
             Image(systemName: "text.viewfinder")
+                .foregroundStyle(model.ocrMode ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
+                .padding(3)
+                .background { if model.ocrMode { Circle().fill(Color.accentColor) } }
         }
     }
 
@@ -531,20 +534,14 @@ struct ContentView: View {
         ToolbarItem(id: "sidebar.mode", placement: .navigation) { sidebarToggleButton }
         ToolbarItem(id: "ocr.mode", placement: .navigation) {
             // On is a FILLED accent circle with a white glyph, the way Preview draws Markup while
-            // it is on - a mode you are inside of, not a tinted glyph you might have moused over.
-            // Off is an ordinary toolbar button.
-            Group {
-                if model.ocrMode {
-                    ocrToggleButton
-                        .buttonStyle(.borderedProminent)
-                        .buttonBorderShape(.circle)
-                } else {
-                    ocrToggleButton
-                }
-            }
-            .help(model.ocrMode ? "Back to search  \u{2318}\u{2325}O" : "Transcribe a document  \u{2318}\u{2325}O")
-            .accessibilityLabel(model.ocrMode ? "Back to search" : "Transcribe a document")
-            .accessibilityIdentifier("ocr.toggle")
+            // it is on. The fill is drawn INSIDE the label rather than by `.borderedProminent`: a
+            // prominent button takes a background of its own, which broke this item out of the
+            // glass capsule it shares with the sidebar toggle - two separate surfaces in OCR mode
+            // where every other mode had one.
+            ocrToggleButton
+                .help(model.ocrMode ? "Back to search  \u{2318}\u{2325}O" : "Transcribe a document  \u{2318}\u{2325}O")
+                .accessibilityLabel(model.ocrMode ? "Back to search" : "Transcribe a document")
+                .accessibilityIdentifier("ocr.toggle")
         }
         if #available(macOS 26.0, *) {
             // Tahoe draws a Liquid Glass capsule behind every toolbar item, including this one when
@@ -1043,6 +1040,10 @@ private struct WindowTitleHider: NSViewRepresentable {
     /// False in OCR mode: the field finds text inside the open transcript there, and starting a
     /// similarity search by picking a file is not something it can do.
     var showsSearchByFile: Bool = true
+    /// The drawer width this mode wants. Declaring it on the split view is not enough: the window
+    /// restores the divider it was last left at and that restoration wins, so a cold launch
+    /// straight into OCR opened the page rail at the search sidebar's width.
+    var sidebarWidth: CGFloat
 
     /// Toolbar tuner (an invisible background view holding coalesced observers; despite the
     /// legacy name it no longer touches the window title - stock Sequoia titlebar chrome, i.e.
@@ -1059,6 +1060,9 @@ private struct WindowTitleHider: NSViewRepresentable {
     final class TunerView: NSView {
         var onSearchByFile: (() -> Void)?
         var showsSearchByFile = true { didSet { if showsSearchByFile != oldValue { scheduleApply() } } }
+        var sidebarWidth: CGFloat = 0 {
+            didSet { if sidebarWidth != oldValue { appliedWidth = nil; scheduleApply() } } }
+        private var appliedWidth: CGFloat?
         // nonisolated(unsafe): deinit is nonisolated under strict concurrency; the view lives and
         // dies on the main thread, so the unregistration is race-free in practice.
         nonisolated(unsafe) private var observers: [NSObjectProtocol] = []
@@ -1096,6 +1100,7 @@ private struct WindowTitleHider: NSViewRepresentable {
         }
 
         private func apply(_ w: NSWindow) {
+            applySidebarWidth(w)
             guard let toolbar = w.toolbar else { return }
             for item in toolbar.items {
                 guard let s = item as? NSSearchToolbarItem else { continue }
@@ -1171,6 +1176,27 @@ private struct WindowTitleHider: NSViewRepresentable {
             field.addSubview(b)
         }
 
+        /// Set once per wanted width, never on every window update: this is a correction to what
+        /// the window restored, not a policy, and re-applying it would fight a divider drag.
+        private func applySidebarWidth(_ w: NSWindow) {
+            guard sidebarWidth > 0, appliedWidth != sidebarWidth,
+                  let split = Self.firstSplitView(in: w.contentView),
+                  split.subviews.count >= 2 else { return }
+            appliedWidth = sidebarWidth
+            if abs(split.subviews[0].frame.width - sidebarWidth) > 1 {
+                split.setPosition(sidebarWidth, ofDividerAt: 0)
+            }
+        }
+
+        private static func firstSplitView(in view: NSView?) -> NSSplitView? {
+            guard let view else { return nil }
+            if let split = view as? NSSplitView { return split }
+            for sub in view.subviews {
+                if let split = firstSplitView(in: sub) { return split }
+            }
+            return nil
+        }
+
         @objc private func fireSearchByFile() { onSearchByFile?() }
     }
 
@@ -1178,10 +1204,12 @@ private struct WindowTitleHider: NSViewRepresentable {
         let v = TunerView()
         v.onSearchByFile = onSearchByFile
         v.showsSearchByFile = showsSearchByFile
+        v.sidebarWidth = sidebarWidth
         return v
     }
     func updateNSView(_ nsView: NSView, context: Context) {
         (nsView as? TunerView)?.onSearchByFile = onSearchByFile
         (nsView as? TunerView)?.showsSearchByFile = showsSearchByFile
+        (nsView as? TunerView)?.sidebarWidth = sidebarWidth
     }
 }
