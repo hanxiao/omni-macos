@@ -581,14 +581,44 @@ final class OCRLanguageModel: @unchecked Sendable {
     /// tokenizer is byte-level BPE with ids in merge order - i.e. roughly frequency order.
     /// Verified rather than assumed: `Ġthe` is id 270, `Ġof` 294, the digits 18-27 and ASCII
     /// punctuation 3-32, while the tail holds rare merges. EOS is id 1, so it is always in range.
-    nonisolated(unsafe) static var draftVocab = 0        // 0 = full vocabulary
+    /// 32768 measured best on long_scan (199 aggregate against 185 at full vocabulary, 197 at
+    /// 16384 and 192 at 8192): below it acceptance starts to cost more than the read saves.
+    nonisolated(unsafe) static var draftVocab = 32768   // 0 = full vocabulary
     nonisolated(unsafe) static var adaptiveDraft = false
 
+    /// The shortlisted head, MATERIALISED so the read really is smaller.
+    ///
+    /// This used to require `case .plain`, i.e. an unquantized head - which every shipped build
+    /// fails, because the head is a pack. So the shortlist silently did nothing on exactly the
+    /// builds it was meant to help, and the +1.8% it was once measured at was measuring nothing.
+    ///
+    /// It also sliced `lmHead` while `draftLogits` prefers `mtp.head`, so even on a plain build it
+    /// could shrink a matrix the draft never reads.
+    ///
+    /// A pack quantizes along its OUTPUT axis here (`outputWidth == scales.dim(-1) * groupSize`),
+    /// so a vocabulary prefix is a contiguous slice of all three tensors - provided the limit is a
+    /// whole number of groups AND of packed words, which the divisibility guard enforces rather
+    /// than assumes.
     private var draftHeadSlice: OCRWeight? {
         let limit = Self.draftVocab
-        guard limit > 0, case .plain(let m) = lmHead, limit < m.dim(-1) else { return nil }
+        guard limit > 0 else { return nil }
         if let cached = cachedDraftHead, cachedDraftHeadLimit == limit { return cached }
-        let sliced = OCRWeight.plain(MLX.contiguous(m[0..., 0 ..< limit]))
+        let full = mtp?.head ?? lmHead
+        guard limit < full.outputWidth else { return nil }
+        let sliced: OCRWeight
+        switch full {
+        case .plain(let m):
+            sliced = .plain(MLX.contiguous(m[0..., 0 ..< limit]))
+        case .pack(let p):
+            guard limit % p.groupSize == 0, (limit * p.bits) % 32 == 0 else { return nil }
+            let groups = limit / p.groupSize
+            let words = limit * p.bits / 32
+            sliced = .pack(OCRWeight.Pack(
+                w: MLX.contiguous(p.w[0..., 0 ..< words]),
+                scales: MLX.contiguous(p.scales[0..., 0 ..< groups]),
+                biases: p.biases.map { MLX.contiguous($0[0..., 0 ..< groups]) },
+                groupSize: p.groupSize, bits: p.bits))
+        }
         cachedDraftHead = sliced
         cachedDraftHeadLimit = limit
         return sliced

@@ -77,8 +77,22 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
 - Measured and rejected: `MLX_METAL_PREALLOCATE=1` (noise: 214.8/290.4/229.0 against
   214.4/290.6/227.0). Fused MoE dispatch is still right at n=5 (188 aggregate, against 132 never
   fused and 183 fused only at n<=16).
-- Measured and rejected, do not re-derive: FR-Spec draft-vocab shortlist (+1.8% hard, 0% easy),
-  adaptive draft length (+0.8% and worse CER), mlx-swift 0.31.4 (same qmm bug; 0.31.5+ needs
+- FR-Spec draft-vocab shortlist is ON at 32768 (was "measured and rejected at +1.8%"). That
+  measurement was of nothing: `draftHeadSlice` required `case .plain`, which no shipped build
+  satisfies because the head is a PACK, and it sliced `lmHead` while `draftLogits` prefers
+  `mtp.head`. Made to work on packs (groups run along the OUTPUT axis, so a vocabulary prefix is a
+  contiguous slice of w/scales/biases, guarded on divisibility) it is worth +7.6% aggregate and
+  +17% on a long page. 32768 is the peak: 199 aggregate against 185 full, 197 at 16384, 192 at 8192.
+- A shortlist CANNOT change the output by construction - a drafted token still faces the target's
+  full-vocabulary verification. What it can change is acceptance, and any acceptance change moves
+  the batch shape of the verify forward, whose matmul reduction order differs with M. On long_scan
+  the digest is identical at every shortlist size; on hard2 one token in ~1900 flips. That is the
+  same floating-point tie-flip every speculative setting has relative to greedy, which is why the
+  gate here is CER against the torch oracle and NOT digest equality. That CER run is still owed.
+- Adaptive draft length REJECTED AGAIN, now with a mechanism: it changes k mid-decode, so block
+  boundaries move and the output changes (hard2 digest fafb7630 vs d2d17e6a). Same cause as the
+  k=5 anomaly. Its speed win does not justify a non-reproducible transcript.
+- Measured and rejected, do not re-derive: mlx-swift 0.31.4 (same qmm bug; 0.31.5+ needs
   Swift 6.3). DFlash/EAGLE trees need a draft model we cannot train here; ViT token merging breaks
   the fixed visual-token/prompt-slot contract.
 - The OCR model does NOT live inside the app's MLX memory cap. It is loaded when the OCR toggle
