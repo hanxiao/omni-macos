@@ -956,6 +956,8 @@ private struct IndexTab: View {
                 // the loaded engine, and selectVariant replaces it.
                 .disabled(model.isDownloading || model.isIndexing || model.isPaperRunning)
 
+                OCRModelRow()
+
                 if model.isDownloading {
                     VStack(alignment: .leading, spacing: 4) {
                         ProgressView(value: model.downloadFraction)
@@ -987,7 +989,6 @@ private struct IndexTab: View {
                         .controlSize(.small)
                     }
                 }
-                OCRModelRow()
             } header: {
                 Text("Model")
             } footer: {
@@ -1066,15 +1067,21 @@ private struct OCRTab: View {
     var body: some View {
         Form {
             Section {
-                TextEditor(text: $prompt)
-                    .font(.system(.callout, design: .monospaced))
-                    .frame(height: 200)
-                    .onChange(of: prompt) { _, new in OCRSession.Settings.customPrompt = new }
-                HStack {
-                    Spacer()
-                    Button("Restore Default") { prompt = OCRModel.defaultPrompt }
-                        .controlSize(.small)
-                        .disabled(prompt == OCRModel.defaultPrompt)
+                // One row, not two: a second row draws a separator across the section, and there is
+                // nothing on either side of it worth separating. The editor also drops its own
+                // background - inset on the section's inset read as a panel inside a panel.
+                VStack(alignment: .leading, spacing: 8) {
+                    TextEditor(text: $prompt)
+                        .font(.system(.callout, design: .monospaced))
+                        .scrollContentBackground(.hidden)
+                        .frame(height: 210)
+                        .onChange(of: prompt) { _, new in OCRSession.Settings.customPrompt = new }
+                    HStack {
+                        Spacer()
+                        Button("Restore Default") { prompt = OCRModel.defaultPrompt }
+                            .controlSize(.small)
+                            .disabled(prompt == OCRModel.defaultPrompt)
+                    }
                 }
             } header: {
                 Text("Prompt")
