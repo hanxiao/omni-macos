@@ -32,6 +32,17 @@ if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
     --latest=false
 fi
 
+# Mirrors OCRModelCatalog.Variant.slug - what was quantized and to how many bits, plus the draft
+# head. Keep the two in step; the app builds its URLs from the Swift side.
+slug_for() {
+  case "$1" in
+    fidelity) echo "q8-experts-mtp-mlx" ;;
+    balanced) echo "q8-mtp-mlx" ;;
+    compact)  echo "q4-mtp-mlx" ;;
+    *) echo "$1" ;;
+  esac
+}
+
 for variant in "${VARIANTS[@]}"; do
   dir="$ROOT/publish-$variant"
   [ -d "$dir" ] || { echo "missing $dir"; exit 1; }
@@ -42,7 +53,7 @@ for variant in "${VARIANTS[@]}"; do
   for f in "$dir"/*.safetensors "$dir"/tokenizer.json "$dir"/tokenizer_config.json "$dir"/omni-ocr.json; do
     [ -f "$f" ] || continue
     base="$(basename "$f")"
-    name="jina-ocr-v1-mlx-$variant-$base"
+    name="jina-ocr-v1-$(slug_for "$variant")-$base"
     echo "   $name"
     gh release upload "$TAG" "$f" --repo "$REPO" --clobber
     id=$(gh api "/repos/$REPO/releases/tags/$TAG" -q ".assets[] | select(.name == \"$base\") | .id")

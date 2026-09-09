@@ -57,15 +57,13 @@ struct OnboardingView: View {
                 // staged copy on its own, and Settings > Storage > Model keeps an explicit
                 // Change... for the rare case, where the surrounding context makes it honest.
                 VStack(spacing: 10) {
-                    downloadButton(title: "Download Omni Nano", size: "~1.9 GB",
-                                   prominent: true) { model.downloadModel(.nano) }
+                    downloadButton(0, prominent: true) { model.downloadModel(.nano) }
                     // The second choice is the OCR add-on, not the larger embedding build. Someone
                     // meeting the app for the first time is choosing what it can DO, and a second
                     // embedding variant that is 60% bigger for a quality difference they cannot
                     // see yet is not that choice - it stays in Settings > Storage, where the
                     // surrounding context makes it answerable.
-                    downloadButton(title: "Download OCR model", size: "~4.5 GB \u{00B7} recommended",
-                                   prominent: false) { model.downloadOCRModel(.balanced) }
+                    downloadButton(1, prominent: false) { model.downloadOCRModel(.balanced) }
                 }
                 .padding(.top, 4)
 
@@ -85,20 +83,23 @@ struct OnboardingView: View {
         .padding()
     }
 
-    @ViewBuilder private func downloadButton(title: String, size: String, prominent: Bool,
+    /// The two choices, in one place: each button lays out a hidden copy of BOTH so the pair
+    /// measures to the widest of them. Equal width with no pixel guess - a fixed 260 left a finger
+    /// of empty pill past anything either of them said, and every narrower guess clipped whichever
+    /// title was longest.
+    private static let choices: [(title: String, size: String)] = [
+        ("Download embedding model", "~1.9 GB"),
+        ("Download OCR model", "~4.5 GB \u{00B7} optional"),
+    ]
+
+    @ViewBuilder private func downloadButton(_ choice: Int, prominent: Bool,
                                              action: @escaping () -> Void) -> some View {
-        // 160, not 260: the width is here only so the two buttons agree, and the old one left a
-        // finger of empty pill past the longest line in either of them.
-        let content = HStack {
-            Image(systemName: "arrow.down.circle")
-            VStack(alignment: .leading, spacing: 1) {
-                Text(title).fontWeight(.medium)
-                // Smaller than the action it qualifies: a size and a tag are not the decision.
-                Text(size).font(.caption).foregroundStyle(.secondary)
+        let content = ZStack(alignment: .leading) {
+            ForEach(Self.choices, id: \.title) { other in
+                label(other.title, other.size).hidden()
             }
+            label(Self.choices[choice].title, Self.choices[choice].size)
         }
-        .font(.callout)
-        .frame(width: 160, alignment: .leading)
 
         if prominent {
             Button(action: action) { content }
@@ -107,5 +108,18 @@ struct OnboardingView: View {
             Button(action: action) { content }
                 .controlSize(.large).buttonStyle(.bordered)
         }
+    }
+
+    private func label(_ title: String, _ size: String) -> some View {
+        HStack {
+            Image(systemName: "arrow.down.circle")
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).fontWeight(.medium)
+                // Smaller than the action it qualifies: a size and a tag are not the decision.
+                Text(size).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .font(.callout)
+        .fixedSize(horizontal: true, vertical: false)
     }
 }

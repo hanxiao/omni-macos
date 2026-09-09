@@ -136,12 +136,15 @@ final class OCRPortTests: XCTestCase {
         XCTAssertFalse(OCRModelCatalog.Variant.allCases.isEmpty)
     }
 
-    /// Asset names are the download contract: variant-prefixed, flat, one tag.
+    /// Asset names are the download contract: flat, one tag, and prefixed with what was
+    /// quantized rather than with a judgement about the trade-off ("balanced" said nothing a
+    /// reader could check). The published assets carry these exact names.
     func testAssetURLShape() throws {
         let url = try XCTUnwrap(OCRModelCatalog.assetURL(variant: .compact, file: "omni-ocr.json"))
         XCTAssertEqual(url.absoluteString,
                        "https://github.com/\(OCRModelCatalog.repository)/releases/download/"
-                       + "\(OCRModelCatalog.releaseTag)/jina-ocr-v1-mlx-compact-omni-ocr.json")
+                       + "\(OCRModelCatalog.releaseTag)/jina-ocr-v1-q4-mtp-mlx-omni-ocr.json")
+        XCTAssertEqual(OCRModelCatalog.Variant.balanced.slug, "q8-mtp-mlx")
     }
 
     /// MLX 0.31.3's `quantizedMM` is WRONG at exactly two row counts, and the port pads around

@@ -195,7 +195,11 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   partial transcript. The chip says "Finishing this page" until the loop actually reaches the hold.
 
 ## OCR weights (published)
-- The `balanced` build is LIVE at github.com/hanxiao/omni-macos/releases/tag/ocr-weights-v1, and
+- Builds are named by WHAT WAS QUANTIZED, not by a judgement about the trade-off: `q8-mtp-mlx`
+  (was "balanced"), `q4-mtp-mlx`, `q8-experts-mtp-mlx`. `Variant.slug` is the one definition; the
+  release assets, the install folder and `Tools/ocr/publish.sh` all follow it, and
+  `testAssetURLShape` pins it.
+- The `q8-mtp-mlx` build is LIVE at github.com/hanxiao/omni-macos/releases/tag/ocr-weights-v1, and
   the in-app download was verified end to end against it: 4.3 GB at ~22 MB/s, model loads, page
   transcribes. `special_tokens_map.json` is NOT published and is not needed - the manifest names
   the three shards, both tokenizer files and `omni-ocr.json`, and that is what the loader reads.
@@ -204,7 +208,7 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   each asset through the API after upload, which is in place and does not re-send gigabytes.
 
 ## OCR settings
-- ONE build is offered, and the weights live at `Application Support/Omni/ocr-v1-<variant>` beside
+- ONE build is offered, and the weights live at `Application Support/Omni/jina-ocr-v1-<slug>` beside
   the embedding model, not in an `ocr/` of their own. `OCRModelCatalog.migrateLegacyInstall()`
   renames an older install once, at LAUNCH - not when Settings opens, because the workspace asks
   whether the model is installed long before anyone visits a tab.

@@ -992,9 +992,7 @@ private struct IndexTab: View {
             } header: {
                 Text("Model")
             } footer: {
-                Text("Picking a variant switches to it, or downloads it. Switching rebuilds the index. "
-                     + "The OCR model is optional, transcribes document images to Markdown on this "
-                     + "Mac, and is not used by search.")
+                Text("Switching the embedding model rebuilds the index. OCR is optional.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -1086,9 +1084,7 @@ private struct OCRTab: View {
             } header: {
                 Text("Prompt")
             } footer: {
-                Text("The instruction sent with every page. It decides the shape of the output - "
-                     + "whether formulas come back as LaTeX, tables as HTML, and what happens to "
-                     + "headers and footers.")
+                Text("Sent with every page; it shapes the output.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }

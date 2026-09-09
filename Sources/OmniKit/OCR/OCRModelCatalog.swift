@@ -69,8 +69,19 @@ public enum OCRModelCatalog {
             }
         }
 
+        /// How the build is named on disk and in a release: what was quantized and to how many
+        /// bits, plus the draft head every build carries. "balanced" said nothing a reader could
+        /// check - it is a judgement about a trade-off, not a description of the weights.
+        public var slug: String {
+            switch self {
+            case .fidelity: return "q8-experts-mtp-mlx"
+            case .balanced: return "q8-mtp-mlx"
+            case .compact: return "q4-mtp-mlx"
+            }
+        }
+
         /// Prefix of the release assets for this variant.
-        var assetPrefix: String { "jina-ocr-v1-mlx-\(rawValue)-" }
+        var assetPrefix: String { "jina-ocr-v1-\(slug)-" }
     }
 
     /// GitHub release the weights are published under. Kept separate from the app's own version
@@ -91,21 +102,23 @@ public enum OCRModelCatalog {
         else { return nil }
         // Beside the embedding model rather than inside an `ocr/` of its own: one folder holds
         // everything this app has downloaded, which is what someone looking for 4.5 GB expects.
-        return appSupport.appendingPathComponent("Omni/ocr-v1-\(variant.rawValue)")
+        // Named the same as the release assets, for the same reason.
+        return appSupport.appendingPathComponent("Omni/jina-ocr-v1-\(variant.slug)")
     }
 
-    /// Move an install made before the folders were flattened. One rename, and only when there is
+    /// Move an install made under an older name. One rename per variant, and only when there is
     /// nothing at the new path - never a copy, never a delete.
     public static func migrateLegacyInstall() {
         let fm = FileManager.default
         guard let appSupport = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask,
                                            appropriateFor: nil, create: false) else { return }
-        let legacyRoot = appSupport.appendingPathComponent("Omni/ocr")
-        guard fm.fileExists(atPath: legacyRoot.path) else { return }
+        let omni = appSupport.appendingPathComponent("Omni")
+        let legacyRoot = omni.appendingPathComponent("ocr")
         for variant in Variant.allCases {
-            let from = legacyRoot.appendingPathComponent(variant.rawValue)
-            guard fm.fileExists(atPath: from.path), let to = installDir(for: variant),
-                  !fm.fileExists(atPath: to.path) else { continue }
+            guard let to = installDir(for: variant), !fm.fileExists(atPath: to.path) else { continue }
+            let candidates = [legacyRoot.appendingPathComponent(variant.rawValue),
+                              omni.appendingPathComponent("ocr-v1-\(variant.rawValue)")]
+            guard let from = candidates.first(where: { fm.fileExists(atPath: $0.path) }) else { continue }
             try? fm.moveItem(at: from, to: to)
         }
         // Only if it is now empty; a directory with anything left in it is not ours to remove.
