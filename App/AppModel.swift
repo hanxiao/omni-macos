@@ -2573,11 +2573,13 @@ final class AppModel {
     func downloadModel(_ variant: ModelVariant) {
         guard !isDownloading, let dest = ModelDownloader.installDir(for: variant) else { return }
         isDownloading = true; downloadFraction = 0; downloadLabel = "Preparing\u{2026}"; downloadFailed = false
+        downloadSpeed = ""; embedSpeedMark = nil; embedSpeedRate = 0
         let dl = ModelDownloader(); downloader = dl
         Task {
             do {
                 try await dl.download(variant: variant, to: dest) { p in
                     Task { @MainActor in
+                        self.noteDownloadSpeed(received: p.received)
                         if p.file == "model.safetensors" {
                             self.downloadFraction = p.total > 0 ? Double(p.received) / Double(p.total) : 0
                             let gb = Double(p.received) / 1_000_000_000, tgb = Double(p.total) / 1_000_000_000
@@ -2589,6 +2591,7 @@ final class AppModel {
                 }
                 await MainActor.run {
                     self.isDownloading = false
+                    self.downloadSpeed = ""
                     self.installedVariants = ModelLocator.installedVariants()
                     self.modelVariant = variant
                     self.setModelDir(dest)
@@ -2596,6 +2599,7 @@ final class AppModel {
             } catch {
                 await MainActor.run {
                     self.isDownloading = false
+                    self.downloadSpeed = ""
                     if (error as? URLError)?.code == .cancelled {
                         // User-cancelled from onboarding: back to the variant picker, quietly.
                         self.downloadFailed = false
@@ -2676,6 +2680,25 @@ final class AppModel {
     }
 
     func cancelOCRDownload() { ocrDownloader?.cancel() }
+
+    /// Throughput of the embedding download, sampled the same way.
+    var downloadSpeed = ""
+    @ObservationIgnored private var embedSpeedMark: (at: Date, bytes: Int64)?
+    @ObservationIgnored private var embedSpeedRate: Double = 0
+
+    private func noteDownloadSpeed(received: Int64) {
+        let now = Date()
+        guard let mark = embedSpeedMark, received >= mark.bytes else {
+            embedSpeedMark = (now, received)
+            return
+        }
+        let elapsed = now.timeIntervalSince(mark.at)
+        guard elapsed >= 0.5 else { return }
+        let rate = Double(received - mark.bytes) / elapsed
+        embedSpeedRate = embedSpeedRate == 0 ? rate : embedSpeedRate * 0.6 + rate * 0.4
+        downloadSpeed = String(format: "%.1f MB/s", embedSpeedRate / 1_000_000)
+        embedSpeedMark = (now, received)
+    }
 
     /// Bytes per second, sampled at half-second intervals and smoothed. `received` is per FILE, so
     /// it goes backwards when the downloader moves to the next shard; that restarts the sample

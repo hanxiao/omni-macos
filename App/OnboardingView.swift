@@ -30,15 +30,20 @@ struct OnboardingView: View {
                 .font(.callout).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center).frame(maxWidth: 440)
 
-            if model.isDownloading {
+            if model.isDownloading || model.isOCRDownloading {
+                let embedding = model.isDownloading
                 VStack(spacing: 8) {
-                    ProgressView(value: model.downloadFraction)
-                        .frame(width: 360)
-                    Text(model.downloadLabel)
-                        .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                    ProgressView(value: embedding ? model.downloadFraction : model.ocrDownloadFraction)
+                        .frame(width: 300)
+                    HStack(spacing: 10) {
+                        Text(embedding ? model.downloadLabel : model.ocrDownloadLabel)
+                        Text(embedding ? model.downloadSpeed : model.ocrDownloadSpeed)
+                            .foregroundStyle(.secondary)
+                    }
+                    .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
                     // A multi-GB download on a slow connection must be escapable (HIG); partial
                     // files are kept and skipped on the next attempt.
-                    Button("Cancel") { model.cancelDownload() }
+                    Button("Cancel") { embedding ? model.cancelDownload() : model.cancelOCRDownload() }
                         .controlSize(.small)
                         .padding(.top, 2)
                 }
@@ -52,8 +57,15 @@ struct OnboardingView: View {
                 // staged copy on its own, and Settings > Storage > Model keeps an explicit
                 // Change... for the rare case, where the surrounding context makes it honest.
                 VStack(spacing: 10) {
-                    variantButton(.nano, size: "~1.9 GB \u{00B7} recommended", prominent: true)
-                    variantButton(.small, size: "~3.1 GB \u{00B7} higher quality", prominent: false)
+                    downloadButton(title: "Download Omni Nano", size: "~1.9 GB",
+                                   prominent: true) { model.downloadModel(.nano) }
+                    // The second choice is the OCR add-on, not the larger embedding build. Someone
+                    // meeting the app for the first time is choosing what it can DO, and a second
+                    // embedding variant that is 60% bigger for a quality difference they cannot
+                    // see yet is not that choice - it stays in Settings > Storage, where the
+                    // surrounding context makes it answerable.
+                    downloadButton(title: "Download OCR model", size: "~4.5 GB \u{00B7} recommended",
+                                   prominent: false) { model.downloadOCRModel(.balanced) }
                 }
                 .padding(.top, 4)
 
@@ -73,22 +85,25 @@ struct OnboardingView: View {
         .padding()
     }
 
-    @ViewBuilder private func variantButton(_ v: ModelVariant, size: String, prominent: Bool) -> some View {
+    @ViewBuilder private func downloadButton(title: String, size: String, prominent: Bool,
+                                             action: @escaping () -> Void) -> some View {
+        // 160, not 260: the width is here only so the two buttons agree, and the old one left a
+        // finger of empty pill past the longest line in either of them.
         let content = HStack {
             Image(systemName: "arrow.down.circle")
             VStack(alignment: .leading, spacing: 1) {
-                Text("Download \(v.title)").fontWeight(.medium)
+                Text(title).fontWeight(.medium)
                 Text(size).foregroundStyle(.secondary)
             }
         }
         .font(.callout)
-        .frame(width: 260, alignment: .leading)
+        .frame(width: 160, alignment: .leading)
 
         if prominent {
-            Button { model.downloadModel(v) } label: { content }
+            Button(action: action) { content }
                 .controlSize(.large).buttonStyle(.borderedProminent)
         } else {
-            Button { model.downloadModel(v) } label: { content }
+            Button(action: action) { content }
                 .controlSize(.large).buttonStyle(.bordered)
         }
     }
