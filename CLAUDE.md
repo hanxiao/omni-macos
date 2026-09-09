@@ -165,6 +165,11 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
 - The OCR toggle's "on" fill is drawn INSIDE its label, not with `.borderedProminent`: a prominent
   button takes a background of its own and broke the item out of the glass capsule it shares with
   the sidebar toggle, so OCR mode had two separate toolbar surfaces where every other mode had one.
+- Leaving OCR mode used to block the main thread for 82 ms on a 40-page transcript: `deactivate`
+  released 4.5 GB of weights and `setOCRResident(false)` called `MLX.GPU.clearCache()`, both
+  between the click and the next frame. Both now happen on a utility queue and the measurement is
+  0 ms. Returning costs ~19 ms, which is the editor rebuilding its text storage from the whole
+  document (54 ms the first time, before `MarkdownSource`'s cache is warm) - one frame, left alone.
 - Side-by-side keeps its halves together by SECTION AND FRACTION, and three things had to be true
   before any of it worked. A coordinate space named ON a `ScrollView` is the CONTENT's, so the
   probes reported once at layout and never again - it has to be named on a view outside the

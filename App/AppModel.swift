@@ -2532,7 +2532,9 @@ final class AppModel {
             omniSetMemoryLimit(0)
         } else {
             applyMemoryLimit()
-            MLX.GPU.clearCache()
+            // Off the main thread for the same reason the weights are: reclaiming the buffer cache
+            // is measurable work and the click that asked for it is not waiting on the result.
+            DispatchQueue.global(qos: .utility).async { MLX.GPU.clearCache() }
         }
     }
     /// True for the whole of an OCR run. A one-shot `pauseIndexing()` is not enough: a run

@@ -654,7 +654,13 @@ final class OCRSession {
         cancel()
         work = nil
         runToken += 1
+        // Releasing 4.5 GB of weights is 80 ms of work with nothing to show for it, and it was
+        // happening between the click and the next frame - measured on a 40-page transcript, where
+        // toggling out of OCR mode stalled visibly. Hand it to a background queue; nothing here
+        // waits on it.
+        let dropped = Farewell(model)
         model = nil
+        DispatchQueue.global(qos: .utility).async { dropped.release() }
         onModelResident?(false)
     }
 
@@ -1058,6 +1064,14 @@ final class OCRSession {
     }
 }
 
+/// Carries a model off the main thread to be released there. `@unchecked` because nothing reads
+/// it: the box exists only so the last reference is dropped somewhere else.
+private final class Farewell: @unchecked Sendable {
+    private var model: OCRModel?
+    init(_ model: OCRModel?) { self.model = model }
+    func release() { model = nil }
+}
+
 /// Stop and pause signals the decode loop can read from its own thread. `Task.isCancelled` cannot
 /// serve here: the decode runs in a detached task, which a parent's cancellation does not reach.
 private final class OCRRunGate: @unchecked Sendable {
@@ -1100,3 +1114,5 @@ extension OCRSession {
         return nil
     }
 }
+
+
