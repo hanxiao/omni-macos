@@ -106,8 +106,7 @@ struct OCRView: View {
 
     @ViewBuilder private var content: some View {
         if session.sectionIDs.isEmpty {
-            CenteredHint(symbol: "text.viewfinder", title: "Preparing",
-                         detail: "Rendering pages and loading the model.")
+            CenteredHint(symbol: "text.viewfinder", title: "Preparing", detail: "")
         } else {
             switch session.mode {
             case .rendered:
@@ -491,14 +490,6 @@ private struct RawDocument: View {
             }
         }
         .background(.background.secondary)
-        .overlay(alignment: .topTrailing) {
-            if !editable {
-                Text("read-only while transcribing")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .padding(6)
-            }
-        }
     }
 }
 
@@ -610,10 +601,6 @@ private struct RawSection: View {
     }
 }
 
-/// The anchor the tail-follow scrolls to. File scope because `DocumentScroll` is generic and a
-/// generic type cannot hold a static stored property.
-private let documentTailID = "ocr.tail"
-
 /// The scroller both panes share: page sections, the reading measure, room for the floating
 /// readout, and the one place that follows the run.
 private struct DocumentScroll<Content: View>: View {
@@ -624,14 +611,8 @@ private struct DocumentScroll<Content: View>: View {
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                VStack(spacing: 0) {
-                    content(session.sectionIDs)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    // The anchor the tail-follow scrolls to. Inside the padding so "the bottom"
-                    // means the bottom of the text, clear of the floating readout.
-                    Color.clear.frame(height: 1).id(documentTailID)
-                }
-                .frame(maxWidth: width ?? .infinity, alignment: .leading)
+                content(session.sectionIDs)
+                    .frame(maxWidth: width ?? .infinity, alignment: .leading)
                 .padding(.horizontal, width == nil ? 12 : 28)
                 .padding(.top, 24)
                 // Room for the floating readout, so the end of the document is never parked
@@ -642,8 +623,14 @@ private struct DocumentScroll<Content: View>: View {
             // Follows the run, and follows the navigator, through the same value: `visibleIndex` is
             // the running page until the user picks one. It does NOT change while a page decodes,
             // so the document never scrolls out from under someone mid-read.
+            // Jump to the top of a page only when the READER asked for that page. While following
+            // the run, the page that becomes current is still EMPTY at that moment, and putting an
+            // empty section at the top of the viewport scrolls everything else out and leaves the
+            // pane blank until the first token lands. The rendered pane hid that behind scroll
+            // clamping; the taller raw pane showed it as a blank half of the window at every page
+            // boundary. Following is the tail's job, below.
             .onChange(of: session.visibleIndex) { _, id in
-                guard let id else { return }
+                guard let id, !session.isFollowingRun else { return }
                 withAnimation(.easeOut(duration: 0.25)) { proxy.scrollTo(id, anchor: .top) }
             }
             // Follow the text as it is written, not just when the page turns. A long page grows
@@ -657,8 +644,8 @@ private struct DocumentScroll<Content: View>: View {
                 withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(id, anchor: .center) }
             }
             .onChange(of: session.streamTick) { _, _ in
-                guard session.isFollowingRun else { return }
-                proxy.scrollTo(documentTailID, anchor: .bottom)
+                guard session.isFollowingRun, let last = session.sectionIDs.last else { return }
+                proxy.scrollTo(last, anchor: .bottom)
             }
             // Switching Formatted/Side by Side/Markdown builds a NEW scroller, which starts at the
             // top. Without this you land on page 1 of a document whose run is on page 13, and
@@ -823,7 +810,7 @@ private struct DropZone: View {
                 .foregroundStyle(targeted ? Color.accentColor : .secondary)
             Text("Drop a document to transcribe")
                 .font(.title3.weight(.medium))
-            Text("PDFs and images become Markdown on this Mac. Nothing is uploaded.")
+            Text("PDFs and images become Markdown on this Mac.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
             // Dragging is the fast path, not the only one: a file already open in another app, or
@@ -984,11 +971,13 @@ private struct CenteredHint: View {
                 .font(.system(size: 34, weight: .light))
                 .foregroundStyle(.secondary)
             Text(title).font(.title3.weight(.medium))
-            Text(detail)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 380)
+            if !detail.isEmpty {
+                Text(detail)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 380)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
