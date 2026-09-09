@@ -277,17 +277,41 @@ public enum PhotoLibrary {
     /// `image(_:maxDimension:allowNetwork:)` uses - a probe more permissive than the decode would
     /// wave through assets that then embed as nil, which is how #13 produced skipped photos.
     private static func isLocal(_ asset: PHAsset) -> Bool {
+        request(asset, side: 32, mode: .fastFormat, allowNetwork: false) != nil
+    }
+
+    /// One `requestImage`, waited for.
+    ///
+    /// NOT the synchronous flag. It is documented to IGNORE `deliveryMode` and behave as
+    /// `.highQualityFormat`, which with the network off refuses any asset whose only local copy is
+    /// a smaller derivative - silently undoing the whole point of asking for `.fastFormat`, and the
+    /// substance of #17: an optimized library still indexed only the originals it had downloaded.
+    /// Both modes used here deliver exactly one result, so a semaphore is enough and cannot hang on
+    /// a second callback that never comes.
+    private static func request(_ asset: PHAsset, side: Int,
+                                mode: PHImageRequestOptionsDeliveryMode,
+                                allowNetwork: Bool) -> NSImage? {
         let opts = PHImageRequestOptions()
-        opts.isSynchronous = true
-        opts.isNetworkAccessAllowed = false
-        opts.deliveryMode = .fastFormat
-        opts.resizeMode = .fast
-        var local = true
-        PHImageManager.default().requestImage(for: asset, targetSize: CGSize(width: 32, height: 32),
-                                              contentMode: .aspectFit, options: opts) { image, info in
-            if (info?[PHImageResultIsInCloudKey] as? Bool) == true || image == nil { local = false }
+        opts.deliveryMode = mode
+        // .exact, NOT .fast: `.fast` is documented to answer with a size merely CLOSE to the
+        // target, so it can overshoot into a needlessly large decode. The target is capped to the
+        // asset's own pixels (see targetSide), so exact never means upscaled.
+        opts.resizeMode = .exact
+        opts.isNetworkAccessAllowed = allowNetwork
+        opts.version = .current            // the photo as the user edited it, not the original
+        let sem = DispatchSemaphore(value: 0)
+        nonisolated(unsafe) var out: NSImage?
+        PHImageManager.default().requestImage(
+            for: asset, targetSize: CGSize(width: side, height: side),
+            contentMode: .aspectFit, options: opts
+        ) { image, info in
+            if (info?[PHImageResultIsInCloudKey] as? Bool) != true { out = image }
+            sem.signal()
         }
-        return local
+        // A download is off by construction when `allowNetwork` is false; the wait is a guard
+        // against a request that never answers, not a budget.
+        if sem.wait(timeout: .now() + 60) == .timedOut { return nil }
+        return out
     }
 
     /// The long edge to ask PhotoKit for: `maxDimension`, but never more than the asset already
@@ -312,38 +336,30 @@ public enum PhotoLibrary {
     }
 
     private static func image(_ asset: PHAsset, maxDimension: Int, allowNetwork: Bool) -> CGImage? {
-        let opts = PHImageRequestOptions()
-        opts.isSynchronous = true          // called from the indexer's decode stage / a detached task
-        // THE SAME CONTRACT THE FILE PIPELINE HAS: "the best representation available here, capped
-        // at maxDimension" - never "this exact size or nothing". `.highQualityFormat` is the second
-        // one: it promises a result "as asked or better", so with the network off it has to REFUSE
-        // an asset whose only local copy is a smaller derivative, and returns nil. Under Optimize
-        // Mac Storage that is nearly the whole library - the user in #13 had 40 GB of resident
-        // previews for 40,000 photos and got about 150 of them indexed.
+        let side = targetSide(maxDimension: maxDimension,
+                              pixelWidth: asset.pixelWidth, pixelHeight: asset.pixelHeight)
+        // The best local representation, capped at maxDimension - the same contract the file
+        // pipeline has, never "this exact size or nothing".
         //
-        // `.opportunistic` with isSynchronous is documented to deliver exactly one result, the best
-        // it can do under the other options - the local derivative when that is all there is, the
-        // full-size render when the asset is materialized. That is what FileExtractor.loadImage
-        // already does for a file on disk, and a 1024 px embedding of a photo beats no row for it.
-        opts.deliveryMode = .opportunistic
-        // .exact, NOT .fast: `.fast` is documented to answer with a size merely CLOSE to the target,
-        // so it can overshoot into a needlessly large decode. The target is capped to the asset's
-        // own pixels (see targetSide), so exact never means upscaled.
-        opts.resizeMode = .exact
-        opts.isNetworkAccessAllowed = allowNetwork
-        opts.version = .current            // the photo as the user edited it, not the original
-        var out: CGImage?
-        let side = CGFloat(targetSide(maxDimension: maxDimension,
-                                      pixelWidth: asset.pixelWidth, pixelHeight: asset.pixelHeight))
-        PHImageManager.default().requestImage(for: asset, targetSize: CGSize(width: side, height: side),
-                                              contentMode: .aspectFit, options: opts) { image, _ in
-            guard let image else { return }
-            var rect = CGRect(origin: .zero, size: image.size)
-            // NSImage -> CGImage bakes in the orientation Photos applied, which is the whole
-            // reason the still goes through NSImage rather than the raw resource data.
-            out = image.cgImage(forProposedRect: &rect, context: nil, hints: nil)
+        // `.highQualityFormat` first, so a materialized asset is decoded exactly as it always was.
+        // It promises a result "as asked or better", which means that with the network off it has
+        // to REFUSE an asset whose only local copy is a smaller derivative - under Optimize Mac
+        // Storage that is nearly the whole library (#13: 40 GB of resident previews for 40,000
+        // photos, about 150 of them indexed). `.fastFormat` is the fallback for exactly that case:
+        // it accepts the derivative, and a 1024 px embedding of a photo beats no row for it.
+        if let image = request(asset, side: side, mode: .highQualityFormat, allowNetwork: allowNetwork) {
+            return cgImage(image)
         }
-        return out
+        guard let derivative = request(asset, side: side, mode: .fastFormat, allowNetwork: allowNetwork)
+        else { return nil }
+        return cgImage(derivative)
+    }
+
+    /// NSImage -> CGImage bakes in the orientation Photos applied, which is the whole reason the
+    /// still goes through NSImage rather than the raw resource data.
+    private static func cgImage(_ image: NSImage) -> CGImage? {
+        var rect = CGRect(origin: .zero, size: image.size)
+        return image.cgImage(forProposedRect: &rect, context: nil, hints: nil)
     }
 
     /// The playable asset behind a video, for frame sampling. Any AVAsset shape (an edited or

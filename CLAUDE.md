@@ -264,6 +264,14 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
 ## Apple Photos (OmniKit/PhotosSource.swift)
 - Photos assets ride the file pipeline under `photos://<source>/<escaped localIdentifier>/<name>`
   paths. They are NOT filesystem paths: never build a file URL from one (CrawledFile.isPhoto).
+- `PHImageRequestOptions.isSynchronous` IGNORES `deliveryMode` and behaves as
+  `.highQualityFormat` - Apple documents this. Three requests here set it alongside a delivery mode
+  chosen precisely to avoid that mode, so the #13 fix (`.opportunistic`, so an Optimize-Mac-Storage
+  derivative is accepted) never took effect and #17 reported the same symptom on 0.7.4: only
+  downloaded originals indexed. Requests are async with a semaphore now, and the decode asks
+  `.highQualityFormat` first (a materialized asset is unchanged) then falls back to `.fastFormat`,
+  which accepts the resident derivative. NOT reproducible on this machine - the library here has 12
+  local assets - so it wants confirmation from the reporter.
 - HARDENED RUNTIME GATES TCC. The app is unsandboxed, but tccd still refuses to show the Photos
   prompt for a hardened binary that does not DECLARE
   `com.apple.security.personal-information.photos-library` (App/Omni.entitlements) - the request
