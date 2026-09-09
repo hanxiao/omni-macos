@@ -96,8 +96,14 @@ struct ContentView: View {
 
     private var split: some View {
         NavigationSplitView {
-            Sidebar()
-                .navigationSplitViewColumnWidth(min: 230, ideal: 260, max: 320)
+            // ONE drawer. In OCR mode the sidebar becomes the page navigator rather than the app
+            // growing a second column on the trailing edge: the window keeps its shape, the system
+            // sidebar toggle shows and hides it like any sidebar, and there is no inspector to
+            // restructure the split - which is what moved the toolbar 300pt.
+            Group {
+                if model.ocrMode { PageRail() } else { Sidebar() }
+            }
+            .navigationSplitViewColumnWidth(min: 230, ideal: 260, max: 320)
         } detail: {
             // No navigationTitle/navigationSubtitle: either one claims the leading toolbar slot
             // and pushes back/forward to its right.
@@ -124,16 +130,6 @@ struct ContentView: View {
             }
             .toolbar { toolbar }
             .background(WindowTitleHider(onSearchByFile: { model.searchByFilePanel() }))
-        }
-        // The page navigator belongs to the SPLIT VIEW, not to the detail's content. Applied
-        // inside the detail it made SwiftUI build a second split group, and the system's sidebar
-        // toggle is placed relative to whichever split owns it - so the toggle jumped 300pt to the
-        // right the moment OCR mode was entered, measured at x=874 against x=1174.
-        .inspector(isPresented: Binding(
-            get: { model.ocrMode && ocr.railVisible && !ocr.pages.isEmpty },
-            set: { ocr.railVisible = $0 }
-        )) {
-            PageRail().inspectorColumnWidth(min: 132, ideal: 168, max: 280)
         }
     }
 

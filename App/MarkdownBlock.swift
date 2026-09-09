@@ -82,6 +82,53 @@ enum MarkdownBlock {
         }
     }
 
+    /// The block as one styled string, or nil for blocks that need a view of their own.
+    ///
+    /// This exists so a drag can select across paragraphs. SwiftUI's text selection does not span
+    /// sibling `Text` views, so a page drawn as one view per block is a page where every paragraph
+    /// break ends the selection; merged into a single `Text`, a whole run of prose selects and
+    /// copies in one go. Tables and code blocks stay separate - they are objects in the flow, and
+    /// a selection that stops at one reads as deliberate rather than broken.
+    @MainActor func attributed(highlighting find: String) -> AttributedString? {
+        switch self {
+        case .heading(let level, let text):
+            var out = inline(text, find)
+            out.font = Self.headingFont(level)
+            return out
+
+        case .paragraph(let text):
+            var out = inline(text, find)
+            out.font = .body
+            return out
+
+        case .bullets(let items):
+            return Self.list(items.map { ("\u{2022}  ", $0) }, find, self)
+
+        case .ordered(let items):
+            return Self.list(items.enumerated().map { ("\($0.offset + 1).  ", $0.element) },
+                             find, self)
+
+        case .code, .rule, .table:
+            return nil
+        }
+    }
+
+    @MainActor private static func list(_ items: [(String, String)], _ find: String,
+                                        _ owner: MarkdownBlock) -> AttributedString {
+        var out = AttributedString()
+        for (index, item) in items.enumerated() {
+            if index > 0 { out += AttributedString("\n") }
+            var marker = AttributedString(item.0)
+            marker.font = .body
+            marker.foregroundColor = .secondary
+            out += marker
+            var body = owner.inline(item.1, find)
+            body.font = .body
+            out += body
+        }
+        return out
+    }
+
     /// Inline Markdown only. `.inlineOnlyPreservingWhitespace` is deliberate: the full parser
     /// would swallow leading `#` and `-` markers that this splitter has already claimed.
     private func inline(_ text: String, _ find: String) -> AttributedString {
@@ -116,6 +163,46 @@ private final class InlineCache: @unchecked Sendable {
             entries[text] = parsed
             return parsed
         }
+    }
+}
+
+// MARK: - Runs
+
+/// One drawable unit of a finished section: a merged run of flowing text, or a block that draws
+/// itself. See `MarkdownBlock.attributed(highlighting:)` for why the merge exists.
+enum MarkdownRun: Identifiable {
+    case text(index: Int, AttributedString)
+    case block(index: Int, MarkdownBlock)
+
+    var id: Int {
+        switch self {
+        case .text(let index, _), .block(let index, _): return index
+        }
+    }
+}
+
+extension MarkdownBlock {
+    @MainActor static func runs(_ blocks: [MarkdownBlock], highlighting find: String) -> [MarkdownRun] {
+        var out: [MarkdownRun] = []
+        var pending: AttributedString?
+
+        func flush() {
+            guard let text = pending else { return }
+            out.append(.text(index: out.count, text))
+            pending = nil
+        }
+
+        for block in blocks {
+            if let piece = block.attributed(highlighting: find) {
+                // A blank line between blocks, which is the spacing the separate views had.
+                pending = pending.map { $0 + AttributedString("\n\n") + piece } ?? piece
+            } else {
+                flush()
+                out.append(.block(index: out.count, block))
+            }
+        }
+        flush()
+        return out
     }
 }
 

@@ -110,10 +110,10 @@ struct OCRView: View {
                 // squeezes the app's sidebar past its own minimum - the sidebar labels start
                 // clipping. Halves that simply divide what is available cannot do that.
                 HStack(spacing: 0) {
-                    RenderedDocument()
+                    RawDocument()
                         .frame(maxWidth: .infinity)
                     Divider()
-                    RawDocument()
+                    RenderedDocument()
                         .frame(maxWidth: .infinity)
                 }
             }
@@ -180,16 +180,6 @@ struct OCRView: View {
                                                 image: Image(systemName: "doc.plaintext")))
                     .help("Share the transcription")
                     .disabled(session.completedPages == 0)
-            }
-            if #available(macOS 26.0, *) { ToolbarSpacer(.fixed) }
-            ToolbarItem(id: "ocr.rail", placement: .primaryAction) {
-                Button {
-                    withAnimation(.easeOut(duration: 0.2)) { session.railVisible.toggle() }
-                } label: {
-                    Label("Pages", systemImage: "sidebar.trailing")
-                }
-                .help("Show or hide the page list")
-                .accessibilityIdentifier("ocr.rail.toggle")
             }
         }
     }
@@ -439,8 +429,25 @@ private struct RenderedSection: View {
     var body: some View {
         let blocks = MarkdownBlock.parse(session.sectionText(id))
         VStack(alignment: .leading, spacing: 10) {
-            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                block.view(highlighting: session.find).transition(StreamFade.transition)
+            if state == .running {
+                // While the page is decoding, one view per block: arrival is what the fade is
+                // driven by, and a block that appears inside a merged string cannot animate.
+                ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                    block.view(highlighting: session.find).transition(StreamFade.transition)
+                }
+            } else {
+                // Finished: contiguous prose merged into one `Text` so a drag selects across
+                // paragraphs rather than stopping at each one.
+                ForEach(MarkdownBlock.runs(blocks, highlighting: session.find)) { run in
+                    switch run {
+                    case .text(_, let text):
+                        Text(text)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    case .block(_, let block):
+                        block.view(highlighting: session.find)
+                    }
+                }
             }
             if state == .running { TypingCaret() }
             if state == .failed { PageFailed() }
@@ -473,7 +480,8 @@ private struct RawDocument: View {
                     LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(ids, id: \.self) { id in
                             if id != ids.first { PageBreak() }
-                            RawSection(id: id).id(id)
+                            RawSection(id: id)
+                                .id(id)
                         }
                     }
                 }
@@ -598,16 +606,26 @@ private struct DocumentScroll<Content: View>: View {
     @ViewBuilder var content: ([Int]) -> Content
     @Environment(OCRSession.self) private var session
 
+    /// Outside the page-id namespace: page ids are non-negative.
+    private var tailID: Int { -1 }
+
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                content(session.sectionIDs)
-                    .frame(maxWidth: width ?? .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 0) {
+                    content(session.sectionIDs)
+                    // The tail anchor and the clearance under the floating readout, in one view.
+                    // It sits OUTSIDE the lazy stack deliberately: `scrollTo` cannot reach an item
+                    // a `LazyVStack` has not built yet, and while following a run the item it would
+                    // have to reach is precisely the one just below the fold - so the scroll stuck
+                    // about a page behind the decode, one page at a time. This view always exists,
+                    // and putting ITS bottom at the viewport's leaves the newest line clear of the
+                    // readout.
+                    Color.clear.frame(height: 72).id(tailID)
+                }
+                .frame(maxWidth: width ?? .infinity, alignment: .leading)
                 .padding(.horizontal, width == nil ? 12 : 28)
                 .padding(.top, 24)
-                // Room for the floating readout, so the end of the document is never parked
-                // underneath it.
-                .padding(.bottom, 72)
                 .frame(maxWidth: .infinity, alignment: .center)
             }
             // Follows the run, and follows the navigator, through the same value: `visibleIndex` is
@@ -634,8 +652,8 @@ private struct DocumentScroll<Content: View>: View {
                 withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(id, anchor: .center) }
             }
             .onChange(of: session.streamTick) { _, _ in
-                guard session.isFollowingRun, let last = session.sectionIDs.last else { return }
-                proxy.scrollTo(last, anchor: .bottom)
+                guard session.isFollowingRun else { return }
+                proxy.scrollTo(tailID, anchor: .bottom)
             }
             // Switching Formatted/Side by Side/Markdown builds a NEW scroller, which starts at the
             // top. Without this you land on page 1 of a document whose run is on page 13, and
@@ -719,12 +737,10 @@ private struct ProgressReadout: View {
 
     var body: some View {
         GlassGroup(spacing: 10) {
-            HStack(spacing: 12) {
+            HStack(spacing: 10) {
                 indicator
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(session.isBusy
-                         ? "Page \(min(session.completedPages + 1, session.pages.count)) of \(session.pages.count)"
-                         : "\(session.completedPages) of \(session.pages.count) pages")
+                    Text(headline)
                         .font(.callout.weight(.medium))
                     Text(detail)
                         .font(.caption.monospacedDigit())
@@ -734,23 +750,18 @@ private struct ProgressReadout: View {
                 if session.isBusy && !session.isFollowingRun {
                     // The way back to the live end of a document you have scrolled away from.
                     // Without it, following is a door that only locks.
-                    Button { session.follow() } label: {
-                        Image(systemName: "arrow.down.to.line")
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Jump to the page being transcribed")
-                    .accessibilityLabel("Jump to the page being transcribed")
+                    ChipButton(symbol: "arrow.down.to.line",
+                               help: "Jump to the page being transcribed") { session.follow() }
                 }
-                if session.isBusy {
-                    Button { session.cancel() } label: {
-                        Image(systemName: "stop.fill")
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Stop transcribing  \u{238b}")
-                    .accessibilityLabel("Stop transcribing")
+                if session.isPaused {
+                    ChipButton(symbol: "play.fill", help: "Resume transcribing") { session.resume() }
+                    ChipButton(symbol: "stop.fill",
+                               help: "Stop transcribing  \u{2318}.") { session.cancel() }
+                } else if session.isBusy {
+                    ChipButton(symbol: "pause.fill", help: "Pause transcribing") { session.pause() }
                 }
             }
-            .padding(.horizontal, 14)
+            .padding(.horizontal, 12)
             .padding(.vertical, 9)
             .glassChip(interactive: session.isBusy)
         }
@@ -759,31 +770,69 @@ private struct ProgressReadout: View {
         .padding(.bottom, 18)
         .transition(.move(edge: .bottom).combined(with: .opacity))
         .accessibilityElement(children: .contain)
+        // The file name is the one thing here a reader already knows - it is in the tab bar and in
+        // the window title - so it costs width in the chip and earns it back only when a document
+        // is ambiguous. Hovering asks.
+        .help(session.documentName)
     }
 
-    /// A determinate bar only where there is something determinate to show. macOS renders the
-    /// circular style as a spinner, so a multi-page run's progress fraction was invisible; a
-    /// single image has no fraction worth drawing, and gets the spinner honestly.
+    /// The same ring the document tabs use, so progress means one thing everywhere in the app. A
+    /// single image has no fraction worth drawing and gets an honest spinner.
     @ViewBuilder private var indicator: some View {
         if !session.isBusy {
             Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
         } else if session.pages.count > 1 {
-            ProgressView(value: session.progress)
-                .progressViewStyle(.linear)
-                .frame(width: 74)
+            CloudSyncPie(fraction: session.progress)
         } else {
             ProgressView().progressViewStyle(.circular).controlSize(.small)
         }
     }
 
+    private var headline: String {
+        session.isBusy
+            ? "Page \(min(session.completedPages + 1, session.pages.count)) of \(session.pages.count)"
+            : "\(session.completedPages) of \(session.pages.count) pages"
+    }
+
     private var detail: String {
+        // A pause takes effect at the next page boundary, so say which of the two states this is
+        // rather than claiming the run has stopped while a page is still decoding.
+        if session.isPaused { return session.isHolding ? "Paused" : "Finishing this page" }
         var parts: [String] = []
         if session.currentTokensPerSecond > 0 {
             parts.append(String(format: "%.0f tok/s", session.currentTokensPerSecond))
         }
         if session.elapsed > 0 { parts.append(session.elapsedText) }
-        parts.append(session.documentName)
         return parts.joined(separator: "  \u{b7}  ")
+    }
+}
+
+/// A control on the floating chip.
+///
+/// `.borderless` draws nothing under the pointer, so these read as glyphs rather than buttons until
+/// one is clicked. This is the system's own hover treatment - a round fill that comes up under the
+/// cursor - at chip scale, and the symbol swap between pause and play uses the replace effect so
+/// the control morphs rather than blinking.
+private struct ChipButton: View {
+    let symbol: String
+    let help: String
+    let action: () -> Void
+    @State private var hovered = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 11, weight: .semibold))
+                .contentTransition(.symbolEffect(.replace))
+                .frame(width: 22, height: 22)
+                .background(Circle().fill(.primary.opacity(hovered ? 0.12 : 0)))
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovered = $0 }
+        .animation(.easeOut(duration: 0.12), value: hovered)
+        .help(help)
+        .accessibilityLabel(help)
     }
 }
 

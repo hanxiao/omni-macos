@@ -124,6 +124,18 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   replacing.
 - The find bar exists because a searchable PROMPT only shows while the field is empty, so a match
   count put there vanishes exactly when there is one.
+- `ScrollViewProxy.scrollTo` CANNOT reach a `LazyVStack` item that has not been built. Following a
+  live run by scrolling to `sectionIDs.last` therefore stuck about a page behind and advanced one
+  page at a time: the target was always the item just below the fold, and it never materialised
+  because the scroll never got there. The anchor is now a zero-height view OUTSIDE the lazy stack,
+  which doubles as the clearance under the floating readout.
+- SwiftUI text selection does not span sibling `Text` views, so one view per Markdown block means a
+  drag stops at every paragraph. Finished sections merge their contiguous prose into a single
+  `AttributedString`; a section still decoding stays per-block, because the arrival fade is driven
+  by insertion and text appended inside one string cannot animate.
+- Pause holds at a PAGE boundary, not mid-decode: holding mid-page pins the GPU working set with
+  nothing to show for it, and the half-decoded page would have to be discarded or resumed from a
+  partial transcript. The chip says "Finishing this page" until the loop actually reaches the hold.
 
 ## UI tests (UITests/, Scripts/ui-test.sh)
 - XCUITest, not synthetic events. `./Scripts/ui-test.sh [Class[/test]]` - never a bare

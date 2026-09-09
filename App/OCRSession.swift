@@ -161,8 +161,9 @@ final class OCRSession {
     private(set) var texts: [String] = []
     private(set) var documentName: String = ""
 
-    var mode: ViewMode = .rendered
-    var railVisible = true
+    /// Source first. What comes out of a transcription run is Markdown, and the thing a person
+    /// wants from it is usually that text - the formatted view is the check, not the product.
+    var mode: ViewMode = .raw
     /// Drives Quick Look. On the session rather than in a view because the page navigator and the
     /// preview now live in different views - see the inspector's placement in ContentView.
     var previewing: URL?
@@ -387,7 +388,14 @@ final class OCRSession {
     /// drops its result if the token has moved on, so a decode or a thumbnail belonging to the
     /// previous document cannot write into this one.
     private var runToken = 0
-    @ObservationIgnored private var stopFlag = OCRStopFlag()
+    @ObservationIgnored private var gate = OCRRunGate()
+    /// The user has asked the run to hold. Pausing is not stopping: the model stays resident and
+    /// the queue keeps its place, so resuming costs nothing.
+    private(set) var isPaused = false
+    /// The loop has actually reached a page boundary and is holding there. `isPaused` is the
+    /// request; this is the state, and the difference is one page of decoding that was already
+    /// under way when the button was pressed.
+    private(set) var isHolding = false
     @ObservationIgnored private var previewCache: [Int: URL] = [:]
 
     // MARK: - Input
@@ -405,7 +413,9 @@ final class OCRSession {
         cancel()
         runToken += 1
         let token = runToken
-        stopFlag = OCRStopFlag()
+        gate = OCRRunGate()
+        isPaused = false
+        isHolding = false
 
         documentName = sources.count == 1 ? sources[0].lastPathComponent : "\(sources.count) files"
         selection = nil
@@ -467,14 +477,31 @@ final class OCRSession {
         run(jobs: jobs, modelDir: installed.dir, variant: installed.variant, token: token)
     }
 
-    /// Stop the run. The decode loop polls `stopFlag` once per step, so this actually frees the
+    /// Hold the run at the next page boundary. Mid-page would be the wrong place: it pins the
+    /// GPU's working set with nothing to show for it, and the half-decoded page would have to be
+    /// discarded or resumed from a partial transcript.
+    func pause() {
+        guard isBusy else { return }
+        gate.pause()
+        isPaused = true
+    }
+
+    func resume() {
+        gate.resume()
+        isPaused = false
+        isHolding = false
+    }
+
+    /// Stop the run. The decode loop polls the gate once per step, so this actually frees the
     /// GPU instead of leaving it to grind to the token budget with nobody listening.
     ///
     /// The work task is deliberately left to wind down on its own rather than being cancelled
     /// outright: it is the only thing that can record what the interrupted page managed to decode,
     /// and killing it mid-page leaves that page stuck in `.running` with a spinner forever.
     func cancel() {
-        stopFlag.stop()
+        gate.stop()
+        isPaused = false
+        isHolding = false
         ticker?.cancel(); ticker = nil
         thumbs?.cancel(); thumbs = nil
         if phase == .running || phase == .loading { phase = pages.isEmpty ? .empty : .finished }
@@ -597,7 +624,7 @@ final class OCRSession {
         // page 11 about how it was produced.
         let settings = (prompt: Settings.prompt, draftLength: Settings.draftLength,
                         loopGuard: Settings.loopGuard)
-        let flag = stopFlag
+        let gate = self.gate
         ticker = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(250))
@@ -638,7 +665,17 @@ final class OCRSession {
                 let documents = PDFCache()
 
                 for (index, job) in jobs.enumerated() {
-                    if flag.stopped || self.runToken != token { break }
+                    if gate.isStopped || self.runToken != token { break }
+
+                    // A pause holds here, between pages, and nowhere else.
+                    if gate.isPaused {
+                        self.isHolding = true
+                        while gate.isPaused, !gate.isStopped, self.runToken == token {
+                            try? await Task.sleep(for: .milliseconds(120))
+                        }
+                        self.isHolding = false
+                        if gate.isStopped || self.runToken != token { break }
+                    }
                     self.pages[index].state = .running
                     self.runningIndex = index
                     if !self.userPinnedDocument,
@@ -672,7 +709,7 @@ final class OCRSession {
                                     self.streamTick &+= 1
                                 }
                             },
-                            shouldContinue: { !flag.stopped })
+                            shouldContinue: { !gate.isStopped })
                     }.value
 
                     guard self.runToken == token, self.texts.indices.contains(index) else { return }
@@ -689,7 +726,7 @@ final class OCRSession {
                     }
                     self.pages[index].seconds = Date().timeIntervalSince(pageStart)
                     self.completedPages += 1
-                    if flag.stopped { break }
+                    if gate.isStopped { break }
                 }
                 self.ticker?.cancel()
                 self.runningIndex = nil
@@ -865,13 +902,17 @@ final class OCRSession {
     }
 }
 
-/// A stop signal the decode loop can read from its own thread. `Task.isCancelled` cannot serve
-/// here: the decode runs in a detached task, which a parent's cancellation does not reach.
-private final class OCRStopFlag: @unchecked Sendable {
+/// Stop and pause signals the decode loop can read from its own thread. `Task.isCancelled` cannot
+/// serve here: the decode runs in a detached task, which a parent's cancellation does not reach.
+private final class OCRRunGate: @unchecked Sendable {
     private let lock = NSLock()
-    private var value = false
-    var stopped: Bool { lock.withLock { value } }
-    func stop() { lock.withLock { value = true } }
+    private var stopped = false
+    private var paused = false
+    var isStopped: Bool { lock.withLock { stopped } }
+    var isPaused: Bool { lock.withLock { paused } }
+    func stop() { lock.withLock { stopped = true; paused = false } }
+    func pause() { lock.withLock { paused = true } }
+    func resume() { lock.withLock { paused = false } }
 }
 
 /// One `PDFDocument` per file for the lifetime of a lane. Confined to a single serial consumer;
