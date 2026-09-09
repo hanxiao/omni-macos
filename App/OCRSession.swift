@@ -34,7 +34,11 @@ final class OCRSession {
         case failed(String)
     }
 
-    enum PageState: Equatable { case pending, running, done, failed }
+    /// `stopped` is a page the run never reached: still in the document, no longer in the queue.
+    /// Without it, stopping left pages `.pending` and the next drop's run walked the queue from the
+    /// beginning - so dropping one new file quietly resumed the document someone had just stopped
+    /// and did the new one after it.
+    enum PageState: Equatable { case pending, running, done, failed, stopped }
 
     /// One dropped file. A multi-page PDF is ONE tab whose pages run continuously inside it;
     /// several files are several tabs, the way Preview opens them.
@@ -110,13 +114,14 @@ final class OCRSession {
     enum ViewMode: String, CaseIterable, Identifiable {
         // Source, formatted, both - in that order, because that is the order of the work: read
         // what the model wrote, check how it sets, put them side by side when they disagree.
-        case raw, rendered, split
+        case raw, rendered, split, triple
         var id: String { rawValue }
         var label: String {
             switch self {
             case .raw: return "Raw Text"
             case .rendered: return "Markdown"
             case .split: return "Dual"
+            case .triple: return "Page, Source, Markdown"
             }
         }
         var symbol: String {
@@ -126,6 +131,7 @@ final class OCRSession {
             case .raw: return "doc.plaintext"
             case .rendered: return "doc.richtext"
             case .split: return "rectangle.split.2x1"
+            case .triple: return "rectangle.split.3x1"
             }
         }
     }
@@ -296,7 +302,8 @@ final class OCRSession {
     /// at the end of the document.
     var sectionIDs: [Int] {
         if documentEdit != nil { return Array(editSections.indices) }
-        return visibleDocument?.pageIDs.filter { pages[$0].state != .pending } ?? []
+        return visibleDocument?.pageIDs.filter { pages[$0].state == .running || pages[$0].state == .done
+                                                 || pages[$0].state == .failed } ?? []
     }
 
     /// What the navigator marks. `visibleIndex` is global, so on a tab whose pages nothing has
@@ -602,8 +609,41 @@ final class OCRSession {
         isHolding = false
         ticker?.cancel(); ticker = nil
         thumbs.forEach { $0.cancel() }; thumbs = []
+        discardQueue()
         if phase == .running || phase == .loading { phase = pages.isEmpty ? .empty : .finished }
         scheduleReadoutDismissal()
+    }
+
+    /// Transcribe one page that a stop left behind.
+    ///
+    /// Clicking a dim thumbnail is the natural way to ask for a page, and after a stop it is the
+    /// only way: the queue does not resume itself. A run already in flight simply finds it - the
+    /// loop takes the next pending page wherever it sits.
+    func transcribe(_ index: Int) {
+        guard pages.indices.contains(index),
+              pages[index].state == .pending || pages[index].state == .stopped,
+              let installed = Self.installedModel() else { return }
+        pages[index].state = .pending
+        selection = index
+        userPinnedSelection = true
+        guard !isBusy else { return }
+        gate = OCRRunGate()
+        isPaused = false
+        isHolding = false
+        phase = .loading
+        readoutVisible = true
+        willRun?()
+        run(modelDir: installed.dir, variant: installed.variant, token: runToken)
+    }
+
+    /// Take the pages the run never reached out of the QUEUE, not out of the document.
+    ///
+    /// They stay in the rail, dimmed, and clicking one asks for it - which is the only way back
+    /// after a stop, because nothing resumes them on its own any more.
+    private func discardQueue() {
+        for index in pages.indices where pages[index].state == .pending {
+            pages[index].state = .stopped
+        }
     }
 
     /// Entering and leaving OCR mode. The model is loaded on first use and dropped on the way out,
@@ -648,7 +688,11 @@ final class OCRSession {
             userPinnedSelection = false
             return
         }
-        guard pages[index].state != .pending else { return }
+        // A page the run never reached: clicking its dim thumbnail is how you ask for it.
+        if pages[index].state == .pending || pages[index].state == .stopped {
+            transcribe(index)
+            return
+        }
         selection = index
         userPinnedSelection = true
     }
@@ -674,7 +718,8 @@ final class OCRSession {
         let start = visibleIndex ?? 0
         var next = start + delta
         while pages.indices.contains(next) {
-            if pages[next].state != .pending { select(next); return }
+            if pages[next].state == .done || pages[next].state == .failed
+                || pages[next].state == .running { select(next); return }
             next += delta
         }
     }
@@ -767,17 +812,13 @@ final class OCRSession {
                 // pure overhead before a single pixel is rendered.
                 let documents = PDFCache()
 
-                var next = 0
-                while next < self.jobs.count {
-                    // An immutable binding per turn: the stream callback captures it, and a
-                    // captured `var` is not something an escaping closure may carry.
-                    let index = next
-                    next += 1
+                while true {
                     if gate.isStopped || self.runToken != token { break }
-                    // Pages a previous run already transcribed stay as they are; only the queue's
-                    // pending tail is work.
-                    guard self.pages.indices.contains(index),
-                          self.pages[index].state == .pending else { continue }
+                    // The next PENDING page, wherever it is - not a cursor that only moves forward.
+                    // A page re-queued by clicking its thumbnail can sit behind the last one done,
+                    // and a drop that lands mid-run appends ahead of it; both are just "pending".
+                    guard let index = self.pages.firstIndex(where: { $0.state == .pending }),
+                          self.jobs.indices.contains(index) else { break }
                     let job = self.jobs[index]
 
                     // A pause holds here, between pages, and nowhere else.

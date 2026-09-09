@@ -41,6 +41,9 @@ struct SettingsView: View {
 private struct IndexStatusRow: View {
     @Environment(AppModel.self) private var model: AppModel
 
+    /// Files still to embed before a background pass is worth drawing progress for.
+    private static let worthWatching = 50
+
     private var overall: Double {
         let rs = model.progress.perRoot.values
         let total = rs.reduce(0) { $0 + $1.total }
@@ -103,7 +106,11 @@ private struct IndexStatusRow: View {
                 Button("Resume") { model.startIndexing() }.controlSize(.small)
             }
         case .idle:
-            if !model.activeRoots.isEmpty {
+            // A background reconcile of a handful of files is done before it can be read, and this
+            // block appearing and vanishing under the pointer is the one thing a settings pane must
+            // not do. Only a backlog worth watching gets a bar; everything smaller finishes behind
+            // the "Up to date" row it would have replaced.
+            if !model.activeRoots.isEmpty, activeCounts.total - activeCounts.done > Self.worthWatching {
                 // A newly added folder (or a background reconcile) is embedding right now.
                 // It tracks per-root totals just like a full pass, so show the same progress.
                 VStack(alignment: .leading, spacing: 8) {

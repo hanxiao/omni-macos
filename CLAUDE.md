@@ -165,6 +165,19 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
 - The OCR toggle's "on" fill is drawn INSIDE its label, not with `.borderedProminent`: a prominent
   button takes a background of its own and broke the item out of the glass capsule it shares with
   the sidebar toggle, so OCR mode had two separate toolbar surfaces where every other mode had one.
+- Side-by-side keeps its halves together by SECTION AND FRACTION, and three things had to be true
+  before any of it worked. A coordinate space named ON a `ScrollView` is the CONTENT's, so the
+  probes reported once at layout and never again - it has to be named on a view outside the
+  scroller. The lead is claimed by whichever half MOVED (the follower stays quiet for 200 ms after
+  being scrolled); hover and `onScrollPhaseChange` were both tried and neither is the same
+  question. And the raw pane is the SECTIONED one in a comparison view, never the editor: an
+  `NSTextView` has no sections to report from or scroll to. Alignment is page-level - the same page
+  sets two to four times taller as source than as prose, so an exact match is not available.
+- A run STOPPED leaves its untouched pages `.stopped`, not `.pending`. They stay in the rail,
+  dimmed, and clicking one transcribes it; the run loop takes the next `.pending` page wherever it
+  is rather than walking a cursor, so a re-queued page behind the last one done is picked up. Before
+  this, dropping a new file quietly resumed the document someone had just stopped and did the new
+  one after it.
 - The page navigator is an EAGER `ScrollView`, not a `List`. A sidebar list draws its own row
   chrome - the system selection, which greys out the moment the text pane takes focus, and a hover
   fill on top of it - so the accent mark this rail needs sat inside a second background.

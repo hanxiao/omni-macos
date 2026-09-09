@@ -921,6 +921,10 @@ struct SearchWaysPrompt: View {
     /// itself for no gain.
     var symbol: String = "sparkle.magnifyingglass"
     var ways: [(icon: String, text: String)] = SearchWaysPrompt.searchWays
+    /// Something to do about what the rows just described - the OCR pane hangs its download button
+    /// here when the model is missing. `AnyView` because this view is built once per empty state
+    /// and a generic parameter would spread through every call site for nothing.
+    var footer: AnyView?
 
     static let searchWays: [(icon: String, text: String)] = [
         ("character.cursor.ibeam", "Type a phrase, ranked by meaning"),
@@ -952,6 +956,7 @@ struct SearchWaysPrompt: View {
             }
             .font(.callout).foregroundStyle(.secondary)   // content-width block; the outer VStack centers it
             if showSpinner { ProgressView().controlSize(.small).padding(.top, 4) }
+            if let footer { footer.padding(.top, 6) }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding()

@@ -17,7 +17,13 @@ import UniformTypeIdentifiers
 /// after the run ends rather than sitting on the text forever.
 struct OCRView: View {
     @Environment(OCRSession.self) private var session
+    @Environment(AppModel.self) private var model
     @State private var dropTargeted = false
+    @State private var split = SplitScroll()
+
+    /// The add-on is not here yet. Said in the empty state rather than only when a drop fails: a
+    /// pane that invites a document it cannot read is a trap.
+    private var needsModel: Bool { !model.ocrInstalled.contains(.balanced) }
 
     var body: some View {
         @Bindable var session = session
@@ -26,8 +32,10 @@ struct OCRView: View {
             case .empty:
                 SearchWaysPrompt(title: "Drop a document to transcribe",
                                  symbol: "text.viewfinder",
-                                 ways: SearchWaysPrompt.transcribeWays)
-                    .accessibilityIdentifier("ocr.dropzone")
+                                 ways: SearchWaysPrompt.transcribeWays,
+                                 footer: needsModel ? AnyView(OCRDownloadAction()) : nil)
+                    .accessibilityIdentifier(needsModel ? "ocr.needsmodel" : "ocr.dropzone")
+                    .task { model.refreshOCRInstalled() }
             case .needsModel:
                 ModelMissing().accessibilityIdentifier("ocr.needsmodel")
             case .failed(let message):
@@ -104,19 +112,35 @@ struct OCRView: View {
         } else {
             switch session.mode {
             case .rendered:
-                RenderedDocument()
+                RenderedDocument(sync: $split)
             case .raw:
-                RawDocument()
+                RawDocument(sync: $split)
             case .split:
                 // A plain proportional split, not HSplitView. HSplitView propagates its children's
                 // minimum widths up as its own, and inside a NavigationSplitView detail pane that
                 // squeezes the app's sidebar past its own minimum - the sidebar labels start
                 // clipping. Halves that simply divide what is available cannot do that.
+                // Scrolling either half moves the other. The pointer decides which one leads, so
+                // they cannot chase each other; they meet at page boundaries, which is the
+                // granularity both panes share - the same text sets to different heights.
                 HStack(spacing: 0) {
-                    RawDocument()
+                    RawDocument(side: 0, sync: $split)
                         .frame(maxWidth: .infinity)
                     Divider()
-                    RenderedDocument()
+                    RenderedDocument(side: 1, sync: $split)
+                        .frame(maxWidth: .infinity)
+                }
+            case .triple:
+                // The page itself beside what was read off it. The image column follows whichever
+                // text column is being scrolled, which is what the split's own sync already knows.
+                HStack(spacing: 0) {
+                    PageImage(id: split.section ?? session.visibleIndex)
+                        .frame(maxWidth: .infinity)
+                    Divider()
+                    RawDocument(side: 0, sync: $split)
+                        .frame(maxWidth: .infinity)
+                    Divider()
+                    RenderedDocument(side: 1, sync: $split)
                         .frame(maxWidth: .infinity)
                 }
             }
@@ -149,7 +173,7 @@ struct OCRView: View {
                 }
                 .pickerStyle(.segmented)
                 .labelStyle(.iconOnly)
-                .help("Raw text, Markdown, or both")
+                .help("Raw text, Markdown, both, or the page beside them")
             }
             if #available(macOS 26.0, *) { ToolbarSpacer(.fixed) }
             // Closing lives in the File menu only (Shift-Cmd-W). It is rare, it is undone by
@@ -331,9 +355,11 @@ private struct PageThumb: View {
         // Unprocessed pages are dimmed rather than hidden: the rail doubles as the progress
         // display, so the shape of what is left has to stay visible. Never the selected page,
         // whatever its state: a translucent sheet over the accent fill turns the paper blue.
-        .opacity(page.state == .pending && !selected ? 0.45 : 1)
+        .opacity(untranscribed && !selected ? 0.45 : 1)
         .animation(.easeOut(duration: 0.25), value: page.state)
     }
+
+    private var untranscribed: Bool { page.state == .pending || page.state == .stopped }
 
     private var stateDescription: String {
         switch page.state {
@@ -341,6 +367,7 @@ private struct PageThumb: View {
         case .running: return "transcribing"
         case .failed: return "could not be transcribed"
         case .pending: return "not transcribed yet"
+        case .stopped: return "not transcribed - click to transcribe it"
         }
     }
 }
@@ -411,6 +438,9 @@ private struct DocumentTabs: View {
                 .buttonStyle(.borderless)
                 .foregroundStyle(.secondary)
                 .opacity(showsClose ? 1 : 0)
+                // An invisible button still takes the click. Reserved space is the point; a hole
+                // in the tab is not.
+                .allowsHitTesting(showsClose)
                 .accessibilityLabel("Close \(doc.name)")
                 .accessibilityHidden(!showsClose)
 
@@ -429,8 +459,10 @@ private struct DocumentTabs: View {
             .padding(.horizontal, 4)
         }
         // Equal widths, the way a tab bar divides its track - not sized to the file name, which
-        // made a long name crowd every other tab out.
-        .frame(maxWidth: .infinity)
+        // made a long name crowd every other tab out. FULL HEIGHT too: the row is 28pt and the
+        // label inside it is about 16, so without this the clickable band was the label's and the
+        // few points above and below it did nothing.
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .contentShape(Rectangle())
         // A container element: without this the tab is only its children (a close button and a
         // label) and nothing answers to the tab itself - for VoiceOver or for a test.
@@ -457,14 +489,17 @@ private struct DocumentTabs: View {
 /// tens of views and not thousands, and each one still reads only its own text - which is what
 /// keeps the 24 Hz stream write cheap.
 private struct RenderedDocument: View {
+    var side: Int? = nil
+    @Binding var sync: SplitScroll
     @Environment(OCRSession.self) private var session
 
     var body: some View {
-        DocumentScroll { ids in
+        DocumentScroll(side: side, sync: $sync) { ids in
             VStack(alignment: .leading, spacing: 0) {
                 ForEach(ids, id: \.self) { id in
                     if id != ids.first { PageBreak() }
                     RenderedSection(id: id, state: session.sectionState(id))
+                        .modifier(SectionTop(id: id))
                         .id(id)
                 }
             }
@@ -522,9 +557,15 @@ private struct RenderedSection: View {
 /// streaming form is also per-page sections so it stays lazy; the editable form is the single
 /// string that Copy and Save produce, so what is edited is exactly what leaves the app.
 private struct RawDocument: View {
+    var side: Int? = nil
+    @Binding var sync: SplitScroll
     @Environment(OCRSession.self) private var session
 
-    private var editable: Bool { !session.isBusy && session.completedPages > 0 }
+    /// Editable only when this is the WHOLE pane. Beside another column it is the sectioned,
+    /// read-only form: the editor is an `NSTextView` with no sections to report a scroll position
+    /// from or scroll to, so a split with the editor in it could not keep its halves together.
+    /// Editing the transcript is what the single Raw Text view is for.
+    private var editable: Bool { side == nil && !session.isBusy && session.completedPages > 0 }
 
     var body: some View {
         Group {
@@ -532,11 +573,12 @@ private struct RawDocument: View {
                 SourceEditor(document: session.visibleDocument?.id, page: session.visibleIndex,
                              find: session.find, activeMatch: session.activeMatch)
             } else {
-                DocumentScroll(width: nil) { ids in
+                DocumentScroll(width: nil, side: side, sync: $sync) { ids in
                     VStack(alignment: .leading, spacing: 0) {
                         ForEach(ids, id: \.self) { id in
                             if id != ids.first { PageBreak() }
                             RawSection(id: id)
+                                .modifier(SectionTop(id: id))
                                 .id(id)
                         }
                     }
@@ -708,13 +750,31 @@ private struct RawSection: View {
 /// readout, and the one place that follows the run.
 private struct DocumentScroll<Content: View>: View {
     var width: CGFloat? = 760
+    /// Which half of the split this is, and the section the OTHER half is showing. Nil outside
+    /// side-by-side, where there is nothing to keep in step and the probes below cost nothing.
+    var side: Int? = nil
+    @Binding var sync: SplitScroll
     @ViewBuilder var content: ([Int]) -> Content
     @Environment(OCRSession.self) private var session
+    /// Set when this half is moved to follow the other one, so it does not report that move back
+    /// as a reader scrolling.
+    @State private var quietUntil = Date.distantPast
 
     /// Outside the page-id namespace: page ids are non-negative.
     private var tailID: Int { -1 }
+    private static var space: String { "ocr.scroll" }
 
     var body: some View {
+        // The named space is on a view OUTSIDE the scroller. Named ON the `ScrollView` it is the
+        // CONTENT's space, so a section's position in it never changes as you scroll - the probes
+        // reported once at layout and then went quiet, and the two halves never moved together.
+        ZStack {
+            scroller
+        }
+        .coordinateSpace(name: Self.space)
+    }
+
+    private var scroller: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
@@ -726,12 +786,34 @@ private struct DocumentScroll<Content: View>: View {
                     // about a page behind the decode, one page at a time. This view always exists,
                     // and putting ITS bottom at the viewport's leaves the newest line clear of the
                     // readout.
-                    Color.clear.frame(height: 72).id(tailID)
+                    Color.clear.frame(height: 72).id(tailID).modifier(SectionTop(id: tailID))
                 }
                 .frame(maxWidth: width ?? .infinity, alignment: .leading)
                 .padding(.horizontal, width == nil ? 12 : 28)
                 .padding(.top, 24)
                 .frame(maxWidth: .infinity, alignment: .center)
+                // Sections report where they sit only in the split, and only while the pointer is
+                // in THIS half: one probe per section per frame is not something to pay for in a
+                // single-pane view that has nothing to keep in step with.
+                .environment(\.sectionProbeSpace, side == nil ? nil : Self.space)
+            }
+            // Whichever half MOVED ON ITS OWN leads. Not hover, and not the scroll phase: the
+            // pointer can sit over one half while the wheel turns in the other, and a follower that
+            // reported the position it was just moved to would start the two panes chasing each
+            // other. So the follower simply stays quiet for a moment after being moved, and
+            // anything that moves outside that window is a reader scrolling.
+            .onPreferenceChange(SectionTopKey.self) { tops in
+                guard let side, quietUntil < Date(), let now = Self.position(tops) else { return }
+                sync = SplitScroll(driver: side, section: now.section, fraction: now.fraction)
+            }
+            .onChange(of: sync) { _, now in
+                guard let side, now.driver != side, let id = now.section else { return }
+                quietUntil = Date().addingTimeInterval(0.2)
+                // Anchored by the FRACTION of the section that has gone past, not just its top: the
+                // same page sets to very different heights as source and as prose, so matching only
+                // the page boundary left the follower a whole page behind by the time the driver
+                // reached the end of one.
+                proxy.scrollTo(id, anchor: UnitPoint(x: 0, y: now.fraction))
             }
             .onChange(of: session.streamTick) { _, _ in
                 guard session.isFollowingRun else { return }
@@ -771,6 +853,59 @@ private struct DocumentScroll<Content: View>: View {
             .modifier(YieldFollowOnScroll())
         }
     }
+
+    /// The section under the viewport's top edge, and how far into it the reader is.
+    private static func position(_ tops: [Int: CGFloat]) -> (section: Int, fraction: Double)? {
+        let above = tops.filter { $0.value <= 1 }
+        guard let current = above.max(by: { $0.value < $1.value })
+                ?? tops.min(by: { $0.value < $1.value }) else { return nil }
+        // The next thing down is what gives this one its height. The tail spacer reports too, so
+        // even the last section has one.
+        let next = tops.values.filter { $0 > current.value }.min()
+        let height = max((next ?? current.value + 1) - current.value, 1)
+        return (current.key, min(max(Double(-current.value / height), 0), 1))
+    }
+}
+
+/// Which half of a side-by-side view the pointer is in, and where in the document it is.
+struct SplitScroll: Equatable {
+    var driver: Int?
+    var section: Int?
+    var fraction: Double = 0
+}
+
+private struct SectionTopKey: PreferenceKey {
+    static let defaultValue: [Int: CGFloat] = [:]
+    static func reduce(value: inout [Int: CGFloat], nextValue: () -> [Int: CGFloat]) {
+        value.merge(nextValue()) { first, _ in first }
+    }
+}
+
+/// The coordinate space a section should report its position in, or nil for "do not report".
+private struct SectionProbeSpaceKey: EnvironmentKey { static let defaultValue: String? = nil }
+
+extension EnvironmentValues {
+    var sectionProbeSpace: String? {
+        get { self[SectionProbeSpaceKey.self] }
+        set { self[SectionProbeSpaceKey.self] = newValue }
+    }
+}
+
+/// Reports a section's distance from the top of the scroll's viewport, when asked to.
+struct SectionTop: ViewModifier {
+    let id: Int
+    @Environment(\.sectionProbeSpace) private var space
+
+    func body(content: Content) -> some View {
+        content.background {
+            if let space {
+                GeometryReader { geometry in
+                    Color.clear.preference(key: SectionTopKey.self,
+                                           value: [id: geometry.frame(in: .named(space)).minY])
+                }
+            }
+        }
+    }
 }
 
 /// Hands the document back to the reader the moment they scroll it themselves.
@@ -790,6 +925,35 @@ private struct YieldFollowOnScroll: ViewModifier {
         } else {
             content
         }
+    }
+}
+
+/// The scanned page, beside the text taken off it.
+///
+/// Rendered through the same cache Quick Look uses, so opening a page full size and reading it in
+/// this column cost one render between them.
+private struct PageImage: View {
+    let id: Int?
+    @Environment(OCRSession.self) private var session
+
+    var body: some View {
+        ZStack {
+            if let id, let url = session.previewURL(for: id), let image = NSImage(contentsOf: url) {
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .overlay(Rectangle().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5))
+                    .shadow(color: .black.opacity(0.16), radius: 2, y: 1)
+                    .padding(16)
+            } else {
+                Image(systemName: "doc")
+                    .font(.system(size: 28, weight: .light))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(.background.secondary)
+        .accessibilityLabel(id.map { "Page \($0 + 1)" } ?? "No page")
     }
 }
 
@@ -861,8 +1025,10 @@ private struct ProgressReadout: View {
                 }
                 if session.isPaused {
                     ChipButton(symbol: "play.fill", help: "Resume transcribing") { session.resume() }
-                    ChipButton(symbol: "stop.fill",
-                               help: "Stop transcribing  \u{2318}.") { session.cancel() }
+                    // Red, because it is the one control here that throws work away: pausing and
+                    // resuming are free, stopping is not.
+                    ChipButton(symbol: "stop.fill", help: "Stop transcribing  \u{2318}.",
+                               tint: .red) { session.cancel() }
                 } else if session.isBusy {
                     ChipButton(symbol: "pause.fill", help: "Pause transcribing") { session.pause() }
                 }
@@ -922,6 +1088,7 @@ private struct ProgressReadout: View {
 private struct ChipButton: View {
     let symbol: String
     let help: String
+    var tint: Color?
     let action: () -> Void
     @State private var hovered = false
 
@@ -930,8 +1097,9 @@ private struct ChipButton: View {
             Image(systemName: symbol)
                 .font(.system(size: 11, weight: .semibold))
                 .contentTransition(.symbolEffect(.replace))
+                .foregroundStyle(tint ?? .primary)
                 .frame(width: 22, height: 22)
-                .background(Circle().fill(.primary.opacity(hovered ? 0.12 : 0)))
+                .background(Circle().fill((tint ?? .primary).opacity(hovered ? 0.12 : 0)))
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
@@ -1059,18 +1227,52 @@ private struct ModelMissing: View {
                 .font(.system(size: 34, weight: .light))
                 .foregroundStyle(.secondary)
             Text("The OCR model is not downloaded").font(.title3.weight(.medium))
-            Text("About 4.5 GB, and it runs entirely on this Mac.")
+            Text("It runs entirely on this Mac.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 380)
-            SettingsLink {
-                Text("Open Settings\u{2026}")
-            }
-            .buttonStyle(.borderedProminent)
-            .padding(.top, 4)
+            OCRDownloadAction().padding(.top, 4)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+/// Get the model from where you noticed it was missing.
+///
+/// The same control the first-run screen offers, in the workspace: pointing at Settings sent the
+/// reader to another window to answer a question they had already answered by turning OCR on.
+struct OCRDownloadAction: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        if model.isOCRDownloading {
+            VStack(spacing: 8) {
+                ProgressView(value: model.ocrDownloadFraction).frame(width: 300)
+                HStack(spacing: 10) {
+                    Text(model.ocrDownloadLabel)
+                    Text(model.ocrDownloadSpeed).foregroundStyle(.secondary)
+                }
+                .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                Button("Cancel") { model.cancelOCRDownload() }.controlSize(.small)
+            }
+        } else {
+            VStack(spacing: 6) {
+                Button { model.downloadOCRModel(.balanced) } label: {
+                    HStack {
+                        Image(systemName: "arrow.down.circle")
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Download OCR model").fontWeight(.medium)
+                            Text("~4.5 GB").font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    .font(.callout)
+                    .fixedSize(horizontal: true, vertical: false)
+                }
+                .controlSize(.large).buttonStyle(.borderedProminent)
+                if model.ocrDownloadFailed {
+                    Text(model.ocrDownloadLabel).font(.caption).foregroundStyle(.red)
+                }
+            }
+        }
     }
 }
 
