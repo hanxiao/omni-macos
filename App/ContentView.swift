@@ -463,6 +463,16 @@ struct ContentView: View {
         }
     }
 
+    private var ocrToggleButton: some View {
+        Button {
+            // No `withAnimation`: the two modes are different content, not a moved view, and
+            // animating the swap made the whole pane slide in from the window's leading edge.
+            model.ocrMode.toggle()
+        } label: {
+            Image(systemName: "text.viewfinder")
+        }
+    }
+
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
         // No explicit sidebar toggle: Sequoia's system toggle (next to the traffic lights, like
         // Finder) lives and dies with the split-view TRACKING SEPARATOR item, which this app keeps
@@ -486,13 +496,17 @@ struct ContentView: View {
         // it on the index would strand the feature exactly when it is most useful - while a large
         // index loads, or when another copy of Omni holds it open.
         ToolbarItem(id: "ocr.mode", placement: .navigation) {
-            Button {
-                // No `withAnimation`: the two modes are different content, not a moved view, and
-                // animating the swap made the whole pane slide in from the window's leading edge.
-                model.ocrMode.toggle()
-            } label: {
-                Image(systemName: "text.viewfinder")
-                    .foregroundStyle(model.ocrMode ? Color.accentColor : Color.primary)
+            // On is a FILLED accent circle with a white glyph, the way Preview draws Markup while
+            // it is on - a mode you are inside of, not a tinted glyph you might have moused over.
+            // Off is an ordinary toolbar button.
+            Group {
+                if model.ocrMode {
+                    ocrToggleButton
+                        .buttonStyle(.borderedProminent)
+                        .buttonBorderShape(.circle)
+                } else {
+                    ocrToggleButton
+                }
             }
             .help(model.ocrMode ? "Back to search  \u{2318}\u{2325}O" : "Transcribe a document  \u{2318}\u{2325}O")
             .accessibilityLabel(model.ocrMode ? "Back to search" : "Transcribe a document")
