@@ -1043,7 +1043,7 @@ private struct OCRModelRow: View {
                 // No Remove button. Deleting four gigabytes is something a person does where they
                 // can see what they are deleting; the folder is watched, so this row is right
                 // whether it goes from here or from the Finder.
-                LabeledContent("OCR model", value: "ocr-v1")
+                LabeledContent("OCR model", value: "jina-ocr-v1")
             } else {
                 HStack(spacing: 8) {
                     Text("OCR model")

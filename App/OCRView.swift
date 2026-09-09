@@ -529,7 +529,8 @@ private struct RawDocument: View {
     var body: some View {
         Group {
             if editable {
-                SourceEditor(document: session.visibleDocument?.id, page: session.visibleIndex)
+                SourceEditor(document: session.visibleDocument?.id, page: session.visibleIndex,
+                             find: session.find, activeMatch: session.activeMatch)
             } else {
                 DocumentScroll(width: nil) { ids in
                     VStack(alignment: .leading, spacing: 0) {
@@ -563,6 +564,8 @@ private struct SourceEditor: NSViewRepresentable {
     /// value changes, and only a read in the PARENT's body is tracked by Observation.
     let document: Int?
     let page: Int?
+    let find: String
+    let activeMatch: Int
     @Environment(OCRSession.self) private var session
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -590,7 +593,7 @@ private struct SourceEditor: NSViewRepresentable {
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         context.coordinator.session = session
-        context.coordinator.show(document: document, page: page)
+        context.coordinator.show(document: document, page: page, find: find, activeMatch: activeMatch)
     }
 
     @MainActor final class Coordinator: NSObject, NSTextViewDelegate {
@@ -600,18 +603,44 @@ private struct SourceEditor: NSViewRepresentable {
         var session: OCRSession?
         private var loaded: Int??
         private var scrolledTo: Int?
+        private var marked: String?
+        private var steppedTo: Int?
         private var recolour: Task<Void, Never>?
 
-        func show(document: Int?, page: Int?) {
+        func show(document: Int?, page: Int?, find: String, activeMatch: Int) {
             guard let text = textView, let session else { return }
             let source = session.documentSource()
-            if loaded != .some(document) {
+            let reload = loaded != .some(document)
+            if reload {
                 loaded = .some(document)
                 scrolledTo = nil
-                text.textStorage?.setAttributedString(
-                    NSAttributedString(MarkdownSource.highlighted(source.text)))
-                text.setSelectedRange(NSRange(location: 0, length: 0))
-                text.scroll(.zero)
+                marked = nil
+                steppedTo = nil
+            }
+            // Find marks live in the text storage, so a change of query rebuilds it. The syntax
+            // pass underneath is memoised, and this only runs when the query itself changes.
+            if reload || marked != find {
+                marked = find
+                let selected = text.selectedRange()
+                let origin = text.enclosingScrollView?.contentView.bounds.origin ?? .zero
+                text.textStorage?.setAttributedString(NSAttributedString(
+                    FindHighlight.mark(find, in: MarkdownSource.highlighted(source.text))))
+                if reload {
+                    text.setSelectedRange(NSRange(location: 0, length: 0))
+                    text.scroll(.zero)
+                } else {
+                    text.setSelectedRange(selected)
+                    text.enclosingScrollView?.contentView.scroll(to: origin)
+                }
+                steppedTo = nil
+            }
+            // Step through matches the way the find bar's chevrons say it does.
+            if !find.isEmpty, steppedTo != activeMatch,
+               let range = Self.match(activeMatch, of: find, in: text.string) {
+                steppedTo = activeMatch
+                scrolledTo = page
+                text.scrollRangeToVisible(range)
+                return
             }
             guard let page, page != scrolledTo, let offset = source.offsets[page] else { return }
             scrolledTo = page
@@ -627,6 +656,21 @@ private struct SourceEditor: NSViewRepresentable {
             text.scrollRangeToVisible(NSRange(location: offset, length: max(1, next - offset - 1)))
         }
 
+        /// The nth occurrence, counted the way `OCRSession.rebuildMatches` counts them: in order
+        /// through the same string the panes render.
+        private static func match(_ index: Int, of find: String, in text: String) -> NSRange? {
+            let ns = text as NSString
+            var from = 0
+            for step in 0 ... max(index, 0) {
+                let found = ns.range(of: find, options: .caseInsensitive,
+                                     range: NSRange(location: from, length: ns.length - from))
+                guard found.location != NSNotFound else { return nil }
+                if step == index { return found }
+                from = found.upperBound
+            }
+            return nil
+        }
+
         func textDidChange(_ notification: Notification) {
             guard let text = textView else { return }
             session?.setDocumentEdit(text.string)
@@ -638,8 +682,8 @@ private struct SourceEditor: NSViewRepresentable {
                 guard !Task.isCancelled, let text = self?.textView else { return }
                 let selected = text.selectedRange()
                 let scroll = text.enclosingScrollView?.contentView.bounds.origin ?? .zero
-                text.textStorage?.setAttributedString(
-                    NSAttributedString(MarkdownSource.highlighted(text.string)))
+                text.textStorage?.setAttributedString(NSAttributedString(
+                    FindHighlight.mark(self?.marked ?? "", in: MarkdownSource.highlighted(text.string))))
                 text.setSelectedRange(selected)
                 text.enclosingScrollView?.contentView.scroll(to: scroll)
             }

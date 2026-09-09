@@ -2761,6 +2761,11 @@ final class AppModel {
         Task.detached { let v = ModelLocator.installedVariants(); await MainActor.run { self.installedVariants = v } }
         // Resolve the model dir off the main actor: it stats candidate dirs including the hardcoded
         // external model volume, which blocks for seconds if that USB volume is mounted-but-spun-down.
+        // A test seam, the same shape as `-omni.ocrOpen`: launch arguments land in NSUserDefaults'
+        // ARGUMENT domain, so this cannot be set by accident and cannot persist. It is the only way
+        // to reach the first-run screen on a machine that already has the model - short of hiding
+        // the user's copy of it.
+        if UserDefaults.standard.bool(forKey: "omni.forceOnboarding") { phase = .noModel; return }
         guard let dir = await Task.detached(priority: .userInitiated, operation: { Self.resolvedModelDir() }).value
         else { phase = .noModel; return }
         modelPath = dir.path

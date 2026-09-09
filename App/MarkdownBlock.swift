@@ -394,8 +394,12 @@ enum FindHighlight {
         while let r = plain.range(of: find, options: .caseInsensitive, range: from ..< plain.endIndex) {
             if let lower = AttributedString.Index(r.lowerBound, within: out),
                let upper = AttributedString.Index(r.upperBound, within: out) {
+                // Both scopes: `Text` reads SwiftUI's, and the editable source pane is an
+                // `NSTextView` whose storage comes from the AppKit one.
                 out[lower ..< upper].backgroundColor = Color(nsColor: .findHighlightColor)
                 out[lower ..< upper].foregroundColor = Color(nsColor: .black)
+                out[lower ..< upper].appKit.backgroundColor = .findHighlightColor
+                out[lower ..< upper].appKit.foregroundColor = .black
             }
             from = r.upperBound
             if r.upperBound == plain.endIndex { break }

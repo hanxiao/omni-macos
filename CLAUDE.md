@@ -179,7 +179,8 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   moves the least it can, so a one-character range below the fold lands at the bottom edge - and
   not by asking the layout manager for a rectangle, which is TextKit 2 here and has no geometry for
   a range it has not laid out.
-- `MarkdownSource` sets every colour in BOTH the SwiftUI and AppKit attribute scopes. `Text` reads
+- `FindHighlight.mark` and `MarkdownSource` set every colour in BOTH the SwiftUI and AppKit
+  attribute scopes. `Text` reads
   the first; the editable pane's text storage comes from the second, and setting only one left the
   source view black.
 - The tab bar uses `windowBackgroundColor` for the track and `controlColor` for the selected
@@ -231,6 +232,9 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   draws `ocr.needsmodel` when the optional model is absent).
 - `.accessibilityIdentifier` on a container OVERRIDES its children. An id on the tab strip made
   every tab answer to the strip's id and none to its own.
+- `-omni.forceOnboarding YES` puts the app on the first-run screen on a machine that already has
+  the model. A fresh `HOME` does NOT work for this: `.applicationSupportDirectory` resolves from
+  the user record, not the environment, so the app finds the real install and the real defaults.
 - `-omni.ocrOpen <path>[:<path>]` opens documents in the OCR workspace; launch arguments land in
   NSUserDefaults' ARGUMENT domain, so a run cannot touch the real index, roots or settings.
 - "Timed out while enabling automation mode" = a stale OmniUITests-Runner, or the display asleep.
