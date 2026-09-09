@@ -124,11 +124,17 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   replacing.
 - The find bar exists because a searchable PROMPT only shows while the field is empty, so a match
   count put there vanishes exactly when there is one.
-- `ScrollViewProxy.scrollTo` CANNOT reach a `LazyVStack` item that has not been built. Following a
-  live run by scrolling to `sectionIDs.last` therefore stuck about a page behind and advanced one
-  page at a time: the target was always the item just below the fold, and it never materialised
-  because the scroll never got there. The anchor is now a zero-height view OUTSIDE the lazy stack,
-  which doubles as the clearance under the floating readout.
+- The transcript panes use an EAGER `VStack` of page sections, and the page navigator is a `List`.
+  Laziness cost three separate bugs here and bought nothing - sections are per PAGE, so a stack of
+  them is tens of views, not thousands. `ScrollViewProxy.scrollTo` cannot reach a `LazyVStack` item
+  that has not been built (following a run stuck a page behind), and a lazy stack ESTIMATES the
+  height of what it has not built, so on a document whose sections run from a two-line note to a
+  hundred-row table, scrolling to the bottom landed in empty space: the pane went blank for whole
+  seconds and the page arrived all at once. Measured after the change: 47 distinct frames in 50
+  captures at 300 ms, against 14 consecutive identical blank ones before.
+- `.defaultScrollAnchor(.bottom)` does NOT follow growing content here - measured, the view stayed
+  on page 1 for a whole run. The tail is followed by scrolling to a zero-height anchor placed after
+  the sections, which doubles as the clearance under the floating readout.
 - SwiftUI text selection does not span sibling `Text` views, so one view per Markdown block means a
   drag stops at every paragraph. Finished sections merge their contiguous prose into a single
   `AttributedString`; a section still decoding stays per-block, because the arrival fade is driven
@@ -143,12 +149,24 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   renumbered "page 13 of 40" into "page 13 of 41" under the reader while they watched.
 - Thumbnails cast a shadow and are NOT stroked. Preview's pages read as paper because of the
   shadow; a hairline on top of it is the frame a page rail is not supposed to have.
-- The page navigator is a `ScrollView`, NOT a `List`. A sidebar list draws the SYSTEM's row
-  selection, which greys out the moment the text pane takes focus - but here the selection means
-  "the page you are looking at", not "the focused row", so it has to stay lit. Preview's own
-  navigator is a collection view for the same reason. Selection is the accent fill around the page
-  AND its number; the thumbnail keeps its own proportions on no plate at all (the old grey plate
-  letterboxed portrait scans and drew a second edge around a bordered page).
+- The page navigator is a `List` with `.listRowBackground(Color.clear)`. The system's row
+  selection greys out the moment the text pane takes focus, and here the selection means "the page
+  you are looking at", not "the focused row" - so the row draws nothing and the thumbnail draws the
+  accent fill itself, around the page AND its number, as Preview does. The List stays because it is
+  the only container that can scroll to a row it has not built. Its selection binding needs a
+  `simultaneousGesture(TapGesture(count: 1))` alongside the high-priority double tap: the
+  high-priority gesture is the only way a row inside a List sees a double click, and it swallows
+  the single click the binding was relying on.
+- The editable source pane is an `NSTextView`, not `TextEditor`: the navigator has to scroll it to
+  a page, which needs a character offset and a scroll call `TextEditor` does not expose. The
+  offsets are built WITH the string (`documentSource()`) rather than found in it, because a page's
+  own content can contain a `---`. Scroll with the page's WHOLE range - `scrollRangeToVisible`
+  moves the least it can, so a one-character range below the fold lands at the bottom edge - and
+  not by asking the layout manager for a rectangle, which is TextKit 2 here and has no geometry for
+  a range it has not laid out.
+- `MarkdownSource` sets every colour in BOTH the SwiftUI and AppKit attribute scopes. `Text` reads
+  the first; the editable pane's text storage comes from the second, and setting only one left the
+  source view black.
 - The tab bar uses `windowBackgroundColor` for the track and `controlColor` for the selected
   capsule. Two shades of `.background` left them the same colour in light mode, so nothing read as
   raised; the semantic pair keeps the capsule lighter than the track in both appearances.

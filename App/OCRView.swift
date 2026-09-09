@@ -210,31 +210,27 @@ struct PageRail: View {
 
     var body: some View {
         ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 2) {
-                    ForEach(session.visiblePages) { page in
-                        PageThumb(page: page,
-                                  selected: session.railSelection == page.id,
-                                  onPreview: { session.previewing = session.previewURL(for: page.id) })
-                            .id(page.id)
-                    }
-                }
-                .padding(.horizontal, 6)
-                .padding(.vertical, 6)
-            }
-            // A scroller and not a `List`. A sidebar list draws the SYSTEM's row selection, which
-            // greys out the moment the text pane takes focus - and here the selection means "the
-            // page you are looking at", not "the focused row", so it has to stay lit. Preview's own
-            // navigator is a collection view for the same reason.
-            .focusable()
-            .focusEffectDisabled()
-            .onMoveCommand { direction in
-                switch direction {
-                case .up: session.step(by: -1)
-                case .down: session.step(by: 1)
-                default: break
+            List(selection: Binding<Int?>(get: { session.railSelection },
+                                          set: { if let id = $0 { session.select(id) } })) {
+                ForEach(session.visiblePages) { page in
+                    PageThumb(page: page,
+                              selected: session.railSelection == page.id,
+                              onPreview: { session.previewing = session.previewURL(for: page.id) })
+                        .id(page.id)
+                        .tag(page.id)
+                        .listRowInsets(EdgeInsets(top: 2, leading: 4, bottom: 2, trailing: 4))
+                        .listRowSeparator(.hidden)
+                        // The system's row highlight greys out the moment the text pane takes
+                        // focus, and here the selection means "the page you are looking at", not
+                        // "the focused row" - so the row draws nothing and `PageThumb` draws the
+                        // accent itself. The List stays because it is the only container that can
+                        // scroll to a row it has not built: a `LazyVStack` cannot, so following a
+                        // run stalled a page or two behind exactly as the transcript once did.
+                        .listRowBackground(Color.clear)
                 }
             }
+            .listStyle(.sidebar)
+            .scrollContentBackground(.hidden)
             // The rail follows the page being decoded. Once nothing is running it belongs to the
             // reader: scrolling it back to the selection under their hands is how a navigator
             // stops being usable.
@@ -271,8 +267,12 @@ private struct PageThumb: View {
             if selected { RoundedRectangle(cornerRadius: 8).fill(Color.accentColor) }
         }
         .contentShape(Rectangle())
-        .onTapGesture(count: 2) { onPreview() }
-        .onTapGesture { session.select(page.id) }
+        // A high-priority double tap is the only way a row inside a List ever sees one - but it
+        // also swallows the single click the List's selection binding was relying on, so the row
+        // selects itself as well. Both fire on a double click, which is what should happen: the
+        // page you preview is the page you are on.
+        .highPriorityGesture(TapGesture(count: 2).onEnded { onPreview() })
+        .simultaneousGesture(TapGesture(count: 1).onEnded { session.select(page.id) })
         // The app's existing file actions, on the file this page came from - not a second set of
         // them. Reveal and Open are the same `PhotoActions` calls the results list makes, so a
         // page behaves like any other file the app knows about.
@@ -446,15 +446,18 @@ private struct DocumentTabs: View {
 /// read straight through, searched with one Find, or selected across a page break - which is most
 /// of what anyone wants from a transcript. The navigator scrolls this view; it does not swap it.
 ///
-/// `LazyVStack` is load-bearing, not tidiness: a 200-page document eagerly builds tens of thousands
-/// of block views, and each visible section reads `texts`, so keeping the built set to what is on
-/// screen is also what keeps the 24 Hz stream write cheap.
+/// The stack is EAGER. A lazy one estimates the height of every section it has not built, and on a
+/// document whose sections run from a two-line note to a hundred-row table that estimate was far
+/// enough out that following the tail scrolled into empty space: the pane went blank for seconds
+/// and the page arrived all at once when the layout caught up. Sections are per PAGE, so this is
+/// tens of views and not thousands, and each one still reads only its own text - which is what
+/// keeps the 24 Hz stream write cheap.
 private struct RenderedDocument: View {
     @Environment(OCRSession.self) private var session
 
     var body: some View {
         DocumentScroll { ids in
-            LazyVStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 0) {
                 ForEach(ids, id: \.self) { id in
                     if id != ids.first { PageBreak() }
                     RenderedSection(id: id, state: session.sectionState(id))
@@ -522,10 +525,10 @@ private struct RawDocument: View {
     var body: some View {
         Group {
             if editable {
-                SourceEditor()
+                SourceEditor(document: session.visibleDocument?.id, page: session.visibleIndex)
             } else {
                 DocumentScroll(width: nil) { ids in
-                    LazyVStack(alignment: .leading, spacing: 0) {
+                    VStack(alignment: .leading, spacing: 0) {
                         ForEach(ids, id: \.self) { id in
                             if id != ids.first { PageBreak() }
                             RawSection(id: id)
@@ -541,65 +544,106 @@ private struct RawDocument: View {
 
 /// The editable Markdown source, highlighted.
 ///
-/// No line-number gutter. The hand-rolled one built a `Text` per line in an eager `VStack`, and on
-/// a real transcript that view tree left the window's sidebar drawing NOTHING and unscrollable -
-/// the page navigator went blank the moment a run finished. It also numbered logical lines, which
-/// a soft-wrapping editor does not lay out one to a row. A number column is not worth a broken
-/// navigator, and the packages that provide a real one do not fit (see CLAUDE.md).
+/// An `NSTextView` rather than SwiftUI's `TextEditor`. The navigator has to be able to scroll this
+/// to a page, which needs a character offset and a scroll call that `TextEditor` does not expose -
+/// clicking a thumbnail in raw view moved the highlight and left the text where it was. AppKit's
+/// text system also lays a document of this size out lazily, where handing SwiftUI one
+/// `AttributedString` per frame does not.
 ///
-/// Tahoe's `TextEditor` takes an `AttributedString` binding, so the syntax colouring survives
-/// editing instead of being a read-only decoration; on macOS 14-15 the same text is edited plain,
-/// which is what those systems offer. Re-highlighting is debounced rather than run per keystroke:
-/// rebuilding the attributed text under a live caret on every character is what makes a
-/// hand-rolled highlighter feel wrong, and 200 ms after the typing stops is invisible.
-private struct SourceEditor: View {
+/// Read-only while any page is still decoding, then editable as a whole. That split is a
+/// correctness one, not a policy: the streaming form is per-page sections so it stays lazy and can
+/// be scrolled to a page; the editable form is the single string that Copy and Save produce, so
+/// what is edited is exactly what leaves the app.
+private struct SourceEditor: NSViewRepresentable {
+    /// Passed in rather than read inside `updateNSView`: a representable is re-run when its own
+    /// value changes, and only a read in the PARENT's body is tracked by Observation.
+    let document: Int?
+    let page: Int?
     @Environment(OCRSession.self) private var session
-    @State private var attributed = AttributedString()
-    @State private var plain = ""
 
-    var body: some View {
-        editor
-        // Keyed on the TAB, not on appearance. Loading in `onAppear` meant the editor kept the
-        // first document it was ever shown: selecting another tab moved the navigator and the
-        // title and left the text where it was.
-        .task(id: session.visibleDocument?.id) {
-            plain = session.documentMarkdown
-            attributed = MarkdownSource.highlighted(plain)
-        }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scroll = NSTextView.scrollableTextView()
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        guard let text = scroll.documentView as? NSTextView else { return scroll }
+        text.delegate = context.coordinator
+        text.allowsUndo = true
+        text.drawsBackground = false
+        text.isAutomaticQuoteSubstitutionEnabled = false
+        text.isAutomaticDashSubstitutionEnabled = false
+        text.isAutomaticTextReplacementEnabled = false
+        text.isAutomaticSpellingCorrectionEnabled = false
+        text.textContainerInset = NSSize(width: 8, height: 14)
+        text.font = context.coordinator.face
+        text.typingAttributes = [.font: context.coordinator.face,
+                                 .foregroundColor: NSColor.labelColor]
+        context.coordinator.textView = text
+        context.coordinator.session = session
+        return scroll
     }
 
-    @ViewBuilder private var editor: some View {
-        Group {
-            if #available(macOS 26.0, *) {
-                TextEditor(text: $attributed)
-                    .onChange(of: attributed) { _, new in
-                        let text = String(new.characters)
-                        guard text != plain else { return }   // our own re-highlight, not a keystroke
-                        plain = text
-                        session.setDocumentEdit(text)
-                    }
-                    .task(id: plain) {
-                        try? await Task.sleep(for: .milliseconds(200))
-                        guard !Task.isCancelled else { return }
-                        let coloured = MarkdownSource.highlighted(plain)
-                        if String(coloured.characters) == plain { attributed = coloured }
-                    }
-            } else {
-                TextEditor(text: Binding(get: { session.documentMarkdown },
-                                         set: { session.setDocumentEdit($0) }))
+    func updateNSView(_ scroll: NSScrollView, context: Context) {
+        context.coordinator.session = session
+        context.coordinator.show(document: document, page: page)
+    }
+
+    @MainActor final class Coordinator: NSObject, NSTextViewDelegate {
+        let face = NSFont.monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+
+        weak var textView: NSTextView?
+        var session: OCRSession?
+        private var loaded: Int??
+        private var scrolledTo: Int?
+        private var recolour: Task<Void, Never>?
+
+        func show(document: Int?, page: Int?) {
+            guard let text = textView, let session else { return }
+            let source = session.documentSource()
+            if loaded != .some(document) {
+                loaded = .some(document)
+                scrolledTo = nil
+                text.textStorage?.setAttributedString(
+                    NSAttributedString(MarkdownSource.highlighted(source.text)))
+                text.setSelectedRange(NSRange(location: 0, length: 0))
+                text.scroll(.zero)
+            }
+            guard let page, page != scrolledTo, let offset = source.offsets[page] else { return }
+            scrolledTo = page
+            let length = (text.string as NSString).length
+            guard offset < length else { return }
+            // Scroll the WHOLE page into view, not its first character. `scrollRangeToVisible`
+            // moves the least it can, so a one-character range that happens to be below the fold
+            // lands at the bottom edge; given the page's full extent it puts the start at the top.
+            // Asking the layout manager for a rectangle instead is not an option here - the text
+            // view is TextKit 2, and the geometry of a range it has not laid out yet is not there
+            // to be read.
+            let next = source.offsets.values.filter { $0 > offset }.min() ?? length
+            text.scrollRangeToVisible(NSRange(location: offset, length: max(1, next - offset - 1)))
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard let text = textView else { return }
+            session?.setDocumentEdit(text.string)
+            // Re-colouring under a live caret on every keystroke is what makes a hand-rolled
+            // highlighter feel wrong; 200 ms after the typing stops is invisible.
+            recolour?.cancel()
+            recolour = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .milliseconds(200))
+                guard !Task.isCancelled, let text = self?.textView else { return }
+                let selected = text.selectedRange()
+                let scroll = text.enclosingScrollView?.contentView.bounds.origin ?? .zero
+                text.textStorage?.setAttributedString(
+                    NSAttributedString(MarkdownSource.highlighted(text.string)))
+                text.setSelectedRange(selected)
+                text.enclosingScrollView?.contentView.scroll(to: scroll)
             }
         }
-        .font(.system(.body, design: .monospaced))
-        .scrollContentBackground(.hidden)
-        // The same insets the read-only sections use. Without the top one the first line of the
-        // document sits under the translucent toolbar when scrolled to the top.
-        .padding(.horizontal, 8)
-        .padding(.top, 24)
-        .padding(.bottom, 8)
     }
 }
 
-
+/// One section of the source, highlighted. Read-only: this is the streaming form.
 private struct RawSection: View {
     let id: Int
     @Environment(OCRSession.self) private var session
@@ -641,6 +685,10 @@ private struct DocumentScroll<Content: View>: View {
                 .padding(.top, 24)
                 .frame(maxWidth: .infinity, alignment: .center)
             }
+            .onChange(of: session.streamTick) { _, _ in
+                guard session.isFollowingRun else { return }
+                proxy.scrollTo(tailID, anchor: .bottom)
+            }
             // Follows the run, and follows the navigator, through the same value: `visibleIndex` is
             // the running page until the user picks one. It does NOT change while a page decodes,
             // so the document never scrolls out from under someone mid-read.
@@ -664,10 +712,7 @@ private struct DocumentScroll<Content: View>: View {
                 guard let id else { return }
                 withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(id, anchor: .center) }
             }
-            .onChange(of: session.streamTick) { _, _ in
-                guard session.isFollowingRun else { return }
-                proxy.scrollTo(tailID, anchor: .bottom)
-            }
+
             // Switching Formatted/Side by Side/Markdown builds a NEW scroller, which starts at the
             // top. Without this you land on page 1 of a document whose run is on page 13, and
             // `visibleIndex` has not changed so nothing above would put you back.
@@ -1003,3 +1048,5 @@ private struct CenteredHint: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
+
+

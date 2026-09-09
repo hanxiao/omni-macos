@@ -403,12 +403,38 @@ final class OCRSession {
     /// divider the panes draw between pages, so what is copied matches what is read.
     /// The Markdown of the tab on screen. Per tab, not per drop: what Copy, Save and Share hand
     /// over is what the window is showing.
-    var documentMarkdown: String {
-        if let documentEdit { return documentEdit }
-        return (visibleDocument?.pageIDs ?? [])
-            .filter { pages.indices.contains($0) && pages[$0].state == .done }
-            .map { texts[$0] }
-            .joined(separator: "\n\n---\n\n")
+    var documentMarkdown: String { documentSource().text }
+
+    /// The document as source, and where each section begins in it.
+    ///
+    /// The offsets are built WITH the string rather than found in it afterwards: the navigator has
+    /// to be able to scroll the source to a page, and searching for the rule that separates pages
+    /// would land on the first `---` a page's own content happened to contain. Once the reader has
+    /// edited the document there is no such guarantee to make, so the offsets come from where the
+    /// rules actually fall in what they wrote.
+    func documentSource() -> (text: String, offsets: [Int: Int]) {
+        let separator = "\n\n---\n\n"
+        if let documentEdit {
+            var offsets: [Int: Int] = [:]
+            var cursor = documentEdit.startIndex
+            var section = 0
+            offsets[0] = 0
+            while let rule = documentEdit.range(of: "\n---\n", range: cursor ..< documentEdit.endIndex) {
+                section += 1
+                offsets[section] = documentEdit.distance(from: documentEdit.startIndex,
+                                                         to: rule.upperBound)
+                cursor = rule.upperBound
+            }
+            return (documentEdit, offsets)
+        }
+        var text = ""
+        var offsets: [Int: Int] = [:]
+        for id in visibleDocument?.pageIDs ?? [] where pages.indices.contains(id) && pages[id].state == .done {
+            if !text.isEmpty { text += separator }
+            offsets[id] = text.count
+            text += texts[id]
+        }
+        return (text, offsets)
     }
 
     func setDocumentEdit(_ text: String) {

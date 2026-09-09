@@ -21,13 +21,13 @@ enum MarkdownSource {
 
     // MARK: - The scheme
 
-    private static let punctuation = Color(nsColor: .tertiaryLabelColor)
-    private static let heading = Color(nsColor: .systemBlue)
-    private static let tag = Color(nsColor: .systemPurple)
-    private static let attribute = Color(nsColor: .systemTeal)
-    private static let code = Color(nsColor: .systemGreen)
-    private static let link = Color(nsColor: .systemBrown)
-    private static let rule = Color(nsColor: .secondaryLabelColor)
+    private static let punctuation = NSColor.tertiaryLabelColor
+    private static let heading = NSColor.systemBlue
+    private static let tag = NSColor.systemPurple
+    private static let attribute = NSColor.systemTeal
+    private static let code = NSColor.systemGreen
+    private static let link = NSColor.systemBrown
+    private static let rule = NSColor.secondaryLabelColor
 
     /// Ordered because later rules paint over earlier ones: a `<td>` inside a fenced block should
     /// read as code, not as a tag.
@@ -49,7 +49,7 @@ enum MarkdownSource {
     ]
 
     private struct Style {
-        var color: Color?
+        var color: NSColor?
         var bold = false
         var italic = false
         var underline = false
@@ -63,6 +63,10 @@ enum MarkdownSource {
 
     fileprivate static func build(_ text: String) -> AttributedString {
         var out = AttributedString(text)
+        // A base face and colour in the AppKit scope, so the editable pane starts from the same
+        // monospaced body text the read-only sections use rather than the text view's default.
+        out.appKit.font = monospaced([])
+        out.appKit.foregroundColor = .labelColor
         let full = NSRange(text.startIndex ..< text.endIndex, in: text)
         for (expression, style) in expressions {
             for match in expression.matches(in: text, range: full) {
@@ -70,14 +74,23 @@ enum MarkdownSource {
                       let lower = AttributedString.Index(range.lowerBound, within: out),
                       let upper = AttributedString.Index(range.upperBound, within: out)
                 else { continue }
-                if let color = style.color { out[lower ..< upper].foregroundColor = color }
+                // Both scopes. `Text` reads SwiftUI's, and the editable pane is an `NSTextView`
+                // whose text storage comes from the AppKit one - setting only the first left the
+                // source view black.
+                if let color = style.color {
+                    out[lower ..< upper].foregroundColor = Color(nsColor: color)
+                    out[lower ..< upper].appKit.foregroundColor = color
+                }
                 if style.bold || style.italic {
                     var traits: NSFontDescriptor.SymbolicTraits = []
                     if style.bold { traits.insert(.bold) }
                     if style.italic { traits.insert(.italic) }
                     out[lower ..< upper].appKit.font = monospaced(traits)
                 }
-                if style.underline { out[lower ..< upper].underlineStyle = .single }
+                if style.underline {
+                    out[lower ..< upper].underlineStyle = .single
+                    out[lower ..< upper].appKit.underlineStyle = .single
+                }
             }
         }
         return out
