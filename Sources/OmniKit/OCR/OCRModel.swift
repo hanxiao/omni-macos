@@ -165,15 +165,18 @@ public final class OCRModel: @unchecked Sendable {
     /// still pointing at another stream's work.
     func preparePage(image: OCRImage, prompt: String?) throws -> PreparedPage {
         let tPrepare = Date()
-        defer {
-            if OCRRuntimeFlags.reportPrefill {
-                FileHandle.standardError.write(Data(String(format: "[prefill] vision %.0f ms\n",
-                                                           Date().timeIntervalSince(tPrepare) * 1000).utf8))
-            }
-        }
         let prep = try prepare(image: image, prompt: prompt)
+        let tHost = Date()
         let visual = visualFeatures(prep)
         eval(visual)
+        if OCRRuntimeFlags.reportPrefill {
+            // Split, because the two halves have different cures: the host half is Pillow's
+            // fixed-point resample in pure Swift and can run on any core, the tower half is GPU.
+            FileHandle.standardError.write(Data(String(
+                format: "[prefill] host %.0f ms  tower %.0f ms\n",
+                tHost.timeIntervalSince(tPrepare) * 1000,
+                Date().timeIntervalSince(tHost) * 1000).utf8))
+        }
         return PreparedPage(prep: prep, visual: visual)
     }
 

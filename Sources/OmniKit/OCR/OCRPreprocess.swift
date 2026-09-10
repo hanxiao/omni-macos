@@ -175,8 +175,8 @@ enum PILResample {
 
 /// Image loading + the reference processor's crop/pad layout.
 public enum OCRPreprocess {
-    static let baseSize = 1024      // global view
-    static let tileSize = 640       // local tile
+    public static let baseSize = 1024      // global view
+    public static let tileSize = 640       // local tile
     static let patch = 16
     static let downsample = 4
 

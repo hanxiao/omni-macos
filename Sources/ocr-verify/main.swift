@@ -112,6 +112,17 @@ while i < args.count {
 // Minimal, model-free check of MLX's quantized matmul across batch sizes. It exists because a
 // whole-model symptom (speculative verification wrong at some batch sizes and right at others)
 // has to be reduced to one op before it can be called an upstream bug rather than a port bug.
+if args.contains("--probe-vision") {
+    let modelPath = args.first { !$0.hasPrefix("--") }
+    guard let modelPath else { fatalError("--probe-vision needs a model dir") }
+    let model = try await OCRModel(modelDir: URL(fileURLWithPath: modelPath))
+    print("-- local tiles, 640 --")
+    print(model.probeVisionScaling())
+    print("-- global view, 1024 --")
+    print(model.probeVisionScaling(counts: [1, 2, 4, 8, 16], side: 1024))
+    exit(0)
+}
+
 if args.contains("--probe-qmm") {
     let K = 1280, N = 896
     for bits in [4, 8] {

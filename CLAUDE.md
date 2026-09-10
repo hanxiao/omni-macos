@@ -156,6 +156,34 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   until the slowest one stopped froze the whole workspace: on a ten-file drop every tab's progress
   ring sat at zero for the length of the run and then cleared at once. The group return is now a
   backstop for the pages that failed and for a callback that lost the race.
+- PREFILL IS NOW THE DOMINANT COST, and it got that way by fixing decode. Per page it is fixed at
+  ~653 ms while the decode share shrank with batch width: 21% of a run at width 1 (3.1 s/page),
+  40% at width 16 (1.64 s/page). Measured at width 16 on 16 pages: 26.3 s total, of which
+  16 x 335 ms of `preparePage` and 16 x ~317 ms of LM prefill. Any further work on throughput
+  belongs here, not in the decode loop.
+- `--report-prefill` now splits `preparePage` into HOST and TOWER. Measured per page: host 55 ms,
+  tower 280 ms. The host half is `PILResample`, Pillow's fixed-point bicubic in pure Swift, and it
+  must stay on the CPU in integer arithmetic - a float or Metal resize lands within a LSB or two
+  and flips greedy ties, which is the failure mode the port exists to avoid. It is however the one
+  part that is trivially parallel across cores and currently runs serially, one page at a time.
+- BATCHING THE VISION TOWER ACROSS PAGES IS WORTH ~4%, measured, do not build it.
+  `probeVisionScaling` (`ocr-verify --probe-vision`) times the real tower at 1/2/4/8/16/32 tiles:
+  40.5 / 33.7 / 31.3 / 30.5 / 29.9 / 29.4 ms per tile, i.e. 1.37x from 1 to 32 and only 1.04x from
+  8 to 32. A page already carries a 1024 global view (~101 ms) plus ~6 tiles at 640 (~30 ms each),
+  so it is already past the knee. The vLLM `--mm-encoder-tp-mode data` trick that is worth 40% is
+  about replicating the encoder across GPUS, not amortising it on one, and does not transfer.
+- Corroborated upstream: ml-explore/mlx discussion #3829 measures per-frame VLM cost on an M3 Max
+  and finds vision encode ~constant at ~75 ms/frame and "encoder-independent - optimizing the
+  vision tower doesn't move the needle", with LM prefill dominating on capable models.
+- Unexplored leads, recorded so the search is not repeated: (a) OVERLAP prefill of the next group
+  with the decode of the current one - decode at width 32 is launch- and bandwidth-bound while
+  prefill is compute-bound, so the two should be complementary, but `--vision-prefetch` was ~0 on
+  the single path because it reschedules rather than removes, so this needs measuring before it is
+  built. (b) BaseRT (arXiv 2607.00501) reports uzu beating it on prefill because uzu goes through
+  MPSGraph, which can dispatch GEMM to the ANE; our prefill is exactly that GEMM and the ANE is
+  idle. (c) vllm-mlx (arXiv 2601.19139) caches vision embeddings by content hash for 28x on
+  repeated images - useless for a first pass over distinct pages, but it is the right answer for
+  re-transcribing a page the workspace has already seen.
 - Measured and rejected, do not re-derive: mlx-swift 0.31.4 (same qmm bug; 0.31.5+ needs
   Swift 6.3). DFlash/EAGLE trees need a draft model we cannot train here; ViT token merging breaks
   the fixed visual-token/prompt-slot contract.

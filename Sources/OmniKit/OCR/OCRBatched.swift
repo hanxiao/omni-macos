@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXRandom
 import PDFKit
 
 /// Decoding several pages at once, through one copy of the weights.
@@ -66,6 +67,30 @@ public enum OCRBatchPlan {
 }
 
 extension OCRModel {
+
+    /// Does the vision tower amortise across tiles, or is it flat out compute-bound?
+    ///
+    /// A page carries a handful of tiles. If four times the tiles cost four times the time there
+    /// is nothing to win by pushing several pages' tiles through the tower together; if they cost
+    /// less, batching the tower is a real lever on the prefill half of a run.
+    public func probeVisionScaling(counts: [Int] = [1, 2, 4, 8, 16, 32], reps: Int = 3,
+                                   side: Int = OCRPreprocess.tileSize) -> String {
+        var lines: [String] = []
+        var perTileAtOne = 0.0
+        for n in counts {
+            let x = MLXRandom.normal([n, side, side, 3]) * 0.5
+            eval(x)
+            eval(vision(x))                                  // warm the kernels for this shape
+            let t = Date()
+            for _ in 0 ..< reps { eval(vision(x)) }
+            let ms = Date().timeIntervalSince(t) * 1000 / Double(reps)
+            let per = ms / Double(n)
+            if n == counts.first { perTileAtOne = per }
+            lines.append(String(format: "tiles %2d  %8.1f ms  %7.1f ms/tile  %4.2fx",
+                                n, ms, per, perTileAtOne / per))
+        }
+        return lines.joined(separator: "\n")
+    }
 
     /// Transcribe `pages` with `width` of them decoding together.
     ///
