@@ -17,7 +17,7 @@ extension OCRModel {
         let prep = try prepare(image: image, prompt: prompt)
 
         out["input_ids"] = MLXArray(prep.ids.map { Int32($0) })
-        out["images_ori"] = prep.global.transposed(0, 3, 1, 2)          // NHWC -> NCHW, as torch dumps
+        if let g = prep.global { out["images_ori"] = g.transposed(0, 3, 1, 2) }   // NHWC -> NCHW
         if let tiles = prep.tiles { out["images_crop"] = tiles.transposed(0, 3, 1, 2) }
         out["spatial_crop"] = MLXArray([Int32(prep.grid.w), Int32(prep.grid.h)], [1, 2])
 
@@ -29,7 +29,12 @@ extension OCRModel {
         }
 
         // Global stream. torch dumps SAM as NCHW (B, C, g, g) and CLIP/projector as (B, N, C).
-        let samOut = vision.sam(prep.global)
+        // The stage dump exists to compare pixels against the torch oracle, so it is always
+        // driven from a freshly prepared page and never from a cached one.
+        guard let globalPixels = prep.global else {
+            throw OmniError.model("stage dump needs a page's pixels, not cached features")
+        }
+        let samOut = vision.sam(globalPixels)
         out["sam.out"] = samOut.transposed(0, 3, 1, 2)
         let clipOut = vision.clip(samOut)
         out["clip.out"] = clipOut

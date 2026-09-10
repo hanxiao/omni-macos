@@ -1,6 +1,8 @@
 import Foundation
 import MLX
 import MLXRandom
+import Metal
+import MetalPerformanceShadersGraph
 import OmniKit
 import PDFKit
 
@@ -112,6 +114,56 @@ while i < args.count {
 // Minimal, model-free check of MLX's quantized matmul across batch sizes. It exists because a
 // whole-model symptom (speculative verification wrong at some batch sizes and right at others)
 // has to be reduced to one op before it can be called an upstream bug rather than a port bug.
+// Is there a faster GEMM than MLX's for the shapes prefill uses? BaseRT (arXiv 2607.00501)
+// reports uzu beating it on prefill and attributes that to MPSGraph, which can in principle
+// dispatch to the Neural Engine. Prefill is exactly that GEMM and the ANE is idle, so the
+// question is worth one measurement even though our weights are quantized and MPSGraph would
+// need them dequantized.
+if args.contains("--probe-gemm") {
+    let shapes: [(Int, Int, Int)] = [(1007, 1280, 1280), (1007, 1280, 5120),
+                                     (1007, 2048, 2048), (4096, 1280, 1280)]
+    guard let dev = MTLCreateSystemDefaultDevice(), let queue = dev.makeCommandQueue() else {
+        fatalError("no Metal device")
+    }
+    let reps = 20
+    for (m, k, n) in shapes {
+        // --- MLX, fp16 and fp32 ---
+        var mlxMs: [String: Double] = [:]
+        for (name, dtype) in [("f16", DType.float16), ("f32", DType.float32)] {
+            let a = MLXRandom.normal([m, k]).asType(dtype)
+            let b = MLXRandom.normal([k, n]).asType(dtype)
+            eval(a, b); eval(matmul(a, b))
+            let t = Date()
+            for _ in 0 ..< reps { eval(matmul(a, b)) }
+            mlxMs[name] = Date().timeIntervalSince(t) * 1000 / Double(reps)
+        }
+
+        // --- MPSGraph, fp16 ---
+        let graph = MPSGraph()
+        let ta = graph.placeholder(shape: [m, k].map(NSNumber.init), dataType: .float16, name: nil)
+        let tb = graph.placeholder(shape: [k, n].map(NSNumber.init), dataType: .float16, name: nil)
+        let tc = graph.matrixMultiplication(primary: ta, secondary: tb, name: nil)
+        let ba = dev.makeBuffer(length: m * k * 2, options: .storageModeShared)!
+        let bb = dev.makeBuffer(length: k * n * 2, options: .storageModeShared)!
+        let da = MPSGraphTensorData(ba, shape: [m, k].map(NSNumber.init), dataType: .float16)
+        let db = MPSGraphTensorData(bb, shape: [k, n].map(NSNumber.init), dataType: .float16)
+        _ = graph.run(with: queue, feeds: [ta: da, tb: db], targetTensors: [tc], targetOperations: nil)
+        let tg = Date()
+        for _ in 0 ..< reps {
+            _ = graph.run(with: queue, feeds: [ta: da, tb: db], targetTensors: [tc],
+                          targetOperations: nil)
+        }
+        let mpsMs = Date().timeIntervalSince(tg) * 1000 / Double(reps)
+
+        let flops = 2.0 * Double(m) * Double(k) * Double(n)
+        print(String(format: "M%-5d K%-5d N%-5d  mlx-f16 %6.2f ms (%5.1f TF)  mlx-f32 %6.2f ms  mpsgraph-f16 %6.2f ms (%5.1f TF)  %.2fx",
+                     m, k, n, mlxMs["f16"]!, flops / (mlxMs["f16"]! / 1000) / 1e12,
+                     mlxMs["f32"]!, mpsMs, flops / (mpsMs / 1000) / 1e12,
+                     mlxMs["f16"]! / mpsMs))
+    }
+    exit(0)
+}
+
 if args.contains("--probe-vision") {
     let modelPath = args.first { !$0.hasPrefix("--") }
     guard let modelPath else { fatalError("--probe-vision needs a model dir") }
@@ -239,15 +291,31 @@ if let i = args.firstIndex(of: "--pdf") {
     // Batched decode: B pages through ONE copy of the weights, which is the parallelism a laptop
     // can also have.
     if let batchWidth = intAfter("--batch", in: args), batchWidth > 1 {
-        let started = Date()
-        let out = try model.transcribeBatched(pdfAt: pdf, maxNewTokens: cap,
-                                              pageRange: limit.map { 0 ..< $0 }, width: batchWidth)
-        let elapsed = Date().timeIntervalSince(started)
+        // --twice runs the same document a second time in the same process, which is the only
+        // way to see what the visual cache is worth: on a first pass it is worth nothing.
+        let passes = args.contains("--twice") ? 2 : 1
+        var out: OCRModel.DocumentResult!
+        var elapsed = 0.0
+        for pass in 1 ... passes {
+            let started = Date()
+            out = try model.transcribeBatched(pdfAt: pdf, maxNewTokens: cap,
+                                              pageRange: limit.map { 0 ..< $0 }, width: batchWidth,
+                                              pipelined: args.contains("--pipeline"),
+                                              pipelineHostOnly: args.contains("--pipeline-host"))
+            elapsed = Date().timeIntervalSince(started)
+            if passes > 1 {
+                print(String(format: "pass %d: %.1f s, %.0f aggregate tok/s, stalled %.1f s  [%@]",
+                             pass, elapsed,
+                             Double(out.pages.reduce(0) { $0 + $1.tokenCount }) / elapsed,
+                             out.stalledSeconds, model.visionCacheReport))
+            }
+        }
         var found = 0
         for page in out.pages where page.text.contains(String(format: "PAGE %03d", page.page)) { found += 1 }
         print(String(format: "\n%d pages in %.1f s = %.2f s/page, %.0f aggregate tok/s (batch=%d)",
                      out.pages.count, elapsed, elapsed / Double(max(out.pages.count, 1)),
                      Double(out.pages.reduce(0) { $0 + $1.tokenCount }) / elapsed, batchWidth))
+        print(String(format: "stalled on prefill: %.1f s", out.stalledSeconds))
         print("page markers recovered in place: \(found)/\(out.pages.count)")
         print("document digest: \(digest(out.markdown()))  chars \(out.markdown().count)")
         exit(0)
@@ -290,6 +358,7 @@ if let i = args.firstIndex(of: "--pdf") {
         print(String(format: "\n%d pages in %.1f s = %.2f s/page, %.0f aggregate tok/s  (workers=%d)",
                      out.pages.count, out.totalSeconds,
                      out.totalSeconds / Double(max(out.pages.count, 1)), out.tokensPerSecond, workers))
+        print(String(format: "stalled on prefill: %.1f s", out.stalledSeconds))
         print("page markers recovered in place: \(found)/\(out.pages.count)")
         print("document digest: \(digest(out.markdown()))  chars \(out.markdown().count)")
         exit(0)

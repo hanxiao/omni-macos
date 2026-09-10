@@ -54,7 +54,7 @@ public final class OCRModel: @unchecked Sendable {
     /// prefetch task, `eval`d there so nothing is left pending, and then handed to the page loop
     /// which is the only reader. No two tasks ever hold the same one.
     struct Prepared: @unchecked Sendable {
-        let global: MLXArray            // (1, 1024, 1024, 3)
+        let global: MLXArray?           // (1, 1024, 1024, 3); nil when the features were cached
         let tiles: MLXArray?            // (n, 640, 640, 3)
         let grid: (w: Int, h: Int)
         let ids: [Int]
@@ -73,6 +73,15 @@ public final class OCRModel: @unchecked Sendable {
 
     public let weights: OCRWeights
     let vision: OCRVisionTower
+    /// Visual features keyed by pixels. Worth nothing on a first pass over distinct pages and a
+    /// great deal on a second look at one - see `OCRVisionCache`.
+    let visionCache = OCRVisionCache()
+
+    /// Hit rate and size of the visual cache, for a harness that wants to report it.
+    public var visionCacheReport: String { visionCache.report }
+
+    /// Drop every cached page's features. The workspace calls this when the model is unloaded.
+    public func clearVisionCache() { visionCache.clear() }
     let llm: OCRLanguageModel
     let tokenizer: Tokenizer
     private let imageNewline: MLXArray
@@ -112,6 +121,31 @@ public final class OCRModel: @unchecked Sendable {
         return "<|User|>:\n<image>" + literalNewline + body + literalNewline + "<|Assistant|>:\n"
     }
 
+    /// The token ids for a page whose GEOMETRY is already known.
+    ///
+    /// Split out of `prepare` because the ids depend on the prompt and the tile grid and on
+    /// nothing else - the pixels never appear in them. That is what lets a cached page be
+    /// re-prompted without re-running the resample or the vision tower.
+    func promptIDs(grid: (w: Int, h: Int), prompt: String?) throws -> [Int] {
+        let gq = OCRPreprocess.queries(size: OCRPreprocess.baseSize)
+        var imageIDs = [Int](repeating: Self.imageTokenID, count: (gq + 1) * gq + 1)
+        if !(grid.w == 1 && grid.h == 1) {
+            let nq = OCRPreprocess.queries(size: OCRPreprocess.tileSize)
+            imageIDs += [Int](repeating: Self.imageTokenID, count: (nq * grid.w + 1) * (nq * grid.h))
+        }
+        let text = Self.chatText(prompt: prompt ?? Self.defaultPrompt)
+        let parts = text.components(separatedBy: "<image>")
+        guard parts.count == 2 else {
+            throw OmniError.model("""
+                prompt has \(parts.count - 1) <image> markers but one image was supplied. The chat \
+                template inserts the marker itself, so a custom prompt must be plain instruction text.
+                """)
+        }
+        return try tokenizer.encode(text: parts[0], addSpecialTokens: false)
+            + imageIDs
+            + tokenizer.encode(text: parts[1], addSpecialTokens: false)
+    }
+
     func prepare(image: OCRImage, prompt: String?) throws -> Prepared {
         let small = image.width <= OCRPreprocess.tileSize && image.height <= OCRPreprocess.tileSize
         var tiles: [OCRImage] = []
@@ -124,28 +158,11 @@ public final class OCRModel: @unchecked Sendable {
         if grid.w == 1 && grid.h == 1 { tiles = [] }
 
         let globalView = OCRPreprocess.padSquare(image, size: OCRPreprocess.baseSize)
-        let gq = OCRPreprocess.queries(size: OCRPreprocess.baseSize)
-        var imageIDs = [Int](repeating: Self.imageTokenID, count: (gq + 1) * gq + 1)
-        if !tiles.isEmpty {
-            let nq = OCRPreprocess.queries(size: OCRPreprocess.tileSize)
-            imageIDs += [Int](repeating: Self.imageTokenID, count: (nq * grid.w + 1) * (nq * grid.h))
-        }
-
-        let text = Self.chatText(prompt: prompt ?? Self.defaultPrompt)
-        let parts = text.components(separatedBy: "<image>")
-        guard parts.count == 2 else {
-            throw OmniError.model("""
-                prompt has \(parts.count - 1) <image> markers but one image was supplied. The chat \
-                template inserts the marker itself, so a custom prompt must be plain instruction text.
-                """)
-        }
-        let ids = try tokenizer.encode(text: parts[0], addSpecialTokens: false)
-            + imageIDs
-            + tokenizer.encode(text: parts[1], addSpecialTokens: false)
-
         return Prepared(global: OCRPreprocess.tensorNHWC(globalView),
                         tiles: tiles.isEmpty ? nil : OCRPreprocess.tensorNHWC(tiles),
-                        grid: grid, ids: ids)
+                        grid: grid,
+                        ids: try promptIDs(grid: tiles.isEmpty ? (w: 1, h: 1) : grid,
+                                           prompt: prompt))
     }
 
     /// Pixels plus their visual features: everything a page needs before the language model runs.
@@ -165,10 +182,23 @@ public final class OCRModel: @unchecked Sendable {
     /// still pointing at another stream's work.
     func preparePage(image: OCRImage, prompt: String?) throws -> PreparedPage {
         let tPrepare = Date()
+        // A page whose pixels have been seen before needs neither the resample nor the tower;
+        // only the ids, which are the one part the prompt can change.
+        if let hit = visionCache.lookup(image) {
+            let ids = try promptIDs(grid: hit.grid, prompt: prompt)
+            if OCRRuntimeFlags.reportPrefill {
+                FileHandle.standardError.write(Data(String(
+                    format: "[prefill] cached  %.0f ms\n",
+                    Date().timeIntervalSince(tPrepare) * 1000).utf8))
+            }
+            return PreparedPage(prep: Prepared(global: nil, tiles: nil, grid: hit.grid, ids: ids),
+                                visual: hit.visual)
+        }
         let prep = try prepare(image: image, prompt: prompt)
         let tHost = Date()
         let visual = visualFeatures(prep)
         eval(visual)
+        visionCache.insert(image, visual: visual, grid: prep.grid)
         if OCRRuntimeFlags.reportPrefill {
             // Split, because the two halves have different cures: the host half is Pillow's
             // fixed-point resample in pure Swift and can run on any core, the tower half is GPU.
@@ -210,7 +240,12 @@ public final class OCRModel: @unchecked Sendable {
             parts.append(rows.reshaped([-1, d]))
         }
 
-        let globalFeatures = vision(prep.global)                 // (1, gq*gq, D)
+        guard let globalPixels = prep.global else {
+            // Only reachable if someone asks for features from a page whose pixels were dropped
+            // after they were cached, which is a programming error rather than a runtime one.
+            fatalError("visualFeatures called on a page with no pixels; use the cached features")
+        }
+        let globalFeatures = vision(globalPixels)                // (1, gq*gq, D)
         let gq = Int(Double(globalFeatures.dim(1)).squareRoot().rounded())
         var g = globalFeatures.reshaped([gq, gq, d])
         g = concatenated([g, broadcast(imageNewline.reshaped([1, 1, d]), to: [gq, 1, d])], axis: 1)

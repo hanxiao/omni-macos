@@ -175,15 +175,36 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
 - Corroborated upstream: ml-explore/mlx discussion #3829 measures per-frame VLM cost on an M3 Max
   and finds vision encode ~constant at ~75 ms/frame and "encoder-independent - optimizing the
   vision tower doesn't move the needle", with LM prefill dominating on capable models.
-- Unexplored leads, recorded so the search is not repeated: (a) OVERLAP prefill of the next group
-  with the decode of the current one - decode at width 32 is launch- and bandwidth-bound while
-  prefill is compute-bound, so the two should be complementary, but `--vision-prefetch` was ~0 on
-  the single path because it reschedules rather than removes, so this needs measuring before it is
-  built. (b) BaseRT (arXiv 2607.00501) reports uzu beating it on prefill because uzu goes through
-  MPSGraph, which can dispatch GEMM to the ANE; our prefill is exactly that GEMM and the ANE is
-  idle. (c) vllm-mlx (arXiv 2601.19139) caches vision embeddings by content hash for 28x on
-  repeated images - useless for a first pass over distinct pages, but it is the right answer for
-  re-transcribing a page the workspace has already seen.
+- GROUP-AHEAD PREFETCH: BUILT, MEASURED, NOT DEFAULT (`--pipeline`, `--pipeline-host`). Prefill
+  the NEXT group on its own MLX stream while the current one decodes. It works exactly as
+  designed - the stall it is meant to remove does fall, 14.6 -> 3.0 s at width 8 and 14.5 ->
+  11.7 s at width 32 - and it buys almost nothing, because the GPU has no idle compute to absorb
+  it: 259 -> 266 at width 8, 340 -> 350 at width 16, 400 -> 402 at width 32. Hidden work returns
+  only 20-25% of its own time. THE HYPOTHESIS WAS WRONG: batch decode is not leaving the compute
+  units idle for a compute-bound prefill to slot into, it is already saturating them. Host-only
+  prefetch (rasterise and resample ahead, pure CPU) is worth 0.2-0.9 s of a whole run. Same
+  conclusion `--vision-prefetch` reached on the single path, now confirmed for the batched one at
+  17x the prefetch depth. Digest unchanged at every setting.
+- MPSGRAPH / ANE FOR PREFILL: MEASURED AND REJECTED (`--probe-gemm`). BaseRT (arXiv 2607.00501)
+  attributes uzu's prefill lead to MPSGraph's ability to reach the Neural Engine, so the raw op
+  was timed at prefill shapes. MPSGraph fp16 runs at 0.84x to 1.04x of MLX - within noise, mostly
+  slower: M1007xK1280xN1280 0.65 vs 0.64 ms, M4096xK1280xN1280 1.05 vs 0.88 ms. No ANE dispatch
+  materialises. Note also that MLX fp32 matches or beats its own fp16 at these shapes (5-15
+  TFLOPs against the chip's ceiling), so prefill's GEMMs are launch- and occupancy-bound rather
+  than arithmetic-bound, and a faster GEMM kernel is not the lever. Our weights are quantized
+  anyway, so an MPSGraph path would have to dequantize the model first.
+- VISION CACHE: ADOPTED (`OCRVisionCache`). Visual features keyed by a 128-bit content hash of
+  the pixel buffer. The tower and the resample depend only on the image - the prompt reaches the
+  model as token ids and the pixels never appear in them - so `promptIDs(grid:prompt:)` is split
+  out of `prepare` and a hit costs only the ids. Measured on the 40-page scan, same process:
+  pass 1 59.5 s / 401 tok/s, pass 2 45.6 s / 523 tok/s, stall 14.6 -> 0.9 s, digest identical
+  (772db0f94e0ae106). In the app, the same file dropped twice runs 80 pages at 473 tok/s against
+  381 for a single pass. 4.4 MB a page; bounded at 256 MB and CHARGED TO `OCRBatchPlan`'s reserve
+  so it costs a slot on paper rather than discovering one at runtime. Worth nothing on a first
+  pass over distinct pages, which is why it is a cache: it pays for an edited prompt, a re-drop,
+  and a page re-queued after a stop.
+- `Prepared.global` is OPTIONAL because a cached page has features and no pixels. `visualFeatures`
+  traps on nil and the stage dump throws - both are only ever driven from a freshly prepared page.
 - Measured and rejected, do not re-derive: mlx-swift 0.31.4 (same qmm bug; 0.31.5+ needs
   Swift 6.3). DFlash/EAGLE trees need a draft model we cannot train here; ViT token merging breaks
   the fixed visual-token/prompt-slot contract.

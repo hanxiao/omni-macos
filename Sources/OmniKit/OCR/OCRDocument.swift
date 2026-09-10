@@ -296,7 +296,7 @@ extension OCRModel {
 /// read by at most one detached task at a time, because the page loop joins each lookahead before
 /// creating the next. It is never touched by the loop's own rendering, which uses a separate
 /// handle.
-private final class PageRenderer: @unchecked Sendable {
+final class PageRenderer: @unchecked Sendable {
     private let document: PDFDocument?
     private let maxDimension: Int
 
@@ -318,7 +318,7 @@ private final class PageRenderer: @unchecked Sendable {
 /// The page loop is synchronous by design - it drives a GPU that serialises anyway, and making it
 /// `async` would push `await` through every caller for no concurrency gain. The only genuine
 /// parallelism is the CPU page-prep running ahead, and this is what joins it back.
-private func await_<T: Sendable>(_ task: Task<T, Never>) -> T {
+func await_<T: Sendable>(_ task: Task<T, Never>) -> T {
     let semaphore = DispatchSemaphore(value: 0)
     let box = ResultBox<T>()
     Task.detached(priority: .userInitiated) {

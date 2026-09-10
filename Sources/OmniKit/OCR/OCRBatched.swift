@@ -1,6 +1,5 @@
 import Foundation
 import MLX
-import MLXRandom
 import PDFKit
 
 /// Decoding several pages at once, through one copy of the weights.
@@ -52,8 +51,13 @@ public enum OCRBatchPlan {
     /// Sized from memory the way the worker count is, and for the same reason: this must not be a
     /// number that happens to fit the machine it was tuned on. A 16 GB laptop lands around 16,
     /// which is worth 1.75x; it cannot hold a second copy of the weights at all.
+    /// What the visual cache is allowed to hold, and therefore what the width has to leave for
+    /// it. Counted in the reserve rather than left to chance: a cache that quietly costs a slot
+    /// is a cache that makes the machine it is meant to help slower.
+    public static let visualCacheBytes = 256 << 20
+
     public static func recommendedWidth(modelBytes: Int, pageCount: Int,
-                                        reserveBytes: Int = 2_000_000_000,
+                                        reserveBytes: Int = 2_000_000_000 + visualCacheBytes,
                                         availableBytes: Int? = nil) -> Int {
         guard pageCount >= worthwhile else { return 1 }
         let ceiling = availableBytes
@@ -78,7 +82,7 @@ extension OCRModel {
         var lines: [String] = []
         var perTileAtOne = 0.0
         for n in counts {
-            let x = MLXRandom.normal([n, side, side, 3]) * 0.5
+            let x = MLX.zeros([n, side, side, 3], dtype: .float32) + 0.5
             eval(x)
             eval(vision(x))                                  // warm the kernels for this shape
             let t = Date()
@@ -274,7 +278,9 @@ extension OCRModel {
     public func transcribeBatched(pdfAt url: URL, prompt: String? = nil, maxNewTokens: Int = 0,
                                   pageRange: Range<Int>? = nil, dpi: Int = 200, width: Int? = nil,
                                   loopGuard: Bool = true, loopReps: Int = 24,
-                                  loopGrace: Int = 96) throws -> DocumentResult {
+                                  loopGrace: Int = 96,
+                                  pipelined: Bool = false,
+                                  pipelineHostOnly: Bool = false) throws -> DocumentResult {
         guard let document = PDFDocument(url: url) else {
             throw OmniError.model("cannot open PDF \(url.lastPathComponent)")
         }
@@ -287,36 +293,83 @@ extension OCRModel {
 
         let start = Date()
         var results: [PageResult] = []
-        var group: [PreparedPage] = []
-        var groupIndices: [Int] = []
+        var stalled: Double = 0
 
-        func flush() throws {
-            guard !group.isEmpty else { return }
-            let out = try decodeBatch(group, width: group.count, maxNewTokens: maxNewTokens,
+        let indices = Array(range)
+        let groups = stride(from: 0, to: indices.count, by: width).map {
+            Array(indices[$0 ..< min($0 + width, indices.count)])
+        }
+
+        // GROUP-AHEAD PREFETCH. Prefill is fixed per page and now the larger half of a batched
+        // run, so the question is not how to make it cheaper but where to hide it. The decode of a
+        // wide group is long, and it is launch- and bandwidth-bound rather than compute-bound, so
+        // the compute-bound prefill of the NEXT group should have room to run underneath it. Its
+        // own PDF handle and its own MLX stream; at most one is in flight.
+        let renderer = PageRenderer(url: url, maxDimension: maxDimension)
+        let model = self
+        // Two depths, because they are different bets. HOST ahead moves only the rasterise and
+        // the fixed-point resample, which are pure CPU and cannot contend with the GPU at all.
+        // FULL also runs the vision tower ahead on its own MLX stream, which can only pay if the
+        // decode leaves the GPU's compute units idle.
+        let hostOnly = pipelineHostOnly
+        func prefetch(_ g: [Int]) -> Task<[PreparedPage], Never> {
+            Task.detached(priority: .userInitiated) {
+                if hostOnly {
+                    return g.compactMap { i -> PreparedPage? in
+                        renderer.render(i).map { PreparedPage(pending: $0) }
+                    }
+                }
+                return Stream.withNewDefaultStream(device: .gpu) {
+                    g.compactMap { i -> PreparedPage? in
+                        guard let image = renderer.render(i) else { return nil }
+                        return try? model.preparePage(image: image, prompt: prompt)
+                    }
+                }
+            }
+        }
+
+        func prepareHere(_ g: [Int]) throws -> [PreparedPage] {
+            try g.compactMap { i -> PreparedPage? in
+                guard let cg = FileExtractor.renderPDFPage(document, index: i,
+                                                           maxDimension: maxDimension),
+                      let image = try? OCRPreprocess.rgb(from: cg) else { return nil }
+                return try preparePage(image: image, prompt: prompt)
+            }
+        }
+
+        let pipelined = pipelined || pipelineHostOnly
+        var ahead: Task<[PreparedPage], Never>? = pipelined && !groups.isEmpty
+            ? prefetch(groups[0]) : nil
+
+        for (gi, g) in groups.enumerated() {
+            let waitStart = Date()
+            var prepared: [PreparedPage]
+            if let ahead { prepared = await_(ahead) } else { prepared = try prepareHere(g) }
+            // Host-ahead hands back pixels; the tower still has to run, here, on the main stream.
+            for i in prepared.indices where prepared[i].pending != nil {
+                prepared[i] = try preparePage(image: prepared[i].pending!, prompt: prompt)
+            }
+            stalled += Date().timeIntervalSince(waitStart)
+
+            // Start the next group's pixels and vision BEFORE decoding this one.
+            ahead = (pipelined && gi + 1 < groups.count) ? prefetch(groups[gi + 1]) : nil
+
+            guard !prepared.isEmpty else { continue }
+            let out = try decodeBatch(prepared, width: prepared.count, maxNewTokens: maxNewTokens,
                                       loopGuard: loopGuard, loopReps: loopReps,
                                       loopGrace: loopGrace)
-            for (offset, r) in out.enumerated() {
-                results.append(PageResult(page: groupIndices[offset] + 1, text: r.text,
+            for (offset, r) in out.enumerated() where offset < g.count {
+                results.append(PageResult(page: g[offset] + 1, text: r.text,
                                           tokenCount: r.tokens.count, promptTokens: r.promptTokens,
                                           ttft: r.ttft, decodeTokensPerSecond: r.decodeTokensPerSecond,
                                           stoppedBy: r.stoppedBy, prepareSeconds: r.prepareSeconds,
                                           totalSeconds: 0))
             }
-            group.removeAll()
-            groupIndices.removeAll()
         }
-
-        for index in range {
-            guard let cg = FileExtractor.renderPDFPage(document, index: index, maxDimension: maxDimension),
-                  let image = try? OCRPreprocess.rgb(from: cg) else { continue }
-            group.append(try preparePage(image: image, prompt: prompt))
-            groupIndices.append(index)
-            if group.count == width { try flush() }
-        }
-        try flush()
 
         return DocumentResult(pages: results.sorted { $0.page < $1.page },
-                              totalSeconds: Date().timeIntervalSince(start), stalledSeconds: 0)
+                              totalSeconds: Date().timeIntervalSince(start),
+                              stalledSeconds: stalled)
     }
 }
 
