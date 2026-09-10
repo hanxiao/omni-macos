@@ -387,6 +387,11 @@ extension OCRModel {
             }
         }
         let ttft = Date().timeIntervalSince(t0)
+        if OCRRuntimeFlags.reportPrefill {
+            FileHandle.standardError.write(Data(String(
+                format: "[group] %d pages prefilled in %.1f s before the first token\n",
+                b, ttft).utf8))
+        }
 
         let cap = requested > 0 ? requested
             : OCRTokenBudget.maxNewTokens(promptTokens: promptLengths.max() ?? 1007,
@@ -513,7 +518,8 @@ extension OCRModel {
                                   loopGuard: Bool = true, loopReps: Int = 24,
                                   loopGrace: Int = 96,
                                   pipelined: Bool = false,
-                                  pipelineHostOnly: Bool = false) throws -> DocumentResult {
+                                  pipelineHostOnly: Bool = false,
+                                  opener: Int = 0) throws -> DocumentResult {
         guard let document = PDFDocument(url: url) else {
             throw OmniError.model("cannot open PDF \(url.lastPathComponent)")
         }
@@ -532,11 +538,31 @@ extension OCRModel {
         // Continuous batching schedules ROWS, not groups: it needs every page in one call so a
         // finished row has something to be refilled with. Slicing into groups of exactly `width`
         // leaves it nothing to admit and it silently degenerates to the static path.
-        let groups = OCRRuntimeFlags.continuousBatch
-            ? [indices]
-            : stride(from: 0, to: indices.count, by: width).map {
-                Array(indices[$0 ..< min($0 + width, indices.count)])
+        // A narrow OPENING group, matching what the app does: every page of a group is prefilled
+        // before the group's first token exists, so a full-width opener means no text at all for
+        // width x ~650 ms. This measures what that costs in throughput.
+        func planned(_ all: [Int]) -> [[Int]] {
+            var out: [[Int]] = []
+            var rest = all[...]
+            if opener > 0, opener < width, rest.count > opener {
+                out.append(Array(rest.prefix(opener)))
+                rest = rest.dropFirst(opener)
             }
+            // BALANCED, not greedy. Greedy packing leaves a stub - 36 pages at width 32 becomes
+            // 32 and 4 - and a 4-row group costs nearly as much per step as a 32-row one. Split
+            // the remainder into equal groups instead: 18 and 18.
+            guard !rest.isEmpty else { return out }
+            let count = (rest.count + width - 1) / width
+            let base = rest.count / count
+            let extra = rest.count % count
+            for g in 0 ..< count {
+                let take = base + (g < extra ? 1 : 0)
+                out.append(Array(rest.prefix(take)))
+                rest = rest.dropFirst(take)
+            }
+            return out
+        }
+        let groups = OCRRuntimeFlags.continuousBatch ? [indices] : planned(indices)
 
         // GROUP-AHEAD PREFETCH. Prefill is fixed per page and now the larger half of a batched
         // run, so the question is not how to make it cheaper but where to hide it. The decode of a
@@ -623,11 +649,20 @@ extension OCRModel {
                                   width: Int? = nil, loopGuard: Bool = true, loopReps: Int = 24,
                                   loopGrace: Int = 96,
                                   onStream: (@Sendable (Int, StreamUpdate) -> Void)? = nil,
+                                  onPrefill: (@Sendable (Int, Int) -> Void)? = nil,
                                   onFinish: (@Sendable (Int, Result) -> Void)? = nil,
                                   shouldContinue: (@Sendable () -> Bool)? = nil) throws -> [Result] {
         let width = width ?? OCRBatchPlan.recommendedWidth(modelBytes: weightBytes,
                                                            pageCount: images.count)
-        let prepared = try images.map { try preparePage(image: $0, prompt: prompt) }
+        // Every page is prefilled before the group's first token exists, so on a wide group this
+        // is the whole of the wait the reader sees. Report it rather than leaving a still label.
+        var prepared: [PreparedPage] = []
+        prepared.reserveCapacity(images.count)
+        for (n, image) in images.enumerated() {
+            prepared.append(try preparePage(image: image, prompt: prompt))
+            onPrefill?(n + 1, images.count)
+            if let shouldContinue, !shouldContinue() { break }
+        }
         return try decodeBatch(prepared, width: max(width, 1), maxNewTokens: maxNewTokens,
                                loopGuard: loopGuard, loopReps: loopReps, loopGrace: loopGrace,
                                onStream: onStream, onFinish: onFinish,

@@ -161,6 +161,11 @@ struct OCRView: View {
     /// at a wide batch that alone is twenty seconds of prefill before a single token lands.
     private var waitingTitle: String {
         if session.phase == .loading { return "Loading the model" }
+        if session.prefillTarget > 1 {
+            // A wide group prefills every page before any of them can produce a word, so this is
+            // the whole wait and it needs a number that moves.
+            return "Reading \(session.prefilled) of \(session.prefillTarget) pages"
+        }
         if visibleDocumentIsRunning { return "Reading the page" }
         return session.isBusy ? "Queued" : "Preparing"
     }

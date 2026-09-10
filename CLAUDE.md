@@ -205,6 +205,22 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   and a page re-queued after a stop.
 - `Prepared.global` is OPTIONAL because a cached page has features and no pixels. `visualFeatures`
   traps on nil and the stage dump throws - both are only ever driven from a freshly prepared page.
+- THE WAIT BEFORE THE FIRST WORD IS PREFILL, NOT SHADER COMPILATION. Asked because a first run
+  looked stuck for a long time: page 1's vision tower costs 364 ms against 284 ms for page 2, and
+  a SECOND process measures the same 364, so Metal pipeline building is a ~80 ms one-off and
+  there is nothing to precompile after download. The real cause is that every page of a group is
+  prefilled before the group's first token exists - 10.0 s for a 32-page group here, roughly
+  twice that on a laptop, with a label that did not move.
+- GROUPS ARE BALANCED, NOT GREEDY. 40 pages at width 32 used to be 32 + 8, and a narrow group
+  costs nearly as much per step as a full one, so the stub was paid for twice. Splitting evenly
+  (20 + 20) is free on throughput and better on latency: 401 tok/s against 399, first token at
+  6.3 s against 10.0 s, digest unchanged.
+- A NARROW OPENING GROUP IS MEASURED AND REJECTED. Four pages first puts words on screen in 1.2 s
+  but costs 16% (399 -> 337, and 339 even with the rest balanced), because a group runs as long
+  as its LONGEST page: an opener holding a 1309-token page decodes almost serially at width 4.
+  No opener size escapes that. Continuous batching is the fix for this wait, not a smaller group.
+- The workspace reports prefill progress ("Reading 12 of 20 pages") through `onPrefill`, because
+  a wide group's prefill IS the wait and a still label reads as a hang.
 - BATCH OCCUPANCY ON A REAL DOCUMENT IS 45%. Pages run 72 to 1310 tokens, so a static group runs
   for as many steps as its LONGEST page and spends most of them narrowed. That matters because a
   decode step is strongly SUB-LINEAR in its row count, measured at a 1024-token context with

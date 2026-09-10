@@ -313,7 +313,8 @@ if let i = args.firstIndex(of: "--pdf") {
                                               dpi: intAfter("--dpi", in: args) ?? 200,
                                               width: batchWidth,
                                               pipelined: args.contains("--pipeline"),
-                                              pipelineHostOnly: args.contains("--pipeline-host"))
+                                              pipelineHostOnly: args.contains("--pipeline-host"),
+                                              opener: intAfter("--opener", in: args) ?? 0)
             elapsed = Date().timeIntervalSince(started)
             if passes > 1 {
                 print(String(format: "pass %d: %.1f s, %.0f aggregate tok/s, stalled %.1f s  [%@]",
