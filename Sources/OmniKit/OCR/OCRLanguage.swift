@@ -160,15 +160,24 @@ final class OCRBatchKVCache {
     private(set) var startedAt: [Int]
     private(set) var cursor = 0
 
+    /// Rows actually in use, always a PREFIX of the buffer. The buffer is allocated at the full
+    /// width so nothing is reallocated, but a run can start decoding on a handful of rows and
+    /// bring the rest in as it goes - which is what stops the first token waiting on every
+    /// page's prefill.
+    private(set) var active = 0
+
     /// -1 until the row writes its first generated token. It CANNOT be fixed at seed time: a
     /// fresh batch seeds its rows one after another, and prompts differ in length whenever the
     /// pages have different tile grids, so a later, longer prompt moves the cursor past an
     /// earlier row's recorded start and silently turns that row's gap into valid history.
     private static let notStarted = -1
 
+    /// Bring `n` rows into the batch. Only ever grows, and never past the allocated width.
+    func activate(_ n: Int) { active = min(max(active, n), batchCount) }
+
     /// Logical tokens per row: its prompt plus what it has generated since it started.
     var lengths: [Int] {
-        (0 ..< batchCount).map {
+        (0 ..< active).map {
             promptLen[$0] + (startedAt[$0] < 0 ? 0 : max(0, cursor - startedAt[$0]))
         }
     }
@@ -185,11 +194,20 @@ final class OCRBatchKVCache {
     /// Append one token per sequence. `k`/`v` are (B, heads, 1, d).
     func appendStep(_ k: MLXArray, _ v: MLXArray) {
         grow(to: cursor + 1, like: k)
-        keys![0..., 0..., cursor ..< (cursor + 1), 0...] = k
-        values![0..., 0..., cursor ..< (cursor + 1), 0...] = v
+        // The FULL-RANGE form when every row is live, which is the common case. Slicing the
+        // batch axis explicitly costs the in-place fast path: writing `0 ..< n` unconditionally
+        // measured 282 aggregate tok/s against 401 on the 40-page scan.
+        let n = k.dim(0)
+        if n == batchCount {
+            keys![0..., 0..., cursor ..< (cursor + 1), 0...] = k
+            values![0..., 0..., cursor ..< (cursor + 1), 0...] = v
+        } else {
+            keys![0 ..< n, 0..., cursor ..< (cursor + 1), 0...] = k
+            values![0 ..< n, 0..., cursor ..< (cursor + 1), 0...] = v
+        }
         // A row that had not written yet starts here, which is the only moment the shared cursor
         // and the row's own history are guaranteed to line up.
-        for b in 0 ..< batchCount where startedAt[b] < 0 { startedAt[b] = cursor }
+        for b in 0 ..< n where startedAt[b] < 0 { startedAt[b] = cursor }
         cursor += 1
         if OCRRuntime.evalCacheWrites { eval(keys!, values!) }
     }
@@ -209,6 +227,7 @@ final class OCRBatchKVCache {
         promptLen[slot] = t
         cursor = max(cursor, t)
         startedAt[slot] = Self.notStarted
+        activate(slot + 1)
     }
 
     /// Whether a page of `promptTokens` can be admitted into a finished row right now. It cannot
@@ -235,8 +254,12 @@ final class OCRBatchKVCache {
     }
 
     var view: (keys: MLXArray, values: MLXArray)? {
-        guard let k = keys, let v = values, cursor > 0 else { return nil }
-        return (k[0..., 0..., 0 ..< cursor, 0...], v[0..., 0..., 0 ..< cursor, 0...])
+        guard let k = keys, let v = values, cursor > 0, active > 0 else { return nil }
+        if active == batchCount {
+            return (k[0..., 0..., 0 ..< cursor, 0...], v[0..., 0..., 0 ..< cursor, 0...])
+        }
+        return (k[0 ..< active, 0..., 0 ..< cursor, 0...],
+                v[0 ..< active, 0..., 0 ..< cursor, 0...])
     }
 
     /// Drop the rows a finished sequence occupied. Page lengths here run 75 to 1309 tokens, so
@@ -250,6 +273,7 @@ final class OCRBatchKVCache {
         promptLen = idx.map { promptLen[$0] }
         startedAt = idx.map { startedAt[$0] }
         batchCount = count
+        active = count
     }
 
     /// Additive mask, (B, 1, 1, cursor): 0 where a row may attend, -inf on the span between its
@@ -261,15 +285,16 @@ final class OCRBatchKVCache {
     func mask() -> MLXArray? {
         let t = cursor
         guard t > 0 else { return nil }
+        guard active > 0 else { return nil }
         guard OCRRuntimeFlags.forceBatchMask
-            || (0 ..< batchCount).contains(where: { promptLen[$0] < outputStart($0) }) else {
+            || (0 ..< active).contains(where: { promptLen[$0] < outputStart($0) }) else {
             return nil
         }
-        var buf = [Float](repeating: 0, count: batchCount * t)
-        for b in 0 ..< batchCount where promptLen[b] < outputStart(b) {
+        var buf = [Float](repeating: 0, count: active * t)
+        for b in 0 ..< active where promptLen[b] < outputStart(b) {
             for j in promptLen[b] ..< min(outputStart(b), t) { buf[b * t + j] = -Float.infinity }
         }
-        return MLXArray(buf, [batchCount, 1, 1, t])
+        return MLXArray(buf, [active, 1, 1, t])
     }
 }
 

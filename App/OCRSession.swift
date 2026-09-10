@@ -923,9 +923,14 @@ final class OCRSession {
                         ? (queued.count + groupCount - 1) / groupCount
                         : width
                     if effective > 1 {
-                        let group = Array(queued.prefix(effective))
-                        await self.runGroup(group, model: loaded, settings: settings,
-                                            documents: documents, gate: gate, token: token)
+                        // Continuous decoding schedules ROWS, so it needs the whole queue in one
+                        // call: handed a slice exactly as wide as the batch it has nothing to
+                        // admit and quietly behaves like the static path.
+                        let group = OCRRuntimeFlags.continuousBatch
+                            ? queued : Array(queued.prefix(effective))
+                        await self.runGroup(group, width: effective, model: loaded,
+                                            settings: settings, documents: documents,
+                                            gate: gate, token: token)
                         continue
                     }
 
@@ -1006,13 +1011,17 @@ final class OCRSession {
     /// Every page in the group streams at once - they all produce a token per step - so the
     /// workspace shows live text for whichever one the reader is on, and the rail fills in as each
     /// finishes. The group is the pause and stop boundary, the way a single page was.
-    private func runGroup(_ group: [Int], model loaded: OCRModel,
+    private func runGroup(_ group: [Int], width: Int, model loaded: OCRModel,
                           settings: (prompt: String?, draftLength: Int, loopGuard: Bool),
                           documents: PDFCache, gate: OCRRunGate, token: Int) async {
         startRateClock()
         prefilled = 0
-        prefillTarget = group.count
-        for index in group { pages[index].state = .running }
+        let continuous = OCRRuntimeFlags.continuousBatch
+        // Static prefills every page before anything decodes, so the whole group is running and
+        // the wait is worth counting. Continuous admits a few rows and grows, so pages become
+        // running as they arrive and there is no long still moment to report.
+        prefillTarget = continuous ? 0 : group.count
+        if !continuous { for index in group { pages[index].state = .running } }
         runningIndex = group.first
         isGroupRunning = group.count > 1
         // `documents` here is the PDF cache parameter, not the tab list - hence `self`.
@@ -1031,7 +1040,7 @@ final class OCRSession {
             return (try? loaded.transcribeBatched(
                 images: images,
                 prompt: settings.prompt,
-                width: group.count,
+                width: width,
                 loopGuard: settings.loopGuard,
                 onStream: { slot, update in
                     Task { @MainActor [weak self] in
@@ -1067,6 +1076,22 @@ final class OCRSession {
                         self.settle(index, with: result)
                     }
                 },
+                onAdmit: { page in
+                    // Continuous decoding brings rows in as it goes, so a page becomes running
+                    // when its row is admitted rather than when the group starts.
+                    Task { @MainActor [weak self] in
+                        guard let self, self.runToken == token, page < group.count else { return }
+                        let index = group[page]
+                        guard self.pages.indices.contains(index),
+                              self.pages[index].state == .pending else { return }
+                        self.pages[index].state = .running
+                        if self.runningIndex == nil { self.runningIndex = index }
+                    }
+                },
+                // A pause stops ADMISSION rather than freezing mid-page: the batch drains to
+                // nothing and the run loop's own hold takes over, which is the page boundary the
+                // pause has always meant.
+                shouldAdmit: { !gate.isPaused },
                 shouldContinue: { !gate.isStopped })) ?? []
         }.value
 
@@ -1084,6 +1109,9 @@ final class OCRSession {
                     pages[index].state = gate.isStopped ? .stopped : .failed
                 }
             }
+            // A page the scheduler never admitted - because the run was paused or stopped while
+            // it was still queued - stays PENDING, so resuming picks it up where it was left.
+
             pages[index].seconds = seconds
         }
         if !find.isEmpty { rebuildMatches() }

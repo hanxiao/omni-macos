@@ -265,6 +265,12 @@ if await OCRWorker.runIfRequested(CommandLine.arguments) { exit(0) }
 /// The integer after a flag, or nil. Guarded: a flag given as the LAST argument used to index
 /// past the end of `args` and trap, which is how `--processes` with no explicit count crashed the
 /// run before it had transcribed a single page.
+// Global switches, set BEFORE any mode branches. They used to be assigned inside the `--pdf`
+// branch, so `--continuous` was silently ignored by every other mode - including the grading
+// one, which then reported the static path's CER under a "continuous" heading.
+OCRRuntimeFlags.continuousBatch = !args.contains("--static")
+OCRRuntimeFlags.forceBatchMask = args.contains("--force-mask")
+
 func intAfter(_ flag: String, in args: [String]) -> Int? {
     guard let i = args.firstIndex(of: flag), i + 1 < args.count else { return nil }
     return Int(args[i + 1])
@@ -293,8 +299,6 @@ if let i = args.firstIndex(of: "--pdf") {
     OCRRuntimeFlags.loopGuardForPDF = !args.contains("--no-loop-guard")
     OCRRuntimeFlags.visionPrefetch = args.contains("--vision-prefetch")
     OCRRuntimeFlags.reportPrefill = args.contains("--report-prefill")
-    OCRRuntimeFlags.continuousBatch = args.contains("--continuous")
-    OCRRuntimeFlags.forceBatchMask = args.contains("--force-mask")
     let workers = intAfter("--workers", in: args) ?? 1
     let printText = args.contains("--print-text")
 
@@ -528,6 +532,45 @@ print("        \(String(format: "%.2f", Double(inventory.bytes) / 1e9)) GB  "
       + "\(inventory.packs) packs / \(inventory.plainTensors) plain  [\(bitsSummary)]")
 print("        loaded in \(String(format: "%.1f", model.loadSeconds))s")
 print("oracle  \(refRoot.path)  (torch bfloat16)")
+
+// The QUALITY GATE for the batched paths. Every other batch measurement runs on a PDF, but the
+// grading corpus is loose PNGs, and rendering them through a PDF at 200 dpi mangles 7pt type
+// badly enough that the model loops - so that harness measured nothing. This one feeds the same
+// images the single path is graded on straight into `transcribeBatched`, so a batch's CER is
+// comparable with the greedy CER printed below it, page for page, against the same torch oracle.
+if args.contains("--grade-batch") {
+    let width = intAfter("--batch", in: args) ?? references.count
+    var images: [OCRImage] = []
+    for ref in references {
+        guard let image = try? OCRPreprocess.load(contentsOf: URL(fileURLWithPath: ref.imagePath)) else {
+            die("cannot read \(ref.imagePath)")
+        }
+        images.append(image)
+    }
+    let started = Date()
+    // Loop guard OFF, as the greedy gate runs it: the claim under test is that an unguarded
+    // batched decode reproduces the reference, not that the guard rescues it.
+    // The SAME cap the greedy gate uses (--max-new, default 1024). Two hard2 pages never reach
+    // EOS, so with the budget-derived cap they run to 31753 tokens of repetition and the two
+    // paths are not comparable at all - which is what the first attempt at this measured.
+    let out = try model.transcribeBatched(images: images, maxNewTokens: maxNew, width: width,
+                                          loopGuard: false)
+    let elapsed = Date().timeIntervalSince(started)
+    var cers: [Double] = []
+    var exact = 0
+    for (n, ref) in references.enumerated() where n < out.count {
+        let cer = characterErrorRate(out[n].text, ref.text)
+        cers.append(cer)
+        if out[n].text == ref.text { exact += 1 }
+        print(String(format: "%-16s CER %.4f  %5d tok  %@", (ref.name as NSString).utf8String!,
+                     cer, out[n].tokens.count, out[n].text == ref.text ? "exact" : ""))
+    }
+    let mean = cers.isEmpty ? 0 : cers.reduce(0, +) / Double(cers.count)
+    let mode = OCRRuntimeFlags.continuousBatch ? "continuous" : "static"
+    print("\nbatch width \(width) \(mode): \(exact)/\(references.count) exact vs torch bf16, "
+          + String(format: "mean CER %.4f, %.1f s", mean, elapsed))
+    exit(0)
+}
 print("")
 
 var results: [CaseResult] = []

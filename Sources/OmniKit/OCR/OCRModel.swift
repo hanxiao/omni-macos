@@ -171,9 +171,15 @@ public final class OCRModel: @unchecked Sendable {
         var visual: MLXArray! = nil
         /// Set when only the PIXELS were prepared ahead and the vision tower still has to run.
         var pending: OCRImage? = nil
+        /// The prompt that page is to be read with, carried alongside the pixels: a page prepared
+        /// later must not silently fall back to the default one the reader edited away.
+        var pendingPrompt: String? = nil
 
         init(prep: Prepared, visual: MLXArray) { self.prep = prep; self.visual = visual }
-        init(pending: OCRImage) { self.pending = pending }
+        init(pending: OCRImage, prompt: String? = nil) {
+            self.pending = pending
+            self.pendingPrompt = prompt
+        }
     }
 
     /// Preprocess and run the vision tower. Safe to call on a background task inside

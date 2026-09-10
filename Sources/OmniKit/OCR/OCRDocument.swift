@@ -33,8 +33,11 @@ public enum OCRRuntimeFlags {
     /// TTFT is dead time before a single character appears, and on a laptop it is the part of the
     /// wall clock a reader actually feels.
     nonisolated(unsafe) public static var reportPrefill = false
-    /// Refill a finished row with the next page instead of narrowing the batch.
-    nonisolated(unsafe) public static var continuousBatch = false
+    /// Refill a finished row with the next page instead of narrowing the batch, and start on a
+    /// few rows rather than every page. ON by default since it is both faster and quicker to
+    /// first word, and graded against the torch oracle on bench/hard2 at 8/10 exact, mean CER
+    /// 0.0086, against 7/10 and 0.0087 for the single path.
+    nonisolated(unsafe) public static var continuousBatch = true
     /// Diagnostic: hand attention an all-zero mask even when the rows are level, so the masked
     /// and unmasked kernel paths can be compared on identical scheduling.
     nonisolated(unsafe) public static var forceBatchMask = false

@@ -211,6 +211,16 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   there is nothing to precompile after download. The real cause is that every page of a group is
   prefilled before the group's first token exists - 10.0 s for a 32-page group here, roughly
   twice that on a laptop, with a label that did not move.
+- THE RAMP is what fixes the opening wait, and continuous batching alone does NOT: it still
+  admitted every row before the first step. Starting on `rampRows` (4) and admitting one more row
+  per step moves those prefills off the front of the run without stranding the early pages in a
+  narrow group, which is exactly what the static opener could not do.
+- Do not slice the batch axis when every row is live. Writing `keys![0 ..< n, ...]` unconditionally
+  in `appendStep` cost the in-place fast path and measured 282 aggregate tok/s against 401; the
+  full-range form is kept for the common case and the slice only used while the batch is ramping.
+- MEASURE BACK TO BACK. A long session leaves this machine measurably slower - the same committed
+  build scored 401 tok/s early and 307 hours later - so a number from earlier in the day is not a
+  baseline for a number now. Re-run the control.
 - GROUPS ARE BALANCED, NOT GREEDY. 40 pages at width 32 used to be 32 + 8, and a narrow group
   costs nearly as much per step as a full one, so the stub was paid for twice. Splitting evenly
   (20 + 20) is free on throughput and better on latency: 401 tok/s against 399, first token at
@@ -227,12 +237,13 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   `--probe-decode-width`: 5.60 / 8.95 / 9.53 / 11.47 / 15.89 / 22.21 ms at 1 / 2 / 4 / 8 / 16 / 32
   rows. 32 rows cost 4x what one row does and carry 32x the tokens, so running narrow is expensive
   and the row, not the group, is the unit of work.
-- CONTINUOUS BATCHING: BUILT, BIG, NOT DEFAULT YET (`--continuous`, `OCRRuntimeFlags.continuousBatch`).
-  A finished row is refilled with the next page instead of being dropped. Measured on the 40-page
-  scan: 260 -> 343 at width 8, 339 -> 417 at width 16, 402 -> 475 at width 32. It matters most at
-  the narrow widths a laptop can afford. `OCRBatchKVCache` grew per-row `promptLen`/`startedAt` and
-  a shared `cursor`: a recycled row keeps its prompt at [0, promptLen) and its output from
-  `startedAt`, and `mask()` hides the dead span in between.
+- CONTINUOUS BATCHING IS THE DEFAULT (`OCRRuntimeFlags.continuousBatch`, `--static` to turn it
+  off in ocr-verify). A finished row is refilled with the next page instead of being dropped, and
+  the batch RAMPS UP from 4 rows rather than prefilling every page first. Measured back to back
+  on the 40-page scan: 282 -> 364 aggregate tok/s and first token 9.2 s -> 1.3 s. `OCRBatchKVCache`
+  grew per-row `promptLen`/`startedAt` over a shared `cursor`, plus an `active` prefix so the
+  batch can widen while decoding; a recycled row keeps its prompt at [0, promptLen) and its
+  output from `startedAt`, and `mask()` hides the dead span between them.
 - PROMPTS IN A GROUP ARE NOT THE SAME LENGTH, and assuming they are crashed the shipped app
   (EXC_BREAKPOINT, `OCRBatchKVCache.seed`, cursor 1007 against a 1197-token prompt) the first
   time several documents were dropped at once. A page's tile grid comes from its ASPECT RATIO,
@@ -250,16 +261,21 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   groups of exactly `width`, so the scheduler was handed 32 pages with width 32, had nothing to
   admit, and degenerated to the static path while reporting a clean A/B of 403 vs 401 - a null
   result that was measuring nothing.
-- WHAT STILL GATES IT: at 20 pages the output is byte-identical to static; at 40 pages ONE token in
-  23,834 flips, "199 mL" to "199 m3". The static path already renders that same glyph family wrong
-  twice on its own ("373 m.L", "588 m3"), so this is the near-tie class, not corruption - but the
-  static path IS digest-stable across widths 8/16/32 and this is not, so it does not get to be the
-  default on a hunch. Forcing an all-zero mask through the static path reproduces the static digest
-  exactly, which rules out the masked kernel path and leaves the dead-span -inf reduction as the
-  suspect. The gate is CER against the torch oracle on bench/hard2, same as every other
-  near-tie change here. NOTE: hard2 is PNGs, and converting them to a PDF to reach the batch path
-  produces pages the model loops on (737 KB of repeated paragraphs for 30 pages) - that harness is
-  invalid, an images-based batch entry point is needed instead.
+- THE GATE IT PASSED: `ocr-verify <model> <refRoot> --grade-batch [--batch N] [--static]` feeds the
+  hard2 PNGs straight into `transcribeBatched` and scores CER against the same torch oracle the
+  greedy gate uses, so the two are comparable page for page. Continuous at width 4 over 10 pages
+  (6 rows recycled) scores 8/10 exact, mean CER 0.0086, against 7/10 and 0.0087 for the single
+  path - every page identical except `receipt_faded`, which continuous gets EXACT where the
+  single path had CER 0.0008. So the "199 mL" -> "199 m3" flip on long_scan is the near-tie class
+  and, on the corpus that grades quality, the flips are neutral to positive.
+- Two traps in building that gate, both of which made it measure nothing. `--grade-batch` must pass
+  the SAME `--max-new` cap the greedy gate uses (1024): with the budget-derived cap the two hard2
+  pages that never reach EOS run to 31753 tokens of repetition and score CER 29. And the runtime
+  flags were assigned inside the `--pdf` branch, so `--continuous` was ignored by every other mode
+  - the first three "continuous" gate runs were the static path under a continuous heading. Flags
+  are parsed globally now.
+- Converting hard2 to a PDF to reach the batch path is INVALID: at 200 dpi the 7pt columns turn to
+  mush and the model loops (737 KB of repeated paragraphs for 30 pages). Use `--grade-batch`.
 - IMAGE SIZE IS NOT A SPEED KNOB, measured: 12 pages at dpi 120 / 150 / 200 / 300 all run in
   22.5 s with an identical 4.5 s prefill stall. The reason is in `dynamicPreprocess`: it picks a
   tile grid from the ASPECT RATIO alone (`closestAspectRatio`, product capped at 9) and then

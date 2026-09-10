@@ -148,12 +148,16 @@ extension OCRModel {
                      loopGuard: Bool, loopReps: Int, loopGrace: Int,
                      onStream: (@Sendable (Int, StreamUpdate) -> Void)? = nil,
                      onFinish: (@Sendable (Int, Result) -> Void)? = nil,
+                     onAdmit: (@Sendable (Int) -> Void)? = nil,
+                     shouldAdmit: (@Sendable () -> Bool)? = nil,
                      shouldContinue: (@Sendable () -> Bool)? = nil) throws -> [Result] {
         if OCRRuntimeFlags.continuousBatch, width > 1 {
             return try decodeContinuous(prepared, width: width, maxNewTokens: requested,
                                         loopGuard: loopGuard, loopReps: loopReps,
                                         loopGrace: loopGrace, onStream: onStream,
-                                        onFinish: onFinish, shouldContinue: shouldContinue)
+                                        onFinish: onFinish, onAdmit: onAdmit,
+                                        shouldAdmit: shouldAdmit,
+                                        shouldContinue: shouldContinue)
         }
         var out = [Result?](repeating: nil, count: prepared.count)
         var next = 0
@@ -188,10 +192,16 @@ extension OCRModel {
     ///
     /// The cost is that a row admitted mid-flight is not level with its neighbours, so the shared
     /// KV buffer carries a dead span for it and attention needs a mask. See `OCRBatchKVCache`.
+    /// Rows the batch starts on before it widens. Four is enough that the first word lands in
+    /// about a second and small enough that the ramp is over within a few steps.
+    private static let rampRows = 4
+
     private func decodeContinuous(_ pages: [PreparedPage], width: Int, maxNewTokens requested: Int,
                                   loopGuard: Bool, loopReps: Int, loopGrace: Int,
                                   onStream: (@Sendable (Int, StreamUpdate) -> Void)? = nil,
                                   onFinish: (@Sendable (Int, Result) -> Void)? = nil,
+                                  onAdmit: (@Sendable (Int) -> Void)? = nil,
+                                  shouldAdmit: (@Sendable () -> Bool)? = nil,
                                   shouldContinue: (@Sendable () -> Bool)? = nil) throws -> [Result] {
         let n = pages.count
         let w = min(width, n)
@@ -202,14 +212,29 @@ extension OCRModel {
         var tokens = [[Int]](repeating: [], count: n)
         var promptLengths = [Int](repeating: 0, count: n)
         var stopped = [StopReason](repeating: .cap, count: n)
-        var rowPage = [Int](repeating: -1, count: w)     // which page each row is carrying
-        var rowPos = [Int](repeating: 0, count: w)       // that page's next logical position
+        // EMPTY, not pre-sized to the width: the batch starts on a few rows and grows, so a row
+        // exists only once a page has actually been admitted into it.
+        var rowPage: [Int] = []                          // which page each row is carrying
+        var rowPos: [Int] = []                           // that page's next logical position
         var nextPage = 0
         var ttft: Double = 0
 
         // Prefill one page and seed it into a row. This is the same single-sequence prefill the
         // static path does before a group; continuous batching only changes WHEN it happens.
+        var pages = pages
+
+        /// Run the vision tower for a page that arrived as pixels, and report its prompt length.
+        /// It has to happen BEFORE `canAdmit` can be asked anything: a pending page has no
+        /// `prep` at all, and reaching for one traps.
+        func ensurePrepared(_ p: Int) throws -> Int {
+            if let pixels = pages[p].pending {
+                pages[p] = try preparePage(image: pixels, prompt: pages[p].pendingPrompt)
+            }
+            return pages[p].prep.ids.count
+        }
+
         func admit(row: Int, page p: Int) throws {
+            _ = try ensurePrepared(p)
             let page = pages[p]
             let count = page.prep.ids.count
             promptLengths[p] = count
@@ -224,13 +249,27 @@ extension OCRModel {
             }
             rowPage[row] = p
             rowPos[row] = count
+            onAdmit?(p)
         }
 
-        for row in 0 ..< w {
+        // RAMP UP rather than filling every row first. A group's first token cannot exist until
+        // every one of its pages is prefilled, so a 32-wide opening group means no text for
+        // ~10 s. Starting on a few rows puts words on screen in about a second, and because the
+        // remaining pages are admitted WHILE decoding - not left in a narrow group of their own -
+        // it does not cost the throughput a small static group does.
+        let ramp = min(Self.rampRows, w)
+        for row in 0 ..< ramp {
+            rowPage.append(-1)
+            rowPos.append(0)
             try admit(row: row, page: nextPage)
             nextPage += 1
         }
         ttft = Date().timeIntervalSince(t0)
+        if OCRRuntimeFlags.reportPrefill {
+            FileHandle.standardError.write(Data(String(
+                format: "[group] %d of %d rows prefilled in %.1f s before the first token\n",
+                ramp, w, ttft).utf8))
+        }
 
         let cap = requested > 0
             ? requested
@@ -247,6 +286,23 @@ extension OCRModel {
                     stopped[rowPage[row]] = .cancelled
                 }
                 break
+            }
+
+            // Widen by one row per step until the batch is full. One prefill between steps is
+            // ~650 ms of work that has to happen anyway; doing it here rather than up front is
+            // what moves the wait off the front of the run.
+            // The new row is the one just appended, NOT a running count: a compaction earlier in
+            // the run renumbers the rows, and `filled` then indexed past the end. The buffer
+            // cannot grow past what was allocated either, so admission is capped by it.
+            if rowPage.count < w, rowPage.count < batchCaches[0].batch,
+               nextPage < n, shouldAdmit?() ?? true {
+                let t = try ensurePrepared(nextPage)
+                if batchCaches[0].canAdmit(promptTokens: t) {
+                    rowPage.append(-1)
+                    rowPos.append(0)
+                    try admit(row: rowPage.count - 1, page: nextPage)
+                    nextPage += 1
+                }
             }
 
             let rows = 0 ..< rowPage.count
@@ -327,12 +383,14 @@ extension OCRModel {
                 // its first generated token would land inside the prompt it just seeded. Rare
                 // (it needs a longer prompt than anything decoded so far) and the row is simply
                 // dropped, leaving the page for the next group.
-                if nextPage < n, batchCaches[0].canAdmit(promptTokens: pages[nextPage].prep.ids.count) {
+                var took = false
+                if nextPage < n, shouldAdmit?() ?? true,
+                   batchCaches[0].canAdmit(promptTokens: try ensurePrepared(nextPage)) {
                     try admit(row: row, page: nextPage)
                     nextPage += 1
-                } else {
-                    vacated.append(row)
+                    took = true
                 }
+                if !took { vacated.append(row) }
             }
             if !vacated.isEmpty {
                 let keep = rows.filter { !vacated.contains($0) }
@@ -651,21 +709,29 @@ extension OCRModel {
                                   onStream: (@Sendable (Int, StreamUpdate) -> Void)? = nil,
                                   onPrefill: (@Sendable (Int, Int) -> Void)? = nil,
                                   onFinish: (@Sendable (Int, Result) -> Void)? = nil,
+                                  onAdmit: (@Sendable (Int) -> Void)? = nil,
+                                  shouldAdmit: (@Sendable () -> Bool)? = nil,
                                   shouldContinue: (@Sendable () -> Bool)? = nil) throws -> [Result] {
         let width = width ?? OCRBatchPlan.recommendedWidth(modelBytes: weightBytes,
                                                            pageCount: images.count)
         // Every page is prefilled before the group's first token exists, so on a wide group this
         // is the whole of the wait the reader sees. Report it rather than leaving a still label.
+        // Continuous decoding prefills a page when it ADMITS it, so preparing everything here
+        // would put the whole wait back on the front of the run - the thing the ramp removes.
         var prepared: [PreparedPage] = []
         prepared.reserveCapacity(images.count)
-        for (n, image) in images.enumerated() {
-            prepared.append(try preparePage(image: image, prompt: prompt))
-            onPrefill?(n + 1, images.count)
-            if let shouldContinue, !shouldContinue() { break }
+        if OCRRuntimeFlags.continuousBatch, width > 1 {
+            prepared = images.map { PreparedPage(pending: $0, prompt: prompt) }
+        } else {
+            for (n, image) in images.enumerated() {
+                prepared.append(try preparePage(image: image, prompt: prompt))
+                onPrefill?(n + 1, images.count)
+                if let shouldContinue, !shouldContinue() { break }
+            }
         }
         return try decodeBatch(prepared, width: max(width, 1), maxNewTokens: maxNewTokens,
                                loopGuard: loopGuard, loopReps: loopReps, loopGrace: loopGrace,
-                               onStream: onStream, onFinish: onFinish,
-                               shouldContinue: shouldContinue)
+                               onStream: onStream, onFinish: onFinish, onAdmit: onAdmit,
+                               shouldAdmit: shouldAdmit, shouldContinue: shouldContinue)
     }
 }
