@@ -389,6 +389,17 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   attribute scopes. `Text` reads
   the first; the editable pane's text storage comes from the second, and setting only one left the
   source view black.
+- A DOCUMENT'S ID IS NOT ITS INDEX, and conflating them broke the tab bar twice over. Ids were
+  `documents.count + n`, so closing a tab and dropping another handed the new one an id a
+  surviving tab still held - and a `ForEach` keyed on a duplicate id renders and hit-tests the
+  wrong row. On top of that the bar passed `doc.id` to `selectDocument`/`closeDocument`/
+  `progress(ofDocument:)`, which all INDEXED `documents` with it, so once a close made the two
+  diverge, clicking one tab brought up another. Ids now come from a monotonic counter that is
+  never reused, the selection is held as `selectedDocumentID`, and every lookup is by id. The
+  rename is the guard: an index assigned to it no longer compiles.
+- There is NO native macOS control for document tabs inside a pane. `TabView` on macOS is a
+  segmented control, and real document tabs are `NSWindowTabGroup`, a WINDOW feature. The custom
+  bar is the right call; when it misbehaves the bug is in the model, not the control.
 - The tab bar uses `windowBackgroundColor` for the track and `controlColor` for the selected
   capsule. Two shades of `.background` left them the same colour in light mode, so nothing read as
   raised; the semantic pair keeps the capsule lighter than the track in both appearances.

@@ -454,7 +454,7 @@ private struct DocumentTabs: View {
                 // Close sits on the leading edge and appears on hover, as it does in Preview and
                 // Safari. Reserved space rather than inserted space: a button that appears by
                 // widening the row makes the title jump under the pointer.
-                Button { session.closeDocument(doc.id) } label: {
+                Button { session.closeDocument(id: doc.id) } label: {
                     Image(systemName: "xmark")
                         .font(.system(size: 8, weight: .bold))
                         .frame(width: 14, height: 14)
@@ -493,7 +493,7 @@ private struct DocumentTabs: View {
         // label) and nothing answers to the tab itself - for VoiceOver or for a test.
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("ocr.tab.\(doc.id)")
-        .onTapGesture { session.selectDocument(doc.id) }
+        .onTapGesture { session.selectDocument(id: doc.id) }
         .onHover { hovered = $0 ? doc.id : (hovered == doc.id ? nil : hovered) }
         .help(doc.name)
         .accessibilityAddTraits(selected ? [.isSelected, .isButton] : .isButton)

@@ -154,7 +154,10 @@ final class OCRSession {
     private(set) var pages: [Page] = []
     private(set) var documents: [Document] = []
     /// Which tab is on screen. Follows the file being transcribed until the user picks one.
-    private(set) var selectedDocument = 0
+    /// The id of the tab on screen, never its index. The two used to be conflated: the tab bar
+    /// passed `doc.id` to functions that indexed `documents` with it, so once a close made the
+    /// two diverge, clicking one tab brought up another.
+    private(set) var selectedDocumentID = 0
     private(set) var userPinnedDocument = false
     /// Decoded Markdown per page, parallel to `pages`.
     private(set) var texts: [String] = []
@@ -349,7 +352,7 @@ final class OCRSession {
     }
 
     var visibleDocument: Document? {
-        documents.indices.contains(selectedDocument) ? documents[selectedDocument] : documents.first
+        documents.first { $0.id == selectedDocumentID } ?? documents.first
     }
 
     /// The pages the navigator shows: this tab's, not the whole drop's.
@@ -357,28 +360,31 @@ final class OCRSession {
         visibleDocument.map { $0.pageIDs.compactMap { id in pages.indices.contains(id) ? pages[id] : nil } } ?? []
     }
 
-    func selectDocument(_ index: Int) {
-        guard documents.indices.contains(index) else { return }
-        selectedDocument = index
+    func selectDocument(id: Int) {
+        guard documents.contains(where: { $0.id == id }) else { return }
+        selectedDocumentID = id
         userPinnedDocument = true
         selection = nil
         userPinnedSelection = false
     }
 
-    func closeDocument(_ index: Int) {
-        guard documents.indices.contains(index), documents.count > 1 else { clear(); return }
+    func closeDocument(id: Int) {
+        guard let index = documents.firstIndex(where: { $0.id == id }), documents.count > 1
+        else { clear(); return }
         let removed = Set(documents[index].pageIDs)
         // Only the tab's presence is removed. Its pages keep their ids so nothing that captured an
         // index - a running decode, a thumbnail render - can write into the wrong page.
         documents.remove(at: index)
         for id in removed where pages.indices.contains(id) { pages[id].state = .failed }
-        selectedDocument = min(selectedDocument, documents.count - 1)
+        if selectedDocumentID == id {
+            selectedDocumentID = documents[min(index, documents.count - 1)].id
+        }
     }
 
     /// How far through its pages a tab is, for its progress ring.
-    func progress(ofDocument index: Int) -> Double? {
-        guard documents.indices.contains(index) else { return nil }
-        let ids = documents[index].pageIDs
+    func progress(ofDocument id: Int) -> Double? {
+        guard let doc = documents.first(where: { $0.id == id }) else { return nil }
+        let ids = doc.pageIDs
         guard !ids.isEmpty else { return nil }
         let done = ids.filter { pages.indices.contains($0) && pages[$0].state != .pending && pages[$0].state != .running }.count
         // A finished tab shows no ring at all. A full circle is still a progress indicator, and
@@ -486,6 +492,10 @@ final class OCRSession {
     @ObservationIgnored private var previewCache: [Int: URL] = [:]
     /// Bumped by every drop, so pages carry the batch they came in with.
     private var batchCount = 0
+    /// Never reused, unlike an index. Ids used to be `documents.count + n`, so closing a tab and
+    /// dropping another handed the new one an id a surviving tab already had - and a `ForEach`
+    /// keyed on a duplicate id renders and hit-tests the wrong row.
+    private var documentCounter = 0
 
     // MARK: - Input
 
@@ -517,7 +527,6 @@ final class OCRSession {
         // Enumerate pages first so the sidebar has something to show while the model loads. A
         // 200-page PDF must not be rasterised here - only counted.
         let firstNewPage = pages.count
-        let firstNewDocument = documents.count
         batchCount += 1
         let batch = batchCount
         var enumerated: [Page] = []
@@ -545,7 +554,8 @@ final class OCRSession {
             }
             let last = firstNewPage + enumerated.count
             if last > first {
-                docs.append(Document(id: firstNewDocument + docs.count, name: url.lastPathComponent,
+                documentCounter += 1
+                docs.append(Document(id: documentCounter, name: url.lastPathComponent,
                                      pageIDs: Array(first ..< last)))
             }
         }
@@ -562,7 +572,7 @@ final class OCRSession {
         documents.append(contentsOf: docs)
         // A dropped file is a file the user wants to look at, so its tab comes forward - and
         // pinning it stops the run they were already watching from pulling the view back.
-        selectedDocument = firstNewDocument
+        selectedDocumentID = docs.first?.id ?? documents.first?.id ?? 0
         userPinnedDocument = adding
         selection = nil
         userPinnedSelection = false
@@ -593,7 +603,8 @@ final class OCRSession {
         texts = []
         jobs = []
         documents = []
-        selectedDocument = 0
+        selectedDocumentID = 0
+        documentCounter = 0
         userPinnedDocument = false
         selection = nil
         userPinnedSelection = false
@@ -903,9 +914,9 @@ final class OCRSession {
                     self.pages[index].state = .running
                     self.runningIndex = index
                     if !self.userPinnedDocument,
-                       let doc = self.documents.firstIndex(where: { $0.pageIDs.contains(index) }),
-                       doc != self.selectedDocument {
-                        self.selectedDocument = doc
+                       let doc = self.documents.first(where: { $0.pageIDs.contains(index) }),
+                       doc.id != self.selectedDocumentID {
+                        self.selectedDocumentID = doc.id
                     }
                     if !self.userPinnedSelection { self.selection = nil }
 
@@ -983,9 +994,11 @@ final class OCRSession {
         for index in group { pages[index].state = .running }
         runningIndex = group.first
         isGroupRunning = group.count > 1
+        // `documents` here is the PDF cache parameter, not the tab list - hence `self`.
         if !userPinnedDocument, let first = group.first,
-           let doc = documents_indexOfDocument(containing: first), doc != selectedDocument {
-            selectedDocument = doc
+           let doc = self.documents.first(where: { $0.pageIDs.contains(first) }),
+           doc.id != selectedDocumentID {
+            selectedDocumentID = doc.id
         }
         if !userPinnedSelection { selection = nil }
 
