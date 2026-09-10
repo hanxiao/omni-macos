@@ -112,6 +112,21 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   once per page, so it is compute-bound, not bandwidth-bound.
 - `--vision-prefetch` re-measured on 40 pages: 197 against 194, and per-page TTFT 656 -> 595 ms. It
   reschedules work rather than removing it, which is why it is ~0 on a busy GPU. Confirmed, still off.
+- BATCHED DECODE IS THE ANSWER, and it is the one that works on a laptop. B pages decode together
+  through ONE copy of the weights (`OCRBatchKVCache`, `forwardBatch`, `transcribeBatched`, and
+  `ocr-verify --pdf --batch B`). Measured on the 40-page doc, all with the SAME digest
+  772db0f94e0ae106 as the single-process baseline - byte-identical output at every width:
+  194 (single, speculative) / 158 (B=2) / 185 (B=4) / 260 (B=8) / 339 (B=16) / 485 (B=40).
+  2.5x the baseline and past the 400 target, greedy, on one copy of the weights.
+- The scaling is NOT linear at small B and that is the MoE: 8 tokens routing to 8 different sets of
+  6 experts read 8x the expert weight, exactly as if they had run separately. Attention, the dense
+  MLP, the shared expert and the LM head amortise from B=2; the routed experts only amortise once
+  B is wide enough that the batch touches most of the 64 anyway. That crossover is why B=40 is
+  worth 1.9x of B=8 and B=4 is worth almost nothing. Do not conclude from a narrow batch that
+  batching does not work here - that was concluded mid-measurement and it was wrong.
+- Batch WIDTH is a memory decision, like the worker count: KV is 65 KB/token, a page runs to ~2300
+  tokens, so a slot costs ~150 MB. B=16 is ~7 GB with the weights and comfortable on 16 GB; B=40 is
+  ~10.5 GB and is not.
 - THE BATCHING ARITHMETIC, from numbers already measured here: the language prefill carries 1007
   tokens in 317 ms (3177 tok/s) while a decode step carries 1 token in ~4.3 ms (234 tok/s). Same
   weights, same layers - a forward that carries many tokens costs ~13x less PER TOKEN. That is why

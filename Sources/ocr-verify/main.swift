@@ -225,6 +225,23 @@ if let i = args.firstIndex(of: "--pdf") {
     let workers = intAfter("--workers", in: args) ?? 1
     let printText = args.contains("--print-text")
 
+    // Batched decode: B pages through ONE copy of the weights, which is the parallelism a laptop
+    // can also have.
+    if let batchWidth = intAfter("--batch", in: args), batchWidth > 1 {
+        let started = Date()
+        let out = try model.transcribeBatched(pdfAt: pdf, maxNewTokens: cap,
+                                              pageRange: limit.map { 0 ..< $0 }, width: batchWidth)
+        let elapsed = Date().timeIntervalSince(started)
+        var found = 0
+        for page in out.pages where page.text.contains(String(format: "PAGE %03d", page.page)) { found += 1 }
+        print(String(format: "\n%d pages in %.1f s = %.2f s/page, %.0f aggregate tok/s (batch=%d)",
+                     out.pages.count, elapsed, elapsed / Double(max(out.pages.count, 1)),
+                     Double(out.pages.reduce(0) { $0 + $1.tokenCount }) / elapsed, batchWidth))
+        print("page markers recovered in place: \(found)/\(out.pages.count)")
+        print("document digest: \(digest(out.markdown()))  chars \(out.markdown().count)")
+        exit(0)
+    }
+
     // Process pool: the only page parallelism that actually scales here.
     if args.contains("--processes") {
         let requested = intAfter("--processes", in: args)

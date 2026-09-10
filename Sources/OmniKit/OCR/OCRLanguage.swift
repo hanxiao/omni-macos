@@ -126,6 +126,107 @@ final class OCRKVCache {
     }
 }
 
+// MARK: - Batched decode
+
+/// A KV cache for B independent sequences sharing one set of weights.
+///
+/// The single-sequence `OCRKVCache` is deliberately batch-free and stays that way: this sits
+/// beside it so the proven path keeps its measured behaviour and the two can be compared against
+/// each other page for page.
+///
+/// Why a batch at all. Decode here is bound by fixed per-launch latency and by reading the active
+/// experts once per step, and BOTH amortise over a batch. Measured on this stack: the language
+/// prefill carries 1007 tokens in 317 ms while a decode step carries one in 4.3 ms - the same
+/// weights and the same layers, ~13x cheaper per token when the forward carries many. Worker
+/// processes amortise neither; they just buy another 4.5 GB copy of the weights, which a 16 GB
+/// machine does not have.
+///
+/// Sequences of different lengths share one padded buffer, and `lengths` is what keeps a short
+/// sequence from attending the padding beyond its own end.
+final class OCRBatchKVCache {
+    static let step = 256
+
+    private(set) var keys: MLXArray?      // (B, heads, T, d)
+    private(set) var values: MLXArray?
+    private(set) var lengths: [Int]
+    private var batchCount: Int
+    var batch: Int { batchCount }
+
+    init(batch: Int) {
+        self.batchCount = batch
+        self.lengths = [Int](repeating: 0, count: batch)
+    }
+
+    /// Append one token per sequence. `k`/`v` are (B, heads, 1, d).
+    func appendStep(_ k: MLXArray, _ v: MLXArray) {
+        let need = (lengths.max() ?? 0) + 1
+        grow(to: need, like: k)
+        // Every sequence advances together during decode, so one slice covers the batch.
+        let at = lengths[0]
+        keys![0..., 0..., at ..< (at + 1), 0...] = k
+        values![0..., 0..., at ..< (at + 1), 0...] = v
+        for b in 0 ..< batch { lengths[b] += 1 }
+        if OCRRuntime.evalCacheWrites { eval(keys!, values!) }
+    }
+
+    /// Seed one slot from a finished single-sequence prefill. `k`/`v` are (heads, T, d).
+    func seed(slot: Int, keys kIn: MLXArray, values vIn: MLXArray) {
+        let t = kIn.dim(1)
+        grow(to: t, like: kIn.expandedDimensions(axis: 0))
+        keys![slot ..< (slot + 1), 0..., 0 ..< t, 0...] = kIn.expandedDimensions(axis: 0)
+        values![slot ..< (slot + 1), 0..., 0 ..< t, 0...] = vIn.expandedDimensions(axis: 0)
+        lengths[slot] = t
+    }
+
+    private func grow(to need: Int, like k: MLXArray) {
+        let current = keys?.dim(2) ?? 0
+        guard keys == nil || need > current else { return }
+        let h = k.dim(1), d = k.dim(3)
+        // Geometric, for the reason the single cache is: each growth copies the whole buffer.
+        let target = max(need, max(current * 2, Self.step))
+        let grow = target - current
+        let newK = MLXArray.zeros([batch, h, grow, d], dtype: k.dtype)
+        let newV = MLXArray.zeros([batch, h, grow, d], dtype: k.dtype)
+        if let oldK = keys, let oldV = values {
+            keys = concatenated([oldK, newK], axis: 2)
+            values = concatenated([oldV, newV], axis: 2)
+        } else {
+            keys = newK
+            values = newV
+        }
+    }
+
+    var view: (keys: MLXArray, values: MLXArray)? {
+        guard let k = keys, let v = values else { return nil }
+        let t = lengths.max() ?? 0
+        return (k[0..., 0..., 0 ..< t, 0...], v[0..., 0..., 0 ..< t, 0...])
+    }
+
+    /// Drop the rows a finished sequence occupied. Page lengths here run 75 to 1309 tokens, so
+    /// carrying finished rows would spend most of a group's compute on sequences with nothing left
+    /// to say.
+    func keepRows(_ rows: MLXArray, count: Int) {
+        guard let k = keys, let v = values else { return }
+        keys = take(k, rows, axis: 0)
+        values = take(v, rows, axis: 0)
+        let kept = rows.asArray(Int32.self).map { lengths[Int($0)] }
+        lengths = kept
+        batchCount = count
+    }
+
+    /// Additive mask, (B, 1, 1, T): 0 where a sequence may attend, -inf beyond its own end. Only
+    /// needed when the sequences disagree about their length.
+    func mask() -> MLXArray? {
+        let t = lengths.max() ?? 0
+        guard let shortest = lengths.min(), shortest < t else { return nil }
+        var buf = [Float](repeating: 0, count: batch * t)
+        for b in 0 ..< batch where lengths[b] < t {
+            for j in lengths[b] ..< t { buf[b * t + j] = -Float.infinity }
+        }
+        return MLXArray(buf, [batch, 1, 1, t])
+    }
+}
+
 @inline(__always)
 func ocrSiLU(_ x: MLXArray) -> MLXArray { x * sigmoid(x) }
 
@@ -199,6 +300,48 @@ final class OCRAttention: @unchecked Sendable {
         let x2 = x[.ellipsis, half ..< d]
         let rotated = concatenated([-x2, x1], axis: -1)
         return x * cos.expandedDimensions(axis: 0) + rotated * sin.expandedDimensions(axis: 0)
+    }
+
+    /// One decode step for B sequences at once. `x` is (B, dim), `cos`/`sin` are (B, headDim) -
+    /// each sequence sits at its own position, which is the only thing that differs between them.
+    ///
+    /// Beside `callAsFunction` rather than replacing it: the single-sequence path is what every
+    /// fidelity number was measured on, and keeping it lets the two be compared page for page.
+    func callBatch(_ x: MLXArray, cos: MLXArray, sin: MLXArray, cache: OCRBatchKVCache) -> MLXArray {
+        let b = x.dim(0)
+        let d = OCRLanguageConfig.headDim
+        let h = nHeads
+        let qkv = ocrProj(x, wqkv)
+        var q = qkv[0..., 0 ..< (h * d)].reshaped([b, h, 1, d])
+        var k = qkv[0..., (h * d) ..< (2 * h * d)].reshaped([b, h, 1, d])
+        let v = qkv[0..., (2 * h * d)...].reshaped([b, h, 1, d])
+        q = applyRopeBatch(q.asType(.float32), cos: cos, sin: sin).asType(x.dtype)
+        k = applyRopeBatch(k.asType(.float32), cos: cos, sin: sin).asType(x.dtype)
+
+        cache.appendStep(k, v)
+        guard let view = cache.view else { return ocrProj(x, wo).asType(x.dtype) }
+        let scale = 1.0 / Float(d).squareRoot()
+        // A mask only when the sequences disagree about their length; when they are level the
+        // fused kernel takes its fastest path, exactly as the single-sequence n == 1 case does.
+        let mode: MLXFast.ScaledDotProductAttentionMaskMode =
+            cache.mask().map { .array($0.asType(x.dtype)) } ?? .none
+        let y = MLXFast.scaledDotProductAttention(queries: q, keys: view.keys, values: view.values,
+                                                  scale: scale, mask: mode)
+        return ocrProj(y.reshaped([b, h * d]), wo).asType(x.dtype)
+    }
+
+    /// Rope for a batch: one position per sequence, so cos/sin are (B, d) and broadcast across
+    /// heads and the single query.
+    @inline(__always)
+    private func applyRopeBatch(_ x: MLXArray, cos: MLXArray, sin: MLXArray) -> MLXArray {
+        let d = x.dim(-1)
+        let half = d / 2
+        let x1 = x[.ellipsis, 0 ..< half]
+        let x2 = x[.ellipsis, half ..< d]
+        let rotated = concatenated([-x2, x1], axis: -1)
+        let c = cos.reshaped([cos.dim(0), 1, 1, d])
+        let s = sin.reshaped([sin.dim(0), 1, 1, d])
+        return x * c + rotated * s
     }
 
     func callAsFunction(_ x: MLXArray, cos: MLXArray, sin: MLXArray, cache: OCRKVCache?) -> MLXArray {
@@ -430,6 +573,16 @@ final class OCRDecoderLayer: @unchecked Sendable {
         h = h + (moe?(normed) ?? dense!(normed))
         return h
     }
+
+    /// The same layer for B sequences at once. Everything but attention already works on
+    /// (rows, dim) and does not care whether the rows are one sequence's tokens or one token from
+    /// each of B sequences - including the MoE, whose n > 1 dispatch is what this reuses.
+    func callBatch(_ x: MLXArray, cos: MLXArray, sin: MLXArray, cache: OCRBatchKVCache) -> MLXArray {
+        var h = x + attn.callBatch(ocrRMSNorm(x, inLN), cos: cos, sin: sin, cache: cache)
+        let normed = ocrRMSNorm(h, postLN)
+        h = h + (moe?(normed) ?? dense!(normed))
+        return h
+    }
 }
 
 /// FastMTP draft head: `enorm(token embedding) + hnorm(previous hidden) -> eh_proj -> one dense block`.
@@ -552,6 +705,24 @@ final class OCRLanguageModel: @unchecked Sendable {
     }
 
     /// `(n, hidden)` embeddings -> pre-lm_head hidden and fp32 logits.
+    /// One decode step for B sequences. `embeddings` is (B, dim) - one token per sequence - and
+    /// `positions` gives each sequence's own position, which is all that distinguishes them.
+    func forwardBatch(_ embeddings: MLXArray, positions: [Int],
+                      caches: [OCRBatchKVCache]) -> (hidden: MLXArray, logits: MLXArray) {
+        let (cos, sin) = rope(positions: positions)
+        var x = embeddings
+        for (layer, cache) in zip(layers, caches) {
+            x = layer.callBatch(x, cos: cos, sin: sin, cache: cache)
+        }
+        let h = ocrRMSNorm(x, normW)
+        let logits = ocrProj(h.asType(lmHead.computeDType), lmHead).asType(.float32)
+        return (h, logits)
+    }
+
+    func newBatchCaches(_ batch: Int) -> [OCRBatchKVCache] {
+        (0 ..< OCRLanguageConfig.layers).map { _ in OCRBatchKVCache(batch: batch) }
+    }
+
     func forward(_ embeddings: MLXArray, positions: [Int], caches: [OCRKVCache]) -> (hidden: MLXArray, logits: MLXArray) {
         let (cos, sin) = rope(positions: positions)
         var x = embeddings
