@@ -131,15 +131,21 @@ extension OCRModel {
         stats.acceptedAt = [Int](repeating: 0, count: Self.maxAdaptiveDraft + 1)
         let prep: Prepared = ready.prep
         let visual: MLXArray = ready.visual
+        let tEmbed = Date()
         let embeddings = try embedPrompt(prep, visual: visual, table: nil)
         let caches = llm.newCaches()
         let mtpCache = OCRKVCache()
+        eval(embeddings)
+        let dEmbed = Date().timeIntervalSince(tEmbed)
 
         let n = prep.ids.count
         let maxNewTokens = requested > 0 ? requested
             : OCRTokenBudget.maxNewTokens(promptTokens: n, modelBytes: weightBytes)
+        let tPrefill = Date()
         var (hidden, logits) = llm.forward(embeddings, positions: Array(0 ..< n), caches: caches)
         eval(logits)
+        let dPrefill = Date().timeIntervalSince(tPrefill)
+        let tPrime = Date()
 
         // Prime the draft's KV over the prompt. Slot j consumes the token AT j paired with the
         // target hidden from j-1, so the hidden stream is shifted right by one and slot 0 gets a
@@ -152,6 +158,12 @@ extension OCRModel {
         _ = llm.mtpStep(tokenEmbedding: maskedDraft, previousHidden: shiftedHidden,
                         positions: Array(0 ..< n), cache: mtpCache)
         if let keys = mtpCache.keys { eval(keys) }
+        let dPrime = Date().timeIntervalSince(tPrime)
+        if OCRRuntimeFlags.reportPrefill {
+            FileHandle.standardError.write(Data(String(format:
+                "[prefill] n=%d embed %.0f ms  lm %.0f ms  mtp-prime %.0f ms\n",
+                n, dEmbed * 1000, dPrefill * 1000, dPrime * 1000).utf8))
+        }
         let ttft = Date().timeIntervalSince(t0)
 
         var tokens = [logits[-1].argMax().item(Int.self)]

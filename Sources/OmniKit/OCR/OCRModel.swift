@@ -164,6 +164,13 @@ public final class OCRModel: @unchecked Sendable {
     /// stream, so what crosses back to the caller is a finished tensor rather than a graph node
     /// still pointing at another stream's work.
     func preparePage(image: OCRImage, prompt: String?) throws -> PreparedPage {
+        let tPrepare = Date()
+        defer {
+            if OCRRuntimeFlags.reportPrefill {
+                FileHandle.standardError.write(Data(String(format: "[prefill] vision %.0f ms\n",
+                                                           Date().timeIntervalSince(tPrepare) * 1000).utf8))
+            }
+        }
         let prep = try prepare(image: image, prompt: prompt)
         let visual = visualFeatures(prep)
         eval(visual)

@@ -92,6 +92,32 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
 - Adaptive draft length REJECTED AGAIN, now with a mechanism: it changes k mid-decode, so block
   boundaries move and the output changes (hard2 digest fafb7630 vs d2d17e6a). Same cause as the
   k=5 anomaly. Its speed win does not justify a non-reproducible transcript.
+- 40-page long_scan BASELINE on this M3 Ultra, single process: 194 aggregate tok/s, 123.1 s,
+  digest 772db0f94e0ae106, 62014 chars. Every throughput claim below is against that, and the
+  digest is the quality gate - it stayed identical through every measurement in this round.
+- PROCESS POOL, measured end to end on the 40-page doc: 194 / 284 / 321 / 323 / 322 at 1 / 2 / 4 /
+  6 / 8 workers. It SATURATES at 4 - the GPU is the wall past that, not memory. Output identical at
+  every count. But it is a big-machine win only: each worker holds its own 4.5 GB of weights, so
+  `recommendedWorkers` returns 1 on a 16 GB laptop and the whole gain is zero for the machines that
+  need it most. Do not quote it as the headline number.
+- `--processes N --draft K` measured k = 3 at EVERY K until 2026-09-09: `OCRWorkerPool.init`
+  defaults `draftLength: 3` and ocr-verify never passed it. The flat line (321/321/321) is the
+  signature. Re-measured properly: 277 / 307 / 321 / 309 / 243 at k = 1 / 2 / 3 / 4 / 5, so k = 3
+  is still the peak under saturation - speculation does NOT become a net loss when the GPU is busy,
+  which was the hypothesis and it was wrong.
+- TTFT BREAKDOWN, measured with `--report-prefill`: vision 336-413 ms, language prefill 313-317 ms,
+  prompt embed ~0 ms, MTP priming 2-3 ms. 336 + 317 = 653 = the reported TTFT exactly. So prefill
+  is half vision and half language, and the draft head's priming pass - the obvious suspect - costs
+  nothing. Quantizing the vision tower would not help either: SAM-ViT-B + CLIP-L is ~800 MB read
+  once per page, so it is compute-bound, not bandwidth-bound.
+- `--vision-prefetch` re-measured on 40 pages: 197 against 194, and per-page TTFT 656 -> 595 ms. It
+  reschedules work rather than removing it, which is why it is ~0 on a busy GPU. Confirmed, still off.
+- THE BATCHING ARITHMETIC, from numbers already measured here: the language prefill carries 1007
+  tokens in 317 ms (3177 tok/s) while a decode step carries 1 token in ~4.3 ms (234 tok/s). Same
+  weights, same layers - a forward that carries many tokens costs ~13x less PER TOKEN. That is why
+  batching pages inside ONE process is the real lever and worker processes are not: batching
+  amortises both bounds (fixed per-launch latency, and reading the active experts once per step)
+  over B sequences while holding one copy of the weights, so it works on a 16 GB machine.
 - Measured and rejected, do not re-derive: mlx-swift 0.31.4 (same qmm bug; 0.31.5+ needs
   Swift 6.3). DFlash/EAGLE trees need a draft model we cannot train here; ViT token merging breaks
   the fixed visual-token/prompt-slot contract.

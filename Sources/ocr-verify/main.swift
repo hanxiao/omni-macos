@@ -103,7 +103,7 @@ while i < args.count {
     case "--spec": i += 1; specK = Int(args[i]) ?? 0
     case "--draft-vocab": i += 1; OCRRuntimeFlags.draftVocab = Int(args[i]) ?? 0
     case "--adaptive-draft": OCRRuntimeFlags.adaptiveDraft = true
-    case "--probe-batch": i += 1; probeChunk = Int(args[i]) ?? 0
+    case "--probe-chunk": i += 1; probeChunk = i < args.count ? (Int(args[i]) ?? 0) : 0
     case "--repeat": i += 1; repeats = max(1, Int(args[i]) ?? 1)
     default: positional.append(args[i])
     }
@@ -191,39 +191,51 @@ if let i = args.firstIndex(of: "--streamcost") {
 if await OCRWorker.runIfRequested(CommandLine.arguments) { exit(0) }
 
 // Long-document mode: transcribe a PDF page by page and report the pipeline's behaviour.
+/// The integer after a flag, or nil. Guarded: a flag given as the LAST argument used to index
+/// past the end of `args` and trap, which is how `--processes` with no explicit count crashed the
+/// run before it had transcribed a single page.
+func intAfter(_ flag: String, in args: [String]) -> Int? {
+    guard let i = args.firstIndex(of: flag), i + 1 < args.count else { return nil }
+    return Int(args[i + 1])
+}
+
 if let i = args.firstIndex(of: "--pdf") {
     let pdf = URL(fileURLWithPath: args[i + 1])
     let modelPath = args.first { !$0.hasPrefix("--") && $0 != args[i + 1] }
         ?? { die("usage: ocr-verify <modelDir> --pdf <file.pdf> [--pages N] [--no-pipeline] [--tokenizer DIR]") }()
-    let limit = args.firstIndex(of: "--pages").flatMap { Int(args[$0 + 1]) }
+    let limit = intAfter("--pages", in: args)
     let pipelined = !args.contains("--no-pipeline")
     // Draft length for the document path. It had none, so `--draft N` here silently measured the
     // default on every run - a sweep that could only ever report a flat line.
-    let pdfDraft = args.firstIndex(of: "--draft").flatMap { $0 + 1 < args.count ? Int(args[$0 + 1]) : nil } ?? 3
+    let pdfDraft = intAfter("--draft", in: args) ?? 3
     let tokDir = args.firstIndex(of: "--tokenizer").map { URL(fileURLWithPath: args[$0 + 1]) }
 
     let model = try await OCRModel(modelDir: URL(fileURLWithPath: modelPath), tokenizerDir: tokDir)
     print("model  \(modelPath)  loaded in \(String(format: "%.1f", model.loadSeconds))s")
     print("pdf    \(pdf.lastPathComponent)  pipelined=\(pipelined)  draft=\(pdfDraft)")
     // 0 = let OCRTokenBudget decide from the context window and this machine's memory.
-    let cap = args.firstIndex(of: "--max-new").flatMap { Int(args[$0 + 1]) } ?? 0
+    let cap = intAfter("--max-new", in: args) ?? 0
     print(String(format: "budget %d tok/page for a 1007-token prompt (%.1f KB KV per token, %.2f GB weights)",
                  OCRTokenBudget.maxNewTokens(promptTokens: 1007, modelBytes: model.weightBytes),
                  Double(OCRTokenBudget.bytesPerToken) / 1024,
                  Double(model.weightBytes) / 1e9))
     OCRRuntimeFlags.loopGuardForPDF = !args.contains("--no-loop-guard")
     OCRRuntimeFlags.visionPrefetch = args.contains("--vision-prefetch")
-    let workers = args.firstIndex(of: "--workers").flatMap { Int(args[$0 + 1]) } ?? 1
+    OCRRuntimeFlags.reportPrefill = args.contains("--report-prefill")
+    let workers = intAfter("--workers", in: args) ?? 1
     let printText = args.contains("--print-text")
 
     // Process pool: the only page parallelism that actually scales here.
     if args.contains("--processes") {
-        let requested = args.firstIndex(of: "--processes").flatMap { Int(args[$0 + 1]) }
+        let requested = intAfter("--processes", in: args)
         let lanes = requested ?? OCRWorkerPool.recommendedWorkers(modelBytes: model.weightBytes)
         let pageCount = limit ?? PDFDocument(url: pdf)?.pageCount ?? 0
+        // Pass the draft length THROUGH. The pool defaulted it to 3, so `--processes N --draft K`
+        // measured k = 3 at every K and could only ever report a flat line - the same bug the
+        // single-process document path had, in the one path added to measure around it.
         let pool = OCRWorkerPool(executable: URL(fileURLWithPath: CommandLine.arguments[0]),
                                  modelDir: URL(fileURLWithPath: modelPath),
-                                 tokenizerDir: tokDir, pdf: pdf)
+                                 tokenizerDir: tokDir, pdf: pdf, draftLength: pdfDraft)
         print("process pool: \(lanes) worker(s) "
               + "(recommended \(OCRWorkerPool.recommendedWorkers(modelBytes: model.weightBytes)) "
               + "for \(String(format: "%.1f", Double(model.weightBytes) / 1e9)) GB of weights)")
