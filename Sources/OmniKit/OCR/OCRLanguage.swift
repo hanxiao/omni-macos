@@ -148,34 +148,56 @@ final class OCRBatchKVCache {
 
     private(set) var keys: MLXArray?      // (B, heads, T, d)
     private(set) var values: MLXArray?
-    private(set) var lengths: [Int]
     private var batchCount: Int
     var batch: Int { batchCount }
 
+    /// Every live row writes at the SAME buffer index, and that is what makes a decode step one
+    /// slice rather than B of them. A row admitted mid-flight therefore has its prompt at
+    /// `[0, promptLen)` and its generated tokens from `startedAt` onward, with a dead span in
+    /// between that belonged to whoever held the slot before. `mask()` is what makes that span
+    /// invisible; nothing else in the model needs to know the row was recycled.
+    private(set) var promptLen: [Int]
+    private(set) var startedAt: [Int]
+    private(set) var cursor = 0
+
+    /// Logical tokens per row: its prompt plus what it has generated since being admitted.
+    var lengths: [Int] {
+        (0 ..< batchCount).map { promptLen[$0] + max(0, cursor - startedAt[$0]) }
+    }
+
     init(batch: Int) {
         self.batchCount = batch
-        self.lengths = [Int](repeating: 0, count: batch)
+        self.promptLen = [Int](repeating: 0, count: batch)
+        self.startedAt = [Int](repeating: 0, count: batch)
     }
 
     /// Append one token per sequence. `k`/`v` are (B, heads, 1, d).
     func appendStep(_ k: MLXArray, _ v: MLXArray) {
-        let need = (lengths.max() ?? 0) + 1
-        grow(to: need, like: k)
-        // Every sequence advances together during decode, so one slice covers the batch.
-        let at = lengths[0]
-        keys![0..., 0..., at ..< (at + 1), 0...] = k
-        values![0..., 0..., at ..< (at + 1), 0...] = v
-        for b in 0 ..< batch { lengths[b] += 1 }
+        grow(to: cursor + 1, like: k)
+        keys![0..., 0..., cursor ..< (cursor + 1), 0...] = k
+        values![0..., 0..., cursor ..< (cursor + 1), 0...] = v
+        cursor += 1
         if OCRRuntime.evalCacheWrites { eval(keys!, values!) }
     }
 
     /// Seed one slot from a finished single-sequence prefill. `k`/`v` are (heads, T, d).
+    ///
+    /// Used both to fill a fresh batch, where every row seeds before the first step and the
+    /// cursor ends up at the common prompt length, and to ADMIT a new page into a slot whose
+    /// page has finished. In the second case the cursor is already past the prompt, so the row
+    /// carries a dead span that `mask()` excludes.
     func seed(slot: Int, keys kIn: MLXArray, values vIn: MLXArray) {
         let t = kIn.dim(1)
-        grow(to: t, like: kIn.expandedDimensions(axis: 0))
+        grow(to: max(t, cursor), like: kIn.expandedDimensions(axis: 0))
         keys![slot ..< (slot + 1), 0..., 0 ..< t, 0...] = kIn.expandedDimensions(axis: 0)
         values![slot ..< (slot + 1), 0..., 0 ..< t, 0...] = vIn.expandedDimensions(axis: 0)
-        lengths[slot] = t
+        promptLen[slot] = t
+        // A row can only be recycled once the cursor is past its prompt; otherwise its own next
+        // write would land inside the prompt it just seeded.
+        precondition(cursor == 0 || cursor >= t,
+                     "cannot admit a \(t)-token prompt at cursor \(cursor)")
+        cursor = max(cursor, t)
+        startedAt[slot] = cursor
     }
 
     private func grow(to need: Int, like k: MLXArray) {
@@ -197,9 +219,8 @@ final class OCRBatchKVCache {
     }
 
     var view: (keys: MLXArray, values: MLXArray)? {
-        guard let k = keys, let v = values else { return nil }
-        let t = lengths.max() ?? 0
-        return (k[0..., 0..., 0 ..< t, 0...], v[0..., 0..., 0 ..< t, 0...])
+        guard let k = keys, let v = values, cursor > 0 else { return nil }
+        return (k[0..., 0..., 0 ..< cursor, 0...], v[0..., 0..., 0 ..< cursor, 0...])
     }
 
     /// Drop the rows a finished sequence occupied. Page lengths here run 75 to 1309 tokens, so
@@ -209,21 +230,30 @@ final class OCRBatchKVCache {
         guard let k = keys, let v = values else { return }
         keys = take(k, rows, axis: 0)
         values = take(v, rows, axis: 0)
-        let kept = rows.asArray(Int32.self).map { lengths[Int($0)] }
-        lengths = kept
+        let idx = rows.asArray(Int32.self).map { Int($0) }
+        promptLen = idx.map { promptLen[$0] }
+        startedAt = idx.map { startedAt[$0] }
         batchCount = count
     }
 
-    /// Additive mask, (B, 1, 1, T): 0 where a sequence may attend, -inf beyond its own end. Only
-    /// needed when the sequences disagree about their length.
+    /// Additive mask, (B, 1, 1, cursor): 0 where a row may attend, -inf on the span between its
+    /// prompt and the point it was admitted - the tokens of whoever held the slot before it.
+    ///
+    /// nil when every row is level, which is the common case for a batch that started together
+    /// and has not recycled a slot yet; the fused attention kernel then takes its fastest path,
+    /// exactly as the single-sequence case does.
     func mask() -> MLXArray? {
-        let t = lengths.max() ?? 0
-        guard let shortest = lengths.min(), shortest < t else { return nil }
-        var buf = [Float](repeating: 0, count: batch * t)
-        for b in 0 ..< batch where lengths[b] < t {
-            for j in lengths[b] ..< t { buf[b * t + j] = -Float.infinity }
+        let t = cursor
+        guard t > 0 else { return nil }
+        guard OCRRuntimeFlags.forceBatchMask
+            || (0 ..< batchCount).contains(where: { promptLen[$0] < startedAt[$0] }) else {
+            return nil
         }
-        return MLXArray(buf, [batch, 1, 1, t])
+        var buf = [Float](repeating: 0, count: batchCount * t)
+        for b in 0 ..< batchCount where promptLen[b] < startedAt[b] {
+            for j in promptLen[b] ..< min(startedAt[b], t) { buf[b * t + j] = -Float.infinity }
+        }
+        return MLXArray(buf, [batchCount, 1, 1, t])
     }
 }
 
@@ -681,7 +711,13 @@ final class OCRLanguageModel: @unchecked Sendable {
     /// so the table matches the reference's float32 rotary exactly. Cached by the position span,
     /// which is what a decode loop reuses.
     func rope(positions: [Int]) -> (MLXArray, MLXArray) {
-        let key = "\(positions.first ?? 0)-\(positions.last ?? 0)-\(positions.count)"
+        // Keyed by the WHOLE vector. "first-last-count" was enough while every row advanced in
+        // lockstep, but continuous batching admits a fresh page beside running ones, and two
+        // different position vectors that happen to share their ends would then get each other's
+        // rotation - a silent, catastrophic wrong answer.
+        var hasher = Hasher()
+        for p in positions { hasher.combine(p) }
+        let key = "\(positions.count):\(hasher.finalize())"
         ropeLock.lock(); defer { ropeLock.unlock() }
         if let hit = ropeCache[key] { return hit }
         let d = OCRLanguageConfig.headDim

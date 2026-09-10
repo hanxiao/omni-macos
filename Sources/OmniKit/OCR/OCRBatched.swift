@@ -96,6 +96,49 @@ extension OCRModel {
         return lines.joined(separator: "\n")
     }
 
+    /// What does ONE decode step cost as a function of how many rows are live?
+    ///
+    /// This is the crux for continuous batching. Batch occupancy on a real document is 45% -
+    /// pages run 72 to 1310 tokens, so a group spends most of its steps with dead rows dropped
+    /// and the batch narrowed. Refilling those slots is only worth building if a step at 32 rows
+    /// costs meaningfully less than four steps at 8. If step time is LINEAR in the row count,
+    /// the narrowing costs nothing and continuous batching buys latency, not throughput.
+    ///
+    /// Driven through the real language model with real caches, at a realistic context depth.
+    public func probeDecodeWidth(counts: [Int] = [1, 2, 4, 8, 16, 32],
+                                 context: Int = 1024, steps: Int = 24) -> String {
+        var lines: [String] = []
+        var perRowAtOne = 0.0
+        for b in counts {
+            let caches = llm.newBatchCaches(b)
+            // Seed every row to the same depth with arbitrary but correctly shaped history.
+            for cache in caches {
+                let k = MLX.zeros([OCRLanguageConfig.heads, context, OCRLanguageConfig.headDim],
+                                  dtype: .float32) + 0.02
+                for slot in 0 ..< b { cache.seed(slot: slot, keys: k, values: k) }
+            }
+            let ids = [Int](repeating: 100, count: b)
+            var position = context
+            eval(llm.forwardBatch(llm.embed(ids), positions: [Int](repeating: position, count: b),
+                                  caches: caches).logits)
+            position += 1
+            let t = Date()
+            for _ in 0 ..< steps {
+                let out = llm.forwardBatch(llm.embed(ids),
+                                           positions: [Int](repeating: position, count: b),
+                                           caches: caches)
+                eval(out.logits)
+                position += 1
+            }
+            let ms = Date().timeIntervalSince(t) * 1000 / Double(steps)
+            let per = ms / Double(b)
+            if b == counts.first { perRowAtOne = per }
+            lines.append(String(format: "rows %2d  %7.2f ms/step  %6.2f ms/row  %5.2fx  %6.0f tok/s",
+                                b, ms, per, perRowAtOne / per, Double(b) / (ms / 1000)))
+        }
+        return lines.joined(separator: "\n")
+    }
+
     /// Transcribe `pages` with `width` of them decoding together.
     ///
     /// Pages are prefilled one at a time - prefill already carries 1007 tokens and is nowhere near
@@ -106,6 +149,12 @@ extension OCRModel {
                      onStream: (@Sendable (Int, StreamUpdate) -> Void)? = nil,
                      onFinish: (@Sendable (Int, Result) -> Void)? = nil,
                      shouldContinue: (@Sendable () -> Bool)? = nil) throws -> [Result] {
+        if OCRRuntimeFlags.continuousBatch, width > 1 {
+            return try decodeContinuous(prepared, width: width, maxNewTokens: requested,
+                                        loopGuard: loopGuard, loopReps: loopReps,
+                                        loopGrace: loopGrace, onStream: onStream,
+                                        onFinish: onFinish, shouldContinue: shouldContinue)
+        }
         var out = [Result?](repeating: nil, count: prepared.count)
         var next = 0
         while next < prepared.count {
@@ -125,6 +174,186 @@ extension OCRModel {
             if let shouldContinue, !shouldContinue() { break }
         }
         return out.compactMap { $0 }
+    }
+
+    /// Every page through a batch that stays FULL: when a page ends, the next one is prefilled
+    /// into the row it vacated instead of the row being dropped.
+    ///
+    /// Why this exists. A decode step is strongly sub-linear in its row count - measured on this
+    /// checkpoint at a 1024-token context, 5.60 ms at 1 row against 22.21 ms at 32, so 32 rows
+    /// cost 4x what one does and carry 32x the tokens. A static group therefore pays dearly for
+    /// running narrow, and it runs narrow for most of its life: page lengths here are 72 to 1310
+    /// tokens, so batch occupancy on the 40-page scan is 45%. The group is not the unit of work,
+    /// the row is.
+    ///
+    /// The cost is that a row admitted mid-flight is not level with its neighbours, so the shared
+    /// KV buffer carries a dead span for it and attention needs a mask. See `OCRBatchKVCache`.
+    private func decodeContinuous(_ pages: [PreparedPage], width: Int, maxNewTokens requested: Int,
+                                  loopGuard: Bool, loopReps: Int, loopGrace: Int,
+                                  onStream: (@Sendable (Int, StreamUpdate) -> Void)? = nil,
+                                  onFinish: (@Sendable (Int, Result) -> Void)? = nil,
+                                  shouldContinue: (@Sendable () -> Bool)? = nil) throws -> [Result] {
+        let n = pages.count
+        let w = min(width, n)
+        guard w > 0 else { return [] }
+        let t0 = Date()
+
+        let batchCaches = llm.newBatchCaches(w)
+        var tokens = [[Int]](repeating: [], count: n)
+        var promptLengths = [Int](repeating: 0, count: n)
+        var stopped = [StopReason](repeating: .cap, count: n)
+        var rowPage = [Int](repeating: -1, count: w)     // which page each row is carrying
+        var rowPos = [Int](repeating: 0, count: w)       // that page's next logical position
+        var nextPage = 0
+        var ttft: Double = 0
+
+        // Prefill one page and seed it into a row. This is the same single-sequence prefill the
+        // static path does before a group; continuous batching only changes WHEN it happens.
+        func admit(row: Int, page p: Int) throws {
+            let page = pages[p]
+            let count = page.prep.ids.count
+            promptLengths[p] = count
+            let embeddings = try embedPrompt(page.prep, visual: page.visual, table: nil)
+            let caches = llm.newCaches()
+            let (_, logits) = llm.forward(embeddings, positions: Array(0 ..< count), caches: caches)
+            eval(logits)
+            tokens[p] = [logits[-1].argMax().item(Int.self)]
+            for (layer, cache) in zip(0 ..< OCRLanguageConfig.layers, caches) {
+                guard let view = cache.view else { continue }
+                batchCaches[layer].seed(slot: row, keys: view.keys, values: view.values)
+            }
+            rowPage[row] = p
+            rowPos[row] = count
+        }
+
+        for row in 0 ..< w {
+            try admit(row: row, page: nextPage)
+            nextPage += 1
+        }
+        ttft = Date().timeIntervalSince(t0)
+
+        let cap = requested > 0
+            ? requested
+            : OCRTokenBudget.maxNewTokens(promptTokens: promptLengths.max() ?? 1007,
+                                          modelBytes: weightBytes)
+
+        let tDecode = Date()
+        var lastEmit = Date.distantPast
+        var finishedAt = [Double](repeating: 0, count: n)
+
+        while batchCaches[0].batch > 0 {
+            if let shouldContinue, !shouldContinue() {
+                for row in 0 ..< rowPage.count where rowPage[row] >= 0 {
+                    stopped[rowPage[row]] = .cancelled
+                }
+                break
+            }
+
+            let rows = 0 ..< rowPage.count
+            let ids = rows.map { tokens[rowPage[$0]].last! }
+            let x = llm.embed(ids)
+            let (_, logits) = llm.forwardBatch(x, positions: rows.map { rowPos[$0] },
+                                               caches: batchCaches.map { $0 })
+            eval(logits)
+            let picked = logits.argMax(axis: -1)
+            eval(picked)
+            let ids32 = picked.asArray(Int32.self)
+
+            var done: [Int] = []                                   // rows whose page just ended
+            for row in rows {
+                let p = rowPage[row]
+                let id = Int(ids32[row])
+                tokens[p].append(id)
+                rowPos[row] += 1
+                if id == eosID {
+                    stopped[p] = .eos
+                    done.append(row)
+                    continue
+                }
+                if tokens[p].count >= cap {
+                    stopped[p] = .cap
+                    done.append(row)
+                    continue
+                }
+                if loopGuard, tokens[p].count > loopGrace,
+                   let period = Self.loopPeriod(tokens[p], reps: loopReps) {
+                    let block = Array(tokens[p][(tokens[p].count - period)...])
+                    var first = tokens[p].count - period * (loopReps - 1)
+                    for i in 0 ... (tokens[p].count - period)
+                    where Array(tokens[p][i ..< (i + period)]) == block {
+                        first = i
+                        break
+                    }
+                    tokens[p] = Array(tokens[p][0 ..< (first + period)])
+                    stopped[p] = .loopGuard
+                    done.append(row)
+                }
+            }
+
+            if let onStream, Date().timeIntervalSince(lastEmit) >= Self.streamInterval {
+                lastEmit = Date()
+                let elapsed = Date().timeIntervalSince(tDecode)
+                for row in rows where !done.contains(row) {
+                    let p = rowPage[row]
+                    let text = (try? tokenizer.decode(tokenIds: tokens[p], skipSpecialTokens: true)) ?? ""
+                    onStream(p, StreamUpdate(text: text, tokens: tokens[p].count,
+                                             tokensPerSecond: elapsed > 0
+                                                 ? Double(tokens[p].count) / elapsed : 0))
+                }
+            }
+
+            guard !done.isEmpty else { continue }
+
+            let now = Date()
+            for row in done {
+                let p = rowPage[row]
+                finishedAt[p] = now.timeIntervalSince(tDecode)
+                if let onFinish {
+                    let text = (try? tokenizer.decode(tokenIds: tokens[p], skipSpecialTokens: true)) ?? ""
+                    onFinish(p, Result(text: text, tokens: tokens[p],
+                                       promptTokens: promptLengths[p], ttft: ttft,
+                                       decodeTokensPerSecond: Double(max(tokens[p].count - 1, 0))
+                                           / max(finishedAt[p], 1e-9),
+                                       stoppedBy: stopped[p], tiles: pages[p].prep.grid))
+                }
+            }
+
+            // Refill what we can, drop what we cannot. A row is only removed once there is
+            // nothing left to put in it, which is what keeps the batch at full width until the
+            // very end of the document instead of from the first page that finishes early.
+            var vacated: [Int] = []
+            for row in done {
+                if nextPage < n {
+                    try admit(row: row, page: nextPage)
+                    nextPage += 1
+                } else {
+                    vacated.append(row)
+                }
+            }
+            if !vacated.isEmpty {
+                let keep = rows.filter { !vacated.contains($0) }
+                if keep.isEmpty {
+                    for cache in batchCaches { cache.keepRows(MLXArray([Int32]()), count: 0) }
+                    rowPage = []
+                    rowPos = []
+                    break
+                }
+                let sel = MLXArray(keep.map { Int32($0) })
+                for cache in batchCaches { cache.keepRows(sel, count: keep.count) }
+                rowPage = keep.map { rowPage[$0] }
+                rowPos = keep.map { rowPos[$0] }
+            }
+        }
+
+        let decodeSeconds = Date().timeIntervalSince(tDecode)
+        return try (0 ..< n).map { p in
+            let ids = tokens[p]
+            let text = try tokenizer.decode(tokenIds: ids, skipSpecialTokens: true)
+            let secs = finishedAt[p] > 0 ? finishedAt[p] : decodeSeconds
+            return Result(text: text, tokens: ids, promptTokens: promptLengths[p], ttft: ttft,
+                          decodeTokensPerSecond: Double(max(ids.count - 1, 0)) / max(secs, 1e-9),
+                          stoppedBy: stopped[p], tiles: pages[p].prep.grid)
+        }
     }
 
     /// One group, decoded together until every sequence has stopped.
@@ -296,9 +525,14 @@ extension OCRModel {
         var stalled: Double = 0
 
         let indices = Array(range)
-        let groups = stride(from: 0, to: indices.count, by: width).map {
-            Array(indices[$0 ..< min($0 + width, indices.count)])
-        }
+        // Continuous batching schedules ROWS, not groups: it needs every page in one call so a
+        // finished row has something to be refilled with. Slicing into groups of exactly `width`
+        // leaves it nothing to admit and it silently degenerates to the static path.
+        let groups = OCRRuntimeFlags.continuousBatch
+            ? [indices]
+            : stride(from: 0, to: indices.count, by: width).map {
+                Array(indices[$0 ..< min($0 + width, indices.count)])
+            }
 
         // GROUP-AHEAD PREFETCH. Prefill is fixed per page and now the larger half of a batched
         // run, so the question is not how to make it cheaper but where to hide it. The decode of a
@@ -355,7 +589,8 @@ extension OCRModel {
             ahead = (pipelined && gi + 1 < groups.count) ? prefetch(groups[gi + 1]) : nil
 
             guard !prepared.isEmpty else { continue }
-            let out = try decodeBatch(prepared, width: prepared.count, maxNewTokens: maxNewTokens,
+            let out = try decodeBatch(prepared, width: min(width, prepared.count),
+                                      maxNewTokens: maxNewTokens,
                                       loopGuard: loopGuard, loopReps: loopReps,
                                       loopGrace: loopGrace)
             for (offset, r) in out.enumerated() where offset < g.count {

@@ -164,6 +164,14 @@ if args.contains("--probe-gemm") {
     exit(0)
 }
 
+if args.contains("--probe-decode-width") {
+    let modelPath = args.first { !$0.hasPrefix("--") }
+    guard let modelPath else { fatalError("--probe-decode-width needs a model dir") }
+    let model = try await OCRModel(modelDir: URL(fileURLWithPath: modelPath))
+    print(model.probeDecodeWidth())
+    exit(0)
+}
+
 if args.contains("--probe-vision") {
     let modelPath = args.first { !$0.hasPrefix("--") }
     guard let modelPath else { fatalError("--probe-vision needs a model dir") }
@@ -285,6 +293,8 @@ if let i = args.firstIndex(of: "--pdf") {
     OCRRuntimeFlags.loopGuardForPDF = !args.contains("--no-loop-guard")
     OCRRuntimeFlags.visionPrefetch = args.contains("--vision-prefetch")
     OCRRuntimeFlags.reportPrefill = args.contains("--report-prefill")
+    OCRRuntimeFlags.continuousBatch = args.contains("--continuous")
+    OCRRuntimeFlags.forceBatchMask = args.contains("--force-mask")
     let workers = intAfter("--workers", in: args) ?? 1
     let printText = args.contains("--print-text")
 
@@ -316,7 +326,26 @@ if let i = args.firstIndex(of: "--pdf") {
                      out.pages.count, elapsed, elapsed / Double(max(out.pages.count, 1)),
                      Double(out.pages.reduce(0) { $0 + $1.tokenCount }) / elapsed, batchWidth))
         print(String(format: "stalled on prefill: %.1f s", out.stalledSeconds))
+        // How much of the batch was actually alive? A group runs for as many steps as its LONGEST
+        // page, and every slot that finished early is a dead row from then on. This is the
+        // ceiling on what continuous batching (refilling a finished slot) could recover.
+        do {
+            let lens = out.pages.map(\.tokenCount)
+            var used = 0, capacity = 0
+            for start in stride(from: 0, to: lens.count, by: batchWidth) {
+                let g = Array(lens[start ..< min(start + batchWidth, lens.count)])
+                used += g.reduce(0, +)
+                capacity += (g.max() ?? 0) * g.count
+            }
+            print("page tokens: " + lens.map(String.init).joined(separator: ","))
+            print(String(format: "batch occupancy: %.0f%% (%d tokens in %d slot-steps), pages %d-%d tok",
+                         100.0 * Double(used) / Double(max(capacity, 1)), used, capacity,
+                         lens.min() ?? 0, lens.max() ?? 0))
+        }
         print("page markers recovered in place: \(found)/\(out.pages.count)")
+        if printText {
+            for page in out.pages { print("----- page \(page.page)\n\(page.text)\n") }
+        }
         print("document digest: \(digest(out.markdown()))  chars \(out.markdown().count)")
         exit(0)
     }

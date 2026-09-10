@@ -33,6 +33,11 @@ public enum OCRRuntimeFlags {
     /// TTFT is dead time before a single character appears, and on a laptop it is the part of the
     /// wall clock a reader actually feels.
     nonisolated(unsafe) public static var reportPrefill = false
+    /// Refill a finished row with the next page instead of narrowing the batch.
+    nonisolated(unsafe) public static var continuousBatch = false
+    /// Diagnostic: hand attention an all-zero mask even when the rows are level, so the masked
+    /// and unmasked kernel paths can be compared on identical scheduling.
+    nonisolated(unsafe) public static var forceBatchMask = false
     /// FR-Spec shortlist size for the draft head; 0 = full vocabulary. See
     /// `OCRLanguageModel.draftVocab` for why a prefix of the id space is the right shortlist.
     /// Let the draft length follow measured acceptance instead of being fixed.

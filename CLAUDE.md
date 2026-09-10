@@ -205,6 +205,35 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   and a page re-queued after a stop.
 - `Prepared.global` is OPTIONAL because a cached page has features and no pixels. `visualFeatures`
   traps on nil and the stage dump throws - both are only ever driven from a freshly prepared page.
+- BATCH OCCUPANCY ON A REAL DOCUMENT IS 45%. Pages run 72 to 1310 tokens, so a static group runs
+  for as many steps as its LONGEST page and spends most of them narrowed. That matters because a
+  decode step is strongly SUB-LINEAR in its row count, measured at a 1024-token context with
+  `--probe-decode-width`: 5.60 / 8.95 / 9.53 / 11.47 / 15.89 / 22.21 ms at 1 / 2 / 4 / 8 / 16 / 32
+  rows. 32 rows cost 4x what one row does and carry 32x the tokens, so running narrow is expensive
+  and the row, not the group, is the unit of work.
+- CONTINUOUS BATCHING: BUILT, BIG, NOT DEFAULT YET (`--continuous`, `OCRRuntimeFlags.continuousBatch`).
+  A finished row is refilled with the next page instead of being dropped. Measured on the 40-page
+  scan: 260 -> 343 at width 8, 339 -> 417 at width 16, 402 -> 475 at width 32. It matters most at
+  the narrow widths a laptop can afford. `OCRBatchKVCache` grew per-row `promptLen`/`startedAt` and
+  a shared `cursor`: a recycled row keeps its prompt at [0, promptLen) and its output from
+  `startedAt`, and `mask()` hides the dead span in between.
+- Two traps found building it, both worth remembering. `rope(positions:)` was keyed
+  "first-last-count", which is only unique while every row advances in lockstep - continuous
+  batching makes two different position vectors collide on that key and silently swaps their
+  rotations. Now keyed by the whole vector. And `transcribeBatched(pdfAt:)` pre-slices pages into
+  groups of exactly `width`, so the scheduler was handed 32 pages with width 32, had nothing to
+  admit, and degenerated to the static path while reporting a clean A/B of 403 vs 401 - a null
+  result that was measuring nothing.
+- WHAT STILL GATES IT: at 20 pages the output is byte-identical to static; at 40 pages ONE token in
+  23,834 flips, "199 mL" to "199 m3". The static path already renders that same glyph family wrong
+  twice on its own ("373 m.L", "588 m3"), so this is the near-tie class, not corruption - but the
+  static path IS digest-stable across widths 8/16/32 and this is not, so it does not get to be the
+  default on a hunch. Forcing an all-zero mask through the static path reproduces the static digest
+  exactly, which rules out the masked kernel path and leaves the dead-span -inf reduction as the
+  suspect. The gate is CER against the torch oracle on bench/hard2, same as every other
+  near-tie change here. NOTE: hard2 is PNGs, and converting them to a PDF to reach the batch path
+  produces pages the model loops on (737 KB of repeated paragraphs for 30 pages) - that harness is
+  invalid, an images-based batch entry point is needed instead.
 - Measured and rejected, do not re-derive: mlx-swift 0.31.4 (same qmm bug; 0.31.5+ needs
   Swift 6.3). DFlash/EAGLE trees need a draft model we cannot train here; ViT token merging breaks
   the fixed visual-token/prompt-slot contract.
