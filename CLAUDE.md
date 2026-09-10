@@ -149,10 +149,13 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   is per-SLOT: at B = 32 that reads ~13 tok/s while the run is doing 400. Mid-run it also reads low
   for a different and honest reason - the first group's 32 vision towers and prefills are on the
   clock before much text exists (244 tok/s at 29 s, 381 at the end).
-- A group is confined to ONE DROP BATCH. The readout counts within a drop, so a group spanning two
-  of them has no honest page numbers, and `batchRange` is stored batch-relative for the same reason
-  - page indices are workspace-wide and would print "Pages 41-48 of 8" for a second document. Four
-  files dropped together are one batch, so they still decode as one group ("Pages 1-8 of 8").
+- A group is confined to ONE DROP BATCH, so a file opened mid-run does not join the group someone
+  is watching. Four files dropped together are one batch and still decode as one group.
+- A page SETTLES WHEN ITS OWN SEQUENCE STOPS, not when the group returns (`decodeGroup`'s
+  `onFinish`). Page lengths in a group run from 75 to 1309 tokens, so holding every finished page
+  until the slowest one stopped froze the whole workspace: on a ten-file drop every tab's progress
+  ring sat at zero for the length of the run and then cleared at once. The group return is now a
+  backstop for the pages that failed and for a callback that lost the race.
 - Measured and rejected, do not re-derive: mlx-swift 0.31.4 (same qmm bug; 0.31.5+ needs
   Swift 6.3). DFlash/EAGLE trees need a draft model we cannot train here; ViT token merging breaks
   the fixed visual-token/prompt-slot contract.
@@ -212,9 +215,12 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
 - While a group is in flight the transcript follows `visibleIndex` (the first page of the group,
   which is what the navigator marks), not the tail: every page in the group grows at once, so the
   tail is the LAST page of the group and following it left the rail and the text on different pages.
-- The readout counts within a DROP BATCH, not across the workspace. Pages carry the batch they
-  arrived in; the chip reports the batch containing the running page. Summing the whole queue
-  renumbered "page 13 of 40" into "page 13 of 41" under the reader while they watched.
+- The readout is PAGES FINISHED over pages queued: "6 of 24 pages". It used to name the page being
+  worked on, which a group made meaningless - there is no single page - and naming the group's
+  range instead ("Pages 1-32 of 40") answered the width of the batch when the question is how far
+  along the document is. An earlier rule counted within a drop batch to stop a mid-run drop
+  renumbering "page 13 of 40" into "page 13 of 41"; a finished COUNT does not have that problem,
+  since a new file moves the total and leaves the count alone.
 - Thumbnails cast a shadow and are NOT stroked. Preview's pages read as paper because of the
   shadow; a hairline on top of it is the frame a page rail is not supposed to have.
 - The sidebar toggle is OURS, not the system's. The automatic one lives in the sidebar's own

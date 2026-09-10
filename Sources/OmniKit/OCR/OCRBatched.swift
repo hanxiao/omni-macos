@@ -75,6 +75,7 @@ extension OCRModel {
     func decodeBatch(_ prepared: [PreparedPage], width: Int, maxNewTokens requested: Int,
                      loopGuard: Bool, loopReps: Int, loopGrace: Int,
                      onStream: (@Sendable (Int, StreamUpdate) -> Void)? = nil,
+                     onFinish: (@Sendable (Int, Result) -> Void)? = nil,
                      shouldContinue: (@Sendable () -> Bool)? = nil) throws -> [Result] {
         var out = [Result?](repeating: nil, count: prepared.count)
         var next = 0
@@ -84,9 +85,12 @@ extension OCRModel {
             // Slot indices are group-local; the caller thinks in page indices.
             var shifted: (@Sendable (Int, StreamUpdate) -> Void)?
             if let onStream { shifted = { slot, update in onStream(base + slot, update) } }
+            var shiftedFinish: (@Sendable (Int, Result) -> Void)?
+            if let onFinish { shiftedFinish = { slot, result in onFinish(base + slot, result) } }
             let results = try decodeGroup(slice, maxNewTokens: requested, loopGuard: loopGuard,
                                           loopReps: loopReps, loopGrace: loopGrace,
-                                          onStream: shifted, shouldContinue: shouldContinue)
+                                          onStream: shifted, onFinish: shiftedFinish,
+                                          shouldContinue: shouldContinue)
             for (offset, r) in results.enumerated() { out[next + offset] = r }
             next += slice.count
             if let shouldContinue, !shouldContinue() { break }
@@ -98,6 +102,7 @@ extension OCRModel {
     private func decodeGroup(_ pages: [PreparedPage], maxNewTokens requested: Int,
                              loopGuard: Bool, loopReps: Int, loopGrace: Int,
                              onStream: (@Sendable (Int, StreamUpdate) -> Void)? = nil,
+                             onFinish: (@Sendable (Int, Result) -> Void)? = nil,
                              shouldContinue: (@Sendable () -> Bool)? = nil) throws -> [Result] {
         let b = pages.count
         let t0 = Date()
@@ -195,6 +200,23 @@ extension OCRModel {
                 }
             }
 
+            // A page that has stopped is DONE, now - not when the last of its group stops. The
+            // group is a decode detail; a reader watching a ten-file drop sees ten tabs whose
+            // progress rings all sit at zero for the length of the run and then clear at once.
+            if let onFinish, !finished.isEmpty {
+                let elapsed = Date().timeIntervalSince(tDecode)
+                for row in finished {
+                    let slot = live[row]
+                    let ids = tokens[slot]
+                    let text = (try? tokenizer.decode(tokenIds: ids, skipSpecialTokens: true)) ?? ""
+                    onFinish(slot, Result(text: text, tokens: ids,
+                                          promptTokens: promptLengths[slot], ttft: ttft,
+                                          decodeTokensPerSecond: Double(max(ids.count - 1, 0))
+                                              / max(elapsed, 1e-9),
+                                          stoppedBy: stopped[slot], tiles: pages[slot].prep.grid))
+                }
+            }
+
             if !finished.isEmpty {
                 let keep = (0 ..< live.count).filter { !finished.contains($0) }
                 live = keep.map { live[$0] }
@@ -284,12 +306,14 @@ extension OCRModel {
                                   width: Int? = nil, loopGuard: Bool = true, loopReps: Int = 24,
                                   loopGrace: Int = 96,
                                   onStream: (@Sendable (Int, StreamUpdate) -> Void)? = nil,
+                                  onFinish: (@Sendable (Int, Result) -> Void)? = nil,
                                   shouldContinue: (@Sendable () -> Bool)? = nil) throws -> [Result] {
         let width = width ?? OCRBatchPlan.recommendedWidth(modelBytes: weightBytes,
                                                            pageCount: images.count)
         let prepared = try images.map { try preparePage(image: $0, prompt: prompt) }
         return try decodeBatch(prepared, width: max(width, 1), maxNewTokens: maxNewTokens,
                                loopGuard: loopGuard, loopReps: loopReps, loopGrace: loopGrace,
-                               onStream: onStream, shouldContinue: shouldContinue)
+                               onStream: onStream, onFinish: onFinish,
+                               shouldContinue: shouldContinue)
     }
 }

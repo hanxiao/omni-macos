@@ -269,25 +269,18 @@ final class OCRSession {
     private(set) var notice: String?
     private(set) var noticeSymbol = "exclamationmark.triangle"
 
-    /// The drop being transcribed. Not the whole workspace: a file opened while a run is in flight
-    /// joins the queue behind it, and counting it into the run already on screen turned "page 13 of
-    /// 40" into "page 13 of 41" under the reader's eyes.
-    private var activeBatch: Int {
-        if let index = runningIndex, pages.indices.contains(index) { return pages[index].batch }
-        return pages.last?.batch ?? 0
-    }
+    /// What the readout counts: pages finished, over every page in the queue. Not a range of the
+    /// group in flight - a group is a decode detail, and "Pages 1-32 of 40" tells a reader nothing
+    /// about how much of their document is done.
+    var queueTotal: Int { pages.count }
 
-    var batchTotal: Int { pages.reduce(0) { $1.batch == activeBatch ? $0 + 1 : $0 } }
-
-    var batchCompleted: Int {
-        let batch = activeBatch
-        return pages.reduce(0) { $1.batch == batch && $1.state != .pending && $1.state != .running
-            ? $0 + 1 : $0 }
+    var queueCompleted: Int {
+        pages.reduce(0) { $1.state == .done || $1.state == .failed ? $0 + 1 : $0 }
     }
 
     var progress: Double {
-        let total = batchTotal
-        return total == 0 ? 0 : Double(batchCompleted) / Double(total)
+        let total = queueTotal
+        return total == 0 ? 0 : Double(queueCompleted) / Double(total)
     }
     var isBusy: Bool { phase == .loading || phase == .running }
 
@@ -487,9 +480,9 @@ final class OCRSession {
     /// The pages decoding together right now, if a group is in flight. Several pages stream at
     /// once, so "the page being transcribed" is a range rather than a number and the readout and
     /// the follow both have to say so.
-    /// The pages decoding together, numbered within their drop batch. nil when one page is
-    /// running on its own.
-    private(set) var batchRange: ClosedRange<Int>?
+    /// True while a GROUP of pages is decoding together. The transcript follows differently then:
+    /// every page in the group grows at once, so the tail belongs to the last of them.
+    private(set) var isGroupRunning = false
     @ObservationIgnored private var previewCache: [Int: URL] = [:]
     /// Bumped by every drop, so pages carry the batch they came in with.
     private var batchCount = 0
@@ -989,12 +982,7 @@ final class OCRSession {
         startRateClock()
         for index in group { pages[index].state = .running }
         runningIndex = group.first
-        // Batch-RELATIVE, because that is what the readout counts against: page indices are
-        // workspace-wide and would print "pages 41-48 of 8" for a second document.
-        if let low = group.min(), let high = group.max(),
-           let base = pages.firstIndex(where: { $0.batch == pages[low].batch }) {
-            batchRange = (low - base) ... (high - base)
-        }
+        isGroupRunning = group.count > 1
         if !userPinnedDocument, let first = group.first,
            let doc = documents_indexOfDocument(containing: first), doc != selectedDocument {
             selectedDocument = doc
@@ -1024,6 +1012,19 @@ final class OCRSession {
                         self.streamTick &+= 1
                     }
                 },
+                onFinish: { slot, result in
+                    // A page lands the moment ITS sequence stops, not when the group returns. Its
+                    // tab ring, the rail and the counter all read the same page states, so holding
+                    // ten finished pages back until the slowest one stops froze every one of them.
+                    Task { @MainActor [weak self] in
+                        guard let self, self.runToken == token, slot < group.count else { return }
+                        let index = group[slot]
+                        guard self.pages.indices.contains(index),
+                              self.pages[index].state == .running,
+                              !result.text.isEmpty else { return }
+                        self.settle(index, with: result)
+                    }
+                },
                 shouldContinue: { !gate.isStopped })) ?? []
         }.value
 
@@ -1031,24 +1032,36 @@ final class OCRSession {
         let seconds = Date().timeIntervalSince(started) / Double(max(group.count, 1))
         for (slot, index) in group.enumerated() {
             guard texts.indices.contains(index) else { continue }
-            liveTokens[index] = nil
-            if slot < results.count, !results[slot].text.isEmpty {
-                texts[index] = results[slot].text
-                pages[index].tokens = results[slot].tokens.count
-                pages[index].tokensPerSecond = results[slot].decodeTokensPerSecond
-                pages[index].state = .done
-                lastDoneIndex = index
-                settledTokens += results[slot].tokens.count
-            } else {
-                pages[index].state = gate.isStopped ? .stopped : .failed
+            // Most of these are already settled by `onFinish`; this is the backstop for a page
+            // whose callback lost the race with the group returning, and for the ones that failed.
+            if pages[index].state == .running {
+                if slot < results.count, !results[slot].text.isEmpty {
+                    settle(index, with: results[slot])
+                } else {
+                    liveTokens[index] = nil
+                    pages[index].state = gate.isStopped ? .stopped : .failed
+                }
             }
             pages[index].seconds = seconds
-            if pages[index].state == .done { completedPages += 1 }
         }
         if !find.isEmpty { rebuildMatches() }
         noteRate()
         runningIndex = nil
-        batchRange = nil
+        isGroupRunning = false
+    }
+
+    /// Record a finished page: its text, its counters, and the rate they feed.
+    private func settle(_ index: Int, with result: OCRModel.Result) {
+        texts[index] = result.text
+        pages[index].tokens = result.tokens.count
+        pages[index].tokensPerSecond = result.decodeTokensPerSecond
+        pages[index].state = .done
+        lastDoneIndex = index
+        completedPages += 1
+        settledTokens += result.tokens.count
+        liveTokens[index] = nil
+        noteRate()
+        if !find.isEmpty { rebuildMatches() }
     }
 
     /// Start the rate clock at the first page's decode, not at the run's, so loading four and a

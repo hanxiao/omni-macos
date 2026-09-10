@@ -820,7 +820,7 @@ private struct DocumentScroll<Content: View>: View {
                 // With a group in flight every page in it grows at once, so the tail is the LAST
                 // page of the group rather than the one being read. Follow the page the navigator
                 // is marking instead, which is the first of the group.
-                if session.batchRange != nil, let id = session.visibleIndex {
+                if session.isGroupRunning, let id = session.visibleIndex {
                     proxy.scrollTo(id, anchor: .top)
                 } else {
                     proxy.scrollTo(tailID, anchor: .bottom)
@@ -1060,7 +1060,7 @@ private struct ProgressReadout: View {
     @ViewBuilder private var indicator: some View {
         if !session.isBusy {
             Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-        } else if session.batchTotal > 1 {
+        } else if session.queueTotal > 1 {
             CloudSyncPie(fraction: session.progress)
         } else {
             ProgressView().progressViewStyle(.circular).controlSize(.small)
@@ -1068,14 +1068,10 @@ private struct ProgressReadout: View {
     }
 
     private var headline: String {
-        // A group decodes several pages at once, so there is no single page being worked on and
-        // saying "Page 1 of 40" while thirty-two of them are in flight is simply untrue.
-        if let range = session.batchRange, range.count > 1 {
-            return "Pages \(range.lowerBound + 1)-\(range.upperBound + 1) of \(session.batchTotal)"
-        }
-        return session.isBusy
-            ? "Page \(min(session.batchCompleted + 1, session.batchTotal)) of \(session.batchTotal)"
-            : "\(session.batchCompleted) of \(session.batchTotal) pages"
+        // Pages FINISHED over pages queued, running or not. A group decodes several pages at once,
+        // so there is no single page being worked on, and naming the group's range answered a
+        // question nobody asked - how far along is this - with the width of the batch.
+        "\(session.queueCompleted) of \(session.queueTotal) pages"
     }
 
     private var detail: String {
