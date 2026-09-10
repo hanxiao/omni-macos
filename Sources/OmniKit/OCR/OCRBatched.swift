@@ -323,7 +323,11 @@ extension OCRModel {
             // very end of the document instead of from the first page that finishes early.
             var vacated: [Int] = []
             for row in done {
-                if nextPage < n {
+                // A page whose prompt reaches past the shared cursor cannot take a recycled row:
+                // its first generated token would land inside the prompt it just seeded. Rare
+                // (it needs a longer prompt than anything decoded so far) and the row is simply
+                // dropped, leaving the page for the next group.
+                if nextPage < n, batchCaches[0].canAdmit(promptTokens: pages[nextPage].prep.ids.count) {
                     try admit(row: row, page: nextPage)
                     nextPage += 1
                 } else {

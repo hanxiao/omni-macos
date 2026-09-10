@@ -217,6 +217,16 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   the narrow widths a laptop can afford. `OCRBatchKVCache` grew per-row `promptLen`/`startedAt` and
   a shared `cursor`: a recycled row keeps its prompt at [0, promptLen) and its output from
   `startedAt`, and `mask()` hides the dead span in between.
+- PROMPTS IN A GROUP ARE NOT THE SAME LENGTH, and assuming they are crashed the shipped app
+  (EXC_BREAKPOINT, `OCRBatchKVCache.seed`, cursor 1007 against a 1197-token prompt) the first
+  time several documents were dropped at once. A page's tile grid comes from its ASPECT RATIO,
+  so a portrait scan and a squarer one produce different `imageIDs` counts and different prompt
+  lengths, in the STATIC path as much as the continuous one. Two consequences: a row's output
+  start cannot be fixed when it is seeded, because a later, longer prompt in the same group moves
+  the shared cursor past it and silently turns that row's gap into valid history - it is assigned
+  lazily, at the row's first `appendStep`; and a finished row can only be recycled when its new
+  prompt fits under the cursor (`canAdmit`), otherwise the page waits for the next group.
+  `OCRBatchCacheTests` pins all of it, including the 1007/1197 shape from the crash.
 - Two traps found building it, both worth remembering. `rope(positions:)` was keyed
   "first-last-count", which is only unique while every row advances in lockstep - continuous
   batching makes two different position vectors collide on that key and silently swaps their

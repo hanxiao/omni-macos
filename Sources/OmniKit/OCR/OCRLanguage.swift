@@ -160,15 +160,26 @@ final class OCRBatchKVCache {
     private(set) var startedAt: [Int]
     private(set) var cursor = 0
 
-    /// Logical tokens per row: its prompt plus what it has generated since being admitted.
+    /// -1 until the row writes its first generated token. It CANNOT be fixed at seed time: a
+    /// fresh batch seeds its rows one after another, and prompts differ in length whenever the
+    /// pages have different tile grids, so a later, longer prompt moves the cursor past an
+    /// earlier row's recorded start and silently turns that row's gap into valid history.
+    private static let notStarted = -1
+
+    /// Logical tokens per row: its prompt plus what it has generated since it started.
     var lengths: [Int] {
-        (0 ..< batchCount).map { promptLen[$0] + max(0, cursor - startedAt[$0]) }
+        (0 ..< batchCount).map {
+            promptLen[$0] + (startedAt[$0] < 0 ? 0 : max(0, cursor - startedAt[$0]))
+        }
     }
+
+    /// The first buffer index a row's own output occupies, or `cursor` while it has none.
+    private func outputStart(_ b: Int) -> Int { startedAt[b] < 0 ? cursor : startedAt[b] }
 
     init(batch: Int) {
         self.batchCount = batch
         self.promptLen = [Int](repeating: 0, count: batch)
-        self.startedAt = [Int](repeating: 0, count: batch)
+        self.startedAt = [Int](repeating: Self.notStarted, count: batch)
     }
 
     /// Append one token per sequence. `k`/`v` are (B, heads, 1, d).
@@ -176,29 +187,34 @@ final class OCRBatchKVCache {
         grow(to: cursor + 1, like: k)
         keys![0..., 0..., cursor ..< (cursor + 1), 0...] = k
         values![0..., 0..., cursor ..< (cursor + 1), 0...] = v
+        // A row that had not written yet starts here, which is the only moment the shared cursor
+        // and the row's own history are guaranteed to line up.
+        for b in 0 ..< batchCount where startedAt[b] < 0 { startedAt[b] = cursor }
         cursor += 1
         if OCRRuntime.evalCacheWrites { eval(keys!, values!) }
     }
 
     /// Seed one slot from a finished single-sequence prefill. `k`/`v` are (heads, T, d).
     ///
-    /// Used both to fill a fresh batch, where every row seeds before the first step and the
-    /// cursor ends up at the common prompt length, and to ADMIT a new page into a slot whose
-    /// page has finished. In the second case the cursor is already past the prompt, so the row
-    /// carries a dead span that `mask()` excludes.
+    /// Used both to fill a fresh batch, where every row seeds before the first step, and to
+    /// ADMIT a new page into a slot whose page has finished. Prompts may differ in length in
+    /// either case - a page's tile grid comes from its aspect ratio, so a mixed drop puts 1007-
+    /// and 1197-token prompts in one group - and the shorter rows simply carry a dead span that
+    /// `mask()` excludes.
     func seed(slot: Int, keys kIn: MLXArray, values vIn: MLXArray) {
         let t = kIn.dim(1)
         grow(to: max(t, cursor), like: kIn.expandedDimensions(axis: 0))
         keys![slot ..< (slot + 1), 0..., 0 ..< t, 0...] = kIn.expandedDimensions(axis: 0)
         values![slot ..< (slot + 1), 0..., 0 ..< t, 0...] = vIn.expandedDimensions(axis: 0)
         promptLen[slot] = t
-        // A row can only be recycled once the cursor is past its prompt; otherwise its own next
-        // write would land inside the prompt it just seeded.
-        precondition(cursor == 0 || cursor >= t,
-                     "cannot admit a \(t)-token prompt at cursor \(cursor)")
         cursor = max(cursor, t)
-        startedAt[slot] = cursor
+        startedAt[slot] = Self.notStarted
     }
+
+    /// Whether a page of `promptTokens` can be admitted into a finished row right now. It cannot
+    /// if its prompt would reach past the shared cursor, because its own next write lands AT the
+    /// cursor and would fall inside the prompt it just seeded.
+    func canAdmit(promptTokens t: Int) -> Bool { cursor == 0 || cursor >= t }
 
     private func grow(to need: Int, like k: MLXArray) {
         let current = keys?.dim(2) ?? 0
@@ -246,12 +262,12 @@ final class OCRBatchKVCache {
         let t = cursor
         guard t > 0 else { return nil }
         guard OCRRuntimeFlags.forceBatchMask
-            || (0 ..< batchCount).contains(where: { promptLen[$0] < startedAt[$0] }) else {
+            || (0 ..< batchCount).contains(where: { promptLen[$0] < outputStart($0) }) else {
             return nil
         }
         var buf = [Float](repeating: 0, count: batchCount * t)
-        for b in 0 ..< batchCount where promptLen[b] < startedAt[b] {
-            for j in promptLen[b] ..< min(startedAt[b], t) { buf[b * t + j] = -Float.infinity }
+        for b in 0 ..< batchCount where promptLen[b] < outputStart(b) {
+            for j in promptLen[b] ..< min(outputStart(b), t) { buf[b * t + j] = -Float.infinity }
         }
         return MLXArray(buf, [batchCount, 1, 1, t])
     }
