@@ -138,6 +138,21 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   batching pages inside ONE process is the real lever and worker processes are not: batching
   amortises both bounds (fixed per-launch latency, and reading the active experts once per step)
   over B sequences while holding one copy of the weights, so it works on a 16 GB machine.
+- WIRED INTO THE APP: a run decodes in groups, sized by `OCRBatchPlan` or by "Pages at once" in
+  the OCR settings tab (0 = Automatic, 1 = the page-at-a-time path, then 8/12/16/24/32). Measured
+  IN THE APP on the same 40-page scan, final chip readings: 182 tok/s / 2:09 at one page at a time,
+  245 / 1:39 at 8, 323 / 1:15 at 16, 381 / 1:03 at 32. That is 4-6% under the headless figures
+  (193 / 259 / 339 / 399 at the same widths, all with digest 772db0f94e0ae106), which is what the
+  workspace costs: every live slot decodes its whole id list per emission at 24 Hz.
+- The chip's rate is the run's AGGREGATE - all tokens over the wall clock since the first page
+  started decoding, model load excluded. It used to be the last streaming update's own rate, which
+  is per-SLOT: at B = 32 that reads ~13 tok/s while the run is doing 400. Mid-run it also reads low
+  for a different and honest reason - the first group's 32 vision towers and prefills are on the
+  clock before much text exists (244 tok/s at 29 s, 381 at the end).
+- A group is confined to ONE DROP BATCH. The readout counts within a drop, so a group spanning two
+  of them has no honest page numbers, and `batchRange` is stored batch-relative for the same reason
+  - page indices are workspace-wide and would print "Pages 41-48 of 8" for a second document. Four
+  files dropped together are one batch, so they still decode as one group ("Pages 1-8 of 8").
 - Measured and rejected, do not re-derive: mlx-swift 0.31.4 (same qmm bug; 0.31.5+ needs
   Swift 6.3). DFlash/EAGLE trees need a draft model we cannot train here; ViT token merging breaks
   the fixed visual-token/prompt-slot contract.
@@ -190,6 +205,13 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   page navigator went blank the moment a run finished, which is how it was found. It also numbered
   logical lines, which a soft-wrapping editor does not lay out one to a row, and `Text("\(line)")`
   is a LocalizedStringKey, so past 999 it rendered "1,300" into a column sized for four digits.
+- A page that is RUNNING but still empty is not a section. With one page in flight it never showed;
+  with a group of 32 it put a wall of bare page rules on screen, one per page in the group, and the
+  text arrived under the reader's scroll position. `sectionIDs` admits a running page only once it
+  has text.
+- While a group is in flight the transcript follows `visibleIndex` (the first page of the group,
+  which is what the navigator marks), not the tail: every page in the group grows at once, so the
+  tail is the LAST page of the group and following it left the rail and the text on different pages.
 - The readout counts within a DROP BATCH, not across the workspace. Pages carry the batch they
   arrived in; the chip reports the batch containing the running page. Summing the whole queue
   renumbered "page 13 of 40" into "page 13 of 41" under the reader while they watched.

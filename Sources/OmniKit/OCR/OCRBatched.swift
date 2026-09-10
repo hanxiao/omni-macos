@@ -73,22 +73,32 @@ extension OCRModel {
     /// launch-bound, so there is nothing to win by batching it and a good deal of complexity in
     /// trying. Only the decode loop is shared.
     func decodeBatch(_ prepared: [PreparedPage], width: Int, maxNewTokens requested: Int,
-                     loopGuard: Bool, loopReps: Int, loopGrace: Int) throws -> [Result] {
+                     loopGuard: Bool, loopReps: Int, loopGrace: Int,
+                     onStream: (@Sendable (Int, StreamUpdate) -> Void)? = nil,
+                     shouldContinue: (@Sendable () -> Bool)? = nil) throws -> [Result] {
         var out = [Result?](repeating: nil, count: prepared.count)
         var next = 0
         while next < prepared.count {
+            let base = next
             let slice = Array(prepared[next ..< min(next + width, prepared.count)])
+            // Slot indices are group-local; the caller thinks in page indices.
+            var shifted: (@Sendable (Int, StreamUpdate) -> Void)?
+            if let onStream { shifted = { slot, update in onStream(base + slot, update) } }
             let results = try decodeGroup(slice, maxNewTokens: requested, loopGuard: loopGuard,
-                                          loopReps: loopReps, loopGrace: loopGrace)
+                                          loopReps: loopReps, loopGrace: loopGrace,
+                                          onStream: shifted, shouldContinue: shouldContinue)
             for (offset, r) in results.enumerated() { out[next + offset] = r }
             next += slice.count
+            if let shouldContinue, !shouldContinue() { break }
         }
         return out.compactMap { $0 }
     }
 
     /// One group, decoded together until every sequence has stopped.
     private func decodeGroup(_ pages: [PreparedPage], maxNewTokens requested: Int,
-                             loopGuard: Bool, loopReps: Int, loopGrace: Int) throws -> [Result] {
+                             loopGuard: Bool, loopReps: Int, loopGrace: Int,
+                             onStream: (@Sendable (Int, StreamUpdate) -> Void)? = nil,
+                             shouldContinue: (@Sendable () -> Bool)? = nil) throws -> [Result] {
         let b = pages.count
         let t0 = Date()
 
@@ -124,8 +134,13 @@ extension OCRModel {
         var stopped = [StopReason](repeating: .cap, count: b)
         var position = promptLengths[0]
         let tDecode = Date()
+        var lastEmit = Date.distantPast
 
         while !live.isEmpty {
+            if let shouldContinue, !shouldContinue() {
+                for slot in live { stopped[slot] = .cancelled }
+                break
+            }
             if tokens[live[0]].count >= cap {
                 for slot in live { stopped[slot] = .cap }
                 break
@@ -164,6 +179,21 @@ extension OCRModel {
                 }
             }
             position += 1
+
+            // Every live page streams, on the same throttle a single page uses. Decoding the whole
+            // id list per slot is what keeps multi-byte glyphs intact - a per-token delta would
+            // hand the UI half a character - and at 24 Hz it costs a few percent even at B = 32.
+            if let onStream, Date().timeIntervalSince(lastEmit) >= Self.streamInterval {
+                lastEmit = Date()
+                let elapsed = Date().timeIntervalSince(tDecode)
+                for slot in live {
+                    let ids = tokens[slot]
+                    let text = (try? tokenizer.decode(tokenIds: ids, skipSpecialTokens: true)) ?? ""
+                    onStream(slot, StreamUpdate(text: text, tokens: ids.count,
+                                                tokensPerSecond: elapsed > 0
+                                                    ? Double(ids.count) / elapsed : 0))
+                }
+            }
 
             if !finished.isEmpty {
                 let keep = (0 ..< live.count).filter { !finished.contains($0) }
@@ -216,7 +246,8 @@ extension OCRModel {
         func flush() throws {
             guard !group.isEmpty else { return }
             let out = try decodeBatch(group, width: group.count, maxNewTokens: maxNewTokens,
-                                      loopGuard: loopGuard, loopReps: loopReps, loopGrace: loopGrace)
+                                      loopGuard: loopGuard, loopReps: loopReps,
+                                      loopGrace: loopGrace)
             for (offset, r) in out.enumerated() {
                 results.append(PageResult(page: groupIndices[offset] + 1, text: r.text,
                                           tokenCount: r.tokens.count, promptTokens: r.promptTokens,
@@ -239,5 +270,26 @@ extension OCRModel {
 
         return DocumentResult(pages: results.sorted { $0.page < $1.page },
                               totalSeconds: Date().timeIntervalSince(start), stalledSeconds: 0)
+    }
+}
+
+extension OCRModel {
+
+    /// Transcribe already-rendered pages with `width` of them decoding together.
+    ///
+    /// The app's entry point: its pages come from a PDF or from dropped image files, so it has
+    /// images rather than a document URL. `onStream` carries the SLOT index, because every live
+    /// page produces a token each step and the workspace shows whichever one the reader is on.
+    public func transcribeBatched(images: [OCRImage], prompt: String? = nil, maxNewTokens: Int = 0,
+                                  width: Int? = nil, loopGuard: Bool = true, loopReps: Int = 24,
+                                  loopGrace: Int = 96,
+                                  onStream: (@Sendable (Int, StreamUpdate) -> Void)? = nil,
+                                  shouldContinue: (@Sendable () -> Bool)? = nil) throws -> [Result] {
+        let width = width ?? OCRBatchPlan.recommendedWidth(modelBytes: weightBytes,
+                                                           pageCount: images.count)
+        let prepared = try images.map { try preparePage(image: $0, prompt: prompt) }
+        return try decodeBatch(prepared, width: max(width, 1), maxNewTokens: maxNewTokens,
+                               loopGuard: loopGuard, loopReps: loopReps, loopGrace: loopGrace,
+                               onStream: onStream, shouldContinue: shouldContinue)
     }
 }

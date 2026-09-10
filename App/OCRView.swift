@@ -817,7 +817,14 @@ private struct DocumentScroll<Content: View>: View {
             }
             .onChange(of: session.streamTick) { _, _ in
                 guard session.isFollowingRun else { return }
-                proxy.scrollTo(tailID, anchor: .bottom)
+                // With a group in flight every page in it grows at once, so the tail is the LAST
+                // page of the group rather than the one being read. Follow the page the navigator
+                // is marking instead, which is the first of the group.
+                if session.batchRange != nil, let id = session.visibleIndex {
+                    proxy.scrollTo(id, anchor: .top)
+                } else {
+                    proxy.scrollTo(tailID, anchor: .bottom)
+                }
             }
             // Follows the run, and follows the navigator, through the same value: `visibleIndex` is
             // the running page until the user picks one. It does NOT change while a page decodes,
@@ -1061,7 +1068,12 @@ private struct ProgressReadout: View {
     }
 
     private var headline: String {
-        session.isBusy
+        // A group decodes several pages at once, so there is no single page being worked on and
+        // saying "Page 1 of 40" while thirty-two of them are in flight is simply untrue.
+        if let range = session.batchRange, range.count > 1 {
+            return "Pages \(range.lowerBound + 1)-\(range.upperBound + 1) of \(session.batchTotal)"
+        }
+        return session.isBusy
             ? "Page \(min(session.batchCompleted + 1, session.batchTotal)) of \(session.batchTotal)"
             : "\(session.batchCompleted) of \(session.batchTotal) pages"
     }

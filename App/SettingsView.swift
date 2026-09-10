@@ -1078,9 +1078,24 @@ private struct OCRModelRow: View {
 /// model, because that is where its four and a half gigabytes are.
 private struct OCRTab: View {
     @State private var prompt = OCRSession.Settings.customPrompt
+    @State private var batch = OCRSession.Settings.batchWidth
 
     var body: some View {
         Form {
+            Section {
+                Picker("Pages at once", selection: $batch) {
+                    Text("Automatic").tag(0)
+                    Text("One").tag(1)
+                    ForEach([8, 12, 16, 24, 32], id: \.self) { Text("\($0)").tag($0) }
+                }
+                .onChange(of: batch) { _, new in OCRSession.Settings.batchWidth = new }
+            } header: {
+                Text("Speed")
+            } footer: {
+                Text("Decoding pages together is faster per page and costs memory. Automatic sizes it to this Mac.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
             Section {
                 // One row, not two: a second row draws a separator across the section, and there is
                 // nothing on either side of it worth separating. The editor also drops its own

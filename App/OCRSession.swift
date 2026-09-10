@@ -8,10 +8,10 @@ import UniformTypeIdentifiers
 /// Drives one OCR run: loads the model on demand, renders page thumbnails, streams a page's
 /// Markdown as it decodes, and keeps the finished pages addressable.
 ///
-/// Pages are transcribed one at a time in this session, on purpose. The process pool is faster on
-/// a long document (1.6x) but hands back whole pages, and the thing that makes this feel like a
-/// tool rather than a progress bar is watching the first page appear immediately. Batch throughput
-/// belongs to a headless caller; interactivity belongs here.
+/// Pages decode in GROUPS, sized to the machine by `OCRBatchPlan` and overridable in Settings.
+/// Every page in a group streams, so a group is not a batch job with a progress bar: the reader
+/// still watches text arrive on the page they are on. The process pool is not used here - it holds
+/// one copy of the weights per worker, so it is a win only on a machine that did not need one.
 ///
 /// ## Why page text lives outside `pages`
 ///
@@ -91,6 +91,20 @@ final class OCRSession {
         static var loopGuard: Bool {
             get { UserDefaults.standard.object(forKey: "omni.ocr.loopGuard") as? Bool ?? true }
             set { UserDefaults.standard.set(newValue, forKey: "omni.ocr.loopGuard") }
+        }
+
+        /// How many pages decode together. 0 means "as many as this Mac can hold".
+        ///
+        /// Measured on a 40-page scan: 194 aggregate tok/s one page at a time, 295 at 11 pages,
+        /// 401 at 32. A width below 8 is a LOSS - a narrow batch gives up speculative decoding and
+        /// the routed experts have not started to amortise yet - so Automatic never picks one, but
+        /// an explicit choice is honoured as asked, including 1 for the page-at-a-time path.
+        static var batchWidth: Int {
+            get {
+                let stored = UserDefaults.standard.integer(forKey: "omni.ocr.batchWidth")
+                return stored <= 0 ? 0 : min(stored, 32)
+            }
+            set { UserDefaults.standard.set(newValue, forKey: "omni.ocr.batchWidth") }
         }
 
         /// The instruction the model is given, editable in Settings. One box rather than a set of
@@ -176,7 +190,15 @@ final class OCRSession {
     private var lastDoneIndex: Int?
 
     /// Live figures for the floating readout.
+    ///
+    /// The rate is the run's AGGREGATE: every token this run has produced over the wall clock it
+    /// has been decoding, which is the figure batching moves. A per-page rate would read as a
+    /// collapse the moment pages decode together - one slot of 32 produces ~13 tok/s on its own
+    /// while the run does 400 - and that is the same number the measurements in CLAUDE.md quote.
     private(set) var currentTokensPerSecond: Double = 0
+    private var decodeStart: Date?
+    private var settledTokens = 0
+    private var liveTokens: [Int: Int] = [:]
     private(set) var elapsed: Double = 0
     private(set) var completedPages: Int = 0
     /// The readout is a status toast, not permanent chrome: it stays for the run and a few seconds
@@ -302,8 +324,16 @@ final class OCRSession {
     /// at the end of the document.
     var sectionIDs: [Int] {
         if documentEdit != nil { return Array(editSections.indices) }
-        return visibleDocument?.pageIDs.filter { pages[$0].state == .running || pages[$0].state == .done
-                                                 || pages[$0].state == .failed } ?? []
+        // A page that is decoding but has produced nothing yet is NOT a section. With one page in
+        // flight that was a single empty gap; with a group of eight it is eight page rules and no
+        // text, which reads as a broken document rather than a starting one.
+        return visibleDocument?.pageIDs.filter {
+            switch pages[$0].state {
+            case .done, .failed: return true
+            case .running: return !texts[$0].isEmpty
+            case .pending, .stopped: return false
+            }
+        } ?? []
     }
 
     /// What the navigator marks. `visibleIndex` is global, so on a tab whose pages nothing has
@@ -454,6 +484,12 @@ final class OCRSession {
     /// request; this is the state, and the difference is one page of decoding that was already
     /// under way when the button was pressed.
     private(set) var isHolding = false
+    /// The pages decoding together right now, if a group is in flight. Several pages stream at
+    /// once, so "the page being transcribed" is a range rather than a number and the readout and
+    /// the follow both have to say so.
+    /// The pages decoding together, numbered within their drop batch. nil when one page is
+    /// running on its own.
+    private(set) var batchRange: ClosedRange<Int>?
     @ObservationIgnored private var previewCache: [Int: URL] = [:]
     /// Bumped by every drop, so pages carry the batch they came in with.
     private var batchCount = 0
@@ -547,7 +583,7 @@ final class OCRSession {
             isPaused = false
             isHolding = false
             elapsed = 0
-            currentTokensPerSecond = 0
+            resetRate()
             phase = .loading
             readoutVisible = true
             willRun?()
@@ -572,7 +608,7 @@ final class OCRSession {
         lastDoneIndex = nil
         completedPages = 0
         elapsed = 0
-        currentTokensPerSecond = 0
+        resetRate()
         documentEdits = [:]
         editSectionsByDocument = [:]
         previewCache = [:]
@@ -783,7 +819,10 @@ final class OCRSession {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(250))
                 guard let self, self.runToken == token else { return }
-                if self.isBusy { self.elapsed = Date().timeIntervalSince(started) }
+                if self.isBusy {
+                    self.elapsed = Date().timeIntervalSince(started)
+                    self.noteRate()
+                }
             }
         }
         work = Task { [weak self] in
@@ -836,6 +875,38 @@ final class OCRSession {
                         self.isHolding = false
                         if gate.isStopped || self.runToken != token { break }
                     }
+
+                    // A GROUP of pages, if this Mac can hold one. Decoding pages together is
+                    // faster per page than decoding them in turn (measured on a 40-page scan: 194
+                    // aggregate tok/s one at a time, 295 at 11, 401 at 32) and unlike a second
+                    // worker process it needs one copy of the weights, so a 16 GB laptop gets it
+                    // too. `recommendedWidth` returns 1 when the machine or the document is too
+                    // small, and then this falls through to the page-at-a-time path below.
+                    // Only pages from ONE drop group together. The readout counts within a drop
+                    // batch, so a group spanning two of them would have no honest page numbers -
+                    // and a file opened mid-run is a different thing the reader dropped, not part
+                    // of what they are watching. A multi-file drop is a single batch, so several
+                    // files opened together still decode together.
+                    let pending = self.pages.indices.filter { self.pages[$0].state == .pending }
+                    let queued = pending.first.map { first in
+                        pending.filter { self.pages[$0].batch == self.pages[first].batch }
+                    } ?? []
+                    let chosen = Settings.batchWidth
+                    // A chosen width is honoured as asked, including 1 - the setting exists so a
+                    // reader can put the machine back on the page-at-a-time path. Only Automatic
+                    // consults the sizing rule, which returns 1 below the width worth batching.
+                    let width = chosen > 0
+                        ? min(chosen, queued.count)
+                        : OCRBatchPlan.recommendedWidth(modelBytes: loaded.weightBytes,
+                                                        pageCount: queued.count)
+                    if width > 1 {
+                        let group = Array(queued.prefix(width))
+                        await self.runGroup(group, model: loaded, settings: settings,
+                                            documents: documents, gate: gate, token: token)
+                        continue
+                    }
+
+                    self.startRateClock()
                     self.pages[index].state = .running
                     self.runningIndex = index
                     if !self.userPinnedDocument,
@@ -865,7 +936,8 @@ final class OCRSession {
                                           self.texts.indices.contains(index) else { return }
                                     self.texts[index] = update.text
                                     self.pages[index].tokens = update.tokens
-                                    self.currentTokensPerSecond = update.tokensPerSecond
+                                    self.liveTokens[index] = update.tokens
+                                    self.noteRate()
                                     self.streamTick &+= 1
                                 }
                             },
@@ -873,6 +945,7 @@ final class OCRSession {
                     }.value
 
                     guard self.runToken == token, self.texts.indices.contains(index) else { return }
+                    self.liveTokens[index] = nil
                     if let result, !result.text.isEmpty {
                         self.texts[index] = result.text
                         self.pages[index].tokens = result.tokens.count
@@ -880,7 +953,8 @@ final class OCRSession {
                         self.pages[index].state = .done
                         self.lastDoneIndex = index
                         if !self.find.isEmpty { self.rebuildMatches() }
-                        self.currentTokensPerSecond = result.decodeTokensPerSecond
+                        self.settledTokens += result.tokens.count
+                        self.noteRate()
                     } else {
                         self.pages[index].state = .failed
                     }
@@ -902,6 +976,103 @@ final class OCRSession {
                 self.phase = .failed("Loading \(modelDir.lastPathComponent): \(error)")
             }
         }
+    }
+
+    /// Decode a group of pages together.
+    ///
+    /// Every page in the group streams at once - they all produce a token per step - so the
+    /// workspace shows live text for whichever one the reader is on, and the rail fills in as each
+    /// finishes. The group is the pause and stop boundary, the way a single page was.
+    private func runGroup(_ group: [Int], model loaded: OCRModel,
+                          settings: (prompt: String?, draftLength: Int, loopGuard: Bool),
+                          documents: PDFCache, gate: OCRRunGate, token: Int) async {
+        startRateClock()
+        for index in group { pages[index].state = .running }
+        runningIndex = group.first
+        // Batch-RELATIVE, because that is what the readout counts against: page indices are
+        // workspace-wide and would print "pages 41-48 of 8" for a second document.
+        if let low = group.min(), let high = group.max(),
+           let base = pages.firstIndex(where: { $0.batch == pages[low].batch }) {
+            batchRange = (low - base) ... (high - base)
+        }
+        if !userPinnedDocument, let first = group.first,
+           let doc = documents_indexOfDocument(containing: first), doc != selectedDocument {
+            selectedDocument = doc
+        }
+        if !userPinnedSelection { selection = nil }
+
+        let jobs = group.map { self.jobs[$0] }
+        let started = Date()
+        let results: [OCRModel.Result] = await Task.detached(priority: .userInitiated) {
+            let images = jobs.compactMap { Self.load($0, documents: documents) }
+            guard images.count == jobs.count else { return [] }
+            return (try? loaded.transcribeBatched(
+                images: images,
+                prompt: settings.prompt,
+                width: group.count,
+                loopGuard: settings.loopGuard,
+                onStream: { slot, update in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.runToken == token,
+                              slot < group.count else { return }
+                        let index = group[slot]
+                        guard self.texts.indices.contains(index) else { return }
+                        self.texts[index] = update.text
+                        self.pages[index].tokens = update.tokens
+                        self.liveTokens[index] = update.tokens
+                        self.noteRate()
+                        self.streamTick &+= 1
+                    }
+                },
+                shouldContinue: { !gate.isStopped })) ?? []
+        }.value
+
+        guard runToken == token else { return }
+        let seconds = Date().timeIntervalSince(started) / Double(max(group.count, 1))
+        for (slot, index) in group.enumerated() {
+            guard texts.indices.contains(index) else { continue }
+            liveTokens[index] = nil
+            if slot < results.count, !results[slot].text.isEmpty {
+                texts[index] = results[slot].text
+                pages[index].tokens = results[slot].tokens.count
+                pages[index].tokensPerSecond = results[slot].decodeTokensPerSecond
+                pages[index].state = .done
+                lastDoneIndex = index
+                settledTokens += results[slot].tokens.count
+            } else {
+                pages[index].state = gate.isStopped ? .stopped : .failed
+            }
+            pages[index].seconds = seconds
+            if pages[index].state == .done { completedPages += 1 }
+        }
+        if !find.isEmpty { rebuildMatches() }
+        noteRate()
+        runningIndex = nil
+        batchRange = nil
+    }
+
+    /// Start the rate clock at the first page's decode, not at the run's, so loading four and a
+    /// half gigabytes of weights is not charged to the transcription.
+    private func resetRate() {
+        currentTokensPerSecond = 0
+        decodeStart = nil
+        settledTokens = 0
+        liveTokens = [:]
+    }
+
+    private func startRateClock() {
+        if decodeStart == nil { decodeStart = Date() }
+    }
+
+    private func noteRate() {
+        guard let decodeStart else { return }
+        let seconds = Date().timeIntervalSince(decodeStart)
+        guard seconds > 0 else { return }
+        currentTokensPerSecond = Double(settledTokens + liveTokens.values.reduce(0, +)) / seconds
+    }
+
+    private func documents_indexOfDocument(containing page: Int) -> Int? {
+        documents.firstIndex { $0.pageIDs.contains(page) }
     }
 
     /// Thumbnails are rendered off the main actor and land as they finish, so a long document
