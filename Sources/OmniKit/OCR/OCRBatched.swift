@@ -30,6 +30,41 @@ import PDFKit
 /// mixing the two is what oMLX found not to be worth it for concurrent VLM requests. Greedy in a
 /// batch is compared against greedy alone, so the comparison says what batching is worth on its
 /// own.
+/// How wide a batch this machine and this document can carry.
+public enum OCRBatchPlan {
+
+    /// A slot's KV. 65 KB per token measured on this checkpoint; a page runs to ~2300 tokens
+    /// including its 1007-token prompt, and the cache grows on demand rather than to the budget's
+    /// cap, so this is what a slot actually costs rather than what it could.
+    public static let bytesPerSlot = 384_000_000
+
+    /// The narrowest batch worth having.
+    ///
+    /// NOT 2. Measured on the 40-page document: 194 aggregate for the single speculative path
+    /// against 158 at B=2 and 185 at B=4 - a narrow batch is a REGRESSION, because it gives up
+    /// speculation and gets almost nothing back until the batch is wide enough for the routed
+    /// experts to amortise. 260 at B=8 is the first width that pays.
+    public static let worthwhile = 8
+
+    /// The batch width to use, or 1 for "decode pages one at a time".
+    ///
+    /// Sized from memory the way the worker count is, and for the same reason: this must not be a
+    /// number that happens to fit the machine it was tuned on. A 16 GB laptop lands around 16,
+    /// which is worth 1.75x; it cannot hold a second copy of the weights at all.
+    public static func recommendedWidth(modelBytes: Int, pageCount: Int,
+                                        reserveBytes: Int = 2_000_000_000,
+                                        availableBytes: Int? = nil) -> Int {
+        guard pageCount >= worthwhile else { return 1 }
+        let ceiling = availableBytes
+            ?? min(omniMetalWorkingSetBytes() ?? Int(ProcessInfo.processInfo.physicalMemory),
+                   Int(ProcessInfo.processInfo.physicalMemory))
+        let spare = ceiling - modelBytes - reserveBytes
+        let affordable = spare / bytesPerSlot
+        guard affordable >= worthwhile else { return 1 }
+        return min(affordable, pageCount, 32)
+    }
+}
+
 extension OCRModel {
 
     /// Transcribe `pages` with `width` of them decoding together.
@@ -160,7 +195,7 @@ extension OCRModel {
     /// it. Only the decode loop is shared, which is where the per-launch latency and the expert
     /// reads are.
     public func transcribeBatched(pdfAt url: URL, prompt: String? = nil, maxNewTokens: Int = 0,
-                                  pageRange: Range<Int>? = nil, dpi: Int = 200, width: Int = 4,
+                                  pageRange: Range<Int>? = nil, dpi: Int = 200, width: Int? = nil,
                                   loopGuard: Bool = true, loopReps: Int = 24,
                                   loopGrace: Int = 96) throws -> DocumentResult {
         guard let document = PDFDocument(url: url) else {
@@ -170,6 +205,8 @@ extension OCRModel {
         guard count > 0 else { throw OmniError.model("PDF has no pages: \(url.lastPathComponent)") }
         let range = pageRange.map { $0.clamped(to: 0 ..< count) } ?? 0 ..< count
         let maxDimension = Int((Double(dpi) / 72.0) * 842.0 * 1.02)
+        let width = width ?? OCRBatchPlan.recommendedWidth(modelBytes: weightBytes,
+                                                           pageCount: range.count)
 
         let start = Date()
         var results: [PageResult] = []

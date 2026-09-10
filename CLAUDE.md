@@ -124,6 +124,11 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   B is wide enough that the batch touches most of the 64 anyway. That crossover is why B=40 is
   worth 1.9x of B=8 and B=4 is worth almost nothing. Do not conclude from a narrow batch that
   batching does not work here - that was concluded mid-measurement and it was wrong.
+- The batch width is SIZED, not fixed: `OCRBatchPlan.recommendedWidth` from Metal's working set,
+  capped at 32 and floored at 8. Measured at the widths it actually picks: 401 on this M3 Ultra
+  (32) and 295 on a 16 GB laptop's share (11), against 194 - and that same laptop affords exactly
+  ONE worker process, i.e. no gain at all from the pool. Below 8 it returns 1 and the single
+  speculative path runs instead, because a narrow batch is a regression (158 at B=2, 185 at B=4).
 - Batch WIDTH is a memory decision, like the worker count: KV is 65 KB/token, a page runs to ~2300
   tokens, so a slot costs ~150 MB. B=16 is ~7 GB with the weights and comfortable on 16 GB; B=40 is
   ~10.5 GB and is not.
