@@ -293,6 +293,17 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
 - While a group is in flight the transcript follows `visibleIndex` (the first page of the group,
   which is what the navigator marks), not the tail: every page in the group grows at once, so the
   tail is the LAST page of the group and following it left the rail and the text on different pages.
+- SPLIT AND TRIPLE ARE ONE `switch` CASE, and that is a performance fix, not tidiness. As separate
+  branches SwiftUI saw two unrelated hierarchies and rebuilt all 40 sections in BOTH text panes on
+  every toggle: measured at 2693 ms on the 40-page transcript, against 13-54 ms once the columns
+  keep their identity and only the image column comes and goes.
+- Where that 2.7 s actually was, measured rather than guessed: `MarkdownBlock.parse` 16-23 ms and
+  `MarkdownSource.highlighted` 0 ms once warm (it was already memoised; `parse` now is too). The
+  rest is SwiftUI constructing and laying out the eager 40-section stacks themselves. Switching
+  from raw or rendered INTO split still costs ~2.5 s for that reason, with parsing and
+  highlighting both at zero - the remaining fix would be to keep the sectioned panes mounted
+  across modes, and it has to be weighed against hidden panes re-laying out on every geometry
+  change. `PageImage` was the obvious suspect and is innocent: its decode is 0.4 ms.
 - The readout is PAGES FINISHED over pages queued: "6 of 24 pages". It used to name the page being
   worked on, which a group made meaningless - there is no single page - and naming the group's
   range instead ("Pages 1-32 of 40") answered the width of the batch when the question is how far

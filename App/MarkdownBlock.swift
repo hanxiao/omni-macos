@@ -209,7 +209,21 @@ extension MarkdownBlock {
 // MARK: - Parsing
 
 extension MarkdownBlock {
+    /// Memoised, because a mode switch rebuilds every section and the block split is pure: the
+    /// same page text always yields the same blocks. Bounded so a long run cannot grow it.
+    @MainActor private static var parseCache: [String: [MarkdownBlock]] = [:]
+
     static func parse(_ markdown: String) -> [MarkdownBlock] {
+        if let hit = MainActor.assumeIsolated({ parseCache[markdown] }) { return hit }
+        let blocks = parseUncached(markdown)
+        MainActor.assumeIsolated {
+            if parseCache.count > 400 { parseCache.removeAll(keepingCapacity: true) }
+            parseCache[markdown] = blocks
+        }
+        return blocks
+    }
+
+    static func parseUncached(_ markdown: String) -> [MarkdownBlock] {
         var blocks: [MarkdownBlock] = []
         let lines = markdown.components(separatedBy: .newlines)
         var index = 0

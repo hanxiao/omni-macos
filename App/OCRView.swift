@@ -115,7 +115,13 @@ struct OCRView: View {
                 RenderedDocument(sync: $split)
             case .raw:
                 RawDocument(sync: $split)
-            case .split:
+            case .split, .triple:
+                // ONE case for both, so the two text columns keep their identity when the image
+                // column is added or removed. As separate `switch` branches SwiftUI saw two
+                // unrelated hierarchies and rebuilt 40 sections in each pane on every toggle -
+                // measured at 2.7 s on a 40-page transcript, for a change that only concerns a
+                // third column.
+                //
                 // A plain proportional split, not HSplitView. HSplitView propagates its children's
                 // minimum widths up as its own, and inside a NavigationSplitView detail pane that
                 // squeezes the app's sidebar past its own minimum - the sidebar labels start
@@ -124,19 +130,13 @@ struct OCRView: View {
                 // they cannot chase each other; they meet at page boundaries, which is the
                 // granularity both panes share - the same text sets to different heights.
                 HStack(spacing: 0) {
-                    RawDocument(side: 0, sync: $split)
-                        .frame(maxWidth: .infinity)
-                    Divider()
-                    RenderedDocument(side: 1, sync: $split)
-                        .frame(maxWidth: .infinity)
-                }
-            case .triple:
-                // The page itself beside what was read off it. The image column follows whichever
-                // text column is being scrolled, which is what the split's own sync already knows.
-                HStack(spacing: 0) {
-                    PageImage(id: split.section ?? session.visibleIndex)
-                        .frame(maxWidth: .infinity)
-                    Divider()
+                    // The page itself beside what was read off it. The image column follows
+                    // whichever text column is being scrolled, which the split's sync knows.
+                    if session.mode == .triple {
+                        PageImage(id: split.section ?? session.visibleIndex)
+                            .frame(maxWidth: .infinity)
+                        Divider()
+                    }
                     RawDocument(side: 0, sync: $split)
                         .frame(maxWidth: .infinity)
                     Divider()
