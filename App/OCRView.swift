@@ -33,7 +33,14 @@ struct OCRView: View {
                 SearchWaysPrompt(title: "Drop a document to transcribe",
                                  symbol: "text.viewfinder",
                                  ways: SearchWaysPrompt.transcribeWays,
-                                 footer: needsModel ? AnyView(OCRDownloadAction()) : nil)
+                                 // Something to click. The rows describe ways in, but an empty
+                                 // pane whose only affordance is a drag leaves anyone without a
+                                 // file already in hand with nothing to do.
+                                 footer: needsModel
+                                     ? AnyView(OCRDownloadAction())
+                                     : AnyView(Button("Choose Files\u{2026}") { session.chooseAndOpen() }
+                                         .controlSize(.large)
+                                         .accessibilityIdentifier("ocr.choosefiles")))
                     .accessibilityIdentifier(needsModel ? "ocr.needsmodel" : "ocr.dropzone")
                     .task { model.refreshOCRInstalled() }
             case .needsModel:
@@ -105,10 +112,11 @@ struct OCRView: View {
 
     @ViewBuilder private var content: some View {
         if session.sectionIDs.isEmpty {
-            // A tab opened while another document is still decoding is waiting its turn, and
-            // saying so is the difference between a queue and a stall.
-            CenteredHint(symbol: "text.viewfinder",
-                         title: session.isBusy ? "Queued" : "Preparing", detail: "")
+            // Say which of the two waits this is. "Queued" was shown for both, and for the first
+            // run of a session it was simply wrong: nothing is queued behind anything, the app is
+            // reading four and a half gigabytes of weights off disk.
+            CenteredHint(symbol: session.phase == .loading ? "gearshape.arrow.trianglehead.2.clockwise.rotate.90" : "text.viewfinder",
+                         title: waitingTitle, detail: "", spinner: session.isBusy)
         } else {
             switch session.mode {
             case .rendered:
@@ -144,6 +152,23 @@ struct OCRView: View {
                         .frame(maxWidth: .infinity)
                 }
             }
+        }
+    }
+
+    /// Three different waits, three different labels. "Queued" was shown for all of them, and on
+    /// a first run it was simply untrue twice over: nothing is queued behind anything while the
+    /// weights load, and nothing is queued while this document's own first page is being read -
+    /// at a wide batch that alone is twenty seconds of prefill before a single token lands.
+    private var waitingTitle: String {
+        if session.phase == .loading { return "Loading the model" }
+        if visibleDocumentIsRunning { return "Reading the page" }
+        return session.isBusy ? "Queued" : "Preparing"
+    }
+
+    private var visibleDocumentIsRunning: Bool {
+        guard let doc = session.visibleDocument else { return false }
+        return doc.pageIDs.contains {
+            session.pages.indices.contains($0) && session.pages[$0].state == .running
         }
     }
 
@@ -598,6 +623,60 @@ private struct RawDocument: View {
     }
 }
 
+/// An `NSTextView` that hands file drops to the workspace instead of pasting their paths.
+///
+/// AppKit registers a text view for `NSFilenamesPboardType` and friends, so it wins the drop over
+/// any SwiftUI `dropDestination` above it and inserts the path as text. Declining is not enough
+/// either - the drag has to be answered here, because this view is the deepest one under the
+/// pointer. So it answers, and forwards.
+final class OCRSourceTextView: NSTextView {
+    var onFiles: (([URL]) -> Void)?
+
+    static func scrollable() -> NSScrollView {
+        let scroll = NSScrollView()
+        let big = CGFloat.greatestFiniteMagnitude
+        let container = NSTextContainer(size: NSSize(width: 0, height: big))
+        container.widthTracksTextView = true
+        let layout = NSLayoutManager()
+        layout.addTextContainer(container)
+        let storage = NSTextStorage()
+        storage.addLayoutManager(layout)
+        let text = OCRSourceTextView(frame: .zero, textContainer: container)
+        text.autoresizingMask = [NSView.AutoresizingMask.width]
+        text.isVerticallyResizable = true
+        text.isHorizontallyResizable = false
+        text.minSize = NSSize(width: 0, height: 0)
+        text.maxSize = NSSize(width: big, height: big)
+        scroll.documentView = text
+        scroll.hasVerticalScroller = true
+        return scroll
+    }
+
+    private func droppedFiles(_ sender: NSDraggingInfo) -> [URL] {
+        let objects = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self]) as? [URL]
+        return (objects ?? []).filter(\.isFileURL)
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        droppedFiles(sender).isEmpty ? super.draggingEntered(sender) : .copy
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        droppedFiles(sender).isEmpty ? super.draggingUpdated(sender) : .copy
+    }
+
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        droppedFiles(sender).isEmpty ? super.prepareForDragOperation(sender) : true
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let urls = droppedFiles(sender)
+        guard !urls.isEmpty else { return super.performDragOperation(sender) }
+        onFiles?(urls)
+        return true
+    }
+}
+
 /// The editable Markdown source, highlighted.
 ///
 /// An `NSTextView` rather than SwiftUI's `TextEditor`. The navigator has to be able to scroll this
@@ -622,10 +701,14 @@ private struct SourceEditor: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let scroll = NSTextView.scrollableTextView()
+        let scroll = OCRSourceTextView.scrollable()
         scroll.drawsBackground = false
         scroll.hasVerticalScroller = true
-        guard let text = scroll.documentView as? NSTextView else { return scroll }
+        guard let text = scroll.documentView as? OCRSourceTextView else { return scroll }
+        // A file dropped on the editor is a document to transcribe, the same as everywhere else
+        // in this pane. An `NSTextView` would otherwise take it as an insertion and paste the
+        // path into the transcript, which is neither what was meant nor undoable in an obvious way.
+        text.onFiles = { [weak session] urls in session?.open(urls: urls) }
         text.delegate = context.coordinator
         text.allowsUndo = true
         text.drawsBackground = false
@@ -650,7 +733,7 @@ private struct SourceEditor: NSViewRepresentable {
     @MainActor final class Coordinator: NSObject, NSTextViewDelegate {
         let face = NSFont.monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
 
-        weak var textView: NSTextView?
+        weak var textView: OCRSourceTextView?
         var session: OCRSession?
         private var loaded: Int??
         private var scrolledTo: Int?
@@ -1212,12 +1295,17 @@ private struct Failure: View {
     let message: String
     var onDismiss: () -> Void
 
+    /// A file that is already text is not a failure, it is a file that does not need this pane.
+    /// Saying "could not transcribe" over it reads as a defect in the app or the document.
+    private var isNothingToDo: Bool { message.contains("already text") }
+
     var body: some View {
         VStack(spacing: 12) {
-            Image(systemName: "exclamationmark.triangle")
+            Image(systemName: isNothingToDo ? "text.document" : "exclamationmark.triangle")
                 .font(.system(size: 34, weight: .light))
-                .foregroundStyle(.orange)
-            Text("Could not transcribe that document").font(.title3.weight(.medium))
+                .foregroundStyle(isNothingToDo ? AnyShapeStyle(.secondary) : AnyShapeStyle(.orange))
+            Text(isNothingToDo ? "Nothing to transcribe" : "Could not transcribe that document")
+                .font(.title3.weight(.medium))
             ScrollView {
                 Text(message)
                     .font(.callout.monospaced())
@@ -1227,7 +1315,7 @@ private struct Failure: View {
                     .frame(maxWidth: 520, alignment: .leading)
             }
             .frame(maxHeight: 160)
-            Button("Start Over", action: onDismiss)
+            Button(isNothingToDo ? "Choose Another" : "Start Over", action: onDismiss)
                 .keyboardShortcut(.defaultAction)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1297,6 +1385,7 @@ private struct CenteredHint: View {
     let symbol: String
     let title: String
     let detail: String
+    var spinner: Bool = false
 
     var body: some View {
         VStack(spacing: 10) {
@@ -1311,6 +1400,7 @@ private struct CenteredHint: View {
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 380)
             }
+            if spinner { ProgressView().controlSize(.small).padding(.top, 2) }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }

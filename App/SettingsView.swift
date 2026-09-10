@@ -1090,7 +1090,7 @@ private struct OCRTab: View {
                 }
                 .onChange(of: batch) { _, new in OCRSession.Settings.batchWidth = new }
             } header: {
-                Text("Speed")
+                Text("Parallelization")
             } footer: {
                 Text("Decoding pages together is faster per page and costs memory. Automatic sizes it to this Mac.")
                     .font(.caption).foregroundStyle(.secondary)

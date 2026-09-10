@@ -309,7 +309,9 @@ if let i = args.firstIndex(of: "--pdf") {
         for pass in 1 ... passes {
             let started = Date()
             out = try model.transcribeBatched(pdfAt: pdf, maxNewTokens: cap,
-                                              pageRange: limit.map { 0 ..< $0 }, width: batchWidth,
+                                              pageRange: limit.map { 0 ..< $0 },
+                                              dpi: intAfter("--dpi", in: args) ?? 200,
+                                              width: batchWidth,
                                               pipelined: args.contains("--pipeline"),
                                               pipelineHostOnly: args.contains("--pipeline-host"))
             elapsed = Date().timeIntervalSince(started)

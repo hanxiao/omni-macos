@@ -500,7 +500,7 @@ final class OCRSession {
         guard !sources.isEmpty else {
             // Do NOT tear down a document the user is reading because they dropped the wrong file
             // on it. Only an empty workspace has nothing to lose.
-            let message = "That is not a document this can read. Drop a PDF or an image."
+            let message = Self.rejection(for: urls)
             if pages.isEmpty { phase = .failed(message) } else { post(notice: message) }
             return
         }
@@ -1245,6 +1245,27 @@ final class OCRSession {
     static func isSupported(_ url: URL) -> Bool {
         ["pdf", "png", "jpg", "jpeg", "tif", "tiff", "heic", "heif", "bmp", "gif", "webp"]
             .contains(url.pathExtension.lowercased())
+    }
+
+    /// A file whose text can already be read without a model. Asked by UTType rather than by
+    /// extension so a `.swift`, a `.csv` and a `.md` all answer the same way.
+    static func isAlreadyText(_ url: URL) -> Bool {
+        guard let type = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType
+        else { return false }
+        return type.conforms(to: .text)
+    }
+
+    /// Why a drop was refused, in the terms the person who made it would use. Dropping a .md on
+    /// an OCR pane is not a mistake about the app, it is a reasonable thing to try - so the answer
+    /// is what is already true of the file, not that this pane cannot read it.
+    static func rejection(for urls: [URL]) -> String {
+        let text = urls.filter { isAlreadyText($0) }
+        if !text.isEmpty {
+            let name = text.count == 1 ? "\(text[0].lastPathComponent) is" : "Those files are"
+            return "\(name) already text - there is nothing to transcribe. "
+                + "OCR is for scans, photographs and PDFs with no text layer."
+        }
+        return "That is not a document this can read. Drop a PDF or an image."
     }
 }
 
