@@ -272,6 +272,10 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   `.highQualityFormat` first (a materialized asset is unchanged) then falls back to `.fastFormat`,
   which accepts the resident derivative. NOT reproducible on this machine - the library here has 12
   local assets - so it wants confirmation from the reporter.
+- A photo with no local copy produces NO rows, NO error and NO log line, which is
+  indistinguishable from one that was never considered - which is why #17 went two releases before
+  anyone could say how many photos it was. `IndexProgress.photosNotLocal` counts both halves (the
+  locality gate and a decode that returns nothing) and Storage shows it only when it is non-zero.
 - HARDENED RUNTIME GATES TCC. The app is unsandboxed, but tccd still refuses to show the Photos
   prompt for a hardened binary that does not DECLARE
   `com.apple.security.personal-information.photos-library` (App/Omni.entitlements) - the request

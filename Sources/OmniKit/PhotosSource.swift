@@ -197,6 +197,20 @@ public enum PhotoLibrary {
         return true
     }
 
+    // MARK: - What a pass could not read
+
+    /// Assets a pass had to leave out because nothing was on this Mac.
+    ///
+    /// Counted because the skip is otherwise INVISIBLE: an asset with no local copy produces no
+    /// rows, no error and no log line, which is indistinguishable from one that was never
+    /// considered. #17 was two releases old before anyone could say how many photos it was.
+    private static let notLocalLock = NSLock()
+    nonisolated(unsafe) private static var notLocalCount = 0
+
+    public static func resetNotLocal() { notLocalLock.withLock { notLocalCount = 0 } }
+    public static var notLocal: Int { notLocalLock.withLock { notLocalCount } }
+    static func noteNotLocal() { notLocalLock.withLock { notLocalCount += 1 } }
+
     /// A filename that cannot split the path or read as a directory.
     private static func sanitize(_ s: String) -> String {
         let cleaned = s.replacingOccurrences(of: "/", with: "-")

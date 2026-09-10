@@ -888,6 +888,16 @@ private struct IndexTab: View {
                 IndexStatusRow()
                 LabeledContent("Indexed files", value: model.indexedFiles.formatted())
                 LabeledContent("Indexed chunks", value: model.indexedChunks.formatted())
+                // Only when there are some. A photo with no local copy produces no rows, no error
+                // and no log line, which is indistinguishable from one that was never considered -
+                // and that is why #17 went two releases without anyone being able to say how many
+                // photos it was.
+                if model.progress.photosNotLocal > 0 {
+                    LabeledContent("Photos not on this Mac",
+                                   value: model.progress.photosNotLocal.formatted())
+                        .help("These live in iCloud only. Files > iCloud decides whether Omni "
+                              + "downloads them or leaves them out.")
+                }
                 if model.diskUse.isEmpty {
                     LabeledContent("Size", value: ByteCountFormatter.string(fromByteCount: model.dbSizeBytes, countStyle: .file))
                 } else {

@@ -106,6 +106,9 @@ public struct IndexProgress: Sendable {
     public var skipped = 0       // genuinely nothing to embed (no content / undecodable)
     public var unchanged = 0     // already indexed and current
     public var failed = 0
+    /// Photos left out because nothing was on this Mac. Zero on any library whose assets are all
+    /// downloaded, which is why the UI only draws it when it is not.
+    public var photosNotLocal = 0
     public var currentPath = ""
     public var done = false
     public var cancelled = false   // ended via pause rather than completing
@@ -600,6 +603,7 @@ public final class Indexer: @unchecked Sendable {
         // ends - so seeding it here is what makes a folder look worked-on from the first second.
         // Without it the rings vanished for the whole crawl, which is the opposite of the point.
         for r in rootPaths { p.perRoot[r] = RootProgress() }
+        PhotoLibrary.resetNotLocal()
         onProgress(p)
 
         // ONE walk over ALL roots, not one per root in sequence. The walker pools directories from a
@@ -759,7 +763,7 @@ public final class Indexer: @unchecked Sendable {
                     p.perRoot[r] = rp
                 }
             }
-            if p.scanned % 10 == 0 { onProgress(p) }
+            if p.scanned % 10 == 0 { p.photosNotLocal = PhotoLibrary.notLocal; onProgress(p) }
         }
         func storeChunks(_ path: String, _ raw: [IndexedChunk]) {
             // A non-finite vector means corrupted resident weights (per-process cold-load fault)
@@ -1139,6 +1143,7 @@ public final class Indexer: @unchecked Sendable {
         let dedupHits = takeDedupHits()
         if dedupHits > 0 { Self.log.info("content dedup: \(dedupHits, privacy: .public) file(s) reused stored vectors") }
         embedder.indexingIdle()   // arm the debounced GPU buffer-cache trim
+        p.photosNotLocal = PhotoLibrary.notLocal
         p.done = true
         p.cancelled = wasCancelled
         onProgress(p)

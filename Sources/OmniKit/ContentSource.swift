@@ -185,7 +185,10 @@ struct PhotosContentSource: ContentSource {
         // would make an index pass silently pull the library down from iCloud. `isLocal` means some
         // renderable version is HERE, including the downscaled derivative that Optimize Mac Storage
         // leaves resident - that is what the decode can read, and the substance of issue #13.
-        guard info.isLocal || !settings.skipDataless else { return nil }
+        guard info.isLocal || !settings.skipDataless else {
+            PhotoLibrary.noteNotLocal()
+            return nil
+        }
         return SourceProbe(kind: info.isVideo ? .video : .image, width: info.width, height: info.height,
                            duration: info.duration, measured: true)
     }
@@ -203,9 +206,14 @@ struct PhotosContentSource: ContentSource {
     }
 
     func content(_ file: CrawledFile, kind: FileKind, settings: IndexSettings) -> ExtractedContent {
-        guard kind == .image,
-              let image = PhotoLibrary.image(ref, maxDimension: settings.maxImageDimension,
-                                             allowNetwork: !settings.skipDataless) else { return .empty }
+        guard kind == .image else { return .empty }
+        guard let image = PhotoLibrary.image(ref, maxDimension: settings.maxImageDimension,
+                                             allowNetwork: !settings.skipDataless) else {
+            // Passed the locality gate and then decoded to nothing: the other half of the same
+            // story, and the half that produced #17.
+            PhotoLibrary.noteNotLocal()
+            return .empty
+        }
         return .images([image])
     }
 
