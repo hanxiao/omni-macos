@@ -234,6 +234,17 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   near-tie change here. NOTE: hard2 is PNGs, and converting them to a PDF to reach the batch path
   produces pages the model loops on (737 KB of repeated paragraphs for 30 pages) - that harness is
   invalid, an images-based batch entry point is needed instead.
+- IMAGE SIZE IS NOT A SPEED KNOB, measured: 12 pages at dpi 120 / 150 / 200 / 300 all run in
+  22.5 s with an identical 4.5 s prefill stall. The reason is in `dynamicPreprocess`: it picks a
+  tile grid from the ASPECT RATIO alone (`closestAspectRatio`, product capped at 9) and then
+  resamples the WHOLE page to 640*tw x 640*th before cutting it up. The tower therefore sees the
+  same pixel count for a given page shape whatever the source resolution - A4 portrait lands on
+  2x3, so 6 tiles of 640 plus the 1024 global view, every time. Source resolution only buys detail
+  and costs host resample time.
+- 200 dpi is close to the floor, and not by accident: A4 at 200 dpi is 1654x2339 against a 1280x1920
+  target, so the resample DOWNSAMPLES. At 150 it is 1240x1754 and starts upsampling the long edge.
+  Digests agree at 150/200/300 and diverge at 120, which is where the detail loss first shows.
+  Do not lower it for speed - there is none to win.
 - Measured and rejected, do not re-derive: mlx-swift 0.31.4 (same qmm bug; 0.31.5+ needs
   Swift 6.3). DFlash/EAGLE trees need a draft model we cannot train here; ViT token merging breaks
   the fixed visual-token/prompt-slot contract.
