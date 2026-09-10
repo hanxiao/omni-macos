@@ -495,12 +495,19 @@ private struct RenderedDocument: View {
 
     var body: some View {
         DocumentScroll(side: side, sync: $sync) { ids in
-            VStack(alignment: .leading, spacing: 0) {
+            // LAZY, and each element is exactly ONE subview. Those two go together: a lazy stack
+            // addresses its subviews by index, so a `ForEach` body that resolves to a page break
+            // AND a section - two subviews for every element but the first - breaks that indexing,
+            // which is what made `scrollTo` unreachable and left the pane blank the first time
+            // this was tried. Wrapping the pair in a `VStack` restores the one-to-one mapping.
+            LazyVStack(alignment: .leading, spacing: 0) {
                 ForEach(ids, id: \.self) { id in
-                    if id != ids.first { PageBreak() }
-                    RenderedSection(id: id, state: session.sectionState(id))
-                        .modifier(SectionTop(id: id))
-                        .id(id)
+                    VStack(alignment: .leading, spacing: 0) {
+                        if id != ids.first { PageBreak() }
+                        RenderedSection(id: id, state: session.sectionState(id))
+                    }
+                    .modifier(SectionTop(id: id))
+                    .id(id)
                 }
             }
             .textSelection(.enabled)
@@ -574,12 +581,14 @@ private struct RawDocument: View {
                              find: session.find, activeMatch: session.activeMatch)
             } else {
                 DocumentScroll(width: nil, side: side, sync: $sync) { ids in
-                    VStack(alignment: .leading, spacing: 0) {
+                    LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(ids, id: \.self) { id in
-                            if id != ids.first { PageBreak() }
-                            RawSection(id: id)
-                                .modifier(SectionTop(id: id))
-                                .id(id)
+                            VStack(alignment: .leading, spacing: 0) {
+                                if id != ids.first { PageBreak() }
+                                RawSection(id: id)
+                            }
+                            .modifier(SectionTop(id: id))
+                            .id(id)
                         }
                     }
                 }

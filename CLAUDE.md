@@ -266,14 +266,18 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   replacing.
 - The find bar exists because a searchable PROMPT only shows while the field is empty, so a match
   count put there vanishes exactly when there is one.
-- The transcript panes use an EAGER `VStack` of page sections, and the page navigator is a `List`.
-  Laziness cost three separate bugs here and bought nothing - sections are per PAGE, so a stack of
-  them is tens of views, not thousands. `ScrollViewProxy.scrollTo` cannot reach a `LazyVStack` item
-  that has not been built (following a run stuck a page behind), and a lazy stack ESTIMATES the
-  height of what it has not built, so on a document whose sections run from a two-line note to a
-  hundred-row table, scrolling to the bottom landed in empty space: the pane went blank for whole
-  seconds and the page arrived all at once. Measured after the change: 47 distinct frames in 50
-  captures at 300 ms, against 14 consecutive identical blank ones before.
+- The transcript panes are a `LazyVStack` of page sections, and each `ForEach` element resolves to
+  exactly ONE subview - a `VStack` holding the page break and the section together. Those two facts
+  are one fact. Laziness was tried early, broke `scrollTo` (following a run stuck a page behind) and
+  left the pane blank for whole seconds, and was reverted to an eager `VStack` as "laziness cost
+  three bugs and bought nothing". That diagnosis was wrong. WWDC26 session 321 states it plainly: a
+  lazy stack addresses its subviews BY INDEX, and programmatic scrolling wants each `ForEach`
+  element to resolve to a single subview. The old body emitted `PageBreak()` AND the section - two
+  subviews for every element but the first - so the indexing the lazy stack relies on never matched
+  the ids `scrollTo` was given. Wrapping the pair restores the mapping, and with it: clicking a
+  distant thumbnail lands on that page, a live run follows correctly, and the eager cost is gone.
+  Measured on the 40-page transcript, entering split from raw: 2513 ms eager, 164 ms lazy.
+  Do not re-flatten that `VStack` for tidiness - it is the whole fix.
 - `.defaultScrollAnchor(.bottom)` does NOT follow growing content here - measured, the view stayed
   on page 1 for a whole run. The tail is followed by scrolling to a zero-height anchor placed after
   the sections, which doubles as the clearance under the floating readout.
@@ -299,11 +303,11 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   keep their identity and only the image column comes and goes.
 - Where that 2.7 s actually was, measured rather than guessed: `MarkdownBlock.parse` 16-23 ms and
   `MarkdownSource.highlighted` 0 ms once warm (it was already memoised; `parse` now is too). The
-  rest is SwiftUI constructing and laying out the eager 40-section stacks themselves. Switching
-  from raw or rendered INTO split still costs ~2.5 s for that reason, with parsing and
-  highlighting both at zero - the remaining fix would be to keep the sectioned panes mounted
-  across modes, and it has to be weighed against hidden panes re-laying out on every geometry
-  change. `PageImage` was the obvious suspect and is innocent: its decode is 0.4 ms.
+  rest was SwiftUI constructing and laying out the eager 40-section stacks themselves, which is
+  what the lazy fix above removed: raw into split went 2513 ms -> 164 ms. `PageImage` was the
+  obvious suspect and is innocent: its decode is 0.4 ms. Keeping hidden panes mounted was the
+  other candidate and is NOT needed - it would have traded a switch stall for a relayout on every
+  geometry change.
 - The readout is PAGES FINISHED over pages queued: "6 of 24 pages". It used to name the page being
   worked on, which a group made meaningless - there is no single page - and naming the group's
   range instead ("Pages 1-32 of 40") answered the width of the batch when the question is how far
