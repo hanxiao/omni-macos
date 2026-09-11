@@ -272,13 +272,29 @@ final class OCRSession {
     private(set) var notice: String?
     private(set) var noticeSymbol = "exclamationmark.triangle"
 
-    /// What the readout counts: pages finished, over every page in the queue. Not a range of the
+    /// Pages already finished when the current run started. The readout is about the work the
+    /// reader just asked for, so a document with pages transcribed earlier must not open at
+    /// "2 of 3" with two of them already counted. Re-queuing a page from its thumbnail moves it
+    /// out of `.done`, which drops it from here and puts it back in the count, and a file dropped
+    /// mid-run was never in it - both land in the readout, which is what the reader expects.
+    private var preSettled: Set<Int> = []
+
+    private func isSettled(_ p: Page) -> Bool { p.state == .done || p.state == .failed }
+    /// Finished before this run AND still finished, so not part of what is being watched.
+    private func carriedOver(_ p: Page) -> Bool { isSettled(p) && preSettled.contains(p.id) }
+
+    /// Snapshot the already-finished pages. Called as a run starts.
+    private func markPreSettled() {
+        preSettled = Set(pages.filter { isSettled($0) }.map(\.id))
+    }
+
+    /// What the readout counts: pages finished, over the pages THIS RUN queued. Not a range of the
     /// group in flight - a group is a decode detail, and "Pages 1-32 of 40" tells a reader nothing
     /// about how much of their document is done.
-    var queueTotal: Int { pages.count }
+    var queueTotal: Int { pages.reduce(0) { carriedOver($1) ? $0 : $0 + 1 } }
 
     var queueCompleted: Int {
-        pages.reduce(0) { $1.state == .done || $1.state == .failed ? $0 + 1 : $0 }
+        pages.reduce(0) { isSettled($1) && !carriedOver($1) ? $0 + 1 : $0 }
     }
 
     var progress: Double {
@@ -858,6 +874,7 @@ final class OCRSession {
                     self.loadProgress = nil
                 }
                 guard self.runToken == token else { return }
+                self.markPreSettled()
                 self.phase = .running
 
                 // One PDFDocument per file, not per page. `PDFDocument(url:)` re-parses the whole

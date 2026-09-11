@@ -685,6 +685,29 @@ measured on an M3 Ultra too, so they compare directly.
   toolbar re-lays out whenever any item changes - including the share item, whose title is the
   visible document's name. That was 10% of main-thread samples, and 41 stalls over 18 tab
   switches. `.frame(width: 132).fixedSize()` takes it to 0. Do not remove the frame.
+- NEVER `tell application "Omni" to activate` IN A HARNESS. It resolves by NAME through
+  LaunchServices and launches /Applications/Omni.app as a SECOND INSTANCE, so the build under
+  test then competes with a whole other copy of the app for the GPU and memory. This inflated a
+  whole afternoon of stall numbers: with the duplicate running a 40-page run reads 91% of the
+  decode window blocked with 1000 ms maxima; with exactly one instance the same build reads
+  ~40% and 207 ms. Activate by unix id instead -
+  `set frontmost of (first process whose unix id is <pid>) to true` - and assert
+  `pgrep -x Omni | wc -l` is 1 before believing anything.
+- MEASURE TOTAL BLOCKED MILLISECONDS, NOT THE PERCENTAGE. The stall window's span depends on when
+  the run happens to start and finish inside a fixed observation window, and model load varies by
+  ~13 s run to run, so the same build reads 16% or 53% purely from where the run landed. Total
+  blocked time is stable: ~6.8-7.4 s in every configuration tried.
+- WHAT THE DECODE-PHASE STALLS ARE NOT. On the 40-page scan with one instance: ~45 stalls of
+  ~150-200 ms, ~7 s total, and an IDLE app takes ZERO. Ruled out by measurement, each with a
+  reproducible A/B: window visibility (hidden 51.3% against visible 50.6% - hiding a window does
+  not stop SwiftUI evaluating bodies), batch width (1 / 8 / 32 all land at the same total blocked),
+  main-actor hop count (coalescing 768 per-row hops a second into 24 changed nothing), and the
+  stream flush rate (24 Hz against 4 Hz is worth ~15% of the total, not the 45% the percentage
+  metric suggested). Both speculative fixes were reverted rather than shipped unproven.
+- WHAT IS LEFT POINTING AT. ~40 pages, ~45 stalls, ~150 ms each: the shape says per-PAGE
+  completion, not per-token streaming. `settle` itself is a handful of assignments, so the cost is
+  the SwiftUI update its `state = .done` and final text assignment provoke, once per page. That is
+  where to look next; do not re-litigate the four above.
 - Where it stands, measured with verified coordinates on an 11-document chaotic drop: decode 1
   stall, tab switches 0, and mode switches / thumbnail clicks / OCR toggles about two stalls each
   at a median of 184 ms, p90 242, max 296. Perceptible stutter, no freezes, nothing over 300 ms.
