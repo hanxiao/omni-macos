@@ -81,6 +81,14 @@ struct OmniApp: App {
                     ocr.open(urls: key.split(separator: ":").map { URL(fileURLWithPath: String($0)) })
                 }
                 .frame(minWidth: 820, minHeight: 520)
+                // A main-thread stall detector, off unless asked for with -omni.hangwatch YES.
+                // A timer on the main run loop only fires when the main thread is free, so the
+                // gap between firings IS the block. This is how "feels laggy" becomes a number.
+                .task {
+                    guard UserDefaults.standard.bool(forKey: "omni.hangwatch") else { return }
+                    let ms = UserDefaults.standard.integer(forKey: "omni.hangwatchMs")
+                    HangWatch.start(reportAbove: ms > 0 ? Double(ms) / 1000 : 0.25)
+                }
                 .task { Updater.checkOnLaunchIfDue() }   // silent once-a-day check; prompts only if newer
         }
         .defaultSize(width: 1000, height: 660)
@@ -135,7 +143,7 @@ struct OmniApp: App {
                     // Same system share sheet the results carry, and like Finder's Share it takes
                     // no key equivalent.
                     ShareLink(item: TranscriptFile(name: ocr.suggestedFileName,
-                                                   markdown: ocr.documentMarkdown),
+                                                   markdown: { ocr.documentMarkdown }),
                               preview: SharePreview(ocr.documentName,
                                                     image: Image(systemName: "doc.plaintext"))) {
                         Text("Share\u{2026}")
@@ -401,5 +409,36 @@ private struct ShortcutsView: View {
         }
         .padding(24)
         .frame(width: 340)
+    }
+}
+
+/// Reports how long the main thread was unresponsive, in milliseconds.
+///
+/// Scheduled at 50 ms on the main run loop: anything longer than that between firings is time
+/// the main thread spent not servicing the run loop, which is exactly what a dropped frame or a
+/// stuck click is. Enabled with `-omni.hangwatch YES`, so it costs a shipping build nothing.
+@MainActor
+enum HangWatch {
+    private static var last = Date()
+    private static var began = Date()
+    private static var worst: Double = 0
+
+    static func start(reportAbove seconds: Double = 0.25) {
+        last = Date()
+        began = last
+        FileHandle.standardError.write(Data(String(
+            format: "[hang] watching, reporting blocks over %.0f ms\n", seconds * 1000).utf8))
+        Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in
+            MainActor.assumeIsolated {
+                let now = Date()
+                let gap = now.timeIntervalSince(last)
+                last = now
+                guard gap > seconds else { return }
+                worst = max(worst, gap)
+                FileHandle.standardError.write(Data(String(
+                    format: "[hang] t+%.1fs blocked %.0f ms (worst %.0f)\n",
+                    now.timeIntervalSince(began), gap * 1000, worst * 1000).utf8))
+            }
+        }
     }
 }

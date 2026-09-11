@@ -521,6 +521,38 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   (DEVELOPER_ID_P12, DEVELOPER_ID_P12_PASSWORD, AC_APPLE_ID, AC_PASSWORD, SITE_TOKEN).
 - notarize.sh takes AC_* creds from env (no keychain profile) so the self-hosted runner works.
 
+## UI responsiveness (App/OmniApp.swift HangWatch)
+- `-omni.hangwatch YES [-omni.hangwatchMs N]` reports how long the MAIN THREAD was unresponsive.
+  A timer on the main run loop only fires when the thread is free, so the gap between firings is
+  the block. This is how "feels laggy" becomes a number; N defaults to 250 ms.
+- DRIVE THE UI FROM THE LIVE WINDOW FRAME, never hardcoded screen coordinates. The window moves
+  between launches: a whole round of measurements was taken with the toolbar clicks landing at
+  y=155 while the window started at y=249, so every "interaction" phase measured an app that was
+  never clicked, and read as 0 stalls. Get it from System Events
+  (`get {position, size} of window 1`) each run and add offsets.
+- And RAISE the window: an occluded window does far less work, so decode-phase stall counts are
+  not comparable between a raised and an unraised run. An early "79 stalls -> 1" claim here was
+  that confound; the controlled A/B with the window visible in both is 2 stalls -> 1.
+- THE SHARE ITEM REBUILT THE WHOLE TRANSCRIPT. `TranscriptFile(markdown:)` took a String, so the
+  toolbar concatenated every page each time it was rebuilt. It takes a closure now, so the
+  document is only produced when a share actually happens. Found by sampling, not by guessing.
+- THE VIEW-MODE PICKER NEEDS A FIXED WIDTH. An `NSSegmentedControl` recomputes
+  `intrinsicContentSize` through the constraint system on every toolbar re-layout, and the
+  toolbar re-lays out whenever any item changes - including the share item, whose title is the
+  visible document's name. That was 10% of main-thread samples, and 41 stalls over 18 tab
+  switches. `.frame(width: 132).fixedSize()` takes it to 0. Do not remove the frame.
+- Where it stands, measured with verified coordinates on an 11-document chaotic drop: decode 1
+  stall, tab switches 0, and mode switches / thumbnail clicks / OCR toggles about two stalls each
+  at a median of 184 ms, p90 242, max 296. Perceptible stutter, no freezes, nothing over 300 ms.
+
+## Releases
+- PATCH by default. `gh workflow run release.yml -f version=<x.y.Z+1>` unless Han asks for a minor
+  or major bump in that message. 0.9.0 and 0.10.0 were cut as minors on my own judgement about
+  "scope"; that call is his, not mine.
+- Push BEFORE triggering: the workflow builds from the remote, and the previous release's version
+  bump commit means a local push can be rejected right as the run starts, which builds the wrong
+  tree. Rebase, push, then trigger.
+
 ## Commit identity
 - Commits are ALWAYS authored by Han Xiao <han.xiao@jina.ai>. Never omni-ci, never
   github-actions[bot], never any other bot identity - in this repo or any other on this machine.

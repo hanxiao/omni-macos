@@ -203,6 +203,14 @@ struct OCRView: View {
                 }
                 .pickerStyle(.segmented)
                 .labelStyle(.iconOnly)
+                // FIXED WIDTH, and it is a performance fix. An `NSSegmentedControl` recomputes
+                // `intrinsicContentSize` through the constraint system whenever the toolbar
+                // re-lays out, and the toolbar re-lays out whenever any item changes - including
+                // the share item, whose title is the visible document's name. That measurement
+                // was 10% of the main thread in a sample, and 41 stalls over 18 tab switches;
+                // pinning the width removes the recomputation and the stalls go to zero.
+                .frame(width: 132)
+                .fixedSize()
                 .help("Raw text, Markdown, both, or the page beside them")
             }
             if #available(macOS 26.0, *) { ToolbarSpacer(.fixed) }
@@ -241,10 +249,11 @@ struct OCRView: View {
         }
     }
 
-    /// What the share sheet hands over: a Markdown FILE, so a service that wants an attachment
-    /// gets one and a service that wants text still gets the text.
     private var transcript: TranscriptFile {
-        TranscriptFile(name: session.suggestedFileName, markdown: session.documentMarkdown)
+        // `session` is captured, not read: touching `documentMarkdown` here would make this
+        // toolbar item depend on every streamed token.
+        let s = session
+        return TranscriptFile(name: session.suggestedFileName, markdown: { s.documentMarkdown })
     }
 
     private var hasDocument: Bool {
@@ -1230,13 +1239,21 @@ private struct DropOverlay: View {
 }
 
 /// The transcription as something the share sheet can hand to another app.
+/// What the share sheet hands over: a Markdown FILE, so a service that wants an attachment gets
+/// one and a service that wants text still gets the text.
+///
+/// The markdown is a CLOSURE, not a string. Building it eagerly meant the toolbar concatenated
+/// the entire transcript every time it was rebuilt, and the toolbar is rebuilt on every streaming
+/// tick - which then re-measured the view-mode segmented control, and measuring an AppKit control
+/// inside SwiftUI layout drags a nested graph update behind it. That was the single largest
+/// main-thread cost during a run: 19% of samples in `SystemSegmentedControl` sizing alone.
 struct TranscriptFile: Transferable {
     let name: String
-    let markdown: String
+    let markdown: () -> String
 
     static var transferRepresentation: some TransferRepresentation {
         DataRepresentation(exportedContentType: OCRSession.markdownType) { file in
-            Data(file.markdown.utf8)
+            Data(file.markdown().utf8)
         }
         .suggestedFileName { $0.name }
     }
