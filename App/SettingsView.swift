@@ -128,6 +128,14 @@ private struct IndexStatusRow: View {
                             .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                     }
                 }
+            } else if model.ocrRunActive {
+                // Already true and previously invisible: a transcription stands indexing down for
+                // its duration, so "Up to date" with a live Index button would be a lie.
+                HStack(spacing: 8) {
+                    Image(systemName: "pause.circle").foregroundStyle(.secondary)
+                    Text("Paused while transcribing")
+                    Spacer()
+                }
             } else {
                 HStack(spacing: 8) {
                     Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)

@@ -39,4 +39,29 @@ final class OCRBatchPlanTests: XCTestCase {
         XCTAssertLessThanOrEqual(width, 9)
         XCTAssertGreaterThanOrEqual(width, OCRBatchPlan.worthwhile)
     }
+
+    /// The planner must subtract what ANOTHER model is holding. Metal reports a device
+    /// capability, not free memory, so a resident embedding model is invisible to it.
+    func testCoresidentModelNarrowsTheBatch() {
+        let sixteenGig = 11_000_000_000          // a 16 GB laptop's working set
+        OCRBatchPlan.coresidentBytes = 0
+        let alone = OCRBatchPlan.recommendedWidth(modelBytes: weights, pageCount: 100,
+                                                  availableBytes: sixteenGig)
+        OCRBatchPlan.coresidentBytes = 3_600_000_000   // embedding weights, upcast
+        let shared = OCRBatchPlan.recommendedWidth(modelBytes: weights, pageCount: 100,
+                                                   availableBytes: sixteenGig)
+        OCRBatchPlan.coresidentBytes = 0
+        XCTAssertGreaterThan(alone, shared,
+                             "a resident embedding model must narrow the batch, not be ignored")
+        XCTAssertGreaterThanOrEqual(alone, OCRBatchPlan.worthwhile)
+    }
+
+    /// A big machine is unaffected: it caps at 32 either way.
+    func testCoresidentModelDoesNotNarrowABigMachine() {
+        OCRBatchPlan.coresidentBytes = 3_600_000_000
+        let width = OCRBatchPlan.recommendedWidth(modelBytes: weights, pageCount: 100,
+                                                  availableBytes: 512_000_000_000)
+        OCRBatchPlan.coresidentBytes = 0
+        XCTAssertEqual(width, 32)
+    }
 }

@@ -2856,6 +2856,10 @@ final class AppModel {
             }
             self.store = store
             self.engine = engine
+            // Tell the OCR batch planner what this model is holding. Metal's working set is a
+            // device capability, not a live figure, so the planner would otherwise size a batch
+            // as if these weights were not resident.
+            OCRBatchPlan.coresidentBytes = engineTotalBytes ?? 0
             self.clearQueryEmbedCache()   // cached query vectors are model-specific
             self.indexer = Indexer(store: store, embedder: engine)
             // Hand the live engine and store to the serving layer. attach() swaps in the new

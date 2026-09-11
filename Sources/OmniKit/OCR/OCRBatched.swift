@@ -56,9 +56,18 @@ public enum OCRBatchPlan {
     /// is a cache that makes the machine it is meant to help slower.
     public static let visualCacheBytes = 256 << 20
 
+    /// What ANOTHER model is holding on this device right now, which the ceiling below does not
+    /// know about: `recommendedMaxWorkingSetSize` is a static device capability, not current
+    /// availability. The app keeps its embedding model resident while transcribing - it is 1.8 GB
+    /// on disk and more once the backbone is upcast - so without this the batch is sized as if
+    /// that memory were free. Invisible on a machine that caps at 32 anyway; on a 16 GB laptop it
+    /// is the difference between a width that fits and one that does not.
+    nonisolated(unsafe) public static var coresidentBytes = 0
+
     public static func recommendedWidth(modelBytes: Int, pageCount: Int,
-                                        reserveBytes: Int = 2_000_000_000 + visualCacheBytes,
+                                        reserveBytes: Int? = nil,
                                         availableBytes: Int? = nil) -> Int {
+        let reserveBytes = reserveBytes ?? (2_000_000_000 + visualCacheBytes + coresidentBytes)
         guard pageCount >= worthwhile else { return 1 }
         let ceiling = availableBytes
             ?? min(omniMetalWorkingSetBytes() ?? Int(ProcessInfo.processInfo.physicalMemory),

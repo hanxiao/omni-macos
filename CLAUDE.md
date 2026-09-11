@@ -456,6 +456,22 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   basename, so every URL `assetURL(variant:file:)` builds 404s. `Tools/ocr/publish.sh` now renames
   each asset through the API after upload, which is in place and does not re-send gigabytes.
 
+## Memory between the two models
+- THE OCR MODEL ALREADY OFFLOADS. `deactivate()` drops its 4.53 GB on a utility queue when the
+  toggle goes off, and `ocrRunActive` stands indexing down for the whole run. Do not re-add
+  either as a setting; they are not missing.
+- `omniMetalWorkingSetBytes()` is `recommendedMaxWorkingSetSize`, a DEVICE CAPABILITY, not free
+  memory. It does not fall when the embedding model loads, so `recommendedWidth` was sizing the
+  OCR batch as if 1.8 GB+ of resident embedding weights were not there. `OCRBatchPlan.coresidentBytes`
+  is set by the app when the engine loads and enters the reserve. No effect on a machine that caps
+  at 32; on a 16 GB laptop it is the difference between a width that fits and one that does not.
+- EVICTING THE EMBEDDING MODEL ON THE OCR TOGGLE WAS CONSIDERED AND NOT BUILT. `self.engine = nil`
+  frees nothing: `Indexer` holds it as `embedder` and `serving.attach(engine:)` hands it to the
+  HTTP/MCP layer, so a real eviction is a bootstrap-level teardown (cancel the indexer, detach
+  serving, reload on return) hung off a toolbar click. It buys nothing on a roomy machine, and on
+  a small one it trades a multi-second warm-up when you leave OCR for perhaps 15% OCR throughput
+  - while risking search and a serving endpoint that promised to answer. Size the batch instead.
+
 ## OCR settings
 - ONE build is offered, and the weights live at `Application Support/Omni/jina-ocr-v1-<slug>` beside
   the embedding model, not in an `ocr/` of their own. `OCRModelCatalog.migrateLegacyInstall()`
