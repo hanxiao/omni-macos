@@ -349,11 +349,20 @@ measured on an M3 Ultra too, so they compare directly.
 - SPARSE PREFILL (their SpecPrefill) scores prompt tokens with a draft model and prefills only
   the top `keep_pct`. It DROPS prompt tokens, which for transcription means dropping image
   tokens, so it is graded against the CER gate before it is believed, not adopted on its face.
-- NOT A LEVER, ALREADY DONE BETTER HERE: oMLX's embedding engine sorts inputs by length so a
-  batch does not pad to its longest member, at a fixed batch of 32 with `mx.compile` on the
-  forward. `Indexer.embedGroupsReusing` already length-sorts (padding is ~0% by construction)
-  and adds a content-keyed vector reuse cache and GPU/CPU double buffering that oMLX has no
-  equivalent of. The embedding path is ahead, not behind.
+- THE EMBEDDING PATH IS AHEAD, NOT BEHIND, and the transfer runs the other way. oMLX sorts
+  inputs by length so a batch does not pad to its longest member, at a fixed batch of 32 with
+  `mx.compile` on the forward; `Indexer.embedGroupsReusing` already length-sorts (padding is
+  ~0% by construction) and adds a content-keyed vector reuse cache and GPU/CPU double buffering
+  that oMLX has no equivalent of. `forwardPooled` also narrows to the pooled row BEFORE the last
+  MLP and the final norm, so neither runs on pad positions - oMLX computes the whole
+  last_hidden_state and pools afterwards. Most of its embedding code is multi-checkpoint
+  plumbing (resolving a pooling mode from sentence-transformers config, remapping input keys)
+  that a single-model app does not need.
+- ONE CHECK WORTH HAVING RUN: oMLX warns that a bare `[:, -1]` last-token pool is correct only
+  under LEFT padding and that an unmasked mean averages pad tokens in, and that both "still look
+  fine" on single inputs. This port right-pads. It is correct - `forwardPooled` gathers per row
+  with `takeAlong(h, poolIndexGraph(lengths), axis: 1)`, never a bare last column - and the
+  backbone being causal means a real token never attends to a pad. Verified, not assumed.
 
 ## Markdown panes (App/MarkdownBlock.swift, MarkdownSource.swift)
 - LaTeX rendering was built and then REMOVED on purpose. This is a transcription workspace, not a
