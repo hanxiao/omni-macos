@@ -341,11 +341,27 @@ measured on an M3 Ultra too, so they compare directly.
   figures on Qwen3.8-27B: GPU-only 458 tok/s prefill at 4K, ANE/GPU 588 (+28%), ANE/CPU/GPU 625
   (+36%), fused MLP/down 349 -> 527 (+51%). It holds at q8 (432 -> 557, +29%), which is the
   build we ship, decode is unchanged (prefill-only lever) and peak memory costs about 7 GB.
-  Prefill is 14.7 s of a 52.4 s run here, so +30% on prefill is about +8% end to end. This port
-  is unusually well suited: `dynamicPreprocess` fixes the prompt at ~1007 tokens from the aspect
-  ratio, and fixed shapes are exactly what ANE compilation needs. It is still a native extension
-  against private API inside a notarised Apache-2.0 app, so it is a project and not a patch.
-  Not attempted.
+  Prefill is 14.7 s of a 52.4 s run here, so +30% on prefill would be about +8% end to end.
+- THE ANE IS REACHABLE WITHOUT PRIVATE API, AND IT IS FAST, AND IT IS STILL NOT WORTH IT HERE.
+  Spiked with plain CoreML (no private runtime): a 1x1 conv over (1, K, M, 1) is the ANE-friendly
+  spelling of a linear layer, and at this port's exact prefill shape M1007 K1280 N1280 it runs at
+  0.235 ms per GEMM = 14.0 TFLOP/s, against 0.48 ms / 6.8 TF for MPSGraph and 0.72 ms / 4.6 TF for
+  MLX. So the ANE is 2.1x the GPU at the shape that matters. Measured by CHAINING L GEMMs and
+  taking the slope, with a relu between them - consecutive 1x1 convs collapse into one matmul and
+  a fused chain measures nothing. Confirmed from Swift with a preallocated MLMultiArray, which
+  also gives the honest fixed cost: ~7.2 ms PER CoreML CALL (7.66 ms at depth 1, 10.00 at 12,
+  18.47 at 48). So an offloaded region must be big: one call per page, never one per layer.
+- WHAT KILLS IT IS THIS MODEL'S MoE, not the ANE. Per token per layer the GEMM work splits
+  attention projections 21.4%, routed experts (top-6 of 64) 67.4%, shared expert 11.2%. Only the
+  dense, static-shape parts can go to the ANE, which is 32.6%. The routed two-thirds is a
+  top-k gather/scatter; running all 64 experts densely instead costs 10.7x the FLOPs, and at
+  2.06x the throughput that is 5.2x SLOWER than top-k on the GPU. So the ceiling is 2.06x on a
+  third of the GEMMs, or ~17% of language prefill, which is ~1.9% end to end BEFORE paying for
+  fp16 weight copies (oMLX measures ~7 GB, so big-machine only), one compiled program per prompt
+  shape, MLX-to-MLMultiArray movement per call, and a CER re-gate for fp16 numerics.
+  oMLX gets +28-51% because Qwen3.8's dense MLP/GDN projections are most of ITS prefill. The
+  lever is real and does not transfer to a 67%-routed-MoE model. Do not build it. If a dense
+  model is ever ported, revisit: the CoreML numbers above are the ones to start from.
 - THEIR QUANTIZER (`oq.py`, "oQ": GGUF K-quant layer positioning + unsloth Dynamic 2.0 selective
   non-quantization + BnB MSE-optimal clipping) IS AT PARITY WITH `Tools/ocr/convert.py` ON POLICY
   AND BEHIND IT ON EVIDENCE. Both emit per-tensor affine weights with a quant map; both keep
