@@ -374,10 +374,30 @@ measured on an M3 Ultra too, so they compare directly.
   4.6-22.8 TF depending on how well a shape maps to it, so the ANE wins where the GPU is badly
   UTILISED and loses where it is not: 2.1x on the OCR prefill shape (M1007 K1280 N1280, a shape
   MLX runs at only 4.6 TF), 0.48x on the embedding MLP.
-- SO oMLX'S WIN IS CONCURRENCY, NOT SPEED. Adding a unit worth ~0.5x the GPU and running both at
-  once is worth about their +28%. What their private runtime actually buys is not ANE ACCESS -
-  plain CoreML has that - it is SUB-MILLISECOND ANE DISPATCH. A concurrent split needs a
-  handoff per layer, and CoreML charges 7.2 ms per call. That, not the ANE, is the blocker.
+- SO oMLX'S WIN IS CONCURRENCY, NOT SPEED. Adding a unit worth ~0.5x the GPU and running both
+  at once is worth about their +28%.
+- COREML DISPATCH IS NOT THE BLOCKER - MARSHALLING IS. The floor is 0.038 ms for a 1-element
+  tensor; the cost tracks TENSOR SIZE, at roughly 0.1 GB/s through coremltools and 0.7 GB/s
+  from Swift with a preallocated MLMultiArray (C1280 x M1007: 15.6 ms python, 7.7 ms swift).
+  That is CoreML copying and re-tiling into its ANE-side buffer, and it is why a per-layer
+  handoff is hopeless - but it also means a per-layer handoff is the wrong design.
+- THE RIGHT DESIGN FOR INDEXING IS BATCH-PARALLEL, AND THE TWO UNITS ARE ADDITIVE. Run a whole
+  forward on the GPU for batch A and a whole forward on the ANE for batch B: one CoreML call
+  per batch, no handoff, marshalling amortised over the entire model. Measured at the MLP shape
+  (h1024/ffn3072, M4096, depth 6) in SEPARATE PROCESSES: GPU 71.50 it/s solo and 71.50
+  concurrent (100% kept), ANE 8.53 solo and 8.37 concurrent (98%). The ANE costs the GPU
+  NOTHING. Do this measurement across processes, never across threads - in threads both
+  collapsed to exactly 8.53 it/s, which is coremltools holding the GIL through the numpy
+  conversion, not hardware contention.
+- WHAT IT IS WORTH, on that shape: +12% with coremltools, +22% from Swift with a preallocated
+  MLMultiArray (15.93 it/s, 4.93 TF against the ANE's 10.5 TF compute slope), and +48% if the
+  remaining marshalling goes away via an IOSurface-backed MLMultiArray, which is Apple's
+  documented zero-copy path and is untested here. Over the whole 28-layer model the ANE takes
+  1.70x the GPU's time (75% MLP at 0.48x, 25% attention projections at 1.8x), so the concurrent
+  ceiling is 1.59x on INDEXING THROUGHPUT. This is the one lever from the oMLX sweep that
+  survived, and it is on the indexing path rather than OCR. Not built: it needs the 28-layer
+  model expressed in CoreML MIL, an fp16 weight copy (~1.8 GB), and the cosine >= 0.999 gate.
+  The numbers above are a synthetic MLP chain, not an end-to-end indexing measurement.
 - THEIR QUANTIZER (`oq.py`, "oQ": GGUF K-quant layer positioning + unsloth Dynamic 2.0 selective
   non-quantization + BnB MSE-optimal clipping) IS AT PARITY WITH `Tools/ocr/convert.py` ON POLICY
   AND BEHIND IT ON EVIDENCE. Both emit per-tensor affine weights with a quant map; both keep
