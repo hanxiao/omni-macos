@@ -385,39 +385,33 @@ measured on an M3 Ultra too, so they compare directly.
   queue and MLX-Swift on the main thread: both keep 99-104% of their solo rate at every size
   tried. Do NOT measure this from Python threads - there both collapse to the same rate, which
   is coremltools holding the GIL through the conversion, not memory contention.
-- WHAT IT IS WORTH on the embedding tower (h1024, ffn3072, attn 25% of GEMM work / mlp 75%),
-  weighting the two measured shapes, as combined throughput against the GPU alone:
-    M 1024  GPU 15.5 TF  ANE 11.4 TF  ->  1.74x
-    M 2048  GPU 18.7 TF  ANE 12.2 TF  ->  1.65x
-    M 4096  GPU 21.2 TF  ANE 12.6 TF  ->  1.59x
-    M 8192  GPU 22.5 TF  ANE 12.9 TF  ->  1.57x
-  The ANE is FLAT (10.8-16.9 TF across every shape and size) while the GPU swings 11.4-23.0, so
-  the ANE is worth relatively MORE at small M where the GPU is launch-bound - at M 1024 it beats
-  the GPU outright on the attention shape (13.05 against 11.38 TF). Indexing batches are
-  length-sorted, so short-chunk batches are exactly the small-M case.
-- IOSURFACE ZERO-COPY IS NOT NEEDED. A CVPixelBuffer-backed MLMultiArray was expected to matter
-  and is worth only +1% to +4% over a plain preallocated heap MLMultiArray from Swift, because
-  the heap path is already at the ANE's compute bound. The probe keeps both so that stays
-  checkable, but do not build a surface-management layer for it.
-- THE fp16 GATE IS CLEARED, which is the precondition for any ANE port (the ANE is fp16-only).
-  `OMNI_BACKBONE_DTYPE` and `OMNI_COMPUTE_DTYPE` select fp32/bf16/fp16 for weights and for
-  activations. BOTH are needed to measure anything: with bf16 weights an fp16 activation
-  promotes the matmul back to fp32, so a compute flag alone measures activation rounding and
-  not fp16 arithmetic - a first pass here reported "fp16 is exact" on exactly that mistake.
-  True fp16 (fp16 weights AND fp16 compute) scores worst cosine 1.00000 against the reference
-  fixtures, against 0.99992 for the shipped bf16 path. fp16 has 10 mantissa bits to bf16's 7,
-  so it is the MORE accurate of the two 16-bit formats here; bf16 was chosen for its fp32
-  exponent range, and no overflow appeared on these inputs.
-- DO NOT FLIP THE DEFAULT TO fp16 ON THAT EVIDENCE. Throughput is identical - bf16 and fp16
-  interleaved four times through `omni-verify bench` land at 22826/22685/22725/22773 tok/s
-  bucketed at batch 48 - so the only gain is 0.99992 -> 1.00000, which is far inside the 0.999
-  gate either way. The fixtures are six short strings and do not stress fp16's exponent range,
-  and this project has been bitten by NaN poisoning before. The finding is worth having because
-  it unblocks the ANE, not because the default is wrong.
-- STILL NOT BUILT, and what it would take: the 28-layer tower expressed in CoreML MIL (attention,
-  RoPE, GQA, RMSNorm, pooling), an fp16 weight copy (~1.8 GB), batch-parallel scheduling so the
-  GPU takes one batch while the ANE takes another, and the cosine >= 0.999 gate. The figures
-  above are synthetic chains at the right shapes, not an end-to-end indexing run.
+- THE SYNTHETIC PROBE OVERESTIMATED BY 4x, AND ONLY BUILDING THE REAL THING SHOWED IT. Chained
+  1x1 convs at the tower's shapes put the ANE at 0.57-0.74x of the GPU and perfectly additive,
+  which projected roughly +60% on indexing. The ACTUAL 28-layer tower, ported to CoreML and
+  verified correct, runs at 3612 tok/s against the GPU path's ~22800: 0.16x. The probe measured
+  only the ops the ANE likes, in isolation, with nothing between them.
+- AND IT IS NOT ON THE ANE AT ALL. Same compiled tower, L=512, by compute unit:
+  cpuOnly 4225 tok/s, cpuAndGPU 15458, cpuAndNE 3676, all 15474. The ANE configuration is SLOWER
+  THAN CPU ALONE, and `all` just equals `cpuAndGPU`. CoreML fragments the graph and the transfers
+  cost more than the ANE saves. Even CoreML's own GPU path (15458) is well under MLX-Swift's
+  22800, so there is nothing here to win with either.
+- THE fp32 CASTS WERE NOT THE CAUSE, which was the obvious suspect (57 cast pairs for RMSNorm,
+  and casts are known to break ANE residency). A cast-free variant with RMSNorm in fp16 measures
+  7.17 it/s against 7.18 - identical - at unchanged accuracy. What fragments the graph is the
+  attention block: reshape to (H, D, L), tile for GQA, transpose, batched matmul, softmax. Making
+  that ANE-resident needs the full ml-ane-transformers treatment (per-head chunked convs, no
+  reshapes), which is a rewrite of the port with no guarantee at the end of it.
+- THE PORT ITSELF IS CORRECT AND THE TOOLING IS KEPT, so this is re-testable if CoreML improves:
+  `omni-verify dumpbackbone` exports the app's own LoRA-merged fp16 weights (do not re-derive the
+  merge elsewhere - that is how you get a wrong answer that looks like a numerics bug),
+  `Tools/ane/tower.py` is the MLX reference for the same maths, `Tools/ane/build_tower.py` emits
+  the CoreML program and `verify_tower.py` scores it. All eight shipped fixtures pass through the
+  CoreML tower at worst cosine 0.99998. Right-padding is free to verify with because the tower is
+  causal, so one padded length covers every record.
+- SO THE ANE IS CLOSED, on both models and for different reasons: the OCR model because two
+  thirds of its GEMM work is a top-k MoE gather the ANE cannot take, and the embedding model
+  because its attention will not stay resident. Do not reopen on a synthetic GEMM benchmark;
+  reopen only on a measurement of a whole model.
 - SPARSE PREFILL (their SpecPrefill) scores prompt tokens with a draft model and prefills only
   the top `keep_pct`. It DROPS prompt tokens, which for transcription means dropping image
   tokens, so it is graded against the CER gate before it is believed, not adopted on its face.

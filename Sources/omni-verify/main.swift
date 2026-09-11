@@ -259,6 +259,12 @@ func churnbenchRun(_ nFiles: Int, _ secs: Double) throws -> Int32 {
     print("  RESULT: \(ok ? "PASS" : "FAIL")")
     return ok ? 0 : 1
 }
+if args.count >= 4 && args[1] == "dumpbackbone" {
+    try DumpBackbone.run(modelDir: URL(fileURLWithPath: args[2]),
+                         out: URL(fileURLWithPath: args[3]))
+    exit(0)
+}
+
 if args.count >= 2 && args[1] == "churnbench" {
     let nFiles = (args.count >= 3 ? Int(args[2]) : nil) ?? 3000
     let secs = (args.count >= 4 ? Double(args[3]) : nil) ?? 12
