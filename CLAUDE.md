@@ -302,6 +302,59 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   checkpoint is Llama split-half, MLX is interleaved) and half-precision qkv/mask inside the
   fused vision SDPA (slower and it drifts). Do not re-adopt without new numbers.
 
+## Learning from oMLX (github.com/jundot/omlx, read at v0.6.4)
+
+oMLX is an MLX inference server for Apple silicon. Its macOS app bundles the full Python
+source, which is the reference used here rather than the README, and its published numbers are
+measured on an M3 Ultra too, so they compare directly.
+
+- SPECULATION INSIDE A BATCH IS A LOSS, measured there independently: row-wise MTP on
+  Qwen3.6-27B / M3 Ultra gives 53.3 / 52.5 aggregate tok/s at batch 2 / 4 against 65.2 / 86.5
+  for plain batched decode, DESPITE 83-93% draft acceptance. Their rule generalises ours: a
+  drafted cycle carries tokens-per-cycle tokens, so it only beats a batch narrower than that.
+  At k=3 this port carries ~2.9, so speculation can only pay below 3 rows.
+- AND THAT WINDOW IS EMPTY HERE. `ocr-verify --pdf --batch 32 --report-occupancy` on the 40-page
+  scan: 1.4% of decode steps run at <=2 rows and carry 0.2% of the tokens. 62.4% of steps run at
+  exactly 14 rows (51.4% of tokens), because the page lengths are 1309/352/73 repeating - the
+  short and medium pages finish early and 14 long pages grind together to the end. So
+  "speculate once the batch narrows" is worth ~0.3% of a run. Do not build it.
+- PREFIX CACHING ACROSS PAGES IS WORTH ~2%, not the large win it is for a chat server. oMLX's
+  hot/cold tiered KV cache exists because coding agents resend a long shared prefix; here
+  `promptIDs` puts only the chat template's opening ahead of the image tokens, and the ~1000
+  image tokens after it are page-specific. There is no long shared prefix to cache.
+- THE DECODE STEP IS NOT KV-BANDWIDTH-BOUND, so KV quantization is a MEMORY lever and not a
+  speed one. Seeding the same probe with fp32 and fp16 KV at 3072 context: 34.14 vs 34.12 ms at
+  32 rows, 21.85 vs 21.83 at 16. Halving the bytes changed nothing. Neither wall is close
+  either: at 32 rows / 3072 context a step is 6.04 GFLOP over 6.04 GB of KV, which at 34 ms is
+  177 GFLOP/s and 177 GB/s against roughly 27 TFLOP/s and 800 GB/s. Attention at one query per
+  row is occupancy-bound, the same conclusion `--probe-gemm` reached for prefill.
+- `probeDecodeWidth` seeds fp16 now, which is what `appendStep` actually writes. It seeded fp32
+  before and so timed a cache at twice production's size; the numbers are identical either way
+  (previous point), which is why the recorded figures still stand.
+- CONTEXT COSTS MORE THAN WIDTH DOES. ms/step at 1 / 32 rows is 5.82 / 22.30 at 1024 context and
+  6.34 / 34.04 at 3072: one row is nearly flat in context (+9% over 3x), 32 rows is not (+53%).
+  A long page in a wide batch is superlinear, which is the mechanism behind the 14-row plateau.
+- ANE PREFILL IS REAL, AND `--probe-gemm` MEASURED THE WRONG DOOR. Its conclusion that no ANE
+  dispatch materialises is true OF MPSGRAPH; oMLX does not use MPSGraph. It drives a private ANE
+  runtime from a native extension, compiling per-layer program banks at a FIXED sequence length
+  and splitting each matmul across ANE0, ANE1, the GPU and optionally the CPU. Their M3 Ultra
+  figures on Qwen3.8-27B: GPU-only 458 tok/s prefill at 4K, ANE/GPU 588 (+28%), ANE/CPU/GPU 625
+  (+36%), fused MLP/down 349 -> 527 (+51%). It holds at q8 (432 -> 557, +29%), which is the
+  build we ship, decode is unchanged (prefill-only lever) and peak memory costs about 7 GB.
+  Prefill is 14.7 s of a 52.4 s run here, so +30% on prefill is about +8% end to end. This port
+  is unusually well suited: `dynamicPreprocess` fixes the prompt at ~1007 tokens from the aspect
+  ratio, and fixed shapes are exactly what ANE compilation needs. It is still a native extension
+  against private API inside a notarised Apache-2.0 app, so it is a project and not a patch.
+  Not attempted.
+- SPARSE PREFILL (their SpecPrefill) scores prompt tokens with a draft model and prefills only
+  the top `keep_pct`. It DROPS prompt tokens, which for transcription means dropping image
+  tokens, so it is graded against the CER gate before it is believed, not adopted on its face.
+- NOT A LEVER, ALREADY DONE BETTER HERE: oMLX's embedding engine sorts inputs by length so a
+  batch does not pad to its longest member, at a fixed batch of 32 with `mx.compile` on the
+  forward. `Indexer.embedGroupsReusing` already length-sorts (padding is ~0% by construction)
+  and adds a content-keyed vector reuse cache and GPU/CPU double buffering that oMLX has no
+  equivalent of. The embedding path is ahead, not behind.
+
 ## Markdown panes (App/MarkdownBlock.swift, MarkdownSource.swift)
 - LaTeX rendering was built and then REMOVED on purpose. This is a transcription workspace, not a
   rich editor: the model emits usable LaTeX, but setting it properly needs either a dependency or

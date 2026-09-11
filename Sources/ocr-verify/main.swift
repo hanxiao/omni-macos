@@ -168,7 +168,18 @@ if args.contains("--probe-decode-width") {
     let modelPath = args.first { !$0.hasPrefix("--") }
     guard let modelPath else { fatalError("--probe-decode-width needs a model dir") }
     let model = try await OCRModel(modelDir: URL(fileURLWithPath: modelPath))
-    print(model.probeDecodeWidth())
+    // Context length matters as much as the row count: a decode step reads the WHOLE KV cache,
+    // so if the step is bandwidth-bound its cost tracks rows x context, not rows alone.
+    let ctxs = args.firstIndex(of: "--context").map { Int(args[$0 + 1]) ?? 1024 }.map { [$0] }
+        ?? [1024, 2048, 3072]
+    // Halving the bytes per KV element isolates the bandwidth term: whatever part of a step
+    // scales with cache SIZE moves, and whatever is launch- or weight-bound does not.
+    for dt in [(DType.float32, "fp32"), (DType.float16, "fp16")] {
+        for c in ctxs {
+            print("kv \(dt.1)  context \(c):")
+            print(model.probeDecodeWidth(context: c, kvDType: dt.0))
+        }
+    }
     exit(0)
 }
 
@@ -299,6 +310,7 @@ if let i = args.firstIndex(of: "--pdf") {
     OCRRuntimeFlags.loopGuardForPDF = !args.contains("--no-loop-guard")
     OCRRuntimeFlags.visionPrefetch = args.contains("--vision-prefetch")
     OCRRuntimeFlags.reportPrefill = args.contains("--report-prefill")
+    OCRRuntimeFlags.reportOccupancy = args.contains("--report-occupancy")
     let workers = intAfter("--workers", in: args) ?? 1
     let printText = args.contains("--print-text")
 
@@ -354,6 +366,21 @@ if let i = args.firstIndex(of: "--pdf") {
             for page in out.pages { print("----- page \(page.page)\n\(page.text)\n") }
         }
         print("document digest: \(digest(out.markdown()))  chars \(out.markdown().count)")
+        if OCRRuntimeFlags.reportOccupancy {
+            let occ = OCRRuntimeFlags.occupancy()
+            let steps = occ.reduce(0) { $0 + $1.steps }
+            let carried = occ.reduce(0) { $0 + $1.rows * $1.steps }
+            print("decode-step occupancy (rows: steps, share of steps, share of tokens carried)")
+            for e in occ {
+                print(String(format: "  %2d rows: %6d steps  %5.1f%% of steps  %5.1f%% of tokens",
+                             e.rows, e.steps,
+                             100.0 * Double(e.steps) / Double(max(steps, 1)),
+                             100.0 * Double(e.rows * e.steps) / Double(max(carried, 1))))
+            }
+            let narrow = occ.filter { $0.rows <= 2 }.reduce(0) { $0 + $1.steps }
+            print(String(format: "  steps at <=2 rows: %d of %d (%.1f%%)",
+                         narrow, steps, 100.0 * Double(narrow) / Double(max(steps, 1))))
+        }
         exit(0)
     }
 

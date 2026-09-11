@@ -115,7 +115,8 @@ extension OCRModel {
     ///
     /// Driven through the real language model with real caches, at a realistic context depth.
     public func probeDecodeWidth(counts: [Int] = [1, 2, 4, 8, 16, 32],
-                                 context: Int = 1024, steps: Int = 24) -> String {
+                                 context: Int = 1024, steps: Int = 24,
+                                 kvDType: DType = .float16) -> String {
         var lines: [String] = []
         var perRowAtOne = 0.0
         for b in counts {
@@ -123,7 +124,7 @@ extension OCRModel {
             // Seed every row to the same depth with arbitrary but correctly shaped history.
             for cache in caches {
                 let k = MLX.zeros([OCRLanguageConfig.heads, context, OCRLanguageConfig.headDim],
-                                  dtype: .float32) + 0.02
+                                  dtype: kvDType) + 0.02
                 for slot in 0 ..< b { cache.seed(slot: slot, keys: k, values: k) }
             }
             let ids = [Int](repeating: 100, count: b)
@@ -315,6 +316,7 @@ extension OCRModel {
             }
 
             let rows = 0 ..< rowPage.count
+            OCRRuntimeFlags.noteDecodeStep(rows: rowPage.count)
             let ids = rows.map { tokens[rowPage[$0]].last! }
             let x = llm.embed(ids)
             let (_, logits) = llm.forwardBatch(x, positions: rows.map { rowPos[$0] },
@@ -484,6 +486,7 @@ extension OCRModel {
                 for slot in live { stopped[slot] = .cap }
                 break
             }
+            OCRRuntimeFlags.noteDecodeStep(rows: live.count)
             let ids = live.map { tokens[$0].last! }
             let x = llm.embed(ids)                              // (B, dim)
             let positions = [Int](repeating: position, count: live.count)

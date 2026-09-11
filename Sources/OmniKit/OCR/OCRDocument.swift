@@ -52,6 +52,30 @@ public enum OCRRuntimeFlags {
         get { OCRLanguageModel.draftVocab }
         set { OCRLanguageModel.draftVocab = newValue }
     }
+
+    /// Histogram of decode steps by live row count, so "how much of a run decodes narrow" is a
+    /// measurement rather than an intuition. A step is strongly sub-linear in its row count
+    /// (5.60 ms at 1 row against 22.21 ms at 32), so steps spent narrow are the expensive ones
+    /// per token carried - and they are also the only place speculation can pay, since a drafted
+    /// cycle carries ~2.9 tokens and that only beats a batch narrower than itself.
+    nonisolated(unsafe) private static var rowSteps: [Int: Int] = [:]
+    private static let rowLock = NSLock()
+    nonisolated(unsafe) public static var reportOccupancy = false
+
+    public static func noteDecodeStep(rows: Int) {
+        guard reportOccupancy else { return }
+        rowLock.lock(); rowSteps[rows, default: 0] += 1; rowLock.unlock()
+    }
+
+    /// Steps per live-row count, ascending. Cleared by the caller between runs.
+    public static func occupancy() -> [(rows: Int, steps: Int)] {
+        rowLock.lock(); defer { rowLock.unlock() }
+        return rowSteps.sorted { $0.key < $1.key }.map { (rows: $0.key, steps: $0.value) }
+    }
+
+    public static func resetOccupancy() {
+        rowLock.lock(); rowSteps.removeAll(); rowLock.unlock()
+    }
 }
 
 extension OCRModel {
