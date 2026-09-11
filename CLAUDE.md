@@ -346,6 +346,26 @@ measured on an M3 Ultra too, so they compare directly.
   ratio, and fixed shapes are exactly what ANE compilation needs. It is still a native extension
   against private API inside a notarised Apache-2.0 app, so it is a project and not a patch.
   Not attempted.
+- THEIR QUANTIZER (`oq.py`, "oQ": GGUF K-quant layer positioning + unsloth Dynamic 2.0 selective
+  non-quantization + BnB MSE-optimal clipping) IS AT PARITY WITH `Tools/ocr/convert.py` ON POLICY
+  AND BEHIND IT ON EVIDENCE. Both emit per-tensor affine weights with a quant map; both keep
+  lm_head and embeddings wide; both single out the routed-expert `down` projection. oQ picks bits
+  from a sensitivity heuristic, convert.py picked them from a measured CER ladder against the
+  torch oracle. It does NOT protect the MoE routers, which this port never quantizes.
+- ITS ONE MISSING INGREDIENT IS MSE-OPTIMAL CLIPPING, AND IT IS MEASURED AND REJECTED HERE.
+  `convert.py` calls plain `mx.quantize` (min/max affine); oQ's `_weighted_affine_quantize`
+  instead searches 14 candidate (scale, bias) pairs per group - anchored on w_max or w_min,
+  times factors 0.5 to 1.25 - and keeps whichever minimises reconstruction error, in a layout
+  deliberately identical to `mx.quantize(mode="affine")`. So it would cost the Swift side
+  nothing. On this model's 4-bit routed experts it is worth a uniform 7-9% lower reconstruction
+  error, which is about +0.07 EFFECTIVE BITS (error goes as 4^-bits, so a 0.91 ratio is
+  log4(1/0.91)). It will not rescue the 4-bit build.
+  The reason is in the error DISTRIBUTION, not its mean: per group the gain is 6.6% at the
+  median, 7-8% at p99 and 0% at the max on two of four tensors sampled, and the spread from
+  median to max is only 3x. Clipping pays on outlier-dominated weights; these are not. The
+  4-bit failure (CER 0.082 on dense pages, and losing EOS) is 4 bits being too few, not the
+  scale being badly chosen. Do not re-derive this - it cost two scripts, not a build and a
+  CER run.
 - SPARSE PREFILL (their SpecPrefill) scores prompt tokens with a draft model and prefills only
   the top `keep_pct`. It DROPS prompt tokens, which for transcription means dropping image
   tokens, so it is graded against the CER gate before it is believed, not adopted on its face.
