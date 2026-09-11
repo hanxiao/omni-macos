@@ -700,7 +700,27 @@ measured on an M3 Ultra too, so they compare directly.
   120-200 ms, ~6.5 s of a ~57 s run. NONE exceed 250 ms, which is the threshold the earlier
   "decode 1 stall" note used - so that figure and this one agree, they were counting different
   things. Fitting blocked time against page count gives ~123 ms per page plus ~1.7 s fixed.
-- FIVE CANDIDATES FOR THAT PER-PAGE COST ARE MEASURED AND REJECTED, do not re-try them:
+- THE CAUSE WAS `pages[index].tokens`, WRITTEN ON EVERY STREAM UPDATE. `Page.tokens` is read in
+  exactly one place, `case .done: "\(page.tokens) tokens"`, and `settle` sets it from the final
+  result - so the per-update write displayed nothing and mutated the whole `pages` array 24 times
+  a second, invalidating all 40 rows of the rail. `PageThumb.body.getter` is what gave it away in
+  the Instruments profile. Removing it from both stream handlers, measured with focus HELD in
+  both arms and zero steals: 38/43 stalls and 5.79/6.49 s blocked before, 22/21 stalls and
+  3.09/2.87 s after - 51% less main-thread blocking for two deleted lines.
+- HOW IT WAS FOUND, after seven guesses failed: `xcrun xctrace record --template 'CPU Profiler'
+  --attach <pid>`, then export the `cpu-profile` table and aggregate frames for the Main Thread
+  row only. `sample` wedges on this binary; xctrace does not. The profile also settles two
+  questions: SQLite and the ignore matcher run during an OCR run but on WORKER threads, so
+  indexing is not what stalls the UI; and Instruments' own hang detector records ZERO hangs,
+  because its threshold is 250 ms and nothing here exceeds that.
+- WHAT THE MAIN THREAD SPENDS THE REST ON, from that profile: SwiftUI environment and attribute
+  graph traversal (`find1` 562 samples, `Attribute.init` 293, `PropertyList.Tracker.value` 128,
+  `EnvironmentBox.update` 78) plus AttributedString-to-NSAttributedString conversion and CoreText
+  layout (`transformingAppKitAttributedForSwiftUI` 92, `NSCoreTypesetter` and `TCompositionEngine`
+  147, `Text.Style.nsAttributes` 68). That is the cost of re-rendering visible transcript
+  sections, and it is inherent to drawing the text.
+- FIVE CANDIDATES FOR THAT PER-PAGE COST WERE MEASURED AND REJECTED BEFORE THE REAL ONE, do not
+  re-try them:
   coalescing the 768 per-row main-actor hops a second into 24; publishing only the focused page
   at full rate; memoising `MarkdownBlock.runs` the way `parse` is (worth ~5%, inside variance);
   guarding the run-follow `scrollTo` so it fires once per page rather than every tick; and

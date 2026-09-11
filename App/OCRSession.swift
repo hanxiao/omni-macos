@@ -980,7 +980,9 @@ final class OCRSession {
                                     guard let self, self.runToken == token,
                                           self.texts.indices.contains(index) else { return }
                                     self.texts[index] = update.text
-                                    self.pages[index].tokens = update.tokens
+                                    // See the batched handler: `pages[index].tokens` is only read
+                                    // once the page is `.done`, and writing it per update churns
+                                    // the whole `pages` array and so the whole rail.
                                     self.liveTokens[index] = update.tokens
                                                 self.noteRate()
                                     self.streamTick &+= 1
@@ -1066,7 +1068,10 @@ final class OCRSession {
                         let index = group[slot]
                         guard self.texts.indices.contains(index) else { return }
                         self.texts[index] = update.text
-                        self.pages[index].tokens = update.tokens
+                        // NOT `pages[index].tokens`: it is only read once a page is `.done`, and
+                        // `settle` sets it from the final result. Writing it per update mutated
+                        // the whole `pages` array 24 times a second, which invalidates every row
+                        // of the rail - `PageThumb.body` was all over the main-thread profile.
                         self.liveTokens[index] = update.tokens
                         self.prefillTarget = 0
                         self.noteRate()
