@@ -685,6 +685,27 @@ measured on an M3 Ultra too, so they compare directly.
   toolbar re-lays out whenever any item changes - including the share item, whose title is the
   visible document's name. That was 10% of main-thread samples, and 41 stalls over 18 tab
   switches. `.frame(width: 132).fixedSize()` takes it to 0. Do not remove the frame.
+- THE THREE INTERACTIONS IN THE OLD NOTE NO LONGER STALL. Measured on the current build with the
+  run allowed to FINISH first, so decode is not in the numbers: 18 view-mode switches, 10
+  thumbnail clicks and 4 OCR toggles add ZERO stalls over 120 ms (39 before, 39 after each
+  phase). The earlier "about two stalls each at a median of 184 ms" is not reproducible - the
+  lazy sections and the pinned picker width appear to have taken it, or it carried the
+  duplicate-instance confound below.
+- ASSERT WHICH APP OWNS THE FRONT WINDOW BEFORE EVERY CLICK, not once at the start. Focus is
+  stolen mid-run (Slack did it here during a 95 s wait) and the clicks then land in another
+  application, which measures nothing and does something unintended. `raise` by unix id, then
+  check `unix id of first process whose frontmost is true` equals the pid, and ABORT on a
+  mismatch. Verified to discriminate: 1603 -> our pid -> 1603 across a raise and a steal.
+- WHAT REMAINS IS DECODE-PHASE AND MODEST. On the 40-page scan, one instance: ~40 stalls of
+  120-200 ms, ~6.5 s of a ~57 s run. NONE exceed 250 ms, which is the threshold the earlier
+  "decode 1 stall" note used - so that figure and this one agree, they were counting different
+  things. Fitting blocked time against page count gives ~123 ms per page plus ~1.7 s fixed.
+- FIVE CANDIDATES FOR THAT PER-PAGE COST ARE MEASURED AND REJECTED, do not re-try them:
+  coalescing the 768 per-row main-actor hops a second into 24; publishing only the focused page
+  at full rate; memoising `MarkdownBlock.runs` the way `parse` is (worth ~5%, inside variance);
+  guarding the run-follow `scrollTo` so it fires once per page rather than every tick; and
+  lowering the stream flush rate (worth ~15% of total blocked, not the 45% the percentage
+  metric implied). All four code changes were reverted rather than shipped unproven.
 - NEVER `tell application "Omni" to activate` IN A HARNESS. It resolves by NAME through
   LaunchServices and launches /Applications/Omni.app as a SECOND INSTANCE, so the build under
   test then competes with a whole other copy of the app for the GPU and memory. This inflated a
