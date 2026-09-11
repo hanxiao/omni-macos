@@ -11,10 +11,13 @@ final class Qwen3Backbone: @unchecked Sendable {
     let cfg: OmniConfig
     let w: WeightStore
     private let rope: RoPE
-    /// Activation precision for the transformer matmuls + attention. Default fp32 (reference
-    /// fidelity). OMNI_BF16_COMPUTE=1 runs them in bf16 (NaN-safe: bf16 keeps fp32's 8-bit
-    /// exponent, unlike fp16) for throughput - RMSNorm variance and the pooled output stay fp32.
-    /// Requires bf16 weights (OMNI_BACKBONE_BF16) for the matmul to actually run in bf16.
+    /// Activation precision for the transformer matmuls + attention. DEFAULT bf16, which keeps
+    /// fp32's 8-bit exponent and so cannot overflow where fp32 would not; RMSNorm variance and
+    /// the pooled output stay fp32 regardless. Requires bf16 weights (OMNI_BACKBONE_BF16) for
+    /// the matmul to actually run in bf16.
+    /// `OMNI_COMPUTE_DTYPE=fp32|bf16|fp16` selects it; `OMNI_BF16_COMPUTE=0` still forces fp32.
+    /// fp16 exists to price the Neural Engine, which is fp16-only: it trades bf16's exponent
+    /// range for three more mantissa bits, so it is the one option that can overflow.
     private let computeDType: DType
 
     /// mx.compile of the fixed-shape per-layer transformer block - fuses the per-layer
@@ -43,7 +46,13 @@ final class Qwen3Backbone: @unchecked Sendable {
         self.rope = RoPE(dimensions: config.text.headDim, traditional: false, base: config.text.ropeTheta)
         // bf16 compute by default (faster, half the backbone VRAM); set OMNI_BF16_COMPUTE=0 for the
         // exact fp32 path (the parity test does this to match the fp32 reference fixtures).
-        self.computeDType = ProcessInfo.processInfo.environment["OMNI_BF16_COMPUTE"] == "0" ? .float32 : .bfloat16
+        let env = ProcessInfo.processInfo.environment
+        switch env["OMNI_COMPUTE_DTYPE"]?.lowercased() {
+        case "fp32", "float32": self.computeDType = .float32
+        case "fp16", "float16": self.computeDType = .float16
+        case "bf16", "bfloat16": self.computeDType = .bfloat16
+        default: self.computeDType = env["OMNI_BF16_COMPUTE"] == "0" ? .float32 : .bfloat16
+        }
         self.compileEnv = ProcessInfo.processInfo.environment["OMNI_COMPILE_BLOCK"]
     }
 

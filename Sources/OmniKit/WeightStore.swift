@@ -29,7 +29,20 @@ public struct WeightStore {
             }
         }
 
-        let bf16Backbone = ProcessInfo.processInfo.environment["OMNI_BACKBONE_BF16"] != "0"
+        // Storage precision for the backbone. bf16 by default. fp16 exists to price the Neural
+        // Engine, which is fp16-only: with bf16 weights an fp16 activation promotes the matmul
+        // back to fp32, so a compute-dtype flag ALONE does not measure fp16 arithmetic.
+        let backboneDType: DType = {
+            switch ProcessInfo.processInfo.environment["OMNI_BACKBONE_DTYPE"]?.lowercased() {
+            case "fp32", "float32": return .float32
+            case "fp16", "float16": return .float16
+            case "bf16", "bfloat16": return .bfloat16
+            default:
+                return ProcessInfo.processInfo.environment["OMNI_BACKBONE_BF16"] != "0"
+                    ? .bfloat16 : .float32
+            }
+        }()
+        let bf16Backbone = backboneDType != .float32
 
         // Load the retrieval LoRA adapter and compute which backbone weights it modifies, so the
         // fp32 round-trip is paid only where it matters.
@@ -73,8 +86,12 @@ public struct WeightStore {
         // upcast, so only they need casting back; non-target weights are already bf16. The result is
         // byte-identical to upcasting + casting the whole backbone, at a fraction of the load memory.
         if bf16Backbone {
-            for key in loraTargets where w[key] != nil {
-                w[key] = w[key]!.asType(.bfloat16)
+            // Cast the whole backbone to the target. For bf16 this touches only the LoRA targets
+            // (everything else is already bf16, so the guard makes it a no-op) and is exactly the
+            // previous behaviour; for fp16 it also narrows the bf16 weights that were never
+            // upcast, which is what makes the matmul actually run in fp16.
+            for key in Array(w.keys) where key.hasPrefix("language_model.") {
+                if w[key]!.dtype != backboneDType { w[key] = w[key]!.asType(backboneDType) }
             }
         }
 

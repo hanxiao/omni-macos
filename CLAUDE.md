@@ -399,6 +399,21 @@ measured on an M3 Ultra too, so they compare directly.
   and is worth only +1% to +4% over a plain preallocated heap MLMultiArray from Swift, because
   the heap path is already at the ANE's compute bound. The probe keeps both so that stays
   checkable, but do not build a surface-management layer for it.
+- THE fp16 GATE IS CLEARED, which is the precondition for any ANE port (the ANE is fp16-only).
+  `OMNI_BACKBONE_DTYPE` and `OMNI_COMPUTE_DTYPE` select fp32/bf16/fp16 for weights and for
+  activations. BOTH are needed to measure anything: with bf16 weights an fp16 activation
+  promotes the matmul back to fp32, so a compute flag alone measures activation rounding and
+  not fp16 arithmetic - a first pass here reported "fp16 is exact" on exactly that mistake.
+  True fp16 (fp16 weights AND fp16 compute) scores worst cosine 1.00000 against the reference
+  fixtures, against 0.99992 for the shipped bf16 path. fp16 has 10 mantissa bits to bf16's 7,
+  so it is the MORE accurate of the two 16-bit formats here; bf16 was chosen for its fp32
+  exponent range, and no overflow appeared on these inputs.
+- DO NOT FLIP THE DEFAULT TO fp16 ON THAT EVIDENCE. Throughput is identical - bf16 and fp16
+  interleaved four times through `omni-verify bench` land at 22826/22685/22725/22773 tok/s
+  bucketed at batch 48 - so the only gain is 0.99992 -> 1.00000, which is far inside the 0.999
+  gate either way. The fixtures are six short strings and do not stress fp16's exponent range,
+  and this project has been bitten by NaN poisoning before. The finding is worth having because
+  it unblocks the ANE, not because the default is wrong.
 - STILL NOT BUILT, and what it would take: the 28-layer tower expressed in CoreML MIL (attention,
   RoPE, GQA, RMSNorm, pooling), an fp16 weight copy (~1.8 GB), batch-parallel scheduling so the
   GPU takes one batch while the ANE takes another, and the cosine >= 0.999 gate. The figures
