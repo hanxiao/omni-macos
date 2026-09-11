@@ -376,48 +376,33 @@ measured on an M3 Ultra too, so they compare directly.
   MLX runs at only 4.6 TF), 0.48x on the embedding MLP.
 - SO oMLX'S WIN IS CONCURRENCY, NOT SPEED. Adding a unit worth ~0.5x the GPU and running both
   at once is worth about their +28%.
-- COREML DISPATCH IS NOT THE BLOCKER - MARSHALLING IS. The floor is 0.038 ms for a 1-element
-  tensor; the cost tracks TENSOR SIZE, at roughly 0.1 GB/s through coremltools and 0.7 GB/s
-  from Swift with a preallocated MLMultiArray (C1280 x M1007: 15.6 ms python, 7.7 ms swift).
-  That is CoreML copying and re-tiling into its ANE-side buffer, and it is why a per-layer
-  handoff is hopeless - but it also means a per-layer handoff is the wrong design.
-- THE RIGHT DESIGN FOR INDEXING IS BATCH-PARALLEL, AND THE TWO UNITS ARE ADDITIVE. Run a whole
-  forward on the GPU for batch A and a whole forward on the ANE for batch B: one CoreML call
-  per batch, no handoff, marshalling amortised over the entire model. Measured at the MLP shape
-  (h1024/ffn3072, M4096, depth 6) in SEPARATE PROCESSES: GPU 71.50 it/s solo and 71.50
-  concurrent (100% kept), ANE 8.53 solo and 8.37 concurrent (98%). The ANE costs the GPU
-  NOTHING. Do this measurement across processes, never across threads - in threads both
-  collapsed to exactly 8.53 it/s, which is coremltools holding the GIL through the numpy
-  conversion, not hardware contention.
-- WHAT IT IS WORTH, on that shape: +12% with coremltools, +22% from Swift with a preallocated
-  MLMultiArray (15.93 it/s, 4.93 TF against the ANE's 10.5 TF compute slope), and +48% if the
-  remaining marshalling goes away via an IOSurface-backed MLMultiArray, which is Apple's
-  documented zero-copy path and is untested here. Over the whole 28-layer model the ANE takes
-  1.70x the GPU's time (75% MLP at 0.48x, 25% attention projections at 1.8x), so the concurrent
-  ceiling is 1.59x on INDEXING THROUGHPUT. This is the one lever from the oMLX sweep that
-  survived, and it is on the indexing path rather than OCR. Not built: it needs the 28-layer
-  model expressed in CoreML MIL, an fp16 weight copy (~1.8 GB), and the cosine >= 0.999 gate.
-  The numbers above are a synthetic MLP chain, not an end-to-end indexing measurement.
-- THEIR QUANTIZER (`oq.py`, "oQ": GGUF K-quant layer positioning + unsloth Dynamic 2.0 selective
-  non-quantization + BnB MSE-optimal clipping) IS AT PARITY WITH `Tools/ocr/convert.py` ON POLICY
-  AND BEHIND IT ON EVIDENCE. Both emit per-tensor affine weights with a quant map; both keep
-  lm_head and embeddings wide; both single out the routed-expert `down` projection. oQ picks bits
-  from a sensitivity heuristic, convert.py picked them from a measured CER ladder against the
-  torch oracle. It does NOT protect the MoE routers, which this port never quantizes.
-- ITS ONE MISSING INGREDIENT IS MSE-OPTIMAL CLIPPING, AND IT IS MEASURED AND REJECTED HERE.
-  `convert.py` calls plain `mx.quantize` (min/max affine); oQ's `_weighted_affine_quantize`
-  instead searches 14 candidate (scale, bias) pairs per group - anchored on w_max or w_min,
-  times factors 0.5 to 1.25 - and keeps whichever minimises reconstruction error, in a layout
-  deliberately identical to `mx.quantize(mode="affine")`. So it would cost the Swift side
-  nothing. On this model's 4-bit routed experts it is worth a uniform 7-9% lower reconstruction
-  error, which is about +0.07 EFFECTIVE BITS (error goes as 4^-bits, so a 0.91 ratio is
-  log4(1/0.91)). It will not rescue the 4-bit build.
-  The reason is in the error DISTRIBUTION, not its mean: per group the gain is 6.6% at the
-  median, 7-8% at p99 and 0% at the max on two of four tensors sampled, and the spread from
-  median to max is only 3x. Clipping pays on outlier-dominated weights; these are not. The
-  4-bit failure (CER 0.082 on dense pages, and losing EOS) is 4 bits being too few, not the
-  scale being badly chosen. Do not re-derive this - it cost two scripts, not a build and a
-  CER run.
+- MEASURE THIS STACK IN THIS STACK. A first pass priced the ANE through coremltools and
+  MLX-Python and got it badly wrong: coremltools understates the ANE by 4.4x on the MLP shape
+  (8.5 it/s against 37.6 from Swift), because the numpy-to-MLMultiArray conversion dominates.
+  Every number below is `ocr-verify --probe-ane`, which times MLX-Swift against CoreML natively;
+  Python only emits the .mlpackage fixture (`Tools/ane/emit_fixtures.py`).
+- THE ANE AND THE GPU ARE PERFECTLY ADDITIVE, measured in-process with CoreML on a background
+  queue and MLX-Swift on the main thread: both keep 99-104% of their solo rate at every size
+  tried. Do NOT measure this from Python threads - there both collapse to the same rate, which
+  is coremltools holding the GIL through the conversion, not memory contention.
+- WHAT IT IS WORTH on the embedding tower (h1024, ffn3072, attn 25% of GEMM work / mlp 75%),
+  weighting the two measured shapes, as combined throughput against the GPU alone:
+    M 1024  GPU 15.5 TF  ANE 11.4 TF  ->  1.74x
+    M 2048  GPU 18.7 TF  ANE 12.2 TF  ->  1.65x
+    M 4096  GPU 21.2 TF  ANE 12.6 TF  ->  1.59x
+    M 8192  GPU 22.5 TF  ANE 12.9 TF  ->  1.57x
+  The ANE is FLAT (10.8-16.9 TF across every shape and size) while the GPU swings 11.4-23.0, so
+  the ANE is worth relatively MORE at small M where the GPU is launch-bound - at M 1024 it beats
+  the GPU outright on the attention shape (13.05 against 11.38 TF). Indexing batches are
+  length-sorted, so short-chunk batches are exactly the small-M case.
+- IOSURFACE ZERO-COPY IS NOT NEEDED. A CVPixelBuffer-backed MLMultiArray was expected to matter
+  and is worth only +1% to +4% over a plain preallocated heap MLMultiArray from Swift, because
+  the heap path is already at the ANE's compute bound. The probe keeps both so that stays
+  checkable, but do not build a surface-management layer for it.
+- STILL NOT BUILT, and what it would take: the 28-layer tower expressed in CoreML MIL (attention,
+  RoPE, GQA, RMSNorm, pooling), an fp16 weight copy (~1.8 GB), batch-parallel scheduling so the
+  GPU takes one batch while the ANE takes another, and the cosine >= 0.999 gate. The figures
+  above are synthetic chains at the right shapes, not an end-to-end indexing run.
 - SPARSE PREFILL (their SpecPrefill) scores prompt tokens with a draft model and prefills only
   the top `keep_pct`. It DROPS prompt tokens, which for transcription means dropping image
   tokens, so it is graded against the CER gate before it is believed, not adopted on its face.

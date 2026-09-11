@@ -183,6 +183,14 @@ if args.contains("--probe-decode-width") {
     exit(0)
 }
 
+if args.contains("--probe-ane") {
+    let dir = args.firstIndex(of: "--probe-ane").map { args[$0 + 1] } ?? "build/ane"
+    let tokens = args.firstIndex(of: "--tokens").map { Int(args[$0 + 1]) ?? 4096 } ?? 4096
+    let secs = args.firstIndex(of: "--seconds").map { Double(args[$0 + 1]) ?? 4.0 } ?? 4.0
+    print(ProbeANE.run(dir: dir, tokens: tokens, seconds: secs))
+    exit(0)
+}
+
 if args.contains("--probe-vision") {
     let modelPath = args.first { !$0.hasPrefix("--") }
     guard let modelPath else { fatalError("--probe-vision needs a model dir") }

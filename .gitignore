@@ -39,3 +39,4 @@ site-assets/
 
 # Local planning notes, not part of the shipped source
 PAPERBENCH-PLAN.md
+build/ane*/
