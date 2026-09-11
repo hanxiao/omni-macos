@@ -359,9 +359,25 @@ measured on an M3 Ultra too, so they compare directly.
   third of the GEMMs, or ~17% of language prefill, which is ~1.9% end to end BEFORE paying for
   fp16 weight copies (oMLX measures ~7 GB, so big-machine only), one compiled program per prompt
   shape, MLX-to-MLMultiArray movement per call, and a CER re-gate for fp16 numerics.
-  oMLX gets +28-51% because Qwen3.8's dense MLP/GDN projections are most of ITS prefill. The
-  lever is real and does not transfer to a 67%-routed-MoE model. Do not build it. If a dense
-  model is ever ported, revisit: the CoreML numbers above are the ones to start from.
+  oMLX gets +28-51% because Qwen3.8's dense MLP/GDN projections are most of ITS prefill.
+- "ONLY A DENSE MODEL BENEFITS" IS THE WRONG RULE, and the EMBEDDING model disproves it. It is
+  dense (28 layers, h 1024, ffn 3072, GQA 16/8, no experts), pure prefill with no decode,
+  already bucket-padded to a fixed set of shapes, and a throughput job - the ideal ANE profile
+  on paper. Measured anyway: attention projections 1024->1024 run 26.5 TF on ANE against 14.7
+  on GPU (1.8x), but the MLP 1024->3072->1024 runs 10.5 TF against 22.8 (0.48x). The MLP is
+  75% of the GEMM work, so the ANE is slow exactly where this model spends its time. It
+  plateaus near 11 TF on the wide shape regardless of M, which is what a 3072-channel
+  intermediate spilling out of ANE SRAM looks like (~100 MB fp16 at M=16384) - and is
+  presumably why oMLX splits the MLP hidden dimension across both ANEs. Offloading only the
+  25% it wins caps at 11% of GEMM time and needs one CoreML call per layer, 28 x 7.2 ms.
+- THE REAL RULE IS SHAPE, NOT DENSITY. The ANE is roughly flat at 11-26 TF while the GPU swings
+  4.6-22.8 TF depending on how well a shape maps to it, so the ANE wins where the GPU is badly
+  UTILISED and loses where it is not: 2.1x on the OCR prefill shape (M1007 K1280 N1280, a shape
+  MLX runs at only 4.6 TF), 0.48x on the embedding MLP.
+- SO oMLX'S WIN IS CONCURRENCY, NOT SPEED. Adding a unit worth ~0.5x the GPU and running both at
+  once is worth about their +28%. What their private runtime actually buys is not ANE ACCESS -
+  plain CoreML has that - it is SUB-MILLISECOND ANE DISPATCH. A concurrent split needs a
+  handoff per layer, and CoreML charges 7.2 ms per call. That, not the ANE, is the blocker.
 - THEIR QUANTIZER (`oq.py`, "oQ": GGUF K-quant layer positioning + unsloth Dynamic 2.0 selective
   non-quantization + BnB MSE-optimal clipping) IS AT PARITY WITH `Tools/ocr/convert.py` ON POLICY
   AND BEHIND IT ON EVIDENCE. Both emit per-tensor affine weights with a quant map; both keep
