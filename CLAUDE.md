@@ -430,6 +430,37 @@ measured on an M3 Ultra too, so they compare directly.
   with `takeAlong(h, poolIndexGraph(lengths), axis: 1)`, never a bare last column - and the
   backbone being causal means a real token never attends to a pad. Verified, not assumed.
 
+## Filter chips in the search field
+
+- THE PLATFORM HAS THIS CONTROL: `searchable(text:tokens:placement:prompt:token:)`, macOS 13+,
+  so no token-field package and no `NSTokenField` wrapping. Filters are chips in the field and
+  the box holds only the semantic text. The chips are a projection of the canonical query string,
+  which is still the one thing history and back/forward replay.
+- TOKENS MUST BE STORED, NOT COMPUTED. The field mutates the collection it is bound to and keeps
+  state beside it, so a getter that rebuilt the array from `activeQualifiers` on every read
+  desynchronised it and the chips vanished the moment anything was typed after them.
+  `searchTokens` is stored and `syncSearchTokens()` keeps it in step at the three places
+  `activeQualifiers` is assigned.
+- ONLY A REMOVAL IS A USER EDIT. The field writes the collection back on its own account as it
+  re-renders; treating an echo as an edit rebuilt the query from stale state. `setSearchTokens`
+  ignores anything that is not strictly shorter.
+- PROMOTE A QUALIFIER ONLY WHEN THE FINISHED WORD IS ONE. Re-parsing on every space also
+  re-normalises the text, which swallowed the space itself: "a very long" typed straight through
+  arrived as "averylong". The edit path now re-parses only when a trailing space follows text
+  that actually contains a qualifier, and Return promotes whatever is left. Mid-word, `type:i`
+  stays editable text - promoting it would build a chip out of half a word.
+- THE TOOLBAR SEARCH FIELD WILL NOT GROW ON TAHOE. Measured at 0/1/2/3 chips it is 330 px every
+  time, with `NSSearchToolbarItem.preferredWidthForSearchField` set (it reads back the value and
+  changes nothing) AND with a width constraint on `item.searchField`. The Liquid Glass toolbar
+  group lays its contents out itself. The sizing code was written, measured to do nothing, and
+  deleted; do not write it again.
+- A TOKEN CHIP RENDERS ITS TITLE ONLY - SwiftUI drops the `systemImage` from a token's `Label` on
+  macOS, measured. So the KEY has to be in the text (`type:image`, not `image`), or a chip cannot
+  be told from a tag of the same name. No space after the colon and paths show their last
+  component, because the width is fixed and every character costs one of the query's.
+- The qualifier bar under the toolbar is gone except in plain-text mode, where it explains why
+  the chips do not apply and offers the way back. Entering that mode moved to the filter menu.
+
 ## Folder browsing (App/FolderBrowser.swift)
 
 - SELECTING A FOLDER BROWSES IT, it does not draw a map. The embedding map said nothing about

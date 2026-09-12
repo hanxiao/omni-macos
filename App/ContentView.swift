@@ -28,9 +28,20 @@ struct ContentView: View {
     /// Apply a user edit of the search box: parse it into the semantic query + qualifiers, apply the
     /// filters, clear a file query if real text was typed, and schedule the (debounced) search. The
     /// box binds to the RAW typed string; `set` (user edits only) routes here.
-    private func handleQueryEdit(_ raw: String) {
-        model.applyParsedQuery(raw)
+    private func handleQueryEdit(_ typed: String) {
         model.suggestionsAllowed = true   // this fires only on real keystrokes (the .searchable set:), so arm the dropdown
+        // The field holds the SEMANTIC text; finished filters live beside it as chips. A qualifier
+        // becomes a chip only once a space ends it - mid-word, `type:i` has to stay editable text
+        // or the chip is made from half a word and cannot be corrected.
+        model.setSemanticText(typed)
+        // ONLY when the finished word really is a qualifier. Re-parsing on every space also
+        // re-normalises the text, which swallowed the space itself and ran the next word into the
+        // last one: "a very long" typed straight through arrived as "averylong".
+        if typed.last?.isWhitespace ?? false,
+           !SearchQueryParser.parse(typed).qualifiers.isEmpty {
+            model.promoteQualifiers()
+        }
+        let raw = typed
         if !model.query.isEmpty, model.fileQuery != nil { model.fileQuery = nil; model.queryError = nil }
         // Instant search off: typing still parses filters and pops suggestions, but the search
         // itself waits for Return (.onSubmit) - kinder to low-end GPUs. Clearing the box always
@@ -55,17 +66,34 @@ struct ContentView: View {
                     .onSubmit(of: .search) { ocr.stepMatch(by: 1) }
             } else if showsSearch {
                 split
-                    .searchable(text: Binding(get: { model.rawQuery }, set: { handleQueryEdit($0) }),
-                                placement: .toolbar, prompt: "Search by meaning") {
-                        // Typeahead: keys (ty -> type:), values (type: -> image/...), and matching past
-                        // queries as instant (cached) shortcuts. Navigate with arrows + Return. Only while
-                        // the user is typing - a programmatic box change (history replay, filter menu) keeps
-                        // the dropdown closed (suggestionsAllowed is false unless handleQueryEdit armed it).
-                        ForEach(model.suggestionsAllowed ? searchSuggestions(model.rawQuery) : [], id: \.completion) { sug in
+                    // Filters are CHIPS in the field, not text the reader has to retype and step
+                    // over. `searchable(text:tokens:)` is the platform's own control for this
+                    // (macOS 13+), so there is no token-field component to import and no second
+                    // source of truth: the chips are a projection of the canonical query string,
+                    // which is still the thing history and back/forward replay.
+                    .searchable(text: Binding(get: { model.query }, set: { handleQueryEdit($0) }),
+                                tokens: Binding(get: { model.searchTokens },
+                                                set: { model.setSearchTokens($0) }),
+                                placement: .toolbar, prompt: "Search by meaning") { token in
+                        // Text, not Label: a token chip renders its title only on macOS, so an
+                        // icon here is carried and then thrown away.
+                        Text(token.label)
+                    }
+                    // Typeahead: keys (ty -> type:), values (type: -> image/...), and matching past
+                    // queries as instant (cached) shortcuts. Navigate with arrows + Return. Only while
+                    // the user is typing - a programmatic box change (history replay, filter menu) keeps
+                    // the dropdown closed (suggestionsAllowed is false unless handleQueryEdit armed it).
+                    .searchSuggestions {
+                        ForEach(model.suggestionsAllowed ? searchSuggestions(model.query) : [], id: \.completion) { sug in
                             Label(sug.label, systemImage: sug.icon).searchCompletion(sug.completion)
                         }
                     }
-                    .onSubmit(of: .search) { model.search(); model.recordCurrentSearchToHistory(viaSubmit: true) }
+                    // Return finishes the word too: a qualifier typed without a trailing space
+                    // still becomes a chip rather than being embedded as prose.
+                    .onSubmit(of: .search) {
+                        model.promoteQualifiers()
+                        model.search(); model.recordCurrentSearchToHistory(viaSubmit: true)
+                    }
             } else {
                 split
             }
@@ -232,19 +260,15 @@ struct ContentView: View {
             && model.rawResults.isEmpty && model.queryError == nil && !model.isResolving
     }
 
-    /// The browser's breadcrumb already shows the folder and navigates it, so its chip would be
-    /// a second copy of the same path that does less.
-    private var hiddenQualifiers: Set<String> { showsFolderBrowser ? ["in"] : [] }
-
-    /// Nothing left to show once the browsed folder's own chip is dropped.
-    private var showsQualifierBar: Bool {
-        model.literalQuery || model.activeQualifiers.contains { !hiddenQualifiers.contains($0.key) }
-    }
+    /// The filters are chips INSIDE the search field now, so a bar repeating them is the same
+    /// duplication one row lower. It survives only to explain plain-text mode, where the field's
+    /// text is embedded verbatim and the chips do not apply, and to offer the way back.
+    private var showsQualifierBar: Bool { model.literalQuery }
 
     @ViewBuilder private var content: some View {
         VStack(spacing: 0) {
             if let fq = model.fileQuery { FileQueryChip(fileQuery: fq) }
-            else if showsQualifierBar { QualifierBar(hiding: hiddenQualifiers) }
+            else if showsQualifierBar { QualifierBar() }
             if !model.results.isEmpty {
                 ResultsList(results: model.results) { belowThresholdFooter }
             } else if showsFolderBrowser {
@@ -688,6 +712,13 @@ struct ContentView: View {
 
     private var filterMenu: some View {
         Menu {
+            Section {
+                Toggle(isOn: Binding(get: { model.literalQuery },
+                                     set: { _ in model.toggleLiteralQuery() })) {
+                    Label("Plain text", systemImage: "textformat")
+                }
+                .help("Embed the box text as-is, ignoring key:value qualifiers")
+            }
             Section("Show") {
                 ForEach(filterKinds, id: \.self) { kind in
                     Toggle(isOn: Binding(
@@ -843,19 +874,6 @@ private struct QualifierBar: View {
                 Image(systemName: "textformat").foregroundStyle(.secondary).frame(width: 18)
                 Text("Plain-text search").foregroundStyle(.secondary)
                 Text("- qualifiers ignored").font(.caption).foregroundStyle(.tertiary)
-            } else {
-                Image(systemName: "line.3.horizontal.decrease.circle").foregroundStyle(.secondary).frame(width: 18)
-                ForEach(Array(model.activeQualifiers.enumerated().filter { !hiding.contains($0.element.key) }),
-                        id: \.offset) { _, q in
-                    HStack(spacing: 3) {
-                        if q.negated { Text("not").font(.caption2).foregroundStyle(.tertiary) }
-                        Text(q.key).fontWeight(.medium).foregroundStyle(.tint)
-                        Text(q.value).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-                    }
-                    .font(.caption)
-                    .padding(.horizontal, 7).padding(.vertical, 2)
-                    .background(.quaternary, in: Capsule())
-                }
             }
             Spacer(minLength: 8)
             Button { model.toggleLiteralQuery() } label: {

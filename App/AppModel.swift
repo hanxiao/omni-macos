@@ -622,6 +622,67 @@ final class AppModel {
         captureNavStop()
     }
 
+    /// One active filter, shown as a chip inside the search field. A PROJECTION of
+    /// `activeQualifiers`, never a second source of truth: the canonical query string stays the
+    /// one thing history and back/forward replay, and the chips are how it is read and edited.
+    struct SearchToken: Identifiable, Hashable {
+        let key: String        // canonical qualifier key: type, ext, in, date, score, sort...
+        let value: String
+        let negated: Bool
+        var id: String { "\(negated ? "-" : "")\(key):\(value)" }
+
+        /// The KEY has to be in the text. A chip renders as a plain capsule - SwiftUI drops the
+        /// `systemImage` from a token's `Label` on macOS, measured - so nothing else says whether
+        /// `image` means `type:image` or a tag called "image". No space after the colon, and a
+        /// path shows its last component only, because the field's width is fixed (see CLAUDE.md:
+        /// the toolbar will not grow on Tahoe) and every character costs one of the query's.
+        var label: String {
+            let shown = key == "in" ? (value as NSString).lastPathComponent : value
+            return "\(negated ? "-" : "")\(key):\(shown)"
+        }
+        var queryText: String { "\(negated ? "-" : "")\(key):\(AppModel.quoteIfNeeded(value))" }
+    }
+
+    /// Typing that has not finished a word. The text is taken VERBATIM as the semantic query and
+    /// the existing chips are kept: nothing is promoted until a space or Return ends the word, so
+    /// `type:i` stays correctable instead of becoming a chip made from half a word. `rawQuery` is
+    /// still kept canonical, because that string is what history and back/forward replay.
+    func setSemanticText(_ text: String) {
+        engine?.noteInteractive()
+        query = text
+        let parts = searchTokens.map(\.queryText) + (text.isEmpty ? [] : [text])
+        rawQuery = parts.joined(separator: " ")
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { literalQuery = false }
+    }
+
+    /// Re-parse what is in the box, promoting any finished qualifier to a chip. Used when a word
+    /// ends and on Return.
+    func promoteQualifiers() { applyParsedQuery(rawQuery) }
+
+    /// The filters, as chips for the search field. STORED, not computed: the token field mutates
+    /// the collection it is bound to and keeps state beside it, so a projection recomputed on
+    /// every read desynchronises it - the chips vanished the moment the reader typed after them.
+    /// Kept in step with `activeQualifiers`, which remains the source of truth.
+    private(set) var searchTokens: [SearchToken] = []
+
+    private func syncSearchTokens() {
+        let next = activeQualifiers.map { SearchToken(key: $0.key, value: $0.value, negated: $0.negated) }
+        if next != searchTokens { searchTokens = next }
+    }
+
+    /// Deleting a chip in the field clears that filter. Rebuilds the canonical query from the
+    /// chips that survived plus the semantic text and re-parses it, rather than reaching into the
+    /// individual filter properties - one path in, one path out, and the round trip stays the
+    /// thing history replays.
+    func setSearchTokens(_ kept: [SearchToken]) {
+        // Only a REMOVAL is a user action. The field writes the collection back on its own account
+        // as it re-renders, and treating an echo as an edit rebuilt the query from stale state.
+        guard kept.count < searchTokens.count else { return }
+        let parts = kept.map(\.queryText) + (query.isEmpty ? [] : [query])
+        applyParsedQuery(parts.joined(separator: " "))
+        search()
+    }
+
     func goBack() {
         guard let prev = navBack.popLast() else { return }
         if let cur = navCurrent { navForward.append(cur) }
@@ -2287,11 +2348,13 @@ final class AppModel {
         // Literal mode: embed the whole string verbatim, no qualifiers, no filters.
         guard !literalQuery else {
             activeQualifiers = []
+            syncSearchTokens()
             query = raw
             return
         }
         let parsed = SearchQueryParser.parse(raw)
         activeQualifiers = parsed.qualifiers
+        syncSearchTokens()
         var includeKinds: Set<FileKind> = []
         var excludeKinds: Set<FileKind> = []
         var sawType = false
@@ -2350,6 +2413,7 @@ final class AppModel {
         rawQuery = serializeSearch(semantic: query)
         suggestionsAllowed = false   // a filter-menu change rewrites the box; don't pop the dropdown for it
         activeQualifiers = SearchQueryParser.parse(rawQuery).qualifiers
+        syncSearchTokens()
         if reSearch { search() } else { recomputeResults() }
     }
 
@@ -2382,7 +2446,7 @@ final class AppModel {
         if sortOrder != .relevance { parts.append("sort:" + (sortOrder == .name ? "name" : "date")) }
         return parts.joined(separator: " ")
     }
-    private static func quoteIfNeeded(_ s: String) -> String {
+    nonisolated static func quoteIfNeeded(_ s: String) -> String {
         // A value without whitespace is read verbatim by the parser's bare branch, so leave it as-is.
         // A value WITH whitespace must be quoted - and then any inner quote/backslash must be escaped,
         // because the parser unescapes inside quotes (\" and \\). Otherwise the round-trip is asymmetric
