@@ -232,10 +232,19 @@ struct ContentView: View {
             && model.rawResults.isEmpty && model.queryError == nil && !model.isResolving
     }
 
+    /// The browser's breadcrumb already shows the folder and navigates it, so its chip would be
+    /// a second copy of the same path that does less.
+    private var hiddenQualifiers: Set<String> { showsFolderBrowser ? ["in"] : [] }
+
+    /// Nothing left to show once the browsed folder's own chip is dropped.
+    private var showsQualifierBar: Bool {
+        model.literalQuery || model.activeQualifiers.contains { !hiddenQualifiers.contains($0.key) }
+    }
+
     @ViewBuilder private var content: some View {
         VStack(spacing: 0) {
             if let fq = model.fileQuery { FileQueryChip(fileQuery: fq) }
-            else if !model.activeQualifiers.isEmpty || model.literalQuery { QualifierBar() }
+            else if showsQualifierBar { QualifierBar(hiding: hiddenQualifiers) }
             if !model.results.isEmpty {
                 ResultsList(results: model.results) { belowThresholdFooter }
             } else if showsFolderBrowser {
@@ -822,6 +831,10 @@ struct ContentView: View {
 /// literal-mode state), with a one-click toggle to treat the box as plain text instead of filters.
 private struct QualifierBar: View {
     @Environment(AppModel.self) private var model: AppModel
+    /// Qualifier keys another view is already showing, better. While browsing, the breadcrumb
+    /// carries the folder AND lets you click any ancestor; a chip of the same path is a
+    /// duplicate that cannot be clicked.
+    var hiding: Set<String> = []
     var body: some View {
         HStack(spacing: 6) {
             if model.literalQuery {
@@ -830,7 +843,8 @@ private struct QualifierBar: View {
                 Text("- qualifiers ignored").font(.caption).foregroundStyle(.tertiary)
             } else {
                 Image(systemName: "line.3.horizontal.decrease.circle").foregroundStyle(.secondary).frame(width: 18)
-                ForEach(Array(model.activeQualifiers.enumerated()), id: \.offset) { _, q in
+                ForEach(Array(model.activeQualifiers.enumerated().filter { !hiding.contains($0.element.key) }),
+                        id: \.offset) { _, q in
                     HStack(spacing: 3) {
                         if q.negated { Text("not").font(.caption2).foregroundStyle(.tertiary) }
                         Text(q.key).fontWeight(.medium).foregroundStyle(.tint)

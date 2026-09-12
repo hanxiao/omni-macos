@@ -449,6 +449,10 @@ measured on an M3 Ultra too, so they compare directly.
 - A sidebar selection that is NOT a folder must not clear `filterFolder`. A history row applies
   its own filters first, and clearing afterwards wiped them straight back out; the else branch
   only clears the map.
+- THE BROWSED FOLDER'S QUALIFIER CHIP IS SUPPRESSED while the browser is up. The chips in
+  `QualifierBar` are display-only - `Text(key)` + `Text(value)` in a capsule, no action - so a
+  chip of the path the breadcrumb is already showing is a second copy that does strictly less.
+  Other qualifiers still get chips; the bar hides entirely when nothing is left to show.
 - Packages (.app, .rtfd) are files, not folders - `isPackageKey`, the way Finder treats them.
   Directory listing runs off the main thread: a home folder is not a frame's worth of work.
 - Verified in the app, not just built: sidebar click browses, double-click descends, the
