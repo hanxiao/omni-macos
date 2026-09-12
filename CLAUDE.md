@@ -430,6 +430,31 @@ measured on an M3 Ultra too, so they compare directly.
   with `takeAlong(h, poolIndexGraph(lengths), axis: 1)`, never a bare last column - and the
   backbone being causal means a real token never attends to a pad. Verified, not assumed.
 
+## Folder browsing (App/FolderBrowser.swift)
+
+- SELECTING A FOLDER BROWSES IT, it does not draw a map. The embedding map said nothing about
+  what is IN a folder and left the search unscoped; the browser lists the folder Finder-style,
+  folders before files, and a double-click descends. The map is still there, behind "Show folder
+  map" in the folder's context menu, which clears `filterFolder` because the two share the
+  empty-result region and the browser wins.
+- THE BROWSED FOLDER IS `filterFolder`. There is no second "current directory" and there must not
+  be, because that one property already did everything and simply had no UI reaching it: the store
+  filter takes `folderPrefix` so a search is ALREADY scoped to the subtree, `syncBoxFromFilters`
+  already writes `in:"<path>"` into the box, and a `NavEntry` carries that box string - so
+  back/forward walks folders with no new history. Connecting those was the whole feature.
+- `hasQuery` IS WHAT MAKES IT WORK. It reads the SEMANTIC query, not the raw box, so setting a
+  folder filter fills the box with `in:"..."` without counting as a query - which is what keeps
+  the empty-result region (and so the browser) available. Typing hides the browser instantly and
+  the results are already scoped. Do not "fix" `hasQuery` to read `rawQuery`.
+- A sidebar selection that is NOT a folder must not clear `filterFolder`. A history row applies
+  its own filters first, and clearing afterwards wiped them straight back out; the else branch
+  only clears the map.
+- Packages (.app, .rtfd) are files, not folders - `isPackageKey`, the way Finder treats them.
+  Directory listing runs off the main thread: a home folder is not a frame's worth of work.
+- Verified in the app, not just built: sidebar click browses, double-click descends, the
+  breadcrumb walks back up, `readme` inside 911-fanbook returns only that folder's files, and
+  back/forward moves between folders with the chevrons enabling and greying correctly.
+
 ## Markdown panes (App/MarkdownBlock.swift, MarkdownSource.swift)
 - LaTeX rendering was built and then REMOVED on purpose. This is a transcription workspace, not a
   rich editor: the model emits usable LaTeX, but setting it properly needs either a dependency or

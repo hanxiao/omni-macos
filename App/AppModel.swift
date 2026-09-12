@@ -611,6 +611,17 @@ final class AppModel {
         navForward.removeAll()
     }
 
+    /// Browse into a folder (or out of browsing, with nil). The browsed folder IS `filterFolder`:
+    /// it already scopes the search through `folderPrefix`, already writes `in:"<path>"` into the
+    /// box, and that box string is what a `NavEntry` carries - so back and forward walk folders
+    /// without a second history. Selecting a folder used to only draw its embedding map, which
+    /// left the search unscoped and told a reader nothing about the folder's contents.
+    func enterFolder(_ url: URL?) {
+        selectFolderForVisualization(nil)        // browsing takes the empty-result region
+        filterFolder = url                       // re-runs the search and rewrites the box
+        captureNavStop()
+    }
+
     func goBack() {
         guard let prev = navBack.popLast() else { return }
         if let cur = navCurrent { navForward.append(cur) }

@@ -89,6 +89,14 @@ struct Sidebar: View {
                         // Settings > Folder map layout), mirroring the Pause/Resume idiom above.
                         // Selecting the folder first makes the map visible in the new layout right
                         // away; the mode's didSet clears the layout cache and re-fits it.
+                        // Selecting a folder BROWSES it now, so the embedding map needs a door of
+                        // its own or it is orphaned. It clears `filterFolder`, because the browser
+                        // and the map both own the empty-result region and the browser wins.
+                        Button("Show folder map") {
+                            selection = .folder(url)
+                            model.filterFolder = nil
+                            model.selectFolderForVisualization(url)
+                        }
                         Button(model.mapUsesUMAP ? "Use fast map layout" : "Use detailed map layout") {
                             // Point the MODEL at this folder before flipping the mode. Writing
                             // `selection` only reaches the model on the next update pass, through
@@ -178,9 +186,11 @@ struct Sidebar: View {
                 // row isn't left stuck-highlighted and a re-click still fires.
                 if !model.runHistoryQuery(item) { selection = nil }
             }
-            // Folder selection shows that folder's embedding map (precedence-gated in ContentView so
-            // an active query/results always win); any other selection clears the viz.
-            if case .folder(let url) = sel { model.selectFolderForVisualization(url) }
+            // Folder selection BROWSES that folder (precedence-gated in ContentView so an active
+            // query/results always win) and scopes the search to it. Any other selection clears the
+            // map; it must NOT clear the folder filter, because a history row applies its own
+            // filters first and clearing here would wipe them straight back out.
+            if case .folder(let url) = sel { model.enterFolder(url) }
             else { model.selectFolderForVisualization(nil) }
         }
         // Editing the query by hand invalidates a selected saved search: deselect (Finder drops

@@ -224,12 +224,22 @@ struct ContentView: View {
             && model.rawResults.isEmpty && model.queryError == nil && !model.isResolving
     }
 
+    /// Same precedence as the map below: a folder is being browsed, and nothing search-related is
+    /// active. Typing hides it instantly and the results are already scoped to the folder, which
+    /// is the whole point - the browser and the search are two views of one `filterFolder`.
+    private var showsFolderBrowser: Bool {
+        model.filterFolder != nil && !model.hasQuery && model.fileQuery == nil
+            && model.rawResults.isEmpty && model.queryError == nil && !model.isResolving
+    }
+
     @ViewBuilder private var content: some View {
         VStack(spacing: 0) {
             if let fq = model.fileQuery { FileQueryChip(fileQuery: fq) }
             else if !model.activeQualifiers.isEmpty || model.literalQuery { QualifierBar() }
             if !model.results.isEmpty {
                 ResultsList(results: model.results) { belowThresholdFooter }
+            } else if showsFolderBrowser {
+                FolderBrowser(folder: model.filterFolder!)
             } else if showsFolderViz {
                 FolderEmbeddingVisualization(folderName: model.selectedFolderForViz!.lastPathComponent)
             } else {
