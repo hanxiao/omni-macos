@@ -459,6 +459,12 @@ measured on an M3 Ultra too, so they compare directly.
   the browser honours `sortOrder` for real: folders before files, then Name or Date modified,
   with `.relevance` reading as Name because it means nothing for a directory.
 - No separators between rows: Finder's list view draws none, and a folder listing is not a table.
+- THE GALLERY SHOWS REAL THUMBNAILS, via the app's existing `Thumbnail` view - the same
+  QuickLook-backed, memory-bounded cache the results list uses, which already falls back to the
+  type icon when QuickLook has nothing. A gallery of type icons is not a gallery. Folders keep a
+  folder icon and skip the well and border so they do not read as boxed files, and that icon is
+  fetched ONCE: `NSWorkspace.icon(forFile:)` calls the icon daemon per call, and a directory of a
+  few hundred folders would ask it a few hundred times for the same picture.
 - Packages (.app, .rtfd) are files, not folders - `isPackageKey`, the way Finder treats them.
   Directory listing runs off the main thread: a home folder is not a frame's worth of work.
 - Verified in the app, not just built: sidebar click browses, double-click descends, the
@@ -726,6 +732,10 @@ measured on an M3 Ultra too, so they compare directly.
   phase). The earlier "about two stalls each at a median of 184 ms" is not reproducible - the
   lazy sections and the pinned picker width appear to have taken it, or it carried the
   duplicate-instance confound below.
+- A LOCKED SCREEN LOOKS EXACTLY LIKE A BROKEN HARNESS. `loginwindow` becomes the frontmost
+  process, the window query returns nothing and every click is refused; `caffeinate -d -i -s`
+  stops sleep but not the lock. Check `first process whose frontmost is true` before concluding
+  the app is at fault - twice here the answer was that the machine had simply locked.
 - ASSERT WHICH APP OWNS THE FRONT WINDOW BEFORE EVERY CLICK, not once at the start. Focus is
   stolen mid-run (Slack did it here during a 95 s wait) and the clicks then land in another
   application, which measures nothing and does something unintended. `raise` by unix id, then

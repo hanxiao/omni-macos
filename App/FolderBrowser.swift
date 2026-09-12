@@ -130,8 +130,7 @@ struct FolderBrowser: View {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 108), spacing: 14)], spacing: 14) {
                 ForEach(sorted) { entry in
                     VStack(spacing: 6) {
-                        Image(nsImage: icon(entry)).resizable()
-                            .frame(width: 48, height: 48)
+                        galleryIcon(entry)
                         Text(entry.name).font(.caption).lineLimit(2)
                             .multilineTextAlignment(.center)
                     }
@@ -169,6 +168,29 @@ struct FolderBrowser: View {
         let image = NSWorkspace.shared.icon(forFile: entry.url.path)
         image.size = NSSize(width: 48, height: 48)
         return image
+    }
+
+    /// One icon for every folder, fetched once. `NSWorkspace.icon(forFile:)` hits the icon
+    /// services daemon per call, and a gallery of a few hundred directories asks it a few hundred
+    /// times for the same picture.
+    private static let folderIcon: NSImage = {
+        let image = NSWorkspace.shared.icon(for: .folder)
+        image.size = NSSize(width: 64, height: 64)
+        return image
+    }()
+
+    /// A gallery of type icons is not a gallery. Files get the app's real thumbnail view - the
+    /// same QuickLook-backed, memory-bounded cache the results list uses, which already falls
+    /// back to the type icon when QuickLook has nothing. Folders keep the folder icon, as Finder
+    /// does, and skip the well and border so they do not read as boxed files.
+    @ViewBuilder private func galleryIcon(_ entry: Entry) -> some View {
+        if entry.isDirectory {
+            Image(nsImage: Self.folderIcon)
+                .resizable().aspectRatio(contentMode: .fit)
+                .frame(width: 52, height: 52)
+        } else {
+            Thumbnail(path: entry.url.path, side: 52, corner: 5)
+        }
     }
 
     // MARK: - Loading
