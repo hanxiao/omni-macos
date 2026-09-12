@@ -632,8 +632,10 @@ struct ContentView: View {
             filterMenu.disabled(model.indexedFiles == 0)
         }
         }
-        // Result presentation - sort + view. Only meaningful with results.
-        if model.phase == .ready, !model.ocrMode, !model.rawResults.isEmpty {
+        // Result presentation - sort + view. Meaningful with results AND while browsing a folder,
+        // which is also a list of things with a name and a date; without the browser in this
+        // condition its gallery view existed but nothing could ever switch to it.
+        if model.phase == .ready, !model.ocrMode, !model.rawResults.isEmpty || showsFolderBrowser {
         ToolbarItem(placement: .primaryAction) {
             if #available(macOS 26.0, *) {
                 // Tahoe: the inline sort menu + segmented view toggle render and overflow cleanly.

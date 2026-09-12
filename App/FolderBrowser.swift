@@ -19,6 +19,7 @@ struct FolderBrowser: View {
     struct Entry: Identifiable, Hashable {
         let url: URL
         let isDirectory: Bool
+        let modified: Date
         var id: URL { url }
         var name: String { url.lastPathComponent }
     }
@@ -27,6 +28,19 @@ struct FolderBrowser: View {
     @State private var loading = true
     @State private var loadError: String?
     @State private var selected: URL?
+
+    /// Folders before files, then the toolbar's Sort. `.relevance` has no meaning for a directory
+    /// listing, so it reads as Name - which is also Finder's default.
+    private var sorted: [Entry] {
+        entries.sorted { a, b in
+            if a.isDirectory != b.isDirectory { return a.isDirectory }
+            switch model.sortOrder {
+            case .dateModified: return a.modified > b.modified
+            case .name, .relevance:
+                return a.name.localizedStandardCompare(b.name) == .orderedAscending
+            }
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -92,7 +106,7 @@ struct FolderBrowser: View {
     // MARK: - Bodies
 
     private var listBody: some View {
-        List(entries, selection: $selected) { entry in
+        List(sorted, selection: $selected) { entry in
             HStack(spacing: 8) {
                 Image(nsImage: icon(entry)).resizable().frame(width: 18, height: 18)
                 Text(entry.name).lineLimit(1).truncationMode(.middle)
@@ -105,6 +119,8 @@ struct FolderBrowser: View {
             .simultaneousGesture(TapGesture(count: 2).onEnded { activate(entry) })
             .contextMenu { menu(entry) }
             .tag(entry.url)
+            // Finder's list draws no rules between rows, and a folder listing is not a table.
+            .listRowSeparator(.hidden)
         }
         .listStyle(.inset)
     }
@@ -112,7 +128,7 @@ struct FolderBrowser: View {
     private var gridBody: some View {
         ScrollView {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 108), spacing: 14)], spacing: 14) {
-                ForEach(entries) { entry in
+                ForEach(sorted) { entry in
                     VStack(spacing: 6) {
                         Image(nsImage: icon(entry)).resizable()
                             .frame(width: 48, height: 48)
@@ -173,7 +189,7 @@ struct FolderBrowser: View {
 
     /// Off the main thread: a home folder with thousands of entries is not a frame's worth of work.
     private nonisolated static func contents(of url: URL) -> Loaded {
-        let keys: [URLResourceKey] = [.isDirectoryKey, .isPackageKey]
+        let keys: [URLResourceKey] = [.isDirectoryKey, .isPackageKey, .contentModificationDateKey]
         do {
             let items = try FileManager.default.contentsOfDirectory(
                 at: url, includingPropertiesForKeys: keys,
@@ -183,12 +199,10 @@ struct FolderBrowser: View {
                 // A package (.app, .rtfd) is a directory on disk and a FILE to a reader, which is
                 // how Finder treats it - descending into one is never what was meant.
                 let isDir = (values?.isDirectory ?? false) && !(values?.isPackage ?? false)
-                return Entry(url: item, isDirectory: isDir)
+                return Entry(url: item, isDirectory: isDir,
+                             modified: values?.contentModificationDate ?? .distantPast)
             }
-            return .success(entries.sorted {
-                if $0.isDirectory != $1.isDirectory { return $0.isDirectory }
-                return $0.name.localizedStandardCompare($1.name) == .orderedAscending
-            })
+            return .success(entries)
         } catch {
             return .failure(error.localizedDescription)
         }

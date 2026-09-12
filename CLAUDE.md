@@ -453,6 +453,12 @@ measured on an M3 Ultra too, so they compare directly.
   `QualifierBar` are display-only - `Text(key)` + `Text(value)` in a capsule, no action - so a
   chip of the path the breadcrumb is already showing is a second copy that does strictly less.
   Other qualifiers still get chips; the bar hides entirely when nothing is left to show.
+- THE VIEW TOGGLE HAD TO BE LET OUT OF ITS GATE. Sort and view appear only once there are
+  results ("only meaningful with results"), so the browser's gallery view existed and NOTHING
+  could switch to it - written, built, unreachable. The condition now includes the browser, and
+  the browser honours `sortOrder` for real: folders before files, then Name or Date modified,
+  with `.relevance` reading as Name because it means nothing for a directory.
+- No separators between rows: Finder's list view draws none, and a folder listing is not a table.
 - Packages (.app, .rtfd) are files, not folders - `isPackageKey`, the way Finder treats them.
   Directory listing runs off the main thread: a home folder is not a frame's worth of work.
 - Verified in the app, not just built: sidebar click browses, double-click descends, the
