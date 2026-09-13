@@ -486,14 +486,17 @@ struct FolderBrowser: View {
     /// Files Indexed counts and any new rows appear as they land rather than only on a revisit.
     ///
     /// PACED BY WHAT THE QUERY COSTS, not by a fixed interval. `indexedChildrenDetailed` walks the
-    /// whole subtree of the browsed folder on the store's SERIAL queue - the same queue the indexer
-    /// is writing on - and measured idle it runs 0.7 ms on a 105-file folder, 66 ms on 65k, 417 ms
-    /// on 23k with many files at the top level, and 2.4 SECONDS on a 2.4M-file root. A 2 s poll
-    /// would have spent most of that root's wall clock re-listing it and starved the pass it was
-    /// reporting on. So each round sleeps for 20x the time the last one took (floor 1.5 s, ceiling
-    /// 30 s), holding the duty cycle at about 5% whatever the folder: 1.5 s on a small one, ~8 s on
-    /// Downloads, ~48 s on a 2.4M-file backup. It self-corrects as the store gets busier, too,
-    /// because it measures the real elapsed time rather than a number baked in here.
+    /// whole subtree of the browsed folder, and measured idle it runs 0.7 ms on a 105-file folder,
+    /// 66 ms on 65k, 417 ms on 23k with many files at the top level, and 2.4 SECONDS on a 2.4M-file
+    /// root. A 2 s poll would have spent most of that root's wall clock re-listing it. So each round
+    /// sleeps for 20x the time the last one took (floor 1.5 s, ceiling 30 s), holding the duty cycle
+    /// at about 5% whatever the folder: 1.5 s on a small one, ~8 s on Downloads, ~48 s on a
+    /// 2.4M-file backup. It self-corrects as the store gets busier, too, because it measures the
+    /// real elapsed time rather than a number baked in here.
+    ///
+    /// It no longer has to protect the INDEXER from this poll - the browse runs on the store's
+    /// read-only connection now, not on the serial queue the indexer writes on. What is left to
+    /// ration is CPU, which is why the backoff stays.
     private func followIndexing() async {
         var lastCost: TimeInterval = 0
         while !Task.isCancelled {
@@ -517,15 +520,18 @@ struct FolderBrowser: View {
         // Membership AND the column facts come from the INDEX: this is a browser inside a search
         // app, and listing files it cannot find, rank or preview promises more than the index can
         // answer for.
-        // THE LISTING FIRST, THE SUBFOLDER COUNTS SECOND. `folderAggregates` walks the whole
-        // subtree - 0.7 ms on a small folder, 417 ms on 23k, 2.4 s on a 2.4M root - on the same
-        // serial queue the indexer writes on, so asking for it up front is what made switching
-        // folders feel slow, and rapid clicks queued those walks behind one another.
+        // THE LISTING FIRST, THE SUBFOLDER COUNTS SECOND. The listing is proportional to this
+        // folder's own children; `folderAggregates` walks the whole SUBTREE beneath it, which is
+        // 5-50x more on the same folder (measured on the real index: 0.2-11 ms to list, 15-52 ms
+        // to count) and unbounded on a root. Splitting them puts rows on screen at the cost of the
+        // cheap half.
+        //
+        // Both halves ride the store's read-only connection, so neither waits on the indexer.
         let children = await model.indexedChildrenDetailed(of: url, aggregates: false)
         guard url == folder else { return }        // a faster click already moved us on
         var tagsByPath: [String: [String]] = [:]
         if columns.isOn(.tags) {
-            tagsByPath = await model.tags(for: children.filter { !$0.isDirectory }.map(\.path))
+            tagsByPath = await model.tags(inFolder: url)
             guard url == folder else { return }
         }
         entries = children.map { c in

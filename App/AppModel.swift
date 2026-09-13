@@ -817,9 +817,15 @@ final class AppModel {
     }
 
     /// Content tags for the rows the Tags column is showing. Only called when it is on.
-    func tags(for paths: [String]) async -> [String: [String]] {
-        guard let store, !paths.isEmpty else { return [:] }
-        return await Task.detached(priority: .userInitiated) { store.storedTags(paths: paths) }.value
+    ///
+    /// FOLDER-SCOPED, not a path list: `browseTags` is one statement on the store's read-only
+    /// connection, where `storedTags(paths:)` is a prepared lookup per file on the writer's serial
+    /// queue. With the column on, that lookup ran on every folder switch and waited behind whatever
+    /// the indexer was writing - the same wait the listing itself was moved off.
+    func tags(inFolder folder: URL) async -> [String: [String]] {
+        guard let store else { return [:] }
+        let path = folder.path
+        return await Task.detached(priority: .userInitiated) { store.browseTags(inFolder: path) }.value
     }
 
     /// Draw the embedding map for ANY folder, in the layout the caller picked.
@@ -2058,11 +2064,27 @@ final class AppModel {
         }
     }
 
+    /// UI state that a TEST must not write into the real install.
+    ///
+    /// `-omni.dbDir` and `-omni.roots` isolate a UI-test run because they are launch arguments, and
+    /// the ARGUMENT domain shadows reads without ever being written back. Search history and photo
+    /// sources are not launch arguments: they are encoded blobs the app SAVES, and a save lands in
+    /// the app's own persistent domain no matter what the argument domain says. So every UI-test run
+    /// was reading the developer's real history into its sidebar and appending its own test queries
+    /// to it - verified by dumping the accessibility tree mid-run, where the suite's "porsche
+    /// quarterly revenue" sat among real searches.
+    ///
+    /// The flag is checked once: it is a launch argument, so it cannot change during a session.
+    private static let ephemeralUIState =
+        UserDefaults.standard.bool(forKey: "omni.ephemeralUIState")
+
     private func persistHistory() {
+        guard !Self.ephemeralUIState else { return }
         if let data = try? JSONEncoder().encode(searchHistory) { UserDefaults.standard.set(data, forKey: historyKey) }
     }
 
     private func loadHistory() {
+        guard !Self.ephemeralUIState else { return }
         guard let data = UserDefaults.standard.data(forKey: historyKey),
               let items = try? JSONDecoder().decode([HistoryItem].self, from: data) else { return }
         let merged = Self.canonicalized(items)
@@ -3761,11 +3783,13 @@ final class AppModel {
     // MARK: - Apple Photos sources
 
     private func loadPhotoSources() {
+        guard !Self.ephemeralUIState else { return }   // see ephemeralUIState
         guard let data = UserDefaults.standard.data(forKey: "omni.photoSources"),
               let saved = try? JSONDecoder().decode([PhotoLibrary.Source].self, from: data) else { return }
         photoSources = canonicalizePhotoSources(saved)
     }
     private func savePhotoSources() {
+        guard !Self.ephemeralUIState else { return }
         UserDefaults.standard.set(try? JSONEncoder().encode(photoSources), forKey: "omni.photoSources")
     }
 

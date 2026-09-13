@@ -1672,6 +1672,11 @@ public final class VectorStore: @unchecked Sendable {
         // value - bulk insert keeps more dirty pages hot), down to 64MB under tight low-end caps.
         exec("PRAGMA cache_size=-\(OmniMemoryBudget.scaled(anchor6GB: 262_144, floor: 65_536, ceiling: 262_144));")
         exec("PRAGMA temp_store=MEMORY;")
+        // The browse runs on a SECOND connection (see readerLocked), which is the only thing in
+        // this process that can hand this one SQLITE_BUSY. A reader's txn lasts one statement, so
+        // the overlap window is small - VACUUM survived it 20/20 under continuous browse traffic -
+        // but a refused VACUUM means space is never reclaimed again, and waiting beats failing.
+        exec("PRAGMA busy_timeout=5000;")
         // SQLite's automatic checkpoint fires inside whatever write txn crosses the page threshold -
         // measured 40-70ms stalls on the serial queue every ~32MB of WAL, landing directly in a
         // concurrent search's lockwait tail. Disable it (0) and checkpoint via checkpointIfDueLocked
@@ -1913,6 +1918,7 @@ public final class VectorStore: @unchecked Sendable {
     /// reader/writer or a new same-path connection). Idempotent. Call this when switching model/db so the
     /// synchronous checkpoint + close runs off the main actor instead of at the @MainActor ref-drop site.
     public func close() {
+        closeReader()   // the browse connection first: nothing on its queue enters this one
         queue.sync {
             // Before the stamp, not after it: stamping an already-closed store is pure work whose
             // result nothing can persist, and it used to happen on every repeat close() because the
@@ -1935,6 +1941,7 @@ public final class VectorStore: @unchecked Sendable {
     deinit {
         // Safety net if close() was not called explicitly. deinit runs after all queued work and at
         // refcount 0 (no concurrent access), so the raw checkpoint + close is safe without the queue.
+        closeReader()
         guard !closed, let h = db else { return }
         sqlite3_finalize(snippetStmt); snippetStmt = nil
         sqlite3_finalize(dedupStmt); dedupStmt = nil
@@ -2640,15 +2647,30 @@ public final class VectorStore: @unchecked Sendable {
             queue.sync {
                 guard dbOpen() else { return }
                 var stmt: OpaquePointer?
+                // ORDER BY chunk_id, NOT chunk_index. `chunk_text` has no `chunk_index` column -
+                // it is keyed by `chunk_id` - so this statement failed to PREPARE, every slice took
+                // the early return, and storedTags answered [:] for every path it was ever given.
+                // A prepare failure is silent here by construction, which is why it survived: the
+                // browser's Tags column and the serving layer's tag lookup both read "no tags" and
+                // neither has any way to tell that apart from a file with none.
+                //
+                // chunk_id is the chunk row's primary key and chunks are inserted in chunk order,
+                // so it carries the same ordering chunk_index was reaching for.
                 guard sqlite3_prepare_v2(db, """
                     SELECT t.snippet FROM chunk_text t
                     WHERE t.file_id = \(StoreSchema.fileIDByPath) AND t.kind IN (\(StoreSchema.mediaKindCodes.map(String.init).joined(separator: ",")))
-                    ORDER BY chunk_index;
+                    ORDER BY t.chunk_id;
                     """, -1, &stmt, nil) == SQLITE_OK else { return }
                 defer { sqlite3_finalize(stmt) }
                 for p in group where presentPaths.contains(p) {
                     sqlite3_reset(stmt); sqlite3_clear_bindings(stmt)
-                    sqlite3_bind_text(stmt, 1, p, -1, SQLITE_TRANSIENT)
+                    // bindPath, NOT one bind of the whole path. `fileIDByPath` is a two-parameter
+                    // form (d.path = ?, f.name = ?); binding the full path to the first and leaving
+                    // the second NULL made `f.name = NULL`, which is never true, so this returned
+                    // an empty dictionary for EVERY path - measured against the real index, 0 rows
+                    // for a file that has five tags stored. The Tags column and the serving layer's
+                    // tag lookup were both reading nothing.
+                    bindPath(stmt, 1, p)
                     var tags: [String] = []
                     var seen = Set<String>()
                     var isMedia = false
@@ -2924,47 +2946,293 @@ public final class VectorStore: @unchecked Sendable {
         public let fileCount: Int        // indexed files beneath a folder; 0 for a file
     }
 
-    /// `indexedChildren` plus the per-row facts the browser's columns need.
+    // MARK: - Browse reader
+
+    /// A SECOND SQLite connection, read-only, serving the folder browser's four queries.
     ///
-    /// Built from the tested pieces rather than one hand-rolled query: `fileStatus` already
-    /// returns a file's kind, size, mtime and `indexed_at` (and the `kind` COLUMN is an interned
-    /// id, not a `FileKind` ordinal - decoding it here would have been a silent mis-mapping). The
-    /// only new SQL is the folder aggregate, which counts indexed files beneath each immediate
-    /// child and takes the newest stamp among them.
+    /// The store has ONE serial queue and the indexer writes on it, so a browse issued behind a
+    /// write batch waits for that batch to finish before its own query starts. Measured on the
+    /// real index: four switches waited 0.0 ms and one waited 510.9 ms to do 0.1 ms of work, and
+    /// 511 ms is only the batch that happened to be in flight - a reclaim or a checkpoint holds
+    /// the queue far longer. The wait is the whole cost, and it is not a property of the query.
+    ///
+    /// WAL already allows any number of readers concurrently with the one writer, so the fix is a
+    /// connection that does not share the queue rather than a cache of the answers (a cache would
+    /// buy invalidation risk against a live index to avoid a wait that need not exist).
+    ///
+    /// `PRAGMA query_only` is set on it: a handle that cannot write cannot corrupt the index, which
+    /// is what makes a second connection safe here rather than merely faster. It also carries NO
+    /// resident state - every query below is self-contained SQL, including the kind table, which it
+    /// reads for itself rather than reaching into the writer's intern maps.
+    private var readDB: OpaquePointer?
+    private let readQueue = DispatchQueue(label: "omni.vectorstore.read")
+    /// code -> kind name, the reader's own copy of `kinds`. Reloaded at most once per query when a
+    /// code lands outside it, because the writer can mint a new kind at runtime.
+    private var readKinds: [String] = []
+    private var readOpened = false
+    private var readShut = false
+
+    /// Open the reader on first use, on `readQueue`.
+    ///
+    /// Lazy rather than in `init`: init migrates the schema in place, and a reader opened before
+    /// that finished would hold a connection to a shape that is about to stop existing. By the time
+    /// anything browses, init has returned.
+    private func readerLocked() -> OpaquePointer? {
+        if readOpened { return readDB }
+        readOpened = true
+        guard !readShut else { return nil }
+        // A/B and escape hatch. The fallback is the pre-existing queued path, so OMNI_BROWSE_READER=0
+        // is a supported way to measure what the second connection buys - and to get the old
+        // behaviour back without a build if it ever misbehaves in the field.
+        if ProcessInfo.processInfo.environment["OMNI_BROWSE_READER"] == "0" { return nil }
+        var h: OpaquePointer?
+        guard sqlite3_open_v2(dbURL.path, &h, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK, let handle = h else {
+            if let h { sqlite3_close(h) }
+            return nil                       // callers fall back to the writer's queue
+        }
+        sqlite3_exec(handle, "PRAGMA busy_timeout=5000;", nil, nil, nil)
+        sqlite3_exec(handle, "PRAGMA mmap_size=268435456;", nil, nil, nil)
+        sqlite3_exec(handle, "PRAGMA cache_size=-16384;", nil, nil, nil)   // 16MB: metadata only
+        sqlite3_exec(handle, "PRAGMA temp_store=MEMORY;", nil, nil, nil)
+        sqlite3_exec(handle, "PRAGMA wal_autocheckpoint=0;", nil, nil, nil)  // checkpointing is the writer's job
+        sqlite3_exec(handle, "PRAGMA query_only=1;", nil, nil, nil)          // last: nothing below writes
+        readDB = handle
+        return handle
+    }
+
+    /// Close the reader. Called from `close()` and from `deinit`, BEFORE the writer's own close so
+    /// no browse is mid-statement when the writer checkpoints. A browse that arrives in between
+    /// takes the fallback and gets the same empty answer `dbOpen()` gives, because the writer is
+    /// closed by the time it reaches the queue.
+    ///
+    /// Nothing on `readQueue` ever enters `queue`, so the two can never deadlock on each other.
+    private func closeReader() {
+        readQueue.sync {
+            readShut = true
+            readOpened = true
+            if let h = readDB { sqlite3_close(h); readDB = nil }
+        }
+    }
+
+    /// Run a browse query on the reader, falling back to the writer's queue if the reader could not
+    /// open (a removed database, a permissions change). The fallback is the pre-existing behaviour,
+    /// so a reader that never opens costs correctness nothing.
+    private func onReader<T>(_ empty: T, _ body: (OpaquePointer) -> T) -> T {
+        var out = empty
+        var ran = false
+        readQueue.sync {
+            guard let h = readerLocked() else { return }
+            out = body(h)
+            ran = true
+        }
+        if ran { return out }
+        return queue.sync {
+            guard dbOpen(), let h = db else { return empty }
+            return body(h)
+        }
+    }
+
+    /// TEST HOOKS. The two properties the reader has to have cannot be observed from outside: that
+    /// the handle refuses writes, and that a browse does not sit behind the writer's queue.
+
+    /// Attempt a write on the browse connection. True would mean `query_only` is not in force.
+    func readConnectionCanWriteForTesting() -> Bool {
+        readQueue.sync {
+            guard let h = readDB else { return false }
+            return sqlite3_exec(h, "CREATE TABLE IF NOT EXISTS omni_reader_probe(x);", nil, nil, nil) == SQLITE_OK
+        }
+    }
+
+    /// Occupy the serial queue the way a write batch does, so a test can browse while it is held.
+    func holdSerialQueueForTesting(entered: DispatchSemaphore, until release: DispatchSemaphore) {
+        queue.sync {
+            entered.signal()
+            release.wait()
+        }
+    }
+
+    /// The same hold, for a fixed slice, so a bench can contend the queue continuously.
+    func holdSerialQueueForTesting(milliseconds: Int) {
+        queue.sync { usleep(UInt32(milliseconds) * 1000) }
+    }
+
+    /// Run the repack's VACUUM on the writer, unconditionally, and return the sqlite result code.
+    /// The gated path cannot be forced on a small database, and the question this answers - can a
+    /// browse in flight hand the repack SQLITE_BUSY - is the one thing a second connection is most
+    /// likely to break.
+    func vacuumForTesting() -> Int32 {
+        queue.sync {
+            guard dbOpen() else { return SQLITE_MISUSE }
+            return sqlite3_exec(db, "VACUUM;", nil, nil, nil)
+        }
+    }
+
+    /// The reader's own `kinds` lookup, mirroring `kindNameLocked` including its "text" fallback.
+    /// `reloaded` bounds the refresh to one per query no matter how many rows carry a stray code.
+    private func readKindName(_ h: OpaquePointer, _ code: Int, _ reloaded: inout Bool) -> String {
+        if code >= 0 && code < readKinds.count { return readKinds[code] }
+        if !reloaded {
+            reloaded = true
+            var st: OpaquePointer?
+            if sqlite3_prepare_v2(h, "SELECT code, name FROM kinds ORDER BY code;", -1, &st, nil) == SQLITE_OK {
+                var table: [String] = []
+                while sqlite3_step(st) == SQLITE_ROW {
+                    let c = Int(sqlite3_column_int(st, 0))
+                    guard let n = sqlite3_column_text(st, 1) else { continue }
+                    while table.count < c { table.append("") }
+                    if table.count == c { table.append(String(cString: n)) } else { table[c] = String(cString: n) }
+                }
+                readKinds = table
+            }
+            sqlite3_finalize(st)
+        }
+        return code >= 0 && code < readKinds.count ? readKinds[code] : "text"
+    }
+
+    /// One file row as the browser's columns need it.
+    ///
+    /// In v4 these facts live ON the file row, so the whole per-file half of a listing is a single
+    /// statement over the same `dirs` range the folder half uses. It replaces the old
+    /// `indexedChildren` + `fileStatus(paths:)` pair, which issued one prepared lookup per child
+    /// and counted each file's chunks - a count `IndexedChild` has no field for and threw away.
+    private struct BrowseFile {
+        let name: String, kind: String
+        let modified: Double, indexedAt: Double
+        let size: Int
+    }
+
+    private func browseFiles(inFolder folder: String) -> [BrowseFile] {
+        onReader([]) { h in
+            var out: [BrowseFile] = []
+            var st: OpaquePointer?
+            defer { sqlite3_finalize(st) }
+            guard sqlite3_prepare_v2(h, """
+                SELECT f.name, f.kind, f.modified, f.indexed_at, f.size
+                  FROM files f JOIN dirs d ON d.id = f.dir_id
+                 WHERE d.path = ?1 AND EXISTS(SELECT 1 FROM chunks c WHERE c.file_id = f.id);
+                """, -1, &st, nil) == SQLITE_OK else { return [] }
+            sqlite3_bind_text(st, 1, folder, -1, SQLITE_TRANSIENT)
+            var reloaded = false
+            while sqlite3_step(st) == SQLITE_ROW {
+                guard let n = sqlite3_column_text(st, 0) else { continue }
+                out.append(BrowseFile(name: String(cString: n),
+                                      kind: readKindName(h, Int(sqlite3_column_int(st, 1)), &reloaded),
+                                      modified: sqlite3_column_double(st, 2),
+                                      indexedAt: sqlite3_column_double(st, 3),
+                                      size: Int(sqlite3_column_int64(st, 4))))
+            }
+            return out
+        }
+    }
+
+    /// Immediate subfolders of `folder` that still hold an indexed file, reduced from the descendant
+    /// range scan. A subfolder earns a row only if something under it is searchable, so descending
+    /// can never dead-end on a folder the index knows nothing about.
+    private func browseFolders(under folder: String) -> [String] {
+        onReader([]) { h in
+            let pfx = folder + "/"
+            var out: [String] = []
+            var seen = Set<String>()
+            var st: OpaquePointer?
+            defer { sqlite3_finalize(st) }
+            guard sqlite3_prepare_v2(h, """
+                SELECT d.path FROM dirs d
+                 WHERE d.path >= ?1 AND d.path < ?2
+                   AND EXISTS(SELECT 1 FROM files f WHERE f.dir_id = d.id
+                              AND EXISTS(SELECT 1 FROM chunks c WHERE c.file_id = f.id));
+                """, -1, &st, nil) == SQLITE_OK else { return [] }
+            sqlite3_bind_text(st, 1, pfx, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(st, 2, folder + "0", -1, SQLITE_TRANSIENT)
+            while sqlite3_step(st) == SQLITE_ROW {
+                guard let c = sqlite3_column_text(st, 0) else { continue }
+                let name = String(cString: c).dropFirst(pfx.count).prefix { $0 != "/" }
+                if !name.isEmpty, seen.insert(String(name)).inserted { out.append(pfx + name) }
+            }
+            return out
+        }
+    }
+
+    /// Tags for every media file sitting directly in `folder`, for the browser's Tags column.
+    ///
+    /// Folder-scoped, so it needs no path binding and no `presentPaths` guard: it is one statement
+    /// over the same `dirs` row the listing already used, where `storedTags(paths:)` issues a
+    /// prepared lookup per file. That API stays on the writer's queue because the serving layer
+    /// hands it arbitrary paths, which have to resolve through `pathID` for the NFC/NFD spelling -
+    /// the browser's paths come out of this same table, so there is nothing to normalise.
+    ///
+    /// Same two rules as `storedTags`: filename-derived snippets are not tags (OmniTagger decides),
+    /// and a media file with none still gets an entry, so the caller can tell "untagged" from
+    /// "not media".
+    public func browseTags(inFolder folder: String) -> [String: [String]] {
+        let pfx = folder + "/"
+        return onReader([:]) { h in
+            var out: [String: [String]] = [:]
+            var seen: [String: Set<String>] = [:]
+            var st: OpaquePointer?
+            defer { sqlite3_finalize(st) }
+            guard sqlite3_prepare_v2(h, """
+                SELECT f.name, t.snippet
+                  FROM chunk_text t
+                  JOIN files f ON f.id = t.file_id
+                  JOIN dirs d ON d.id = f.dir_id
+                 WHERE d.path = ?1
+                   AND t.kind IN (\(StoreSchema.mediaKindCodes.map(String.init).joined(separator: ",")))
+                 ORDER BY f.name, t.chunk_id;
+                """, -1, &st, nil) == SQLITE_OK else { return [:] }
+            sqlite3_bind_text(st, 1, folder, -1, SQLITE_TRANSIENT)
+            while sqlite3_step(st) == SQLITE_ROW {
+                guard let n = sqlite3_column_text(st, 0) else { continue }
+                let path = pfx + String(cString: n)
+                if out[path] == nil { out[path] = []; seen[path] = [] }
+                guard let c = sqlite3_column_text(st, 1) else { continue }
+                let snippet = String(cString: c)
+                if snippet.isEmpty || OmniTagger.nameDerivedSnippet(snippet, path: path) { continue }
+                for t in snippet.components(separatedBy: ", ")
+                where !t.isEmpty && seen[path]!.insert(t).inserted {
+                    out[path]!.append(t)
+                }
+            }
+            return out
+        }
+    }
+
+    /// `indexedChildren` plus the per-row facts the browser's columns need.
     /// `aggregates: false` returns the listing WITHOUT each subfolder's file count.
     ///
-    /// The other two queries are proportional to the folder's own children; `folderAggregates`
-    /// walks the entire SUBTREE, which is what makes switching folders feel slow - measured at
-    /// 0.7 ms on a 105-file folder but 417 ms on 23k and 2.4 s on a 2.4M root, all on the store's
-    /// serial queue, so rapid clicks queue behind one another. The browser asks for the listing
-    /// first and the counts second, which puts rows on screen at the cost of the cheap half.
+    /// The first two queries are proportional to the folder's own children; `folderAggregates`
+    /// walks the entire SUBTREE - measured at 0.1 ms on a 77-file folder, 51.6 ms on a deep one.
+    /// The browser asks for the listing first and the counts second, which puts rows on screen at
+    /// the cost of the cheap half.
     public func indexedChildrenDetailed(ofFolder folder: String, aggregates: Bool = true) -> [IndexedChild] {
-        // Timed under OMNI_PERF_LOG because the browser can re-run this on a timer while an index
-        // pass is in flight, and `folderAggregates` walks the WHOLE subtree of the browsed folder
-        // on the store's serial queue - the same queue the indexer writes on. The refresh period
-        // has to come from this number, not from a guess.
+        // SPLIT, because "browse-list 400ms" does not say which query to fix: the per-file facts,
+        // the subfolder scan, or the subtree aggregate.
         let t0 = omniPerfEnabled ? Date() : nil
-        let children = indexedChildren(ofFolder: folder)
-        let status = fileStatus(paths: children.files)
+        let files = browseFiles(inFolder: folder)
+        let tFiles = omniPerfEnabled ? Date() : nil
+        let folders = browseFolders(under: folder)
+        let tFolders = omniPerfEnabled ? Date() : nil
         let agg = aggregates ? folderAggregates(under: folder) : [:]
-        if let t0 {
-            omniPerfLog(String(format: "browse-list %.1fms files=%d folders=%d agg=%@ folder=%@",
-                               Date().timeIntervalSince(t0) * 1000,
-                               children.files.count, children.folders.count,
-                               aggregates ? "YES" : "no", folder))
+        if let t0, let tFiles, let tFolders {
+            omniPerfLog(String(format:
+                "browse-list %.1fms (files %.1f, folders %.1f, agg %.1f) files=%d folders=%d folder=%@",
+                Date().timeIntervalSince(t0) * 1000,
+                tFiles.timeIntervalSince(t0) * 1000,
+                tFolders.timeIntervalSince(tFiles) * 1000,
+                Date().timeIntervalSince(tFolders) * 1000,
+                files.count, folders.count, folder))
         }
+        let pfx = folder + "/"
         var out: [IndexedChild] = []
-        out.reserveCapacity(children.files.count + children.folders.count)
-        for path in children.files {
-            let st = status[path]
-            out.append(IndexedChild(path: path, isDirectory: false,
-                                    kind: st?.kind ?? "",
-                                    modified: st?.modified ?? 0,
-                                    size: st?.size ?? 0,
-                                    indexedAt: st?.indexedAt ?? 0,
+        out.reserveCapacity(files.count + folders.count)
+        for f in files {
+            out.append(IndexedChild(path: pfx + f.name, isDirectory: false,
+                                    kind: f.kind,
+                                    modified: f.modified,
+                                    size: f.size,
+                                    indexedAt: f.indexedAt,
                                     fileCount: 0))
         }
-        for path in children.folders {
+        for path in folders {
             let a = agg[(path as NSString).lastPathComponent] ?? (0, 0)
             out.append(IndexedChild(path: path, isDirectory: true, kind: "",
                                     modified: 0, size: 0,
@@ -2989,19 +3257,18 @@ public final class VectorStore: @unchecked Sendable {
     /// `indexed_at` among them. One grouped pass over the `dirs` range scan the browser already
     /// uses, so it rides the same unique index.
     private func folderAggregates(under folder: String) -> [String: (count: Int, newest: Double)] {
-        queue.sync {
-            guard dbOpen() else { return [:] }
+        onReader([:]) { h in
             let pfx = folder + "/"
             var out: [String: (count: Int, newest: Double)] = [:]
             var st: OpaquePointer?
-            guard sqlite3_prepare_v2(db, """
+            defer { sqlite3_finalize(st) }
+            guard sqlite3_prepare_v2(h, """
                 SELECT d.path, COUNT(f.id), MAX(f.indexed_at)
                   FROM dirs d JOIN files f ON f.dir_id = d.id
                  WHERE d.path >= ?1 AND d.path < ?2
                    AND EXISTS(SELECT 1 FROM chunks c WHERE c.file_id = f.id)
                  GROUP BY d.path;
                 """, -1, &st, nil) == SQLITE_OK else { return [:] }
-            defer { sqlite3_finalize(st) }
             sqlite3_bind_text(st, 1, pfx, -1, SQLITE_TRANSIENT)
             sqlite3_bind_text(st, 2, folder + "0", -1, SQLITE_TRANSIENT)
             while sqlite3_step(st) == SQLITE_ROW {
@@ -3023,11 +3290,12 @@ public final class VectorStore: @unchecked Sendable {
     /// a two-character needle against 2.6M files matches a great many directories and the sheet
     /// shows a handful.
     public func indexedFolders(matching needle: String, limit: Int = 12) -> [String] {
-        queue.sync {
-            guard dbOpen(), !needle.isEmpty else { return [] }
+        guard !needle.isEmpty else { return [] }
+        return onReader([]) { h in
             var out: [String] = []
             var st: OpaquePointer?
-            guard sqlite3_prepare_v2(db, """
+            defer { sqlite3_finalize(st) }
+            guard sqlite3_prepare_v2(h, """
                 SELECT d.path FROM dirs d
                  WHERE d.path LIKE ?1 ESCAPE '\\'
                    AND EXISTS(SELECT 1 FROM files f WHERE f.dir_id = d.id
@@ -3035,7 +3303,6 @@ public final class VectorStore: @unchecked Sendable {
                  ORDER BY LENGTH(d.path) ASC
                  LIMIT ?2;
                 """, -1, &st, nil) == SQLITE_OK else { return [] }
-            defer { sqlite3_finalize(st) }
             // LIKE's own wildcards have to be neutralised, or a path with an underscore in it -
             // which is most of them - matches any character there.
             let escaped = needle
@@ -3051,49 +3318,18 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
+    /// The browser's children as bare paths. Same two queries as the detailed listing, which is why
+    /// it is built from the same pieces rather than a third copy of the SQL.
     public func indexedChildren(ofFolder folder: String) -> (files: [String], folders: [String]) {
-        queue.sync {
-            guard dbOpen() else { return ([], []) }
-            let pfx = folder + "/"
-            var files: [String] = []
-            var folders: [String] = []
-
-            // Files sitting directly in this folder, that still have chunks.
-            var st: OpaquePointer?
-            if sqlite3_prepare_v2(db, """
-                SELECT f.name FROM files f JOIN dirs d ON d.id = f.dir_id
-                 WHERE d.path = ?1 AND EXISTS(SELECT 1 FROM chunks c WHERE c.file_id = f.id);
-                """, -1, &st, nil) == SQLITE_OK {
-                sqlite3_bind_text(st, 1, folder, -1, SQLITE_TRANSIENT)
-                while sqlite3_step(st) == SQLITE_ROW {
-                    if let c = sqlite3_column_text(st, 0) { files.append(pfx + String(cString: c)) }
-                }
-            }
-            sqlite3_finalize(st)
-
-            // Descendant directories that still hold an indexed file, reduced to the immediate
-            // child. A subfolder earns a row here only if something under it is searchable, so
-            // descending can never dead-end on a folder the index knows nothing about.
-            var seen = Set<String>()
-            var sub: OpaquePointer?
-            if sqlite3_prepare_v2(db, """
-                SELECT d.path FROM dirs d
-                 WHERE d.path >= ?1 AND d.path < ?2
-                   AND EXISTS(SELECT 1 FROM files f WHERE f.dir_id = d.id
-                              AND EXISTS(SELECT 1 FROM chunks c WHERE c.file_id = f.id));
-                """, -1, &sub, nil) == SQLITE_OK {
-                sqlite3_bind_text(sub, 1, pfx, -1, SQLITE_TRANSIENT)
-                sqlite3_bind_text(sub, 2, folder + "0", -1, SQLITE_TRANSIENT)
-                while sqlite3_step(sub) == SQLITE_ROW {
-                    guard let c = sqlite3_column_text(sub, 0) else { continue }
-                    let rest = String(cString: c).dropFirst(pfx.count)
-                    let name = rest.prefix { $0 != "/" }
-                    if !name.isEmpty, seen.insert(String(name)).inserted { folders.append(pfx + name) }
-                }
-            }
-            sqlite3_finalize(sub)
-            return (files, folders)
+        let pfx = folder + "/"
+        let tAsk = omniPerfEnabled ? Date() : nil
+        let files = browseFiles(inFolder: folder).map { pfx + $0.name }
+        let folders = browseFolders(under: folder)
+        if let tAsk {
+            omniPerfLog(String(format: "browse-children %.1fms files=%d folders=%d folder=%@",
+                               -tAsk.timeIntervalSinceNow * 1000, files.count, folders.count, folder))
         }
+        return (files, folders)
     }
 
     public func fileCount(underFolder folder: String) -> Int {
