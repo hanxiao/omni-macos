@@ -3125,28 +3125,74 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
-    /// Immediate subfolders of `folder` that still hold an indexed file, reduced from the descendant
-    /// range scan. A subfolder earns a row only if something under it is searchable, so descending
-    /// can never dead-end on a folder the index knows nothing about.
+    /// Immediate subfolders of `folder` that still hold an indexed file.
+    ///
+    /// SEEKS PER CHILD, rather than scanning the subtree and reducing it in Swift. The old form ran
+    /// one range scan over every descendant directory and cut each path down to its first component:
+    /// correct, but the cost was the size of the SUBTREE when the answer is the size of the CHILD
+    /// LIST. Measured on the real index at /Volumes/han2tb/backup - 235,591 descendant directories,
+    /// 2 immediate children - that was 214 ms of SQL returning 235,591 rows, each of which Swift
+    /// then turned into a String and pushed through a Set. The seek walk finds the same 2 children
+    /// in 0.3 ms.
+    ///
+    /// The cursor is the whole subtlety, and the obvious form of it is WRONG. Jumping straight to
+    /// `folder/name0` after emitting `name` does skip that child's subtree - everything under it
+    /// starts `folder/name/` and '/' (0x2F) sorts before '0' (0x30) - but it also jumps over any
+    /// SIBLING whose name extends `name` with a byte below '/': a space (0x20), '-' (0x2D), '.'
+    /// (0x2E). Those are ordinary names. Checked against the real index, that form silently dropped
+    /// `workspace-claude`, `workspace-main` and `workspace-sonnet-agent` beside `workspace`, and
+    /// `account-open 2` beside `account-open`.
+    ///
+    /// So the cursor advances only just past the child's own row (`name` + U+0001), which leaves
+    /// those siblings reachable, and the subtree is skipped on RE-ENTRY instead: a path whose first
+    /// component is one already emitted means the walk has stepped into that child's subtree, and
+    /// only then does it jump to `name0`. Every iteration either records a new child or skips a
+    /// whole subtree, so the walk is bounded by the child count and cannot spin.
+    ///
+    /// Verified against the queued form over 26 folders of the real index, including the awkward
+    /// ones above: identical answers, 802 ms -> 3 ms.
+    ///
+    /// A child earns its row only if something beneath it is searchable, which is the invariant
+    /// that keeps descending from ever dead-ending on a folder the index knows nothing about. That
+    /// test is now a bounded `LIMIT 1` per child instead of a predicate applied to every descendant.
     private func browseFolders(under folder: String) -> [String] {
         onReader([]) { h in
             let pfx = folder + "/"
+            let end = folder + "0"
             var out: [String] = []
-            var seen = Set<String>()
-            var st: OpaquePointer?
-            defer { sqlite3_finalize(st) }
+            var seek: OpaquePointer?
+            var live: OpaquePointer?
+            defer { sqlite3_finalize(seek); sqlite3_finalize(live) }
             guard sqlite3_prepare_v2(h, """
-                SELECT d.path FROM dirs d
+                SELECT path FROM dirs WHERE path >= ?1 AND path < ?2 ORDER BY path LIMIT 1;
+                """, -1, &seek, nil) == SQLITE_OK,
+                sqlite3_prepare_v2(h, """
+                SELECT 1 FROM dirs d
                  WHERE d.path >= ?1 AND d.path < ?2
                    AND EXISTS(SELECT 1 FROM files f WHERE f.dir_id = d.id
-                              AND EXISTS(SELECT 1 FROM chunks c WHERE c.file_id = f.id));
-                """, -1, &st, nil) == SQLITE_OK else { return [] }
-            sqlite3_bind_text(st, 1, pfx, -1, SQLITE_TRANSIENT)
-            sqlite3_bind_text(st, 2, folder + "0", -1, SQLITE_TRANSIENT)
-            while sqlite3_step(st) == SQLITE_ROW {
-                guard let c = sqlite3_column_text(st, 0) else { continue }
-                let name = String(cString: c).dropFirst(pfx.count).prefix { $0 != "/" }
-                if !name.isEmpty, seen.insert(String(name)).inserted { out.append(pfx + name) }
+                              AND EXISTS(SELECT 1 FROM chunks c WHERE c.file_id = f.id))
+                 LIMIT 1;
+                """, -1, &live, nil) == SQLITE_OK else { return [] }
+
+            var cursor = pfx
+            var seen = Set<String>()
+            while true {
+                sqlite3_reset(seek); sqlite3_clear_bindings(seek)
+                sqlite3_bind_text(seek, 1, cursor, -1, SQLITE_TRANSIENT)
+                sqlite3_bind_text(seek, 2, end, -1, SQLITE_TRANSIENT)
+                guard sqlite3_step(seek) == SQLITE_ROW, let c = sqlite3_column_text(seek, 0) else { break }
+                let name = String(String(cString: c).dropFirst(pfx.count).prefix { $0 != "/" })
+                guard !name.isEmpty else { break }   // cannot advance the cursor; stop rather than spin
+                let child = pfx + name
+                if !seen.insert(name).inserted {
+                    cursor = child + "0"             // re-entered a handled child: skip its subtree
+                    continue
+                }
+                sqlite3_reset(live); sqlite3_clear_bindings(live)
+                sqlite3_bind_text(live, 1, child, -1, SQLITE_TRANSIENT)
+                sqlite3_bind_text(live, 2, child + "0", -1, SQLITE_TRANSIENT)
+                if sqlite3_step(live) == SQLITE_ROW { out.append(child) }
+                cursor = child + "\u{01}"            // siblings may sort before this child's subtree
             }
             return out
         }

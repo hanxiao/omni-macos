@@ -218,6 +218,109 @@ final class BrowseReaderTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(t0), 1.0, "the counts pass waited for the writer's queue")
     }
 
+    // MARK: - The seek walk that enumerates subfolders
+
+    /// THE CURSOR EDGE, and the one that actually bit.
+    ///
+    /// The obvious walk emits `kid`, then jumps the cursor to `kid0` to skip its subtree. That
+    /// also jumps over every sibling extending `kid` with a byte below '/' (0x2F) - a space
+    /// (0x20), '-' (0x2D), '.' (0x2E) - which are ordinary directory names. Against the real
+    /// index that form dropped `workspace-claude`, `workspace-main` and `workspace-sonnet-agent`
+    /// beside `workspace`, and `account-open 2` beside `account-open`, silently and with a 267x
+    /// speedup to make it look like a win.
+    ///
+    /// Every byte class around the boundary is covered here: below '/', the subtree itself, and
+    /// above '/'.
+    func testSiblingsAroundTheSkipCursorSurvive() throws {
+        let store = try seeded(tempDB())
+        defer { store.close() }
+        let kids = ["kid",            // the child whose subtree gets skipped
+                    "kid child",      // 0x20, below '/'
+                    "kid-dash",       // 0x2D, below '/'
+                    "kid.dot",        // 0x2E, below '/' - the byte just under it
+                    "kid0",           // 0x30, exactly the naive cursor
+                    "kid0extra",
+                    "kid1"]           // above '/'
+        for k in kids { try store.replace(path: "/root/\(k)/a.txt", chunks: [chunk("/root/\(k)/a.txt")]) }
+        // And give `kid` a subtree, so the walk really does have a block to skip.
+        try store.replace(path: "/root/kid/deep/b.txt", chunks: [chunk("/root/kid/deep/b.txt")])
+
+        let got = Set(store.indexedChildren(ofFolder: "/root").folders.map {
+            ($0 as NSString).lastPathComponent
+        })
+        XCTAssertEqual(got, Set(kids + ["sub", "other"]),
+                       "the skip cursor swallowed \(Set(kids).subtracting(got))")
+    }
+
+    /// The same shape one level down, because the walk is re-entered per folder and a cursor bug
+    /// that only shows at depth is exactly what a root-only test misses.
+    func testTheCursorEdgeHoldsAtDepth() throws {
+        let store = try seeded(tempDB())
+        defer { store.close() }
+        for k in ["w", "w-one", "w two"] {
+            try store.replace(path: "/root/deep/\(k)/a.txt", chunks: [chunk("/root/deep/\(k)/a.txt")])
+        }
+        try store.replace(path: "/root/deep/w/inner/b.txt", chunks: [chunk("/root/deep/w/inner/b.txt")])
+        let got = Set(store.indexedChildren(ofFolder: "/root/deep").folders.map {
+            ($0 as NSString).lastPathComponent
+        })
+        XCTAssertEqual(got, ["w", "w-one", "w two"])
+    }
+
+    /// The deep case the walk has to keep: a child with NO files of its own, earning its row only
+    /// through a grandchild. Skipping the subtree must not skip the test for content in it.
+    func testAChildEarnsItsRowThroughADeepDescendantOnly() throws {
+        let store = try seeded(tempDB())
+        defer { store.close() }
+        try store.replace(path: "/root/hollow/a/b/c/deep.txt",
+                          chunks: [chunk("/root/hollow/a/b/c/deep.txt")])
+        XCTAssertTrue(store.indexedChildren(ofFolder: "/root").folders.contains("/root/hollow"),
+                      "a child whose only content is several levels down was dropped")
+    }
+
+    /// And the inverse: a directory row with nothing indexed anywhere beneath it must NOT list, or
+    /// descending into it dead-ends on an empty listing.
+    func testAChildWithNothingIndexedBeneathItIsNotListed() throws {
+        let store = try seeded(tempDB())
+        defer { store.close() }
+        try store.replace(path: "/root/ghost/a.txt", chunks: [chunk("/root/ghost/a.txt")])
+        XCTAssertTrue(store.indexedChildren(ofFolder: "/root").folders.contains("/root/ghost"))
+        store.deletePath("/root/ghost/a.txt")
+        XCTAssertFalse(store.indexedChildren(ofFolder: "/root").folders.contains("/root/ghost"),
+                       "a folder whose last indexed file went away still listed")
+    }
+
+    /// Many children, so the walk is exercised as a walk rather than as one seek, and the ordering
+    /// of the cursor advance is what produces a complete set.
+    func testTheWalkEnumeratesEveryChild() throws {
+        let db = tempDB()
+        let store = try VectorStore(dbURL: db)
+        defer { store.close() }
+        let names = (0 ..< 50).map { "c\($0)" } + ["ünïcode", "with space", "with-dash", "with.dot"]
+        for n in names {
+            let p = "/tree/\(n)/f.txt"
+            try store.replace(path: p, chunks: [chunk(p)])
+        }
+        let got = Set(store.indexedChildren(ofFolder: "/tree").folders.map {
+            ($0 as NSString).lastPathComponent
+        })
+        XCTAssertEqual(got, Set(names), "the walk missed \(Set(names).subtracting(got))")
+    }
+
+    /// The walk must terminate even when a path cannot yield a child name to advance the cursor
+    /// with - otherwise it spins forever holding the read connection.
+    func testTheWalkTerminatesOnAFolderWithNoChildren() throws {
+        let store = try seeded(tempDB())
+        defer { store.close() }
+        let done = expectation(description: "walk returned")
+        DispatchQueue.global().async {
+            _ = store.indexedChildren(ofFolder: "/root/sub/deep")
+            _ = store.indexedChildren(ofFolder: "/nonexistent")
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 5)
+    }
+
     // MARK: - What a second connection can break
 
     /// VACUUM. This is the case a second connection is most likely to break rather than speed up:
