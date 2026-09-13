@@ -269,6 +269,15 @@ extension OCRModel {
         // it does not cost the throughput a small static group does.
         let ramp = min(Self.rampRows, w)
         for row in 0 ..< ramp {
+            // CHECKED HERE TOO, not only in the decode loop below. Each `admit` is a whole page's
+            // vision tower and LM prefill - ~650 ms that cannot be taken back once submitted - so
+            // a ramp of 4 is ~2.6 s during which a stop used to be invisible. Measured before this
+            // check: Cmd-. landing in a group's prologue was honoured 10.4 s later, because the
+            // rasterise and this loop both ran to completion first.
+            if let shouldContinue, !shouldContinue() {
+                for r in 0 ..< rowPage.count where rowPage[r] >= 0 { stopped[rowPage[r]] = .cancelled }
+                break
+            }
             rowPage.append(-1)
             rowPos.append(0)
             try admit(row: row, page: nextPage)
@@ -419,13 +428,22 @@ extension OCRModel {
         }
 
         let decodeSeconds = Date().timeIntervalSince(tDecode)
+        // Pages the loop never reached. Admission is lazy - `nextPage` walks forward one row per
+        // decode step - so an early exit (a cancel through `shouldContinue`, or every row vacating)
+        // leaves `[nextPage, n)` untouched: no `prep`, no tokens, and `stopped` still holding the
+        // array's default `.cap`, which would report a page that never started as one that ran to
+        // the token cap. Found by a seeded UI chaos run: Cmd-. during a batched run trapped on
+        // `prep` below, which is the very hazard `ensurePrepared` warns about above.
+        for p in nextPage ..< n where tokens[p].isEmpty { stopped[p] = .cancelled }
         return try (0 ..< n).map { p in
             let ids = tokens[p]
             let text = try tokenizer.decode(tokenIds: ids, skipSpecialTokens: true)
             let secs = finishedAt[p] > 0 ? finishedAt[p] : decodeSeconds
             return Result(text: text, tokens: ids, promptTokens: promptLengths[p], ttft: ttft,
                           decodeTokensPerSecond: Double(max(ids.count - 1, 0)) / max(secs, 1e-9),
-                          stoppedBy: stopped[p], tiles: pages[p].prep.grid)
+                          stoppedBy: stopped[p],
+                          // Optional, not force-unwrapped: an unreached page has no tile grid.
+                          tiles: pages[p].prep?.grid ?? (w: 0, h: 0))
         }
     }
 

@@ -124,7 +124,7 @@ private struct IndexStatusRow: View {
                     }
                     if activeCounts.total > 0 {
                         ProgressView(value: overall)
-                        Text("\(activeCounts.done.formatted()) / \(activeCounts.total.formatted()) files")
+                        Text("\(activeCounts.done.formatted()) of \(activeCounts.total.formatted()) files")
                             .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                     }
                 }
@@ -203,7 +203,7 @@ private struct ActivityTab: View {
                         Spacer()
                         if let rp, rp.total > 0, rp.done < rp.total,
                            model.isIndexing || model.activeRoots.contains(url.path) {
-                            Text("\(rp.done.formatted()) / \(rp.total.formatted())")
+                            Text("\(rp.done.formatted()) of \(rp.total.formatted())")
                                 .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                         } else if (model.activeRoots.contains(url.path) || model.isFolderQueued(url)
                                     || (model.isIndexing && (rp?.total ?? 0) == 0))
@@ -231,7 +231,7 @@ private struct ActivityTab: View {
                             Spacer()
                             if let rp, rp.total > 0, rp.done < rp.total,
                                model.isIndexing || model.activeRoots.contains(source.key) {
-                                Text("\(rp.done.formatted()) / \(rp.total.formatted())")
+                                Text("\(rp.done.formatted()) of \(rp.total.formatted())")
                                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                             } else if model.activeRoots.contains(source.key) || model.isPhotoSourceQueued(source) {
                                 ProgressView().controlSize(.small)
@@ -268,11 +268,17 @@ private struct ActivityTab: View {
         // the pending-off state so the switch doesn't snap back to ON under the dialog.
         let on = model.kindEnabled(k) && model.pendingDisable?.kind != k
         HStack(spacing: 8) {
-            Image(systemName: "line.3.horizontal").foregroundStyle(.tertiary).font(.callout)
+            // No drag grip. The whole row is the drag source (`.draggable` below), and a standing
+            // `line.3.horizontal` handle is an iOS edit-mode idiom - macOS reorders rows by
+            // dragging them, with nothing drawn. The footer says so.
             Label(k.title, systemImage: k.symbol)
             Spacer()
-            Toggle("", isOn: Binding(get: { on }, set: { v in Task { await model.toggleKind(k, on: v) } }))
-                .labelsHidden().toggleStyle(.switch).controlSize(.mini)
+            // Titled, then hidden: `Toggle("")` leaves VoiceOver reading an unnamed switch. And no
+            // `.controlSize(.mini)` - the switch two sections down ("Generate tags") is the
+            // default size, and two switch sizes in one window is the kind of thing you see
+            // without being able to name it.
+            Toggle(k.title, isOn: Binding(get: { on }, set: { v in Task { await model.toggleKind(k, on: v) } }))
+                .labelsHidden().toggleStyle(.switch)
         }
         .opacity(on ? 1 : 0.55)
     }
@@ -537,7 +543,7 @@ private struct PerformanceTab: View {
                     } minimumValueLabel: {
                         Text("Off").font(.caption2).foregroundStyle(.tertiary)
                     } maximumValueLabel: {
-                        Text("\(Int(memoryCeiling))").font(.caption2).foregroundStyle(.tertiary)
+                        Text("\(Int(memoryCeiling)) GB").font(.caption2).foregroundStyle(.tertiary)
                     }
                     .labelsHidden()
                     // Locked while the paper run holds the cap. Settings is its own window, so this
@@ -559,7 +565,7 @@ private struct PerformanceTab: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
-                LabeledContent("Benchmark This Mac") {
+                LabeledContent("Benchmark this Mac") {
                     HStack(spacing: 8) {
                         Button("Run benchmark") { Task { await model.runProfiling() } }
                             .controlSize(.small)
@@ -631,9 +637,7 @@ private struct MemoryBreakdown: View {
          ("Other", Color(nsColor: .systemGray), sample.other, "App, thumbnails, database cache, frameworks")]
     }
 
-    private func fmt(_ bytes: Int) -> String {
-        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .memory)
-    }
+    private func fmt(_ bytes: Int) -> String { ByteSize.memory(bytes) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -717,9 +721,7 @@ private struct DiskBreakdown: View {
         }
     }
 
-    private func fmt(_ bytes: Int64) -> String {
-        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
-    }
+    private func fmt(_ bytes: Int64) -> String { ByteSize.file(bytes) }
 
     private var total: Int64 { max(1, entries.reduce(0) { $0 + $1.bytes }) }
 
@@ -826,7 +828,7 @@ private struct HistoryTab: View {
         // detail moves to its tooltip, where it is there when wanted and silent when not.
         Form {
             Section {
-                Picker("Add searches to History", selection: Binding(get: { model.historyMode }, set: { model.historyMode = $0 })) {
+                Picker("Add searches to history", selection: Binding(get: { model.historyMode }, set: { model.historyMode = $0 })) {
                     ForEach(HistoryMode.allCases) { Text($0.title).tag($0) }
                 }
                 .help(model.historyMode.detail)
@@ -907,7 +909,7 @@ private struct IndexTab: View {
                               + "downloads them or leaves them out.")
                 }
                 if model.diskUse.isEmpty {
-                    LabeledContent("Size", value: ByteCountFormatter.string(fromByteCount: model.dbSizeBytes, countStyle: .file))
+                    LabeledContent("Size", value: ByteSize.file(model.dbSizeBytes))
                 } else {
                     DiskBreakdown(entries: model.diskUse)
                 }
@@ -926,7 +928,7 @@ private struct IndexTab: View {
                         }
                         ProgressView(value: Double(m.done), total: Double(m.total))
                             .progressViewStyle(.linear)
-                        Text("Frees \(ByteCountFormatter.string(fromByteCount: m.bytesToReclaim, countStyle: .file)) when it finishes.")
+                        Text("Frees \(ByteSize.file(m.bytesToReclaim)) when it finishes.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -1104,6 +1106,8 @@ private struct OCRTab: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
+            OCRCacheSection()
+
             Section {
                 // One row, not two: a second row draws a separator across the section, and there is
                 // nothing on either side of it worth separating. The editor also drops its own
@@ -1115,6 +1119,18 @@ private struct OCRTab: View {
                         .frame(height: 210)
                         .onChange(of: prompt) { _, new in OCRSession.Settings.customPrompt = new }
                     HStack {
+                        // EXAMPLES, NOT PRESETS. A preset changes the shape of the output from
+                        // behind a name nobody can judge; an example lands IN the box, where it can
+                        // be read and edited first. Each is a whole prompt - a fragment appended to
+                        // the default would contradict rules the default has already given.
+                        Menu("Examples") {
+                            ForEach(OCRPromptExample.all) { example in
+                                Button(example.title) { prompt = example.text }
+                            }
+                        }
+                        .menuStyle(.borderlessButton)
+                        .fixedSize()
+                        .controlSize(.small)
                         Spacer()
                         Button("Restore Default") { prompt = OCRModel.defaultPrompt }
                             .controlSize(.small)
@@ -1124,10 +1140,105 @@ private struct OCRTab: View {
             } header: {
                 Text("Prompt")
             } footer: {
-                Text("Sent with every page; it shapes the output.")
+                Text("Sent with every page. Changing it invalidates the cache.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
+    }
+}
+
+/// Whole prompts a reader can start from, not fragments to append: the default already states
+/// rules about LaTeX, tables and headers, and a fragment added after it contradicts them silently.
+private struct OCRPromptExample: Identifiable {
+    let title: String
+    let text: String
+    var id: String { title }
+
+    static let all: [OCRPromptExample] = [
+        OCRPromptExample(
+            title: "Plain text, no layout",
+            text: "Transcribe every word on this page as plain text, in reading order. "
+                + "Do not use Markdown, tables or LaTeX. Do not describe the page."),
+        OCRPromptExample(
+            title: "Tables only",
+            text: "Transcribe only the tables on this page, as Markdown tables. "
+                + "Keep every cell, including empty ones. Ignore all other text."),
+        OCRPromptExample(
+            title: "Keep line breaks",
+            text: "Transcribe this page as Markdown, preserving the original line breaks "
+                + "exactly as they appear rather than reflowing paragraphs."),
+        OCRPromptExample(
+            title: "Translate to English",
+            text: "Transcribe this page and translate the result into English, as Markdown. "
+                + "Keep the layout, tables and headings of the original."),
+    ]
+}
+
+/// Transcripts already produced, kept as Markdown so the same page is never decoded twice.
+///
+/// The folder and the Clear button are on the pane, not behind a disclosure: a cache whose
+/// location cannot be seen and whose contents cannot be removed is a folder that only grows.
+private struct OCRCacheSection: View {
+    @State private var enabled = OCRCache.isEnabled
+    @State private var folder = OCRCache.directory
+    @State private var confirmingClear = false
+
+    var body: some View {
+        Section {
+            Toggle("Reuse saved transcripts", isOn: $enabled)
+                .onChange(of: enabled) { _, new in OCRCache.isEnabled = new }
+
+            // The Storage tab's Location rows, exactly: the path takes the whole value side of the
+            // label line and the buttons drop to a second line, so a long path never squeezes them
+            // into heavy truncation. Same shape here means one layout to learn, not two.
+            VStack(spacing: 6) {
+                HStack(spacing: 8) {
+                    Text("Location")
+                    Spacer()
+                    Text((folder.path as NSString).abbreviatingWithTildeInPath)
+                        .font(.caption.monospaced()).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                        .help(folder.path)
+                }
+                HStack(spacing: 8) {
+                    Spacer()
+                    Button("Change\u{2026}") { choose() }
+                    Button("Reveal in Finder") {
+                        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                        NSWorkspace.shared.activateFileViewerSelecting([folder])
+                    }
+                    Button("Clear\u{2026}") { confirmingClear = true }
+                }
+                .controlSize(.small)
+            }
+        } header: {
+            Text("Cache")
+        } footer: {
+            Text("Pages are saved as Markdown and reused while the file and prompt are unchanged.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        // The folder is the user's to choose, so Clear names it. Only files this cache wrote are
+        // removed - the name test in OCRCache - so anything else in the folder survives it.
+        .confirmationDialog("Clear the transcript cache?", isPresented: $confirmingClear) {
+            Button("Clear Cache", role: .destructive) { OCRCache.clear() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(folder.path)
+        }
+    }
+
+    private func choose() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.directoryURL = folder
+        panel.prompt = "Choose"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        // Nothing is MOVED. The old transcripts stay where they are, valid, and re-pointing at
+        // that folder finds them again - which is what makes this safe to try.
+        OCRCache.directory = url
+        folder = url
     }
 }

@@ -402,7 +402,9 @@ private struct PageThumb: View {
 
     private var stateDescription: String {
         switch page.state {
-        case .done: return "\(page.tokens) tokens"
+        // A restored page has no counters - nothing decoded it this time - so it says what it
+        // is rather than "0 tokens".
+        case .done: return page.restored ? "cached" : "\(page.tokens) tokens"
         case .running: return "transcribing"
         case .failed: return "could not be transcribed"
         case .pending: return "not transcribed yet"
@@ -688,6 +690,38 @@ final class OCRSourceTextView: NSTextView {
         guard !urls.isEmpty else { return super.performDragOperation(sender) }
         onFiles?(urls)
         return true
+    }
+
+    /// The other direction: take a passage OUT of a transcript and search the index for it.
+    ///
+    /// Added to the text view's own selection menu, above Copy, where macOS puts "Look Up" and
+    /// "Search with Google" - so it reads as one of the system's text actions rather than as an
+    /// app feature bolted on. Named the way those are: the phrase itself, quoted and elided, so the
+    /// menu says what it will search for.
+    override func menu(for event: NSEvent) -> NSMenu? {
+        guard let menu = super.menu(for: event) else { return nil }
+        let selected = (string as NSString).substring(with: selectedRange())
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !selected.isEmpty else { return menu }
+        let item = NSMenuItem(title: "Search for \u{201C}\(Self.elided(selected))\u{201D}",
+                              action: #selector(searchForSelection(_:)), keyEquivalent: "")
+        item.target = self
+        menu.insertItem(item, at: 0)
+        menu.insertItem(.separator(), at: 1)
+        return menu
+    }
+
+    @objc private func searchForSelection(_ sender: Any?) {
+        let selected = (string as NSString).substring(with: selectedRange())
+        AppModel.shared?.searchForText(selected)
+    }
+
+    /// A menu title is one line. Apple elides the middle of a long phrase here; so does this.
+    static func elided(_ s: String, max: Int = 40) -> String {
+        let flat = s.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).joined(separator: " ")
+        guard flat.count > max else { return flat }
+        let head = flat.prefix(max - 12), tail = flat.suffix(9)
+        return "\(head)\u{2026}\(tail)"
     }
 }
 
@@ -1123,11 +1157,20 @@ private struct ProgressReadout: View {
             HStack(spacing: 10) {
                 indicator
                 VStack(alignment: .leading, spacing: 1) {
+                    // Both lines are counters that change while you are looking at them, so the
+                    // digits roll instead of cutting. `numericText(value:)` is given the number
+                    // itself so the roll goes the way the count is going - a page finishing rolls
+                    // up, a rate dropping rolls down. No library: this is macOS 14 system API,
+                    // the same family as the `.symbolEffect(.replace)` on the chip's buttons.
                     Text(headline)
                         .font(.callout.weight(.medium))
+                        .contentTransition(.numericText(value: Double(session.queueCompleted)))
+                        .animation(.snappy(duration: 0.28), value: session.queueCompleted)
                     Text(detail)
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
+                        .contentTransition(.numericText(value: session.currentTokensPerSecond))
+                        .animation(.snappy(duration: 0.28), value: session.currentTokensPerSecond)
                 }
 
                 if session.isBusy && !session.isFollowingRun {

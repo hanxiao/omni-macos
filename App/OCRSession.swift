@@ -65,6 +65,12 @@ final class OCRSession {
         /// Where the page came from, so Quick Look can show the original at full size.
         var source: Source = .none
         var state: PageState = .pending
+        /// Came back from the transcript cache rather than from a decode. The counters below are
+        /// zero for such a page and must not be read as a measurement of anything.
+        var restored: Bool = false
+        /// The decode was cut short by a stop, so the text is however far it got. Kept on screen,
+        /// never written to the cache - see `cacheStore`.
+        var truncatedByStop: Bool = false
         /// Which drop this page arrived in. The readout counts within a batch, so opening a second
         /// file does not renumber the run the reader is watching.
         var batch: Int = 0
@@ -510,6 +516,31 @@ final class OCRSession {
     private(set) var prefilled = 0
     private(set) var prefillTarget = 0
     @ObservationIgnored private var previewCache: [Int: URL] = [:]
+    /// Pages whose cached transcript is still being looked up. The run loop skips them, so a page
+    /// that is about to be restored is not decoded in the moment before the lookup lands. Emptied
+    /// by `applyCacheHits`, which then starts the run for whatever actually missed.
+    @ObservationIgnored private var awaitingCache: Set<Int> = []
+    /// The variant the run in flight is using, so a finished page is cached under the model that
+    /// produced it rather than under whichever one happens to be installed when it lands.
+    @ObservationIgnored private var runVariant: OCRModelCatalog.Variant?
+    /// When the user last asked the run to hold or stop, for the gated latency lines below. The
+    /// question these answer is the one a reader actually asks of a Pause button: how long after
+    /// the click does anything happen.
+    @ObservationIgnored private var interruptAskedAt: Date?
+    @ObservationIgnored private var firstTokenPending = true
+
+    private func notePauseHeld() {
+        guard let asked = interruptAskedAt else { return }
+        interruptAskedAt = nil
+        omniPerfLog(String(format: "ocr-pause-held %.0fms", -asked.timeIntervalSinceNow * 1000))
+    }
+
+    /// Called where the decode loop actually leaves, so a Stop can be timed the same way.
+    private func noteRunEnded() {
+        guard let asked = interruptAskedAt else { return }
+        interruptAskedAt = nil
+        omniPerfLog(String(format: "ocr-stop-honoured %.0fms", -asked.timeIntervalSinceNow * 1000))
+    }
     /// Bumped by every drop, so pages carry the batch they came in with.
     private var batchCount = 0
     /// Never reused, unlike an index. Ids used to be `documents.count + n`, so closing a tab and
@@ -599,18 +630,138 @@ final class OCRSession {
 
         renderThumbnails(from: firstNewPage, token: runToken)
 
-        // A run already in flight picks the new jobs up on its own: the loop reads `jobs` by index
-        // and the array only ever grows. Only a workspace with nothing running needs starting.
-        if !isBusy {
-            gate = OCRRunGate()
-            isPaused = false
-            isHolding = false
-            elapsed = 0
-            resetRate()
-            phase = .loading
-            readoutVisible = true
-            willRun?()
-            run(modelDir: installed.dir, variant: installed.variant, token: runToken)
+        // The cache is consulted BEFORE the run starts, and the run is started from the lookup's
+        // continuation. That order is what lets a document which is entirely cached come back
+        // without loading four and a half gigabytes of weights to discover it has no work.
+        //
+        // The lookup is a file read per page, so it happens off the main actor - the pages, their
+        // thumbnails and the tab are already on screen by the time it begins.
+        let arrived = Array(firstNewPage ..< pages.count)
+        if OCRCache.isEnabled {
+            awaitingCache.formUnion(arrived)
+            restoreFromCache(arrived, variant: installed.variant, token: runToken)
+        } else {
+            startRunIfNeeded(installed, token: runToken)
+        }
+    }
+
+    /// Start the run unless there is nothing to decode.
+    ///
+    /// A run already in flight picks new jobs up on its own: the loop reads `jobs` by index and the
+    /// array only ever grows. Only a workspace with nothing running needs starting - and only one
+    /// with a page still pending needs the model.
+    private func startRunIfNeeded(_ installed: InstalledModel, token: Int) {
+        guard runToken == token, !isBusy else { return }
+        guard pages.contains(where: { $0.state == .pending && !awaitingCache.contains($0.id) })
+        else {
+            // Every page came from the cache. The workspace is finished rather than idle - but a
+            // failure that is already on screen is not overwritten with success.
+            let failed: Bool = if case .failed = phase { true } else { false }
+            if !pages.isEmpty, !failed { phase = .finished }
+            return
+        }
+        gate = OCRRunGate()
+        isPaused = false
+        isHolding = false
+        elapsed = 0
+        resetRate()
+        phase = .loading
+        readoutVisible = true
+        willRun?()
+        run(modelDir: installed.dir, variant: installed.variant, token: runToken)
+    }
+
+    /// Look up the pages that just arrived, off the main actor, and hand what came back to
+    /// `applyCacheHits`.
+    private func restoreFromCache(_ ids: [Int], variant: OCRModelCatalog.Variant, token: Int) {
+        let prompt = Settings.prompt ?? OCRModel.defaultPrompt
+        let slug = variant.rawValue
+        let t0 = omniPerfEnabled ? Date() : nil
+        let wanted: [(id: Int, url: URL, page: Int?)] = ids.compactMap { id in
+            guard pages.indices.contains(id) else { return nil }
+            switch pages[id].source {
+            case .file(let url): return (id, url, nil)
+            case .pdfPage(let url, let index): return (id, url, index)
+            case .none: return nil
+            }
+        }
+        Task.detached(priority: .userInitiated) {
+            var hits: [(id: Int, text: String)] = []
+            for page in wanted {
+                if let text = OCRCache.read(source: page.url, page: page.page,
+                                            prompt: prompt, variant: slug) {
+                    hits.append((page.id, text))
+                }
+            }
+            let elapsed = t0.map { -$0.timeIntervalSinceNow * 1000 }
+            await MainActor.run { [weak self] in
+                if let elapsed {
+                    omniPerfLog(String(format: "ocr-cache-lookup %.1fms pages=%d hits=%d",
+                                       elapsed, wanted.count, hits.count))
+                }
+                self?.applyCacheHits(hits, of: ids, token: token)
+            }
+        }
+    }
+
+    /// Put the restored transcripts in, release the pages that missed, and start the run for them.
+    private func applyCacheHits(_ hits: [(id: Int, text: String)], of ids: [Int], token: Int) {
+        guard runToken == token else { return }
+        var restored = 0
+        for hit in hits where pages.indices.contains(hit.id) && pages[hit.id].state == .pending {
+            texts[hit.id] = hit.text
+            pages[hit.id].state = .done
+            pages[hit.id].restored = true
+            lastDoneIndex = hit.id
+            restored += 1
+        }
+        awaitingCache.subtract(ids)
+        if restored > 0 {
+            if !find.isEmpty { rebuildMatches() }
+            post(notice: restored == 1 ? "Restored 1 page" : "Restored \(restored) pages",
+                 symbol: "clock.arrow.circlepath", seconds: 3)
+        }
+        guard let installed = Self.installedModel() else { return }
+        startRunIfNeeded(installed, token: token)
+        // A run that was already winding down may have taken its LAST look at the queue while
+        // these pages were still held back, and then finished - which would leave the ones that
+        // missed pending with nothing running. Narrow, but the cost of losing it is a document
+        // that never transcribes, so it is checked once more after the run has settled.
+        if isBusy {
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .milliseconds(400))
+                guard let self, self.runToken == token,
+                      let installed = Self.installedModel() else { return }
+                self.startRunIfNeeded(installed, token: token)
+            }
+        }
+    }
+
+    /// Save a finished page's Markdown. Off the main actor because it is a file write, and skipped
+    /// for a restored page, which came from there.
+    private func cacheStore(_ index: Int) {
+        guard OCRCache.isEnabled, pages.indices.contains(index), !pages[index].restored,
+              // NEVER cache a page a STOP cut short. A cancelled row still carries the text it
+              // managed to decode, and the backstop in `runGroup` settles it as `.done` rather
+              // than throwing that away - which is right on screen, where the reader can see it is
+              // half a page. It is wrong on disk: the cut is wherever the user happened to press
+              // Stop, so caching it would serve half a page as the finished transcript for good.
+              // `.cap` and `.loopGuard` are cached, because those are the model's own ends and a
+              // re-run reproduces them exactly.
+              !pages[index].truncatedByStop,
+              let variant = runVariant ?? Self.installedModel()?.variant else { return }
+        let text = texts.indices.contains(index) ? texts[index] : ""
+        guard !text.isEmpty else { return }
+        let source: (url: URL, page: Int?)
+        switch pages[index].source {
+        case .file(let url): source = (url, nil)
+        case .pdfPage(let url, let page): source = (url, page)
+        case .none: return
+        }
+        let prompt = Settings.prompt ?? OCRModel.defaultPrompt
+        let slug = variant.rawValue
+        Task.detached(priority: .utility) {
+            OCRCache.write(text, source: source.url, page: source.page, prompt: prompt, variant: slug)
         }
     }
 
@@ -637,6 +788,8 @@ final class OCRSession {
         editSectionsByDocument = [:]
         previewCache = [:]
         batchCount = 0
+        awaitingCache = []
+        runVariant = nil
         find = ""
         notice = nil
     }
@@ -647,6 +800,7 @@ final class OCRSession {
     /// discarded or resumed from a partial transcript.
     func pause() {
         guard isBusy else { return }
+        interruptAskedAt = omniPerfEnabled ? Date() : nil
         gate.pause()
         isPaused = true
     }
@@ -664,6 +818,12 @@ final class OCRSession {
     /// outright: it is the only thing that can record what the interrupted page managed to decode,
     /// and killing it mid-page leaves that page stuck in `.running` with a spinner forever.
     func cancel() {
+        // ONLY when there is a run to interrupt. `open()` calls `reset()` which calls this, so an
+        // unconditional stamp here is set at launch and every "stop latency" it then reports is
+        // really app-open-to-run-end. Three measurements were thrown away to that before the
+        // arithmetic gave it up: a run reported 29.2 s for a keystroke sent at 31 s.
+        if omniPerfEnabled, isBusy { interruptAskedAt = Date() }
+        stoodDown = []          // an explicit Stop is not something to resume from
         gate.stop()
         isPaused = false
         isHolding = false
@@ -708,10 +868,30 @@ final class OCRSession {
 
     /// Entering and leaving OCR mode. The model is loaded on first use and dropped on the way out,
     /// so 4.53 GB is only resident while the user is actually transcribing something.
-    func activate() { onModelResident?(true) }
+    func activate() {
+        onModelResident?(true)
+        resumeAfterStandDown()
+    }
+
+    /// Pages a STAND-DOWN left unreached - leaving OCR mode, not a Stop. Empty after an explicit
+    /// Stop, which is the distinction the resume below depends on.
+    @ObservationIgnored private var stoodDown: Set<Int> = []
 
     func deactivate() {
+        // LEAVING OCR MODE IS NOT A STOP, and until now it produced the identical state. Switching
+        // to search to look something up mid-document cancelled the run and left every unreached
+        // page dimmed, to be clicked back one at a time. The pages that were still queued are
+        // remembered here and re-queued on the way back in.
+        //
+        // `isBusy` is the whole test: if the user had already stopped the run, nothing was in
+        // flight and nothing is owed a resume.
+        // Captured BEFORE `cancel()` - which marks these pages `.stopped` - and re-assigned after,
+        // because `cancel()` deliberately clears the debt (an explicit Stop has nothing to resume).
+        let owed = isBusy
+            ? Set(pages.filter { $0.state == .pending || $0.state == .running }.map(\.id))
+            : []
         cancel()
+        stoodDown = owed
         work = nil
         runToken += 1
         // Releasing 4.5 GB of weights is 80 ms of work with nothing to show for it, and it was
@@ -724,7 +904,28 @@ final class OCRSession {
         onModelResident?(false)
     }
 
+    /// Put a stand-down's unreached pages back in the queue and start the run again.
+    ///
+    /// Only the pages the stand-down itself left behind, and only those still sitting `.stopped` -
+    /// so a page the user had stopped earlier stays stopped, and a page that settled with partial
+    /// text keeps what it has rather than silently restarting.
+    private func resumeAfterStandDown() {
+        let owed = stoodDown
+        stoodDown = []
+        guard !owed.isEmpty, !isBusy, let installed = Self.installedModel() else { return }
+        var requeued = 0
+        for index in pages.indices where owed.contains(pages[index].id) && pages[index].state == .stopped {
+            pages[index].state = .pending
+            requeued += 1
+        }
+        guard requeued > 0 else { return }
+        post(notice: requeued == 1 ? "Resumed 1 page" : "Resumed \(requeued) pages",
+             symbol: "play.circle", seconds: 3)
+        startRunIfNeeded(installed, token: runToken)
+    }
+
     func clear() {
+        stoodDown = []
         cancel()
         work?.cancel(); work = nil
         // Past this point the old run's writes must not land: `pages` and `texts` are about to
@@ -740,6 +941,8 @@ final class OCRSession {
         userPinnedSelection = false
         lastDoneIndex = nil
         readoutVisible = false
+        awaitingCache = []
+        runVariant = nil
         notice = nil
         phase = .empty
     }
@@ -838,6 +1041,7 @@ final class OCRSession {
         // page 11 about how it was produced.
         let settings = (prompt: Settings.prompt, draftLength: Settings.draftLength,
                         loopGuard: Settings.loopGuard)
+        runVariant = installed
         let gate = self.gate
         ticker = Task { [weak self] in
             while !Task.isCancelled {
@@ -874,6 +1078,11 @@ final class OCRSession {
                     self.loadProgress = nil
                 }
                 guard self.runToken == token else { return }
+                // The two boundaries a stop can land between: the weights are up, but no page has
+                // produced a token yet. That window is the group prologue - every page of the
+                // group rasterised, then `rampRows` of them prefilled - and it is the one stretch
+                // of a run with no decode step to carry a cancellation check.
+                omniPerfLog("ocr-model-ready")
                 self.markPreSettled()
                 self.phase = .running
 
@@ -887,12 +1096,14 @@ final class OCRSession {
                     // The next PENDING page, wherever it is - not a cursor that only moves forward.
                     // A page re-queued by clicking its thumbnail can sit behind the last one done,
                     // and a drop that lands mid-run appends ahead of it; both are just "pending".
-                    guard let index = self.pages.firstIndex(where: { $0.state == .pending }),
-                          self.jobs.indices.contains(index) else { break }
+                    guard let index = self.pages.firstIndex(where: {
+                        $0.state == .pending && !self.awaitingCache.contains($0.id)
+                    }), self.jobs.indices.contains(index) else { break }
                     let job = self.jobs[index]
 
                     // A pause holds here, between pages, and nowhere else.
                     if gate.isPaused {
+                        self.notePauseHeld()
                         self.isHolding = true
                         while gate.isPaused, !gate.isStopped, self.runToken == token {
                             try? await Task.sleep(for: .milliseconds(120))
@@ -912,7 +1123,9 @@ final class OCRSession {
                     // and a file opened mid-run is a different thing the reader dropped, not part
                     // of what they are watching. A multi-file drop is a single batch, so several
                     // files opened together still decode together.
-                    let pending = self.pages.indices.filter { self.pages[$0].state == .pending }
+                    let pending = self.pages.indices.filter {
+                        self.pages[$0].state == .pending && !self.awaitingCache.contains($0)
+                    }
                     let queued = pending.first.map { first in
                         pending.filter { self.pages[$0].batch == self.pages[first].batch }
                     } ?? []
@@ -995,6 +1208,7 @@ final class OCRSession {
                     self.liveTokens[index] = nil
                     if let result, !result.text.isEmpty {
                         self.texts[index] = result.text
+                        self.pages[index].truncatedByStop = result.stoppedBy == .cancelled
                         self.pages[index].tokens = result.tokens.count
                         self.pages[index].tokensPerSecond = result.decodeTokensPerSecond
                         self.pages[index].state = .done
@@ -1002,6 +1216,7 @@ final class OCRSession {
                         if !self.find.isEmpty { self.rebuildMatches() }
                         self.settledTokens += result.tokens.count
                         self.noteRate()
+                        self.cacheStore(index)
                     } else {
                         self.pages[index].state = .failed
                     }
@@ -1011,6 +1226,14 @@ final class OCRSession {
                 }
                 self.ticker?.cancel()
                 self.runningIndex = nil
+                if omniPerfEnabled {
+                    let done = self.pages.filter { $0.state == .done && !$0.restored }
+                    let tokens = done.reduce(0) { $0 + $1.tokens }
+                    let secs = Date().timeIntervalSince(started)
+                    omniPerfLog(String(format: "ocr-run-done pages=%d tokens=%d %.1fs %.0f tok/s",
+                                       done.count, tokens, secs, secs > 0 ? Double(tokens) / secs : 0))
+                }
+                self.noteRunEnded()
                 self.didFinishRun?()
                 if self.runToken == token {
                     self.phase = .finished
@@ -1054,7 +1277,22 @@ final class OCRSession {
         let jobs = group.map { self.jobs[$0] }
         let started = Date()
         let results: [OCRModel.Result] = await Task.detached(priority: .userInitiated) {
-            let images = jobs.compactMap { Self.load($0, documents: documents) }
+            // The whole group is rasterised before a single token is decoded - a PDF page render
+            // at 2384 px plus the Pillow-exact resample, per page - so on a wide group this is
+            // seconds of work with no stop check in it. Bail between pages: a stop pressed here
+            // used to wait for every page of the group to be rasterised AND the ramp prefilled.
+            let tRaster = omniPerfEnabled ? Date() : nil
+            var images: [OCRImage] = []
+            images.reserveCapacity(jobs.count)
+            for job in jobs {
+                if gate.isStopped { return [] }
+                guard let image = Self.load(job, documents: documents) else { continue }
+                images.append(image)
+            }
+            if let tRaster {
+                omniPerfLog(String(format: "ocr-group-rasterise %.0fms pages=%d",
+                                   -tRaster.timeIntervalSinceNow * 1000, images.count))
+            }
             guard images.count == jobs.count else { return [] }
             return (try? loaded.transcribeBatched(
                 images: images,
@@ -1067,6 +1305,7 @@ final class OCRSession {
                               slot < group.count else { return }
                         let index = group[slot]
                         guard self.texts.indices.contains(index) else { return }
+                        if self.firstTokenPending { self.firstTokenPending = false; omniPerfLog("ocr-first-token") }
                         self.texts[index] = update.text
                         // NOT `pages[index].tokens`: it is only read once a page is `.done`, and
                         // `settle` sets it from the final result. Writing it per update mutated
@@ -1146,6 +1385,7 @@ final class OCRSession {
     /// Record a finished page: its text, its counters, and the rate they feed.
     private func settle(_ index: Int, with result: OCRModel.Result) {
         texts[index] = result.text
+        pages[index].truncatedByStop = result.stoppedBy == .cancelled
         pages[index].tokens = result.tokens.count
         pages[index].tokensPerSecond = result.decodeTokensPerSecond
         pages[index].state = .done
@@ -1155,6 +1395,7 @@ final class OCRSession {
         liveTokens[index] = nil
         noteRate()
         if !find.isEmpty { rebuildMatches() }
+        cacheStore(index)
     }
 
     /// Start the rate clock at the first page's decode, not at the run's, so loading four and a
