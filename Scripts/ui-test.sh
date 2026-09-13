@@ -35,7 +35,10 @@ xcodebuild -resolvePackageDependencies -project Omni.xcodeproj -scheme OmniUITes
 # Informational only - the tests decide for themselves by asking the app, because the sandboxed
 # runner cannot see the user's Application Support.
 OCR_MODEL=0
-for d in "$HOME/Library/Application Support/Omni/ocr"/*; do
+# The weights live beside the embedding model as Omni/jina-ocr-v1-<slug>, not in an ocr/ of their
+# own - migrateLegacyInstall moved them at launch long ago. This still probed the legacy path, so
+# it printed "not installed" on every machine that has the model.
+for d in "$HOME/Library/Application Support/Omni"/jina-ocr-v1-*; do
   [ -e "$d/omni-ocr.json" ] && OCR_MODEL=1
 done
 [ "$OCR_MODEL" = 1 ] || echo "note: OCR model not installed - the OCR UI tests will skip"

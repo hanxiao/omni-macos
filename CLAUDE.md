@@ -1719,6 +1719,29 @@ fragment appended to the default contradicts rules the default has already given
   change the SHAPE of the output, which is not something a reader can judge from a preset's name.
 
 ## UI tests (UITests/, Scripts/ui-test.sh)
+- THE HANDOFF TESTS TAKE THEIR QUERY FROM A LAUNCH SEAM (`-omni.query`), not from typing. XCUITest
+  could not get text into the toolbar's `.searchable` field in that suite - exists / enabled /
+  hittable all true, `typeText` lands nowhere - so all three selection tests SKIPPED for a session
+  while looking like coverage. The seam goes through `applyParsedQuery`, the same door a typed
+  query uses, so chips, qualifier bar and store filter are built exactly as they would be.
+- CHAOS DOES TYPE, AND THIS WAS CHECKED RATHER THAN ASSUMED. The suspicion that `ChaosUITests` had
+  never typed either (it only asserted the app was alive) is WRONG: with an assertion on the
+  field's value it reports `field="porsche"` and passes. Anything that suite says about search is
+  therefore about search. It does flake ~1 run in 2 with "Failed to synthesize event: Timed out
+  while synthesizing event" mid-loop; re-run before believing a failure.
+- ASSERT THE SELECTION COUNT, NOT THAT THE WORKSPACE OPENED. `Transcribe.title` renders
+  "Transcribe 3 Items", so the File menu item's title is a readable statement of what the app
+  thinks is selected. Asserting only "did OCR mode open" passes with ONE row selected, which is how
+  a three-row test would have gone green while selecting one.
+- THE RESULTS LIST HAS NO ARROW-KEY SELECTION. It is a ScrollView of custom rows, not a `List`; its
+  only key handler is Return. Click selects, Cmd-click toggles, Shift-click extends - Finder's
+  modifiers, but no keyboard range. A test using shift-down to build a run selects nothing.
+- A MODIFIED CLICK IS `XCUIElement.perform(withKeyModifiers:)`, and it is main-actor isolated, so
+  the test method needs `@MainActor` (not the whole class - that makes `setUpWithError` fight the
+  isolated stored properties). A chord sent straight after one intermittently times out in the
+  event synthesizer; settle ~0.7 s first.
+- `Scripts/ui-test.sh` PROBED THE LEGACY OCR PATH (`Omni/ocr/*`) long after the weights moved to
+  `Omni/jina-ocr-v1-<slug>`, so it printed "OCR model not installed" on every machine that had it.
 - XCUITest, not synthetic events. `./Scripts/ui-test.sh [Class[/test]]` - never a bare
   `xcodebuild test`, same SE-0482 tokenizers artifact reason as Scripts/build-app.sh.
 - CGEvent key PRESSES from an external tool (cliclick `kp:`) never reach the app; typed TEXT does.

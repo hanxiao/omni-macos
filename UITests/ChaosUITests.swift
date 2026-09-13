@@ -191,7 +191,17 @@ final class ChaosUITests: XCTestCase {
 
         churnStop = true
 
-        // It has to still work at the end, not merely still be alive.
+        // IT HAS TO STILL WORK AT THE END, NOT MERELY STILL BE ALIVE - and for a long time this
+        // suite only checked the second half. Every `typeText` above goes at the toolbar's search
+        // field, and XCUITest cannot reliably get text into it: the field reports exists / enabled
+        // / hittable true and the text lands nowhere. So this ran hundreds of rounds of keystrokes
+        // that very likely never reached a query, and passed on liveness alone.
+        //
+        // The assertion below is now on the FIELD'S VALUE. If it fails, this suite is exercising
+        // event handling and not search, and its "no regression" result should not be trusted for
+        // anything about queries. The handoff suite works around the same limitation with the
+        // `-omni.query` launch seam; that seam deliberately is NOT used here, because chaos is
+        // about what typing does.
         focusSearch(app)
         app.typeKey("a", modifierFlags: .command)
         app.typeKey(XCUIKeyboardKey.delete, modifierFlags: [])
@@ -199,7 +209,12 @@ final class ChaosUITests: XCTestCase {
         sleep(3)
         XCTAssertEqual(app.state, .runningForeground, "app was not alive at the end")
         XCTAssertTrue(app.windows.firstMatch.exists, "window was gone at the end")
-        print("[chaos] completed \(rounds) interaction rounds")
+        let field = app.windows.firstMatch.searchFields.firstMatch
+        let typed = (field.value as? String) ?? ""
+        XCTAssertTrue(typed.contains("porsche"),
+                      "the search field holds \"\(typed)\" after typing - this suite is not "
+                      + "exercising search, only event handling")
+        print("[chaos] completed \(rounds) interaction rounds, field=\"\(typed)\"")
     }
 
     private func focusSearch(_ app: XCUIApplication) {

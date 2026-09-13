@@ -1,4 +1,4 @@
-import XCTest
+@preconcurrency import XCTest
 import PDFKit
 import AppKit
 
@@ -14,12 +14,12 @@ import AppKit
 /// OCR -> search: text selected in the transcript becomes the next query, literally (a sentence out
 /// of a document is full of colons and newlines that the query language would read as qualifiers).
 ///
-/// STATUS: THESE SKIP RATHER THAN PASS. The driver cannot get text into the toolbar's search field
-/// - it reports `exists/enabled/hittable` true and `typeText` lands nowhere, leaving the field
-/// empty, so no results appear and there is nothing to select. Worth knowing before trusting the
-/// other suites: `ChaosUITests` types into the same field and only ever asserts that the app is
-/// still alive, so it very likely never typed either. Fixing the field's automation seam would give
-/// all three suites real coverage. Until then these skip WITH DIAGNOSTICS rather than pass falsely.
+/// THE QUERY ARRIVES THROUGH A LAUNCH SEAM, not by typing. XCUITest cannot get text into the
+/// toolbar's search field - it reports `exists/enabled/hittable` true and `typeText` lands nowhere
+/// - so these tests skipped for a whole session while appearing to be coverage. `-omni.query`
+/// applies the query through `applyParsedQuery`, the same door a typed query uses, so the chips,
+/// the qualifier bar and the store filter are built exactly as they would be; only the keystrokes
+/// are skipped, and keystrokes are not what these tests are about.
 ///
 /// NOT COVERED HERE: the no-model case. `OCRModelCatalog` reads a fixed Application Support path
 /// that an isolated test cannot redirect, and on any machine with the model installed this suite
@@ -93,16 +93,32 @@ final class TranscribeHandoffUITests: XCTestCase {
         try png.write(to: corpus.appendingPathComponent(name))
     }
 
-    private func launchIsolated() -> XCUIApplication {
+    /// SCOPED TO PDFs in the query itself, so the first result is always transcribable. Without
+    /// `ext:pdf` the plain-text notes outrank the PDFs on a semantic query - the menu item is then
+    /// correctly DISABLED and the test fails for a reason that has nothing to do with the handoff.
+    private func launchIsolated(query: String = "ext:pdf porsche invoice") -> XCUIApplication {
         let app = XCUIApplication()
         app.launchArguments = [
             "-omni.dbDir", scratchDB.path,
             "-omni.roots", "(\"\(corpus.path)\")",
             "-omni.serving.enabled", "NO",
             "-omni.uiChaos", "YES",
+            "-omni.query", query,
         ]
         app.launch()
         return app
+    }
+
+    /// Results on screen, or a diagnostic that says what IS on screen. Indexing the corpus and
+    /// loading the embedding model both happen before the first result, so this waits rather than
+    /// sleeping a guessed number of seconds.
+    @discardableResult
+    private func waitForResults(_ app: XCUIApplication) -> Bool {
+        if app.windows.firstMatch.staticTexts["scan0.pdf"].waitForExistence(timeout: 180) { return true }
+        let f = searchField(app)
+        print("[handoff] field value=\(f.value as? String ?? "nil") placeholder=\(f.placeholderValue ?? "nil")")
+        print("[handoff] TREE >>>\n\(app.windows.firstMatch.debugDescription)\n<<< TREE")
+        return false
     }
 
     private func searchField(_ app: XCUIApplication) -> XCUIElement {
@@ -115,45 +131,20 @@ final class TranscribeHandoffUITests: XCTestCase {
         (searchField(app).placeholderValue ?? "").contains("Find in document")
     }
 
-    private func runQuery(_ app: XCUIApplication, _ text: String) {
-        let field = searchField(app)
-        if field.exists, field.isHittable { field.click() } else { app.typeKey("f", modifierFlags: .command) }
-        app.typeKey("a", modifierFlags: .command)
-        app.typeKey(XCUIKeyboardKey.delete, modifierFlags: [])
-        app.typeText(text)
-        sleep(3)
-        app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])   // leave the suggestion list
-    }
-
-    /// SCOPED TO PDFs, so the first result is always transcribable. Without `ext:pdf` the plain-text
-    /// notes outrank the PDFs on a semantic query - the menu item is then correctly DISABLED and the
-    /// test fails for a reason that has nothing to do with the handoff.
-    ///
-    /// Waits for a row rather than sleeping a guessed number of seconds: the corpus is tiny but the
-    /// first query also waits on the embedding model's first load.
-    @discardableResult
-    private func searchForPDFs(_ app: XCUIApplication) -> Bool {
-        for attempt in 0 ..< 8 {
-            runQuery(app, "ext:pdf porsche invoice")
-            if app.windows.firstMatch.staticTexts["scan0.pdf"].waitForExistence(timeout: 20) { return true }
-            if attempt < 7 { sleep(5) }     // still indexing; ask again
-        }
-        // Say what IS on screen before giving up. A bare skip sends the next person back to
-        // guessing at four minutes a guess, which is how this test was debugged the slow way once.
-        // Say what IS on screen before giving up. A bare skip sends the next person back to
-        // guessing at four minutes a guess, which is how this was debugged the slow way once.
-        let f = searchField(app)
-        print("[handoff] field exists=\(f.exists) enabled=\(f.isEnabled) hittable=\(f.isHittable) "
-              + "value=\(f.value as? String ?? "nil") placeholder=\(f.placeholderValue ?? "nil")")
-        print("[handoff] TREE >>>\n\(app.windows.firstMatch.debugDescription)\n<<< TREE")
-        return false
-    }
-
     /// Cmd-Opt-T is the menu item, which is the point: it is reachable without a right-click and it
     /// acts on whatever is selected.
     private func transcribeSelection(_ app: XCUIApplication) {
-        app.typeKey("t", modifierFlags: [.command, .option])
-        sleep(4)
+        // A chord sent straight after `perform(withKeyModifiers:)` intermittently fails with
+        // "Timed out while synthesizing event" - the modified click leaves the synthesizer busy,
+        // and the next chord lands on it. Settle first, and retry once rather than failing the
+        // test for a harness stumble that says nothing about the handoff.
+        usleep(700_000)
+        for attempt in 0 ..< 2 {
+            app.typeKey("t", modifierFlags: [.command, .option])
+            sleep(4)
+            if inOCRMode(app) { return }
+            if attempt == 0 { usleep(700_000) }
+        }
     }
 
     private func backToSearch(_ app: XCUIApplication) {
@@ -164,42 +155,96 @@ final class TranscribeHandoffUITests: XCTestCase {
     func testSingleSelectionGoesToTheWorkspace() throws {
         let app = launchIsolated()
         XCTAssertTrue(app.wait(for: .runningForeground, timeout: 60), "app did not come up")
-        try XCTSkipUnless(searchForPDFs(app), "the corpus never produced a PDF result")
-        app.typeKey(XCUIKeyboardKey.downArrow, modifierFlags: [])
+        XCTAssertTrue(waitForResults(app), "the corpus never produced a PDF result")
+        row(app, "scan0.pdf").click()
+        let title = transcribeItemTitle(app)
+        XCTAssertEqual(title, "Transcribe",
+                       "one selected result read as \(title ?? "no Transcribe item")")
         transcribeSelection(app)
         XCTAssertTrue(inOCRMode(app),
                       "one selected result did not open the transcription workspace "
                       + "(placeholder was \(searchField(app).placeholderValue ?? "nil"))")
     }
 
-    func testContiguousAndNonContiguousSelections() throws {
+    /// What the File menu's Transcribe item is TITLED, which is the only readable statement of how
+    /// many results the app thinks are selected: `Transcribe.title` renders "Transcribe 3 Items".
+    /// Asserting on it turns "did the workspace open" into "did the app see the selection I built".
+    private func transcribeItemTitle(_ app: XCUIApplication) -> String? {
+        // Activate first: `menuBars` resolves against the FRONTMOST app, and a query made while
+        // something else owns the menu bar fails with "No matches found for Descendants matching
+        // type MenuBar" rather than returning nothing.
+        usleep(500_000)          // see transcribeSelection: let the event synthesizer settle
+        app.activate()
+        guard app.menuBars.firstMatch.waitForExistence(timeout: 10) else { return nil }
+        let file = app.menuBars.menuBarItems["File"]
+        guard file.waitForExistence(timeout: 5) else { return nil }
+        file.click()
+        defer { app.typeKey(XCUIKeyboardKey.escape, modifierFlags: []) }
+        // EXACTLY the selection item: "Transcribe" or "Transcribe 3 Items". A prefix match also
+        // catches "Transcribe a Document...", the mode toggle, which is always present and says
+        // nothing about the selection - the first version of this matched that and reported it as
+        // the answer for every shape.
+        let wanted = try? NSRegularExpression(pattern: "^Transcribe( \\d+ Items)?$")
+        for item in app.menuBars.menuItems.allElementsBoundByIndex {
+            let t = item.title
+            let range = NSRange(t.startIndex ..< t.endIndex, in: t)
+            if wanted?.firstMatch(in: t, range: range) != nil { return t }
+        }
+        return nil
+    }
+
+    private func row(_ app: XCUIApplication, _ name: String) -> XCUIElement {
+        app.windows.firstMatch.staticTexts[name]
+    }
+
+    /// A CONTIGUOUS run, built with SHIFT-CLICK - which is the gesture this list implements.
+    ///
+    /// Not shift-arrow: the results list is a ScrollView of custom rows, not a `List`, and it has
+    /// no arrow-key selection at all (its only key handler is Return). Shift-down therefore does
+    /// nothing, which this test caught by asserting the count instead of asserting that the
+    /// workspace opened - an assertion on "did OCR mode open" passes with one row selected and
+    /// would have reported a three-row selection as working.
+    @MainActor
+    func testContiguousSelectionCarriesEveryRow() throws {
         let app = launchIsolated()
         XCTAssertTrue(app.wait(for: .runningForeground, timeout: 60), "app did not come up")
-        try XCTSkipUnless(searchForPDFs(app), "the corpus never produced a PDF result")
+        XCTAssertTrue(waitForResults(app), "the corpus never produced a PDF result")
+        XCTAssertTrue(row(app, "scan2.pdf").waitForExistence(timeout: 30), "need three PDFs on screen")
 
-        // CONTIGUOUS: a run extended with shift-down, the way a keyboard user builds one.
-        app.typeKey(XCUIKeyboardKey.downArrow, modifierFlags: [])
-        app.typeKey(XCUIKeyboardKey.downArrow, modifierFlags: .shift)
-        app.typeKey(XCUIKeyboardKey.downArrow, modifierFlags: .shift)
+        row(app, "scan0.pdf").click()
+        XCUIElement.perform(withKeyModifiers: .shift) {
+            row(app, "scan2.pdf").click()      // extends across scan1
+        }
+
+        let title = transcribeItemTitle(app)
+        XCTAssertEqual(title, "Transcribe 3 Items",
+                       "a shift-extended run of three read as \(title ?? "no Transcribe item")")
         transcribeSelection(app)
         XCTAssertTrue(inOCRMode(app), "a contiguous multi-selection did not open the workspace")
+    }
 
-        backToSearch(app)
-        try XCTSkipUnless(searchForPDFs(app), "the corpus never produced a PDF result")
+    /// A NON-CONTIGUOUS set: cmd-click leaves a gap. The ordered selection is built by filtering
+    /// `results` by membership, so a gap should not be special - but that is exactly the kind of
+    /// claim worth pinning rather than assuming.
+    ///
+    /// The gesture is a real modified click (`perform(withKeyModifiers:)`). An earlier version of
+    /// this test took a `modifiers` parameter and then discarded it with `_ = modifiers`, so it
+    /// built a CONTIGUOUS selection and asserted the non-contiguous case against it.
+    @MainActor
+    func testNonContiguousSelectionCarriesEveryRow() throws {
+        let app = launchIsolated()
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 60), "app did not come up")
+        XCTAssertTrue(waitForResults(app), "the corpus never produced a PDF result")
+        XCTAssertTrue(row(app, "scan2.pdf").waitForExistence(timeout: 30), "need three PDFs on screen")
 
-        // NON-CONTIGUOUS: cmd-click leaves gaps in the selection. Clicked through the app's own
-        // coordinate space, so the events cannot land in another application.
-        let window = app.windows.firstMatch
-        func clickRow(_ n: Int, modifiers: XCUIElement.KeyModifierFlags) {
-            let dy = 0.18 + Double(n) * 0.09
-            guard dy < 0.95 else { return }
-            window.coordinate(withNormalizedOffset: CGVector(dx: 0.45, dy: dy))
-                .click(forDuration: 0.05, thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.45, dy: dy)))
-            _ = modifiers
+        row(app, "scan0.pdf").click()
+        XCUIElement.perform(withKeyModifiers: .command) {
+            row(app, "scan2.pdf").click()      // skips scan1 - that is the gap
         }
-        clickRow(0, modifiers: [])
-        window.typeKey(XCUIKeyboardKey.downArrow, modifierFlags: [])
-        window.typeKey(XCUIKeyboardKey.downArrow, modifierFlags: [.command, .shift])
+
+        let title = transcribeItemTitle(app)
+        XCTAssertEqual(title, "Transcribe 2 Items",
+                       "a cmd-click selection with a gap read as \(title ?? "no Transcribe item")")
         transcribeSelection(app)
         XCTAssertTrue(inOCRMode(app), "a non-contiguous multi-selection did not open the workspace")
     }
@@ -207,10 +252,13 @@ final class TranscribeHandoffUITests: XCTestCase {
     func testTranscriptSelectionBecomesTheNextQuery() throws {
         let app = launchIsolated()
         XCTAssertTrue(app.wait(for: .runningForeground, timeout: 60), "app did not come up")
-        try XCTSkipUnless(searchForPDFs(app), "the corpus never produced a PDF result")
-        app.typeKey(XCUIKeyboardKey.downArrow, modifierFlags: [])
+        XCTAssertTrue(waitForResults(app), "the corpus never produced a PDF result")
+        // CLICK, not an arrow key: this list has no arrow-key selection (see the contiguous test),
+        // so a down-arrow here selected nothing, the Transcribe item stayed disabled, and the test
+        // skipped with a message blaming the corpus.
+        row(app, "scan0.pdf").click()
         transcribeSelection(app)
-        try XCTSkipUnless(inOCRMode(app), "nothing transcribable in this corpus' results")
+        XCTAssertTrue(inOCRMode(app), "a selected PDF did not open the transcription workspace")
 
         // Give the transcription a chance to produce text, then select some of it and search for it.
         sleep(25)

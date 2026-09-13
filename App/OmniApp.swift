@@ -140,6 +140,27 @@ struct OmniApp: App {
                     model.ocrMode = true
                     ocr.open(urls: key.split(separator: ":").map { URL(fileURLWithPath: String($0)) })
                 }
+                // The same seam for a QUERY, and it exists because XCUITest cannot get text into
+                // the toolbar's search field: the field reports exists / enabled / hittable true
+                // and `typeText` lands nowhere, so a test that needs RESULTS on screen could only
+                // skip. Worth knowing that `ChaosUITests` types into that same field and asserts
+                // only that the app is still alive, so it very likely never typed either.
+                //
+                // This goes through `applyParsedQuery`, the same door a typed query uses, so the
+                // chips, the qualifier bar and the store filter are all built exactly as they
+                // would be - a seam that bypassed the parser would prove nothing about search.
+                .task {
+                    let query = UserDefaults.standard.string(forKey: "omni.query") ?? ""
+                    guard !query.isEmpty else { return }
+                    // Wait for the engine: a query fired at launch, before the model is resident,
+                    // returns nothing and the test reads as a product failure.
+                    for _ in 0 ..< 600 {
+                        if model.phase == .ready { break }
+                        try? await Task.sleep(for: .milliseconds(100))
+                    }
+                    model.applyParsedQuery(query)
+                    model.search()
+                }
                 .frame(minWidth: 820, minHeight: 520)
                 // A main-thread stall detector, off unless asked for with -omni.hangwatch YES.
                 // A timer on the main run loop only fires when the main thread is free, so the
