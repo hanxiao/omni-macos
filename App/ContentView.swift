@@ -659,7 +659,15 @@ struct ContentView: View {
             //
             // SECONDARY, not primary. Sampled from a side-by-side: Finder's title is a mid grey
             // (darkest pixel 160 against a 255 ground), where this was rendering near-black.
-            Text(t.name).font(.headline).foregroundStyle(.secondary).help(t.help)
+            //
+            // SF SEMIBOLD 15, not `.headline`. Measured off a real NSWindow's titlebar text field
+            // rather than matched by eye: it reports .SFNS-Semibold at 15.0pt, where `.headline`
+            // resolves to Bold 13 on macOS. Two points smaller and a weight heavier is exactly the
+            // mismatch that reads as "nearly Finder" beside a Finder window.
+            Text(t.name)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .help(t.help)
         }
     }
 
