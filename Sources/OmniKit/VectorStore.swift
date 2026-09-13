@@ -2984,6 +2984,12 @@ public final class VectorStore: @unchecked Sendable {
         private var db: OpaquePointer?
         private var opened = false
         private var shut = false
+        /// The same handle, reachable OFF the lane's queue so a newer request can cut short a walk
+        /// that is already running. Guarded because `interrupt` races `close`: the lock is held
+        /// across both the interrupt and the sqlite3_close, so the pointer cannot be freed between
+        /// the read and the call.
+        private let handleLock = NSLock()
+        private var interruptible: OpaquePointer?
         /// code -> kind name, this lane's own copy of `kinds`. Reloaded at most once per query when
         /// a code lands outside it, because the writer can mint a new kind at runtime.
         var kinds: [String] = []
@@ -3016,14 +3022,29 @@ public final class VectorStore: @unchecked Sendable {
             sqlite3_exec(handle, "PRAGMA wal_autocheckpoint=0;", nil, nil, nil)  // the writer checkpoints
             sqlite3_exec(handle, "PRAGMA query_only=1;", nil, nil, nil)          // last: nothing below writes
             db = handle
+            handleLock.lock(); interruptible = handle; handleLock.unlock()
             return handle
+        }
+
+        /// Abort whatever statement is running on this lane right now.
+        ///
+        /// Safe against a close (the lock covers both) and safe against arriving early: SQLite
+        /// documents that an interrupt raised while nothing is running is a no-op and does NOT
+        /// affect statements started after it returns, so this cannot abort its own caller's query.
+        func interrupt() {
+            handleLock.lock()
+            defer { handleLock.unlock() }
+            if let h = interruptible { sqlite3_interrupt(h) }
         }
 
         func close() {
             queue.sync {
                 shut = true
                 opened = true
+                handleLock.lock()
+                interruptible = nil
                 if let h = db { sqlite3_close(h); db = nil }
+                handleLock.unlock()
             }
         }
 
@@ -3330,9 +3351,28 @@ public final class VectorStore: @unchecked Sendable {
 
     /// Just the per-subfolder counts, for the browser's second pass. Same query as the one inside
     /// `indexedChildrenDetailed`; separated so the listing can land without waiting for it.
+    /// ONLY THE NEWEST REQUEST SURVIVES.
+    ///
+    /// The browser asks for these counts on every folder switch, and the answer is only ever wanted
+    /// for the folder currently on screen. Nothing used to say so: `.task(id: folder)` cancels when
+    /// the folder changes, but AppModel runs the call in a `Task.detached`, which does NOT inherit
+    /// cancellation - so every superseded 1.4 s subtree walk ran to completion anyway, serialized
+    /// behind the others on this lane. Clicking through ten folders queued about fourteen seconds
+    /// of walking that nobody was waiting for, and put the counts that WERE wanted at the back of
+    /// it. That is the "gets slower the more you click" shape.
+    ///
+    /// Two halves, because a backlog and a walk already in flight need different handling: a newer
+    /// request interrupts the running one, and each request re-checks on entry whether it has since
+    /// been superseded and drops out without touching the database.
     public func folderCounts(under folder: String) -> [String: (count: Int, newest: Double)] {
+        aggTicketLock.lock()
+        aggTicket &+= 1
+        let mine = aggTicket
+        aggTicketLock.unlock()
+        aggregateLane.interrupt()          // cut short an older walk that is already running
+
         let t0 = omniPerfEnabled ? Date() : nil
-        let agg = folderAggregates(under: folder)
+        let agg = folderAggregates(under: folder, ticket: mine)
         if let t0 {
             omniPerfLog(String(format: "browse-counts %.1fms folders=%d folder=%@",
                                -t0.timeIntervalSinceNow * 1000, agg.count, folder))
@@ -3340,13 +3380,40 @@ public final class VectorStore: @unchecked Sendable {
         return agg
     }
 
+    /// Serial number of the newest counts request. Superseded ones return nothing rather than walk
+    /// a subtree whose answer is already stale.
+    private let aggTicketLock = NSLock()
+    private var aggTicket: UInt64 = 0
+    /// How many subtree walks actually reached the database. The property that matters under fast
+    /// switching is "superseded requests do no work", and that is a COUNT, not a duration - a
+    /// synthetic subtree is microseconds deep, so a timing assertion on one passes whether the
+    /// supersede logic is there or not (it did).
+    private let aggWalksLock = NSLock()
+    private var aggWalks: UInt64 = 0
+    var aggregateWalksForTesting: UInt64 {
+        aggWalksLock.lock(); defer { aggWalksLock.unlock() }; return aggWalks
+    }
+
+    private func aggregateIsCurrent(_ ticket: UInt64) -> Bool {
+        aggTicketLock.lock()
+        defer { aggTicketLock.unlock() }
+        return ticket == aggTicket
+    }
+
     /// Per-immediate-child totals under `folder`: indexed files beneath it, and the newest
     /// `indexed_at` among them. One grouped pass over the `dirs` range scan the browser already
     /// uses, so it rides the same unique index.
-    private func folderAggregates(under folder: String) -> [String: (count: Int, newest: Double)] {
+    /// `ticket` is the supersede token from `folderCounts`; 0 means "not on the browse path" for
+    /// any other caller, which never drops out.
+    private func folderAggregates(under folder: String,
+                                  ticket: UInt64 = 0) -> [String: (count: Int, newest: Double)] {
         // THE AGGREGATE LANE. This is the only caller of it: 1.4 s on a 235k-directory subtree, and
         // it must never be what an interactive listing is waiting behind.
         onReader(aggregateLane, [:]) { h in
+            // Drained on entry: while this request sat in the lane's queue a newer folder was
+            // asked for, so the walk below is already answering the wrong question.
+            if ticket != 0, !self.aggregateIsCurrent(ticket) { return [:] }
+            self.aggWalksLock.lock(); self.aggWalks &+= 1; self.aggWalksLock.unlock()
             let pfx = folder + "/"
             var out: [String: (count: Int, newest: Double)] = [:]
             var st: OpaquePointer?
@@ -3360,7 +3427,12 @@ public final class VectorStore: @unchecked Sendable {
                 """, -1, &st, nil) == SQLITE_OK else { return [:] }
             sqlite3_bind_text(st, 1, pfx, -1, SQLITE_TRANSIENT)
             sqlite3_bind_text(st, 2, folder + "0", -1, SQLITE_TRANSIENT)
+            var rows = 0
             while sqlite3_step(st) == SQLITE_ROW {
+                // A partial answer is worse than none: it would write wrong counts into rows the
+                // browser then leaves alone. An interrupted or superseded walk yields nothing.
+                rows += 1
+                if ticket != 0, rows % 4096 == 0, !self.aggregateIsCurrent(ticket) { return [:] }
                 guard let c = sqlite3_column_text(st, 0) else { continue }
                 let name = String(String(cString: c).dropFirst(pfx.count).prefix { $0 != "/" })
                 guard !name.isEmpty else { continue }
@@ -3368,6 +3440,7 @@ public final class VectorStore: @unchecked Sendable {
                 out[name] = (prior.count + Int(sqlite3_column_int64(st, 1)),
                              Swift.max(prior.newest, sqlite3_column_double(st, 2)))
             }
+            if ticket != 0, !self.aggregateIsCurrent(ticket) { return [:] }
             return out
         }
     }

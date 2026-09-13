@@ -424,6 +424,81 @@ final class BrowseReaderTests: XCTestCase {
         XCTAssertEqual(counts["sub"]?.count, 202, "the counting lane was starved or wrong")
     }
 
+    /// CLICKING FAST, which is the gesture that actually got slower.
+    ///
+    /// Every switch asks for subtree counts, and only the newest answer is ever used - but nothing
+    /// said so: `.task(id: folder)` cancels on switch while AppModel runs the call in a
+    /// `Task.detached`, which does not inherit cancellation, so each superseded 1.4 s walk ran to
+    /// completion anyway and they serialized behind one another. Ten fast clicks queued roughly
+    /// fourteen seconds of walking nobody wanted, with the wanted answer last in line.
+    ///
+    /// Staged with a held lane, for the same reason as the lane test: a fixture subtree is
+    /// microseconds, so a backlog built from one would not reproduce anything.
+    func testFastSwitchingDoesNotQueueUpStaleCounts() throws {
+        let store = try seeded(tempDB())
+        defer { store.close() }
+        _ = store.folderCounts(under: "/root")            // open the lane
+
+        // Occupy the lane, so every request below has to queue behind it exactly as a real 1.4 s
+        // walk would.
+        let held = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            held.signal()
+            store.holdAggregateLaneForTesting(milliseconds: 1500)
+        }
+        held.wait()
+        usleep(50_000)
+
+        // Ten switches in flight at once, the way clicking through the sidebar produces them.
+        let before = store.aggregateWalksForTesting
+        let group = DispatchGroup()
+        for _ in 0 ..< 10 {
+            group.enter()
+            DispatchQueue.global().async {
+                _ = store.folderCounts(under: "/root")
+                group.leave()
+            }
+            usleep(10_000)
+        }
+        XCTAssertEqual(group.wait(timeout: .now() + 10), .success, "the backlog never drained")
+
+        // COUNTED, not timed. A synthetic subtree walks in microseconds, so a duration assertion
+        // here passes with the supersede logic removed - verified, it did. What has to hold is that
+        // the nine stale requests never touch the database at all.
+        let walks = store.aggregateWalksForTesting - before
+        XCTAssertLessThanOrEqual(walks, 2,
+                                 "\(walks) of 10 superseded count requests still walked the subtree; "
+                                 + "on the real index that is ~1.4s of wasted work each")
+
+        // And the newest request still answers correctly afterwards.
+        XCTAssertEqual(store.folderCounts(under: "/root")["sub"]?.count, 2,
+                       "the supersede logic dropped a request that was current")
+    }
+
+    /// A superseded request returns NOTHING rather than a half-walked subtree: a partial answer
+    /// would write wrong counts into rows the browser then leaves alone.
+    func testASupersededCountReturnsNothingRatherThanAPartialAnswer() throws {
+        let store = try seeded(tempDB())
+        defer { store.close() }
+        for i in 0 ..< 300 {
+            let p = "/root/big/d\(i % 30)/f\(i).txt"
+            try store.replace(path: p, chunks: [chunk(p)])
+        }
+        let stale = DispatchSemaphore(value: 0)
+        var staleResult: [String: (count: Int, newest: Double)] = [:]
+        DispatchQueue.global().async {
+            staleResult = store.folderCounts(under: "/root/big")
+            stale.signal()
+        }
+        // Supersede it immediately, repeatedly, so it is stale whether it is queued or mid-walk.
+        for _ in 0 ..< 40 { _ = store.folderCounts(under: "/root"); usleep(1_000) }
+        XCTAssertEqual(stale.wait(timeout: .now() + 10), .success)
+        if !staleResult.isEmpty {
+            // It won the race and was current - then it must be COMPLETE, not partial.
+            XCTAssertEqual(staleResult.count, 30, "a superseded walk returned a partial answer")
+        }
+    }
+
     // MARK: - Lifetime
 
     /// `close()` shuts the reader too. A browse after it returns empty rather than touching a
