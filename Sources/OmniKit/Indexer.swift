@@ -690,6 +690,13 @@ public final class Indexer: @unchecked Sendable {
                     feed.lock.unlock()
                 }
             feed.lock.lock()
+            // What a RESUME costs. `pauseIndexing` is a cancel, so every resume re-walks the whole
+            // tree even when nothing changed - this is the number that says whether replaying
+            // FSEvents instead would be worth its correctness risk.
+            if omniPerfEnabled {
+                omniPerfLog(String(format: "crawl-done %.2fs files=%d",
+                                   -passStart.timeIntervalSinceNow, counts.values.reduce(0, +)))
+            }
             // A root that yielded nothing still needs a total, or the sweep cannot tell "empty"
             // from "unreadable" - blindRoots is what protects an unreadable root from deletion.
             for r in filePaths { feed.totals[r] = counts[r] ?? 0 }

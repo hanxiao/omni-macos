@@ -1664,9 +1664,19 @@ store there writes rows that are about to be, or have just been, deleted - the r
 including that the bare `cancel()` defaults to discard: a default of `.pause` would silently make
 all five unsafe at once.
 
-WHAT IS NOT ON THIS LANE AT ALL: `pauseIndexing()` is a cancel, so every resume re-walks the whole
-tree. Real waste, but CPU and disk - the crawl is streaming and the consumer embeds alongside it,
-so it does not occupy the GPU.
+RESUMING RE-WALKS THE TREE, AND THAT IS FINE - MEASURED, DO NOT BUILD THE CLEVER VERSION.
+`pauseIndexing()` is a cancel, so every resume crawls from the top again. The obvious optimisation
+is to replay FSEvents since a stored event id instead (FSWatcher already takes `since:`), and it is
+not worth it: the crawl costs 0.24 s FOR 100,000 FILES (`crawl-done`, gated), measured on a
+synthetic tree whose files are all below `minTextChars` so nothing embeds - which is precisely the
+no-op resume shape, with no consumer backpressure inflating the number. `BulkDirWalker` is
+getattrlistbulk-based and linear in entries, so 2.6M files extrapolates to ~6 s of background work
+on a utility queue, concurrent with embedding and nowhere near the GPU.
+
+Against that, an FSEvents replay has to be right about DROPPED EVENTS (MustScanSubDirs, UserDropped,
+KernelDropped, EventIdsWrapped) or it misses a deletion and leaves stale rows in the index forever -
+the same bug class as the Photos ghost rows. Six seconds of background crawling does not buy that
+risk. The instrument is kept so the premise can be re-checked if a root ever gets far larger.
 
 ## Transcript cache (OmniKit/OCR/OCRCache.swift, 2026-09-12)
 
