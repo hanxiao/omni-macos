@@ -1307,7 +1307,14 @@ public final class Indexer: @unchecked Sendable {
         // and the double-buffered pipeline that make the full pass fast. Live updates are the most
         // user-visible indexing there is (files appear as you save them), so they now stage text
         // chunks across files and embed per length-bucketed window exactly like index(). Media
-        // items keep the per-file path (their batching lives in the encoders).
+        // items stage across files too (flushImagesU) - the per-file path is ~batch-1 for still
+        // images, which is the whole reason the full pass stages them.
+        //
+        // THIS IS THE PATH THAT INDEXES A NEWLY WATCHED FOLDER, not the full pass. Measured on 120
+        // images from a cold index: eight `image-flush-update` batches of 16 at ~1.0 s each, while
+        // the full pass that follows correctly finds every file unchanged and its own flushImages
+        // never fires. An earlier read of this comment - which used to say media kept the per-file
+        // path - started a hunt for a dead batching path that does not exist.
         var tBuf: [(fid: Int, idx: Int, text: String, snippet: String, locator: String, key: String)] = []
         var tAcc: [Int: (path: String, file: CrawledFile, kind: String, total: Int, done: [IndexedChunk])] = [:]
         var tNextFid = 0
@@ -1368,6 +1375,13 @@ public final class Indexer: @unchecked Sendable {
             guard !iStage.isEmpty else { return }
             let batch = iStage; iStage = []; iStagedRaws = 0
             let allRaws = batch.flatMap { $0.raws }
+            let tFlushU = omniPerfEnabled ? Date() : nil
+            defer {
+                if let tFlushU {
+                    omniPerfLog(String(format: "image-flush-update %.0fms raws=%d files=%d",
+                                       -tFlushU.timeIntervalSinceNow * 1000, allRaws.count, batch.count))
+                }
+            }
             // Per-RAW crop alignment: single-raw files carry their 5 CWR crops (retag pass with
             // hqMediaTags), everything else an empty slot - the engine refines only where crops exist.
             let allCrops: [[OmniVisionPreprocess.RawPatches]] = batch.flatMap { b in

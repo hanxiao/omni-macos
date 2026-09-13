@@ -1612,14 +1612,23 @@ is the resurrection shape the tag-backfill note already warns about. A cancel wo
 (pause keeps the work, scope-change discards it) before this is safe - the same distinction the OCR
 stand-down needed.
 
-OPEN QUESTION, AND IT MAY BE BIGGER THAN THE DISCARD: on a 120-image folder indexed from scratch
-(fresh db, `-omni.roots` at the corpus, all 120 rows land with kind `image` and 120 chunks), the
-cross-file image batching path logs NOTHING - neither `image-flush` nor a probe placed on its own
-per-file fallback inside the same closure. Only one `kind == .image` branch exists (Indexer.swift
-~1054) and `embedImagesTagged` is called only from its `flushImages`. So either the harness routes
-these files somewhere else, or that closure is not running and still images are being embedded at
-the batch-1 throughput the cross-file staging exists to avoid. Resolve this before trusting any
-image-indexing throughput number. The `image-flush` perf line is left in place as the probe.
+CLOSED, AND THE ANSWER WAS THE PROBE: the full pass's `flushImages` logs nothing on a cold index
+because `update()` - the reconcile path - indexes the folder FIRST, through its own cross-file
+staging (`iStage` / `flushImagesU`), and the full pass that follows then correctly finds every file
+unchanged. Measured on 120 images from a fresh db: eight `image-flush-update` batches of 16 at
+~1.0 s each. The batching is alive and there is no batch-1 defect.
+
+Two things led the hunt astray for an hour, both worth knowing. The comment above `update()`'s
+staging said "media items keep the per-file path (their batching lives in the encoders)" - stale,
+and directly above the code that stages them; it is corrected now. And an instrument that only
+covers one of two paths reads exactly like a dead path: the full pass and the reconcile path have
+SEPARATE image flushes, and only one was instrumented. `image-flush` and `image-flush-update` now
+name both.
+
+SO THE CANCEL DISCARD HAS A PRICE AT LAST: one `flushImages` is ~1.0 s of vision tower work for 16
+images, thrown away at the `if self.isCancelled { return }` after the embed. Once per cancel, and
+a cancel happens on every `beginOCRRun`, folder pause and settings change. Still not changed, for
+the reason above: it needs a cancel REASON first.
 
 WHAT IS NOT ON THIS LANE AT ALL: `pauseIndexing()` is a cancel, so every resume re-walks the whole
 tree. Real waste, but CPU and disk - the crawl is streaming and the consumer embeds alongside it,
