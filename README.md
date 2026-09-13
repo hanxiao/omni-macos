@@ -7,6 +7,8 @@
 <p align="center">Semantic search over your local files, running entirely on-device.</p>
 
 <p align="center">
+  <a href="https://arxiv.org/abs/2608.05543"><b>Technical report</b></a>
+  &nbsp;&nbsp;&middot;&nbsp;&nbsp;
   <a href="https://hanxiao.io/omni"><b>Download for macOS &rarr;</b></a>
 </p>
 
@@ -55,51 +57,8 @@ Tools/             reference fixture generator
 Tests/             numeric parity + end-to-end search tests
 ```
 
-### Embedding
-
-`jina-embeddings-v5-omni` ported to MLX-Swift: a Qwen3 text tower, a Qwen3-VL vision
-tower (also used for video frames and scanned-PDF pages), and a Whisper-style audio
-tower. `WeightStore` loads the HF safetensors and merges the retrieval LoRA into the
-backbone; encoders pool the last token and L2-normalize. All modalities land in one
-shared space, so text finds images and audio finds text.
-
-This is not a stock checkpoint runner. The towers are reworked for throughput - fused
-norm/activation/rope kernels, fused bias matmuls, shape-aware compile policy, tuned
-attention I/O precision, cross-file GPU batching with double-buffered readout - while
-staying parity-gated against the Python reference (cosine >= 0.999, exact token match).
-Same vectors as the original model, much faster than running it stock.
-
-### Indexing
-
-Crawl -> extract -> chunk -> embed -> store, incremental by file mtime and size. A
-concurrent decode stage (text extraction, image patchify, audio mel) feeds one
-serialized GPU embed stage; text chunks and images batch across files, audio batches
-clips under a frame budget. Live updates from the file watcher go through the same
-batched path as a full pass. MLX calls are serialized through a priority gate and the
-batch size adapts while you type, so search stays responsive during indexing.
-
-Identical bytes never embed twice: a content hash maps copies, moves, and
-touched-but-unmodified files (a git checkout, a re-save) to their already-stored
-vectors. A touch storm that used to re-embed everything now completes in well under
-a second.
-
-### Storing
-
-SQLite is the durable store: file metadata plus bf16 vectors (2 bytes per dimension,
-negligible recall loss on normalized embeddings). The resident form adapts to the
-memory budget in Settings > Performance: a full bf16 matrix when it fits, and past
-that a 4-bit quantized scan replica with the exact bf16 copy kept in a file-backed
-mapping the OS can page out. Old indexes load unchanged in either mode.
-
-### Search
-
-Exact cosine when the index fits the budget: one GPU matmul of the query against the
-resident matrix (a base prefix plus a small delta of recent rows, scored in one
-evaluation). At scale, a two-stage funnel: a coarse scan over the quantized replica
-selects top candidates on the GPU, which are rescored exactly in bf16 before ranking -
-final scores are exact either way, and recall is gated against the full-precision
-baseline. Results reduce to the best chunk per file, filtered by kind, folder,
-extension, and recency. Idle search is a few milliseconds.
+How the engine, indexer, store and search work is in the
+[technical report](https://arxiv.org/abs/2608.05543).
 
 ## Serving: search and manage the index from anything
 
