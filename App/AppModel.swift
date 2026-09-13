@@ -1306,6 +1306,27 @@ final class AppModel {
         }
     }
 
+    /// Add a folder to the search scope instead of replacing it (issue #18).
+    ///
+    /// `enterFolder` REPLACES the scope, because browsing means "I am looking at this folder now".
+    /// Scoping is the other intent: two project folders under one indexed root, searched together.
+    /// Adding a folder already covered by one in the scope is a no-op - the answer would not
+    /// change, and a chip for it would suggest it narrowed something.
+    /// Whether adding this folder would change the scope at all.
+    func canAddFolderToScope(_ url: URL) -> Bool {
+        !filterFolders.contains { url.path == $0.path || url.path.hasPrefix($0.path + "/") }
+    }
+
+    func addFolderToScope(_ url: URL) {
+        guard !filterFolders.contains(url) else { return }
+        let covered = filterFolders.contains { url.path == $0.path || url.path.hasPrefix($0.path + "/") }
+        guard !covered else { return }
+        // Drop any folder the new one now covers, for the same reason.
+        var next = filterFolders.filter { !($0.path.hasPrefix(url.path + "/")) }
+        next.append(url)
+        filterFolders = next
+    }
+
     /// The configured root that `path` lives under, if any.
     func rootKey(for path: String) -> String? {
         if let key = PhotoLibrary.sourceKey(ofPath: path) {
@@ -1323,7 +1344,21 @@ final class AppModel {
     // A menu change writes the filter into the box string (syncBoxFromFilters) so the box stays the
     // single source of truth. score/sort are client-side post-filters -> reshape results, don't re-search.
     var filterKinds: Set<FileKind> = [] { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
-    var filterFolder: URL? = nil { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
+    /// The folders a search is scoped to. SEVERAL, since issue #18: with one indexed root you could
+    /// scope to that root or to a single folder under it, never to two siblings, because adding the
+    /// children as roots does not help - the parent subsumes them.
+    ///
+    /// Browsing still uses exactly one (see `filterFolder` and `showsFolderBrowser`): a browser
+    /// showing two folders at once is a different feature, and the empty-result region has room for
+    /// one listing.
+    var filterFolders: [URL] = [] { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
+
+    /// The single-folder spelling. Browsing, the breadcrumb and every "am I in a folder" check read
+    /// this; assigning it REPLACES the whole scope, which is what entering a folder means.
+    var filterFolder: URL? {
+        get { filterFolders.first }
+        set { filterFolders = newValue.map { [$0] } ?? [] }
+    }
     var filterExt: String = "" { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
     /// Explicit `filename:` intent. Not a filter - it does not exclude anything - but a request for
     /// the filename channel to lead the ranking. Kept beside the filters because it arrives through
@@ -2186,7 +2221,7 @@ final class AppModel {
     }
 
     var filtersActive: Bool {
-        !filterKinds.isEmpty || filterFolder != nil
+        !filterKinds.isEmpty || !filterFolders.isEmpty
             || !filterExt.isEmpty || !filterTags.isEmpty || !filterTagsExclude.isEmpty
             || dateRange != .any
             || minScore != Self.defaultMinScore
@@ -2639,6 +2674,10 @@ final class AppModel {
         var includeKinds: Set<FileKind> = []
         var excludeKinds: Set<FileKind> = []
         var sawType = false
+        // Staged, then assigned ONCE below: `filterFolders` re-runs the search in its didSet, so
+        // appending per qualifier would fire a search per `in:` and each intermediate one would be
+        // scoped to fewer folders than the user asked for.
+        var folders: [URL] = []
         for qual in parsed.qualifiers {
             switch qual.key {
             case "type":
@@ -2654,7 +2693,10 @@ final class AppModel {
                     filterTags = filterTags.isEmpty ? qual.value : filterTags + "," + qual.value
                 }
             case "ext": filterExt = qual.value.hasPrefix(".") ? String(qual.value.dropFirst()) : qual.value
-            case "in":  if let url = Self.resolveFolder(qual.value) { filterFolder = url }
+            // ACCUMULATES, like `tag:` above and unlike every other qualifier: `in:A in:B` means
+            // both folders. Last-one-wins silently dropped A, which is the shape of issue #18.
+            case "in":
+                if let url = Self.resolveFolder(qual.value), !folders.contains(url) { folders.append(url) }
             case "filename": filterFilename = qual.negated ? "" : qual.value
             case "date": if let d = DateRange(rawValue: qual.value.lowercased()) { dateRange = d }
             case "after": if let d = Self.mapAfter(qual.value) { dateRange = d }
@@ -2674,12 +2716,13 @@ final class AppModel {
             if !includeKinds.isEmpty { filterKinds = includeKinds.subtracting(excludeKinds) }
             else if !excludeKinds.isEmpty { filterKinds = Set(FileKind.allCases).subtracting(excludeKinds) }  // -type:x = all but x
         }
+        if !folders.isEmpty { filterFolders = folders }
         query = parsed.semanticText
     }
 
     /// Reset every filter dimension to its default (caller holds the applyingParsedQuery guard).
     private func resetAllFilters() {
-        filterKinds = []; filterExt = ""; filterFolder = nil; filterFilename = ""
+        filterKinds = []; filterExt = ""; filterFolders = []; filterFilename = ""
         filterTags = ""; filterTagsExclude = ""
         dateRange = .any; minScore = Self.defaultMinScore; sortOrder = .relevance
     }
@@ -2721,7 +2764,7 @@ final class AppModel {
         if !filterTagsExclude.isEmpty { parts.append("-tag:" + Self.quoteIfNeeded(filterTagsExclude)) }
         if !filterExt.isEmpty { parts.append("ext:" + filterExt) }
         if !filterFilename.isEmpty { parts.append("filename:" + Self.quoteIfNeeded(filterFilename)) }
-        if let f = filterFolder { parts.append("in:" + Self.quoteIfNeeded(f.path)) }
+        for f in filterFolders { parts.append("in:" + Self.quoteIfNeeded(f.path)) }
         if dateRange != .any { parts.append("date:" + dateRange.rawValue) }
         if minScore != Self.defaultMinScore { parts.append("score:\(Int((minScore * 100).rounded()))%") }
         if sortOrder != .relevance { parts.append("sort:" + (sortOrder == .name ? "name" : "date")) }
@@ -2850,7 +2893,7 @@ final class AppModel {
     private func currentFilter() -> SearchFilter {
         var f = SearchFilter()
         f.kinds = Set(filterKinds.map { $0.rawValue })
-        f.folderPrefix = filterFolder?.path
+        f.folderPrefixes = filterFolders.map(\.path)
         f.ext = filterExt.isEmpty ? nil : filterExt
         f.filenameQuery = filterFilename.isEmpty ? nil : filterFilename
         f.since = dateRange.since

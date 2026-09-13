@@ -139,6 +139,11 @@ enum MCPAdapter {
                         "type": "string",
                         "description": "Restrict to files under this absolute folder path."
                     ],
+                    "folders": [
+                        "type": "array",
+                        "items": ["type": "string"],
+                        "description": "Restrict to files under ANY of these absolute folder paths. Use this to search two or more folders at once - adding them as sources instead does not work, because an indexed parent folder already covers its children."
+                    ],
                     "group_duplicates": [
                         "type": "boolean",
                         "description": "Collapse copies of the same file into one result (default true). A collapsed result carries duplicate_count, duplicates (the other paths) and duplicate_kind ('exact' = byte-identical, 'near' = same kind and extension, sizes within 10%, cosine >= 0.98). Set false for the flat list with every copy as its own result."
@@ -210,11 +215,24 @@ enum MCPAdapter {
             if let err { return toolError(id: id, "search failed: \(err)") }
             if let set { filter.kinds = set }
         }
+        // `folder` (one) and `folders` (several) - issue #18. An agent scoping to two project
+        // folders under one indexed root could not say so: the parent subsumes its children, so
+        // adding them as roots does not help either. Both spellings are accepted and merged, so an
+        // existing caller passing `folder` is unaffected.
+        var scoped: [String] = []
         if let folder = args["folder"] as? String {
             let (value, err) = normalizedFolder(folder)
             if let err { return toolError(id: id, "search failed: \(err)") }
-            filter.folderPrefix = value
+            if let value { scoped.append(value) }
         }
+        if let folders = args["folders"] as? [String] {
+            for folder in folders {
+                let (value, err) = normalizedFolder(folder)
+                if let err { return toolError(id: id, "search failed: \(err)") }
+                if let value, !scoped.contains(value) { scoped.append(value) }
+            }
+        }
+        filter.folderPrefixes = scoped
 
         // INDEX STATE, FETCHED CONCURRENTLY. An agent cannot tell an empty result set caused by
         // "not on this Mac" from one caused by "not indexed yet", and the second reading is the

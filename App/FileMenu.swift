@@ -230,6 +230,15 @@ struct FolderMenuItems: View {
         Button { model.enterFolder(url); SearchFieldFocus.focus() } label: {
             Label("Search in this folder", systemImage: "magnifyingglass")
         }
+        // ADD, not replace - issue #18. With one indexed root you could scope a search to that
+        // root or to a single folder under it, never to two siblings, because adding the children
+        // as sources does not help: the parent already covers them. Hidden when the scope already
+        // covers this folder, where it would do nothing.
+        if model.canAddFolderToScope(url) {
+            Button { model.addFolderToScope(url); SearchFieldFocus.focus() } label: {
+                Label("Add to Search Scope", systemImage: "plus.magnifyingglass")
+            }
+        }
         // A submenu rather than two flat items because the layout is a CHOICE between two
         // algorithms, not a toggle with a hidden current state - "Use fast map layout" never said
         // which one you were looking at.

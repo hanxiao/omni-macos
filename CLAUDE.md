@@ -1178,6 +1178,45 @@ speculatively - a wrong `underPassRoots` predicate deletes live rows. `PhotoLibr
 and the gated `photo-thumb` log exist so the next person can tell the three causes apart in one
 run instead of guessing between TCC, iCloud and staleness the way this took.
 
+## Several folders at once (issue #18, 2026-09-13)
+
+"Parent consumes child": with one indexed root you could scope a search to that root or to a single
+folder under it, never to two siblings - and adding the children as SOURCES does not help, because
+an indexed parent already covers them. The scope was a single `String?` and `case "in"` was
+last-one-wins, so `in:A in:B` silently became `in:B`.
+
+`SearchFilter.folderPrefixes: [String]` now holds them all, with `folderPrefix` kept as a
+single-folder accessor - most callers scope to one, and `filter.folderPrefix = path` reads better
+there than a one-element array. `underAnyFolder` keeps the ONE-folder case at exactly one
+allocation-free byte compare and only loops when there are several: it runs once per FILE while the
+path table is rebuilt, 2.6M times on this index, which is why the boundary bytes are precomputed.
+
+THREE THINGS THAT WOULD HAVE BITTEN LATER:
+- THE PATH-ALLOW CACHE KEY MUST CARRY EVERY PREFIX. With only the first, the mask built for `in:A`
+  is served to a later `in:A in:B` and B's files vanish from the results - a bug that can only
+  appear once a second folder is scoped, i.e. only in the feature being added.
+- THE DENSE-HIT FILTER USED BARE `hasPrefix`, so a SIBLING whose name merely starts the same way
+  ("~/Docs2" under a "~/Docs" scope) was accepted. Everything else used the boundary form; this
+  path was the odd one out. Fixed, and pinned by `testANamePrefixIsNotAFolderPrefix`.
+- `filterFolders` RE-RUNS THE SEARCH IN ITS didSet, so the parser stages folders in a local and
+  assigns once. Appending per qualifier fires a search per `in:`, each scoped to fewer folders than
+  the user asked for.
+
+BROWSING STILL TAKES EXACTLY ONE. `showsFolderBrowser` requires `filterFolders.count == 1`: the
+empty-result region holds one listing, and showing the first of two would misrepresent the scope.
+With several scoped the idle prompt says "Search N folders" and the chips show each, individually
+removable (chip removal already rebuilds the query from the survivors).
+
+`enterFolder` REPLACES the scope (browsing means "I am looking at this folder now");
+`addFolderToScope` adds, and is what the context menu's "Add to Search Scope" calls - one item in
+`FolderMenuItems`, so it appears in the sidebar and the browser alike. Adding a folder already
+covered by the scope is a no-op, and adding a parent drops the children it now covers.
+
+SERVING TAKES `folders: [...]` alongside `folder`, merged, so existing callers are unaffected. The
+MCP tool description says why adding sources instead does not work, because that is the trap the
+reporter hit. Verified end to end over HTTP on a three-folder corpus: unscoped returns all three,
+`folder` returns one, `folders` returns exactly the two named.
+
 ## Folder-scoped search: what it actually costs (measured 2026-09-12)
 
 Folder scoping is a headline feature now, so the numbers are here rather than assumed. Real index,

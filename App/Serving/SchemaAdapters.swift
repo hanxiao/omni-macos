@@ -303,7 +303,12 @@ enum SearchAdapter {
                 if set.contains(FileKind.text.rawValue) { set.insert(FileKind.scan.rawValue) }
                 filter.kinds = set
             }
-            if let folder = filters["folder"] as? String, !folder.isEmpty { filter.folderPrefix = folder }
+            // `folder` (one) and `folders` (several) - see issue #18. Both are accepted and merged.
+            var scoped: [String] = []
+            if let folder = filters["folder"] as? String, !folder.isEmpty { scoped.append(folder) }
+            for folder in (filters["folders"] as? [String] ?? [])
+            where !folder.isEmpty && !scoped.contains(folder) { scoped.append(folder) }
+            if !scoped.isEmpty { filter.folderPrefixes = scoped }
             if let ext = filters["ext"] as? String, !ext.isEmpty { filter.ext = ext }
             if let since = filters["since"] as? Double { filter.since = since }
             else if let sinceInt = filters["since"] as? Int { filter.since = Double(sinceInt) }

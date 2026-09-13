@@ -169,11 +169,26 @@ public struct SearchFilter: Sendable {
     /// 750k times at 750k files - and `hasPrefix(f + "/")` allocated a fresh String on every one
     /// of those calls. Computed once per assignment instead; the comparison itself is unchanged,
     /// so folder matching keeps String's Unicode semantics rather than a byte-wise shortcut.
-    public var folderPrefix: String? = nil {
+    /// SEVERAL folders, not one. Issue #18: a parent root "consumes" its children, so scoping to
+    /// two sibling project folders under one indexed root was not expressible - it was one folder
+    /// or all of them. Repeated `in:` qualifiers, a multi-selection in the sidebar and the serving
+    /// API's `folders` array all land here.
+    ///
+    /// An EMPTY array means unscoped. The boundary forms below are kept in lockstep for the same
+    /// reason they always were: `acceptsPath` runs once per FILE while the path table is rebuilt -
+    /// 2.6M times on this index - and building `f + "/"` there allocated a String per call.
+    public var folderPrefixes: [String] = [] {
         didSet {
-            folderSlash = folderPrefix.map { $0 + "/" }
-            folderSlashBytes = folderSlash.map { Array($0.utf8) }
+            folderSlash = folderPrefixes.first.map { $0 + "/" }
+            folderSlashBytes = folderPrefixes.map { Array(($0 + "/").utf8) }
         }
+    }
+
+    /// The single-folder spelling, kept because most callers scope to exactly one and reading
+    /// `filter.folderPrefix = path` at those sites is clearer than a one-element array.
+    public var folderPrefix: String? {
+        get { folderPrefixes.first }
+        set { folderPrefixes = newValue.map { [$0] } ?? [] }
     }
     private(set) var folderSlash: String? = nil
     /// The same boundary as UTF-8 BYTES. `hasPrefix` compares grapheme clusters, so a path whose
@@ -181,7 +196,23 @@ public struct SearchFilter: Sendable {
     /// reads as NOT under the folder - while SQLite's byte range says it is. macOS stores filenames
     /// NFD, so those paths are ordinary. Precomputed for the same reason folderSlash is: this runs
     /// once per FILE while the path table is rebuilt, hundreds of thousands of times.
-    private(set) var folderSlashBytes: [UInt8]? = nil
+    private(set) var folderSlashBytes: [[UInt8]] = []
+
+    /// True when `path` is at or under ANY of the scoped folders. Written as an explicit loop with
+    /// the one-folder case first: that is overwhelmingly the common shape, and it must keep costing
+    /// exactly what it did before - one byte-wise compare, no allocation, no iterator.
+    @inline(__always) func underAnyFolder(_ path: String) -> Bool {
+        switch folderPrefixes.count {
+        case 0: return true
+        case 1: return path == folderPrefixes[0] || Self.underFolderBytes(path, folderSlashBytes[0])
+        default:
+            for i in 0 ..< folderPrefixes.count
+            where path == folderPrefixes[i] || Self.underFolderBytes(path, folderSlashBytes[i]) {
+                return true
+            }
+            return false
+        }
+    }
     public var ext: String? = nil             // restrict to a file extension (no dot)
     public var since: Double? = nil           // modified >= since (epoch seconds)
     /// Content-tag terms (`tag:bear` / `-tag:cat`): the file's generated tag snippet must
@@ -202,7 +233,7 @@ public struct SearchFilter: Sendable {
 
     /// No constraints set - the common plain-query case (enables the GPU candidate fast path).
     var isEmpty: Bool {
-        kinds.isEmpty && folderPrefix == nil && (ext?.isEmpty ?? true) && since == nil
+        kinds.isEmpty && folderPrefixes.isEmpty && (ext?.isEmpty ?? true) && since == nil
             && tagTerms.isEmpty && tagExcludeTerms.isEmpty
     }
 
@@ -218,7 +249,7 @@ public struct SearchFilter: Sendable {
     }
 
     func acceptsPath(_ path: String) -> Bool {
-        if let f = folderPrefix, !(path == f || Self.underFolderBytes(path, folderSlashBytes ?? Array((f + "/").utf8))) { return false }
+        if !underAnyFolder(path) { return false }
         if let e = ext, !e.isEmpty, !Self.hasExtensionCI(path, e) { return false }
         if let allow = tagAllow, !allow.contains(path) { return false }
         if let deny = tagDeny, deny.contains(path) { return false }
@@ -227,7 +258,7 @@ public struct SearchFilter: Sendable {
 
     func accepts(path: String, kind: String, modified: Double) -> Bool {
         if !kinds.isEmpty && !kinds.contains(kind) { return false }
-        if let f = folderPrefix, !(path == f || Self.underFolderBytes(path, folderSlashBytes ?? Array((f + "/").utf8))) { return false }
+        if !underAnyFolder(path) { return false }
         if let e = ext, !e.isEmpty, !Self.hasExtensionCI(path, e) { return false }
         if let s = since, modified < s { return false }
         if let allow = tagAllow, !allow.contains(path) { return false }
@@ -3584,7 +3615,10 @@ public final class VectorStore: @unchecked Sendable {
     private func passesFilterForLexical(_ h: SearchHit, _ f: SearchFilter) -> Bool {
         if !f.kinds.isEmpty, !f.kinds.contains(h.kind) { return false }
         if let since = f.since, h.modified < since { return false }
-        if let folder = f.folderPrefix, !h.path.hasPrefix(folder) { return false }
+        // `underAnyFolder`, not `hasPrefix`: a bare prefix test also accepts a SIBLING whose name
+        // merely starts with the same characters ("~/Docs2" under a "~/Docs" scope). The boundary
+        // form has always been what `acceptsPath` uses; this path was the odd one out.
+        if !f.underAnyFolder(h.path) { return false }
         if let ext = f.ext, !ext.isEmpty {
             let e = (h.path as NSString).pathExtension.lowercased()
             if !ext.contains(e) { return false }
@@ -3620,7 +3654,7 @@ public final class VectorStore: @unchecked Sendable {
             // `modified`, which is not resident - so it keeps the host path. Everything else
             // (kind via the kind code, folder/ext/tag via the per-file path table) becomes a
             // GPU mask, and the query then takes the same candidate selection a plain one does.
-            let pathFilter = filter.folderPrefix != nil || (filter.ext?.isEmpty == false)
+            let pathFilter = !filter.folderPrefixes.isEmpty || (filter.ext?.isEmpty == false)
                 || filter.tagAllow != nil || filter.tagDeny != nil
             // The mask itself decides whether this path is usable, rather than a separate
             // predicate that could disagree with it. FAILING CLOSED MATTERS: a filter with a
@@ -3938,7 +3972,7 @@ public final class VectorStore: @unchecked Sendable {
         }
         // Path filters, per file, for the same reason: the delta was scored on the host and never
         // saw the GPU mask. Bounded work - at most C + delta offers, not a pass over the index.
-        let pathFiltered = filter.folderPrefix != nil || (filter.ext?.isEmpty == false)
+        let pathFiltered = !filter.folderPrefixes.isEmpty || (filter.ext?.isEmpty == false)
             || filter.tagAllow != nil || filter.tagDeny != nil
         func offer(_ row: Int32, _ score: Float) {
             guard score.isFinite, !deadRows.contains(row) else { return }
@@ -3998,7 +4032,7 @@ public final class VectorStore: @unchecked Sendable {
         // tagAllow/tagDeny are path-based prefilters exactly like folder/ext: they MUST gate
         // candidate selection here, or a tag-filtered quant-mode query silently loses every
         // match whose coarse score falls outside the global top-C.
-        let pathFiltered = filter.folderPrefix != nil || (filter.ext?.isEmpty == false)
+        let pathFiltered = !filter.folderPrefixes.isEmpty || (filter.ext?.isEmpty == false)
             || filter.tagAllow != nil || filter.tagDeny != nil
         var kindAllowed = [Bool](repeating: false, count: 256)
         if hasKind { for k in kinds { if let id = kindID[k] { kindAllowed[Int(id)] = true } } }
@@ -4234,7 +4268,8 @@ public final class VectorStore: @unchecked Sendable {
         MLX.eval(g)
         if let t0 {
             omniPerfLog(String(format: "path-allow build=%.1fms files=%d folder=%@",
-                               -t0.timeIntervalSinceNow * 1000, nGlobal, f.folderPrefix ?? "-"))
+                               -t0.timeIntervalSinceNow * 1000, nGlobal,
+                               f.folderPrefixes.isEmpty ? "-" : f.folderPrefixes.joined(separator: ">")))
         }
         guard let key = cacheKey else { return g }
         if tagFree { pathAllowPureKey = key; pathAllowPureGPU = g }
@@ -4249,7 +4284,10 @@ public final class VectorStore: @unchecked Sendable {
         }
         let terms = f.tagTerms.map { $0.lowercased() }.sorted().joined(separator: ",")
         let exTerms = f.tagExcludeTerms.map { $0.lowercased() }.sorted().joined(separator: ",")
-        return "\(f.folderPrefix ?? "")|\(f.ext ?? "")|\(terms)|\(exTerms)"
+        // EVERY folder, joined - not just the first. A key carrying one prefix would serve the
+        // mask built for `in:A` to a later `in:A in:B`, silently dropping B's files from the
+        // results, and the bug would only appear once a second folder was scoped.
+        return "\(f.folderPrefixes.joined(separator: ">"))|\(f.ext ?? "")|\(terms)|\(exTerms)"
             + "|\(f.tagAllow?.count ?? -1)|\(f.tagDeny?.count ?? -1)|\(nGlobal)"
     }
     /// Called on every row mutation (through `invalidateTagFilterCacheLocked`). It deliberately
@@ -4347,7 +4385,7 @@ public final class VectorStore: @unchecked Sendable {
     private func invalidateModifiedGPULocked() { mlxModified = nil; mlxModifiedRows = 0 }
 
     private func onlyKindFiltered(_ f: SearchFilter) -> Bool {
-        f.folderPrefix == nil && (f.ext?.isEmpty ?? true) && f.since == nil
+        f.folderPrefixes.isEmpty && (f.ext?.isEmpty ?? true) && f.since == nil
             && f.tagTerms.isEmpty && f.tagExcludeTerms.isEmpty
     }
 

@@ -278,7 +278,10 @@ struct ContentView: View {
     /// active. Typing hides it instantly and the results are already scoped to the folder, which
     /// is the whole point - the browser and the search are two views of one `filterFolder`.
     private var showsFolderBrowser: Bool {
-        model.filterFolder != nil && !model.hasQuery && model.fileQuery == nil
+        // EXACTLY ONE folder. Scoping to several is a search filter, not a place to browse - the
+        // empty-result region holds one listing, and showing the first of two would misrepresent
+        // what the search is scoped to.
+        model.filterFolders.count == 1 && !model.hasQuery && model.fileQuery == nil
             && model.rawResults.isEmpty && model.queryError == nil && !model.isResolving
     }
 
@@ -490,7 +493,11 @@ struct ContentView: View {
             // pending search only fades a small spinner in under the same prompt - it never flashes
             // "No matches" while the debounce/search for what you just typed is still running.
             SearchWaysPrompt(
-                title: model.indexedFiles > 0 ? "Search \(model.indexedFiles.formatted()) file\(model.indexedFiles == 1 ? "" : "s")" : "Search your files",
+                // With several folders scoped there is no browser to show (that needs exactly one),
+                // so the prompt is the only place that says what the next query will cover.
+                title: model.filterFolders.count > 1
+                    ? "Search \(model.filterFolders.count) folders"
+                    : (model.indexedFiles > 0 ? "Search \(model.indexedFiles.formatted()) file\(model.indexedFiles == 1 ? "" : "s")" : "Search your files"),
                 count: model.indexedFiles,
                 showSpinner: model.isResolving)
         } else if model.hiddenByThreshold > 0 {
