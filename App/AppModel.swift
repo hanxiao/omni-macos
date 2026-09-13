@@ -1285,7 +1285,7 @@ final class AppModel {
     func requestIndexPass() {
         if indexState == .indexing {
             restartAfterPause = true
-            indexer?.cancel()
+            indexer?.cancel(.pause)
         } else {
             startIndexing()
         }
@@ -3923,7 +3923,7 @@ final class AppModel {
     private func indexNewSourcesFirst(_ queue: () -> Void) {
         if indexState == .indexing {
             restartAfterPause = true
-            indexer?.cancel()
+            indexer?.cancel(.pause)
         } else {
             queue()
             catchUpPendingRoots()
@@ -4711,7 +4711,7 @@ final class AppModel {
         // embedding, racing reconciles). Cancel it and defer; its completion drains the flag.
         guard activeRoots.isEmpty, !fsReconcileInFlight else {
             restartAfterPause = true
-            indexer.cancel()
+            indexer.cancel(.pause)
             return
         }
         // Paused folders are excluded from the pass; if every folder is paused (or there are
@@ -4948,7 +4948,9 @@ final class AppModel {
     private func yieldRetagToSearch() {
         guard tagBackfillActive, !tagBackfillYieldedToSearch else { return }
         tagBackfillYieldedToSearch = true
-        indexer?.cancel()   // safe: the retag holds the only in-flight pipeline (guards ensure it)
+        // .pause: the retag is yielding the GPU, not narrowing the index, so anything it has
+        // already embedded is kept rather than re-embedded on the way back.
+        indexer?.cancel(.pause)   // safe: the retag holds the only in-flight pipeline (guards ensure it)
     }
 
     /// True when the tagger is attached and ready - drives the context menu's Generate Tags item.
@@ -5087,7 +5089,9 @@ final class AppModel {
     }
 
     /// Pause indexing. Files embedded so far are kept; resume continues from there.
-    func pauseIndexing() { indexer?.cancel() }
+    /// .pause, so a batch the tower has already finished is stored rather than thrown away.
+    /// This is the call an OCR run makes, which is the most frequent cancel in the app.
+    func pauseIndexing() { indexer?.cancel(.pause) }
 
     /// Stop indexing for an orderly quit. The quit handler holds termination until `isIndexing`
     /// clears - i.e. the worker has left MLX - so MLX's global C++ teardown on exit() can't race a

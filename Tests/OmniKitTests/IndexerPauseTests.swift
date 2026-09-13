@@ -24,6 +24,59 @@ final class IndexerPauseTests: XCTestCase {
         func embedAudioMelBatch(_ mels: [[Float]], frames: [Int]) -> [[Float]]? { nil }
     }
 
+    // MARK: - Why a pass stopped
+    //
+    // `cancel()` is one verb doing two jobs, and which one it is decides whether embeddings the GPU
+    // has ALREADY produced are stored or thrown away. The discard is not free - one image flush is
+    // ~1.0 s of vision tower work for 16 images (`image-flush`), and a cancel happens on every OCR
+    // run, folder pause and settings change. It also cannot simply be removed: a cancel that
+    // SHRINKS the index (a root removed, a folder paused, rows being deleted) must still drop the
+    // batch, or the pass writes rows that are about to be, or have just been, deleted.
+
+    private func idleIndexer() throws -> Indexer {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omni-cancel-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        let store = try VectorStore(dbURL: dir.appendingPathComponent("index.sqlite"))
+        addTeardownBlock { store.close() }
+        return Indexer(store: store, embedder: SlowTextEmbedder())
+    }
+
+    func testAPauseKeepsCompletedWork() throws {
+        let indexer = try idleIndexer()
+        XCTAssertFalse(indexer.keepsCompletedWork, "nothing is kept before a cancel")
+        indexer.cancel(.pause)
+        XCTAssertTrue(indexer.isCancelled)
+        XCTAssertTrue(indexer.keepsCompletedWork, "a pause discarded work the GPU had already done")
+    }
+
+    func testAScopeChangeDiscardsCompletedWork() throws {
+        let indexer = try idleIndexer()
+        indexer.cancel(.discard)
+        XCTAssertTrue(indexer.isCancelled)
+        XCTAssertFalse(indexer.keepsCompletedWork,
+                       "a cancel that shrinks the index kept a batch it must not store")
+    }
+
+    /// The default has to be the SAFE one. Every call site that shrinks the index - the folder
+    /// pause, the root removal, the row delete, the store swap, the quit drain - reaches this
+    /// through the bare `cancel()`, so a default of `.pause` would silently make all five unsafe.
+    func testTheDefaultIsDiscard() throws {
+        let indexer = try idleIndexer()
+        indexer.cancel()
+        XCTAssertFalse(indexer.keepsCompletedWork, "bare cancel() must not keep work")
+    }
+
+    func testResetClearsTheReason() throws {
+        let indexer = try idleIndexer()
+        indexer.cancel(.pause)
+        indexer.resetCancelled()
+        XCTAssertFalse(indexer.isCancelled)
+        XCTAssertFalse(indexer.keepsCompletedWork,
+                       "a reset pass still reported a pause, so the next discard would keep work")
+    }
+
     func testPauseDoesNotInflateSkipped() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("omni-pause-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

@@ -198,6 +198,7 @@ public final class Indexer: @unchecked Sendable {
     private let embedder: Embedder
     private let queue = DispatchQueue(label: "omni.indexer")
     private var cancelled = false
+    private var cancelReason: CancelReason = .discard
 
     // Content dedup: identical bytes never embed twice. OMNI_CONTENT_DEDUP=0 disables (A/B).
     // PAPER LEVER (var, not let): the in-app paper suite A/Bs this in-process; see PaperLevers.
@@ -470,13 +471,31 @@ public final class Indexer: @unchecked Sendable {
         self.embedder = embedder
     }
 
-    public func cancel() { queue.sync { cancelled = true } }
+    /// Why a pass was stopped, which decides whether work ALREADY DONE is kept.
+    ///
+    /// `cancel()` is one verb doing two jobs. Most call sites are ordinary pauses - an OCR run
+    /// taking the GPU, a re-kick, a re-scope, the retag yielding to a search - and there the
+    /// completed work is valid and throwing it away just means embedding it again. The rest shrink
+    /// what the index is meant to contain (a folder paused, a root removed, rows being deleted) or
+    /// tear the store down, and there a late store would write rows that should not exist - the
+    /// resurrection shape `applyIgnoreText` already has to be careful about.
+    ///
+    /// Priced before it was built: one image flush is ~1.0 s of vision tower work for 16 images
+    /// (`image-flush`), discarded at every `beginOCRRun`, folder pause and settings change.
+    public enum CancelReason: Sendable { case pause, discard }
+
+    public func cancel(_ reason: CancelReason = .discard) {
+        queue.sync { cancelled = true; cancelReason = reason }
+    }
+
+    /// True when the pass was stopped by something that leaves already-embedded work valid.
+    public var keepsCompletedWork: Bool { queue.sync { cancelled && cancelReason == .pause } }
     public var isCancelled: Bool { queue.sync { cancelled } }
     /// Clear a STALE cancel before starting a new pass. `cancel()` outlives the pass it stopped
     /// (only `index()`'s own start resets it), so a caller that cancels-and-reschedules (folder
     /// removal, deferred restart) must reset at the moment the new pass is committed - otherwise
     /// pre-pass checks read the old cancel and abort the new pass as if the user paused it.
-    public func resetCancelled() { queue.sync { cancelled = false } }
+    public func resetCancelled() { queue.sync { cancelled = false; cancelReason = .discard } }
 
     /// Roots whose rows must NOT be swept, because nothing proves they were readable.
     ///
@@ -506,7 +525,7 @@ public final class Indexer: @unchecked Sendable {
                       settings: IndexSettings = .default, force: Bool = false,
                       onProgress: @escaping (IndexProgress) -> Void) {
         beginChunkReuse(settings)
-        queue.sync { cancelled = false }
+        queue.sync { cancelled = false; cancelReason = .discard }
         var p = IndexProgress()
         // The known-files snapshot is a whole-table GROUP BY (O(rows)) that shares no resource with
         // the filesystem crawl below, yet it ran strictly before the crawl. Compute it concurrently
@@ -1078,7 +1097,12 @@ public final class Indexer: @unchecked Sendable {
                                            -tFlush.timeIntervalSinceNow * 1000, allRaws.count,
                                            batch.count, self.isCancelled ? " DISCARDED" : ""))
                     }
-                    if self.isCancelled { return }   // mid-batch pause: nothing stored, files redo next pass
+                    // A PAUSE KEEPS IT. The tower has already run - ~1.0 s for 16 images - and on
+                    // an ordinary pause those vectors are as correct as any other. Only a cancel
+                    // that shrinks the index (root removed, folder paused, rows being deleted) or
+                    // tears the store down still drops them, because storing then writes rows that
+                    // are about to be, or have just been, deleted.
+                    if self.isCancelled, !self.keepsCompletedWork { return }
                     var off = 0
                     for b in batch {
                         var out: [IndexedChunk] = []

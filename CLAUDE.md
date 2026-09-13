@@ -1648,10 +1648,21 @@ covers one of two paths reads exactly like a dead path: the full pass and the re
 SEPARATE image flushes, and only one was instrumented. `image-flush` and `image-flush-update` now
 name both.
 
-SO THE CANCEL DISCARD HAS A PRICE AT LAST: one `flushImages` is ~1.0 s of vision tower work for 16
-images, thrown away at the `if self.isCancelled { return }` after the embed. Once per cancel, and
-a cancel happens on every `beginOCRRun`, folder pause and settings change. Still not changed, for
-the reason above: it needs a cancel REASON first.
+SO THE CANCEL DISCARD HAD A PRICE AT LAST: one `flushImages` is ~1.0 s of vision tower work for 16
+images, thrown away at the `if self.isCancelled { return }` after the embed - once per cancel, and
+a cancel happens on every `beginOCRRun`, folder pause and settings change.
+
+FIXED WITH A CANCEL REASON, which is what it always needed. `cancel(.pause)` keeps work already
+done; `cancel()` (the default, and it must stay the default) discards it. The split is not a
+judgement call - it falls out of what the call site is doing:
+  .pause    pauseIndexing (the OCR run - the most frequent cancel in the app), requestIndexPass,
+            indexNewSourcesFirst, startIndexing's re-scope, yieldRetagToSearch
+  .discard  setFolderPaused, deleteRowsUnder, root removal, the engine/store swap, quiesceForQuit
+The discarding five either SHRINK what the index should contain or tear the store down, and a late
+store there writes rows that are about to be, or have just been, deleted - the resurrection shape
+`applyIgnoreText` already has to be careful about. `IndexerPauseTests` pins all four cases,
+including that the bare `cancel()` defaults to discard: a default of `.pause` would silently make
+all five unsafe at once.
 
 WHAT IS NOT ON THIS LANE AT ALL: `pauseIndexing()` is a cancel, so every resume re-walks the whole
 tree. Real waste, but CPU and disk - the crawl is streaming and the consumer embeds alongside it,
