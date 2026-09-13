@@ -47,6 +47,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // app's own main queue is safe. Inert in normal runs - the source is never installed.
     private var uiDebugSource: DispatchSourceSignal?
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // THE STALL DETECTOR STARTS HERE, NOT FROM A `.task` ON THE WINDOW'S CONTENT. It lived
+        // there and never ran: a probe placed as the first statement of that task - writing
+        // unconditionally to stderr, then to a file - produced nothing across repeated launches,
+        // while sibling `.task` modifiers in the same chain (`-omni.ocrOpen`, `-omni.query`) run
+        // every time. So `-omni.hangwatch YES` silently did nothing, which matters because the
+        // stall figures quoted in CLAUDE.md came from this instrument.
+        if UserDefaults.standard.bool(forKey: "omni.hangwatch") {
+            let ms = UserDefaults.standard.integer(forKey: "omni.hangwatchMs")
+            // `-omni.hangwatchFile <path>` because under XCUITest the app's stderr goes into the
+            // test bundle's log and is not readable from a shell - so the one question worth asking
+            // during a chaos run ("was the main thread blocked when the driver timed out?") could
+            // not be asked at all.
+            HangWatch.start(reportAbove: ms > 0 ? Double(ms) / 1000 : 0.25,
+                            file: UserDefaults.standard.string(forKey: "omni.hangwatchFile"))
+        }
         guard ProcessInfo.processInfo.environment["OMNI_UI_DEBUG"] == "1" else { return }
         signal(SIGUSR2, SIG_IGN)
         let src = DispatchSource.makeSignalSource(signal: SIGUSR2, queue: .main)
@@ -162,14 +177,6 @@ struct OmniApp: App {
                     model.search()
                 }
                 .frame(minWidth: 820, minHeight: 520)
-                // A main-thread stall detector, off unless asked for with -omni.hangwatch YES.
-                // A timer on the main run loop only fires when the main thread is free, so the
-                // gap between firings IS the block. This is how "feels laggy" becomes a number.
-                .task {
-                    guard UserDefaults.standard.bool(forKey: "omni.hangwatch") else { return }
-                    let ms = UserDefaults.standard.integer(forKey: "omni.hangwatchMs")
-                    HangWatch.start(reportAbove: ms > 0 ? Double(ms) / 1000 : 0.25)
-                }
                 .task { Updater.checkOnLaunchIfDue() }   // silent once-a-day check; prompts only if newer
         }
         .defaultSize(width: 1000, height: 660)
@@ -603,11 +610,16 @@ enum HangWatch {
     private static var began = Date()
     private static var worst: Double = 0
 
-    static func start(reportAbove seconds: Double = 0.25) {
+    private static var sink: FileHandle?
+
+    static func start(reportAbove seconds: Double = 0.25, file: String? = nil) {
         last = Date()
         began = last
-        FileHandle.standardError.write(Data(String(
-            format: "[hang] watching, reporting blocks over %.0f ms\n", seconds * 1000).utf8))
+        if let file {
+            FileManager.default.createFile(atPath: file, contents: nil)
+            sink = FileHandle(forWritingAtPath: file)
+        }
+        emit(String(format: "[hang] watching, reporting blocks over %.0f ms\n", seconds * 1000))
         Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in
             MainActor.assumeIsolated {
                 let now = Date()
@@ -615,10 +627,14 @@ enum HangWatch {
                 last = now
                 guard gap > seconds else { return }
                 worst = max(worst, gap)
-                FileHandle.standardError.write(Data(String(
-                    format: "[hang] t+%.1fs blocked %.0f ms (worst %.0f)\n",
-                    now.timeIntervalSince(began), gap * 1000, worst * 1000).utf8))
+                emit(String(format: "[hang] t+%.1fs blocked %.0f ms (worst %.0f)\n",
+                            now.timeIntervalSince(began), gap * 1000, worst * 1000))
             }
         }
+    }
+
+    private static func emit(_ line: String) {
+        let data = Data(line.utf8)
+        if let sink { sink.write(data) } else { FileHandle.standardError.write(data) }
     }
 }

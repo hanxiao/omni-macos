@@ -36,6 +36,11 @@ final class ChaosUITests: XCTestCase {
 
     override func tearDownWithError() throws {
         churnStop = true
+        // Terminate explicitly and settle: back-to-back tests otherwise launch while the previous
+        // instance is still winding down, and the new one fails with "has not loaded accessibility"
+        // - a failure of the runner's handshake, not of the app.
+        XCUIApplication().terminate()
+        usleep(1_500_000)
         try? FileManager.default.removeItem(at: corpus.deletingLastPathComponent())
     }
 
@@ -46,6 +51,12 @@ final class ChaosUITests: XCTestCase {
             "-omni.roots", "(\"\(corpus.path)\")",
             "-omni.serving.enabled", "NO",
             "-omni.uiChaos", "YES",
+            // The stall detector, into a file: under XCUITest the app's stderr is swallowed, and
+            // "was the main thread blocked when the driver timed out?" is the only question that
+            // separates a product hang from an event-synthesis flake.
+            "-omni.hangwatch", "YES",
+            "-omni.hangwatchMs", "250",
+            "-omni.hangwatchFile", "/tmp/omni-chaos-hang.log",
         ]
         app.launch()
         return app
@@ -125,13 +136,7 @@ final class ChaosUITests: XCTestCase {
                 // Taking them from the window at large picked "_XCUI:CloseWindow" on the first run,
                 // which shut the last window and took the app down with it: a bug in the driver
                 // that reads exactly like a crash in the app.
-                let buttons = app.windows.firstMatch.toolbars.firstMatch.buttons
-                let safe = (0 ..< buttons.count).map { buttons.element(boundBy: $0) }.filter {
-                    guard $0.exists else { return false }
-                    return !$0.identifier.hasPrefix("_XCUI")
-                }
-                if let b = safe.randomElement(), b.isHittable { b.click() }
-                usleep(300_000)
+                clickARandomToolbarButton(app)
                 app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
             case 4:
                 // Escape spam and refocus: the state machine sees stop, stop, stop, start.
@@ -215,6 +220,165 @@ final class ChaosUITests: XCTestCase {
                       "the search field holds \"\(typed)\" after typing - this suite is not "
                       + "exercising search, only event handling")
         print("[chaos] completed \(rounds) interaction rounds, field=\"\(typed)\"")
+    }
+
+    /// The OTHER half of the app: browsing, the menu bar, the transcription workspace, Settings,
+    /// and the window's own close behaviour. The search-side test above never leaves the results
+    /// view, so none of this was exercised by it.
+    ///
+    /// WHAT IS DELIBERATELY NOT DRIVEN, because it takes the run out of the app's hands rather than
+    /// testing it: Cmd-O and Shift-Cmd-O (open panels - a modal file panel blocks the event tap and
+    /// wedges the run), Shift-Cmd-R (Finder takes the front window), Cmd-G (share sheet), Cmd-S in
+    /// the workspace (save panel), Cmd-/ (a browser), Cmd-Delete (trashes files), and Cmd-Q.
+    ///
+    /// Cmd-W IS driven, on purpose: the red button now HIDES the window rather than quitting, so
+    /// the recovery path (activate, which is what a Dock click and `open -a` both go through) is
+    /// part of what needs to survive chaos.
+    func testChaoticNavigationAcrossViews() throws {
+        let app = launchIsolated()
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 60), "app did not come up")
+        startChurn()
+        defer { churnStop = true }
+
+        let deadline = Date().addingTimeInterval(180)
+        var rounds = 0
+
+        while Date() < deadline {
+            switch rounds % 10 {
+            case 0:
+                // The drawer, twice - it carries the roots the rest of this test navigates.
+                for _ in 0 ..< 2 { app.typeKey("s", modifierFlags: [.command, .control]); usleep(250_000) }
+            case 1:
+                // Into a root from the Go menu, then flip the view mode under it.
+                app.typeKey("1", modifierFlags: [.command, .control])
+                usleep(600_000)
+                app.typeKey("2", modifierFlags: .command); usleep(300_000)
+                app.typeKey("1", modifierFlags: .command); usleep(300_000)
+            case 2:
+                // Up a level and back along the trail. Back/forward is shared with search history,
+                // so this is the case where the two meanings of the chevrons meet.
+                app.typeKey(XCUIKeyboardKey.upArrow, modifierFlags: .command); usleep(300_000)
+                for _ in 0 ..< Int.random(in: 2 ... 5) {
+                    app.typeKey("[", modifierFlags: .command); usleep(120_000)
+                }
+                for _ in 0 ..< Int.random(in: 1 ... 4) {
+                    app.typeKey("]", modifierFlags: .command); usleep(120_000)
+                }
+            case 3:
+                // Go to Folder: open it, type a real prefix so the index completion runs, escape.
+                app.typeKey("g", modifierFlags: [.command, .shift])
+                usleep(400_000)
+                app.typeText("/pri")
+                usleep(500_000)
+                app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
+                usleep(200_000)
+            case 4:
+                // Into the transcription workspace and back out. With no document open this is the
+                // empty state, which is the cheap half; the expensive half is that leaving tears
+                // down 4.5 GB of weights if any were loaded.
+                app.typeKey("o", modifierFlags: [.command, .option]); usleep(700_000)
+                app.typeKey("o", modifierFlags: [.command, .option]); usleep(500_000)
+            case 5:
+                // Settings, then away. Cmd-W CLOSES THE FRONT WINDOW, and which window that is
+                // depends on whether Cmd-comma actually landed - when it did not, the Cmd-W hid the
+                // MAIN window instead, every later round drove nothing, and the run ended with "no
+                // window at the end" pointing at the app rather than at this ambiguity. So the
+                // close is conditional on a second window actually existing.
+                let before = app.windows.count
+                app.typeKey(",", modifierFlags: .command)
+                usleep(900_000)
+                if app.windows.count > before {
+                    app.typeKey("w", modifierFlags: .command)
+                    usleep(400_000)
+                }
+                XCTAssertTrue(app.windows.firstMatch.exists, "the main window went away at Settings")
+            case 6:
+                // Quick Look from the browser, which is a different selection source than results.
+                app.typeKey(XCUIKeyboardKey.downArrow, modifierFlags: [])
+                usleep(150_000)
+                app.typeKey("y", modifierFlags: .command)
+                usleep(700_000)
+                app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
+            case 7:
+                // Quick Look again from whatever view is up, rather than Cmd-W - see the note on
+                // the close-to-hide check at the end of this test for why that one cannot live in
+                // the middle of a loop that keeps driving the UI.
+                app.typeKey("y", modifierFlags: .command)
+                usleep(600_000)
+                app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
+            case 8:
+                // A search, so the browser and the results view keep swapping places.
+                focusSearch(app)
+                app.typeKey("a", modifierFlags: .command)
+                app.typeKey(XCUIKeyboardKey.delete, modifierFlags: [])
+                app.typeText(["porsche", "memory budget", "recipe tomatoes"].randomElement()!)
+                usleep(900_000)
+                app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
+            default:
+                // Toolbar controls again, but from whatever view the rounds above have left up -
+                // the toolbar's contents differ per mode, which is the thing being poked here.
+                clickARandomToolbarButton(app)
+                app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
+            }
+            rounds += 1
+        }
+
+        churnStop = true
+
+        // Alive is not enough: it has to still SEARCH. Same assertion as the other test, for the
+        // same reason - a suite that only checks liveness passes through a broken query path.
+        app.activate()
+        XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 20), "no window at the end")
+        focusSearch(app)
+        app.typeKey("a", modifierFlags: .command)
+        app.typeKey(XCUIKeyboardKey.delete, modifierFlags: [])
+        app.typeText("porsche")
+        sleep(3)
+        XCTAssertEqual(app.state, .runningForeground, "app was not alive at the end")
+        let field = app.windows.firstMatch.searchFields.firstMatch
+        let typed = (field.value as? String) ?? ""
+        XCTAssertTrue(typed.contains("porsche"),
+                      "the search field holds \"\(typed)\" after \(rounds) rounds across views")
+        print("[chaos] completed \(rounds) cross-view rounds, field=\"\(typed)\"")
+
+        // CLOSE-TO-HIDE, LAST, because it ends the ability to drive the UI. Cmd-W hides the window
+        // and the app keeps running - that is the whole contract, so the assertion is on the
+        // PROCESS, not on a window coming back.
+        //
+        // `app.activate()` does NOT bring it back, and that is correct rather than a bug: activation
+        // is not a reopen. `applicationShouldHandleReopen` fires for a Dock click, Spotlight and
+        // `open -a`; Cmd-Tab does not send it either, which is exactly how Chrome behaves with its
+        // last window closed - the behaviour this was modelled on. Verified separately: after Cmd-W
+        // the process is alive with no window, and `open -a` restores it.
+        app.typeKey("w", modifierFlags: .command)
+        sleep(2)
+        XCTAssertNotEqual(app.state, .notRunning,
+                          "Cmd-W quit the app - closing the window must only hide it")
+    }
+
+    /// Click a toolbar control at random, and NAME IT if the window disappears.
+    ///
+    /// "window was gone at the end" is not a diagnosis - it says something closed the window
+    /// without saying what, and with close-to-hide the app stays alive so the run limps on doing
+    /// nothing until the final assertion. The window-management buttons live in the toolbar's
+    /// accessibility subtree on macOS, which is how an earlier version of this clicked
+    /// `_XCUI:CloseWindow` and took the app down with it; the prefix filter catches that one, and
+    /// the check below catches whatever else behaves like it.
+    private func clickARandomToolbarButton(_ app: XCUIApplication) {
+        let buttons = app.windows.firstMatch.toolbars.firstMatch.buttons
+        let safe = (0 ..< buttons.count).map { buttons.element(boundBy: $0) }.filter {
+            guard $0.exists else { return false }
+            if $0.identifier.hasPrefix("_XCUI") { return false }
+            // Close / minimise / zoom by any spelling: identifier, title or label.
+            let words = [$0.identifier, $0.title, $0.label].map { $0.lowercased() }
+            return !words.contains { $0.contains("close") || $0.contains("minimi") || $0.contains("zoom") }
+        }
+        guard let b = safe.randomElement(), b.isHittable else { return }
+        let what = "id=\(b.identifier) title=\(b.title) label=\(b.label)"
+        b.click()
+        usleep(300_000)
+        XCTAssertTrue(app.windows.firstMatch.exists,
+                      "a toolbar button made the window disappear: \(what)")
     }
 
     private func focusSearch(_ app: XCUIApplication) {

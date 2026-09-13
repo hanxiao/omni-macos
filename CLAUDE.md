@@ -1763,6 +1763,34 @@ fragment appended to the default contradicts rules the default has already given
   change the SHAPE of the output, which is not something a reader can judge from a preset's name.
 
 ## UI tests (UITests/, Scripts/ui-test.sh)
+- `-omni.hangwatch YES` DID NOTHING FOR AN UNKNOWN STRETCH, and the stall figures quoted in this
+  file came from it. It was started from a `.task` on the window's content that never ran: a probe
+  as the first statement of that task - writing unconditionally to stderr, then to a file - produced
+  nothing across repeated launches, while sibling `.task` modifiers in the SAME chain
+  (`-omni.ocrOpen`, `-omni.query`) fire every time. The break predates 2026-09-12: `9b1e589` has the
+  identical `.task { ocrOpen } / .frame / .task { hangwatch }` shape. It now starts from
+  `applicationDidFinishLaunching`, which is guaranteed to run, and takes `-omni.hangwatchFile
+  <path>` because under XCUITest the app's stderr goes into the test bundle and cannot be read from
+  a shell.
+- ALWAYS RUN THE POSITIVE CONTROL. A detector reporting nothing looks exactly like one that is not
+  firing - which is how "0 stalls" was nearly reported off the dead instrument. Drop the threshold
+  (`-omni.hangwatchMs 30`) and check it produces hundreds of lines before believing a zero at 250.
+- MEASURED 2026-09-12, cross-view tour under index churn (sidebar, browse roots, gallery/list,
+  enclosing folder, back/forward, search, OCR in and out, Settings), and again inside a full chaos
+  run: ZERO main-thread blocks over 250 ms. Positive control at 30 ms on the same build: 457 blocks,
+  worst 179 ms. So the app does not stall; the driver failures below are the harness.
+- THE CHAOS SUITE IS FLAKY AND IT IS NOT A REGRESSION. It fails perhaps half the time with "Failed
+  to synthesize event: Timed out while synthesizing event", "window was gone at the end", or
+  "Application has not loaded accessibility" on a back-to-back launch. Checked rather than assumed:
+  a worktree at `9b1e589` - before any of the 2026-09-12 work - fails the same suite with the same
+  "window was gone at the end". Re-run before believing a red, and capture the error line.
+- CMD-W IS AMBIGUOUS IN A CHAOS LOOP. It closes the FRONT window, so a Settings round whose
+  Cmd-comma did not land hides the MAIN window instead, every later round drives nothing, and the
+  run ends blaming the app. Close conditionally on a second window actually existing.
+- `activate()` IS NOT A REOPEN. Closing the window hides it (close-to-hide), and
+  `applicationShouldHandleReopen` fires for a Dock click, Spotlight and `open -a` - not for
+  Cmd-Tab or `XCUIApplication.activate()`. That is the same as Chrome with its last window closed.
+  A test asserting the window returns after `activate()` is testing a path no user takes.
 - THE HANDOFF TESTS TAKE THEIR QUERY FROM A LAUNCH SEAM (`-omni.query`), not from typing. XCUITest
   could not get text into the toolbar's `.searchable` field in that suite - exists / enabled /
   hittable all true, `typeText` lands nowhere - so all three selection tests SKIPPED for a session
