@@ -87,7 +87,7 @@ final class ChaosUITests: XCTestCase {
         var rounds = 0
 
         while Date() < deadline {
-            switch rounds % 6 {
+            switch rounds % 8 {
             case 0:
                 // Search as you type, then abandon it part way.
                 focusSearch(app)
@@ -138,6 +138,37 @@ final class ChaosUITests: XCTestCase {
                 for _ in 0 ..< 5 { app.typeKey(XCUIKeyboardKey.escape, modifierFlags: []); usleep(60_000) }
                 focusSearch(app)
                 app.typeText("m")
+            case 6:
+                // FIND SIMILAR, through the menu chord that owns it (a chord declared inside a
+                // context menu never fires on macOS). Run a query, take a result, then use it as
+                // the next query - the doc-vs-doc path, re-entered while the indexer is writing.
+                focusSearch(app)
+                app.typeKey("a", modifierFlags: .command)
+                app.typeKey(XCUIKeyboardKey.delete, modifierFlags: [])
+                app.typeText("porsche")
+                usleep(900_000)
+                app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
+                app.typeKey(XCUIKeyboardKey.downArrow, modifierFlags: [])
+                usleep(150_000)
+                app.typeKey("f", modifierFlags: [.command, .option])
+                usleep(UInt32.random(in: 400_000 ... 1_200_000))
+                // And out again, so the file-query chip is built and torn down repeatedly.
+                app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
+            case 7:
+                // HISTORY REPLAY. Every query above is recorded; clicking one has to restore its
+                // text AND its filters and re-run it. Clicked by row rather than by label, because
+                // what is in the list depends on what the earlier rounds happened to run.
+                let rows = app.windows.firstMatch.outlines.firstMatch.cells
+                if rows.count > 2 {
+                    let r = rows.element(boundBy: Int.random(in: 2 ..< rows.count))
+                    if r.exists, r.isHittable { r.click() }
+                }
+                usleep(UInt32.random(in: 300_000 ... 900_000))
+                // Back and forward across the replay, which is where a bad restore shows up.
+                app.typeKey("[", modifierFlags: .command)
+                usleep(200_000)
+                app.typeKey("]", modifierFlags: .command)
+                usleep(200_000)
             default:
                 // Sidebar clicks.
                 let rows = app.windows.firstMatch.outlines.firstMatch.cells

@@ -1066,11 +1066,17 @@ public final class Indexer: @unchecked Sendable {
                     guard !stage.isEmpty else { return }
                     let batch = stage; stage = []; stagedRaws = 0
                     let allRaws = batch.flatMap { $0.raws }
+                    let tFlush = omniPerfEnabled ? Date() : nil
                     // Tags ride the same forward pass (empty when no tagger is attached); a tagged
                     // image's snippet becomes its content tags instead of the bare filename.
                     guard let (vecs, tags) = self.embedder.embedImagesTagged(allRaws), vecs.count == allRaws.count else {
                         for b in batch { storeChunks(b.file.path, []) }   // vision unavailable/fault
                         return
+                    }
+                    if let tFlush {
+                        omniPerfLog(String(format: "image-flush %.0fms raws=%d files=%d%@",
+                                           -tFlush.timeIntervalSinceNow * 1000, allRaws.count,
+                                           batch.count, self.isCancelled ? " DISCARDED" : ""))
                     }
                     if self.isCancelled { return }   // mid-batch pause: nothing stored, files redo next pass
                     var off = 0

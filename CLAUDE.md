@@ -501,6 +501,846 @@ measured on an M3 Ultra too, so they compare directly.
 - Verified in the app, not just built: sidebar click browses, double-click descends, the
   breadcrumb walks back up, `readme` inside 911-fanbook returns only that folder's files, and
   back/forward moves between folders with the chevrons enabling and greying correctly.
+- It lists what the INDEX knows, never the directory. `VectorStore.indexedChildren(ofFolder:)`:
+  files indexed directly in the folder, plus subfolders holding at least one indexed file beneath
+  them, so descending can never dead-end. Checked against the live index - ~/Documents has 58
+  files + 94 folders on disk and 51 + 88 in the index, and the six hidden folders are genuinely
+  unindexed. Dates and sizes still come from DISK, the way Finder reports them; the index's copies
+  belong to the version that was indexed and go stale on the next edit. A path that no longer
+  stats is dropped rather than listed, which makes a deleted file self-heal out of the listing.
+- That query is SQL over `dirs`, and it has to be. The obvious version - one pass over the
+  in-memory `idPath` table, the way `fileCount(underFolder:)` does it - is O(live files), 2.6M
+  here, and it held the browser on a spinner for MINUTES in a debug build (the main thread was
+  idle the whole time; `sample` showed the work on a background thread, so it never looked like a
+  hang). `dirs` has one row per directory and a unique index on `path`, so the range scan
+  `>= folder||'/'` .. `< folder||'0'` (the `StoreSchema.dirSubtreeIDs` idiom; '0' is the byte
+  after '/') plus EXISTS clauses riding `files(dir_id, name)` and `chunks(file_id, chunk_index)`
+  make it instant.
+- No trailing chevron on folder rows. Finder's LIST view has none - it puts a disclosure triangle
+  on the LEFT - and a right chevron is its COLUMN view's idiom, not this one.
+
+## Liquid Glass (App/Design.swift) - audited 2026-09-11 against the macOS 26.2 SDK
+
+Adoption is complete for what this app is. Verified running on Tahoe, not read off a doc: the
+score chip over a dark synthwave thumbnail renders dark with the magenta behind it showing
+through, and over a bright beach photo the same chip renders light and warm. A static
+`.ultraThinMaterial` would look identical on both. That is the real `glassEffect` lensing.
+
+Preconditions, all checked: built against `macosx26.2`, `LSMinimumSystemVersion` 14.0, and NO
+`UIDesignRequiresCompatibility` / `NSRequiresAquaSystemAppearance` opt-out anywhere - so every
+standard control gets Liquid Glass automatically and only custom surfaces need the API.
+
+In use: `glassEffect(_:in:)` with `.regular` and `.regular.interactive()`, `GlassEffectContainer`
+(via `GlassGroup`), `ToolbarSpacer`, `sharedBackgroundVisibility`, and a Reduce Transparency
+fallback to `.ultraThinMaterial` - which is both the HIG-correct behaviour and a real GPU saving,
+since it removes a live glass pass per visible cell.
+
+Deliberately NOT used, so nobody "fixes" this later:
+- `.buttonStyle(.glass)` / `.glassProminent` - every button we would apply it to already sits
+  INSIDE a glass chip, and glass inside glass is the thing Apple tells you not to do. Standard
+  `.bordered` / `.borderedProminent` buttons (onboarding, settings) already get the new look for
+  free by recompiling.
+- `Glass.clear` - Apple recommends it over media-rich content, but only with a dimming layer.
+  `.regular` was checked on both a dark and a bright photo and reads cleanly on each; `.clear`
+  would trade that for a dimming layer we would then have to tune.
+- `backgroundExtensionEffect()` - wants full-bleed media running under a sidebar. The detail pane
+  is a results grid.
+- `scrollEdgeEffectStyle(_:for:)` - WRONG WHEN FIRST WRITTEN, and worth the correction: this said
+  Finder's icon view clips hard at the toolbar boundary the way ours did. It does not. Both its
+  list and its icon views use the SOFT pocket - measured, a gradient from 245 to 253 over ~25pt with
+  no rule. Ours had the hard one. The modifier still turns out not to be the fix: see the
+  scroll-pocket note under "Folder browser columns".
+- `Glass.tint(_:)`, `Glass.identity` - no surface wants them.
+
+Unused and arguably worth it, if the subject ever comes up again: `glassEffectUnion(id:namespace:)`
+would make the gallery cell's score / locator / stack chips ONE glass shape rather than three that
+merge when they approach; `glassEffectID(_:in:)` plus `glassEffectTransition(.materialize)` would
+let chips morph and form instead of sliding in on a generic `.move` transition; and
+`ConcentricRectangle` / `containerShape` would keep nested corner radii concentric instead of the
+fixed `Design.corner = 8`. All three are refinements, none is a defect, and none has been done.
+
+## Third-party UI packages (surveyed 2026-09-11)
+
+The app has TWO dependencies: `mlx-swift` and `swift-tokenizers`. `App/Updater.swift` says it in
+one line - "No Sparkle / no third-party dependency." A package has to close a gap the system API
+does not, and has to be safe for an Apache-2.0 notarised public app on macOS 14. Most are not.
+This survey exists so the search is not repeated.
+
+- BUILT AND REMOVED, 2026-09-11: a global summon shortcut (`sindresorhus/KeyboardShortcuts`, MIT,
+  Carbon `RegisterEventHotKey`), a floating `NSPanel` quick-search palette over the shared
+  `AppModel`, and a menu bar item. All three worked end to end - Option-Space from another app
+  raised the palette, typing searched, Return opened, Command-Return revealed in Finder,
+  Shift-Return handed the query to the main window. Han looked at it and said no: "I don't like
+  menu icon and call out search popup thing." Omni is a window, not a launcher. Do not re-propose
+  this. The dependency went back out with it, and the count is two again.
+- REJECT `siteline/swiftui-introspect` (MIT, 6.5k, active, macOS 12). Good software, wrong trade:
+  nine AppKit spelunking sites in `App/` is too few to justify a dependency whose entire business
+  is tracking undocumented SwiftUI view hierarchies. It breaks on macOS betas by design.
+- REJECT `mrkai77/Luminare` on licence alone. GitHub reports "Other" and there is no resolvable
+  LICENSE on main. An Apache-2.0 public app cannot take that. Same gate as STTextView.
+- REJECT `SwiftUIX/SwiftUIX` (MIT, 8.2k). An "exhaustive expansion" of SwiftUI: the cost is the
+  whole package, the benefit is a handful of views, and its macOS 11 floor means its shims predate
+  everything we ship on.
+- REJECT `EmergeTools/Pow` (MIT, 4.4k, last release 2024-11, iOS-shaped). The honest version of
+  that want was unused SYSTEM API, and it has now been spent - see below.
+- REJECT `sindresorhus/Settings` - the app already uses the SwiftUI `Settings {}` scene.
+  REJECT `sindresorhus/Defaults` - 75 working `UserDefaults` sites; a typed refactor with nothing
+  user-visible at the end. REJECT `LaunchAtLogin-Modern` - it wraps the one `SMAppService` call
+  that `App/LaunchAtLogin.swift` now makes directly, and has not been touched since 2023-12.
+- OPEN `nalexn/ViewInspector` (MIT, 2.6k, macOS 10.15). Worth a spike, not a commitment: it
+  unit-tests SwiftUI view trees IN PROCESS, the one thing that would unblock UI testing without
+  the XCTest automation password prompt. It reflects into SwiftUI's private view storage, same
+  fragility as introspect - but test-only, so a break cannot reach a user. That asymmetry is the
+  whole argument. Last tag 0.10.3 (2025-09-21), 60 open issues, `@Observable`-era support
+  unverified.
+
+### MenuBarExtra keeps its content live (measured, 2026-09-11)
+
+A SwiftUI `MenuBarExtra`'s content stays in the view graph whether or not the menu is open, so
+reading anything from `AppModel` in it puts the whole MAIN menu on that property's change rate.
+With a status line reading `model.progress.perRoot`, `sample` showed 100% of the main thread
+inside `AppDelegate.scenesDidChange -> makeMainMenu -> updateMenuHost -> requestUpdate`, looping:
+the app never reached idle, a `DispatchQueue.main.asyncAfter(5s)` never fired, and the global
+hotkey - correctly registered, `RegisterEventHotKey` probe returned `-9878` - could not be
+delivered. The same shape as the OCR rail stutter: a high-frequency write invalidating a whole
+tree that only needs to be correct when someone looks at it. A static `MenuBarExtra` costs
+nothing; `NSStatusItem` with `menuNeedsUpdate` costs nothing and never touches the main menu. If a
+menu bar item is ever wanted again, that is the way to build it.
+
+### SwiftUI will not give you a plain Return (measured, 2026-09-11)
+
+For a focused `TextField`: `onSubmit` sees ONLY an unmodified Return, `onKeyPress` on an ancestor
+sees only a MODIFIED one, and once that `onKeyPress(keys: [.return])` exists it takes the plain
+Return too and drops it - so the combination leaves Return doing nothing at all. Tab never arrives
+either; focus traversal eats it first. A local `NSEvent` monitor runs ahead of the responder chain
+and is the only place all the chords can be decided together.
+
+### Motion: system API, not a package
+
+`.contentTransition(.numericText(value:))` and `.symbolEffect` are macOS 14 and were the answer to
+wanting Pow. Live counters roll their digits instead of cutting: the OCR chip's page count and
+tok/s (`App/OCRView.swift`, `ProgressReadout`) and the empty state's indexed-file count
+(`SearchWaysPrompt.count`). Pass the NUMBER to `numericText(value:)`, not just the string - that
+is what makes a rising count roll up and a falling rate roll down.
+
+## Settings window, audited pane by pane (2026-09-11)
+
+Seven tabs is the ceiling at `width: 480`. An eighth (a "General" tab, since removed) pushed
+SERVING behind an overflow chevron, where a whole pane only opens as a popover outside the window.
+If a tab is ever added, one has to go or the window has to get wider - check the strip, the
+overflow is silent.
+
+Fixed in this pass:
+- `ByteCountFormatter.string(fromByteCount:countStyle:)`, the static convenience, leaves
+  `allowsNonnumericFormatting` ON and renders 0 as "Zero KB". That shipped in the memory legend.
+  No Apple surface says it - Finder's Get Info says "0 bytes". All byte formatting now goes through
+  `ByteSize` in App/Design.swift, which turns that off once; it is `@MainActor` because
+  `ByteCountFormatter` is not `Sendable` and the instances are cached rather than rebuilt per row.
+- Labels are sentence case throughout this window ("Search as you type", "Max image size").
+  "Benchmark This Mac" and "Add searches to History" were title case and are not any more. Button
+  labels stay as they are - "Restore Default", "Reveal in Finder" - which is the macOS convention.
+- The Serving port was a bare titled `TextField` with `.frame(width: 90)`. A width-constrained
+  field hugs its own label, so the number sat right after the word "Port" while every other row in
+  the window puts its value at the trailing edge. `LabeledContent` plus trailing text alignment
+  puts it back on the column.
+
+## Four search-box fixes (2026-09-12)
+
+- ESCAPE CLEARS THE WHOLE QUERY. `AppModel.clearSearch()` goes through `applyParsedQuery("")`,
+  the same door a parse uses, because the chips, the qualifier bar and the store filter are all
+  PROJECTIONS of `rawQuery` - clearing the text alone left them behind, so a "cleared" box still
+  returned a filtered, empty result set. Bound with `onKeyPress(.escape)` on the searchable
+  content, and it returns `.ignored` when there is nothing to clear so Escape still does its
+  normal job everywhere else.
+
+- CLICKING A HISTORY ROW NO LONGER RECORDS A TWIN. `runHistoryQuery` set the re-record guard to
+  the item's stored text, then `applyParsedQuery` rewrote the box into canonical form
+  (`in:/Users/x model` -> `in:"/Users/x" model`). The guard compared unquoted against quoted,
+  never matched, and every click recorded a quoted duplicate. The guard now holds `rawQuery`,
+  read AFTER canonicalisation. Verified: 164 items, three clicks, still 164.
+  That alone was not enough: the RECORDER deduped on the exact string, so a query TYPED unquoted
+  still landed beside the canonical row the box rewrites to. Dedup now runs on
+  `HistoryItem.canonicalKey` - parse, lowercase the semantic text, sort the qualifiers - which is
+  the same key `AppModel.canonicalized` uses to collapse the twins already on disk at load
+  (newest `lastUsed` wins, a bookmark on either survives). Verified end to end: the parser returns
+  identical output for both spellings, the load merge took 167 rows to 164 and then 165 to 164,
+  and three history clicks left the count at 164.
+
+- A CLICK IN THE FOLDER BROWSER SELECTS, AND LOOKS LIKE FINDER. A tap gesture of ANY kind on a row
+  swallows the click `List(selection:)` needs - verified twice, including with a double-tap alone,
+  which also selected nothing - so both taps and the highlight are ours. Finder's treatment
+  exactly: the whole row filled with the ACCENT colour and every label turned white. The first
+  attempt used `Color.accentColor.opacity(0.18)` with dark text and read as a pale blue band with
+  margins, which is not what Finder draws. Same in the photo browser.
+
+- SUGGESTIONS ARE ONE LINE, AND THE SCOPE IS A CHIP. They used `HistoryItem.displayText` as the
+  label, so a 340-character path rendered as a ten-line wrapped paragraph, five of them stacked
+  taller than the window. The row is now `lineLimit(1)`, the label is `displayLabel`, and the
+  folder is drawn as a chip; the COMPLETION is still the full query, so selecting one replays
+  everything. `displayScope` middle-elides through `SearchToken.elided` for the same reason the
+  field's chip does - sibling folders here differ only in their suffix.
+
+  ON THE CHIP'S LOOK, since it will be asked again: native macOS suggestion lists (Spotlight,
+  Safari, Finder) have NO chips - plain text rows. The chips are a deliberate departure, made
+  because these queries carry paths that are illegible as plain text. Given that, the most native
+  option available is to match the token the SEARCH FIELD itself draws for the same qualifier, so
+  field and suggestions speak one language: a rounded rect, not a capsule, `.primary.opacity(0.06)`
+  fill, primary text. `.quaternary` was the first try and measured far heavier than the system
+  token (which is roughly a 3% wash on its own surface) - it read as a grey block.
+  It is NOT a glass effect on purpose: the suggestion popover is already a vibrant surface, and
+  glass inside glass is the one thing Apple's guidance rules out.
+
+HARNESS NOTE, cost an hour twice: `CGEventKeyboardSetUnicodeString` typing into this app is
+intermittent - it silently drops the whole string and looks exactly like a broken text field.
+`osascript -e 'tell application "System Events" to keystroke "..."'` is reliable. Rule out the
+harness before believing a typing regression.
+
+## Sidebar history: labels, and what the buckets really hold (2026-09-12)
+
+Rows show the WORDS, not the query. `HistoryItem.displayLabel` returns the parser's
+`semanticText`, so `cat in:/Users/hanxiao/Documents/embedding-inversion type:image` reads as
+`cat`. The path was the noise - the same path on every row, the one part that says nothing about
+which search it was. A pure-filter search with no words falls back to the qualifier VALUES
+("Documents, image"), never the raw string.
+
+Two things had to come back after that, because clean went too far:
+- `displayScope` - the `in:` folder's LAST COMPONENT, dimmed, after the label. Without it the same
+  word searched in eight folders is eight rows reading "model". The path was the noise, the folder
+  was not.
+- a generic `line.3.horizontal.decrease` glyph on any filtered row (`tag:` keeps its own). With
+  the qualifiers gone a filtered search and a bare one were identical.
+
+`displayText` is UNTOUCHED and must stay so: `id` is derived from it, so it carries identity,
+dedup and replay. Only the label changed. The tooltip still shows the whole query.
+
+BUCKETING IS CORRECT - measured, not assumed. Decoded the persisted `omni.searchHistory` (164
+items) and re-bucketed it on calendar days the way `historyGroups` does: Today 8, Yesterday 9,
+Previous 7 Days 32, Previous 30 Days 111, Earlier 4, spanning 2026-08-13 to 2026-09-12. Dates
+survive an upgrade intact - they are plain reference-date doubles in JSON, nothing reseeds them.
+What LOOKS like a bug is the shape of the ladder: Today and Yesterday are one day each while
+"Previous 30 Days" is 23 days wide and holds 68% of the list, so after any gap the sidebar is
+mostly that one section. If this is ever revisited, the fix is the ladder (or a bound on how many
+rows a section shows), not the counting.
+
+## The `in:` chip in a deep folder (2026-09-12)
+
+Depth was already handled - the chip shows the folder's LAST COMPONENT, not the path - so a deep
+folder is not what breaks it. A long NAME is. This index really holds
+`defense_yiyic_sentiment140_1k_google-bert_bert-base-multilingual-cased_train1000_noise_0_epsilon0.05_delta0.0001`,
+112 characters, with six siblings differing only after character 90.
+
+SwiftUI does truncate a token that will not fit, but it truncates at the TAIL, so all six siblings
+rendered as the identical chip `in:defense_yiyic_sentiment...` and there was no way to tell which
+folder the search was scoped to. `SearchToken.elided` now cuts the value in the MIDDLE at 24
+characters, in the STRING - not via `truncationMode(.middle)` on the token's `Text`, because a
+token chip already drops the `systemImage` off a `Label` and its content modifiers are not
+something to rely on. Reads `in:defense_yiyi...delta0.0001` against
+`in:defense_yiyi..._delta1e-06`, and the typed query still has room beside it.
+
+Only `label` is elided. `queryText` - what history, back/forward and the store filter all replay -
+still carries the full path, and must.
+
+## Folder browser columns (App/BrowserColumns.swift, 2026-09-12)
+
+Finder's header, with the index's facts instead of the filesystem's. Right-click the header to
+choose columns, click a title to sort, click again to reverse.
+
+Offered: Kind (the modality the index filed it under - the SAME vocabulary as the filter menu),
+Date Modified, Date Indexed, Size, Files Indexed (folders), Tags (media). Default on: Kind, Date
+Indexed, Size, Files Indexed. Name is not in the menu, because Finder will not let you turn its
+Name column off either.
+
+FILES INDEXED is the one column Finder cannot have, and the reason the header is worth building:
+it answers "how much of this folder is searchable" at a glance. It comes from a grouped aggregate
+over the same `dirs` range scan the listing already runs, so it is free.
+
+FIRST INDEX TIME IS NOT AVAILABLE, and was asked for. The schema keeps ONE `indexed_at` stamp per
+file and a reindex overwrites it, so what exists is LAST indexed. A first-indexed column needs a
+schema column, a migration, and would read empty for every row already in the index.
+
+FIX THESE BY SCREENSHOTTING FINDER AND OMNI STACKED, NOT FROM MEMORY, AND MEASURE THE PIXELS.
+Every detail below was invisible until the two windows were one above the other at the same size
+browsing the same folder, and several of them were invisible even then until a column of pixels was
+averaged. Finder at {0,40,1300,420}, Omni at {0,470,1300,380}, crop the same strip from each, paste
+them together; then scan rows for hairlines and dark runs for text positions. Eyeballing a stacked
+capture found the first five; only measurement found the rest.
+
+What that caught, in order:
+- the title sat INSIDE the chevrons' Liquid Glass capsule. Tahoe folds consecutive `.navigation`
+  items into one pill, so it looked like a third button.
+- a hairline ran between the toolbar and the column header. `w.titlebarSeparatorStyle = .none` was
+  the first guess and is NOT what draws it - see the scroll-pocket note below.
+- the title was near-black; Finder's is a mid grey (sampled: darkest pixel 160 on a 255 ground).
+- the sorted column needed weight as well as colour - `.semibold` - because colour alone did not
+  read next to Finder's.
+- it was a `Menu` with a disclosure chevron. Finder's title is plain text.
+- the name did not move when the chevrons were not there. Two `.navigation` items with the empty
+  one hidden still cost a full Tahoe inter-group gap on BOTH sides: the name sat at x=405 with a
+  2pt item at x=378 in front of it, against x=361 with that item gone. See the single-item note.
+- header and rows were 9pt out of line, and drifted a further point per column.
+- rows repeated every 24pt against Finder's 20.
+
+THE TOOLBAR/HEADER HAIRLINE IS TAHOE'S SCROLL POCKET, and none of the obvious knobs touch it. The
+window's `titlebarSeparatorStyle` was already `.none` (verified by reading it back from the live
+window) and the rule was still drawn. There is no `NSSplitViewController` in a SwiftUI window, so
+`NSSplitViewItem.titlebarSeparatorStyle` has nothing to set. `scrollEdgeEffectStyle(.soft, for:
+.top)` was tried on the `List`, on the browser's root and on the whole detail pane, and the rule
+survived all three. Dumping the live view tree named it: a 1pt `_NSLayerBasedFillColorView` inside
+`NSHardPocketView < NSScrollPocket < NSTitlebarBackgroundView < NSSplitView` - the pocket belongs to
+the SPLIT VIEW's titlebar background, not to any scroll view in the subtree, which is why no
+modifier in the subtree reaches it. Finder's list AND icon views both use the SOFT pocket (a
+gradient from 245 to 253 over ~25pt, no rule). So `WindowTitleHider` hides the rule directly: walk
+down at most 8 levels to `NSTitlebarBackgroundView`, then hide any 1pt-tall fill inside it. Shallow
+on purpose - it never walks the content pane - and entirely defensive.
+
+ONE TOOLBAR ITEM HOLDS BOTH THE CHEVRONS AND THE NAME. Two items cannot do it, and both ways of
+splitting them were tried:
+- make the chevron item CONDITIONAL, and when it comes back it is APPENDED - descending into a
+  folder put the chevrons to the RIGHT of the name.
+- keep it always present but empty, and Tahoe charges a full inter-group gap on either side of it
+  (an item whose shared background is hidden is its own group), which is the 44pt hole.
+Inside one item the chevrons simply appear and the name slides to meet them. The item draws no
+glass, so the name stays outside it - and then the chevrons need a capsule of their own, which a
+`ControlGroup` will NOT give: with the item's shared background hidden each of its buttons grew a
+capsule and the pair rendered as two circles. Two plain `.borderless` buttons with a `Divider`
+between them and one `.glassEffect(.regular, in: .capsule)` around the lot is Finder's shape.
+`.borderless` also mutes its label, so an enabled chevron came out as grey as a disabled one; it
+needs an explicit `.primary`.
+
+`OMNI_UI_DEBUG=1` + `kill -USR2 <pid>` dumps `/tmp/omni-debug-toolbar.txt`: toolbar item frames and
+constraints, the view-controller tree, and every view thinner than 3pt with its ancestor chain.
+That last section is what identified the pocket. Use it for layout facts - the shot it also writes
+renders SwiftUI layers as garbage.
+
+The folder name lives in the TOOLBAR, after the back/forward chevrons, exactly where Finder puts
+it - not on a content row above the listing, which cost a whole row and made the header look like
+a second bar. Three corrections were needed to match, all from looking at Finder rather than
+guessing:
+- it goes AFTER the chevrons, not before.
+- it is PLAIN TEXT. A `Menu` was tried, and its disclosure chevron and button chrome are the
+  giveaway - Finder's title carries neither. The ancestors already have two ways up (the back
+  chevron, the sidebar), and the full path is on hover.
+- the header has NO background fill. In Finder the header sits on the same surface as the toolbar
+  with no seam; a `.quaternary` band under it read as a separate component bolted on. The only
+  hairline divides the header from the ROWS.
+
+HEADER AND ROWS SHARE ONE SET OF NUMBERS (`BrowserMetrics`, `ColumnSlot`). While each carried
+padding of its own they sat 9pt apart and drifted a further point per column, and no value lined up
+with its title. Measured off Finder: its dividers sat at x=890/1071/1168 in a 1100pt pane, every
+header title and every left-aligned value 9pt after its divider, the one right-aligned value (Size)
+8pt before the next, rows every 20pt around a 16pt icon, a row's icon 27pt from the pane edge and
+its name at 46.
+
+Four things that geometry depends on, none of them guessable:
+- HEADER TITLES ARE LEFT-ALIGNED IN EVERY COLUMN, including numeric ones. Sorting Finder by Size
+  puts "Size" hard against the column's leading edge while the values under it stay right aligned.
+  The header does not follow the column's own alignment.
+- THE DIVIDERS AND THE SORT CHEVRON ARE OVERLAYS. As laid-out views each divider stole a point from
+  the strip and walked the header off the rows by one more point per column.
+- `List` KEEPS 9pt OF HORIZONTAL INSET that no API reports back - with `listRowInsets` zeroed a row
+  still began 9pt in from the pane edge. A header drawn above the list has to add the same 9pt by
+  hand (`BrowserMetrics.listInset`). Row padding goes INSIDE the row, not in `listRowInsets`.
+- 24pt ROWS ARE `defaultMinListRowHeight`, not anything in the row: a 16pt icon with no padding
+  still measured 24. Negative row insets did not move it. `.environment(\.defaultMinListRowHeight,
+  20)` does.
+
+`.listStyle(.plain)`, not `.inset`: the inset style adds ~12pt of horizontal inset of its own and
+draws the alternating bands as inset rounded capsules. Finder's bands are full-bleed and square.
+
+`BrowserColumn.width` is the WHOLE slot, insets included, so one number lays out both strips.
+
+THE SELECTION FILL IS A ROUNDED INSET RECT, not a full-bleed bar. Measured off Finder: the fill is
+the full row HEIGHT but runs x=208..1289 in a pane starting at 200 in a 1300pt window - 8pt in on
+the left, ~10 on the right. The alternating bands behind it ARE full-bleed; only the selection is
+inset. Same shape in the SEARCH RESULTS, whose rows are taller but should not round differently.
+
+THE RADIUS WAS FITTED, NOT PICKED. Reading Finder's fill edge scanline by scanline down from the
+top, its inset runs 4,3,2,1,0 px. A 4pt CONTINUOUS corner gave 1,0 - a squircle is much flatter near
+the edge than a circular arc of the same radius - and circular 6 gave 3,1,1,0. Circular 8 reproduces
+Finder's profile exactly. Measure the profile, do not eyeball the number.
+
+NO WELL BEHIND A THUMBNAIL. `Thumbnail` used to draw a translucent card with a faint stroke around
+it, which put a second background behind file icons that already have a shape of their own; Finder
+draws neither, in list view or in icon view, and a page of them read as a grid of boxes. The clip
+stays, so a photo still gets rounded corners.
+
+THE SEARCH RESULTS LIST IS STRIPED TOO. It cannot use `alternatingRowBackgrounds()` - it is a
+`ScrollView` of rows rather than a `List`, deliberately (see the note at `listView`) - so it bands
+by index on `NSColor.alternatingContentBackgroundColors[1]`. Its `LazyVStack` spacing went to 0 at
+the same time: with a 2pt gap the stripes read as separate cards instead of a ruled table.
+
+The Photos browser uses the same metrics and the same `ColumnSlot` - a Photos source is a folder as
+far as browsing goes. Its column header belongs to the LIST, not to the browser: an icon grid has
+no columns and Finder draws no header over one.
+
+## The menu bar, diffed against Finder's (2026-09-12)
+
+DUMPED BOTH MENU BARS THROUGH THE ACCESSIBILITY API AND COMPARED THEM ITEM BY ITEM, rather than
+from memory - `osascript` over `menu bar items of menu bar 1` for Finder and for Omni. Worth
+repeating whenever a feature lands: three of the gaps below were invisible until the two dumps sat
+side by side.
+
+- NO GO MENU AT ALL. Finder's is navigation (Back, Forward, Enclosing Folder), then places, then
+  the typed path. Ours had Back/Forward buried in View, no way up a level, and no Go to Folder.
+  There is a Go menu now with all of it, plus the indexed roots and Photos sources as the "places"
+  (Finder lists Documents/Desktop/Downloads there; ours are whatever the user added, which is the
+  same idea with the right contents for this app) on Ctrl-Cmd-1..9, since Cmd-1/2 are the view modes.
+- BACK/FORWARD MOVED to Go, and were REMOVED from View. They cannot be in both: two items with one
+  key equivalent make AppKit strip the chord from one, which reads as Cmd-[ silently doing nothing.
+- SHOW SIDEBAR WAS MISSING ENTIRELY ON TAHOE. It was gated to pre-26 on the belief that macOS 26
+  supplies its own item in View; the dump shows a View menu with no sidebar item, so the only way to
+  unhide the sidebar was the toolbar button. Now unconditional.
+- FEATURES THAT WERE CONTEXT-MENU OR TOOLBAR ONLY now have File-menu items: Generate Tags, Search in
+  This Folder, Visualize (UMAP/PCA), Ignore Folder, and the Serve over HTTP toggle. A feature
+  reachable only by right-click is one most people never find, and it cannot carry a working key
+  equivalent either - a chord declared inside a closed context menu never fires on macOS.
+
+GO TO FOLDER COMPLETES AGAINST THE INDEX, not the filesystem. Finder completes against the disk,
+which is right for Finder; here the useful answer is narrower - a folder Omni has actually indexed,
+because those are the ones that can be browsed and scoped to. It rides the same `dirs` range scan
+the browser already uses (`indexedFolders(matching:)`, shortest path first, capped at 12), and a
+path that is not indexed is still accepted if it exists, because the empty state is a truthful
+answer rather than a refusal. LIKE's own wildcards are escaped - most paths contain `_`, which
+would otherwise match any character.
+
+## Closing the window does not quit (2026-09-12)
+
+The red button HIDES the window. Omni keeps serving over HTTP, keeps its MCP endpoint up and keeps
+answering skills with nothing on screen, so closing the window is "put it away", the way it is in
+Chrome and Mail - not a request to stop the service. Quit is Cmd-Q, the one gesture that means it.
+
+Three parts, and all three are needed: `applicationShouldTerminateAfterLastWindowClosed` returns
+false; `isReleasedWhenClosed = false` on the window, so there is something left to bring back (state,
+sidebar width and the current search all survive - verified by closing with a sheet open and finding
+the sheet still there on reopen); and `applicationShouldHandleReopen` orders it front, which is what
+a Dock click, a Spotlight open and `open -a` all go through.
+
+## Toolbar visibility, audited mode by mode (2026-09-12)
+
+Three modes, and every item belongs to a stated one. The rule is that a control is SHOWN only where
+it changes something visible - not greyed, not "harmlessly there".
+
+|                          | idle | browse | search | OCR |
+|--------------------------|------|--------|--------|-----|
+| sidebar toggle, OCR toggle | yes | yes | yes | yes |
+| back/forward             | -    | yes    | yes    | **no** |
+| name in the toolbar      | -    | folder / source | - | **document** |
+| bookmark (star)          | -    | yes    | yes    | -   |
+| filter                   | -    | **no** | yes    | -   |
+| sort                     | -    | **no** | yes    | -   |
+| grid/list                | -    | **yes**| yes    | -   |
+| search by file, share    | yes  | yes    | yes    | - (OCR has its own) |
+| OCR view / open / save / copy / share | - | - | - | with a document |
+
+The five entries in bold were wrong, and four of them were wrong in the same direction - chrome that
+did nothing where it stood:
+
+- SORT was shown while browsing. It orders RESULTS, which are ranked; a browser sorts by clicking a
+  column header. Inert there.
+- FILTER was shown while browsing, because entering a folder sets `filterFolder` and that makes
+  `filtersActive` true. The browser lists indexed children and no filter touches that listing.
+- BACK/FORWARD were shown in OCR mode. That trail is the SEARCH history: stepping it while reading
+  a transcript changes a result set you cannot see, and the chevrons read as page navigation for
+  the document, which they are not.
+- GRID/LIST was missing in the Photos browser (the condition named `showsFolderBrowser` only) and
+  therefore its gallery existed with no way to reach it.
+- OCR mode showed no name at all - the one mode whose toolbar did not say what was on screen.
+
+The star STAYS while browsing, deliberately: bookmarking a browsed folder saves a state you can
+return to, which is not the same as a control that does nothing.
+
+THE CHROME IS 44pt TALL, NOT 40. Measured against Finder at the same window size: its chrome runs
+y=0..43 and ours ran 0..39, both holding the same 36pt item capsules - so ours had 2pt of air around
+them where Finder has 4, and the whole bar read as slightly squashed. `w.toolbarStyle = .unified`
+is what Finder uses; hiding the title text was enough for AppKit to pick `.unifiedCompact` on its
+own. With it, our column header's ink sits at y=60 against Finder's 61.
+
+## Content blurs under the chrome: a scroll view must FILL ITS PANE (solved 2026-09-12)
+
+THE SCROLL EDGE EFFECT IS NOT ABOUT THE TOOLBAR, IT IS ABOUT THE SCROLL VIEW'S FRAME. On Tahoe a
+scroll view gets the effect only when it fills its pane top to bottom. Anything stacked as a SIBLING
+above it - a column header, a filter chip - takes it out of contact with the safe area, and the
+effect silently does not apply: content then clips at a hard line instead of blurring under the
+chrome. This is why `scrollEdgeEffectStyle(.soft, for: .top)` appeared to do nothing however high or
+low it was applied. The modifier was never the problem.
+
+THE FIX IS `safeAreaBar(edge: .top)` (macOS 26). The bar sits in the safe area and the scroll
+content passes under it, which is exactly what a column header is. All three views now use it - the
+folder browser's header, the Photos browser's header, and the detail pane's file-query/qualifier
+chip - and content visibly ghosts under them and under the toolbar.
+
+How this was found, since three earlier guesses were wrong: Sarah Reichelt hit the AppKit twin
+(troz.net, Jan 2026) - an `NSTableView` whose rows scrolled INTO the header with no blur, cured by
+letting the enclosing `NSScrollView` span the whole content view. An Apple forums thread on sticky
+section headers names `safeAreaBar` as the API for a pinned header that the edge effect respects.
+Jon Sterling's Mastodon thread (Aug 2025) has a second, unrelated AppKit trap worth knowing: the
+effect is also not applied when a scroll view has no vertical scroller, so `hasVerticalScroller =
+true` matters even when the scroller is meant to be hidden.
+
+What was tried and did NOT work, so it is not tried again: `scrollEdgeEffectStyle` on the list, on
+the browser's root and on the whole detail pane; `NSSplitViewItem.titlebarSeparatorStyle` (a SwiftUI
+window has no `NSSplitViewController` to set it on); and `titlebarAppearsTransparent = true`, which
+does let content through and takes the toolbar's backdrop with it, so rows run across the buttons.
+
+ONE THING STILL NOT MATCHED:
+
+- THE SIDEBAR SELECTION IS STILL SWIFTUI'S, not Finder's. Finder fills a selected source-list row
+  with light grey and tints its icon and label with the accent colour. `.tint` on the List does NOT
+  drive that fill on macOS - it recoloured only the labels, giving blue on blue. Matching Finder
+  here means hand-drawing the row background and giving up native focus and keyboard selection,
+  which is the trade this note has refused twice; System Settings, also SwiftUI, draws the same
+  solid pill we do.
+
+ONE FILLED-TOGGLE STYLE (`ToolbarToggle`, App/Design.swift). The OCR toggle used to hand-draw its
+on state - an accent `Circle` behind a white glyph, painted inside the label - which had to be
+re-derived for the next toggle that came along and was a guess at the platform's look rather than
+the platform's look. `Toggle` + `.toggleStyle(.button)` is the control the system provides: the
+item's own capsule fills with the accent colour and the glyph inverts, which is what Finder does,
+and it stays correct through theme, accent and appearance changes for free.
+
+SERVE OVER HTTP SITS WITH THE MODE TOGGLES, not with Share. It is the same KIND of control as the
+sidebar and OCR toggles - a global mode of the app, on until turned off - rather than an action on
+whatever is on screen, so it shares their capsule and is present in every mode. Same switch as
+Settings > Serving, never a second source of truth.
+
+SEARCH BY A FILE IS A TOOLBAR BUTTON, not a glyph inside the search field. It was in the field, and
+that had two problems: as an affordance it was invisible, and it had to hide itself whenever the
+field held text - so it vanished exactly when a query was on screen. It now sits with a Share
+button immediately before the field, in the same order and the same slot OCR mode puts its own
+`Open Document` / `Share` pair, and wears the same `folder` symbol as OCR's. All the in-field
+accessory machinery (`installAccessory`, the tag, the shrunk magnifier) is gone.
+
+For Share to mean anything while browsing, BOTH BROWSERS NOW PUBLISH THEIR SELECTION to the model
+(`selectSingle`) as well as keeping their own. The model's selection is what every selection-driven
+action already reads - toolbar Share, the File menu, Quick Look - so a browsed file used to be
+clickable but not actionable from anywhere outside the browser view.
+
+ONE CONTEXT MENU FOR A FOLDER TOO (`FolderMenuItems`, App/FileMenu.swift). The sidebar's roots and
+the browser's subfolders had drifted badly: the browser's menu was iconed and led with Open, the
+sidebar's was icon-less, led with Pause, and offered no way to open, scope a search to, or copy the
+path of the folder you had just right-clicked. One builder now serves both, root actions included.
+
+Two things that shape it:
+- "Open" and "Search in this folder" were literally the same call under two labels. They are now
+  genuinely different: both enter the folder, the second also puts the caret in the search field
+  (`SearchFieldFocus`, shared with the Find command and with the window's own focus-on-appear).
+- "Remove from Omni" means one thing to a reader - Omni stops covering this folder - and needs two
+  mechanisms. A ROOT is un-added. A SUBFOLDER has no such record, so the equivalent is an
+  `.omniignore` rule via `ignoreFolder`, which also prunes what is indexed under it and is
+  revertible in Settings > Content.
+- PAUSE IS ROOT-SCOPED IN THE ENGINE and is shown only on a root. `pausedRoots` is consulted when
+  roots are collected into a pass; nothing tests a crawled path against it, so offering it on a
+  subfolder would set a flag that changes nothing.
+
+Splitting the sidebar was forced, not chosen: with the folder row, its four badge states and this
+menu inline, the `List` literal stopped type-checking in reasonable time. `FolderRow` and
+`PhotoSourceRow` are now their own views and the badge predicates live in `RootIndexState`.
+
+ONE CONTEXT MENU FOR A FILE (App/FileMenu.swift). The folder and Photos browsers used to carry two
+items - Open, Reveal - against the results' twelve, so the same file offered less depending on which
+list you reached it from. `FileMenuItems` is now the single builder for all three: Open, Quick Look,
+[passages], Find similar, Generate Tags, Reveal, Copy path, Share, Move to Trash, [Select all],
+Ignore folder. What stays with its own list is what only that list has - stacks and matching
+passages in the results (through the `passages` slot, so the results menu keeps its exact order),
+multi-selection actions (the browsers select one row), and the folder menu's Open / Search in this
+folder / Visualize, since folders never appear in search results.
+
+Two conditionals inside it are deliberate, not oversights: Generate Tags appears only for media
+(`taggableKinds`), because a text file's snippet is a real excerpt and tags would be a downgrade;
+Move to Trash is absent for a Photos asset, because deleting one deletes it from the library and
+every synced device - that is Photos.app's offer to make, not Omni's.
+
+## Real-time progress in the folder browser (2026-09-12)
+
+Two things the browser now does while an index pass is running: the Files Indexed counts climb
+without navigating away and back, and a folder that is filling carries the sidebar's pie at the
+trailing edge of its Name column (a badge on the icon, in gallery view).
+
+THE REFRESH IS PACED BY WHAT THE QUERY COSTS. `indexedChildrenDetailed` walks the whole subtree of
+the browsed folder on the store's SERIAL queue - the same queue the indexer writes on. Measured
+idle (`OMNI_PERF_LOG=1`, the `browse-list` line): 0.7 ms on a 105-file folder, 66 ms on 65k, 417 ms
+on 23k, and 2.4 SECONDS on a 2.4M-file root; under load the same query on ~/Documents went from
+68 ms to 648 ms. A fixed 2 s poll would have spent most of a big root's wall clock re-listing it.
+Each round therefore sleeps 20x the time the last one took (floor 1.5 s, ceiling 30 s), holding the
+duty cycle near 5% whatever the folder, and self-correcting as the store gets busier. It only runs
+while `isIndexingUnder(folder:)` - an idle window costs nothing.
+
+THE RING'S SIGNAL IS THE COUNT GOING UP, and getting there took three tries:
+- every descendant of a working root: 25 identical empty rings down a listing, none of them moving.
+  Says only what the sidebar already says.
+- `progress.currentPath`: too narrow to ever fire. A pass interleaves roots and moves through a
+  tree far faster than anyone can open a folder; instrumented over several minutes the current file
+  never once landed inside the folder being browsed.
+- a child whose indexed count GREW since the last listing. That is the same number the user is
+  watching, so the ring appears on exactly the rows whose figures are climbing. Held for 45 s,
+  because consecutive listings can be tens of seconds apart on a large folder and a ring that
+  blinked out between them reads as stopped.
+
+A SUBFOLDER BORROWS THE ROOT'S WEDGE. It has no clock of its own and one cannot be invented: the
+index knows how many files it HAS under a folder, never how many it is going to get, so a
+per-folder percentage would be a made-up denominator. The pass covering it does have a real clock -
+the same one the sidebar draws - so the wedge is that, and the tooltip names the root rather than
+implying the folder itself is that far along. An empty ring that never fills is not progress.
+
+Three bugs found on the way, all of them invisible without the instrumentation:
+- the CATCH-UP pass (the one that runs when you add a folder) merges progress field by field and
+  never carried `currentPath`, so anything keyed off it was dead during exactly the pass that
+  matters. The full pass assigns the whole struct.
+- `currentPath` was set by the CRAWL only, which races far ahead of the encoder and on a small root
+  finishes in a blink. It is now also set where chunks are WRITTEN - which is what "being indexed
+  right now" means, and what Settings' caption wanted all along.
+- the growth baseline survived a navigation, so every row of a folder you had just opened looked
+  like a brand-new one that had grown: a listing full of rings where nothing was happening.
+
+THE PIES ARE SAMPLED INTO `@State`, TWICE A SECOND, never read from the model inside a row.
+`AppModel.progress` is one observable property that changes on every indexed file - hundreds a
+second - so a row that reads it re-renders the whole listing at that rate. The sampled dict is only
+assigned when it actually changed, so an idle listing re-renders not at all.
+
+BACK/FORWARD STRESS: `Scripts/navstress.py <seed> <n> <x> <y> <w> <h>` - Cmd-[ / Cmd-], clicks
+on either half of the nav capsule, double-clicks that descend, and bursts of 8 alternating. 200
+actions at seeds 1337 and 4242: no crash, no new .ips, app still answering Accessibility queries at
+0.9% CPU, title and chevron enablement still correct afterwards. One thing to know: a "descend"
+double-click that lands on a FILE opens it in another app, which then takes the front window - keep
+the click column left of any other window on screen.
+
+Two traps met while building it:
+- the `files.kind` COLUMN is an interned id, not a `FileKind` ordinal. Decoding it directly is a
+  silent mis-mapping. `fileStatus(paths:)` already returns the kind as a String, along with size,
+  mtime and `indexed_at` - build on that rather than on raw SQL.
+- sort lives in the BROWSER, not in the toolbar's Sort menu. That menu governs search results,
+  which are ranked by relevance and have no header to click.
+
+## Emptying a Photos library left its rows immortal (fixed 2026-09-12)
+
+The ghost rows behind the missing thumbnails were not a Photos bug and not iCloud - they were a
+RECONCILE bug, and the mechanism is worth knowing because it guards deletions.
+
+The stale sweep protects a root that crawled empty: "a root that yielded zero files is almost
+certainly unreadable (permission revoked, volume offline), not emptied". For a FOLDER that is
+sound - the filesystem gives no other signal. For a Photos source it is wrong:
+`PhotoLibrary.enumerate` returns ok/not-ok explicitly, and the code was already throwing that
+signal away, leaving the total at 0 in BOTH cases. So a library the user emptied looked exactly
+like one we had lost access to, and its rows were never swept - which is why 12 assets that no
+longer exist still had index rows, and why their thumbnails fell back to type icons.
+
+`Indexer.blindRoots(totals:photoRoots:unreadablePhotos:)` is now a named static with
+`BlindRootTests` covering all four cases, because it decides what gets DELETED and does not belong
+in a closure. A folder root keeps today's behaviour exactly; a Photos source is blind only when
+`enumerate` actually failed. The ghosts clear on the next pass that includes the Photos source -
+both `index(roots:photos:)` call sites pass it, and `rootOf` already resolves `photos://all/...`
+to its root, so the sweep reaches them.
+
+## Browsing a Photos source (App/PhotoSourceBrowser.swift, 2026-09-12)
+
+Selecting a Photos source used to do NOTHING: `Sidebar.onChange(of: selection)` handled `.folder`
+and let `.photos` fall into the else, so the row took the highlight and the pane never moved.
+
+It is NOT the folder browser with a different root, and cannot be. A photo is indexed at
+`photos://all/<ASSET-UUID>%2FL0%2F001/<name>`, so every asset is its own ONE-FILE directory -
+`indexedChildren(ofFolder: "photos://all")` returns no files and one UUID-named folder per photo.
+A library is a flat gallery, so this lists the assets and draws them.
+
+Two things that were tried and do not work, so they are not worth retrying:
+- `filterFolder` cannot carry the source. It is a `URL`, and `URL(string: "photos://all")?.path`
+  is empty - `all` is a HOST, not a path. Hence `AppModel.browsedPhotoSource`. The store side is
+  fine: `folderPrefix` is a plain string prefix test, so the key works there directly.
+- `ResultsList(results:)` cannot render it. It takes a `results` array but iterates `model.groups`
+  to DRAW, so it is wired to the live search result set and silently ignores what it is passed -
+  it rendered a blank pane. Browsing is not a search (no query, no ranking), so the grid and list
+  are drawn in the browser, in the same shape `FolderBrowser` uses.
+
+The listing is `store.listMatching(filter:topK:)` - a query-less lister that already orders by
+mtime with path as the deterministic tiebreak. Capped at 1000, and the header says "first 1,000"
+rather than quietly showing a prefix.
+
+THE THUMBNAILS ARE GHOSTS, AND IT IS A REAL BUG - just not in this view. They render as
+file-type placeholders, and the cause was measured, not guessed (`OMNI_PERF_LOG=1`, the
+`photo-thumb` line in `Thumbnail.load`):
+
+    photo-thumb nil auth=2 assetFound=false id=23596587-...  (12 of 12)
+
+`auth=2` is authorized, so it is not TCC - and the bundle id is `io.hanxiao.omni` either way, so
+a `.build` copy shares the grant with the installed app. `assetFound=false` means
+`PHAsset.fetchAssets(withLocalIdentifiers:)` returns NOTHING: the index holds 12 photo rows whose
+assets are gone from the library. Not iCloud either - `PhotoLibrary.image` already falls back to
+`.fastFormat` for the Optimize-Mac-Storage case (issue #13), and that fallback is never reached
+because there is no asset to ask.
+
+So the index is not reconciling deleted Photos assets the way it reconciles deleted files. The
+stale sweep in `Indexer` is filesystem-shaped - it deletes `known` paths not in `seen`, gated on
+`underPassRoots` - and a `photos://` root only gets swept when that source is actually crawled in
+the pass. Ghost rows are worse than they look: they are unsearchable in practice, since a hit on
+one shows a placeholder that cannot be opened.
+
+NOT FIXED HERE ON PURPOSE. The fix is in deletion logic, which is the dangerous kind to change
+speculatively - a wrong `underPassRoots` predicate deletes live rows. `PhotoLibrary.debugAssetExists`
+and the gated `photo-thumb` log exist so the next person can tell the three causes apart in one
+run instead of guessing between TCC, iCloud and staleness the way this took.
+
+## Folder-scoped search: what it actually costs (measured 2026-09-12)
+
+Folder scoping is a headline feature now, so the numbers are here rather than assumed. Real index,
+2,661,412 files, Release build, `OMNI_PERF_LOG=1`.
+
+DEPTH IS NOT A COST. The per-file test is `path.utf8.starts(with:)`, which bails at the first
+differing byte, so a deep prefix is no dearer than a shallow one: 69.8 ms at
+`~/Documents`, 62.7 ms at `~/Documents/jina-mcp`. Do not go looking for a depth problem.
+
+The cost that IS real is the per-file allow table in `pathAllowGPULocked` - one O(live files) pass,
+~65 ms, which is MORE than the rest of a warm search (40 ms). It is cached, keyed on
+(folderPrefix, ext, tag terms, nGlobal).
+
+THE BUG THAT WAS THERE: the cache was cleared by every row mutation, through
+`invalidateTagFilterCacheLocked` -> `invalidatePathAllowCacheLocked`, which `fileChunkInc/Dec`
+calls on every chunk written. So while the index was live, a folder-scoped search rebuilt the
+whole 2.66M-entry table on essentially every keystroke. Measured before the fix: EIGHT rebuilds
+for one folder, `files=` unchanged across all eight, 62 ms each.
+
+THE FIX: a second cache slot for filters with no tag component, which row mutations do not clear.
+A tag-free table is a pure function of (folderPrefix, ext, `idPath`), and `idPath` only ever
+APPENDS - `internPath` is its single writer, a delete leaves the entry behind (a file id outlives
+its rows), a rename interns a new id - and appends move `nGlobal`, which the key already carries.
+So a chunk mutation cannot change it. A TAG filter keeps the old slot and the old invalidation,
+because its resolved path sets genuinely do depend on row content. All three places that rebuild
+`idPath` wholesale (the wipe, and the quant-replica adoption) call `resetPathAllowCachesLocked`.
+After: 8 builds for 8 distinct searches, and a second keystroke on the same folder costs nothing.
+
+STILL OPEN, deliberately not done: the tag-free slot holds ONE entry, so browsing A -> B -> A
+rebuilds. A small LRU would fix it at ~10.6 MB per entry (2.66M floats), and making the build
+itself fast would need a per-file dir id in memory so the test becomes an array lookup instead of
+a UTF-8 compare - which means touching `idPath`, whose load order is contractual. Neither was
+worth doing unasked; both are real options if folder browsing ever feels heavy.
+
+## Folder map, per folder (2026-09-12)
+
+The map was never root-only in the ENGINE: `VectorStore.vectorsUnderFolder` takes a path PREFIX,
+so it has always been recursive and has always worked for a subfolder. All that was missing was a
+way to ask for one. `AppModel.visualizeFolder(_:umap:)` is that way, and the sidebar's two flat
+map items plus the folder browser's subfolder rows (list AND grid - one `menu(_:)` builder serves
+both) now route through it as a "Visualize" submenu of UMAP / PCA.
+
+Two orderings inside it are load-bearing, and both were learned the hard way:
+- `filterFolder` is cleared FIRST. Browsing wins the empty-result region (`showsFolderBrowser` is
+  checked before `showsFolderViz`), so a map requested while a folder is being browsed would fit
+  and then never be seen.
+- the folder is pointed at BEFORE the mode is flipped, because `mapUsesUMAP.didSet` refits
+  `selectedFolderForViz` synchronously. Setting the mode first fits the folder you are LEAVING and
+  throws it away a moment later.
+- it deliberately does NOT touch the sidebar selection. Selecting a folder means BROWSE, and the
+  selection change calls `enterFolder` straight back over the map.
+
+Release timings, 65,879 files under ~/Documents, `OMNI_PERF_LOG=1`:
+UMAP pull 367 ms + fit 1075 ms; PCA pull 209 ms + fit 91 ms. The same operations in a DEBUG build
+take tens of seconds - do not judge map performance from a debug run, and do not "optimise" it on
+that evidence.
+
+## Chaos testing the UI (2026-09-11, Tools: /tmp/chaos/drive.py pattern)
+
+A seeded randomised driver (PyObjC `CGEvent`) against a `-omni.hangwatch YES` build. Destructive
+actions are blacklisted deliberately: no Cmd-Delete (trashes files), no Cmd-D, no Cmd-O /
+Cmd-Shift-O (a modal file panel blocks the event tap and wedges the run), no right-clicks (the
+context menus carry "Remove from Omni"), no Settings. Seed the RNG so a finding replays.
+
+FOUND AND FIXED - a hard crash, `OCRBatched.swift` `decodeContinuous`:
+`Fatal error: Unexpectedly found nil while implicitly unwrapping an Optional value`, stack
+`closure #8 in decodeContinuous` inside `Collection.map`. Admission is lazy - `nextPage` walks
+forward one row per decode step - so an early exit (Cmd-. through `shouldContinue`, or every row
+vacating) leaves `[nextPage, n)` never prepared. The trailing `map` then ran over ALL n pages and
+force-unwrapped `pages[p].prep.grid` on a page that has no `prep`. Exactly the hazard the comment
+on `ensurePrepared` already warns about, 190 lines further down. Two parts to the fix: `prep?.grid
+?? (0, 0)`, and marking those pages `.cancelled` - `stopped` defaults to `.cap`, so a page that
+never started was reporting as one that ran to the token cap. Reproduced with seed 4242, verified
+fixed on the same seed and on seed 777 with two documents.
+
+FOUND, NOT FIXED - AppKit logs "Application performed a reentrant operation in its NSTableView
+delegate. This warning will become an assert in the future." Deterministic on seed 1337 in SEARCH
+mode: clean at 110 and 165 actions, fires at 188 and 220 (confirmed on four separate clean
+processes). The site is NOT isolated. Three hypotheses were tested and all disproved: rapid
+history-row selection, a Quick Look storm, and a back/forward storm with a sidebar row selected.
+Deferring the three `selection = nil` writes in `Sidebar.swift` out of their `onChange` handlers
+did NOT silence it either, so that change was reverted rather than left in as a speculative fix.
+Two traps for whoever picks this up: AppKit logs the warning ONCE PER PROCESS, so any repro attempt
+needs a fresh launch or it silently proves nothing; and it does not reproduce under lldb at all
+(it is timing-dependent), while a breakpoint on `NSLog` never fires because the warning goes
+through `os_log`.
+
+Main-thread stalls over 250 ms, with the index live: 5-6 per 220 search actions, worst 396-440 ms;
+3 per 200 OCR actions. Consistent with the known remaining SwiftUI/CoreText cost.
+
+## Settings controls that were not native (2026-09-11)
+
+- File-type rows carried a standing `line.3.horizontal` grip. That is an iOS edit-mode idiom;
+  macOS reorders rows by dragging them with nothing drawn. The grip was never the handle either -
+  `.draggable`/`.dropDestination` are on the WHOLE row, and the glyph was a plain `Image` with no
+  gesture - so removing it cannot change the behaviour. NOTE: drag-to-reorder could not be
+  exercised from the harness; synthetic `CGEvent` drags do not start an `NSDraggingSession`, so
+  `.draggable` never fires. It needs a real mouse to confirm, and it is unverified either way.
+- Those same rows used `.controlSize(.mini)` switches while "Generate tags" two sections down used
+  the default size. Two switch sizes in one window. Now both default.
+- `Toggle("", isOn:)` in those rows left VoiceOver reading an unnamed switch. Titled, then
+  `.labelsHidden()`.
+- "78 / 105" as a folder's progress reads as a ratio, and sat next to rows saying "65,876 files".
+  macOS spells it "78 of 105". Three sites.
+- The memory slider's two end labels were in different units: the word "Off" against a bare
+  "128", under a value reading "6 GB". Now "128 GB".
+- The Serving bearer token row had NO LABEL - "Bearer token" was the TextField's placeholder, so
+  the row went blank-but-for-two-buttons the moment a token existed. It is `LabeledContent` now.
+  Getting that right took three passes and both states have to be checked: a fixed 232pt field
+  clipped the last two characters of a real 32-char token, and dropping the prompt left an empty
+  token as two buttons with nothing between them (a borderless field in a grouped form is
+  invisible until it has text). `maxWidth: .infinity` plus `.multilineTextAlignment(.trailing)`
+  plus `prompt: Text("Not set")` handles both. To re-test, set `omni.serving.token` in defaults
+  with the app CLOSED and put it back afterwards - do not type into the live field, every edit
+  restarts the server.
+
+Checked and left alone: the "Skip files smaller than" numeric fields (bordered, right-aligned,
+units aligned in their own column - that is what a grouped form does), the composition bars with
+legends in Storage and Performance, and the monospaced code blocks in Content/OCR/Serving.
+
+## Compared against Finder, side by side (2026-09-11)
+
+Both windows on screen at the same size, same folder, same view mode, screenshots diffed. What
+follows is the result, so the comparison need not be redone.
+
+Already matching, do not "fix":
+- Toolbar grouping. Finder groups per FUNCTION into separate glass capsules - view modes in one,
+  group-by in its own, the three actions in a third, search separate. Ours is the same shape:
+  sidebar+OCR leading, then star / filter / sort / view as their own capsules. Finder does not put
+  its sort control in with its view control either.
+- Back/forward leading with Cmd-[ / Cmd-], flexible spacer, trailing cluster. Same SF Symbols as
+  Finder throughout (`square.grid.2x2`, `list.bullet`, `sidebar.leading`, `chevron.backward`).
+- The toolbar/content boundary. SUPERSEDED - this claimed Finder clips at a hard line too. It does
+  not; both its views use the soft scroll pocket. See "Folder browser columns".
+- SIDEBAR SELECTION: see "Two things not matched" under the toolbar audit - raised again and
+  re-tested in 2026-09-12, same conclusion, with the `.tint` route now ruled out too.
+- SIDEBAR SELECTION IS NOT A BUG. Finder draws a subtle fill with an accent-tinted label; we draw
+  a solid accent pill with white text. Checked against System Settings, which is SwiftUI like us:
+  it draws the solid pill too. Finder differs because it is an AppKit `NSOutlineView` in
+  source-list style. Ours is a plain `List(selection:)` + `.listStyle(.sidebar)` - already the
+  correct native rendering for the framework. Matching Finder here means hand-drawing row
+  backgrounds and giving up native focus and keyboard selection. Don't.
+
+Closed in this pass:
+- View segments now run gallery-then-list, Finder's order (icon view first). They used to run the
+  other way, which contradicted Finder AND this app's own Cmd-1 gallery / Cmd-2 list.
+- The folder browser's list got `.alternatingRowBackgrounds()`. Finder's list view separates rows
+  by striping them, not by drawing rules - which is the same reason the separators here are
+  hidden. Finder stripes the empty area below the last row too, and so do we now.
+- Date Modified and Size columns in the folder browser, to Finder's alignment: date reads from the
+  left of its column, size from the right. Sizes go through `ByteCountFormatter`, not
+  `Int.formatted(.byteCount(style: .file))` - the modern API renders SI case ("454 kB") where
+  Finder writes "454 KB". `.fileSizeKey` rides along in the existing prefetch, so it costs no
+  extra stat.
+
+Known, deliberate differences that remain:
+- No Kind column and no clickable column-header row. Finder has both; sorting here lives in the
+  toolbar.
+- Folder rows carry a trailing `chevron.right`, not a leading disclosure triangle. Finder's LIST
+  view expands in place; this browser DESCENDS, which is Finder's COLUMN view idiom, and the right
+  chevron is the honest symbol for it.
+- The search results list is not a Finder list and should not become one - it carries a snippet
+  and a score, which is the product.
 
 ## Markdown panes (App/MarkdownBlock.swift, MarkdownSource.swift)
 - LaTeX rendering was built and then REMOVED on purpose. This is a transcription workspace, not a
@@ -671,6 +1511,185 @@ measured on an M3 Ultra too, so they compare directly.
   serving, reload on return) hung off a toolbar click. It buys nothing on a roomy machine, and on
   a small one it trades a multi-second warm-up when you leave OCR for perhaps 15% OCR throughput
   - while risking search and a serving endpoint that promised to answer. Size the batch instead.
+
+## Interrupting the GPU: who yields to whom (audited and measured 2026-09-12)
+
+THERE ARE THREE LANES, NOT TWO, and only one of them is arbitrated.
+- `OmniEngine.run(highPriority:)` - a condition-variable gate. Interactive search is high, indexing
+  / projection / tagging are low, plus `interactiveQueryActive` (2 s) shrinking the indexing batch
+  and splitting a flush into per-batch gate windows. This one is tuned and correct.
+- `VectorStore` - 167 MLX operations and NEVER takes that gate. So the scan half of every search
+  runs outside the priority system, as does the mask build.
+- `OCRModel` - its own MLX lane, no gate. `ocrRunActive` is read in exactly TWO functional places
+  (the `startIndexing` guard and a Settings label), so coordination is all-or-nothing: the whole
+  indexing pass is cancelled for the whole OCR run. Serving does not know a run is in progress.
+
+VISUALIZATION AND TAGGING DO OCCUPY THE LANE - checked, because it is the obvious thing to get
+wrong. The app's projection path wraps every slice in `runLowPriorityGPU` (the ungated
+`ProjectionEngine.layout` is the reference path, used only by tests and omni-verify), and the
+tagger's score matmul is fused into the image embed inside the gate, with the prior seed an
+explicit `run(highPriority: false)`.
+
+THE GATE IS ABOUT SUBMISSION, NOT PREEMPTION. MLX submits through one Metal command queue per
+process, so the lanes serialise whatever the gate does; what the gate controls is who submits next
+and HOW BIG each submission is. That is why the lever for responsiveness is submission
+granularity - which is exactly what `interactiveQueryActive` already does for indexing and what
+OCR had no equivalent of.
+
+MEASURED (Release, real index, 21-page PDF, search over HTTP, 59 samples after the cold one):
+
+    search, idle                  p50  14.9 ms   p90  50.8   p99 178.9   first 239 ms
+    search, during an OCR run     p50  49.3 ms   p90  51.9   p99  72.5   first 1656 ms
+
+Steady-state contention is real but modest. The damaging number is the FIRST request at 1656 ms:
+it lands while OCR is prefilling a wide group, which is one enormous command buffer a query can
+only queue behind. NOT FIXED - the fix is submitting prefill in smaller units, and group-ahead
+prefetch is already measured-and-rejected above because the GPU has no idle compute to absorb it.
+
+    stop during steady decode                     98 ms
+    stop inside a group prologue, before          2178 ms
+    stop inside a group prologue, after            151 ms
+    the prologue window (weights up -> 1st token) 4134 ms
+
+THE DECODE LOOP WAS NEVER THE PROBLEM - `shouldContinue` per step honours a stop in 98 ms. The
+un-interruptible stretch is the group PROLOGUE: every page of the group rasterised (a 2384 px PDF
+render plus the Pillow-exact resample, per page), then `rampRows` pages prefilled at ~650 ms each,
+with no cancellation check in either. Both now check, and the A/B above is a real revert-and-rerun,
+not an inference.
+
+A STOP DURING MODEL LOAD waits out the load: `OCRModel(modelDir:)` has no cancellation, and the
+loop's first `gate.isStopped` check is after it. Bounded (~13 s, once per session) and not fixed.
+
+INSTRUMENT TRAP THAT COST THREE MEASUREMENTS: `open()` calls `reset()` which calls `cancel()`, so
+stamping the interrupt time inside `cancel()` unconditionally stamps it AT LAUNCH - and every
+"stop latency" it reports is really app-open-to-run-end. It read 28.2 s, 10.4 s and 29.2 s before
+the arithmetic gave it up (a keystroke sent at 31 s cannot produce a 29.2 s latency). Stamp only
+when `isBusy`.
+
+LEAVING OCR MODE IS NOT A STOP, and it used to produce the identical state: `deactivate()`
+cancelled the run and left every unreached page dimmed, to be clicked back one at a time. The
+pages still queued are now remembered and re-queued by `activate()`, with `isBusy` as the test so
+an explicit Stop is never resurrected. ORDERING MATTERS: `cancel()` clears that debt, so it is
+captured before and re-assigned after - written the other way round first, which silently disabled
+the whole feature.
+
+A STOP-TRUNCATED PAGE IS NEVER CACHED. `runGroup`'s backstop settles a cancelled row that has
+produced text as `.done`, which is right on screen - the reader can see it is half a page - and
+wrong on disk, where it would become that file's finished transcript for good. Gated on
+`stoppedBy == .cancelled`; `.cap` and `.loopGuard` still cache, being the model's own endings.
+
+PAUSE HAD NO MENU ITEM AND NO KEY EQUIVALENT - it existed only as a button on the floating readout,
+which withdraws a few seconds after a run. So the gesture that hands the GPU back POLITELY, keeping
+the queue, was the hard one to reach while Stop had Cmd-. It is now File > Pause Transcribing on
+Opt-Cmd-. Same argument as the context-menu items promoted in the menu-bar audit.
+
+## Busline efficiency: what is NOT worth doing (measured 2026-09-12)
+
+This round went looking for wasted GPU work on the shared lane and mostly ruled things out. Kept
+here so the same ground is not re-dug.
+
+THE OCR GROUP PROLOGUE HAS NO WASTE TO RECLAIM. The suspicion was that rasterising a whole group
+up front is seconds of serial CPU with the GPU idle - 21 pages x the 55 ms/page host cost quoted
+under the TTFT breakdown. It is 121 ms FOR ALL 21 PAGES (`ocr-group-rasterise`, gated). The 55 ms
+figure is `PILResample` inside `preparePage`, which is already deferred per page into the decode
+loop; `Self.load` is only the PDF render plus the RGB conversion, ~6 ms a page. So the 3600 ms
+prologue is ~3.5 s of genuine ramp prefill. Parallelising the rasterise across cores - which the
+TTFT note correctly calls trivially parallel - would buy ~100 ms and needs one PDFDocument per
+worker (PDFKit will not render one document concurrently). Not worth it.
+
+THE ROUND-3 INTERRUPT CHECKS COST NOTHING, and this is arithmetic, not a measurement: 25 lock
+reads (21 rasterise pages + 4 ramp rows) against 83.6 s of GPU work is ~6 parts per billion, while
+this machine's run-to-run variance on an unchanged build is ~25% (401 vs 307 tok/s, recorded
+above). An A/B there measures drift. Reference figure for the 21-page arXiv PDF, for whoever wants
+a baseline: `ocr-run-done pages=21 tokens=42253 83.6s 505 tok/s`.
+
+A COMPLETED IMAGE EMBED IS DISCARDED ON CANCEL, at the `if self.isCancelled { return }` after
+`embedImagesTagged` in `flushImages` - the vision tower has already run and the vectors are thrown
+away. NOT CHANGED, for two reasons. It could not be priced (see below), and the obvious fix has a
+hazard beside it: a cancel from `setFolderPaused` would then store files under the root just
+paused, and `applyIgnoreText` deletes rows from a detached task while a pass may be running, which
+is the resurrection shape the tag-backfill note already warns about. A cancel would need a REASON
+(pause keeps the work, scope-change discards it) before this is safe - the same distinction the OCR
+stand-down needed.
+
+OPEN QUESTION, AND IT MAY BE BIGGER THAN THE DISCARD: on a 120-image folder indexed from scratch
+(fresh db, `-omni.roots` at the corpus, all 120 rows land with kind `image` and 120 chunks), the
+cross-file image batching path logs NOTHING - neither `image-flush` nor a probe placed on its own
+per-file fallback inside the same closure. Only one `kind == .image` branch exists (Indexer.swift
+~1054) and `embedImagesTagged` is called only from its `flushImages`. So either the harness routes
+these files somewhere else, or that closure is not running and still images are being embedded at
+the batch-1 throughput the cross-file staging exists to avoid. Resolve this before trusting any
+image-indexing throughput number. The `image-flush` perf line is left in place as the probe.
+
+WHAT IS NOT ON THIS LANE AT ALL: `pauseIndexing()` is a cancel, so every resume re-walks the whole
+tree. Real waste, but CPU and disk - the crawl is streaming and the consumer embeds alongside it,
+so it does not occupy the GPU.
+
+## Transcript cache (OmniKit/OCR/OCRCache.swift, 2026-09-12)
+
+A page is transcribed ONCE. Finished Markdown is written to a folder of .md files and read back on
+the next open, so re-dropping a document, reopening it next week, or picking up the pages a stop
+left behind all cost a file read instead of a GPU minute. On by default, with a switch, a folder
+and a Clear button in Settings > OCR.
+
+WHAT IDENTIFIES A TRANSCRIPT: the source file's CONTENT hash, the page index, the prompt, and the
+model variant. Content rather than path and date, so a file moved or copied under the same name
+hits and a file rewritten in place misses. NOT in the key: batch width and draft length (scheduling
+choices that do not change what is decoded - that is the premise of speculative decoding and it is
+graded above), and the loop guard, which CAN change a degenerate page. That last one is the honest
+gap: a page that only transcribes correctly with the guard off will serve its guarded transcript.
+Turning the cache off is the way out, which is what the switch is for.
+
+IDENTITY LIVES IN THE FILE NAME, not in a header inside the file - `Quarterly Report-p7-<16 hex>.md`
+- so what is in the file is the transcript and nothing else, and a lookup is one `contentsOfFile`
+with no index to keep in step with the directory. The price is that RENAMING a source file misses;
+moving or copying it does not. That trade is deliberate: the transcript is the product, and a
+directory of 16-hex-digit names is one nobody can use for anything.
+
+THE MEMO NEEDED THE INODE, and the test that was supposed to prove it was passing by luck. Hashing
+is memoised per session against size + modification date + inode. Without the inode,
+`testEditingTheSourceInPlaceMisses` still passed - but only because `setAttributes` restores a date
+a few hundred nanoseconds off; with both versions the same length and the date stamped to an
+identical fixed instant, the cache served the PREVIOUS version's transcript. Atomic writes (which
+is what `String.write` and every editor here does) always change the inode, so that is the signal.
+The test now fails without it and passes with it. What remains is an in-place rewrite, to the same
+byte length, with the date forced back, inside one session.
+
+CLEAR ONLY DELETES WHAT IT WROTE. The folder is the user's to choose, so a Clear button that
+empties whatever directory is selected is a way to lose a documents folder to one click. Counting
+and deleting both go through the same name test (`-p<n>-<16 lowercase hex>.md`), the dialog names
+the folder and the count, and a transcript the user has renamed is out of scope for both. Pinned by
+`testClearOnlyTouchesItsOwnFiles`.
+
+MEASURED END TO END, two-page PDF, Release build, isolated db and cache dir. Peak RSS over 100 s,
+two passes: 8.14 / 9.37 GB with an EMPTY cache (the 4.53 GB of weights load) against 4.49 / 4.98 GB
+restoring from a WARM one. A no-OCR launch of the same build peaks at 4.30 GB. The absolutes drift
+~0.5 GB between passes - that is MLX's buffer cache, and it is why the no-OCR control is needed -
+but the GAP is 3.7-4.4 GB in both, i.e. the weights. A fully cached document never reaches `run()`.
+The lookup itself is `ocr-cache-lookup 0.6ms pages=2 hits=2` (gated on OMNI_PERF_LOG).
+
+TWO TRAPS IN MEASURING THAT, both of which produced a confident wrong answer first:
+- `-omni.ocr.cache.enabled NO` DID NOT DISABLE IT. Launch arguments land in the argument domain as
+  STRINGS, so `object(forKey:) as? Bool` casts to nil and falls back to the default - the control
+  arm ran with the cache ON and the A/B compared two arms of the same thing. `isEnabled` now reads
+  "unset means on" then `bool(forKey:)`, which coerces both spellings. To disable it in a test,
+  point it at an EMPTY DIRECTORY.
+- PEAK RSS IS NOT READABLE WITHOUT THE NO-OCR CONTROL. A single 4.50 GB sample was read here as
+  "the model loaded"; the baseline with no OCR at all is 4.30 GB, so it meant nothing. Only the
+  8.14 vs 4.49 split against that baseline says anything.
+
+THE LOOKUP GATES THE RUN, it does not race it. Pages arriving in a drop go into `awaitingCache` and
+the run loop skips them, so a page about to be restored is not decoded in the moment before the
+lookup lands; `applyCacheHits` empties that set and then starts the run for whatever actually
+missed. Two consequences worth knowing: a fully cached document never reaches `run()` at all, and a
+run already winding down gets a second `startRunIfNeeded` 400 ms later, because it may have taken
+its last look at the queue while those pages were still held.
+
+EXAMPLES, NOT PRESETS, in the prompt box. The rule above ("presets change the SHAPE of the output,
+which is not something a reader can judge from a preset's name") stands and is why these are whole
+prompts that land IN the editable box, where they can be read and changed before they are used -
+not a picker that swaps the prompt from behind a label. Each is a complete prompt, because a
+fragment appended to the default contradicts rules the default has already given.
 
 ## OCR settings
 - ONE build is offered, and the weights live at `Application Support/Omni/jina-ocr-v1-<slug>` beside
