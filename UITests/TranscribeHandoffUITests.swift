@@ -101,6 +101,10 @@ final class TranscribeHandoffUITests: XCTestCase {
         app.launchArguments = [
             "-omni.dbDir", scratchDB.path,
             "-omni.roots", "(\"\(corpus.path)\")",
+            // Search history and photo sources are SAVED blobs, not launch arguments, so the
+            // argument domain cannot isolate them: without this flag a run reads the real install's
+            // history into its sidebar and appends its own test queries to it.
+            "-omni.ephemeralUIState", "YES",
             "-omni.serving.enabled", "NO",
             "-omni.uiChaos", "YES",
             "-omni.query", query,
