@@ -1201,7 +1201,10 @@ final class OCRSession {
                                     self.streamTick &+= 1
                                 }
                             },
-                            shouldContinue: { !gate.isStopped })
+                            shouldContinue: {
+                                GPUInteractive.yieldWhileBusy()
+                                return !gate.isStopped
+                            })
                     }.value
 
                     guard self.runToken == token, self.texts.indices.contains(index) else { return }
@@ -1352,8 +1355,16 @@ final class OCRSession {
                 // A pause stops ADMISSION rather than freezing mid-page: the batch drains to
                 // nothing and the run loop's own hold takes over, which is the page boundary the
                 // pause has always meant.
-                shouldAdmit: { !gate.isPaused },
-                shouldContinue: { !gate.isStopped })) ?? []
+                // ADMISSION IS WHERE THE BIG SUBMISSION IS: admitting a row runs a whole page's
+                // vision tower and LM prefill, ~650 ms that cannot be taken back once submitted,
+                // and a query landing behind one waits it out. Holding admission while interactive
+                // work is in flight is what keeps a search from queueing behind a prefill.
+                shouldAdmit: { !gate.isPaused && !GPUInteractive.isBusy },
+                // Polled once per decode step, so this is the finest granularity the loop has.
+                shouldContinue: {
+                    GPUInteractive.yieldWhileBusy()
+                    return !gate.isStopped
+                })) ?? []
         }.value
 
         guard runToken == token else { return }

@@ -3425,6 +3425,10 @@ public final class VectorStore: @unchecked Sendable {
     /// query cache / passage ranking.
     public func search(queryGraph: MLXArray, filter: SearchFilter = SearchFilter(), topK: Int = 40,
                        textQuery: String? = nil) -> (hits: [SearchHit], query: [Float]) {
+        // The SCAN is the half of a search that takes no priority gate (see GPUInteractive). The
+        // engine raises the flag around the embed; without this the OCR lane would resume
+        // submitting the moment the embed returned and contend with the scan that follows it.
+        GPUInteractive.enter(); defer { GPUInteractive.leave() }
         let r = searchGraphDense(queryGraph: queryGraph, filter: filter, topK: topK)
         guard LexicalIndex.enabled else { return r }
         if let explicit = filter.filenameQuery, !explicit.isEmpty {
@@ -3493,6 +3497,7 @@ public final class VectorStore: @unchecked Sendable {
     /// is why it is optional rather than required.
     public func search(_ query: [Float], filter: SearchFilter = SearchFilter(), topK: Int = 40,
                        markActive: Bool = true, textQuery: String? = nil) -> [SearchHit] {
+        GPUInteractive.enter(); defer { GPUInteractive.leave() }
         let dense = searchDense(query, filter: filter, topK: topK, markActive: markActive)
         guard LexicalIndex.enabled else { return dense }
         // Explicit `filename:` beats the heuristic. Otherwise a bare query contributes only if it

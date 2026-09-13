@@ -1541,10 +1541,33 @@ MEASURED (Release, real index, 21-page PDF, search over HTTP, 59 samples after t
     search, idle                  p50  14.9 ms   p90  50.8   p99 178.9   first 239 ms
     search, during an OCR run     p50  49.3 ms   p90  51.9   p99  72.5   first 1656 ms
 
-Steady-state contention is real but modest. The damaging number is the FIRST request at 1656 ms:
-it lands while OCR is prefilling a wide group, which is one enormous command buffer a query can
-only queue behind. NOT FIXED - the fix is submitting prefill in smaller units, and group-ahead
-prefetch is already measured-and-rejected above because the GPU has no idle compute to absorb it.
+Steady-state contention was real but modest. The damaging number was the FIRST request at 1656 ms:
+it lands while OCR prefills a page, which is one large command buffer a query can only queue
+behind.
+
+FIXED BY `GPUInteractive` (OmniKit), a process-wide count of interactive requests in flight:
+
+    search, idle                  p50  17.8 ms   p90  71.0   p99 298.0   first   49 ms
+    search, during an OCR run     p50  18.1 ms   p90  34.9   p99  36.9   first   37 ms
+
+A search during a transcription is now indistinguishable from an idle one, and the first request
+went 1656 -> 37 ms. OCR throughput 505 -> 495 tok/s on the same 21-page document, which is inside
+this machine's ~25% run-to-run variance and is anyway a run with no searches in it, so the cost
+measured there is only the per-step flag read.
+
+Three things make it work, and each was chosen against an alternative that does not:
+- IT IS RAISED AROUND THE WHOLE SEARCH, not just the embed. `run(highPriority:)` raises it BEFORE
+  the gate wait, because a query spends most of its latency queued, and `VectorStore.search` raises
+  it too - the scan takes no gate at all, so without that the OCR lane resumed submitting the
+  moment the embed returned.
+- IT IS NOT `interactiveQueryActive`. That flag stays true for 2 s after a query so the indexer can
+  keep its batches small. Two seconds is right for choosing a batch size and completely wrong for
+  blocking a decode step.
+- OCR CONSULTS IT AT THE POLL POINTS IT ALREADY HAD, so no decode code changed: `shouldContinue`
+  yields between steps, and `shouldAdmit` refuses to START a row while a query is in flight.
+  Admission is where the damage was - it runs a whole page's vision tower and LM prefill.
+The yield is ALWAYS BOUNDED (250 ms): the decode loop must keep progressing whatever happens on the
+other lane, or a request that never lowers the count stalls a transcription for good.
 
     stop during steady decode                     98 ms
     stop inside a group prologue, before          2178 ms

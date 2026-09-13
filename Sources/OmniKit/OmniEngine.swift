@@ -467,6 +467,10 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     /// (indexing) calls; a low-priority call also yields whenever a high-priority call
     /// is queued, so a search waits at most one in-flight embed.
     private func run<T>(highPriority: Bool, _ work: () -> T) -> T {
+        // Raised BEFORE the wait, not after it: the point is that the OCR lane stops submitting
+        // while a query is queued, and a query spends most of its latency queued.
+        if highPriority { GPUInteractive.enter() }
+        defer { if highPriority { GPUInteractive.leave() } }
         let tWait = omniPerfEnabled ? Date() : nil
         cond.lock()
         if highPriority { highWaiting += 1 }
