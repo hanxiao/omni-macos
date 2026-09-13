@@ -16,6 +16,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _exit(0)                                 // immediate; skips the MLX C++ destructors (no GPU-sync hang/crash)
     }
 
+    /// The red button HIDES the window; it does not quit. Omni keeps serving over HTTP, keeps its
+    /// MCP endpoint up and keeps answering skills while no window is open, so closing the window is
+    /// a "put it away", the way it is in Chrome and Mail - not a request to stop the service. Quit
+    /// is still Cmd-Q, which is the one gesture that means it.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    /// ...and clicking the Dock icon (or picking the app in the Window menu, or opening it again
+    /// from Spotlight) brings it back. `hasVisibleWindows` is false exactly in the case this
+    /// exists for: the window was closed but the process is still running.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag { Self.showMainWindow() }
+        return true
+    }
+
+    /// Order the main window back to the front. The window is kept alive rather than recreated -
+    /// `isReleasedWhenClosed = false` is set on it when it is first tuned - so its state, its
+    /// sidebar width and its current search all survive a close.
+    @MainActor static func showMainWindow() {
+        NSApp.setActivationPolicy(.regular)
+        let window = NSApp.windows.first { $0.toolbar != nil }
+            ?? NSApp.windows.first { $0.canBecomeMain }
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
     // UI debug tap (OMNI_UI_DEBUG=1 only): on SIGUSR2, dump a window self-render and the toolbar
     // item frames to /tmp. Exists because ATTACHING lldb to evaluate the same questions crashes
     // the live app (expression evaluation re-enters SwiftUI mid-commit); an in-process dump on the
@@ -40,6 +65,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 lines.append("   constraint: \(c)")
             }
         }
+        // View-controller tree, with each split item's separator style. The titlebar hairline is
+        // owned by NSSplitViewItem, not by the window, so this is the only way to see who is
+        // still drawing one.
+        func walk(_ vc: NSViewController?, _ depth: Int) {
+            guard let vc else { return }
+            var note = ""
+            if let svc = vc as? NSSplitViewController {
+                note = " items=" + svc.splitViewItems.map { "\($0.titlebarSeparatorStyle.rawValue)" }.joined(separator: ",")
+            }
+            lines.append(String(repeating: "  ", count: depth) + "\(type(of: vc))\(note)")
+            for c in vc.children { walk(c, depth + 1) }
+        }
+        lines.append("-- vc tree, window sep=\(w.titlebarSeparatorStyle.rawValue)")
+        walk(w.contentViewController, 0)
+        // Every view thinner than 3pt, in window coordinates. The toolbar/header hairline is drawn
+        // by SOMETHING; this is how to find out by what instead of guessing.
+        lines.append("-- thin views (h<3), window coords")
+        func thin(_ v: NSView) {
+            let r = v.convert(v.bounds, to: nil)
+            if r.height < 3 && r.width > 100 {
+                var chain: [String] = []
+                var a: NSView? = v.superview
+                while let x = a { chain.append("\(type(of: x))"); a = x.superview }
+                lines.append("  \(type(of: v)) \(NSStringFromRect(r)) hidden=\(v.isHidden) alpha=\(v.alphaValue)")
+                lines.append("    up: " + chain.joined(separator: " < "))
+            }
+            for c in v.subviews { thin(c) }
+        }
+        if let root = w.contentView?.superview { thin(root) }
         try? lines.joined(separator: "\n").write(toFile: "/tmp/omni-debug-toolbar.txt", atomically: true, encoding: .utf8)
         if let rep = frame.bitmapImageRepForCachingDisplay(in: frame.bounds) {
             frame.cacheDisplay(in: frame.bounds, to: rep)
@@ -55,12 +109,18 @@ struct OmniApp: App {
     /// Owned by the App rather than by ContentView so the File menu can act on it. Menu commands
     /// are the only place a keyboard shortcut actually fires on macOS.
     @State private var ocr = OCRSession()
+    /// Go to Folder's sheet. Held by the App because the MENU opens it, and a command lives in the
+    /// scene rather than in any view.
+    @State private var showGoToFolder = false
 
     var body: some Scene {
         Window("Omni", id: "main") {
             ContentView()
                 .environment(model)
                 .environment(ocr)
+                .sheet(isPresented: $showGoToFolder) {
+                    GoToFolderSheet().environment(model)
+                }
                 .onAppear {
                     ocr.willRun = { [weak model] in model?.beginOCRRun() }
                     ocr.didFinishRun = { [weak model] in model?.endOCRRun() }
@@ -156,6 +216,16 @@ struct OmniApp: App {
                     Button("Find Previous") { ocr.stepMatch(by: -1) }
                         .keyboardShortcut("g", modifiers: [.command, .shift])
                         .disabled(ocr.matchCount == 0)
+                    // Pause had no menu item and no key equivalent - it existed only as a button
+                    // on the floating readout, which is the chrome that withdraws a few seconds
+                    // after a run. So the one gesture that hands the GPU back POLITELY, keeping the
+                    // queue, was the hard one to reach, while Stop - which discards the queue - had
+                    // Cmd-. Same argument as the context-menu items promoted in the menu-bar audit.
+                    Button(ocr.isPaused ? "Resume Transcribing" : "Pause Transcribing") {
+                        ocr.isPaused ? ocr.resume() : ocr.pause()
+                    }
+                    .keyboardShortcut(".", modifiers: [.command, .option])
+                    .disabled(!ocr.isBusy)
                     Button("Stop Transcribing") { ocr.cancel() }
                         .keyboardShortcut(".", modifiers: .command)
                         .disabled(!ocr.isBusy)
@@ -215,6 +285,40 @@ struct OmniApp: App {
                 }
                 .keyboardShortcut("d", modifiers: .command)
                 .disabled(!model.hasActiveSearch)
+                Divider()
+                // EVERYTHING BELOW WAS CONTEXT-MENU OR TOOLBAR ONLY. A feature reachable by
+                // right-click alone is a feature most people never find, and it cannot be given a
+                // working key equivalent either - a chord declared inside a closed context menu
+                // never fires on macOS.
+                // Both directions between the two modes, in the menu bar as well as in the
+                // context menus - a feature reachable only by right-click is one most people never
+                // find, and only the menu bar can carry a working key equivalent.
+                Button(Transcribe.title(Transcribe.candidates(model.selectedPathsForMenu).count)) {
+                    Transcribe.send(model.selectedPathsForMenu, model: model, ocr: ocr)
+                }
+                .keyboardShortcut("t", modifiers: [.command, .option])
+                .disabled(Transcribe.candidates(model.selectedPathsForMenu).isEmpty)
+                Button("Search for Selected Text") { searchForTranscriptSelection() }
+                    .keyboardShortcut("e", modifiers: [.command, .option])
+                    .disabled(!model.ocrMode)
+                Divider()
+                Button("Generate Tags") { model.requestTags(Array(model.selectedPaths)) }
+                    .disabled(!model.hasSelection || !model.canGenerateTags)
+                Button("Search in This Folder") { model.enterFolder(model.filterFolder) }
+                    .disabled(model.filterFolder == nil)
+                Menu("Visualize") {
+                    Button("UMAP") { if let f = model.filterFolder { model.visualizeFolder(f, umap: true) } }
+                    Button("PCA") { if let f = model.filterFolder { model.visualizeFolder(f, umap: false) } }
+                }
+                .disabled(model.filterFolder == nil)
+                Button(ignoreFolderTitle) {
+                    if let p = model.selection { model.ignoreEnclosingFolder(ofPath: p) }
+                }
+                .disabled(model.selection.map { !model.canIgnoreEnclosingFolder(ofPath: $0) } ?? true)
+                Divider()
+                // The serving switch, same one as Settings and the toolbar toggle.
+                Toggle("Serve over HTTP", isOn: Binding(get: { model.serving.enabled },
+                                                        set: { model.serving.enabled = $0 }))
             }
             // Add to the SYSTEM View menu (which NavigationSplitView already provides with Show
             // Sidebar / Full Screen) instead of declaring a second "View" CommandMenu - otherwise
@@ -223,22 +327,18 @@ struct OmniApp: App {
                 // Sequoia's View menu lacks the automatic Show/Hide Sidebar item here (Tahoe
                 // provides its own - gated so the menu never shows two). Same responder-chain
                 // action and Ctrl-Cmd-S chord as the system item.
-                if #unavailable(macOS 26.0) {
-                    Button("Toggle Sidebar") { NSApp.sendAction(Selector(("toggleSidebar:")), to: nil, from: nil) }
-                        .keyboardShortcut("s", modifiers: [.command, .control])
-                }
+                // UNCONDITIONAL. This was gated to pre-Tahoe on the belief that macOS 26 supplies
+                // its own Show/Hide Sidebar item here; dumping the live menu bar showed the View
+                // menu with no sidebar item at all, so on Tahoe the only way to unhide the sidebar
+                // was the toolbar button. Same responder-chain action and chord as the system item,
+                // so if AppKit ever does add one back this is the same command twice, not a clash.
+                Button("Toggle Sidebar") { NSApp.sendAction(Selector(("toggleSidebar:")), to: nil, from: nil) }
+                    .keyboardShortcut("s", modifiers: [.command, .control])
                 Divider()
-                // Back / forward through the session's search + selection trail (like Finder's Go menu).
-                // The menu OWNS the Cmd-[ / Cmd-] shortcuts (single owner, no duplicate-shortcut conflict
-                // with the toolbar chevrons, and they stay active even when the toolbar control is hidden
-                // in the idle state); the toolbar buttons just name the same chords.
-                Button("Back") { model.goBack() }
-                    .keyboardShortcut("[", modifiers: .command)
-                    .disabled(!model.canGoBack)
-                Button("Forward") { model.goForward() }
-                    .keyboardShortcut("]", modifiers: .command)
-                    .disabled(!model.canGoForward)
-                Divider()
+                // Back / Forward used to live here. They are in GO now, where Finder keeps them,
+                // and they cannot be in both: two menu items with one key equivalent make AppKit
+                // strip the chord from one of them, which shows up as Cmd-[ silently doing nothing.
+                // The toolbar chevrons still name the same chords; the Go menu owns them.
                 // Inline Picker so the active mode gets a checkmark (Finder-style); the Cmd-1/Cmd-2
                 // shortcuts ride on the items.
                 Picker("View", selection: Binding(get: { model.viewMode }, set: { model.viewMode = $0 })) {
@@ -251,6 +351,42 @@ struct OmniApp: App {
                 Picker("Sort by", selection: Binding(get: { model.sortOrder }, set: { model.sortOrder = $0 })) {
                     ForEach(SortOrder.allCases) { Text($0.title).tag($0) }
                 }
+            }
+            // FINDER HAS A GO MENU AND WE DID NOT. Dumped both menu bars through the accessibility
+            // API and compared them item by item rather than from memory: Back and Forward were
+            // buried in View, there was no way up a level, no way to jump to an indexed root, and
+            // no Go to Folder at all. Finder's order is kept - navigation, then places, then the
+            // typed path - so the muscle memory transfers.
+            CommandMenu("Go") {
+                Button("Back") { model.goBack() }
+                    .keyboardShortcut("[", modifiers: .command)
+                    .disabled(!model.canGoBack)
+                Button("Forward") { model.goForward() }
+                    .keyboardShortcut("]", modifiers: .command)
+                    .disabled(!model.canGoForward)
+                // Finder's chord for this exact action, on the exact same meaning.
+                Button("Enclosing Folder") { model.enterFolder(model.enclosingFolder) }
+                    .keyboardShortcut(.upArrow, modifiers: .command)
+                    .disabled(model.enclosingFolder == nil)
+                Divider()
+                // Finder lists Documents / Desktop / Downloads here; ours are whatever the user
+                // added, which is the same idea with the right contents for this app.
+                ForEach(Array(model.roots.enumerated()), id: \.element) { i, url in
+                    Button(url.lastPathComponent) { model.enterFolder(url) }
+                        // Cmd-1..9 belong to the view modes, so the roots take Ctrl-Cmd-1..9.
+                        .keyboardShortcut(i < 9 ? KeyboardShortcut(KeyEquivalent(Character("\(i + 1)")),
+                                                                   modifiers: [.command, .control]) : nil)
+                }
+                if !model.photoSources.isEmpty {
+                    Divider()
+                    ForEach(model.photoSources) { source in
+                        Button(source.title) { model.enterPhotoSource(source) }
+                    }
+                }
+                Divider()
+                Button("Go to Folder\u{2026}") { showGoToFolder = true }
+                    .keyboardShortcut("g", modifiers: [.command, .shift])
+                    .disabled(model.phase != .ready)
             }
             CommandGroup(after: .toolbar) {
                 // Cmd-Shift-I, not Cmd-R: in a file browser Cmd-R reads as Finder's Show Original /
@@ -285,6 +421,29 @@ struct OmniApp: App {
     /// Discoverability surface for the keyboard interactions (Help > Cmd-/). A small native SwiftUI
     /// window with an aligned action/keycap grid - reused (not re-created) on repeat invocations.
     private static var shortcutsWindow: NSWindow?
+    /// Names the folder it would exclude, the way the context menu does, so the menu bar item is
+    /// not a vague "Ignore folder" with no indication of which.
+    private var ignoreFolderTitle: String {
+        guard let p = model.selection, model.canIgnoreEnclosingFolder(ofPath: p) else {
+            return "Ignore Enclosing Folder"
+        }
+        let name = (p as NSString).deletingLastPathComponent.components(separatedBy: "/").last ?? ""
+        return "Ignore Folder \u{201C}\(name)\u{201D}"
+    }
+
+    /// The transcript pane's selection, searched. Reads the FIRST RESPONDER rather than any state
+    /// of ours: the text is an `NSTextView`, its selection lives there, and asking AppKit for it is
+    /// both simpler and always current. Does nothing when the responder is not that view - which is
+    /// also why the item is only enabled in OCR mode.
+    private func searchForTranscriptSelection() {
+        guard let text = NSApp.keyWindow?.firstResponder as? NSTextView else { NSSound.beep(); return }
+        let selected = (text.string as NSString).substring(with: text.selectedRange())
+        guard !selected.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            NSSound.beep(); return
+        }
+        model.searchForText(selected)
+    }
+
     private func showShortcuts() {
         if let w = OmniApp.shortcutsWindow {
             w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return

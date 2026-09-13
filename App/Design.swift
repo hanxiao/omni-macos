@@ -10,6 +10,38 @@ enum Design {
     static let gapLarge: CGFloat = 16
 }
 
+/// File and memory sizes, spelled the way the system spells them.
+///
+/// Two reasons this is not `ByteCountFormatter.string(fromByteCount:countStyle:)` at each call
+/// site. The static convenience leaves `allowsNonnumericFormatting` ON, which renders 0 as
+/// "Zero KB" - that shipped in the memory legend, and no Apple surface says it; Finder's Get Info
+/// says "0 bytes". And `Int.formatted(.byteCount(style:))`, the modern spelling, renders SI case
+/// ("454 kB") where Finder writes "454 KB".
+/// `@MainActor` because `ByteCountFormatter` is not `Sendable` and these instances are cached
+/// rather than rebuilt per row - a directory listing formats one size per visible row. Every call
+/// site is already main-actor (view bodies, and the repair message inside a `MainActor.run`).
+@MainActor
+enum ByteSize {
+    private static func formatter(_ style: ByteCountFormatter.CountStyle) -> ByteCountFormatter {
+        let f = ByteCountFormatter()
+        f.countStyle = style
+        f.allowsNonnumericFormatting = false
+        return f
+    }
+    private static let fileFormatter = formatter(.file)
+    private static let memoryFormatter = formatter(.memory)
+
+    /// Disk and document sizes - what Finder shows in a Size column.
+    static func file(_ bytes: some BinaryInteger) -> String {
+        fileFormatter.string(fromByteCount: Int64(bytes))
+    }
+
+    /// Resident memory, which the system reports in powers of two.
+    static func memory(_ bytes: some BinaryInteger) -> String {
+        memoryFormatter.string(fromByteCount: Int64(bytes))
+    }
+}
+
 /// Applies a Liquid Glass capsule, but honors Reduce Transparency: when the user has it on (an
 /// accessibility preference, also common on low-power/older Macs), it drops the live vibrancy sample
 /// for a flat material capsule. That is the HIG-correct behavior AND removes a per-chip glass pass -
@@ -107,5 +139,24 @@ extension FileKind {
         case 4: return (t, p, b)
         default: return (b, p, q)
         }
+    }
+}
+
+/// A toolbar button that is either on or off, drawn the way the system draws one.
+///
+/// ONE STYLE FOR EVERY SUCH BUTTON in this app. The OCR toggle used to hand-draw its on state - an
+/// accent `Circle` behind a white glyph, painted inside the label - which had to be re-derived for
+/// the next toggle that came along, and was a guess at the platform's look rather than the platform's
+/// look. `Toggle` + `.toggleStyle(.button)` is the control the system provides for exactly this: on
+/// Tahoe the item's own capsule fills with the accent colour and the glyph inverts, which is what
+/// Finder's toolbar toggles do, and it stays correct through theme, accent-colour and appearance
+/// changes without this app knowing about any of them.
+struct ToolbarToggle: View {
+    @Binding var isOn: Bool
+    let symbol: String
+
+    var body: some View {
+        Toggle(isOn: $isOn) { Image(systemName: symbol) }
+            .toggleStyle(.button)
     }
 }

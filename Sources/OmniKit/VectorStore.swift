@@ -1552,6 +1552,12 @@ public final class VectorStore: @unchecked Sendable {
     /// Rebuild the dense fileID/pathID/kindCode tables from the current `rows`. Call after any
     /// structural change that rewrites or reorders `rows` (compaction, reload, wipe).
     private func rebuildFileIDsLocked() {
+        // EVERY path-allow slot, including the tag-free one. That slot is allowed to survive row
+        // mutations only because `idPath` append-only under `internPath`; this function is the
+        // exception - it rewrites `idPath` from scratch, so global row N afterwards is a different
+        // FILE than before, and a surviving mask would be applied to the wrong rows. Reached from
+        // the compaction branch of the bulk remove, where rows are dropped and the tables rebuilt.
+        resetPathAllowCachesLocked()
         pathID.removeAll(keepingCapacity: true)
         idPath.removeAll(keepingCapacity: true)
         fileChunkCount.removeAll(keepingCapacity: true)
@@ -2449,6 +2455,7 @@ public final class VectorStore: @unchecked Sendable {
             // rather than removeAll which keeps the ~1.6GB capacity reserved.
             rows = []; flat16.releaseAll(); presentPaths = []; fileID = []; pathID = [:]; idPath = []; fileChunkCount = []
             kindCode = []; kindID = [:]; idKind = []; resetTombstonesLocked(); invalidateBase()
+            resetPathAllowCachesLocked()   // idPath is gone, so the tag-free table is gone with it
             fileRowLo = []; fileRowHi = []; rowWindowCovered = 0   // same reason: release, not removeAll
             try? FileManager.default.removeItem(at: quantReplicaURL); lastPersistedBaseRows = -1   // replica is of wiped rows
             removeRowSidecarFiles()   // sidecar caches the wiped rows; releaseAll() above dropped the mapping
@@ -2858,6 +2865,186 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     /// Distinct indexed files under a folder (path-boundary aware). Iterates LIVE FILES, not rows.
+    /// The immediate children of `folder` that the INDEX knows about: files indexed directly in
+    /// it, and subfolders holding at least one indexed file beneath them.
+    ///
+    /// This is what a folder browser inside a search app should list. `FileManager` would show
+    /// everything on disk, most of which the app cannot find, rank or preview - a listing that
+    /// promises more than the index can answer for.
+    ///
+    /// SQL, not a walk of the in-memory path table. The obvious implementation - one pass over
+    /// `idPath` the way `fileCount(underFolder:)` does it - is O(live files), which is 2.6M here,
+    /// and it was measured holding the browser on a spinner for minutes in a debug build. This
+    /// reads `dirs` instead, which has one row per DIRECTORY, over the range scan the unique
+    /// `dirs(path)` index already serves (`>= folder||'/'` .. `< folder||'0'`, the same idiom as
+    /// `StoreSchema.dirSubtreeIDs`, and '0' is the byte after '/'). The EXISTS clauses ride the
+    /// `files(dir_id, name)` and `chunks(file_id, chunk_index)` indexes.
+    /// A child row for the folder browser, with the facts the index holds about it.
+    ///
+    /// `indexedAt` is the LAST index time, not the first: the schema keeps one `indexed_at` stamp
+    /// per file and a reindex overwrites it. There is no first-indexed column to read.
+    public struct IndexedChild: Sendable {
+        public let path: String
+        public let isDirectory: Bool
+        public let kind: String          // FileKind rawValue; "" for a folder
+        public let modified: Double
+        public let size: Int
+        public let indexedAt: Double     // last indexed; for a folder, the newest beneath it
+        public let fileCount: Int        // indexed files beneath a folder; 0 for a file
+    }
+
+    /// `indexedChildren` plus the per-row facts the browser's columns need.
+    ///
+    /// Built from the tested pieces rather than one hand-rolled query: `fileStatus` already
+    /// returns a file's kind, size, mtime and `indexed_at` (and the `kind` COLUMN is an interned
+    /// id, not a `FileKind` ordinal - decoding it here would have been a silent mis-mapping). The
+    /// only new SQL is the folder aggregate, which counts indexed files beneath each immediate
+    /// child and takes the newest stamp among them.
+    public func indexedChildrenDetailed(ofFolder folder: String) -> [IndexedChild] {
+        // Timed under OMNI_PERF_LOG because the browser can re-run this on a timer while an index
+        // pass is in flight, and `folderAggregates` walks the WHOLE subtree of the browsed folder
+        // on the store's serial queue - the same queue the indexer writes on. The refresh period
+        // has to come from this number, not from a guess.
+        let t0 = omniPerfEnabled ? Date() : nil
+        let children = indexedChildren(ofFolder: folder)
+        let status = fileStatus(paths: children.files)
+        let agg = folderAggregates(under: folder)
+        if let t0 {
+            omniPerfLog(String(format: "browse-list %.1fms files=%d folders=%d folder=%@",
+                               Date().timeIntervalSince(t0) * 1000,
+                               children.files.count, children.folders.count, folder))
+        }
+        var out: [IndexedChild] = []
+        out.reserveCapacity(children.files.count + children.folders.count)
+        for path in children.files {
+            let st = status[path]
+            out.append(IndexedChild(path: path, isDirectory: false,
+                                    kind: st?.kind ?? "",
+                                    modified: st?.modified ?? 0,
+                                    size: st?.size ?? 0,
+                                    indexedAt: st?.indexedAt ?? 0,
+                                    fileCount: 0))
+        }
+        for path in children.folders {
+            let a = agg[(path as NSString).lastPathComponent] ?? (0, 0)
+            out.append(IndexedChild(path: path, isDirectory: true, kind: "",
+                                    modified: 0, size: 0,
+                                    indexedAt: a.newest, fileCount: a.count))
+        }
+        return out
+    }
+
+    /// Per-immediate-child totals under `folder`: indexed files beneath it, and the newest
+    /// `indexed_at` among them. One grouped pass over the `dirs` range scan the browser already
+    /// uses, so it rides the same unique index.
+    private func folderAggregates(under folder: String) -> [String: (count: Int, newest: Double)] {
+        queue.sync {
+            guard dbOpen() else { return [:] }
+            let pfx = folder + "/"
+            var out: [String: (count: Int, newest: Double)] = [:]
+            var st: OpaquePointer?
+            guard sqlite3_prepare_v2(db, """
+                SELECT d.path, COUNT(f.id), MAX(f.indexed_at)
+                  FROM dirs d JOIN files f ON f.dir_id = d.id
+                 WHERE d.path >= ?1 AND d.path < ?2
+                   AND EXISTS(SELECT 1 FROM chunks c WHERE c.file_id = f.id)
+                 GROUP BY d.path;
+                """, -1, &st, nil) == SQLITE_OK else { return [:] }
+            defer { sqlite3_finalize(st) }
+            sqlite3_bind_text(st, 1, pfx, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(st, 2, folder + "0", -1, SQLITE_TRANSIENT)
+            while sqlite3_step(st) == SQLITE_ROW {
+                guard let c = sqlite3_column_text(st, 0) else { continue }
+                let name = String(String(cString: c).dropFirst(pfx.count).prefix { $0 != "/" })
+                guard !name.isEmpty else { continue }
+                let prior = out[name] ?? (0, 0)
+                out[name] = (prior.count + Int(sqlite3_column_int64(st, 1)),
+                             Swift.max(prior.newest, sqlite3_column_double(st, 2)))
+            }
+            return out
+        }
+    }
+
+    /// Indexed folders whose path contains `needle`, case-insensitively, most-specific first.
+    ///
+    /// For Go to Folder's completion. Rides the `dirs` table - the same one the browser lists from -
+    /// so a folder can only be offered if something under it is actually searchable. Capped, because
+    /// a two-character needle against 2.6M files matches a great many directories and the sheet
+    /// shows a handful.
+    public func indexedFolders(matching needle: String, limit: Int = 12) -> [String] {
+        queue.sync {
+            guard dbOpen(), !needle.isEmpty else { return [] }
+            var out: [String] = []
+            var st: OpaquePointer?
+            guard sqlite3_prepare_v2(db, """
+                SELECT d.path FROM dirs d
+                 WHERE d.path LIKE ?1 ESCAPE '\\'
+                   AND EXISTS(SELECT 1 FROM files f WHERE f.dir_id = d.id
+                              AND EXISTS(SELECT 1 FROM chunks c WHERE c.file_id = f.id))
+                 ORDER BY LENGTH(d.path) ASC
+                 LIMIT ?2;
+                """, -1, &st, nil) == SQLITE_OK else { return [] }
+            defer { sqlite3_finalize(st) }
+            // LIKE's own wildcards have to be neutralised, or a path with an underscore in it -
+            // which is most of them - matches any character there.
+            let escaped = needle
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "%", with: "\\%")
+                .replacingOccurrences(of: "_", with: "\\_")
+            sqlite3_bind_text(st, 1, "%" + escaped + "%", -1, SQLITE_TRANSIENT)
+            sqlite3_bind_int(st, 2, Int32(limit))
+            while sqlite3_step(st) == SQLITE_ROW {
+                if let c = sqlite3_column_text(st, 0) { out.append(String(cString: c)) }
+            }
+            return out
+        }
+    }
+
+    public func indexedChildren(ofFolder folder: String) -> (files: [String], folders: [String]) {
+        queue.sync {
+            guard dbOpen() else { return ([], []) }
+            let pfx = folder + "/"
+            var files: [String] = []
+            var folders: [String] = []
+
+            // Files sitting directly in this folder, that still have chunks.
+            var st: OpaquePointer?
+            if sqlite3_prepare_v2(db, """
+                SELECT f.name FROM files f JOIN dirs d ON d.id = f.dir_id
+                 WHERE d.path = ?1 AND EXISTS(SELECT 1 FROM chunks c WHERE c.file_id = f.id);
+                """, -1, &st, nil) == SQLITE_OK {
+                sqlite3_bind_text(st, 1, folder, -1, SQLITE_TRANSIENT)
+                while sqlite3_step(st) == SQLITE_ROW {
+                    if let c = sqlite3_column_text(st, 0) { files.append(pfx + String(cString: c)) }
+                }
+            }
+            sqlite3_finalize(st)
+
+            // Descendant directories that still hold an indexed file, reduced to the immediate
+            // child. A subfolder earns a row here only if something under it is searchable, so
+            // descending can never dead-end on a folder the index knows nothing about.
+            var seen = Set<String>()
+            var sub: OpaquePointer?
+            if sqlite3_prepare_v2(db, """
+                SELECT d.path FROM dirs d
+                 WHERE d.path >= ?1 AND d.path < ?2
+                   AND EXISTS(SELECT 1 FROM files f WHERE f.dir_id = d.id
+                              AND EXISTS(SELECT 1 FROM chunks c WHERE c.file_id = f.id));
+                """, -1, &sub, nil) == SQLITE_OK {
+                sqlite3_bind_text(sub, 1, pfx, -1, SQLITE_TRANSIENT)
+                sqlite3_bind_text(sub, 2, folder + "0", -1, SQLITE_TRANSIENT)
+                while sqlite3_step(sub) == SQLITE_ROW {
+                    guard let c = sqlite3_column_text(sub, 0) else { continue }
+                    let rest = String(cString: c).dropFirst(pfx.count)
+                    let name = rest.prefix { $0 != "/" }
+                    if !name.isEmpty, seen.insert(String(name)).inserted { folders.append(pfx + name) }
+                }
+            }
+            sqlite3_finalize(sub)
+            return (files, folders)
+        }
+    }
+
     public func fileCount(underFolder folder: String) -> Int {
         queue.sync {
             let pfx = folder + "/"
@@ -3992,18 +4179,61 @@ public final class VectorStore: @unchecked Sendable {
     /// would hash every matched path on every keystroke.
     private var pathAllowKey: String? = nil
     private var pathAllowGPU: MLXArray? = nil
+    /// The same table for a filter with NO tag component, in a slot that row mutations do NOT
+    /// clear.
+    ///
+    /// A tag-free table is a pure function of (folderPrefix, ext, `idPath`), and `idPath` only
+    /// ever APPENDS during normal operation - `internPath` is its single writer, a delete leaves
+    /// the entry behind (a file id outlives its rows), and a rename interns a new id. Appends move
+    /// `nGlobal`, which the key already carries. So a chunk insert or delete cannot change this
+    /// table, and clearing it on one is pure waste.
+    ///
+    /// FOUR PLACES REWRITE `idPath` WHOLESALE and all four now call `resetPathAllowCachesLocked`:
+    /// the wipe, the mmap commit, the coverage-load fallback, and `rebuildFileIDsLocked`. Audited,
+    /// because if one of them left a mask standing then global row N would mean a different FILE
+    /// than the mask was built for and a folder-scoped search would quietly return the wrong ones.
+    ///
+    /// Two of those calls are INSURANCE, not bug fixes, and the audit is recorded so nobody has to
+    /// redo it: the hazard was already unreachable twice over. `pathAllowKey` ends in `nGlobal`, so
+    /// a rebuild that changes the file count cannot hit a stale entry; and `rebuildFileIDsLocked`
+    /// is reached only from `removeRowsLocked`'s `guard dim > 0 else` branch, where no vectors are
+    /// stored and `pathAllowGPULocked` has nothing cached to serve. The reset removes the
+    /// dependence on both coincidences at the cost of one call in a function that runs when the
+    /// store is empty.
+    ///
+    /// Measured before splitting the slot: browsing folders while the index was live rebuilt a
+    /// 2,661,412-entry table EIGHT times for one folder, 62 ms each - more than the 40 ms rest of
+    /// the search, because `invalidateTagFilterCacheLocked` runs on every `fileChunkInc/Dec`.
+    /// A tag filter still uses the slot above and still clears on every mutation, because its
+    /// resolved path sets genuinely do depend on row content.
+    private var pathAllowPureKey: String? = nil
+    private var pathAllowPureGPU: MLXArray? = nil
     private func pathAllowGPULocked(_ f: SearchFilter) -> MLXArray? {
         let nGlobal = max(1, fileChunkCount.count)
         guard nGlobal > 1, idPath.count >= nGlobal else { return nil }
         let cacheKey = Self.pathAllowKey(f, nGlobal: nGlobal)
-        if let key = cacheKey, key == pathAllowKey, let g = pathAllowGPU { return g }
+        let tagFree = f.tagAllow == nil && f.tagDeny == nil
+            && f.tagTerms.isEmpty && f.tagExcludeTerms.isEmpty
+        if let key = cacheKey {
+            if tagFree, key == pathAllowPureKey, let g = pathAllowPureGPU { return g }
+            if !tagFree, key == pathAllowKey, let g = pathAllowGPU { return g }
+        }
+        // The one O(live files) pass a folder-scoped search still pays, and it is paid once per
+        // DISTINCT filter, not per keystroke. Instrumented because folder scoping is a headline
+        // feature now and the cost has to stay a measured number, not an assumption: browsing
+        // folder to folder changes the key every time, so this is a per-navigation cost.
+        let t0 = omniPerfEnabled ? Date() : nil
         var allow = [Float](repeating: 0, count: nGlobal)
         for gid in 0 ..< nGlobal where f.acceptsPath(idPath[gid]) { allow[gid] = 1 }
         let g = MLXArray(allow)
         MLX.eval(g)
+        if let t0 {
+            omniPerfLog(String(format: "path-allow build=%.1fms files=%d folder=%@",
+                               -t0.timeIntervalSinceNow * 1000, nGlobal, f.folderPrefix ?? "-"))
+        }
         guard let key = cacheKey else { return g }
-        pathAllowKey = key
-        pathAllowGPU = g
+        if tagFree { pathAllowPureKey = key; pathAllowPureGPU = g }
+        else { pathAllowKey = key; pathAllowGPU = g }
         return g
     }
     /// Identity of the path table `f` produces, or nil when it cannot be identified - which happens
@@ -4017,9 +4247,18 @@ public final class VectorStore: @unchecked Sendable {
         return "\(f.folderPrefix ?? "")|\(f.ext ?? "")|\(terms)|\(exTerms)"
             + "|\(f.tagAllow?.count ?? -1)|\(f.tagDeny?.count ?? -1)|\(nGlobal)"
     }
+    /// Called on every row mutation (through `invalidateTagFilterCacheLocked`). It deliberately
+    /// leaves `pathAllowPure*` alone - see the note on that slot for why a chunk mutation cannot
+    /// change a tag-free table.
     func invalidatePathAllowCacheLocked() {
         pathAllowKey = nil; pathAllowGPU = nil
         selectMaskKey = nil; selectMaskGPU = nil
+    }
+
+    /// Everything, including the tag-free slot. For the paths that rebuild `idPath` itself.
+    func resetPathAllowCachesLocked() {
+        invalidatePathAllowCacheLocked()
+        pathAllowPureKey = nil; pathAllowPureGPU = nil
     }
 
     /// The COMBINED per-row keep mask for a filtered query, cached across keystrokes.
@@ -5267,6 +5506,7 @@ public final class VectorStore: @unchecked Sendable {
         guard ok, covered == coveredRows - holes, flat16.count == rows.count * dim else {
             rows.removeAll(); flat16.removeAll(); presentPaths.removeAll()
             fileID.removeAll(); pathID.removeAll(); idPath.removeAll(); fileChunkCount.removeAll()
+            resetPathAllowCachesLocked()   // idPath emptied: nothing derived from it survives
             kindCode.removeAll(); kindID.removeAll(); idKind.removeAll()
             seedKindsLocked()   // the codes are a storage format; the scan below reads them back
             resetTombstonesLocked(); resetAggregatesLocked(); resetRowWindowsLocked()
@@ -6387,6 +6627,7 @@ public final class VectorStore: @unchecked Sendable {
         // Commit: rebuild the derived structures exactly as loadIntoMemory would have.
         dim = header.dim
         idPath = pathTable
+        resetPathAllowCachesLocked()   // idPath replaced wholesale: the tag-free table is stale
         idKind = kindTable
         pathID = [:]; pathID.reserveCapacity(pathTable.count)
         for (i, p) in pathTable.enumerated() { pathID[p] = Int32(i) }

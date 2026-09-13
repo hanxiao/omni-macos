@@ -3,15 +3,9 @@ import AppKit
 import QuickLook
 import OmniKit
 
-/// Kinds whose snippets are generated content tags (media) - the Generate Tags menu item
-/// applies to these only; text snippets are real excerpts. (File-scope: ResultsList is
-/// generic, which forbids static stored properties.)
-private let taggableKinds: Set<String> = [
-    FileKind.image.rawValue, FileKind.scan.rawValue, FileKind.video.rawValue
-]
-
 struct ResultsList<Footer: View>: View {
     @Environment(AppModel.self) private var model: AppModel
+    @Environment(OCRSession.self) private var ocr: OCRSession
     let results: [SearchHit]
     @ViewBuilder var footer: Footer
     @State private var expanded: Set<String> = []
@@ -138,8 +132,11 @@ struct ResultsList<Footer: View>: View {
     private var listView: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(spacing: 2) {
-                    ForEach(model.groups) { group in
+                // No inter-row spacing: the alternating bands have to MEET, the way a native list's
+                // do. With a 2pt gap the stripes read as separate cards rather than as a ruled
+                // table, which is the whole point of them.
+                LazyVStack(spacing: 0) {
+                    ForEach(Array(model.groups.enumerated()), id: \.element.id) { index, group in
                         let hit = group.representative
                         VStack(spacing: 0) {
                             ResultRow(hit: hit,
@@ -159,6 +156,13 @@ struct ResultsList<Footer: View>: View {
                                 // files coming from OUTSIDE the app (Finder); use Find similar / Reveal
                                 // in Finder for a result.
                                 .contentShape(Rectangle())
+                                // Every other row on the system's own alternating colour - the same
+                                // banding `alternatingRowBackgrounds()` gives the browsers, which
+                                // this view cannot use because it is a ScrollView, not a List (see
+                                // the note above). Under the selection fill, never over it.
+                                .background(index.isMultiple(of: 2)
+                                            ? Color.clear
+                                            : Color(nsColor: .alternatingContentBackgroundColors[1]))
                                 .onTapGesture { handleTap(hit.path) }
                                 .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
                                 .contextMenu { menu(hit) }
@@ -231,6 +235,11 @@ struct ResultsList<Footer: View>: View {
             // Arrow keys move the selection up/down (Return/Space handled on the body). Same
             // focusable + onMoveCommand wiring the gallery uses. Right/left disclose/collapse the
             // selected row's passages - the Finder list-view convention for expandable rows.
+            // SOFT SCROLL EDGE: content blurs under the toolbar's glass instead of clipping at a
+            // hard line. Finder's list and icon views both do this (measured: a gradient from 245
+            // to 253 over ~25pt, no rule). Applied to the scroll view ITSELF, which is what the
+            // modifier looks for - it did nothing when it was put on an ancestor.
+            .modifier(SoftTopScrollEdge())
             .focusable()
             .focusEffectDisabled()
             .onMoveCommand { direction in
@@ -381,6 +390,11 @@ struct ResultsList<Footer: View>: View {
             })
             // Make the gallery keyboard-navigable like the list: arrow keys move the selection by
             // column/row, and Return/Space (handled on the body) then open/preview it.
+            // SOFT SCROLL EDGE: content blurs under the toolbar's glass instead of clipping at a
+            // hard line. Finder's list and icon views both do this (measured: a gradient from 245
+            // to 253 over ~25pt, no rule). Applied to the scroll view ITSELF, which is what the
+            // modifier looks for - it did nothing when it was put on an ancestor.
+            .modifier(SoftTopScrollEdge())
             .focusable()
             .focusEffectDisabled()
             .onMoveCommand { direction in
@@ -468,6 +482,15 @@ struct ResultsList<Footer: View>: View {
             if model.canGenerateTags, selectionHasMedia {
                 Button { model.requestTags(Array(model.selectedPaths)) } label: { Label("Generate Tags", systemImage: "tag") }
             }
+            // The whole selection, in result order, each file its own tab in the workspace - the
+            // same shape as Open and Reveal above. Absent when nothing in the selection is a PDF
+            // or an image.
+            let transcribable = Transcribe.candidates(model.selectedPathsForMenu)
+            if !transcribable.isEmpty {
+                Button { Transcribe.send(transcribable, model: model, ocr: ocr) } label: {
+                    Label(Transcribe.title(transcribable.count), systemImage: "text.viewfinder")
+                }
+            }
             Divider()
             Button(role: .destructive) { model.moveSelectedToTrash() } label: { Label("Move \(count) items to Trash", systemImage: "trash") }
                 .keyboardShortcut(.delete, modifiers: .command)
@@ -493,97 +516,46 @@ struct ResultsList<Footer: View>: View {
                 }
                 Divider()
             }
-            Button { model.selectSingle(path); open(path) } label: { Label("Open", systemImage: "arrow.up.forward.app") }
-                .keyboardShortcut("o", modifiers: .command)
-            Button { model.selectSingle(path); model.showPreview(path: path) } label: { Label("Quick Look", systemImage: "eye") }
-                .keyboardShortcut("y", modifiers: .command)
-            // Per-chunk breakdown (pages of a PDF, passages of a long doc) - only for files that
-            // actually have several chunks. The list expands inline; the grid opens a popover.
-            if hit.chunkCount > 1 {
-                switch model.viewMode {
-                case .list:
-                    Button { toggle(path) } label: {
-                        Label(expanded.contains(path) ? "Hide matching passages" : "Show matching passages", systemImage: "text.alignleft")
-                    }
-                case .grid:
-                    Button {
-                        // Load first, present after: the popover must mount at its final size
-                        // (see the crash note at the .popover site). Both writes are re-validated
-                        // against the LIVE model after the rank's await, for the same reason
-                        // fetchPassages is: the results can be replaced while the store's serial
-                        // queue works through it, and presenting then either showed the previous
-                        // query's passages or anchored the popover to a cell that no longer exists,
-                        // which presents nothing and leaves the state pointing at a dead path.
-                        Task {
-                            let token = model.resolvedQuery
-                            let ranked = passagesCache[path] == nil ? await model.passages(for: path) : nil
-                            guard model.resolvedQuery == token,
-                                  model.renderedPaths.contains(path) else { return }
-                            if let ranked { passagesCache[path] = ranked }
-                            passagesPopover = path
+            // The shared per-file menu (App/FileMenu.swift): the folder and Photos browsers show
+            // exactly these items, in this order. Only what is specific to a ranked result list
+            // stays here - the stack block above, and the passages slot below.
+            FileMenuItems(path: path, kind: hit.kind, showsSelectAll: true) {
+                // Per-chunk breakdown (pages of a PDF, passages of a long doc) - only for files
+                // that actually have several chunks. The list expands inline; the grid opens a
+                // popover.
+                if hit.chunkCount > 1 {
+                    switch model.viewMode {
+                    case .list:
+                        Button { toggle(path) } label: {
+                            Label(expanded.contains(path) ? "Hide matching passages" : "Show matching passages",
+                                  systemImage: "text.alignleft")
                         }
-                    } label: { Label("Show matching passages", systemImage: "text.alignleft") }
-                }
-            }
-            Divider()
-            // Use this file itself as the query - doc-vs-doc "more like this" across all modalities.
-            Button { model.searchBySimilar(to: path) } label: { Label("Find similar", systemImage: "sparkle.magnifyingglass") }
-                .keyboardShortcut("f", modifiers: [.command, .option])
-            // (Re)generate this file's content tags - explicit request, HQ quality. Media only:
-            // a text file's snippet is a real excerpt, tags would be a downgrade.
-            if model.canGenerateTags, taggableKinds.contains(hit.kind) {
-                Button { model.selectSingle(path); model.requestTags([path]) } label: { Label("Generate Tags", systemImage: "tag") }
-            }
-            Button { model.selectSingle(path); reveal(path) } label: { Label(PhotoActions.revealTitle(path), systemImage: "folder") }
-                .keyboardShortcut("r", modifiers: [.command, .shift])
-            Button {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(path, forType: .string)
-            } label: { Label("Copy path", systemImage: "doc.on.doc") }
-            .keyboardShortcut("c", modifiers: .command)
-            // Native macOS share picker for this file - the same system sheet Finder's Share opens.
-            // A Photos asset has no file to share until it is exported, so that one goes through a
-            // button that exports first and then opens the same picker.
-            if PhotoLibrary.isPhotoPath(path) {
-                Button { sharePhoto(path) } label: { Label("Share\u{2026}", systemImage: "square.and.arrow.up") }
-            } else {
-                ShareLink(item: URL(fileURLWithPath: path, isDirectory: false)) { Label("Share\u{2026}", systemImage: "square.and.arrow.up") }
-            }
-            Divider()
-            // Deleting a Photos asset means deleting it from the library and every synced device -
-            // Photos.app's decision to offer, not Omni's.
-            if !PhotoLibrary.isPhotoPath(path) {
-                Button(role: .destructive) { model.moveToTrash([path]) } label: { Label("Move to Trash", systemImage: "trash") }
-                    .keyboardShortcut(.delete, modifiers: .command)
-            }
-            Button { model.selectAllResults() } label: { Label("Select all", systemImage: "checkmark.circle") }
-                .keyboardShortcut("a", modifiers: .command)
-            // Exclude this result's folder from indexing - the "stop showing me this build/cache
-            // noise" action. Routes through the same apply path as the Settings ignore editor (backed
-            // up, pruned, persisted, visible there). Hidden when the folder is an indexed root:
-            // removing a whole root belongs to the sidebar, with its confirmation.
-            if model.canIgnoreEnclosingFolder(ofPath: path) {
-                Divider()
-                Button { model.ignoreEnclosingFolder(ofPath: path) } label: {
-                    Label("Ignore folder \u{201C}\((path as NSString).deletingLastPathComponent.components(separatedBy: "/").last ?? "")\u{201D}", systemImage: "eye.slash")
+                    case .grid:
+                        Button {
+                            // Load first, present after: the popover must mount at its final size
+                            // (see the crash note at the .popover site). Both writes are
+                            // re-validated against the LIVE model after the rank's await, for the
+                            // same reason fetchPassages is: the results can be replaced while the
+                            // store's serial queue works through it, and presenting then either
+                            // showed the previous query's passages or anchored the popover to a
+                            // cell that no longer exists, which presents nothing and leaves the
+                            // state pointing at a dead path.
+                            Task {
+                                let token = model.resolvedQuery
+                                let ranked = passagesCache[path] == nil ? await model.passages(for: path) : nil
+                                guard model.resolvedQuery == token,
+                                      model.renderedPaths.contains(path) else { return }
+                                if let ranked { passagesCache[path] = ranked }
+                                passagesPopover = path
+                            }
+                        } label: { Label("Show matching passages", systemImage: "text.alignleft") }
+                    }
                 }
             }
         }
     }
 
     private func open(_ path: String) { PhotoActions.open(path) }
-    private func reveal(_ path: String) { PhotoActions.reveal(path) }
-
-    /// Export the asset, then hand the file to the system share sheet - the same sheet ShareLink
-    /// puts up for a file, minus the file that does not exist yet.
-    private func sharePhoto(_ path: String) {
-        Task { @MainActor in
-            guard let url = await PhotoActions.materialized(path),
-                  let view = NSApp.keyWindow?.contentView else { return }
-            NSSharingServicePicker(items: [url])
-                .show(relativeTo: .zero, of: view, preferredEdge: .minY)
-        }
-    }
 
     /// Click selection with Finder modifiers: Cmd toggles a row, Shift extends the range from the
     /// anchor, plain click replaces the selection.
@@ -682,14 +654,18 @@ struct ResultRow: View {
         // the window is key, the system's unemphasized grey (with normal label text) when it is not -
         // the cue for where keyboard input lands. White text comes from driving the whole row's
         // foreground to the selection text color, so the secondary/tertiary metadata derive their
-        // translucent-white tints from it automatically. Radius concentric with the 6pt thumbnail
-        // corners across the 6pt padding.
+        // translucent-white tints from it automatically.
+        //
+        // SAME RADIUS AS EVERY OTHER LIST (`BrowserMetrics.selectionRadius`, Finder's 4). This was
+        // 12 - derived from the thumbnail's corners rather than from the selection - which made a
+        // result row's highlight visibly rounder than the same highlight in the folder browser one
+        // click away. A taller row is not a reason to round differently.
         .foregroundStyle(emphasized ? AnyShapeStyle(Color(nsColor: .alternateSelectedControlTextColor)) : AnyShapeStyle(.primary))
         .background(
             selected ? (controlActive == .key
                 ? Color(nsColor: .selectedContentBackgroundColor)
                 : Color(nsColor: .unemphasizedSelectedContentBackgroundColor)) : .clear,
-            in: RoundedRectangle(cornerRadius: Design.cornerSmall + 6, style: .continuous)
+            in: RoundedRectangle(cornerRadius: BrowserMetrics.selectionRadius)
         )
     }
 }
@@ -1075,5 +1051,18 @@ private struct MarqueeSelect: ViewModifier {
                     }
                     .onEnded { _ in origin = nil; rect = nil }
             )
+    }
+}
+
+
+/// `.soft` on Tahoe, nothing anywhere else: the scroll-edge effect that lets content blur under the
+/// toolbar's Liquid Glass rather than clip at its boundary.
+struct SoftTopScrollEdge: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            content.scrollEdgeEffectStyle(.soft, for: .top)
+        } else {
+            content
+        }
     }
 }

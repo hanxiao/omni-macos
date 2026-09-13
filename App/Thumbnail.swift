@@ -73,20 +73,11 @@ struct Thumbnail: View {
             }
         }
         .frame(width: side, height: side)
-        .background {
-            // Translucent well so thumbnails sit on the glass detail pane on macOS 26;
-            // opaque control background below. The border keeps definition either way.
-            if #available(macOS 26, *) { Rectangle().fill(.ultraThinMaterial) }
-            else { Color(.controlBackgroundColor) }
-        }
+        // NO WELL AND NO BORDER. There used to be a translucent card behind every thumbnail with a
+        // faint stroke around it, which put a second background behind file icons that already have
+        // a shape of their own - Finder draws neither, in list view or in icon view, and a page of
+        // them read as a grid of boxes. The clip stays: a photo still gets the rounded corners.
         .clipShape(RoundedRectangle(cornerRadius: corner, style: .continuous))
-        .overlay(
-            // A soft edge for definition. separatorColor is tuned for list dividers and reads as a
-            // hard hairline boxing every thumbnail; a faint primary tint defines the edge without
-            // drawing a grid of lines across the content.
-            RoundedRectangle(cornerRadius: corner, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
-        )
         .task(id: "\(path)@\(Int(side))") { await load() }
     }
 
@@ -108,6 +99,10 @@ struct Thumbnail: View {
                 PhotoLibrary.image(ref, maxDimension: maxPixel, allowNetwork: false)
             }
             if Task.isCancelled { return }
+            if cg == nil {
+                omniPerfLog("photo-thumb nil auth=\(PhotoLibrary.authorization.rawValue) "
+                            + "assetFound=\(PhotoLibrary.debugAssetExists(ref)) id=\(ref.localIdentifier)")
+            }
             if let cg {
                 let img = NSImage(cgImage: cg, size: NSSize(width: CGFloat(cg.width) / scale,
                                                             height: CGFloat(cg.height) / scale))

@@ -796,6 +796,12 @@ public final class Indexer: @unchecked Sendable {
             if p.scanned % 10 == 0 { p.photosNotLocal = PhotoLibrary.notLocal; onProgress(p) }
         }
         func storeChunks(_ path: String, _ raw: [IndexedChunk]) {
+            // The file being WRITTEN, not the one being crawled. The crawl sets `currentPath` too,
+            // but it races far ahead of the encoder and on a small root it finishes in a blink, so
+            // for most of a pass the crawl's value is stale - it named a folder the pass had long
+            // left. Anything asking "what is being indexed right now" (Settings' caption, the
+            // folder browser's ring) wants this one.
+            p.currentPath = path
             // A non-finite vector means corrupted resident weights (per-process cold-load fault)
             // or a transient GPU fault. Storing the finite SUBSET would persist a silently
             // truncated file under its current mtime - never repaired because later passes see it

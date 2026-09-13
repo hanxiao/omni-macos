@@ -50,7 +50,67 @@ struct HistoryItem: Codable, Sendable, Identifiable, Equatable {
         return isServed ? "serving:\(displayText)" : "query:\(displayText)"
     }
     var isFile: Bool { filePath != nil }
-    var displayLabel: String { isFile ? ((filePath! as NSString).lastPathComponent) : displayText }
+    /// What the SIDEBAR shows. The qualifiers are deliberately not in it.
+    ///
+    /// A recents list reading `cat in:/Users/hanxiao/Documents/embedding-inversion type:image
+    /// tag:holiday` is mostly path, and mostly the SAME path on every row - the one part that
+    /// carries no information about which search it was. Only the words the reader typed go here.
+    ///
+    /// Nothing about replay changes: `displayText` still carries the full query (and `id` is
+    /// derived from it, so identity and dedup are untouched), the stored filter fields still
+    /// restore on click, and the row's tooltip still shows the whole thing.
+    var displayLabel: String {
+        if isFile { return (filePath! as NSString).lastPathComponent }
+        let parsed = SearchQueryParser.parse(displayText)
+        let text = parsed.semanticText.trimmingCharacters(in: .whitespaces)
+        if !text.isEmpty { return text }
+        // A pure-filter search has no words to show. Name it by its VALUES rather than falling
+        // back to the raw string: "Documents, image" beats "in:/Users/.../Documents type:image",
+        // and a path shows its last component for the same reason the field's chip does.
+        let values = parsed.qualifiers.map { q in
+            (q.negated ? "-" : "") + (q.key == "in" ? (q.value as NSString).lastPathComponent : q.value)
+        }
+        return values.isEmpty ? displayText : values.joined(separator: ", ")
+    }
+
+    /// Identity for DEDUP: what this search IS, independent of how it was spelled.
+    ///
+    /// `in:/Users/x model` and `in:"/Users/x" model` are the same search - the parser returns the
+    /// same `semanticText` and the same qualifiers for both (verified) - but `displayText`, and so
+    /// `id`, differ. The recorder used to dedup on the exact string, so typing a query unquoted
+    /// left a second row beside the canonical one the box rewrites to.
+    var canonicalKey: String {
+        if let p = filePath { return "file:\(p)" }
+        let parsed = SearchQueryParser.parse(displayText)
+        let quals = parsed.qualifiers
+            .map { "\($0.negated ? "-" : "")\($0.key):\($0.value)" }
+            .sorted().joined(separator: " ")
+        return (isServed ? "serving:" : "query:") + parsed.semanticText.lowercased() + "\u{1}" + quals
+    }
+
+    /// Whether this search carries any filter at all - the sidebar shows a quiet glyph for it,
+    /// because the qualifiers themselves are no longer in the label.
+    var isFiltered: Bool {
+        !isFile && !SearchQueryParser.parse(displayText).qualifiers.isEmpty
+    }
+
+    /// The folder a search was scoped to, as its last component, shown dimmed after the label.
+    ///
+    /// Dropping the qualifiers made the list clean and made folder-scoped searches indist-
+    /// inguishable: the same word searched in eight folders is eight rows reading "model". The
+    /// PATH was the noise, not the folder, so the leaf comes back and the rest stays gone.
+    /// Nil when the search had no `in:`, or when the label already IS the folder name (a
+    /// pure-filter search, where repeating it would just stutter).
+    var displayScope: String? {
+        guard !isFile else { return nil }
+        let parsed = SearchQueryParser.parse(displayText)
+        guard let folder = parsed.qualifiers.first(where: { $0.key == "in" && !$0.negated }) else { return nil }
+        let leaf = (folder.value as NSString).lastPathComponent
+        guard !leaf.isEmpty, leaf != displayLabel else { return nil }
+        // Middle-elided, for the same reason the search field's chip is: the generated folders in
+        // this tree differ only in their SUFFIX, so a tail truncation renders siblings identically.
+        return AppModel.SearchToken.elided(leaf)
+    }
 }
 
 /// When a search enters History. Mirrors how macOS apps treat recents - automatic, on explicit
@@ -212,7 +272,7 @@ final class AppModel {
             await MainActor.run {
                 self.repairRunning = false
                 self.repairMessage = "Removed the old index ("
-                    + ByteCountFormatter.string(fromByteCount: freed, countStyle: .file)
+                    + ByteSize.file(freed)
                     + "). Your files are being indexed again."
                 self.retryBootstrap()
             }
@@ -440,6 +500,13 @@ final class AppModel {
     var hasSelection: Bool { selection != nil }
 
     /// Every selected result path in result order (falls back to the active item).
+    /// The selection in RESULT order, for menu items that act on all of it. Public twin of
+    /// `selectedPathsOrdered`, which is private because it is also the share sheet's input; a menu
+    /// needs the same list to count and label itself ("Transcribe 3 Items"). Non-contiguous
+    /// selections work by construction - this filters `results` by membership, so it never assumes
+    /// the selected rows are adjacent.
+    var selectedPathsForMenu: [String] { selectedPathsOrdered }
+
     private var selectedPathsOrdered: [String] {
         let ordered = results.filter { selectedPaths.contains($0.path) }.map { $0.path }
         return ordered.isEmpty ? (selection.map { [$0] } ?? []) : ordered
@@ -618,8 +685,141 @@ final class AppModel {
     /// left the search unscoped and told a reader nothing about the folder's contents.
     func enterFolder(_ url: URL?) {
         selectFolderForVisualization(nil)        // browsing takes the empty-result region
+        browsedPhotoSource = nil                 // one browser at a time
         filterFolder = url                       // re-runs the search and rewrites the box
         captureNavStop()
+    }
+
+    /// The Photos source currently being browsed, or nil.
+    ///
+    /// Its own property rather than a value in `filterFolder`, which is a `URL`: a photo source is
+    /// addressed by a synthetic key (`photos://all`), and `URL(string:)?.path` throws that away -
+    /// it is a host, not a path. The store's `folderPrefix` is a plain String prefix test, so the
+    /// key works there directly.
+    var browsedPhotoSource: PhotoLibrary.Source? = nil
+
+    /// Browse a Photos source. Selecting one used to do NOTHING - the sidebar's `onChange` handled
+    /// `.folder` and let `.photos` fall through - so the row highlighted and the pane did not move.
+    func enterPhotoSource(_ source: PhotoLibrary.Source) {
+        selectFolderForVisualization(nil)
+        filterFolder = nil                 // the two browsers share one region; the last click wins
+        browsedPhotoSource = source
+    }
+
+    /// The contents of a Photos source, newest first.
+    ///
+    /// `listMatching` and not a search: browsing is a LISTING, there is no query vector, and it
+    /// already orders by mtime with path as the deterministic tiebreak. Capped, because a library
+    /// can hold tens of thousands of assets and every hit carries a filled snippet.
+    func photoSourceHits(_ source: PhotoLibrary.Source, cap: Int = 1000) async -> [SearchHit] {
+        guard let store else { return [] }
+        var f = SearchFilter()
+        f.folderPrefix = source.key
+        return await Task.detached(priority: .userInitiated) {
+            store.listMatching(filter: f, topK: cap)
+        }.value
+    }
+
+    /// What the folder browser lists: the children of `folder` the INDEX knows about, never the
+    /// raw directory. Runs the pass on a detached worker because it walks the whole live-file
+    /// table, which is 2.6M entries on this machine.
+    func indexedChildren(of folder: URL) async -> (files: [URL], folders: [URL]) {
+        guard let store else { return ([], []) }
+        let path = folder.path
+        return await Task.detached(priority: .userInitiated) {
+            let found = store.indexedChildren(ofFolder: path)
+            return (found.files.map { URL(fileURLWithPath: $0) },
+                    found.folders.map { URL(fileURLWithPath: $0) })
+        }.value
+    }
+
+    /// Clear the search: text, chips, every filter, and the results. Bound to Escape.
+    ///
+    /// One call, because there is one query: the chips, the qualifier bar and the store filter are
+    /// all projections of `rawQuery`, so clearing has to go through the same door a parse does or
+    /// the projections survive their source. `applyParsedQuery("")` is that door.
+    func clearSearch() {
+        fileQuery = nil
+        queryError = nil
+        literalQuery = false
+        applyParsedQuery("")      // rawQuery, semantic text, chips and every filter field at once
+        rawResults = []
+        searchToken += 1          // an in-flight search cannot repopulate the list behind us
+        searching = false
+    }
+
+    /// The browsed folder and its ancestors, never above the indexed root that contains it - the
+    /// app has no permission up there and a dead crumb is worse than none. Lives here rather than
+    /// in the browser because the TOOLBAR draws it now, the way Finder puts the folder name beside
+    /// the back/forward buttons instead of spending a content row on it.
+    var browseCrumbs: [URL] {
+        guard let folder = filterFolder else { return [] }
+        guard let root = roots.first(where: { folder.path == $0.path || folder.path.hasPrefix($0.path + "/") })
+        else { return [folder] }
+        var chain: [URL] = []
+        var cur = folder
+        while cur.path.hasPrefix(root.path) {
+            chain.append(cur)
+            if cur.path == root.path { break }
+            let parent = cur.deletingLastPathComponent()
+            if parent.path == cur.path { break }
+            cur = parent
+        }
+        return chain.reversed()
+    }
+
+    /// The folder browser's rows, with the facts its columns show. Off the main actor.
+    func indexedChildrenDetailed(of folder: URL) async -> [VectorStore.IndexedChild] {
+        guard let store else { return [] }
+        let path = folder.path
+        return await Task.detached(priority: .userInitiated) {
+            store.indexedChildrenDetailed(ofFolder: path)
+        }.value
+    }
+
+    /// Indexed folders matching what has been typed into Go to Folder.
+    func indexedFolders(matching needle: String) async -> [URL] {
+        guard let store, needle.count >= 2 else { return [] }
+        return await Task.detached(priority: .userInitiated) {
+            store.indexedFolders(matching: needle).map { URL(fileURLWithPath: $0) }
+        }.value
+    }
+
+    /// The folder one level up from whatever is being browsed - Finder's Enclosing Folder. Nil at a
+    /// root, because going above an indexed root lands somewhere with nothing in it.
+    var enclosingFolder: URL? {
+        guard let folder = filterFolder, !roots.contains(folder) else { return nil }
+        let parent = folder.deletingLastPathComponent()
+        return parent.path == "/" || parent == folder ? nil : parent
+    }
+
+    /// Content tags for the rows the Tags column is showing. Only called when it is on.
+    func tags(for paths: [String]) async -> [String: [String]] {
+        guard let store, !paths.isEmpty else { return [:] }
+        return await Task.detached(priority: .userInitiated) { store.storedTags(paths: paths) }.value
+    }
+
+    /// Draw the embedding map for ANY folder, in the layout the caller picked.
+    ///
+    /// The map is not a property of the indexed ROOTS - `VectorStore.vectorsUnderFolder` takes a
+    /// path PREFIX, so it has always been recursive and has always worked for a subfolder. All
+    /// that was missing was a way to ask for one.
+    ///
+    /// Two orderings matter here and both are load-bearing:
+    /// - `filterFolder` is cleared first because browsing WINS the empty-result region
+    ///   (`showsFolderBrowser` is checked before `showsFolderViz`), so a map requested while a
+    ///   folder is being browsed would fit and then never be seen.
+    /// - the folder is pointed at BEFORE the mode is flipped, because `mapUsesUMAP.didSet` refits
+    ///   `selectedFolderForViz` synchronously: setting the mode first fits the folder we are
+    ///   leaving and throws it away a moment later.
+    ///
+    /// It deliberately does NOT touch the sidebar selection. Selecting a folder means BROWSE, and
+    /// the selection change would call `enterFolder` straight back over the map.
+    func visualizeFolder(_ url: URL, umap: Bool) {
+        filterFolder = nil
+        guard mapUsesUMAP != umap else { selectFolderForVisualization(url); return }
+        selectedFolderForViz = url
+        mapUsesUMAP = umap        // didSet drops the other mode's cache and refits THIS folder
     }
 
     /// One active filter, shown as a chip inside the search field. A PROJECTION of
@@ -638,7 +838,26 @@ final class AppModel {
         /// the toolbar will not grow on Tahoe) and every character costs one of the query's.
         var label: String {
             let shown = key == "in" ? (value as NSString).lastPathComponent : value
-            return "\(negated ? "-" : "")\(key):\(shown)"
+            return "\(negated ? "-" : "")\(key):\(SearchToken.elided(shown))"
+        }
+
+        /// Long values are elided in the MIDDLE, and the string is cut here rather than left to
+        /// the chip.
+        ///
+        /// Two reasons it cannot be left alone. SwiftUI truncates a token at the TAIL when it runs
+        /// out of room, and the tail is exactly where a generated folder tree carries its meaning:
+        /// this index holds six siblings named
+        /// `defense_yiyic_sentiment140_1k_..._epsilon0.05_delta0.0001`, differing only after
+        /// character 90, so all six render as the same `in:defense_yiyic_sentiment...` chip and
+        /// the reader cannot tell which folder the search is scoped to. And the field's width is
+        /// fixed (the toolbar will not grow on Tahoe), so a 112-character name would otherwise eat
+        /// the whole box. `truncationMode(.middle)` on the token's `Text` is not the fix - a token
+        /// chip already drops the `systemImage` off a `Label`, so its content modifiers are not
+        /// something to rely on.
+        static func elided(_ s: String, max n: Int = 24) -> String {
+            guard s.count > n else { return s }
+            let head = (n - 1) / 2 + (n - 1) % 2
+            return s.prefix(head) + "\u{2026}" + s.suffix(n - 1 - head)
         }
         var queryText: String { "\(negated ? "-" : "")\(key):\(AppModel.quoteIfNeeded(value))" }
     }
@@ -1560,7 +1779,9 @@ final class AppModel {
         // "type:pdf budget" and "budget" are distinct entries and live-typed prefixes still collapse.
         searchHistory.removeAll { !$0.bookmarked && !$0.isFile && !$0.displayText.isEmpty
             && $0.displayText.count < raw.count && lower.hasPrefix($0.displayText.lowercased()) }
-        if let i = searchHistory.firstIndex(where: { !$0.isFile && $0.displayText.caseInsensitiveCompare(raw) == .orderedSame }) {
+        // Canonical, not the literal string: see `HistoryItem.canonicalKey`.
+        let incomingKey = HistoryItem(query: q, bookmarked: false, lastUsed: Date(), rawQuery: raw).canonicalKey
+        if let i = searchHistory.firstIndex(where: { !$0.isFile && $0.canonicalKey == incomingKey }) {
             searchHistory[i].lastUsed = Date()
             searchHistory[i].query = q
             searchHistory[i].rawQuery = raw
@@ -1637,10 +1858,15 @@ final class AppModel {
             // no leak. (Old items predating the query language fall back to their plain text; any filter
             // they had only via the menu is dropped, which is the intended cleanup.)
             let raw = item.displayText   // rawQuery ?? query - the full query-language string
-            lastHistoryRunQuery = raw
             fileQuery = nil
             literalQuery = false                  // replay always starts in parse mode
             applyParsedQuery(raw)                  // sets rawQuery + all filters + semantic query + qualifier bar
+            // The guard has to hold the CANONICAL string, not the one stored on the item.
+            // `applyParsedQuery` rewrites the box - `in:/Users/x model` comes back as
+            // `in:"/Users/x" model` - so guarding on `raw` compared an unquoted string against a
+            // quoted one, never matched, and every click on a history row recorded a second,
+            // quoted twin of the row that was clicked.
+            lastHistoryRunQuery = rawQuery
             // A click is a single deliberate action - don't make it eat the typing debounce (180ms
             // of dead time before an often-cached, ~20ms search). Rapid click-through still
             // coalesces: search() cancels the previous in-flight work and the searchToken guard
@@ -1772,10 +1998,41 @@ final class AppModel {
     }
 
     private func loadHistory() {
-        if let data = UserDefaults.standard.data(forKey: historyKey),
-           let items = try? JSONDecoder().decode([HistoryItem].self, from: data) {
-            searchHistory = items
+        guard let data = UserDefaults.standard.data(forKey: historyKey),
+              let items = try? JSONDecoder().decode([HistoryItem].self, from: data) else { return }
+        let merged = Self.canonicalized(items)
+        searchHistory = merged
+        if merged.count != items.count { persistHistory() }   // write the collapse back once
+    }
+
+    /// Collapse rows that are the SAME search written two ways.
+    ///
+    /// `applyParsedQuery` canonicalises the box - `in:/Users/x model` comes back as
+    /// `in:"/Users/x" model` - and `HistoryItem.id` is derived from the raw text, so before the
+    /// re-record guard was fixed every click on a history row left a quoted twin beside the
+    /// original. Both rows replay identically and render identically; they were just two spellings.
+    /// Re-parsing each one and keying on the canonical form merges them, newest `lastUsed` winning,
+    /// and a bookmark on either survives.
+    private static func canonicalized(_ items: [HistoryItem]) -> [HistoryItem] {
+        var seen: [String: Int] = [:]          // canonical key -> index into out
+        var out: [HistoryItem] = []
+        for item in items {
+            guard !item.isFile else { out.append(item); continue }
+            let key = item.canonicalKey
+            guard let i = seen[key] else {
+                seen[key] = out.count
+                out.append(item)
+                continue
+            }
+            if item.lastUsed > out[i].lastUsed {
+                var keep = item
+                keep.bookmarked = keep.bookmarked || out[i].bookmarked
+                out[i] = keep
+            } else if item.bookmarked {
+                out[i].bookmarked = true
+            }
         }
+        return out
     }
 
     // MARK: - Derived results
@@ -2097,6 +2354,30 @@ final class AppModel {
     func ignoreEnclosingFolder(ofPath path: String) {
         guard canIgnoreEnclosingFolder(ofPath: path) else { return }
         let pattern = (path as NSString).deletingLastPathComponent + "/"
+        let present = ignoreText.split(separator: "\n", omittingEmptySubsequences: true)
+            .contains { $0.trimmingCharacters(in: .whitespaces) == pattern }
+        guard !present else { return }
+        var text = ignoreText
+        if !text.isEmpty, !text.hasSuffix("\n") { text += "\n" }
+        applyIgnoreText(text + pattern + "\n")
+    }
+
+    /// Whether a FOLDER (as opposed to a result's enclosing folder) can be excluded. A root is
+    /// removed, not ignored - that is the sidebar's job and it has its own consequences.
+    func canIgnoreFolder(_ url: URL) -> Bool {
+        !roots.contains(url) && !PhotoLibrary.isPhotoPath(url.path)
+    }
+
+    /// Exclude this folder itself from indexing, through the same `.omniignore` path as
+    /// `ignoreEnclosingFolder`: backed up (one-step Revert), pruned from the index, persisted,
+    /// visible in Settings > Content, and followed by an incremental pass.
+    ///
+    /// This is what "Remove from Omni" means for a folder that is not a root. Removing a root drops
+    /// a folder the user added; there is no such record for a subfolder, so the equivalent - stop
+    /// covering it, and drop what is already indexed under it - is an ignore rule.
+    func ignoreFolder(_ url: URL) {
+        guard canIgnoreFolder(url) else { return }
+        let pattern = url.path + "/"
         let present = ignoreText.split(separator: "\n", omittingEmptySubsequences: true)
             .contains { $0.trimmingCharacters(in: .whitespaces) == pattern }
         guard !present else { return }
@@ -2454,6 +2735,29 @@ final class AppModel {
         guard s.contains(where: { $0.isWhitespace }) else { return s }
         let escaped = s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
         return "\"\(escaped)\""
+    }
+
+    /// Search for a passage of PROSE - a selection lifted out of a transcript, not a typed query.
+    ///
+    /// LITERAL, not parsed. A sentence taken from a document is full of colons, quotes and
+    /// newlines, and the query language would read "Figure 3: results" as a qualifier and
+    /// `in:memory` as a folder scope. Literal mode embeds the string verbatim, which is what
+    /// "search for this text" means to the person who selected it.
+    ///
+    /// Normalised first: newlines and runs of whitespace collapse to single spaces, because a
+    /// selection spanning a line break carries the layout of the page it came from and not the
+    /// meaning. Capped at 512 characters - the encoder truncates long inputs anyway, and a whole
+    /// paragraph is a worse query than its first sentences.
+    func searchForText(_ raw: String) {
+        let cleaned = raw.split(whereSeparator: { $0.isWhitespace || $0.isNewline })
+            .joined(separator: " ")
+            .prefix(512)
+        guard !cleaned.isEmpty else { return }
+        ocrMode = false            // back to the results, which is where the answer will appear
+        fileQuery = nil
+        literalQuery = true
+        applyParsedQuery(String(cleaned))
+        search()
     }
 
     /// Toggle literal mode: embed the box text as-is (ignoring qualifiers) vs parse it as a query
@@ -3493,6 +3797,91 @@ final class AppModel {
 
     /// Is this folder waiting for its turn to be crawled? Distinct from `activeRoots`, which means
     /// a pass is running for it: both should read as "working", neither as a count.
+    /// What the folder browser should draw beside a row, mirroring the sidebar's pie.
+    ///
+    /// `.fraction` only where a real one exists - a root has a `perRoot` clock, a SUBFOLDER of one
+    /// does not, and inventing a per-subtree percentage would be a made-up number. A subfolder of a
+    /// root that is indexing gets the ring with no wedge, which is the same thing the sidebar draws
+    /// for a root that is queued or still being counted: work is happening in here, no count yet.
+    enum BrowseProgress: Equatable {
+        /// This folder's own clock - it is an indexed root.
+        case fraction(Double)
+        /// The clock of the root whose pass is filling this folder, and that root's path.
+        case borrowed(root: String, fraction: Double)
+        case indeterminate
+
+        /// What `CloudSyncPie` wants: a wedge, or nil for the ring alone.
+        var wedge: Double? {
+            switch self {
+            case .fraction(let f):       return f
+            case .borrowed(_, let f):    return f
+            case .indeterminate:         return nil
+            }
+        }
+        var help: String {
+            switch self {
+            case .fraction(let f):       return "Indexing - \(Int(f * 100))%"
+            case .borrowed(let r, let f): return "Indexing \((r as NSString).lastPathComponent) - \(Int(f * 100))%"
+            case .indeterminate:         return "Indexing\u{2026}"
+            }
+        }
+    }
+
+    /// Root keys with a pass in flight right now. `activeRoots` alone is NOT the answer: it is
+    /// empty during a background reconcile, where the only evidence is a `perRoot` clock that has
+    /// not reached its total - which is why the browser's live refresh at first never fired on a
+    /// folder whose sidebar row was visibly showing a pie. Same rule the sidebar's `isActive` uses.
+    /// Folder roots only; a `photos://` key is not a path and can never contain one.
+    private var workingRootPaths: [String] {
+        var keys = activeRoots
+        if isIndexing { keys.formUnion(progress.perRoot.keys) }
+        return keys.filter { key in
+            guard !key.hasPrefix("photos://") else { return false }
+            // FINISHED WINS: a root keeps its key until the whole batch completes.
+            if let rp = progress.perRoot[key], rp.total > 0, rp.done >= rp.total { return false }
+            return true
+        }
+    }
+
+    /// Nil when nothing is indexing under `path`, which is the common case and must stay cheap:
+    /// this is asked once per visible row.
+    func browseProgress(forFolder path: String) -> BrowseProgress? {
+        if pausedRoots.contains(path) { return nil }
+        if let rp = progress.perRoot[path] {
+            if rp.total > 0, rp.done >= rp.total { return nil }
+            return rp.total > 0 ? .fraction(rp.fraction) : .indeterminate
+        }
+        if pendingCatchUpRoots.contains(URL(fileURLWithPath: path)) { return .indeterminate }
+        return nil
+    }
+
+    /// The clock of the root whose pass is filling `path` - what a SUBFOLDER's ring shows.
+    ///
+    /// A subfolder has no clock of its own and one cannot be invented: the index knows how many
+    /// files it HAS under a folder, never how many it is going to get, so any per-folder percentage
+    /// would be a made-up denominator. What is real, and is the thing actually determining when
+    /// that folder stops filling, is the progress of the pass covering it - the same number the
+    /// sidebar draws on its root. So a growing subfolder borrows it, and the tooltip says whose it
+    /// is rather than implying the folder itself is that far along.
+    func enclosingRootProgress(forFolder path: String) -> (root: String, fraction: Double?)? {
+        let prefixed = path + "/"
+        for root in workingRootPaths where prefixed.hasPrefix(root + "/") {
+            guard let rp = progress.perRoot[root], rp.total > 0 else { return (root, nil) }
+            return (root, rp.fraction)
+        }
+        return nil
+    }
+
+    /// True while anything at or under `path` is being indexed - the browser polls its listing only
+    /// then, so an idle window costs nothing.
+    func isIndexingUnder(folder path: String) -> Bool {
+        let prefixed = path + "/"
+        for root in workingRootPaths {
+            if path == root || prefixed.hasPrefix(root + "/") || root.hasPrefix(prefixed) { return true }
+        }
+        return false
+    }
+
     func isFolderQueued(_ url: URL) -> Bool { pendingCatchUpRoots.contains(url) }
     /// The same question for a Photos source.
     func isPhotoSourceQueued(_ source: PhotoLibrary.Source) -> Bool {
@@ -3579,6 +3968,11 @@ final class AppModel {
                     let live = (gen == self.indexGen)   // superseded by a full reindex / model switch?
                     if live {
                         for k in keys { if let rp = p.perRoot[k] { self.progress.perRoot[k] = rp } }
+                        // The file in flight, which the folder browser uses to put its ring on the
+                        // subfolder being walked. The full pass assigns the whole `IndexProgress`;
+                        // this one merges field by field and simply never carried it, so the ring
+                        // was dead during exactly the pass that adds a new folder.
+                        self.progress.currentPath = p.currentPath
                         if doStats { self.refreshIndexStats(store) }
                     }
                     if p.done {

@@ -85,7 +85,30 @@ struct ContentView: View {
                     // the dropdown closed (suggestionsAllowed is false unless handleQueryEdit armed it).
                     .searchSuggestions {
                         ForEach(model.suggestionsAllowed ? searchSuggestions(model.query) : [], id: \.completion) { sug in
-                            Label(sug.label, systemImage: sug.icon).searchCompletion(sug.completion)
+                            HStack(spacing: 6) {
+                                Image(systemName: sug.icon).foregroundStyle(.secondary)
+                                Text(sug.label).lineLimit(1).truncationMode(.middle)
+                                if let chip = sug.chip {
+                                    // Shaped and weighted to match the token the SEARCH FIELD
+                                    // draws for the same qualifier, so the field and its
+                                    // suggestions speak one language: a rounded rect, not a
+                                    // capsule, and a light wash rather than `.quaternary` - which
+                                    // measured far heavier than the system token (a ~3% wash on
+                                    // its own surface) and read as a grey block.
+                                    //
+                                    // Deliberately NOT a glass effect: this popover is already a
+                                    // vibrant surface, and glass inside glass is the one thing
+                                    // Apple's guidance rules out (see the Liquid Glass notes).
+                                    Text(chip)
+                                        .font(.caption)
+                                        .foregroundStyle(.primary)
+                                        .padding(.horizontal, 5).padding(.vertical, 1)
+                                        .background(.primary.opacity(0.06),
+                                                    in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                                        .lineLimit(1)
+                                }
+                            }
+                            .searchCompletion(sug.completion)
                         }
                     }
                     // Return finishes the word too: a qualifier typed without a trailing space
@@ -93,6 +116,14 @@ struct ContentView: View {
                     .onSubmit(of: .search) {
                         model.promoteQualifiers()
                         model.search(); model.recordCurrentSearchToHistory(viaSubmit: true)
+                    }
+                    // Escape clears the whole query, not just the text: the chips and filters are
+                    // the same query, so leaving them behind is what made a "cleared" box still
+                    // return a filtered, empty result set.
+                    .onKeyPress(.escape) {
+                        guard model.hasActiveSearch || !model.searchTokens.isEmpty else { return .ignored }
+                        model.clearSearch()
+                        return .handled
                     }
             } else {
                 split
@@ -119,22 +150,7 @@ struct ContentView: View {
         }
     }
 
-    /// The search field is installed by AppKit as a side effect of `.searchable` being applied, on
-    /// AppKit's own schedule - a different publish from the model flag this is keyed on. A single
-    /// delayed attempt was a guess at that latency, and when the guess lost (a cold launch, where
-    /// model loading and the first toolbar layout compete) it returned silently and the caret was
-    /// simply never placed. Retry on a short cadence until the item exists, then focus it once.
-    private func focusSearchField(attemptsLeft: Int = 12) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + (attemptsLeft == 12 ? 0.4 : 0.15)) {
-            guard let window = NSApp.windows.first(where: { $0.isVisible && $0.toolbar != nil }),
-                  let item = window.toolbar?.items.compactMap({ $0 as? NSSearchToolbarItem }).first
-            else {
-                if attemptsLeft > 1 { focusSearchField(attemptsLeft: attemptsLeft - 1) }
-                return
-            }
-            window.makeFirstResponder(item.searchField)
-        }
-    }
+    private func focusSearchField() { SearchFieldFocus.focus() }
 
     private var split: some View {
         NavigationSplitView(columnVisibility: $columns) {
@@ -186,9 +202,7 @@ struct ContentView: View {
                 }
             }
             .toolbar { toolbar }
-            .background(WindowTitleHider(onSearchByFile: { model.searchByFilePanel() },
-                                        showsSearchByFile: !model.ocrMode,
-                                        sidebarWidth: model.ocrMode ? 168 : 260))
+            .background(WindowTitleHider(sidebarWidth: model.ocrMode ? 168 : 260))
         }
     }
 
@@ -252,6 +266,14 @@ struct ContentView: View {
             && model.rawResults.isEmpty && model.queryError == nil && !model.isResolving
     }
 
+    /// A Photos source is being browsed. Same precedence rule as the folder browser below, and
+    /// checked before it - `enterPhotoSource` clears `filterFolder` and `enterFolder` clears the
+    /// source, so only one can be set, but the order makes that explicit rather than incidental.
+    private var showsPhotoBrowser: Bool {
+        model.browsedPhotoSource != nil && !model.hasQuery && model.fileQuery == nil
+            && model.rawResults.isEmpty && model.queryError == nil && !model.isResolving
+    }
+
     /// Same precedence as the map below: a folder is being browsed, and nothing search-related is
     /// active. Typing hides it instantly and the results are already scoped to the folder, which
     /// is the whole point - the browser and the search are two views of one `filterFolder`.
@@ -266,11 +288,22 @@ struct ContentView: View {
     private var showsQualifierBar: Bool { model.literalQuery }
 
     @ViewBuilder private var content: some View {
-        VStack(spacing: 0) {
+        // The chip / qualifier bar is a SAFE-AREA BAR, not a row stacked above the content, for the
+        // same reason the browsers' column headers are: a scroll view stacked BELOW a sibling does
+        // not fill its pane, and on Tahoe that is what stops the scroll edge effect from applying,
+        // so results clipped at a hard line instead of blurring under the chrome.
+        contentBody.modifier(TopBar {
             if let fq = model.fileQuery { FileQueryChip(fileQuery: fq) }
             else if showsQualifierBar { QualifierBar() }
+        })
+    }
+
+    @ViewBuilder private var contentBody: some View {
+        VStack(spacing: 0) {
             if !model.results.isEmpty {
                 ResultsList(results: model.results) { belowThresholdFooter }
+            } else if showsPhotoBrowser {
+                PhotoSourceBrowser(source: model.browsedPhotoSource!)
             } else if showsFolderBrowser {
                 FolderBrowser(folder: model.filterFolder!)
             } else if showsFolderViz {
@@ -458,6 +491,7 @@ struct ContentView: View {
             // "No matches" while the debounce/search for what you just typed is still running.
             SearchWaysPrompt(
                 title: model.indexedFiles > 0 ? "Search \(model.indexedFiles.formatted()) file\(model.indexedFiles == 1 ? "" : "s")" : "Search your files",
+                count: model.indexedFiles,
                 showSpinner: model.isResolving)
         } else if model.hiddenByThreshold > 0 {
             CenteredStatus(symbol: "line.3.horizontal.decrease.circle",
@@ -507,33 +541,113 @@ struct ContentView: View {
     /// Whether the back/forward chevrons have anything to show. Also decides whether the leading
     /// toolbar item gets a Liquid Glass background on Tahoe - an empty item must not draw one.
     private var showsHistoryControls: Bool {
-        model.phase == .ready && (model.canGoBack || model.canGoForward)
+        // NOT IN OCR MODE. This trail is the SEARCH history; stepping it while reading a transcript
+        // changes a result set you cannot see, and leaves the chevrons looking like page navigation
+        // for the document - which they are not. OCR has its own page rail for that.
+        model.phase == .ready && !model.ocrMode && (model.canGoBack || model.canGoForward)
     }
 
-    @ViewBuilder private var historyControls: some View {
+    /// Only rendered inside an item that exists solely when `showsHistoryControls` is true, so
+    /// there is no empty state here and no need for the 1pt clear fillers an always-present item
+    /// used to carry against AppKit's "ambiguous width" warning.
+    /// The leading navigation group: back/forward when there is somewhere to go, then the name of
+    /// whatever is being browsed. 10pt between them - Finder's gap, measured at 11.
+    @ViewBuilder private var navAndTitle: some View {
         HStack(spacing: 0) {
-            // A completely empty toolbar item has zero intrinsic size, and AppKit logs an
-            // "ambiguous width/height" warning for it on every toolbar layout pass - measured
-            // on macOS 26 too (12 hits at launch), not just 14/15, so the filler is
-            // unconditional. 1pt of clear gives the item a size without a visible footprint.
+            // A completely empty toolbar item has zero intrinsic size and AppKit logs an
+            // "ambiguous width/height" warning for it on every layout pass, so 1pt of clear keeps
+            // it measurable while nothing is being browsed.
             Color.clear.frame(width: 1, height: 1)
             if showsHistoryControls {
-                ControlGroup {
-                    // The View menu owns Cmd-[ / Cmd-] (single owner, avoids a duplicate-shortcut
-                    // conflict); these buttons are click targets that name the same chords.
-                    Button { model.goBack() } label: { Image(systemName: "chevron.backward") }
-                        .disabled(!model.canGoBack)
-                        .help("Back  \u{2318}[")
-                        .accessibilityLabel("Back")
-                    Button { model.goForward() } label: { Image(systemName: "chevron.forward") }
-                        .disabled(!model.canGoForward)
-                        .help("Forward  \u{2318}]")
-                        .accessibilityLabel("Forward")
-                }
-                .fixedSize()
+                historyControls
+                    .modifier(NavPill())
+                    .padding(.trailing, 10)
             }
-            // Trailing 1pt filler, same reason as the leading one (all systems).
+            browseTitle
             Color.clear.frame(width: 1, height: 1)
+        }
+    }
+
+    /// The chevrons' own Liquid Glass capsule, since the toolbar item they sit in deliberately
+    /// draws none (it also holds the name, which must stay outside the glass).
+    private struct NavPill: ViewModifier {
+        func body(content: Content) -> some View {
+            if #available(macOS 26.0, *) {
+                content.glassEffect(.regular, in: .capsule)
+            } else {
+                content
+            }
+        }
+    }
+
+    /// ONE capsule holding both chevrons with a hairline between them - Finder's shape, measured
+    /// at 75x28 with a divider down the middle. A `ControlGroup` cannot draw it here: with the
+    /// toolbar item's shared background hidden (which it must be, so the name stays outside the
+    /// glass) each of its buttons grew a capsule of ITS own and the pair rendered as two circles.
+    /// So the capsule is drawn once, around a plain HStack.
+    @ViewBuilder private var historyControls: some View {
+        HStack(spacing: 0) {
+            // The View menu owns Cmd-[ / Cmd-] (single owner, avoids a duplicate-shortcut
+            // conflict); these buttons are click targets that name the same chords.
+            navButton("chevron.backward", enabled: model.canGoBack,
+                      help: "Back  \u{2318}[", label: "Back") { model.goBack() }
+            Divider().frame(height: 15)
+            navButton("chevron.forward", enabled: model.canGoForward,
+                      help: "Forward  \u{2318}]", label: "Forward") { model.goForward() }
+        }
+        .fixedSize()
+    }
+
+    private func navButton(_ symbol: String, enabled: Bool, help: String, label: String,
+                           action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                // `.borderless` tints its own label and IGNORES this, which left the enabled
+                // chevron at a measured 127 against the mode glyphs' 77 - so `.plain`, which does
+                // not. Finder's own chevrons sample at 110 enabled and 196 disabled: secondary and
+                // quaternary, not primary and tertiary. Its back arrow is not black either.
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(enabled ? AnyShapeStyle(.secondary) : AnyShapeStyle(.tertiary))
+                // 36pt, which is what the SYSTEM draws for a toolbar item's capsule - measured off
+                // the mode pill next door, whose fill runs y=8..43 in a toolbar strip where this
+                // one ran y=12..39. Hand-drawing the capsule means hand-matching its height too.
+                .frame(width: 37, height: 36)
+                .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .help(help)
+        .accessibilityLabel(label)
+    }
+
+    /// The name of whatever is being browsed, or nil when nothing is. Nil is what removes the
+    /// toolbar item entirely - an always-present item holding an empty `Text` still cost a full
+    /// Tahoe inter-group gap, which is the hole the name used to sit behind.
+    private var browseTitleText: (name: String, help: String)? {
+        // The open document, where every other mode puts the thing being looked at. Preview names
+        // its document in the same slot; leaving it blank made OCR the one mode whose toolbar did
+        // not say what was on screen.
+        if model.ocrMode {
+            return ocr.documentName.isEmpty ? nil : (ocr.documentName, ocr.documentName)
+        }
+        if showsPhotoBrowser, let source = model.browsedPhotoSource {
+            return (source.title, source.title)
+        }
+        if showsFolderBrowser, let folder = model.filterFolder {
+            return (folder.lastPathComponent, folder.path)
+        }
+        return nil
+    }
+
+    @ViewBuilder private var browseTitle: some View {
+        if let t = browseTitleText {
+            // PLAIN TEXT, like Finder. A Menu was tried and is wrong: Finder's title carries no
+            // disclosure chevron and no button chrome, and the ancestors already have two ways up
+            // (the back chevron and the sidebar). The path is on hover.
+            //
+            // SECONDARY, not primary. Sampled from a side-by-side: Finder's title is a mid grey
+            // (darkest pixel 160 against a 255 ground), where this was rendering near-black.
+            Text(t.name).font(.headline).foregroundStyle(.secondary).help(t.help)
         }
     }
 
@@ -551,16 +665,62 @@ struct ContentView: View {
     }
 
     private var ocrToggleButton: some View {
-        Button {
-            // No `withAnimation`: the two modes are different content, not a moved view, and
-            // animating the swap made the whole pane slide in from the window's leading edge.
-            model.ocrMode.toggle()
-        } label: {
-            Image(systemName: "text.viewfinder")
-                .foregroundStyle(model.ocrMode ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
-                .padding(3)
-                .background { if model.ocrMode { Circle().fill(Color.accentColor) } }
+        // No `withAnimation` on the change: the two modes are different content, not a moved view,
+        // and animating the swap made the whole pane slide in from the window's leading edge.
+        ToolbarToggle(isOn: Binding(get: { model.ocrMode }, set: { model.ocrMode = $0 }),
+                      symbol: "text.viewfinder")
+    }
+
+    /// Either browser is on screen. The two are one mode as far as the toolbar is concerned.
+    private var showsBrowser: Bool { showsFolderBrowser || showsPhotoBrowser }
+
+    /// Gallery first, then list - Finder's order (icon view, list view, ...), and the order this
+    /// app's own shortcuts already use: Cmd-1 gallery, Cmd-2 list. The segments used to run the
+    /// other way round, so the control contradicted both Finder and the View menu above it.
+    ///
+    /// Shared by the search cluster and the browser's, which is the point: one control, one place
+    /// to change it, and no way for the two to end up offering different segments.
+    private var viewPicker: some View {
+        Picker("View", selection: Binding(get: { model.viewMode }, set: { model.viewMode = $0 })) {
+            Image(systemName: "square.grid.2x2").accessibilityLabel("Gallery view").tag(ResultViewMode.grid)
+            Image(systemName: "list.bullet").accessibilityLabel("List view").tag(ResultViewMode.list)
         }
+        .pickerStyle(.segmented)
+        .help("Switch between list and gallery")
+    }
+
+    /// Search by a file, and share what is selected - the same pair, in the same order, that OCR
+    /// mode puts next to its own search field (`ocr.open`, `ocr.share`). This USED to be a glyph
+    /// installed inside the search field itself, which had two problems: it was invisible as an
+    /// affordance, and it had to hide whenever the field held text, so it disappeared exactly when
+    /// a query was on screen. A toolbar button is always there and always the same size.
+    @ToolbarContentBuilder private var fileActions: some ToolbarContent {
+        ToolbarItem(id: "search.open") {
+            Button { model.searchByFilePanel() } label: {
+                // `folder`, the same symbol OCR's Open Document uses. The two are the same verb.
+                Label("Search by File\u{2026}", systemImage: "folder")
+            }
+            .help("Search by a file  \u{21e7}\u{2318}O")
+            .accessibilityLabel("Search by a file")
+        }
+        ToolbarItem(id: "search.share") {
+            // The system share sheet, not a menu of our own - same as OCR's. Disabled rather than
+            // hidden when nothing is selected, so the group does not change width as you click
+            // around; that is how the OCR group behaves too.
+            ShareLink(items: model.selectedURLsOrdered) {
+                Label("Share\u{2026}", systemImage: "square.and.arrow.up")
+            }
+            // Both states say something true and useful: what it will do, or what is missing.
+            .help(model.selectedURLsOrdered.isEmpty ? "Select a file to share" : "Share the selection")
+            .disabled(model.selectedURLsOrdered.isEmpty)
+        }
+    }
+
+    /// Names the port when it is actually listening, because that is the thing a user needs next.
+    /// Names the port when it is actually listening, because that is what a reader needs next. No
+    /// "click to stop": it is a toggle, and its filled state already says which way it is.
+    private var servingHelp: String {
+        model.serving.isRunning ? "Serving on port \(model.serving.port)" : "Serve over HTTP"
     }
 
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
@@ -597,15 +757,34 @@ struct ContentView: View {
                 .accessibilityLabel(model.ocrMode ? "Back to search" : "Transcribe a document")
                 .accessibilityIdentifier("ocr.toggle")
         }
+        // A shortcut to Settings > Serving > "Serve Omni over HTTP", on the same switch - not a
+        // second source of truth. It sits with the sidebar and OCR toggles because it is the same
+        // KIND of control: a global mode of the app, on until you turn it off, rather than an
+        // action on whatever happens to be on screen. It was briefly next to Share, which grouped
+        // it with per-file actions it has nothing to do with.
+        ToolbarItem(id: "serve.mode", placement: .navigation) {
+            ToolbarToggle(isOn: Binding(get: { model.serving.enabled },
+                                        set: { model.serving.enabled = $0 }),
+                          symbol: "network")
+                .help(servingHelp)
+                .accessibilityLabel("Serve over HTTP")
+        }
+        // ONE ITEM for the chevrons AND the name, in that order. Two items cannot do it: a
+        // toolbar item that only exists sometimes is APPENDED when it comes back, so descending
+        // into a folder (which is what makes the chevrons appear) put them to the RIGHT of the
+        // name. An always-present empty item is no good either - Tahoe charges a full inter-group
+        // gap on both sides of one, which pinned the name ~46pt right of the mode pill whether or
+        // not there was anything to go back to. Inside a single item the chevrons simply appear
+        // and the name slides to meet them, which is the behaviour Finder has.
+        //
+        // The ITEM draws no glass (`.sharedBackgroundVisibility(.hidden)`); the chevrons carry
+        // their own capsule. That is the whole point: Finder's name is loose text beside the
+        // navigation group, not a third button inside it.
         if #available(macOS 26.0, *) {
-            // Tahoe draws a Liquid Glass capsule behind every toolbar item, including this one when
-            // it holds nothing but the 1pt fillers - which rendered as a thin white vertical bar
-            // left of the window title whenever there was no history to go back to. Hide the shared
-            // background while the item is empty; the chevrons keep their pill when they appear.
-            ToolbarItem(placement: .navigation) { historyControls }
-                .sharedBackgroundVisibility(showsHistoryControls ? .automatic : .hidden)
+            ToolbarItem(id: "nav.title", placement: .navigation) { navAndTitle }
+                .sharedBackgroundVisibility(.hidden)
         } else {
-            ToolbarItem(placement: .navigation) { historyControls }
+            ToolbarItem(id: "nav.title", placement: .navigation) { navAndTitle }
         }
         // Flexible space after back/forward pushes every other control to the trailing edge (chevrons
         // own the left, everything else is right-aligned), and on Tahoe it's also the correct separator
@@ -619,10 +798,6 @@ struct ContentView: View {
         // `ToolbarItem { Spacer() }` is silently DROPPED on macOS 14/15 (verified via the live
         // NSToolbar's item list), so without the AppKit item nothing separates the leading chevrons
         // from the trailing cluster and the stretchy search field parks every control center-left.
-        // Search by a file lives INSIDE the search field (trailing upload glyph, installed by
-        // WindowTitleHider's tuner - magnifier left, upload right), not as a separate toolbar
-        // button. The File menu owns the Shift-Cmd-O shortcut; the in-field button is the click
-        // target naming the same chord.
         // Bookmark the current search. The only way into History when recording is set to "Only when
         // I bookmark", and a quick save otherwise. Appears once there's a search to keep.
         if model.phase == .ready, !model.ocrMode, model.hasActiveSearch {
@@ -648,7 +823,12 @@ struct ContentView: View {
         // to act on - hidden, not greyed out, during onboarding and the idle/empty states.
         // Exception: keep the filter menu reachable whenever a filter is active, so a filter that
         // hides every result can still be cleared (otherwise the menu vanishes with the results).
-        if model.phase == .ready, !model.ocrMode, !model.rawResults.isEmpty || model.filtersActive {
+        // NOT WHILE BROWSING. Entering a folder sets `filterFolder`, which makes `filtersActive`
+        // true, so this menu used to appear over a browser whose listing it cannot change - the
+        // browser lists indexed children, not filtered results. Inert chrome. (The star stays:
+        // bookmarking a browsed folder saves a state you can actually return to.)
+        if model.phase == .ready, !model.ocrMode, !showsBrowser,
+           !model.rawResults.isEmpty || model.filtersActive {
         // Filter joins sort/view in the trailing placement so on Tahoe the three result controls
         // share ONE Liquid Glass pill (search-by-file + bookmark form the other). filterPlacement
         // keeps filter leading on pre-26 so the Sequoia toolbar layout is unchanged.
@@ -656,10 +836,19 @@ struct ContentView: View {
             filterMenu.disabled(model.indexedFiles == 0)
         }
         }
-        // Result presentation - sort + view. Meaningful with results AND while browsing a folder,
-        // which is also a list of things with a name and a date; without the browser in this
-        // condition its gallery view existed but nothing could ever switch to it.
-        if model.phase == .ready, !model.ocrMode, !model.rawResults.isEmpty || showsFolderBrowser {
+        // Result presentation - sort + view.
+        //
+        // SORT IS SEARCH-ONLY. It orders RESULTS, which are ranked; a browser sorts by clicking a
+        // column header (see FolderBrowser) and this menu does nothing there. It used to be shown
+        // while browsing, where it was inert chrome.
+        //
+        // VIEW IS BOTH. A listing is a list of things with a name and a date whichever way you
+        // arrived at it, and both browsers draw a gallery - which nothing could switch to while
+        // the Photos browser was missing from this condition.
+        if model.phase == .ready, !model.ocrMode, showsBrowser, model.rawResults.isEmpty {
+            ToolbarItem(id: "browse.view", placement: .primaryAction) { viewPicker }
+        }
+        if model.phase == .ready, !model.ocrMode, !model.rawResults.isEmpty {
         ToolbarItem(placement: .primaryAction) {
             if #available(macOS 26.0, *) {
                 // Tahoe: the inline sort menu + segmented view toggle render and overflow cleanly.
@@ -672,12 +861,7 @@ struct ContentView: View {
                     .help("Sort by \(model.sortOrder.title)")
                     .accessibilityLabel("Sort results")
 
-                    Picker("View", selection: Binding(get: { model.viewMode }, set: { model.viewMode = $0 })) {
-                        Image(systemName: "list.bullet").accessibilityLabel("List view").tag(ResultViewMode.list)
-                        Image(systemName: "square.grid.2x2").accessibilityLabel("Gallery view").tag(ResultViewMode.grid)
-                    }
-                    .pickerStyle(.segmented)
-                    .help("Switch between list and gallery")
+                    viewPicker
                 }
             } else {
                 // Sequoia and earlier: a ControlGroup of a menu + segmented picker overflows into an
@@ -698,6 +882,13 @@ struct ContentView: View {
                 .help("Sort and view")
             }
         }
+        }
+        // LAST, so it sits immediately before the search field - the slot OCR mode puts the same
+        // pair in. Not in OCR mode: that mode has its own Open Document and Share, for the
+        // document rather than for the index.
+        if model.phase == .ready, !model.ocrMode {
+            if #available(macOS 26.0, *) { ToolbarSpacer(.fixed) }
+            fileActions
         }
     }
 
@@ -786,7 +977,15 @@ struct ContentView: View {
 
     // MARK: - Query-language autocomplete
 
-    struct Suggestion: Hashable { let label: String; let completion: String; let icon: String }
+    /// `chip` is rendered as a capsule after the label, the way the search field draws a
+    /// qualifier - an em dash between the words and the folder read as punctuation in a list that
+    /// is otherwise all chips.
+    struct Suggestion: Hashable {
+        let label: String
+        let completion: String
+        let icon: String
+        var chip: String? = nil
+    }
 
     /// Typeahead for the search box: complete a partial qualifier key (`ty` -> `type:`) or a key's
     /// values (`type:` -> image/video/...). Returns full-string completions - the text before the
@@ -829,7 +1028,15 @@ struct ContentView: View {
                 .filter { !$0.isFile && $0.displayText.lowercased().contains(needle) && $0.displayText.lowercased() != needle }
                 .sorted { a, b in a.bookmarked != b.bookmarked ? a.bookmarked : a.lastUsed > b.lastUsed }
                 .prefix(5)
-            out += hist.map { Suggestion(label: $0.displayText, completion: $0.displayText, icon: $0.bookmarked ? "star.fill" : "clock") }
+            // The LABEL is the compact form and the COMPLETION is still the full query. Showing
+            // `displayText` here rendered a 340-character path as a ten-line wrapped paragraph,
+            // five of them stacked - the suggestion list was taller than the window.
+            out += hist.map { item in
+                Suggestion(label: item.displayLabel,
+                           completion: item.displayText,
+                           icon: item.bookmarked ? "star.fill" : "clock",
+                           chip: item.displayScope.map { "in:" + $0 })
+            }
         }
         return Array(out.prefix(10))
     }
@@ -958,6 +1165,9 @@ struct CenteredStatus: View {
 /// square.on.square = the Find Similar / file-query chip) so the list maps onto the actual UI.
 struct SearchWaysPrompt: View {
     let title: String
+    /// The number inside `title` when it has one, so the headline's digits roll as the index grows
+    /// instead of the whole line cutting to a new string. 0 for a title with no number in it.
+    var count: Int = 0
     var showSpinner: Bool = false
     /// The empty state is ONE view whose contents cross-fade between searching and transcribing.
     /// Both modes want the same thing said the same way - an icon, what this pane is for, and the
@@ -989,7 +1199,10 @@ struct SearchWaysPrompt: View {
     var body: some View {
         VStack(spacing: 16) {
             Image(systemName: symbol).font(.system(size: 44, weight: .light)).foregroundStyle(.tertiary)
-            Text(title).font(.title)
+            Text(title)
+                .font(.title)
+                .contentTransition(.numericText(value: Double(count)))
+                .animation(.snappy(duration: 0.3), value: count)
             VStack(alignment: .leading, spacing: 10) {
                 ForEach(ways, id: \.icon) { w in
                     HStack(alignment: .firstTextBaseline, spacing: 10) {
@@ -1095,11 +1308,6 @@ struct IndexFailedView: View {
 /// SwiftUI re-asserts `.visible` from the Window scene's title; the window keeps its "Omni" title for
 /// the Window menu, Mission Control, and Stage Manager.
 private struct WindowTitleHider: NSViewRepresentable {
-    /// Called when the in-field search-by-file button is clicked.
-    var onSearchByFile: () -> Void
-    /// False in OCR mode: the field finds text inside the open transcript there, and starting a
-    /// similarity search by picking a file is not something it can do.
-    var showsSearchByFile: Bool = true
     /// The drawer width this mode wants. Declaring it on the split view is not enough: the window
     /// restores the divider it was last left at and that restoration wins, so a cold launch
     /// straight into OCR opened the page rail at the search sidebar's width.
@@ -1118,15 +1326,12 @@ private struct WindowTitleHider: NSViewRepresentable {
     /// All work runs in a coalesced main.async pass - never synchronously inside a window or
     /// toolbar notification, where mutations mid-SwiftUI-commit are unsafe.
     final class TunerView: NSView {
-        var onSearchByFile: (() -> Void)?
-        var showsSearchByFile = true { didSet { if showsSearchByFile != oldValue { scheduleApply() } } }
         var sidebarWidth: CGFloat = 0 {
             didSet { if sidebarWidth != oldValue { appliedWidth = nil; scheduleApply() } } }
         private var appliedWidth: CGFloat?
         // nonisolated(unsafe): deinit is nonisolated under strict concurrency; the view lives and
         // dies on the main thread, so the unregistration is race-free in practice.
         nonisolated(unsafe) private var observers: [NSObjectProtocol] = []
-        private static let accessoryTag = 0xF17E
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
@@ -1161,79 +1366,62 @@ private struct WindowTitleHider: NSViewRepresentable {
 
         private func apply(_ w: NSWindow) {
             applySidebarWidth(w)
-            guard let toolbar = w.toolbar else { return }
-            for item in toolbar.items {
-                guard let s = item as? NSSearchToolbarItem else { continue }
-                installAccessory(in: s.searchField)
-            }
+            // No rule under the toolbar. Finder's column header sits on the SAME surface as the
+            // chrome with no seam between them; the automatic separator drew a hairline there and
+            // made the header read as a second bar stuck underneath. The header keeps its OWN
+            // divider, which separates it from the rows - that one Finder has too.
+            w.titlebarSeparatorStyle = .none
+            // FULL HEIGHT, not the compact one. Measured against Finder at the same window size:
+            // its chrome runs 0..43 and ours ran 0..39 - a 44pt bar against a 40pt one, both
+            // holding the same 36pt item capsules, so ours had 2pt of air around them where
+            // Finder has 4. `.unified` is the style Finder uses; hiding the title text was enough
+            // for AppKit to pick the compact one on its own.
+            w.toolbarStyle = .unified
+            // Closing must not DESTROY the window, or there is nothing left to bring back when the
+            // Dock icon is clicked (see AppDelegate.showMainWindow). The process outlives the
+            // window on purpose: serving, MCP and skills keep working with nothing on screen.
+            w.isReleasedWhenClosed = false
+            // CONTENT DOES NOT BLUR UNDER THIS TOOLBAR, and not for want of trying. Finder's does:
+            // its scroll pocket is the SOFT one, a gradient with no rule. Ours is
+            // `NSHardPocketView` (named by the live view tree), owned by the SwiftUI split view's
+            // titlebar background rather than by any scroll view, so `scrollEdgeEffectStyle(.soft,
+            // for: .top)` does not reach it - tried on the results scroll view itself, on the
+            // browser's root and on the whole detail pane. `NSSplitViewItem.titlebarSeparatorStyle`
+            // has nothing to set (a SwiftUI window has no `NSSplitViewController`), and
+            // `titlebarAppearsTransparent = true` DOES let content through but takes the toolbar's
+            // backdrop with it - rows then run straight across the buttons. What is fixed is the
+            // rule that used to sit at the boundary; the blur needs API this window structure does
+            // not expose.
+            // ...and the window's setting is not what draws the rule that was actually there.
+            // Measured: two hairlines, one at the titlebar boundary and one under our own header;
+            // Finder has only the second. The live view tree named the first one - a 1pt
+            // `_NSLayerBasedFillColorView` inside `NSHardPocketView < NSScrollPocket <
+            // NSTitlebarBackgroundView < NSSplitView`, i.e. Tahoe's scroll-edge effect in its HARD
+            // style. Finder's list AND icon views both use the soft one (a faint gradient, no
+            // rule - sampled at 245 fading to 253 over ~25pt). SwiftUI's `scrollEdgeEffectStyle`
+            // does not reach it: tried on the list, on the browser's root, and on the whole detail
+            // pane, and the rule survived all three, because the pocket belongs to the split view's
+            // titlebar background rather than to any scroll view in the subtree. So hide the rule.
+            hidePocketRule(w.contentView?.superview)
         }
 
-        /// The upload button lives as a subview of the NSSearchField, frame-pinned to the pill's
-        /// trailing edge, and hidden entirely while the field has text - the text run owns that
-        /// space and a long query would otherwise be drawn over the glyph. Defensive by
-        /// construction: if any expectation fails the button simply does not appear - the field
-        /// itself is never altered.
-        private func installAccessory(in field: NSSearchField) {
-            guard showsSearchByFile else {
-                field.viewWithTag(Self.accessoryTag)?.isHidden = true
+        /// Hides the 1pt rule inside Tahoe's titlebar scroll pocket. Deliberately shallow: it
+        /// stops at `NSTitlebarBackgroundView`, a handful of levels below the theme frame, so it
+        /// never walks the content pane's view tree. Entirely defensive - if AppKit ever renames
+        /// or restructures these views nothing matches and nothing is touched.
+        private func hidePocketRule(_ v: NSView?, depth: Int = 0) {
+            guard let v else { return }
+            if String(describing: type(of: v)).contains("TitlebarBackgroundView") {
+                hideThinFills(in: v)
                 return
             }
-            let side: CGFloat = 20   // hit target + hover-highlight capsule; the glyph inside is 11pt
-            let hasText = !field.stringValue.isEmpty
-            // Anchor to the CELL's cancel-button rect - the pill's true inner trailing edge. The
-            // NSSearchField view can extend past the drawn pill (trailing padding), so math off
-            // bounds.width parked the button visually outside the field.
-            let cancelRect = (field.cell as? NSSearchFieldCell)?.cancelButtonRect(forBounds: field.bounds)
-                ?? NSRect(x: field.bounds.width - 24, y: 0, width: 16, height: field.bounds.height)
-            let x = cancelRect.maxX - side
-            let y = (field.bounds.height - side) / 2
-            // Hidden as soon as there is text, which is why nothing needs to reserve room in the
-            // text run. SwiftUI lays that run across the whole pill and reserves a trailing gutter
-            // for its own clear (x) button only; a second button parked inside the run got drawn
-            // over by long queries. Hiding it removes the collision by construction AND gives the
-            // query the full width. Nothing is lost: this action starts a file query, so invoking
-            // it mid-text would discard the typed query anyway, and it stays on Shift-Cmd-O.
-            if let b = field.viewWithTag(Self.accessoryTag) as? NSButton {
-                b.isHidden = hasText
-                let want = NSRect(x: x, y: y, width: side, height: side)
-                if b.frame != want { b.frame = want }
-                return
-            }
-            // photo.badge.magnifyingglass: the SAME symbol this action already wears in the
-            // empty-state hint row and the file-query chip. square.and.arrow.up was tried first
-            // and read as Share - which it literally is elsewhere in this app (context menus).
-            guard let icon = NSImage(systemSymbolName: "photo.badge.magnifyingglass",
-                                     accessibilityDescription: "Search by a file") else { return }
-            // Shrink the field's own magnifier to the same 11pt so the two glyphs read as one
-            // family (the stock loupe is drawn noticeably larger). Idempotent via the cell tag.
-            if let cell = field.cell as? NSSearchFieldCell, let loupeCell = cell.searchButtonCell,
-               loupeCell.tag != Self.accessoryTag,
-               let loupe = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: "Search") {
-                let img = loupe.withSymbolConfiguration(.init(pointSize: 11, weight: .regular))
-                loupeCell.image = img
-                loupeCell.alternateImage = img
-                loupeCell.tag = Self.accessoryTag
-            }
-            let b = NSButton(frame: NSRect(x: x, y: y, width: side, height: side))
-            b.tag = Self.accessoryTag
-            // 11pt glyph inside the 20pt hover target: the accessoryBarAction highlight capsule
-            // gets visible breathing room around the icon, matching the (shrunk) magnifier.
-            // accessoryBarAction + border-on-hover is the native in-field button treatment
-            // (Spotlight's mic): a soft rounded highlight on hover, darker while pressed.
-            b.image = icon.withSymbolConfiguration(.init(pointSize: 11, weight: .regular))
-            b.bezelStyle = .accessoryBarAction
-            b.isBordered = true
-            b.showsBorderOnlyWhileMouseInside = true
-            b.setButtonType(.momentaryPushIn)
-            b.imagePosition = .imageOnly
-            b.contentTintColor = .secondaryLabelColor
-            b.target = self
-            b.action = #selector(fireSearchByFile)
-            b.toolTip = "Search by a file (image, audio, video, or text)  \u{21E7}\u{2318}O"
-            b.setAccessibilityLabel("Search by a file")
-            b.autoresizingMask = [.minXMargin]   // stay pinned to the trailing edge on resize
-            b.isHidden = hasText
-            field.addSubview(b)
+            guard depth < 8 else { return }
+            for c in v.subviews { hidePocketRule(c, depth: depth + 1) }
+        }
+
+        private func hideThinFills(in v: NSView) {
+            if v.bounds.height <= 1 && v.bounds.width > 100 && !v.isHidden { v.isHidden = true }
+            for c in v.subviews { hideThinFills(in: c) }
         }
 
         /// Set once per wanted width, never on every window update: this is a correction to what
@@ -1257,19 +1445,30 @@ private struct WindowTitleHider: NSViewRepresentable {
             return nil
         }
 
-        @objc private func fireSearchByFile() { onSearchByFile?() }
     }
 
     func makeNSView(context: Context) -> NSView {
         let v = TunerView()
-        v.onSearchByFile = onSearchByFile
-        v.showsSearchByFile = showsSearchByFile
         v.sidebarWidth = sidebarWidth
         return v
     }
     func updateNSView(_ nsView: NSView, context: Context) {
-        (nsView as? TunerView)?.onSearchByFile = onSearchByFile
-        (nsView as? TunerView)?.showsSearchByFile = showsSearchByFile
         (nsView as? TunerView)?.sidebarWidth = sidebarWidth
+    }
+}
+
+
+/// A bar pinned in the top safe area, with scroll content passing under it. On Tahoe that is
+/// `safeAreaBar`, which is what lets the scroll edge effect apply; earlier systems just stack it.
+/// An EMPTY bar must cost nothing, so the modifier checks before it inserts one.
+private struct TopBar<Bar: View>: ViewModifier {
+    @ViewBuilder var bar: () -> Bar
+
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            content.safeAreaBar(edge: .top, spacing: 0) { bar() }
+        } else {
+            VStack(spacing: 0) { bar(); content }
+        }
     }
 }
