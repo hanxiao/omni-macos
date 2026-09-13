@@ -22,6 +22,20 @@ struct PhotoSourceBrowser: View {
     @State private var hits: [SearchHit] = []
     @State private var loading = true
     @State private var selected: String?
+    /// Click-to-sort, so this header behaves like the folder browser's rather than being a row of
+    /// labels that look the same and do nothing. Only the two columns that exist here.
+    @State private var sortByName = false
+    @State private var ascending = false
+
+    /// The listing in the order the header asks for. Date descending by default, which is the order
+    /// `listMatching` already returns and the order a photo library reads in.
+    private var sorted: [SearchHit] {
+        let rows = sortByName
+            ? hits.sorted { ($0.path as NSString).lastPathComponent.localizedStandardCompare(
+                            ($1.path as NSString).lastPathComponent) == .orderedAscending }
+            : hits.sorted { $0.modified < $1.modified }
+        return ascending ? rows : rows.reversed()
+    }
 
     /// Matches `photoSourceHits`' default. Named here so the header can say when it truncated
     /// rather than quietly showing a prefix of the library.
@@ -51,6 +65,19 @@ struct PhotoSourceBrowser: View {
             hits = found
             loading = false
         }
+        // QUICK LOOK, which this view never had either - see the same note in FolderBrowser.
+        // Cmd-Y set `previewURL` and nothing here presented it, so the menu item did nothing.
+        .quickLookPreview(Binding(get: { model.previewURL },
+                                  set: { if $0 != model.previewURL { model.previewURL = $0 } }))
+        .background(QuickLookKeyMonitor(
+            onSpace: { model.toggleQuickLook() },
+            onPreviewArrow: { vertical, forward in
+                guard model.previewURL != nil, vertical else { return false }
+                moveSelection(by: forward ? 1 : -1)
+                if let p = selected { model.showPreview(path: p) }
+                return true
+            },
+            isPreviewOpen: { model.previewURL != nil }))
     }
 
     // MARK: - Bodies
@@ -59,7 +86,7 @@ struct PhotoSourceBrowser: View {
     private var gridBody: some View {
         ScrollView {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 108), spacing: 14)], spacing: 14) {
-                ForEach(hits, id: \.path) { hit in
+                ForEach(sorted, id: \.path) { hit in
                     VStack(spacing: 6) {
                         Thumbnail(path: hit.path, side: 96, corner: Design.cornerSmall)
                         Text((hit.path as NSString).lastPathComponent)
@@ -96,7 +123,10 @@ struct PhotoSourceBrowser: View {
 
     private var listCore: some View {
         Group {
-            List(hits, id: \.path, selection: $selected) { hit in
+            // NO `selection:` binding, for the same reason the folder browser dropped one: the
+            // List draws its own full-bleed square selection underneath the inset rounded fill
+            // below, and the difference shows as blue past the corner radius. Taps are ours.
+            List(sorted, id: \.path) { hit in
                 let isSelected = selected == hit.path
                 HStack(spacing: 0) {
                     Thumbnail(path: hit.path, side: BrowserMetrics.icon, corner: 3)
@@ -114,7 +144,7 @@ struct PhotoSourceBrowser: View {
                 }
                 .padding(.leading, BrowserMetrics.rowLead)
                 .padding(.trailing, BrowserMetrics.rowTrail)
-                .contentShape(.rect)
+                .contentShape(RoundedRectangle(cornerRadius: BrowserMetrics.selectionRadius))
                 .onTapGesture(count: 2) { PhotoActions.open(hit.path) }
                 .onTapGesture { selected = hit.path; model.selectSingle(hit.path) }
                 .contextMenu { menu(hit) }
@@ -126,6 +156,9 @@ struct PhotoSourceBrowser: View {
                 )
                 .listRowInsets(EdgeInsets())
             }
+            // Arrow keys, since the List no longer owns the selection.
+            .onKeyPress(.upArrow) { moveSelection(by: -1); return .handled }
+            .onKeyPress(.downArrow) { moveSelection(by: 1); return .handled }
             .environment(\.defaultMinListRowHeight, BrowserMetrics.rowHeight)
             .modifier(SoftTopScrollEdge())
             .alternatingRowBackgrounds()
@@ -139,6 +172,31 @@ struct PhotoSourceBrowser: View {
         FileMenuItems(path: hit.path, kind: hit.kind)
     }
 
+    private func moveSelection(by delta: Int) {
+        let rows = sorted
+        guard !rows.isEmpty else { return }
+        let current = selected.flatMap { path in rows.firstIndex { $0.path == path } }
+        let next = current.map { min(max(0, $0 + delta), rows.count - 1) } ?? (delta > 0 ? 0 : rows.count - 1)
+        selected = rows[next].path
+        model.selectSingle(rows[next].path)
+    }
+
+    /// EXACTLY the folder browser's header cell - same weight and colour rules, same sort chevron.
+    /// These two headers sit one sidebar click apart, and this one used to leave "Name" at primary
+    /// weight while everything else was secondary, so the two read as different controls.
+    @ViewBuilder private func headerCell(_ title: String, active: Bool) -> some View {
+        Text(title)
+            .fontWeight(active ? .semibold : .regular)
+            .foregroundStyle(active ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+            .lineLimit(1)
+            .overlay(alignment: .trailing) {
+                Image(systemName: ascending ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .opacity(active ? 1 : 0)
+            }
+    }
+
     /// Finder's column header, the same two-strip layout the folder browser uses. The source's
     /// NAME is not repeated here - the toolbar carries it, next to the back chevron, exactly where
     /// Finder puts a folder's name. What is left is the column titles and the item count.
@@ -146,19 +204,22 @@ struct PhotoSourceBrowser: View {
         HStack(spacing: 0) {
             Color.clear.frame(width: BrowserMetrics.icon + BrowserMetrics.iconGap, height: 1)
             HStack(spacing: 6) {
-                Text("Name")
+                headerCell("Name", active: sortByName)
                 if !hits.isEmpty {
                     Text(hits.count >= Self.cap
                          ? "first \(Self.cap.formatted())"
                          : "\(hits.count.formatted()) item\(hits.count == 1 ? "" : "s")")
                         .foregroundStyle(.tertiary)
                 }
+                Spacer(minLength: 0)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            Text("Date Modified")
-                .foregroundStyle(.secondary)
+            .contentShape(.rect)
+            .onTapGesture { if sortByName { ascending.toggle() } else { sortByName = true; ascending = true } }
+            headerCell("Date Modified", active: !sortByName)
                 .modifier(ColumnSlot(col: .dateModified, alignment: .leading))
                 .overlay(alignment: .leading) { Divider().frame(height: 12) }
+                .onTapGesture { if !sortByName { ascending.toggle() } else { sortByName = false; ascending = false } }
         }
         .font(.caption)
         .padding(.leading, BrowserMetrics.rowLead + BrowserMetrics.listInset)

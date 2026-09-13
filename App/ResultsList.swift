@@ -160,9 +160,17 @@ struct ResultsList<Footer: View>: View {
                                 // banding `alternatingRowBackgrounds()` gives the browsers, which
                                 // this view cannot use because it is a ScrollView, not a List (see
                                 // the note above). Under the selection fill, never over it.
+                                // SAME SHAPE AS THE SELECTION, which sits on top of it: the band
+                                // was a plain rect while the selection is a rounded one, so a grey
+                                // row and the blue row below it had visibly different corners.
+                                // (The folder browser keeps SQUARE full-bleed bands on purpose -
+                                // that is what Finder's list draws, and it is a Finder surface.
+                                // This list is ours, with tall thumbnail rows, and the mismatch
+                                // reads as a mistake rather than as a table.)
                                 .background(index.isMultiple(of: 2)
                                             ? Color.clear
-                                            : Color(nsColor: .alternatingContentBackgroundColors[1]))
+                                            : Color(nsColor: .alternatingContentBackgroundColors[1]),
+                                            in: RoundedRectangle(cornerRadius: BrowserMetrics.selectionRadius))
                                 .onTapGesture { handleTap(hit.path) }
                                 .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
                                 .contextMenu { menu(hit) }

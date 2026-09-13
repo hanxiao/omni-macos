@@ -641,7 +641,12 @@ struct ContentView: View {
             return (source.title, source.title)
         }
         if showsFolderBrowser, let folder = model.filterFolder {
-            return (folder.lastPathComponent, folder.path)
+            // The folder whose rows are ON SCREEN, falling back to the requested one only before
+            // the first listing exists. Reading `filterFolder` directly renamed the toolbar the
+            // instant a row was clicked, while the previous folder's files were still listed
+            // underneath it - which reads as "I am in the new folder" when you are not.
+            let shown = model.browsingFolderShown ?? folder
+            return (shown.lastPathComponent, shown.path)
         }
         return nil
     }

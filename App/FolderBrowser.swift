@@ -101,7 +101,27 @@ struct FolderBrowser: View {
                 listBody
             }
         }
+        // QUICK LOOK, which this view never had. `.quickLookPreview` and the Space monitor were
+        // attached only in the results list, so in the browser Space did nothing and Cmd-Y set
+        // `previewURL` with nothing on screen to present it - the feature looked broken because
+        // half of it was missing here, not because the selection was wrong.
+        .quickLookPreview(Binding(get: { model.previewURL },
+                                  set: { if $0 != model.previewURL { model.previewURL = $0 } }))
+        .background(QuickLookKeyMonitor(
+            onSpace: { model.toggleQuickLook() },
+            onPreviewArrow: { vertical, forward in
+                // Only while the panel is open: then arrows walk the listing and the preview
+                // follows, the way Finder's does.
+                guard model.previewURL != nil, vertical else { return false }
+                moveSelection(by: forward ? 1 : -1, in: sorted)
+                if let url = selected { model.showPreview(path: url.path) }
+                return true
+            },
+            isPreviewOpen: { model.previewURL != nil }))
         .task(id: folder) { await reload() }
+        // Something removed files behind our back (a trash, an ignore rule): re-list rather than
+        // leave a row pointing at a file that is gone.
+        .onChange(of: model.browserReloadTick) { _, _ in Task { await reload(quiet: true) } }
         .task(id: folder) { await followIndexing() }
         .task(id: folder) { await followProgress() }
     }
@@ -129,7 +149,12 @@ struct FolderBrowser: View {
 
     private var listCore: some View {
         Group {
-            List(sorted, selection: $selected) { entry in
+            // NO `selection:` BINDING. With one, the List draws its OWN selection - full-bleed and
+            // square - underneath the inset rounded fill below, and the difference shows as blue
+            // past the corner radius at both ends of the row. The taps were already ours (a tap
+            // gesture of any kind swallows the click `List(selection:)` needs), so the binding was
+            // only buying arrow keys, which `.onKeyPress` below provides without the second fill.
+            List(sorted) { entry in
                 let isSelected = selected == entry.url
                 HStack(spacing: 0) {
                     // 16pt, Finder's list-view icon size. 18 was a touch larger and, with the row
@@ -158,7 +183,13 @@ struct FolderBrowser: View {
                 }
                 .padding(.leading, BrowserMetrics.rowLead)
                 .padding(.trailing, BrowserMetrics.rowTrail)
-                .contentShape(.rect)
+                // ROUNDED, because the right-click highlight takes this shape on macOS. With
+                // `.rect` the context menu drew a hard-cornered rectangle inside a list whose
+                // every other highlight is rounded - Finder's is rounded, matching its selection.
+                .contentShape(RoundedRectangle(cornerRadius: BrowserMetrics.selectionRadius))
+                // Finder's right-click highlight is a ROUNDED rect, the same shape as the row's
+                // selection. Without this the context-menu highlight is a hard rectangle with
+                // square corners sitting inside a list whose every other highlight is rounded.
                 // Both taps are ours. A tap gesture of ANY kind on a row swallows the click
                 // `List(selection:)` needs - verified with a double-tap alone, which also selected
                 // nothing - so the selection is set and drawn here. Finder's treatment exactly:
@@ -187,6 +218,15 @@ struct FolderBrowser: View {
             // default minimum row height on macOS, not because of anything in the row - a 16pt
             // icon with no padding still measured 24. Negative row insets did not move it; this is
             // the knob that does.
+            // Arrow keys, since the List no longer owns the selection. Up/Down move within the
+            // sorted order and Return activates, which is what the binding used to give for free.
+            .onKeyPress(.upArrow) { moveSelection(by: -1, in: sorted); return .handled }
+            .onKeyPress(.downArrow) { moveSelection(by: 1, in: sorted); return .handled }
+            .onKeyPress(.return) {
+                guard let url = selected, let e = sorted.first(where: { $0.url == url }) else { return .ignored }
+                activate(e)
+                return .handled
+            }
             .environment(\.defaultMinListRowHeight, BrowserMetrics.rowHeight)
             .modifier(SoftTopScrollEdge())
             .alternatingRowBackgrounds()
@@ -298,6 +338,7 @@ struct FolderBrowser: View {
         ScrollView {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 108), spacing: 14)], spacing: 14) {
                 ForEach(sorted) { entry in
+                    let isSelected = selected == entry.url
                     VStack(spacing: 6) {
                         galleryIcon(entry)
                             // Same indicator as the list, badged on the icon's trailing corner -
@@ -309,14 +350,31 @@ struct FolderBrowser: View {
                                         .help(p.help)
                                 }
                             }
+                            // TWO PARTS, LIKE FINDER, NOT ONE TINT OVER THE WHOLE CELL. Finder puts
+                            // a NEUTRAL rounded rect behind the icon and an ACCENT pill behind the
+                            // name, with the name in white. A single translucent accent wash over
+                            // icon and label together is the thing that made this look unlike the
+                            // Finder cell next to it.
+                            .padding(5)
+                            .background(isSelected
+                                        ? Color(nsColor: .unemphasizedSelectedContentBackgroundColor)
+                                        : .clear,
+                                        in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                         Text(entry.name).font(.caption).lineLimit(2)
                             .multilineTextAlignment(.center)
+                            .foregroundStyle(isSelected
+                                             ? AnyShapeStyle(Color(nsColor: .alternateSelectedControlTextColor))
+                                             : AnyShapeStyle(.primary))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(isSelected
+                                        ? Color(nsColor: .selectedContentBackgroundColor)
+                                        : .clear,
+                                        in: RoundedRectangle(cornerRadius: 4, style: .continuous))
                     }
                     .frame(maxWidth: .infinity)
                     .padding(6)
-                    .background(selected == entry.url ? Color.accentColor.opacity(0.18) : .clear,
-                                in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                    .contentShape(.rect)
+                    .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                     .onTapGesture(count: 2) { activate(entry) }
                     .onTapGesture { select(entry) }
                     .contextMenu { menu(entry) }
@@ -343,6 +401,15 @@ struct FolderBrowser: View {
     /// is what every selection-driven action in the app already reads - Share in the toolbar, the
     /// File menu, Quick Look - so without this half of it a browsed file could be clicked but not
     /// acted on from anywhere outside this view.
+    /// Move the selection by one row in the order currently on screen, clamped at both ends -
+    /// the List used to do this through its selection binding.
+    private func moveSelection(by delta: Int, in rows: [Entry]) {
+        guard !rows.isEmpty else { return }
+        let current = selected.flatMap { url in rows.firstIndex { $0.url == url } }
+        let next = current.map { min(max(0, $0 + delta), rows.count - 1) } ?? (delta > 0 ? 0 : rows.count - 1)
+        select(rows[next])
+    }
+
     private func select(_ entry: Entry) {
         selected = entry.url
         model.selectSingle(entry.url.path)
@@ -450,7 +517,11 @@ struct FolderBrowser: View {
         // Membership AND the column facts come from the INDEX: this is a browser inside a search
         // app, and listing files it cannot find, rank or preview promises more than the index can
         // answer for.
-        let children = await model.indexedChildrenDetailed(of: url)
+        // THE LISTING FIRST, THE SUBFOLDER COUNTS SECOND. `folderAggregates` walks the whole
+        // subtree - 0.7 ms on a small folder, 417 ms on 23k, 2.4 s on a 2.4M root - on the same
+        // serial queue the indexer writes on, so asking for it up front is what made switching
+        // folders feel slow, and rapid clicks queued those walks behind one another.
+        let children = await model.indexedChildrenDetailed(of: url, aggregates: false)
         guard url == folder else { return }        // a faster click already moved us on
         var tagsByPath: [String: [String]] = [:]
         if columns.isOn(.tags) {
@@ -467,8 +538,35 @@ struct FolderBrowser: View {
                   tags: tagsByPath[c.path] ?? [],
                   size: c.isDirectory ? nil : c.size)
         }
-        noteGrowth()
+        // NOT noteGrowth() HERE. This pass carries fileCount 0 for every folder - the counts are
+        // the expensive half, fetched below - so comparing it against the previous listing's real
+        // numbers makes every folder look like it grew the moment they arrive, and the whole
+        // listing sprouts progress rings. The growth signal is only meaningful once the counts are
+        // real, so it runs at the end of phase two.
+        // The rows for THIS folder are now the ones on screen, so the toolbar may rename itself.
+        model.browsingFolderShown = url
         if !quiet { loading = false }
+
+        // Now the expensive half, only if the column that shows it is actually on. A superseded
+        // folder drops out here as well: the walk still runs (it is already on the store queue),
+        // but its answer is not applied to a listing that has moved on.
+        guard columns.isOn(.filesIndexed) || columns.isOn(.dateIndexed) else {
+            // No counts will arrive, so rebase here instead - otherwise the next folder's listing
+            // would be compared against whatever counts this one last held.
+            countsFolder = folder
+            lastCounts = [:]
+            growingUntil = [:]
+            return
+        }
+        let counts = await model.folderCounts(under: url)
+        guard url == folder, !counts.isEmpty else { return }
+        for i in entries.indices where entries[i].isDirectory {
+            if let a = counts[entries[i].url.lastPathComponent] {
+                entries[i].fileCount = a.count
+                if a.newest > 0 { entries[i].indexedAt = Date(timeIntervalSince1970: a.newest) }
+            }
+        }
+        noteGrowth()
     }
 
     /// Which child folders gained indexed files since the last listing. THIS is the ring's signal.

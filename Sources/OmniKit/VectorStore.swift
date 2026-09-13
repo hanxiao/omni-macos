@@ -2931,7 +2931,14 @@ public final class VectorStore: @unchecked Sendable {
     /// id, not a `FileKind` ordinal - decoding it here would have been a silent mis-mapping). The
     /// only new SQL is the folder aggregate, which counts indexed files beneath each immediate
     /// child and takes the newest stamp among them.
-    public func indexedChildrenDetailed(ofFolder folder: String) -> [IndexedChild] {
+    /// `aggregates: false` returns the listing WITHOUT each subfolder's file count.
+    ///
+    /// The other two queries are proportional to the folder's own children; `folderAggregates`
+    /// walks the entire SUBTREE, which is what makes switching folders feel slow - measured at
+    /// 0.7 ms on a 105-file folder but 417 ms on 23k and 2.4 s on a 2.4M root, all on the store's
+    /// serial queue, so rapid clicks queue behind one another. The browser asks for the listing
+    /// first and the counts second, which puts rows on screen at the cost of the cheap half.
+    public func indexedChildrenDetailed(ofFolder folder: String, aggregates: Bool = true) -> [IndexedChild] {
         // Timed under OMNI_PERF_LOG because the browser can re-run this on a timer while an index
         // pass is in flight, and `folderAggregates` walks the WHOLE subtree of the browsed folder
         // on the store's serial queue - the same queue the indexer writes on. The refresh period
@@ -2939,11 +2946,12 @@ public final class VectorStore: @unchecked Sendable {
         let t0 = omniPerfEnabled ? Date() : nil
         let children = indexedChildren(ofFolder: folder)
         let status = fileStatus(paths: children.files)
-        let agg = folderAggregates(under: folder)
+        let agg = aggregates ? folderAggregates(under: folder) : [:]
         if let t0 {
-            omniPerfLog(String(format: "browse-list %.1fms files=%d folders=%d folder=%@",
+            omniPerfLog(String(format: "browse-list %.1fms files=%d folders=%d agg=%@ folder=%@",
                                Date().timeIntervalSince(t0) * 1000,
-                               children.files.count, children.folders.count, folder))
+                               children.files.count, children.folders.count,
+                               aggregates ? "YES" : "no", folder))
         }
         var out: [IndexedChild] = []
         out.reserveCapacity(children.files.count + children.folders.count)
@@ -2963,6 +2971,18 @@ public final class VectorStore: @unchecked Sendable {
                                     indexedAt: a.newest, fileCount: a.count))
         }
         return out
+    }
+
+    /// Just the per-subfolder counts, for the browser's second pass. Same query as the one inside
+    /// `indexedChildrenDetailed`; separated so the listing can land without waiting for it.
+    public func folderCounts(under folder: String) -> [String: (count: Int, newest: Double)] {
+        let t0 = omniPerfEnabled ? Date() : nil
+        let agg = folderAggregates(under: folder)
+        if let t0 {
+            omniPerfLog(String(format: "browse-counts %.1fms folders=%d folder=%@",
+                               -t0.timeIntervalSinceNow * 1000, agg.count, folder))
+        }
+        return agg
     }
 
     /// Per-immediate-child totals under `folder`: indexed files beneath it, and the newest

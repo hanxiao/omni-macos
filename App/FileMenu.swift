@@ -73,7 +73,10 @@ struct FileMenuItems<Passages: View>: View {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(path, forType: .string)
         } label: { Label("Copy path", systemImage: "doc.on.doc") }
-        .keyboardShortcut("c", modifiers: .command)
+        // Opt-Cmd-C, matching the File menu, because that is the chord that actually fires. A
+        // chord declared inside a context menu never fires on macOS, so this label is decoration -
+        // and it read "Cmd-C", which IS bound, to Edit > Copy, and does something else entirely.
+        .keyboardShortcut("c", modifiers: [.command, .option])
         // Native macOS share picker - the same system sheet Finder's Share opens. A Photos asset
         // has no file to share until it is exported, so that one exports first.
         if PhotoLibrary.isPhotoPath(path) {

@@ -331,7 +331,7 @@ struct OmniApp: App {
                     .disabled(!model.ocrMode)
                 Divider()
                 Button("Generate Tags") { model.requestTags(Array(model.selectedPaths)) }
-                    .disabled(!model.hasSelection || !model.canGenerateTags)
+                    .disabled(!model.hasSelection || !model.canGenerateTags || !model.selectionIsTaggable)
                 Button("Search in This Folder") { model.enterFolder(model.filterFolder) }
                     .disabled(model.filterFolder == nil)
                 Menu("Visualize") {
