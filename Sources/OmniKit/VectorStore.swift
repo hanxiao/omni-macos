@@ -2964,64 +2964,100 @@ public final class VectorStore: @unchecked Sendable {
     /// is what makes a second connection safe here rather than merely faster. It also carries NO
     /// resident state - every query below is self-contained SQL, including the kind table, which it
     /// reads for itself rather than reaching into the writer's intern maps.
-    private var readDB: OpaquePointer?
-    private let readQueue = DispatchQueue(label: "omni.vectorstore.read")
-    /// code -> kind name, the reader's own copy of `kinds`. Reloaded at most once per query when a
-    /// code lands outside it, because the writer can mint a new kind at runtime.
-    private var readKinds: [String] = []
-    private var readOpened = false
-    private var readShut = false
-
-    /// Open the reader on first use, on `readQueue`.
+    /// TWO LANES, because the browse has two jobs with different deadlines and one serial queue
+    /// makes the slow one block the fast one.
     ///
-    /// Lazy rather than in `init`: init migrates the schema in place, and a reader opened before
-    /// that finished would hold a connection to a shape that is about to stop existing. By the time
-    /// anything browses, init has returned.
-    private func readerLocked() -> OpaquePointer? {
-        if readOpened { return readDB }
-        readOpened = true
-        guard !readShut else { return nil }
-        // A/B and escape hatch. The fallback is the pre-existing queued path, so OMNI_BROWSE_READER=0
-        // is a supported way to measure what the second connection buys - and to get the old
-        // behaviour back without a build if it ever misbehaves in the field.
-        if ProcessInfo.processInfo.environment["OMNI_BROWSE_READER"] == "0" { return nil }
-        var h: OpaquePointer?
-        guard sqlite3_open_v2(dbURL.path, &h, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK, let handle = h else {
-            if let h { sqlite3_close(h) }
-            return nil                       // callers fall back to the writer's queue
+    /// The browser deliberately lists first and counts second, so rows reach the screen without
+    /// waiting on the subtree walk (FolderBrowser.reload). That split does nothing if both halves
+    /// queue behind each other: the aggregate under /Volumes/han2tb/backup takes 1.4 s, so leaving
+    /// that folder left 1.4 s of counting in flight, and the NEXT folder's listing - 3 ms of work -
+    /// sat behind it. Exactly the head-of-line blocking the read connection was introduced to
+    /// remove, recreated one queue over.
+    ///
+    /// `interactive` serves the listing, the per-file facts, the tags and Go to Folder's
+    /// completion: everything a person is waiting on. `aggregate` serves only `folderAggregates`,
+    /// the subtree count that fills the Files Indexed and Date Indexed columns after the rows are
+    /// already up. Separate connections, so neither can be behind the other.
+    private final class ReadLane: @unchecked Sendable {
+        let queue: DispatchQueue
+        private let dbURL: URL
+        private var db: OpaquePointer?
+        private var opened = false
+        private var shut = false
+        /// code -> kind name, this lane's own copy of `kinds`. Reloaded at most once per query when
+        /// a code lands outside it, because the writer can mint a new kind at runtime.
+        var kinds: [String] = []
+
+        init(dbURL: URL, label: String) {
+            self.dbURL = dbURL
+            self.queue = DispatchQueue(label: label)
         }
-        sqlite3_exec(handle, "PRAGMA busy_timeout=5000;", nil, nil, nil)
-        sqlite3_exec(handle, "PRAGMA mmap_size=268435456;", nil, nil, nil)
-        sqlite3_exec(handle, "PRAGMA cache_size=-16384;", nil, nil, nil)   // 16MB: metadata only
-        sqlite3_exec(handle, "PRAGMA temp_store=MEMORY;", nil, nil, nil)
-        sqlite3_exec(handle, "PRAGMA wal_autocheckpoint=0;", nil, nil, nil)  // checkpointing is the writer's job
-        sqlite3_exec(handle, "PRAGMA query_only=1;", nil, nil, nil)          // last: nothing below writes
-        readDB = handle
-        return handle
+
+        /// Open on first use, ON `queue`. Lazy rather than at init: `VectorStore.init` migrates the
+        /// schema in place, and a connection opened before that finished would hold a handle to a
+        /// shape that is about to stop existing. By the time anything browses, init has returned.
+        func handle() -> OpaquePointer? {
+            if opened { return db }
+            opened = true
+            guard !shut else { return nil }
+            // A/B and escape hatch. The fallback is the pre-existing queued path, so
+            // OMNI_BROWSE_READER=0 is a supported way to measure what these connections buy - and
+            // to get the old behaviour back without a build if they ever misbehave in the field.
+            if ProcessInfo.processInfo.environment["OMNI_BROWSE_READER"] == "0" { return nil }
+            var h: OpaquePointer?
+            guard sqlite3_open_v2(dbURL.path, &h, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK,
+                  let handle = h else {
+                if let h { sqlite3_close(h) }
+                return nil                     // callers fall back to the writer's queue
+            }
+            sqlite3_exec(handle, "PRAGMA busy_timeout=5000;", nil, nil, nil)
+            sqlite3_exec(handle, "PRAGMA mmap_size=268435456;", nil, nil, nil)
+            sqlite3_exec(handle, "PRAGMA cache_size=-16384;", nil, nil, nil)   // 16MB: metadata only
+            sqlite3_exec(handle, "PRAGMA wal_autocheckpoint=0;", nil, nil, nil)  // the writer checkpoints
+            sqlite3_exec(handle, "PRAGMA query_only=1;", nil, nil, nil)          // last: nothing below writes
+            db = handle
+            return handle
+        }
+
+        func close() {
+            queue.sync {
+                shut = true
+                opened = true
+                if let h = db { sqlite3_close(h); db = nil }
+            }
+        }
+
+        /// For the test that asserts `query_only` is actually in force on the handle.
+        func acceptsAWrite() -> Bool {
+            queue.sync {
+                guard let h = db else { return false }
+                return sqlite3_exec(h, "CREATE TABLE IF NOT EXISTS omni_reader_probe(x);", nil, nil, nil) == SQLITE_OK
+            }
+        }
     }
 
-    /// Close the reader. Called from `close()` and from `deinit`, BEFORE the writer's own close so
-    /// no browse is mid-statement when the writer checkpoints. A browse that arrives in between
-    /// takes the fallback and gets the same empty answer `dbOpen()` gives, because the writer is
-    /// closed by the time it reaches the queue.
+    private lazy var interactiveLane = ReadLane(dbURL: dbURL, label: "omni.vectorstore.read")
+    private lazy var aggregateLane = ReadLane(dbURL: dbURL, label: "omni.vectorstore.read.agg")
+
+    /// Close both lanes. Called from `close()` and from `deinit`, BEFORE the writer's own close so
+    /// no browse is mid-statement when the writer checkpoints. A browse arriving in between takes
+    /// the fallback and gets the same empty answer `dbOpen()` gives, because the writer is closed
+    /// by the time it reaches the queue.
     ///
-    /// Nothing on `readQueue` ever enters `queue`, so the two can never deadlock on each other.
+    /// Nothing on either lane ever enters `queue`, so they cannot deadlock against it.
     private func closeReader() {
-        readQueue.sync {
-            readShut = true
-            readOpened = true
-            if let h = readDB { sqlite3_close(h); readDB = nil }
-        }
+        interactiveLane.close()
+        aggregateLane.close()
     }
 
-    /// Run a browse query on the reader, falling back to the writer's queue if the reader could not
-    /// open (a removed database, a permissions change). The fallback is the pre-existing behaviour,
-    /// so a reader that never opens costs correctness nothing.
-    private func onReader<T>(_ empty: T, _ body: (OpaquePointer) -> T) -> T {
+    /// Run a browse query on `lane`, falling back to the writer's queue if that lane could not open
+    /// (a removed database, a permissions change). The fallback is the pre-existing behaviour, so a
+    /// lane that never opens costs correctness nothing.
+    private func onReader<T>(_ lane: ReadLane, _ empty: T, _ body: (OpaquePointer) -> T) -> T {
         var out = empty
         var ran = false
-        readQueue.sync {
-            guard let h = readerLocked() else { return }
+        lane.queue.sync {
+            guard let h = lane.handle() else { return }
             out = body(h)
             ran = true
         }
@@ -3037,10 +3073,15 @@ public final class VectorStore: @unchecked Sendable {
 
     /// Attempt a write on the browse connection. True would mean `query_only` is not in force.
     func readConnectionCanWriteForTesting() -> Bool {
-        readQueue.sync {
-            guard let h = readDB else { return false }
-            return sqlite3_exec(h, "CREATE TABLE IF NOT EXISTS omni_reader_probe(x);", nil, nil, nil) == SQLITE_OK
-        }
+        interactiveLane.acceptsAWrite() || aggregateLane.acceptsAWrite()
+    }
+
+    /// Occupy the AGGREGATE lane for a fixed slice, so a test can assert that an interactive
+    /// listing does not wait behind a subtree count. A synthetic index cannot make that walk slow
+    /// enough to measure - the real one takes 1.4 s, a fixture takes microseconds - so the wait is
+    /// staged rather than simulated with a corpus that would take minutes to build.
+    func holdAggregateLaneForTesting(milliseconds: Int) {
+        aggregateLane.queue.sync { usleep(UInt32(milliseconds) * 1000) }
     }
 
     /// Occupy the serial queue the way a write batch does, so a test can browse while it is held.
@@ -3069,8 +3110,8 @@ public final class VectorStore: @unchecked Sendable {
 
     /// The reader's own `kinds` lookup, mirroring `kindNameLocked` including its "text" fallback.
     /// `reloaded` bounds the refresh to one per query no matter how many rows carry a stray code.
-    private func readKindName(_ h: OpaquePointer, _ code: Int, _ reloaded: inout Bool) -> String {
-        if code >= 0 && code < readKinds.count { return readKinds[code] }
+    private func readKindName(_ lane: ReadLane, _ h: OpaquePointer, _ code: Int, _ reloaded: inout Bool) -> String {
+        if code >= 0 && code < lane.kinds.count { return lane.kinds[code] }
         if !reloaded {
             reloaded = true
             var st: OpaquePointer?
@@ -3082,11 +3123,11 @@ public final class VectorStore: @unchecked Sendable {
                     while table.count < c { table.append("") }
                     if table.count == c { table.append(String(cString: n)) } else { table[c] = String(cString: n) }
                 }
-                readKinds = table
+                lane.kinds = table
             }
             sqlite3_finalize(st)
         }
-        return code >= 0 && code < readKinds.count ? readKinds[code] : "text"
+        return code >= 0 && code < lane.kinds.count ? lane.kinds[code] : "text"
     }
 
     /// One file row as the browser's columns need it.
@@ -3102,7 +3143,7 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     private func browseFiles(inFolder folder: String) -> [BrowseFile] {
-        onReader([]) { h in
+        onReader(interactiveLane, []) { h in
             var out: [BrowseFile] = []
             var st: OpaquePointer?
             defer { sqlite3_finalize(st) }
@@ -3116,7 +3157,7 @@ public final class VectorStore: @unchecked Sendable {
             while sqlite3_step(st) == SQLITE_ROW {
                 guard let n = sqlite3_column_text(st, 0) else { continue }
                 out.append(BrowseFile(name: String(cString: n),
-                                      kind: readKindName(h, Int(sqlite3_column_int(st, 1)), &reloaded),
+                                      kind: readKindName(interactiveLane, h, Int(sqlite3_column_int(st, 1)), &reloaded),
                                       modified: sqlite3_column_double(st, 2),
                                       indexedAt: sqlite3_column_double(st, 3),
                                       size: Int(sqlite3_column_int64(st, 4))))
@@ -3156,7 +3197,7 @@ public final class VectorStore: @unchecked Sendable {
     /// that keeps descending from ever dead-ending on a folder the index knows nothing about. That
     /// test is now a bounded `LIMIT 1` per child instead of a predicate applied to every descendant.
     private func browseFolders(under folder: String) -> [String] {
-        onReader([]) { h in
+        onReader(interactiveLane, []) { h in
             let pfx = folder + "/"
             let end = folder + "0"
             var out: [String] = []
@@ -3211,7 +3252,7 @@ public final class VectorStore: @unchecked Sendable {
     /// "not media".
     public func browseTags(inFolder folder: String) -> [String: [String]] {
         let pfx = folder + "/"
-        return onReader([:]) { h in
+        return onReader(interactiveLane, [:]) { h in
             var out: [String: [String]] = [:]
             var seen: [String: Set<String>] = [:]
             var st: OpaquePointer?
@@ -3303,7 +3344,9 @@ public final class VectorStore: @unchecked Sendable {
     /// `indexed_at` among them. One grouped pass over the `dirs` range scan the browser already
     /// uses, so it rides the same unique index.
     private func folderAggregates(under folder: String) -> [String: (count: Int, newest: Double)] {
-        onReader([:]) { h in
+        // THE AGGREGATE LANE. This is the only caller of it: 1.4 s on a 235k-directory subtree, and
+        // it must never be what an interactive listing is waiting behind.
+        onReader(aggregateLane, [:]) { h in
             let pfx = folder + "/"
             var out: [String: (count: Int, newest: Double)] = [:]
             var st: OpaquePointer?
@@ -3337,7 +3380,7 @@ public final class VectorStore: @unchecked Sendable {
     /// shows a handful.
     public func indexedFolders(matching needle: String, limit: Int = 12) -> [String] {
         guard !needle.isEmpty else { return [] }
-        return onReader([]) { h in
+        return onReader(interactiveLane, []) { h in
             var out: [String] = []
             var st: OpaquePointer?
             defer { sqlite3_finalize(st) }

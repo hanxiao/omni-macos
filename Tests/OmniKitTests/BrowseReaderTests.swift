@@ -366,6 +366,64 @@ final class BrowseReaderTests: XCTestCase {
         func set() { l.lock(); v = true; l.unlock() }
     }
 
+    // MARK: - The two lanes
+
+    /// THE LISTING MUST NOT WAIT ON THE COUNTS.
+    ///
+    /// The browser lists first and counts second so rows reach the screen without waiting on the
+    /// subtree walk. That split is worthless if both halves share one serial queue: measured on the
+    /// real index, leaving /Volumes/han2tb/backup left 1.4 s of counting in flight, and the next
+    /// folder's 3 ms listing sat behind it - the same head-of-line blocking the read connection was
+    /// introduced to remove, one queue over.
+    ///
+    /// The counting lane is HELD rather than loaded with a real aggregate: no synthetic index makes
+    /// that walk slow enough to measure (the real one is 1.4 s, a fixture is microseconds), and a
+    /// first version of this test built one anyway, passed with the lanes deliberately collapsed,
+    /// and proved nothing.
+    func testAListingDoesNotWaitBehindASubtreeCount() throws {
+        let store = try seeded(tempDB())
+        defer { store.close() }
+        _ = store.indexedChildrenDetailed(ofFolder: "/root")   // open both lanes
+
+        let held = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            held.signal()
+            store.holdAggregateLaneForTesting(milliseconds: 2000)
+        }
+        held.wait()
+        usleep(100_000)                                        // let the hold actually start
+
+        let t0 = Date()
+        let rows = store.indexedChildrenDetailed(ofFolder: "/root", aggregates: false)
+        let waited = Date().timeIntervalSince(t0)
+        XCTAssertFalse(rows.isEmpty, "the listing came back empty while the counting lane was held")
+        XCTAssertLessThan(waited, 0.5,
+                          "the listing waited \(Int(waited * 1000))ms behind a held counting lane - "
+                          + "the two read lanes have collapsed onto one queue")
+    }
+
+    /// And the counts still arrive while listings are hammering their own lane, so the split did
+    /// not simply starve the slow half.
+    func testTheCountsStillLandWhileListingsRun() throws {
+        let store = try seeded(tempDB())
+        defer { store.close() }
+        for i in 0 ..< 200 {
+            let p = "/root/sub/deep/f\(i).txt"
+            try store.replace(path: p, chunks: [chunk(p)])
+        }
+        let stop = Flag()
+        let listing = Thread {
+            while !stop.isSet { _ = store.indexedChildrenDetailed(ofFolder: "/root", aggregates: false) }
+        }
+        listing.start()
+        defer { stop.set(); usleep(200_000) }
+        usleep(100_000)
+
+        let counts = store.folderCounts(under: "/root")
+        stop.set()
+        XCTAssertEqual(counts["sub"]?.count, 202, "the counting lane was starved or wrong")
+    }
+
     // MARK: - Lifetime
 
     /// `close()` shuts the reader too. A browse after it returns empty rather than touching a
