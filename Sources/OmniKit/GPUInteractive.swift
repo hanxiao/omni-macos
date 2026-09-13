@@ -24,7 +24,14 @@ public enum GPUInteractive {
     /// condition for the wait.
     private nonisolated(unsafe) static var inFlight = 0
 
+    /// What this lane is carrying, for the saturation tests. `peakDepth` is the number that matters
+    /// here: interactive requests are supposed to be brief and few at once, and a peak that climbs
+    /// under load means they are stacking rather than being served - which is invisible in any
+    /// timing measurement taken from inside one of them.
+    public static let busline = Busline(name: "omni.gpu.interactive")
+
     public static func enter() {
+        busline.enter()
         cond.lock(); inFlight += 1; cond.unlock()
     }
 
@@ -33,7 +40,13 @@ public enum GPUInteractive {
         inFlight -= 1
         if inFlight <= 0 { inFlight = 0; cond.broadcast() }
         cond.unlock()
+        busline.leave()
     }
+
+    /// A decode step that gave way to interactive work and has to be taken again. Counted because
+    /// yielding is only correct while it stays rare: a lane that yields on every step is not
+    /// arbitrating, it is starving.
+    public static func noteYielded() { busline.noteWasted() }
 
     public static func around<T>(_ work: () throws -> T) rethrows -> T {
         enter(); defer { leave() }
@@ -53,10 +66,13 @@ public enum GPUInteractive {
     /// extra decode step of latency per stall.
     public static func yieldWhileBusy(timeout: TimeInterval = 0.25) {
         cond.lock()
+        var yielded = false
         if inFlight > 0 {
+            yielded = true
             let deadline = Date().addingTimeInterval(timeout)
             while inFlight > 0, Date() < deadline { cond.wait(until: deadline) }
         }
         cond.unlock()
+        if yielded { busline.noteWasted() }
     }
 }

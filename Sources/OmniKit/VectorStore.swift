@@ -2980,6 +2980,9 @@ public final class VectorStore: @unchecked Sendable {
     /// already up. Separate connections, so neither can be behind the other.
     private final class ReadLane: @unchecked Sendable {
         let queue: DispatchQueue
+        /// What this lane is carrying. Read by the saturation tests, which assert on depth and on
+        /// wasted work rather than on duration - see Busline for why duration does not work here.
+        let busline: Busline
         private let dbURL: URL
         private var db: OpaquePointer?
         private var opened = false
@@ -2997,6 +3000,7 @@ public final class VectorStore: @unchecked Sendable {
         init(dbURL: URL, label: String) {
             self.dbURL = dbURL
             self.queue = DispatchQueue(label: label)
+            self.busline = Busline(name: label)
         }
 
         /// Open on first use, ON `queue`. Lazy rather than at init: `VectorStore.init` migrates the
@@ -3077,6 +3081,8 @@ public final class VectorStore: @unchecked Sendable {
     private func onReader<T>(_ lane: ReadLane, _ empty: T, _ body: (OpaquePointer) -> T) -> T {
         var out = empty
         var ran = false
+        lane.busline.enter()                 // the ENQUEUE: depth is what is waiting, not what runs
+        defer { lane.busline.leave() }
         lane.queue.sync {
             guard let h = lane.handle() else { return }
             out = body(h)
@@ -3087,6 +3093,16 @@ public final class VectorStore: @unchecked Sendable {
             guard dbOpen(), let h = db else { return empty }
             return body(h)
         }
+    }
+
+    /// What the two browse lanes are carrying. `peakDepth` says whether a lane is crowding under
+    /// load; `wasted` says whether it is doing work that had already stopped mattering.
+    public var browseBuslines: (interactive: Busline.Reading, aggregate: Busline.Reading) {
+        (interactiveLane.busline.reading, aggregateLane.busline.reading)
+    }
+    public func resetBrowseBuslines() {
+        interactiveLane.busline.resetPeaks()
+        aggregateLane.busline.resetPeaks()
     }
 
     /// TEST HOOKS. The two properties the reader has to have cannot be observed from outside: that
@@ -3412,7 +3428,10 @@ public final class VectorStore: @unchecked Sendable {
         onReader(aggregateLane, [:]) { h in
             // Drained on entry: while this request sat in the lane's queue a newer folder was
             // asked for, so the walk below is already answering the wrong question.
-            if ticket != 0, !self.aggregateIsCurrent(ticket) { return [:] }
+            if ticket != 0, !self.aggregateIsCurrent(ticket) {
+                self.aggregateLane.busline.noteWasted()   // queued, admitted, already pointless
+                return [:]
+            }
             self.aggWalksLock.lock(); self.aggWalks &+= 1; self.aggWalksLock.unlock()
             let pfx = folder + "/"
             var out: [String: (count: Int, newest: Double)] = [:]
@@ -3432,7 +3451,10 @@ public final class VectorStore: @unchecked Sendable {
                 // A partial answer is worse than none: it would write wrong counts into rows the
                 // browser then leaves alone. An interrupted or superseded walk yields nothing.
                 rows += 1
-                if ticket != 0, rows % 4096 == 0, !self.aggregateIsCurrent(ticket) { return [:] }
+                if ticket != 0, rows % 4096 == 0, !self.aggregateIsCurrent(ticket) {
+                    self.aggregateLane.busline.noteWasted()   // superseded mid-walk
+                    return [:]
+                }
                 guard let c = sqlite3_column_text(st, 0) else { continue }
                 let name = String(String(cString: c).dropFirst(pfx.count).prefix { $0 != "/" })
                 guard !name.isEmpty else { continue }
@@ -3440,7 +3462,10 @@ public final class VectorStore: @unchecked Sendable {
                 out[name] = (prior.count + Int(sqlite3_column_int64(st, 1)),
                              Swift.max(prior.newest, sqlite3_column_double(st, 2)))
             }
-            if ticket != 0, !self.aggregateIsCurrent(ticket) { return [:] }
+            if ticket != 0, !self.aggregateIsCurrent(ticket) {
+                self.aggregateLane.busline.noteWasted()       // finished, then found stale
+                return [:]
+            }
             return out
         }
     }
