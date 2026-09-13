@@ -1771,8 +1771,13 @@ fragment appended to the default contradicts rules the default has already given
 - CHAOS DOES TYPE, AND THIS WAS CHECKED RATHER THAN ASSUMED. The suspicion that `ChaosUITests` had
   never typed either (it only asserted the app was alive) is WRONG: with an assertion on the
   field's value it reports `field="porsche"` and passes. Anything that suite says about search is
-  therefore about search. It does flake ~1 run in 2 with "Failed to synthesize event: Timed out
-  while synthesizing event" mid-loop; re-run before believing a failure.
+  therefore about search.
+- BOTH UI SUITES FLAKE, at the XCUITest level rather than the app's. Chaos fails ~1 run in 2 with
+  "Failed to synthesize event: Timed out while synthesizing event" mid-loop; the handoff suite was
+  seen failing once in three full-suite runs while passing in isolation and on the next full run.
+  Re-run before believing a red, and CAPTURE THE ERROR LINE when you do - a filtered grep that
+  keeps only "Test Case ... failed" throws away the one piece of evidence that would say whether it
+  was the synthesizer or the app.
 - ASSERT THE SELECTION COUNT, NOT THAT THE WORKSPACE OPENED. `Transcribe.title` renders
   "Transcribe 3 Items", so the File menu item's title is a readable statement of what the app
   thinks is selected. Asserting only "did OCR mode open" passes with ONE row selected, which is how
