@@ -120,9 +120,9 @@ final class OCRCacheTests: XCTestCase {
                      "a write made while the cache was off left a file behind")
     }
 
-    /// Clear must not be a way to empty a folder the user chose for something else. Only files
-    /// this cache could have written are counted or removed.
-    func testClearOnlyTouchesItsOwnFiles() throws {
+    /// MOVING must not drag off files the cache did not write. The folder is the user's to choose,
+    /// so it may hold their own notes; only files matching this cache's own name pattern travel.
+    func testMoveOnlyTakesItsOwnFiles() throws {
         let source = try write("scan.pdf", "pretend this is a scan")
         OCRCache.write("mine", source: source, page: 0, prompt: "P", variant: "balanced")
         OCRCache.write("mine too", source: source, page: 1, prompt: "P", variant: "balanced")
@@ -133,15 +133,21 @@ final class OCRCacheTests: XCTestCase {
         let renamed = dir.appendingPathComponent("my transcript.md")
         try "also not ours".write(to: renamed, atomically: true, encoding: .utf8)
 
-        XCTAssertEqual(OCRCache.clear(), 2, "clear removed a file it did not write")
-        XCTAssertEqual(try String(contentsOf: note, encoding: .utf8), "not ours")
+        let dest = dir.deletingLastPathComponent().appendingPathComponent("moved", isDirectory: true)
+        XCTAssertEqual(try OCRCache.move(to: dest), 2, "move took a file it did not write")
+        XCTAssertEqual(try String(contentsOf: note, encoding: .utf8), "not ours",
+                       "a hand-written note was dragged along by the move")
         XCTAssertEqual(try String(contentsOf: renamed, encoding: .utf8), "also not ours")
+        // The transcripts read back from the new folder, and are gone from the old one.
+        OCRCache.directory = dest
+        XCTAssertEqual(OCRCache.read(source: source, page: 0, prompt: "P", variant: "balanced"), "mine")
+        OCRCache.directory = dir
         XCTAssertNil(OCRCache.read(source: source, page: 0, prompt: "P", variant: "balanced"))
     }
 
-    func testClearSurvivesAMissingFolder() {
+    func testMoveSurvivesAMissingFolder() throws {
         OCRCache.directory = dir.appendingPathComponent("never-created", isDirectory: true)
-        XCTAssertEqual(OCRCache.clear(), 0)
+        XCTAssertEqual(try OCRCache.move(to: dir.appendingPathComponent("elsewhere", isDirectory: true)), 0)
     }
 
     /// A name is only a name. This pins the shape the Settings pane's Clear button depends on.

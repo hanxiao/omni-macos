@@ -176,17 +176,39 @@ public enum OCRCache {
             && key.allSatisfy { $0.isHexDigit && !$0.isUppercase }
     }
 
-    /// Returns how many were removed.
+    /// Move every cached transcript into `dst`, returning how many moved.
+    ///
+    /// Same reasoning as the index's folder change: repointing alone leaves the old transcripts
+    /// stranded where nothing will ever read or clear them, and the next open re-transcribes pages
+    /// that were already done. Only files this cache wrote are moved - the name test again - so a
+    /// folder the user also keeps notes in does not have its notes dragged along.
     @discardableResult
-    public static func clear() -> Int {
+    public static func move(to dst: URL) throws -> Int {
+        let fm = FileManager.default
+        let src = directory
+        guard src.standardizedFileURL != dst.standardizedFileURL else { return 0 }
+        try fm.createDirectory(at: dst, withIntermediateDirectories: true)
+        guard let names = try? fm.contentsOfDirectory(atPath: src.path) else { return 0 }
+        var moved = 0
+        for name in names where isOurs(name) {
+            let from = src.appendingPathComponent(name), to = dst.appendingPathComponent(name)
+            if fm.fileExists(atPath: to.path) { try fm.removeItem(at: to) }
+            // Rename when the volume allows it (instant), copy when it does not.
+            do { try fm.moveItem(at: from, to: to) }
+            catch { try fm.copyItem(at: from, to: to); try? fm.removeItem(at: from) }
+            moved += 1
+        }
+        return moved
+    }
+
+    /// Bytes currently held, for the space check before a move.
+    public static func storedBytes() -> Int64 {
         let fm = FileManager.default
         guard let names = try? fm.contentsOfDirectory(atPath: directory.path) else { return 0 }
-        var removed = 0
-        for name in names where isOurs(name) {
-            if (try? fm.removeItem(at: directory.appendingPathComponent(name))) != nil { removed += 1 }
+        return names.filter(isOurs).reduce(0) { sum, name in
+            sum + (((try? fm.attributesOfItem(atPath: directory.appendingPathComponent(name).path))?[.size]
+                    as? NSNumber)?.int64Value ?? 0)
         }
-        memo.withLock { $0.removeAll() }
-        return removed
     }
 
     // MARK: - Memo

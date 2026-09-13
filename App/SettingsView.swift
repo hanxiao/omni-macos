@@ -1032,11 +1032,50 @@ private struct IndexTab: View {
         panel.message = "Choose the model folder (model.safetensors, config.json, tokenizer.json)"
         if panel.runModal() == .OK, let url = panel.url { model.setModelDir(url) }
     }
+    /// Choosing a folder MOVES the index into it. It used to only repoint the setting, which
+    /// silently abandoned the existing index and started reindexing from scratch - on a large
+    /// library that is hours of work and tens of gigabytes left behind with nothing pointing at it.
     private func pickDatabase() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true; panel.canChooseFiles = false
         panel.message = "Choose a folder to store the search index"
-        if panel.runModal() == .OK, let url = panel.url { model.setDatabaseDir(url) }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        let src = URL(fileURLWithPath: model.dbPath).deletingLastPathComponent()
+        let payload = IndexRelocation.byteSize(of: IndexRelocation.files(in: src))
+        // Refuse BEFORE anything is copied and before the setting is touched.
+        if let refusal = IndexRelocation.refusal(from: src, to: url, payload: payload) {
+            let a = NSAlert()
+            a.messageText = "Can't use that folder"
+            a.informativeText = refusal
+            a.runModal()
+            return
+        }
+        let confirm = NSAlert()
+        confirm.messageText = "Move the index to \(url.lastPathComponent)?"
+        confirm.informativeText = "\(ByteSize.file(payload)) will be copied. Searching and indexing "
+            + "stop until it finishes, and the current copy is left in place so you can check the "
+            + "move before deleting it."
+        confirm.addButton(withTitle: "Move Index"); confirm.addButton(withTitle: "Cancel")
+        guard confirm.runModal() == .alertFirstButtonReturn else { return }
+
+        Task { @MainActor in
+            if let failure = await model.moveDatabaseDir(to: url) {
+                let a = NSAlert()
+                a.messageText = "The index was not moved"
+                a.informativeText = failure + " Nothing changed - the index is still where it was."
+                a.runModal()
+            } else {
+                let a = NSAlert()
+                a.messageText = "Index moved"
+                a.informativeText = "The old copy is still at \(src.path). Delete it yourself once "
+                    + "you are satisfied the move worked."
+                a.addButton(withTitle: "OK"); a.addButton(withTitle: "Reveal Old Copy")
+                if a.runModal() == .alertSecondButtonReturn {
+                    NSWorkspace.shared.activateFileViewerSelecting([src])
+                }
+            }
+        }
     }
 }
 
@@ -1182,7 +1221,6 @@ private struct OCRPromptExample: Identifiable {
 private struct OCRCacheSection: View {
     @State private var enabled = OCRCache.isEnabled
     @State private var folder = OCRCache.directory
-    @State private var confirmingClear = false
 
     var body: some View {
         Section {
@@ -1208,7 +1246,6 @@ private struct OCRCacheSection: View {
                         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
                         NSWorkspace.shared.activateFileViewerSelecting([folder])
                     }
-                    Button("Clear\u{2026}") { confirmingClear = true }
                 }
                 .controlSize(.small)
             }
@@ -1217,14 +1254,6 @@ private struct OCRCacheSection: View {
         } footer: {
             Text("Pages are saved as Markdown and reused while the file and prompt are unchanged.")
                 .font(.caption).foregroundStyle(.secondary)
-        }
-        // The folder is the user's to choose, so Clear names it. Only files this cache wrote are
-        // removed - the name test in OCRCache - so anything else in the folder survives it.
-        .confirmationDialog("Clear the transcript cache?", isPresented: $confirmingClear) {
-            Button("Clear Cache", role: .destructive) { OCRCache.clear() }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text(folder.path)
         }
     }
 
@@ -1236,9 +1265,34 @@ private struct OCRCacheSection: View {
         panel.directoryURL = folder
         panel.prompt = "Choose"
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        // Nothing is MOVED. The old transcripts stay where they are, valid, and re-pointing at
-        // that folder finds them again - which is what makes this safe to try.
-        OCRCache.directory = url
-        folder = url
+        // MOVE the transcripts, don't just repoint. Leaving them behind strands files nothing will
+        // read or clear, and makes the next open re-transcribe pages that were already done.
+        // Checked first, exactly like the index move: a folder that cannot be written, or has no
+        // room, is refused before anything is touched.
+        let payload = OCRCache.storedBytes()
+        if let refusal = IndexRelocation.refusal(from: folder, to: url, payload: payload) {
+            let a = NSAlert()
+            a.messageText = "Can't use that folder"
+            a.informativeText = refusal
+            a.runModal()
+            return
+        }
+        do {
+            let moved = try OCRCache.move(to: url)
+            OCRCache.directory = url
+            folder = url
+            if moved > 0 {
+                let a = NSAlert()
+                a.messageText = "Moved \(moved) transcript\(moved == 1 ? "" : "s")"
+                a.informativeText = url.path
+                a.runModal()
+            }
+        } catch {
+            let a = NSAlert()
+            a.messageText = "The transcripts were not moved"
+            a.informativeText = error.localizedDescription
+                + " The cache folder is unchanged."
+            a.runModal()
+        }
     }
 }

@@ -545,6 +545,12 @@ final class AppModel {
     }
     /// Move files to the Trash (reversible). Drops them from the visible results at once; the index
     /// catches the deletion through the file-system watcher.
+    /// Bumped whenever something removes files behind a browser's back - a trash, an ignore rule.
+    /// The browsers keep their own `entries`, which `rawResults` pruning does not touch, so without
+    /// this a trashed file stayed on screen until the next indexing refresh (up to 30 s away).
+    private(set) var browserReloadTick = 0
+    func requestBrowserReload() { browserReloadTick &+= 1 }
+
     func moveToTrash(_ paths: [String]) {
         // A Photos asset is not a file Omni may move: deleting it means deleting it from the
         // library (and from every synced device). That belongs in Photos.app, not here.
@@ -553,6 +559,7 @@ final class AppModel {
         let set = Set(paths)
         NSWorkspace.shared.recycle(paths.map { URL(fileURLWithPath: $0) }, completionHandler: nil)
         rawResults.removeAll { set.contains($0.path) }
+        requestBrowserReload()          // the browsers hold their own rows; prune those too
         selectedPaths.subtract(set)
         if let s = selection, set.contains(s) { selection = selectedPaths.first }
         if let a = selectionAnchor, set.contains(a) { selectionAnchor = nil }
@@ -690,6 +697,14 @@ final class AppModel {
         captureNavStop()
     }
 
+    /// The folder whose listing is ON SCREEN, which is not always the one that was asked for.
+    ///
+    /// The toolbar title used to read `filterFolder` - set synchronously the instant a sidebar row
+    /// is clicked - while the listing arrives a query later. On a big folder that gap is hundreds
+    /// of milliseconds, and the title changing first tells the reader they are already somewhere
+    /// they are not. The browser publishes what it has actually rendered; the title follows THAT.
+    var browsingFolderShown: URL? = nil
+
     /// The Photos source currently being browsed, or nil.
     ///
     /// Its own property rather than a value in `filterFolder`, which is a `URL`: a photo source is
@@ -769,12 +784,20 @@ final class AppModel {
     }
 
     /// The folder browser's rows, with the facts its columns show. Off the main actor.
-    func indexedChildrenDetailed(of folder: URL) async -> [VectorStore.IndexedChild] {
+    func indexedChildrenDetailed(of folder: URL, aggregates: Bool = true) async -> [VectorStore.IndexedChild] {
         guard let store else { return [] }
         let path = folder.path
         return await Task.detached(priority: .userInitiated) {
-            store.indexedChildrenDetailed(ofFolder: path)
+            store.indexedChildrenDetailed(ofFolder: path, aggregates: aggregates)
         }.value
+    }
+
+    /// The subfolder counts the listing deliberately skipped, fetched second. See
+    /// `indexedChildrenDetailed(ofFolder:aggregates:)` for why they are split.
+    func folderCounts(under folder: URL) async -> [String: (count: Int, newest: Double)] {
+        guard let store else { return [:] }
+        let path = folder.path
+        return await Task.detached(priority: .utility) { store.folderCounts(under: path) }.value
     }
 
     /// Indexed folders matching what has been typed into Go to Folder.
@@ -1312,17 +1335,24 @@ final class AppModel {
     /// Scoping is the other intent: two project folders under one indexed root, searched together.
     /// Adding a folder already covered by one in the scope is a no-op - the answer would not
     /// change, and a chip for it would suggest it narrowed something.
-    /// Whether adding this folder would change the scope at all.
+    /// Whether adding this folder would change the scope at all. Only an EXACT repeat is refused.
+    ///
+    /// It used to refuse anything already covered by a scoped ancestor, which reads correct and
+    /// blocks the whole point of issue #18: browsing a root scopes that root, so every child was
+    /// "already covered" and the item vanished from exactly the menu where someone picking two
+    /// child folders would look for it.
     func canAddFolderToScope(_ url: URL) -> Bool {
-        !filterFolders.contains { url.path == $0.path || url.path.hasPrefix($0.path + "/") }
+        !filterFolders.contains { $0.path == url.path }
     }
 
     func addFolderToScope(_ url: URL) {
-        guard !filterFolders.contains(url) else { return }
-        let covered = filterFolders.contains { url.path == $0.path || url.path.hasPrefix($0.path + "/") }
-        guard !covered else { return }
-        // Drop any folder the new one now covers, for the same reason.
-        var next = filterFolders.filter { !($0.path.hasPrefix(url.path + "/")) }
+        guard canAddFolderToScope(url) else { return }
+        // Drop scoped ANCESTORS as well as descendants. Adding a child of something already scoped
+        // is how you narrow from "this whole tree" to "these two folders underneath it" - keeping
+        // the parent would leave the scope covering everything and make the add do nothing at all.
+        var next = filterFolders.filter {
+            !url.path.hasPrefix($0.path + "/") && !$0.path.hasPrefix(url.path + "/")
+        }
         next.append(url)
         filterFolders = next
     }
@@ -3485,12 +3515,58 @@ final class AppModel {
         return base.appendingPathComponent("index.sqlite")
     }
 
-    /// Move the index to a user-chosen folder (reloads the store from there).
-    func setDatabaseDir(_ url: URL) {
-        UserDefaults.standard.set(url.path, forKey: "omni.dbDir")
-        phase = .loadingModel
-        Task { await bootstrap() }
+    /// MOVE the index to a user-chosen folder, rather than just repointing at it.
+    ///
+    /// Order matters and is the whole point: check access and space FIRST, copy second, switch the
+    /// setting only once every file has landed and verified, and reload last. The previous version
+    /// set the preference and re-bootstrapped, so choosing a new folder silently abandoned the
+    /// existing index - on this machine 21 GB - and started reindexing millions of files from
+    /// scratch, with no way back to the old copy from inside the app.
+    ///
+    /// The old copy is LEFT IN PLACE. Deleting tens of gigabytes on the user's behalf, immediately
+    /// after a move they can still be verifying, is not something to do silently; the caller is
+    /// told where it is.
+    @discardableResult
+    func moveDatabaseDir(to url: URL) async -> String? {
+        let src = (try? Self.indexURL())?.deletingLastPathComponent()
+            ?? URL(fileURLWithPath: dbPath).deletingLastPathComponent()
+        let files = IndexRelocation.files(in: src)
+        let payload = IndexRelocation.byteSize(of: files)
+        if let refusal = IndexRelocation.refusal(from: src, to: url, payload: payload) { return refusal }
+
+        // Nothing may be reading or writing the store while its files are copied: a half-copied
+        // sqlite + mmapped vector sidecar is a corrupt index, not a slow one.
+        migratingIndex = true
+        defer { migratingIndex = false }
+        isTerminating = true                 // blocks new passes the way the quit drain does
+        indexer?.cancel()
+        for _ in 0 ..< 600 where isIndexing { try? await Task.sleep(for: .milliseconds(100)) }
+        serving.detach()
+        store?.close()
+        store = nil
+
+        let copied: Result<Void, Error> = await Task.detached(priority: .userInitiated) {
+            do { try IndexRelocation.copy(from: src, to: url); return .success(()) }
+            catch { return .failure(error) }
+        }.value
+
+        isTerminating = false
+        switch copied {
+        case .failure(let error):
+            // The setting was never changed, so reopening puts things back exactly as they were.
+            phase = .loadingModel
+            await bootstrap()
+            return "The index could not be moved: \(error.localizedDescription)"
+        case .success:
+            UserDefaults.standard.set(url.path, forKey: "omni.dbDir")
+            phase = .loadingModel
+            await bootstrap()
+            return nil
+        }
     }
+
+    /// True while the index files are being copied - search, indexing and serving are all down.
+    private(set) var migratingIndex = false
 
     /// Storage-tab model picker action: switch if the variant is installed, otherwise confirm and
     /// download it (no separate Download button - selecting the variant is the trigger).
@@ -4998,6 +5074,20 @@ final class AppModel {
 
     /// True when the tagger is attached and ready - drives the context menu's Generate Tags item.
     var canGenerateTags: Bool { imageTagsEnabled && engine?.tagger != nil }
+
+    /// Whether anything SELECTED is worth tagging. Media only - a text file's snippet is a real
+    /// excerpt and tags would be a downgrade, which is why the context menu has always hidden the
+    /// item for one. The File menu checked only `canGenerateTags`, so with a .txt selected it
+    /// offered Generate Tags and would have run it.
+    var selectionIsTaggable: Bool {
+        let paths = selectedPathsForMenu
+        guard !paths.isEmpty else { return false }
+        return paths.contains { path in
+            guard let kind = FileExtractor.kind(forExtension: (path as NSString).pathExtension)
+            else { return false }
+            return taggableKinds.contains(kind.rawValue)
+        }
+    }
 
     /// Explicit "Generate Tags" from the results context menu: (re)tag these files with the HQ
     /// crop refinement, regardless of their current snippet - unlike the lazy backfill, an
