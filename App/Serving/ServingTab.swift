@@ -260,8 +260,12 @@ struct ServingTab: View {
           -d '{"query": "invoice from Anthropic in February", "top_k": 10}'
         ```
 
-        Optional `filters`: `{"kinds": ["text"|"image"|"audio"|"video"|"scan"], "folder": "/abs/path", "since": <epoch seconds>}`.
+        Optional `filters`: `{"kinds": ["text"|"image"|"audio"|"video"|"scan"], "folder": "/abs/path",
+        "folders": ["/abs/one", "/abs/two"], "since": <epoch seconds>}`.
         `"text"` includes scanned PDFs; `"scan"` is scanned PDFs only.
+        Use `folders` to search two or more folders at once - asking the user to add them as
+        sources instead does NOT work, because an indexed parent folder already covers its
+        children, so there is no way to name just two of them that way.
         Response: `{"results": [{"path", "score" (0..1), "snippet", "kind", "modified", "locator", "chunk_count", ...}]}`.
         `locator` is where the best match sits inside the file ("Page 3", "Line 1240"; "" if n/a);
         `chunk_count` is how many chunks (pages/passages) the file has in the index. Hits also
