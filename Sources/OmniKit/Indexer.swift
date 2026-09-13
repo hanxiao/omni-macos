@@ -478,6 +478,25 @@ public final class Indexer: @unchecked Sendable {
     /// pre-pass checks read the old cancel and abort the new pass as if the user paused it.
     public func resetCancelled() { queue.sync { cancelled = false } }
 
+    /// Roots whose rows must NOT be swept, because nothing proves they were readable.
+    ///
+    /// A root that yielded zero files is presumed unreadable rather than emptied - permission
+    /// revoked, volume offline - and its rows are kept. That is right for a FOLDER, which gives no
+    /// other signal. It is wrong for a Photos source: `PhotoLibrary.enumerate` reports ok/not-ok
+    /// explicitly, so an empty-but-readable library is genuinely empty and its leftover rows are
+    /// stale. Before this, emptying a Photos library left its rows immortal - they enumerated 0,
+    /// looked blind, and were never deleted, so the sidebar kept counting assets that no longer
+    /// exist and their thumbnails fell back to type icons.
+    ///
+    /// Extracted and named because it decides what gets DELETED; it has tests for that reason.
+    static func blindRoots(totals: [String: Int],
+                           photoRoots: Set<String>,
+                           unreadablePhotos: Set<String>) -> [String] {
+        totals.filter { $0.value == 0 }.map(\.key).filter { key in
+            photoRoots.contains(key) ? unreadablePhotos.contains(key) : true
+        }
+    }
+
     /// Full incremental pass over `roots`. `onProgress` is called on a background
     /// thread; marshal to the main actor in the UI.
     /// - Parameter photos: Apple Photos slices to index alongside the folder roots. Each becomes a
@@ -551,6 +570,14 @@ public final class Indexer: @unchecked Sendable {
             /// truer picture of that than an indeterminate spinner.
             var discovered: [String: Int] = [:]
             var totals: [String: Int] = [:]          // final, once the walk has finished
+            /// Photos sources whose enumeration FAILED (access revoked, album gone). A folder root
+            /// that crawls empty is presumed unreadable, because the filesystem gives no other
+            /// signal - but `PhotoLibrary.enumerate` returns ok/not-ok explicitly, so an empty
+            /// Photos source can be told apart from an unreadable one. Without that distinction a
+            /// library the user emptied kept its rows forever: they enumerated 0, looked blind, and
+            /// were never swept. Their thumbnails then render as type icons, because the assets
+            /// they point at no longer exist.
+            var unreadablePhotoRoots: Set<String> = []
             /// Producer threads still running. A count, not a flag: the Photos library is walked by
             /// a SECOND producer alongside the filesystem, and the consumer must not decide the
             /// crawl is over because one of them finished.
@@ -679,7 +706,10 @@ public final class Indexer: @unchecked Sendable {
                     // Not readable (access revoked, album deleted): leave its total at 0 so the
                     // sweep counts it a BLIND root and keeps its rows, exactly as for a folder
                     // whose permission was withdrawn.
-                    if !ok { Self.log.error("photos: source \(key, privacy: .public) unreadable; skipping deletion sweep for it") }
+                    if !ok {
+                        Self.log.error("photos: source \(key, privacy: .public) unreadable; skipping deletion sweep for it")
+                        feed.lock.lock(); feed.unreadablePhotoRoots.insert(key); feed.lock.unlock()
+                    }
                 }
                 feed.lock.lock()
                 for r in photoPaths { feed.totals[r] = counts[r] ?? 0 }
@@ -1113,7 +1143,9 @@ public final class Indexer: @unchecked Sendable {
             //  3. Blind root: a root that crawled zero files is almost certainly unreadable
             //     (permission revoked, volume offline), not emptied. Skip its paths too.
             func underPassRoots(_ path: String) -> Bool { rootOf(path) != nil }
-            let blindRoots = feed.totals.filter { $0.value == 0 }.map { $0.key }
+            let blindRoots = Self.blindRoots(totals: feed.totals,
+                                             photoRoots: Set(photoPaths),
+                                             unreadablePhotos: feed.unreadablePhotoRoots)
             func inBlindRoot(_ path: String) -> Bool {
                 blindRoots.contains { path == $0 || path.hasPrefix($0 + "/") }
             }

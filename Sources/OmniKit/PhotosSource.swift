@@ -242,6 +242,10 @@ public enum PhotoLibrary {
     // MARK: - Content (the decode)
 
     /// The asset behind a path, or nil if it is gone from the library.
+    /// Diagnostic only: whether the library still knows this asset id. Separates "the id is
+    /// stale / not visible to us" from "there is no local representation to hand back".
+    public static func debugAssetExists(_ ref: Ref) -> Bool { asset(ref) != nil }
+
     private static func asset(_ ref: Ref) -> PHAsset? {
         PHAsset.fetchAssets(withLocalIdentifiers: [ref.localIdentifier], options: nil).firstObject
     }
