@@ -65,13 +65,22 @@ struct ServingTab: View {
                 Text("Local network").tag(ServingScope.public)
             }
 
-            TextField("Port", value: Binding(
-                get: { model.serving.port },
-                set: { model.serving.port = min(65535, max(1, $0)) }   // valid TCP port range
-            ), format: .number.grouping(.never))
-            .frame(width: 90)
+            // `LabeledContent`, not a bare titled `TextField`: a width-constrained field hugs its
+            // own label, so the port sat immediately after the word "Port" while every other row
+            // in this window puts its value at the trailing edge. Trailing text alignment inside
+            // the box keeps the digits ending on the same column as the values above and below.
+            LabeledContent("Port") {
+                TextField("Port", value: Binding(
+                    get: { model.serving.port },
+                    set: { model.serving.port = min(65535, max(1, $0)) }   // valid TCP port range
+                ), format: .number.grouping(.never))
+                .labelsHidden()
+                .multilineTextAlignment(.trailing)
+                .frame(width: 90)
+            }
 
-            HStack(spacing: 6) {
+            LabeledContent("Bearer token") {
+              HStack(spacing: 6) {
                 let token = Binding(
                     get: { model.serving.bearerToken },
                     set: { model.serving.bearerToken = $0 }
@@ -81,7 +90,16 @@ struct ServingTab: View {
                 // it by default only added a click before every useful thing you can do with it.
                 // Default font, like every other field here - the monospaced treatment made one row
                 // of a settings form look like a code sample.
-                TextField("Bearer token", text: token)
+                // Fills whatever the label leaves, and reads from the right like every other
+                // value in this window. Both halves are load-bearing: a FIXED width clipped the
+                // last characters of a real 32-char token, and without the prompt an empty token
+                // left the row as two buttons with nothing between them - a borderless field in a
+                // grouped form is invisible until it has text. "Not set" is also the truth; no
+                // token is needed while the scope is this Mac only.
+                TextField("Bearer token", text: token, prompt: Text("Not set"))
+                    .labelsHidden()
+                    .multilineTextAlignment(.trailing)
+                    .frame(maxWidth: .infinity)
                 Button {
                     let pb = NSPasteboard.general
                     pb.clearContents()
@@ -94,6 +112,7 @@ struct ServingTab: View {
                 } label: { Image(systemName: "arrow.clockwise") }
                 .buttonStyle(.borderless).foregroundStyle(.secondary)
                 .help("Replace the token with a new one")
+              }
             }
 
             // One row: live status on the left, the agent hand-off buttons on the right
