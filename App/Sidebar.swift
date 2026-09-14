@@ -42,6 +42,9 @@ struct Sidebar: View {
 
     /// Extracted from `body`: with the folder row, its four badge states and the shared
     /// context menu all inline, the whole `List` stopped type-checking in reasonable time.
+    /// Is anything actually nested? Nothing is indented when nothing is inside anything.
+    private var isNested: Bool { model.folderTree.contains { $0.children != nil } }
+
     @ViewBuilder private var foldersSection: some View {
             Section("Folders") {
                 // NESTED, the way Finder's sidebar nests. The user's folders are a tree - a parent
@@ -50,17 +53,31 @@ struct Sidebar: View {
                 // of them live inside the seventh.
                 //
                 // `OutlineGroup` is the platform's own control for this, so the disclosure
-                // triangles, their state and the keyboard behaviour are all native. A folder with
-                // nothing added under it gets nil children and therefore no triangle.
-                ForEach(model.folderTree) { node in
-                    OutlineGroup(node, children: \.children) { item in
-                        folderRow(item.url)
-                            .tag(SidebarSelection.folder(item.url))
+                // triangles, their state and the keyboard behaviour are all native.
+                //
+                // ONLY WHEN SOMETHING IS NESTED. A List that has drawn a disclosure triangle keeps
+                // the column it drew it in: after the last subfolder was removed every row stayed
+                // indented by a triangle that was no longer there, which is not where Finder puts
+                // a top-level folder. A flat tree is built as plain rows instead, and the section
+                // is re-identified when that flips so the List lays out again rather than keeping
+                // the insets it had.
+                if isNested {
+                    ForEach(model.folderTree) { node in
+                        OutlineGroup(node, children: \.children) { item in
+                            folderRow(item.url)
+                                .tag(SidebarSelection.folder(item.url))
+                        }
+                    }
+                } else {
+                    ForEach(model.folderTree) { node in
+                        folderRow(node.url)
+                            .tag(SidebarSelection.folder(node.url))
                     }
                 }
                 Button { pickFolder() } label: { Label("Add folder\u{2026}", systemImage: "plus") }
                     .buttonStyle(.plain)
             }
+            .id(isNested)
     }
 
     /// Extracted for the same reason as `foldersSection`: the two badge-heavy sections in
@@ -406,7 +423,11 @@ private struct PhotoSourceRow: View {
                 if let c = model.folderFileCounts[source.key], c > 0 {
                     Text(c.formatted()).font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
                 }
-                Image(systemName: "pause.circle").foregroundStyle(.tertiary)
+                // A WARNING, not a transport control. `pause.circle` read as a button that would
+                // resume the pass; it is a state badge, and the state it reports is "this is not
+                // being kept up to date". Finder marks a sidebar item that needs attention with
+                // the same outline triangle in the same trailing column.
+                Image(systemName: "exclamationmark.triangle").foregroundStyle(.secondary)
             } else if (RootIndexState.isActive(model, key: source.key) || model.isPhotoSourceQueued(source)) && !RootIndexState.isFinished(model, key: source.key) {
                 CloudSyncPie(fraction: RootIndexState.activeFraction(model, key: source.key))
             } else if model.indexedFiles > 0, let c = model.folderFileCounts[source.key] {
@@ -498,7 +519,11 @@ private struct FolderRow: View {
                 if model.indexedFiles > 0, let c = model.folderFileCounts[url.path], c > 0 {
                     Text(c.formatted()).font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
                 }
-                Image(systemName: "pause.circle").foregroundStyle(.tertiary)
+                // A WARNING, not a transport control. `pause.circle` read as a button that would
+                // resume the pass; it is a state badge, and the state it reports is "this is not
+                // being kept up to date". Finder marks a sidebar item that needs attention with
+                // the same outline triangle in the same trailing column.
+                Image(systemName: "exclamationmark.triangle").foregroundStyle(.secondary)
             } else if (RootIndexState.isActive(model, url) || model.isFolderQueued(url)) && !RootIndexState.isFinished(model, url) {
                 // iCloud-Drive-style transfer indicator: a pie that fills as this
                 // folder is indexed (or sweeps when reconciling in the background).
