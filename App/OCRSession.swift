@@ -516,6 +516,15 @@ final class OCRSession {
     /// instead of a label that sits still for half a minute.
     private(set) var prefilled = 0
     private(set) var prefillTarget = 0
+
+    /// The batch is still filling, so the GPU is almost entirely prefilling and the rate is
+    /// genuinely low. Worth saying: on a 32-wide batch that is ~40 s during which the readout
+    /// showed "0 of N pages" at 2-4 tok/s, which is true and reads as a hung app.
+    ///
+    /// KEYED ON THE STATE, NOT ON THE RATE. A "below 5 tok/s" test would also fire on a page that
+    /// is genuinely slow, and would then be telling the reader to wait for something that is not
+    /// going to change.
+    var isWarmingUp: Bool { prefillTarget > 1 && prefilled < prefillTarget }
     @ObservationIgnored private var previewCache: [Int: URL] = [:]
     /// Pages whose cached transcript is still being looked up. The run loop skips them, so a page
     /// that is about to be restored is not decoded in the moment before the lookup lands. Emptied

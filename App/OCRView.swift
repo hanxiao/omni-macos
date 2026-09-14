@@ -1178,8 +1178,14 @@ private struct ProgressReadout: View {
                     Text(detail)
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
-                        .contentTransition(.numericText(value: session.currentTokensPerSecond))
-                        .animation(.snappy(duration: 0.28), value: session.currentTokensPerSecond)
+                        // ANIMATE ON WHAT IS SHOWN, not on what the line happens to be derived
+                        // from. This was keyed straight to `currentTokensPerSecond`, which keeps
+                        // changing while the batch fills - so during warm-up the chip ran a
+                        // numeric roll on every tick for a number the text no longer contains,
+                        // which is the flicker. Held at a constant while warming, the transition
+                        // is inert until there is a digit to roll.
+                        .contentTransition(.numericText(value: detailAnimationValue))
+                        .animation(.snappy(duration: 0.28), value: detailAnimationValue)
                 }
 
                 if session.isBusy && !session.isFollowingRun {
@@ -1232,12 +1238,30 @@ private struct ProgressReadout: View {
         "\(session.queueCompleted) of \(session.queueTotal) pages"
     }
 
+    /// What the detail line's numeric transition should follow: the rate once there is one, and
+    /// nothing while the batch is still filling.
+    private var detailAnimationValue: Double {
+        session.isWarmingUp ? 0 : session.currentTokensPerSecond
+    }
+
     private var detail: String {
         // A pause takes effect at the next page boundary, so say which of the two states this is
         // rather than claiming the run has stopped while a page is still decoding.
         if session.isPaused { return session.isHolding ? "Paused" : "Finishing this page" }
         var parts: [String] = []
-        if session.currentTokensPerSecond > 0 {
+        // WHILE THE BATCH FILLS, SAY SO INSTEAD OF QUOTING THE RATE. Admitting a page runs its
+        // vision tower and LM prefill, and the batch widens by one row per decode step, so until
+        // it is full almost all the time goes to prefill and the aggregate rate is a few tok/s.
+        // The number is arithmetically right and tells the reader the wrong thing.
+        //
+        // TWO WORDS, NO COUNT. The first version read "Warming up - reading 12 of 32 pages", which
+        // changes on every admission: the chip is sized to its text, so the number churning at
+        // stream rate resized the whole readout back and forth. A count that flickers costs more
+        // than it tells - the state is what matters, and the state is one short phrase that does
+        // not change until it stops being true.
+        if session.isWarmingUp {
+            parts.append("Warming up")
+        } else if session.currentTokensPerSecond > 0 {
             parts.append(String(format: "%.0f tok/s", session.currentTokensPerSecond))
         }
         if session.elapsed > 0 { parts.append(session.elapsedText) }

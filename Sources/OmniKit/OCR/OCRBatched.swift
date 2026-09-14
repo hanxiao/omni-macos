@@ -157,6 +157,7 @@ extension OCRModel {
     func decodeBatch(_ prepared: [PreparedPage], width: Int, maxNewTokens requested: Int,
                      loopGuard: Bool, loopReps: Int, loopGrace: Int,
                      onStream: (@Sendable (Int, StreamUpdate) -> Void)? = nil,
+                     onPrefill: (@Sendable (Int, Int) -> Void)? = nil,
                      onFinish: (@Sendable (Int, Result) -> Void)? = nil,
                      onAdmit: (@Sendable (Int) -> Void)? = nil,
                      shouldAdmit: (@Sendable () -> Bool)? = nil,
@@ -165,6 +166,7 @@ extension OCRModel {
             return try decodeContinuous(prepared, width: width, maxNewTokens: requested,
                                         loopGuard: loopGuard, loopReps: loopReps,
                                         loopGrace: loopGrace, onStream: onStream,
+                                        onPrefill: onPrefill,
                                         onFinish: onFinish, onAdmit: onAdmit,
                                         shouldAdmit: shouldAdmit,
                                         shouldContinue: shouldContinue)
@@ -209,6 +211,7 @@ extension OCRModel {
     private func decodeContinuous(_ pages: [PreparedPage], width: Int, maxNewTokens requested: Int,
                                   loopGuard: Bool, loopReps: Int, loopGrace: Int,
                                   onStream: (@Sendable (Int, StreamUpdate) -> Void)? = nil,
+                                  onPrefill: (@Sendable (Int, Int) -> Void)? = nil,
                                   onFinish: (@Sendable (Int, Result) -> Void)? = nil,
                                   onAdmit: (@Sendable (Int) -> Void)? = nil,
                                   shouldAdmit: (@Sendable () -> Bool)? = nil,
@@ -268,6 +271,17 @@ extension OCRModel {
         // remaining pages are admitted WHILE decoding - not left in a narrow group of their own -
         // it does not cost the throughput a small static group does.
         let ramp = min(Self.rampRows, w)
+        // THE RAMP REPORTS ITSELF. Admitting a page runs its vision tower and LM prefill - ~650 ms
+        // here, roughly twice that on a laptop - and the batch widens by one row per decode step,
+        // so until it is full the GPU is almost entirely prefilling. On a 32-wide batch that is
+        // ~40 s in which the readout said "0 of N pages" at 2-4 tok/s, which is arithmetically
+        // true and reads as a hung app.
+        //
+        // `onPrefill` already exists for the STATIC path, where every page is prefilled up front;
+        // the continuous path prefills inside `admit` and reported nothing, so the comment above
+        // that call ("a still label reads as a hang") described a fix the branch never got.
+        let rampTarget = min(w, n)
+        func noteAdmitted() { onPrefill?(min(nextPage, rampTarget), rampTarget) }
         for row in 0 ..< ramp {
             // CHECKED HERE TOO, not only in the decode loop below. Each `admit` is a whole page's
             // vision tower and LM prefill - ~650 ms that cannot be taken back once submitted - so
@@ -282,6 +296,7 @@ extension OCRModel {
             rowPos.append(0)
             try admit(row: row, page: nextPage)
             nextPage += 1
+            noteAdmitted()
         }
         ttft = Date().timeIntervalSince(t0)
         if OCRRuntimeFlags.reportPrefill {
@@ -321,6 +336,7 @@ extension OCRModel {
                     rowPos.append(0)
                     try admit(row: rowPage.count - 1, page: nextPage)
                     nextPage += 1
+                    noteAdmitted()
                 }
             }
 
@@ -761,7 +777,8 @@ extension OCRModel {
         }
         return try decodeBatch(prepared, width: max(width, 1), maxNewTokens: maxNewTokens,
                                loopGuard: loopGuard, loopReps: loopReps, loopGrace: loopGrace,
-                               onStream: onStream, onFinish: onFinish, onAdmit: onAdmit,
+                               onStream: onStream, onPrefill: onPrefill,
+                               onFinish: onFinish, onAdmit: onAdmit,
                                shouldAdmit: shouldAdmit, shouldContinue: shouldContinue)
     }
 }
