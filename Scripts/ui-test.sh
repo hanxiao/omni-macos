@@ -43,12 +43,16 @@ for d in "$HOME/Library/Application Support/Omni"/jina-ocr-v1-*; do
 done
 [ "$OCR_MODEL" = 1 ] || echo "note: OCR model not installed - the OCR UI tests will skip"
 
+# `${ONLY[@]}` on an EMPTY array is an unbound variable under `set -u` in bash 3.2, which is
+# what /bin/bash is on macOS. The script died on that line before xcodebuild ever ran - and it
+# died with exit 0, so a no-arg run looked exactly like a passing test run. `${ONLY[@]+...}`
+# expands to nothing when the array is empty instead of erroring.
 ONLY=()
 if [ $# -gt 0 ]; then ONLY=(-only-testing:"OmniUITests/$1"); fi
 
 xcodebuild -project Omni.xcodeproj -scheme OmniUITests -configuration Debug \
   -destination 'platform=macOS' -derivedDataPath "$DD" \
-  "${ONLY[@]}" \
+  ${ONLY[@]+"${ONLY[@]}"} \
   OTHER_SWIFT_FLAGS="\$(inherited) -Xcc -fmodule-map-file=$ART/include/module.modulemap -Xcc -I$ART/include" \
   OTHER_LDFLAGS="\$(inherited) $ART/apple-macos/libtokenizers_rust.a" \
   test
