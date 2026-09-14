@@ -1103,7 +1103,7 @@ private struct PageImage: View {
 
     var body: some View {
         ZStack {
-            if let id, let url = session.previewURL(for: id), let image = NSImage(contentsOf: url) {
+            if let id, let image = session.pageImage(for: id) {
                 Image(nsImage: image)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
@@ -1118,6 +1118,10 @@ private struct PageImage: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.background.secondary)
+        // The render is asked for HERE, not from `pageImage(for:)`: a view body must not start
+        // work as a side effect of being read. Cancelled and restarted when the page changes,
+        // which is what `task(id:)` is for.
+        .task(id: id) { if let id { await session.loadPageImage(id) } }
         .accessibilityLabel(id.map { "Page \($0 + 1)" } ?? "No page")
     }
 }

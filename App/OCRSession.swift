@@ -526,6 +526,23 @@ final class OCRSession {
     /// going to change.
     var isWarmingUp: Bool { prefillTarget > 1 && prefilled < prefillTarget }
     @ObservationIgnored private var previewCache: [Int: URL] = [:]
+
+    /// Page images for the image column, at reading resolution.
+    ///
+    /// That column used to call `previewURL` from inside its view body: open the PDF, render the
+    /// page at 2048px, PNG-encode it, write it to the caches directory, then hand back a file for
+    /// `NSImage` to read again - all synchronous, all on the main thread. Measured at 21-30 ms per
+    /// new page on an M3 Ultra, and `NSImage(contentsOf:)` decodes lazily, so the bitmap decode
+    /// landed on the main thread too, during draw, where nothing was counting it.
+    ///
+    /// None of it has to be synchronous, and none of it has to touch the disk: the column needs an
+    /// IMAGE, not a file. Quick Look still goes through `previewURL`, because Quick Look does need
+    /// a file.
+    private(set) var pageImages: [Int: NSImage] = [:]
+    /// Bounded, because these are full-resolution: an A4 page at 2048px is ~23 MB, and a 200-page
+    /// document read end to end would otherwise hold all of them.
+    @ObservationIgnored private var pageImageOrder: [Int] = []
+    @ObservationIgnored private static let pageImageLimit = 6
     /// Pages whose cached transcript is still being looked up. The run loop skips them, so a page
     /// that is about to be restored is not decoded in the moment before the lookup lands. Emptied
     /// by `applyCacheHits`, which then starts the run for whatever actually missed.
@@ -797,6 +814,8 @@ final class OCRSession {
         documentEdits = [:]
         editSectionsByDocument = [:]
         previewCache = [:]
+        pageImages = [:]
+        pageImageOrder = []
         batchCount = 0
         awaitingCache = []
         runVariant = nil
@@ -1592,6 +1611,46 @@ final class OCRSession {
         case .none: return nil
         case .file(let url): return url
         case .pdfPage(let url, _): return url
+        }
+    }
+
+    /// The page at reading resolution, or the rail's thumbnail while the full render is in
+    /// flight - a page that is already on screen in the navigator should not become a blank
+    /// rectangle for the time it takes to render it larger.
+    func pageImage(for id: Int) -> NSImage? {
+        if let ready = pageImages[id] { return ready }
+        return pages.indices.contains(id) ? pages[id].thumbnail : nil
+    }
+
+    /// Renders one page off the main thread and publishes it. Driven by the view's `task(id:)`
+    /// rather than from `pageImage(for:)`, so nothing is started during a view update.
+    func loadPageImage(_ id: Int) async {
+        guard pageImages[id] == nil, jobs.indices.contains(id) else { return }
+        let job = jobs[id]
+        let token = runToken
+        let image = await Task.detached(priority: .userInitiated) {
+            Self.fullPageImage(job, documents: PDFCache())
+        }.value
+        // Same guard the thumbnail render uses: a slow render from the PREVIOUS document must not
+        // land on this one.
+        guard runToken == token, let image, pageImages[id] == nil else { return }
+        pageImages[id] = image
+        pageImageOrder.removeAll { $0 == id }
+        pageImageOrder.append(id)
+        while pageImageOrder.count > Self.pageImageLimit {
+            pageImages.removeValue(forKey: pageImageOrder.removeFirst())
+        }
+    }
+
+    private nonisolated static func fullPageImage(_ job: PageJob, documents: PDFCache) -> NSImage? {
+        switch job {
+        case .pdfPage(let url, let index):
+            guard let document = documents.document(url),
+                  let cg = FileExtractor.renderPDFPage(document, index: index, maxDimension: 2048)
+            else { return nil }
+            return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        case .image(let url):
+            return NSImage(contentsOf: url)
         }
     }
 
