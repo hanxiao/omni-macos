@@ -37,6 +37,15 @@ struct Sidebar: View {
                               deselect: { if selection == .folder(url) { selection = nil } })
                     .tag(SidebarSelection.folder(url))
                 }
+                // FOLDERS A BROADER ROOT NOW COVERS. They are indexed - by that root - and a search
+                // can still be scoped to any of them, which is exactly what issue #18 asked for.
+                // What they are not is crawl roots, so they carry no progress and no pause: adding
+                // six folders and then their parent used to make six rows disappear with no word,
+                // and "it consumed all of them" is the reasonable thing to conclude from that.
+                ForEach(model.coveredFolders, id: \.self) { url in
+                    CoveredFolderRow(url: url)
+                        .tag(SidebarSelection.folder(url))
+                }
                 Button { pickFolder() } label: { Label("Add folder\u{2026}", systemImage: "plus") }
                     .buttonStyle(.plain)
             }
@@ -427,6 +436,35 @@ private struct PhotoSourceRow: View {
             Button(role: .destructive) { deselect(); model.removePhotoSource(source) } label: {
                 Label("Remove from Omni", systemImage: "minus.circle")
             }
+        }
+    }
+}
+
+/// A folder the user added that a broader root now indexes.
+///
+/// Dimmed and badge-less on purpose: it has no pass of its own, so a progress ring or a pause
+/// control here would be describing the parent's state under this folder's name. What it keeps is
+/// the thing that makes it worth listing - selecting it browses it, and its context menu still
+/// offers "Add to Search Scope", which is how several folders get searched at once.
+private struct CoveredFolderRow: View {
+    @Environment(AppModel.self) private var model: AppModel
+    let url: URL
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "folder").foregroundStyle(.tertiary).frame(width: 16)
+            Text(url.lastPathComponent).lineLimit(1).truncationMode(.middle)
+                .foregroundStyle(.secondary)
+            Spacer()
+        }
+        .help(model.rootCovering(url).map { "Indexed as part of \($0.lastPathComponent)" }
+              ?? "Indexed by a folder above it")
+        .contextMenu {
+            FolderMenuItems(url: url)
+            Divider()
+            // NOT "Remove from Omni". This is not a root, so there is nothing to un-index - the
+            // parent still covers these files. It only forgets the shortcut.
+            Button("Remove from Sidebar") { model.removeCoveredFolder(url) }
         }
     }
 }

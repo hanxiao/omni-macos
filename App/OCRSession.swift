@@ -384,6 +384,7 @@ final class OCRSession {
 
     func selectDocument(id: Int) {
         guard documents.contains(where: { $0.id == id }) else { return }
+        defer { logDocumentState("after selectDocument(\(id))") }
         selectedDocumentID = id
         userPinnedDocument = true
         selection = nil
@@ -803,6 +804,7 @@ final class OCRSession {
         interruptAskedAt = omniPerfEnabled ? Date() : nil
         gate.pause()
         isPaused = true
+        logDocumentState("after pause")
     }
 
     func resume() {
@@ -832,6 +834,31 @@ final class OCRSession {
         discardQueue()
         if phase == .running || phase == .loading { phase = pages.isEmpty ? .empty : .finished }
         scheduleReadoutDismissal()
+        logDocumentState("after cancel")
+    }
+
+    /// What the panes will actually draw, at a moment worth asking about. Gated on OMNI_PERF_LOG.
+    ///
+    /// "The text disappeared when I hit Stop, and came back after switching tabs" is not
+    /// answerable from the outside: it could be the sections list, the per-page states, the texts
+    /// themselves, or an edit buffer shadowing all three. This prints all four so one reproduction
+    /// settles it instead of a guess per round trip.
+    func logDocumentState(_ when: String) {
+        guard omniPerfEnabled else { return }
+        let ids = sectionIDs
+        let states = (visibleDocument?.pageIDs ?? []).map { id -> String in
+            let st: String
+            switch pages[id].state {
+            case .done: st = "done"
+            case .failed: st = "failed"
+            case .running: st = "running"
+            case .pending: st = "pending"
+            case .stopped: st = "stopped"
+            }
+            return "\(id):\(st):\(texts.indices.contains(id) ? texts[id].count : -1)"
+        }
+        omniPerfLog("ocr-doc \(when) phase=\(phase) edit=\(documentEdit == nil ? "nil" : "\(documentEdit!.count)ch") "
+                    + "sections=\(ids.count) pages=[\(states.joined(separator: " "))]")
     }
 
     /// Transcribe one page that a stop left behind.

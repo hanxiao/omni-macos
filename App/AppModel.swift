@@ -3663,8 +3663,32 @@ final class AppModel {
         } else {
             roots = canonicalizeRoots(FileCrawler.defaultRoots())
         }
+        // Covered folders ride alongside: they are not crawl roots, so they are loaded but never
+        // handed to the indexer. Anything that has since become a root drops out here.
+        if let saved = UserDefaults.standard.array(forKey: "omni.coveredFolders") as? [String] {
+            coveredFolders = saved.map { URL(fileURLWithPath: $0) }
+                .filter { c in !roots.contains(c) }
+        }
     }
     private func saveRoots() { UserDefaults.standard.set(roots.map { $0.path }, forKey: "omni.roots") }
+
+    /// Folders the user added that a later, broader root now covers. They are NOT crawl roots -
+    /// `roots` is still the canonical crawl set and nothing here reaches the indexer - they are the
+    /// user's own list of places worth naming, kept so the sidebar can still offer them and a
+    /// search can still be scoped to one. See addRoots for why.
+    var coveredFolders: [URL] = [] {
+        didSet { if coveredFolders != oldValue { saveCoveredFolders() } }
+    }
+    private func saveCoveredFolders() {
+        UserDefaults.standard.set(coveredFolders.map { $0.path }, forKey: "omni.coveredFolders")
+    }
+    /// The root that actually indexes a covered folder, for the row's tooltip.
+    func rootCovering(_ url: URL) -> URL? { RootScope.rootCovering(url, in: roots) }
+    /// Drop a covered folder from the list. It is not a root, so there is nothing to un-index -
+    /// this only forgets the shortcut.
+    func removeCoveredFolder(_ url: URL) {
+        coveredFolders.removeAll { $0 == url }
+    }
 
     // MARK: - Serving: what Omni indexes, over the API
 
@@ -3932,17 +3956,18 @@ final class AppModel {
     /// silently miss. canonicalPath is required here, not resolvingSymlinksInPath - the latter strips
     /// /private (it would leave /tmp as /tmp). Falls back to the given path when a root can't be
     /// resolved (e.g. it no longer exists).
+    /// Resolve symlinks, then reduce to the crawl set. The RULE lives in `RootScope` (and is
+    /// tested there): it decides which of the user's folders disappear as roots, and the report
+    /// that it does so silently is issue #18's second half.
     private func canonicalizeRoots(_ roots: [URL]) -> [URL] {
-        let resolved = roots.map { url -> URL in
+        RootScope.canonical(resolvedRoots(roots))
+    }
+
+    private func resolvedRoots(_ roots: [URL]) -> [URL] {
+        roots.map { url in
             (try? url.resourceValues(forKeys: [.canonicalPathKey]))?.canonicalPath
                 .map { URL(fileURLWithPath: $0) } ?? url
         }
-        let sorted = resolved.sorted { $0.path.count < $1.path.count }   // ancestors first
-        var canonical: [URL] = []
-        for r in sorted where !canonical.contains(where: { r.path == $0.path || r.path.hasPrefix($0.path + "/") }) {
-            canonical.append(r)
-        }
-        return canonical
     }
 
     /// Is this folder waiting for its turn to be crawled? Distinct from `activeRoots`, which means
@@ -4046,7 +4071,31 @@ final class AppModel {
     func addRoots(_ urls: [URL]) {
         let new = urls.filter { !roots.contains($0) }
         guard !new.isEmpty else { return }
+        let before = roots
         roots = canonicalizeRoots(roots + new)
+        // FOLDERS THE NEW ROOT SWALLOWED. Canonicalization is right for CRAWLING - a parent and
+        // its child cover the same files, and walking both is the same work twice - but it used to
+        // be right silently: add six folders, then their parent, and six sidebar rows vanish with
+        // no word. Reported as "it consumed all of them instead of literally indexing and being
+        // separate" (#18), and the reasonable conclusion from the outside is that the folders are
+        // no longer indexed. They are, by the parent - and a search can still be scoped to any of
+        // them, which is the whole point of the multi-folder scope that issue asked for (verified
+        // over HTTP: with only the parent as a source, `folders: [alpha, gamma]` returns exactly
+        // alpha and gamma).
+        //
+        // So they are kept as SCOPE SHORTCUTS: still listed, still right-clickable for "Add to
+        // Search Scope", marked as covered by the root that now indexes them. Nothing about what
+        // gets crawled changes.
+        let swallowed = RootScope.covered(resolvedRoots(before + new))
+        if !swallowed.isEmpty {
+            coveredFolders = (coveredFolders + swallowed).filter { c in !roots.contains(c) }
+            saveCoveredFolders()
+        }
+        // A folder that has just BECOME a root is no longer merely covered.
+        if coveredFolders.contains(where: { roots.contains($0) }) {
+            coveredFolders.removeAll { roots.contains($0) }
+            saveCoveredFolders()
+        }
         saveRoots()
         restartWatcher()   // once
         // FSEvents only sees future changes, so pre-existing files would never be indexed without a
