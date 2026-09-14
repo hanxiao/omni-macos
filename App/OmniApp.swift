@@ -46,7 +46,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // the live app (expression evaluation re-enters SwiftUI mid-commit); an in-process dump on the
     // app's own main queue is safe. Inert in normal runs - the source is never installed.
     private var uiDebugSource: DispatchSourceSignal?
+    /// Name of the cross-process nudge a redundant launch sends before it exits, so the surviving
+    /// instance comes forward even if its window is hidden. `NSRunningApplication.activate()` is
+    /// NOT a reopen (the same fact the chaos suite records), so activation alone leaves a
+    /// close-to-hide window hidden and the double-click appears to do nothing.
+    static let reopenNotification = Notification.Name("io.hanxiao.omni.reopen")
+
+    /// ONE INSTANCE PER INDEX, enforced here as well as in Info.plist.
+    ///
+    /// This is the ONLY enforcement: `INFOPLIST_KEY_LSMultipleInstancesProhibited` does not work,
+    /// because Xcode's INFOPLIST_KEY_ mechanism honours only Apple's whitelisted keys and silently
+    /// drops the rest (verified by reading it back out of the built Info.plist - absent). It would
+    /// not have been sufficient regardless: running the executable directly bypasses LaunchServices
+    /// entirely, and that is how a second copy gets started in practice - a terminal launch for a
+    /// debug dump, then a normal double-click.
+    ///
+    /// Two copies share one index directory and the second loses: the vector sidecar is flock'd
+    /// exclusively, so it silently falls back to a private scratch mapping and its window is a
+    /// degraded twin of the first.
+    ///
+    /// EXEMPT WHEN `-omni.dbDir` IS SET. That argument means the caller brought its own index -
+    /// every UI-test suite passes it - and two instances on two indexes contend over nothing. The
+    /// guard exists to stop two copies fighting over ONE index, not to stop two copies existing.
+    ///
+    /// Runs in `applicationWillFinishLaunching`, before the store is opened, so the redundant
+    /// process exits without ever touching the index.
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        guard UserDefaults.standard.string(forKey: "omni.dbDir")?.isEmpty ?? true,
+              let id = Bundle.main.bundleIdentifier else { return }
+        let mine = ProcessInfo.processInfo.processIdentifier
+        let others = NSRunningApplication.runningApplications(withBundleIdentifier: id)
+            .filter { $0.processIdentifier != mine && !$0.isTerminated }
+        guard let survivor = others.first else { return }
+        DistributedNotificationCenter.default().postNotificationName(
+            Self.reopenNotification, object: nil, deliverImmediately: true)
+        survivor.activate()
+        NSApp.terminate(nil)
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // The other half of the single-instance guard: a redundant launch nudges us before it
+        // exits, and this is what turns that into a visible window.
+        DistributedNotificationCenter.default().addObserver(
+            forName: Self.reopenNotification, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated { Self.showMainWindow() }
+            }
         // THE STALL DETECTOR STARTS HERE, NOT FROM A `.task` ON THE WINDOW'S CONTENT. It lived
         // there and never ran: a probe placed as the first statement of that task - writing
         // unconditionally to stderr, then to a file - produced nothing across repeated launches,

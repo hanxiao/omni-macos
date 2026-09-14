@@ -58,6 +58,12 @@ targets:
         # Nothing is exported, copied, or uploaded, and Omni never writes to the library.
         INFOPLIST_KEY_NSPhotoLibraryUsageDescription: "Omni indexes your Photos library on this Mac so you can search your photos and videos by meaning. Nothing leaves your Mac."
         INFOPLIST_KEY_LSMinimumSystemVersion: "14.0"
+        # NO `INFOPLIST_KEY_LSMultipleInstancesProhibited` HERE, AND IT IS NOT AN OVERSIGHT.
+        # Xcode's INFOPLIST_KEY_ mechanism only honours Apple's whitelisted keys; this is not one,
+        # and the setting is silently dropped - verified by reading the key back out of the built
+        # Info.plist, where it does not exist. Single-instance enforcement lives in AppDelegate's
+        # applicationWillFinishLaunching instead, which also covers the direct-binary launch that
+        # LaunchServices would never have brokered anyway.
 
   OmniUITests:
     type: bundle.ui-testing
