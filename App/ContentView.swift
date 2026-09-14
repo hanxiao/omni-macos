@@ -743,6 +743,41 @@ struct ContentView: View {
         model.serving.isRunning ? "Serving on port \(model.serving.port)" : "Serve over HTTP"
     }
 
+    /// The four leading controls, emitted at whatever placement the running system actually
+    /// renders. See the note at the call site for why Sequoia cannot have `.navigation`.
+    ///
+    /// OCR mode sits next to the sidebar toggle because it switches what the content area IS - the
+    /// same class of thing as showing or hiding the sidebar - rather than acting on results; in the
+    /// trailing cluster it drifted with the search field's width. It is deliberately NOT gated on
+    /// `phase == .ready`: transcription reads a dropped file and writes Markdown, touching neither
+    /// the vector index nor the embedding model, so gating it on the index would strand the feature
+    /// exactly when it is most useful - while a large index loads.
+    ///
+    /// Serving is here for the same reason: a global mode of the app, on until turned off, rather
+    /// than an action on whatever is on screen. Same switch as Settings > Serving, never a second
+    /// source of truth.
+    @ToolbarContentBuilder
+    private func leadingModeItems(_ placement: ToolbarItemPlacement) -> some ToolbarContent {
+        ToolbarItem(id: "sidebar.mode", placement: placement) { sidebarToggleButton }
+        ToolbarItem(id: "ocr.mode", placement: placement) {
+            // On is a FILLED accent circle with a white glyph, the way Preview draws Markup while
+            // it is on. The fill is drawn INSIDE the label rather than by `.borderedProminent`: a
+            // prominent button takes a background of its own, which broke this item out of the
+            // glass capsule it shares with the sidebar toggle.
+            ocrToggleButton
+                .help(model.ocrMode ? "Back to search  \u{2318}\u{2325}O" : "Transcribe a document  \u{2318}\u{2325}O")
+                .accessibilityLabel(model.ocrMode ? "Back to search" : "Transcribe a document")
+                .accessibilityIdentifier("ocr.toggle")
+        }
+        ToolbarItem(id: "serve.mode", placement: placement) {
+            ToolbarToggle(isOn: Binding(get: { model.serving.enabled },
+                                        set: { model.serving.enabled = $0 }),
+                          symbol: "network")
+                .help(servingHelp)
+                .accessibilityLabel("Serve over HTTP")
+        }
+    }
+
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
         // No explicit sidebar toggle: Sequoia's system toggle (next to the traffic lights, like
         // Finder) lives and dies with the split-view TRACKING SEPARATOR item, which this app keeps
@@ -765,46 +800,28 @@ struct ContentView: View {
         // writes Markdown, and touches neither the vector index nor the embedding model. Gating
         // it on the index would strand the feature exactly when it is most useful - while a large
         // index loads, or when another copy of Omni holds it open.
-        ToolbarItem(id: "sidebar.mode", placement: .navigation) { sidebarToggleButton }
-        ToolbarItem(id: "ocr.mode", placement: .navigation) {
-            // On is a FILLED accent circle with a white glyph, the way Preview draws Markup while
-            // it is on. The fill is drawn INSIDE the label rather than by `.borderedProminent`: a
-            // prominent button takes a background of its own, which broke this item out of the
-            // glass capsule it shares with the sidebar toggle - two separate surfaces in OCR mode
-            // where every other mode had one.
-            ocrToggleButton
-                .help(model.ocrMode ? "Back to search  \u{2318}\u{2325}O" : "Transcribe a document  \u{2318}\u{2325}O")
-                .accessibilityLabel(model.ocrMode ? "Back to search" : "Transcribe a document")
-                .accessibilityIdentifier("ocr.toggle")
-        }
-        // A shortcut to Settings > Serving > "Serve Omni over HTTP", on the same switch - not a
-        // second source of truth. It sits with the sidebar and OCR toggles because it is the same
-        // KIND of control: a global mode of the app, on until you turn it off, rather than an
-        // action on whatever happens to be on screen. It was briefly next to Share, which grouped
-        // it with per-file actions it has nothing to do with.
-        ToolbarItem(id: "serve.mode", placement: .navigation) {
-            ToolbarToggle(isOn: Binding(get: { model.serving.enabled },
-                                        set: { model.serving.enabled = $0 }),
-                          symbol: "network")
-                .help(servingHelp)
-                .accessibilityLabel("Serve over HTTP")
-        }
-        // ONE ITEM for the chevrons AND the name, in that order. Two items cannot do it: a
-        // toolbar item that only exists sometimes is APPENDED when it comes back, so descending
-        // into a folder (which is what makes the chevrons appear) put them to the RIGHT of the
-        // name. An always-present empty item is no good either - Tahoe charges a full inter-group
-        // gap on both sides of one, which pinned the name ~46pt right of the mode pill whether or
-        // not there was anything to go back to. Inside a single item the chevrons simply appear
-        // and the name slides to meet them, which is the behaviour Finder has.
+        // SEQUOIA DROPS EVERY `.navigation` ITEM. On macOS 15 the sidebar toggle, the OCR toggle,
+        // the serve toggle and the back/forward group are all absent from the toolbar, while every
+        // `.primaryAction` item renders - `browse.view` included, which carries an `id` too, so the
+        // discriminator is the PLACEMENT and not the identifier. The mechanism fits the window
+        // structure: in a NavigationSplitView the leading edge belongs to the SIDEBAR column and
+        // these are declared from the DETAIL's toolbar, which Tahoe's unified toolbar flattens and
+        // Sequoia's real toolbar sections do not. It is the same class of Sequoia sectioning
+        // failure e8ec400 recorded when the tuner still touched the titlebar.
         //
-        // The ITEM draws no glass (`.sharedBackgroundVisibility(.hidden)`); the chevrons carry
-        // their own capsule. That is the whole point: Finder's name is loose text beside the
-        // navigation group, not a third button inside it.
+        // Pre-Tahoe therefore puts the same four controls in `.primaryAction` - the one placement
+        // there is positive evidence for on that system, from the same screenshot that showed the
+        // others missing - declared FIRST so they lead the trailing cluster and keep their order.
+        // The position differs from Tahoe; what was broken was REACHABILITY, and these four are
+        // the drawer, the transcription workspace, the HTTP server and the whole back/forward
+        // trail. NOT VERIFIED ON SEQUOIA - there is no macOS 15 machine or VM here.
         if #available(macOS 26.0, *) {
+            leadingModeItems(.navigation)
             ToolbarItem(id: "nav.title", placement: .navigation) { navAndTitle }
                 .sharedBackgroundVisibility(.hidden)
         } else {
-            ToolbarItem(id: "nav.title", placement: .navigation) { navAndTitle }
+            leadingModeItems(.primaryAction)
+            ToolbarItem(id: "nav.title", placement: .primaryAction) { navAndTitle }
         }
         // Flexible space after back/forward pushes every other control to the trailing edge (chevrons
         // own the left, everything else is right-aligned), and on Tahoe it's also the correct separator
