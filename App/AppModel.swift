@@ -3028,12 +3028,19 @@ final class AppModel {
         }
     }
 
+    /// THREE THINGS RESUME, not one. Indexing is only the path that was actually paused; the
+    /// catch-up queue and the watcher's buffered changes were REFUSED while the run held the GPU,
+    /// and nothing else would come back for them - a Photos change debounce or a file edit during a
+    /// transcription would otherwise sit in its buffer until the next unrelated trigger.
     func endOCRRun() {
         ocrRunActive = false
         if indexingPausedForOCR {
             indexingPausedForOCR = false
             startIndexing()
         }
+        if omniPerfEnabled { omniPerfLog("gpu-standdown lifted (ocr run ended)") }
+        catchUpPendingRoots()
+        drainPendingFSChanges()
     }
 
     private func applyMemoryLimit() {
@@ -4085,7 +4092,14 @@ final class AppModel {
         // !isPaperRunning: the paper suite moves process-wide levers (tail rows, chunk cache, the
         // can't-win gate), so a pass starting mid-run would embed the user's files under a
         // benchmark arm. The run's completion resumes indexing, which re-enters here.
-        guard !isTerminating, !isPaperRunning, !isProfilingRunning, !indexObsolete, indexState != .indexing, activeRoots.isEmpty,
+        // !ocrRunActive: this path calls indexer.index() DIRECTLY, so the stand-down in
+        // startIndexing does not cover it. The pending roots are kept and endOCRRun kicks this
+        // again - see the note there.
+        if ocrRunActive, !(pendingCatchUpRoots.isEmpty && pendingCatchUpPhotos.isEmpty), omniPerfEnabled {
+            omniPerfLog("gpu-standdown catch-up held roots=\(pendingCatchUpRoots.count) (ocr run active)")
+        }
+        guard !isTerminating, !isPaperRunning, !isProfilingRunning, !indexObsolete, !ocrRunActive,
+              indexState != .indexing, activeRoots.isEmpty,
               !fsReconcileInFlight,
               let indexer, let store, !(pendingCatchUpRoots.isEmpty && pendingCatchUpPhotos.isEmpty) else { return }
         let batch = pendingCatchUpRoots.filter { roots.contains($0) }
@@ -5215,8 +5229,17 @@ final class AppModel {
     private func drainPendingFSChanges() {
         // !isPaperRunning: the watcher is stopped for the run, but events buffered before it was
         // stopped must stay buffered - a reconcile shares the Indexer and the levers with the suite.
-        guard !isTerminating, !isPaperRunning, !pendingFSPaths.isEmpty, !fsReconcileInFlight,
-              let indexer, let store else { return }
+        // !ocrRunActive for the same reason as catchUpPendingRoots: this calls indexer.update()
+        // directly and never passes through startIndexing's stand-down. The `indexState != .paused`
+        // check below does NOT cover an OCR run - beginOCRRun only pauses when indexing is already
+        // running, and a run "usually starts at launch, BEFORE the crawl has begun", so the state
+        // is .idle and a watcher event walks straight into the GPU alongside the transcription.
+        // The paths stay buffered; endOCRRun drains them.
+        if ocrRunActive, !pendingFSPaths.isEmpty, omniPerfEnabled {
+            omniPerfLog("gpu-standdown fs-drain held paths=\(pendingFSPaths.count) (ocr run active)")
+        }
+        guard !isTerminating, !isPaperRunning, !ocrRunActive, !pendingFSPaths.isEmpty,
+              !fsReconcileInFlight, let indexer, let store else { return }
         // Globally paused: keep the events buffered (resume's pass completion re-drains them).
         // Running update() now would also hit the stale cancel and silently DROP the batch.
         guard indexState != .paused else { return }

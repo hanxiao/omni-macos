@@ -209,7 +209,16 @@ struct OCRView: View {
                 // the share item, whose title is the visible document's name. That measurement
                 // was 10% of the main thread in a sample, and 41 stalls over 18 tab switches;
                 // pinning the width removes the recomputation and the stalls go to zero.
-                .frame(width: 132)
+                //
+                // DERIVED FROM THE CASE COUNT, because a hard-coded 132 is what clipped it. That
+                // number fitted three segments; `triple` made four and nothing recomputed it, so
+                // the fourth was cut off. `allCases.count` is fixed at build time, so the width is
+                // still IMPOSED rather than measured and the stall fix is intact - but it cannot
+                // silently stop matching the content again.
+                //
+                // 38pt per segment is measured, not guessed: with the frame removed the live
+                // NSToolbar reported this item at 152pt across four segments.
+                .frame(width: CGFloat(OCRSession.ViewMode.allCases.count) * 38)
                 .fixedSize()
                 .help("Raw text, Markdown, both, or the page beside them")
             }

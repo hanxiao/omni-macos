@@ -372,7 +372,12 @@ struct FolderBrowser: View {
                                         : .clear,
                                         in: RoundedRectangle(cornerRadius: 4, style: .continuous))
                     }
-                    .frame(maxWidth: .infinity)
+                    // TOP, NOT CENTRE. A name wraps to one line or two, so cells in a row are
+                    // different heights, and LazyVGrid centres the shorter ones - which puts their
+                    // icons lower than their neighbours' and reads as a ragged grid. Finder keeps
+                    // every icon on one line by reserving the name's space; pinning the cell to the
+                    // top of its row is the same result without guessing a fixed name height.
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                     .padding(6)
                     .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                     .onTapGesture(count: 2) { activate(entry) }
