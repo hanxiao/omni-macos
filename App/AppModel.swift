@@ -3671,7 +3671,10 @@ final class AppModel {
         recomputeRoots()
     }
 
-    private func saveRoots() { UserDefaults.standard.set(roots.map { $0.path }, forKey: "omni.roots") }
+    private func saveRoots() {
+        guard !isIsolatedRun else { return }   // see isIsolatedRun
+        UserDefaults.standard.set(roots.map { $0.path }, forKey: "omni.roots")
+    }
 
     /// ONE STORED LIST, TWO DERIVED ONES. `addedFolders` is what the user actually chose, in the
     /// order they chose it; `roots` (the crawl set) and `coveredFolders` are both COMPUTED from it.
@@ -3696,7 +3699,20 @@ final class AppModel {
     /// each: a root has a pass of its own to report on, a covered folder has none.
     func isCrawlRoot(_ url: URL) -> Bool { roots.contains(url) }
 
+    /// An isolated run must not write the developer's folder list.
+    ///
+    /// `-omni.dbDir` means the caller brought its own index, and `-omni.roots` seeds the folders
+    /// from the ARGUMENT domain - which is read-only and never written back. Persisting was not:
+    /// recomputeRoots saved those scratch paths straight into the real `io.hanxiao.omni` domain and
+    /// overwrote the real folder list, which is exactly what happened here. The same shape as the
+    /// search-history leak, one key later, and the same fix: an isolated session reads settings and
+    /// writes none.
+    private var isIsolatedRun: Bool {
+        !(UserDefaults.standard.string(forKey: "omni.dbDir")?.isEmpty ?? true)
+    }
+
     private func saveAddedFolders() {
+        guard !isIsolatedRun else { return }
         UserDefaults.standard.set(addedFolders.map { $0.path }, forKey: "omni.addedFolders")
     }
 
