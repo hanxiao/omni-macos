@@ -226,18 +226,14 @@ struct OmniApp: App {
         .defaultSize(width: 1000, height: 660)
         .windowResizability(.contentMinSize)
         .commands {
+            // About, then the update check, in Apple's order and with its separator. NO
+            // BENCHMARK HERE. The app menu holds what the APP is - identity, updates, settings,
+            // quitting - not a job that pins this Mac for minutes; it sat one slip below About,
+            // and its real home is Settings > Performance, where it still is.
             CommandGroup(replacing: .appInfo) {
                 Button("About Omni") { showAbout() }
-                Button("Check for updates\u{2026}") { Updater.check(userInitiated: true) }
                 Divider()
-                // Benchmarks this Mac on a fixed 5000-file dataset; results (hardware + timing only)
-                // can be shared to hanxiao.io/omni.
-                // No ellipsis: the command runs immediately, with no further input (HIG).
-                // No "Paper" item here on purpose: a hidden developer-only run does not belong in
-                // the App menu, where it is one slip away from a user starting a 25-minute
-                // benchmark. Its only entry point is the gated control in Settings > Performance.
-                Button("Run benchmark") { Task { await model.runProfiling() } }
-                    .disabled(model.isProfilingRunning || model.isPaperRunning || !model.canIndex)
+                Button("Check for Updates\u{2026}") { Updater.check(userInitiated: true) }
             }
             // Cmd-V/C/A are routed: when a text field is being edited they do the standard text
             // paste/copy/select-all; otherwise they act on the search results - Cmd-V searches by a
@@ -252,6 +248,16 @@ struct OmniApp: App {
                     .keyboardShortcut("v", modifiers: .command)
                 Button("Select All") { selectAllCommand() }
                     .keyboardShortcut("a", modifiers: .command)
+                // COPYING IS AN EDIT COMMAND. This sat in File, under the transcription items,
+                // because that is where the rest of the OCR block grew - but a menu is read by
+                // what a command IS, not by which feature added it, and every Mac app puts a copy
+                // beside the other copies. Same chord, same condition.
+                if model.ocrMode {
+                    Divider()
+                    Button("Copy Markdown") { ocr.copyMarkdownToPasteboard() }
+                        .keyboardShortcut("c", modifiers: [.command, .shift])
+                        .disabled(ocr.completedPages == 0)
+                }
             }
             // The primary actions on the selected result, reachable from the menu bar and keyboard
             // with visible shortcut hints (previously double-click / context-menu only).
@@ -263,14 +269,19 @@ struct OmniApp: App {
                     model.ocrMode.toggle()
                 }
                 .keyboardShortcut("o", modifiers: [.command, .option])
+                // APPLE'S FILE ORDER: open, close, save, share - then the commands that run the
+                // document. It used to read open, save, copy, share, find next, find previous,
+                // pause, stop, close: Close at the far end from Open, a copy among the saves, and
+                // the two Find items in the wrong menu entirely. Every chord is unchanged.
                 if model.ocrMode {
                     Button("Open Document\u{2026}") { ocr.chooseAndOpen() }
                         .keyboardShortcut("o", modifiers: .command)
+                    Button("Close Document") { ocr.clear() }
+                        .keyboardShortcut("w", modifiers: [.command, .shift])
+                        .disabled(ocr.pages.isEmpty)
+                    Divider()
                     Button("Save Markdown\u{2026}") { ocr.exportMarkdown() }
                         .keyboardShortcut("s", modifiers: .command)
-                        .disabled(ocr.completedPages == 0)
-                    Button("Copy Markdown") { ocr.copyMarkdownToPasteboard() }
-                        .keyboardShortcut("c", modifiers: [.command, .shift])
                         .disabled(ocr.completedPages == 0)
                     // Same system share sheet the results carry, and like Finder's Share it takes
                     // no key equivalent.
@@ -281,13 +292,7 @@ struct OmniApp: App {
                         Text("Share\u{2026}")
                     }
                     .disabled(ocr.completedPages == 0)
-                    // Find navigation, on the chords every Mac app uses for it.
-                    Button("Find Next") { ocr.stepMatch(by: 1) }
-                        .keyboardShortcut("g", modifiers: .command)
-                        .disabled(ocr.matchCount == 0)
-                    Button("Find Previous") { ocr.stepMatch(by: -1) }
-                        .keyboardShortcut("g", modifiers: [.command, .shift])
-                        .disabled(ocr.matchCount == 0)
+                    Divider()
                     // Pause had no menu item and no key equivalent - it existed only as a button
                     // on the floating readout, which is the chrome that withdraws a few seconds
                     // after a run. So the one gesture that hands the GPU back POLITELY, keeping the
@@ -301,9 +306,6 @@ struct OmniApp: App {
                     Button("Stop Transcribing") { ocr.cancel() }
                         .keyboardShortcut(".", modifiers: .command)
                         .disabled(!ocr.isBusy)
-                    Button("Close Document") { ocr.clear() }
-                        .keyboardShortcut("w", modifiers: [.command, .shift])
-                        .disabled(ocr.pages.isEmpty)
                 }
                 Divider()
                 // Open / Reveal / Copy / Move to Trash act on the WHOLE selection. Quick Look and
@@ -328,10 +330,10 @@ struct OmniApp: App {
                 // inside a closed context menu never fire on macOS, so the app's own Shortcuts
                 // window was advertising a dead Option-Cmd-F. The context-menu items remain as
                 // click targets naming the same chords.
-                Button("Find similar") { model.findSimilarSelected() }
+                Button("Find Similar") { model.findSimilarSelected() }
                     .keyboardShortcut("f", modifiers: [.command, .option])
                     .disabled(!model.hasSelection || multi)
-                Button(multi ? "Copy \(model.selectedPaths.count) paths" : "Copy path") { model.copySelectedPaths() }
+                Button(multi ? "Copy \(model.selectedPaths.count) Paths" : "Copy Path") { model.copySelectedPaths() }
                     .keyboardShortcut("c", modifiers: [.command, .option])
                     .disabled(!model.hasSelection)
                 // Native share picker over the whole selection, mirroring the context menu. Like
@@ -346,13 +348,13 @@ struct OmniApp: App {
                 Divider()
                 // Search-level actions in one group: start a search from a file, save the
                 // current one. (A lone item between two separators reads as over-separation.)
-                Button("Search by a file\u{2026}") { model.searchByFilePanel() }
+                Button("Search by a File\u{2026}") { model.searchByFilePanel() }
                     .keyboardShortcut("o", modifiers: [.command, .shift])
                     .disabled(model.phase != .ready)
                 // Bookmark the current search. The menu bar owns the Cmd-D shortcut (always present,
                 // just disabled when there's nothing to save) so it works even when the toolbar star
                 // is hidden; the toolbar button is a click target that names the same shortcut.
-                Button(model.currentSearchIsBookmarked ? "Remove bookmark" : "Bookmark search") {
+                Button(model.currentSearchIsBookmarked ? "Remove Bookmark" : "Bookmark Search") {
                     model.toggleBookmarkCurrentSearch()
                 }
                 .keyboardShortcut("d", modifiers: .command)
@@ -370,9 +372,6 @@ struct OmniApp: App {
                 }
                 .keyboardShortcut("t", modifiers: [.command, .option])
                 .disabled(Transcribe.candidates(model.selectedPathsForMenu).isEmpty)
-                Button("Search for Selected Text") { searchForTranscriptSelection() }
-                    .keyboardShortcut("e", modifiers: [.command, .option])
-                    .disabled(!model.ocrMode)
                 Divider()
                 Button("Generate Tags") { model.requestTags(Array(model.selectedPaths)) }
                     .disabled(!model.hasSelection || !model.canGenerateTags || !model.selectionIsTaggable)
@@ -388,6 +387,19 @@ struct OmniApp: App {
                 }
                 .disabled(model.selection.map { !model.canIgnoreEnclosingFolder(ofPath: $0) } ?? true)
                 Divider()
+                // THE LIBRARY'S OWN COMMANDS, LAST. These two were attached after the View menu's
+                // toolbar group, which put "Index" and "Pause indexing" under Show Toolbar and
+                // Customize Toolbar - View is where a window's appearance is changed, and building
+                // the index is not an appearance. They sit with the serving switch instead: the
+                // two things Omni does in the background, in the menu that owns the library.
+                //
+                // Cmd-Shift-I, not Cmd-R: in a file browser Cmd-R reads as Finder's Show Original /
+                // Reload, so it is reserved (Reveal uses Cmd-Shift-R above).
+                Button(model.isPaused ? "Resume Indexing" : (model.indexedFiles == 0 ? "Index" : "Update Index")) { model.startIndexing() }
+                    .keyboardShortcut("i", modifiers: [.command, .shift])
+                    .disabled(model.isIndexing || !model.canIndex)
+                Button("Pause Indexing") { model.pauseIndexing() }
+                    .disabled(!model.isIndexing)
                 // The serving switch, same one as Settings and the toolbar toggle.
                 Toggle("Serve over HTTP", isOn: Binding(get: { model.serving.enabled },
                                                         set: { model.serving.enabled = $0 }))
@@ -460,27 +472,33 @@ struct OmniApp: App {
                     .keyboardShortcut("g", modifiers: [.command, .shift])
                     .disabled(model.phase != .ready)
             }
-            CommandGroup(after: .toolbar) {
-                // Cmd-Shift-I, not Cmd-R: in a file browser Cmd-R reads as Finder's Show Original /
-                // Reload, so it is reserved (Reveal uses Cmd-Shift-R above).
-                Button(model.isPaused ? "Resume indexing" : (model.indexedFiles == 0 ? "Index" : "Update")) { model.startIndexing() }
-                    .keyboardShortcut("i", modifiers: [.command, .shift])
-                    .disabled(model.isIndexing || !model.canIndex)
-                Button("Pause indexing") { model.pauseIndexing() }
-                    .disabled(!model.isIndexing)
-            }
             // Focus the toolbar search field (.searchable doesn't bind ⌘F on its own).
+            // THE WHOLE FIND GROUP, in the menu Mac users look in for it. Find focuses the
+            // toolbar search field (`.searchable` does not bind Cmd-F on its own); Find Next and
+            // Find Previous step the transcript's matches and used to sit in File, four items
+            // below Save, where nobody looks for Cmd-G. "Search for Selected Text" is this app's
+            // Use Selection for Find, so it joins them.
             CommandGroup(after: .textEditing) {
+                Divider()
                 Button("Find") {
                     guard let w = NSApp.keyWindow ?? NSApp.mainWindow,
                           let item = w.toolbar?.items.compactMap({ $0 as? NSSearchToolbarItem }).first else { return }
                     w.makeFirstResponder(item.searchField)
                 }
                 .keyboardShortcut("f", modifiers: .command)
+                Button("Find Next") { ocr.stepMatch(by: 1) }
+                    .keyboardShortcut("g", modifiers: .command)
+                    .disabled(!model.ocrMode || ocr.matchCount == 0)
+                Button("Find Previous") { ocr.stepMatch(by: -1) }
+                    .keyboardShortcut("g", modifiers: [.command, .shift])
+                    .disabled(!model.ocrMode || ocr.matchCount == 0)
+                Button("Search for Selected Text") { searchForTranscriptSelection() }
+                    .keyboardShortcut("e", modifiers: [.command, .option])
+                    .disabled(!model.ocrMode)
             }
             CommandGroup(replacing: .help) {
-                Button("Omni website") { NSWorkspace.shared.open(URL(string: "https://hanxiao.io/omni")!) }
-                Button("Omni keyboard shortcuts") { showShortcuts() }
+                Button("Omni Website") { NSWorkspace.shared.open(URL(string: "https://hanxiao.io/omni")!) }
+                Button("Omni Keyboard Shortcuts") { showShortcuts() }
                     .keyboardShortcut("/", modifiers: .command)
             }
         }
