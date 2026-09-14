@@ -28,23 +28,35 @@ struct Sidebar: View {
     @State private var showPhotoPicker = false
     @State private var showPhotoDenied = false
 
+    /// A crawl root reports on its own pass; a folder a broader root covers has no pass to report
+    /// on, so it gets the quieter row. Both are selectable, both browse, and both carry the folder
+    /// context menu - which is what keeps "Add to Search Scope" reachable for a nested folder.
+    @ViewBuilder private func folderRow(_ url: URL) -> some View {
+        if model.isCrawlRoot(url) {
+            FolderRow(url: url,
+                      deselect: { if selection == .folder(url) { selection = nil } })
+        } else {
+            CoveredFolderRow(url: url)
+        }
+    }
+
     /// Extracted from `body`: with the folder row, its four badge states and the shared
     /// context menu all inline, the whole `List` stopped type-checking in reasonable time.
     @ViewBuilder private var foldersSection: some View {
             Section("Folders") {
-                ForEach(model.roots, id: \.self) { url in
-                    FolderRow(url: url,
-                              deselect: { if selection == .folder(url) { selection = nil } })
-                    .tag(SidebarSelection.folder(url))
-                }
-                // FOLDERS A BROADER ROOT NOW COVERS. They are indexed - by that root - and a search
-                // can still be scoped to any of them, which is exactly what issue #18 asked for.
-                // What they are not is crawl roots, so they carry no progress and no pause: adding
-                // six folders and then their parent used to make six rows disappear with no word,
-                // and "it consumed all of them" is the reasonable thing to conclude from that.
-                ForEach(model.coveredFolders, id: \.self) { url in
-                    CoveredFolderRow(url: url)
-                        .tag(SidebarSelection.folder(url))
+                // NESTED, the way Finder's sidebar nests. The user's folders are a tree - a parent
+                // and the folders they added inside it - and a flat list could not say so: after a
+                // parent absorbed six children the sidebar held seven rows with no sign that six
+                // of them live inside the seventh.
+                //
+                // `OutlineGroup` is the platform's own control for this, so the disclosure
+                // triangles, their state and the keyboard behaviour are all native. A folder with
+                // nothing added under it gets nil children and therefore no triangle.
+                ForEach(model.folderTree) { node in
+                    OutlineGroup(node, children: \.children) { item in
+                        folderRow(item.url)
+                            .tag(SidebarSelection.folder(item.url))
+                    }
                 }
                 Button { pickFolder() } label: { Label("Add folder\u{2026}", systemImage: "plus") }
                     .buttonStyle(.plain)

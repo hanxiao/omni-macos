@@ -3689,6 +3689,13 @@ final class AppModel {
     /// Folders a broader root covers. Indexed - by that root - and scopable, but not crawl roots.
     var coveredFolders: [URL] { addedFolders.filter { u in !roots.contains(u) } }
 
+    /// The user's folders nested by containment, for the sidebar. See `RootScope.tree`.
+    var folderTree: [RootScope.Node] { RootScope.tree(addedFolders) }
+
+    /// Is this folder a crawl root, or one a broader root covers? The row reads differently for
+    /// each: a root has a pass of its own to report on, a covered folder has none.
+    func isCrawlRoot(_ url: URL) -> Bool { roots.contains(url) }
+
     private func saveAddedFolders() {
         UserDefaults.standard.set(addedFolders.map { $0.path }, forKey: "omni.addedFolders")
     }

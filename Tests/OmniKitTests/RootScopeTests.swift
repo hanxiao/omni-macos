@@ -152,3 +152,85 @@ final class CrawlOverlapTests: XCTestCase {
         XCTAssertTrue(both.contains { $0.hasSuffix("/beta/b.txt") }, "the sibling root was dropped")
     }
 }
+
+/// The sidebar's folder tree. A flat list cannot say what the user's folders mean to each other -
+/// after a parent absorbs six children it held seven rows with no sign that six live inside the
+/// seventh - so they are nested by containment, the way Finder's sidebar nests.
+final class FolderTreeTests: XCTestCase {
+
+    private func urls(_ p: [String]) -> [URL] { p.map { URL(fileURLWithPath: $0) } }
+    private func shape(_ nodes: [RootScope.Node]) -> [String] {
+        nodes.flatMap { n -> [String] in
+            [n.url.lastPathComponent] + (n.children ?? []).flatMap { c in
+                ["  " + c.url.lastPathComponent] + (c.children ?? []).map { "    " + $0.url.lastPathComponent }
+            }
+        }
+    }
+
+    func testChildrenNestUnderTheParentTheyWereAddedWith() {
+        let t = RootScope.tree(urls(["/w/parent/alpha", "/w/parent/beta", "/w/parent"]))
+        XCTAssertEqual(t.count, 1, "the parent should be the only top-level row")
+        XCTAssertEqual(shape(t), ["parent", "  alpha", "  beta"])
+    }
+
+    /// NEAREST ancestor, not the outermost: a/b/c hangs off a/b, not off a.
+    func testEachFolderHangsOffItsNearestAddedAncestor() {
+        let t = RootScope.tree(urls(["/w/a", "/w/a/b", "/w/a/b/c"]))
+        XCTAssertEqual(shape(t), ["a", "  b", "    c"])
+    }
+
+    /// A gap in the chain is fine - with a/b not added, a/b/c hangs off a.
+    func testAMissingLevelIsSkipped() {
+        let t = RootScope.tree(urls(["/w/a", "/w/a/b/c"]))
+        XCTAssertEqual(shape(t), ["a", "  c"])
+    }
+
+    /// Unrelated folders are all top level, in the order they were added.
+    func testSiblingsStayTopLevelInAddOrder() {
+        let t = RootScope.tree(urls(["/w/two", "/w/one", "/x/three"]))
+        XCTAssertEqual(t.map { $0.url.lastPathComponent }, ["two", "one", "three"])
+        XCTAssertTrue(t.allSatisfy { $0.children == nil })
+    }
+
+    /// A NAME PREFIX IS NOT A PARENT. "/w/Docs2" must not nest under "/w/Docs" - the same trap the
+    /// crawl set has, and it would be visible here as a folder filed inside one it has nothing to
+    /// do with.
+    func testANamePrefixDoesNotNest() {
+        let t = RootScope.tree(urls(["/w/Docs", "/w/Docs2"]))
+        XCTAssertEqual(t.count, 2)
+        XCTAssertTrue(t.allSatisfy { $0.children == nil })
+    }
+
+    /// nil, not [], for a leaf: SwiftUI draws a disclosure triangle for an empty array, and a
+    /// folder with nothing added under it must not get one.
+    func testALeafHasNilChildrenSoItDrawsNoTriangle() {
+        let t = RootScope.tree(urls(["/w/only"]))
+        XCTAssertNil(t.first?.children)
+    }
+
+    /// Adding the same folder twice must not produce two rows.
+    func testARepeatedFolderAppearsOnce() {
+        let t = RootScope.tree(urls(["/w/a", "/w/a", "/w/a/b"]))
+        XCTAssertEqual(t.count, 1)
+        XCTAssertEqual(shape(t), ["a", "  b"])
+    }
+
+    /// Order of addition must not change the shape, only the order within a level.
+    func testTheShapeDoesNotDependOnAddOrder() {
+        let a = RootScope.tree(urls(["/w/p", "/w/p/x", "/w/p/y"]))
+        let b = RootScope.tree(urls(["/w/p/y", "/w/p/x", "/w/p"]))
+        XCTAssertEqual(a.count, b.count)
+        XCTAssertEqual(Set(shape(a)), Set(shape(b)))
+    }
+
+    /// Every added folder appears exactly once somewhere in the tree - nothing is lost to nesting.
+    func testEveryAddedFolderAppearsExactlyOnce() {
+        let added = urls(["/w/p", "/w/p/x", "/w/p/x/deep", "/w/q", "/w/p/y"])
+        func flatten(_ ns: [RootScope.Node]) -> [String] {
+            ns.flatMap { [$0.url.path] + flatten($0.children ?? []) }
+        }
+        let all = flatten(RootScope.tree(added))
+        XCTAssertEqual(all.sorted(), added.map(\.path).sorted())
+        XCTAssertEqual(Set(all).count, all.count)
+    }
+}

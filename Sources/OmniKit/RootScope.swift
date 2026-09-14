@@ -39,6 +39,53 @@ public enum RootScope {
         roots.first { covers($0.path, url.path) }
     }
 
+    /// One node of the sidebar's folder tree: a folder the user added, and the folders they added
+    /// beneath it.
+    ///
+    /// `children` is nil for a leaf rather than empty, because SwiftUI draws a disclosure triangle
+    /// for an empty array and a folder with nothing added under it must not get one.
+    public struct Node: Identifiable, Hashable, Sendable {
+        public let url: URL
+        public let children: [Node]?
+        public var id: String { url.path }
+    }
+
+    /// The user's folders as a TREE, nested by containment.
+    ///
+    /// A flat list cannot say what the folders mean to each other: after a parent absorbs six
+    /// children the sidebar held seven rows with no indication that six of them live inside the
+    /// seventh. Nesting is also what makes the covered ones legible - they are not a second class
+    /// of folder, they are the folders inside this one.
+    ///
+    /// Each folder hangs off its NEAREST added ancestor, so adding `a`, `a/b` and `a/b/c` nests
+    /// three deep rather than hanging both descendants off `a`. Order within a level follows the
+    /// order they were added, which is the order the user has in mind.
+    public static func tree(_ added: [URL]) -> [Node] {
+        let unique = dedupe(added)
+        func nearestAncestor(of url: URL) -> URL? {
+            unique
+                .filter { $0.path != url.path && covers($0.path, url.path) }
+                .max { $0.path.count < $1.path.count }
+        }
+        var childrenOf: [String: [URL]] = [:]
+        var top: [URL] = []
+        for u in unique {
+            if let parent = nearestAncestor(of: u) { childrenOf[parent.path, default: []].append(u) }
+            else { top.append(u) }
+        }
+        func build(_ url: URL) -> Node {
+            let kids = childrenOf[url.path] ?? []
+            return Node(url: url, children: kids.isEmpty ? nil : kids.map(build))
+        }
+        return top.map(build)
+    }
+
+    /// First spelling of each path wins, so a repeat add never produces a second row.
+    public static func dedupe(_ urls: [URL]) -> [URL] {
+        var seen = Set<String>()
+        return urls.filter { seen.insert($0.path).inserted }
+    }
+
     /// PATH BOUNDARY, not a bare prefix. "/a/Docs2" is not inside "/a/Docs", and a plain
     /// `hasPrefix` says it is - the same defect issue #18 turned up in the dense-hit filter.
     @inline(__always)
