@@ -830,11 +830,15 @@ struct ContentView: View {
         if #available(macOS 26.0, *) {
             ToolbarSpacer(.flexible)
         }
-        // Pre-Tahoe gets the equivalent flexible space from WindowTitleHider's tuner, which inserts
-        // AppKit's native .flexibleSpace NSToolbarItem after the chevrons: a SwiftUI
-        // `ToolbarItem { Spacer() }` is silently DROPPED on macOS 14/15 (verified via the live
-        // NSToolbar's item list), so without the AppKit item nothing separates the leading chevrons
-        // from the trailing cluster and the stretchy search field parks every control center-left.
+        // NO SPACER PRE-TAHOE, AND NONE IS NEEDED ANY MORE. This used to say the tuner inserted an
+        // AppKit `.flexibleSpace` item to do the same job; it did once, and 692c238 took that
+        // machinery out with the in-field search-by-file button while leaving the claim here - so
+        // the comment described code that had not existed for a while. A SwiftUI
+        // `ToolbarItem { Spacer() }` is genuinely dropped on macOS 14/15 (verified against the live
+        // NSToolbar's item list), which is why the AppKit item was there.
+        //
+        // It is moot now: pre-Tahoe every item this toolbar declares is `.primaryAction`, which is
+        // trailing by definition, so there is nothing on the leading edge to push away from.
         // Bookmark the current search. The only way into History when recording is set to "Only when
         // I bookmark", and a quick save otherwise. Appears once there's a search to keep.
         if model.phase == .ready, !model.ocrMode, model.hasActiveSearch {
@@ -1350,16 +1354,22 @@ private struct WindowTitleHider: NSViewRepresentable {
     /// straight into OCR opened the page rail at the search sidebar's width.
     var sidebarWidth: CGFloat
 
-    /// Toolbar tuner (an invisible background view holding coalesced observers; despite the
-    /// legacy name it no longer touches the window title - stock Sequoia titlebar chrome, i.e.
-    /// the visible "Omni" title, the system sidebar toggle, and the split tracking separator,
-    /// proved load-bearing: every attempt to hide any of them broke another state - the toggle
-    /// vanished, section layout collapsed, or divider drags misrendered). What it does do:
-    /// - pre-Tahoe: caps the search field at Tahoe's ~300pt and installs the flexible-space
-    ///   width constraint on the chevrons item so the trailing cluster hugs the right edge.
-    /// - all systems: keeps the search-by-file button installed INSIDE the search field's
-    ///   trailing edge (magnifier left, upload right), hidden while the field has text so it
-    ///   cannot be drawn over by a long query, and shrinks the stock magnifier to match.
+    /// Window tuner (an invisible background view holding coalesced observers). Despite the legacy
+    /// name it does not touch the window title: stock Sequoia titlebar chrome - the visible "Omni"
+    /// title, the system sidebar toggle, the split tracking separator - proved load-bearing, and
+    /// every attempt to hide any of it broke another state (the toggle vanished, section layout
+    /// collapsed, or divider drags misrendered).
+    ///
+    /// WHAT IT ACTUALLY DOES, and this list is now the code rather than a memory of it: sets the
+    /// restored sidebar width once per wanted value, turns off the titlebar separator, pins the
+    /// full-height `.unified` toolbar style, keeps the window alive when it closes, and hides the
+    /// 1pt rule inside Tahoe's titlebar scroll pocket.
+    ///
+    /// It no longer caps the search field, installs a flexible-space constraint, or embeds the
+    /// search-by-file button in the field - 692c238 removed all three when that button became a
+    /// toolbar item, and this comment went on claiming them. If a pre-Tahoe layout problem is ever
+    /// traced back here, that is the history: the tuner is smaller than it reads.
+    ///
     /// All work runs in a coalesced main.async pass - never synchronously inside a window or
     /// toolbar notification, where mutations mid-SwiftUI-commit are unsafe.
     final class TunerView: NSView {
