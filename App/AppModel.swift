@@ -3656,38 +3656,62 @@ final class AppModel {
     }
 
     private func loadRoots() {
-        // Canonicalize on load too, so a root persisted before symlink resolution (e.g. a /tmp path)
-        // migrates to its resolved form and its per-folder count starts matching the index.
-        if let saved = UserDefaults.standard.array(forKey: "omni.roots") as? [String], !saved.isEmpty {
-            roots = canonicalizeRoots(saved.map { URL(fileURLWithPath: $0) })
+        // MIGRATION, in the order the keys appeared. `omni.addedFolders` is the source of truth
+        // now; before it there was `omni.roots` (the crawl set) and briefly `omni.coveredFolders`
+        // beside it. Seeding from both loses nothing for anyone upgrading.
+        let stored = UserDefaults.standard.array(forKey: "omni.addedFolders") as? [String]
+        if let stored, !stored.isEmpty {
+            addedFolders = stored.map { URL(fileURLWithPath: $0) }
         } else {
-            roots = canonicalizeRoots(FileCrawler.defaultRoots())
+            let legacyRoots = (UserDefaults.standard.array(forKey: "omni.roots") as? [String]) ?? []
+            let legacyCovered = (UserDefaults.standard.array(forKey: "omni.coveredFolders") as? [String]) ?? []
+            let seed = legacyRoots + legacyCovered
+            addedFolders = seed.isEmpty ? FileCrawler.defaultRoots() : seed.map { URL(fileURLWithPath: $0) }
         }
-        // Covered folders ride alongside: they are not crawl roots, so they are loaded but never
-        // handed to the indexer. Anything that has since become a root drops out here.
-        if let saved = UserDefaults.standard.array(forKey: "omni.coveredFolders") as? [String] {
-            coveredFolders = saved.map { URL(fileURLWithPath: $0) }
-                .filter { c in !roots.contains(c) }
-        }
+        recomputeRoots()
     }
+
     private func saveRoots() { UserDefaults.standard.set(roots.map { $0.path }, forKey: "omni.roots") }
 
-    /// Folders the user added that a later, broader root now covers. They are NOT crawl roots -
-    /// `roots` is still the canonical crawl set and nothing here reaches the indexer - they are the
-    /// user's own list of places worth naming, kept so the sidebar can still offer them and a
-    /// search can still be scoped to one. See addRoots for why.
-    var coveredFolders: [URL] = [] {
-        didSet { if coveredFolders != oldValue { saveCoveredFolders() } }
+    /// ONE STORED LIST, TWO DERIVED ONES. `addedFolders` is what the user actually chose, in the
+    /// order they chose it; `roots` (the crawl set) and `coveredFolders` are both COMPUTED from it.
+    ///
+    /// They used to be two stored lists that had to be kept in agreement, and they did not stay in
+    /// agreement: removing a parent dropped it from `roots` and deleted every vector beneath it
+    /// while the folders it had covered stayed in the sidebar, now naming nothing indexed. A
+    /// derived value cannot desync from its source, which is the only reason that class of bug is
+    /// gone rather than patched.
+    ///
+    /// It also makes promotion free: remove the parent and its children simply become roots again,
+    /// because `RootScope.canonical` no longer has a reason to drop them.
+    private(set) var addedFolders: [URL] = []
+
+    /// Folders a broader root covers. Indexed - by that root - and scopable, but not crawl roots.
+    var coveredFolders: [URL] { addedFolders.filter { u in !roots.contains(u) } }
+
+    private func saveAddedFolders() {
+        UserDefaults.standard.set(addedFolders.map { $0.path }, forKey: "omni.addedFolders")
     }
-    private func saveCoveredFolders() {
-        UserDefaults.standard.set(coveredFolders.map { $0.path }, forKey: "omni.coveredFolders")
+
+    /// The single place `roots` is derived. Every mutation of `addedFolders` goes through here.
+    private func recomputeRoots() {
+        addedFolders = dedupeKeepingOrder(resolvedRoots(addedFolders))
+        roots = RootScope.canonical(addedFolders)
+        saveAddedFolders()
+        saveRoots()
+    }
+
+    private func dedupeKeepingOrder(_ urls: [URL]) -> [URL] {
+        var seen = Set<String>()
+        return urls.filter { seen.insert($0.path).inserted }
     }
     /// The root that actually indexes a covered folder, for the row's tooltip.
     func rootCovering(_ url: URL) -> URL? { RootScope.rootCovering(url, in: roots) }
     /// Drop a covered folder from the list. It is not a root, so there is nothing to un-index -
     /// this only forgets the shortcut.
     func removeCoveredFolder(_ url: URL) {
-        coveredFolders.removeAll { $0 == url }
+        addedFolders.removeAll { $0 == url }
+        recomputeRoots()
     }
 
     // MARK: - Serving: what Omni indexes, over the API
@@ -4069,39 +4093,24 @@ final class AppModel {
     /// canonicalizes + persists + rebuilds the FSEvents watcher ONCE for the whole batch, then queues
     /// them for a single serialized catch-up - instead of N watcher rebuilds and N concurrent crawls.
     func addRoots(_ urls: [URL]) {
-        let new = urls.filter { !roots.contains($0) }
+        let resolved = resolvedRoots(urls)
+        let known = Set(addedFolders.map(\.path))
+        let new = resolved.filter { !known.contains($0.path) }
         guard !new.isEmpty else { return }
-        let before = roots
-        roots = canonicalizeRoots(roots + new)
-        // FOLDERS THE NEW ROOT SWALLOWED. Canonicalization is right for CRAWLING - a parent and
-        // its child cover the same files, and walking both is the same work twice - but it used to
-        // be right silently: add six folders, then their parent, and six sidebar rows vanish with
-        // no word. Reported as "it consumed all of them instead of literally indexing and being
-        // separate" (#18), and the reasonable conclusion from the outside is that the folders are
-        // no longer indexed. They are, by the parent - and a search can still be scoped to any of
-        // them, which is the whole point of the multi-folder scope that issue asked for (verified
-        // over HTTP: with only the parent as a source, `folders: [alpha, gamma]` returns exactly
-        // alpha and gamma).
-        //
-        // So they are kept as SCOPE SHORTCUTS: still listed, still right-clickable for "Add to
-        // Search Scope", marked as covered by the root that now indexes them. Nothing about what
-        // gets crawled changes.
-        let swallowed = RootScope.covered(resolvedRoots(before + new))
-        if !swallowed.isEmpty {
-            coveredFolders = (coveredFolders + swallowed).filter { c in !roots.contains(c) }
-            saveCoveredFolders()
-        }
-        // A folder that has just BECOME a root is no longer merely covered.
-        if coveredFolders.contains(where: { roots.contains($0) }) {
-            coveredFolders.removeAll { roots.contains($0) }
-            saveCoveredFolders()
-        }
-        saveRoots()
+        let rootsBefore = Set(roots.map(\.path))
+        addedFolders += new
+        recomputeRoots()
         restartWatcher()   // once
+        // Only the folders that actually became CRAWL roots are queued. A folder a broader root
+        // already covers needs no pass of its own - its files are indexed by that root - and
+        // queueing it would crawl the same tree twice, which is the thing canonicalization exists
+        // to prevent.
+        let toCrawl = roots.filter { !rootsBefore.contains($0.path) }
+        guard !toCrawl.isEmpty else { return }
         // FSEvents only sees future changes, so pre-existing files would never be indexed without a
         // manual reindex. Queue the new roots and kick the catch-up, which runs ONE pass at a time so
         // we never start concurrent index() calls racing the same Indexer.
-        indexNewSourcesFirst { self.pendingCatchUpRoots.append(contentsOf: new) }
+        indexNewSourcesFirst { self.pendingCatchUpRoots.append(contentsOf: toCrawl) }
     }
 
     /// PUT A JUST-ADDED SOURCE AT THE FRONT OF THE QUEUE.
@@ -4205,7 +4214,16 @@ final class AppModel {
         }
     }
     func removeRoot(_ url: URL) {
-        roots.removeAll { $0 == url }
+        // OUT OF THE USER'S LIST, and `roots` follows. A folder this one was covering becomes a
+        // crawl root again all by itself, because RootScope no longer has a reason to drop it -
+        // that promotion used to not happen at all, so removing a parent left its children in the
+        // sidebar naming files that had just been deleted from the index.
+        let rootsBefore = Set(roots.map(\.path))
+        addedFolders.removeAll { $0 == url }
+        recomputeRoots()
+        // Promoted by this removal: under the folder being removed, and a root only now. Their
+        // vectors go with the delete below, so they have to be crawled again.
+        let promoted = roots.filter { !rootsBefore.contains($0.path) && RootScope.covers(url.path, $0.path) }
         if filterFolder == url { filterFolder = nil }
         if pausedRoots.remove(url.path) != nil {
             UserDefaults.standard.set(Array(pausedRoots), forKey: "omni.pausedRoots")
@@ -4228,9 +4246,17 @@ final class AppModel {
                 await MainActor.run {
                     self.refreshIndexStats(store)
                     self.refreshSearchAfterBackgroundChange()
+                    self.requeuePromoted(promoted)
                 }
             }
         }
+    }
+
+    /// Folders that became roots because the root covering them was removed. The delete took their
+    /// vectors with it, so they need a pass; queued rather than started, like any other new source.
+    private func requeuePromoted(_ promoted: [URL]) {
+        guard !promoted.isEmpty else { return }
+        indexNewSourcesFirst { self.pendingCatchUpRoots.append(contentsOf: promoted) }
     }
 
     // MARK: - Search

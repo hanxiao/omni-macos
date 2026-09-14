@@ -113,11 +113,23 @@ public struct FileCrawler: Sendable {
         // paths by concatenation, so without this the two engines return the same files under
         // different names. Those names are the index's keys: a switch would make every file on the
         // machine look new, and re-embed all of it. Once per root, not per entry.
-        let resolved: [(url: URL, path: String)] = roots.map { r in
+        var resolved: [(url: URL, path: String)] = roots.map { r in
             var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
             if realpath(r.path, &buf) != nil { return (r, String(cString: buf)) }
             return (r, r.path)
         }
+        // DEFENCE IN DEPTH AGAINST OVERLAPPING ROOTS. AppModel already reduces the user's folders
+        // to ancestors before any pass starts, and until now that was the ONLY thing standing
+        // between "add a folder and its parent" and crawling the same tree twice: BulkDirWalker
+        // pushes every root onto one shared stack and has no notion of one containing another, so
+        // a nested pair would be walked from both ends - every file hashed twice, and the ones the
+        // index had not seen embedded twice.
+        //
+        // Dropping the nested root here costs one pass over a handful of paths and makes the
+        // guarantee local to the thing that does the walking, rather than a property of every
+        // caller remembering. Resolved paths, because that is what the walk uses as its keys.
+        let keep = Set(RootScope.canonical(resolved.map { URL(fileURLWithPath: $0.path) }).map(\.path))
+        resolved = resolved.filter { keep.contains($0.path) }
 
         // The device of each root, so the walk stays on one volume the way the enumerator does. A
         // mount point inside a root (a disk image, a network share) would otherwise be crawled as

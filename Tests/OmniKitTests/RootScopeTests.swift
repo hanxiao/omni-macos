@@ -80,3 +80,75 @@ final class RootScopeTests: XCTestCase {
         XCTAssertTrue(RootScope.covers("/w/a", "/w/a/b"))
     }
 }
+
+/// The invariant the whole nesting rule exists for: a file is crawled ONCE however many of the
+/// folders covering it the user added.
+///
+/// This is the belt to canonicalization's braces. Until it existed, `AppModel.canonicalizeRoots`
+/// was the only thing standing between "add a folder and its parent" and walking the same tree
+/// twice - BulkDirWalker pushes every root onto one shared stack and has no notion of one
+/// containing another, so a nested pair is walked from both ends: every file hashed twice, and
+/// every file the index had not seen embedded twice.
+final class CrawlOverlapTests: XCTestCase {
+
+    private func tree() throws -> URL {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("overlap-\(UUID().uuidString)")
+        for sub in ["alpha", "beta", "alpha/deep"] {
+            try FileManager.default.createDirectory(at: root.appendingPathComponent(sub),
+                                                    withIntermediateDirectories: true)
+        }
+        for rel in ["top.txt", "alpha/a.txt", "alpha/deep/d.txt", "beta/b.txt"] {
+            try String(repeating: "content for \(rel)\n", count: 40)
+                .write(to: root.appendingPathComponent(rel), atomically: true, encoding: .utf8)
+        }
+        return root
+    }
+
+    private func crawl(_ roots: [URL]) -> [String] {
+        var seen: [String] = []
+        let lock = NSLock()
+        FileCrawler(roots: roots).walk(shouldContinue: { true }) { file in
+            lock.lock(); seen.append(file.path); lock.unlock()
+        }
+        return seen
+    }
+
+    func testAFileUnderBothAParentAndAChildRootIsCrawledOnce() throws {
+        let root = try tree()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let parentOnly = crawl([root]).sorted()
+        XCTAssertEqual(parentOnly.count, 4, "the corpus itself is wrong")
+
+        // The reporter's shape: children added first, then the parent.
+        let withOverlap = crawl([root.appendingPathComponent("alpha"),
+                                 root.appendingPathComponent("alpha/deep"),
+                                 root.appendingPathComponent("beta"),
+                                 root]).sorted()
+        XCTAssertEqual(Set(withOverlap).count, withOverlap.count,
+                       "a file was crawled twice: \(withOverlap)")
+        XCTAssertEqual(withOverlap, parentOnly,
+                       "adding nested folders changed what gets crawled")
+    }
+
+    /// And the other order, because the walker sees whatever order the caller kept.
+    func testTheParentFirstIsTheSameCrawl() throws {
+        let root = try tree()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let a = crawl([root, root.appendingPathComponent("alpha")]).sorted()
+        let b = crawl([root.appendingPathComponent("alpha"), root]).sorted()
+        XCTAssertEqual(a, b)
+        XCTAssertEqual(Set(a).count, a.count, "a file was crawled twice")
+    }
+
+    /// Siblings are not nested and must BOTH be crawled - the failure mode of over-eager dropping.
+    func testTwoSiblingRootsAreBothCrawled() throws {
+        let root = try tree()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let both = crawl([root.appendingPathComponent("alpha"),
+                          root.appendingPathComponent("beta")]).sorted()
+        XCTAssertEqual(both.count, 3, "expected alpha/a.txt, alpha/deep/d.txt, beta/b.txt - got \(both)")
+        XCTAssertTrue(both.contains { $0.hasSuffix("/beta/b.txt") }, "the sibling root was dropped")
+    }
+}
