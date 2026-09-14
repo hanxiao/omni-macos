@@ -347,8 +347,17 @@ private struct PageThumb: View {
             if selected { RoundedRectangle(cornerRadius: 8).fill(Color.accentColor) }
         }
         .contentShape(Rectangle())
+        // SELECT ON THE FIRST CLICK, not after the double-click window has closed. A count-2
+        // tap and a count-1 tap on the same view cannot both be plain gestures: SwiftUI has to
+        // wait for the double to FAIL before it can conclude the single, so the selection did not
+        // move until the double-click interval expired. Measured here at 360-606 ms between the
+        // mouse-up and `select` running, on a default 500 ms interval - that delay WAS "clicking a
+        // thumbnail feels laggy"; the main thread was not busy, it was waiting for the timer. A
+        // SIMULTANEOUS single tap is not required to wait for the other to fail, so it lands on
+        // mouse-up, and a double click still selects on its way to opening, which is what Finder
+        // does. The same pair was in both browsers and the photo browser, on every row.
         .onTapGesture(count: 2) { onPreview() }
-        .onTapGesture { session.select(page.id) }
+        .simultaneousGesture(TapGesture().onEnded { session.select(page.id) })
         // The app's existing file actions, on the file this page came from - not a second set of
         // them. Reveal and Open are the same `PhotoActions` calls the results list makes, so a
         // page behaves like any other file the app knows about.

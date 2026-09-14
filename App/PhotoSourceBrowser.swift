@@ -98,7 +98,7 @@ struct PhotoSourceBrowser: View {
                                 in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                     .contentShape(.rect)
                     .onTapGesture(count: 2) { PhotoActions.open(hit.path) }
-                    .onTapGesture { selected = hit.path; model.selectSingle(hit.path) }
+                    .simultaneousGesture(TapGesture().onEnded { selected = hit.path; model.selectSingle(hit.path) })
                     .contextMenu { menu(hit) }
                 }
             }
@@ -146,7 +146,7 @@ struct PhotoSourceBrowser: View {
                 .padding(.trailing, BrowserMetrics.rowTrail)
                 .contentShape(RoundedRectangle(cornerRadius: BrowserMetrics.selectionRadius))
                 .onTapGesture(count: 2) { PhotoActions.open(hit.path) }
-                .onTapGesture { selected = hit.path; model.selectSingle(hit.path) }
+                .simultaneousGesture(TapGesture().onEnded { selected = hit.path; model.selectSingle(hit.path) })
                 .contextMenu { menu(hit) }
                 .listRowSeparator(.hidden)
                 .listRowBackground(

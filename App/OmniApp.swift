@@ -197,7 +197,31 @@ struct OmniApp: App {
                     let key = UserDefaults.standard.string(forKey: "omni.ocrOpen") ?? ""
                     guard !key.isEmpty else { return }
                     model.ocrMode = true
+                    if let mode = UserDefaults.standard.string(forKey: "omni.ocrMode").flatMap(OCRSession.ViewMode.init(rawValue:)) {
+                        ocr.mode = mode
+                    }
                     ocr.open(urls: key.split(separator: ":").map { URL(fileURLWithPath: String($0)) })
+                }
+                // The same seam for CLICKING THE PAGE RAIL. `-omni.ocrClickPages 3,17,5` walks
+                // those pages once enough of them are transcribed to be selectable, through
+                // `select` - the exact call a click on a thumbnail makes, so what it costs is what
+                // a click costs. It exists because the stall being chased here only appears under
+                // a real click and the investigation had no way to produce one: reading a log the
+                // user generated is a slow loop, and a screenshot-and-cliclick loop drives the
+                // pointer across whatever else is on their screen.
+                .task {
+                    let spec = UserDefaults.standard.string(forKey: "omni.ocrClickPages") ?? ""
+                    let pages = spec.split(separator: ",").compactMap { Int($0) }
+                    guard !pages.isEmpty else { return }
+                    while ocr.completedPages <= pages.max()! {
+                        try? await Task.sleep(for: .milliseconds(500))
+                        if Task.isCancelled { return }
+                    }
+                    for page in pages {
+                        try? await Task.sleep(for: .milliseconds(900))
+                        UIProbe.count("SEAM.click(\(page))")
+                        ocr.select(page)
+                    }
                 }
                 // The same seam for a QUERY, and it exists because XCUITest cannot get text into
                 // the toolbar's search field: the field reports exists / enabled / hittable true
@@ -673,24 +697,65 @@ enum HangWatch {
     private static var worst: Double = 0
 
     private static var sink: FileHandle?
+    private static var cpuAtLast: Double = 0
+
+    /// Seconds of CPU this thread has actually consumed, user plus system.
+    private static func threadCPU() -> Double {
+        var info = thread_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<thread_basic_info>.size / MemoryLayout<integer_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                thread_info(mach_thread_self(), thread_flavor_t(THREAD_BASIC_INFO), $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return 0 }
+        return Double(info.user_time.seconds) + Double(info.user_time.microseconds) / 1e6
+            + Double(info.system_time.seconds) + Double(info.system_time.microseconds) / 1e6
+    }
 
     static func start(reportAbove seconds: Double = 0.25, file: String? = nil) {
         last = Date()
         began = last
+        cpuAtLast = threadCPU()
         if let file {
             FileManager.default.createFile(atPath: file, contents: nil)
             sink = FileHandle(forWritingAtPath: file)
         }
         emit(String(format: "[hang] watching, reporting blocks over %.0f ms\n", seconds * 1000))
-        Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in
+        UIProbe.enabled = true
+        UIProbe.emit = { emit($0) }
+        // THE TICK MUST BE WELL UNDER THE THRESHOLD. It was a flat 0.05 s, so `-omni.hangwatchMs 30`
+        // asked for blocks over 30 ms from an instrument whose own firing interval was 50 ms: every
+        // single tick cleared the bar and the log filled with 130,000 lines of "blocked 50 ms",
+        // burying the handful of real stalls in it. The tick now follows the threshold, so the
+        // floor is always below what is being asked about.
+        let tick = min(0.05, max(0.005, seconds / 3))
+        Timer.scheduledTimer(withTimeInterval: tick, repeats: true) { _ in
             MainActor.assumeIsolated {
                 let now = Date()
                 let gap = now.timeIntervalSince(last)
                 last = now
-                guard gap > seconds else { return }
+                guard gap > seconds else {
+                    cpuAtLast = Self.threadCPU()
+                    UIProbe.reset()
+                    return
+                }
                 worst = max(worst, gap)
-                emit(String(format: "[hang] t+%.1fs blocked %.0f ms (worst %.0f)\n",
-                            now.timeIntervalSince(began), gap * 1000, worst * 1000))
+                // HOW MUCH OF THE GAP WAS THIS THREAD RUNNING CODE. A block with cpu ~= wall is
+                // work: something on the main thread is executing and can be found and moved off
+                // it. A block with cpu << wall is a WAIT - a lock, the render server, the GPU -
+                // and no amount of optimising main-thread code will touch it. The first round of
+                // this investigation had three candidate causes and no way to separate them;
+                // this single ratio rules out half of them per sample.
+                let cpu = Self.threadCPU()
+                let used = cpu - cpuAtLast
+                cpuAtLast = cpu
+                // What ran DURING the gap, not since launch: the counters are cleared on every
+                // quiet tick above, so a report only ever describes the block it is attached to.
+                emit(String(format: "[hang] t+%.1fs blocked %.0f ms (cpu %.0f ms, %.0f%%) (worst %.0f)%@\n",
+                            now.timeIntervalSince(began), gap * 1000, used * 1000,
+                            gap > 0 ? used / gap * 100 : 0, worst * 1000,
+                            UIProbe.drain()))
             }
         }
     }
@@ -698,5 +763,80 @@ enum HangWatch {
     private static func emit(_ line: String) {
         let data = Data(line.utf8)
         if let sink { sink.write(data) } else { FileHandle.standardError.write(data) }
+    }
+}
+
+/// Where a main-thread block was spent, by name.
+///
+/// The stall detector says how long the main thread was gone; this says what it was doing. The
+/// counters are drained by the detector on every tick, so each report covers exactly one block.
+/// Off unless the detector is running, and `measure` compiles down to a direct call when it is.
+@MainActor
+enum UIProbe {
+    static var enabled = false
+    /// Where `mark` writes. The tallies are drained by the stall detector, so anything that does
+    /// NOT stall leaves no trace at all - which is how a run of clicks that were merely slow to
+    /// arrive produced an empty log and read as "no clicks landed".
+    static var emit: ((String) -> Void)?
+
+    private struct Tally { var n = 0; var seconds: Double = 0 }
+    private static var tallies: [String: Tally] = [:]
+    private static var order: [String] = []
+
+    @inline(__always)
+    static func measure<T>(_ label: String, _ body: () -> T) -> T {
+        guard enabled else { return body() }
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let value = body()
+        add(label, CFAbsoluteTimeGetCurrent() - t0)
+        return value
+    }
+
+    static func count(_ label: String) {
+        guard enabled else { return }
+        add(label, 0)
+    }
+
+    /// Reports one event immediately, stall or no stall.
+    static func mark(_ label: String, seconds: Double? = nil) {
+        guard enabled, let emit else { return }
+        if let seconds {
+            emit(String(format: "[probe] %@ %.0f ms\n", label, seconds * 1000))
+        } else {
+            emit("[probe] \(label)\n")
+        }
+    }
+
+    /// The age of the event behind an action, reported on the spot.
+    static func markEventAge(_ label: String) {
+        guard enabled, let event = NSApp.currentEvent else { mark("\(label) (no event)"); return }
+        mark(label, seconds: max(0, ProcessInfo.processInfo.systemUptime - event.timestamp))
+    }
+
+
+
+    private static func add(_ label: String, _ seconds: Double) {
+        if tallies[label] == nil { order.append(label) }
+        tallies[label, default: Tally()].n += 1
+        tallies[label, default: Tally()].seconds += seconds
+    }
+
+    static func reset() {
+        guard enabled, !order.isEmpty else { return }
+        tallies.removeAll(keepingCapacity: true)
+        order.removeAll(keepingCapacity: true)
+    }
+
+    /// The counters as one line, then cleared.
+    static func drain() -> String {
+        guard enabled, !order.isEmpty else { return "" }
+        let parts = order.compactMap { label -> String? in
+            guard let t = tallies[label] else { return nil }
+            return t.seconds > 0.0005
+                ? String(format: "%@ x%d %.0fms", label, t.n, t.seconds * 1000)
+                : "\(label) x\(t.n)"
+        }
+        reset()
+        return "  [" + parts.joined(separator: ", ") + "]"
     }
 }

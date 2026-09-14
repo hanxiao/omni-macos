@@ -987,6 +987,9 @@ final class OCRSession {
     /// releases the pin - otherwise the first click on a thumbnail permanently stops the view from
     /// tracking the run, with no way back.
     func select(_ index: Int) {
+        // Kept: this is the instrument that found the half-second the selection used to spend
+        // waiting for the double-click window to close. Silent unless `-omni.hangwatch` is on.
+        UIProbe.markEventAge("CLICK.select event age")
         guard pages.indices.contains(index) else { return }
         if index == runningIndex {
             selection = nil

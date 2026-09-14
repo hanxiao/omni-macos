@@ -195,7 +195,7 @@ struct FolderBrowser: View {
                 // nothing - so the selection is set and drawn here. Finder's treatment exactly:
                 // the whole row filled with the accent colour and every label turned white.
                 .onTapGesture(count: 2) { activate(entry) }
-                .onTapGesture { select(entry) }
+                .simultaneousGesture(TapGesture().onEnded { select(entry) })
                 .contextMenu { menu(entry) }
                 .tag(entry.url)
                 // Finder's list draws no rules between rows, and a folder listing is not a table.
@@ -381,7 +381,7 @@ struct FolderBrowser: View {
                     .padding(6)
                     .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                     .onTapGesture(count: 2) { activate(entry) }
-                    .onTapGesture { select(entry) }
+                    .simultaneousGesture(TapGesture().onEnded { select(entry) })
                     .contextMenu { menu(entry) }
                 }
             }
