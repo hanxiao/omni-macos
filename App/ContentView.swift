@@ -608,7 +608,9 @@ struct ContentView: View {
     private func navButton(_ symbol: String, enabled: Bool, help: String, label: String,
                            action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Image(systemName: symbol)
+            // Titled, for the same reason as sidebarToggleButton: a bare Image collapses the
+            // enclosing toolbar item to 10x10 on Sequoia.
+            Label(label, systemImage: symbol)
                 // `.borderless` tints its own label and IGNORES this, which left the enabled
                 // chevron at a measured 127 against the mode glyphs' 77 - so `.plain`, which does
                 // not. Finder's own chevrons sample at 110 enabled and 196 disabled: secondary and
@@ -671,13 +673,21 @@ struct ContentView: View {
         }
     }
 
+    /// A TITLED `Label`, not a bare `Image`, and that is load-bearing rather than cosmetic. On
+    /// Sequoia a toolbar item whose label carries no title gets no intrinsic size and the item
+    /// collapses: dumped from a live macOS 15 toolbar, this button and its three neighbours each
+    /// measured 10x10 while `search.open` and `search.share` beside them - built with
+    /// `Label(title, systemImage:)` - measured 33x28 and 29x28. macOS 26 sizes either form, which
+    /// is why it looked fine here. The toolbar renders the icon alone on both, so nothing changes
+    /// visually; the title is what AppKit sizes from, and it is also what the overflow menu and
+    /// VoiceOver read.
     private var sidebarToggleButton: some View {
         Button {
             withAnimation(.easeOut(duration: 0.2)) {
                 columns = columns == .detailOnly ? .all : .detailOnly
             }
         } label: {
-            Image(systemName: "sidebar.leading")
+            Label("Hide or show the sidebar", systemImage: "sidebar.leading")
         }
         .help("Hide or show the sidebar")
         .accessibilityLabel("Hide or show the sidebar")
@@ -688,7 +698,8 @@ struct ContentView: View {
         // No `withAnimation` on the change: the two modes are different content, not a moved view,
         // and animating the swap made the whole pane slide in from the window's leading edge.
         ToolbarToggle(isOn: Binding(get: { model.ocrMode }, set: { model.ocrMode = $0 }),
-                      symbol: "text.viewfinder")
+                      symbol: "text.viewfinder",
+                      title: model.ocrMode ? "Back to search" : "Transcribe a document")
     }
 
     /// Either browser is on screen. The two are one mode as far as the toolbar is concerned.
@@ -772,7 +783,8 @@ struct ContentView: View {
         ToolbarItem(id: "serve.mode", placement: placement) {
             ToolbarToggle(isOn: Binding(get: { model.serving.enabled },
                                         set: { model.serving.enabled = $0 }),
-                          symbol: "network")
+                          symbol: "network",
+                          title: "Serve over HTTP")
                 .help(servingHelp)
                 .accessibilityLabel("Serve over HTTP")
         }
@@ -847,10 +859,11 @@ struct ContentView: View {
                     // No explicit color in the unbookmarked state, so the toolbar can dim it like every
                     // other button when the window resigns key (e.g. while Settings is open). Yellow is
                     // applied only when bookmarked, where the lit status color is intentional.
+                    // Titled, so the item sizes on Sequoia - see sidebarToggleButton.
                     if model.currentSearchIsBookmarked {
-                        Image(systemName: "star.fill").foregroundStyle(.yellow)
+                        Label("Remove bookmark", systemImage: "star.fill").foregroundStyle(.yellow)
                     } else {
-                        Image(systemName: "star")
+                        Label("Bookmark search", systemImage: "star")
                     }
                 }
                 // Cmd-D is owned by the File-menu "Bookmark search" command (single owner, avoids a

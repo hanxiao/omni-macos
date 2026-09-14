@@ -154,9 +154,14 @@ extension FileKind {
 struct ToolbarToggle: View {
     @Binding var isOn: Bool
     let symbol: String
+    /// TITLED, and not optional. A toolbar item whose label carries no title gets no intrinsic
+    /// size on Sequoia and collapses to 10x10 - measured off a live macOS 15 toolbar, where the
+    /// two items built with `Label(title, systemImage:)` sized correctly beside it. macOS 26 sizes
+    /// either form, so a bare `Image` looked right on Tahoe and was broken everywhere else.
+    let title: String
 
     var body: some View {
-        Toggle(isOn: $isOn) { Image(systemName: symbol) }
+        Toggle(isOn: $isOn) { Label(title, systemImage: symbol) }
             .toggleStyle(.button)
     }
 }
