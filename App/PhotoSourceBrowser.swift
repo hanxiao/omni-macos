@@ -123,10 +123,10 @@ struct PhotoSourceBrowser: View {
 
     private var listCore: some View {
         Group {
-            // NO `selection:` binding, for the same reason the folder browser dropped one: the
-            // List draws its own full-bleed square selection underneath the inset rounded fill
-            // below, and the difference shows as blue past the corner radius. Taps are ours.
-            List(sorted, id: \.path) { hit in
+            // Inset and bound, for the same reason the folder browser is: `.plain` draws the
+            // selection AND the right-click highlight full-bleed and square, `.inset` draws both
+            // rounded, which is the style Finder uses.
+            List(sorted, id: \.path, selection: $selected) { hit in
                 let isSelected = selected == hit.path
                 HStack(spacing: 0) {
                     Thumbnail(path: hit.path, side: BrowserMetrics.icon, corner: 3)
@@ -162,7 +162,7 @@ struct PhotoSourceBrowser: View {
             .environment(\.defaultMinListRowHeight, BrowserMetrics.rowHeight)
             .modifier(SoftTopScrollEdge())
             .alternatingRowBackgrounds()
-            .listStyle(.plain)
+            .listStyle(.inset)
         }
     }
 

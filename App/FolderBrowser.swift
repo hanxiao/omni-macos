@@ -149,12 +149,23 @@ struct FolderBrowser: View {
 
     private var listCore: some View {
         Group {
-            // NO `selection:` BINDING. With one, the List draws its OWN selection - full-bleed and
-            // square - underneath the inset rounded fill below, and the difference shows as blue
-            // past the corner radius at both ends of the row. The taps were already ours (a tap
-            // gesture of any kind swallows the click `List(selection:)` needs), so the binding was
-            // only buying arrow keys, which `.onKeyPress` below provides without the second fill.
-            List(sorted) { entry in
+            // INSET, and with a real `selection:` binding. Both halves matter and both were wrong
+            // before. `.plain` maps to NSTableView's full-width style, whose selection is
+            // full-bleed and square, so a binding drew that square underneath our inset rounded
+            // fill and showed as blue past the corner radius - which is why the binding had been
+            // dropped. `.inset` is the style Finder uses: AppKit then draws the selection rounded
+            // and inset itself, at the same geometry we draw, so the two coincide.
+            //
+            // The payoff is the RIGHT-CLICK highlight, which SwiftUI gives no way to shape on
+            // macOS - `.contentShape(.contextMenuPreview, _)` is iOS-only. AppKit draws it in the
+            // table's own style, so under `.plain` it was a 22pt square full-bleed band against
+            // the selection's rounded 20pt, and under `.inset` it is 20pt with the same 5,3,2,1
+            // corner profile the selection has. Measured against Finder on the same display:
+            // identical.
+            //
+            // A tap gesture used to swallow the click a binding needs, which is the other reason
+            // it was dropped; the single tap is a `simultaneousGesture` now and does not.
+            List(sorted, selection: $selected) { entry in
                 let isSelected = selected == entry.url
                 HStack(spacing: 0) {
                     // 16pt, Finder's list-view icon size. 18 was a touch larger and, with the row
@@ -183,9 +194,10 @@ struct FolderBrowser: View {
                 }
                 .padding(.leading, BrowserMetrics.rowLead)
                 .padding(.trailing, BrowserMetrics.rowTrail)
-                // ROUNDED, because the right-click highlight takes this shape on macOS. With
-                // `.rect` the context menu drew a hard-cornered rectangle inside a list whose
-                // every other highlight is rounded - Finder's is rounded, matching its selection.
+                // Hit shape only. It does NOT govern the right-click highlight on macOS: that is
+                // drawn by AppKit as a square, full-bleed rect, measured as a 22pt band with an
+                // all-zero corner profile against the selection's rounded 20pt. SwiftUI's
+                // `.contentShape(.contextMenuPreview, _)` would shape it, and is iOS-only.
                 .contentShape(RoundedRectangle(cornerRadius: BrowserMetrics.selectionRadius))
                 // Finder's right-click highlight is a ROUNDED rect, the same shape as the row's
                 // selection. Without this the context-menu highlight is a hard rectangle with
@@ -235,7 +247,7 @@ struct FolderBrowser: View {
             // (measured: the Kind value sat 15pt left of the Kind title), and it draws the
             // alternating bands as inset rounded capsules. Finder's bands are full-bleed and
             // square, and its values sit exactly under their titles.
-            .listStyle(.plain)
+            .listStyle(.inset)
         }
     }
 
