@@ -45,7 +45,9 @@ public struct IndexedChunk: Sendable {
 
 public struct SearchHit: Sendable {
     public let path: String
-    public let score: Float
+    /// The number this hit is RANKED by. Dense-only searches put the cosine here; a fused search
+    /// puts the fused score here, so order and score can never disagree (see `fuseLexical`).
+    public var score: Float
     public var snippet: String   // filled lazily from SQLite for the winners (not resident per row)
     public let kind: String
     public let chunkIndex: Int
@@ -2793,24 +2795,87 @@ public final class VectorStore: @unchecked Sendable {
 
     /// Materialize display rows for paths the dense scan did not return. Indexed by the chunks
     /// primary key, so this is a handful of point lookups, not a scan.
+    /// Best chunk score per path, read from the MAPPED vectors. Must run on `queue`.
+    ///
+    /// `hitsForPaths` used to score from `LEFT JOIN pending_vecs`, which is a staging table: a
+    /// vector lives there only until the base is folded, after which the column is NULL and the
+    /// score silently stayed 0. Measured on a live index, 1,122,487 of 9,670,766 chunks were still
+    /// in that table - so 88% of filename and tag matches came back scored 0, which renders as "0%"
+    /// and is dropped by any score threshold. That is exactly the failure the comment on the old
+    /// SQL said it existed to prevent.
+    private func bestChunkScoreLocked(_ paths: [String], query: [Float]) -> [String: (score: Float, chunkIndex: Int)] {
+        guard dim > 0, query.count == dim, !paths.isEmpty,
+              !rows.isEmpty, flat16.count == rows.count * dim else { return [:] }
+        // Returns the winning chunk INDEX with its score: the snippet a hit shows has to come from
+        // the chunk that won, the way the dense path's `fillSnippetsLocked` does it.
+        var wanted = [Bool](repeating: false, count: max(1, fileChunkCount.count))
+        var ids: [Int32] = []
+        for p in paths {
+            guard let fid = pathID[p], !wanted[Int(fid)] else { continue }
+            wanted[Int(fid)] = true
+            ids.append(fid)
+        }
+        guard !ids.isEmpty else { return [:] }
+        let dead = deadRows
+        let hasDead = !dead.isEmpty
+        // The cap TRUNCATES; it does not abandon the batch. Bailing with [:] let one pathological
+        // file zero the score of every other path in the same query, and a zero score is not a
+        // neutral value now that the score is what the results are ranked and thresholded by.
+        var idx: [Int] = []
+        outer: for range in provenRowRangesLocked(ids, dead: dead, spanCap: Self.maxInlineScanRows) {
+            for i in range where wanted[Int(fileID[i])] {
+                if hasDead, dead.contains(Int32(i)) { continue }
+                idx.append(i)
+                if idx.count >= Self.maxInlineScanRows { break outer }
+            }
+        }
+        guard !idx.isEmpty else { return [:] }
+        let m = idx.count
+        var gathered = [UInt16](repeating: 0, count: m * dim)
+        flat16.withUnsafeBufferPointer { src in
+            gathered.withUnsafeMutableBufferPointer { dst in
+                guard let sp = src.baseAddress, let dp = dst.baseAddress else { return }
+                for (j, i) in idx.enumerated() {
+                    memcpy(dp + j * dim, sp + i * dim, dim * MemoryLayout<UInt16>.size)
+                }
+            }
+        }
+        let qv = MLXArray(query, [dim, 1]).asType(.bfloat16)
+        let scores: [Float] = gathered.withUnsafeBytes { raw in
+            let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!),
+                            count: m * dim * MemoryLayout<UInt16>.size, deallocator: .none)
+            let mat = MLXArray(data, [m, dim], dtype: .bfloat16)
+            let sc = MLX.matmul(mat, qv).reshaped([m]).asType(.float32)
+            MLX.eval(sc)
+            return sc.asArray(Float.self)
+        }
+        var best: [String: (score: Float, chunkIndex: Int)] = [:]
+        for (j, i) in idx.enumerated() {
+            let v = scores[j]
+            guard v.isFinite else { continue }
+            let r = rows[i]
+            if let cur = best[r.path], cur.score >= v { continue }
+            best[r.path] = (v, r.chunkIndex)
+        }
+        return best
+    }
+
     private func hitsForPaths(_ paths: [String], query: [Float]? = nil) -> [SearchHit] {
         guard !paths.isEmpty else { return [] }
         return queue.sync {
             guard dbOpen() else { return [] }
             var out: [SearchHit] = []
             var st: OpaquePointer?
-            // Score these exactly rather than leaving them at zero. A file found by name is often a
-            // strong semantic match too, and a zero would both render as "0%" and be dropped by any
-            // score: threshold the user sets. The vectors are already in the row we are reading, so
-            // the true best-chunk score costs one dot product per chunk of a handful of files.
+            // Scores come from the MAPPED vectors, not from this statement: `pending_vecs` holds a
+            // chunk only until the base is folded, so reading the score from it returned 0 for most
+            // of the index. Metadata is still SQL, which is what this query is for.
+            let scoreOf = query.map { bestChunkScoreLocked(paths, query: $0) } ?? [:]
             let sql = """
                 SELECT f.modified, f.size, c.kind, c.chunk_index, t.snippet, f.width, f.height,
-                       f.duration, t.locator,
-                       COALESCE(length(p.vec) / 2, 0), p.vec
+                       f.duration, t.locator
                   FROM chunks c
                   JOIN files f ON f.id = c.file_id
                   JOIN chunk_text t ON t.chunk_id = c.id
-                  LEFT JOIN pending_vecs p ON p.chunk_id = c.id
                  WHERE c.file_id = \(StoreSchema.fileIDByPath)
                  ORDER BY c.chunk_index;
                 """
@@ -2819,18 +2884,14 @@ public final class VectorStore: @unchecked Sendable {
             for p in paths {
                 sqlite3_reset(st)
                 bindPath(st, 1, p)
-                var best: (score: Float, row: Int32) = (-Float.infinity, 0)
                 var meta: (Double, Int, String, Int, String, Int, Int, Double, String)? = nil
+                let wantChunk = scoreOf[p]?.chunkIndex
                 while sqlite3_step(st) == SQLITE_ROW {
-                    let d = Int(sqlite3_column_int(st, 9))
-                    var sc: Float = 0
-                    if let q = query, d == q.count, let blob = sqlite3_column_blob(st, 10),
-                       Int(sqlite3_column_bytes(st, 10)) == d * 2 {
-                        let bf = blob.assumingMemoryBound(to: UInt16.self)
-                        for k in 0 ..< d { sc += Self.fromBF16(bf[k]) * q[k] }
-                    }
-                    if sc > best.score || meta == nil {
-                        best = (sc, sqlite3_column_int(st, 3))
+                    // Metadata from the WINNING chunk when the scorer named one, so the snippet and
+                    // locator describe the chunk the score came from. Otherwise the first row: every
+                    // column but the chunk index is per-file anyway.
+                    let thisChunk = Int(sqlite3_column_int(st, 3))
+                    if meta == nil || thisChunk == wantChunk {
                         meta = (sqlite3_column_double(st, 0), Int(sqlite3_column_int64(st, 1)),
                                 kindTextLocked(st, 2),
                                 Int(sqlite3_column_int(st, 3)),
@@ -2838,12 +2899,13 @@ public final class VectorStore: @unchecked Sendable {
                                 Int(sqlite3_column_int(st, 5)), Int(sqlite3_column_int(st, 6)),
                                 sqlite3_column_double(st, 7),
                                 sqlite3_column_text(st, 8).map { String(cString: $0) } ?? "")
+                        if thisChunk == wantChunk { break }
                     }
                 }
                 guard let m = meta else { continue }
                 let cc = pathID[p].map { Int(fileChunkCount[Int($0)]) } ?? 1
                 out.append(SearchHit(
-                    path: p, score: best.score.isFinite ? best.score : 0, snippet: m.4,
+                    path: p, score: scoreOf[p]?.score ?? 0, snippet: m.4,
                     kind: m.2, chunkIndex: m.3, modified: m.0,
                     width: m.5, height: m.6, duration: m.7, size: m.1,
                     locator: m.8, chunkCount: cc))
@@ -3983,13 +4045,64 @@ public final class VectorStore: @unchecked Sendable {
         return fuseLexical(dense: dense, text: text, filter: filter, topK: topK, explicit: false, denseQuery: query)
     }
 
-    /// Reciprocal-rank fusion of the dense ranking with the filename channel.
+    /// How the filename channel is combined with the dense ranking. `OMNI_FUSION=rrf` restores the
+    /// reciprocal-rank fusion that shipped through v0.11.7; it is kept so the two can be A/B'd
+    /// against one frozen index in one process (`omni-verify fusecheck`), and as a rollback.
+    nonisolated(unsafe) public static var fusionMode =
+        ProcessInfo.processInfo.environment["OMNI_FUSION"] ?? "score"
+
+    /// Weight of the filename channel when intent is explicit: a `filename:` clause, or a query that
+    /// IS some file's whole basename. 1.0 lets such a match reach rank 1 from any cosine, which is
+    /// the rule the old `+= 1.0` rank bonus was expressing by other means.
+    nonisolated(unsafe) public static var lexicalWeightExplicit = 1.0
+    /// Weight when the gate fired on a bare query and the name only partly matches. The gate is a
+    /// heuristic and it leaks (measured: it fires on 9 of 23 natural-language queries), so this
+    /// number is what makes a wrong gate decision harmless.
     ///
-    /// RRF is used rather than a score blend because the two channels have incommensurable scales:
-    /// a cosine and a bm25 have no common unit, and every convex combination measured on the live
-    /// index either failed to fix filenames or destroyed the semantic ranking. Ranks have no unit.
-    /// k is small (10) so a top-few lexical match can actually reach the top; the gate is what keeps
-    /// that from firing on prose.
+    /// Swept on a frozen 2.68M-file index (`omni-verify fusecheck`), against typed stems
+    /// ("vectorstore" for VectorStore.swift - the partial match this weight actually governs) and
+    /// against prose retention of the dense top-10:
+    ///
+    ///     w      stem top-1  stem top-10   prose kept   rank-1 moved
+    ///     0.20      2.5%        8.8%         99.2%          0/26
+    ///     0.25      7.5%       20.0%         99.2%          0/26
+    ///     0.35     32.5%       53.8%         99.2%          1/26
+    ///     0.50     58.8%       65.0%         97.7%          2/26
+    ///     0.75     65.0%       66.2%         91.9%          3/26
+    ///
+    /// 0.35 is the largest weight that costs nothing in prose retention. Past it the trade turns:
+    /// 0.75 buys 1.2 more points of stem recall for 7.3 points of the semantic ranking.
+    nonisolated(unsafe) public static var lexicalWeightImplicit = 0.35
+
+    /// Score fusion of the dense ranking with the filename channel.
+    ///
+    /// Weighted-sum fusion (CombSUM; Fox and Shaw, TREC-2, 1994) over two channels that already
+    /// share a [0,1] scale, NOT reciprocal-rank fusion. RRF is what shipped, and it carries a defect
+    /// that only surfaces once a relevance cutoff is wanted: it ORDERS by 1/(k+rank) while every
+    /// consumer - the results list, the HTTP surface, SKILL.md - reads `SearchHit.score`, which
+    /// stayed the raw cosine. Order and score then disagree, and a threshold on the score punches
+    /// holes in the middle of the list (measured on the live index: 7 such inversions in the top 20
+    /// for "README.md", 4 for "VectorStore.swift"). Weaviate hit the same wall and moved their
+    /// default off RRF in v1.24 for the stated reason that RRF retains only the rankings, so it
+    /// cannot detect a cutoff point.
+    ///
+    /// The dense channel is the anchor and keeps its native scale. That rules out the per-query
+    /// min-max normalization Weaviate's relativeScoreFusion does, because a threshold has to mean
+    /// the same thing on every query and min-max makes every query's top hit 1.0. The filename
+    /// channel is instead a bounded boost into the dense channel's remaining headroom:
+    ///
+    ///     fused = d + w * s * (1 - d)
+    ///
+    /// d is the cosine clamped to [0,1], s the match strength in [0,1], w the channel weight. s = 0
+    /// returns d untouched, so a query the channel does not match scores exactly as it would
+    /// dense-only - which is what keeps one threshold valid across fused and unfused queries. The
+    /// result stays in [0,1] (the score contract omni-verify asserts) and is strictly increasing in
+    /// both inputs, so ranking by the fused score IS ranking by the score the caller sees.
+    ///
+    /// w is per-CHANNEL, which is where a weight belongs. The RRF this replaces multiplied its rank
+    /// term by a per-DOCUMENT strength and varied k per channel (60 dense against 5 or 120 lexical)
+    /// to stand in for a weight - a score blend wearing RRF's clothes, which voids the "ranks have
+    /// no unit" argument that justified RRF in the first place.
     ///
     /// The lexical list is capped: 8,075 files in the reference corpus share the basename
     /// "results.json", and an uncapped list would flood the results with one name.
@@ -3997,24 +4110,29 @@ public final class VectorStore: @unchecked Sendable {
                              explicit: Bool, denseQuery: [Float]? = nil) -> [SearchHit] {
         let names = lexical.match(text, limit: explicit ? topK : Swift.min(topK, 24))
         guard !names.isEmpty else { return dense }
-        // Asymmetric RRF. Symmetric k gave a perfect filename match exactly the weight of an
-        // arbitrary dense hit, so a typed filename could not reach rank 1 (measured: top-1 0.0%,
-        // top-10 74%). Dense keeps the standard k=60; the lexical channel gets k=20, which lets a
-        // strong name match climb without letting a weak one displace a confident dense result.
-        var rank: [String: Double] = [:]
-        for (i, h) in dense.enumerated() { rank[h.path, default: 0] += 1.0 / Double(60 + i + 1) }
-        // Match quality, not just rank, decides how loudly the channel speaks. The gate is a
-        // heuristic and it leaks: measured, it fires on 9 of 23 natural-language queries. So the
-        // fusion is built to make a wrong gate decision HARMLESS rather than relying on the gate
-        // being right. A partial name match contributes weakly (k=120) and can only add results at
-        // the tail; it cannot displace a confident dense hit. Only a match that covers the whole
-        // basename is treated as intent.
-        var lexRank: [String: Double] = [:]
         let qt = Set(LexicalIndex.terms(text))
+        // Normalized so "OmniEngine.swift", "omniengine.swift" and "omni engine swift" all count as
+        // the same exact match.
+        let qn = LexicalIndex.terms(text).joined(separator: " ")
+        // Per-name match strength and the weight that applies to it.
+        var strength: [String: Double] = [:]
+        var weight: [String: Double] = [:]
+        var lexPos: [String: Int] = [:]
+        var exactNames: Set<String> = []
         for (i, p) in names.enumerated() {
-            let bt = LexicalIndex.terms((p as NSString).lastPathComponent)
-            guard !bt.isEmpty else { continue }
-            // fraction of the basename the query accounts for, and vice versa.
+            let btFull = LexicalIndex.terms((p as NSString).lastPathComponent)
+            guard !btFull.isEmpty else { continue }
+            // The extension is part of the name but is rarely part of the intent: "readme" names
+            // README.md completely, yet counting "md" as an uncovered basename term caps coverage at
+            // 0.5. RRF hid that, because k=5 made even a halved lexical term ten times the largest
+            // dense term; a per-channel weight does not, so `filename:readme` lost 2 of its 10 slots
+            // to dense hits. Drop the extension unless the query asked for it. (`terms` splits on
+            // punctuation, so the extension is the last term.) The exact-name test below still reads
+            // the FULL basename, so this widens coverage without widening what counts as exact.
+            var bt = btFull
+            let fileExt = (p as NSString).pathExtension.lowercased()
+            if bt.count > 1, bt.last == fileExt, !qt.contains(fileExt) { bt.removeLast() }
+            // Fraction of the basename the query accounts for, and vice versa.
             //
             // Equality is the rule for letters. It is not sufficient for CJK: those scripts write
             // without spaces, so a basename term is a whole RUN ("会议记录") while the query is one
@@ -4025,30 +4143,51 @@ public final class VectorStore: @unchecked Sendable {
                         / Double(bt.count)
             let used = Double(qt.filter { q in bt.contains(where: { LexicalIndex.termMatches(query: q, basename: $0) }) }.count)
                      / Double(Swift.max(1, qt.count))
-            let strength = Swift.min(covered, used)
-            // Explicit intent: the channel leads. Implicit: it may only nudge.
-            lexRank[p] = strength / Double((explicit ? 5 : 120) + i + 1)
-        }
-        // An exact basename match is unambiguous intent: the user typed this file's name. Nothing a
-        // dense scan returns should outrank it. Normalized so "OmniEngine.swift", "omniengine.swift"
-        // and "omni engine swift" all count as exact.
-        let qn = LexicalIndex.terms(text).joined(separator: " ")
-        for p in names where LexicalIndex.terms((p as NSString).lastPathComponent).joined(separator: " ") == qn {
-            lexRank[p, default: 0] += 1.0
+            strength[p] = Swift.min(covered, used)
+            // An exact basename match is unambiguous intent: the user typed this file's name.
+            // Nothing a dense scan returns should outrank it, so it takes the explicit weight even
+            // when the query carried no `filename:` clause.
+            if btFull.joined(separator: " ") == qn { exactNames.insert(p) }
+            weight[p] = (explicit || exactNames.contains(p)) ? Self.lexicalWeightExplicit : Self.lexicalWeightImplicit
+            lexPos[p] = i
         }
         // Only admit lexical-only files that pass the same filter the dense path applied, or a
         // filtered search would silently gain rows the filter excluded.
         let denseSet = Set(dense.map { $0.path })
         let extra = names.filter { !denseSet.contains($0) }
         let materialized = hitsForPaths(extra, query: denseQuery).filter { passesFilterForLexical($0, filter) }
-        for (p, r) in lexRank { rank[p, default: 0] += r }
         var pool = dense + materialized
-        // Stable order: fused score, then the dense order, so ties never depend on dictionary order.
+        // densePos also breaks ties, so it is computed either way.
         let densePos = Dictionary(uniqueKeysWithValues: dense.enumerated().map { ($1.path, $0) })
+
+        var fused: [String: Double] = [:]
+        if Self.fusionMode == "rrf" {
+            // Rollback path only. Ordered by the RRF score while `score` keeps the cosine, which is
+            // the disagreement this function exists to remove; kept verbatim for the A/B.
+            for (i, h) in dense.enumerated() { fused[h.path, default: 0] += 1.0 / Double(60 + i + 1) }
+            for (p, s) in strength {
+                fused[p, default: 0] += s / Double((explicit ? 5 : 120) + (lexPos[p] ?? 0) + 1)
+            }
+            for p in exactNames { fused[p, default: 0] += 1.0 }
+        } else {
+            for h in pool {
+                let d = Double(Swift.max(0, Swift.min(1, h.score)))
+                let s = strength[h.path] ?? 0
+                fused[h.path] = d + (weight[h.path] ?? 0) * s * (1 - d)
+            }
+            // The score the caller sees is the score the sort uses. This is the whole point.
+            for i in pool.indices { pool[i].score = Float(fused[pool[i].path] ?? Double(pool[i].score)) }
+        }
+        // Total order: fused score, then the dense order, then the lexical order, then the path.
+        // Swift's sort is not stable, so a comparator with ties would order them unpredictably.
         pool.sort {
-            let a = rank[$0.path] ?? 0, b = rank[$1.path] ?? 0
+            let a = fused[$0.path] ?? 0, b = fused[$1.path] ?? 0
             if a != b { return a > b }
-            return (densePos[$0.path] ?? Int.max) < (densePos[$1.path] ?? Int.max)
+            let da = densePos[$0.path] ?? Int.max, db = densePos[$1.path] ?? Int.max
+            if da != db { return da < db }
+            let la = lexPos[$0.path] ?? Int.max, lb = lexPos[$1.path] ?? Int.max
+            if la != lb { return la < lb }
+            return $0.path < $1.path
         }
         return Array(pool.prefix(topK))
     }
@@ -5102,8 +5241,16 @@ public final class VectorStore: @unchecked Sendable {
             }
         }
         }}
-        // Order the K survivors by descending score (K is small).
-        let order = (0 ..< heapScore.count).sorted { heapScore[$0] > heapScore[$1] }
+        // Order the K survivors by descending score (K is small). Ties break on path, the same rule
+        // `reduceTopKReference` uses, so the differential test stays meaningful and two runs of one
+        // query cannot disagree: bf16 scores have an 8-bit mantissa, so exact collisions inside a
+        // top-K are routine, and Swift's sort is not stable.
+        let order = (0 ..< heapScore.count).sorted { (a: Int, b: Int) -> Bool in
+            let sa: Float = heapScore[a], sb: Float = heapScore[b]
+            if sa != sb { return sa > sb }
+            let pa: String = rows[Int(heapRow[a])].path, pb: String = rows[Int(heapRow[b])].path
+            return pa < pb
+        }
         let out = order.map { idx -> SearchHit in
             let ri = Int(heapRow[idx])
             let r = rows[ri]
@@ -5132,7 +5279,8 @@ public final class VectorStore: @unchecked Sendable {
             best[r.path] = SearchHit(path: r.path, score: dot, snippet: "", kind: r.kind, chunkIndex: r.chunkIndex, modified: r.modified,
                                      width: r.width, height: r.height, duration: r.duration, locator: "")
         }
-        return Array(best.values).sorted { $0.score > $1.score }.prefix(topK).map { $0 }
+        return Array(best.values).sorted { $0.score != $1.score ? $0.score > $1.score : $0.path < $1.path }
+            .prefix(topK).map { $0 }
     }
 
     /// Build the owned base score matrix over rows [0, rowCount). mlx_array_new_data copies, so the
@@ -7678,8 +7826,10 @@ public final class VectorStore: @unchecked Sendable {
             query.withUnsafeBufferPointer { q in
                 flat16.withUnsafeBufferPointer { fb in
                     guard let qp = q.baseAddress, let mb = fb.baseAddress else { return }
-                    // Ascending, so `hits` is built in the same order and the stable sort below
-                    // breaks ties between equal scores the same way it did before.
+                    // Ascending, so `hits` is built in chunk order and the tiebreak below reads it
+                    // back out in that order. (Swift's sort is NOT stable, so the tie has to be
+                    // broken explicitly - two chunks of the same boilerplate page score identically
+                    // often enough that leaving it to introsort made the disclosure list jump.)
                     var i = window.lowerBound
                     while i < window.upperBound, remaining > 0 {
                         defer { i += 1 }
@@ -7696,7 +7846,8 @@ public final class VectorStore: @unchecked Sendable {
                     }
                 }
             }
-            return hits.sorted { $0.score > $1.score }.prefix(topK).map { $0 }
+            return hits.sorted { $0.score != $1.score ? $0.score > $1.score : $0.chunkIndex < $1.chunkIndex }
+                .prefix(topK).map { $0 }
         }
     }
 
@@ -7802,8 +7953,12 @@ public final class VectorStore: @unchecked Sendable {
             }
 
             // Top-k by score over the gathered rows.
+            // Ties broken by row index, which `idx` holds in ascending order. Swift's sort is not
+            // stable, so equal scores - two copies of the same boilerplate page, the common case in
+            // a scope of sibling files - would otherwise come back in introsort order and the
+            // passage list would reshuffle between identical queries.
             let winners = Array(zip(idx, scores).filter { $0.1.isFinite }
-                .sorted { $0.1 > $1.1 }.prefix(max(1, topK)))
+                .sorted { $0.1 != $1.1 ? $0.1 > $1.1 : $0.0 < $1.0 }.prefix(max(1, topK)))
             guard !winners.isEmpty else { return [] }
 
             // Snippets for just the winning chunks (point lookups by path + chunk index).

@@ -4224,6 +4224,215 @@ if args.count >= 4 && args[1] == "nameconcat" {
     exit(0)
 }
 
+// Fusion A/B: omni-verify fusecheck <dbCopy> <modelDir> [n]
+// Runs BOTH fusion modes against ONE frozen store in ONE process, so the only difference between
+// the arms is the merge rule. Measures the four things the merge is accountable for: does the
+// order agree with the score the caller reads (the defect that motivated the change), does a typed
+// filename still reach the top, does prose still survive the gate leaking, and is the score a
+// number a fixed threshold can be set on.
+if args.count >= 4 && args[1] == "fusecheck" {
+    let dbPath = args[2]
+    let n = (args.count >= 5 ? Int(args[4]) : nil) ?? 150
+    let store = try VectorStore(dbURL: URL(fileURLWithPath: dbPath))
+    store.prepareLexicalIndex()
+    let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[3]))
+    let all = store.allIndexedPaths()
+    guard !all.isEmpty else { print("empty store"); exit(1) }
+    func say(_ s: String) { print(s); fflush(stdout) }
+    say("fusecheck  files=\(store.fileCount)  paths=\(all.count)")
+
+    // Query sets. Names are sampled deterministically; the modality and language sets come from the
+    // corpus itself so the calibration is not measured on Latin text alone.
+    var st = UInt64(0x243F6A8885A308D3)
+    func rnd(_ m: Int) -> Int { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return Int(st % UInt64(m)) }
+    func ext(_ p: String) -> String { (p as NSString).pathExtension.lowercased() }
+    func base(_ p: String) -> String { (p as NSString).lastPathComponent }
+    func isCJK(_ s: String) -> Bool { s.unicodeScalars.contains {
+        (0x3040...0x30FF).contains($0.value) || (0x4E00...0x9FFF).contains($0.value) || (0xAC00...0xD7AF).contains($0.value) } }
+    let mediaExt = Set(["jpg","jpeg","png","heic","mp4","mov","mp3","wav","m4a","gif","webp"])
+    var names: [String] = []
+    while names.count < n { let b = base(all[rnd(all.count)]); if b.count >= 4 { names.append(b) } }
+    let media = all.filter { mediaExt.contains(ext($0)) }.prefix(2000).map(base)
+    let cjk = all.filter { isCJK(base($0)) }.prefix(2000).map(base)
+    func sample(_ xs: [String], _ k: Int) -> [String] {
+        guard xs.count > k else { return xs }
+        return stride(from: 0, to: xs.count, by: xs.count / k).prefix(k).map { xs[$0] }
+    }
+    let mediaQ = sample(Array(media), 60), cjkQ = sample(Array(cjk), 40)
+    // Full basenames are all EXACT matches, so they take the explicit weight and say nothing about
+    // the implicit one. The stem ("vectorstore" for VectorStore.swift) is the partial match the
+    // implicit weight actually governs, so the sweep needs it or it measures a flat line.
+    var stemOf: [String: String] = [:]   // stem query -> basename it should retrieve
+    for b in names where (b as NSString).pathExtension.count >= 1 {
+        let st = (b as NSString).deletingPathExtension
+        if st.count >= 4, st != b, stemOf[st] == nil { stemOf[st] = b }
+    }
+    let stemQ = Array(stemOf.keys.sorted().prefix(80))
+    let prose = ["photos of a cat on a couch", "the design of the priority gate",
+                 "what did we decide about memory", "how does the indexer handle deletes",
+                 "notes from the meeting last week", "a picture of the mountains at sunset",
+                 "how do we handle memory pressure", "what changed in the indexer recently",
+                 "sunset over the ocean", "invoice from last quarter", "meeting notes",
+                 "quarterly revenue report", "screenshots of the dashboard", "cat sitting on a laptop",
+                 "distributed systems latency", "machine learning embeddings", "swift concurrency",
+                 "vacation photos italy", "budget spreadsheet 2025", "resume draft",
+                 "error handling in rust", "database migration plan", "onboarding checklist",
+                 "会议记录里我们决定了什么", "去年的报销单据", "血压记录表"]
+    // Embed once; every arm and every weight reuses the same vectors.
+    var qvec: [String: [Float]] = [:]
+    for q in names + mediaQ + cjkQ + prose + stemQ where qvec[q] == nil { qvec[q] = engine.embedQuery(q) }
+    say("  embedded \(qvec.count) distinct queries")
+
+    // Dense-only baseline, taken once with the channel off: what fusion must not destroy.
+    var denseTop: [String: [String]] = [:]
+    for q in prose { denseTop[q] = store.search(qvec[q]!, topK: 10, markActive: false).map { $0.path } }
+
+    func recall(_ qs: [String], topK: Int) -> (t1: Double, t10: Double) {
+        guard !qs.isEmpty else { return (0, 0) }
+        var h1 = 0, h10 = 0
+        for b in qs {
+            let hits = store.search(qvec[b]!, topK: topK, markActive: false, textQuery: b)
+            if let f = hits.first, base(f.path) == b { h1 += 1 }
+            if hits.contains(where: { base($0.path) == b }) { h10 += 1 }
+        }
+        return (100.0 * Double(h1) / Double(qs.count), 100.0 * Double(h10) / Double(qs.count))
+    }
+    // The defect, measured: a pair (i, j) with i before j but score_i < score_j.
+    func inversions(_ qs: [String]) -> (mean: Double, max: Int, affected: Int) {
+        var tot = 0, mx = 0, aff = 0
+        for q in qs {
+            let hits = store.search(qvec[q]!, topK: 20, markActive: false, textQuery: q)
+            var c = 0
+            for i in 1 ..< Swift.max(1, hits.count) where hits[i].score > hits[i - 1].score + 1e-6 { c += 1 }
+            tot += c; mx = Swift.max(mx, c); if c > 0 { aff += 1 }
+        }
+        return (Double(tot) / Double(Swift.max(1, qs.count)), mx, aff)
+    }
+    func proseRetention() -> (kept: Int, total: Int, moved: Int) {
+        var kept = 0, total = 0, moved = 0
+        for q in prose {
+            let b = denseTop[q]!
+            let f = store.search(qvec[q]!, topK: 10, markActive: false, textQuery: q)
+            let fs = Set(f.map { $0.path })
+            kept += b.filter { fs.contains($0) }.count; total += b.count
+            if b.first != f.first?.path { moved += 1 }
+        }
+        return (kept, total, moved)
+    }
+    func explicitLead() -> String {
+        var out: [String] = []
+        for term in ["readme", "vectorstore", "记录"] {
+            var ef = SearchFilter(); ef.filenameQuery = term
+            let ex = store.search(engine.embedQuery(term), filter: ef, topK: 10, markActive: false)
+            let named = ex.filter { base($0.path).lowercased().contains(term.lowercased()) }.count
+            out.append("\(term) \(named)/\(ex.count)")
+        }
+        return out.joined(separator: "  ")
+    }
+
+    for mode in ["rrf", "score"] {
+        VectorStore.fusionMode = mode
+        say("\n  arm: \(mode)")
+        let inv = inversions(prose + Array(names.prefix(40)))
+        say(String(format: "    order/score inversions in top-20: mean %.2f  max %d  queries affected %d/%d",
+                     inv.mean, inv.max, inv.affected, prose.count + Swift.min(40, names.count)))
+        let r = recall(names, topK: 10), m = recall(mediaQ, topK: 10), c = recall(cjkQ, topK: 10)
+        say(String(format: "    typed filename n=%d:  top-1 %5.1f%%  top-10 %5.1f%%", names.count, r.t1, r.t10))
+        say(String(format: "    media    n=%d:  top-1 %5.1f%%  top-10 %5.1f%%", mediaQ.count, m.t1, m.t10))
+        say(String(format: "    CJK      n=%d:  top-1 %5.1f%%  top-10 %5.1f%%", cjkQ.count, c.t1, c.t10))
+        let pr = proseRetention()
+        say(String(format: "    prose retention: %d/%d (%.1f%%) of the dense top-10, rank-1 changed %d/%d",
+                     pr.kept, pr.total, 100.0 * Double(pr.kept) / Double(Swift.max(1, pr.total)), pr.moved, prose.count))
+        say("    explicit filename: \(explicitLead())")
+        // What a threshold would actually see.
+        var buckets = [Int](repeating: 0, count: 5)   // <.3 .3-.45 .45-.6 .6-.75 >=.75
+        var atRank: [Int: [Double]] = [:]
+        for q in prose {
+            let hits = store.search(qvec[q]!, topK: 20, markActive: false, textQuery: q)
+            for (i, h) in hits.enumerated() {
+                let s = Double(h.score)
+                if [0, 4, 9, 19].contains(i) { atRank[i + 1, default: []].append(s) }
+                let b = s < 0.3 ? 0 : s < 0.45 ? 1 : s < 0.6 ? 2 : s < 0.75 ? 3 : 4
+                buckets[b] += 1
+            }
+        }
+        func med(_ xs: [Double]) -> Double { xs.isEmpty ? 0 : xs.sorted()[xs.count / 2] }
+        say(String(format: "    prose score by rank (median): r1 %.3f  r5 %.3f  r10 %.3f  r20 %.3f",
+                     med(atRank[1] ?? []), med(atRank[5] ?? []), med(atRank[10] ?? []), med(atRank[20] ?? [])))
+        say("    prose score histogram <.30 \(buckets[0])  .30-.45 \(buckets[1])  .45-.60 \(buckets[2])  .60-.75 \(buckets[3])  >=.75 \(buckets[4])")
+    }
+
+    // Can an ABSOLUTE cutoff separate relevant from irrelevant at all? Ground truth we actually
+    // have: for a typed filename, the file of that name is relevant and the rest of the page is not.
+    // Measured on the dense channel alone, since a fused score would just be measuring the boost.
+    VectorStore.fusionMode = "score"
+    do {
+        var tgt: [Double] = [], oth: [Double] = []
+        for b in sample(names, 80) {
+            let hits = store.search(qvec[b]!, topK: 20, markActive: false)
+            guard let t = hits.first(where: { base($0.path) == b }) else { continue }
+            tgt.append(Double(t.score))
+            for h in hits where base(h.path) != b { oth.append(Double(h.score)) }
+        }
+        func pct(_ xs: [Double], _ q: Double) -> Double {
+            guard !xs.isEmpty else { return 0 }
+            let v = xs.sorted(); return v[Swift.min(v.count - 1, Int(q * Double(v.count)))]
+        }
+        say(String(format: "\n  absolute-cutoff separation (dense only, n=%d targets vs %d others)", tgt.count, oth.count))
+        say(String(format: "    relevant   p10 %.3f  p50 %.3f  p90 %.3f", pct(tgt, 0.10), pct(tgt, 0.50), pct(tgt, 0.90)))
+        say(String(format: "    irrelevant p10 %.3f  p50 %.3f  p90 %.3f", pct(oth, 0.10), pct(oth, 0.50), pct(oth, 0.90)))
+        for t in [0.45, 0.50, 0.55, 0.60, 0.65, 0.70] {
+            let tp = Double(tgt.filter { $0 >= t }.count) / Double(Swift.max(1, tgt.count))
+            let fp = Double(oth.filter { $0 >= t }.count) / Double(Swift.max(1, oth.count))
+            say(String(format: "    cut %.2f  keeps %5.1f%% of relevant, %5.1f%% of irrelevant", t, 100 * tp, 100 * fp))
+        }
+        // A RELATIVE cutoff is what "detect the cutoff point" means; measure it on the same data.
+        for a in [0.85, 0.90, 0.95] {
+            var keptRel = 0, keptIrr = 0, nRel = 0, nIrr = 0
+            for b in sample(names, 80) {
+                let hits = store.search(qvec[b]!, topK: 20, markActive: false)
+                guard let top = hits.first?.score else { continue }
+                for h in hits {
+                    let keep = Double(h.score) >= a * Double(top)
+                    if base(h.path) == b { nRel += 1; if keep { keptRel += 1 } }
+                    else { nIrr += 1; if keep { keptIrr += 1 } }
+                }
+            }
+            say(String(format: "    rel %.2f x top  keeps %5.1f%% of relevant, %5.1f%% of irrelevant",
+                       a, 100 * Double(keptRel) / Double(Swift.max(1, nRel)),
+                       100 * Double(keptIrr) / Double(Swift.max(1, nIrr))))
+        }
+    }
+
+    // The one free parameter in the new rule, swept rather than guessed.
+    VectorStore.fusionMode = "score"
+    say("\n  implicit-weight sweep (explicit weight fixed at 1.0)")
+    let sweepNames = sample(names, 60), sweepCJK = sample(cjkQ, 25)
+    func stemRecall() -> (t1: Double, t10: Double) {
+        guard !stemQ.isEmpty else { return (0, 0) }
+        var h1 = 0, h10 = 0
+        for q in stemQ {
+            let want = stemOf[q]!
+            let hits = store.search(qvec[q]!, topK: 10, markActive: false, textQuery: q)
+            if let f = hits.first, base(f.path) == want { h1 += 1 }
+            if hits.contains(where: { base($0.path) == want }) { h10 += 1 }
+        }
+        return (100.0 * Double(h1) / Double(stemQ.count), 100.0 * Double(h10) / Double(stemQ.count))
+    }
+    for w in [0.0, 0.10, 0.20, 0.25, 0.35, 0.50, 0.75] {
+        VectorStore.lexicalWeightImplicit = w
+        let st = stemRecall()
+        let r = recall(sweepNames, topK: 10), c = recall(sweepCJK, topK: 25)
+        let pr = proseRetention()
+        say(String(format: "    w=%.2f  stem t1 %5.1f%% t10 %5.1f%%  fullname t10 %5.1f%%  CJK t10 %5.1f%%  prose kept %5.1f%%  r1 moved %d",
+                     w, st.t1, st.t10, r.t10, c.t10,
+                     100.0 * Double(pr.kept) / Double(Swift.max(1, pr.total)), pr.moved))
+    }
+    VectorStore.lexicalWeightImplicit = 0.35
+    store.close()
+    exit(0)
+}
+
 // Filename channel: omni-verify lexcheck <dbCopy> [n]
 // Builds the filename index over a copy of a real store, then measures (a) whether typed filenames
 // are retrievable, (b) that the gate stays shut on prose, (c) query cost. Dense recall is not
