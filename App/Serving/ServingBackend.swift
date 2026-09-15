@@ -1,6 +1,10 @@
 import Foundation
 import OmniKit
 
+/// Which surface a served request arrived on. The history row is marked from this, so an agent's
+/// tool call and a script's REST call are distinguishable after the fact.
+enum ServedSurface: String, Sendable { case rest, mcp }
+
 /// The only seam between the HTTP serving layer and the engine/store. Adapters call
 /// these three members; nothing else in Serving touches OmniKit directly.
 protocol ServingBackend: Sendable {
@@ -10,10 +14,10 @@ protocol ServingBackend: Sendable {
     /// path; otherwise the low-priority passage (indexing) path. Output order matches input.
     func embedBatch(_ texts: [String], query: Bool) -> [[Float]]
     /// Semantic search: embeds `query` at high priority and scores against the store.
-    func search(_ query: String, topK: Int, filter: SearchFilter) -> [SearchHit]
+    func search(_ query: String, topK: Int, filter: SearchFilter, surface: ServedSurface) -> [SearchHit]
     /// Rank passages WITHIN an explicit set of files/folders. Embeds `query` (high priority)
     /// and scores against the already-indexed chunk vectors of those paths only.
-    func searchInline(_ query: String, paths: [String], topK: Int) -> [InlineChunkHit]
+    func searchInline(_ query: String, paths: [String], topK: Int, surface: ServedSurface) -> [InlineChunkHit]
     /// Index status for an explicit set of absolute file paths: which are indexed, as what kind,
     /// at which stored (modified, size) signature, with how many chunks. Read-only SQLite
     /// metadata lookups; never touches the engine or the vector data.
@@ -53,7 +57,7 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
     /// Hooked HERE rather than in the adapters because every route that runs a search - /v1/search
     /// and the MCP search tool alike - converges on `search` below. An adapter-level hook would
     /// have to be added again for each new provider, and forgotten once.
-    var onSearch: (@Sendable (String) -> Void)? = nil
+    var onSearch: (@Sendable (String, ServedSurface) -> Void)? = nil
 
     /// Matches the indexer's forward-pass width so we never exceed the engine's batch
     /// expectations; large client batches are split into groups of this size.
@@ -76,14 +80,18 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
         return out
     }
 
-    func search(_ query: String, topK: Int, filter: SearchFilter) -> [SearchHit] {
+    func search(_ query: String, topK: Int, filter: SearchFilter, surface: ServedSurface) -> [SearchHit] {
         let vec = engine.embedQuery(query)
-        onSearch?(query)
+        onSearch?(query, surface)
         return store.search(vec, filter: filter, topK: topK, textQuery: query)
     }
 
-    func searchInline(_ query: String, paths: [String], topK: Int) -> [InlineChunkHit] {
+    /// RECORDED TOO. Ranking passages within named files is a search the user did not type, which
+    /// is the whole of what the history switch covers - it was simply the one route that never
+    /// called back, so an agent reading inside files left no trace in the sidebar at all.
+    func searchInline(_ query: String, paths: [String], topK: Int, surface: ServedSurface) -> [InlineChunkHit] {
         let vec = engine.embedQuery(query)
+        onSearch?(query, surface)
         return store.rankChunksAcross(vec, paths: paths, topK: topK)
     }
 

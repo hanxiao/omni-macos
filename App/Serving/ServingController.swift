@@ -42,7 +42,7 @@ final class ServingController {
 
     /// Set by AppModel: what to do with the query text of a served search. Kept as a closure so
     /// Serving stays unaware of AppModel, which is the whole point of the ServingBackend seam.
-    var onServedSearch: ((String) -> Void)?
+    var onServedSearch: ((String, ServedSurface) -> Void)?
 
     /// What Omni indexes, and how to change it - supplied by AppModel, for the same reason
     /// `onServedSearch` is: Serving must not know what AppModel is. Set before attach(); a running
@@ -71,8 +71,8 @@ final class ServingController {
         var b = EngineServingBackend(engine: engine, store: store, modelName: modelName)
         // The hop off the connection's Task and onto the main actor, in one place. `onServedSearch`
         // is weak-captured through self so a torn-down controller cannot resurrect the model.
-        b.onSearch = { [weak self] q in
-            Task { @MainActor in self?.onServedSearch?(q) }
+        b.onSearch = { [weak self] q, surface in
+            Task { @MainActor in self?.onServedSearch?(q, surface) }
         }
         backend = b
         if isRunning {

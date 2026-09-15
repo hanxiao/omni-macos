@@ -245,7 +245,7 @@ enum MCPAdapter {
         // agent more than they cost a human - every one is context spent re-reading a file it has
         // already seen - so this defaults ON, with "group_duplicates": false for the flat list.
         let group = (args["group_duplicates"] as? Bool) ?? true
-        let hits = backend.search(query, topK: group ? min(topK * 3, 150) : topK, filter: filter)
+        let hits = backend.search(query, topK: group ? min(topK * 3, 150) : topK, filter: filter, surface: .mcp)
         let groups = backend.groupedResults(hits, enabled: group, limit: topK)
         let reps = groups.map(\.representative)
         let dupesByPath = Dictionary(uniqueKeysWithValues: groups.map { ($0.representative.path, $0) })
@@ -413,7 +413,7 @@ enum MCPAdapter {
         var maxSnippet = (args["max_snippet"] as? Int) ?? 400
         maxSnippet = max(0, min(maxSnippet, 4000))
 
-        let hits = backend.searchInline(query, paths: paths, topK: topK)
+        let hits = backend.searchInline(query, paths: paths, topK: topK, surface: .mcp)
 
         var content: [[String: Any]] = []
         if hits.isEmpty {

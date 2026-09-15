@@ -165,3 +165,24 @@ struct ToolbarToggle: View {
             .toggleStyle(.button)
     }
 }
+
+/// The Model Context Protocol mark, monochrome.
+///
+/// There is no SF Symbol for MCP, so the sidebar used `network` - a globe, which says "this came
+/// over a socket" and not "an agent asked for this". The glyph is the official mark, taken from
+/// simple-icons (CC0) and carried in the asset catalog as a template image, so it tints with
+/// `foregroundStyle` exactly as a symbol does. The first version of this was a path drawn from
+/// memory; it looked like a pair of ticks, and a mark nobody recognises is not a mark.
+struct MCPMark: View {
+    var body: some View {
+        Image("MCPMark")
+            .renderingMode(.template)
+            .resizable()
+            .aspectRatio(contentMode: .fit)
+            // OPTICALLY MATCHED, not box-matched. An SF Symbol carries its own margin inside the
+            // frame it is given; this glyph is a corner-to-corner diagonal that fills its 24pt
+            // viewBox edge to edge, so at the same frame it drew visibly larger and heavier than
+            // the symbols beside it. The inset gives it the margin a symbol would have had.
+            .padding(2)
+    }
+}

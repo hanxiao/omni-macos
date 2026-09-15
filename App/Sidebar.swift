@@ -270,14 +270,21 @@ private struct HistorySections: View {
     @ViewBuilder private func row(_ item: HistoryItem) -> some View {
                     HStack(spacing: 7) {
                         if item.bookmarked {
-                            Image(systemName: "star.fill").foregroundStyle(Color.yellow).frame(width: 16)
+                            // Monochrome, like every other glyph in this list. The rows it marks
+                            // are already under a Bookmarks header, so the colour was carrying no
+                            // information the reader did not already have from the grouping.
+                            Image(systemName: "star.fill").foregroundStyle(Color.secondary).frame(width: 16)
                         } else if item.isFile, let p = item.filePath {
                             // A file query: show its thumbnail (falls back to a generic icon if the
                             // file is gone, so deleted files degrade gracefully).
                             Thumbnail(path: p, side: 16, corner: 3)
+                        } else if item.isMCP {
+                            // An agent's tool call, marked with the protocol's own mark rather than
+                            // a globe: the globe says the query crossed a socket, which is true of
+                            // every served row and therefore tells the reader nothing.
+                            MCPMark().foregroundStyle(Color.secondary).frame(width: 16, height: 16)
                         } else if item.isServed {
-                            // Same glyph the Serving tab carries, so the sidebar and Settings agree
-                            // about what "this came over the server" looks like.
+                            // The REST surface: a script or a curl, not an agent.
                             Image(systemName: "network").foregroundStyle(Color.secondary).frame(width: 16)
                         } else {
                             Image(systemName: "magnifyingglass").foregroundStyle(Color.secondary).frame(width: 16)

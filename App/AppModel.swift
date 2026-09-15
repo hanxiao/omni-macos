@@ -17,7 +17,9 @@ enum IndexState { case idle, indexing, paused }
 /// Where a remembered search came from. A served search is one an agent or script sent over the
 /// HTTP/MCP server, not something the user typed - worth telling apart in the sidebar, and worth
 /// being able to switch off separately.
-enum HistorySource: String, Codable, Sendable { case app, serving }
+/// `serving` is the REST surface, `mcp` an agent's tool call. Two cases and not one because the
+/// sidebar marks them differently and a reader should be able to tell an agent apart from a script.
+enum HistorySource: String, Codable, Sendable { case app, serving, mcp }
 
 struct HistoryItem: Codable, Sendable, Identifiable, Equatable {
     var query: String                 // semantic (embedding) text, or "" for a file query
@@ -37,7 +39,8 @@ struct HistoryItem: Codable, Sendable, Identifiable, Equatable {
     var similar: Bool = false         // doc-vs-doc "find similar" vs query-by-file
     /// Defaulted, so every history item written before serving was remembered decodes unchanged.
     var source: String = HistorySource.app.rawValue
-    var isServed: Bool { source == HistorySource.serving.rawValue }
+    var isServed: Bool { source == HistorySource.serving.rawValue || source == HistorySource.mcp.rawValue }
+    var isMCP: Bool { source == HistorySource.mcp.rawValue }
     // The string the user actually typed/sees (with qualifiers) drives display, identity, and dedup.
     var displayText: String { rawQuery ?? query }
     // Namespaced so a file path can never collide with a text query of the same string. id is
@@ -1876,16 +1879,21 @@ final class AppModel {
     /// the active filters and the typing state, none of which describe a request that arrived over a
     /// socket. It also collapses live-typed prefixes ("ca" -> "cat"), which would silently eat an
     /// agent's genuinely distinct queries.
-    func recordServedSearch(_ raw: String) {
+    func recordServedSearch(_ raw: String, surface: ServedSurface = .rest) {
         guard saveServingHistory else { return }
         let q = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard q.count >= 2 else { return }
+        let source = (surface == .mcp ? HistorySource.mcp : HistorySource.serving).rawValue
         if let i = searchHistory.firstIndex(where: { $0.isServed && $0.displayText.caseInsensitiveCompare(q) == .orderedSame }) {
             searchHistory[i].lastUsed = Date()
+            // The same text can arrive first over REST and later from an agent. The row keeps one
+            // identity (both are `serving:` ids) and takes the surface that used it last, so the
+            // mark tracks where the query is actually coming from.
+            searchHistory[i].source = source
         } else {
             var item = HistoryItem(query: q, bookmarked: false, lastUsed: Date())
             item.rawQuery = q
-            item.source = HistorySource.serving.rawValue
+            item.source = source
             searchHistory.insert(item, at: 0)
         }
         // The in-memory insert is immediate, so the sidebar updates live. The SORT and the JSON
@@ -3349,7 +3357,7 @@ final class AppModel {
             // any in-flight server. modelName is reported by /health and /v1/models.
             // Served searches land in History like the user's own, subject to their own switch.
             // Set before attach(), so a server that auto-starts inside it is already wired.
-            self.serving.onServedSearch = { [weak self] q in self?.recordServedSearch(q) }
+            self.serving.onServedSearch = { [weak self] q, surface in self?.recordServedSearch(q, surface: surface) }
             self.serving.sources = self.makeSourcesControl()
             self.serving.attach(engine: engine, store: store, modelName: "omni-\(modelVariant.rawValue)")
             if let oldStore { Task.detached(priority: .utility) { _ = oldIndexer; oldStore.close() } }

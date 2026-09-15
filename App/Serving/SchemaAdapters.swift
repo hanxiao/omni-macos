@@ -320,7 +320,7 @@ enum SearchAdapter {
         // caller with fewer distinct files than it asked for.
         let group = (body["group_duplicates"] as? Bool) ?? true
         let fetch = group ? min(topK * 3, 300) : topK
-        let hits = backend.search(query, topK: fetch, filter: filter)
+        let hits = backend.search(query, topK: fetch, filter: filter, surface: .rest)
         let groups = backend.groupedResults(hits, enabled: group, limit: topK)
         // Lockstep rule as duplicateChunks: only trust a key whose modified matches the hit's.
         let contentKeys = backend.contentKeys(paths: groups.map { $0.representative.path })
