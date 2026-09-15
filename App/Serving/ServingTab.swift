@@ -31,10 +31,13 @@ struct ServingTab: View {
             requestsSection
         }
         .formStyle(.grouped)
-        .frame(height: 520)   // matches the Content tab so switching tall tabs doesn't jump
+        // NO FIXED HEIGHT. The Settings TabView sizes itself to the selected tab
+        // (`fixedSize(vertical:)`), so a pinned height here did not make the window steady - it
+        // made this one tab shorter than its own content and put a scroller inside it, which no
+        // other tab has.
         .sheet(isPresented: $showMCPSheet) {
             AgentConfigSheet(title: "Connect agents over MCP",
-                             subtitle: "For any MCP client with HTTP transport (Claude Code, Cursor, VS Code). Tools: search, search_inline, file_status, tag_image.",
+                             subtitle: "For any MCP client with HTTP transport. Eight tools: search, search_inline, file_status, tag_image, list_sources, add_source, pause_source, remove_source.",
                              text: mcpConfigText, saveAs: nil)
         }
         .sheet(isPresented: $showSkillSheet) {
@@ -131,7 +134,7 @@ struct ServingTab: View {
                 }
                 Spacer()
                 Button("MCP") { showMCPSheet = true }
-                    .help("Connection config for MCP clients (Claude Code, Cursor, VS Code)")
+                    .help("Connection config for MCP clients such as Claude Code, Cursor or VS Code")
                 Button("SKILL.md") { showSkillSheet = true }
                     .help("A ready skill file for instruction-following agents")
             }
@@ -140,7 +143,7 @@ struct ServingTab: View {
         } header: {
             Text("Server")
         } footer: {
-            Text("A local HTTP API for search, tags, and embeddings. Local network needs a token; changes restart the server.")
+            Text("A local HTTP API for search, tags, embeddings, and the folders Omni indexes. Local network needs a token; changes restart the server.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }
@@ -241,19 +244,19 @@ struct ServingTab: View {
         return """
         ---
         name: omni-local-search
-        description: Search the user's local files by MEANING (semantic search over text, code, PDFs, images, audio, and video) via the Omni app's local HTTP API. Use when the user asks to find, locate, or recall their own files by content ("find my notes about X", "that invoice from February", "photos of the beach").
+        description: Semantic search over the user's own files - text, code, PDFs, images, audio and video - through the Omni app's local HTTP API. Use it when the user asks to find, locate or recall their own files by content: find my notes about X, that invoice from February, photos of the beach.
         ---
 
         # Omni - local semantic file search
 
         Omni indexes the user's files into one embedding space, so describe the CONTENT you want
-        in natural language (any language); keywords are not required. Results are absolute file
-        paths - read the files yourself if you need their contents.
+        in natural language. Any language works and keywords are not required. Results are
+        absolute file paths; read the files yourself if you need their contents.
 
         Base URL: \(base)
         \(authNote)
 
-        ## Search (the main call)
+        ## Search
 
         ```bash
         curl -s \(base)/v1/search\(authFlag) -H 'Content-Type: application/json' \\
@@ -263,27 +266,30 @@ struct ServingTab: View {
         Optional `filters`: `{"kinds": ["text"|"image"|"audio"|"video"|"scan"], "folder": "/abs/path",
         "folders": ["/abs/one", "/abs/two"], "since": <epoch seconds>}`.
         `"text"` includes scanned PDFs; `"scan"` is scanned PDFs only.
-        Use `folders` to search two or more folders at once - asking the user to add them as
-        sources instead does NOT work, because an indexed parent folder already covers its
-        children, so there is no way to name just two of them that way.
-        Response: `{"results": [{"path", "score" (0..1), "snippet", "kind", "modified", "locator", "chunk_count", ...}]}`.
-        `locator` is where the best match sits inside the file ("Page 3", "Line 1240"; "" if n/a);
-        `chunk_count` is how many chunks (pages/passages) the file has in the index. Hits also
-        carry `bytes` (indexed file size) and `mime_type`, and media hits add `width`/`height`
-        (px) and `duration` (seconds) recorded at index time - so you can prefer, say, the
-        4032x3024 original over a 192px thumbnail without opening either. Copies of one file are
-        ALREADY collapsed for you: a hit that stands for several carries `duplicate_count`, the
-        other `duplicates` paths, and `duplicate_kind` - `exact` (byte-identical) or `near` (same
-        kind and extension, sizes within 10%, cosine >= 0.98). So `top_k` counts distinct files, and
-        you never spend context reading the same document twice. Pass `"group_duplicates": false`
-        for the flat list. (`content_key` is still there, and is now identity-per-size, if you want
-        to group differently.) Image hits
-        indexed with tagging on carry a few content words as their `snippet` ("cat, couch,
-        crib") instead of the filename - see Image tags below to read those as a list, or to
-        tag a picture that is not indexed. Fields are omitted when unknown. Scores above ~0.45
-        are usually relevant; below ~0.3 usually noise.
+        Use `folders` to search two or more folders at once. Asking the user to add them as sources
+        instead does not work, because an indexed parent folder already covers its children.
 
-        ## File status (is this file indexed, and is the index fresh?)
+        Response: `{"results": [{"path", "score", "snippet", "kind", "modified", "locator",
+        "chunk_count", ...}]}`. `score` runs 0 to 1; above 0.45 is usually relevant and below 0.3
+        usually noise. `locator` is where the best match sits inside the file, such as `Page 3` or
+        `Line 1240`, and is empty when the file has no meaningful position. `chunk_count` is how
+        many pages or passages the file has in the index. Hits also carry `bytes` for the indexed
+        file size and `mime_type`. Media hits add `width` and `height` in pixels and `duration` in
+        seconds, recorded at index time, so you can prefer a 4032x3024 original over a 192px
+        thumbnail without opening either.
+
+        Copies of one file are already collapsed. A hit standing for several carries
+        `duplicate_count`, the other `duplicates` paths, and a `duplicate_kind` of `exact` for
+        byte-identical files or `near` for the same kind and extension within 10% in size and at
+        cosine 0.98 or above. So `top_k` counts distinct files. Pass `"group_duplicates": false`
+        for the flat list, or group differently yourself with `content_key`, which is
+        identity-per-size.
+
+        An image indexed with tagging on carries a few content words as its `snippet`, such as
+        `cat, couch, crib`, in place of the filename. Read those as a list, or tag an untagged
+        picture, through the tag calls below. Fields are omitted when unknown.
+
+        ## File status
 
         ```bash
         curl -s \(base)/v1/files/status\(authFlag) -H 'Content-Type: application/json' \\
@@ -292,12 +298,12 @@ struct ServingTab: View {
 
         Response: `{"files": [{"path", "indexed", and when indexed: "exists", "kind", "chunk_count",
         "modified", "bytes", "up_to_date", "indexed_at"?}]}`. `up_to_date` compares the on-disk
-        (mtime, size) with the indexed version - false means the file on disk changed (or was
-        deleted, see `exists`) after it was indexed. `indexed_at` (epoch seconds) is when the
-        indexer last wrote the file; absent on files indexed by older app versions. Files only
-        (not folders); up to 2048 paths. Non-indexed paths return just `{"path", "indexed": false}`.
+        mtime and size with the indexed version; false means the file changed or was deleted after
+        it was indexed, and `exists` tells you which. `indexed_at` is epoch seconds and is absent on
+        files indexed by older app versions. Files only, not folders, up to 2048 paths. A path Omni
+        does not hold returns just `{"path", "indexed": false}`.
 
-        ## Image tags (what is in this picture?)
+        ## Image tags
 
         ```bash
         curl -s \(base)/v1/files/tags\(authFlag) -H 'Content-Type: application/json' \\
@@ -305,11 +311,11 @@ struct ServingTab: View {
         ```
 
         Response: `{"files": [{"path", "indexed", "kind", "taggable", "tags": [...]}]}`. These are
-        the tags Omni generated at index time - the same words `tag:` matches in a search - so the
+        the tags Omni generated at index time, the same words `tag:` matches in a search, so the
         call is instant and costs nothing. `taggable` is false for text and audio, which carry no
         tags. An empty `tags` on taggable media means it has not been tagged yet.
 
-        To tag an image Omni has NOT indexed, or to re-tag a changed file, compute on demand:
+        To tag an image Omni has not indexed, or to re-tag a changed file, compute on demand:
 
         ```bash
         curl -s \(base)/v1/tag\(authFlag) -H 'Content-Type: application/json' \\
@@ -318,39 +324,64 @@ struct ServingTab: View {
 
         `path` must be inside the user's indexed folders; otherwise send the bytes as
         `{"image": "<base64 or data: URI>"}`. Multi-crop refinement is on by default so the result
-        matches what the index would store - pass `"hq": false` for one forward per image instead
-        of six. Nothing is written to the index. Max 4 images per request (16 with `hq: false`).
+        matches what the index would store; pass `"hq": false` for one forward pass per image
+        instead of six. Nothing is written to the index. Max 4 images per request, or 16 with
+        `hq: false`.
 
-        ## Health check
+        ## Sources - what Omni indexes
 
-        `curl -s \(base)/health` -> `{"status":"ok", ...}`. If the connection is refused, the
-        server is off - ask the user to enable Settings -> Serving in the Omni app.
+        ```bash
+        curl -s \(base)/v1/sources\(authFlag)
+        ```
 
-        ## Embeddings (optional)
+        Response: `{"sources": [{"key", "title", "path", "kind", "indexed", "paused", "indexing"}]}`.
+        `kind` is `folder` or `photos`. Call this before concluding a file is not on the Mac: a
+        folder that is not a source is simply not indexed.
 
-        `POST \(base)/v1/embeddings` accepts OpenAI/Jina-style bodies (`{"model":"omni","input":[...]}`)
-        and returns L2-normalized vectors - useful for building your own similarity logic.
+        Add a folder, or the Apple Photos library whole or by album:
+
+        ```bash
+        curl -s \(base)/v1/sources/add\(authFlag) -H 'Content-Type: application/json' \\
+          -d '{"path": "/abs/folder"}'
+        ```
+
+        Send `{"album": "all"}` or an album id from the list instead of `path`; give one or the
+        other, never both. Indexing starts immediately. `POST \(base)/v1/sources/pause` takes
+        `{"key": "...", "paused": true|false}` and keeps what is already indexed;
+        `POST \(base)/v1/sources/remove` takes `{"key": "..."}` and drops the source and its rows.
+        Both keys come from the list above. Adding and especially removing change what the user
+        sees in the app, so do them on request, not on your own initiative.
+
+        ## Health and model
+
+        `GET \(base)/health` -> `{"status":"ok", ...}`. A refused connection means the server is
+        off; ask the user to enable Settings -> Serving in the Omni app.
+        `GET \(base)/v1/models` lists the loaded model.
+
+        ## Embeddings
+
+        Four request schemas, all returning L2-normalized vectors over the same model. Use them to
+        build your own similarity logic; searching Omni's index does not need them.
+
+        - `POST \(base)/v1/embeddings` - OpenAI and Jina bodies, `{"model":"omni","input":[...]}`,
+          with an optional Jina `task` such as `retrieval.query`.
+        - `POST \(base)/v1/embed` and `POST \(base)/v2/embed` - Cohere v1 and v2 bodies.
+        - `POST \(base)/v1beta/models/omni:embedContent` and `:batchEmbedContents` - Gemini bodies,
+          authenticated with `x-goog-api-key` rather than a bearer header.
 
         ## MCP
 
-        The server also speaks MCP (streamable HTTP) at `\(base)/mcp` - point any MCP client at
-        that URL. Three tools:
+        The server also speaks MCP over streamable HTTP at `\(base)/mcp`. Point any MCP client at
+        that URL. Eight tools, each one the call of the same name above:
+        `search`, `search_inline`, `file_status`, `tag_image`, `list_sources`, `add_source`,
+        `pause_source`, `remove_source`.
 
-        - `search` - the same semantic search as above. Args: `query` (required), `top_k` (default
-          10, max 50), `kinds`, `folder`, `max_snippet` (snippet chars per result, default 200),
-          `group_duplicates` (collapse copies into one result, default true - the text line says
-          "N identical copies" and the structured row carries `duplicate_count`/`duplicates`), and
-          `include_images` (when true, image and scanned-PDF hits carry an inline JPEG thumbnail so
-          they render in the client). Each result also returns a `resource_link` - a `file://` URI
-          the client can open or preview - and media hits carry resolution/duration/size.
-        - `search_inline` - rank the best passages WITHIN a specific set of files or folders. Args:
-          `query` and `paths` (absolute file or folder paths), plus `top_k` and `max_snippet`. Reuses
-          the index (only the query is embedded), so it is fast - use it to pinpoint where something
-          is discussed across documents you already know.
-        - `file_status` - per-file index coverage. Args: `paths` (absolute file paths, up to 2048).
-          Reports indexed, kind, chunk count, the indexed version's (modified, bytes), exists, and
-          `up_to_date` - whether the on-disk file still matches the index. Same data as
-          `/v1/files/status` above.
+        Two differ from their HTTP form. `search` takes `include_images`, which attaches an inline
+        JPEG thumbnail to image and scanned-PDF hits so they render in the client, and returns a
+        `resource_link` per result that the client can open or preview. `search_inline` ranks the
+        best passages within an explicit set of files or folders, taking `query` and `paths` plus
+        `top_k` and `max_snippet`; only the query is embedded, so use it to pinpoint where a topic
+        is discussed across documents you already know.
         """
     }
 
