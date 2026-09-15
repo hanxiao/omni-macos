@@ -132,7 +132,7 @@ struct PhotoSourcePicker: View {
         // when the sources are saved, said here so the greyed-out album list is not a mystery.
         if wholeLibrary {
             let n = "\(libraryCount.formatted()) photos and videos"
-            return albums.isEmpty ? n : n + " \u{00B7} covers every album"
+            return albums.isEmpty ? n : n + ", covering every album"
         }
         let picked = chosen.subtracting(alreadyAdded)
         guard !picked.isEmpty else { return "Nothing selected" }

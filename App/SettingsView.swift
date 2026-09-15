@@ -173,19 +173,6 @@ private struct ActivityTab: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
-            Section {
-                Toggle("Generate tags", isOn: Binding(
-                    get: { model.imageTagsEnabled },
-                    set: { model.imageTagsEnabled = $0 }
-                ))
-                .toggleStyle(.switch)
-            } header: {
-                Text("Image & video tagging")
-            } footer: {
-                Text("A few words per photo, video, or scan (\"cat, couch, crib\"), on-device while indexing.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-
             Section("iCloud") {
                 Picker("Files not downloaded", selection: Binding(get: { model.skipDatalessFiles },
                                                                  set: { model.skipDatalessFiles = $0 })) {
@@ -274,9 +261,8 @@ private struct ActivityTab: View {
             Label(k.title, systemImage: k.symbol)
             Spacer()
             // Titled, then hidden: `Toggle("")` leaves VoiceOver reading an unnamed switch. And no
-            // `.controlSize(.mini)` - the switch two sections down ("Generate tags") is the
-            // default size, and two switch sizes in one window is the kind of thing you see
-            // without being able to name it.
+            // `.controlSize(.mini)` - every other switch in Settings is the default size, and two
+            // switch sizes in one window is the kind of thing you see without being able to name it.
             Toggle(k.title, isOn: Binding(get: { on }, set: { v in Task { await model.toggleKind(k, on: v) } }))
                 .labelsHidden().toggleStyle(.switch)
         }
@@ -296,6 +282,19 @@ private struct ContentTypesTab: View {
 
     var body: some View {
         Form {
+            Section {
+                Toggle("Generate tags", isOn: Binding(
+                    get: { model.imageTagsEnabled },
+                    set: { model.imageTagsEnabled = $0 }
+                ))
+                .toggleStyle(.switch)
+            } header: {
+                Text("Image & video tagging")
+            } footer: {
+                Text("A few words per photo, video, or scan (\"cat, couch, crib\"), on-device while indexing.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
             // "Skip small files" left the direction to the reader: is 300 the floor or the ceiling?
             // The header states it, so each row is just a modality and a number and no footer is
             // needed to explain which way it cuts.
@@ -313,12 +312,16 @@ private struct ContentTypesTab: View {
             }
 
             Section {
-                IgnoreEditor(text: $draft)
-                    .frame(minHeight: 180)
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
-                    .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(.separator))
-
-                previewBar
+                // ONE ROW, not two. A second row makes the Form draw a separator straight across
+                // the section, between the editor and the controls that act on it - a rule with
+                // nothing on either side of it worth separating.
+                VStack(alignment: .leading, spacing: 8) {
+                    IgnoreEditor(text: $draft)
+                        .frame(minHeight: 180)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(.separator))
+                    previewBar
+                }
             } header: {
                 Text("Ignore rules")
             } footer: {
@@ -507,13 +510,13 @@ private struct PerformanceTab: View {
                 Picker("Max image size", selection: Binding(get: { model.maxImageDimension }, set: { model.maxImageDimension = $0 })) {
                     Text("1024 px").tag(1024)
                     Text("1280 px").tag(1280)
-                    Text("1568 px \u{00B7} recommended").tag(1568)
+                    Text("1568 px").tag(1568)
                     Text("2048 px").tag(2048)
                 }
                 Picker("Max frames per video", selection: Binding(get: { model.maxVideoFrames }, set: { model.maxVideoFrames = $0 })) {
                     Text("6").tag(6)
                     Text("16").tag(16)
-                    Text("32 \u{00B7} recommended").tag(32)
+                    Text("32").tag(32)
                 }
                 Picker("Max characters per chunk", selection: Binding(get: { model.maxTextChunkChars }, set: { model.maxTextChunkChars = $0 })) {
                     Text("1200").tag(1200)
@@ -842,13 +845,19 @@ private struct HistoryTab: View {
                     Text("31 days").tag(31)
                 }
                 .help("Older searches are removed automatically; bookmarks are kept")
-                LabeledContent("Saved searches") {
+                // ONE ROW, and the button on the trailing edge. As two rows the Form drew a
+                // separator between the count and the control that acts on it, and left the button
+                // hanging on the leading edge - the only left-aligned button in Settings.
+                HStack(spacing: 10) {
+                    Text("Saved searches")
+                    Spacer()
                     Text("\(model.recentHistoryCount) recent \u{00B7} \(model.bookmarkCount) bookmarked")
                         .foregroundStyle(.secondary).monospacedDigit()
+                    Button("Clear\u{2026}", role: .destructive) { confirmClear = true }
+                        .controlSize(.small)
+                        .disabled(model.recentHistoryCount == 0)
+                        .help("Remove all recent searches; bookmarks are kept")
                 }
-                Button("Clear search history\u{2026}", role: .destructive) { confirmClear = true }
-                    .disabled(model.recentHistoryCount == 0)
-                    .help("Remove all recent searches; bookmarks are kept")
             }
         }
         .formStyle(.grouped)
@@ -1126,7 +1135,6 @@ private struct OCRModelRow: View {
 /// What the OCR model is asked to do. The model itself lives in Storage, beside the embedding
 /// model, because that is where its four and a half gigabytes are.
 private struct OCRTab: View {
-    @State private var prompt = OCRSession.Settings.customPrompt
     @State private var batch = OCRSession.Settings.batchWidth
 
     var body: some View {
@@ -1147,71 +1155,9 @@ private struct OCRTab: View {
 
             OCRCacheSection()
 
-            Section {
-                // One row, not two: a second row draws a separator across the section, and there is
-                // nothing on either side of it worth separating. The editor also drops its own
-                // background - inset on the section's inset read as a panel inside a panel.
-                VStack(alignment: .leading, spacing: 8) {
-                    TextEditor(text: $prompt)
-                        .font(.system(.callout, design: .monospaced))
-                        .scrollContentBackground(.hidden)
-                        .frame(height: 210)
-                        .onChange(of: prompt) { _, new in OCRSession.Settings.customPrompt = new }
-                    HStack {
-                        // EXAMPLES, NOT PRESETS. A preset changes the shape of the output from
-                        // behind a name nobody can judge; an example lands IN the box, where it can
-                        // be read and edited first. Each is a whole prompt - a fragment appended to
-                        // the default would contradict rules the default has already given.
-                        Menu("Examples") {
-                            ForEach(OCRPromptExample.all) { example in
-                                Button(example.title) { prompt = example.text }
-                            }
-                        }
-                        .menuStyle(.borderlessButton)
-                        .fixedSize()
-                        .controlSize(.small)
-                        Spacer()
-                        Button("Restore Default") { prompt = OCRModel.defaultPrompt }
-                            .controlSize(.small)
-                            .disabled(prompt == OCRModel.defaultPrompt)
-                    }
-                }
-            } header: {
-                Text("Prompt")
-            } footer: {
-                Text("Sent with every page. Changing it invalidates the cache.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
         }
         .formStyle(.grouped)
     }
-}
-
-/// Whole prompts a reader can start from, not fragments to append: the default already states
-/// rules about LaTeX, tables and headers, and a fragment added after it contradicts them silently.
-private struct OCRPromptExample: Identifiable {
-    let title: String
-    let text: String
-    var id: String { title }
-
-    static let all: [OCRPromptExample] = [
-        OCRPromptExample(
-            title: "Plain text, no layout",
-            text: "Transcribe every word on this page as plain text, in reading order. "
-                + "Do not use Markdown, tables or LaTeX. Do not describe the page."),
-        OCRPromptExample(
-            title: "Tables only",
-            text: "Transcribe only the tables on this page, as Markdown tables. "
-                + "Keep every cell, including empty ones. Ignore all other text."),
-        OCRPromptExample(
-            title: "Keep line breaks",
-            text: "Transcribe this page as Markdown, preserving the original line breaks "
-                + "exactly as they appear rather than reflowing paragraphs."),
-        OCRPromptExample(
-            title: "Translate to English",
-            text: "Transcribe this page and translate the result into English, as Markdown. "
-                + "Keep the layout, tables and headings of the original."),
-    ]
 }
 
 /// Transcripts already produced, kept as Markdown so the same page is never decoded twice.
@@ -1252,7 +1198,7 @@ private struct OCRCacheSection: View {
         } header: {
             Text("Cache")
         } footer: {
-            Text("Pages are saved as Markdown and reused while the file and prompt are unchanged.")
+            Text("Pages are saved as Markdown and reused while the file and the model are unchanged.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }

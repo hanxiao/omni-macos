@@ -113,19 +113,19 @@ final class OCRSession {
             set { UserDefaults.standard.set(newValue, forKey: "omni.ocr.batchWidth") }
         }
 
-        /// The instruction the model is given, editable in Settings. One box rather than a set of
-        /// presets: a preset that changes the LaTeX, table and header rules changes the SHAPE of
-        /// the output, which is not a setting a reader can judge from its name.
-        static var customPrompt: String {
-            get { UserDefaults.standard.string(forKey: "omni.ocr.customPrompt") ?? OCRModel.defaultPrompt }
-            set { UserDefaults.standard.set(newValue, forKey: "omni.ocr.customPrompt") }
-        }
-
-        /// nil means "the model's own default", which is what `transcribeAuto` expects.
-        static var prompt: String? {
-            let text = customPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-            return text.isEmpty || text == OCRModel.defaultPrompt ? nil : text
-        }
+        /// Always the model's own prompt. `nil` is what `transcribeAuto` expects for it.
+        ///
+        /// THE PROMPT IS NOT A SETTING. It was an editable box until measurement showed the model
+        /// does not act on what is in it: jina-ocr-v1 is trained with one assigned prompt per
+        /// dataset over a fixed set of tasks, so an instruction it was not trained on falls back to
+        /// full-page parsing. Five prompts were tried on two documents - translate to English,
+        /// plain text with no Markdown, title only, tables only, and the default with its own table
+        /// line changed from HTML to Markdown. None changed the task; the strongest effect was a
+        /// 3094 to 2828 byte drift with the page still fully transcribed.
+        ///
+        /// A stored value from the old box is deliberately not read. Honouring it with no UI left
+        /// would perturb decoding invisibly, with no way to get back to the default.
+        static var prompt: String? { nil }
     }
 
     /// How the transcription is displayed. Lives here rather than in the view so it survives

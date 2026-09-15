@@ -344,8 +344,8 @@ struct FolderEmbeddingVisualization: View {
     @ViewBuilder private var layoutMenu: some View {
         Menu {
             Picker("Layout", selection: Binding(get: { model.mapUsesUMAP }, set: { model.mapUsesUMAP = $0 })) {
-                Text("Fast \u{00B7} PCA").tag(false)
-                Text("Detailed \u{00B7} UMAP").tag(true)
+                Text("PCA").tag(false)
+                Text("UMAP").tag(true)
             }
             .pickerStyle(.inline)
             Divider()

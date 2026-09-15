@@ -89,7 +89,7 @@ struct OnboardingView: View {
     /// title was longest.
     private static let choices: [(title: String, size: String)] = [
         ("Download embedding model", "~1.9 GB"),
-        ("Download OCR model", "~4.5 GB \u{00B7} optional"),
+        ("Download OCR model", "Optional, ~4.5 GB"),
     ]
 
     @ViewBuilder private func downloadButton(_ choice: Int, prominent: Bool,
