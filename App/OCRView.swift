@@ -55,10 +55,12 @@ struct OCRView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .dropDestination(for: URL.self) { urls, _ in
-            session.open(urls: urls)
-            return true
-        } isTargeted: { dropTargeted = $0 }
+        // Same flavors the search pane accepts, through the same resolver: a browser image
+        // arrives as inline bytes, a file promise, or a remote URL, never as a file URL, so
+        // `dropDestination(for: URL.self)` took the drag and did nothing with it.
+        .onDrop(of: [.image, .fileURL, .url], isTargeted: $dropTargeted) { providers in
+            session.drop(pasteboard: NSPasteboard(name: .drag), providers: providers)
+        }
         .overlay(alignment: .top) {
             // In every state, including the empty one: the drop zone that used to carry its own
             // targeting is gone, so this chip is the only feedback a drag gets.
