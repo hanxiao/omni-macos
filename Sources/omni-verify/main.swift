@@ -4404,7 +4404,8 @@ if args.count >= 4 && args[1] == "qppcheck" {
     func med(_ xs: [Double]) -> Double { xs.isEmpty ? 0 : xs.sorted()[xs.count / 2] }
     let preds: [(String, (VectorStore.RetrievalConfidence) -> Float)] = [
         ("max score", { $0.topScore }), ("WIG", { $0.wig }), ("NQC", { $0.nqc }),
-        ("top - baseline", { $0.topScore - $0.baseline })]
+        ("top - baseline", { $0.topScore - $0.baseline }),
+        ("AS-norm (top)", { $0.tnorm }), ("AS-norm (mean)", { $0.tnormMean })]
     say("  predictor          AUROC far   AUROC near   med answerable   med far   med near")
     for (name, f) in preds {
         say(String(format: "  %-18s %.3f        %.3f     %+12.4f  %+8.4f  %+8.4f",

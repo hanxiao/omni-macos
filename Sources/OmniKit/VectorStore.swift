@@ -3992,6 +3992,98 @@ public final class VectorStore: @unchecked Sendable {
         public var baseline: Float = 0
         public var topScore: Float = 0
         public var kind: String = ""
+        /// Adaptive T-norm: the top score in standard deviations above the most confusable
+        /// impostors this query could find. The one number meant to be compared across queries.
+        public var tnorm: Float = 0
+        /// The same for the top-k mean rather than the single best hit.
+        public var tnormMean: Float = 0
+    }
+
+    /// ADAPTIVE T-NORM, borrowed from speaker verification.
+    ///
+    /// That field has solved this exact problem since the 1990s: given a probe, decide whether it
+    /// matches anything in the gallery or is an impostor. Matejka et al. (Interspeech 2017) state
+    /// our situation exactly - "without the normalization, different distributions of target and
+    /// non-target scores can be obtained for two different enrolled speaker models; this makes it
+    /// impossible to set a single detection threshold" - and their answer, adaptive score
+    /// normalization, was worth 30% relative on NIST SRE 2016.
+    ///
+    /// Score the query against a COHORT of impostor documents, keep the top N most similar of them,
+    /// and express the real score in standard deviations above that:
+    ///
+    ///     t = (s - mean(top-N cohort scores)) / sd(top-N cohort scores)
+    ///
+    /// Two details separate this from the corpus-baseline form (WIG) that measured worse here, and
+    /// the paper is explicit that both matter:
+    ///
+    ///   ADAPTIVE. The cohort is the top N, not the whole pool - the most CONFUSABLE impostors, not
+    ///   average ones. "If matched data are present in the cohort then the adaptive score
+    ///   normalization is always better than using all data, because it selects the correct cohort",
+    ///   and "using all data from the cohort yields worse results". A corpus centroid is the
+    ///   using-all-data case, which is what WIG computes.
+    ///
+    ///   SCALED. Dividing by the cohort standard deviation, not just subtracting its mean, is what
+    ///   makes the number comparable across queries rather than merely re-centred.
+    ///
+    /// It also dissolves the modality problem for free. The top-N most similar cohort members for a
+    /// text query are text chunks, so the query is judged against its own modality without a
+    /// per-kind table: adaptive cohort selection picks the right comparison set by construction.
+    ///
+    /// N: the paper reports a flat minimum between 200 and 500 and prefers 200.
+    private var cohort: [Float] = []        // [cohortCount * dim], row-major
+    private var cohortCount = 0
+    private var cohortRows = 0
+    private static let cohortPool = 8192
+    nonisolated(unsafe) public static var cohortTopN = 200
+
+    private func ensureCohortLocked() {
+        let n = rows.count
+        guard dim > 0, n > 0, flat16.count == n * dim else { return }
+        if cohortCount > 0, abs(n - cohortRows) * 20 < cohortRows { return }
+        let dead = deadRows
+        var picks: [Int] = []
+        picks.reserveCapacity(Self.cohortPool)
+        // Strided across the whole index, every kind included: adaptive selection does the
+        // per-modality work at query time, so the pool only has to be representative.
+        let stride = Swift.max(1, n / Self.cohortPool)
+        var i = 0
+        while i < n, picks.count < Self.cohortPool {
+            if !dead.contains(Int32(i)) { picks.append(i) }
+            i += stride
+        }
+        guard !picks.isEmpty else { return }
+        var out = [Float](repeating: 0, count: picks.count * dim)
+        flat16.withUnsafeBufferPointer { src in
+            guard let sp = src.baseAddress else { return }
+            out.withUnsafeMutableBufferPointer { dp in
+                guard let d = dp.baseAddress else { return }
+                for (j, r) in picks.enumerated() { Self.expandBF16(sp + r * dim, into: d + j * dim, count: dim) }
+            }
+        }
+        cohort = out
+        cohortCount = picks.count
+        cohortRows = n
+    }
+
+    /// Cohort mean and standard deviation for this query, over the top-N most similar impostors.
+    /// One [C, dim] x [dim] matmul on the GPU - 8192 x 768 is about 6M multiply-adds, which is
+    /// nothing next to the scan that produced the results being judged.
+    private func cohortStatsLocked(_ query: [Float]) -> (mean: Float, sd: Float)? {
+        ensureCohortLocked()
+        guard cohortCount > 0, query.count == dim else { return nil }
+        let m = MLXArray(cohort, [cohortCount, dim])
+        let qv = MLXArray(query, [dim, 1])
+        let sc = MLX.matmul(m, qv).reshaped([cohortCount])
+        let n = Swift.min(Self.cohortTopN, cohortCount)
+        let top = MLX.top(sc, k: n)
+        MLX.eval(top)
+        let vals = top.asArray(Float.self)
+        guard !vals.isEmpty else { return nil }
+        let mean = vals.reduce(0, +) / Float(vals.count)
+        var varc: Float = 0
+        for v in vals { varc += (v - mean) * (v - mean) }
+        let sd = (varc / Float(vals.count)).squareRoot()
+        return (mean, sd > 1e-6 ? sd : 1e-6)
     }
 
     /// Per-kind mean vector over a strided sample of rows. `q . centroid` IS the mean score of that
@@ -4078,6 +4170,10 @@ public final class VectorStore: @unchecked Sendable {
             // NQC divides the dispersion by the baseline, which is what makes it a ratio rather
             // than a score difference and therefore comparable across queries and kinds.
             out.nqc = base > 1e-6 ? Float(varc.squareRoot()) / base : 0
+            if let c = cohortStatsLocked(query) {
+                out.tnorm = (out.topScore - c.mean) / c.sd
+                out.tnormMean = (Float(mean) - c.mean) / c.sd
+            }
             return out
         }
     }
