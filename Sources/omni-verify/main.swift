@@ -4224,25 +4224,26 @@ if args.count >= 4 && args[1] == "nameconcat" {
     exit(0)
 }
 
-// Build and inspect the NNN bias: omni-verify nnnbuild <dbCopy> [alpha] [k]
-if args.count >= 3 && args[1] == "nnnbuild" {
+// Per-kind score profile: omni-verify conecheck <dbCopy> [alpha] [k]
+// Re-derives VectorStore.kindScoreScale. Run it after a model change; if one kind's p10, p50 and
+// p90 collapse to one number, that kind's embeddings sit in their own cone and its scores carry no
+// per-file information relative to a text query - which is what makes a per-kind floor necessary.
+if args.count >= 3 && args[1] == "conecheck" {
     let store = try VectorStore(dbURL: URL(fileURLWithPath: args[2]))
-    if args.count >= 4, let a = Float(args[3]) { VectorStore.nnnAlpha = a }
-    if args.count >= 5, let k = Int(args[4]) { VectorStore.nnnK = k }
-    print("nnnbuild files=\(store.fileCount) alpha=\(VectorStore.nnnAlpha) k=\(VectorStore.nnnK)")
+    let alpha = args.count >= 4 ? (Float(args[3]) ?? 0.75) : 0.75
+    let k = args.count >= 5 ? (Int(args[4]) ?? 8) : 8
+    print("conecheck files=\(store.fileCount) alpha=\(alpha) k=\(k)")
     let t = Date()
-    let ok = store.prepareNNNBias(force: true)
-    let secs = -t.timeIntervalSinceNow
-    let st = store.nnnStats()
-    print(String(format: "  built=%@ in %.1fs   files with bias %d   mean %.4f   p10 %.4f  p50 %.4f  p90 %.4f",
-                 ok ? "yes" : "no", secs, st.built, st.mean, st.p10, st.p50, st.p90))
-    // Per-kind, since equalizing the modality scale is the point.
-    for (k, v) in store.nnnBiasByKind().sorted(by: { $0.value.n > $1.value.n }) {
-        print(String(format: "  %-6s n=%-9d p10 %.4f  p50 %.4f  p90 %.4f", (k as NSString).utf8String!,
-                     v.n, v.p10, v.p50, v.p90))
+    let prof = store.modalityScoreProfile(alpha: alpha, k: k)
+    print(String(format: "  %.1fs", -t.timeIntervalSinceNow))
+    let ref = prof["text"]?.p50 ?? 0
+    for (kind, v) in prof.sorted(by: { $0.value.files > $1.value.files }) where !kind.isEmpty {
+        print(String(format: "  %-6s n=%-9d p10 %.4f  p50 %.4f  p90 %.4f   scale vs text %.3f",
+                     (kind as NSString).utf8String!, v.files, v.p10, v.p50, v.p90,
+                     ref > 0 ? Double(v.p50 / ref) : 0))
     }
     store.close()
-    exit(ok ? 0 : 1)
+    exit(prof.isEmpty ? 1 : 0)
 }
 
 // Relevance cutoff calibration: omni-verify cutcheck <dbCopy> <modelDir> [n]
@@ -4265,10 +4266,6 @@ if args.count >= 4 && args[1] == "cutcheck" {
     let store = try VectorStore(dbURL: URL(fileURLWithPath: dbPath))
     store.prepareLexicalIndex()
     let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[3]))
-    // The bias is LOADED but the store's own correction stays OFF: the search has to return raw
-    // scores so one page can serve both arms. Correcting twice would be measuring nothing.
-    VectorStore.nnnEnabled = false
-    _ = store.prepareNNNBias()
     let all = store.allIndexedPaths()
     guard !all.isEmpty else { print("empty store"); exit(1) }
     func say(_ s: String) { print(s); fflush(stdout) }
@@ -4356,7 +4353,6 @@ if args.count >= 4 && args[1] == "cutcheck" {
         let v = engine.embedQuery(q); qcache[q] = v; return v
     }
     var allRuns: [Run] = []
-    var nnnRuns: [Run] = []
     for c in cases {
         // ONE search, deep enough to contain both arms' top 40. The store's own correction is a
         // constant per file applied to a finished page, so the corrected top 40 is a re-sort of
@@ -4373,16 +4369,6 @@ if args.count >= 4 && args[1] == "cutcheck" {
         let top40 = Array(zip(hits.map { Double($0.score) }, rel).prefix(40))
         allRuns.append(Run(scores: top40.map { $0.0 }, relevant: top40.map { $0.1 }, kind: c.kind,
                            length: c.length, candVecs: Array(hits.prefix(40)).map { vecs[$0.path] ?? [] }))
-        // The same page, re-sorted by the store's own corrected score.
-        let bi = store.nnnBiasFor(paths: hits.map { $0.path })
-        if !bi.bias.isEmpty {
-            let corrected = zip(hits, rel).map { h, isRel -> (Double, Bool) in
-                let b = bi.bias[h.path] ?? bi.mean
-                return (Double(h.score) - Double(b) + Double(bi.mean), isRel)
-            }.sorted { $0.0 > $1.0 }.prefix(40)
-            nnnRuns.append(Run(scores: corrected.map { $0.0 }, relevant: corrected.map { $0.1 },
-                               kind: c.kind, length: c.length, candVecs: nil))
-        }
     }
     // DROP THE DEGENERATE LISTS.
     //
@@ -4564,34 +4550,6 @@ if args.count >= 4 && args[1] == "cutcheck" {
     }
     scope = runs
 
-    if !nnnRuns.isEmpty {
-        let usable = nnnRuns.filter { r in (1 ... maxFamily).contains(r.relevant.filter { $0 }.count) }
-        if usable.count >= 15 {
-            let r1 = usable.compactMap { $0.relevant.firstIndex(of: true) }.filter { $0 == 0 }.count
-            let b1 = runs.compactMap { $0.relevant.firstIndex(of: true) }.filter { $0 == 0 }.count
-            say(String(format: "\n  === STORE NNN, as shipped (n=%d) === relevant at rank 1: %d -> %d",
-                       usable.count, b1, r1))
-            for kd in ["text", "media"] {
-                var rel: [Double] = [], irr: [Double] = []
-                for r in usable where r.kind == kd {
-                    for (i, isRel) in r.relevant.enumerated() { if isRel { rel.append(r.scores[i]) } else { irr.append(r.scores[i]) } }
-                }
-                func pc(_ x: [Double], _ q: Double) -> Double {
-                    guard !x.isEmpty else { return 0 }
-                    let v = x.sorted(); return v[Swift.min(v.count - 1, Int(q * Double(v.count)))]
-                }
-                say(String(format: "    %-5s relevant n=%-5d p10 %.3f p50 %.3f p90 %.3f   irrelevant n=%-5d p10 %.3f p50 %.3f p90 %.3f",
-                           (kd as NSString).utf8String!, rel.count, pc(rel, 0.10), pc(rel, 0.50), pc(rel, 0.90),
-                           irr.count, pc(irr, 0.10), pc(irr, 0.50), pc(irr, 0.90)))
-            }
-            scope = usable
-            for t in [0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90] {
-                score(String(format: "t=%.2f", t), { y in y.prefix(while: { $0 >= t }).count })
-            }
-            scope = runs
-        }
-    }
-
     // PER-KIND THRESHOLD, which is what the cone effect says the cut has to be. Evaluated on the
     // raw scores, against the same global cut, so the two are directly comparable.
     say("\n  === per-kind cut (text at t, media at t * 0.615) ===")
@@ -4657,7 +4615,6 @@ if args.count >= 4 && args[1] == "fusecheck" {
     let n = (args.count >= 5 ? Int(args[4]) : nil) ?? 150
     let store = try VectorStore(dbURL: URL(fileURLWithPath: dbPath))
     store.prepareLexicalIndex()
-    if VectorStore.nnnEnabled { _ = store.prepareNNNBias() }
     let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[3]))
     let all = store.allIndexedPaths()
     guard !all.isEmpty else { print("empty store"); exit(1) }
