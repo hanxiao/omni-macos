@@ -274,11 +274,9 @@ struct ServingTab: View {
         `N. /path  (kind, score%, locator, N passages, yyyy-MM-dd)`, followed by the snippet.
         `score` runs 0 to 1. Compare it only within a kind: a text query scores a photo on a
         different scale than a document, so a 0.50 image and a 0.80 document are comparable matches.
-        Pass `"min_score"` in `filters` to drop weak hits; the default keeps everything.
-        A search that matches nothing well returns NO hits and says so instead: semantic search
-        always has a top result, so Omni compares the best score against the most confusable files
-        in the index and withholds the page when it is not clearly better. Retry with
-        `"include_weak": true` to see the nearest files anyway. `locator` is where the best match sits inside the file, such as `Page 3` or
+        Hits below 50% are dropped by default (scaled per kind, so media is not deleted by a
+        text-shaped floor). Pass `min_score` to change it - `0` returns everything. Over HTTP it
+        goes in `filters`; over MCP it is a top-level argument. `locator` is where the best match sits inside the file, such as `Page 3` or
         `Line 1240`, and is empty when the file has no meaningful position. `chunk_count` is how
         many pages or passages the file has in the index. Hits also carry `bytes` for the indexed
         file size and `mime_type`. Media hits add `width` and `height` in pixels and `duration` in

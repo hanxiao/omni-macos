@@ -297,7 +297,13 @@ final class AppModel {
     /// concurrency" (0.562). No absolute cutoff separates those, because they are not separated on
     /// this axis. Junk needs path and content rules; this control is for a user who wants a
     /// stricter list, which is why it stays, with a picker, off.
-    static let defaultMinScore = 0.0
+    /// The default relevance floor. "Only strong matches" in the filter menu, against "All" (0).
+    ///
+    /// A per-KIND floor, not a flat cosine: `VectorStore.relevanceFloor` scales it by the modality's
+    /// own score range, because a text query scores a photo on a different scale than a document
+    /// (measured: image, audio and video sit at 0.615 of the text scale, scans too). A flat 0.50
+    /// would keep documents and delete the media.
+    static let defaultMinScore = 0.5
 
     /// Cosine similarity is -1...1; the UI presents it as a 0...100% relevance, clamping the
     /// (rare, semantically-opposite) negative scores to 0. Filtering uses this same clamped
@@ -459,59 +465,6 @@ final class AppModel {
             recomputeResults()
         }
     }
-    /// Whether a search that matched nothing well should withhold its nearest neighbours.
-    ///
-    /// This is the whole of the Relevance control, and it is a two-way choice because the judgement
-    /// underneath it is per QUERY - does the index contain an answer to this - not per row. A
-    /// per-row cut was measured and is not offered: a fixed 60% floor emptied three of twelve
-    /// ordinary queries and removed 74% of all results, because the score scale moves with modality
-    /// and with the query.
-    ///
-    /// DEFAULTS ON by Han's decision, with the calibration below still outstanding. At the shipped
-    /// threshold it is INERT on a large index - nothing reaches 2.7 - so turning it on arms the
-    /// control for a refitted threshold rather than changing what anyone sees today.
-    ///
-    /// That measurement built its unanswerable class by scoping each query to a DIFFERENT FOLDER.
-    /// That lowers the top score because the candidate pool shrank, not because no answer exists,
-    /// so 2.7 was fitted to an artificial regime. Swept against the live 2.6M-file index by
-    /// bisecting the threshold until each query flips, real UNSCOPED queries land nowhere near it,
-    /// and the signal is inverted:
-    ///
-    ///     out of domain (should fire)          in domain (should not)
-    ///       11.02 Peruvian referendum 1997       5.98 jina embeddings v5 omni small mlx
-    ///       13.48 feline hyperthyroidism         8.44 vector store fuse lexical filename
-    ///       15.70 pruning apple trees            9.14 how does the indexer handle deletes
-    ///       24.38 seasoning a cast iron skillet 16.29 speculative decoding draft acceptance
-    ///
-    /// Off-topic queries score HIGHER (median 15.9 against 8.9), and nothing reaches 2.7 at all.
-    /// Same mechanism as the image cone, milder: for an off-topic query the whole cohort scores low
-    /// AND tightly, so sd collapses and the top reads as a large outlier in sd units; for an
-    /// on-topic query the cohort is full of genuinely related text, so the spread is real and the
-    /// top stands out less. t rewards the wrong thing under an unscoped search.
-    ///
-    /// Do not turn this back on by default until the negative class is rebuilt WITHOUT the folder
-    /// trick - files held out at index time, so the answer is absent from the index rather than
-    /// merely out of scope - and the threshold refitted against it.
-    var strongMatchesOnly: Bool = UserDefaults.standard.object(forKey: "omni.strongMatchesOnly") as? Bool ?? true {
-        didSet {
-            guard oldValue != strongMatchesOnly else { return }
-            UserDefaults.standard.set(strongMatchesOnly, forKey: "omni.strongMatchesOnly")
-            EngineServingBackend.strongMatchesOnly = strongMatchesOnly   // one switch, both surfaces
-        }
-    }
-    /// Set when the last search's top hit did not clear the confidence threshold. nil means either
-    /// a confident result or no opinion - the statistic declines on a small or still-filling index,
-    /// and "no opinion" must not read as "no match".
-    private(set) var retrievalNotice: String? = nil
-    /// "Show them anyway", for THIS query only. A per-query escape rather than a setting: the
-    /// judgement is per query, so overriding it should not quietly change the next search.
-    var showWeakAnyway = false
-
-    /// The results are being held back because nothing in the index really matches.
-    var withholdingWeakResults: Bool {
-        strongMatchesOnly && retrievalNotice != nil && !showWeakAnyway && !rawResults.isEmpty
-    }
-
     /// Snap the finished layout onto a grid so no two dots overlap (DGrid). Display-only: it does
     /// not change the fit, so toggling re-lays the existing projection without refitting.
     var mapNoOverlap: Bool = UserDefaults.standard.bool(forKey: "omni.mapNoOverlap") {
@@ -1487,7 +1440,12 @@ final class AppModel {
     var filterTags: String = "" { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
     var filterTagsExclude: String = "" { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
     var dateRange: DateRange = .any { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
-    var minScore: Double = defaultMinScore { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: false) } } }
+    var minScore: Double = defaultMinScore {
+        didSet {
+            EngineServingBackend.minScore = minScore   // one floor, window and server
+            if !suppressFilterSearch { syncBoxFromFilters(reSearch: false) }
+        }
+    }
     var sortOrder: SortOrder = .relevance { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: false) } } }
     private var suppressFilterEffects = false   // set while bulk-clearing filters for the folder map
     private var suppressFilterSearch: Bool { applyingParsedQuery || suppressFilterEffects }
@@ -3439,7 +3397,7 @@ final class AppModel {
             // Set before attach(), so a server that auto-starts inside it is already wired.
             self.serving.onServedSearch = { [weak self] q, surface in self?.recordServedSearch(q, surface: surface) }
             self.serving.sources = self.makeSourcesControl()
-            EngineServingBackend.strongMatchesOnly = self.strongMatchesOnly   // the stored setting, at attach
+            EngineServingBackend.minScore = self.minScore   // one floor, window and server
             self.serving.attach(engine: engine, store: store, modelName: "omni-\(modelVariant.rawValue)")
             if let oldStore { Task.detached(priority: .utility) { _ = oldIndexer; oldStore.close() } }
             self.supportsImages = engine.supportsImages
@@ -4730,11 +4688,8 @@ final class AppModel {
         }
     }
 
-    private func applyResults(_ hits: [SearchHit], resolved: String,
-                              confidence: VectorStore.RetrievalConfidence? = nil) {
+    private func applyResults(_ hits: [SearchHit], resolved: String) {
         let isNewQuery = resolvedQuery != resolved
-        retrievalNotice = WeakMatch.notice(confidence, hits: hits)
-        if isNewQuery { showWeakAnyway = false }   // a new question gets the judgement fresh
         rawResults = hits
         resolvedQuery = resolved
         resultsToken = resolved + "\u{1}" + filterSignature()
@@ -4831,9 +4786,6 @@ final class AppModel {
                     store.search(h, filter: filter, topK: Self.searchTopK)
                         .filter { !selfPaths.contains($0.path) }
                 }
-                // Judged on the same list the user sees. With the query file still in it the top
-                // score is its own 1.0 and the statistic reads the query back rather than the index.
-                let conf = vec.flatMap { v in hits.map { store.retrievalConfidence(query: v, hits: $0) } }
                 if omniMemLogEnabled, similar {
                     FileHandle.standardError.write(Data(String(format: "[similar] storeSearch=%.1fms hits=%d\n",
                         Double(DispatchTime.now().uptimeNanoseconds - tScan) / 1e6, hits?.count ?? -1).utf8))
@@ -4855,7 +4807,7 @@ final class AppModel {
                     }
                     if stored == nil { self.cacheFileQueryVector(cacheKey, vec) }
                     self.lastQueryVector = vec
-                    self.applyResults(hits, resolved: self.fileToken(url), confidence: conf)
+                    self.applyResults(hits, resolved: self.fileToken(url))
                     // Re-running from history must not reorder it; a transient temp-file image must
                     // not enter History at all (its UUID path never dedups and soon dangles).
                     if !fq.fromHistory && !fq.transient { self.recordFileQueryToHistory(fq) }
@@ -4892,11 +4844,10 @@ final class AppModel {
             searchWorkTask = Task.detached(priority: .userInitiated) {
                 if Task.isCancelled { return }   // superseded before the scan started: skip it
                 let hits = store.search(cached, filter: filter, topK: Self.searchTopK, textQuery: q)
-                let conf = store.retrievalConfidence(query: cached, hits: hits)
                 await MainActor.run {
                     guard token == self.searchToken else { return }
                     self.lastQueryVector = cached
-                    self.applyResults(hits, resolved: q, confidence: conf)
+                    self.applyResults(hits, resolved: q)
                     self.searching = false
                     self.engine?.indexingIdle()   // arm the buffer-cache trim (see file-query path)
                 }
@@ -4920,12 +4871,11 @@ final class AppModel {
                 hits = store.search(vec, filter: filter, topK: Self.searchTopK, textQuery: q)
             }
             if let tSearch { omniPerfLog(String(format: "search total=%.0fms indexing=%@ hits=%d", -tSearch.timeIntervalSinceNow * 1000, indexingNow ? "YES" : "no", hits.count)) }
-            let conf = store.retrievalConfidence(query: vec, hits: hits)
             await MainActor.run {
                 guard token == self.searchToken else { return }
                 self.cacheQueryVector(q, vec)
                 self.lastQueryVector = vec
-                self.applyResults(hits, resolved: q, confidence: conf)
+                self.applyResults(hits, resolved: q)
                 self.searching = false
                 self.engine?.indexingIdle()   // arm the buffer-cache trim (see file-query path)
             }

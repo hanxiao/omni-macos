@@ -153,13 +153,14 @@ enum MCPAdapter {
                         "items": ["type": "string"],
                         "description": "Restrict to files under ANY of these absolute folder paths. Use this to search two or more folders at once - adding them as sources instead does not work, because an indexed parent folder already covers its children."
                     ],
+                    "min_score": [
+                        "type": "number",
+                        "description": "Relevance floor, 0 to 1. Defaults to 0.5, the same floor the app's window applies, so weak matches are dropped rather than padding the page - semantic search always returns its nearest neighbours, and most of them are not answers. The floor is scaled per kind (a text query scores a photo on a lower scale than a document), so images are not deleted by a text-shaped cut. Pass 0 for everything.",
+                        "minimum": 0, "maximum": 1
+                    ],
                     "group_duplicates": [
                         "type": "boolean",
                         "description": "Collapse copies of the same file into one result (default true). A collapsed result carries duplicate_count, duplicates (the other paths) and duplicate_kind ('exact' = byte-identical, 'near' = same kind and extension, sizes within 10%, cosine >= 0.98). Set false for the flat list with every copy as its own result."
-                    ],
-                    "include_weak": [
-                        "type": "boolean",
-                        "description": "Return the nearest files even when none of them really matches. Semantic search always has a top result, so a weak query still returns a full page; by default Omni compares this query's best score against the most confusable files in the whole index and withholds the page when it is not clearly better, which is how 'there is nothing here' becomes sayable. Set true to see them anyway."
                     ]
                 ] as [String: Any],
                 "required": ["query"]
@@ -223,6 +224,11 @@ enum MCPAdapter {
         maxSnippet = max(0, min(maxSnippet, 2000))
         let includeImages = (args["include_images"] as? Bool) ?? false
         var filter = SearchFilter()
+        // Absent means "use the server's default floor", which is why this is Optional rather than
+        // defaulted here: a caller that says nothing gets the same cut the window applies, and
+        // min_score 0 is the explicit way to ask for everything.
+        if let ms = args["min_score"] as? Double { filter.minScore = Swift.max(0, Swift.min(1, ms)) }
+        else if let ms = args["min_score"] as? Int { filter.minScore = Swift.max(0, Swift.min(1, Double(ms))) }
         if let kinds = args["kinds"] as? [String] {
             let (set, err) = normalizedKinds(kinds)
             if let err { return toolError(id: id, "search failed: \(err)") }
@@ -258,10 +264,7 @@ enum MCPAdapter {
         // agent more than they cost a human - every one is context spent re-reading a file it has
         // already seen - so this defaults ON, with "group_duplicates": false for the flat list.
         let group = (args["group_duplicates"] as? Bool) ?? true
-        let includeWeak = (args["include_weak"] as? Bool) ?? false
-        let found = backend.searchReporting(query, topK: group ? min(topK * 3, 150) : topK,
-                                            filter: filter, surface: .mcp)
-        let hits = found.hits
+        let hits = backend.search(query, topK: group ? min(topK * 3, 150) : topK, filter: filter, surface: .mcp)
         let groups = backend.groupedResults(hits, enabled: group, limit: topK)
         let reps = groups.map(\.representative)
         let dupesByPath = Dictionary(uniqueKeysWithValues: groups.map { ($0.representative.path, $0) })
@@ -286,19 +289,7 @@ enum MCPAdapter {
 
         var content: [[String: Any]] = []
         if let building { content.append(["type": "text", "text": building]) }
-        // NOTHING MATCHED, so the page is withheld rather than annotated. An agent handed ten
-        // plausible paths will read them; a caveat above the list competes with the list and
-        // loses. The escape is named in the same sentence, because a withheld page that cannot be
-        // recovered would be worse than the problem - the judgement is wrong on about 1% of
-        // queries that do have an answer.
-        let weak = found.notice != nil && !includeWeak && !hits.isEmpty
-        if weak, let notice = found.notice {
-            content.append(["type": "text", "text":
-                "\(notice). \(hits.count) held back; retry with include_weak: true."])
-        }
-        if weak {
-            // The rows are deliberately absent; the line above already explained why.
-        } else if hits.isEmpty {
+        if hits.isEmpty {
             // Say WHICH kind of nothing this is, so the agent's next move is right.
             var text = "No results for \"\(query)\"."
             if let snap {

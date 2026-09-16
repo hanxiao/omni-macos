@@ -303,14 +303,7 @@ struct ContentView: View {
 
     @ViewBuilder private var contentBody: some View {
         VStack(spacing: 0) {
-            if model.withholdingWeakResults {
-                // The rows are not gone, they are held: a person cannot tell a confident answer
-                // from the nearest forty things by looking at them, which is the whole failure mode
-                // of dense retrieval, and one button undoes this for this query.
-                CenteredStatus(symbol: "questionmark.circle",
-                               title: WeakMatch.title, subtitle: "", showSpinner: false,
-                               action: ("Show nearest anyway", { model.showWeakAnyway = true }))
-            } else if !model.results.isEmpty {
+            if !model.results.isEmpty {
                 ResultsList(results: model.results) { belowThresholdFooter }
             } else if showsPhotoBrowser {
                 PhotoSourceBrowser(source: model.browsedPhotoSource!)
@@ -1004,15 +997,14 @@ struct ContentView: View {
             Picker("Date", selection: Binding(get: { model.dateRange }, set: { model.dateRange = $0 })) {
                 ForEach(DateRange.allCases) { Text($0.title).tag($0) }
             }
-            // TWO options, not a percentage ladder. The judgement underneath is per QUERY - does
-            // the index contain an answer to this - so a per-row percentage was the wrong shape for
-            // it, and the measured band (50/55/60) was a fixed floor on a score scale that moves
-            // with modality: 60% emptied three of twelve ordinary queries. `score:` in the query
-            // language still sets an explicit floor for anyone who wants one.
-            Picker("Relevance", selection: Binding(
-                get: { model.strongMatchesOnly }, set: { model.strongMatchesOnly = $0 })) {
-                Text("Only strong matches").tag(true)
-                Text("All").tag(false)
+            // Two options, on the SCORE. 50% is the floor 0.60 was measured down from: 0.60
+            // returned nothing at all for ordinary queries whose best hit was 0.59, while 0.50
+            // keeps 94.7% of known answers. Scaled per kind on the way through, so it does not
+            // delete the media (see AppModel.defaultMinScore). `score:` in the query language
+            // still sets any other floor.
+            Picker("Relevance", selection: Binding(get: { model.minScore }, set: { model.minScore = $0 })) {
+                Text("Only strong matches").tag(0.5)
+                Text("All").tag(0.0)
             }
             Divider()
             Button("Clear filters") { model.clearFilters() }.disabled(!model.filtersActive)

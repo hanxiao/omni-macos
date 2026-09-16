@@ -15,12 +15,6 @@ protocol ServingBackend: Sendable {
     func embedBatch(_ texts: [String], query: Bool) -> [[Float]]
     /// Semantic search: embeds `query` at high priority and scores against the store.
     func search(_ query: String, topK: Int, filter: SearchFilter, surface: ServedSurface) -> [SearchHit]
-    /// The same search, plus one line when the top hit is not clearly better than what this query
-    /// finds anywhere in the index. An agent cannot see the score distribution the way a person
-    /// scanning a list can, so the thing a human infers from "these all look unrelated" has to be
-    /// said out loud. Defaulted, so a stub backend need not have an opinion.
-    func searchReporting(_ query: String, topK: Int, filter: SearchFilter, surface: ServedSurface)
-        -> (hits: [SearchHit], notice: String?)
     /// Rank passages WITHIN an explicit set of files/folders. Embeds `query` (high priority)
     /// and scores against the already-indexed chunk vectors of those paths only.
     func searchInline(_ query: String, paths: [String], topK: Int, surface: ServedSurface) -> [InlineChunkHit]
@@ -53,22 +47,15 @@ protocol ServingBackend: Sendable {
 /// called directly from the connection's detached Task (off the main actor). The engine's
 /// gate yields passage work to queries, so serving never deadlocks with indexing and
 /// introduces no new locks.
-extension ServingBackend {
-    func searchReporting(_ query: String, topK: Int, filter: SearchFilter, surface: ServedSurface)
-        -> (hits: [SearchHit], notice: String?) {
-        (search(query, topK: topK, filter: filter, surface: surface), nil)
-    }
-}
-
 struct EngineServingBackend: ServingBackend, @unchecked Sendable {
     /// The relevance floor served results must clear, in text-score units. Same default and same
     /// per-kind scaling as the window, so an agent and a human asking one question see one answer.
     /// OFF, for the reason recorded on AppModel.defaultMinScore: a floor high enough to trim
     /// anything also empties ordinary queries. A caller that wants one passes `min_score`.
-    nonisolated(unsafe) static var minScore = 0.0
-    /// Mirrors the window's Relevance choice, so one setting governs both surfaces. On by
-    /// default - see AppModel.strongMatchesOnly for the calibration that is still outstanding.
-    nonisolated(unsafe) static var strongMatchesOnly = true
+    /// Mirrors the window's Relevance choice, so one floor governs both surfaces. Seeded from
+    /// AppModel.defaultMinScore and kept in step by its didSet; an explicit `min_score` in a
+    /// request still wins over it.
+    nonisolated(unsafe) static var minScore = 0.5
 
     let engine: OmniEngine
     let store: VectorStore
@@ -103,24 +90,14 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
     }
 
     func search(_ query: String, topK: Int, filter: SearchFilter, surface: ServedSurface) -> [SearchHit] {
-        searchReporting(query, topK: topK, filter: filter, surface: surface).hits
-    }
-
-    func searchReporting(_ query: String, topK: Int, filter: SearchFilter, surface: ServedSurface)
-        -> (hits: [SearchHit], notice: String?) {
         let vec = engine.embedQuery(query)
         onSearch?(query, surface)
         let hits = store.search(vec, filter: filter, topK: topK, textQuery: query)
-        // Judged on the UNCUT list: the floor below removes rows, and a statistic about whether
-        // anything matched must not be computed on a list something else has already trimmed.
-        let notice = Self.strongMatchesOnly
-            ? WeakMatch.notice(store.retrievalConfidence(query: vec, hits: hits), hits: hits)
-            : nil
         // The SAME cut the window applies, so an agent and a human asking one question see one
         // answer. Per kind, because the score scale is per kind - see VectorStore.relevanceFloor.
         let floor = filter.minScore ?? Self.minScore
-        guard floor > 0 else { return (hits, notice) }
-        return (hits.filter { Double($0.score) >= VectorStore.relevanceFloor(kind: $0.kind, base: floor) }, notice)
+        guard floor > 0 else { return hits }
+        return hits.filter { Double($0.score) >= VectorStore.relevanceFloor(kind: $0.kind, base: floor) }
     }
 
     /// RECORDED TOO. Ranking passages within named files is a search the user did not type, which
