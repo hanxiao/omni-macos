@@ -502,7 +502,7 @@ private struct PerformanceTab: View {
             } header: {
                 Text("Search")
             } footer: {
-                Text("Off: results update on Return. Identical copies always stack; near-identical ones are a judgement call.")
+                Text("Off: results update on Return.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -881,10 +881,12 @@ private struct IndexTab: View {
                         VStack(alignment: .leading, spacing: 6) {
                             Text("Index doesn't match the loaded model").fontWeight(.medium)
                             if let v = model.indexBuiltVariant {
-                                Text("Built with \(v.title), now running \(model.modelVariant.title). Switch back to keep it, or reindex.")
+                                // The FACT. The clause that followed it named the two buttons in
+                                // the row below, which already say what they do.
+                                Text("Built with \(v.title). \(model.modelVariant.title) is loaded.")
                                     .font(.caption).foregroundStyle(.secondary)
                             } else {
-                                Text("Built with an older embedding version. Reindex to keep results accurate.")
+                                Text("Built with an older embedding version.")
                                     .font(.caption).foregroundStyle(.secondary)
                             }
                             HStack {
@@ -914,8 +916,7 @@ private struct IndexTab: View {
                 if model.progress.photosNotLocal > 0 {
                     LabeledContent("Photos not on this Mac",
                                    value: model.progress.photosNotLocal.formatted())
-                        .help("These live in iCloud only. Files > iCloud decides whether Omni "
-                              + "downloads them or leaves them out.")
+                        .help("In iCloud only. Files > iCloud decides whether they download.")
                 }
                 if model.diskUse.isEmpty {
                     LabeledContent("Size", value: ByteSize.file(model.dbSizeBytes))

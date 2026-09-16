@@ -67,12 +67,11 @@ struct OnboardingView: View {
                 }
                 .padding(.top, 4)
 
-                // Frames the macOS permission prompts BEFORE they fire: they arrive right after the
-                // download with no other context.
-                Text("Next, Omni asks for access to Desktop, Documents, and Downloads.")
-                    .font(.callout).foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center).frame(maxWidth: 420)
-                    .padding(.top, 6)
+                // A line here used to frame the macOS permission prompts before they fired:
+                // "Next, Omni asks for access to Desktop, Documents, and Downloads." Nothing is
+                // seeded on a first launch any more (AppModel.loadRoots), so no prompt follows the
+                // download and there is nothing to frame - the user picks a folder when they are
+                // ready and macOS asks then, in the context of their own choice.
             }
 
             if model.downloadFailed {

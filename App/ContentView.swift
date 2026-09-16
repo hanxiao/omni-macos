@@ -478,7 +478,7 @@ struct ContentView: View {
                            subtitle: "", showSpinner: false,
                            action: ("Add\u{2026}", { SourcePicker.add(to: model) }))
         } else if let err = model.queryError {
-            CenteredStatus(symbol: "exclamationmark.triangle", title: "Couldn't search by that file",
+            CenteredStatus(symbol: "exclamationmark.magnifyingglass", title: "Couldn't search by that file",
                            subtitle: err, showSpinner: false)
         } else if model.indexObsolete && model.hasQuery {
             // A dim/model mismatch makes every search return nothing; explain it and offer both the
@@ -486,9 +486,12 @@ struct ContentView: View {
             let built = model.indexBuiltVariant
             CenteredStatus(symbol: "arrow.triangle.2.circlepath",
                            title: built != nil ? "Switch to \(built!.title) or reindex" : "Reindex to search",
+                           // The FACT only. The sentence that used to follow it ("Switch back to
+                           // keep your index, or reindex with the current model") described the two
+                           // buttons directly beneath it, which already say so themselves.
                            subtitle: built != nil
-                               ? "This index was built with \(built!.title), but \(model.modelVariant.title) is loaded. Switch back to keep your index, or reindex with the current model."
-                               : "This index was built with a different model than the one loaded. Reindex to search again.",
+                               ? "Built with \(built!.title). \(model.modelVariant.title) is loaded."
+                               : "Built with a different model than the one loaded.",
                            showSpinner: false,
                            action: built.map { v in ("Switch to \(v.title)", { model.selectVariant(v) }) },
                            secondary: ("Reindex", { model.startIndexing() }))
@@ -505,17 +508,24 @@ struct ContentView: View {
                 count: model.indexedFiles,
                 showSpinner: model.isResolving)
         } else if model.hiddenByThreshold > 0 {
+            // The count sits in the BUTTON, the only thing that acts on it. As a subtitle it
+            // restated the title and then named the mechanism doing it.
             CenteredStatus(symbol: "line.3.horizontal.decrease.circle",
                            title: "No results above \(Int(model.minScore * 100))%",
-                           subtitle: "\(model.hiddenByThreshold) weaker \(model.hiddenByThreshold == 1 ? "match is" : "matches are") hidden by the relevance threshold.",
-                           showSpinner: false, action: ("Show all matches", { model.showAllBelowThreshold() }))
+                           subtitle: "", showSpinner: false,
+                           action: ("Show \(model.hiddenByThreshold) weaker \(model.hiddenByThreshold == 1 ? "match" : "matches")",
+                                    { model.showAllBelowThreshold() }))
         } else if model.filtersActive {
-            // Filters can hide every result; the empty state is the only place left to escape them.
-            CenteredStatus(symbol: "line.3.horizontal.decrease.circle", title: "No matches",
-                           subtitle: "Filters are hiding every result.", showSpinner: false,
+            // Filters can hide every result; the empty state is the only place left to escape
+            // them. The cause goes in the TITLE - as a subtitle it was a sentence explaining the
+            // button underneath it.
+            CenteredStatus(symbol: "line.3.horizontal.decrease.circle", title: "No matches with these filters",
+                           subtitle: "", showSpinner: false,
                            action: ("Clear filters", { model.clearFilters() }))
         } else {
-            CenteredStatus(symbol: "magnifyingglass", title: "No matches", subtitle: "Try a different phrase.", showSpinner: false)
+            // No subtitle. "Try a different phrase" is the only thing anyone could do here, so
+            // saying it adds a line and no information.
+            CenteredStatus(symbol: "magnifyingglass", title: "No matches", subtitle: "", showSpinner: false)
         }
     }
 
@@ -1245,10 +1255,10 @@ struct SearchWaysPrompt: View {
     var footer: AnyView?
 
     static let searchWays: [(icon: String, text: String)] = [
-        ("character.cursor.ibeam", "Type a phrase, ranked by meaning"),
+        ("character.cursor.ibeam", "Type a phrase"),
         ("arrow.down.doc", "Drag in an image, file, or text"),
         ("doc.on.clipboard", "Paste an image or text  \u{2318}V"),
-        ("photo.badge.magnifyingglass", "Search by a file  \u{21E7}\u{2318}O"),
+        ("doc.viewfinder", "Search by a file  \u{21E7}\u{2318}O"),
         ("square.on.square", "Right-click a result for Find Similar"),
     ]
 

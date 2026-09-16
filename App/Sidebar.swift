@@ -46,15 +46,18 @@ struct Sidebar: View {
 
     /// ONE section holding both. They are the same thing to the user - places Omni indexes - and
     /// splitting them cost two headers and two "Add" rows to carry, on this machine, six folders
-    /// and one photo library. "Sources" rather than "Folders" because a photo library is not a
-    /// folder, and it is the word the app already uses for the pair everywhere else (add_source,
-    /// list_sources over MCP).
+    /// and one photo library.
+    ///
+    /// "Index", singular, because there IS one: a single store that these folders and this photo
+    /// library all feed. "Indices" would promise several. "Folders" was wrong once a photo library
+    /// sat in the list, and "Sources" named the inputs where the user's question is what is IN the
+    /// thing they search.
     ///
     /// Still assembled from extracted properties, not inlined: two badge-heavy row sets in one
     /// `List` literal is what exceeded the type checker before, and merging the SECTIONS does not
     /// change that.
     @ViewBuilder private var sourcesSection: some View {
-            Section("Sources") {
+            Section("Index") {
                 // NESTED, the way Finder's sidebar nests. The user's folders are a tree - a parent
                 // and the folders they added inside it - and a flat list could not say so: after a
                 // parent absorbed six children the sidebar held seven rows with no sign that six
@@ -535,7 +538,7 @@ private struct FolderRow: View {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
                 }
                 .buttonStyle(.plain)
-                .help("Omni doesn't have permission to read this folder. Click to open System Settings > Privacy & Security, then allow Omni under Files and Folders.")
+                .help("No permission to read this folder. Click to open Privacy & Security > Files and Folders.")
             } else if model.indexedFiles > 0, let c = model.folderFileCounts[url.path] {
                 // Once anything is indexed, show every folder's real count - a
                 // plain "0" is an unambiguous "nothing here yet" rather than blank.

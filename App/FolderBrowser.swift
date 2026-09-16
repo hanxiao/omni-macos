@@ -93,7 +93,7 @@ struct FolderBrowser: View {
                 // "Empty folder" would be a lie: the folder on disk may be full, and what is
                 // missing is an INDEX entry for anything in it. Say which.
                 ContentUnavailableView("Nothing indexed here", systemImage: "folder",
-                                       description: Text("Omni lists what it has indexed. Nothing under \(folder.lastPathComponent) is in the index yet."))
+                                       description: Text("Nothing under \(folder.lastPathComponent) is indexed yet."))
                 Spacer()
             } else if model.viewMode == .grid {
                 gridBody
