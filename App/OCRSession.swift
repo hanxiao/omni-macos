@@ -1564,6 +1564,48 @@ final class OCRSession {
         present(panel) { [weak self] in self?.open(urls: panel.urls) }
     }
 
+    /// Cmd-V in the transcription pane: transcribe whatever is on the clipboard.
+    ///
+    /// The search pane has done this since it shipped - paste an image, search by it - and the
+    /// transcription pane is the other half of the same gesture. Without it Cmd-V here did
+    /// something actively wrong rather than nothing: this pane's toolbar carries a search item too
+    /// (Find in document), so the app's Paste command read the window as search-owning and pasted
+    /// an image into an image SEARCH, leaving the document the user was reading.
+    ///
+    /// A real FILE wins over bitmap bytes, the same order the search side uses: a file copied in
+    /// Finder should be transcribed as itself, not as a re-encoded snapshot of it.
+    func pasteAndOpen() {
+        let pb = NSPasteboard.general
+        if let urls = (pb.readObjects(forClasses: [NSURL.self]) as? [URL])?
+            .filter({ $0.isFileURL && Self.isSupported($0) }), !urls.isEmpty {
+            open(urls: urls)
+            return
+        }
+        // Inline bytes - a browser's Copy Image, a screenshot taken to the clipboard. Everything
+        // downstream works from a file (the page rasteriser, and the transcript cache's key, which
+        // is a hash of the CONTENT - so the same image pasted again still hits the cache even
+        // though this path is new each time).
+        guard let (data, ext) = ContentView.pasteboardImageBytes(pb) else {
+            let message = "Nothing on the clipboard to transcribe. Copy a PDF, an image file, or an image."
+            if pages.isEmpty { phase = .failed(message) } else { post(notice: message) }
+            return
+        }
+        // Its own directory so the file can carry a name worth showing in the tab, without two
+        // pastes colliding on it.
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omni-paste-\(UUID().uuidString)", isDirectory: true)
+        let url = dir.appendingPathComponent("Pasted image.\(ext)")
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try data.write(to: url)
+        } catch {
+            let message = "Couldn't save the pasted image: \(error.localizedDescription)"
+            if pages.isEmpty { phase = .failed(message) } else { post(notice: message) }
+            return
+        }
+        open(urls: [url])
+    }
+
     func copyMarkdownToPasteboard() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(documentMarkdown, forType: .string)
