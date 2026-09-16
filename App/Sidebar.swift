@@ -45,8 +45,17 @@ struct Sidebar: View {
     /// Is anything actually nested? Nothing is indented when nothing is inside anything.
     private var isNested: Bool { model.folderTree.contains { $0.children != nil } }
 
-    @ViewBuilder private var foldersSection: some View {
-            Section("Folders") {
+    /// ONE section holding both. They are the same thing to the user - places Omni indexes - and
+    /// splitting them cost two headers and two "Add" rows to carry, on this machine, six folders
+    /// and one photo library. "Sources" rather than "Folders" because a photo library is not a
+    /// folder, and it is the word the app already uses for the pair everywhere else (add_source,
+    /// list_sources over MCP).
+    ///
+    /// Still assembled from extracted properties, not inlined: two badge-heavy row sets in one
+    /// `List` literal is what exceeded the type checker before, and merging the SECTIONS does not
+    /// change that.
+    @ViewBuilder private var sourcesSection: some View {
+            Section("Sources") {
                 // NESTED, the way Finder's sidebar nests. The user's folders are a tree - a parent
                 // and the folders they added inside it - and a flat list could not say so: after a
                 // parent absorbed six children the sidebar held seven rows with no sign that six
@@ -74,35 +83,37 @@ struct Sidebar: View {
                             .tag(SidebarSelection.folder(node.url))
                     }
                 }
-                Button { pickFolder() } label: { Label("Add folder\u{2026}", systemImage: "plus") }
-                    .buttonStyle(.plain)
+                photoRows
+                // One "Add", because the user is adding a place to search, and whether that place
+                // is a folder or the photo library is a detail of the picker, not a separate
+                // decision to be made from the sidebar.
+                Menu {
+                    Button("Folder\u{2026}") { pickFolder() }
+                    Button("Photos Library\u{2026}") { addPhotos() }
+                } label: {
+                    Label("Add\u{2026}", systemImage: "plus")
+                }
+                .menuIndicator(.hidden)
+                .buttonStyle(.plain)
             }
             .id(isNested)
     }
 
-    /// Extracted for the same reason as `foldersSection`: the two badge-heavy sections in
-    /// one `List` literal exceeded the type checker.
-    @ViewBuilder private var photosSection: some View {
-            Section("Photos") {
-                ForEach(model.photoSources) { source in
-                    PhotoSourceRow(source: source,
-                                   deselect: { if selection == .photos(source.key) { selection = nil } })
-                    .tag(SidebarSelection.photos(source.key))
-                }
-                Button { addPhotos() } label: { Label("Add photos\u{2026}", systemImage: "plus") }
-                    .buttonStyle(.plain)
-            }
+    /// Extracted for the same reason the folder rows are: two badge-heavy row sets in one `List`
+    /// literal exceeded the type checker.
+    @ViewBuilder private var photoRows: some View {
+        ForEach(model.photoSources) { source in
+            PhotoSourceRow(source: source,
+                           deselect: { if selection == .photos(source.key) { selection = nil } })
+            .tag(SidebarSelection.photos(source.key))
+        }
     }
 
     /// The three sections. Split from `body` because the modifier chain below plus three
     /// badge-heavy sections in one literal exceeded the type checker.
     private var list: some View {
         List(selection: $selection) {
-            foldersSection
-
-            // The Apple Photos library, kept in its own section rather than mixed in with folders:
-            // it is not a folder, it is not removed the same way, and it has no path to reveal.
-            photosSection
+            sourcesSection
 
             // Past searches, grouped by time. Extracted into its own view so it re-renders only when
             // searchHistory changes - NOT on every indexing-progress publish (~12x/sec), which would
