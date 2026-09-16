@@ -261,10 +261,19 @@ enum MCPAdapter {
         // Lockstep rule keeps stale sidecar rows from mislabeling.
         let contentKeys = backend.contentKeys(paths: reps.map { $0.path })
 
-        // The response interleaves, per result, a human/LLM-readable text block and a
-        // `resource_link` (a file:// URI the client can open or render directly). Capable
-        // clients show a list of openable files; dumb ones still read every text block in
-        // order.
+        // One text block per result, and nothing else.
+        //
+        // This used to interleave a `resource_link` carrying the same path as a file:// URI. MCP
+        // defines a resource_link as something the client then READS BACK through `resources/read`,
+        // and this server implements no resources at all - `resources/list` answers "method not
+        // found" and the handshake declares `{"tools": {}}`. So the links named a door that was
+        // never built, restating a path the text line above already gives in full. Measured, they
+        // were 2,079 bytes of a 9,656-byte ten-result response, about 519 tokens of a model's
+        // context per search. An agent that wants the file opens the path; a local search server
+        // is talking to a client that already has the filesystem.
+        //
+        // Implementing resources/read instead would be the other way out, and it would mean serving
+        // bytes the client can already open for itself.
         let snap = await snapshot
         let building = indexStateLine(snap)
 
@@ -312,7 +321,6 @@ enum MCPAdapter {
                     if !snippet.isEmpty { text += "\n   \(String(snippet.prefix(maxSnippet)))" }
                 }
                 content.append(["type": "text", "text": text])
-                content.append(resourceLink(for: h, description: "\(h.kind), \(score)%\(loc)\(meta)"))
                 let isMedia = h.kind == FileKind.image.rawValue || h.kind == FileKind.scan.rawValue
                 if includeImages && isMedia {
                     if inlined >= maxInlineImages {
@@ -321,13 +329,13 @@ enum MCPAdapter {
                         content.append(["type": "image", "data": b64, "mimeType": "image/jpeg"])
                         inlined += 1
                     }
-                    // else: a decode failure (missing/corrupt file) - the resource_link still stands; don't
-                    // count it against the cap message, which is specifically about hitting the limit.
+                    // else: a decode failure (missing/corrupt file) - the text block still carries the
+                    // path; don't count it against the cap message, which is about hitting the limit.
                 }
             }
             if cappedSkips > 0 {
                 content.append(["type": "text",
-                                 "text": "(\(cappedSkips) more image result(s) not inlined; cap is \(maxInlineImages). Open them via their file:// links.)"])
+                                 "text": "(\(cappedSkips) more image result(s) not inlined; cap is \(maxInlineImages). Open them by path.)"])
             }
         }
 
@@ -569,23 +577,9 @@ enum MCPAdapter {
         ])
     }
 
-    /// An MCP `resource_link` content block pointing at a local file. Clients that render
-    /// resources can open or preview the image/audio/video/document directly; the rest
-    /// ignore it and fall back to the adjacent text block.
-    private static func resourceLink(for hit: SearchHit, description: String) -> [String: Any] {
-        var link: [String: Any] = [
-            "type": "resource_link",
-            "uri": URL(fileURLWithPath: hit.path).absoluteString,
-            "name": (hit.path as NSString).lastPathComponent,
-            "description": description
-        ]
-        if let mime = mimeType(forPath: hit.path) { link["mimeType"] = mime }
-        return link
-    }
-
     // mimeType(forPath:) is shared with the HTTP adapters - see SchemaAdapters.swift.
 
-    /// Compact human-readable media suffix for a hit's text line / resource_link description:
+    /// Compact human-readable media suffix for a hit's text line:
     /// resolution for images ("4032x3024"), duration for audio/video ("12:34", "1:23:45"), and
     /// the indexed byte size - the quality clues an agent needs to pick between similar hits.
     private static func mediaLabel(width: Int, height: Int, duration: Double, bytes: Int) -> String {

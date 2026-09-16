@@ -380,8 +380,9 @@ struct ServingTab: View {
         `pause_source`, `remove_source`.
 
         Two differ from their HTTP form. `search` takes `include_images`, which attaches an inline
-        JPEG thumbnail to image and scanned-PDF hits so they render in the client, and returns a
-        `resource_link` per result that the client can open or preview. `search_inline` ranks the
+        JPEG thumbnail to image and scanned-PDF hits so they render in the client, and returns one
+        text line per hit rather than JSON rows: `N. /path  (kind, score%, locator, N passages,
+        yyyy-MM-dd)` followed by the snippet. Open a result by its path. `search_inline` ranks the
         best passages within an explicit set of files or folders, taking `query` and `paths` plus
         `top_k` and `max_snippet`; only the query is embedded, so use it to pinpoint where a topic
         is discussed across documents you already know.
