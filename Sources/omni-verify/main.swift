@@ -4224,6 +4224,243 @@ if args.count >= 4 && args[1] == "nameconcat" {
     exit(0)
 }
 
+// Relevance cutoff calibration: omni-verify cutcheck <dbCopy> <modelDir> [n]
+//
+// The question is where to stop a ranked list. A FIXED score threshold is what the app exposes
+// today, and Elastic's own issue for the same feature (elastic/elasticsearch#99416) says why that
+// is hard: "in practice this threshold value can be difficult to find and can vary from
+// query-to-query". So this measures the fixed cut against the per-query rules the field actually
+// uses - Kneedle's knee (Satopaa et al., ICDCS 2011, the method Elastic spiked and Weaviate's
+// autocut is built on), the largest gap, the largest relative drop, Weaviate's jump rule, and an
+// outlier cut - on the same ground truth.
+//
+// GROUND TRUTH. A fragment of a file's own indexed text is a query whose answer we know: that
+// file. It is weak labelling (another file may legitimately answer better) but it is real, it
+// scales to hundreds of queries, and it covers every modality in the index - an image's indexed
+// text is its caption and tags, which is what someone would actually type to find it.
+if args.count >= 4 && args[1] == "cutcheck" {
+    let dbPath = args[2]
+    let n = (args.count >= 5 ? Int(args[4]) : nil) ?? 300
+    let store = try VectorStore(dbURL: URL(fileURLWithPath: dbPath))
+    store.prepareLexicalIndex()
+    let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[3]))
+    let all = store.allIndexedPaths()
+    guard !all.isEmpty else { print("empty store"); exit(1) }
+    func say(_ s: String) { print(s); fflush(stdout) }
+    func base(_ p: String) -> String { (p as NSString).lastPathComponent }
+    func ext(_ p: String) -> String { (p as NSString).pathExtension.lowercased() }
+    say("cutcheck  files=\(store.fileCount)")
+
+    // Build the query set. Sample across the whole index so every modality is represented in
+    // proportion, then take a middle fragment of each file's text.
+    var st = UInt64(0x2545F4914F6CDD1D)
+    func rnd(_ m: Int) -> Int { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return Int(st % UInt64(m)) }
+    let zero = [Float](repeating: 0, count: 768)
+    struct Case { let query: String; let answer: String; let kind: String; let full: String }
+    var cases: [Case] = []
+    var tries = 0
+    let mediaExt = Set(["jpg","jpeg","png","heic","mp4","mov","mp3","wav","m4a","gif","webp"])
+    while cases.count < n && tries < n * 40 {
+        tries += 1
+        let p = all[rnd(all.count)]
+        guard let snip = store.rankChunks(zero, path: p, topK: 1).first?.snippet, snip.count >= 24 else { continue }
+        let words = snip.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" }).map(String.init)
+        var q: String
+        if words.count >= 14 {
+            // A 9-word fragment identified its own source file 6% of the time in 2.68M files: too
+            // generic to be a label. Take a longer window, and require it to carry some rare-ish
+            // tokens, so the query actually names one document rather than a genre.
+            let start = Swift.min(words.count - 12, 2 + rnd(Swift.max(1, words.count / 2)))
+            let w = Array(words[start ..< Swift.min(words.count, start + 24)])
+            guard w.filter({ $0.count >= 7 }).count >= 3 else { continue }
+            q = w.joined(separator: " ")
+        } else {
+            // Short text: captions, tag lists, CJK and other scripts that write without spaces.
+            // These ARE the whole indexed text, so the whole thing is the query.
+            q = snip
+        }
+        q = String(q.prefix(300)).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard q.count >= 12 else { continue }
+        cases.append(Case(query: q, answer: p, kind: mediaExt.contains(ext(p)) ? "media" : "text",
+                          full: String(snip.prefix(300))))
+    }
+    say("  \(cases.count) labelled queries (\(cases.filter { $0.kind == "media" }.count) media)")
+    for c in cases.prefix(4) {
+        say("    e.g. [\(c.kind)] \(base(c.answer))  <-  \"\(c.query.prefix(90))\"")
+    }
+    // THE LABEL IS A DOCUMENT, NOT A PATH.
+    //
+    // First attempt labelled only the exact source file and measured 6.3% retrieval, which looked
+    // like a retrieval failure and was not. A random sample of this index lands mostly in
+    // machine-generated asset families - Material Design icon sets, thousands of files sharing one
+    // body of text - where the source path is simply not identifiable from its own content, and a
+    // sanity check confirmed it: the FULL indexed text of a file found that file 5 times in 60.
+    // So a hit counts as relevant when it is the source file or a near-duplicate of it, using the
+    // same cosine the app's own duplicate grouping uses. This understates recall (a different but
+    // genuinely relevant document still scores as a miss) but it understates every cut rule
+    // equally, which is what a comparison needs.
+    let nearDupCos = 0.95
+    var answerVec: [String: [Float]] = [:]
+    for c in cases { if answerVec[c.answer] == nil { answerVec[c.answer] = store.fileVector(c.answer) } }
+    func cos(_ a: [Float], _ b: [Float]) -> Double {
+        guard a.count == b.count, !a.isEmpty else { return 0 }
+        var d: Double = 0
+        for i in 0 ..< a.count { d += Double(a[i]) * Double(b[i]) }
+        return d
+    }
+
+    // One search per case, reused by every cut rule. topK is the app's default, not a test value.
+    struct Run { let scores: [Double]; let relevant: [Bool]; let kind: String }
+    var allRuns: [Run] = []
+    for c in cases {
+        let hits = store.search(engine.embedQuery(c.query), topK: 40, markActive: false, textQuery: c.query)
+        guard !hits.isEmpty, let av = answerVec[c.answer], !av.isEmpty else { continue }
+        let vecs = store.pooledVectors(paths: hits.map { $0.path })
+        let rel = hits.map { h -> Bool in
+            if h.path == c.answer { return true }
+            guard let v = vecs[h.path] else { return false }
+            return cos(v, av) >= nearDupCos
+        }
+        guard rel.contains(true) else { continue }   // no judgeable answer in the list
+        allRuns.append(Run(scores: hits.map { Double($0.score) }, relevant: rel, kind: c.kind))
+    }
+    // DROP THE DEGENERATE LISTS.
+    //
+    // A query drawn from a file that has hundreds of near-duplicates returns a list that is almost
+    // entirely near-duplicates, and then every cut rule scores well for a reason that has nothing
+    // to do with relevance. Measured on this index, the median such list had 33 of its 40 results
+    // labelled relevant and a total score span of 0.008 - forty copies of one document. Those lists
+    // cannot distinguish cut rules, so the evaluation is scoped to queries whose answer is a
+    // DISTINGUISHABLE document: at most `maxFamily` near-duplicates in the top 40. How many are
+    // dropped is itself worth printing, since it says how much of this index is asset families.
+    let maxFamily = 5
+    let famSizes = allRuns.map { $0.relevant.filter { $0 }.count }.sorted()
+    let runs = allRuns.filter { r in (1 ... maxFamily).contains(r.relevant.filter { $0 }.count) }
+    say(String(format: "  %d/%d queries have a judgeable answer; family size median %d, p90 %d",
+               allRuns.count, cases.count,
+               famSizes.isEmpty ? 0 : famSizes[famSizes.count / 2],
+               famSizes.isEmpty ? 0 : famSizes[Swift.min(famSizes.count - 1, famSizes.count * 9 / 10)]))
+    say("  \(runs.count) usable (answer has at most \(maxFamily) near-duplicates in the list)")
+    guard runs.count >= 20 else { say("  too few usable queries to calibrate"); store.close(); exit(1) }
+    let firstRel = runs.compactMap { $0.relevant.firstIndex(of: true) }
+    say(String(format: "  best relevant hit at rank 1 for %.1f%%, median rank %d",
+               100.0 * Double(firstRel.filter { $0 == 0 }.count) / Double(Swift.max(1, firstRel.count)),
+               firstRel.isEmpty ? 0 : firstRel.sorted()[firstRel.count / 2] + 1))
+
+    // Cut rules. Each returns how many results to KEEP, given the descending score list.
+    // Knee by maximum distance below the chord from the first point to the last, on axes
+    // normalized to the unit square. That difference curve is the core of Kneedle once the
+    // smoothing step - which exists for noisy curves of thousands of points, not for 40 - is
+    // dropped. `sens` is the minimum bend required before a knee is declared at all.
+    func kneeKeep(_ y: [Double], sens: Double) -> Int? {
+        guard y.count >= 4, let hi = y.first, let lo = y.last, hi - lo > 1e-9 else { return nil }
+        var best = -1.0, bestI = 0
+        for i in 0 ..< y.count {
+            let xn = Double(i) / Double(y.count - 1)
+            let yn = (y[i] - lo) / (hi - lo)
+            let d = (1 - xn) - yn
+            if d > best { best = d; bestI = i }
+        }
+        return best > sens ? bestI + 1 : nil
+    }
+    func gaps(_ y: [Double]) -> [Double] { (1 ..< y.count).map { y[$0 - 1] - y[$0] } }
+    func maxGapKeep(_ y: [Double]) -> Int? {
+        let g = gaps(y); guard let m = g.indices.max(by: { g[$0] < g[$1] }) else { return nil }
+        return m + 1
+    }
+    func maxRatioKeep(_ y: [Double]) -> Int? {
+        guard y.count >= 4 else { return nil }
+        var best = 1.0, bestI = -1
+        for i in 1 ..< y.count where y[i] > 1e-9 {
+            let r = y[i - 1] / y[i]
+            if r > best { best = r; bestI = i - 1 }
+        }
+        return bestI >= 0 ? bestI + 1 : nil
+    }
+    // Weaviate's autocut: stop after the first discontinuity, where a gap counts as one if it is
+    // `mult` times the average gap in the list.
+    func jumpKeep(_ y: [Double], mult: Double) -> Int? {
+        let g = gaps(y); guard !g.isEmpty else { return nil }
+        let mean = g.reduce(0, +) / Double(g.count)
+        guard mean > 1e-12 else { return nil }
+        for (i, v) in g.enumerated() where v > mult * mean { return i + 1 }
+        return nil
+    }
+    // Outlier cut: keep what stands above the list's own noise floor.
+    func zKeep(_ y: [Double], k: Double) -> Int? {
+        guard y.count >= 4 else { return nil }
+        let mean = y.reduce(0, +) / Double(y.count)
+        let varc = y.reduce(0.0) { $0 + ($1 - mean) * ($1 - mean) } / Double(y.count)
+        let sd = varc.squareRoot()
+        guard sd > 1e-9 else { return nil }
+        let t = mean + k * sd
+        let keep = y.prefix(while: { $0 >= t }).count
+        return keep > 0 ? keep : nil
+    }
+
+    // Evaluate: does the known answer survive, and how much of the list went away.
+    func score(_ name: String, _ rule: ([Double]) -> Int?) {
+        var kept = 0, total = 0, trimmed = 0.0, fired = 0
+        var keptMedia = 0, totalMedia = 0
+        for r in runs {
+            let fire = rule(r.scores)
+            let keep = fire ?? r.scores.count
+            if fire != nil { fired += 1 }
+            trimmed += 1.0 - Double(keep) / Double(r.scores.count)
+            for (i, isRel) in r.relevant.enumerated() where isRel {
+                total += 1
+                if r.kind == "media" { totalMedia += 1 }
+                if i < keep { kept += 1; if r.kind == "media" { keptMedia += 1 } }
+            }
+        }
+        say(String(format: "    %-14s keeps %5.1f%% of answers (media %5.1f%%)   trims %5.1f%% of the list   fires %5.1f%%",
+                   (name as NSString).utf8String!,
+                   100.0 * Double(kept) / Double(Swift.max(1, total)),
+                   100.0 * Double(keptMedia) / Double(Swift.max(1, totalMedia)),
+                   100.0 * trimmed / Double(Swift.max(1, runs.count)),
+                   100.0 * Double(fired) / Double(Swift.max(1, runs.count))))
+    }
+    let mediaRuns = runs.filter { $0.kind == "media" }.count
+    say("  \(runs.count - mediaRuns) text, \(mediaRuns) media")
+    // Where the relevant items actually sit, per modality. If these two distributions do not
+    // overlap, no single global threshold can serve both and the cutoff has to be per-kind.
+    for k in ["text", "media"] {
+        var rel: [Double] = [], irr: [Double] = []
+        for r in runs where r.kind == k {
+            for (i, isRel) in r.relevant.enumerated() { if isRel { rel.append(r.scores[i]) } else { irr.append(r.scores[i]) } }
+        }
+        func pc(_ x: [Double], _ q: Double) -> Double {
+            guard !x.isEmpty else { return 0 }
+            let v = x.sorted(); return v[Swift.min(v.count - 1, Int(q * Double(v.count)))]
+        }
+        say(String(format: "    %-5s relevant n=%-5d p10 %.3f p50 %.3f p90 %.3f   irrelevant n=%-5d p10 %.3f p50 %.3f p90 %.3f",
+                   (k as NSString).utf8String!, rel.count, pc(rel, 0.10), pc(rel, 0.50), pc(rel, 0.90),
+                   irr.count, pc(irr, 0.10), pc(irr, 0.50), pc(irr, 0.90)))
+    }
+    say("\n  fixed absolute cut (what the app exposes today)")
+    for t in [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80] {
+        score(String(format: "t=%.2f", t), { y in y.prefix(while: { $0 >= t }).count })
+    }
+    say("\n  per-query cuts")
+    for s in [0.02, 0.05, 0.10, 0.15] { score(String(format: "knee s=%.2f", s), { kneeKeep($0, sens: s) }) }
+    score("max gap", maxGapKeep)
+    score("max ratio", maxRatioKeep)
+    for m in [2.0, 3.0, 5.0, 8.0] { score(String(format: "jump x%.0f", m), { jumpKeep($0, mult: m) }) }
+    for k in [0.5, 1.0, 1.5, 2.0] { score(String(format: "z mean+%.1fsd", k), { zKeep($0, k: k) }) }
+
+    // Shape of a result list, which is what every per-query rule is reading.
+    var spans: [Double] = [], tops: [Double] = [], floors: [Double] = []
+    for r in runs where r.scores.count >= 10 {
+        tops.append(r.scores[0]); floors.append(r.scores[r.scores.count - 1])
+        spans.append(r.scores[0] - r.scores[r.scores.count - 1])
+    }
+    func med(_ x: [Double]) -> Double { x.isEmpty ? 0 : x.sorted()[x.count / 2] }
+    say(String(format: "\n  list shape: top %.3f  floor %.3f  span %.3f (medians over %d lists)",
+               med(tops), med(floors), med(spans), spans.count))
+    store.close()
+    exit(0)
+}
+
 // Fusion A/B: omni-verify fusecheck <dbCopy> <modelDir> [n]
 // Runs BOTH fusion modes against ONE frozen store in ONE process, so the only difference between
 // the arms is the merge rule. Measures the four things the merge is accountable for: does the
@@ -4330,13 +4567,23 @@ if args.count >= 4 && args[1] == "fusecheck" {
         return out.joined(separator: "  ")
     }
 
-    for mode in ["rrf", "score"] {
-        VectorStore.fusionMode = mode
-        say("\n  arm: \(mode)")
+    for arm in ["rrf", "score", "score+stemtier"] {
+        VectorStore.fusionMode = arm == "rrf" ? "rrf" : "score"
+        VectorStore.stemCountsAsExact = arm == "score+stemtier"
+        say("\n  arm: \(arm)")
         let inv = inversions(prose + Array(names.prefix(40)))
         say(String(format: "    order/score inversions in top-20: mean %.2f  max %d  queries affected %d/%d",
                      inv.mean, inv.max, inv.affected, prose.count + Swift.min(40, names.count)))
         let r = recall(names, topK: 10), m = recall(mediaQ, topK: 10), c = recall(cjkQ, topK: 10)
+        var sh1 = 0, sh10 = 0
+        for q in stemQ {
+            let hits = store.search(qvec[q]!, topK: 10, markActive: false, textQuery: q)
+            if let f = hits.first, base(f.path) == stemOf[q]! { sh1 += 1 }
+            if hits.contains(where: { base($0.path) == stemOf[q]! }) { sh10 += 1 }
+        }
+        say(String(format: "    typed stem   n=%d:  top-1 %5.1f%%  top-10 %5.1f%%", stemQ.count,
+                   100.0 * Double(sh1) / Double(Swift.max(1, stemQ.count)),
+                   100.0 * Double(sh10) / Double(Swift.max(1, stemQ.count))))
         say(String(format: "    typed filename n=%d:  top-1 %5.1f%%  top-10 %5.1f%%", names.count, r.t1, r.t10))
         say(String(format: "    media    n=%d:  top-1 %5.1f%%  top-10 %5.1f%%", mediaQ.count, m.t1, m.t10))
         say(String(format: "    CJK      n=%d:  top-1 %5.1f%%  top-10 %5.1f%%", cjkQ.count, c.t1, c.t10))
@@ -4360,6 +4607,32 @@ if args.count >= 4 && args[1] == "fusecheck" {
         say(String(format: "    prose score by rank (median): r1 %.3f  r5 %.3f  r10 %.3f  r20 %.3f",
                      med(atRank[1] ?? []), med(atRank[5] ?? []), med(atRank[10] ?? []), med(atRank[20] ?? [])))
         say("    prose score histogram <.30 \(buckets[0])  .30-.45 \(buckets[1])  .45-.60 \(buckets[2])  .60-.75 \(buckets[3])  >=.75 \(buckets[4])")
+    }
+
+    VectorStore.stemCountsAsExact = true
+    // RETRIEVAL vs RANKING. Recall numbers cannot tell the two apart: a miss is either "the
+    // sidecar never returned the file" or "it did and the fusion buried it". This separates them.
+    say("\n  name-sidecar retrieval (candidates returned, before any ranking)")
+    for probe in ["readme", "vectorstore", "记录", "会议", "会议记录", "報告", "レポート"] {
+        let c = store.lexicalCandidates(probe, limit: 24)
+        let hit = c.filter { base($0).lowercased().contains(probe.lowercased()) }.count
+        say(String(format: "    %-12s -> %3d candidates, %d contain the term   %@",
+                   (probe as NSString).utf8String!, c.count, hit,
+                   c.first.map { base($0) } ?? "-"))
+    }
+    if !stemQ.isEmpty {
+        var found = 0, gated = 0, both = 0
+        for q in stemQ {
+            let ret = store.lexicalCandidates(q, limit: 24).contains(where: { base($0) == stemOf[q]! })
+            let g = LexicalIndexProbe.shouldFuse(q)
+            if ret { found += 1 }
+            if g { gated += 1 }
+            if ret && g { both += 1 }
+        }
+        say(String(format: "    stems: sidecar returns the right file %d/%d   gate fires %d/%d   both %d/%d",
+                   found, stemQ.count, gated, stemQ.count, both, stemQ.count))
+        let missed = stemQ.filter { !LexicalIndexProbe.shouldFuse($0) }.prefix(6)
+        if !missed.isEmpty { say("    gate rejects e.g.: " + missed.joined(separator: " | ")) }
     }
 
     // Can an ABSOLUTE cutoff separate relevant from irrelevant at all? Ground truth we actually
@@ -4420,7 +4693,7 @@ if args.count >= 4 && args[1] == "fusecheck" {
         return (100.0 * Double(h1) / Double(stemQ.count), 100.0 * Double(h10) / Double(stemQ.count))
     }
     for w in [0.0, 0.10, 0.20, 0.25, 0.35, 0.50, 0.75] {
-        VectorStore.lexicalWeightImplicit = w
+        VectorStore.lexicalWeight = w
         let st = stemRecall()
         let r = recall(sweepNames, topK: 10), c = recall(sweepCJK, topK: 25)
         let pr = proseRetention()
@@ -4428,7 +4701,7 @@ if args.count >= 4 && args[1] == "fusecheck" {
                      w, st.t1, st.t10, r.t10, c.t10,
                      100.0 * Double(pr.kept) / Double(Swift.max(1, pr.total)), pr.moved))
     }
-    VectorStore.lexicalWeightImplicit = 0.35
+    VectorStore.lexicalWeight = 0.10
     store.close()
     exit(0)
 }

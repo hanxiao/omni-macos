@@ -2788,6 +2788,13 @@ public final class VectorStore: @unchecked Sendable {
 
     /// Build the filename index if it is missing or stale. Safe to call at any time; it is a no-op
     /// when current. Never call it on the store's queue - it takes its own lock and does its own IO.
+    /// Raw name-sidecar candidates for a query. Diagnostics only (`omni-verify`): it exposes the
+    /// RETRIEVAL half of the filename channel, which the recall numbers cannot separate from the
+    /// ranking half.
+    public func lexicalCandidates(_ q: String, limit: Int = 24) -> [String] {
+        lexical.match(q, limit: limit)
+    }
+
     public func prepareLexicalIndex() {
         let stamp = queue.sync { mutationGen }
         lexical.rebuildIfStale(paths: self.allIndexedPaths(), stamp: stamp)
@@ -4051,28 +4058,54 @@ public final class VectorStore: @unchecked Sendable {
     nonisolated(unsafe) public static var fusionMode =
         ProcessInfo.processInfo.environment["OMNI_FUSION"] ?? "score"
 
-    /// Weight of the filename channel when intent is explicit: a `filename:` clause, or a query that
-    /// IS some file's whole basename. 1.0 lets such a match reach rank 1 from any cosine, which is
-    /// the rule the old `+= 1.0` rank bonus was expressing by other means.
-    nonisolated(unsafe) public static var lexicalWeightExplicit = 1.0
-    /// Weight when the gate fired on a bare query and the name only partly matches. The gate is a
-    /// heuristic and it leaks (measured: it fires on 9 of 23 natural-language queries), so this
-    /// number is what makes a wrong gate decision harmless.
+    /// Weight of the filename channel, in the dense channel's units.
     ///
-    /// Swept on a frozen 2.68M-file index (`omni-verify fusecheck`), against typed stems
-    /// ("vectorstore" for VectorStore.swift - the partial match this weight actually governs) and
-    /// against prose retention of the dense top-10:
+    /// This is a convex combination in disguise. Bruch, Gai and Ingber (arXiv 2210.11934, TOIS
+    /// 2023) write hybrid fusion as `alpha * f_sem + (1 - alpha) * f_lex` and show it beats RRF on
+    /// all nine BEIR collections they test, in-domain and out. Their Lemma 4.2 also shows that any
+    /// positive linear rescaling of the channels is RANK-EQUIVALENT under a remapped alpha, so the
+    /// whole family induces the same achievable orderings. We take the representative that leaves
+    /// the dense channel at scale 1:
     ///
-    ///     w      stem top-1  stem top-10   prose kept   rank-1 moved
-    ///     0.20      2.5%        8.8%         99.2%          0/26
-    ///     0.25      7.5%       20.0%         99.2%          0/26
-    ///     0.35     32.5%       53.8%         99.2%          1/26
-    ///     0.50     58.8%       65.0%         97.7%          2/26
-    ///     0.75     65.0%       66.2%         91.9%          3/26
+    ///     d + w * s     with     w = (1 - alpha) / alpha
     ///
-    /// 0.35 is the largest weight that costs nothing in prose retention. Past it the trade turns:
-    /// 0.75 buys 1.2 more points of stem recall for 7.3 points of the semantic ranking.
-    nonisolated(unsafe) public static var lexicalWeightImplicit = 0.35
+    /// because the reported score has to keep one fixed meaning for a relevance threshold to work,
+    /// and `alpha * d` would rescale every score in the product the moment a filename channel
+    /// exists.
+    ///
+    /// w governs PARTIAL name matches and nothing else. Once `exactTier` carries unambiguous intent
+    /// (see below), the weight is inert on every case the corpus can produce a query for - swept on
+    /// a frozen 2.68M-file index, stem, full-name and CJK recall do not move at all, and the only
+    /// thing w changes is how much prose it damages:
+    ///
+    ///     w      stem t1/t10   fullname t10  CJK t10   prose kept   rank-1 moved
+    ///     0.00   65.0 / 66.2      93.3        100.0      100.0%         0/26
+    ///     0.10   65.0 / 66.2      93.3        100.0       99.2%         0/26
+    ///     0.25   65.0 / 66.2      93.3        100.0       98.1%         1/26
+    ///     0.35   65.0 / 66.2      93.3        100.0       95.8%         2/26
+    ///     0.75   65.0 / 66.2      93.3        100.0       83.5%         7/26
+    ///
+    /// So it is set to the largest value that keeps prose retention at 99%. It is not set to 0
+    /// only because the query sets above are built from real basenames and therefore contain no
+    /// partial matches - typing two words of a four-word name is a real thing to do, and this is
+    /// the channel that serves it. If a measurement ever exercises that case, re-sweep here.
+    nonisolated(unsafe) public static var lexicalWeight = 0.10
+
+    /// Candidates pulled from the name sidecar when `filename:` scopes the query. The clause is a
+    /// filter, so this is how many files it can admit, not how many it can rank.
+    static let filenameScopeLimit = 512
+
+    /// Separates the exact-basename tier from everything else. Must exceed the maximum the lower
+    /// tier can reach, which is 1 + lexicalWeight.
+    static let exactTier = 2.0
+
+    /// Typing a file's STEM ("vectorstore" for VectorStore.swift) is the same intent as typing its
+    /// whole basename, so it takes the same tier. The name sidecar already returns the right file
+    /// for 76 of 80 stem queries inside its first 24 candidates, so what used to lose them was
+    /// ranking, not retrieval: a stem fails the strict exact test and stayed in the lower tier on a
+    /// low cosine. Measured, the tier takes stem top-1 from 56.2% to 65.0% and costs nothing
+    /// anywhere else. Left a var so fusecheck can A/B it.
+    nonisolated(unsafe) public static var stemCountsAsExact = true
 
     /// Score fusion of the dense ranking with the filename channel.
     ///
@@ -4081,42 +4114,55 @@ public final class VectorStore: @unchecked Sendable {
     /// that only surfaces once a relevance cutoff is wanted: it ORDERS by 1/(k+rank) while every
     /// consumer - the results list, the HTTP surface, SKILL.md - reads `SearchHit.score`, which
     /// stayed the raw cosine. Order and score then disagree, and a threshold on the score punches
-    /// holes in the middle of the list (measured on the live index: 7 such inversions in the top 20
-    /// for "README.md", 4 for "VectorStore.swift"). Weaviate hit the same wall and moved their
-    /// default off RRF in v1.24 for the stated reason that RRF retains only the rankings, so it
-    /// cannot detect a cutoff point.
+    /// holes in the middle of the list (measured on a frozen index: 38 of 66 queries carried at
+    /// least one such inversion in the top 20, up to 9 in one). Bruch et al. put the same objection
+    /// theoretically - RRF is a function of ranks, so "the distance between raw scores plays no role
+    /// in determining their hybrid score" - and Weaviate moved their default off RRF in v1.24
+    /// because it "retains only the rankings" and so cannot detect a cutoff point.
     ///
-    /// The dense channel is the anchor and keeps its native scale. That rules out the per-query
-    /// min-max normalization Weaviate's relativeScoreFusion does, because a threshold has to mean
-    /// the same thing on every query and min-max makes every query's top hit 1.0. The filename
-    /// channel is instead a bounded boost into the dense channel's remaining headroom:
+    ///     fused = d + w * s
     ///
-    ///     fused = d + w * s * (1 - d)
+    /// d is the cosine clamped to [0,1] and s the name-match strength in [0,1]. s = 0 returns d
+    /// untouched, which is what keeps ONE threshold valid across fused and unfused queries. The
+    /// weight is per CHANNEL. The RRF this replaces multiplied its rank term by a per-DOCUMENT
+    /// strength and varied k per channel (60 dense, 5 or 120 lexical) to stand in for a weight; the
+    /// first version of this function then reintroduced the same mistake by giving exact-basename
+    /// matches their own weight. Per-document weighting is what makes a fusion untunable, so all
+    /// per-document information now lives in s and nowhere else.
     ///
-    /// d is the cosine clamped to [0,1], s the match strength in [0,1], w the channel weight. s = 0
-    /// returns d untouched, so a query the channel does not match scores exactly as it would
-    /// dense-only - which is what keeps one threshold valid across fused and unfused queries. The
-    /// result stays in [0,1] (the score contract omni-verify asserts) and is strictly increasing in
-    /// both inputs, so ranking by the fused score IS ranking by the score the caller sees.
+    /// An exact basename match is a TIER, not a weight. Measured: dropping it and letting the
+    /// convex combination carry the whole job took media recall from 98.3% to 28.3% at top-10. The
+    /// reason is that the dense channel's scale is modality-dependent - a photo's cosine against its
+    /// own filename is about 0.2, a text file's against its own text about 0.6 - so no single
+    /// additive weight can put a photo the user named above a text file it did not. Meilisearch and
+    /// Typesense both solve exactly this with ordered criteria instead of one blended number:
+    /// "there is no way for a high score in one dimension to compensate for a low score in another".
+    /// So the ranking is lexicographic in two criteria, the convex combination ranking WITHIN each:
     ///
-    /// w is per-CHANNEL, which is where a weight belongs. The RRF this replaces multiplied its rank
-    /// term by a per-DOCUMENT strength and varied k per channel (60 dense against 5 or 120 lexical)
-    /// to stand in for a weight - a score blend wearing RRF's clothes, which voids the "ranks have
-    /// no unit" argument that justified RRF in the first place.
+    ///     1. the query is this file's whole basename
+    ///     2. d + w * s
     ///
-    /// The lexical list is capped: 8,075 files in the reference corpus share the basename
-    /// "results.json", and an uncapped list would flood the results with one name.
+    /// encoded in one number by offsetting the top tier past the bottom tier's maximum (1 + w).
+    /// `exactTier` is not a tuned quantity; any value above that maximum gives the same order.
+    ///
+    /// The fused score can therefore exceed 1. That is a real ordering among the best possible
+    /// results, so it is kept in the sort; the display and JSON layers clamp.
+    ///
+    /// `filename:` is a SCOPE, not a boost. It sits with the other filters in the UI, it reads as a
+    /// filter, and every mainstream search box treats it as one. Under RRF it behaved like one only
+    /// by accident: k = 5 made the lexical term ten times the largest dense term, so name matches
+    /// swamped the list. Saying so outright costs one branch and removes a per-query weight that
+    /// would otherwise give explicit queries their own score scale.
     private func fuseLexical(dense: [SearchHit], text: String, filter: SearchFilter, topK: Int,
                              explicit: Bool, denseQuery: [Float]? = nil) -> [SearchHit] {
-        let names = lexical.match(text, limit: explicit ? topK : Swift.min(topK, 24))
-        guard !names.isEmpty else { return dense }
+        let names = lexical.match(text, limit: explicit ? Self.filenameScopeLimit : Swift.min(topK, 24))
+        // A scope that matches no name has no results. A boost that matches no name is a no-op.
+        guard !names.isEmpty else { return explicit ? [] : dense }
         let qt = Set(LexicalIndex.terms(text))
         // Normalized so "OmniEngine.swift", "omniengine.swift" and "omni engine swift" all count as
         // the same exact match.
         let qn = LexicalIndex.terms(text).joined(separator: " ")
-        // Per-name match strength and the weight that applies to it.
         var strength: [String: Double] = [:]
-        var weight: [String: Double] = [:]
         var lexPos: [String: Int] = [:]
         var exactNames: Set<String> = []
         for (i, p) in names.enumerated() {
@@ -4124,11 +4170,8 @@ public final class VectorStore: @unchecked Sendable {
             guard !btFull.isEmpty else { continue }
             // The extension is part of the name but is rarely part of the intent: "readme" names
             // README.md completely, yet counting "md" as an uncovered basename term caps coverage at
-            // 0.5. RRF hid that, because k=5 made even a halved lexical term ten times the largest
-            // dense term; a per-channel weight does not, so `filename:readme` lost 2 of its 10 slots
-            // to dense hits. Drop the extension unless the query asked for it. (`terms` splits on
-            // punctuation, so the extension is the last term.) The exact-name test below still reads
-            // the FULL basename, so this widens coverage without widening what counts as exact.
+            // 0.5. Drop it unless the query asked for it. (`terms` splits on punctuation, so the
+            // extension is the last term.)
             var bt = btFull
             let fileExt = (p as NSString).pathExtension.lowercased()
             if bt.count > 1, bt.last == fileExt, !qt.contains(fileExt) { bt.removeLast() }
@@ -4144,11 +4187,8 @@ public final class VectorStore: @unchecked Sendable {
             let used = Double(qt.filter { q in bt.contains(where: { LexicalIndex.termMatches(query: q, basename: $0) }) }.count)
                      / Double(Swift.max(1, qt.count))
             strength[p] = Swift.min(covered, used)
-            // An exact basename match is unambiguous intent: the user typed this file's name.
-            // Nothing a dense scan returns should outrank it, so it takes the explicit weight even
-            // when the query carried no `filename:` clause.
-            if btFull.joined(separator: " ") == qn { exactNames.insert(p) }
-            weight[p] = (explicit || exactNames.contains(p)) ? Self.lexicalWeightExplicit : Self.lexicalWeightImplicit
+            if btFull.joined(separator: " ") == qn
+                || (Self.stemCountsAsExact && bt.joined(separator: " ") == qn) { exactNames.insert(p) }
             lexPos[p] = i
         }
         // Only admit lexical-only files that pass the same filter the dense path applied, or a
@@ -4156,7 +4196,9 @@ public final class VectorStore: @unchecked Sendable {
         let denseSet = Set(dense.map { $0.path })
         let extra = names.filter { !denseSet.contains($0) }
         let materialized = hitsForPaths(extra, query: denseQuery).filter { passesFilterForLexical($0, filter) }
-        var pool = dense + materialized
+        // Scope: only files the clause names. Boost: the dense list plus what the name found.
+        var pool = explicit ? dense.filter { strength[$0.path] != nil } + materialized
+                            : dense + materialized
         // densePos also breaks ties, so it is computed either way.
         let densePos = Dictionary(uniqueKeysWithValues: dense.enumerated().map { ($1.path, $0) })
 
@@ -4172,8 +4214,8 @@ public final class VectorStore: @unchecked Sendable {
         } else {
             for h in pool {
                 let d = Double(Swift.max(0, Swift.min(1, h.score)))
-                let s = strength[h.path] ?? 0
-                fused[h.path] = d + (weight[h.path] ?? 0) * s * (1 - d)
+                fused[h.path] = d + Self.lexicalWeight * (strength[h.path] ?? 0)
+                    + (exactNames.contains(h.path) ? Self.exactTier : 0)
             }
             // The score the caller sees is the score the sort uses. This is the whole point.
             for i in pool.indices { pool[i].score = Float(fused[pool[i].path] ?? Double(pool[i].score)) }

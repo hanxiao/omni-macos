@@ -26,6 +26,15 @@ final class LexicalIndex: @unchecked Sendable {
     /// channel is a corpus statistic, and leaving it on would perturb the search timings it measures.
     nonisolated(unsafe) static var enabled = ProcessInfo.processInfo.environment["OMNI_LEXICAL"] != "0"
 
+    /// Version of the TERMS this file derives from a basename. Bump it whenever that recipe
+    /// changes; the sidecar then rebuilds once on the next open. It is not a schema version - the
+    /// schema is unchanged - and it costs nothing but one name-index rebuild, never a re-embed.
+    ///   1: basename, separator-softened, camelCase-split, extension as its own term, CJK bigrams
+    ///      for runs up to 6 characters.
+    ///   2: CJK bigrams for runs of any real length (the 6-character cap was a query-side guard
+    ///      that never belonged on the index).
+    static let termRecipe = 2
+
     private let url: URL
     private let lock = NSLock()
     private var db: OpaquePointer?
@@ -79,7 +88,11 @@ final class LexicalIndex: @unchecked Sendable {
             exec("DROP TABLE IF EXISTS dirs;")
             exec("CREATE TABLE pathmap(id INTEGER PRIMARY KEY, path TEXT NOT NULL);")
         }
+        // The stamp says the PATHS are unchanged. It says nothing about whether the terms we
+        // derive from them are still the ones this build wants, so a change to the term recipe
+        // needs its own version or every existing sidecar keeps serving the old terms forever.
         if scalar("SELECT v FROM meta WHERE k='stamp';") == String(stamp),
+           scalar("SELECT v FROM meta WHERE k='recipe';") == String(Self.termRecipe),
            scalar("SELECT count(*) FROM pathmap;").flatMap(Int.init) ?? 0 > 0 {
             fileCount = Int(scalar("SELECT count(*) FROM pathmap;") ?? "0") ?? 0
             ready = true
@@ -141,7 +154,7 @@ final class LexicalIndex: @unchecked Sendable {
             // on a 2.66M-file corpus to serve 0.06% of it. Terms only - no schema change.
             if base.contains(where: Self.isCJK) {
                 for t in Self.terms(base) {
-                    let bg = Self.cjkBigrams(t)
+                    let bg = Self.indexBigrams(t)
                     if !bg.isEmpty { terms += " " + bg.joined(separator: " ") }
                 }
             }
@@ -161,6 +174,7 @@ final class LexicalIndex: @unchecked Sendable {
             if (i + 1) % 20_000 == 0 { exec("COMMIT;"); exec("BEGIN;") }
         }
         sqlite3_finalize(ins); sqlite3_finalize(insMap)
+        exec("INSERT OR REPLACE INTO meta(k,v) VALUES('recipe','\(Self.termRecipe)');")
         exec("INSERT OR REPLACE INTO meta(k,v) VALUES('stamp','\(stamp)');")
         exec("COMMIT;")
         // And return the high-water mark to the filesystem now that the build is done, rather than
@@ -217,8 +231,23 @@ final class LexicalIndex: @unchecked Sendable {
     static let maxCJKNameRun = 6
 
     /// Overlapping bigrams of a short CJK run, or [] for anything else - ASCII never expands.
+    /// This is the QUERY side, where `maxCJKNameRun` keeps prose out (see the constant).
     static func cjkBigrams(_ token: String) -> [String] {
-        guard token.count >= 2, token.count <= maxCJKNameRun, token.allSatisfy(isCJK) else { return [] }
+        guard token.count <= maxCJKNameRun else { return [] }
+        return indexBigrams(token)
+    }
+
+    /// The INDEX side, with no run-length cap.
+    ///
+    /// `maxCJKNameRun` is a guard against a prose QUERY - one long spaceless run - reaching
+    /// filenames through fragments like "的会". Applying it here too was a bug with the opposite
+    /// effect: a basename run longer than six characters got no bigrams at all, so no inner word
+    /// could ever reach it. "七天血压记录表" is seven, and a search for "记录" returned nothing
+    /// (measured: `filename:记录` retrieved 0 candidates on a 2.68M-file index). A cap still bounds
+    /// a pathological name, but at a length no real filename reaches.
+    static let maxIndexedCJKRun = 40
+    static func indexBigrams(_ token: String) -> [String] {
+        guard token.count >= 2, token.count <= maxIndexedCJKRun, token.allSatisfy(isCJK) else { return [] }
         let a = Array(token)
         return (0..<(a.count - 1)).map { String(a[$0...($0 + 1)]) }
     }
