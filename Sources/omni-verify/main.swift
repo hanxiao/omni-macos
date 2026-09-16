@@ -4347,14 +4347,47 @@ if args.count >= 4 && args[1] == "qppcheck" {
     }
     say("  folder centroids built for \(centroid.count) folders")
 
-    struct Probe { let conf: VectorStore.RetrievalConfidence; let answerable: Bool; let hard: Bool }
+    struct Probe { let conf: VectorStore.RetrievalConfidence; let answerable: Bool; let hard: Bool
+                   let kind: String; let script: String }
+    func scriptOf(_ q: String) -> String {
+        let cjk = q.unicodeScalars.filter {
+            (0x3040...0x30FF).contains($0.value) || (0x4E00...0x9FFF).contains($0.value)
+            || (0xAC00...0xD7AF).contains($0.value) }.count
+        if cjk * 4 >= q.unicodeScalars.count { return "cjk" }
+        if cjk > 0 { return "mixed" }
+        let nonAscii = q.unicodeScalars.filter { $0.value > 127 }.count
+        return nonAscii * 8 >= q.unicodeScalars.count ? "latin+" : "latin"
+    }
+    // OVERSAMPLE NON-LATIN. A uniform sample of this corpus produced one CJK query in 600, which
+    // measures the corpus, not the method. Scan for files whose indexed TEXT is CJK and give them
+    // their own pool, so the multilingual claim is tested rather than assumed.
+    var cjkPool: [(String, String)] = []     // (path, home folder)
+    for (home, paths) in byFolder {
+        for p in paths.prefix(4000) where cjkPool.count < 1200 {
+            let b = (p as NSString).lastPathComponent
+            let hasCJK = b.unicodeScalars.contains {
+                (0x3040...0x30FF).contains($0.value) || (0x4E00...0x9FFF).contains($0.value)
+                || (0xAC00...0xD7AF).contains($0.value) }
+            if hasCJK { cjkPool.append((p, home)) }
+        }
+    }
+    say("  \(cjkPool.count) files with CJK names found for the multilingual slice")
+
     var probes: [Probe] = []
     var tries = 0
-    while probes.count < n * 2 && tries < n * 30 {
+    while probes.count < n * 3 && tries < n * 40 {
         tries += 1
-        let home = folders[rnd(folders.count)]
-        let pool = byFolder[home]!
-        let path = pool[rnd(pool.count)]
+        // Alternate: roughly a third of attempts drawn from the CJK pool when one exists, so the
+        // slice has enough probes to judge.
+        var home: String
+        var path: String
+        if !cjkPool.isEmpty && tries % 3 == 0 {
+            let c = cjkPool[rnd(cjkPool.count)]; path = c.0; home = c.1
+        } else {
+            home = folders[rnd(folders.count)]
+            let pool = byFolder[home]!
+            path = pool[rnd(pool.count)]
+        }
         guard let snip = store.rankChunks(zero, path: path, topK: 1).first?.snippet, snip.count >= 40 else { continue }
         let words = snip.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" }).map(String.init)
         let q: String
@@ -4383,9 +4416,16 @@ if args.count >= 4 && args[1] == "qppcheck" {
         let hFar = store.search(qv, filter: fFar, topK: 40, markActive: false, textQuery: q)
         let hNear = store.search(qv, filter: fNear, topK: 40, markActive: false, textQuery: q)
         guard hFar.count >= 10, hNear.count >= 10 else { continue }
-        probes.append(Probe(conf: store.retrievalConfidence(query: qv, hits: hin), answerable: true, hard: false))
-        probes.append(Probe(conf: store.retrievalConfidence(query: qv, hits: hFar), answerable: false, hard: false))
-        probes.append(Probe(conf: store.retrievalConfidence(query: qv, hits: hNear), answerable: false, hard: true))
+        let kd = (path as NSString).pathExtension.lowercased()
+        let media = Set(["jpg","jpeg","png","heic","gif","webp","mp4","mov","mp3","wav","m4a"])
+        let kind = media.contains(kd) ? "media" : "text"
+        // Classify on the query AND the file name: a CJK document's indexed text is often
+        // romanized or mixed, but the name is the thing a user would type.
+        let nameScript = scriptOf((path as NSString).lastPathComponent)
+        let sc = scriptOf(q) == "latin" && nameScript == "cjk" ? "cjk-name" : scriptOf(q)
+        probes.append(Probe(conf: store.retrievalConfidence(query: qv, hits: hin), answerable: true, hard: false, kind: kind, script: sc))
+        probes.append(Probe(conf: store.retrievalConfidence(query: qv, hits: hFar), answerable: false, hard: false, kind: kind, script: sc))
+        probes.append(Probe(conf: store.retrievalConfidence(query: qv, hits: hNear), answerable: false, hard: true, kind: kind, script: sc))
     }
     let pos = probes.filter { $0.answerable }
     let negFar = probes.filter { !$0.answerable && !$0.hard }
@@ -4413,6 +4453,36 @@ if args.count >= 4 && args[1] == "qppcheck" {
                    med(pos.map { Double(f($0.conf)) }), med(negFar.map { Double(f($0.conf)) }),
                    med(negHard.map { Double(f($0.conf)) })))
     }
+    // MULTIMODAL AND MULTILINGUAL. The claim for adaptive cohort selection is that it picks the
+    // right comparison set by itself - the top-N most similar impostors for a Chinese query are
+    // Chinese, for an image query they are images - so no per-kind or per-language table is
+    // needed. That is a claim, so it gets measured per kind and per script.
+    func slice(_ keep: (Probe) -> Bool) -> (Int, Double, Double) {
+        let p = pos.filter(keep), nh = negHard.filter(keep)
+        guard p.count >= 15, nh.count >= 15 else { return (p.count, 0, 0) }
+        func au(_ f: (VectorStore.RetrievalConfidence) -> Float) -> Double {
+            var wins = 0.0
+            for x in p { for y in nh {
+                let a = f(x.conf), b = f(y.conf); wins += a > b ? 1 : (a == b ? 0.5 : 0) } }
+            return wins / Double(p.count * nh.count)
+        }
+        return (p.count, au { $0.topScore }, au { $0.tnorm })
+    }
+    say("\n  by modality and script (AUROC on hard negatives, n = answerable probes)")
+    say("  slice            n     max score   AS-norm")
+    for (label, keep) in [("text", { (p: Probe) in p.kind == "text" }),
+                          ("media", { $0.kind == "media" }),
+                          ("latin", { $0.script == "latin" }),
+                          ("cjk", { $0.script == "cjk" }),
+                          ("cjk-name", { $0.script == "cjk-name" }),
+                          ("mixed/other", { !["latin", "cjk", "cjk-name"].contains($0.script) })] {
+        let (c, a, b) = slice(keep)
+        if c < 15 { say(String(format: "  %-15s %-5d (too few to judge)", (label as NSString).utf8String!, c)) }
+        else { say(String(format: "  %-15s %-5d   %.3f       %.3f", (label as NSString).utf8String!, c, a, b)) }
+    }
+    let unavail = (pos + negHard).filter { !$0.conf.available }.count
+    say(String(format: "  statistic unavailable on %d of %d probes", unavail, pos.count + negHard.count))
+
     // Operating points for the best predictor, swept across the range its medians actually span.
     let best = preds.max { auroc($0.1, negHard) < auroc($1.1, negHard) }!
     let span = pos.map { Double(best.1($0.conf)) } + negHard.map { Double(best.1($0.conf)) }

@@ -3997,6 +3997,9 @@ public final class VectorStore: @unchecked Sendable {
         public var tnorm: Float = 0
         /// The same for the top-k mean rather than the single best hit.
         public var tnormMean: Float = 0
+        /// False when the index is too small, or too new, to support the statistic. `tnorm` is then
+        /// meaningless and must not be read - "no opinion" is a different answer from "no match".
+        public var available = false
     }
 
     /// ADAPTIVE T-NORM, borrowed from speaker verification.
@@ -4030,11 +4033,31 @@ public final class VectorStore: @unchecked Sendable {
     /// per-kind table: adaptive cohort selection picks the right comparison set by construction.
     ///
     /// N: the paper reports a flat minimum between 200 and 500 and prefers 200.
+    ///
+    /// NOTHING HERE IS STATE THAT CRUD HAS TO MAINTAIN. The cohort is a pull-based memo: it is
+    /// checked and rebuilt on USE, keyed on `rows.count`, which every mutation already maintains
+    /// for its own reasons. No insert, delete, folder removal, wipe or compaction refers to it, and
+    /// nothing is persisted, so there is no sidecar to keep in step, no staleness on disk, and no
+    /// migration. The worst a mutation can do is leave the memo a few percent out of date, and a
+    /// slightly out-of-date set of IMPOSTORS is not a defect - impostors are impostors.
+    ///
+    /// Most indexes start empty and grow, so the whole trajectory has to behave: below the minimum
+    /// the statistic reports itself unavailable rather than guessing, and it switches on by itself
+    /// once there are enough impostors to describe.
     private var cohort: [Float] = []        // [cohortCount * dim], row-major
+    private var cohortFile: [Int32] = []   // file id per cohort row, so results can be excluded
     private var cohortCount = 0
     private var cohortRows = 0
     private static let cohortPool = 8192
     nonisolated(unsafe) public static var cohortTopN = 200
+    /// Below this many usable impostors the statistic is not reported at all. A cohort has to be
+    /// impostors AND large enough for a mean and a standard deviation to mean anything; on a small
+    /// index it is neither, and a confident wrong number is worse than no number. 256 keeps the
+    /// standard error of the cohort mean near 6% of its own spread.
+    private static let cohortMinimum = 256
+    /// How many of the caller's own results are kept out of the impostor cohort. Fixed so the
+    /// statistic does not change meaning with the page size the caller happened to request.
+    private static let cohortExcludeTop = 10
 
     private func ensureCohortLocked() {
         let n = rows.count
@@ -4061,6 +4084,10 @@ public final class VectorStore: @unchecked Sendable {
             }
         }
         cohort = out
+        // Vectors are COPIED, not referenced by row index, so a later fold or deletion cannot make
+        // this read the wrong row - a stale cohort is merely slightly out of date, which for a set
+        // of impostors is no defect at all.
+        cohortFile = picks.map { fileID[$0] }
         cohortCount = picks.count
         cohortRows = n
     }
@@ -4068,23 +4095,48 @@ public final class VectorStore: @unchecked Sendable {
     /// Cohort mean and standard deviation for this query, over the top-N most similar impostors.
     /// One [C, dim] x [dim] matmul on the GPU - 8192 x 768 is about 6M multiply-adds, which is
     /// nothing next to the scan that produced the results being judged.
-    private func cohortStatsLocked(_ query: [Float]) -> (mean: Float, sd: Float)? {
+    /// `exclude` is the file ids of the results being judged. A cohort has to be IMPOSTORS, and on
+    /// a large index a strided sample of 8192 of 9.6M chunks contains the answer with probability
+    /// 0.08% - but on a small one the cohort is most of the corpus and the true match is simply in
+    /// it, which raises the impostor mean and makes a real hit look like nothing. Excluding the
+    /// page under judgement costs a set lookup and removes the whole failure mode.
+    private func cohortStatsLocked(_ query: [Float], exclude: Set<Int32>) -> (mean: Float, sd: Float)? {
         ensureCohortLocked()
-        guard cohortCount > 0, query.count == dim else { return nil }
+        guard cohortCount > 0, query.count == dim, cohortFile.count == cohortCount else { return nil }
         let m = MLXArray(cohort, [cohortCount, dim])
         let qv = MLXArray(query, [dim, 1])
         let sc = MLX.matmul(m, qv).reshaped([cohortCount])
-        let n = Swift.min(Self.cohortTopN, cohortCount)
-        let top = MLX.top(sc, k: n)
-        MLX.eval(top)
-        let vals = top.asArray(Float.self)
-        guard !vals.isEmpty else { return nil }
-        let mean = vals.reduce(0, +) / Float(vals.count)
+        MLX.eval(sc)
+        var vals = sc.asArray(Float.self)
+        if !exclude.isEmpty {
+            var kept: [Float] = []
+            kept.reserveCapacity(vals.count)
+            for (i, v) in vals.enumerated() where !exclude.contains(cohortFile[i]) { kept.append(v) }
+            vals = kept
+        }
+        // Not enough impostors to describe a distribution: say nothing rather than guess. This is
+        // the small-index and still-filling case, which is where every index starts.
+        //
+        // The bar is also relative to the selection: if the top N IS the cohort then "adaptive"
+        // selected nothing, and the statistic degenerates to a plain mean over everything - the
+        // case the speaker-verification literature measured as strictly worse. Requiring twice the
+        // selection keeps the choice meaningful.
+        guard vals.count >= Swift.max(Self.cohortMinimum, Self.cohortTopN * 2) else { return nil }
+        vals.sort(by: >)
+        let n = Swift.min(Self.cohortTopN, vals.count)
+        let top = vals.prefix(n)
+        let mean = top.reduce(0, +) / Float(n)
         var varc: Float = 0
-        for v in vals { varc += (v - mean) * (v - mean) }
-        let sd = (varc / Float(vals.count)).squareRoot()
+        for v in top { varc += (v - mean) * (v - mean) }
+        let sd = (varc / Float(n)).squareRoot()
         return (mean, sd > 1e-6 ? sd : 1e-6)
     }
+
+    /// Test hooks for measuring the cohort directly.
+    func cohortStatsForTest(_ q: [Float], exclude: Set<Int32>) -> (mean: Float, sd: Float)? {
+        queue.sync { cohortStatsLocked(q, exclude: exclude) }
+    }
+    func fileIDForTest(_ path: String) -> Int32? { queue.sync { pathID[path] } }
 
     /// Per-kind mean vector over a strided sample of rows. `q . centroid` IS the mean score of that
     /// kind for `q`, because the mean of dot products is the dot product with the mean - so the
@@ -4170,9 +4222,21 @@ public final class VectorStore: @unchecked Sendable {
             // NQC divides the dispersion by the baseline, which is what makes it a ratio rather
             // than a score difference and therefore comparable across queries and kinds.
             out.nqc = base > 1e-6 ? Float(varc.squareRoot()) / base : 0
-            if let c = cohortStatsLocked(query) {
+            // Exclude only a FIXED, small prefix, never the whole page.
+            //
+            // The cohort has to be impostors, so anything that might BE the answer has to come out
+            // of it. But excluding everything the caller asked for makes the statistic depend on
+            // how much they asked for: measured on a 1,200-file index, the same query scored t =
+            // 8.57 at top_k 10, 11.66 at 40 and 17.70 at 150, purely because a longer page removes
+            // more of the impostor distribution's upper tail. A threshold calibrated at one page
+            // size would then mean something else at another. Ten is enough to cover the answer
+            // and shallow enough that every caller gets the same number.
+            var exclude: Set<Int32> = []
+            for h in hits.prefix(Self.cohortExcludeTop) { if let f = pathID[h.path] { exclude.insert(f) } }
+            if let c = cohortStatsLocked(query, exclude: exclude) {
                 out.tnorm = (out.topScore - c.mean) / c.sd
                 out.tnormMean = (Float(mean) - c.mean) / c.sd
+                out.available = true
             }
             return out
         }
