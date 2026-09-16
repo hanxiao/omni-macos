@@ -238,7 +238,8 @@ final class HTTPServer: @unchecked Sendable {
 
             // Hop back to the network queue to write and continue the loop.
             self.queue.async {
-                self.write(resp, to: conn, keepAlive: keepAlive) {
+                self.write(resp, to: conn, keepAlive: keepAlive,
+                           acceptEncoding: req.headers["accept-encoding"]) {
                     if keepAlive {
                         self.readRequest(on: conn, buffer: residual)
                     } else {
@@ -250,8 +251,9 @@ final class HTTPServer: @unchecked Sendable {
         return true
     }
 
-    private func write(_ resp: HTTPResponse, to conn: NWConnection, keepAlive: Bool, completion: @escaping () -> Void) {
-        let bytes = resp.serialize(keepAlive: keepAlive)
+    private func write(_ resp: HTTPResponse, to conn: NWConnection, keepAlive: Bool,
+                       acceptEncoding: String? = nil, completion: @escaping () -> Void) {
+        let bytes = resp.serialize(keepAlive: keepAlive, acceptEncoding: acceptEncoding)
         conn.send(content: bytes, completion: .contentProcessed { _ in
             completion()
         })
