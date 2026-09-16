@@ -25,6 +25,10 @@ public struct IndexSettings: Sendable, Equatable {
     /// AppModel from the user's .omniignore file (which migration seeds from the legacy kind/extension
     /// settings). `.default`/`.profiling` leave it empty = index everything extractable.
     public var ignore: OmniIgnore = OmniIgnore(text: "")
+    /// Omni's own data directories, never crawled. Runtime values (the index and model folders are
+    /// relocatable in Settings), so they travel with the settings rather than living in the
+    /// user-editable ignore text. See FileCrawler.ownDataPaths.
+    public var ownDataPaths: [String] = []
 
     /// Order the modalities are indexed in (user-reorderable). A uniform phase per kind lets text
     /// chunks batch across files; the order sets which modality is embedded first. Text is last by

@@ -4924,6 +4924,7 @@ final class AppModel {
     private func effectiveSettings() -> IndexSettings {
         var s = settings
         s.ignore = ignore   // single source of truth for what the crawl excludes
+        s.ownDataPaths = Self.ownDataPaths()
         s.maxImageDimension = maxImageDimension
         s.maxVideoFrames = maxVideoFrames
         s.maxCharsPerChunk = maxTextChunkChars
@@ -4934,6 +4935,33 @@ final class AppModel {
         s.skipDataless = skipDatalessFiles
         s.imageTags = imageTagsEnabled
         return s
+    }
+
+    /// Directories that belong to OMNI, which the crawl must never enter, wherever the user has
+    /// put them.
+    ///
+    /// Computed per pass rather than cached: the index folder and the model folder are both
+    /// relocatable from Settings, so a value captured at launch would be wrong the moment someone
+    /// moved one - which is exactly the case this exists for.
+    ///
+    /// The model folder is the one that bites. It holds `tokenizer.json`, 16 MB of vocabulary JSON,
+    /// which is indexable text: point the model download at anywhere inside an indexed folder and
+    /// Omni chunks its own tokenizer into the index and hands it back as results. The index folder
+    /// escaped only because `.sqlite`, `.vecs`, `.quant` and `.rows` happen not to be indexable
+    /// extensions, which is luck rather than a decision, so it is listed too.
+    ///
+    /// The whole Application Support folder goes in as well, because everything else Omni writes
+    /// lives under it by default - the tag cache, query images, OCR transcripts, the OCR model.
+    static func ownDataPaths() -> [String] {
+        var out: [String] = []
+        if let index = try? indexURL().deletingLastPathComponent() { out.append(index.path) }
+        if let model = UserDefaults.standard.string(forKey: "omni.modelDir"), !model.isEmpty {
+            out.append(model)
+        }
+        if let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+            out.append(support.appendingPathComponent("Omni").path)
+        }
+        return out
     }
 
     // MARK: - Image tagger (open-vocabulary tags from the same model)

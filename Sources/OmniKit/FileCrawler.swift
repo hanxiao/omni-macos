@@ -51,6 +51,18 @@ public struct FileCrawler: Sendable {
     /// Modalities the user has turned on. The coarse filter applied BEFORE `ignore`: a file is
     /// indexed iff its kind is in this set AND it is not ignored. Default: all four kinds on.
     public var enabledKinds: Set<FileKind>
+    /// OMNI'S OWN DATA, never crawled, wherever the user has put it.
+    ///
+    /// The index folder and the model folder are both relocatable in Settings, so they are runtime
+    /// values a seeded `.omniignore` line cannot track - and unlike the noise-dir patterns, these
+    /// are not a matter of taste: a model directory holds `tokenizer.json`, 16 MB of vocabulary
+    /// JSON that Omni would happily chunk into thousands of meaningless rows and then return as
+    /// search results. Reported as "I changed the download folder for the models... it tries to
+    /// actually index it" (issue #21's follow-up).
+    ///
+    /// The index files themselves survived only by luck - `.sqlite`, `.vecs`, `.quant` and `.rows`
+    /// are not indexable extensions - which is not a property to keep relying on.
+    public var ownDataPaths: [String] = []
     /// Per-kind file-size ceiling in bytes; a kind with NO entry is uncapped. Video and audio stream
     /// in bounded 240 s segments (embedStreamedVideo/Audio), so a multi-GB file is memory-safe - only
     /// slower to index - and is left uncapped. Text reads only the first maxTextBytes (2 MB) regardless
@@ -72,11 +84,30 @@ public struct FileCrawler: Sendable {
 
     public init(roots: [URL], ignore: OmniIgnore = OmniIgnore(text: ""),
                 enabledKinds: Set<FileKind> = [.text, .image, .video, .audio],
-                maxFileSize: [FileKind: Int] = FileCrawler.defaultMaxFileSize) {
+                maxFileSize: [FileKind: Int] = FileCrawler.defaultMaxFileSize,
+                ownDataPaths: [String] = []) {
         self.roots = roots
         self.ignore = ignore
         self.enabledKinds = enabledKinds
         self.maxFileSize = maxFileSize
+        // REAL PATHS, resolved once here, for the same reason walkBulk resolves its roots: the
+        // walk compares against paths with every symlink already collapsed (/var/... arrives as
+        // /private/var/...). Standardizing without resolving left the two spellings unequal and
+        // the exclusion silently matched nothing - which the tests caught only because they run
+        // under a temp directory, where that difference is real.
+        self.ownDataPaths = ownDataPaths.map { p in
+            var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
+            if realpath(p, &buf) != nil { return String(cString: buf) }
+            return URL(fileURLWithPath: p).standardizedFileURL.path
+        }
+    }
+
+    /// Is this path Omni's own data? Boundary-aware, so a sibling that merely starts with the same
+    /// characters ("/data/omni-index2" under "/data/omni-index") is not swallowed.
+    @inline(__always) func isOwnData(_ path: String) -> Bool {
+        guard !ownDataPaths.isEmpty else { return false }
+        for p in ownDataPaths where path == p || path.hasPrefix(p + "/") { return true }
+        return false
     }
 
     /// Default user folders to index.
@@ -146,6 +177,7 @@ public struct FileCrawler: Sendable {
                 let name = (dir as NSString).lastPathComponent
                 if name.hasPrefix(".") { return false }            // matches .skipsHiddenFiles
                 if ignore.isIgnored(dir, isDir: true) { return false }
+                if isOwnData(dir) { return false }
                 // The volume check reads the id the SAME syscall already returned. A mount point
                 // inside a root (a disk image, a share) is a different volume's worth of files
                 // under a root the user never chose.
@@ -163,7 +195,7 @@ public struct FileCrawler: Sendable {
                       enabledKinds.contains(kind) else { return nil }
                 if let cap = maxFileSize[kind], e.size > cap { return nil }
                 let path = dir + "/" + e.name
-                guard !ignore.isIgnored(path, isDir: false) else { return nil }
+                guard !ignore.isIgnored(path, isDir: false), !isOwnData(path) else { return nil }
                 return CrawledFile(path: path, modified: e.mtime, size: e.size)
             },
             deliver: { batch in for f in batch { onFile(f) } })
@@ -187,14 +219,15 @@ public struct FileCrawler: Sendable {
                 autoreleasepool {
                     guard let vals = try? url.resourceValues(forKeys: keySet) else { return }
                     if vals.isDirectory == true {
-                        if ignore.isIgnored(url.path, isDir: true) || vals.isPackage == true {
+                        if ignore.isIgnored(url.path, isDir: true) || vals.isPackage == true
+                            || isOwnData(url.path) {
                             en.skipDescendants()
                         }
                         return
                     }
                     guard vals.isRegularFile == true,
                           let kind = FileExtractor.kind(for: url), enabledKinds.contains(kind),
-                          !ignore.isIgnored(url.path, isDir: false) else { return }
+                          !ignore.isIgnored(url.path, isDir: false), !isOwnData(url.path) else { return }
                     let size = vals.fileSize ?? 0
                     if let cap = maxFileSize[kind], size > cap { return }   // per-kind cap; uncapped kinds stream
                     let mtime = vals.contentModificationDate?.timeIntervalSince1970 ?? 0

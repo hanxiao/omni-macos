@@ -660,7 +660,8 @@ public final class Indexer: @unchecked Sendable {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             var counts: [String: Int] = [:]
-            FileCrawler(roots: roots, ignore: settings.ignore, enabledKinds: settings.enabledKinds)
+            FileCrawler(roots: roots, ignore: settings.ignore, enabledKinds: settings.enabledKinds,
+                        ownDataPaths: settings.ownDataPaths)
                 .walk(shouldContinue: { !self.isCancelled }) { f in
                     guard let r = rootOf(f.path) else { return }
                     feed.lock.lock()
@@ -1260,7 +1261,8 @@ public final class Indexer: @unchecked Sendable {
             guard stat(path, &st) == 0 else { deletedTop.insert(path); continue }
             if st.st_mode & S_IFMT == S_IFDIR {
                 FileCrawler(roots: [URL(fileURLWithPath: path)], ignore: settings.ignore,
-                            enabledKinds: settings.enabledKinds)
+                            enabledKinds: settings.enabledKinds,
+                            ownDataPaths: settings.ownDataPaths)
                     .walk(shouldContinue: { !self.isCancelled }) { files.append($0) }
             } else {
                 files.append(CrawledFile(path: path,
