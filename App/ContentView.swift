@@ -957,12 +957,20 @@ struct ContentView: View {
 
     private var filterMenu: some View {
         Menu {
-            Section {
-                Toggle(isOn: Binding(get: { model.literalQuery },
-                                     set: { _ in model.toggleLiteralQuery() })) {
-                    Label("Plain text", systemImage: "textformat")
+            // Only when the box actually SPELLS a qualifier. On a plain query the two modes
+            // produce the same search, so the control offered a choice with no consequence at the
+            // top of every menu. Gated on the raw text, not on the parse, so it stays reachable
+            // once literal mode has emptied the qualifier list.
+            if model.rawQueryHasQualifiers {
+                Section {
+                    Toggle(isOn: Binding(get: { model.literalQuery },
+                                         set: { _ in model.toggleLiteralQuery() })) {
+                        // Quotation marks, not "Aa": the question is whether `type:image` is a
+                        // filter or four literal characters, which is quoting, not formatting.
+                        Label("As plain query", systemImage: "quote.opening")
+                    }
+                    .help("Search for the text as written, instead of reading type: and in: as filters")
                 }
-                .help("Embed the box text as-is, ignoring key:value qualifiers")
             }
             Section("Show") {
                 ForEach(filterKinds, id: \.self) { kind in
@@ -1138,19 +1146,19 @@ private struct QualifierBar: View {
     var body: some View {
         HStack(spacing: 6) {
             if model.literalQuery {
-                Image(systemName: "textformat").foregroundStyle(.secondary).frame(width: 18)
-                Text("Plain-text search").foregroundStyle(.secondary)
-                Text("- qualifiers ignored").font(.caption).foregroundStyle(.tertiary)
+                Image(systemName: "quote.opening").foregroundStyle(.secondary).frame(width: 18)
+                Text("Plain query").foregroundStyle(.secondary)
+                Text("- filters ignored").font(.caption).foregroundStyle(.tertiary)
             }
             Spacer(minLength: 8)
             Button { model.toggleLiteralQuery() } label: {
-                Label(model.literalQuery ? "Use as query" : "Plain text",
-                      systemImage: model.literalQuery ? "line.3.horizontal.decrease.circle" : "textformat")
+                Label(model.literalQuery ? "Use filters" : "As plain query",
+                      systemImage: model.literalQuery ? "line.3.horizontal.decrease.circle" : "quote.opening")
             }
             .buttonStyle(.bordered).controlSize(.small)
             .help(model.literalQuery
-                  ? "Interpret key:value as filters again"
-                  : "Embed the box text as-is, ignoring key:value qualifiers")
+                  ? "Read type: and in: as filters again"
+                  : "Search for the text as written, instead of reading type: and in: as filters")
         }
         .font(.callout)
         .padding(.horizontal, 16).padding(.vertical, 6)

@@ -1260,6 +1260,11 @@ final class AppModel {
     var literalQuery: Bool = false
     /// Qualifiers parsed from the current box text, for the feedback bar. Empty in literal mode.
     private(set) var activeQualifiers: [ParsedQuery.Qualifier] = []
+    /// Does the box text SPELL a qualifier, whatever mode we are in? `activeQualifiers` cannot
+    /// answer this: literal mode empties it by definition, so the one control that escapes literal
+    /// mode would vanish the moment it was used. Maintained in `applyParsedQuery`, the single door
+    /// every query change goes through, so no view has to re-parse to lay itself out.
+    private(set) var rawQueryHasQualifiers = false
     /// Query-side embedding cache. A query vector depends only on the text + model, never on the
     /// (changing) document index, so caching lets a repeated / history / bookmark search skip the GPU
     /// embed entirely - instant, and crucially GPU-free while indexing runs. Cleared on model reload.
@@ -2762,12 +2767,14 @@ final class AppModel {
         // Literal mode: embed the whole string verbatim, no qualifiers, no filters.
         guard !literalQuery else {
             activeQualifiers = []
+            rawQueryHasQualifiers = !SearchQueryParser.parse(raw).qualifiers.isEmpty
             syncSearchTokens()
             query = raw
             return
         }
         let parsed = SearchQueryParser.parse(raw)
         activeQualifiers = parsed.qualifiers
+        rawQueryHasQualifiers = !parsed.qualifiers.isEmpty
         syncSearchTokens()
         var includeKinds: Set<FileKind> = []
         var excludeKinds: Set<FileKind> = []
