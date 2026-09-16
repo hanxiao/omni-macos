@@ -40,7 +40,18 @@ public enum WeakMatch {
     /// still-filling index - where every index starts - and a caller that rendered "no opinion" as
     /// "no match" would tell a new user their files are missing while they are being indexed.
     public static func notice(_ c: VectorStore.RetrievalConfidence?, hits: [SearchHit]) -> String? {
-        guard let c, c.available, !hits.isEmpty, c.tnorm < threshold else { return nil }
-        return "Nothing here matches this closely. These are the nearest files, not answers."
+        guard isWeak(c, hits: hits) else { return nil }
+        return "\(title). \(detail)"
     }
+
+    /// The same judgement without the prose, for a surface that lays the two halves out itself.
+    public static func isWeak(_ c: VectorStore.RetrievalConfidence?, hits: [SearchHit]) -> Bool {
+        guard let c, c.available, !hits.isEmpty else { return false }
+        return c.tnorm < threshold
+    }
+
+    /// Split in two because the window gives the headline and the explanation separate typography,
+    /// and a single sentence rendered into both slots says the same thing twice.
+    public static let title = "Nothing here matches this closely"
+    public static let detail = "These are the nearest files, not answers."
 }

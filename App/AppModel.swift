@@ -452,33 +452,43 @@ final class AppModel {
             recomputeResults()
         }
     }
-    /// Say so when the top hit is not clearly better than what this query finds ANYWHERE in the
-    /// index. Advisory only - it never hides or reorders a result, because dense retrieval always
-    /// returns its best guess and the failure being warned about is the guess being no good.
+    /// Whether a search that matched nothing well should show its nearest neighbours anyway.
     ///
-    /// Defaults ON. Measured on a frozen 2.68M-file index at the shipped threshold, over 600
-    /// probes with a known answer and 600 with the answer removed:
+    /// This is the whole of the Relevance control, and it is a two-way choice because the judgement
+    /// underneath it is: the confidence statistic answers "does this index contain an answer to
+    /// this query", not "which of these rows are good". A per-ROW cut was measured and is not
+    /// offered - a fixed 60% floor emptied three of twelve ordinary queries and removed 74% of all
+    /// results, because the score scale is per modality and per query.
     ///
-    ///     slice     answerable   wrongly warned   near-negatives caught
-    ///     text         493           0.8%               20.9%
-    ///     media        107           1.9%                8.4%
-    ///     cjk           89           0.0%               48.3%
+    /// Defaults ON. Measured on a frozen 2.68M-file index, 600 probes with a known answer against
+    /// 600 with the answer removed:
     ///
-    /// It is escapable because the judgement is a threshold on a statistic, and because the one
-    /// case it is NOT calibrated for - a file used as the query - is left on deliberately so it
-    /// can be judged in use rather than in a table.
-    var weakMatchNotice: Bool = UserDefaults.standard.object(forKey: "omni.weakMatchNotice") as? Bool ?? true {
+    ///     slice     answerable   wrongly withheld   near-negatives caught
+    ///     text         493            0.8%                20.9%
+    ///     media        107            1.9%                 8.4%
+    ///     cjk           89            0.0%                48.3%
+    ///
+    /// Nothing is destroyed by withholding: the rows stay in `rawResults` and one button puts them
+    /// back, which is what makes a ~1% wrong call survivable.
+    var strongMatchesOnly: Bool = UserDefaults.standard.object(forKey: "omni.strongMatchesOnly") as? Bool ?? true {
         didSet {
-            guard oldValue != weakMatchNotice else { return }
-            UserDefaults.standard.set(weakMatchNotice, forKey: "omni.weakMatchNotice")
-            EngineServingBackend.weakMatchNotice = weakMatchNotice   // one switch, both surfaces
-            if !weakMatchNotice { retrievalNotice = nil }
+            guard oldValue != strongMatchesOnly else { return }
+            UserDefaults.standard.set(strongMatchesOnly, forKey: "omni.strongMatchesOnly")
+            EngineServingBackend.strongMatchesOnly = strongMatchesOnly   // one switch, both surfaces
         }
     }
     /// Set when the last search's top hit did not clear the confidence threshold. nil means either
     /// a confident result or no opinion - the statistic declines on a small or still-filling index,
     /// and "no opinion" must not read as "no match".
-    var retrievalNotice: String? = nil
+    private(set) var retrievalNotice: String? = nil
+    /// "Show them anyway", for THIS query only. A per-query escape rather than a setting: the
+    /// judgement is per query, so overriding it should not quietly change the next search.
+    var showWeakAnyway = false
+
+    /// The results are being held back because nothing in the index really matches.
+    var withholdingWeakResults: Bool {
+        strongMatchesOnly && retrievalNotice != nil && !showWeakAnyway && !rawResults.isEmpty
+    }
 
     /// Snap the finished layout onto a grid so no two dots overlap (DGrid). Display-only: it does
     /// not change the fit, so toggling re-lays the existing projection without refitting.
@@ -3402,7 +3412,7 @@ final class AppModel {
             // Set before attach(), so a server that auto-starts inside it is already wired.
             self.serving.onServedSearch = { [weak self] q, surface in self?.recordServedSearch(q, surface: surface) }
             self.serving.sources = self.makeSourcesControl()
-            EngineServingBackend.weakMatchNotice = self.weakMatchNotice   // the stored setting, at attach
+            EngineServingBackend.strongMatchesOnly = self.strongMatchesOnly   // the stored setting, at attach
             self.serving.attach(engine: engine, store: store, modelName: "omni-\(modelVariant.rawValue)")
             if let oldStore { Task.detached(priority: .utility) { _ = oldIndexer; oldStore.close() } }
             self.supportsImages = engine.supportsImages
@@ -4694,7 +4704,8 @@ final class AppModel {
     private func applyResults(_ hits: [SearchHit], resolved: String,
                               confidence: VectorStore.RetrievalConfidence? = nil) {
         let isNewQuery = resolvedQuery != resolved
-        retrievalNotice = weakMatchNotice ? WeakMatch.notice(confidence, hits: hits) : nil
+        retrievalNotice = WeakMatch.notice(confidence, hits: hits)
+        if isNewQuery { showWeakAnyway = false }   // a new question gets the judgement fresh
         rawResults = hits
         resolvedQuery = resolved
         resultsToken = resolved + "\u{1}" + filterSignature()

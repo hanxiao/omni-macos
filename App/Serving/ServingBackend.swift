@@ -66,8 +66,8 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
     /// OFF, for the reason recorded on AppModel.defaultMinScore: a floor high enough to trim
     /// anything also empties ordinary queries. A caller that wants one passes `min_score`.
     nonisolated(unsafe) static var minScore = 0.0
-    /// Mirrors the window's "Warn on weak matches" switch, so one setting governs both surfaces.
-    nonisolated(unsafe) static var weakMatchNotice = true
+    /// Mirrors the window's Relevance choice, so one setting governs both surfaces.
+    nonisolated(unsafe) static var strongMatchesOnly = true
 
     let engine: OmniEngine
     let store: VectorStore
@@ -112,7 +112,7 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
         let hits = store.search(vec, filter: filter, topK: topK, textQuery: query)
         // Judged on the UNCUT list: the floor below removes rows, and a statistic about whether
         // anything matched must not be computed on a list something else has already trimmed.
-        let notice = Self.weakMatchNotice
+        let notice = Self.strongMatchesOnly
             ? WeakMatch.notice(store.retrievalConfidence(query: vec, hits: hits), hits: hits)
             : nil
         // The SAME cut the window applies, so an agent and a human asking one question see one

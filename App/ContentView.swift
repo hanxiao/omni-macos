@@ -298,13 +298,20 @@ struct ContentView: View {
         contentBody.modifier(TopBar {
             if let fq = model.fileQuery { FileQueryChip(fileQuery: fq) }
             else if showsQualifierBar { QualifierBar() }
-            if let notice = model.retrievalNotice, !model.results.isEmpty { WeakMatchNotice(text: notice) }
         })
     }
 
     @ViewBuilder private var contentBody: some View {
         VStack(spacing: 0) {
-            if !model.results.isEmpty {
+            if model.withholdingWeakResults {
+                // The rows are not gone, they are held: a person cannot tell a confident answer
+                // from the nearest forty things by looking at them, which is the whole failure mode
+                // of dense retrieval, and one button undoes this for this query.
+                CenteredStatus(symbol: "questionmark.circle",
+                               title: WeakMatch.title, subtitle: WeakMatch.detail,
+                               showSpinner: false,
+                               action: ("Show the nearest files anyway", { model.showWeakAnyway = true }))
+            } else if !model.results.isEmpty {
                 ResultsList(results: model.results) { belowThresholdFooter }
             } else if showsPhotoBrowser {
                 PhotoSourceBrowser(source: model.browsedPhotoSource!)
@@ -998,17 +1005,16 @@ struct ContentView: View {
             Picker("Date", selection: Binding(get: { model.dateRange }, set: { model.dateRange = $0 })) {
                 ForEach(DateRange.allCases) { Text($0.title).tag($0) }
             }
-            Picker("Relevance", selection: Binding(get: { model.minScore }, set: { model.minScore = $0 })) {
-                // 50/55/60 is the useful band: measured on a live index, 0.55 trims 40% of results
-                // without emptying any of twelve ordinary queries, and 0.60 empties three of them.
-                Text("Any").tag(0.0); Text("50%").tag(0.5); Text("55%").tag(0.55); Text("60%").tag(0.6)
+            // TWO options, not a percentage ladder. The judgement underneath is per QUERY - does
+            // the index contain an answer to this - so a per-row percentage was the wrong shape for
+            // it, and the measured band (50/55/60) was a fixed floor on a score scale that moves
+            // with modality: 60% emptied three of twelve ordinary queries. `score:` in the query
+            // language still sets an explicit floor for anyone who wants one.
+            Picker("Relevance", selection: Binding(
+                get: { model.strongMatchesOnly }, set: { model.strongMatchesOnly = $0 })) {
+                Text("Only strong matches").tag(true)
+                Text("All").tag(false)
             }
-            Divider()
-            // Not a filter - it hides nothing - but this is the menu that governs how strict the
-            // results are, and a notice about weak matches belongs with the relevance control
-            // rather than in a settings pane nobody opens mid-search.
-            Toggle("Warn on weak matches", isOn: Binding(
-                get: { model.weakMatchNotice }, set: { model.weakMatchNotice = $0 }))
             Divider()
             Button("Clear filters") { model.clearFilters() }.disabled(!model.filtersActive)
         } label: {
@@ -1530,26 +1536,6 @@ private struct WindowTitleHider: NSViewRepresentable {
 /// A bar pinned in the top safe area, with scroll content passing under it. On Tahoe that is
 /// `safeAreaBar`, which is what lets the scroll edge effect apply; earlier systems just stack it.
 /// An EMPTY bar must cost nothing, so the modifier checks before it inserts one.
-/// The results are still there and still ranked - this says only that the best of them is not
-/// clearly better than what this query finds anywhere in the index. Dense retrieval always returns
-/// its nearest neighbours, so the failure worth naming is not an empty list, it is a full one that
-/// means nothing. Advisory: it never hides or reorders a row.
-private struct WeakMatchNotice: View {
-    let text: String
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "questionmark.circle")
-            Text(text)
-            Spacer(minLength: 0)
-        }
-        .font(.caption)
-        .foregroundStyle(.secondary)
-        .padding(.horizontal, BrowserMetrics.listInset + 8)
-        .padding(.vertical, 5)
-    }
-}
-
 private struct TopBar<Bar: View>: ViewModifier {
     @ViewBuilder var bar: () -> Bar
 

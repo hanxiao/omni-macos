@@ -156,6 +156,10 @@ enum MCPAdapter {
                     "group_duplicates": [
                         "type": "boolean",
                         "description": "Collapse copies of the same file into one result (default true). A collapsed result carries duplicate_count, duplicates (the other paths) and duplicate_kind ('exact' = byte-identical, 'near' = same kind and extension, sizes within 10%, cosine >= 0.98). Set false for the flat list with every copy as its own result."
+                    ],
+                    "include_weak": [
+                        "type": "boolean",
+                        "description": "Return the nearest files even when none of them really matches. Semantic search always has a top result, so a weak query still returns a full page; by default Omni compares this query's best score against the most confusable files in the whole index and withholds the page when it is not clearly better, which is how 'there is nothing here' becomes sayable. Set true to see them anyway."
                     ]
                 ] as [String: Any],
                 "required": ["query"]
@@ -254,6 +258,7 @@ enum MCPAdapter {
         // agent more than they cost a human - every one is context spent re-reading a file it has
         // already seen - so this defaults ON, with "group_duplicates": false for the flat list.
         let group = (args["group_duplicates"] as? Bool) ?? true
+        let includeWeak = (args["include_weak"] as? Bool) ?? false
         let found = backend.searchReporting(query, topK: group ? min(topK * 3, 150) : topK,
                                             filter: filter, surface: .mcp)
         let hits = found.hits
@@ -281,13 +286,20 @@ enum MCPAdapter {
 
         var content: [[String: Any]] = []
         if let building { content.append(["type": "text", "text": building]) }
-        // Ahead of the results, because it changes how they should be read. A person scanning a
-        // list infers this from the scores looking uniformly mediocre; an agent reading ten paths
-        // has no such view, so it is stated. The rows still follow - nothing is withheld.
-        if let notice = found.notice, !hits.isEmpty {
-            content.append(["type": "text", "text": notice])
+        // NOTHING MATCHED, so the page is withheld rather than annotated. An agent handed ten
+        // plausible paths will read them; a caveat above the list competes with the list and
+        // loses. The escape is named in the same sentence, because a withheld page that cannot be
+        // recovered would be worse than the problem - the judgement is wrong on about 1% of
+        // queries that do have an answer.
+        let weak = found.notice != nil && !includeWeak && !hits.isEmpty
+        if weak, let notice = found.notice {
+            content.append(["type": "text", "text": notice
+                + " \(hits.count) file\(hits.count == 1 ? " was" : "s were") found and held back;"
+                + " search again with include_weak: true to see them."])
         }
-        if hits.isEmpty {
+        if weak {
+            // The rows are deliberately absent; the line above already explained why.
+        } else if hits.isEmpty {
             // Say WHICH kind of nothing this is, so the agent's next move is right.
             var text = "No results for \"\(query)\"."
             if let snap {
