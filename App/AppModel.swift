@@ -1804,14 +1804,19 @@ final class AppModel {
         Task { await bootstrap() }
     }
 
-    /// Reclaim leftover drop temp dirs (omni-drop-*) from previous sessions - the file-promise
-    /// receive dirs (a browser drag that materializes a file). Never needed across launches, but
-    /// nothing deletes them mid-session, so they accumulate.
+    /// Reclaim leftover staging temp dirs from previous sessions. Two kinds, and both are written
+    /// by the same gesture at different ends: `omni-drop-` is a file-promise receive dir (a browser
+    /// drag that materializes a file), `omni-paste-` is where pasted image BYTES become a file the
+    /// transcription pane can open. Neither is needed across launches, and nothing deletes them
+    /// mid-session, so they accumulate - four of them turned up in a single afternoon of testing
+    /// the paste path, which is how the second prefix got here.
+    private static let stagingTempPrefixes = ["omni-drop-", "omni-paste-"]
+
     private static func sweepDroppedImageTemps() {
         let tmp = FileManager.default.temporaryDirectory
         guard let entries = try? FileManager.default.contentsOfDirectory(
             at: tmp, includingPropertiesForKeys: nil) else { return }
-        for url in entries where url.lastPathComponent.hasPrefix("omni-drop-") {
+        for url in entries where stagingTempPrefixes.contains(where: url.lastPathComponent.hasPrefix) {
             try? FileManager.default.removeItem(at: url)
         }
     }
