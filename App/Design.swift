@@ -186,3 +186,46 @@ struct MCPMark: View {
             .padding(2)
     }
 }
+
+/// The symbol macOS gives a folder that is not just a folder.
+///
+/// The home folder has a dozen members the system treats as having an identity - Finder draws each
+/// with its own icon rather than the generic folder - and a sidebar of eight identical folder
+/// glyphs makes the user read every label to find the one they want. A root is whatever the user
+/// added, so any of these can turn up there.
+///
+/// Matched on the RESOLVED PATH, never on the name: `~/Projects/Documents` is an ordinary folder
+/// and must not borrow the Documents identity. Symlinks are resolved for the same reason - an
+/// external drive mounted over one of these is still that one.
+enum SpecialFolder {
+    /// Built once. Each entry is a `FileManager` lookup, and this is read per row per render.
+    private static let symbols: [String: String] = {
+        var out: [String: String] = [:]
+        func put(_ dir: FileManager.SearchPathDirectory, _ symbol: String) {
+            guard let url = FileManager.default.urls(for: dir, in: .userDomainMask).first else { return }
+            out[key(url)] = symbol
+        }
+        put(.desktopDirectory, "menubar.dock.rectangle")
+        put(.documentDirectory, "doc")
+        put(.downloadsDirectory, "arrow.down.circle")
+        put(.picturesDirectory, "photo")
+        put(.musicDirectory, "music.note")
+        put(.moviesDirectory, "film")
+        put(.sharedPublicDirectory, "person.2")
+        put(.libraryDirectory, "books.vertical")
+        out[key(FileManager.default.homeDirectoryForCurrentUser)] = "house"
+        out[key(URL(fileURLWithPath: "/Applications"))] = "square.grid.2x2"
+        // iCloud Drive is not a SearchPathDirectory; it is this path, and the user's own files sit
+        // under it, so a root pointing at it is ordinary rather than exotic.
+        out[key(FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs"))] = "icloud"
+        return out
+    }()
+
+    private static func key(_ url: URL) -> String {
+        url.resolvingSymlinksInPath().standardizedFileURL.path
+    }
+
+    /// The system's symbol for this folder, or the generic one.
+    static func symbol(for url: URL) -> String { symbols[key(url)] ?? "folder" }
+}

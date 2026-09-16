@@ -517,7 +517,8 @@ private struct FolderRow: View {
 
     var body: some View {
         HStack(spacing: 7) {
-            Image(systemName: "folder").foregroundStyle(.secondary).frame(width: 16)
+            Image(systemName: SpecialFolder.symbol(for: url))
+                .foregroundStyle(.secondary).frame(width: 16)
             Text(url.lastPathComponent).lineLimit(1).truncationMode(.middle)
             Spacer()
             if model.isFolderPaused(url) {
