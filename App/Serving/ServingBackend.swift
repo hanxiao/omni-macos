@@ -66,8 +66,9 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
     /// OFF, for the reason recorded on AppModel.defaultMinScore: a floor high enough to trim
     /// anything also empties ordinary queries. A caller that wants one passes `min_score`.
     nonisolated(unsafe) static var minScore = 0.0
-    /// Mirrors the window's Relevance choice, so one setting governs both surfaces.
-    nonisolated(unsafe) static var strongMatchesOnly = true
+    /// Mirrors the window's Relevance choice, so one setting governs both surfaces. Off by
+    /// default - see AppModel.strongMatchesOnly for why the threshold behind it is not trusted.
+    nonisolated(unsafe) static var strongMatchesOnly = false
 
     let engine: OmniEngine
     let store: VectorStore

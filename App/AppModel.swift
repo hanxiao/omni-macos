@@ -452,25 +452,39 @@ final class AppModel {
             recomputeResults()
         }
     }
-    /// Whether a search that matched nothing well should show its nearest neighbours anyway.
+    /// Whether a search that matched nothing well should withhold its nearest neighbours.
     ///
     /// This is the whole of the Relevance control, and it is a two-way choice because the judgement
-    /// underneath it is: the confidence statistic answers "does this index contain an answer to
-    /// this query", not "which of these rows are good". A per-ROW cut was measured and is not
-    /// offered - a fixed 60% floor emptied three of twelve ordinary queries and removed 74% of all
-    /// results, because the score scale is per modality and per query.
+    /// underneath it is per QUERY - does the index contain an answer to this - not per row. A
+    /// per-row cut was measured and is not offered: a fixed 60% floor emptied three of twelve
+    /// ordinary queries and removed 74% of all results, because the score scale moves with modality
+    /// and with the query.
     ///
-    /// Defaults ON. Measured on a frozen 2.68M-file index, 600 probes with a known answer against
-    /// 600 with the answer removed:
+    /// DEFAULTS OFF, because the threshold behind it is not calibrated for the way the product is
+    /// actually used, and the measurement that said otherwise was invalid.
     ///
-    ///     slice     answerable   wrongly withheld   near-negatives caught
-    ///     text         493            0.8%                20.9%
-    ///     media        107            1.9%                 8.4%
-    ///     cjk           89            0.0%                48.3%
+    /// That measurement built its unanswerable class by scoping each query to a DIFFERENT FOLDER.
+    /// That lowers the top score because the candidate pool shrank, not because no answer exists,
+    /// so 2.7 was fitted to an artificial regime. Swept against the live 2.6M-file index by
+    /// bisecting the threshold until each query flips, real UNSCOPED queries land nowhere near it,
+    /// and the signal is inverted:
     ///
-    /// Nothing is destroyed by withholding: the rows stay in `rawResults` and one button puts them
-    /// back, which is what makes a ~1% wrong call survivable.
-    var strongMatchesOnly: Bool = UserDefaults.standard.object(forKey: "omni.strongMatchesOnly") as? Bool ?? true {
+    ///     out of domain (should fire)          in domain (should not)
+    ///       11.02 Peruvian referendum 1997       5.98 jina embeddings v5 omni small mlx
+    ///       13.48 feline hyperthyroidism         8.44 vector store fuse lexical filename
+    ///       15.70 pruning apple trees            9.14 how does the indexer handle deletes
+    ///       24.38 seasoning a cast iron skillet 16.29 speculative decoding draft acceptance
+    ///
+    /// Off-topic queries score HIGHER (median 15.9 against 8.9), and nothing reaches 2.7 at all.
+    /// Same mechanism as the image cone, milder: for an off-topic query the whole cohort scores low
+    /// AND tightly, so sd collapses and the top reads as a large outlier in sd units; for an
+    /// on-topic query the cohort is full of genuinely related text, so the spread is real and the
+    /// top stands out less. t rewards the wrong thing under an unscoped search.
+    ///
+    /// Do not turn this back on by default until the negative class is rebuilt WITHOUT the folder
+    /// trick - files held out at index time, so the answer is absent from the index rather than
+    /// merely out of scope - and the threshold refitted against it.
+    var strongMatchesOnly: Bool = UserDefaults.standard.object(forKey: "omni.strongMatchesOnly") as? Bool ?? false {
         didSet {
             guard oldValue != strongMatchesOnly else { return }
             UserDefaults.standard.set(strongMatchesOnly, forKey: "omni.strongMatchesOnly")

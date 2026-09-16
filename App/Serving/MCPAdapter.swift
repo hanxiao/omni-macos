@@ -293,9 +293,8 @@ enum MCPAdapter {
         // queries that do have an answer.
         let weak = found.notice != nil && !includeWeak && !hits.isEmpty
         if weak, let notice = found.notice {
-            content.append(["type": "text", "text": notice
-                + " \(hits.count) file\(hits.count == 1 ? " was" : "s were") found and held back;"
-                + " search again with include_weak: true to see them."])
+            content.append(["type": "text", "text":
+                "\(notice). \(hits.count) held back; retry with include_weak: true."])
         }
         if weak {
             // The rows are deliberately absent; the line above already explained why.

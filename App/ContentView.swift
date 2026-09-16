@@ -308,9 +308,8 @@ struct ContentView: View {
                 // from the nearest forty things by looking at them, which is the whole failure mode
                 // of dense retrieval, and one button undoes this for this query.
                 CenteredStatus(symbol: "questionmark.circle",
-                               title: WeakMatch.title, subtitle: WeakMatch.detail,
-                               showSpinner: false,
-                               action: ("Show the nearest files anyway", { model.showWeakAnyway = true }))
+                               title: WeakMatch.title, subtitle: "", showSpinner: false,
+                               action: ("Show nearest anyway", { model.showWeakAnyway = true }))
             } else if !model.results.isEmpty {
                 ResultsList(results: model.results) { belowThresholdFooter }
             } else if showsPhotoBrowser {

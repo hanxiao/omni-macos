@@ -41,17 +41,16 @@ public enum WeakMatch {
     /// "no match" would tell a new user their files are missing while they are being indexed.
     public static func notice(_ c: VectorStore.RetrievalConfidence?, hits: [SearchHit]) -> String? {
         guard isWeak(c, hits: hits) else { return nil }
-        return "\(title). \(detail)"
+        return title
     }
 
-    /// The same judgement without the prose, for a surface that lays the two halves out itself.
+    /// The judgement without the string, for a surface that supplies its own.
     public static func isWeak(_ c: VectorStore.RetrievalConfidence?, hits: [SearchHit]) -> Bool {
         guard let c, c.available, !hits.isEmpty else { return false }
         return c.tnorm < threshold
     }
 
-    /// Split in two because the window gives the headline and the explanation separate typography,
-    /// and a single sentence rendered into both slots says the same thing twice.
-    public static let title = "Nothing here matches this closely"
-    public static let detail = "These are the nearest files, not answers."
+    /// One line, no second sentence. The state is self-evident from an empty list plus a button;
+    /// explaining it in prose underneath is the thing to cut, not the thing to write.
+    public static let title = "Nothing really matches"
 }
