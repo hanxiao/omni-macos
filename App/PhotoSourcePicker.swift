@@ -22,7 +22,7 @@ struct PhotoSourcePicker: View {
     private var alreadyAdded: Set<String> { Set(model.photoSources.map(\.id)) }
 
     /// Is the whole library already a source? Then EVERY album is already covered - the model
-    /// absorbs an album into All Photos on add (canonicalizePhotoSources), so offering one here
+    /// absorbs an album into the whole library on add (canonicalizePhotoSources), so offering one here
     /// would be an Add button that silently does nothing.
     private var libraryCovered: Bool { alreadyAdded.contains(PhotoLibrary.Source.allID) }
 
@@ -62,7 +62,7 @@ struct PhotoSourcePicker: View {
             List {
                 Section {
                     Toggle(isOn: $wholeLibrary) {
-                        row(title: "All Photos", count: libraryCount, symbol: "photo.on.rectangle.angled")
+                        row(title: PhotoLibrary.Source.all.title, count: libraryCount, symbol: "photo.on.rectangle.angled")
                     }
                     .disabled(alreadyAdded.contains(PhotoLibrary.Source.allID))
                 }

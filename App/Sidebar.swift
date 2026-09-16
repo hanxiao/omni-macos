@@ -84,17 +84,10 @@ struct Sidebar: View {
                     }
                 }
                 photoRows
-                // One "Add", because the user is adding a place to search, and whether that place
-                // is a folder or the photo library is a detail of the picker, not a separate
-                // decision to be made from the sidebar.
-                Menu {
-                    Button("Folder\u{2026}") { pickFolder() }
-                    Button("Photos Library\u{2026}") { addPhotos() }
-                } label: {
-                    Label("Add\u{2026}", systemImage: "plus")
-                }
-                .menuIndicator(.hidden)
-                .buttonStyle(.plain)
+                // One "Add", and one PICKER behind it - see pickFolder. Whether the place is a
+                // folder or the photo library falls out of what was selected.
+                Button { pickFolder() } label: { Label("Add\u{2026}", systemImage: "plus") }
+                    .buttonStyle(.plain)
             }
             .id(isNested)
     }
@@ -238,12 +231,59 @@ struct Sidebar: View {
         }
     }
 
+    /// ONE picker for both kinds of source, because the Photos library IS a file: macOS keeps it
+    /// at ~/Pictures/Photos Library.photoslibrary, type com.apple.photos.library. So "add a place
+    /// to search" is a single Open panel, and which kind of place it is falls out of what was
+    /// picked rather than being a decision the user makes from a menu first.
+    ///
+    /// The panel has to allow FILES for the library to be selectable at all - it is a package, and
+    /// a package is a file unless `treatsFilePackagesAsDirectories` is set, which would let the
+    /// user wander inside it. Allowing files then means everything else is offered too, so a
+    /// delegate enables exactly folders and that one package type. `allowedContentTypes` was the
+    /// other route and is not used: it is documented against FILES, and whether it also disables
+    /// plain directories is not something to find out from a user's bug report.
+    ///
+    /// No `message`. An Open panel that says what an Open panel is for is prose in a dialog.
     private func pickFolder() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
-        panel.canChooseFiles = false
+        panel.canChooseFiles = true
+        panel.treatsFilePackagesAsDirectories = false
         panel.allowsMultipleSelection = true
-        if panel.runModal() == .OK { model.addRoots(panel.urls) }
+        panel.prompt = "Add"
+        let gate = SourcePanelDelegate()
+        panel.delegate = gate                 // weak; `gate` outlives the modal run below
+        guard panel.runModal() == .OK else { return }
+        let picked = panel.urls
+        let folders = picked.filter { !SourcePanelDelegate.isPhotoLibrary($0) }
+        if !folders.isEmpty { model.addRoots(folders) }
+        // The library still opens the album chooser: that is a second QUESTION (whole library, or
+        // which albums), not a second copy of this one.
+        if picked.count != folders.count { addPhotos() }
+        return
+    }
+}
+
+/// Decides what an "Add source" panel will let you pick: a plain folder, or the Photos library.
+///
+/// A delegate rather than `allowedContentTypes` because the panel must accept files (the library
+/// is a package, and a package is a file to an Open panel) while accepting no OTHER file, and
+/// while leaving ordinary directories selectable. Everything else - a .app, a .rtfd, a PDF - is
+/// greyed out, which is a truthful statement: none of them is a place Omni can index.
+private final class SourcePanelDelegate: NSObject, NSOpenSavePanelDelegate {
+    static func isPhotoLibrary(_ url: URL) -> Bool {
+        // Compared by identifier so there is no force-unwrapped UTType to crash on a system that
+        // does not declare the type.
+        (try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType?.identifier
+            == "com.apple.photos.library"
+    }
+
+    func panel(_ sender: Any, shouldEnable url: URL) -> Bool {
+        if Self.isPhotoLibrary(url) { return true }
+        let v = try? url.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
+        // A package that is not the photo library is a document, not a folder: indexing the inside
+        // of someone's .app or .rtfd is not what "add a folder" means.
+        return (v?.isDirectory ?? false) && !(v?.isPackage ?? false)
     }
 }
 

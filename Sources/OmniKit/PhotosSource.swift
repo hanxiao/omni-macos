@@ -91,7 +91,20 @@ public enum PhotoLibrary {
         public init(id: String, title: String) { self.id = id; self.title = title }
 
         public static let allID = "all"
-        public static let all = Source(id: allID, title: "All Photos")
+        /// "Photos Library", which is what macOS calls the thing itself: the library is a real
+        /// file, at ~/Pictures/Photos Library.photoslibrary, type com.apple.photos.library.
+        ///
+        /// It was "All Photos", which is a live Photos.app term - its tab bar reads
+        /// Years | Months | All Photos - but there it names a VIEW, the one that shows every photo
+        /// instead of grouping them by date. Here the string names a SOURCE, and a source called
+        /// "All Photos" sitting in a list of folders reads as a subset of something rather than as
+        /// the library itself. It also has to be told apart from a ~/Pictures FOLDER, which is a
+        /// different thing the user can add separately and which now carries a photo symbol.
+        ///
+        /// Safe to change with no migration: a Source is persisted with its title, but
+        /// canonicalizePhotoSources collapses any whole-library entry to this constant on load, so
+        /// the stored string is discarded. Album titles are user data and are left alone.
+        public static let all = Source(id: allID, title: "Photos Library")
         public var isAll: Bool { id == Source.allID }
 
         /// The root key this source contributes to the index - what `perRoot` progress, the stale

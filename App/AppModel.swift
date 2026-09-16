@@ -3882,10 +3882,10 @@ final class AppModel {
             return .fail("no album with id \(id) (list them with GET /v1/sources)")
         }
         addPhotoSources([source])
-        // Absorbed by All Photos rather than added? Say so instead of reporting a key the caller
+        // Absorbed by the whole library rather than added? Say so instead of reporting a key the caller
         // will not find in the next listing.
         guard photoSources.contains(where: { $0.id == source.id }) else {
-            return .fail("\(source.title) is already covered by All Photos")
+            return .fail("\(source.title) is already covered by \(PhotoLibrary.Source.all.title)")
         }
         return .ok(source.key)
     }
@@ -3925,7 +3925,7 @@ final class AppModel {
         UserDefaults.standard.set(try? JSONEncoder().encode(photoSources), forKey: "omni.photoSources")
     }
 
-    /// The folder rule, for Photos: "All Photos" contains every album, so selecting it absorbs them
+    /// The folder rule, for Photos: the whole library contains every album, so selecting it absorbs them
     /// exactly as an ancestor folder absorbs a nested one. Without this an asset in a selected album
     /// would be indexed twice under two keys - correct, but paid for twice on disk.
     private func canonicalizePhotoSources(_ sources: [PhotoLibrary.Source]) -> [PhotoLibrary.Source] {
@@ -3970,7 +3970,7 @@ final class AppModel {
         }
         let merged = canonicalizePhotoSources(photoSources + sources)
         let new = merged.filter { m in !photoSources.contains { $0.id == m.id } }
-        // Adding "All Photos" drops the albums it absorbs: their rows are now unreachable from any
+        // Adding the whole library drops the albums it absorbs: their rows are now unreachable from any
         // source, so remove them the same way removePhotoSource would.
         let dropped = photoSources.filter { old in !merged.contains { $0.id == old.id } }
         guard !new.isEmpty || !dropped.isEmpty else { return }

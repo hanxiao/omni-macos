@@ -3,7 +3,7 @@ import SwiftUI
 
 /// Browsing a Photos source, the counterpart to `FolderBrowser`.
 ///
-/// Selecting "All Photos" in the sidebar used to do nothing at all: the row took the selection
+/// Selecting the Photos library in the sidebar used to do nothing at all: the row took the selection
 /// highlight and the content pane stayed on the idle empty state. This is the missing half.
 ///
 /// It is NOT the folder browser with a different root, and cannot be. A photo is indexed at
