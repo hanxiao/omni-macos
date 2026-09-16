@@ -4483,6 +4483,27 @@ if args.count >= 4 && args[1] == "qppcheck" {
     let unavail = (pos + negHard).filter { !$0.conf.available }.count
     say(String(format: "  statistic unavailable on %d of %d probes", unavail, pos.count + negHard.count))
 
+    // AUROC ranks; it does not say what the SHIPPED threshold does to each slice. A slice can rank
+    // acceptably and still sit on the wrong side of one fixed cut - which is the only thing a user
+    // experiences. So the operating point is reported per slice too.
+    say("\n  at the shipped operating point t < 2.7, by slice")
+    say("  slice            answerable   wrongly hidden   near-negatives caught")
+    for (label, keep) in [("text", { (p: Probe) in p.kind == "text" }),
+                          ("media", { $0.kind == "media" }),
+                          ("latin", { $0.script == "latin" }),
+                          ("cjk", { $0.script == "cjk" }),
+                          ("cjk-name", { $0.script == "cjk-name" })] {
+        let p = pos.filter(keep), nh = negHard.filter(keep)
+        guard p.count >= 15 else {
+            say(String(format: "  %-15s %-12d (too few to judge)", (label as NSString).utf8String!, p.count)); continue }
+        let hidden = p.filter { $0.conf.tnorm < 2.7 }.count
+        let caught = nh.filter { $0.conf.tnorm < 2.7 }.count
+        say(String(format: "  %-15s %-12d %6.1f%%           %6.1f%%  (n=%d)",
+                   (label as NSString).utf8String!, p.count,
+                   100.0 * Double(hidden) / Double(p.count),
+                   100.0 * Double(caught) / Double(Swift.max(1, nh.count)), nh.count))
+    }
+
     // Operating points for the best predictor, swept across the range its medians actually span.
     let best = preds.max { auroc($0.1, negHard) < auroc($1.1, negHard) }!
     let span = pos.map { Double(best.1($0.conf)) } + negHard.map { Double(best.1($0.conf)) }
