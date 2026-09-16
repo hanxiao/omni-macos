@@ -93,3 +93,25 @@ public enum RootScope {
         path == ancestor || path.hasPrefix(ancestor.hasSuffix("/") ? ancestor : ancestor + "/")
     }
 }
+
+/// Which folders a launch starts with, given what is on disk.
+///
+/// Pulled out of `AppModel.loadRoots` as a pure function because the bug it carried was entirely a
+/// decision about three optionals, and a decision about three optionals is a thing that can be
+/// pinned by a test instead of re-derived by the next person reading a UserDefaults call.
+public enum RootSeed {
+    /// - Parameters:
+    ///   - stored: `omni.addedFolders`, the current key. nil means the key has never been written;
+    ///     EMPTY means the user removed everything, which is an answer, not a missing one.
+    ///   - legacyRoots: `omni.roots`, the pre-`addedFolders` crawl set.
+    ///   - legacyCovered: `omni.coveredFolders`, briefly written beside it.
+    public static func folders(stored: [String]?, legacyRoots: [String], legacyCovered: [String]) -> [String] {
+        // The key EXISTS: its contents are the answer, empty included. Testing `!stored.isEmpty`
+        // here is what made a user who removed every folder look like a first launch, so the
+        // defaults were re-seeded on every start and could not be got rid of (issue #21).
+        if let stored { return stored }
+        // Never written: an upgrade from a build that predates the key, or a genuinely first run.
+        // A first run seeds NOTHING - see AppModel.loadRoots for why.
+        return legacyRoots + legacyCovered
+    }
+}

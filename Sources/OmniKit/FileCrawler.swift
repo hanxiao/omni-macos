@@ -80,12 +80,6 @@ public struct FileCrawler: Sendable {
     }
 
     /// Default user folders to index.
-    public static func defaultRoots() -> [URL] {
-        let fm = FileManager.default
-        return [.documentDirectory, .downloadsDirectory, .desktopDirectory]
-            .compactMap { try? fm.url(for: $0, in: .userDomainMask, appropriateFor: nil, create: false) }
-    }
-
     /// Engine selector. OMNI_CRAWLER=legacy restores the FileManager enumerator, so the two can be
     /// A/B'd in one build - and so a user who hits trouble with the fast walk has a way back.
     static var useLegacyEngine: Bool {

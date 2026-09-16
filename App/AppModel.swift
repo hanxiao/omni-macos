@@ -337,6 +337,9 @@ final class AppModel {
         var sourcePath: String? = nil
     }
     var fileQuery: FileQuery? = nil
+    /// Presented by the sidebar, triggered from anywhere that can add a source (see SourcePicker).
+    var showPhotoPicker = false
+    var showPhotoDenied = false
     var queryError: String? = nil   // a file query that couldn't be embedded (decode/missing)
     var rawResults: [SearchHit] = [] { didSet { recomputeResults() } }   // kind/folder/ext/date filtered, score-sorted
     var searching = false
@@ -3709,21 +3712,32 @@ final class AppModel {
         }
     }
 
+    /// AN EMPTY STORED LIST IS A DECISION, NOT AN ABSENCE. This tested `!stored.isEmpty`, so a
+    /// user who removed every folder was indistinguishable from one who had never had any, and the
+    /// else branch below re-seeded the defaults - they came back on every launch, for good
+    /// (issue #21: "I removed the starting folders. I restart, they are back."). Presence of the
+    /// KEY is the test; its contents are the answer, empty included.
+    ///
+    /// NOTHING IS SEEDED ON A FIRST LAUNCH EITHER. Adding Documents, Downloads and Desktop for
+    /// someone who has not asked costs three macOS permission prompts before they have seen the
+    /// app work, and starts indexing folders they may never want indexed. The sidebar opens empty
+    /// with one "Add..." in it, and the user says which folders Omni may read.
     private func loadRoots() {
         // MIGRATION, in the order the keys appeared. `omni.addedFolders` is the source of truth
         // now; before it there was `omni.roots` (the crawl set) and briefly `omni.coveredFolders`
         // beside it. Seeding from both loses nothing for anyone upgrading.
-        let stored = UserDefaults.standard.array(forKey: "omni.addedFolders") as? [String]
-        if let stored, !stored.isEmpty {
-            addedFolders = stored.map { URL(fileURLWithPath: $0) }
-        } else {
-            let legacyRoots = (UserDefaults.standard.array(forKey: "omni.roots") as? [String]) ?? []
-            let legacyCovered = (UserDefaults.standard.array(forKey: "omni.coveredFolders") as? [String]) ?? []
-            let seed = legacyRoots + legacyCovered
-            addedFolders = seed.isEmpty ? FileCrawler.defaultRoots() : seed.map { URL(fileURLWithPath: $0) }
-        }
+        let d = UserDefaults.standard
+        addedFolders = RootSeed.folders(
+            stored: d.array(forKey: "omni.addedFolders") as? [String],
+            legacyRoots: (d.array(forKey: "omni.roots") as? [String]) ?? [],
+            legacyCovered: (d.array(forKey: "omni.coveredFolders") as? [String]) ?? []
+        ).map { URL(fileURLWithPath: $0) }
         recomputeRoots()
     }
+
+    /// Has the user given Omni anywhere to look yet? Folders OR a photo library - either one means
+    /// the app has work to do and the empty state should stop asking.
+    var hasSources: Bool { !addedFolders.isEmpty || !photoSources.isEmpty }
 
     private func saveRoots() {
         guard !isIsolatedRun else { return }   // see isIsolatedRun

@@ -25,8 +25,7 @@ struct Sidebar: View {
     @Environment(AppModel.self) private var model: AppModel
     @State private var dropTargeted = false
     @State private var selection: SidebarSelection?
-    @State private var showPhotoPicker = false
-    @State private var showPhotoDenied = false
+
 
     /// A crawl root reports on its own pass; a folder a broader root covers has no pass to report
     /// on, so it gets the quieter row. Both are selectable, both browse, and both carry the folder
@@ -86,7 +85,7 @@ struct Sidebar: View {
                 photoRows
                 // One "Add", and one PICKER behind it - see pickFolder. Whether the place is a
                 // folder or the photo library falls out of what was selected.
-                Button { pickFolder() } label: { Label("Add\u{2026}", systemImage: "plus") }
+                Button { SourcePicker.add(to: model) } label: { Label("Add\u{2026}", systemImage: "plus") }
                     .buttonStyle(.plain)
             }
             .id(isNested)
@@ -163,8 +162,8 @@ struct Sidebar: View {
         // is why re-running a file history item sometimes did nothing.
         .onChange(of: model.rawQuery) { _, _ in reconcileSelection() }
         .onChange(of: model.fileQuery) { _, _ in reconcileSelection() }
-        .sheet(isPresented: $showPhotoPicker) { PhotoSourcePicker() }
-        .sheet(isPresented: $showPhotoDenied) { PhotoAccessDenied() }
+        .sheet(isPresented: Binding(get: { model.showPhotoPicker }, set: { model.showPhotoPicker = $0 })) { PhotoSourcePicker() }
+        .sheet(isPresented: Binding(get: { model.showPhotoDenied }, set: { model.showPhotoDenied = $0 })) { PhotoAccessDenied() }
         .onDeleteCommand {
             switch selection {
             case .photos(let key):
@@ -221,70 +220,7 @@ struct Sidebar: View {
 
     /// Ask for library access (once), then offer the picker - or, if macOS already said no, the
     /// only thing that can change that answer.
-    private func addPhotos() {
-        Task { @MainActor in
-            if await model.ensurePhotoAccess() { showPhotoPicker = true }
-            // Still undecided (the request was deferred behind another permission prompt): say
-            // nothing and let the click be repeated. The "go to System Settings" sheet is only
-            // honest once macOS has actually recorded a refusal.
-            else if model.photoAccess != .notDetermined { showPhotoDenied = true }
-        }
-    }
 
-    /// ONE picker for both kinds of source, because the Photos library IS a file: macOS keeps it
-    /// at ~/Pictures/Photos Library.photoslibrary, type com.apple.photos.library. So "add a place
-    /// to search" is a single Open panel, and which kind of place it is falls out of what was
-    /// picked rather than being a decision the user makes from a menu first.
-    ///
-    /// The panel has to allow FILES for the library to be selectable at all - it is a package, and
-    /// a package is a file unless `treatsFilePackagesAsDirectories` is set, which would let the
-    /// user wander inside it. Allowing files then means everything else is offered too, so a
-    /// delegate enables exactly folders and that one package type. `allowedContentTypes` was the
-    /// other route and is not used: it is documented against FILES, and whether it also disables
-    /// plain directories is not something to find out from a user's bug report.
-    ///
-    /// No `message`. An Open panel that says what an Open panel is for is prose in a dialog.
-    private func pickFolder() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = true
-        panel.treatsFilePackagesAsDirectories = false
-        panel.allowsMultipleSelection = true
-        panel.prompt = "Add"
-        let gate = SourcePanelDelegate()
-        panel.delegate = gate                 // weak; `gate` outlives the modal run below
-        guard panel.runModal() == .OK else { return }
-        let picked = panel.urls
-        let folders = picked.filter { !SourcePanelDelegate.isPhotoLibrary($0) }
-        if !folders.isEmpty { model.addRoots(folders) }
-        // The library still opens the album chooser: that is a second QUESTION (whole library, or
-        // which albums), not a second copy of this one.
-        if picked.count != folders.count { addPhotos() }
-        return
-    }
-}
-
-/// Decides what an "Add source" panel will let you pick: a plain folder, or the Photos library.
-///
-/// A delegate rather than `allowedContentTypes` because the panel must accept files (the library
-/// is a package, and a package is a file to an Open panel) while accepting no OTHER file, and
-/// while leaving ordinary directories selectable. Everything else - a .app, a .rtfd, a PDF - is
-/// greyed out, which is a truthful statement: none of them is a place Omni can index.
-private final class SourcePanelDelegate: NSObject, NSOpenSavePanelDelegate {
-    static func isPhotoLibrary(_ url: URL) -> Bool {
-        // Compared by identifier so there is no force-unwrapped UTType to crash on a system that
-        // does not declare the type.
-        (try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType?.identifier
-            == "com.apple.photos.library"
-    }
-
-    func panel(_ sender: Any, shouldEnable url: URL) -> Bool {
-        if Self.isPhotoLibrary(url) { return true }
-        let v = try? url.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
-        // A package that is not the photo library is a document, not a folder: indexing the inside
-        // of someone's .app or .rtfd is not what "add a folder" means.
-        return (v?.isDirectory ?? false) && !(v?.isPackage ?? false)
-    }
 }
 
 /// The past-searches sections of the sidebar. A separate view so SwiftUI Observation re-renders it only

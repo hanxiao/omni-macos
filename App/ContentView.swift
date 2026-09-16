@@ -469,10 +469,14 @@ struct ContentView: View {
     @ViewBuilder private var emptyState: some View {
         // Indexing is invisible here - the sidebar's per-folder progress is the only cue, and
         // search works while it runs. The user just adds folders and searches.
-        if model.roots.isEmpty {
+        // THE FIRST SCREEN A NEW INSTALL SEES, now that nothing is indexed by default (see
+        // AppModel.loadRoots). Keyed on hasSources, not on `roots`: a user who added only their
+        // photo library has a source and can search, and telling them to add a folder over the
+        // top of it would be wrong.
+        if !model.hasSources {
             CenteredStatus(symbol: "folder.badge.plus", title: "Add a folder to search",
-                           subtitle: "Choose the folders you want to search. Omni indexes them automatically and keeps them up to date.",
-                           showSpinner: false, action: ("Add folder\u{2026}", { pickFolder() }))
+                           subtitle: "", showSpinner: false,
+                           action: ("Add\u{2026}", { SourcePicker.add(to: model) }))
         } else if let err = model.queryError {
             CenteredStatus(symbol: "exclamationmark.triangle", title: "Couldn't search by that file",
                            subtitle: err, showSpinner: false)
@@ -1123,14 +1127,6 @@ struct ContentView: View {
         case "filename": return []
         default: return []
         }
-    }
-
-    private func pickFolder() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = true
-        if panel.runModal() == .OK { model.addRoots(panel.urls) }
     }
 
 }
