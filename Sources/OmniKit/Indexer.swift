@@ -2034,7 +2034,21 @@ public final class Indexer: @unchecked Sendable {
     func chunk(_ text: String, settings: IndexSettings, origin: TextOrigin) -> [TextPiece] {   // internal for tests
         let limit = max(200, settings.maxCharsPerChunk)   // user-set; floor keeps chunks meaningful
         let totalCount = text.count
-        if totalCount <= limit { return [TextPiece(text: text, locator: "")] }   // single chunk: position is trivial
+        // A single chunk still HAS a position - the top of the file - and an empty string made
+        // `locator` a field consumers had to special-case: present on a long file, absent on a
+        // short one, with no way to tell "no position" from "position is the start". It is emitted
+        // for the same origins that would emit one if the file were longer, so the field means the
+        // same thing on every text hit. `.opaque` still returns nothing, because for a converted
+        // office document an offset genuinely maps to nothing the reader can see.
+        if totalCount <= limit {
+            let first: String
+            switch origin {
+            case .plain: first = "Line 1"
+            case .paged(let starts): first = starts.isEmpty ? "" : "Page 1"
+            case .opaque: first = ""
+            }
+            return [TextPiece(text: text, locator: first)]
+        }
         // No chunk-count cap: coverage is bounded only by FileExtractor.maxTextBytes at extraction.
         // Single FORWARD String.Index walk - no full Array(text) copy (that was a [Character] at
         // ~16B/grapheme, ~16x the UTF-8 string). Boundaries stay on exact Character (grapheme) units,

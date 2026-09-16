@@ -78,15 +78,21 @@ final class ChunkLocatorTests: XCTestCase {
         }
     }
 
-    /// Office docs (opaque origin) and single-chunk files carry no locator.
-    func testOpaqueAndSingleChunkHaveNoLocator() throws {
+    /// Office docs (opaque origin) carry no locator: their offsets map to nothing a reader sees.
+    ///
+    /// A SINGLE-CHUNK FILE DOES CARRY ONE, which this used to assert the opposite of. An empty
+    /// string made `locator` a field consumers had to special-case - present on a long file,
+    /// absent on a short one - with no way to tell "no position" from "the position is the start".
+    func testOpaqueHasNoLocatorButASingleChunkDoes() throws {
         let (indexer, store) = try makeIndexer()
         defer { store.close() }
         var settings = IndexSettings.default
         settings.maxCharsPerChunk = 200
         let long = String(repeating: "z", count: 2000)
         XCTAssertTrue(indexer.chunk(long, settings: settings, origin: .opaque).allSatisfy { $0.locator.isEmpty })
-        XCTAssertEqual(indexer.chunk("short", settings: settings, origin: .plain).map { $0.locator }, [""])
+        XCTAssertEqual(indexer.chunk("short", settings: settings, origin: .opaque).map { $0.locator }, [""])
+        XCTAssertEqual(indexer.chunk("short", settings: settings, origin: .plain).map { $0.locator }, ["Line 1"])
+        XCTAssertEqual(indexer.chunk("short", settings: settings, origin: .paged([0])).map { $0.locator }, ["Page 1"])
     }
 
     /// Locator survives the store round trip: replace -> search -> SearchHit.locator,
@@ -108,14 +114,17 @@ final class ChunkLocatorTests: XCTestCase {
         let ranked = store.rankChunks([1, 0, 0, 0], path: "/tmp/doc.pdf")
         XCTAssertEqual(ranked.first?.locator, "Page 1")
         // multi -> single transition: a re-embed that collapses the file to one chunk must drop
-        // the count (and locator) so the UI stops offering the expansion.
+        // the count so the UI stops offering the expansion.
         try store.replace(path: "/tmp/doc.pdf", chunks: [
             IndexedChunk(path: "/tmp/doc.pdf", modified: 2, size: 10, kind: "text", chunkIndex: 0,
                          snippet: "doc.pdf", embedding: [1, 0, 0, 0], locator: ""),
         ])
         let single = store.search([1, 0, 0, 0], topK: 1).first
         XCTAssertEqual(single?.chunkCount, 1)
-        XCTAssertEqual(single?.locator, "")
+        // The stored locator is empty - this row was written the way every row written before the
+        // change was - and the read path fills it, which is what spares an index of millions of
+        // files a rebuild for a display string.
+        XCTAssertEqual(single?.locator, "Page 1")
         // and single -> multi again (the other direction of the same edge)
         try store.replace(path: "/tmp/doc.pdf", chunks: chunks)
         XCTAssertEqual(store.search([1, 0, 0, 0], topK: 1).first?.chunkCount, 2)

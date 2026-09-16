@@ -2918,10 +2918,34 @@ public final class VectorStore: @unchecked Sendable {
                     path: p, score: scoreOf[p]?.score ?? 0, snippet: m.4,
                     kind: m.2, chunkIndex: m.3, modified: m.0,
                     width: m.5, height: m.6, duration: m.7, size: m.1,
-                    locator: m.8, chunkCount: cc))
+                    locator: Self.displayLocator(stored: m.8, chunkCount: cc, kind: m.2, path: p),
+                    chunkCount: cc))
             }
             return out
         }
+    }
+
+    /// The locator a hit should SHOW, filling in for rows written before single-chunk files got
+    /// one.
+    ///
+    /// The stored value is the source of truth and is returned untouched whenever it exists. This
+    /// only covers the other case: a file whose whole content is one chunk, indexed by a build that
+    /// wrote "" for it. Deriving it at read time rather than asking for a reindex is the point - an
+    /// index of millions of files should not have to be rebuilt to make a display string uniform,
+    /// and the answer is not a guess: one chunk means the match starts at the beginning of the file.
+    ///
+    /// Media has no line or page to point at, so it keeps an empty locator, as does a file with
+    /// several chunks and nothing stored (that one is genuinely unknown - an opaque origin).
+    static func displayLocator(stored: String, chunkCount: Int, kind: String, path: String) -> String {
+        if !stored.isEmpty || chunkCount != 1 { return stored }
+        guard kind == FileKind.text.rawValue || kind == FileKind.scan.rawValue else { return stored }
+        let ext = (path as NSString).pathExtension.lowercased()
+        if ext == "pdf" { return "Page 1" }
+        // Office formats convert to text whose offsets map to nothing the reader can see; that is
+        // the `.opaque` origin at index time, and it stays empty here for the same reason.
+        if ["doc", "docx", "rtf", "rtfd", "odt", "pages", "ppt", "pptx", "key", "xls", "xlsx", "numbers"]
+            .contains(ext) { return stored }
+        return "Line 1"
     }
 
     public var count: Int { queue.sync { rows.count - deadRows.count } }
@@ -4890,6 +4914,8 @@ public final class VectorStore: @unchecked Sendable {
                 if let c = sqlite3_column_text(stmt, 0) { out[i].snippet = String(cString: c) }
                 // Free with the snippet: same row, and it is the only place the locator lives now.
                 if let c = sqlite3_column_text(stmt, 1) { out[i].locator = String(cString: c) }
+                out[i].locator = Self.displayLocator(stored: out[i].locator, chunkCount: out[i].chunkCount,
+                                                     kind: out[i].kind, path: out[i].path)
             }
         }
         sqlite3_reset(stmt)   // release the read snapshot the cached statement would otherwise hold open
