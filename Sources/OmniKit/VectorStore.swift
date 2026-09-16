@@ -4199,12 +4199,6 @@ public final class VectorStore: @unchecked Sendable {
         return fuseLexical(dense: dense, text: text, filter: filter, topK: topK, explicit: false, denseQuery: query)
     }
 
-    /// How the filename channel is combined with the dense ranking. `OMNI_FUSION=rrf` restores the
-    /// reciprocal-rank fusion that shipped through v0.11.7; it is kept so the two can be A/B'd
-    /// against one frozen index in one process (`omni-verify fusecheck`), and as a rollback.
-    nonisolated(unsafe) public static var fusionMode =
-        ProcessInfo.processInfo.environment["OMNI_FUSION"] ?? "score"
-
     /// Weight of the filename channel, in the dense channel's units.
     ///
     /// This is a convex combination in disguise. Bruch, Gai and Ingber (arXiv 2210.11934, TOIS
@@ -4350,23 +4344,13 @@ public final class VectorStore: @unchecked Sendable {
         let densePos = Dictionary(uniqueKeysWithValues: dense.enumerated().map { ($1.path, $0) })
 
         var fused: [String: Double] = [:]
-        if Self.fusionMode == "rrf" {
-            // Rollback path only. Ordered by the RRF score while `score` keeps the cosine, which is
-            // the disagreement this function exists to remove; kept verbatim for the A/B.
-            for (i, h) in dense.enumerated() { fused[h.path, default: 0] += 1.0 / Double(60 + i + 1) }
-            for (p, s) in strength {
-                fused[p, default: 0] += s / Double((explicit ? 5 : 120) + (lexPos[p] ?? 0) + 1)
-            }
-            for p in exactNames { fused[p, default: 0] += 1.0 }
-        } else {
-            for h in pool {
-                let d = Double(Swift.max(0, Swift.min(1, h.score)))
-                fused[h.path] = d + Self.lexicalWeight * (strength[h.path] ?? 0)
-                    + (exactNames.contains(h.path) ? Self.exactTier : 0)
-            }
-            // The score the caller sees is the score the sort uses. This is the whole point.
-            for i in pool.indices { pool[i].score = Float(fused[pool[i].path] ?? Double(pool[i].score)) }
+        for h in pool {
+            let d = Double(Swift.max(0, Swift.min(1, h.score)))
+            fused[h.path] = d + Self.lexicalWeight * (strength[h.path] ?? 0)
+                + (exactNames.contains(h.path) ? Self.exactTier : 0)
         }
+        // The score the caller sees is the score the sort uses. This is the whole point.
+        for i in pool.indices { pool[i].score = Float(fused[pool[i].path] ?? Double(pool[i].score)) }
         // Total order: fused score, then the dense order, then the lexical order, then the path.
         // Swift's sort is not stable, so a comparator with ties would order them unpredictably.
         pool.sort {

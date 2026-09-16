@@ -4765,8 +4765,10 @@ if args.count >= 4 && args[1] == "fusecheck" {
         return out.joined(separator: "  ")
     }
 
-    for arm in ["rrf", "score", "score+stemtier"] {
-        VectorStore.fusionMode = arm == "rrf" ? "rrf" : "score"
+    // The "rrf" arm is gone with the rollback it exercised: reciprocal-rank fusion lost the A/B
+    // this harness was built to run (inversions 38/66 -> 0, retrieval unchanged) and shipped
+    // disabled for a release before being deleted. What remains worth comparing is the stem tier.
+    for arm in ["score", "score+stemtier"] {
         VectorStore.stemCountsAsExact = arm == "score+stemtier"
         say("\n  arm: \(arm)")
         let inv = inversions(prose + Array(names.prefix(40)))
@@ -4836,7 +4838,6 @@ if args.count >= 4 && args[1] == "fusecheck" {
     // Can an ABSOLUTE cutoff separate relevant from irrelevant at all? Ground truth we actually
     // have: for a typed filename, the file of that name is relevant and the rest of the page is not.
     // Measured on the dense channel alone, since a fused score would just be measuring the boost.
-    VectorStore.fusionMode = "score"
     do {
         var tgt: [Double] = [], oth: [Double] = []
         for b in sample(names, 80) {
@@ -4876,7 +4877,6 @@ if args.count >= 4 && args[1] == "fusecheck" {
     }
 
     // The one free parameter in the new rule, swept rather than guessed.
-    VectorStore.fusionMode = "score"
     say("\n  implicit-weight sweep (explicit weight fixed at 1.0)")
     let sweepNames = sample(names, 60), sweepCJK = sample(cjkQ, 25)
     func stemRecall() -> (t1: Double, t10: Double) {
