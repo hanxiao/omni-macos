@@ -226,6 +226,9 @@ public struct SearchFilter: Sendable {
     /// mean, so there is nothing left to guess. Empty means "no explicit request", and the channel
     /// falls back to contributing weakly when a bare query happens to look like a name.
     public var filenameQuery: String? = nil
+    /// Relevance floor in TEXT-score units; `VectorStore.relevanceFloor` scales it per kind. nil
+    /// means "use the surface's default", 0 means "return everything".
+    public var minScore: Double? = nil
     public var tagTerms: [String] = []
     public var tagExcludeTerms: [String] = []
     // Resolved by the store at search entry from tagTerms/tagExcludeTerms; per-row checks
@@ -2877,6 +2880,8 @@ public final class VectorStore: @unchecked Sendable {
             // chunk only until the base is folded, so reading the score from it returned 0 for most
             // of the index. Metadata is still SQL, which is what this query is for.
             let scoreOf = query.map { bestChunkScoreLocked(paths, query: $0) } ?? [:]
+            // These are corrected below, with applyNNNLocked, for the same reason the dense half is:
+            // a fused list whose two halves sit on different scales cannot be ranked or thresholded.
             let sql = """
                 SELECT f.modified, f.size, c.kind, c.chunk_index, t.snippet, f.width, f.height,
                        f.duration, t.locator
@@ -2917,7 +2922,7 @@ public final class VectorStore: @unchecked Sendable {
                     width: m.5, height: m.6, duration: m.7, size: m.1,
                     locator: m.8, chunkCount: cc))
             }
-            return out
+            return applyNNNLocked(out)
         }
     }
 
@@ -3950,6 +3955,301 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
+
+    // MARK: - Nearest Neighbor Normalization
+
+    /// Nearest Neighbor Normalization (Chowdhury, Wang, Shenoy, Kiela, Schwettmann, Thrush,
+    /// arXiv 2410.24114). A training-free, test-time correction: subtract from each retrieval
+    /// candidate a bias equal to `alpha` times the mean of its top-`k` scores against a bank of
+    /// reference queries. The corrected score answers "how much better did this chunk match THIS
+    /// query than it usually matches anything", which is the quantity a relevance threshold
+    /// actually wants.
+    ///
+    /// Why it is here. Measured on a frozen 2.68M-file index with a held-out bank of 512 queries,
+    /// the correct answer reached rank 1 for 71 of 159 labelled queries against 58 without it,
+    /// +22% relative. And it removes the modality gap that made a single default threshold
+    /// impossible: raw, relevant media tops out at 0.496 while irrelevant TEXT starts at 0.551, so
+    /// every cutoff at or above 0.50 kept 0% of media answers. After the correction both land on
+    /// one scale (text relevant p50 +0.210, media relevant p50 +0.322).
+    ///
+    /// AND THEN IT DID NOT REPRODUCE, which is why this is off. Repeated on a second snapshot of
+    /// the same index the ranking gain fell to +2 to +7 of 176, inside the noise, and the shipped
+    /// per-file form scored 65 of 176 against 63 uncorrected with a max reduction and 57 with a
+    /// mean one. The reason is visible in the bias itself, broken down by kind (`nnnBiasByKind`):
+    ///
+    ///     text   n=2,087,334   p10 0.3133  p50 0.7416  p90 0.7445
+    ///     image  n=  571,230   p10 0.1806  p50 0.1806  p90 0.1806
+    ///     audio  n=   12,996   p10 0.1170  p50 0.1483  p90 0.1856
+    ///
+    /// Every one of 571,230 images carries the SAME bias to four decimal places. On this embedding
+    /// space the correction is not per-document at all - it is a per-MODALITY constant, so within a
+    /// modality it reorders almost nothing. What it was really fixing is the score scale, and
+    /// `relevanceFloor` gets that directly, without rescaling every score in the product.
+    ///
+    /// Kept because it is what MEASURED the cone effect, it is the only thing that can tell a
+    /// per-document bias from a per-modality one on a future index or model, and it costs nothing
+    /// while off. `alpha` and `k` were swept: k = 8 best, alpha 0.75 best, 1.0 clearly worse.
+    /// OFF. Built, measured, and not shipped on: see the note above about what it turned out to be
+    /// on this corpus. `OMNI_NNN=1` turns it on for measurement.
+    nonisolated(unsafe) public static var nnnEnabled =
+        ProcessInfo.processInfo.environment["OMNI_NNN"] == "1"
+    nonisolated(unsafe) public static var nnnAlpha: Float = 0.75
+    nonisolated(unsafe) public static var nnnK = 8
+    /// Reference queries. 512 is what was measured; the paper's ablation finds the method
+    /// insensitive to bank size, and a bank this small keeps the build to one pass over the vectors.
+    nonisolated(unsafe) public static var nnnBankSize = 512
+    /// How many results to select before correcting them. See the note at the call site.
+    nonisolated(unsafe) public static var nnnOverfetch = 5
+
+    /// Per-FILE bias, indexed by file id. Empty when not built.
+    private var nnnFileBias: [Float] = []
+    /// Mean of the built bias. Added back to every corrected score so the number the user sees keeps
+    /// its familiar range: `s - b(r) + mean(b)` is the same ordering as `s - b(r)`, since the mean
+    /// is a constant, but a good text match still reads around 0.65 instead of around 0.21.
+    private var nnnBiasMean: Float = 0
+
+    private var nnnSidecarURL: URL {
+        dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".nnn")
+    }
+
+    /// Is a usable bias resident? Reported so callers can tell "no correction" from "correction of
+    /// zero", which are different statements about a score.
+    public var nnnReady: Bool { queue.sync { !nnnFileBias.isEmpty } }
+
+    /// Build the bias over every resident chunk. ONE pass over the mapped vectors: each block of
+    /// rows is multiplied by the [dim, bank] matrix, and the top-k mean along the bank axis is the
+    /// block's bias. Must run on `queue`; call it off the interactive path.
+    ///
+    /// The bank is sampled from the index's own TEXT chunks, evenly by stride. Text, because the
+    /// queries this corrects for are text: that is what makes a photo's bias small (it rarely scores
+    /// well against text) and a text chunk's bias large, which is exactly the per-modality rescaling
+    /// the correction exists to perform. The paper shows the method is robust to an
+    /// out-of-distribution bank, so document chunks standing in for queries is within its envelope.
+    @discardableResult
+    private func buildNNNBiasLocked(progress: ((Double) -> Void)? = nil) -> Bool {
+        let n = rows.count
+        guard dim > 0, n > 0, flat16.count == n * dim else { return false }
+        let bank = nnnBankLocked()
+        guard bank.count >= 32 else { return false }
+        let Q = bank.count / dim
+        let bankMat = MLXArray(bank, [Q, dim]).asType(.bfloat16).transposed(1, 0)   // [dim, Q]
+        let k = Swift.min(Self.nnnK, Q)
+        var out = [Float](repeating: 0, count: n)
+        // 128k rows per block: the transient [block, Q] score matrix is then about 256 MB at
+        // Q = 512, which a 16 GB machine can hold while the rest of the app runs. The pass is
+        // bandwidth-bound on reading the vectors, so a bigger block buys nothing.
+        let block = 128 * 1024
+        var off = 0
+        while off < n {
+            let m = Swift.min(block, n - off)
+            let scores: MLXArray = flat16.withUnsafeBytes { raw in
+                let p = raw.baseAddress!.advanced(by: off * dim * MemoryLayout<UInt16>.size)
+                let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: p),
+                                count: m * dim * MemoryLayout<UInt16>.size, deallocator: .none)
+                return MLX.matmul(MLXArray(data, [m, dim], dtype: .bfloat16), bankMat).asType(.float32)
+            }
+            // Top-k along the bank axis, then the mean of those k. `MLX.top` returns the k largest
+            // per row without sorting the whole axis.
+            let topk = MLX.top(scores, k: k, axis: -1)
+            let b = MLX.mean(topk, axis: -1) * MLXArray(Self.nnnAlpha)
+            MLX.eval(b)
+            let host = b.asArray(Float.self)
+            for i in 0 ..< m { out[off + i] = Swift.max(0, host[i]) }
+            off += m
+            progress?(Double(off) / Double(n))
+        }
+        // REDUCE TO ONE CONSTANT PER FILE, which is what makes this free to apply.
+        //
+        // A file's score is the max over its chunks, and max(s_i - b) = max(s_i) - b for a constant
+        // b. So a per-FILE bias can be subtracted from a finished hit and the result is identical to
+        // subtracting it before the per-file reduction - no scan kernel has to change, and the
+        // winning chunk cannot shift.
+        //
+        // MEAN, not max. Max looks like the right reduction (a file's typical best score is the
+        // best of its chunks' typical bests) and it is a trap: the max of many samples is
+        // systematically larger than the max of few, so it penalises long documents purely for
+        // being long. Measured, it cost almost the whole gain - the correct answer reached rank 1
+        // for 65 of 176 queries against 63 uncorrected, where a chunk-count-independent bias gets
+        // 69. The mean is what stands in for the bias of the file's pooled vector, which is the
+        // form this was validated in.
+        var fbSum = [Float](repeating: 0, count: Swift.max(1, fileChunkCount.count))
+        var fbN = [Int32](repeating: 0, count: fbSum.count)
+        for i in 0 ..< n {
+            let f = Int(fileID[i])
+            guard f >= 0, f < fbSum.count else { continue }
+            fbSum[f] += out[i]; fbN[f] += 1
+        }
+        var fb = [Float](repeating: 0, count: fbSum.count)
+        for f in 0 ..< fb.count where fbN[f] > 0 { fb[f] = fbSum[f] / Float(fbN[f]) }
+        nnnFileBias = fb
+        let live = zip(fb, fbN).filter { $0.1 > 0 }.map { $0.0 }
+        nnnBiasMean = live.isEmpty ? 0 : live.reduce(0, +) / Float(live.count)
+        writeNNNSidecarLocked()
+        return true
+    }
+
+    /// The correction, applied to a finished result page. `score - bias(file) + mean(bias)`: the
+    /// subtraction is NNN, the mean added back is a constant that changes no ordering and keeps the
+    /// number in the range users and SKILL.md already know. A file with no bias (indexed since the
+    /// last build) gets the mean, so it is corrected by exactly nothing rather than favoured.
+    ///
+    /// Must run on `queue`.
+    private func applyNNNLocked(_ hits: [SearchHit]) -> [SearchHit] {
+        guard Self.nnnEnabled, !nnnFileBias.isEmpty else { return hits }
+        var out = hits
+        for i in out.indices {
+            guard let fid = pathID[out[i].path], Int(fid) < nnnFileBias.count else { continue }
+            let b = nnnFileBias[Int(fid)]
+            guard b > 0 else { continue }
+            out[i].score = out[i].score - b + nnnBiasMean
+        }
+        out.sort { $0.score != $1.score ? $0.score > $1.score : $0.path < $1.path }
+        return out
+    }
+
+    /// Bank vectors, flattened [Q * dim]. Text rows only, evenly spaced so the sample does not sit
+    /// in one folder, and dead rows skipped.
+    private func nnnBankLocked() -> [Float] {
+        let n = rows.count
+        guard n > 0, dim > 0 else { return [] }
+        let dead = deadRows
+        var picks: [Int] = []
+        picks.reserveCapacity(Self.nnnBankSize)
+        let stride = Swift.max(1, n / (Self.nnnBankSize * 4))
+        var i = 0
+        while i < n, picks.count < Self.nnnBankSize {
+            if rows[i].kind == "text", !dead.contains(Int32(i)) { picks.append(i) }
+            i += stride
+        }
+        guard !picks.isEmpty else { return [] }
+        var out = [Float](repeating: 0, count: picks.count * dim)
+        flat16.withUnsafeBufferPointer { src in
+            guard let sp = src.baseAddress else { return }
+            out.withUnsafeMutableBufferPointer { dp in
+                guard let d = dp.baseAddress else { return }
+                for (j, r) in picks.enumerated() { Self.expandBF16(sp + r * dim, into: d + j * dim, count: dim) }
+            }
+        }
+        return out
+    }
+
+    private func writeNNNSidecarLocked() {
+        guard !nnnFileBias.isEmpty else { return }
+        var head = [Int64(nnnFileBias.count), Int64(Self.nnnK), Int64(nnnBiasMean.bitPattern)]
+        var data = Data()
+        head.withUnsafeBufferPointer { data.append(Data(buffer: $0)) }
+        nnnFileBias.withUnsafeBufferPointer { data.append(Data(buffer: $0)) }
+        try? data.write(to: nnnSidecarURL, options: .atomic)
+    }
+
+    /// Load a previously built bias. Silently declines a sidecar that does not match the current row
+    /// count: a stale correction is worse than none, since it would be attributed to the wrong chunk.
+    private func loadNNNSidecarLocked() {
+        guard let data = try? Data(contentsOf: nnnSidecarURL), data.count > 24 else { return }
+        let count = data.withUnsafeBytes { $0.load(fromByteOffset: 0, as: Int64.self) }
+        let meanBits = data.withUnsafeBytes { $0.load(fromByteOffset: 16, as: Int64.self) }
+        guard count > 0, Int(count) == fileChunkCount.count, data.count == 24 + Int(count) * 4 else { return }
+        var out = [Float](repeating: 0, count: Int(count))
+        _ = out.withUnsafeMutableBytes { dst in data.copyBytes(to: dst, from: 24 ..< data.count) }
+        nnnFileBias = out
+        nnnBiasMean = Float(bitPattern: UInt32(truncatingIfNeeded: meanBits))
+    }
+
+    /// Build the bias if it is missing or stale. Public so the app can run it off the interactive
+    /// path; takes the store queue, so never call it from the main actor.
+    @discardableResult
+    public func prepareNNNBias(force: Bool = false) -> Bool {
+        queue.sync {
+            if !force {
+                if nnnFileBias.count == fileChunkCount.count, !nnnFileBias.isEmpty { return true }
+                loadNNNSidecarLocked()
+                if nnnFileBias.count == fileChunkCount.count, !nnnFileBias.isEmpty { return true }
+            }
+            return buildNNNBiasLocked()
+        }
+    }
+
+    /// The per-file bias for an explicit set of paths, and the mean that is added back.
+    /// Diagnostics only: it lets a harness evaluate the corrected and uncorrected rankings from ONE
+    /// search, since the correction is a constant per file applied to a finished page.
+    public func nnnBiasFor(paths: [String]) -> (bias: [String: Float], mean: Float) {
+        queue.sync {
+            guard !nnnFileBias.isEmpty else { return ([:], 0) }
+            var out: [String: Float] = [:]
+            for p in paths {
+                guard let fid = pathID[p], Int(fid) < nnnFileBias.count else { continue }
+                out[p] = nnnFileBias[Int(fid)]
+            }
+            return (out, nnnBiasMean)
+        }
+    }
+
+    /// A relevance threshold is PER KIND, because the score scale is per kind.
+    ///
+    /// This is the cone effect (Liang et al., "Mind the Gap", NeurIPS 2022) measured on a real
+    /// index rather than assumed. The NNN bias - each file's typical top score against a bank of
+    /// text queries - comes out like this over 2.68M files:
+    ///
+    ///     text   n=2,087,334   p10 0.3133  p50 0.7416  p90 0.7445
+    ///     image  n=  571,230   p10 0.1806  p50 0.1806  p90 0.1806
+    ///     audio  n=   12,996   p10 0.1170  p50 0.1483  p90 0.1856
+    ///     video  n=    2,447   p10 0.1241  p50 0.1640  p90 0.2399
+    ///
+    /// Every one of 571,230 images has the SAME bias to four decimal places. Image embeddings sit
+    /// in their own narrow cone, so every image-against-text-query cosine is about the same number;
+    /// there is no per-image information in it at all. A text query therefore scores a photo on a
+    /// different scale than it scores a document, and one threshold across both is meaningless:
+    /// measured, a cut at 0.60 keeps 87.5% of relevant text answers and 10.3% of relevant media.
+    ///
+    /// The scales are proportional, not offset - both modalities are cones from the origin - so the
+    /// correction is a ratio. Calibrated from the relevant-score medians measured by
+    /// `omni-verify cutcheck`: text 0.797, media 0.490.
+    public static let kindScoreScale: [String: Double] = [
+        "text": 1.0, "scan": 1.0,
+        "image": 0.615, "audio": 0.615, "video": 0.615,
+    ]
+
+    /// The floor a hit of this kind must clear, given the threshold the user set. `base` is stated
+    /// in text-score units, which is what the UI slider and the `score:` qualifier mean.
+    public static func relevanceFloor(kind: String, base: Double) -> Double {
+        base * (kindScoreScale[kind] ?? 1.0)
+    }
+
+    /// The bias broken down by kind. The question this answers is whether the correction is really
+    /// per-DOCUMENT or just per-MODALITY in disguise: if a kind explains almost all of it, a
+    /// per-kind threshold gets the same effect without rescaling every score in the product.
+    public func nnnBiasByKind() -> [String: (n: Int, p10: Float, p50: Float, p90: Float)] {
+        queue.sync {
+            guard !nnnFileBias.isEmpty, fileID.count == rows.count else { return [:] }
+            var byKind: [String: [Float]] = [:]
+            var seen = [Bool](repeating: false, count: nnnFileBias.count)
+            for i in 0 ..< rows.count {
+                let f = Int(fileID[i])
+                guard f >= 0, f < seen.count, !seen[f] else { continue }
+                seen[f] = true
+                byKind[rows[i].kind, default: []].append(nnnFileBias[f])
+            }
+            var out: [String: (n: Int, p10: Float, p50: Float, p90: Float)] = [:]
+            for (k, var v) in byKind where !v.isEmpty {
+                v.sort()
+                func q(_ f: Double) -> Float { v[Swift.min(v.count - 1, Int(f * Double(v.count)))] }
+                out[k] = (v.count, q(0.10), q(0.50), q(0.90))
+            }
+            return out
+        }
+    }
+
+    /// What the correction looks like on this index. Diagnostics only.
+    public func nnnStats() -> (built: Int, mean: Float, p10: Float, p50: Float, p90: Float) {
+        queue.sync {
+            guard !nnnFileBias.isEmpty else { return (0, 0, 0, 0, 0) }
+            let s = nnnFileBias.filter { $0 > 0 }.sorted()
+            guard !s.isEmpty else { return (0, 0, 0, 0, 0) }
+            func q(_ f: Double) -> Float { s[Swift.min(s.count - 1, Int(f * Double(s.count)))] }
+            return (s.count, nnnBiasMean, q(0.10), q(0.50), q(0.90))
+        }
+    }
+
     // MARK: - Search (Accelerate GEMV)
 
     /// Top-K cosine search over all indexed files. Scores via base matmul + delta matmul on the GPU,
@@ -3972,7 +4272,13 @@ public final class VectorStore: @unchecked Sendable {
         // engine raises the flag around the embed; without this the OCR lane would resume
         // submitting the moment the embed returned and contend with the scan that follows it.
         GPUInteractive.enter(); defer { GPUInteractive.leave() }
-        let r = searchGraphDense(queryGraph: queryGraph, filter: filter, topK: topK)
+        // OVERFETCH WHEN CORRECTING. The correction is applied to a finished page, so a document it
+        // would have lifted into the top K has to be IN the page to be lifted. Selecting K * 5 and
+        // re-sorting is a rerank, not an exact top-K over corrected scores; with a 5x pool the
+        // difference needs a document whose bias is more than the spread of four fifths of the page.
+        let want = Self.nnnEnabled && nnnReady ? topK * Self.nnnOverfetch : topK
+        var r = searchGraphDense(queryGraph: queryGraph, filter: filter, topK: want)
+        if want != topK { r.hits = Array(queue.sync { applyNNNLocked(r.hits) }.prefix(topK)) }
         guard LexicalIndex.enabled else { return r }
         if let explicit = filter.filenameQuery, !explicit.isEmpty {
             return (fuseLexical(dense: r.hits, text: explicit, filter: filter, topK: topK, explicit: true, denseQuery: r.query), r.query)
@@ -4041,7 +4347,9 @@ public final class VectorStore: @unchecked Sendable {
     public func search(_ query: [Float], filter: SearchFilter = SearchFilter(), topK: Int = 40,
                        markActive: Bool = true, textQuery: String? = nil) -> [SearchHit] {
         GPUInteractive.enter(); defer { GPUInteractive.leave() }
-        let dense = searchDense(query, filter: filter, topK: topK, markActive: markActive)
+        let want = Self.nnnEnabled && nnnReady ? topK * Self.nnnOverfetch : topK
+        var dense = searchDense(query, filter: filter, topK: want, markActive: markActive)
+        if want != topK { dense = Array(queue.sync { applyNNNLocked(dense) }.prefix(topK)) }
         guard LexicalIndex.enabled else { return dense }
         // Explicit `filename:` beats the heuristic. Otherwise a bare query contributes only if it
         // looks like a name, and then only in proportion to how well it matches.

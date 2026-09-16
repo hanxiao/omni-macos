@@ -998,7 +998,7 @@ struct ContentView: View {
                 ForEach(DateRange.allCases) { Text($0.title).tag($0) }
             }
             Picker("Relevance", selection: Binding(get: { model.minScore }, set: { model.minScore = $0 })) {
-                Text("Any").tag(0.0); Text("25%").tag(0.25); Text("50%").tag(0.5); Text("70%").tag(0.7)
+                Text("Any").tag(0.0); Text("50%").tag(0.5); Text("60%").tag(0.6); Text("70%").tag(0.7)
             }
             Divider()
             Button("Clear filters") { model.clearFilters() }.disabled(!model.filtersActive)

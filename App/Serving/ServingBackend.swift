@@ -48,6 +48,11 @@ protocol ServingBackend: Sendable {
 /// gate yields passage work to queries, so serving never deadlocks with indexing and
 /// introduces no new locks.
 struct EngineServingBackend: ServingBackend, @unchecked Sendable {
+    /// The relevance floor served results must clear, in text-score units. Same default and same
+    /// per-kind scaling as the window, so an agent and a human asking one question see one answer.
+    /// A caller that wants everything passes `min_score: 0`.
+    nonisolated(unsafe) static var minScore = 0.60
+
     let engine: OmniEngine
     let store: VectorStore
     let modelName: String
@@ -83,7 +88,12 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
     func search(_ query: String, topK: Int, filter: SearchFilter, surface: ServedSurface) -> [SearchHit] {
         let vec = engine.embedQuery(query)
         onSearch?(query, surface)
-        return store.search(vec, filter: filter, topK: topK, textQuery: query)
+        let hits = store.search(vec, filter: filter, topK: topK, textQuery: query)
+        // The SAME cut the window applies, so an agent and a human asking one question see one
+        // answer. Per kind, because the score scale is per kind - see VectorStore.relevanceFloor.
+        let floor = filter.minScore ?? Self.minScore
+        guard floor > 0 else { return hits }
+        return hits.filter { Double($0.score) >= VectorStore.relevanceFloor(kind: $0.kind, base: floor) }
     }
 
     /// RECORDED TOO. Ranking passages within named files is a search the user did not type, which

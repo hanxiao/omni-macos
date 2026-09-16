@@ -270,8 +270,10 @@ struct ServingTab: View {
         instead does not work, because an indexed parent folder already covers its children.
 
         Response: `{"results": [{"path", "score", "snippet", "kind", "modified", "locator",
-        "chunk_count", ...}]}`. `score` runs 0 to 1; above 0.45 is usually relevant and below 0.3
-        usually noise. `locator` is where the best match sits inside the file, such as `Page 3` or
+        "chunk_count", ...}]}`. `score` runs 0 to 1. Compare it only within a kind: a text query
+        scores a photo on a different scale than a document, so a 0.50 image and a 0.80 document are
+        comparable matches. Results below the relevance floor are already removed; pass
+        `"min_score": 0` in `filters` to see everything. `locator` is where the best match sits inside the file, such as `Page 3` or
         `Line 1240`, and is empty when the file has no meaningful position. `chunk_count` is how
         many pages or passages the file has in the index. Hits also carry `bytes` for the indexed
         file size and `mime_type`. Media hits add `width` and `height` in pixels and `duration` in

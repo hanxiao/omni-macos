@@ -4224,6 +4224,27 @@ if args.count >= 4 && args[1] == "nameconcat" {
     exit(0)
 }
 
+// Build and inspect the NNN bias: omni-verify nnnbuild <dbCopy> [alpha] [k]
+if args.count >= 3 && args[1] == "nnnbuild" {
+    let store = try VectorStore(dbURL: URL(fileURLWithPath: args[2]))
+    if args.count >= 4, let a = Float(args[3]) { VectorStore.nnnAlpha = a }
+    if args.count >= 5, let k = Int(args[4]) { VectorStore.nnnK = k }
+    print("nnnbuild files=\(store.fileCount) alpha=\(VectorStore.nnnAlpha) k=\(VectorStore.nnnK)")
+    let t = Date()
+    let ok = store.prepareNNNBias(force: true)
+    let secs = -t.timeIntervalSinceNow
+    let st = store.nnnStats()
+    print(String(format: "  built=%@ in %.1fs   files with bias %d   mean %.4f   p10 %.4f  p50 %.4f  p90 %.4f",
+                 ok ? "yes" : "no", secs, st.built, st.mean, st.p10, st.p50, st.p90))
+    // Per-kind, since equalizing the modality scale is the point.
+    for (k, v) in store.nnnBiasByKind().sorted(by: { $0.value.n > $1.value.n }) {
+        print(String(format: "  %-6s n=%-9d p10 %.4f  p50 %.4f  p90 %.4f", (k as NSString).utf8String!,
+                     v.n, v.p10, v.p50, v.p90))
+    }
+    store.close()
+    exit(ok ? 0 : 1)
+}
+
 // Relevance cutoff calibration: omni-verify cutcheck <dbCopy> <modelDir> [n]
 //
 // The question is where to stop a ranked list. A FIXED score threshold is what the app exposes
@@ -4244,6 +4265,10 @@ if args.count >= 4 && args[1] == "cutcheck" {
     let store = try VectorStore(dbURL: URL(fileURLWithPath: dbPath))
     store.prepareLexicalIndex()
     let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[3]))
+    // The bias is LOADED but the store's own correction stays OFF: the search has to return raw
+    // scores so one page can serve both arms. Correcting twice would be measuring nothing.
+    VectorStore.nnnEnabled = false
+    _ = store.prepareNNNBias()
     let all = store.allIndexedPaths()
     guard !all.isEmpty else { print("empty store"); exit(1) }
     func say(_ s: String) { print(s); fflush(stdout) }
@@ -4331,8 +4356,12 @@ if args.count >= 4 && args[1] == "cutcheck" {
         let v = engine.embedQuery(q); qcache[q] = v; return v
     }
     var allRuns: [Run] = []
+    var nnnRuns: [Run] = []
     for c in cases {
-        let hits = store.search(qvecOf(c.query), topK: 40, markActive: false, textQuery: c.query)
+        // ONE search, deep enough to contain both arms' top 40. The store's own correction is a
+        // constant per file applied to a finished page, so the corrected top 40 is a re-sort of
+        // this page - exactly what the store does with its 5x overfetch.
+        let hits = store.search(qvecOf(c.query), topK: 200, markActive: false, textQuery: c.query)
         guard !hits.isEmpty, let av = answerVec[c.answer], !av.isEmpty else { continue }
         let vecs = store.pooledVectors(paths: hits.map { $0.path })
         let rel = hits.map { h -> Bool in
@@ -4341,8 +4370,19 @@ if args.count >= 4 && args[1] == "cutcheck" {
             return cos(v, av) >= nearDupCos
         }
         guard rel.contains(true) else { continue }   // no judgeable answer in the list
-        allRuns.append(Run(scores: hits.map { Double($0.score) }, relevant: rel, kind: c.kind,
-                           length: c.length, candVecs: hits.map { vecs[$0.path] ?? [] }))
+        let top40 = Array(zip(hits.map { Double($0.score) }, rel).prefix(40))
+        allRuns.append(Run(scores: top40.map { $0.0 }, relevant: top40.map { $0.1 }, kind: c.kind,
+                           length: c.length, candVecs: Array(hits.prefix(40)).map { vecs[$0.path] ?? [] }))
+        // The same page, re-sorted by the store's own corrected score.
+        let bi = store.nnnBiasFor(paths: hits.map { $0.path })
+        if !bi.bias.isEmpty {
+            let corrected = zip(hits, rel).map { h, isRel -> (Double, Bool) in
+                let b = bi.bias[h.path] ?? bi.mean
+                return (Double(h.score) - Double(b) + Double(bi.mean), isRel)
+            }.sorted { $0.0 > $1.0 }.prefix(40)
+            nnnRuns.append(Run(scores: corrected.map { $0.0 }, relevant: corrected.map { $0.1 },
+                               kind: c.kind, length: c.length, candVecs: nil))
+        }
     }
     // DROP THE DEGENERATE LISTS.
     //
@@ -4485,7 +4525,12 @@ if args.count >= 4 && args[1] == "cutcheck" {
             return alpha * sc.prefix(kk).reduce(0, +) / Double(kk)
         }
     }
-    for (alpha, k) in [(0.75, 32), (1.0, 32), (0.75, 8), (1.0, 128)] {
+    // k decides how this can be BUILT, not just how well it scores. k = 1 is a running max over the
+    // bank: one [F] float array, merged with an elementwise max, streaming one bank query at a time
+    // in flat memory. Any k > 1 needs a per-file top-k heap over 2.68M files, which is hundreds of
+    // megabytes of transient state on a machine that may have 16 GB. So the question is not only
+    // which k ranks best but how much k = 1 gives up.
+    for (alpha, k) in [(0.75, 1), (0.75, 2), (0.75, 4), (0.75, 8), (0.75, 16), (0.5, 1), (1.0, 1)] {
         var adjusted: [Run] = []
         for r in runs {
             guard let v = r.candVecs else { continue }
@@ -4518,6 +4563,55 @@ if args.count >= 4 && args[1] == "cutcheck" {
         }
     }
     scope = runs
+
+    if !nnnRuns.isEmpty {
+        let usable = nnnRuns.filter { r in (1 ... maxFamily).contains(r.relevant.filter { $0 }.count) }
+        if usable.count >= 15 {
+            let r1 = usable.compactMap { $0.relevant.firstIndex(of: true) }.filter { $0 == 0 }.count
+            let b1 = runs.compactMap { $0.relevant.firstIndex(of: true) }.filter { $0 == 0 }.count
+            say(String(format: "\n  === STORE NNN, as shipped (n=%d) === relevant at rank 1: %d -> %d",
+                       usable.count, b1, r1))
+            for kd in ["text", "media"] {
+                var rel: [Double] = [], irr: [Double] = []
+                for r in usable where r.kind == kd {
+                    for (i, isRel) in r.relevant.enumerated() { if isRel { rel.append(r.scores[i]) } else { irr.append(r.scores[i]) } }
+                }
+                func pc(_ x: [Double], _ q: Double) -> Double {
+                    guard !x.isEmpty else { return 0 }
+                    let v = x.sorted(); return v[Swift.min(v.count - 1, Int(q * Double(v.count)))]
+                }
+                say(String(format: "    %-5s relevant n=%-5d p10 %.3f p50 %.3f p90 %.3f   irrelevant n=%-5d p10 %.3f p50 %.3f p90 %.3f",
+                           (kd as NSString).utf8String!, rel.count, pc(rel, 0.10), pc(rel, 0.50), pc(rel, 0.90),
+                           irr.count, pc(irr, 0.10), pc(irr, 0.50), pc(irr, 0.90)))
+            }
+            scope = usable
+            for t in [0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90] {
+                score(String(format: "t=%.2f", t), { y in y.prefix(while: { $0 >= t }).count })
+            }
+            scope = runs
+        }
+    }
+
+    // PER-KIND THRESHOLD, which is what the cone effect says the cut has to be. Evaluated on the
+    // raw scores, against the same global cut, so the two are directly comparable.
+    say("\n  === per-kind cut (text at t, media at t * 0.615) ===")
+    for t in [0.50, 0.55, 0.60, 0.65, 0.70, 0.75] {
+        var kept = 0, total = 0, trimmed = 0.0, keptMedia = 0, totalMedia = 0
+        for r in runs {
+            let floor = r.kind == "media" ? t * 0.615 : t
+            let keep = r.scores.prefix(while: { $0 >= floor }).count
+            trimmed += 1.0 - Double(keep) / Double(r.scores.count)
+            for (i, isRel) in r.relevant.enumerated() where isRel {
+                total += 1
+                if r.kind == "media" { totalMedia += 1 }
+                if i < keep { kept += 1; if r.kind == "media" { keptMedia += 1 } }
+            }
+        }
+        say(String(format: "    t=%.2f         keeps %5.1f%% of answers (media %5.1f%%)   trims %5.1f%% of the list",
+                   t, 100.0 * Double(kept) / Double(Swift.max(1, total)),
+                   100.0 * Double(keptMedia) / Double(Swift.max(1, totalMedia)),
+                   100.0 * trimmed / Double(Swift.max(1, runs.count))))
+    }
 
     for band in ["long", "short", "both"] {
         scope = band == "both" ? runs : runs.filter { $0.length == band }
@@ -4563,6 +4657,7 @@ if args.count >= 4 && args[1] == "fusecheck" {
     let n = (args.count >= 5 ? Int(args[4]) : nil) ?? 150
     let store = try VectorStore(dbURL: URL(fileURLWithPath: dbPath))
     store.prepareLexicalIndex()
+    if VectorStore.nnnEnabled { _ = store.prepareNNNBias() }
     let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[3]))
     let all = store.allIndexedPaths()
     guard !all.isEmpty else { print("empty store"); exit(1) }

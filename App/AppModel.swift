@@ -282,7 +282,12 @@ final class AppModel {
         }
     }
 
-    static let defaultMinScore = 0.0   // show all matches by default; users can raise the bar in Search settings
+    /// ON BY DEFAULT, and stated in TEXT-score units - `VectorStore.relevanceFloor` scales it per
+    /// kind, because a text query scores a photo on a different scale than it scores a document.
+    /// 0.60 measured by `omni-verify cutcheck` on a 2.68M-file index: it keeps 93.6% of known-good
+    /// answers (100% of media ones) while removing 18.7% of the list. A global cut at the same
+    /// number keeps 87.5%, and only 10.3% of the media answers.
+    static let defaultMinScore = 0.60
 
     /// Cosine similarity is -1...1; the UI presents it as a 0...100% relevance, clamping the
     /// (rare, semantically-opposite) negative scores to 0. Filtering uses this same clamped
@@ -2192,7 +2197,7 @@ final class AppModel {
     }
 
     private func recomputeResults() {
-        let above = rawResults.filter { Self.relevance($0.score) >= minScore }
+        let above = rawResults.filter { Self.relevance($0.score) >= VectorStore.relevanceFloor(kind: $0.kind, base: minScore) }
         hiddenByThreshold = rawResults.count - above.count
         // Collapse duplicates BEFORE sorting, on the relevance order the store produced: grouping is
         // anchor-first, and the anchor must be the best-ranked member, not whichever file happens to
