@@ -322,7 +322,14 @@ final class AppModel {
     // `transient` marks a query whose file is an ephemeral temp copy (a dragged/pasted bitmap with no
     // real file on disk): the chip and search work as usual, but it is kept out of persisted History,
     // whose UUID temp path would never dedup and would dangle once the OS purges the temp dir.
-    struct FileQuery: Equatable { var url: URL; var kind: FileKind; var similar: Bool; var fromHistory: Bool = false; var transient: Bool = false }
+    struct FileQuery: Equatable {
+        var url: URL; var kind: FileKind; var similar: Bool
+        var fromHistory: Bool = false; var transient: Bool = false
+        /// The INDEXED path this query came from, when it came from one. Usually the same as
+        /// `url.path`, but a Photos asset is materialised to a temp file first, so the file the
+        /// user picked and the file we embed have different paths and only this knows the former.
+        var sourcePath: String? = nil
+    }
     var fileQuery: FileQuery? = nil
     var queryError: String? = nil   // a file query that couldn't be embedded (decode/missing)
     var rawResults: [SearchHit] = [] { didSet { recomputeResults() } }   // kind/folder/ext/date filtered, score-sorted
@@ -460,8 +467,9 @@ final class AppModel {
     /// ordinary queries and removed 74% of all results, because the score scale moves with modality
     /// and with the query.
     ///
-    /// DEFAULTS OFF, because the threshold behind it is not calibrated for the way the product is
-    /// actually used, and the measurement that said otherwise was invalid.
+    /// DEFAULTS ON by Han's decision, with the calibration below still outstanding. At the shipped
+    /// threshold it is INERT on a large index - nothing reaches 2.7 - so turning it on arms the
+    /// control for a refitted threshold rather than changing what anyone sees today.
     ///
     /// That measurement built its unanswerable class by scoping each query to a DIFFERENT FOLDER.
     /// That lowers the top score because the candidate pool shrank, not because no answer exists,
@@ -484,7 +492,7 @@ final class AppModel {
     /// Do not turn this back on by default until the negative class is rebuilt WITHOUT the folder
     /// trick - files held out at index time, so the answer is absent from the index rather than
     /// merely out of scope - and the threshold refitted against it.
-    var strongMatchesOnly: Bool = UserDefaults.standard.object(forKey: "omni.strongMatchesOnly") as? Bool ?? false {
+    var strongMatchesOnly: Bool = UserDefaults.standard.object(forKey: "omni.strongMatchesOnly") as? Bool ?? true {
         didSet {
             guard oldValue != strongMatchesOnly else { return }
             UserDefaults.standard.set(strongMatchesOnly, forKey: "omni.strongMatchesOnly")
@@ -594,13 +602,17 @@ final class AppModel {
     /// Search by a result, whichever kind it is. A Photos asset has to be written out first - the
     /// query path embeds a FILE - so this is async; a plain file runs straight through.
     func searchBySimilar(to path: String) {
-        if !PhotoLibrary.isPhotoPath(path) { setFileQuery(URL(fileURLWithPath: path), similar: true); return }
+        if !PhotoLibrary.isPhotoPath(path) {
+            setFileQuery(URL(fileURLWithPath: path), similar: true, sourcePath: path); return
+        }
         Task { @MainActor in
             guard let url = await PhotoActions.materialized(path) else {
                 queryError = "That photo could not be read from your Photos library."
                 return
             }
-            setFileQuery(url, similar: true)
+            // The temp export is what gets embedded; `path` is the photos:// row in the index, and
+            // it is that row which must not come back as its own answer.
+            setFileQuery(url, similar: true, sourcePath: path)
         }
     }
 
@@ -1997,7 +2009,8 @@ final class AppModel {
             return false   // keep current results; don't blow them away (caller clears the selection)
         }
         if item.isFile, let path = item.filePath {
-            setFileQuery(URL(fileURLWithPath: path), similar: item.similar, fromHistory: true)
+            setFileQuery(URL(fileURLWithPath: path), similar: item.similar, fromHistory: true,
+                         sourcePath: path)
         } else {
             // The item's canonical query string IS its full state (query + every filter as a qualifier),
             // so a single parse restores the search AND the UI selectors - no separate filter fields,
@@ -4372,7 +4385,8 @@ final class AppModel {
     private func fileToken(_ url: URL) -> String { "\u{0000}file:\(url.path)" }
 
     /// Use a file as the query (any supported modality). `similar` = doc-vs-doc "find similar".
-    func setFileQuery(_ url: URL, similar: Bool = false, fromHistory: Bool = false, transient: Bool = false) {
+    func setFileQuery(_ url: URL, similar: Bool = false, fromHistory: Bool = false,
+                      transient: Bool = false, sourcePath: String? = nil) {
         // Both guards clear rather than stamp: a file token published with no fileQuery behind it
         // claims the displayed (empty) results belong to a query that was never adopted, so
         // isResolving compared that token against the still-present typed text, and a later,
@@ -4404,7 +4418,8 @@ final class AppModel {
         // got here - fresh search, re-search, or a history re-run - so detect it by path. That keeps it
         // out of recents and routes its bookmark toggle to remove-not-demote, consistently.
         let ephemeral = transient || Self.isQueryImage(url)
-        fileQuery = FileQuery(url: url, kind: kind, similar: similar, fromHistory: fromHistory, transient: ephemeral)
+        fileQuery = FileQuery(url: url, kind: kind, similar: similar, fromHistory: fromHistory,
+                              transient: ephemeral, sourcePath: sourcePath)
         search()
     }
 
@@ -4779,6 +4794,12 @@ final class AppModel {
         if let fq = fileQuery {
             searching = true
             let url = fq.url, similar = fq.similar, maxImg = maxImageDimension, maxVid = maxVideoFrames
+            // A FILE USED AS THE QUERY IS NEVER ITS OWN ANSWER. Find similar on an indexed file
+            // searches with that file's own stored vector, so it returns at cosine 1.0 - a row that
+            // tells the user what they just right-clicked, in the one slot the best other match
+            // should occupy. Both paths that can name an indexed file supply it (the menu action
+            // and a history replay), so the two can no longer disagree about whether it appears.
+            let selfPaths = Set([fq.sourcePath, url.path].compactMap { $0 })
             // Re-embed cache: a re-run file query (history click, same file re-picked) otherwise
             // decodes + embeds the file again - up to seconds for a video/PDF. Keyed on mtime so an
             // edited file re-embeds. The stored-vector path (`similar` on an indexed file) is already
@@ -4806,13 +4827,13 @@ final class AppModel {
                 // Run the vector search OFF the main actor (matches the text path); doing it inside
                 // MainActor.run stalled the UI per file query, especially on a large index.
                 let tScan = DispatchTime.now().uptimeNanoseconds
-                let hits = vec.map { store.search($0, filter: filter, topK: Self.searchTopK) }
-                // A file used as the query is IN the index, so it comes back as its own top hit at
-                // cosine 1.0 (measured: 1.0000, median of 744). Judging confidence on that reads the
-                // query back rather than the index, so the query file is dropped from the statistic's
-                // input - not from the results, where it is a useful anchor.
-                let conf = vec.flatMap { v in hits.map {
-                    store.retrievalConfidence(query: v, hits: $0.filter { $0.path != url.path }) } }
+                let hits = vec.map { h in
+                    store.search(h, filter: filter, topK: Self.searchTopK)
+                        .filter { !selfPaths.contains($0.path) }
+                }
+                // Judged on the same list the user sees. With the query file still in it the top
+                // score is its own 1.0 and the statistic reads the query back rather than the index.
+                let conf = vec.flatMap { v in hits.map { store.retrievalConfidence(query: v, hits: $0) } }
                 if omniMemLogEnabled, similar {
                     FileHandle.standardError.write(Data(String(format: "[similar] storeSearch=%.1fms hits=%d\n",
                         Double(DispatchTime.now().uptimeNanoseconds - tScan) / 1e6, hits?.count ?? -1).utf8))
