@@ -298,6 +298,7 @@ struct ContentView: View {
         contentBody.modifier(TopBar {
             if let fq = model.fileQuery { FileQueryChip(fileQuery: fq) }
             else if showsQualifierBar { QualifierBar() }
+            if let notice = model.retrievalNotice, !model.results.isEmpty { WeakMatchNotice(text: notice) }
         })
     }
 
@@ -1003,6 +1004,12 @@ struct ContentView: View {
                 Text("Any").tag(0.0); Text("50%").tag(0.5); Text("55%").tag(0.55); Text("60%").tag(0.6)
             }
             Divider()
+            // Not a filter - it hides nothing - but this is the menu that governs how strict the
+            // results are, and a notice about weak matches belongs with the relevance control
+            // rather than in a settings pane nobody opens mid-search.
+            Toggle("Warn on weak matches", isOn: Binding(
+                get: { model.weakMatchNotice }, set: { model.weakMatchNotice = $0 }))
+            Divider()
             Button("Clear filters") { model.clearFilters() }.disabled(!model.filtersActive)
         } label: {
             Image(systemName: model.filtersActive ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
@@ -1523,6 +1530,26 @@ private struct WindowTitleHider: NSViewRepresentable {
 /// A bar pinned in the top safe area, with scroll content passing under it. On Tahoe that is
 /// `safeAreaBar`, which is what lets the scroll edge effect apply; earlier systems just stack it.
 /// An EMPTY bar must cost nothing, so the modifier checks before it inserts one.
+/// The results are still there and still ranked - this says only that the best of them is not
+/// clearly better than what this query finds anywhere in the index. Dense retrieval always returns
+/// its nearest neighbours, so the failure worth naming is not an empty list, it is a full one that
+/// means nothing. Advisory: it never hides or reorders a row.
+private struct WeakMatchNotice: View {
+    let text: String
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "questionmark.circle")
+            Text(text)
+            Spacer(minLength: 0)
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, BrowserMetrics.listInset + 8)
+        .padding(.vertical, 5)
+    }
+}
+
 private struct TopBar<Bar: View>: ViewModifier {
     @ViewBuilder var bar: () -> Bar
 

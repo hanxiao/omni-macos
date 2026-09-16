@@ -4250,6 +4250,7 @@ if args.count >= 4 && args[1] == "latbench" {
                      ms[Swift.min(ms.count - 1, ms.count * 95 / 100)], ms[ms.count - 1], hits))
     }
     var i = 0
+    let warmPage = store.search(qv[prose[0]]!, topK: 40, markActive: false)
     timeIt("prose, dense only", {
         i += 1; return store.search(qv[prose[i % prose.count]]!, topK: 40, markActive: false).count
     })
@@ -4266,6 +4267,20 @@ if args.count >= 4 && args[1] == "latbench" {
         var f = SearchFilter(); f.filenameQuery = q
         return store.search(qv[q]!, filter: f, topK: 40, markActive: false).count
     })
+    // The confidence statistic, which now runs on EVERY search on both surfaces. It is one
+    // [8192, 768] x [768] matmul plus a partial sort, so the question is whether it is visible
+    // next to the scan that produced the page it judges.
+    timeIt("prose, search + confidence", {
+        i += 1; let q = prose[i % prose.count]
+        let h = store.search(qv[q]!, topK: 40, markActive: false, textQuery: q)
+        _ = store.retrievalConfidence(query: qv[q]!, hits: h)
+        return h.count
+    })
+    timeIt("confidence alone", {
+        i += 1; let q = prose[i % prose.count]
+        return store.retrievalConfidence(query: qv[q]!, hits: warmPage).available ? 1 : 0
+    })
+
     // The threshold itself, which runs per result page in the app and the server.
     let page = store.search(qv[prose[0]]!, topK: 40, markActive: false)
     timeIt("per-kind floor over a page", {

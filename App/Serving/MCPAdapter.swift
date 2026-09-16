@@ -254,7 +254,9 @@ enum MCPAdapter {
         // agent more than they cost a human - every one is context spent re-reading a file it has
         // already seen - so this defaults ON, with "group_duplicates": false for the flat list.
         let group = (args["group_duplicates"] as? Bool) ?? true
-        let hits = backend.search(query, topK: group ? min(topK * 3, 150) : topK, filter: filter, surface: .mcp)
+        let found = backend.searchReporting(query, topK: group ? min(topK * 3, 150) : topK,
+                                            filter: filter, surface: .mcp)
+        let hits = found.hits
         let groups = backend.groupedResults(hits, enabled: group, limit: topK)
         let reps = groups.map(\.representative)
         let dupesByPath = Dictionary(uniqueKeysWithValues: groups.map { ($0.representative.path, $0) })
@@ -279,6 +281,12 @@ enum MCPAdapter {
 
         var content: [[String: Any]] = []
         if let building { content.append(["type": "text", "text": building]) }
+        // Ahead of the results, because it changes how they should be read. A person scanning a
+        // list infers this from the scores looking uniformly mediocre; an agent reading ten paths
+        // has no such view, so it is stated. The rows still follow - nothing is withheld.
+        if let notice = found.notice, !hits.isEmpty {
+            content.append(["type": "text", "text": notice])
+        }
         if hits.isEmpty {
             // Say WHICH kind of nothing this is, so the agent's next move is right.
             var text = "No results for \"\(query)\"."

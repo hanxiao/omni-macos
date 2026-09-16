@@ -452,6 +452,34 @@ final class AppModel {
             recomputeResults()
         }
     }
+    /// Say so when the top hit is not clearly better than what this query finds ANYWHERE in the
+    /// index. Advisory only - it never hides or reorders a result, because dense retrieval always
+    /// returns its best guess and the failure being warned about is the guess being no good.
+    ///
+    /// Defaults ON. Measured on a frozen 2.68M-file index at the shipped threshold, over 600
+    /// probes with a known answer and 600 with the answer removed:
+    ///
+    ///     slice     answerable   wrongly warned   near-negatives caught
+    ///     text         493           0.8%               20.9%
+    ///     media        107           1.9%                8.4%
+    ///     cjk           89           0.0%               48.3%
+    ///
+    /// It is escapable because the judgement is a threshold on a statistic, and because the one
+    /// case it is NOT calibrated for - a file used as the query - is left on deliberately so it
+    /// can be judged in use rather than in a table.
+    var weakMatchNotice: Bool = UserDefaults.standard.object(forKey: "omni.weakMatchNotice") as? Bool ?? true {
+        didSet {
+            guard oldValue != weakMatchNotice else { return }
+            UserDefaults.standard.set(weakMatchNotice, forKey: "omni.weakMatchNotice")
+            EngineServingBackend.weakMatchNotice = weakMatchNotice   // one switch, both surfaces
+            if !weakMatchNotice { retrievalNotice = nil }
+        }
+    }
+    /// Set when the last search's top hit did not clear the confidence threshold. nil means either
+    /// a confident result or no opinion - the statistic declines on a small or still-filling index,
+    /// and "no opinion" must not read as "no match".
+    var retrievalNotice: String? = nil
+
     /// Snap the finished layout onto a grid so no two dots overlap (DGrid). Display-only: it does
     /// not change the fit, so toggling re-lays the existing projection without refitting.
     var mapNoOverlap: Bool = UserDefaults.standard.bool(forKey: "omni.mapNoOverlap") {
@@ -3374,6 +3402,7 @@ final class AppModel {
             // Set before attach(), so a server that auto-starts inside it is already wired.
             self.serving.onServedSearch = { [weak self] q, surface in self?.recordServedSearch(q, surface: surface) }
             self.serving.sources = self.makeSourcesControl()
+            EngineServingBackend.weakMatchNotice = self.weakMatchNotice   // the stored setting, at attach
             self.serving.attach(engine: engine, store: store, modelName: "omni-\(modelVariant.rawValue)")
             if let oldStore { Task.detached(priority: .utility) { _ = oldIndexer; oldStore.close() } }
             self.supportsImages = engine.supportsImages
@@ -4662,8 +4691,10 @@ final class AppModel {
         }
     }
 
-    private func applyResults(_ hits: [SearchHit], resolved: String) {
+    private func applyResults(_ hits: [SearchHit], resolved: String,
+                              confidence: VectorStore.RetrievalConfidence? = nil) {
         let isNewQuery = resolvedQuery != resolved
+        retrievalNotice = weakMatchNotice ? WeakMatch.notice(confidence, hits: hits) : nil
         rawResults = hits
         resolvedQuery = resolved
         resultsToken = resolved + "\u{1}" + filterSignature()
@@ -4751,6 +4782,12 @@ final class AppModel {
                 // MainActor.run stalled the UI per file query, especially on a large index.
                 let tScan = DispatchTime.now().uptimeNanoseconds
                 let hits = vec.map { store.search($0, filter: filter, topK: Self.searchTopK) }
+                // A file used as the query is IN the index, so it comes back as its own top hit at
+                // cosine 1.0 (measured: 1.0000, median of 744). Judging confidence on that reads the
+                // query back rather than the index, so the query file is dropped from the statistic's
+                // input - not from the results, where it is a useful anchor.
+                let conf = vec.flatMap { v in hits.map {
+                    store.retrievalConfidence(query: v, hits: $0.filter { $0.path != url.path }) } }
                 if omniMemLogEnabled, similar {
                     FileHandle.standardError.write(Data(String(format: "[similar] storeSearch=%.1fms hits=%d\n",
                         Double(DispatchTime.now().uptimeNanoseconds - tScan) / 1e6, hits?.count ?? -1).utf8))
@@ -4772,7 +4809,7 @@ final class AppModel {
                     }
                     if stored == nil { self.cacheFileQueryVector(cacheKey, vec) }
                     self.lastQueryVector = vec
-                    self.applyResults(hits, resolved: self.fileToken(url))
+                    self.applyResults(hits, resolved: self.fileToken(url), confidence: conf)
                     // Re-running from history must not reorder it; a transient temp-file image must
                     // not enter History at all (its UUID path never dedups and soon dangles).
                     if !fq.fromHistory && !fq.transient { self.recordFileQueryToHistory(fq) }
@@ -4809,10 +4846,11 @@ final class AppModel {
             searchWorkTask = Task.detached(priority: .userInitiated) {
                 if Task.isCancelled { return }   // superseded before the scan started: skip it
                 let hits = store.search(cached, filter: filter, topK: Self.searchTopK, textQuery: q)
+                let conf = store.retrievalConfidence(query: cached, hits: hits)
                 await MainActor.run {
                     guard token == self.searchToken else { return }
                     self.lastQueryVector = cached
-                    self.applyResults(hits, resolved: q)
+                    self.applyResults(hits, resolved: q, confidence: conf)
                     self.searching = false
                     self.engine?.indexingIdle()   // arm the buffer-cache trim (see file-query path)
                 }
@@ -4836,11 +4874,12 @@ final class AppModel {
                 hits = store.search(vec, filter: filter, topK: Self.searchTopK, textQuery: q)
             }
             if let tSearch { omniPerfLog(String(format: "search total=%.0fms indexing=%@ hits=%d", -tSearch.timeIntervalSinceNow * 1000, indexingNow ? "YES" : "no", hits.count)) }
+            let conf = store.retrievalConfidence(query: vec, hits: hits)
             await MainActor.run {
                 guard token == self.searchToken else { return }
                 self.cacheQueryVector(q, vec)
                 self.lastQueryVector = vec
-                self.applyResults(hits, resolved: q)
+                self.applyResults(hits, resolved: q, confidence: conf)
                 self.searching = false
                 self.engine?.indexingIdle()   // arm the buffer-cache trim (see file-query path)
             }

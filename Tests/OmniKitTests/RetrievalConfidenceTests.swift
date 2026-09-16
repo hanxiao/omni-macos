@@ -205,3 +205,37 @@ final class RetrievalConfidenceTests: XCTestCase {
         XCTAssertFalse(c.available, "100 surviving files cannot support the statistic")
     }
 }
+
+/// The advisory the window and the MCP surface both render. Its job is as much about STAYING
+/// SILENT as about firing: "no opinion" and "no match" are different answers, and a new index
+/// produces the first one constantly.
+final class WeakMatchNoticeTests: XCTestCase {
+    private func conf(tnorm: Float, available: Bool) -> VectorStore.RetrievalConfidence {
+        var c = VectorStore.RetrievalConfidence()
+        c.tnorm = tnorm; c.available = available
+        return c
+    }
+    private var someHits: [SearchHit] {
+        [SearchHit(path: "/a.txt", score: 0.5, snippet: "a", kind: "text", chunkIndex: 0, modified: 1)]
+    }
+
+    func testWarnsOnlyBelowTheThreshold() {
+        XCTAssertNotNil(WeakMatch.notice(conf(tnorm: WeakMatch.threshold - 0.01, available: true), hits: someHits))
+        XCTAssertNil(WeakMatch.notice(conf(tnorm: WeakMatch.threshold, available: true), hits: someHits))
+        XCTAssertNil(WeakMatch.notice(conf(tnorm: 40, available: true), hits: someHits))
+    }
+
+    /// THE ONE THAT MATTERS ON A NEW INDEX. An unavailable statistic has no opinion, and a low
+    /// tnorm field on it is the zero default, not a verdict - rendering that as a warning would
+    /// tell every new user their files are missing while the first pass is still running.
+    func testSaysNothingWhenTheStatisticIsUnavailable() {
+        XCTAssertNil(WeakMatch.notice(conf(tnorm: 0, available: false), hits: someHits))
+        XCTAssertNil(WeakMatch.notice(conf(tnorm: -50, available: false), hits: someHits))
+        XCTAssertNil(WeakMatch.notice(nil, hits: someHits))
+    }
+
+    /// An empty list already says "nothing found" by being empty; a warning on top of it is noise.
+    func testSaysNothingWhenThereAreNoResults() {
+        XCTAssertNil(WeakMatch.notice(conf(tnorm: 0, available: true), hits: []))
+    }
+}
