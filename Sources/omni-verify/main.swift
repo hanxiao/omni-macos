@@ -4256,7 +4256,7 @@ if args.count >= 4 && args[1] == "cutcheck" {
     var st = UInt64(0x2545F4914F6CDD1D)
     func rnd(_ m: Int) -> Int { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return Int(st % UInt64(m)) }
     let zero = [Float](repeating: 0, count: 768)
-    struct Case { let query: String; let answer: String; let kind: String; let full: String }
+    struct Case { let query: String; let answer: String; let kind: String; let full: String; let length: String }
     var cases: [Case] = []
     var tries = 0
     let mediaExt = Set(["jpg","jpeg","png","heic","mp4","mov","mp3","wav","m4a","gif","webp"])
@@ -4281,10 +4281,23 @@ if args.count >= 4 && args[1] == "cutcheck" {
         }
         q = String(q.prefix(300)).trimmingCharacters(in: .whitespacesAndNewlines)
         guard q.count >= 12 else { continue }
-        cases.append(Case(query: q, answer: p, kind: mediaExt.contains(ext(p)) ? "media" : "text",
-                          full: String(snip.prefix(300))))
+        let kind = mediaExt.contains(ext(p)) ? "media" : "text"
+        cases.append(Case(query: q, answer: p, kind: kind, full: String(snip.prefix(300)), length: "long"))
+        // THE SAME DOCUMENT, ASKED FOR IN FOUR WORDS. Score scale moves with query verbosity - a
+        // 24-word fragment tops out near 0.82 and a short question near 0.65 - and a rule that is
+        // robust to that is exactly what the per-query cuts claim to be. One query length cannot
+        // decide between them, so every case contributes both.
+        let qw = q.split(separator: " ").map(String.init).filter { $0.count >= 5 }
+        if qw.count >= 4 {
+            cases.append(Case(query: qw.prefix(4).joined(separator: " "), answer: p, kind: kind,
+                              full: String(snip.prefix(300)), length: "short"))
+        }
     }
-    say("  \(cases.count) labelled queries (\(cases.filter { $0.kind == "media" }.count) media)")
+    // Hold out the first slice as the NNN reference bank and never evaluate on it.
+    let bankSize = Swift.min(512, cases.count / 4)
+    let bankCases = cases.prefix(bankSize).map { $0.query }
+    cases = Array(cases.dropFirst(bankSize))
+    say("  \(cases.count) labelled queries (\(cases.filter { $0.kind == "media" }.count) media), \(bankCases.count) held out as the NNN bank")
     for c in cases.prefix(4) {
         say("    e.g. [\(c.kind)] \(base(c.answer))  <-  \"\(c.query.prefix(90))\"")
     }
@@ -4310,10 +4323,16 @@ if args.count >= 4 && args[1] == "cutcheck" {
     }
 
     // One search per case, reused by every cut rule. topK is the app's default, not a test value.
-    struct Run { let scores: [Double]; let relevant: [Bool]; let kind: String }
+    struct Run { let scores: [Double]; let relevant: [Bool]; let kind: String; let length: String
+                 var candVecs: [[Float]]? = nil }
+    var qcache: [String: [Float]] = [:]
+    func qvecOf(_ q: String) -> [Float] {
+        if let v = qcache[q] { return v }
+        let v = engine.embedQuery(q); qcache[q] = v; return v
+    }
     var allRuns: [Run] = []
     for c in cases {
-        let hits = store.search(engine.embedQuery(c.query), topK: 40, markActive: false, textQuery: c.query)
+        let hits = store.search(qvecOf(c.query), topK: 40, markActive: false, textQuery: c.query)
         guard !hits.isEmpty, let av = answerVec[c.answer], !av.isEmpty else { continue }
         let vecs = store.pooledVectors(paths: hits.map { $0.path })
         let rel = hits.map { h -> Bool in
@@ -4322,7 +4341,8 @@ if args.count >= 4 && args[1] == "cutcheck" {
             return cos(v, av) >= nearDupCos
         }
         guard rel.contains(true) else { continue }   // no judgeable answer in the list
-        allRuns.append(Run(scores: hits.map { Double($0.score) }, relevant: rel, kind: c.kind))
+        allRuns.append(Run(scores: hits.map { Double($0.score) }, relevant: rel, kind: c.kind,
+                           length: c.length, candVecs: hits.map { vecs[$0.path] ?? [] }))
     }
     // DROP THE DEGENERATE LISTS.
     //
@@ -4399,9 +4419,11 @@ if args.count >= 4 && args[1] == "cutcheck" {
     }
 
     // Evaluate: does the known answer survive, and how much of the list went away.
+    nonisolated(unsafe) var scope = runs
     func score(_ name: String, _ rule: ([Double]) -> Int?) {
         var kept = 0, total = 0, trimmed = 0.0, fired = 0
         var keptMedia = 0, totalMedia = 0
+        let runs = scope
         for r in runs {
             let fire = rule(r.scores)
             let keep = fire ?? r.scores.count
@@ -4437,16 +4459,85 @@ if args.count >= 4 && args[1] == "cutcheck" {
                    (k as NSString).utf8String!, rel.count, pc(rel, 0.10), pc(rel, 0.50), pc(rel, 0.90),
                    irr.count, pc(irr, 0.10), pc(irr, 0.50), pc(irr, 0.90)))
     }
-    say("\n  fixed absolute cut (what the app exposes today)")
-    for t in [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80] {
-        score(String(format: "t=%.2f", t), { y in y.prefix(while: { $0 >= t }).count })
+    // NEAREST NEIGHBOR NORMALIZATION (Chowdhury et al., arXiv 2410.24114).
+    //
+    // A training-free, test-time correction: subtract from each candidate's score a bias equal to
+    // alpha times the mean of its top-k scores against a bank of reference queries. It beats
+    // QBNorm, DBNorm and Distribution Normalization on every model and dataset they test, and the
+    // bias is a per-candidate constant, so it can be precomputed and folded into the existing
+    // matmul as one extra vector dimension.
+    //
+    // The reason to try it HERE is the modality split above: relevant media tops out at 0.496 while
+    // irrelevant text starts at 0.547, so no single threshold can serve both. NNN scores a document
+    // by how much better it matched THIS query than it usually matches anything, which is a
+    // quantity that should be comparable across modalities by construction.
+    // The bank must be DISJOINT from what is evaluated, or a query's own presence in the bank
+    // inflates its answer's bias. `bankCases` is split off before any evaluation case is built.
+    let bank = bankCases.map { qvecOf($0) }
+    say("  NNN reference bank: \(bank.count) held-out queries")
+    func nnnBias(_ vecs: [[Float]], alpha: Double, k: Int) -> [Double] {
+        vecs.map { v in
+            guard !v.isEmpty else { return 0 }
+            var sc = bank.compactMap { b -> Double? in b.isEmpty ? nil : cos(v, b) }
+            guard !sc.isEmpty else { return 0 }
+            sc.sort(by: >)
+            let kk = Swift.min(k, sc.count)
+            return alpha * sc.prefix(kk).reduce(0, +) / Double(kk)
+        }
     }
-    say("\n  per-query cuts")
-    for s in [0.02, 0.05, 0.10, 0.15] { score(String(format: "knee s=%.2f", s), { kneeKeep($0, sens: s) }) }
-    score("max gap", maxGapKeep)
-    score("max ratio", maxRatioKeep)
-    for m in [2.0, 3.0, 5.0, 8.0] { score(String(format: "jump x%.0f", m), { jumpKeep($0, mult: m) }) }
-    for k in [0.5, 1.0, 1.5, 2.0] { score(String(format: "z mean+%.1fsd", k), { zKeep($0, k: k) }) }
+    for (alpha, k) in [(0.75, 32), (1.0, 32), (0.75, 8), (1.0, 128)] {
+        var adjusted: [Run] = []
+        for r in runs {
+            guard let v = r.candVecs else { continue }
+            let b = nnnBias(v, alpha: alpha, k: k)
+            let z = zip(zip(r.scores, b).map { $0 - $1 }, r.relevant).sorted { $0.0 > $1.0 }
+            adjusted.append(Run(scores: z.map { $0.0 }, relevant: z.map { $0.1 },
+                                kind: r.kind, length: r.length, candVecs: nil))
+        }
+        guard !adjusted.isEmpty else { continue }
+        let r1 = adjusted.compactMap { $0.relevant.firstIndex(of: true) }.filter { $0 == 0 }.count
+        let base1 = runs.compactMap { $0.relevant.firstIndex(of: true) }.filter { $0 == 0 }.count
+        say(String(format: "\n  === NNN alpha=%.2f k=%d (n=%d) === relevant at rank 1: %d -> %d",
+                   alpha, k, adjusted.count, base1, r1))
+        for kd in ["text", "media"] {
+            var rel: [Double] = [], irr: [Double] = []
+            for r in adjusted where r.kind == kd {
+                for (i, isRel) in r.relevant.enumerated() { if isRel { rel.append(r.scores[i]) } else { irr.append(r.scores[i]) } }
+            }
+            func pc(_ x: [Double], _ q: Double) -> Double {
+                guard !x.isEmpty else { return 0 }
+                let v = x.sorted(); return v[Swift.min(v.count - 1, Int(q * Double(v.count)))]
+            }
+            say(String(format: "    %-5s relevant p10 %+.3f p50 %+.3f p90 %+.3f   irrelevant p10 %+.3f p50 %+.3f p90 %+.3f",
+                       (kd as NSString).utf8String!, pc(rel, 0.10), pc(rel, 0.50), pc(rel, 0.90),
+                       pc(irr, 0.10), pc(irr, 0.50), pc(irr, 0.90)))
+        }
+        scope = adjusted
+        for t in [-0.10, -0.05, 0.0, 0.05, 0.10, 0.15, 0.20] {
+            score(String(format: "t=%+.2f", t), { y in y.prefix(while: { $0 >= t }).count })
+        }
+    }
+    scope = runs
+
+    for band in ["long", "short", "both"] {
+        scope = band == "both" ? runs : runs.filter { $0.length == band }
+        guard scope.count >= 15 else { continue }
+        var tops: [Double] = []
+        for r in scope where !r.scores.isEmpty { tops.append(r.scores[0]) }
+        say(String(format: "\n  === %@ queries (n=%d, median top score %.3f) ===", band, scope.count,
+                   tops.sorted()[tops.count / 2]))
+        say("  fixed absolute cut")
+        for t in [0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80] {
+            score(String(format: "t=%.2f", t), { y in y.prefix(while: { $0 >= t }).count })
+        }
+        say("  per-query cuts")
+        for v in [0.02, 0.10] { score(String(format: "knee s=%.2f", v), { kneeKeep($0, sens: v) }) }
+        score("max gap", maxGapKeep)
+        score("max ratio", maxRatioKeep)
+        for m in [3.0, 8.0] { score(String(format: "jump x%.0f", m), { jumpKeep($0, mult: m) }) }
+        for k in [0.5, 1.0, 1.5, 2.0] { score(String(format: "z mean+%.1fsd", k), { zKeep($0, k: k) }) }
+    }
+    scope = runs
 
     // Shape of a result list, which is what every per-query rule is reading.
     var spans: [Double] = [], tops: [Double] = [], floors: [Double] = []
