@@ -154,3 +154,33 @@ enum DropIntake {
         }.resume()
     }
 }
+
+/// What a dropped or pasted payload MEANS, decided in one place.
+///
+/// The two panes share the plumbing (a drop target, the Paste command), share the reading
+/// (`DropIntake`), and differ only in the action at the end - so that is the only thing branched
+/// on, and it is branched on once. Before this there were two drop targets, two paste entry
+/// points and two copies of the "file, then bytes, then text" ladder, which is how the
+/// transcription pane ended up accepting less than the search pane from the same browser.
+@MainActor
+enum DropRouter {
+    /// - Parameters:
+    ///   - pb: the drag pasteboard for a drop, the general one for a paste, nil to use providers only.
+    ///   - providers: SwiftUI's item providers, tried when the pasteboard yields nothing.
+    /// - Returns: whether the payload was claimed.
+    @discardableResult
+    static func handle(_ pb: NSPasteboard?, providers: [NSItemProvider] = [],
+                       model: AppModel, ocr: OCRSession) -> Bool {
+        // The ONE branch. Which pane is on screen decides which files are usable, whether text
+        // means anything, and what happens to the result - nothing else differs.
+        let toOCR = model.ocrMode
+        let accepts: (URL) -> Bool = toOCR ? OCRSession.isSupported : AppModel.searchableFile
+        let handle: (DroppedItem) -> Void = toOCR ? { ocr.accept($0) } : { model.accept($0) }
+        if let pb, DropIntake.read(pb, accepts: accepts, wantsText: !toOCR, handle: handle) { return true }
+        if DropIntake.read(providers: providers, accepts: accepts, wantsText: !toOCR, handle: handle) { return true }
+        // Only the transcription pane says so. A search surface that ignores an unusable drag is
+        // behaving normally; a transcription pane that swallows one looks broken.
+        if toOCR { ocr.reject("Nothing here to transcribe. Drop or copy a PDF, an image file, or an image.") }
+        return false
+    }
+}

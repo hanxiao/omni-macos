@@ -603,15 +603,15 @@ struct OmniApp: App {
             NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil)
             return
         }
-        // OCR MODE OWNS Cmd-V, and has to be asked BEFORE the search test below: its toolbar
-        // carries a search item too (Find in document), so that test is true here as well and a
-        // pasted image left the document being read for an image search.
-        if model.ocrMode { ocr.pasteAndOpen(); return }
+        // OCR mode has to be asked BEFORE the search test: its toolbar carries a search item too
+        // (Find in document), so that test is true there as well and a pasted image used to leave
+        // the document being read for an image search.
+        //
+        // Both panes then go through the SAME router as a drop does - paste and drop are one
+        // gesture with two names, and the pane only decides what happens at the end.
         let ownsSearch = (NSApp.keyWindow?.toolbar?.items.contains { $0 is NSSearchToolbarItem }) ?? false
-        if ownsSearch {
-            let hasFile = ((pb.readObjects(forClasses: [NSURL.self]) as? [URL]) ?? []).contains { $0.isFileURL }
-            let hasImage = NSImage(pasteboard: pb) != nil
-            if hasFile || hasImage || hasText { model.pasteToSearch(); return }
+        if model.ocrMode || ownsSearch {
+            if DropRouter.handle(pb, model: model, ocr: ocr) { return }
         }
         NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil)
     }

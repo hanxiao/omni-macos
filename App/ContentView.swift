@@ -212,10 +212,25 @@ struct ContentView: View {
     /// opening a window: this is a different way of looking at documents on this Mac, not a
     /// different app, and a separate window would strand it from the sidebar and the index.
     @ViewBuilder private var detailOrOCR: some View {
-        if model.ocrMode {
-            OCRView()
-        } else {
-            detail
+        Group {
+            if model.ocrMode {
+                OCRView(dropTargeted: fileDropTargeted)
+            } else {
+                detail
+            }
+        }
+        // ONE drop target for both panes, because a drop is the same gesture either way - only
+        // what happens at the end differs, and DropRouter is where that is decided. Two targets
+        // meant two flavor lists, and the transcription pane's was quietly narrower.
+        .onDrop(of: [.image, .fileURL, .url, .text, .plainText], isTargeted: $fileDropTargeted) { providers in
+            DropRouter.handle(NSPasteboard(name: .drag), providers: providers, model: model, ocr: ocr)
+        }
+        .overlay {
+            // The transcription pane draws its own chip; this border is the search pane's.
+            if fileDropTargeted && !model.ocrMode {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(Color.accentColor, lineWidth: 2).padding(6).allowsHitTesting(false)
+            }
         }
     }
 
@@ -319,44 +334,6 @@ struct ContentView: View {
         // layout stays cached, so clearing the query still puts its map back instantly.
         .onChange(of: showsFolderViz) { _, shown in
             if !shown { model.trimProjectionCacheToCurrent() }
-        }
-        // Drag an image, file, or text from anywhere (Finder, a browser, another app) - or paste one
-        // (Cmd-V) - to search by it. SwiftUI's .onDrop gives us reachability over the results list and
-        // the empty state alike, but a web image dragged from Chrome/Safari arrives as inline encoded
-        // bytes, a file promise, or a remote URL - none of which loadObject(NSImage/NSURL) can resolve.
-        // So we read the raw drag pasteboard for the full flavor set, and fall back to the providers.
-        .onDrop(of: [.image, .fileURL, .url, .text, .plainText], isTargeted: $fileDropTargeted) { providers in
-            handleSearchDrop(providers)
-        }
-        .overlay {
-            if fileDropTargeted {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .strokeBorder(Color.accentColor, lineWidth: 2).padding(6).allowsHitTesting(false)
-            }
-        }
-    }
-
-    // MARK: - Drag to search
-
-    /// Route a drop onto the search surface. Reachability is SwiftUI's (the closure fires over the
-    /// results list and the empty state alike); the flavors are resolved by `DropIntake`, shared
-    /// with the transcription pane, so both surfaces accept the same things from a browser.
-    private func handleSearchDrop(_ providers: [NSItemProvider]) -> Bool {
-        if DropIntake.read(NSPasteboard(name: .drag), accepts: Self.searchable,
-                           wantsText: true, handle: search) { return true }
-        return DropIntake.read(providers: providers, accepts: Self.searchable,
-                               wantsText: true, handle: search)
-    }
-
-    /// Anything the index can embed is something to search BY.
-    private static let searchable: (URL) -> Bool = { FileExtractor.kind(for: $0) != nil }
-
-    private func search(_ item: DroppedItem) {
-        switch item {
-        case .file(let url): model.setFileQuery(url)
-        case .imageData(let d, let ext): model.searchByImage(data: d, suggestedExtension: ext)
-        case .image(let img): model.searchByImage(img)
-        case .text(let s): model.searchByText(s)
         }
     }
 

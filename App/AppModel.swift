@@ -4473,17 +4473,22 @@ final class AppModel {
         searchByImage(data: png)
     }
 
-    /// Search by whatever is on the general pasteboard, preferring a real FILE (an image file copied
-    /// in Finder embeds better than its thumbnail), then a bitmap IMAGE (a browser copy-image with no
-    /// file), then TEXT. Used by the Edit > Paste command so Cmd-V searches by the clipboard.
-    func pasteToSearch() {
-        let pb = NSPasteboard.general
-        if let url = (pb.readObjects(forClasses: [NSURL.self]) as? [URL])?
-            .first(where: { $0.isFileURL && FileExtractor.kind(for: $0) != nil }) {
-            setFileQuery(url); return
+    /// Anything the index can embed is something to search BY.
+    static let searchableFile: (URL) -> Bool = { FileExtractor.kind(for: $0) != nil }
+
+    /// What a drop or a paste onto the SEARCH pane does. The transcription pane has its own
+    /// (OCRSession.accept); everything before this point - reading the pasteboard, the flavor
+    /// ladder, the promise and download paths - is shared (DropIntake, DropRouter).
+    ///
+    /// A real FILE beats bitmap bytes because an image file copied in Finder embeds better than a
+    /// re-encoded snapshot of it; DropIntake already orders them that way.
+    func accept(_ item: DroppedItem) {
+        switch item {
+        case .file(let url): setFileQuery(url)
+        case .imageData(let d, let ext): searchByImage(data: d, suggestedExtension: ext)
+        case .image(let img): searchByImage(img)
+        case .text(let s): searchByText(s)
         }
-        if let img = NSImage(pasteboard: pb) { searchByImage(img); return }
-        if let s = pb.string(forType: .string) { searchByText(s) }
     }
 
     /// Show the embedding map for `url` (or clear it when nil). Pulls per-file vectors off-thread,

@@ -18,7 +18,9 @@ import UniformTypeIdentifiers
 struct OCRView: View {
     @Environment(OCRSession.self) private var session
     @Environment(AppModel.self) private var model
-    @State private var dropTargeted = false
+    /// Owned by the parent, which holds the single drop target for both panes (see
+    /// ContentView.detailOrOCR). This view only draws the feedback.
+    let dropTargeted: Bool
     @State private var split = SplitScroll()
 
     /// The add-on is not here yet. Said in the empty state rather than only when a drop fails: a
@@ -55,12 +57,6 @@ struct OCRView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        // Same flavors the search pane accepts, through the same resolver: a browser image
-        // arrives as inline bytes, a file promise, or a remote URL, never as a file URL, so
-        // `dropDestination(for: URL.self)` took the drag and did nothing with it.
-        .onDrop(of: [.image, .fileURL, .url], isTargeted: $dropTargeted) { providers in
-            session.drop(pasteboard: NSPasteboard(name: .drag), providers: providers)
-        }
         .overlay(alignment: .top) {
             // In every state, including the empty one: the drop zone that used to carry its own
             // targeting is gone, so this chip is the only feedback a drag gets.

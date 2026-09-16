@@ -1564,36 +1564,14 @@ final class OCRSession {
         present(panel) { [weak self] in self?.open(urls: panel.urls) }
     }
 
-    /// Cmd-V in the transcription pane: transcribe whatever is on the clipboard.
+    /// What a drop or a paste onto the TRANSCRIPTION pane does. Reaching here means the payload
+    /// has already been read and resolved by DropIntake; this is only the action.
     ///
-    /// The search pane has done this since it shipped - paste an image, search by it - and the
-    /// transcription pane is the other half of the same gesture. Without it Cmd-V here did
-    /// something actively wrong rather than nothing: this pane's toolbar carries a search item too
-    /// (Find in document), so the app's Paste command read the window as search-owning and pasted
-    /// an image into an image SEARCH, leaving the document the user was reading.
-    func pasteAndOpen() {
-        guard DropIntake.read(NSPasteboard.general, accepts: Self.isSupported,
-                              wantsText: false, handle: { [weak self] in self?.accept($0) }) else {
-            reject("Nothing on the clipboard to transcribe. Copy a PDF, an image file, or an image.")
-            return
-        }
-    }
-
-    /// A drag onto the transcription pane, through the same resolver the search pane uses. This
-    /// used to be `dropDestination(for: URL.self)`, which meant a browser image - inline bytes, a
-    /// file promise, or a remote URL, never a file URL - landed on the pane and did nothing.
-    func drop(pasteboard pb: NSPasteboard, providers: [NSItemProvider]) -> Bool {
-        let handle: (DroppedItem) -> Void = { [weak self] in self?.accept($0) }
-        if DropIntake.read(pb, accepts: Self.isSupported, wantsText: false, handle: handle) { return true }
-        return DropIntake.read(providers: providers, accepts: Self.isSupported,
-                               wantsText: false, handle: handle)
-    }
-
     /// Turn a resolved item into an open document. Bytes and bitmaps have to become a FILE first,
     /// because everything downstream works from one - the page rasteriser, and the transcript
     /// cache's key, which is a hash of the CONTENT, so the same image pasted twice still hits the
     /// cache despite a fresh path each time.
-    private func accept(_ item: DroppedItem) {
+    func accept(_ item: DroppedItem) {
         switch item {
         case .file(let url):
             open(urls: [url])
@@ -1625,7 +1603,7 @@ final class OCRSession {
     }
 
     /// Say why nothing happened, without tearing down a document the user is reading.
-    private func reject(_ message: String) {
+    func reject(_ message: String) {
         if pages.isEmpty { phase = .failed(message) } else { post(notice: message) }
     }
 
