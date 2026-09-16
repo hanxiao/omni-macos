@@ -50,8 +50,9 @@ protocol ServingBackend: Sendable {
 struct EngineServingBackend: ServingBackend, @unchecked Sendable {
     /// The relevance floor served results must clear, in text-score units. Same default and same
     /// per-kind scaling as the window, so an agent and a human asking one question see one answer.
-    /// A caller that wants everything passes `min_score: 0`.
-    nonisolated(unsafe) static var minScore = 0.60
+    /// OFF, for the reason recorded on AppModel.defaultMinScore: a floor high enough to trim
+    /// anything also empties ordinary queries. A caller that wants one passes `min_score`.
+    nonisolated(unsafe) static var minScore = 0.0
 
     let engine: OmniEngine
     let store: VectorStore

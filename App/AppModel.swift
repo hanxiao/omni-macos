@@ -282,12 +282,22 @@ final class AppModel {
         }
     }
 
-    /// ON BY DEFAULT, and stated in TEXT-score units - `VectorStore.relevanceFloor` scales it per
-    /// kind, because a text query scores a photo on a different scale than it scores a document.
-    /// 0.60 measured by `omni-verify cutcheck` on a 2.68M-file index: it keeps 93.6% of known-good
-    /// answers (100% of media ones) while removing 18.7% of the list. A global cut at the same
-    /// number keeps 87.5%, and only 10.3% of the media answers.
-    static let defaultMinScore = 0.60
+    /// OFF by default. Stated in TEXT-score units when set - `VectorStore.relevanceFloor` scales it
+    /// per kind, because a text query scores a photo on a different scale than a document.
+    ///
+    /// It shipped ON at 0.60 for one commit and that was wrong. The calibration behind 0.60 used
+    /// queries built from documents' own text, which score far higher against this corpus than
+    /// anything a person types: median top score 0.828 for those against 0.633 for real prose
+    /// queries, a gap of 0.2 that the calibration set could not show. Measured against twelve
+    /// ordinary queries on a live index, a 0.60 floor removed 74% of all results and returned
+    /// NOTHING AT ALL for three of them ("vector index design" tops out at 0.590).
+    ///
+    /// And a floor cannot do the job it was wanted for anyway. The complaint that started this was
+    /// junk base64 scoring 0.625 - which is ABOVE the best hit of legitimate queries like "swift
+    /// concurrency" (0.562). No absolute cutoff separates those, because they are not separated on
+    /// this axis. Junk needs path and content rules; this control is for a user who wants a
+    /// stricter list, which is why it stays, with a picker, off.
+    static let defaultMinScore = 0.0
 
     /// Cosine similarity is -1...1; the UI presents it as a 0...100% relevance, clamping the
     /// (rare, semantically-opposite) negative scores to 0. Filtering uses this same clamped

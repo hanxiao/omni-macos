@@ -4224,6 +4224,61 @@ if args.count >= 4 && args[1] == "nameconcat" {
     exit(0)
 }
 
+// Query latency on a real index: omni-verify latbench <dbCopy> <modelDir> [reps]
+// Times the three query SHAPES separately, because the fusion change does different amounts of
+// work in each: a prose query never opens the name channel, a bare filename query opens it with
+// 24 candidates, and a `filename:` clause is now a SCOPE and opens it with 512.
+if args.count >= 4 && args[1] == "latbench" {
+    let store = try VectorStore(dbURL: URL(fileURLWithPath: args[2]))
+    store.prepareLexicalIndex()
+    let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[3]))
+    let reps = (args.count >= 5 ? Int(args[4]) : nil) ?? 30
+    print("latbench files=\(store.fileCount) reps=\(reps)")
+    let prose = ["what did we decide about memory", "photos of a cat on a couch",
+                 "how does the indexer handle deletes", "quarterly revenue report",
+                 "distributed systems latency", "sunset over the ocean"]
+    let names = ["VectorStore.swift", "README.md", "vectorstore", "readme", "会议记录", "results.json"]
+    var qv: [String: [Float]] = [:]
+    for q in prose + names where qv[q] == nil { qv[q] = engine.embedQuery(q) }
+    func timeIt(_ label: String, _ body: () -> Int) {
+        _ = body()   // warm
+        var ms: [Double] = [], hits = 0
+        for _ in 0 ..< reps { let t = Date(); hits = body(); ms.append(-t.timeIntervalSinceNow * 1000) }
+        ms.sort()
+        print(String(format: "  %-26s p50 %6.2f ms   p95 %6.2f ms   max %6.2f ms   (last returned %d)",
+                     (label as NSString).utf8String!, ms[ms.count / 2],
+                     ms[Swift.min(ms.count - 1, ms.count * 95 / 100)], ms[ms.count - 1], hits))
+    }
+    var i = 0
+    timeIt("prose, dense only", {
+        i += 1; return store.search(qv[prose[i % prose.count]]!, topK: 40, markActive: false).count
+    })
+    timeIt("prose, gate offered", {
+        i += 1; let q = prose[i % prose.count]
+        return store.search(qv[q]!, topK: 40, markActive: false, textQuery: q).count
+    })
+    timeIt("filename, fused", {
+        i += 1; let q = names[i % names.count]
+        return store.search(qv[q]!, topK: 40, markActive: false, textQuery: q).count
+    })
+    timeIt("filename: scope (512 cand)", {
+        i += 1; let q = names[i % names.count]
+        var f = SearchFilter(); f.filenameQuery = q
+        return store.search(qv[q]!, filter: f, topK: 40, markActive: false).count
+    })
+    // The threshold itself, which runs per result page in the app and the server.
+    let page = store.search(qv[prose[0]]!, topK: 40, markActive: false)
+    timeIt("per-kind floor over a page", {
+        var kept = 0
+        for _ in 0 ..< 1000 {
+            kept = page.filter { Double($0.score) >= VectorStore.relevanceFloor(kind: $0.kind, base: 0.60) }.count
+        }
+        return kept
+    })
+    store.close()
+    exit(0)
+}
+
 // Per-kind score profile: omni-verify conecheck <dbCopy> [alpha] [k]
 // Re-derives VectorStore.kindScoreScale. Run it after a model change; if one kind's p10, p50 and
 // p90 collapse to one number, that kind's embeddings sit in their own cone and its scores carry no
