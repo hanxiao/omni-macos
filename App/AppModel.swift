@@ -2975,12 +2975,7 @@ final class AppModel {
         if days <= 7 { return .week } else if days <= 31 { return .month } else if days <= 366 { return .year } else { return .any }
     }
 
-    private static func mapScore(_ s: String) -> Double? {
-        var v = s.trimmingCharacters(in: .whitespaces)
-        if v.hasSuffix("%") { v.removeLast(); guard let p = Double(v) else { return nil }; return max(0, min(1, p / 100)) }
-        guard let d = Double(v) else { return nil }
-        return max(0, min(1, d))
-    }
+    private static func mapScore(_ s: String) -> Double? { ScoreQualifier.parse(s) }
 
     private static func mapSort(_ s: String) -> SortOrder? {
         switch s.trimmingCharacters(in: .whitespaces).lowercased() {

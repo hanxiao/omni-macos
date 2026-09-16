@@ -115,3 +115,24 @@ public enum RootSeed {
         return legacyRoots + legacyCovered
     }
 }
+
+/// The `score:` qualifier's value, in every spelling a person actually types.
+///
+/// Pulled out for the same reason as `RootSeed`: it is a parser with edge cases, and a parser with
+/// edge cases is a thing to test rather than to read carefully.
+public enum ScoreQualifier {
+    /// `score:70%`, `score:0.7` and `score:70` all mean the same floor.
+    ///
+    /// The bare integer was the gap. `Double("70")` is 70, clamped to 1.0, so `score:70` quietly
+    /// became a 100% floor and returned nothing - the opposite of the 70% the user asked for, and
+    /// silent about it. Anything above 1 can only have been meant as a percentage: 1.0 is already
+    /// the maximum a cosine reaches.
+    public static func parse(_ raw: String) -> Double? {
+        var v = raw.trimmingCharacters(in: .whitespaces)
+        let hadPercent = v.hasSuffix("%")
+        if hadPercent { v.removeLast() }
+        guard let d = Double(v.trimmingCharacters(in: .whitespaces)), d.isFinite else { return nil }
+        let fraction = (hadPercent || d > 1) ? d / 100 : d
+        return Swift.max(0, Swift.min(1, fraction))
+    }
+}

@@ -474,9 +474,10 @@ struct ContentView: View {
         // photo library has a source and can search, and telling them to add a folder over the
         // top of it would be wrong.
         if !model.hasSources {
-            CenteredStatus(symbol: "folder.badge.plus", title: "Add a folder to search",
+            CenteredStatus(symbol: "folder.badge.plus", title: "Add folders to search",
                            subtitle: "", showSpinner: false,
-                           action: ("Add\u{2026}", { SourcePicker.add(to: model) }))
+                           action: ("Add\u{2026}", { SourcePicker.add(to: model) }),
+                           prominent: true)
         } else if let err = model.queryError {
             CenteredStatus(symbol: "exclamationmark.magnifyingglass", title: "Couldn't search by that file",
                            subtitle: err, showSpinner: false)
@@ -494,7 +495,10 @@ struct ContentView: View {
                                : "Built with a different model than the one loaded.",
                            showSpinner: false,
                            action: built.map { v in ("Switch to \(v.title)", { model.selectVariant(v) }) },
-                           secondary: ("Reindex", { model.startIndexing() }))
+                           secondary: ("Reindex", { model.startIndexing() }),
+                           // Two ways out, and switching back is the cheap one: it keeps the index
+                           // that reindexing would spend an hour rebuilding.
+                           prominent: true)
         } else if !model.hasQuery || model.isResolving {
             // Idle prompt, and the in-flight search state. They share one calm placeholder so a
             // pending search only fades a small spinner in under the same prompt - it never flashes
@@ -1205,6 +1209,11 @@ struct CenteredStatus: View {
     var progress: Double? = nil
     var action: (String, () -> Void)? = nil
     var secondary: (String, () -> Void)? = nil
+    /// Blue is for the action the screen EXISTS for, or the recommended one of two. A recovery
+    /// button - "Clear filters", "Show more" - is a way back, not the point of the screen, and
+    /// painting every one of them prominent means none of them reads as prominent. Finder's panes
+    /// are mostly plain buttons for the same reason. Defaults off so it has to be asked for.
+    var prominent: Bool = false
 
     var body: some View {
         VStack(spacing: 12) {
@@ -1222,7 +1231,10 @@ struct CenteredStatus: View {
             } else if showSpinner { ProgressView().controlSize(.small).padding(.top, 4) }
             if action != nil || secondary != nil {
                 HStack(spacing: 10) {
-                    if let action { Button(action.0, action: action.1).buttonStyle(.borderedProminent) }
+                    if let action {
+                        let b = Button(action.0, action: action.1)
+                        if prominent { b.buttonStyle(.borderedProminent) } else { b }
+                    }
                     if let secondary { Button(secondary.0, action: secondary.1) }
                 }
                 .controlSize(.large).padding(.top, 4)
@@ -1262,12 +1274,12 @@ struct SearchWaysPrompt: View {
         ("square.on.square", "Right-click a result for Find Similar"),
     ]
 
+    /// WAYS IN, not a feature list. This carried three more rows - find in the transcript, copy as
+    /// Markdown, save as .md - which are commands on a document that is not open yet. The search
+    /// pane's rows are all ways to START a search; these now match.
     static let transcribeWays: [(icon: String, text: String)] = [
         ("arrow.down.doc", "Drop a PDF or images"),
         ("folder", "Choose a document  \u{2318}O"),
-        ("magnifyingglass", "Find in the transcript, then \u{2318}G"),
-        ("doc.on.doc", "Copy as Markdown  \u{21E7}\u{2318}C"),
-        ("square.and.arrow.down", "Save as .md  \u{2318}S"),
     ]
 
     var body: some View {

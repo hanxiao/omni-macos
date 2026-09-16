@@ -1412,11 +1412,14 @@ private struct Failure: View {
 
     var body: some View {
         VStack(spacing: 12) {
+            // Matches CenteredStatus, except that a real failure keeps its orange: this is the
+            // one empty state that reports something going wrong, and colour is the fastest way
+            // to say so. The nothing-to-do case is not a failure and stays tertiary.
             Image(systemName: isNothingToDo ? "text.document" : "exclamationmark.triangle")
-                .font(.system(size: 34, weight: .light))
-                .foregroundStyle(isNothingToDo ? AnyShapeStyle(.secondary) : AnyShapeStyle(.orange))
+                .font(.system(size: 44, weight: .light))
+                .foregroundStyle(isNothingToDo ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.orange))
             Text(isNothingToDo ? "Nothing to transcribe" : "Could not transcribe that document")
-                .font(.title3.weight(.medium))
+                .font(.title)
             ScrollView {
                 Text(message)
                     .font(.callout.monospaced())
@@ -1438,11 +1441,14 @@ private struct Failure: View {
 /// for, rather than naming a Settings pane and leaving the user to find it.
 private struct ModelMissing: View {
     var body: some View {
-        VStack(spacing: 10) {
+        // Same scale as every other empty state in the app (CenteredStatus): a 44pt light glyph
+        // in tertiary over a .title. This pane used 34pt over .title3, so switching into OCR
+        // visibly changed the typography of the window's empty states.
+        VStack(spacing: 12) {
             Image(systemName: "arrow.down.circle")
-                .font(.system(size: 34, weight: .light))
-                .foregroundStyle(.secondary)
-            Text("The OCR model is not downloaded").font(.title3.weight(.medium))
+                .font(.system(size: 44, weight: .light))
+                .foregroundStyle(.tertiary)
+            Text("The OCR model is not downloaded").font(.title)
             Text("It runs entirely on this Mac.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
