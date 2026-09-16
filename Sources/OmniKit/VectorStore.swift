@@ -4046,6 +4046,7 @@ public final class VectorStore: @unchecked Sendable {
     /// once there are enough impostors to describe.
     private var cohort: [Float] = []        // [cohortCount * dim], row-major
     private var cohortFile: [Int32] = []   // file id per cohort row, so results can be excluded
+    private var cohortKind: [UInt8] = []   // kind code per cohort row, for the composition diagnostic
     private var cohortCount = 0
     private var cohortRows = 0
     private static let cohortPool = 8192
@@ -4058,6 +4059,10 @@ public final class VectorStore: @unchecked Sendable {
     /// How many of the caller's own results are kept out of the impostor cohort. Fixed so the
     /// statistic does not change meaning with the page size the caller happened to request.
     private static let cohortExcludeTop = 10
+    /// Below this spread the selected impostors are not a distribution and t is a division by the
+    /// floor. Set between what text queries produce (min 0.01358 over 400) and what a collapsed
+    /// image cone produces (exactly 0 for more than 1% of image queries). See cohortStatsLocked.
+    static let cohortMinimumSD: Float = 0.005
 
     private func ensureCohortLocked() {
         let n = rows.count
@@ -4088,6 +4093,7 @@ public final class VectorStore: @unchecked Sendable {
         // this read the wrong row - a stale cohort is merely slightly out of date, which for a set
         // of impostors is no defect at all.
         cohortFile = picks.map { fileID[$0] }
+        cohortKind = picks.map { $0 < kindCode.count ? kindCode[$0] : 0 }
         cohortCount = picks.count
         cohortRows = n
     }
@@ -4129,13 +4135,47 @@ public final class VectorStore: @unchecked Sendable {
         var varc: Float = 0
         for v in top { varc += (v - mean) * (v - mean) }
         let sd = (varc / Float(n)).squareRoot()
-        return (mean, sd > 1e-6 ? sd : 1e-6)
+        // A COLLAPSED cohort is not a confident hit, it is a missing denominator. t = (top - mean)/sd
+        // only carries meaning while sd measures something; when the selected impostors all score
+        // the same, the ratio reports the floor it was divided by. Images make this real rather than
+        // theoretical - they occupy their own narrow cone (every image in this index sits at bias
+        // 0.1806 to four decimals), so the top-200 impostors for an image query can be identical:
+        //
+        //     cohort sd over 400 queries    min       p1        p10       p50
+        //       image query                 0.00000   0.00000   0.00999   0.02480
+        //       text query                  0.01358   0.01372   0.01419   0.09310
+        //
+        // Without this guard t reached 376242 on 29 of 900 image probes. Text never comes within
+        // 2.7x of the floor, so it costs the calibrated case nothing.
+        guard sd >= Self.cohortMinimumSD else { return nil }
+        return (mean, sd)
     }
 
     /// Test hooks for measuring the cohort directly.
     func cohortStatsForTest(_ q: [Float], exclude: Set<Int32>) -> (mean: Float, sd: Float)? {
         queue.sync { cohortStatsLocked(q, exclude: exclude) }
     }
+    /// The raw cohort scored against one query: every impostor's score, its kind and its file id.
+    /// The claim behind ONE shared cohort is that adaptive selection picks the right comparison set
+    /// by itself - the top N most similar impostors for an image query are images - so no per-kind
+    /// cohort is needed. That is a claim, and this is the hook that lets a measurement check it
+    /// instead of assuming it. Diagnostic only; the product path uses cohortStatsLocked.
+    public func cohortProbe(_ q: [Float], excludePaths: [String] = [])
+        -> (scores: [Float], kinds: [String], excluded: [Bool]) {
+        queue.sync {
+            ensureCohortLocked()
+            guard cohortCount > 0, q.count == dim, cohortKind.count == cohortCount,
+                  cohortFile.count == cohortCount else { return ([], [], []) }
+            let m = MLXArray(cohort, [cohortCount, dim])
+            let sc = MLX.matmul(m, MLXArray(q, [dim, 1])).reshaped([cohortCount])
+            MLX.eval(sc)
+            let kinds = cohortKind.map { Int($0) < idKind.count ? idKind[Int($0)] : "?" }
+            var drop: Set<Int32> = []
+            for p in excludePaths { if let f = pathID[p] { drop.insert(f) } }
+            return (sc.asArray(Float.self), kinds, cohortFile.map { drop.contains($0) })
+        }
+    }
+
     func fileIDForTest(_ path: String) -> Int32? { queue.sync { pathID[path] } }
 
     /// Per-kind mean vector over a strided sample of rows. `q . centroid` IS the mean score of that

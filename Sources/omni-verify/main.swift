@@ -4502,6 +4502,290 @@ if args.count >= 4 && args[1] == "qppcheck" {
     exit(0)
 }
 
+// Image-as-query (Find Similar): omni-verify simcheck <dbCopy> [n]
+//
+// Everything measured so far fed the abstention statistic a TEXT query. Find Similar feeds it a
+// stored IMAGE vector, which is a different regime for two reasons, and both of them are reasons
+// to doubt it rather than assume it:
+//
+//   1. The cohort is strided across the whole index, every kind included. The claim behind one
+//      shared cohort is that adaptive selection picks the right comparison set by itself - the top
+//      200 most similar impostors for an image query are images. If images are a small enough
+//      fraction of the rows, the selection runs out of them and spills into text, which sits in its
+//      own cone (measured: every image in this index sits at bias 0.1806 to four decimal places).
+//      The impostor mean then reflects the modality gap, not the query, and t is inflated the same
+//      way for every image query - good and bad alike, which is exactly no signal.
+//   2. Find Similar on an INDEXED file queries with that file's own stored vector, so the file
+//      itself comes back at cosine 1.0. Any statistic reading the top score is then reading the
+//      query back.
+//
+// Ground truth here is deliberately NOT the embedding. Labelling "this image has something similar
+// in the index" by asking the index for a similar image would define the answer with the thing
+// under test and hand max-score a free 1.0. Instead a positive is an image whose NAME core is
+// shared by another image in the same folder (an icon family: the same glyph at another size or
+// weight), which is a fact about the corpus, not about the model.
+if args.count >= 3 && args[1] == "simcheck" {
+    let store = try VectorStore(dbURL: URL(fileURLWithPath: args[2]))
+    let n = (args.count >= 4 ? Int(args[3]) : nil) ?? 300
+    func say(_ s: String) { print(s); fflush(stdout) }
+    let all = store.allIndexedPaths()
+    guard !all.isEmpty else { say("empty store"); exit(1) }
+    say("simcheck files=\(store.fileCount)")
+
+    let imgExt = Set(["jpg", "jpeg", "png", "heic", "heif", "gif", "webp", "tiff", "bmp"])
+    func isImage(_ p: String) -> Bool { imgExt.contains((p as NSString).pathExtension.lowercased()) }
+
+    // Name core: the basename with style, size and colour tokens removed. Shared core = same family.
+    let noise: Set<String> = ["round", "sharp", "twotone", "outline", "outlined", "baseline", "filled",
+                              "fill", "black", "white", "grey", "gray", "wght", "grad", "copy", "final",
+                              "small", "large", "thumb", "icon", "image", "photo", "screenshot", "version"]
+    func nameCore(_ p: String) -> String {
+        let b = ((p as NSString).lastPathComponent as NSString).deletingPathExtension.lowercased()
+        let toks = b.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
+            .filter { $0.count >= 4 && !$0.allSatisfy(\.isNumber) && !noise.contains($0) }
+        return Set(toks).sorted().joined(separator: "_")
+    }
+
+    var byFolder: [String: [String]] = [:]
+    for p in all {
+        let parts = p.split(separator: "/", omittingEmptySubsequences: true)
+        guard parts.count >= 4 else { continue }
+        byFolder["/" + parts.prefix(4).joined(separator: "/"), default: []].append(p)
+    }
+    let folders = byFolder.filter { $0.value.count >= 500 }.map { $0.key }.sorted()
+    guard folders.count >= 2 else { say("need at least two populated folders"); exit(1) }
+
+    var st = UInt64(0xD1B54A32D192ED03)
+    func rnd(_ m: Int) -> Int { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return Int(st % UInt64(m)) }
+
+    // Folder centroids, for the hard negative (nearest other folder: domain kept, answer removed).
+    var centroid: [String: [Float]] = [:]
+    for f in folders {
+        let pool = byFolder[f]!
+        let sample = pool.enumerated().filter { $0.offset % Swift.max(1, pool.count / 200) == 0 }.map { $0.element }
+        let vecs = store.pooledVectors(paths: Array(sample.prefix(200)))
+        guard !vecs.isEmpty else { continue }
+        var m = [Float](repeating: 0, count: 768)
+        for v in vecs.values where v.count == 768 { for i in 0 ..< 768 { m[i] += v[i] } }
+        var norm: Float = 0; for x in m { norm += x * x }
+        if norm > 0 { let inv = 1 / norm.squareRoot(); for i in 0 ..< 768 { m[i] *= inv } }
+        centroid[f] = m
+    }
+    func nearestOther(_ home: String) -> String? {
+        guard let h = centroid[home] else { return nil }
+        var best: (String, Float)? = nil
+        for (f, c) in centroid where f != home {
+            var d: Float = 0; for i in 0 ..< 768 { d += h[i] * c[i] }
+            if best == nil || d > best!.1 { best = (f, d) }
+        }
+        return best?.0
+    }
+
+    // Families, per folder, over IMAGES only.
+    var families: [String: [String: [String]]] = [:]   // folder -> core -> paths
+    for (f, paths) in byFolder {
+        var m: [String: [String]] = [:]
+        for p in paths where isImage(p) {
+            let c = nameCore(p)
+            if !c.isEmpty { m[c, default: []].append(p) }
+        }
+        families[f] = m.filter { $0.value.count >= 2 }
+    }
+    let famFolders = families.filter { !$0.value.isEmpty }.map { $0.key }.sorted()
+    let famTotal = families.values.reduce(0) { $0 + $1.count }
+    say("  \(famTotal) image families (>=2 files sharing a name core) across \(famFolders.count) folders")
+    guard !famFolders.isEmpty else { say("  no image families to label with"); store.close(); exit(1) }
+
+    // ---- 1. What does adaptive selection actually pick for an image query? ----
+    say("\n  adaptive cohort composition (top 200 of 8192 impostors, by kind)")
+    let cohortTopN = 200
+    /// t = (top - mean(top-N cohort)) / sd, optionally over ONE kind of impostor only.
+    func tnorm(_ q: [Float], top: Float, exclude: [String], kind: String?) -> Float? {
+        let (sc, kinds, dropped) = store.cohortProbe(q, excludePaths: exclude)
+        guard !sc.isEmpty else { return nil }
+        var vals: [Float] = []
+        for i in 0 ..< sc.count where !dropped[i] && (kind == nil || kinds[i] == kind!) {
+            vals.append(sc[i])
+        }
+        guard vals.count >= Swift.max(256, cohortTopN * 2) else { return nil }
+        vals.sort(by: >)
+        let n = Swift.min(cohortTopN, vals.count)
+        let mean = vals.prefix(n).reduce(0, +) / Float(n)
+        var varc: Float = 0
+        for v in vals.prefix(n) { varc += (v - mean) * (v - mean) }
+        let sd = (varc / Float(n)).squareRoot()
+        return (top - mean) / Swift.max(sd, 1e-6)
+    }
+    func mixLine(_ label: String, _ qs: [[Float]]) {
+        guard !qs.isEmpty else { say("    \(label): no queries"); return }
+        var total: [String: Int] = [:]
+        for q in qs {
+            let (sc, kinds, _) = store.cohortProbe(q)
+            guard !sc.isEmpty else { continue }
+            let order = (0 ..< sc.count).sorted { sc[$0] == sc[$1] ? $0 < $1 : sc[$0] > sc[$1] }
+            for i in order.prefix(cohortTopN) { total[kinds[i], default: 0] += 1 }
+        }
+        let sum = Swift.max(1, total.values.reduce(0, +))
+        let parts = total.sorted { $0.value > $1.value }
+            .map { String(format: "%@ %.0f%%", $0.key, 100.0 * Double($0.value) / Double(sum)) }
+        say("    \(label) (n=\(qs.count)): " + parts.joined(separator: "  "))
+    }
+    var imgQs: [[Float]] = [], txtQs: [[Float]] = []
+    for f in famFolders {
+        for (_, ps) in families[f]! where imgQs.count < 400 {
+            if let v = store.fileVector(ps[0]) { imgQs.append(v) }
+        }
+    }
+    for f in folders {
+        for p in byFolder[f]!.prefix(400) where txtQs.count < 400 && !isImage(p) {
+            if let v = store.fileVector(p) { txtQs.append(v) }
+        }
+    }
+    mixLine("image query ", imgQs)
+    mixLine("text query  ", txtQs)
+    // The SPREAD of the selected cohort, which is the denominator of t. Images sit in their own
+    // narrow cone (measured elsewhere on this index: every image at bias 0.1806 to four decimals),
+    // so if the top-200 image impostors all score nearly the same, sd collapses and t = (top-mean)/sd
+    // has no stable scale - the same threshold then means different things for text and for images.
+    func sdLine(_ label: String, _ qs: [[Float]]) {
+        var sds: [Double] = [], gaps: [Double] = []
+        for q in qs {
+            let (sc, _, _) = store.cohortProbe(q)
+            guard !sc.isEmpty else { continue }
+            let v = sc.sorted(by: >).prefix(cohortTopN).map(Double.init)
+            let m = v.reduce(0, +) / Double(v.count)
+            sds.append((v.reduce(0) { $0 + ($1 - m) * ($1 - m) } / Double(v.count)).squareRoot())
+            gaps.append((v.first ?? 0) - (v.last ?? 0))
+        }
+        guard !sds.isEmpty else { return }
+        let ss = sds.sorted(), gg = gaps.sorted()
+        say(String(format: "    %@ cohort sd: min %.5f  p1 %.5f  p10 %.5f  p50 %.5f  p90 %.5f   spread(top-200) p50 %.5f",
+                   label, ss[0], ss[Swift.max(0, ss.count / 100)], ss[ss.count / 10], ss[ss.count / 2],
+                   ss[ss.count * 9 / 10], gg[gg.count / 2]))
+    }
+    say("")
+    sdLine("image query", imgQs)
+    sdLine("text query ", txtQs)
+    // The baseline the selection is picking against: what an UNSELECTED cohort would look like.
+    let imgFiles = all.filter(isImage).count
+    say(String(format: "    a random draw would be: image %.0f%%  other %.0f%%  (%d of %d files)",
+               100.0 * Double(imgFiles) / Double(all.count),
+               100.0 * Double(all.count - imgFiles) / Double(all.count), imgFiles, all.count))
+
+    // ---- 2. Does it discriminate? ----
+    struct Probe { let conf: VectorStore.RetrievalConfidence; let answerable: Bool; let hard: Bool
+                   let tImage: Float; let withSelf: Float }
+    var probes: [Probe] = []
+    var selfScores: [Double] = []
+    var tries = 0
+    while probes.count < n * 3 && tries < n * 40 {
+        tries += 1
+        let home = famFolders[rnd(famFolders.count)]
+        let fam = families[home]!
+        guard !fam.isEmpty else { continue }
+        let cores = Array(fam.keys)
+        let core = cores[rnd(cores.count)]
+        let members = fam[core]!
+        let path = members[rnd(members.count)]
+        guard let qv = store.fileVector(path) else { continue }
+
+        // POSITIVE: home folder, where the rest of the family lives. The query file is dropped from
+        // its own results - it is there at cosine 1.0, and a statistic that reads it is reading the
+        // query back, not the index.
+        var fin = SearchFilter(); fin.folderPrefix = home
+        let hinRaw = store.search(qv, filter: fin, topK: 40, markActive: false)
+        if let me = hinRaw.first(where: { $0.path == path }) { selfScores.append(Double(me.score)) }
+        let hin = hinRaw.filter { $0.path != path }
+        guard hin.count >= 10 else { continue }
+        // The label has to be true: a family member other than the query must actually be in scope.
+        let others = Set(members).subtracting([path])
+        guard hin.contains(where: { others.contains($0.path) }) else { continue }
+
+        var far = folders[rnd(folders.count)]
+        var g = 0
+        while (far == home || path.hasPrefix(far)) && g < 10 { far = folders[rnd(folders.count)]; g += 1 }
+        guard far != home, !path.hasPrefix(far), let near = nearestOther(home), !path.hasPrefix(near) else { continue }
+        // A negative scope must not contain a family member, or the label is a lie.
+        guard !members.contains(where: { $0.hasPrefix(far) || $0.hasPrefix(near) }) else { continue }
+        var fFar = SearchFilter(); fFar.folderPrefix = far
+        var fNear = SearchFilter(); fNear.folderPrefix = near
+        let hFar = store.search(qv, filter: fFar, topK: 40, markActive: false)
+        let hNear = store.search(qv, filter: fNear, topK: 40, markActive: false)
+        guard hFar.count >= 10, hNear.count >= 10 else { continue }
+        // Same statistic with the cohort restricted to IMAGE impostors, to find out whether the
+        // text spill in the shared cohort is costing anything or whether adaptive selection was
+        // already doing the job. And the self-kept control, which is what Find Similar reports today.
+        func mk(_ hits: [SearchHit], _ answerable: Bool, _ hard: Bool) -> Probe {
+            let c = store.retrievalConfidence(query: qv, hits: hits)
+            let ex = hits.prefix(10).map(\.path)
+            let ti = tnorm(qv, top: c.topScore, exclude: ex, kind: "image") ?? c.tnorm
+            return Probe(conf: c, answerable: answerable, hard: hard, tImage: ti,
+                         withSelf: answerable ? 1.0 : c.topScore)
+        }
+        probes.append(mk(hin, true, false))
+        probes.append(mk(hFar, false, false))
+        probes.append(mk(hNear, false, true))
+    }
+    let pos = probes.filter { $0.answerable }
+    let negFar = probes.filter { !$0.answerable && !$0.hard }
+    let negHard = probes.filter { !$0.answerable && $0.hard }
+    if !selfScores.isEmpty {
+        say(String(format: "\n  the query file scores %.4f against itself (median of %d) - dropped from its own results",
+                   selfScores.sorted()[selfScores.count / 2], selfScores.count))
+    }
+    say("  \(pos.count) answerable, \(negFar.count) unanswerable-far, \(negHard.count) unanswerable-near")
+    guard pos.count >= 30 else { say("  too few usable probes"); store.close(); exit(1) }
+
+    func auroc(_ f: (Probe) -> Float, _ neg: [Probe]) -> Double {
+        let a = pos.map { Double(f($0)) }, b = neg.map { Double(f($0)) }
+        guard !a.isEmpty, !b.isEmpty else { return 0 }
+        var wins = 0.0
+        for x in a { for y in b { wins += x > y ? 1 : (x == y ? 0.5 : 0) } }
+        return wins / Double(a.count * b.count)
+    }
+    func med(_ xs: [Double]) -> Double { xs.isEmpty ? 0 : xs.sorted()[xs.count / 2] }
+    let preds: [(String, (Probe) -> Float)] = [
+        ("max score", { $0.conf.topScore }), ("WIG", { $0.conf.wig }), ("NQC", { $0.conf.nqc }),
+        ("top - baseline", { $0.conf.topScore - $0.conf.baseline }),
+        ("AS-norm (top)", { $0.conf.tnorm }), ("AS-norm (mean)", { $0.conf.tnormMean }),
+        ("AS-norm image-only", { $0.tImage }),
+        ("max score, self kept", { $0.withSelf })]
+    say("\n  predictor            AUROC far   AUROC near   med answerable   med far   med near")
+    for (name, f) in preds {
+        say(String(format: "  %-20s %.3f        %.3f     %+12.4f  %+8.4f  %+8.4f",
+                   (name as NSString).utf8String!, auroc(f, negFar), auroc(f, negHard),
+                   med(pos.map { Double(f($0)) }), med(negFar.map { Double(f($0)) }),
+                   med(negHard.map { Double(f($0)) })))
+    }
+    let unavail = (pos + negHard).filter { !$0.conf.available }.count
+    say(String(format: "  statistic unavailable on %d of %d probes", unavail, pos.count + negHard.count))
+    // How often t leaves any range a fixed threshold could live in.
+    let allT = (pos + negFar + negHard).map { Double($0.conf.tnorm) }
+    let blown = allT.filter { $0 > 100 }.count
+    say(String(format: "  AS-norm t exceeds 100 on %d of %d probes (max %.0f) - a collapsed cohort sd, not a confident hit",
+               blown, allT.count, allT.max() ?? 0))
+
+    // Sweep the SHIPPED statistic, not the winner of the table: the product has one, and the
+    // question is what it does here.
+    let shipped: (String, (Probe) -> Float) = ("AS-norm (top)", { $0.conf.tnorm })
+    let span = pos.map { Double(shipped.1($0)) } + negHard.map { Double(shipped.1($0)) }
+    let lo = span.min() ?? 0, hi = span.max() ?? 1
+    say("\n  abstain when \(shipped.0) < t")
+    for i in 0 ... 10 {
+        let t = Float(lo + (hi - lo) * Double(i) / 10)
+        say(String(format: "    t=%+.3f  says nothing found: far %5.1f%%  near %5.1f%%   wrongly hides an answer %5.1f%%",
+                   t, 100.0 * Double(negFar.filter { shipped.1($0) < t }.count) / Double(Swift.max(1, negFar.count)),
+                   100.0 * Double(negHard.filter { shipped.1($0) < t }.count) / Double(Swift.max(1, negHard.count)),
+                   100.0 * Double(pos.filter { shipped.1($0) < t }.count) / Double(Swift.max(1, pos.count))))
+    }
+    say(String(format: "    t=+2.700 (the text operating point): far %5.1f%%  near %5.1f%%   wrongly hides an answer %5.1f%%",
+               100.0 * Double(negFar.filter { shipped.1($0) < 2.7 }.count) / Double(Swift.max(1, negFar.count)),
+               100.0 * Double(negHard.filter { shipped.1($0) < 2.7 }.count) / Double(Swift.max(1, negHard.count)),
+               100.0 * Double(pos.filter { shipped.1($0) < 2.7 }.count) / Double(Swift.max(1, pos.count))))
+    store.close()
+    exit(0)
+}
+
 // Per-kind score profile: omni-verify conecheck <dbCopy> [alpha] [k]
 // Re-derives VectorStore.kindScoreScale. Run it after a model change; if one kind's p10, p50 and
 // p90 collapse to one number, that kind's embeddings sit in their own cone and its scores carry no

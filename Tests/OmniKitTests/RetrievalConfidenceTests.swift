@@ -52,6 +52,43 @@ final class RetrievalConfidenceTests: XCTestCase {
         XCTAssertEqual(c.tnorm, 0, "an unavailable statistic must not carry a number")
     }
 
+    /// THE COLLAPSED-COHORT TRAP, which is what image queries actually hit. t = (top - mean)/sd
+    /// only means something while sd measures a spread; when every selected impostor scores the
+    /// same, the ratio reports the floor it was divided by and a caller reads a huge number as
+    /// enormous confidence. On the real index this is not hypothetical: an image query's top-200
+    /// impostors have exactly zero spread for more than 1% of queries (the modality cone), and t
+    /// reached 376242. Here the whole corpus is ONE repeated vector, so the cohort is perfectly
+    /// degenerate by construction.
+    func testDeclinesWhenTheCohortHasNoSpread() throws {
+        let store = try VectorStore(dbURL: tempDB())
+        defer { store.close() }
+        let same = vec(101)
+        for i in 0 ..< 1200 {
+            try store.replace(path: "/same\(i).txt", chunks: [
+                IndexedChunk(path: "/same\(i).txt", modified: 1, size: 1, kind: "text",
+                             chunkIndex: 0, snippet: "s\(i)", embedding: same)])
+        }
+        let hits = store.search(same, topK: 10, markActive: false)
+        XCTAssertFalse(hits.isEmpty, "the search itself must still work")
+        XCTAssertNil(store.cohortStatsForTest(same, exclude: []),
+                     "a cohort with no spread is not a distribution and must not produce stats")
+        let c = store.retrievalConfidence(query: same, hits: hits)
+        XCTAssertFalse(c.available, "a degenerate cohort must report no opinion")
+        XCTAssertEqual(c.tnorm, 0, "an unavailable statistic must not carry a number")
+    }
+
+    /// The guard must not fire on an ordinary cohort - otherwise it would buy safety by switching
+    /// the statistic off everywhere, which the test above could not tell apart.
+    func testAnOrdinaryCohortKeepsItsSpread() throws {
+        let store = try VectorStore(dbURL: tempDB())
+        defer { store.close() }
+        try fill(store, 0 ..< 1200)
+        let stats = store.cohortStatsForTest(vec(7), exclude: [])
+        XCTAssertNotNil(stats, "a varied corpus must still produce cohort stats")
+        XCTAssertGreaterThan(stats!.sd, VectorStore.cohortMinimumSD,
+                             "spread on random unit vectors must clear the degeneracy floor")
+    }
+
     /// Once the index is big enough the statistic turns on, and the document that IS the query
     /// must score far above the impostor cohort.
     func testBecomesAvailableAndRanksAKnownAnswerHigh() throws {
