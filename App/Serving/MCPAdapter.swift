@@ -26,6 +26,15 @@ enum MCPAdapter {
     /// client's context with base64. Image hits past this are still returned as links/text.
     private static let maxInlineImages = 10
 
+    /// yyyy-MM-dd in the local calendar. The only date format that is unambiguous to a reader who
+    /// does not know the server's locale, and the only precision a relevance question ever needs.
+    static func shortDate(_ epoch: Double) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        return f.string(from: Date(timeIntervalSince1970: epoch))
+    }
+
     static func handle(_ req: HTTPRequest, _ backend: any ServingBackend, appVersion: String,
                        sources: SourcesControl? = nil) async -> HTTPResponse {
         // GET is the SSE stream in the full spec; this server has no server-initiated
@@ -123,7 +132,7 @@ enum MCPAdapter {
                     ],
                     "max_snippet": [
                         "type": "integer",
-                        "description": "Max characters of the matching text snippet shown per result (default 200, max 2000). 0 omits snippets. Does not affect structuredContent, which always carries the full snippet.",
+                        "description": "Max characters of the matching text snippet shown per result (default 200, max 2000). 0 omits snippets.",
                         "minimum": 0, "maximum": 2000
                     ],
                     "include_images": [
@@ -255,7 +264,7 @@ enum MCPAdapter {
         // The response interleaves, per result, a human/LLM-readable text block and a
         // `resource_link` (a file:// URI the client can open or render directly). Capable
         // clients show a list of openable files; dumb ones still read every text block in
-        // order. `structuredContent` carries the full machine-readable rows regardless.
+        // order.
         let snap = await snapshot
         let building = indexStateLine(snap)
 
@@ -285,13 +294,18 @@ enum MCPAdapter {
                 let isTextKind = h.kind == FileKind.text.rawValue
                 var meta = isTextKind ? "" : mediaLabel(width: h.width, height: h.height,
                                                         duration: h.duration, bytes: h.size)
-                // State what the row stands for, in the text block itself: a text-only agent must
-                // not have to parse structuredContent to learn that this result is really N files.
+                // State what the row stands for, in the text block itself.
                 if let g = dupesByPath[h.path], g.isStack {
                     meta += g.reason == .exact
                         ? ", \(g.count) identical copies"
                         : ", \(g.count) near-identical files"
                 }
+                // Carried here because the text block is now the ONLY representation. Both were
+                // reachable solely through structuredContent before, and both change what an agent
+                // does next: chunk_count says whether search_inline has more of this file to give,
+                // and the date is what a "most recent" question turns on. A few characters each.
+                if h.chunkCount > 1 { meta += ", \(h.chunkCount) passages" }
+                meta += ", \(Self.shortDate(h.modified))"
                 var text = "\(i + 1). \(h.path)  (\(h.kind), \(score)%\(loc)\(meta))"
                 if maxSnippet > 0 {
                     let snippet = h.snippet.replacingOccurrences(of: "\n", with: " ")
@@ -317,42 +331,8 @@ enum MCPAdapter {
             }
         }
 
-        let structured: [[String: Any]] = reps.map { h in
-            var row: [String: Any] =
-                ["path": h.path,
-                 "uri": URL(fileURLWithPath: h.path).absoluteString,
-                 "score": Double(max(0, min(1, h.score))),
-                 "kind": h.kind,
-                 "snippet": h.snippet,
-                 // Where the best-matching chunk sits inside the file ("Page 3", "Line 1240"); "" if n/a.
-                 "locator": h.locator,
-                 // Total indexed chunks (pages/passages) in this file; > 1 means more passages exist.
-                 "chunk_count": h.chunkCount,
-                 "modified": h.modified]
-            if let mime = mimeType(forPath: h.path) { row["mime_type"] = mime }
-            // Same three fields the HTTP endpoint emits, present only on a stack.
-            if let g = dupesByPath[h.path], g.isStack {
-                row["duplicate_count"] = g.count
-                row["duplicates"] = g.members.dropFirst().map(\.path)
-                row["duplicate_kind"] = g.reason == .exact ? "exact" : "near"
-            }
-            if h.width > 0 { row["width"] = h.width }
-            if h.height > 0 { row["height"] = h.height }
-            if h.duration > 0 { row["duration"] = h.duration }
-            if h.size > 0 { row["bytes"] = h.size }
-            if let ck = contentKeys[h.path], ck.modified == h.modified { row["content_key"] = ck.key }
-            // Same signature file_status compares. Present only when the file has actually drifted
-            // or vanished, so an unchanged result set is byte-for-byte what it was before.
-            switch diskState(of: h) {
-            case .upToDate: break
-            case .changed:  row["stale"] = true
-            case .missing:  row["missing"] = true
-            }
-            return row
-        }
         return result(id: id, [
             "content": content,
-            "structuredContent": ["results": structured],
             "isError": false
         ])
     }
@@ -383,7 +363,7 @@ enum MCPAdapter {
                     ],
                     "max_snippet": [
                         "type": "integer",
-                        "description": "Max characters of each passage in the text block (default 400, max 4000). 0 omits snippets; structuredContent always carries the full snippet.",
+                        "description": "Max characters of each passage in the text block (default 400, max 4000). 0 omits snippets.",
                         "minimum": 0, "maximum": 4000
                     ]
                 ] as [String: Any],
@@ -431,18 +411,8 @@ enum MCPAdapter {
                 content.append(["type": "text", "text": text])
             }
         }
-        let structured: [[String: Any]] = hits.map { h in
-            ["path": h.path,
-             "uri": URL(fileURLWithPath: h.path).absoluteString,
-             "score": Double(max(0, min(1, h.score))),
-             "kind": h.kind,
-             "chunk_index": h.chunkIndex,
-             "snippet": h.snippet,
-             "locator": h.locator]
-        }
         return result(id: id, [
             "content": content,
-            "structuredContent": ["results": structured],
             "isError": false
         ])
     }
@@ -506,7 +476,6 @@ enum MCPAdapter {
         }
         return result(id: id, [
             "content": content,
-            "structuredContent": ["files": rows],
             "isError": false
         ])
     }
@@ -596,7 +565,6 @@ enum MCPAdapter {
         }
         return result(id: id, [
             "content": content,
-            "structuredContent": ["files": rows, "recomputed": recompute],
             "isError": false
         ])
     }
@@ -854,23 +822,8 @@ enum MCPAdapter {
             lines.append("Omni has no access to the Apple Photos library; the user grants it in the app.")
         }
 
-        let structured: [String: Any] = [
-            "indexing": snap.indexing,
-            "photos_authorized": snap.photosAuthorized,
-            "sources": snap.sources.map { s -> [String: Any] in
-                var row: [String: Any] = ["key": s.key, "kind": s.kind, "name": s.name,
-                                          "paused": s.paused, "indexing": s.indexing,
-                                          "queued": s.queued, "indexed_files": s.indexedFiles]
-                if s.total > 0 { row["progress"] = ["done": s.done, "total": s.total] }
-                return row
-            },
-            "available_photo_albums": snap.albums.map {
-                ["id": $0.id, "title": $0.title, "count": $0.count, "smart": $0.smart]
-            },
-        ]
         return result(id: id, [
             "content": [["type": "text", "text": lines.joined(separator: "\n")]],
-            "structuredContent": structured,
         ])
     }
 
