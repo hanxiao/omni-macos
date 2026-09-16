@@ -4279,6 +4279,158 @@ if args.count >= 4 && args[1] == "latbench" {
     exit(0)
 }
 
+// Can we tell "there is no answer" from the scores alone?
+//   omni-verify qppcheck <dbCopy> <modelDir> [n]
+//
+// Every threshold experiment before this one measured WHICH RESULTS TO KEEP given an answer
+// exists. That is a different question from whether one exists at all, and dense retrieval only
+// ever fails at the second: it has no empty result, so "nothing here" and "here are forty things"
+// are the same page.
+//
+// The negative class is the hard part, and it is built here without hand-writing queries, which
+// would only measure the author's imagination. A query is taken from a real file, then the search
+// is SCOPED to a folder that does not contain that file. The query is then provably unanswerable -
+// same query distribution as the positives, same retriever, same corpus, and the one thing it
+// wants is definitely not in scope. That is the "search my Documents for something only in
+// Downloads" case, which is also what a user actually does.
+if args.count >= 4 && args[1] == "qppcheck" {
+    let store = try VectorStore(dbURL: URL(fileURLWithPath: args[2]))
+    let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[3]))
+    let n = (args.count >= 5 ? Int(args[4]) : nil) ?? 400
+    func say(_ s: String) { print(s); fflush(stdout) }
+    let all = store.allIndexedPaths()
+    guard !all.isEmpty else { print("empty store"); exit(1) }
+    say("qppcheck files=\(store.fileCount)")
+
+    // Top-level folders with enough files to scope a search to.
+    var byFolder: [String: [String]] = [:]
+    for p in all {
+        let parts = p.split(separator: "/", omittingEmptySubsequences: true)
+        guard parts.count >= 4 else { continue }
+        byFolder["/" + parts.prefix(4).joined(separator: "/"), default: []].append(p)
+    }
+    let folders = byFolder.filter { $0.value.count >= 500 }.map { $0.key }.sorted()
+    guard folders.count >= 2 else { say("need at least two populated folders"); exit(1) }
+    say("  \(folders.count) folders with 500+ files")
+
+    var st = UInt64(0x9E3779B97F4A7C15)
+    func rnd(_ m: Int) -> Int { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return Int(st % UInt64(m)) }
+    let zero = [Float](repeating: 0, count: 768)
+
+    // TWO negative classes, because one of them flatters the result.
+    //
+    // Scoping to a RANDOM other folder is realistic but soft: a query from a code folder aimed at a
+    // photo folder scores low for the modality, not for the absence of an answer, and any predictor
+    // looks good on that. So each positive also gets a HARD negative - the other folder whose
+    // content is closest to its own, by centroid cosine. That keeps the domain and takes away only
+    // the answer, which is the case that actually matters and the one the literature calls
+    // adversarial.
+    var centroid: [String: [Float]] = [:]
+    for f in folders {
+        let sample = byFolder[f]!.enumerated().filter { $0.offset % Swift.max(1, byFolder[f]!.count / 200) == 0 }.map { $0.element }
+        let vecs = store.pooledVectors(paths: Array(sample.prefix(200)))
+        guard !vecs.isEmpty else { continue }
+        var m = [Float](repeating: 0, count: 768)
+        for v in vecs.values where v.count == 768 { for i in 0 ..< 768 { m[i] += v[i] } }
+        var norm: Float = 0; for x in m { norm += x * x }
+        if norm > 0 { let inv = 1 / norm.squareRoot(); for i in 0 ..< 768 { m[i] *= inv } }
+        centroid[f] = m
+    }
+    func nearestOther(_ home: String) -> String? {
+        guard let h = centroid[home] else { return nil }
+        var best: (String, Float)? = nil
+        for (f, c) in centroid where f != home {
+            var d: Float = 0; for i in 0 ..< 768 { d += h[i] * c[i] }
+            if best == nil || d > best!.1 { best = (f, d) }
+        }
+        return best?.0
+    }
+    say("  folder centroids built for \(centroid.count) folders")
+
+    struct Probe { let conf: VectorStore.RetrievalConfidence; let answerable: Bool; let hard: Bool }
+    var probes: [Probe] = []
+    var tries = 0
+    while probes.count < n * 2 && tries < n * 30 {
+        tries += 1
+        let home = folders[rnd(folders.count)]
+        let pool = byFolder[home]!
+        let path = pool[rnd(pool.count)]
+        guard let snip = store.rankChunks(zero, path: path, topK: 1).first?.snippet, snip.count >= 40 else { continue }
+        let words = snip.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" }).map(String.init)
+        let q: String
+        if words.count >= 14 {
+            let start = Swift.min(words.count - 12, 2 + rnd(Swift.max(1, words.count / 2)))
+            let w = Array(words[start ..< Swift.min(words.count, start + 20)])
+            guard w.filter({ $0.count >= 7 }).count >= 2 else { continue }
+            q = w.joined(separator: " ")
+        } else { q = String(snip.prefix(200)) }
+        guard q.count >= 12 else { continue }
+        let qv = engine.embedQuery(q)
+
+        // POSITIVE: scoped to the folder the file lives in. The answer is in scope.
+        var fin = SearchFilter(); fin.folderPrefix = home
+        let hin = store.search(qv, filter: fin, topK: 40, markActive: false, textQuery: q)
+        guard hin.count >= 10 else { continue }
+        // Only keep a positive that really did find its file; otherwise the label is a lie.
+        guard hin.contains(where: { $0.path == path }) else { continue }
+
+        var far = folders[rnd(folders.count)]
+        var guard_ = 0
+        while (far == home || path.hasPrefix(far)) && guard_ < 10 { far = folders[rnd(folders.count)]; guard_ += 1 }
+        guard far != home, !path.hasPrefix(far), let near = nearestOther(home), !path.hasPrefix(near) else { continue }
+        var fFar = SearchFilter(); fFar.folderPrefix = far
+        var fNear = SearchFilter(); fNear.folderPrefix = near
+        let hFar = store.search(qv, filter: fFar, topK: 40, markActive: false, textQuery: q)
+        let hNear = store.search(qv, filter: fNear, topK: 40, markActive: false, textQuery: q)
+        guard hFar.count >= 10, hNear.count >= 10 else { continue }
+        probes.append(Probe(conf: store.retrievalConfidence(query: qv, hits: hin), answerable: true, hard: false))
+        probes.append(Probe(conf: store.retrievalConfidence(query: qv, hits: hFar), answerable: false, hard: false))
+        probes.append(Probe(conf: store.retrievalConfidence(query: qv, hits: hNear), answerable: false, hard: true))
+    }
+    let pos = probes.filter { $0.answerable }
+    let negFar = probes.filter { !$0.answerable && !$0.hard }
+    let negHard = probes.filter { !$0.answerable && $0.hard }
+    say("  \(pos.count) answerable, \(negFar.count) unanswerable-far, \(negHard.count) unanswerable-near\n")
+    guard pos.count >= 30 else { say("  too few usable probes"); store.close(); exit(1) }
+
+    /// AUROC by the rank-sum identity; 0.5 is a coin flip, 1.0 is perfect separation.
+    func auroc(_ f: (VectorStore.RetrievalConfidence) -> Float, _ neg: [Probe]) -> Double {
+        let a = pos.map { Double(f($0.conf)) }, b = neg.map { Double(f($0.conf)) }
+        guard !a.isEmpty, !b.isEmpty else { return 0 }
+        var wins = 0.0
+        for x in a { for y in b { wins += x > y ? 1 : (x == y ? 0.5 : 0) } }
+        return wins / Double(a.count * b.count)
+    }
+    func med(_ xs: [Double]) -> Double { xs.isEmpty ? 0 : xs.sorted()[xs.count / 2] }
+    let preds: [(String, (VectorStore.RetrievalConfidence) -> Float)] = [
+        ("max score", { $0.topScore }), ("WIG", { $0.wig }), ("NQC", { $0.nqc }),
+        ("top - baseline", { $0.topScore - $0.baseline })]
+    say("  predictor          AUROC far   AUROC near   med answerable   med far   med near")
+    for (name, f) in preds {
+        say(String(format: "  %-18s %.3f        %.3f     %+12.4f  %+8.4f  %+8.4f",
+                   (name as NSString).utf8String!, auroc(f, negFar), auroc(f, negHard),
+                   med(pos.map { Double(f($0.conf)) }), med(negFar.map { Double(f($0.conf)) }),
+                   med(negHard.map { Double(f($0.conf)) })))
+    }
+    // Operating points for the best predictor, swept across the range its medians actually span.
+    let best = preds.max { auroc($0.1, negHard) < auroc($1.1, negHard) }!
+    let span = pos.map { Double(best.1($0.conf)) } + negHard.map { Double(best.1($0.conf)) }
+    let lo = span.min() ?? 0, hi = span.max() ?? 1
+    say("\n  abstain when \(best.0) < t  (swept over the range the data occupies)")
+    for i in 0 ... 10 {
+        let t = Float(lo + (hi - lo) * Double(i) / 10)
+        let hidden = pos.filter { best.1($0.conf) < t }.count
+        let caughtF = negFar.filter { best.1($0.conf) < t }.count
+        let caughtN = negHard.filter { best.1($0.conf) < t }.count
+        say(String(format: "    t=%+.3f  says nothing found: far %5.1f%%  near %5.1f%%   wrongly hides an answer %5.1f%%",
+                   t, 100.0 * Double(caughtF) / Double(Swift.max(1, negFar.count)),
+                   100.0 * Double(caughtN) / Double(Swift.max(1, negHard.count)),
+                   100.0 * Double(hidden) / Double(Swift.max(1, pos.count))))
+    }
+    store.close()
+    exit(0)
+}
+
 // Per-kind score profile: omni-verify conecheck <dbCopy> [alpha] [k]
 // Re-derives VectorStore.kindScoreScale. Run it after a model change; if one kind's p10, p50 and
 // p90 collapse to one number, that kind's embeddings sit in their own cone and its scores carry no

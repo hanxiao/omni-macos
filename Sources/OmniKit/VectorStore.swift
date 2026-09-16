@@ -3954,6 +3954,134 @@ public final class VectorStore: @unchecked Sendable {
     }
 
 
+
+    // MARK: - Retrieval confidence (QPP)
+
+    /// Does this query have an answer in the index AT ALL?
+    ///
+    /// Dense retrieval always returns its top K. It has no empty result, so "nothing here" and
+    /// "here are ten things" look identical to a caller. Query Performance Prediction is the IR
+    /// subfield for exactly this, and its finding is that the answer is in the SHAPE of the score
+    /// vector, not in any single score. Veselý et al. (arXiv 2609.11646, 2026) measure a raw
+    /// max-score threshold at AUROC 0.489 for detecting unanswerable queries - a coin flip - while
+    /// score-distribution features reach 0.934, beating a local LLM that actually reads the
+    /// retrieved documents (0.649) at about a three-thousandth of the cost. Their one-line summary:
+    /// unanswerable queries produce characteristically flat score distributions.
+    ///
+    /// Two classic unsupervised predictors, which need no labels and no training:
+    ///
+    ///   WIG (Weighted Information Gain) - how far the top-k mean sits ABOVE what an average
+    ///   document of the same kind scores for this query. A query with a real answer beats its own
+    ///   corpus baseline; one without does not. This is the measure that makes the number
+    ///   comparable across queries, which a raw cosine never is.
+    ///
+    ///   NQC (Normalized Query Commitment) - dispersion of the top-k scores over that same
+    ///   baseline. A ranking that found something has structure; one that did not is flat.
+    ///
+    /// Pooled, the classic predictors scored 0.835 against a trained model's 0.856 in that paper,
+    /// which is why this is worth having without a training pipeline behind it.
+    public struct RetrievalConfidence: Sendable {
+        /// Top-k mean minus the corpus baseline for this query, in score units.
+        public var wig: Float = 0
+        /// Standard deviation of the top-k scores over the baseline. Flat means nothing was found.
+        public var nqc: Float = 0
+        /// What an average document of the winning kind scores for this query. Exposed because it
+        /// is the quantity that makes wig interpretable, and it is per KIND: a text query scores a
+        /// photo on a different scale, so a shared baseline would measure the modality, not the
+        /// query.
+        public var baseline: Float = 0
+        public var topScore: Float = 0
+        public var kind: String = ""
+    }
+
+    /// Per-kind mean vector over a strided sample of rows. `q . centroid` IS the mean score of that
+    /// kind for `q`, because the mean of dot products is the dot product with the mean - so the
+    /// corpus baseline costs one dot product per kind at query time, not a scan.
+    ///
+    /// Sampled, not exhaustive: the standard error of a mean over 65k samples is about 0.4%, far
+    /// below the score differences this is used to judge, and it turns a 16 GB pass into a 50 MB
+    /// one. Built on the GPU, on the store queue, the first time a confidence is asked for.
+    private var kindCentroid: [String: [Float]] = [:]
+    private var kindCentroidRows = 0
+
+    private static let centroidSamplePerKind = 65_536
+
+    private func ensureKindCentroidsLocked() {
+        let n = rows.count
+        guard dim > 0, n > 0, flat16.count == n * dim else { return }
+        // Rebuild only when the index has moved by more than a few percent; a centroid is a corpus
+        // statistic and does not care about the last hundred files.
+        if !kindCentroid.isEmpty, abs(n - kindCentroidRows) * 20 < kindCentroidRows { return }
+        let dead = deadRows
+        var picks: [String: [Int]] = [:]
+        // One stride per kind would need a per-kind count first; a single stride over all rows in
+        // proportion is enough, since each kind is then sampled in proportion to its own size.
+        let stride = Swift.max(1, n / (Self.centroidSamplePerKind * 4))
+        var i = 0
+        while i < n {
+            if !dead.contains(Int32(i)) {
+                let k = rows[i].kind
+                if (picks[k]?.count ?? 0) < Self.centroidSamplePerKind { picks[k, default: []].append(i) }
+            }
+            i += stride
+        }
+        var out: [String: [Float]] = [:]
+        for (kind, idx) in picks where !idx.isEmpty {
+            var gathered = [UInt16](repeating: 0, count: idx.count * dim)
+            flat16.withUnsafeBufferPointer { src in
+                gathered.withUnsafeMutableBufferPointer { dst in
+                    guard let sp = src.baseAddress, let dp = dst.baseAddress else { return }
+                    for (j, r) in idx.enumerated() {
+                        memcpy(dp + j * dim, sp + r * dim, dim * MemoryLayout<UInt16>.size)
+                    }
+                }
+            }
+            let mean: [Float] = gathered.withUnsafeBytes { raw in
+                let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!),
+                                count: idx.count * dim * MemoryLayout<UInt16>.size, deallocator: .none)
+                let m = MLXArray(data, [idx.count, dim], dtype: .bfloat16).asType(.float32)
+                let c = MLX.mean(m, axis: 0)
+                MLX.eval(c)
+                return c.asArray(Float.self)
+            }
+            out[kind] = mean
+        }
+        kindCentroid = out
+        kindCentroidRows = n
+    }
+
+    /// Confidence for a page of results the caller already has. Reads no vectors and runs no scan:
+    /// one dot product against the winning kind's centroid, plus arithmetic over the scores. Safe
+    /// to call on every query.
+    ///
+    /// `hits` must be the page as returned - descending, scores as the caller sees them.
+    public func retrievalConfidence(query: [Float], hits: [SearchHit], k: Int = 10) -> RetrievalConfidence {
+        queue.sync {
+            var out = RetrievalConfidence()
+            guard !hits.isEmpty, query.count == dim, dim > 0 else { return out }
+            ensureKindCentroidsLocked()
+            let top = Array(hits.prefix(Swift.max(1, k)))
+            out.topScore = top[0].score
+            // The kind of the page, not of one hit: a mixed page is judged against the kind that
+            // won it, which is the modality the query actually reached.
+            var counts: [String: Int] = [:]
+            for h in top { counts[h.kind, default: 0] += 1 }
+            out.kind = counts.max(by: { $0.value < $1.value })?.key ?? top[0].kind
+            guard let c = kindCentroid[out.kind], c.count == dim else { return out }
+            var base: Float = 0
+            for i in 0 ..< dim { base += query[i] * c[i] }
+            out.baseline = base
+            let scores = top.map { Double($0.score) }
+            let mean = scores.reduce(0, +) / Double(scores.count)
+            out.wig = Float(mean) - base
+            let varc = scores.reduce(0.0) { $0 + ($1 - mean) * ($1 - mean) } / Double(scores.count)
+            // NQC divides the dispersion by the baseline, which is what makes it a ratio rather
+            // than a score difference and therefore comparable across queries and kinds.
+            out.nqc = base > 1e-6 ? Float(varc.squareRoot()) / base : 0
+            return out
+        }
+    }
+
     // MARK: - Modality score profile
 
     /// How the score scale differs BY KIND on this index. This is the instrument that produced
