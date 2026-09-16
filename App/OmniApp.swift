@@ -72,7 +72,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Runs in `applicationWillFinishLaunching`, before the store is opened, so the redundant
     /// process exits without ever touching the index.
     func applicationWillFinishLaunching(_ notification: Notification) {
-        guard UserDefaults.standard.string(forKey: "omni.dbDir")?.isEmpty ?? true,
+        // The ARGUMENT domain, for the same reason as AppModel.isolatedByLaunchArgument: reading
+        // the key itself meant a user who moved their index in Settings lost the single-instance
+        // guard too, so two copies could fight over the one index it is here to protect.
+        guard !AppModel.isolatedByLaunchArgument,
               let id = Bundle.main.bundleIdentifier else { return }
         let mine = ProcessInfo.processInfo.processIdentifier
         let others = NSRunningApplication.runningApplications(withBundleIdentifier: id)

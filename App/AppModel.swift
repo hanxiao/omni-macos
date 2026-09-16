@@ -3767,12 +3767,22 @@ final class AppModel {
     /// `-omni.dbDir` means the caller brought its own index, and `-omni.roots` seeds the folders
     /// from the ARGUMENT domain - which is read-only and never written back. Persisting was not:
     /// recomputeRoots saved those scratch paths straight into the real `io.hanxiao.omni` domain and
-    /// overwrote the real folder list, which is exactly what happened here. The same shape as the
-    /// search-history leak, one key later, and the same fix: an isolated session reads settings and
-    /// writes none.
-    private var isIsolatedRun: Bool {
-        !(UserDefaults.standard.string(forKey: "omni.dbDir")?.isEmpty ?? true)
+    /// overwrote the real folder list. The same shape as the search-history leak, one key later,
+    /// and the same fix: an isolated session reads settings and writes none.
+    ///
+    /// THE ARGUMENT DOMAIN, NOT THE KEY. This asked whether `omni.dbDir` was SET, and Settings >
+    /// Storage writes that exact key to the persistent domain when the user moves their index. So
+    /// moving the index turned every session that followed into an "isolated run" permanently:
+    /// saveAddedFolders and saveRoots became no-ops, every folder added after that was forgotten
+    /// on quit, and the user re-added them at every launch. That is issue #21, and it is why the
+    /// reporter's own account pairs "I moved my location for the index" with "adding 30-40 folders
+    /// every time you start". A launch argument lands in NSArgumentDomain and a setting does not,
+    /// which is the difference the check has to read.
+    static var isolatedByLaunchArgument: Bool {
+        let args = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
+        return !((args["omni.dbDir"] as? String)?.isEmpty ?? true)
     }
+    private var isIsolatedRun: Bool { Self.isolatedByLaunchArgument }
 
     private func saveAddedFolders() {
         guard !isIsolatedRun else { return }
