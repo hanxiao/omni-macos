@@ -1989,7 +1989,9 @@ public final class VectorStore: @unchecked Sendable {
 
     private var closed = false
     private var snippetStmt: OpaquePointer?   // cached SELECT reused by fillSnippetsLocked (F3)
-    private var dedupStmt: OpaquePointer?     // cached SELECT reused by duplicateChunks (F8)
+    private var dedupStmt: OpaquePointer?
+    private var contentSelStmt: OpaquePointer?
+    private var slotUpdStmt: OpaquePointer?     // cached SELECT reused by duplicateChunks (F8)
     private var bytesWrittenSinceCkpt = 0     // in-process WAL-growth estimate, gates the per-write stat (F17)
     private var ckptCounterSeeded = false
 
@@ -2062,7 +2064,7 @@ public final class VectorStore: @unchecked Sendable {
                 rollbackTxnLocked()
                 throw OmniError.store("file id failed")
             }
-            guard writeChunksLocked(fileID: fid, chunks: chunks, bfs: bfs, w: w) else {
+            guard let chunkIDs = writeChunksLocked(fileID: fid, chunks: chunks, bfs: bfs, w: w) else {
                 rollbackTxnLocked()
                 throw OmniError.store("insert step failed")
             }
@@ -2072,14 +2074,10 @@ public final class VectorStore: @unchecked Sendable {
             // (the dominant indexing case) there is nothing to remove, so skip the O(N) scan and
             // just append. `append` grows flat16/rows geometrically (amortized O(1)).
             if presentPaths.contains(path) { removeRowsByPathsLocked([path], victims: victims) }
-            for (i, c) in chunks.enumerated() {
-                rows.append(Row(path: canonicalPath(c.path), kind: canonicalKind(c.kind), chunkIndex: c.chunkIndex, modified: c.modified,
-                                size: c.size, width: c.width, height: c.height, duration: c.duration))
-                flat16.append(contentsOf: bfs[i])
-                let fid = internPath(c.path)
-                appendRowMetaLocked(fid, kindCode: internKind(c.kind), kind: c.kind, path: c.path,
-                                    slot: lastAppendedSlot)
-            }
+            // AFTER the removal, never before: the removal can compact, and a slot decided against
+            // the pre-removal numbering would name a different content by the time it is used.
+            let assigned = appendChunksLocked(chunks, bfs: bfs)
+            persistSlotsLocked(ids: chunkIDs, slots: assigned)
             presentPaths.insert(path)
             rowWindowAuditLocked("replace")
             // No invalidateBase(): a new path's rows append past baseRows and are scored as delta.
@@ -2148,6 +2146,7 @@ public final class VectorStore: @unchecked Sendable {
                 throw OmniError.store("prepare insert failed")
             }
             defer { w.finalize() }
+            var chunkIDsByWork: [Int: [Int64]] = [:]
             for (wi, it) in work.enumerated() {
                 guard let first = it.chunks.first,
                       let fid = upsertFileLocked(path: it.path, from: first, indexedAt: now, w: w) else {
@@ -2155,10 +2154,11 @@ public final class VectorStore: @unchecked Sendable {
                     throw OmniError.store("file id failed")
                 }
                 deleteChunksOfFileLocked(fid)
-                guard writeChunksLocked(fileID: fid, chunks: it.chunks, bfs: bfs[wi], w: w) else {
+                guard let ids = writeChunksLocked(fileID: fid, chunks: it.chunks, bfs: bfs[wi], w: w) else {
                     rollbackTxnLocked()
                     throw OmniError.store("insert step failed")
                 }
+                chunkIDsByWork[wi] = ids
             }
             bumpGenLocked()
             exec("COMMIT;")
@@ -2168,14 +2168,8 @@ public final class VectorStore: @unchecked Sendable {
                 removeRowsByPathsLocked(affected, victims: victims)   // one rebuild for the whole batch
             }
             for (wi, it) in work.enumerated() {
-                for (ci, c) in it.chunks.enumerated() {
-                    rows.append(Row(path: canonicalPath(c.path), kind: canonicalKind(c.kind), chunkIndex: c.chunkIndex, modified: c.modified,
-                                    size: c.size, width: c.width, height: c.height, duration: c.duration))
-                    flat16.append(contentsOf: bfs[wi][ci])
-                    let fid = internPath(c.path)
-                    appendRowMetaLocked(fid, kindCode: internKind(c.kind), kind: c.kind, path: c.path,
-                                    slot: lastAppendedSlot)
-                }
+                let assigned = appendChunksLocked(it.chunks, bfs: bfs[wi])
+                if let ids = chunkIDsByWork[wi] { persistSlotsLocked(ids: ids, slots: assigned) }
                 presentPaths.insert(it.path)
             }
             rowWindowAuditLocked("replaceMany")
@@ -4267,7 +4261,10 @@ public final class VectorStore: @unchecked Sendable {
             if baseDirty || (mlxBase == nil && quantBase == nil && bitBase == nil) || (n - baseRows) > Self.foldThreshold { rebuildBaseLocked(rowCount: n) }
             // A rebuild can flip the base to quant mode (mlxBase stays nil); the fused GPU path no
             // longer applies, so fall back to the classic quant-capable path after the lock.
-            guard let base = mlxBase, let fid = mlxFileID else { needClassic = true; return nil }
+            // Through the BUILDER, not the stored array: the cached copy can be sized to a
+            // different occurrence prefix than the one the reduce is about to gather, and the two
+            // only have to disagree once for the scatter to be handed mismatched shapes.
+            guard let base = mlxBase, let fid = fileIDGPULocked() else { needClassic = true; return nil }
             let qv = queryGraph.reshaped([dim, 1]).asType(.bfloat16)
             // NOT maskDeadLocked: that masks the per-CONTENT vector, and a tombstone is a
             // property of a ROW. reduceTopKGPULocked masks dead occurrences after the gather.
@@ -4596,7 +4593,9 @@ public final class VectorStore: @unchecked Sendable {
                 // foldThreshold) are scored and merged on the host. A kind-only filter rides this
                 // path too (masked per-row on the GPU via mlxKindCode); folder/ext/since filters
                 // still fall to the host reducer below.
-                if onlyKindFiltered(filter), Self.gpuReduce, let fid = mlxFileID, baseRows > 0,
+                // Through the builder, for the same reason as the fused path above: the stored
+                // array can be sized to a different occurrence prefix than the reduce will gather.
+                if onlyKindFiltered(filter), Self.gpuReduce, let fid = fileIDGPULocked(), baseRows > 0,
                    filter.kinds.isEmpty || mlxKindCode != nil {
                     var deltaGraph: MLXArray? = nil
                     if n > baseRows {
@@ -9827,15 +9826,22 @@ public final class VectorStore: @unchecked Sendable {
     /// One file's chunks, in the order given - which becomes their id order, and therefore their
     /// slot order in the vector file. `bfs` are the same vectors the caller is about to append to
     /// the resident buffer, so the two copies cannot disagree.
-    func writeChunksLocked(fileID fid: Int64, chunks: [IndexedChunk], bfs: [[UInt16]], w: ChunkInsert) -> Bool {
+    /// Returns the chunk row ids, in order, so the caller can write each one's slot once it is
+    /// known. The slot cannot be decided here: it depends on which contents are still live AFTER
+    /// the in-memory removal that runs past the commit, and deciding it early is how a persisted
+    /// slot ends up naming another content's vector.
+    func writeChunksLocked(fileID fid: Int64, chunks: [IndexedChunk], bfs: [[UInt16]], w: ChunkInsert) -> [Int64]? {
+        var ids: [Int64] = []
+        ids.reserveCapacity(chunks.count)
         for (i, c) in chunks.enumerated() {
             let kc = Int32(kindCodeLocked(c.kind))
             sqlite3_reset(w.chunk)
             sqlite3_bind_int64(w.chunk, 1, fid)
             sqlite3_bind_int(w.chunk, 2, Int32(c.chunkIndex))
             sqlite3_bind_int(w.chunk, 3, kc)
-            guard sqlite3_step(w.chunk) == SQLITE_DONE else { return false }
+            guard sqlite3_step(w.chunk) == SQLITE_DONE else { return nil }
             let cid = sqlite3_last_insert_rowid(db)
+            ids.append(cid)
 
             sqlite3_reset(w.text)
             sqlite3_bind_int64(w.text, 1, cid)
@@ -9845,16 +9851,104 @@ public final class VectorStore: @unchecked Sendable {
             sqlite3_bind_text(w.text, 5, c.locator, -1, SQLITE_TRANSIENT)
             let key = StoreSchema.hexToBytes(c.chunkKey)
             key.withUnsafeBytes { _ = sqlite3_bind_blob(w.text, 6, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT) }
-            guard sqlite3_step(w.text) == SQLITE_DONE else { return false }
+            guard sqlite3_step(w.text) == SQLITE_DONE else { return nil }
 
             sqlite3_reset(w.vec)
             sqlite3_bind_int64(w.vec, 1, cid)
             bfs[i].withUnsafeBytes { _ = sqlite3_bind_blob(w.vec, 2, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT) }
-            guard sqlite3_step(w.vec) == SQLITE_DONE else { return false }
+            guard sqlite3_step(w.vec) == SQLITE_DONE else { return nil }
 
             bytesWrittenSinceCkpt += c.embedding.count * 2 + c.snippet.utf8.count + 160   // WAL-growth estimate (F17)
         }
-        return true
+        return ids
+    }
+
+    /// Does the store already hold a vector for this content, and where? The lookup v4 could not
+    /// make: it stored the key on every row and indexed none of them. `slot >= 0` excludes rows
+    /// written before content addressing, whose slot is still derived from their position.
+    func liveSlotForContentLocked(_ key: Data) -> Int32? {
+        guard !key.isEmpty, dbOpen() else { return nil }
+        if contentSelStmt == nil {
+            _ = sqlite3_prepare_v2(db, """
+                SELECT c.slot FROM chunk_text t JOIN chunks c ON c.id = t.chunk_id
+                 WHERE t.chunk_key = ? AND c.slot >= 0 LIMIT 1;
+                """, -1, &contentSelStmt, nil)
+        }
+        guard let st = contentSelStmt else { return nil }
+        sqlite3_reset(st)
+        let found: Int32? = key.withUnsafeBytes { raw -> Int32? in
+            sqlite3_bind_blob(st, 1, raw.baseAddress, Int32(raw.count), SQLITE_TRANSIENT)
+            guard sqlite3_step(st) == SQLITE_ROW else { return nil }
+            return sqlite3_column_int(st, 0)
+        }
+        // A slot the in-memory side does not have is not usable, whatever SQLite says.
+        guard let f = found, f >= 0, Int(f) < slotCount else { return nil }
+        return f
+    }
+
+    /// Write the slots decided at append time back onto the rows that were just inserted.
+    func persistSlotsLocked(ids: [Int64], slots: [Int32]) {
+        // Only while sharing is on. A STORED slot is a promise that survives a reload, and every
+        // operation that moves a slot afterwards - hole reclaim, compaction - has to keep that
+        // promise by writing the new numbering back. Until they do, storing it makes a reloaded
+        // index name the wrong content: 800 failures, none of them about sharing. With the flag
+        // off the column stays -1 and the loader derives it exactly as it always has.
+        guard Self.contentSharing else { return }
+        guard ids.count == slots.count, !ids.isEmpty, dbOpen() else { return }
+        if slotUpdStmt == nil {
+            _ = sqlite3_prepare_v2(db, "UPDATE chunks SET slot = ? WHERE id = ?;", -1, &slotUpdStmt, nil)
+        }
+        guard let st = slotUpdStmt else { return }
+        for (i, cid) in ids.enumerated() {
+            sqlite3_reset(st)
+            sqlite3_bind_int(st, 1, slots[i])
+            sqlite3_bind_int64(st, 2, cid)
+            _ = sqlite3_step(st)
+        }
+    }
+
+    /// Assign a slot to every chunk about to be appended, appending a vector ONLY for a content the
+    /// store does not already hold, and append the rows. One content, one vector - which is the
+    /// whole point, and the only place it actually happens.
+    /// OFF BY DEFAULT, and the switch is the honest part of this change.
+    ///
+    /// The machinery below is complete and tested - two files holding one passage share a vector,
+    /// survive a reload, and survive each other's deletion. What is NOT yet done is everything
+    /// downstream that still assumes one vector per row: hole reclaim walks slots as if they were
+    /// rows, chunk-reuse eviction counts them the same way, and compaction renumbers contents
+    /// without writing the remap back to SQLite - so a compacted index reloads with every stored
+    /// slot naming the wrong content. Turning sharing on produced 801 failures across those three,
+    /// which is the list of what is left rather than a reason to hide it.
+    ///
+    /// A flag, not a half-finished write path: with it off the store behaves exactly as it did,
+    /// and ContentSharingTests turns it on to prove the machinery works.
+    nonisolated(unsafe) static var contentSharing =
+        ProcessInfo.processInfo.environment["OMNI_CONTENT_SHARING"] == "1"
+
+    func appendChunksLocked(_ chunks: [IndexedChunk], bfs: [[UInt16]]) -> [Int32] {
+        var assigned: [Int32] = []
+        assigned.reserveCapacity(chunks.count)
+        var batch: [Data: Int32] = [:]   // contents first seen in THIS call: not yet in SQLite
+        for (i, c) in chunks.enumerated() {
+            let key = Self.contentSharing ? StoreSchema.hexToBytes(c.chunkKey) : Data()
+            var slot: Int32 = -1
+            if !key.isEmpty {
+                if let s = batch[key] { slot = s }
+                else if let s = liveSlotForContentLocked(key) { slot = s }
+            }
+            if slot < 0 {
+                flat16.append(contentsOf: bfs[i])
+                slot = lastAppendedSlot
+                if !key.isEmpty { batch[key] = slot }
+            }
+            assigned.append(slot)
+            rows.append(Row(path: canonicalPath(c.path), kind: canonicalKind(c.kind),
+                            chunkIndex: c.chunkIndex, modified: c.modified, size: c.size,
+                            width: c.width, height: c.height, duration: c.duration, slot: slot))
+            appendRowMetaLocked(internPath(c.path), kindCode: internKind(c.kind),
+                                kind: c.kind, path: c.path, slot: slot)
+        }
+        return assigned
     }
 
     /// The file row, created or refreshed. THIS is where the watcher's common case got cheap: a
