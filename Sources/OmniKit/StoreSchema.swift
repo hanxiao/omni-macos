@@ -161,7 +161,8 @@ enum StoreSchema {
                 id INTEGER PRIMARY KEY,
                 file_id INTEGER NOT NULL,
                 chunk_index INTEGER NOT NULL,
-                kind INTEGER NOT NULL DEFAULT 0
+                kind INTEGER NOT NULL DEFAULT 0,
+                slot INTEGER NOT NULL DEFAULT -1
             );
             """,
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_chunk_file ON \(chunks)(file_id, chunk_index);",
@@ -183,6 +184,11 @@ enum StoreSchema {
             CREATE INDEX IF NOT EXISTS idx_chunk_label ON \(text)(kind, snippet, file_id)
             WHERE kind IN (\(mediaKindCodes.map(String.init).joined(separator: ",")));
             """,
+            // CONTENT -> ROW. Partial, so it costs nothing for rows with no key (media, and
+            // anything written before keys existed). Without it, "does this content already exist"
+            // is a scan of every chunk in the index - which is why v4 stored the key on all 9.13M
+            // rows, indexed none of them, and re-embedded every duplicate it already had.
+            "CREATE INDEX IF NOT EXISTS idx_chunk_content ON \(text)(chunk_key) WHERE length(chunk_key) > 0;",
             // WHERE A VECTOR LIVES UNTIL THE FILE OWNS IT.
             //
             // A freshly written vector has to be durable in SQLite until `.vecs` has been msync'd

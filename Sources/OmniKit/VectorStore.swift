@@ -1794,6 +1794,10 @@ public final class VectorStore: @unchecked Sendable {
         }
         if layoutLocked() == .v4 {
             for sql in StoreSchema.createStatements() { exec(sql) }
+            // Every v4 database written before content addressing predates this column. Additive
+            // and free; `backfillSlotsLocked` then gives each row the slot its vector already
+            // occupies, after which the rank-through-holes walk is never needed again.
+            addColumnIfMissing("slot", "INTEGER NOT NULL DEFAULT -1")
         } else {
             createLegacySchemaLocked()
         }
@@ -6533,10 +6537,19 @@ public final class VectorStore: @unchecked Sendable {
                             width: Int(sqlite3_column_int(stmt, 6)), height: Int(sqlite3_column_int(stmt, 7)),
                             duration: sqlite3_column_double(stmt, 8)))
             let fid = internPath(path)
-            // The slot this loader has already walked to, holes included. Deriving it again from
-            // the row's position would undo the hole skipping this whole loop exists to do.
+            // The STORED slot when the row has one; the walked slot otherwise. A stored slot is
+            // the only way two rows can name the same vector, and -1 means the row predates
+            // content addressing - for which the walk is still the right answer, and is exactly
+            // what the backfill writes, so the two can never disagree.
+            // sqlite3_column_int RETURNS 0 FOR NULL, and 0 is a perfectly valid slot. A row whose
+            // `slot` is NULL - what an index carrying a half-finished conversion hands back - would
+            // therefore claim slot 0, and EVERY row would read vector 0. Ask the column's TYPE, not
+            // its value. The v4 migration suite said so: 1124 assertions, all "this vector is not
+            // mine".
+            let hasSlot = sqlite3_column_type(stmt, 10) == SQLITE_INTEGER
+            let storedSlot = hasSlot ? Int32(sqlite3_column_int(stmt, 10)) : Int32(-1)
             appendRowMetaLocked(fid, kindCode: internKind(kind), kind: kind, path: path,
-                                slot: Int32(slot))
+                                slot: storedSlot >= 0 ? storedSlot : Int32(slot))
             presentPaths.insert(path)
             slot += 1
         }
@@ -9540,7 +9553,7 @@ public final class VectorStore: @unchecked Sendable {
                 SELECT \(StoreSchema.pathExpr), c.kind, c.chunk_index,
                        COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'dim'),
                                 length(p.vec) / 2), p.vec,
-                       f.modified, f.width, f.height, f.duration, f.size
+                       f.modified, f.width, f.height, f.duration, f.size, c.slot
                   FROM chunks c
                   JOIN files f ON f.id = c.file_id
                   JOIN dirs  d ON d.id = f.dir_id
