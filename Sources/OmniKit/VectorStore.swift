@@ -2172,11 +2172,17 @@ public final class VectorStore: @unchecked Sendable {
             if affected.contains(where: { presentPaths.contains($0) }) {
                 removeRowsByPathsLocked(affected, victims: victims)   // one rebuild for the whole batch
             }
+            // Accumulated across the WHOLE batch and written once. Per file it was one transaction
+            // each - 2000 of them for the store benchmark - and that, not the lookup, is what made
+            // the write path 4x slower: 5787 -> 1636 files/s.
+            var allIDs: [Int64] = []
+            var allSlots: [Int32] = []
             for (wi, it) in work.enumerated() {
                 let assigned = appendChunksLocked(it.chunks, bfs: bfs[wi], ids: chunkIDsByWork[wi] ?? [])
-                if let ids = chunkIDsByWork[wi] { persistSlotsLocked(ids: ids, slots: assigned) }
+                if let ids = chunkIDsByWork[wi] { allIDs += ids; allSlots += assigned }
                 presentPaths.insert(it.path)
             }
+            persistSlotsLocked(ids: allIDs, slots: allSlots)
             rowWindowAuditLocked("replaceMany")
             // No invalidateBase(): appended rows are scored as delta. Any pre-existing path in the
             // batch already triggered removeRowsLocked above, which invalidates the base.
@@ -9888,12 +9894,17 @@ public final class VectorStore: @unchecked Sendable {
     /// Does the store already hold a vector for this content, and where? The lookup v4 could not
     /// make: it stored the key on every row and indexed none of them. `slot >= 0` excludes rows
     /// written before content addressing, whose slot is still derived from their position.
+    /// `length(t.chunk_key) > 0` IS LOAD-BEARING, not defensive. idx_chunk_content is a PARTIAL
+    /// index with exactly that predicate, and SQLite will not use a partial index unless the query
+    /// implies its WHERE clause - equality on the column is not enough. Without the term the plan
+    /// is `SCAN t`, a full pass over chunk_text per lookup, and the write path runs 4x slower:
+    /// 5787 -> 1659 files/s on the store benchmark. With it, `SEARCH t USING COVERING INDEX`.
     func liveSlotForContentLocked(_ key: Data) -> Int32? {
         guard !key.isEmpty, dbOpen() else { return nil }
         if contentSelStmt == nil {
             _ = sqlite3_prepare_v2(db, """
                 SELECT c.slot FROM chunk_text t JOIN chunks c ON c.id = t.chunk_id
-                 WHERE t.chunk_key = ? AND c.slot >= 0 LIMIT 1;
+                 WHERE t.chunk_key = ? AND length(t.chunk_key) > 0 AND c.slot >= 0 LIMIT 1;
                 """, -1, &contentSelStmt, nil)
         }
         guard let st = contentSelStmt else { return nil }
@@ -9944,12 +9955,18 @@ public final class VectorStore: @unchecked Sendable {
             _ = sqlite3_prepare_v2(db, "UPDATE chunks SET slot = ? WHERE id = ?;", -1, &slotUpdStmt, nil)
         }
         guard let st = slotUpdStmt else { return }
+        // ONE TRANSACTION. This runs past the write's COMMIT, so without it every UPDATE is its own
+        // implicit transaction and pays a WAL write each. Measured on the store-write benchmark:
+        // 2000 files went 5787 -> 1442 files/s, a 4x regression, entirely from this.
+        let inTxn = sqlite3_get_autocommit(db) == 0
+        if !inTxn { exec("BEGIN IMMEDIATE;") }
         for (i, cid) in ids.enumerated() {
             sqlite3_reset(st)
             sqlite3_bind_int(st, 1, slots[i])
             sqlite3_bind_int64(st, 2, cid)
             _ = sqlite3_step(st)
         }
+        if !inTxn { exec("COMMIT;") }
     }
 
     /// Assign a slot to every chunk about to be appended, appending a vector ONLY for a content the
