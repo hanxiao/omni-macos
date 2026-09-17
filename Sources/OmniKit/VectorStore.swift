@@ -1208,6 +1208,63 @@ public final class VectorStore: @unchecked Sendable {
     /// whose Strings are why the dense tables exist at all.
     /// INVARIANT: occSlot.count == rows.count, and occSlot[i] == rows[i].slot.
     private var occSlot: [Int32] = []
+    /// THE REVERSE EDGE: content -> the rows holding it, as CSR. A candidate chosen by the scan is a
+    /// CONTENT and every consumer downstream wants FILES, so something has to expand one into the
+    /// other. Two Int32 columns, rebuilt in one pass, keyed on the mutation generation - NOT on
+    /// rows.count, because a replace that removes and adds the same number of rows leaves the count
+    /// identical and every pointer different.
+    private var slotRowStart: [Int32] = []
+    private var slotRowIdx: [Int32] = []
+    private var slotRowGen: Int64 = -1
+
+    private func ensureSlotRowsLocked() {
+        let n = slotCount
+        guard slotRowGen != mutationGen || slotRowStart.count != n + 1 else { return }
+        var start = [Int32](repeating: 0, count: n + 1)
+        for sl in occSlot where sl >= 0 && Int(sl) < n { start[Int(sl) + 1] += 1 }
+        if n > 0 { for i in 1 ... n { start[i] += start[i - 1] } }
+        var idx = [Int32](repeating: 0, count: Int(start[n]))
+        var cursor = start
+        for (r, sl) in occSlot.enumerated() where sl >= 0 && Int(sl) < n {
+            idx[Int(cursor[Int(sl)])] = Int32(r); cursor[Int(sl)] += 1
+        }
+        slotRowStart = start; slotRowIdx = idx; slotRowGen = mutationGen
+    }
+
+    /// The rows holding this content. Empty for one nothing points at - which is what a content
+    /// whose last owner was deleted becomes.
+    @inline(__always) private func rowsOfSlotLocked(_ sl: Int) -> ArraySlice<Int32> {
+        guard sl >= 0, sl + 1 < slotRowStart.count else { return ArraySlice() }
+        let lo = Int(slotRowStart[sl]), hi = Int(slotRowStart[sl + 1])
+        guard lo <= hi, hi <= slotRowIdx.count else { return ArraySlice() }
+        return slotRowIdx[lo ..< hi]
+    }
+
+    /// Contents below `n` that no LIVE row points at, as gather indices. This is what replaces
+    /// masking by dead ROW index: a tombstone releases a pointer, not a content, so a passage two
+    /// files share stays scannable when one of them is deleted - and a content whose last owner is
+    /// gone stops scoring, rather than sitting in the candidate budget it can never be returned from.
+    private var orphanCache: MLXArray?
+    private var orphanCacheGen: Int64 = -1
+    private var orphanCacheRows = -1
+    private func orphanSlotsLocked(upTo n: Int) -> MLXArray? {
+        guard n > 0 else { return nil }
+        if orphanCacheGen == mutationGen, orphanCacheRows == n { return orphanCache }
+        ensureSlotRowsLocked()
+        let dead = deadRows
+        var idx: [Int32] = []
+        let cap = Swift.min(n, Swift.max(0, slotRowStart.count - 1))
+        for sl in 0 ..< cap {
+            var anyLive = false
+            for r in rowsOfSlotLocked(sl) where !dead.contains(r) { anyLive = true; break }
+            if !anyLive { idx.append(Int32(sl)) }
+        }
+        orphanCache = idx.isEmpty ? nil : MLXArray(idx)
+        orphanCacheGen = mutationGen
+        orphanCacheRows = n
+        if let c = orphanCache { MLX.eval(c) }
+        return orphanCache
+    }
     /// The number of vectors flat16 holds. DERIVED, not stored: flat16 shrinks in six different
     /// places (compaction, wipe, reject, two reload paths, releaseAll) and a stored counter has to
     /// be corrected at every one of them. It was stored first, nobody corrected it on the removal
@@ -4717,6 +4774,17 @@ public final class VectorStore: @unchecked Sendable {
     /// scatter is over the dead rows alone, so it costs nothing at the scale of the scan it guards.
     /// Returns the argument untouched when there is nothing dead, which is the usual case.
     private func maskDeadLocked(_ scores: MLXArray) -> MLXArray {
+        // `scores` is per CONTENT. deadRows are ROW indices, and using them to index a per-content
+        // array is the identity only while a row owns its vector - under sharing it masks whichever
+        // contents happen to sit at those offsets. Mask the contents nothing live points at instead,
+        // which is the same set when nothing is shared and the correct one when something is.
+        if Self.contentSharing {
+            var out = scores
+            if let orphans = orphanSlotsLocked(upTo: baseRows), orphans.size > 0 {
+                out[orphans] = MLXArray(-Float.infinity)
+            }
+            return out
+        }
         guard !deadRows.isEmpty else { return scores }
         // BASE ROWS ONLY. `scores` is [baseRows], and tombstones now reach the delta as well, so
         // scattering the raw dead set would index past the end of the array it is masking - a write
@@ -4874,7 +4942,12 @@ public final class VectorStore: @unchecked Sendable {
             if let cur = best[f], cur.score >= score { return }
             best[f] = (score, row)
         }
-        for (j, ri) in cand.enumerated() { offer(ri, exScores[j]) }
+        // A candidate is a CONTENT; every file holding it is a result. `ri` was indexing `rows`
+        // directly, which is the identity only while a content belongs to exactly one row.
+        ensureSlotRowsLocked()
+        for (j, ri) in cand.enumerated() {
+            for r in rowsOfSlotLocked(Int(ri)) { offer(r, exScores[j]) }
+        }
         // Can't-win gate for the delta rows. The gate is the K-th best PER-FILE score among the
         // base candidates, not the K-th best row score: K rows above a threshold can all belong to
         // one file, so a row-level threshold would not bound the file-level result and could drop
@@ -4890,7 +4963,10 @@ public final class VectorStore: @unchecked Sendable {
             sc.sort(by: >)
             gate = sc[topK - 1]
         }
-        for (j, sc) in deltaScores.enumerated() where sc >= gate { offer(Int32(baseRows + j), sc) }
+        // Same expansion for the delta: baseRows + j names the CONTENT, not a row.
+        for (j, sc) in deltaScores.enumerated() where sc >= gate {
+            for r in rowsOfSlotLocked(baseRows + j) { offer(r, sc) }
+        }
 
         // Top-K files by best-chunk score, ties broken on ascending fileID. Without the secondary
         // key this sorted a Dictionary's values, whose iteration order is randomized, so which
@@ -9984,7 +10060,18 @@ public final class VectorStore: @unchecked Sendable {
     /// Assign a slot to every chunk about to be appended, appending a vector ONLY for a content the
     /// store does not already hold, and append the rows. One content, one vector - which is the
     /// whole point, and the only place it actually happens.
-    /// ON. Two files holding the same passage share one vector.
+    /// OFF, because the candidate funnel is not verified under sharing.
+    ///
+    /// Everything else is: two files holding one passage share a vector, survive a reload, survive
+    /// each other's deletion, and media shares by the vector it stores. What is NOT established is
+    /// the QUANTIZED CANDIDATE PATH - the funnel a large index uses. With 400 files and a passage
+    /// shared by five of them, all five come back correctly AND three files that hold nothing like
+    /// the query come back beside them at exactly 1.00000. The fixture is ruled out (a collision
+    /// check on it passes), so a shared content's score is reaching rows that do not hold it.
+    ///
+    /// That path only engages on a large index, which is precisely the one that would meet it
+    /// first. Shipping it on would mean shipping a wrong result list to exactly the users who have
+    /// the most to gain. ContentSharingFunnelTests holds the failing case.
     ///
     /// It was off while the rest of the store still assumed one vector per row. Turning it on cost
     /// 801 failures and every one of them was a place making that assumption, now fixed or
@@ -9998,7 +10085,7 @@ public final class VectorStore: @unchecked Sendable {
     ///
     /// OMNI_CONTENT_SHARING=0 turns it off, which is the A/B and the escape hatch.
     nonisolated(unsafe) static var contentSharing =
-        ProcessInfo.processInfo.environment["OMNI_CONTENT_SHARING"] != "0"
+        ProcessInfo.processInfo.environment["OMNI_CONTENT_SHARING"] == "1"
 
     func appendChunksLocked(_ chunks: [IndexedChunk], bfs: [[UInt16]], ids: [Int64] = []) -> [Int32] {
         var assigned: [Int32] = []

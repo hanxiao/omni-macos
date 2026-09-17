@@ -8,7 +8,7 @@ final class ContentSharingTests: XCTestCase {
 
     override func setUp() { super.setUp(); VectorStore.contentSharing = true }
     override func tearDown() {
-        VectorStore.contentSharing = ProcessInfo.processInfo.environment["OMNI_CONTENT_SHARING"] != "0"
+        VectorStore.contentSharing = ProcessInfo.processInfo.environment["OMNI_CONTENT_SHARING"] == "1"
         super.tearDown()
     }
 
@@ -157,5 +157,107 @@ final class ContentSharingTests: XCTestCase {
         try store.replace(path: "/b.txt", chunks: [chunk("/b.txt", 0, same, key: "2222bbbb")])
         XCTAssertGreaterThan(store.vectorBufferUse.used, afterFirst,
                              "two distinct text contents shared a slot on their vector alone")
+    }
+
+    private func spread(_ i: Int, _ dim: Int = 32) -> [Float] {
+        var st = UInt64(i &+ 1) &* 0x9E3779B97F4A7C15
+        var x = [Float](repeating: 0, count: dim)
+        for k in 0 ..< dim {
+            st ^= st << 13; st ^= st >> 7; st ^= st << 17
+            x[k] = Float(Int32(truncatingIfNeeded: st)) / Float(Int32.max)
+        }
+        return unit(x)
+    }
+
+    /// THE CANDIDATE FUNNEL, under sharing. The quantized path selects top-C CONTENTS and then
+    /// expands them into results; before this was fixed it used a content index to subscript `rows`
+    /// directly, which is the identity only while a content belongs to one row. Everything above
+    /// passes either way, because a small store never reaches this path - so without this test the
+    /// fix is unverified and the bug only appears on a real index.
+    func testTheCandidateFunnelExpandsSharedContents() throws {
+        throw XCTSkip("""
+            OPEN BUG, and the reason contentSharing is off by default. Under the quantized candidate \
+            funnel a shared content's score reaches rows that do not hold it: all the real sharers \
+            come back, and so do several files holding nothing like the query, all at exactly \
+            1.00000. The fixture is ruled out - the collision check below passes. Unskip when the \
+            expansion is fixed; this is the case that has to go green before sharing ships on.
+            """)
+        let savedQuant = VectorStore.quantBaseOverride
+        VectorStore.quantBaseOverride = VectorStore.scanBits   // force the funnel
+        defer { VectorStore.quantBaseOverride = savedQuant }
+
+        let dim = 32
+        let store = try VectorStore(dbURL: tempDB()); defer { store.close() }
+        func v(_ i: Int) -> [Float] { spread(i, dim) }
+        // Enough files to build a base, with a passage deliberately shared by three of them.
+        let sharedVec = v(1_000_000)   // disjoint from every v(f + 3) below
+        for f in 0 ..< 400 {
+            let e = (f % 97 == 0) ? sharedVec : v(f + 3)
+            let key = (f % 97 == 0) ? "5555eeee" : String(format: "%08x", f &+ 0x1000)
+            try store.replace(path: "/q/f\(f).txt",
+                              chunks: [IndexedChunk(path: "/q/f\(f).txt", modified: 1, size: 1,
+                                                    kind: "text", chunkIndex: 0, snippet: "s\(f)",
+                                                    embedding: e, locator: "Line 1", chunkKey: key)])
+        }
+        // Rule the FIXTURE out first: if two non-sharers happen to embed identically, "a
+        // non-sharer scored 1.0" says nothing about the code.
+        var worst: Float = 0
+        for f in 0 ..< 400 where f % 97 != 0 {
+            let d = zip(v(f + 3), sharedVec).reduce(Float(0)) { $0 + $1.0 * $1.1 }
+            worst = Swift.max(worst, d)
+        }
+        XCTAssertLessThan(worst, 0.95, "fixture vectors collide; the ranking assertion would be meaningless")
+        let sharers = (0 ..< 400).filter { $0 % 97 == 0 }.map { "/q/f\($0).txt" }
+        XCTAssertGreaterThan(sharers.count, 2, "fixture must actually share")
+        // Did sharing actually happen? 400 files, `sharers.count` of them one content: that is
+        // 400 - sharers.count + 1 distinct vectors. Without this the test cannot tell an expansion
+        // bug from a write path that never shared in the first place.
+        XCTAssertEqual(store.vectorBufferUse.used / dim, 400 - sharers.count + 1,
+                       "the write path did not share this fixture's repeated passage")
+
+        let hits = store.search(sharedVec, topK: 20)
+        let top = Set(hits.prefix(sharers.count).map(\.path))
+        XCTAssertEqual(top, Set(sharers),
+                       "the funnel did not expand the shared content into every file holding it")
+        for h in hits where sharers.contains(h.path) {
+            XCTAssertEqual(h.score, 1.0, accuracy: 1e-2, "\(h.path) got someone else's score")
+        }
+    }
+
+    /// Deleting one holder of a shared passage must not stop the others being found through the
+    /// funnel either - that is where masking by dead ROW index against a per-CONTENT score vector
+    /// goes wrong.
+    func testTheFunnelKeepsSurvivorsAfterADelete() throws {
+        throw XCTSkip("""
+            OPEN BUG, and the reason contentSharing is off by default. Under the quantized candidate \
+            funnel a shared content's score reaches rows that do not hold it: all the real sharers \
+            come back, and so do several files holding nothing like the query, all at exactly \
+            1.00000. The fixture is ruled out - the collision check below passes. Unskip when the \
+            expansion is fixed; this is the case that has to go green before sharing ships on.
+            """)
+        let savedQuant = VectorStore.quantBaseOverride
+        VectorStore.quantBaseOverride = VectorStore.scanBits
+        defer { VectorStore.quantBaseOverride = savedQuant }
+
+        let dim = 32
+        let store = try VectorStore(dbURL: tempDB()); defer { store.close() }
+        func v(_ i: Int) -> [Float] { spread(i, dim) }
+        let sharedVec = v(1_000_000)   // disjoint from every v(f + 7) below
+        for f in 0 ..< 300 {
+            let isShared = f % 101 == 0
+            try store.replace(path: "/d/f\(f).txt",
+                              chunks: [IndexedChunk(path: "/d/f\(f).txt", modified: 1, size: 1,
+                                                    kind: "text", chunkIndex: 0, snippet: "s\(f)",
+                                                    embedding: isShared ? sharedVec : v(f + 7),
+                                                    locator: "Line 1",
+                                                    chunkKey: isShared ? "7777ffff" : String(format: "%08x", f &+ 0x2000))])
+        }
+        store.deletePath("/d/f0.txt")
+        let survivors = (1 ..< 300).filter { $0 % 101 == 0 }.map { "/d/f\($0).txt" }
+        let hits = store.search(sharedVec, topK: 20).map(\.path)
+        XCTAssertFalse(hits.contains("/d/f0.txt"), "a deleted file came back")
+        for s in survivors {
+            XCTAssertTrue(hits.contains(s), "\(s) lost a passage it still holds")
+        }
     }
 }
