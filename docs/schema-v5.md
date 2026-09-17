@@ -229,9 +229,10 @@ like a delivery list and three of those components deliver nothing yet:
                    CDC WOULD buy, not of what the app does. `ChunkKey.text` carries the cutter
                    fingerprint so the two generations can coexist when it does land.
   ChunkDiff        The reuse/embed/refcount plan for a partial reindex, as a model. Nothing calls
-                   it - but the effect it was written for now falls out of the content lookup: a
-                   file that changes is still re-chunked whole, and every chunk whose bytes did not
-                   move is answered from the index instead of the encoder.
+                   it, and it is not needed for the APPEND case: per-file `chunkVectors(path:)`
+                   reuse has answered that since v4, and measuring it with every chunk-level reuse
+                   path turned off still shows one embedding per edited file. What is missing is
+                   the INSERTION case, and that is the cutter's problem rather than the diff's.
   SlotAllocator    The free list. The reclaim is the v4 answer and now works under sharing, so a
                    released position waits for a whole-file copy rather than being handed to the
                    next new content.

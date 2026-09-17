@@ -1018,8 +1018,11 @@ public final class Indexer: @unchecked Sendable {
                         // without this it re-embeds every chunk while the identical edit made with
                         // the app running costs one forward. Gated on the file being already known:
                         // a cold index has nothing to reuse and should not pay a query per file.
-                        // Cross-file reuse is still declined - it measured 3.15% and would need a
-                        // global chunk_key index - so this stays path-scoped, one file at a time.
+                        // Path-scoped, one file at a time, and that is now the CHEAP half rather
+                        // than the whole story: the global `chunk_key` index exists, and whatever
+                        // this misses is caught by `vectorsForContentKeys` when the pending chunks
+                        // reach embedGroupsReusing. Keeping this first is still worth it - it
+                        // answers a whole file from one query instead of one per chunk.
                         let keys = pieces.map { self.chunkKey($0.text, settings: settings) }
                         let reuseOK = Self.chunkCache && !settings.forceFreshEmbed
                             && pieces.count > 1 && known[path] != nil

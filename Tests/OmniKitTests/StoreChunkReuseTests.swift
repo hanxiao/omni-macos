@@ -85,7 +85,11 @@ final class StoreChunkReuseTests: XCTestCase {
         var s = ""
         for p in 0 ..< 7 {
             s += "section \(p) of passage \(i): distributed search indexes, folders and embedding "
-            s += String(repeating: "vectors with enough words here to fill a realistic chunk \(p). ",
+            // The filler carries BOTH indices. With only `p` in it, every file's section p is the
+            // same text and the in-pass cache collapses them - at which point a reindex test
+            // reports one embedding per file whatever the store does, which is how the first
+            // version of the append test below passed with every reuse path turned off.
+            s += String(repeating: "vectors with enough words here to fill a realistic chunk \(p) of \(i). ",
                         count: 26)
             s += "\n\n"
         }
@@ -204,5 +208,51 @@ final class StoreChunkReuseTests: XCTestCase {
         }
         // Without this the loop above could compare nothing and pass.
         XCTAssertGreaterThanOrEqual(compared, n * 5, "almost no content was shared; the fixture is wrong")
+    }
+
+    /// PARTIAL REINDEX: append a line to a multi-chunk file and only the chunk that moved costs a
+    /// forward pass.
+    ///
+    /// A REGRESSION PIN, NOT A NEW CAPABILITY, and the distinction is worth stating because it is
+    /// easy to read this test as evidence for the content lookup. It is not: measured with every
+    /// chunk-level reuse path turned off, the second pass still embeds one chunk per file. The
+    /// per-file `chunkVectors(path:)` reuse has answered the append case since v4. What this pins
+    /// is that the new lookup does not break it.
+    ///
+    /// The append is at the END on purpose. The index cuts on a fixed grid, so an insertion in the
+    /// MIDDLE shifts every later boundary and those chunks are genuinely new content - which is
+    /// what the FastCDC cutter in ContentChunker exists to fix, and it is not wired yet. An append
+    /// leaves every earlier boundary byte-identical, and is also the most common real edit.
+    func testAppendingToAFileReEmbedsOnlyTheChunkThatMoved() throws {
+        let a = try corpus("a", 3); defer { try? FileManager.default.removeItem(at: a) }
+        let dbDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omni-storereuse-db-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dbDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dbDir) }
+        let store = try VectorStore(dbURL: dbDir.appendingPathComponent("index.sqlite"))
+        defer { store.close() }
+        let embedder = CountingEmbedder()
+
+        pass(store, embedder, a)
+        let chunksPerFile = store.count / 3
+        XCTAssertGreaterThanOrEqual(chunksPerFile, 4, "the fixture files are not multi-chunk enough")
+
+        for i in 0 ..< 3 {
+            let url = a.appendingPathComponent("a\(i).txt")
+            let old = try String(contentsOf: url, encoding: .utf8)
+            try (old + "\nand one more line appended to the end of file \(i).\n")
+                .write(to: url, atomically: true, encoding: .utf8)
+        }
+        embedder.reset()
+        pass(store, embedder, a)
+
+        // At most the tail chunk of each file, against the chunksPerFile it would cost to re-embed
+        // them whole. The bound is 2 per file, not 1: an append can spill into a new chunk as well
+        // as changing the last one.
+        XCTAssertLessThanOrEqual(embedder.embedded, 6,
+                                 "the append re-embedded \(embedder.embedded) chunks; only the tail moved")
+        XCTAssertGreaterThan(embedder.embedded, 0, "nothing was re-embedded, so the edit never landed")
+        XCTAssertLessThan(embedder.embedded, 3 * chunksPerFile,
+                          "the whole file was re-embedded")
     }
 }
