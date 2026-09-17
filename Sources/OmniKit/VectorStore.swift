@@ -4727,7 +4727,8 @@ public final class VectorStore: @unchecked Sendable {
             let t1 = Self.searchTiming ? Date() : nil
             let result = fillSnippetsLocked(Self.reduceTopK(scores: scores, fileID: fileID, occSlot: occSlot, fileCount: fileIDCount,
                                                             rows: rows, filter: filter, topK: topK,
-                                                            kindCode: kindCode, kindID: kindID))
+                                                            kindCode: kindCode, kindID: kindID,
+                                                            dead: deadRows))
             if let t0, let t1 {
                 print(String(format: "[search] n=%d score(matmul+readout)=%.1fms reduce=%.1fms",
                              n, t1.timeIntervalSince(t0) * 1000, -t1.timeIntervalSinceNow * 1000))
@@ -5037,7 +5038,9 @@ public final class VectorStore: @unchecked Sendable {
         }
         coarse.withUnsafeBufferPointer { sp in
             kindCode.withUnsafeBufferPointer { kc in
-                for i in 0 ..< baseRows {
+                // Rows, not contents: every filter below is a per-ROW fact. baseRows counts
+                // CONTENTS, and the two stopped being the same number once contents are shared.
+                for i in 0 ..< Swift.min(baseOccCount, Swift.min(rows.count, occSlot.count)) {
                     let sl = slotOf(i)
                     guard sl >= 0, sl < sp.count else { continue }
                     let sc = sp[sl]
@@ -5056,7 +5059,7 @@ public final class VectorStore: @unchecked Sendable {
         }
 
         var out = [Float](repeating: -.infinity, count: n)
-        for i in baseRows ..< n { out[i] = coarse[i] }   // delta rows: already exact
+        for i in baseRows ..< n { out[i] = coarse[i] }   // delta CONTENTS: already exact
         guard !hIdx.isEmpty else { return out }
 
         // Gather candidates' exact bf16 rows and rescore in one [C, dim] x [dim, 1] matmul.
@@ -5077,7 +5080,19 @@ public final class VectorStore: @unchecked Sendable {
         }
         MLX.eval(exact)
         let exScores = exact.reshaped([hIdx.count]).asType(.float32).asArray(Float.self)
-        for (j, ri) in hIdx.enumerated() { out[Int(ri)] = exScores[j] }
+        // BY SLOT, NOT BY ROW. `out` is handed to the reducer, which reads it as scores per
+        // CONTENT; hIdx holds ROW indices, because the selection loop above filters on per-row
+        // facts (kind, modified, the owning file's path). Writing a row's exact score at out[row]
+        // puts it on whichever CONTENT happens to sit at that offset.
+        //
+        // That is not theoretical. With a passage shared by rows 0, 97, 194, 291 and 388, each of
+        // them wrote 1.0 at its own row index - so out[194] became 1.0, and the unrelated file
+        // owning slot 194 came back as a perfect match. The symptom was several files holding
+        // nothing like the query scoring exactly 1.00000 beside the real sharers.
+        for (j, ri) in hIdx.enumerated() {
+            let sl = slotOf(Int(ri))
+            if sl >= 0, sl < out.count { out[sl] = exScores[j] }
+        }
         return out
     }
 
@@ -5661,11 +5676,18 @@ public final class VectorStore: @unchecked Sendable {
     /// `scores` is indexed by SLOT and everything else by ROW. Those were the same number until
     /// contents became shareable; `occSlot` is what bridges them, and it is required rather than
     /// defaulted precisely so a caller cannot silently get the old identity behaviour.
+    /// `dead` is the tombstone set, by ROW. It used to be applied by writing -inf into `scores`
+    /// before the call, which worked while a score belonged to one row. Scores are per CONTENT now,
+    /// and a tombstoned row can share a content that is still live in another file - so masking the
+    /// content would hide it from everyone, and not masking it let the deleted file come back.
+    /// Skipping the ROW is the only form of it that is correct both ways.
     static func reduceTopK(scores: [Float], fileID: [Int32], occSlot: [Int32], fileCount: Int,
                            rows: [Row], filter: SearchFilter, topK: Int,
-                           kindCode: [UInt8] = [], kindID: [String: UInt8] = [:]) -> [SearchHit] {
+                           kindCode: [UInt8] = [], kindID: [String: UInt8] = [:],
+                           dead: Set<Int32> = []) -> [SearchHit] {
         let n = rows.count
         guard n > 0, fileCount > 0, topK > 0, occSlot.count >= n, fileID.count >= n else { return [] }
+        let hasDeadRows = !dead.isEmpty
         let tA = searchTiming ? Date() : nil
         var bestScore = [Float](repeating: -.infinity, count: fileCount)
         var bestRow = [Int32](repeating: -1, count: fileCount)
@@ -5696,6 +5718,7 @@ public final class VectorStore: @unchecked Sendable {
                 kindCode.withUnsafeBufferPointer { kc in
                 kindAllowed.withUnsafeBufferPointer { ka in
                 for i in 0 ..< n {
+                    if hasDeadRows, dead.contains(Int32(i)) { continue }
                     let f = Int(fp[i])
                     rc[f] += 1
                     let sl = Int(os[i])
@@ -5712,6 +5735,7 @@ public final class VectorStore: @unchecked Sendable {
                 }}
             } else {
                 for i in 0 ..< n {
+                    if hasDeadRows, dead.contains(Int32(i)) { continue }
                     let f = Int(fp[i])
                     rc[f] += 1
                     let sl = Int(os[i])
@@ -10095,32 +10119,23 @@ public final class VectorStore: @unchecked Sendable {
     /// Assign a slot to every chunk about to be appended, appending a vector ONLY for a content the
     /// store does not already hold, and append the rows. One content, one vector - which is the
     /// whole point, and the only place it actually happens.
-    /// OFF, because the candidate funnel is not verified under sharing.
+    /// ON. Two files holding the same passage share one vector.
     ///
-    /// Everything else is: two files holding one passage share a vector, survive a reload, survive
-    /// each other's deletion, and media shares by the vector it stores. What is NOT established is
-    /// the QUANTIZED CANDIDATE PATH - the funnel a large index uses. With 400 files and a passage
-    /// shared by five of them, all five come back correctly AND three files that hold nothing like
-    /// the query come back beside them at exactly 1.00000. The fixture is ruled out (a collision
-    /// check on it passes), so a shared content's score is reaching rows that do not hold it.
+    /// The last thing standing between here and on was a wrong result list under the quantized
+    /// funnel, and it turned out to be one line: rerankLocked wrote each candidate's exact score at
+    /// out[ROW] into an array the reducer reads by CONTENT. With a passage shared by rows 0, 97,
+    /// 194, 291 and 388, each wrote 1.0 at its own row index, so out[194] became 1.0 and the
+    /// unrelated file owning slot 194 came back a perfect match.
     ///
-    /// That path only engages on a large index, which is precisely the one that would meet it
-    /// first. Shipping it on would mean shipping a wrong result list to exactly the users who have
-    /// the most to gain. ContentSharingFunnelTests holds the failing case.
-    ///
-    /// It was off while the rest of the store still assumed one vector per row. Turning it on cost
-    /// 801 failures and every one of them was a place making that assumption, now fixed or
-    /// deliberately declined:
-    ///   - compaction renumbers contents and writes the remap back (persistAllSlotsLocked)
-    ///   - chunkVectors checked flat16 against the ROW count, so it returned nothing at all under
-    ///     sharing, which reads downstream as "no chunk is reusable" and re-embeds the corpus
-    ///   - reclaimVectorHoles DECLINES, because it rebuilds the file as "the live rows in order".
-    ///     Holes accumulate instead, which is exactly what v4 does today (96,256 of them, never
-    ///     reclaimed); the free list is the answer and belongs with making that pass slot-aware.
+    /// Two more fell out of the same confusion: the rerank selection loop walked 0..<baseRows,
+    /// which counts CONTENTS, while filtering on per-ROW facts; and the reducer relied on dead rows
+    /// having been masked to -inf in a per-row score array, which cannot work once a tombstoned row
+    /// can share a content that is still live elsewhere - masking the content hides it from
+    /// everyone, not masking it lets the deleted file come back. It skips the ROW now.
     ///
     /// OMNI_CONTENT_SHARING=0 turns it off, which is the A/B and the escape hatch.
     nonisolated(unsafe) static var contentSharing =
-        ProcessInfo.processInfo.environment["OMNI_CONTENT_SHARING"] == "1"
+        ProcessInfo.processInfo.environment["OMNI_CONTENT_SHARING"] != "0"
 
     func appendChunksLocked(_ chunks: [IndexedChunk], bfs: [[UInt16]], ids: [Int64] = []) -> [Int32] {
         var assigned: [Int32] = []

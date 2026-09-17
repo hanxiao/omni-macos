@@ -8,7 +8,7 @@ final class ContentSharingTests: XCTestCase {
 
     override func setUp() { super.setUp(); VectorStore.contentSharing = true }
     override func tearDown() {
-        VectorStore.contentSharing = ProcessInfo.processInfo.environment["OMNI_CONTENT_SHARING"] == "1"
+        VectorStore.contentSharing = ProcessInfo.processInfo.environment["OMNI_CONTENT_SHARING"] != "0"
         super.tearDown()
     }
 
@@ -175,15 +175,6 @@ final class ContentSharingTests: XCTestCase {
     /// passes either way, because a small store never reaches this path - so without this test the
     /// fix is unverified and the bug only appears on a real index.
     func testTheCandidateFunnelExpandsSharedContents() throws {
-        throw XCTSkip("""
-            OPEN BUG, and the reason contentSharing is off by default. Localized, not guessed: the \
-            failing path is the HOST reducer (probed - neither the GPU reduce nor the candidate \
-            funnel is reached), its shapes are right (scores=396 per content, occSlot=400 per row), \
-            and occSlot is right too - row 196 legitimately owns slot 194, because two rows before \
-            it shared. Yet scores[194] reads 1.00000 against a query its content does not match, so \
-            the score vector and the slot space disagree somewhere between the base matmul and the \
-            reducer. The fixture is ruled out: the collision check below passes.
-            """)
         let savedQuant = VectorStore.quantBaseOverride
         VectorStore.quantBaseOverride = VectorStore.scanBits   // force the funnel
         defer { VectorStore.quantBaseOverride = savedQuant }
@@ -230,13 +221,6 @@ final class ContentSharingTests: XCTestCase {
     /// funnel either - that is where masking by dead ROW index against a per-CONTENT score vector
     /// goes wrong.
     func testTheFunnelKeepsSurvivorsAfterADelete() throws {
-        throw XCTSkip("""
-            OPEN BUG, and the reason contentSharing is off by default. Under the quantized candidate \
-            funnel a shared content's score reaches rows that do not hold it: all the real sharers \
-            come back, and so do several files holding nothing like the query, all at exactly \
-            1.00000. The fixture is ruled out - the collision check below passes. Unskip when the \
-            expansion is fixed; this is the case that has to go green before sharing ships on.
-            """)
         let savedQuant = VectorStore.quantBaseOverride
         VectorStore.quantBaseOverride = VectorStore.scanBits
         defer { VectorStore.quantBaseOverride = savedQuant }
