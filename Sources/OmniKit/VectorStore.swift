@@ -5257,10 +5257,22 @@ public final class VectorStore: @unchecked Sendable {
     /// True while every occurrence owns its own content, which is the case for any index that has
     /// not been through the content-addressed migration. Lets the mask propagation above skip a
     /// scatter it does not need.
+    ///
+    /// CACHED, because this is on the per-query path and the check is O(occurrences). Computed
+    /// fresh it walked 9.7M entries on EVERY kind-filtered query and cost 2x: measured against
+    /// main on the real index, kind:text p50 went 5.1 ms -> 9.7/14.9/9.1 ms. Keyed on the mutation
+    /// generation and the prefix length, which is everything that can change the answer.
+    private var identityCacheGen: Int64 = -1
+    private var identityCacheRows = -1
+    private var identityCacheValue = false
     private var occSlotIsIdentityLocked: Bool {
-        guard occSlot.count >= baseOccCount else { return false }
-        for i in 0 ..< baseOccCount where Int(occSlot[i]) != i { return false }
-        return true
+        if identityCacheGen == mutationGen, identityCacheRows == baseOccCount { return identityCacheValue }
+        var v = occSlot.count >= baseOccCount
+        if v {
+            for i in 0 ..< baseOccCount where Int(occSlot[i]) != i { v = false; break }
+        }
+        identityCacheGen = mutationGen; identityCacheRows = baseOccCount; identityCacheValue = v
+        return v
     }
 
     private func selectMaskLocked(_ f: SearchFilter, pathFilter: Bool) -> MLXArray? {
