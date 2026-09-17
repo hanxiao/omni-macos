@@ -2174,7 +2174,8 @@ public final class VectorStore: @unchecked Sendable {
             if presentPaths.contains(path) { removeRowsByPathsLocked([path], victims: victims) }
             // AFTER the removal, never before: the removal can compact, and a slot decided against
             // the pre-removal numbering would name a different content by the time it is used.
-            let assigned = appendChunksLocked(chunks, bfs: bfs, ids: chunkIDs)
+            var seen: [Data: Int32] = [:]
+            let assigned = appendChunksLocked(chunks, bfs: bfs, ids: chunkIDs, seen: &seen)
             persistSlotsLocked(ids: chunkIDs, slots: assigned)
             presentPaths.insert(path)
             rowWindowAuditLocked("replace")
@@ -2270,8 +2271,12 @@ public final class VectorStore: @unchecked Sendable {
             // the write path 4x slower: 5787 -> 1636 files/s.
             var allIDs: [Int64] = []
             var allSlots: [Int32] = []
+            // ONE map for the whole batch: see appendChunksLocked. Per file, two files in one
+            // batch holding the same passage stored it twice.
+            var seen: [Data: Int32] = [:]
             for (wi, it) in work.enumerated() {
-                let assigned = appendChunksLocked(it.chunks, bfs: bfs[wi], ids: chunkIDsByWork[wi] ?? [])
+                let assigned = appendChunksLocked(it.chunks, bfs: bfs[wi], ids: chunkIDsByWork[wi] ?? [],
+                                                  seen: &seen)
                 if let ids = chunkIDsByWork[wi] { allIDs += ids; allSlots += assigned }
                 presentPaths.insert(it.path)
             }
@@ -3214,9 +3219,13 @@ public final class VectorStore: @unchecked Sendable {
             // worse than useless: the bytes it promises are not duplicated anywhere yet, so there
             // is nothing to free. They are the ONLY copy of those vectors until the file exists.
             guard flat16.isPersistent else { return nil }
-            let total = rows.count
-            guard coveredRows < total else { return nil }
-            // Each remaining row still carries a bf16 blob that the vector file already holds.
+            // POSITIONS, because that is the unit the claim advances in. Against `rows.count` the
+            // bar tops out at the SHARE ratio and sits there: on an index where a tenth of the
+            // chunks are duplicates it reads 90% forever, having actually finished - the same
+            // never-completing bar the two guards above exist to prevent, reintroduced by a unit.
+            let total = Self.contentSharing ? slotCount : rows.count
+            guard total > 0, coveredRows < total else { return nil }
+            // Each remaining position still has a bf16 blob in SQLite that the vector file holds.
             let remaining = Int64(total - coveredRows) * Int64(dim * MemoryLayout<UInt16>.size)
             return (coveredRows, total, remaining)
         }
@@ -8989,6 +8998,11 @@ public final class VectorStore: @unchecked Sendable {
         public var total: Int64 { entries.reduce(0) { $0 + $1.bytes } }
     }
 
+    /// What one stored vector corresponds to, for the Storage pane's caption.
+    static var vectorUnitPhrase: String {
+        contentSharing ? "one fp16 vector per distinct passage" : "one fp16 vector per chunk"
+    }
+
     public func diskUse() -> DiskUse {
         let dir = dbURL.deletingLastPathComponent()
         let base = dbURL.lastPathComponent
@@ -9023,16 +9037,32 @@ public final class VectorStore: @unchecked Sendable {
         // audit checks, and it needs no special case for bf16 mode, where covered is simply 0.
         let pendingVectors = queue.sync { () -> Int64 in
             guard dim > 0 else { return 0 }
+            // A ROW HAS A BLOB UNTIL ITS POSITION IS COVERED, and several rows can point at one
+            // position - so this is a count of ROWS asked about POSITIONS, and the v4 identity
+            // (live rows minus covered live rows) subtracts one unit from the other. It overstates
+            // by exactly the number of duplicates, which then comes off "Snippets", because that
+            // slice is the rest of the database file.
+            if Self.contentSharing {
+                let dead = deadRows
+                var pending = 0
+                for (i, sl) in occSlot.enumerated() where !dead.contains(Int32(i)) {
+                    if sl < 0 || Int(sl) >= coveredRows { pending += 1 }
+                }
+                return Int64(pending) * Int64(dim * MemoryLayout<UInt16>.size)
+            }
             let live = Swift.max(0, rows.count - deadRows.count)
             let coveredLive = Swift.max(0, coveredRows - vecHoles.count)
             return Int64(Swift.max(0, live - coveredLive)) * Int64(dim * MemoryLayout<UInt16>.size)
         }
         var entries: [DiskUse.Entry] = [
             .init(name: "Vectors", bytes: size(base + ".vecs") + pendingVectors, irreplaceable: true,
+                  // "per chunk" stopped being true when contents started sharing a vector: a
+                  // passage in eight files costs one. The wording has to follow, or the pane
+                  // explains the number with something the reader can check and find wrong.
                   detail: size(base + ".vecs") > 0 && pendingVectors > 0
-                      ? "one fp16 vector per chunk, the only copy - some still inside the database"
-                      : (pendingVectors > 0 ? "one fp16 vector per chunk, the only copy - held in the database until the index grows"
-                                            : "one fp16 vector per chunk, the only copy")),
+                      ? "\(Self.vectorUnitPhrase), the only copy - some still inside the database"
+                      : (pendingVectors > 0 ? "\(Self.vectorUnitPhrase), the only copy - held in the database until the index grows"
+                                            : "\(Self.vectorUnitPhrase), the only copy")),
             .init(name: "Snippets", bytes: Swift.max(0, dbBytes - pendingVectors), irreplaceable: true,
                   detail: "text excerpts, file paths, chunk records"),
             .init(name: "Scan codes", bytes: scanCodes, irreplaceable: false,
@@ -10695,22 +10725,34 @@ public final class VectorStore: @unchecked Sendable {
     nonisolated(unsafe) public static var contentSharing =
         ProcessInfo.processInfo.environment["OMNI_CONTENT_SHARING"] != "0"
 
-    func appendChunksLocked(_ chunks: [IndexedChunk], bfs: [[UInt16]], ids: [Int64] = []) -> [Int32] {
+    /// `seen` CARRIES ACROSS THE FILES OF ONE BATCH, and it has to.
+    ///
+    /// The map exists because a content first written in THIS call is not in SQLite yet, so
+    /// `liveSlotForContentLocked` cannot find it. Owned by the call, that covered duplicates
+    /// inside one file and nothing else - and `replaceMany` calls this once PER FILE while
+    /// persisting every slot once at the END, so for the whole of a batch neither place had the
+    /// answer: two files in one batch sharing a passage each appended their own vector.
+    ///
+    /// Invisible to every test that wrote files one at a time, and to every store-level test that
+    /// chose its own keys, because both put the duplicate where one of the two lookups could see
+    /// it. It was found by indexing a corpus with the app and reading the slots back: one content
+    /// key, six files, six different slots.
+    func appendChunksLocked(_ chunks: [IndexedChunk], bfs: [[UInt16]], ids: [Int64] = [],
+                            seen: inout [Data: Int32]) -> [Int32] {
         var assigned: [Int32] = []
         assigned.reserveCapacity(chunks.count)
-        var batch: [Data: Int32] = [:]   // contents first seen in THIS call: not yet in SQLite
         for (i, c) in chunks.enumerated() {
             let key = Self.contentSharing
                 ? StoreSchema.hexToBytes(effectiveKeyLocked(c, bf16: bfs[i])) : Data()
             var slot: Int32 = -1
             if !key.isEmpty {
-                if let s = batch[key] { slot = s }
+                if let s = seen[key] { slot = s }
                 else if let s = liveSlotForContentLocked(key) { slot = s }
             }
             if slot < 0 {
                 flat16.append(contentsOf: bfs[i])
                 slot = lastAppendedSlot
-                if !key.isEmpty { batch[key] = slot }
+                if !key.isEmpty { seen[key] = slot }
             }
             assigned.append(slot)
             rows.append(Row(path: canonicalPath(c.path), kind: canonicalKind(c.kind),

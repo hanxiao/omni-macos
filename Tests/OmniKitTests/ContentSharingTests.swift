@@ -1152,6 +1152,49 @@ final class ContentSharingTests: XCTestCase {
         XCTAssertEqual(b.snippet, "the passage as B stores it", "B was given the other file's snippet")
     }
 
+    /// TWO FILES IN ONE BATCH, sharing a passage.
+    ///
+    /// `replaceMany` is how the indexer writes - many files, one call - and it was the one shape
+    /// nothing covered. A content first written in this call is not in SQLite yet, so the content
+    /// lookup cannot find it; the in-batch map is what covers that, and it was owned by a single
+    /// `appendChunksLocked` call while replaceMany makes one per FILE and persists the slots once
+    /// at the end. So for the whole of a batch neither place had the answer.
+    ///
+    /// Every earlier test put the duplicate somewhere one of the two could see it: inside one
+    /// file, or in a later call once the first file's slots were committed.
+    func testTwoFilesInOneBatchShareOneVector() throws {
+        let store = try VectorStore(dbURL: tempDB()); defer { store.close() }
+        let shared = vec(6)
+        func chunkFor(_ p: String) -> IndexedChunk {
+            chunk(p, 0, shared, key: "5150abcd")
+        }
+        try store.replaceMany([("/b/one.txt", [chunkFor("/b/one.txt")]),
+                               ("/b/two.txt", [chunkFor("/b/two.txt")]),
+                               ("/b/three.txt", [chunkFor("/b/three.txt")])])
+        XCTAssertEqual(store.vectorBufferUse.used / 8, 1,
+                       "three files in one batch stored the same passage more than once")
+        XCTAssertEqual(store.count, 3, "the batch lost a chunk")
+        XCTAssertEqual(Set(store.search(shared, topK: 5).map(\.path)),
+                       ["/b/one.txt", "/b/two.txt", "/b/three.txt"])
+    }
+
+    /// The same, MIXED with contents that are not shared, so a batch is not all-or-nothing.
+    func testABatchMixesSharedAndUniqueContents() throws {
+        let store = try VectorStore(dbURL: tempDB()); defer { store.close() }
+        var items: [(path: String, chunks: [IndexedChunk])] = []
+        for f in 0 ..< 10 {
+            let p = "/m/f\(f).txt"
+            let isShared = f % 2 == 0
+            items.append((p, [chunk(p, 0, isShared ? vec(2) : vec(20 + f),
+                                    key: isShared ? "77aa77aa" : String(format: "%08x", f &+ 0xE000))]))
+        }
+        try store.replaceMany(items)
+        // Five sharers collapse to one; five uniques keep their own.
+        XCTAssertEqual(store.vectorBufferUse.used / 8, 6,
+                       "the batch did not collapse exactly the shared half")
+        XCTAssertEqual(store.count, 10)
+    }
+
     private func claim(_ db: URL) -> Int {
         var h: OpaquePointer?
         guard sqlite3_open(db.path, &h) == SQLITE_OK else { return -1 }

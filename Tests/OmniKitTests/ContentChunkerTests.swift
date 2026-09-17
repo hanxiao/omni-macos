@@ -233,7 +233,7 @@ final class ContentChunkerTests: XCTestCase {
     // MARK: - The user's setting
 
     func testTheSizeSettingIsHonoured() {
-        // "Max characters per chunk" is a four-value picker in Settings, so a cutter that ignored
+        // "Characters per chunk" is a four-value picker in Settings, so a cutter that ignored
         // it would make the control silently do nothing - which is what a fixed-parameter cutter
         // would have done.
         let text = prose(400_000)

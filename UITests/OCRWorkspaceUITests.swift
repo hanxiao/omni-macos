@@ -129,6 +129,13 @@ final class OCRWorkspaceUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchArguments = [
             "-omni.dbDir", scratchDB.path,
+            // `omni.addedFolders` IS THE KEY, not `omni.roots`. Roots became a derived, legacy
+            // fallback that loadRoots consults only when addedFolders is ABSENT - and on any
+            // machine where the app has been used it is present, in the user domain, which an
+            // argument-domain override does not remove. So this suite was crawling the tester's
+            // real folders and never its own corpus: the scratch index kept it from damaging
+            // anything, which is exactly why nobody noticed.
+            "-omni.addedFolders", "(\"\(corpus.path)\")",
             "-omni.roots", "(\"\(corpus.path)\")",
             // Search history and photo sources are SAVED blobs, not launch arguments, so the
             // argument domain cannot isolate them: without this flag a run reads the real install's

@@ -64,9 +64,10 @@ public enum ContentChunker {
             "cdc\(minChars)-\(targetChars)-\(maxChars)-n\(normalization)-l\(lineSnapWindow)"
         }
 
-        /// DERIVED FROM THE USER'S SETTING, because that setting has to keep working. "Max
-        /// characters per chunk" is in Settings > Performance with four values, and a cutter that
-        /// ignored it would make the control silently do nothing. The target IS the setting; the
+        /// DERIVED FROM THE USER'S SETTING, because that setting has to keep working.
+        /// "Characters per chunk" is in Settings > Performance with four values, and a cutter that
+        /// ignored it would make the control silently do nothing. The target IS the setting - which
+        /// is why the label lost the word "Max" when this shipped; the
         /// floor is half of it, and the ceiling twice it plus the line-snap slack - which at the
         /// default 1800 reproduces the 900 / 1800 / 4000 the parameter study measured.
         public static func forMaxChars(_ n: Int) -> Params {

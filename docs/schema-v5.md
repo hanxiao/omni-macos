@@ -243,6 +243,45 @@ reducers, the quantized funnel, compaction, the hole reclaim, reload, vector cov
 slot-column backfill that upgrades an existing index. Plus `OpaqueText`, the base64/payload filter,
 which is on the indexing path, and `vectorsForContentKeys`, below.
 
+## What the app found that the tests did not
+
+Every content-sharing test until the app was actually run drove `store.replace` or `replaceMany`
+with a chunkKey the test chose, one or a few files at a time. The app writes MANY files per
+`replaceMany`, and that was the one shape nothing covered:
+
+    `appendChunksLocked` owns the in-batch map of "contents first seen in this call", which is what
+    covers a content that is not in SQLite yet. `replaceMany` calls it once PER FILE and persists
+    every slot once at the END. So for the whole of a batch neither place had the answer, and two
+    files in one batch sharing a passage each stored their own vector.
+
+Found by indexing a 60-file corpus with the app and reading the slots back: one content key, six
+files, six different slots. The map spans the batch now; on the same corpus the app went from 591
+positions for 533 distinct contents to 533 for 533 - one vector per content, exactly.
+
+THE CUTTER IS WHAT MAKES CROSS-FILE SHARING HAPPEN AT ALL, which fell out of the same test. Eight
+files repeating one long passage after preambles of DIFFERENT lengths share NOTHING under the grid
+- 458 vectors for 458 chunks - because the passage lands at a different offset in every file and
+its chunks are therefore different text. Under the content cutter the boundaries come from the
+passage itself and it collapses. The two changes are not independent: sharing is the mechanism and
+content-defined boundaries are what give it anything to work on.
+
+Three UI-facing unit bugs came out of the same pass, all of them the row-versus-position confusion
+reaching the surface:
+
+  - `storageMigration` fed the progress bar `coveredRows / rows.count`, positions over rows, so on
+    an index where a tenth of the chunks are duplicates it reads 90% forever - the never-completing
+    bar that accessor's own guards exist to prevent.
+  - `diskUse` counted pending vectors as "live rows minus covered live rows", subtracting one unit
+    from the other, which overstates by exactly the number of duplicates and takes the difference
+    off the "Snippets" slice.
+  - Its caption said "one fp16 vector per chunk". A passage in eight files costs one.
+
+And one in the UI TESTS: all five suites isolate with `-omni.roots`, which became a legacy fallback
+that `loadRoots` consults only when `omni.addedFolders` is ABSENT - and on any machine where the
+app has been used it is present, in the user domain, which an argument-domain override does not
+remove. The suites were crawling the tester's real folders and never their own corpus. The scratch
+index kept it from damaging anything, which is why nobody noticed.
+
 ## What sharing does and does not save, and the lookup that changed the answer
 
 WHAT IT DOES NOT SAVE BY ITSELF: GPU time. Duplicate chunks inside one pass are already collapsed

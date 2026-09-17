@@ -257,4 +257,61 @@ final class StoreChunkReuseTests: XCTestCase {
         XCTAssertLessThan(embedder.embedded, 3 * chunksPerFile,
                           "the whole file was re-embedded")
     }
+
+    /// SHARING THROUGH THE INDEXER, which is not the same test as sharing through the store - and
+    /// which the CUTTER decides.
+    ///
+    /// Every other content-sharing test drives `store.replace` with a chunkKey the test chose. The
+    /// app does not: the INDEXER computes the key, from the cutter and the settings, and what it
+    /// computes depends on where the boundaries fall. Eight files that repeat one long passage
+    /// after preambles of DIFFERENT lengths is the case that separates the two cutters - the grid
+    /// puts the passage at a different offset in every file, so its chunks are different text and
+    /// share nothing at all; the content cutter's boundaries come from the passage itself.
+    ///
+    /// Asserted as the DIFFERENCE between the two arms rather than as a threshold, because a
+    /// threshold is a statement about one cutter and this is a statement about the change.
+    func testTheCutterIsWhatMakesACrossFileSharedPassageShareAtAll() throws {
+        let saved = Indexer.contentDefinedChunking
+        defer { Indexer.contentDefinedChunking = saved }
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omni-idxshare-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        var root = dir
+        if let rp = realpath(dir.path, nil) { root = URL(fileURLWithPath: String(cString: rp), isDirectory: true); free(rp) }
+
+        var shared = ""
+        for p in 0 ..< 6 {
+            shared += "the shared passage section \(p): "
+            for w in 0 ..< 320 { shared += "sharedword\(p)_\(w) about indexes and retrieval. " }
+            shared += "\n\n"
+        }
+        for i in 0 ..< 8 {
+            var body = "file \(i) preamble: "
+            for w in 0 ..< (60 + i * 37) { body += "own\(i)_\(w) unique text here. " }
+            body += "\n\n" + shared
+            try body.write(to: root.appendingPathComponent("f\(i).txt"), atomically: true, encoding: .utf8)
+        }
+
+        func ratio(cdc: Bool) throws -> (chunks: Int, positions: Int) {
+            Indexer.contentDefinedChunking = cdc
+            let dbDir = FileManager.default.temporaryDirectory
+                .appendingPathComponent("omni-idxshare-db-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: dbDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: dbDir) }
+            let store = try VectorStore(dbURL: dbDir.appendingPathComponent("index.sqlite"))
+            defer { store.close() }
+            let embedder = CountingEmbedder()
+            pass(store, embedder, root)
+            return (store.count, store.vectorBufferUse.used / embedder.dim)
+        }
+
+        let grid = try ratio(cdc: false)
+        let cdc = try ratio(cdc: true)
+        XCTAssertGreaterThan(grid.chunks, 24, "the fixture is not multi-chunk enough to share anything")
+        XCTAssertEqual(grid.positions, grid.chunks,
+                       "the grid shared something here; the fixture no longer separates the cutters")
+        XCTAssertLessThan(cdc.positions, cdc.chunks * 3 / 4,
+                          "\(cdc.positions) vectors for \(cdc.chunks) chunks: the passage was stored eight times")
+    }
 }

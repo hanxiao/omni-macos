@@ -518,7 +518,10 @@ private struct PerformanceTab: View {
                     Text("16").tag(16)
                     Text("32").tag(32)
                 }
-                Picker("Max characters per chunk", selection: Binding(get: { model.maxTextChunkChars }, set: { model.maxTextChunkChars = $0 })) {
+                // "Max" stopped being true when the cutter became content-defined: the setting is
+                // the TARGET a chunk lands near, and the hard ceiling is a little over twice it.
+                // Under the old grid it was a literal maximum, which is why it was named that.
+                Picker("Characters per chunk", selection: Binding(get: { model.maxTextChunkChars }, set: { model.maxTextChunkChars = $0 })) {
                     Text("1200").tag(1200)
                     Text("1800").tag(1800)
                     Text("2400").tag(2400)
@@ -527,7 +530,7 @@ private struct PerformanceTab: View {
             } header: {
                 Text("Throughput")
             } footer: {
-                Text("Smaller caps index faster, with less detail.")
+                Text("Smaller chunks index faster, with less detail.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {

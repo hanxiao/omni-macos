@@ -469,6 +469,24 @@ follows is what a reader needs before touching this code.
 - `omni-verify sharebench <model> <root>` is the end-to-end A/B: chunks, vectors, tok, and search
   latency for one arm, run it twice with the env var flipped.
 
+## Run the app, not just the tests (2026-09-17)
+
+A whole content-sharing suite passed while the APP stored one vector per chunk. Every test drove
+the store directly, one or a few files at a time; the app writes many files per `replaceMany`, and
+that shape had no coverage. Reading the slots back out of an app-built index found it in a minute:
+one content key, six files, six different slots.
+
+- THE CHECK THAT FOUND IT: index a scratch corpus with the real app, then
+  `sqlite3 <db> "SELECT COUNT(DISTINCT slot) FROM chunks WHERE slot>=0"` against
+  `SELECT COUNT(DISTINCT chunk_key) FROM chunk_text WHERE length(chunk_key)>0`. They must be EQUAL.
+- ISOLATE WITH `-omni.addedFolders`, NOT `-omni.roots`. Roots is a legacy fallback that `loadRoots`
+  reads only when addedFolders is ABSENT, and an argument-domain override does not remove a
+  user-domain key. All five UI suites had it wrong and were crawling the tester's real folders.
+  `-omni.dbDir` does isolate, which is why nothing was damaged.
+- XCUITEST WOULD NOT START HERE: "Timed out while enabling automation mode", three times, after
+  clearing stale runners and waking the display. Driving the built app with `open -n --args` plus
+  `cliclick` and `screencapture` worked and is enough to verify a pipeline end to end.
+
 ## Content-defined chunking (OmniKit/ContentChunker.swift)
 
 ON by default; `OMNI_CDC=0` is the escape hatch. The fixed grid cut at `i * step`, so an inserted
@@ -494,9 +512,11 @@ line moved every boundary below it; boundaries now come from the bytes around th
 - SIZES COUNT CHARACTERS, NOT BYTES. The hash sees bytes; the gates count scalars. In bytes, a
   Chinese document at an 1800-byte target holds 600 characters against English's 1800 - a third of
   the context per chunk on the corpora least able to spare it.
-- THE SIZE SETTING STILL WORKS. `Params.forMaxChars` derives the floor and ceiling from "Max
-  characters per chunk", and the fingerprint carries all of them, so changing the setting re-cuts
-  rather than mixing two cut sizes into one key space.
+- THE SIZE SETTING STILL WORKS. `Params.forMaxChars` derives the floor and ceiling from Settings >
+  Performance > "Characters per chunk", and the fingerprint carries all of them, so changing the
+  setting re-cuts rather than mixing two cut sizes into one key space. The label lost the word
+  "Max" with this change: the setting is now the TARGET a chunk lands near, and the hard ceiling is
+  a little over twice it.
 
 ## Filter chips in the search field
 
