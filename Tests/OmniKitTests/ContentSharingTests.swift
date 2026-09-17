@@ -666,6 +666,106 @@ final class ContentSharingTests: XCTestCase {
         }
     }
 
+    /// COVERAGE OVER A NUMBERING A COMPACTION LEFT OUT OF ORDER.
+    ///
+    /// Positions are handed out in id order by the write path, and the coverage loader used to
+    /// rely on that: it walked a cursor, inserting a hole row wherever the claim said one belonged.
+    /// A compaction that drops a REPRESENTATIVE breaks the ordering - the surviving duplicate keeps
+    /// the deleted row's position, which is below its id-order neighbours' - and the walk then
+    /// places holes in the wrong slots, the counts stop balancing, and a perfectly intact index
+    /// refuses to open with "the vector file could not be read".
+    ///
+    /// So: compact (which renumbers), let coverage re-advance over the new numbering, delete again
+    /// to punch real holes into it, and reload.
+    func testCoverageOverANumberingACompactionLeftOutOfOrder() throws {
+        let savedQuant = VectorStore.quantBaseOverride
+        let savedTomb = VectorStore.tombstones
+        VectorStore.quantBaseOverride = VectorStore.scanBits
+        defer { VectorStore.quantBaseOverride = savedQuant; VectorStore.tombstones = savedTomb }
+
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("share-renumber-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("index.sqlite")
+
+        let d = 64
+        let files = 60
+        func hot(_ i: Int) -> [Float] {
+            var v = [Float](repeating: 0, count: d); v[i % d] = 1; return v
+        }
+        func rep(_ f: Int) -> Int { f % 4 == 3 ? f - 3 : f }
+        func write(_ store: VectorStore, _ f: Int) throws {
+            let p = "/i/f\(f).txt"
+            try store.replace(path: p, chunks: [IndexedChunk(path: p, modified: 1, size: 1, kind: "text",
+                                                             chunkIndex: 0, snippet: "s\(f)",
+                                                             embedding: hot(rep(f)), locator: "Line 1",
+                                                             chunkKey: String(format: "%08x", rep(f) &+ 0x9000))])
+        }
+        do {
+            let s = try VectorStore(dbURL: url)
+            for f in 0 ..< files - 5 { try write(s, f) }
+            _ = s.search(hot(0), topK: 5)
+            for f in files - 5 ..< files { try write(s, f) }
+            _ = s.search(hot(0), topK: 5)
+            s.close()
+        }
+        for _ in 0 ..< 4 { let s = try VectorStore(dbURL: url); s.close() }
+        XCTAssertGreaterThan(claim(url), 0, "fixture never covered anything")
+
+        // PHASE 1 - compact, deleting representatives. `rep(f) == f` for three quarters of the
+        // files, and every fourth file is a duplicate of the one three before it, so this list
+        // takes representatives whose duplicates survive - which is what leaves the numbering out
+        // of order rather than merely sparse.
+        VectorStore.tombstones = false
+        let goneFirst = Set(stride(from: 12, to: files, by: 8))
+        do {
+            let s = try VectorStore(dbURL: url)
+            for f in goneFirst { s.deletePath("/i/f\(f).txt") }
+            XCTAssertEqual(s.coveredRowsForTest, 0, "no compaction happened; the test proves nothing")
+            s.close()
+        }
+        VectorStore.tombstones = savedTomb
+
+        // PHASE 2 - let coverage re-advance over the compacted numbering, and stop it PART WAY.
+        // A partial claim is what puts the coverage boundary in the middle of the out-of-order
+        // stretch, which is where a cursor and a stored slot can disagree about whether a row is
+        // covered - and a row wrongly called uncovered is asked for a blob it no longer has.
+        let savedSlice = VectorStore.coverageSliceOverride
+        VectorStore.coverageSliceOverride = 6
+        defer { VectorStore.coverageSliceOverride = savedSlice }
+        for _ in 0 ..< 3 { let s = try VectorStore(dbURL: url); s.close() }
+        XCTAssertGreaterThan(claim(url), 0, "coverage never came back after the compaction")
+        XCTAssertLessThan(claim(url), files - goneFirst.count - 5,
+                          "coverage ran to the end; the boundary is not inside the index")
+
+        // PHASE 3 - delete again, which records holes INTO that numbering.
+        let goneSecond = Set(stride(from: 5, to: files, by: 11))
+        do {
+            let s = try VectorStore(dbURL: url)
+            for f in goneSecond { s.deletePath("/i/f\(f).txt") }
+            XCTAssertNil(s.coverageAudit(), "audit failed after deleting into a renumbered index")
+            s.close()
+        }
+
+        // The sidecar is a validated cache adopted ahead of everything else, so with it present the
+        // coverage loader never runs and this test measures nothing. Dropping it is the state a
+        // crash or a rejected generation leaves, and the state the loader exists for.
+        for suffix in [".rows", ".rows-wal", ".rows-shm"] {
+            try? FileManager.default.removeItem(atPath: url.path + suffix)
+        }
+
+        let gone = goneFirst.union(goneSecond)
+        let s = try VectorStore(dbURL: url); defer { s.close() }
+        XCTAssertNil(s.coverageAudit(), "audit failed reloading a renumbered, covered index")
+        XCTAssertEqual(s.count, files - gone.count, "rows lost or kept wrongly")
+        for f in 0 ..< files where !gone.contains(f) {
+            let top = s.search(hot(rep(f)), topK: 4).map(\.path)
+            XCTAssertTrue(top.contains("/i/f\(f).txt"),
+                          "f\(f) lost its vector across the renumbering; got \(top)")
+        }
+    }
+
     private func claim(_ db: URL) -> Int {
         var h: OpaquePointer?
         guard sqlite3_open(db.path, &h) == SQLITE_OK else { return -1 }

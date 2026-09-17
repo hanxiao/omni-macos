@@ -312,6 +312,19 @@ than a scan, because `WHERE slot < 0` cannot use the partial index and a full pa
 table on every open is not a cost to hide. Both conversions that REBUILD `chunks` clear the flag,
 since the column they describe has just been replaced.
 
+WHAT THE COVERAGE LOADER STILL ASSUMES, and why it was left alone. It walks a cursor and inserts
+a hole row wherever the claim says one belongs, which is exact while positions are handed out in id
+order. A compaction that drops a REPRESENTATIVE breaks that ordering - the surviving duplicate
+keeps the deleted row's position, which is below its id-order neighbours' - and that state was
+confirmed on a real fixture. Rewriting the walk to seat every row at its stored slot and derive the
+holes from what is left was written and then REVERTED: no fixture could be made to fail with the
+cursor, including one whose coverage boundary sits in the middle of the out-of-order stretch. The
+reason is that rows are already seated at their stored slot, hole rows take a position the claim
+recorded, and the only thing the cursor still decides is covered-vs-uncovered - where a
+disagreement asks a covered row for a blob it does not have, i.e. it fails closed and refuses.
+`testCoverageOverANumberingACompactionLeftOutOfOrder` pins the whole sequence. A rewrite of a
+data-loss-capable loader needs a failing case first.
+
 WHAT IS STILL v4 BEHAVIOUR. `reclaimVectorHoles` declines under sharing, so holes accumulate rather
 than being reclaimed. That is what v4 does in practice too (its own note records 96,256 of them
 never taken back), and the answer is the free list - a released position handed to the next new
