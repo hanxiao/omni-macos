@@ -68,6 +68,26 @@ public enum ChunkKey {
         digest("2|\(kind.rawValue)|\(preprocess)|m\(dim)|", payload)
     }
 
+    /// A media chunk keyed by the VECTOR IT STORES.
+    ///
+    /// v4 gives image, scan, video and audio no content key at all, so they never share - a page
+    /// that appears in two PDFs is stored twice. The obvious key is the decoded payload, and it is
+    /// the better one because it can be computed BEFORE the tower runs and so skips the GPU as
+    /// well. It is also not reachable from here: the payload is gone by the time a chunk is built,
+    /// and threading it out to eight construction sites is a larger change than this is worth.
+    ///
+    /// Keying on the stored bytes deduplicates exactly what is stored, which is the honest smaller
+    /// claim: identical vectors share a slot, and the forward pass still happens. The bf16 row is
+    /// what the store writes, so two chunks share a key exactly when they would share a slot.
+    public static func mediaVector(kind: FileKind, bf16 row: [UInt16], dim: Int) -> String {
+        var h = SHA256()
+        h.update(data: Data("2v|\(kind.rawValue)|m\(dim)|".utf8))
+        row.withUnsafeBufferPointer { p in
+            h.update(data: Data(bytes: p.baseAddress!, count: p.count * MemoryLayout<UInt16>.size))
+        }
+        return h.finalize().prefix(16).map { String(format: "%02x", $0) }.joined()
+    }
+
     /// Hash of a large payload the caller already has in slices, so a 240 s mel or a page of pixels
     /// need not be copied into one Data first.
     public static func media(kind: FileKind, slices: [Data], preprocess: String, dim: Int) -> String {

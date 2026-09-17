@@ -112,4 +112,50 @@ final class ContentSharingTests: XCTestCase {
                              "two keyless chunks collapsed onto one vector")
         XCTAssertEqual(store.search(vec(2), topK: 1).first?.path, "/b.bin")
     }
+
+    /// MEDIA SHARES TOO, and it has no content key of its own - v4 gives image, scan, video and
+    /// audio none, which is why 594,522 chunks on the real index could never dedup. The store keys
+    /// them by the vector they store, so the same page appearing in two PDFs costs one slot.
+    func testTwoMediaChunksWithTheSameVectorShareASlot() throws {
+        let store = try VectorStore(dbURL: tempDB()); defer { store.close() }
+        let page = vec(4)
+        func scan(_ path: String) -> IndexedChunk {
+            IndexedChunk(path: path, modified: 1, size: 1, kind: "scan", chunkIndex: 0,
+                         snippet: "page", embedding: page, locator: "Page 1", chunkKey: "")
+        }
+        try store.replace(path: "/a.pdf", chunks: [scan("/a.pdf")])
+        let afterFirst = store.vectorBufferUse.used
+        try store.replace(path: "/b.pdf", chunks: [scan("/b.pdf")])
+        XCTAssertEqual(store.vectorBufferUse.used, afterFirst,
+                       "the same rendered page was stored twice")
+        XCTAssertEqual(Set(store.search(page, topK: 5).map(\.path)), ["/a.pdf", "/b.pdf"])
+    }
+
+    /// The negative half: two DIFFERENT pages must not collapse, which is what keying on an empty
+    /// key would have done to every image in the index.
+    func testDifferentMediaVectorsDoNotShare() throws {
+        let store = try VectorStore(dbURL: tempDB()); defer { store.close() }
+        func scan(_ path: String, _ e: [Float]) -> IndexedChunk {
+            IndexedChunk(path: path, modified: 1, size: 1, kind: "scan", chunkIndex: 0,
+                         snippet: "page", embedding: e, locator: "Page 1", chunkKey: "")
+        }
+        try store.replace(path: "/a.pdf", chunks: [scan("/a.pdf", vec(1))])
+        let afterFirst = store.vectorBufferUse.used
+        try store.replace(path: "/b.pdf", chunks: [scan("/b.pdf", vec(2))])
+        XCTAssertGreaterThan(store.vectorBufferUse.used, afterFirst, "two different pages collapsed")
+        XCTAssertEqual(store.search(vec(2), topK: 1).first?.path, "/b.pdf")
+    }
+
+    /// Text is keyed by its CONTENT, never by its vector: two different passages that happen to
+    /// embed identically are still different chunks, and the text path must not start keying on
+    /// the vector just because the media path does.
+    func testTextIsNotKeyedByItsVector() throws {
+        let store = try VectorStore(dbURL: tempDB()); defer { store.close() }
+        let same = vec(2)
+        try store.replace(path: "/a.txt", chunks: [chunk("/a.txt", 0, same, key: "1111aaaa")])
+        let afterFirst = store.vectorBufferUse.used
+        try store.replace(path: "/b.txt", chunks: [chunk("/b.txt", 0, same, key: "2222bbbb")])
+        XCTAssertGreaterThan(store.vectorBufferUse.used, afterFirst,
+                             "two distinct text contents shared a slot on their vector alone")
+    }
 }

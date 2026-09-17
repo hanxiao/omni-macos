@@ -9858,6 +9858,18 @@ public final class VectorStore: @unchecked Sendable {
     /// known. The slot cannot be decided here: it depends on which contents are still live AFTER
     /// the in-memory removal that runs past the commit, and deciding it early is how a persisted
     /// slot ends up naming another content's vector.
+    /// The content key to store for this chunk. Text carries its own; media carries none under v4,
+    /// so it is keyed by the bf16 row it is about to store - see ChunkKey.mediaVector for why that
+    /// is the smaller claim. One definition, because the write and the in-memory append must agree
+    /// or a chunk is looked up under one key and stored under another.
+    @inline(__always)
+    func effectiveKeyLocked(_ c: IndexedChunk, bf16: [UInt16]) -> String {
+        if !c.chunkKey.isEmpty { return c.chunkKey }
+        guard Self.contentSharing, !bf16.isEmpty,
+              let k = FileKind(rawValue: c.kind), k != .text else { return "" }
+        return ChunkKey.mediaVector(kind: k, bf16: bf16, dim: bf16.count)
+    }
+
     func writeChunksLocked(fileID fid: Int64, chunks: [IndexedChunk], bfs: [[UInt16]], w: ChunkInsert) -> [Int64]? {
         var ids: [Int64] = []
         ids.reserveCapacity(chunks.count)
@@ -9877,7 +9889,7 @@ public final class VectorStore: @unchecked Sendable {
             sqlite3_bind_int64(w.text, 3, fid)
             sqlite3_bind_text(w.text, 4, c.snippet, -1, SQLITE_TRANSIENT)
             sqlite3_bind_text(w.text, 5, c.locator, -1, SQLITE_TRANSIENT)
-            let key = StoreSchema.hexToBytes(c.chunkKey)
+            let key = StoreSchema.hexToBytes(effectiveKeyLocked(c, bf16: bfs[i]))
             key.withUnsafeBytes { _ = sqlite3_bind_blob(w.text, 6, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT) }
             guard sqlite3_step(w.text) == SQLITE_DONE else { return nil }
 
@@ -9993,7 +10005,8 @@ public final class VectorStore: @unchecked Sendable {
         assigned.reserveCapacity(chunks.count)
         var batch: [Data: Int32] = [:]   // contents first seen in THIS call: not yet in SQLite
         for (i, c) in chunks.enumerated() {
-            let key = Self.contentSharing ? StoreSchema.hexToBytes(c.chunkKey) : Data()
+            let key = Self.contentSharing
+                ? StoreSchema.hexToBytes(effectiveKeyLocked(c, bf16: bfs[i])) : Data()
             var slot: Int32 = -1
             if !key.isEmpty {
                 if let s = batch[key] { slot = s }
