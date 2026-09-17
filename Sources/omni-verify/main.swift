@@ -1741,6 +1741,76 @@ if args.count >= 2 && args[1] == "refoldprobe" {
 // extracting up to 32 frames per segment via AVAssetImageGenerator (the SAME API + settings as
 // FileExtractor.videoFrames - keyframe SEEKS, maximumSize downsample, per-frame autoreleasepool),
 // optionally embedding each segment if a modelDir is given. Tracks peak phys_footprint (host RSS) and
+// Noise-vector probe: omni-verify noisedump <modelDir> <fileList> <outJsonl> [maxChunksPerFile]
+// Answers, on real data, whether semantically empty chunks occupy a COMPACT region of the embedding
+// space (in which case a fixed set of background vectors can gate them at index time) or are spread
+// out (in which case no set of centroids can). Chunks the same fixed grid Indexer.chunk cuts -
+// 1800 chars, 200 overlap - but deliberately UNFILTERED: OpaqueText would remove exactly the class
+// under study. Each chunk is labelled with its payload fraction and embedded through the real text
+// tower. Nothing is written to any index.
+if args.count >= 5 && args[1] == "noisedump" {
+    let modelDir = URL(fileURLWithPath: args[2])
+    let listPath = args[3], outPath = args[4]
+    let maxPerFile = args.count >= 6 ? (Int(args[5]) ?? 8) : 8
+    let engine = try await OmniEngine.loadValidated(modelDir: modelDir, keepAudio: false)
+    let paths = (try String(contentsOfFile: listPath, encoding: .utf8))
+        .split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+    FileManager.default.createFile(atPath: outPath, contents: nil)
+    let fh = try FileHandle(forWritingTo: URL(fileURLWithPath: outPath))
+    defer { try? fh.close() }
+
+    // Same grid as Indexer.chunk: limit 1800, step limit-200.
+    func gridChunks(_ text: String, limit: Int = 1800, overlap: Int = 200) -> [String] {
+        let total = text.count
+        if total <= limit { return [text] }
+        var out: [String] = []
+        let step = Swift.max(1, limit - overlap)
+        var startIdx = text.startIndex, startOff = 0
+        while startOff < total {
+            let endIdx = text.index(startIdx, offsetBy: limit, limitedBy: text.endIndex) ?? text.endIndex
+            out.append(String(text[startIdx ..< endIdx]))
+            if endIdx == text.endIndex { break }
+            startIdx = text.index(startIdx, offsetBy: step, limitedBy: text.endIndex) ?? text.endIndex
+            startOff += step
+        }
+        return out
+    }
+
+    var nFiles = 0, nChunks = 0
+    let t0 = Date()
+    for p in paths {
+        guard let content = try? FileExtractor.extract(URL(fileURLWithPath: p)) else { continue }
+        var t = ""
+        switch content {
+        case .text(let s): t = s
+        case .pagedText(let s, _): t = s
+        default: continue
+        }
+        guard !t.isEmpty else { continue }
+        let pieces = gridChunks(t)
+        guard !pieces.isEmpty else { continue }
+        // Even stride so a long file contributes across its whole length, not just its head.
+        let step = Swift.max(1, pieces.count / maxPerFile)
+        let picked = Swift.stride(from: 0, to: pieces.count, by: step).prefix(maxPerFile).map { pieces[$0] }
+        let vecs = engine.embedTextBatch(picked, as: .passage)
+        for (i, piece) in picked.enumerated() where i < vecs.count {
+            var obj: [String: Any] = [:]
+            obj["path"] = p
+            obj["frac"] = OpaqueText.payloadFraction(piece)
+            obj["chars"] = piece.count
+            obj["head"] = String(piece.prefix(120))
+            obj["vec"] = vecs[i].map { Double($0) }
+            guard let d = try? JSONSerialization.data(withJSONObject: obj) else { continue }
+            fh.write(d); fh.write(Data("\n".utf8))
+            nChunks += 1
+        }
+        nFiles += 1
+        if nFiles % 100 == 0 { print("  \(nFiles)/\(paths.count) files, \(nChunks) chunks, \(Int(-t0.timeIntervalSinceNow))s") }
+    }
+    print("noisedump: \(nFiles) files, \(nChunks) chunks -> \(outPath) in \(Int(-t0.timeIntervalSinceNow))s")
+    exit(0)
+}
+
 // MLX GPU peak. The claim under test: peak memory is bounded by frames-in-flight (one segment), NOT
 // by file size or duration. Compare a small clip vs a multi-GB one - peak RSS should be ~flat.
 // Tag probe: omni-verify tagprobe <modelDir> <image...>

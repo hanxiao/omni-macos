@@ -20,7 +20,7 @@ import CryptoKit
 ///   why a cold open read 615 MB to recover 2.4M rows of (file, index, kind).
 enum StoreSchema {
     /// Bumped when the layout changes in a way an older binary must not read as its own.
-    static let version: Int32 = 4
+    static let version: Int32 = 5
 
     // MARK: - Kinds as codes
     //
@@ -126,6 +126,8 @@ enum StoreSchema {
     static func createStatements(suffix: String = "") -> [String] {
         let dirs = "dirs\(suffix)", files = "files\(suffix)", chunks = "chunks\(suffix)"
         let text = "chunk_text\(suffix)", pend = "pending_vecs\(suffix)", dedup = "dedup\(suffix)"
+        let chunk = "chunk\(suffix)", occ = "occurrence\(suffix)"
+        let snip = "chunk_snippet\(suffix)", free = "free_slot\(suffix)"
         return [
             "CREATE TABLE IF NOT EXISTS \(dirs)(id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);",
             // Per-FILE facts live here exactly once. In v3 every one of these was a column on
@@ -206,11 +208,82 @@ enum StoreSchema {
             );
             """,
             "CREATE INDEX IF NOT EXISTS idx_dedup_key ON \(dedup)(key);",
+
+            // MARK: v5 - CONTENT-ADDRESSED CHUNKS
+            //
+            // WHAT a chunk is, once. Measured on a 2.68M-file index: 9,130,536 text chunks hold only
+            // 5,614,602 distinct contents, so 3,513,679 of them are a second copy of a vector that
+            // already exists - 5.4 GB of the 15.4 GB vector file and 3.5M GPU forward passes spent
+            // twice. Nearly all of that is cross-file (only 2,261 duplicates sit inside one file),
+            // which is exactly what the old path-scoped reuse could not see.
+            //
+            // `id` IS THE .vecs SLOT. v4 derived a row's slot from its rank in rowid order counted
+            // through the hole list, a correspondence this file's own notes call unobservably false
+            // once the two drift. A slot column was rejected then because "compaction renumbers
+            // everything" - a 4.5M-row UPDATE measured at 33.8s. That objection does not apply to an
+            // explicit id plus a free list: a freed slot is handed to the next new chunk instead of
+            // being reclaimed by a renumbering pass, so the pass never has to run and the file only
+            // grows past its high-water mark. v4 accumulated 96,256 holes that nothing ever took back.
+            //
+            // `refs` is the occurrence count. It is DERIVABLE - COUNT(*) over occurrence - and is
+            // stored only so the hot path need not count. An undercount frees a vector another file
+            // still points at, which is silent, so it is checked rather than trusted.
+            """
+            CREATE TABLE IF NOT EXISTS \(chunk)(
+                id INTEGER PRIMARY KEY,
+                key BLOB NOT NULL,
+                kind INTEGER NOT NULL DEFAULT 0,
+                bytes INTEGER NOT NULL DEFAULT 0,
+                refs INTEGER NOT NULL DEFAULT 0
+            );
+            """,
+            // The lookup the whole design turns on, and the one v4 never had: v4 stored chunk_key on
+            // all 9.13M rows and indexed none of them, so nothing could ask "does this content exist
+            // already" without a full table scan.
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_chunk_key ON \(chunk)(key);",
+
+            // WHERE a chunk occurs. The pointer.
+            //
+            // `locator` lives HERE and not on the chunk, and that is the hinge of the whole schema:
+            // the same paragraph is "Line 12" of one file and "Line 4310" of another. A locator on
+            // the chunk is what makes deduplication impossible in the obvious design.
+            """
+            CREATE TABLE IF NOT EXISTS \(occ)(
+                file_id INTEGER NOT NULL,
+                ordinal INTEGER NOT NULL,
+                chunk_id INTEGER NOT NULL,
+                locator TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (file_id, ordinal)
+            );
+            """,
+            // The reverse edge: chunk -> the files that contain it. Read when a hit is expanded into
+            // results, and when the per-file filter mask is propagated to a per-chunk one.
+            "CREATE INDEX IF NOT EXISTS idx_occ_chunk ON \(occ)(chunk_id);",
+
+            // The snippet, split from the hot row for the same reason v4 split chunk_text: it is
+            // read for the ~40 hits a search displays and never by the loader or by scoring.
+            // Keyed by chunk id, so a snippet is stored once per CONTENT rather than once per
+            // occurrence - 3.5M fewer copies on the measured index.
+            """
+            CREATE TABLE IF NOT EXISTS \(snip)(
+                chunk_id INTEGER PRIMARY KEY,
+                snippet TEXT NOT NULL DEFAULT ''
+            );
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_snip_label ON \(snip)(snippet)
+            WHERE snippet <> '';
+            """,
+            // SLOTS NOBODY OWNS. A durable free list, so a released slot is reused instead of
+            // leaking. Reconcilable from SQLite alone - it is exactly the ids in [0, highWater) with
+            // no chunk row - which is the same property that lets vec_holes be rebuilt.
+            "CREATE TABLE IF NOT EXISTS \(free)(id INTEGER PRIMARY KEY);",
         ]
     }
 
     /// Tables the v4 layout owns, newest-dependency first - the order a teardown wants.
-    static let tables = ["pending_vecs", "chunk_text", "chunks", "dedup", "files", "dirs"]
+    static let tables = ["free_slot", "chunk_snippet", "occurrence", "chunk",
+                         "pending_vecs", "chunk_text", "chunks", "dedup", "files", "dirs"]
 
     /// The subset that exists ONLY in v4. `chunks` and `files` are in the list above but not this
     /// one, and the difference is not cosmetic: they exist under both layouts, so a cleanup that
@@ -218,6 +291,10 @@ enum StoreSchema {
     /// along with the leftovers. Written the other way first; the round-trip test emptied a
     /// perfectly good index and said so.
     static let v4OnlyTables = ["pending_vecs", "chunk_text", "dedup", "dirs"]
+
+    /// Tables introduced by v5. Same reasoning as `v4OnlyTables`: these exist only under the
+    /// content-addressed layout, so a cleanup may drop them without touching a v4 index.
+    static let v5OnlyTables = ["free_slot", "chunk_snippet", "occurrence", "chunk"]
 
     /// SQL for "the file id of the path bound at ?i, ?i+1" (directory, then basename). Callers bind
     /// with `bindPath`, which exists so the two halves can never be bound in the wrong order.
