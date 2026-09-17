@@ -1025,6 +1025,36 @@ public final class VectorStore: @unchecked Sendable {
     private var deadBudget: Int { Swift.min(Swift.max(4_096, rows.count / 20), rows.count / 4) }
 
     private var baseRows = 0
+    /// How many OCCURRENCES existed when the base was folded. Every one of them points at a slot
+    /// below `baseRows`, because slots are only ever handed out in increasing order, so the GPU
+    /// reduce can cover exactly this prefix and leave the rest to the host delta merge - the same
+    /// split the base/delta design already had, expressed in the unit that still works once a slot
+    /// and a row are different numbers. Equal to `baseRows` while they are the same.
+    private var baseOccCount = 0
+    /// The longest PREFIX of occurrences that lies entirely inside the first `n` slots.
+    ///
+    /// Not simply `rows.count`: the quantized replica is adopted with `baseRows = header.rows`,
+    /// which can be far short of the current slot count, and taking the whole row count there
+    /// claims the base covers occurrences whose vectors are not in it - a reshape mismatch at best
+    /// and a wrong score at worst. Not a binary search either: occSlot is only monotonic while
+    /// nothing is shared, because an occurrence that reuses an existing content points BACKWARDS.
+    /// Occurrences past this prefix are handled by the delta merge, which covers both cases.
+    private func occCountCoveringSlotsLocked(_ n: Int) -> Int {
+        guard n > 0 else { return 0 }
+        let m = Swift.min(rows.count, occSlot.count)
+        var i = 0
+        while i < m, Int(occSlot[i]) >= 0, Int(occSlot[i]) < n { i += 1 }
+        return i
+    }
+    /// Slot per occurrence for the folded prefix, on the GPU. What turns a score per CONTENT into a
+    /// score per OCCURRENCE, and the identity gather while nothing is shared.
+    private var mlxOccSlot: MLXArray?
+    private var mlxOccSlotRows = 0
+    /// Dead occurrences inside the folded prefix, for masking. Tombstones are a property of a ROW:
+    /// a content can be live in one file and tombstoned in another, so this cannot be applied to
+    /// the per-slot score vector.
+    private var mlxDeadOcc: MLXArray?
+    private var mlxDeadOccRows = 0
     private var baseDirty = true
     /// Monotone counter over CHUNK mutations, persisted in `meta` INSIDE each mutation's SQLite
     /// transaction - so it moves atomically with the rows it describes. The row-table sidecar is
@@ -1153,7 +1183,8 @@ public final class VectorStore: @unchecked Sendable {
     /// a deleted file back to life.
     private func resetTombstonesLocked() { deadRows.removeAll(); deadIdxCache = nil }
 
-    private func invalidateBase() { baseDirty = true; mlxBase = nil; mlxFileID = nil; mlxFileIDRows = 0; mlxKindCode = nil; mlxKindCodeRows = 0; mlxModified = nil; mlxModifiedRows = 0; quantBase = nil; bitBase = nil; baseRows = 0 }
+    private func invalidateBase() { baseDirty = true; mlxBase = nil; mlxFileID = nil; mlxFileIDRows = 0; mlxKindCode = nil; mlxKindCodeRows = 0; mlxModified = nil; mlxModifiedRows = 0; quantBase = nil; bitBase = nil; baseRows = 0
+                                     mlxOccSlot = nil; mlxOccSlotRows = 0; mlxDeadOcc = nil; mlxDeadOccRows = 0; baseOccCount = 0 }
     // Membership index of the paths currently in `rows`. Lets replace() know in O(1) whether a
     // path pre-exists, so a brand-new file skips removeRowsLocked entirely (no O(N) scan per file
     // during a full index). Rebuilt from the surviving rows whenever removeRowsLocked compacts.
@@ -4234,7 +4265,9 @@ public final class VectorStore: @unchecked Sendable {
             // longer applies, so fall back to the classic quant-capable path after the lock.
             guard let base = mlxBase, let fid = mlxFileID else { needClassic = true; return nil }
             let qv = queryGraph.reshaped([dim, 1]).asType(.bfloat16)
-            let baseScore = maskDeadLocked(gemvSafe(base, qv, rows: baseRows))
+            // NOT maskDeadLocked: that masks the per-CONTENT vector, and a tombstone is a
+            // property of a ROW. reduceTopKGPULocked masks dead occurrences after the gather.
+            let baseScore = gemvSafe(base, qv, rows: baseRows)
             var deltaGraph: MLXArray? = nil
             if n > baseRows {
                 let deltaCount = n - baseRows
@@ -4505,8 +4538,8 @@ public final class VectorStore: @unchecked Sendable {
                 // ONE `which` against the cached combined mask, not one per filter clause with
                 // its gathers rebuilt on every keystroke.
                 var selectScore = baseScore
-                if let selectMask {
-                    selectScore = MLX.which(selectMask.reshaped(baseScore.shape) .> 0.5,
+                if let selectMask, let slotMask = slotMaskFromOccMaskLocked(selectMask) {
+                    selectScore = MLX.which(slotMask.reshaped(baseScore.shape) .> 0.5,
                                             selectScore, MLXArray(-Float.infinity))
                 }
                 let result = fillSnippetsLocked(searchCandidatesLocked(
@@ -5016,29 +5049,62 @@ public final class VectorStore: @unchecked Sendable {
     /// 1.4 GB replica. Quant mode never built this eagerly, which is why kind-filtered queries
     /// silently fell to the host reducer.
     private func kindCodeGPULocked() -> MLXArray? {
-        guard baseRows > 0, kindCode.count >= baseRows else { return nil }
-        if let kc = mlxKindCode, mlxKindCodeRows == baseRows { return kc }
+        let m = baseOccCount
+        guard baseRows > 0, m > 0, kindCode.count >= m else { return nil }
+        if let kc = mlxKindCode, mlxKindCodeRows == m { return kc }
         let kc = kindCode.withUnsafeBufferPointer { kp in
-            MLXArray(UnsafeBufferPointer(rebasing: kp[0 ..< baseRows]).map { Int32($0) })
+            MLXArray(UnsafeBufferPointer(rebasing: kp[0 ..< m]).map { Int32($0) })
         }
         MLX.eval(kc)
         mlxKindCode = kc
-        mlxKindCodeRows = baseRows
+        mlxKindCodeRows = m
         return kc
+    }
+
+    /// Slot per occurrence over the folded prefix. The identity while nothing is shared, which is
+    /// what keeps the fused path bit-identical before any content is deduplicated.
+    private func occSlotGPULocked() -> MLXArray? {
+        let m = baseOccCount
+        guard m > 0, occSlot.count >= m else { return nil }
+        if let o = mlxOccSlot, mlxOccSlotRows == m { return o }
+        let o = occSlot.withUnsafeBufferPointer { op in
+            MLXArray(Array(UnsafeBufferPointer(rebasing: op[0 ..< m])))
+        }
+        MLX.eval(o)
+        mlxOccSlot = o
+        mlxOccSlotRows = m
+        return o
+    }
+
+    /// Dead OCCURRENCES in the folded prefix. `maskDeadLocked` masks the per-slot score vector,
+    /// which is only the same thing while a slot belongs to exactly one row; a shared content that
+    /// is tombstoned in one file must stay live in the others.
+    private func deadOccGPULocked() -> MLXArray? {
+        let m = baseOccCount
+        guard m > 0, !deadRows.isEmpty else { return nil }
+        if let d = mlxDeadOcc, mlxDeadOccRows == m { return d }
+        let idx = deadRows.filter { Int($0) < m }.sorted()
+        guard !idx.isEmpty else { mlxDeadOcc = nil; mlxDeadOccRows = m; return nil }
+        let d = MLXArray(idx)
+        MLX.eval(d)
+        mlxDeadOcc = d
+        mlxDeadOccRows = m
+        return d
     }
 
     /// GPU fileID for the current base, built on demand and sized to baseRows. Same contract as
     /// kindCodeGPULocked: full mode builds one eagerly, quant mode never did.
     private var mlxFileIDRows = 0
     private func fileIDGPULocked() -> MLXArray? {
-        guard baseRows > 0, fileID.count >= baseRows else { return nil }
-        if let f = mlxFileID, mlxFileIDRows == baseRows { return f }
+        let m = baseOccCount
+        guard baseRows > 0, m > 0, fileID.count >= m else { return nil }
+        if let f = mlxFileID, mlxFileIDRows == m { return f }
         let f = fileID.withUnsafeBufferPointer { fp in
-            MLXArray(Array(UnsafeBufferPointer(rebasing: fp[0 ..< baseRows])))
+            MLXArray(Array(UnsafeBufferPointer(rebasing: fp[0 ..< m])))
         }
         MLX.eval(f)
         mlxFileID = f
-        mlxFileIDRows = baseRows
+        mlxFileIDRows = m
         return f
     }
 
@@ -5170,6 +5236,29 @@ public final class VectorStore: @unchecked Sendable {
     private var selectMaskKey: String? = nil
     private var selectMaskGPU: MLXArray? = nil
     /// Flat [baseRows] Float32, 1 = keep. Nil when `f` has no GPU-maskable clause.
+    /// Turn a per-OCCURRENCE keep mask into a per-CONTENT one. A content is kept when at least one
+    /// occurrence that passes the filter points at it, because one vector is shared by all of them
+    /// and the scan cannot be finer than that. Post-filtering instead would silently drop a content
+    /// whose only in-scope occurrence ranked below the candidate cut, which is the failure the
+    /// pre-filtering design exists to avoid.
+    private func slotMaskFromOccMaskLocked(_ occMask: MLXArray) -> MLXArray? {
+        guard baseRows > 0, baseOccCount > 0, let oSlot = occSlotGPULocked() else { return nil }
+        if baseOccCount == baseRows, occSlotIsIdentityLocked { return occMask }   // nothing shared yet
+        var m = MLX.full([baseRows], values: MLXArray(Float(0)))
+        m = m.at[oSlot].maximum(occMask.reshaped([baseOccCount]))
+        MLX.eval(m)
+        return m
+    }
+
+    /// True while every occurrence owns its own content, which is the case for any index that has
+    /// not been through the content-addressed migration. Lets the mask propagation above skip a
+    /// scatter it does not need.
+    private var occSlotIsIdentityLocked: Bool {
+        guard occSlot.count >= baseOccCount else { return false }
+        for i in 0 ..< baseOccCount where Int(occSlot[i]) != i { return false }
+        return true
+    }
+
     private func selectMaskLocked(_ f: SearchFilter, pathFilter: Bool) -> MLXArray? {
         let hasKind = !f.kinds.isEmpty
         guard hasKind || pathFilter || f.since != nil else { return nil }
@@ -5178,7 +5267,7 @@ public final class VectorStore: @unchecked Sendable {
         let pathKey: String? = pathFilter ? Self.pathAllowKey(f, nGlobal: max(1, fileChunkCount.count)) : ""
         let key: String? = (!Self.selectMaskCache || (pathFilter && pathKey == nil)) ? nil
             : "\(f.kinds.sorted().joined(separator: ","))|\(sinceCut.map(String.init) ?? "")"
-              + "|\(pathKey ?? "")|\(baseRows)"
+              + "|\(pathKey ?? "")|\(baseRows)|\(baseOccCount)"
         if let key, key == selectMaskKey, let m = selectMaskGPU { return m }
 
         var keep: MLXArray? = nil
@@ -5187,15 +5276,15 @@ public final class VectorStore: @unchecked Sendable {
             guard let kc = kindCodeGPULocked() else { return nil }
             var allow = [Float](repeating: 0, count: 256)
             for k in f.kinds { if let id = kindID[k] { allow[Int(id)] = 1 } }
-            combine(MLXArray(allow)[kc].reshaped([baseRows]))
+            combine(MLXArray(allow)[kc].reshaped([baseOccCount]))
         }
         if pathFilter {
             guard let fid = fileIDGPULocked(), let pa = pathAllowGPULocked(f) else { return nil }
-            combine(pa[fid].reshaped([baseRows]))
+            combine(pa[fid].reshaped([baseOccCount]))
         }
         if let cut = sinceCut {
             guard let md = modifiedGPULocked() else { return nil }
-            combine((md .>= MLXArray(cut)).asType(Float.self).reshaped([baseRows]))
+            combine((md .>= MLXArray(cut)).asType(Float.self).reshaped([baseOccCount]))
         }
         guard let mask = keep else { return nil }
         MLX.eval(mask)
@@ -5312,9 +5401,17 @@ public final class VectorStore: @unchecked Sendable {
     private func reduceTopKGPULocked(baseScore: MLXArray, fid: MLXArray, deltaGraph: MLXArray?, topK: Int,
                                      filter: SearchFilter = SearchFilter()) -> [SearchHit] {
         let F = fileIDCount
-        guard F > 0, topK > 0 else { return [] }
+        let occ = baseOccCount
+        guard F > 0, topK > 0, occ > 0, let oSlot = occSlotGPULocked() else { return [] }
+        // baseScore is per CONTENT. Everything below reduces per OCCURRENCE, so gather once: this
+        // is the whole difference between scoring rows and scoring contents, and it is the identity
+        // gather while nothing is shared.
         let s32 = baseScore.reshaped([baseRows]).asType(.float32)
-        var sClean = MLX.which(s32 .== s32, s32, MLXArray(-Float.infinity))   // NaN rows lose
+        let slotClean = MLX.which(s32 .== s32, s32, MLXArray(-Float.infinity))   // NaN contents lose
+        var sClean = slotClean[oSlot]
+        // Tombstones are a property of a ROW. Masking them on the per-content vector would kill a
+        // content that is live in another file, so it happens here, after the gather.
+        if let dead = deadOccGPULocked() { sClean[dead] = MLXArray(-Float.infinity) }
         // Kind filter (only kinds set; onlyKindFiltered guaranteed by the caller): force every row of a
         // disallowed kind to -inf BEFORE the scatter-max, exactly as a NaN row is forced. A disallowed
         // file's best then scores -inf and the existing `.isFinite` guard below drops it - identical to
@@ -5331,8 +5428,8 @@ public final class VectorStore: @unchecked Sendable {
         }
         var bestScore = MLX.full([F], values: MLXArray(-Float.infinity))
         bestScore = bestScore.at[fid].maximum(sClean)
-        let rowBest = bestScore[fid]                                          // [N] each row's file-best
-        let rowIdx = MLX.arange(0, baseRows, dtype: .int32)
+        let rowBest = bestScore[fid]                                          // [occ] each row's file-best
+        let rowIdx = MLX.arange(0, occ, dtype: .int32)
         let cand = MLX.which(sClean .== rowBest, rowIdx, MLXArray(Int32.max))
         var bestRow = MLX.full([F], values: MLXArray(Int32.max), type: Int32.self)
         bestRow = bestRow.at[fid].minimum(cand)
@@ -5359,10 +5456,34 @@ public final class VectorStore: @unchecked Sendable {
         // eval and fold it into the one sync below, so reading idxHost is a pure copy rather than a
         // second command-buffer round-trip on an orphaned [K] cast node (F5).
         let topIdxI = topIdx.asType(.int32)
+        // Post-fold occurrences that REUSE a content already in the base need that content's score,
+        // and it only exists on the GPU. Gather exactly those - bounded by the fold threshold, so a
+        // handful - and fold the read into the one sync below rather than adding a round trip.
+        // Empty while nothing is shared: then every post-fold occurrence has a post-fold slot.
+        var reuseRows: [Int32] = []
+        var reuseSlots: [Int32] = []
+        if occSlot.count >= rows.count {
+            for ri in occ ..< rows.count {
+                let sl = occSlot[ri]
+                if sl >= 0 && Int(sl) < baseRows { reuseRows.append(Int32(ri)); reuseSlots.append(sl) }
+            }
+        }
+        let reuseGraph: MLXArray? = reuseSlots.isEmpty ? nil : slotClean[MLXArray(reuseSlots)]
         // ONE sync for the whole chain - including the delta matmul (previously its own eval)
         // and, on the fused path, the query-embed forward upstream of baseScore.
-        if let deltaGraph { MLX.eval(topScores, topRows, topIdxI, deltaGraph) } else { MLX.eval(topScores, topRows, topIdxI) }
+        switch (deltaGraph, reuseGraph) {
+        case let (d?, r?): MLX.eval(topScores, topRows, topIdxI, d, r)
+        case let (d?, nil): MLX.eval(topScores, topRows, topIdxI, d)
+        case let (nil, r?): MLX.eval(topScores, topRows, topIdxI, r)
+        case (nil, nil):   MLX.eval(topScores, topRows, topIdxI)
+        }
         let deltaScores: [Float] = deltaGraph.map { $0.asArray(Float.self) } ?? []
+        var reuseScore: [Int32: Float] = [:]
+        if let reuseGraph {
+            let v = reuseGraph.asArray(Float.self)
+            reuseScore.reserveCapacity(v.count)
+            for (j, ri) in reuseRows.enumerated() where j < v.count { reuseScore[ri] = v[j] }
+        }
         let scoresHost = topScores.asArray(Float.self)
         let rowsHost = topRows.asArray(Int32.self)
 
@@ -5388,9 +5509,23 @@ public final class VectorStore: @unchecked Sendable {
         // gating after it only saves the insert, while the hash lookup is the bulk of the loop.
         let gate: Float = (Self.cantWinGate && candScore.count >= topK) ? (candScore.values.min() ?? -.infinity) : -.infinity
         let hasDead = !deadRows.isEmpty
-        for (i, dot) in deltaScores.enumerated() {
+        // THE DELTA IS WALKED BY OCCURRENCE, NOT BY SLOT. `deltaScores` is indexed by content, and
+        // an occurrence added after the fold may point at a BRAND NEW content (its score is in the
+        // delta) or reuse one already folded into the base (its score is in the base vector, on the
+        // GPU). `reuseScore` below carries the second case back; it is empty while nothing is
+        // shared, because then every post-fold occurrence has a post-fold slot.
+        for ri in occ ..< Swift.min(rows.count, occSlot.count) {
+            let sl = Int(occSlot[ri])
+            let dot: Float
+            if sl >= baseRows {
+                let di = sl - baseRows
+                guard di >= 0, di < deltaScores.count else { continue }
+                dot = deltaScores[di]
+            } else {
+                guard let v = reuseScore[Int32(ri)] else { continue }
+                dot = v
+            }
             guard dot.isFinite, dot >= gate else { continue }
-            let ri = baseRows + i
             // Tombstones reach the delta now, and unlike the base rows above (masked to -inf on the
             // GPU before selection) a dead delta row arrives here with a perfectly good score.
             if hasDead, deadRows.contains(Int32(ri)) { continue }
@@ -5846,7 +5981,7 @@ public final class VectorStore: @unchecked Sendable {
             bitBase = codes
             quantBase = nil
             quantBits = 1
-            baseRows = header.rows
+            baseRows = header.rows; baseOccCount = occCountCoveringSlotsLocked(baseRows)
             baseDirty = false
             lastPersistedBaseRows = header.rows
             if Self.searchTiming { print("[search] ADOPT 1-bit replica rows=\(header.rows)") }
@@ -5871,7 +6006,7 @@ public final class VectorStore: @unchecked Sendable {
         MLX.eval(toEval)
         quantBase = (wq, sc, biArr)
         quantBits = header.bits
-        baseRows = header.rows
+        baseRows = header.rows; baseOccCount = occCountCoveringSlotsLocked(baseRows)
         baseDirty = false
         lastPersistedBaseRows = header.rows
         if Self.searchTiming {
@@ -7841,7 +7976,7 @@ public final class VectorStore: @unchecked Sendable {
             let merged = MLX.concatenated([bb, add], axis: 0)
             MLX.eval(merged)
             bitBase = merged
-            baseRows = rowCount
+            baseRows = rowCount; baseOccCount = occCountCoveringSlotsLocked(baseRows)
             ensureVecScratchLocked()
             quantReplicaChangedLocked()
             if let tR { print(String(format: "[search] FOLD(1bit) delta=%d rows=%d %.1fms", deltaRows, rowCount, -tR.timeIntervalSinceNow * 1000)) }
@@ -7859,7 +7994,7 @@ public final class VectorStore: @unchecked Sendable {
                 if let bi { toEval.append(bi) }
                 MLX.eval(toEval)
                 quantBase = (wq, sc, bi)
-                baseRows = rowCount
+                baseRows = rowCount; baseOccCount = occCountCoveringSlotsLocked(baseRows)
                 ensureVecScratchLocked()
                 quantReplicaChangedLocked()
                 if let tR { print(String(format: "[search] FOLD delta=%d rows=%d %.1fms", deltaRows, rowCount, -tR.timeIntervalSinceNow * 1000)) }
@@ -7930,7 +8065,7 @@ public final class VectorStore: @unchecked Sendable {
             MLX.eval(mlxBase!, fid, kc)
             quantBits = 0
         }
-        baseRows = rowCount
+        baseRows = rowCount; baseOccCount = occCountCoveringSlotsLocked(baseRows)
         baseDirty = false
     }
 
@@ -8989,13 +9124,13 @@ public final class VectorStore: @unchecked Sendable {
         // and close() persisted nothing.
         if quantBits == 1, let bb = bitBase, !baseDirty, let survivors = baseSurvivors {
             guard !survivors.isEmpty else {
-                bitBase = nil; baseRows = 0; baseDirty = true
+                bitBase = nil; baseRows = 0; baseOccCount = 0; baseDirty = true
                 return false
             }
             let gathered = bb.take(MLXArray(survivors), axis: 0)
             MLX.eval(gathered)
             bitBase = gathered
-            baseRows = survivors.count
+            baseRows = survivors.count; baseOccCount = occCountCoveringSlotsLocked(baseRows)
             lastPersistedBaseRows = -1
             replicaLaunchPersistScheduled = false
             if Self.searchTiming { print("[search] GATHER 1-bit survivors=\(survivors.count)") }
@@ -9015,7 +9150,7 @@ public final class VectorStore: @unchecked Sendable {
         if let bi { toEval.append(bi) }
         MLX.eval(toEval)
         quantBase = (wq, sc, bi)
-        baseRows = survivors.count
+        baseRows = survivors.count; baseOccCount = occCountCoveringSlotsLocked(baseRows)
         // The on-disk replica no longer matches this prefix: mark it un-persisted and re-arm the
         // async persist so a later fold (or close) writes a fresh one. Adoption's checksum would
         // reject the stale file anyway; this just restores freshness within the session.
