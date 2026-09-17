@@ -79,7 +79,7 @@ public struct FileCrawler: Sendable {
     public static let skipDirNames: [String] = [
         "node_modules", ".git", ".svn", ".hg", "Library", "Pods", ".build",
         "DerivedData", "venv", ".venv", "env", "__pycache__", ".cache",
-        "Caches", ".Trash", "vendor", "dist", "build", ".next", "target",
+        "Caches", ".Trash", "vendor", "dist", "build", "_build", ".next", "target",
     ]
 
     public init(roots: [URL], ignore: OmniIgnore = OmniIgnore(text: ""),

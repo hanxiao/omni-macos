@@ -17,6 +17,16 @@ private final class NullEmbedder: Embedder {
 }
 
 final class ChunkLocatorTests: XCTestCase {
+
+    /// Word-shaped filler of exactly `count` characters. Fixtures cannot be runs of one repeated
+    /// character any more: the chunker drops chunks that are unbroken token runs (OpaqueText), so
+    /// such a fixture would be filtered away before any locator assertion below could run.
+    private func filler(_ count: Int) -> String {
+        let unit = "lorem ipsum dolor sit amet "
+        var s = ""
+        while s.count < count { s += unit }
+        return String(s.prefix(count))
+    }
     private func makeIndexer() throws -> (Indexer, VectorStore) {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("chunk-tests-\(UUID().uuidString)")
         let store = try VectorStore(dbURL: dir.appendingPathComponent("test.sqlite"))
@@ -30,7 +40,7 @@ final class ChunkLocatorTests: XCTestCase {
         var settings = IndexSettings.default
         settings.maxCharsPerChunk = 1000
         // 100k chars -> step 800 -> ~125 chunks, far past the old cap of 40.
-        let text = String(repeating: String(repeating: "a", count: 99) + "\n", count: 1000)
+        let text = String(repeating: filler(99) + "\n", count: 1000)
         let pieces = indexer.chunk(text, settings: settings, origin: .plain)
         XCTAssertGreaterThan(pieces.count, 100, "long text must not be truncated to a fixed chunk cap")
         XCTAssertTrue(text.hasSuffix(pieces.last!.text), "last chunk must end where the text ends")
@@ -46,7 +56,7 @@ final class ChunkLocatorTests: XCTestCase {
         var settings = IndexSettings.default
         settings.maxCharsPerChunk = 200   // floor
         // 50 numbered lines of 50 chars each: chunk 0 starts line 1, step is 200-200(overlap)->floored.
-        let lines = (1 ... 200).map { String(format: "line %04d ", $0) + String(repeating: "x", count: 40) }
+        let lines = (1 ... 200).map { String(format: "line %04d ", $0) + filler(40) }
         let text = lines.joined(separator: "\n")
         let pieces = indexer.chunk(text, settings: settings, origin: .plain)
         XCTAssertGreaterThan(pieces.count, 1)
@@ -68,7 +78,7 @@ final class ChunkLocatorTests: XCTestCase {
         var settings = IndexSettings.default
         settings.maxCharsPerChunk = 200
         // Three "pages" of 500 chars each, page starts at 0/500/1000.
-        let text = String(repeating: "a", count: 500) + String(repeating: "b", count: 500) + String(repeating: "c", count: 500)
+        let text = filler(500) + filler(500) + filler(500)
         let pieces = indexer.chunk(text, settings: settings, origin: .paged([0, 500, 1000]))
         XCTAssertGreaterThan(pieces.count, 3)
         for (i, p) in pieces.enumerated() {

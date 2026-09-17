@@ -2081,7 +2081,11 @@ public final class Indexer: @unchecked Sendable {
             startIdx = text.index(startIdx, offsetBy: step, limitedBy: text.endIndex) ?? text.endIndex
             startOff += step
         }
-        return pieces
+        // Leave out the chunks that are machine payload rather than language. Dropped here, at the
+        // one place every text file is chunked, so the vector, the snippet and the token cost all
+        // go together. A clean chunk's text is untouched, so its chunk key is unchanged and no
+        // existing vector is invalidated by this.
+        return OpaqueText.filter(pieces) { $0.text }
     }
 
     /// Snippet for an image chunk: its open-vocabulary content tags when the tagger produced
