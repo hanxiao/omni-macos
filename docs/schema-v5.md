@@ -183,16 +183,40 @@ Built, tested and pinned with a negative control each:
     ChunkDiff          15 tests   set diff, reference multiplicity
     OccurrenceIndex    16 tests   slot mask, expansion, the scope leak
     SchemaV5            9 tests   DDL, unique key index, reverse edge plan
-    ContentSharing     17 tests   the store end to end: write, search, delete, coverage, reload
+    ContentSharing     19 tests   the store end to end: write, search, delete, coverage, reload
 
-Integrated: the store's in-memory model, the write path, both reducers, the quantized funnel,
-compaction, reload, vector coverage, and the slot-column backfill that upgrades an existing index.
+SHIPPED AND ON: content sharing itself - the store's in-memory model, the write path, both
+reducers, the quantized funnel, compaction, the hole reclaim, reload, vector coverage, and the
+slot-column backfill that upgrades an existing index. Plus `OpaqueText`, the base64/payload filter,
+which is on the indexing path.
 
-Not integrated: the `chunk` / `occurrence` table split. The store shares contents through
-`chunks.slot` plus the partial index on `chunk_text.chunk_key`, which is the same content-addressed
-model reached without moving 9.7M rows; the split tables and MigrationV5's backfill remain the
-route to storing a locator per occurrence rather than per chunk, which is what a shared chunk needs
-before it can report "Line 12 of A and Line 4310 of B".
+WRITTEN, TESTED, AND NOT WIRED TO ANYTHING. Said plainly because "component status" above reads
+like a delivery list and three of those components deliver nothing yet:
+
+  ContentChunker   The FastCDC cutter. The index still uses the fixed 1800/200 grid, so the
+                   insertion-stability numbers at the top of this file are a measurement of what
+                   CDC WOULD buy, not of what the app does. `ChunkKey.text` carries the cutter
+                   fingerprint so the two generations can coexist when it does land.
+  ChunkDiff        The reuse/embed/refcount plan for a partial reindex. Nothing calls it: a file
+                   that changes is still re-chunked and re-embedded whole, and sharing then
+                   collapses whatever came back identical - which is the same vectors, at the cost
+                   of the forward passes.
+  SlotAllocator    The free list. The reclaim is the v4 answer and now works under sharing, so a
+                   released position waits for a whole-file copy rather than being handed to the
+                   next new content.
+  MigrationV5      The backfill for the `chunk` / `occurrence` table split, measured at 79.7s on
+                   the real index. Sharing is reached through `chunks.slot` plus the partial index
+                   on `chunk_text.chunk_key` instead, which needs no table to move.
+
+THE LOCATOR PROBLEM THE SPLIT EXISTS FOR DOES NOT ARISE, and that is worth saying because the
+design above spends a section on it. "A locator on the chunk is what makes deduplication
+impossible in the obvious design" is true of a design where the chunk row is shared. Here the
+VECTOR is shared and the chunk row is not: every occurrence keeps its own `chunk_text` row, and
+`fillSnippetsLocked` looks up by (path, chunk index) - the hit's own - rather than by the content
+it matched. Two files holding one passage report "Line 12" and "Line 4310" respectively, with
+their own snippets. `testEachSharerKeepsItsOwnLocatorAndSnippet` pins it. What the split would
+still buy is storing that text ONCE per content plus a locator per occurrence, rather than a full
+row per occurrence - a size win, not a correctness one.
 
 ## A lead worth taking, measured: Matryoshka truncation as the coarse tier
 

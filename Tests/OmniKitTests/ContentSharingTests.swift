@@ -1122,6 +1122,36 @@ final class ContentSharingTests: XCTestCase {
         }
     }
 
+    /// EACH FILE REPORTS ITS OWN LOCATOR AND SNIPPET for a passage it shares.
+    ///
+    /// The thing a content-addressed store is supposed to get wrong: one vector, so one set of
+    /// display text, so the same passage shows as "Line 12" in every file that has it. It does not
+    /// happen here, and the reason is worth stating rather than discovering: the vector is shared,
+    /// the chunk ROW is not. Every occurrence keeps its own `chunk_text` row, and the snippet
+    /// lookup is by (path, chunk index) - the hit's own - rather than by the content it matched.
+    func testEachSharerKeepsItsOwnLocatorAndSnippet() throws {
+        let store = try VectorStore(dbURL: tempDB()); defer { store.close() }
+        let shared = vec(4)
+        try store.replace(path: "/p/a.txt", chunks: [IndexedChunk(
+            path: "/p/a.txt", modified: 1, size: 1, kind: "text", chunkIndex: 0,
+            snippet: "the passage as A stores it", embedding: shared, locator: "Line 12",
+            chunkKey: "abcd1234")])
+        try store.replace(path: "/p/b.txt", chunks: [IndexedChunk(
+            path: "/p/b.txt", modified: 1, size: 1, kind: "text", chunkIndex: 0,
+            snippet: "the passage as B stores it", embedding: shared, locator: "Line 4310",
+            chunkKey: "abcd1234")])
+        XCTAssertEqual(store.vectorBufferUse.used / 8, 1, "the fixture did not actually share")
+
+        let hits = store.search(shared, topK: 10)
+        XCTAssertEqual(Set(hits.map(\.path)), ["/p/a.txt", "/p/b.txt"])
+        let a = try XCTUnwrap(hits.first { $0.path == "/p/a.txt" })
+        let b = try XCTUnwrap(hits.first { $0.path == "/p/b.txt" })
+        XCTAssertEqual(a.locator, "Line 12", "A was given the other file's locator")
+        XCTAssertEqual(b.locator, "Line 4310", "B was given the other file's locator")
+        XCTAssertEqual(a.snippet, "the passage as A stores it", "A was given the other file's snippet")
+        XCTAssertEqual(b.snippet, "the passage as B stores it", "B was given the other file's snippet")
+    }
+
     private func claim(_ db: URL) -> Int {
         var h: OpaquePointer?
         guard sqlite3_open(db.path, &h) == SQLITE_OK else { return -1 }
