@@ -20,7 +20,7 @@ import CryptoKit
 ///   why a cold open read 615 MB to recover 2.4M rows of (file, index, kind).
 enum StoreSchema {
     /// Bumped when the layout changes in a way an older binary must not read as its own.
-    static let version: Int32 = 5
+    static let version: Int32 = 4
 
     // MARK: - Kinds as codes
     //
@@ -123,12 +123,12 @@ enum StoreSchema {
     ///
     /// That requires the names not to collide with v3's, which is why the label index is
     /// `idx_chunk_label` and not `idx_media_snippet` - v3's still exists while the copy is built.
-    static func createStatements(suffix: String = "") -> [String] {
+    static func createStatements(suffix: String = "", includeV5: Bool = true) -> [String] {
         let dirs = "dirs\(suffix)", files = "files\(suffix)", chunks = "chunks\(suffix)"
         let text = "chunk_text\(suffix)", pend = "pending_vecs\(suffix)", dedup = "dedup\(suffix)"
         let chunk = "chunk\(suffix)", occ = "occurrence\(suffix)"
         let snip = "chunk_snippet\(suffix)", free = "free_slot\(suffix)"
-        return [
+        var out: [String] = [
             "CREATE TABLE IF NOT EXISTS \(dirs)(id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);",
             // Per-FILE facts live here exactly once. In v3 every one of these was a column on
             // `chunks`, written 3.16 times per file on average - and a file whose mtime changed
@@ -208,7 +208,13 @@ enum StoreSchema {
             );
             """,
             "CREATE INDEX IF NOT EXISTS idx_dedup_key ON \(dedup)(key);",
-
+        ]
+        // The v3 -> v4 conversion builds `_new` copies and renames them over the v4 tables. It must
+        // not build the v5 ones: they are not in its rename list, so they would be left behind as
+        // orphaned `_new` tables - which is exactly what its own "temporary tables were left
+        // behind" assertion caught the first time this was written.
+        guard includeV5 else { return out }
+        out += [
             // MARK: v5 - CONTENT-ADDRESSED CHUNKS
             //
             // WHAT a chunk is, once. Measured on a 2.68M-file index: 9,130,536 text chunks hold only
@@ -279,11 +285,19 @@ enum StoreSchema {
             // no chunk row - which is the same property that lets vec_holes be rebuilt.
             "CREATE TABLE IF NOT EXISTS \(free)(id INTEGER PRIMARY KEY);",
         ]
+        return out
     }
 
     /// Tables the v4 layout owns, newest-dependency first - the order a teardown wants.
-    static let tables = ["free_slot", "chunk_snippet", "occurrence", "chunk",
-                         "pending_vecs", "chunk_text", "chunks", "dedup", "files", "dirs"]
+    /// THE v4 LAYOUT'S TABLES, newest-dependency first - the order a teardown wants, and the list
+    /// the v3 -> v4 swap renames `_new` copies over. The v5 tables are deliberately NOT here: they
+    /// are created by every normal open, so a rename onto them fails with "table already exists"
+    /// and takes the whole upgrade down with it. Found by the v4 migration suite the moment they
+    /// were added to this list.
+    static let tables = ["pending_vecs", "chunk_text", "chunks", "dedup", "files", "dirs"]
+
+    /// Every table the store owns, both layouts. For a wipe, which must leave nothing behind.
+    static let allTables = v5OnlyTables + tables
 
     /// The subset that exists ONLY in v4. `chunks` and `files` are in the list above but not this
     /// one, and the difference is not cosmetic: they exist under both layouts, so a cleanup that

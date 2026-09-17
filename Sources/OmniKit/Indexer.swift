@@ -389,10 +389,10 @@ public final class Indexer: @unchecked Sendable {
     /// level down - a settings change must never resurrect a stale vector - and like contentKey
     /// it is keyed on the embedder dimension, with a model switch handled by forceFreshEmbed.
     func chunkKey(_ text: String, settings: IndexSettings) -> String {
-        var h = SHA256()
-        h.update(data: Data("1|c\(settings.maxCharsPerChunk)|o\(chunkOverlap)|m\(embedder.dim)|".utf8))
-        h.update(data: Data(text.utf8))
-        return h.finalize().prefix(16).map { String(format: "%02x", $0) }.joined()
+        // ONE definition of the format, in ChunkKey. It is the identity every existing index's
+        // 9.13M vectors are stored under, so the migration reuses them by looking it up.
+        ChunkKey.grid(text, maxChars: settings.maxCharsPerChunk,
+                      overlap: chunkOverlap, dim: embedder.dim)
     }
 
     // Text chunking. maxCharsPerChunk now comes per-pass from IndexSettings (user-set).

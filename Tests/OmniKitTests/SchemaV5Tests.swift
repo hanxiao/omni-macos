@@ -47,8 +47,15 @@ final class SchemaV5Tests: XCTestCase {
         }
     }
 
-    func testTheVersionIsFive() {
-        XCTAssertEqual(StoreSchema.version, 5)
+    func testTheV5TablesAreNotInTheV4SwapList() {
+        // The v3 -> v4 upgrade renames `<t>_new` over `<t>` for every name in `tables`. The v5
+        // tables are created by every normal open, so a rename onto one fails with "table already
+        // exists" and fails the whole upgrade. Adding them to that list broke all 8 v4 migration
+        // tests; this is the guard.
+        for t in StoreSchema.v5OnlyTables {
+            XCTAssertFalse(StoreSchema.tables.contains(t), "\(t) would be renamed over by the v4 swap")
+            XCTAssertTrue(StoreSchema.allTables.contains(t), "\(t) missing from the wipe list")
+        }
     }
 
     func testV5TablesAreNotListedAsV4Only() {
@@ -56,7 +63,7 @@ final class SchemaV5Tests: XCTestCase {
         // distinction v4 already had to make for `chunks` and `files`.
         XCTAssertTrue(Set(StoreSchema.v4OnlyTables).isDisjoint(with: Set(StoreSchema.v5OnlyTables)))
         for t in StoreSchema.v5OnlyTables {
-            XCTAssertTrue(StoreSchema.tables.contains(t), "\(t) missing from the teardown order")
+            XCTAssertTrue(StoreSchema.allTables.contains(t), "\(t) missing from the teardown order")
         }
     }
 

@@ -2491,7 +2491,7 @@ public final class VectorStore: @unchecked Sendable {
         queue.sync {
             guard dbOpen() else { return }
             beginTxnLocked()
-            for t in StoreSchema.tables { exec("DELETE FROM \(t);") }   // every row is an orphan now
+            for t in StoreSchema.allTables { exec("DELETE FROM \(t);") }   // every row is an orphan now
             bumpGenLocked()
             exec("COMMIT;")
             // Release the backing buffers (a wipe will not refill to the same size immediately),
@@ -9677,7 +9677,7 @@ public final class VectorStore: @unchecked Sendable {
         // restarted rather than resumed WHEN ITS SHAPE IS UNKNOWN - but a complete-looking one is
         // resumed, which is what makes a kill cheap. The distinguishing fact is simply how much of
         // `chunks` it already holds, read below.
-        for sql in StoreSchema.createStatements(suffix: "_new") where !execChecked(sql) {
+        for sql in StoreSchema.createStatements(suffix: "_new", includeV5: false) where !execChecked(sql) {
             failV4("could not create the new tables")
             return
         }
