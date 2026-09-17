@@ -10559,7 +10559,7 @@ public final class VectorStore: @unchecked Sendable {
     /// everyone, not masking it lets the deleted file come back. It skips the ROW now.
     ///
     /// OMNI_CONTENT_SHARING=0 turns it off, which is the A/B and the escape hatch.
-    nonisolated(unsafe) static var contentSharing =
+    nonisolated(unsafe) public static var contentSharing =
         ProcessInfo.processInfo.environment["OMNI_CONTENT_SHARING"] == "1"
 
     func appendChunksLocked(_ chunks: [IndexedChunk], bfs: [[UInt16]], ids: [Int64] = []) -> [Int32] {

@@ -4152,6 +4152,75 @@ if args.count >= 2 && args[1] == "retrieve" {
 // Runs the real Indexer (crawl + concurrent decode + batched embed + SQLite store) over a folder
 // and reports end-to-end files/s, chunks/s, tok/s - so we can see the live bottleneck, not just
 // the isolated embed step.
+// Content sharing, end to end: omni-verify sharebench <modelDir> <root> [searchReps]
+//
+// The A/B for OMNI_CONTENT_SHARING, run against a REAL corpus rather than synthetic vectors,
+// because the whole question is how much of the corpus repeats itself. One pass builds the index
+// and reports what it cost and what it occupies; then the same stored vectors are searched, which
+// is where fewer positions in the file are supposed to pay for the extra work per write.
+//
+// Reported per arm, and every one of them is the point of a separate claim:
+//   chunks    - unchanged by sharing; the index still knows about every occurrence
+//   vectors   - the positions .vecs actually holds. This is the saving.
+//   tok       - what reached the encoder. Sharing does NOT move this: duplicate chunks inside one
+//               pass are already collapsed by the indexer's own key-keyed cache, in both arms.
+//   search    - p50/p90 over the same query set, on the same machine, back to back.
+if args.count >= 4 && args[1] == "sharebench" {
+    let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[2]))
+    let target = URL(fileURLWithPath: args[3])
+    let reps = (args.count >= 5 ? Int(args[4]) : nil) ?? 60
+    let fm = FileManager.default
+    let tmp = fm.temporaryDirectory.appendingPathComponent("sharebench-\(UUID().uuidString).sqlite")
+    defer { for e in ["", "-wal", "-shm", ".rows", ".vecs", ".quant"] { try? fm.removeItem(atPath: tmp.path + e) } }
+    let store = try VectorStore(dbURL: tmp)
+    let idx = Indexer(store: store, embedder: engine)
+    var settings = IndexSettings(enabledKinds: [.text])
+    let nonText = FileExtractor.imageExtensions.union(FileExtractor.videoExtensions).union(FileExtractor.audioExtensions)
+    settings.ignore = OmniIgnore(text: (FileCrawler.skipDirNames.map { "\($0)/" } + nonText.sorted().map { "*.\($0)" }).joined(separator: "\n"))
+    let tok0 = engine.tokensProcessed
+    let t0 = Date()
+    let emb: Int = await withCheckedContinuation { cont in
+        let l = NSLock(); var fired = false
+        idx.index(roots: [target], settings: settings, force: true) { p in
+            if p.done { l.lock(); let go = !fired; fired = true; l.unlock(); if go { cont.resume(returning: p.embedded) } }
+        }
+    }
+    let sec = -t0.timeIntervalSinceNow
+    let toks = engine.tokensProcessed - tok0
+    let use = store.vectorBufferUse
+    let vectors = engine.dim > 0 ? use.used / engine.dim : 0
+    func bytes(_ suffix: String) -> Int64 {
+        ((try? fm.attributesOfItem(atPath: tmp.path + suffix)[.size]) as? Int64) ?? 0
+    }
+    print(String(format: "SHAREBENCH index  sharing=%@  files=%d  chunks=%d  vectors=%d  tok=%d  %.2fs",
+                 VectorStore.contentSharing ? "on" : "off", emb, store.count, vectors, toks, sec))
+    print(String(format: "SHAREBENCH store  vecs=%.1f MB  db=%.1f MB  saved=%.1f%%",
+                 Double(bytes(".vecs")) / 1_048_576, Double(bytes("")) / 1_048_576,
+                 store.count > 0 ? 100 * (1 - Double(vectors) / Double(store.count)) : 0))
+
+    // The queries are STORED TEXT, so they hit the way a real query does rather than landing in
+    // empty space - and the same strings in both arms, derived from the corpus itself.
+    let probes = ["distributed search index", "coverage claim positions", "the vector file",
+                  "swift test failure", "chunk key content hash", "folder scoped search",
+                  "quantized funnel rerank", "tombstone dead row"]
+    let qvecs = probes.map { engine.embedText($0, as: .query) }
+    for q in qvecs { _ = store.search(q, topK: 10) }          // warm
+    var lat: [Double] = []
+    for _ in 0 ..< reps {
+        for q in qvecs {
+            let s = Date()
+            _ = store.search(q, topK: 10)
+            lat.append(-s.timeIntervalSinceNow * 1000)
+        }
+    }
+    lat.sort()
+    func pct(_ p: Double) -> Double { lat.isEmpty ? 0 : lat[Swift.min(lat.count - 1, Int(Double(lat.count) * p))] }
+    print(String(format: "SHAREBENCH search sharing=%@  n=%d  p50=%.2fms  p90=%.2fms  p99=%.2fms",
+                 VectorStore.contentSharing ? "on" : "off", lat.count, pct(0.5), pct(0.9), pct(0.99)))
+    store.close()
+    exit(0)
+}
+
 if args.count >= 4 && args[1] == "indexbench" {
     let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
     let target = URL(fileURLWithPath: args[3])
