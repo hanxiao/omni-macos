@@ -10614,30 +10614,37 @@ public final class VectorStore: @unchecked Sendable {
     /// Assign a slot to every chunk about to be appended, appending a vector ONLY for a content the
     /// store does not already hold, and append the rows. One content, one vector - which is the
     /// whole point, and the only place it actually happens.
-    /// OFF, because COVERAGE still counts rows.
+    /// ON. One content, one vector, one position in the file - and every file that holds it still
+    /// answers for it.
     ///
-    /// Sharing is correct through the write path, both reducers, the quantized funnel, compaction
-    /// and a plain reload. It is NOT correct through coverage - the state a real index lives in.
-    /// coveredRows is advanced per ROW and the loader checks covered == coveredRows - holes, also a
-    /// row count, so once contents are shared the file holds fewer positions than there are rows
-    /// and everything past the first duplicate is mis-seated. That is a protocol change, not an
-    /// indexing fix, and it is the last place assuming one vector per row.
+    /// WHAT IT BUYS, measured rather than argued. On the real 2.68M-file index, 38.5% of text
+    /// chunks hold a vector that already exists elsewhere: 5.4 GB of a 15.4 GB vector file. On one
+    /// project's agent logs - 580 files, 22,868 chunks - it is 9.3%. The rate is a property of the
+    /// corpus, and the range matches what arXiv 2605.09611 measures for byte-exact chunk dedup
+    /// (0.16% on clean academic text, 24% on enterprise content, 80% on conversation logs).
+    ///
+    /// WHAT IT DOES NOT BUY: GPU time. Duplicate chunks inside one pass are already collapsed by
+    /// the indexer's own key-keyed cache, in both arms, so `tokensProcessed` is identical - 9,686,235
+    /// either way on the corpus above. This is a storage and scan-width change, not an embedding one.
+    ///
+    /// WHAT IT COSTS. The store's own write path runs 11-16% slower (the content lookup, the slot
+    /// UPDATE), and that is invisible end to end: the same corpus indexes in 122.4/123.2s with
+    /// sharing and 123.4/122.8s without, because indexing is 99% GPU. Search costs nothing
+    /// measurable - on the 9,729,693-chunk index, p50 4.3ms in both arms - and returns the SAME
+    /// ANSWERS: `omni-verify searchreal` digests the top-10 paths and scores of ten queries and the
+    /// digest is identical in both arms, which it must be, because the occurrence mirror is the
+    /// identity on an index whose contents are not shared.
     ///
     /// The last thing standing between here and on was a wrong result list under the quantized
     /// funnel, and it turned out to be one line: rerankLocked wrote each candidate's exact score at
     /// out[ROW] into an array the reducer reads by CONTENT. With a passage shared by rows 0, 97,
     /// 194, 291 and 388, each wrote 1.0 at its own row index, so out[194] became 1.0 and the
-    /// unrelated file owning slot 194 came back a perfect match.
-    ///
-    /// Two more fell out of the same confusion: the rerank selection loop walked 0..<baseRows,
-    /// which counts CONTENTS, while filtering on per-ROW facts; and the reducer relied on dead rows
-    /// having been masked to -inf in a per-row score array, which cannot work once a tombstoned row
-    /// can share a content that is still live elsewhere - masking the content hides it from
-    /// everyone, not masking it lets the deleted file come back. It skips the ROW now.
+    /// unrelated file owning slot 194 came back a perfect match. Coverage was the layer after that,
+    /// and every part of it counted rows; docs/schema-v5.md records what each of them became.
     ///
     /// OMNI_CONTENT_SHARING=0 turns it off, which is the A/B and the escape hatch.
     nonisolated(unsafe) public static var contentSharing =
-        ProcessInfo.processInfo.environment["OMNI_CONTENT_SHARING"] == "1"
+        ProcessInfo.processInfo.environment["OMNI_CONTENT_SHARING"] != "0"
 
     func appendChunksLocked(_ chunks: [IndexedChunk], bfs: [[UInt16]], ids: [Int64] = []) -> [Int32] {
         var assigned: [Int32] = []

@@ -252,8 +252,15 @@ speed claim at all. Everything above is recall.
 
 ## Coverage, converted to positions
 
-Content sharing is complete and correct through the write path, both reducers, the quantized
-funnel, compaction, reload, and now vector coverage.
+Content sharing is ON by default. It is complete and correct through the write path, both
+reducers, the quantized funnel, compaction, reload, and vector coverage.
+
+THE READ PATH RETURNS THE SAME ANSWERS, which is the gate the flip had to pass. On the real
+9,729,693-chunk index, `omni-verify searchreal` digests the top-10 paths and scores of ten queries
+and the digest is IDENTICAL with sharing on and off (13fd5f37d0a70140, four runs, both arms
+interleaved), at p50 4.3ms either way. It must be identical - the occurrence mirror is the identity
+on an index whose contents are not shared - so a digest that moves is a read-path bug rather than a
+ranking opinion, and that is what makes it a usable gate.
 
 WHAT COVERAGE IS. `coveredRows` claims "the first C slots of .vecs are durable, and the rows that
 own them have had their SQLite blob cleared". That claim is what lets the index stop storing every

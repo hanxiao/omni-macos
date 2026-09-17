@@ -4152,6 +4152,47 @@ if args.count >= 2 && args[1] == "retrieve" {
 // Runs the real Indexer (crawl + concurrent decode + batched embed + SQLite store) over a folder
 // and reports end-to-end files/s, chunks/s, tok/s - so we can see the live bottleneck, not just
 // the isolated embed step.
+// Search an index that already exists: omni-verify searchreal <modelDir> <index.sqlite> [reps]
+//
+// The read-path half of the content-sharing A/B, and the half that has to be run at real scale.
+// With sharing on, a score is produced per CONTENT and turned into files through the occurrence
+// mirror; with it off, a score is a row. On an index whose contents are not shared - every index
+// written before this - the two must produce the IDENTICAL result list, because the mirror is the
+// identity there. So this prints a digest of the hits as well as the latency: the digest says
+// whether the read path changed any answer, and the percentiles say what it cost.
+if args.count >= 4 && args[1] == "searchreal" {
+    let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[2]))
+    let store = try VectorStore(dbURL: URL(fileURLWithPath: args[3]))
+    defer { store.close() }
+    let reps = (args.count >= 5 ? Int(args[4]) : nil) ?? 30
+    let probes = ["distributed search index", "coverage claim positions", "the vector file",
+                  "swift test failure", "chunk key content hash", "folder scoped search",
+                  "quantized funnel rerank", "tombstone dead row", "quarterly revenue report",
+                  "how do I cancel a subscription"]
+    let qvecs = probes.map { engine.embedText($0, as: .query) }
+    var digest: UInt64 = 0xcbf29ce484222325
+    func mix(_ s: String) { for b in s.utf8 { digest = (digest ^ UInt64(b)) &* 0x100000001b3 } }
+    for (i, q) in qvecs.enumerated() {
+        let hits = store.search(q, topK: 10)
+        mix("q\(i):")
+        for h in hits { mix(h.path); mix(String(format: "%.5f", h.score)) }
+    }
+    var lat: [Double] = []
+    for _ in 0 ..< reps {
+        for q in qvecs {
+            let t = Date()
+            _ = store.search(q, topK: 10)
+            lat.append(-t.timeIntervalSinceNow * 1000)
+        }
+    }
+    lat.sort()
+    func pct(_ p: Double) -> Double { lat.isEmpty ? 0 : lat[Swift.min(lat.count - 1, Int(Double(lat.count) * p))] }
+    print(String(format: "SEARCHREAL sharing=%@ chunks=%d n=%d p50=%.1fms p90=%.1fms p99=%.1fms digest=%016llx",
+                 VectorStore.contentSharing ? "on " : "off", store.count, lat.count,
+                 pct(0.5), pct(0.9), pct(0.99), digest))
+    exit(0)
+}
+
 // Content sharing, end to end: omni-verify sharebench <modelDir> <root> [searchReps]
 //
 // The A/B for OMNI_CONTENT_SHARING, run against a REAL corpus rather than synthetic vectors,

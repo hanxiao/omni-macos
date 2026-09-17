@@ -430,6 +430,38 @@ measured on an M3 Ultra too, so they compare directly.
   with `takeAlong(h, poolIndexGraph(lengths), axis: 1)`, never a bare last column - and the
   backbone being causal means a real token never attends to a pad. Verified, not assumed.
 
+## Content sharing: one content, one vector (docs/schema-v5.md)
+
+ON by default since this change; `OMNI_CONTENT_SHARING=0` is the escape hatch and the A/B. Two
+files holding the same passage cost one vector and one position in `.vecs`, and both still answer
+for it. The full design, every measurement and every rejected option are in docs/schema-v5.md; what
+follows is what a reader needs before touching this code.
+
+- A ROW AND A POSITION ARE DIFFERENT NUMBERS NOW, and they were the same number for four years.
+  Every place that indexed a per-CONTENT array with a ROW index was silently wrong and compiled
+  fine: the rerank's `out[ROW]`, the dead-row mask over the delta scores, the hole recorder, the
+  coverage audit, the restore's rank pairing. If you touch anything that reads `deadRows`,
+  `occSlot`, `coveredRows` or `flat16`, decide which unit you are in first.
+- WHAT IT BUYS: 38.5% of text chunks on the real 2.68M-file index are duplicates (5.4 GB of a
+  15.4 GB vector file); 9.3% on one project's agent logs. The rate is a property of the corpus.
+- WHAT IT DOES NOT BUY: GPU time. Duplicates inside one pass were ALREADY collapsed by the
+  indexer's own key-keyed cache, in both arms - `tokensProcessed` is identical. Cross-pass reuse
+  before embedding is not built; it would need a store lookup on the key ahead of the encoder.
+- WHAT IT COSTS: the store's write path is 11-16% slower in isolation and that is invisible end to
+  end (122.4/123.2s with against 123.4/122.8s without on the same corpus), because indexing is 99%
+  GPU. Search costs nothing measurable at 9,729,693 chunks: p50 4.3ms in both arms.
+- SAME ANSWERS. `omni-verify searchreal <model> <index>` digests the top-10 paths and scores of ten
+  queries; the digest is identical in both arms on the real index. It must be - the occurrence
+  mirror is the identity on an index whose contents are not shared - so a digest that moves is a
+  read-path bug, not a ranking opinion.
+- THE UPGRADE is `chunks.slot`, filled in from the RESIDENT state a slice at a time (200k rows,
+  ~0.25s each; 12.2s in total on the real index) with a chunk-id watermark. Coverage refuses to
+  advance until it is complete. The watermark is turned back into a row index by a SCAN, never a
+  bisection: hole rows carry no chunk id, so a bisection over a column with 254,000 zeros in it
+  lands wherever the zeros put it.
+- `omni-verify sharebench <model> <root>` is the end-to-end A/B: chunks, vectors, tok, and search
+  latency for one arm, run it twice with the env var flipped.
+
 ## Filter chips in the search field
 
 - THE PLATFORM HAS THIS CONTROL: `searchable(text:tokens:placement:prompt:token:)`, macOS 13+,
