@@ -325,7 +325,22 @@ disagreement asks a covered row for a blob it does not have, i.e. it fails close
 `testCoverageOverANumberingACompactionLeftOutOfOrder` pins the whole sequence. A rewrite of a
 data-loss-capable loader needs a failing case first.
 
-WHAT IS STILL v4 BEHAVIOUR. `reclaimVectorHoles` declines under sharing, so holes accumulate rather
-than being reclaimed. That is what v4 does in practice too (its own note records 96,256 of them
-never taken back), and the answer is the free list - a released position handed to the next new
-content - which belongs with making that pass slot-aware rather than bolted on beside it.
+TAKING THE HOLES BACK. `reclaimVectorHoles` used to decline under sharing, for two reasons that
+both had to be answered. Its plan was built from ROW indices, so it would have copied one vector
+per row into a file the stored slots describe as one per content; it plans over POSITIONS now. And
+it renumbers, which is a durable fact SQLite has to be told - `chunks.slot` is a promise about
+where a vector lives, and a pass that moves vectors without updating it makes the next reload name
+the wrong content.
+
+The renumbering is DERIVED rather than carried: a surviving position's new number is how many live
+positions sit below it, which is `SELECT DISTINCT slot FROM chunks` and nothing else, because
+SQLite holds no tombstones - a row the store tombstones in memory is already gone from the table,
+so the positions with a row are exactly the ones the copy kept. That makes the UPDATE idempotent -
+on an already-dense column the rank of a slot is the slot - so the crash window between the rename
+and the renumbering needs no remap table to survive and the resume path simply runs it again. A
+remap carried across a crash would be a second source of truth for where a vector lives, and this
+file already has one of those too many.
+
+WHAT IS NOT BUILT. The free list: a released position handed to the NEXT new content instead of
+waiting for a whole-file copy. `SlotAllocator` is written and tested against it. The reclaim is the
+v4 answer and now works in both arms, so this is an optimisation rather than a gap.

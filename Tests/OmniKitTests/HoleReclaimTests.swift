@@ -19,14 +19,13 @@ final class HoleReclaimTests: XCTestCase {
     private var savedFraction: Double?
     private var savedFloor: Int?
 
-    private var savedSharing = false
     override func setUp() {
         super.setUp()
-        // This suite exercises the v4-shaped reclaim: it rebuilds the vector file as "the live ROWS
-        // in order", which is the live CONTENTS in order only while a row owns its vector. The pass
-        // declines under sharing, so pin it off - the pass itself still has to work.
-        savedSharing = VectorStore.contentSharing
-        VectorStore.contentSharing = false
+        // Sharing is NOT pinned off here any more. The pass used to decline under it - a plan built
+        // from row indices copies one vector per ROW into a file the stored slots describe as one
+        // per CONTENT - and now it plans over positions and writes the new numbering back by rank,
+        // so it has to work in both arms. This fixture gives every chunk its own content, which is
+        // the 1:1 case; ContentSharingTests covers the one where positions and rows really diverge.
         savedQuant = VectorStore.quantBaseOverride
         savedFraction = VectorStore.holeReclaimFractionOverride
         savedFloor = VectorStore.holeReclaimFloorOverride
@@ -36,7 +35,6 @@ final class HoleReclaimTests: XCTestCase {
     }
 
     override func tearDown() {
-        VectorStore.contentSharing = savedSharing
         VectorStore.quantBaseOverride = savedQuant
         VectorStore.holeReclaimFractionOverride = savedFraction
         VectorStore.holeReclaimFloorOverride = savedFloor

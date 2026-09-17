@@ -7580,13 +7580,31 @@ public final class VectorStore: @unchecked Sendable {
 
     /// Are the holes worth a copy of the live file?
     private func shouldReclaimHolesLocked() -> Bool {
+        // POSITIONS, like everything else about coverage. `units` is what the file holds and what
+        // the claim is measured in; under v4 it is the row count and every test below reads the
+        // same as it always did.
+        let units = Self.contentSharing ? slotCount : rows.count
         guard Self.vecCoverage, Self.holeReclaimFraction > 0, dbOpen(), dim > 0, !rows.isEmpty,
-              flat16.isPersistent, flat16.count == rows.count * dim,
+              flat16.isPersistent, flat16.count == units * dim,
               // Only with coverage caught up: then every live row's blob is already cleared, so the
               // switch is two writes to `meta` instead of an UPDATE over millions of rows.
-              coveredRows == rows.count, vecHoles.count == deadRows.count, !vecHoles.isEmpty
+              coveredRows == units, !vecHoles.isEmpty
         else { return false }
-        let threshold = Swift.max(Self.holeReclaimFloor, Int(Double(rows.count) * Self.holeReclaimFraction))
+        // The hole list has to account for every position nothing owns, or the copy below would
+        // keep bytes it thinks are live. Under v4 that is exactly the tombstone count; under
+        // sharing a tombstone releases a POINTER, so the question is asked of the positions.
+        if Self.contentSharing {
+            ensureSlotRowsLocked()
+            let dead = deadRows
+            var unowned = 0
+            for sl in 0 ..< units where !rowsOfSlotLocked(sl).contains(where: { !dead.contains($0) }) {
+                unowned += 1
+            }
+            guard vecHoles.count == unowned else { return false }
+        } else {
+            guard vecHoles.count == deadRows.count else { return false }
+        }
+        let threshold = Swift.max(Self.holeReclaimFloor, Int(Double(units) * Self.holeReclaimFraction))
         return vecHoles.count >= threshold
     }
 
@@ -7622,26 +7640,32 @@ public final class VectorStore: @unchecked Sendable {
     /// (any mutation at all, checked by generation) just drops the copy and tries again next time.
     @discardableResult
     public func reclaimVectorHoles() -> Bool {
-        // NOT WHILE CONTENTS ARE SHARED. This pass rebuilds the vector file as "exactly the live
-        // rows in order" and then reloads from it - which is only the same thing as "the live
-        // CONTENTS in order" while a row owns its vector. Running it under sharing renumbers every
-        // content without telling the stored slots, and the reload then names the wrong one.
+        // WHAT MOVES IS A POSITION, NOT A ROW. This pass rebuilds the vector file as the live
+        // positions in order and then reloads from it. Under v4 a row owns its vector outright, so
+        // "the live rows in order" is the same sentence; under sharing it is not, and a plan built
+        // from row indices would copy one vector per row into a file the stored slots describe as
+        // one per content.
         //
-        // Declining is not a regression: holes simply accumulate, which is precisely what v4 does
-        // today (its own note records 96,256 of them against 4.53M rows, never reclaimed). The
-        // answer is the free list - a released slot handed to the next new content - and it belongs
-        // in the same change as making this pass slot-aware, not bolted on beside it.
-        if Self.contentSharing { return false }
+        // The renumbering is also a fact SQLite has to be told, which is the other half of why this
+        // used to decline. See the rank UPDATE in commitReclaimLocked: a position's new number is
+        // how many live positions sit below it, which is derivable from `chunks.slot` alone and is
+        // therefore idempotent - the property that lets an interrupted reclaim be finished by the
+        // resume path with no remap table to carry across the crash.
         // PHASE 1 - the plan, under the queue.
         struct Plan { var writes: [(off: Int, len: Int)]; var newCount: Int; var deadCount: Int; var gen: Int64 }
         let plan: Plan? = queue.sync {
             guard shouldReclaimHolesLocked() else { return nil }
+            // Under sharing, every stored slot is about to be rewritten by rank, so the column has
+            // to exist and be complete first. It always is by here - coverage cannot advance
+            // without it - but the pass that rewrites it should not be the one that assumes it.
+            if Self.contentSharing, !slotsBackfilled { return nil }
             let dead = deadRows
             let bytesPerRow = dim * MemoryLayout<UInt16>.size
             let chunkBytes = 64 << 20   // one write(2) cannot exceed INT_MAX on Darwin anyway
             var writes: [(off: Int, len: Int)] = []
             var newCount = 0
             var runStart = -1, runLen = 0
+            let units = Self.contentSharing ? slotCount : rows.count
             func flushRun() {
                 guard runStart >= 0, runLen > 0 else { return }
                 var written = 0
@@ -7653,14 +7677,27 @@ public final class VectorStore: @unchecked Sendable {
                 }
                 runStart = -1; runLen = 0
             }
-            for i in 0 ..< rows.count {
-                if dead.contains(Int32(i)) { flushRun(); continue }
+            // A position is live when at least ONE live row still points at it, which is the same
+            // test as "not a dead row" whenever a row owns its vector.
+            var live: [Bool]
+            if Self.contentSharing {
+                ensureSlotRowsLocked()
+                live = [Bool](repeating: false, count: units)
+                for (i, sl) in occSlot.enumerated() where !dead.contains(Int32(i)) {
+                    if sl >= 0, Int(sl) < units { live[Int(sl)] = true }
+                }
+            } else {
+                live = [Bool](repeating: true, count: units)
+                for d in dead where Int(d) < units { live[Int(d)] = false }
+            }
+            for i in 0 ..< units {
+                if !live[i] { flushRun(); continue }
                 if runStart < 0 { runStart = i }
                 runLen += 1
                 newCount += 1
             }
             flushRun()
-            guard newCount > 0, newCount < rows.count else { return nil }
+            guard newCount > 0, newCount < units else { return nil }
             // The row sidecar describes the OLD layout, tombstones and all, and it is adopted in
             // preference to everything else at open. Deleting it now means no crash from here on can
             // leave a cache that would map the new file with the old row count - which would read
@@ -7738,6 +7775,7 @@ public final class VectorStore: @unchecked Sendable {
         if Self.compactStopAfter == "rename" { return false }   // TEST: crash before the claim
 
         guard execChecked("BEGIN;"),
+              renumberSlotsByRankLocked(),
               execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.coveredRowsKey)','\(newCount)');"),
               execChecked("DELETE FROM vec_holes;"),
               execChecked("DELETE FROM meta WHERE key = '\(Self.compactPendingKey)';"),
@@ -7764,6 +7802,36 @@ public final class VectorStore: @unchecked Sendable {
         return true
     }
 
+    /// COMPACT THE STORED SLOT NUMBERING, to match a vector file that has just had its unowned
+    /// positions squeezed out.
+    ///
+    /// A surviving position's new number is how many live positions sit below it. "Live" is
+    /// `SELECT DISTINCT slot FROM chunks`, because SQLite carries no tombstones - a row the store
+    /// tombstones in memory is already gone from the table - so the set of positions with a row is
+    /// exactly the set the copy kept.
+    ///
+    /// IDEMPOTENT, and that is the whole design. On an already-dense column the rank of a slot is
+    /// the slot, so re-running changes nothing; which means the crash window between the rename and
+    /// this UPDATE needs no remap table to survive, and the resume path can simply run it again. A
+    /// remap carried across a crash would be a second source of truth for where a vector lives, and
+    /// this file already has one of those too many.
+    ///
+    /// Must run inside the caller's transaction, with the claim it belongs to.
+    private func renumberSlotsByRankLocked() -> Bool {
+        guard Self.contentSharing, dbOpen() else { return true }
+        guard hasColumnLocked("chunks", "slot") else { return true }
+        return execChecked("""
+            CREATE TEMP TABLE IF NOT EXISTS slot_rank(slot INTEGER PRIMARY KEY, r INTEGER NOT NULL);
+            DELETE FROM slot_rank;
+            INSERT INTO slot_rank(slot, r)
+              SELECT slot, ROW_NUMBER() OVER (ORDER BY slot) - 1
+                FROM (SELECT DISTINCT slot FROM chunks WHERE slot >= 0);
+            UPDATE chunks SET slot = (SELECT r FROM slot_rank WHERE slot_rank.slot = chunks.slot)
+             WHERE slot >= 0;
+            DELETE FROM slot_rank;
+            """)
+    }
+
     /// Finish or abandon a reclaim that a crash interrupted. Called at open, before anything reads
     /// the claim. One file test decides it - see the note on compactPendingKey.
     private func resumeVectorCompactionLocked() {
@@ -7780,6 +7848,11 @@ public final class VectorStore: @unchecked Sendable {
         // The rename happened, so the file on disk IS the compacted one and the claim has to catch
         // up with it. Nothing can have mutated the table in between - the crash stopped everything.
         beginTxnLocked()
+        // The same renumbering the commit path applies, and the reason it can simply be repeated:
+        // a position's new number is how many live positions sit below it, read off `chunks.slot`,
+        // so running it on an already-dense column is the identity. There is no remap table to
+        // carry across the crash and no way to apply it twice by mistake.
+        _ = renumberSlotsByRankLocked()
         exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.coveredRowsKey)','\(pending)');")
         exec("DELETE FROM vec_holes;")
         exec("DELETE FROM meta WHERE key = '\(Self.compactPendingKey)';")

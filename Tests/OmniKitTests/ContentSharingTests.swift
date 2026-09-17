@@ -766,6 +766,177 @@ final class ContentSharingTests: XCTestCase {
         }
     }
 
+    /// TAKING THE HOLES BACK, which under sharing means taking back POSITIONS.
+    ///
+    /// The reclaim rebuilds the vector file as the live positions in order and reloads from it. It
+    /// used to decline outright while sharing was on, for a real reason: a plan built from row
+    /// indices copies one vector per ROW into a file the stored slots describe as one per CONTENT,
+    /// and the renumbering it performs is a fact SQLite is never told. Both halves are fixed here -
+    /// the plan is over positions, and the new numbering is written back by rank.
+    ///
+    /// The assertions that matter are the last two. The file must actually shrink (or the pass did
+    /// nothing and everything below is vacuous), and every survivor must still find itself after a
+    /// reload from the renumbered file - the only check that can see a one-position shift.
+    func testReclaimingHolesUnderSharingRenumbersAndKeepsEveryVector() throws {
+        let savedQuant = VectorStore.quantBaseOverride
+        let savedFloor = VectorStore.holeReclaimFloorOverride
+        let savedFraction = VectorStore.holeReclaimFractionOverride
+        VectorStore.quantBaseOverride = VectorStore.scanBits
+        VectorStore.holeReclaimFloorOverride = 1        // a 60-row fixture is below the real floor
+        VectorStore.holeReclaimFractionOverride = 0.01
+        defer {
+            VectorStore.quantBaseOverride = savedQuant
+            VectorStore.holeReclaimFloorOverride = savedFloor
+            VectorStore.holeReclaimFractionOverride = savedFraction
+        }
+
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("share-reclaim-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("index.sqlite")
+
+        let d = 64
+        let files = 60
+        func hot(_ i: Int) -> [Float] {
+            var v = [Float](repeating: 0, count: d); v[i % d] = 1; return v
+        }
+        func rep(_ f: Int) -> Int { f % 4 == 3 ? f - 3 : f }
+        func write(_ store: VectorStore, _ f: Int) throws {
+            let p = "/j/f\(f).txt"
+            try store.replace(path: p, chunks: [IndexedChunk(path: p, modified: 1, size: 1, kind: "text",
+                                                             chunkIndex: 0, snippet: "s\(f)",
+                                                             embedding: hot(rep(f)), locator: "Line 1",
+                                                             chunkKey: String(format: "%08x", rep(f) &+ 0xA000))])
+        }
+        do {
+            let s = try VectorStore(dbURL: url)
+            for f in 0 ..< files - 5 { try write(s, f) }
+            _ = s.search(hot(0), topK: 5)
+            for f in files - 5 ..< files { try write(s, f) }
+            _ = s.search(hot(0), topK: 5)
+            s.close()
+        }
+        for _ in 0 ..< 4 { let s = try VectorStore(dbURL: url); s.close() }
+        XCTAssertGreaterThan(claim(url), 0, "fixture never covered anything")
+
+        // Delete whole content groups, so the positions really are released rather than just
+        // losing one of two owners.
+        let gone = Set((0 ..< files).filter { (0 ..< 4).contains($0 % 16) && $0 >= 16 })
+        let before = claim(url)
+        do {
+            let s = try VectorStore(dbURL: url)
+            for f in gone { s.deletePath("/j/f\(f).txt") }
+            XCTAssertNil(s.coverageAudit(), "audit failed before the reclaim")
+            XCTAssertTrue(s.reclaimVectorHolesForTest(), "the reclaim declined under sharing")
+            XCTAssertNil(s.coverageAudit(), "audit failed straight after the reclaim")
+            s.close()
+        }
+        // The claim IS the position count, so it is what says the file lost the unowned ones. File
+        // SIZE cannot say it at this scale: the mapping precommits slack, so a 60-row fixture
+        // occupies the same bytes either way.
+        XCTAssertLessThan(claim(url), before, "the reclaim took back no positions")
+        // Exactly the positions whose every owner is gone - which is fewer than the files deleted,
+        // because a quarter of them are duplicates sharing a position with a file in the same set.
+        let released = Set(gone.map(rep)).filter { r in
+            (0 ..< files).allSatisfy { rep($0) != r || gone.contains($0) }
+        }.count
+        XCTAssertGreaterThan(released, 0, "the fixture released no whole content")
+        XCTAssertEqual(claim(url), before - released, "it took back the wrong number of positions")
+
+        for suffix in [".rows", ".rows-wal", ".rows-shm"] {
+            try? FileManager.default.removeItem(atPath: url.path + suffix)
+        }
+        let s = try VectorStore(dbURL: url); defer { s.close() }
+        XCTAssertNil(s.coverageAudit(), "audit failed reloading from the reclaimed file")
+        XCTAssertEqual(s.count, files - gone.count, "rows lost")
+        for f in 0 ..< files where !gone.contains(f) {
+            let top = s.search(hot(rep(f)), topK: 4).map(\.path)
+            XCTAssertTrue(top.contains("/j/f\(f).txt"),
+                          "f\(f) lost its vector across the reclaim; got \(top)")
+        }
+    }
+
+    /// A CRASH BETWEEN THE RENAME AND THE RENUMBERING.
+    ///
+    /// The reclaim's switch is a rename(2) with a marker in `meta` on either side of it. Under
+    /// sharing there is a third durable fact to move: the stored slot of every row, because the
+    /// copy renumbered the positions. A remap table carried across the crash would be a second
+    /// source of truth for where a vector lives, so instead the new number is DERIVED - how many
+    /// live positions sit below this one - which makes the UPDATE idempotent and lets the resume
+    /// path simply run it again. This is the test of that claim: stop after the rename, reopen, and
+    /// demand the index be correct rather than merely consistent.
+    func testACrashBetweenTheRenameAndTheRenumberingRecovers() throws {
+        let savedQuant = VectorStore.quantBaseOverride
+        let savedFloor = VectorStore.holeReclaimFloorOverride
+        let savedFraction = VectorStore.holeReclaimFractionOverride
+        VectorStore.quantBaseOverride = VectorStore.scanBits
+        VectorStore.holeReclaimFloorOverride = 1
+        VectorStore.holeReclaimFractionOverride = 0.01
+        defer {
+            VectorStore.quantBaseOverride = savedQuant
+            VectorStore.holeReclaimFloorOverride = savedFloor
+            VectorStore.holeReclaimFractionOverride = savedFraction
+            VectorStore.compactStopAfter = nil
+        }
+
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("share-crash-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("index.sqlite")
+
+        let d = 64
+        let files = 60
+        func hot(_ i: Int) -> [Float] {
+            var v = [Float](repeating: 0, count: d); v[i % d] = 1; return v
+        }
+        func rep(_ f: Int) -> Int { f % 4 == 3 ? f - 3 : f }
+        func write(_ store: VectorStore, _ f: Int) throws {
+            let p = "/k/f\(f).txt"
+            try store.replace(path: p, chunks: [IndexedChunk(path: p, modified: 1, size: 1, kind: "text",
+                                                             chunkIndex: 0, snippet: "s\(f)",
+                                                             embedding: hot(rep(f)), locator: "Line 1",
+                                                             chunkKey: String(format: "%08x", rep(f) &+ 0xB000))])
+        }
+        do {
+            let s = try VectorStore(dbURL: url)
+            for f in 0 ..< files - 5 { try write(s, f) }
+            _ = s.search(hot(0), topK: 5)
+            for f in files - 5 ..< files { try write(s, f) }
+            _ = s.search(hot(0), topK: 5)
+            s.close()
+        }
+        for _ in 0 ..< 4 { let s = try VectorStore(dbURL: url); s.close() }
+        let before = claim(url)
+        XCTAssertGreaterThan(before, 0, "fixture never covered anything")
+
+        let gone = Set((0 ..< files).filter { (0 ..< 4).contains($0 % 16) && $0 >= 16 })
+        VectorStore.compactStopAfter = "rename"
+        do {
+            let s = try VectorStore(dbURL: url)
+            for f in gone { s.deletePath("/k/f\(f).txt") }
+            _ = s.reclaimVectorHolesForTest()
+            s.close()
+        }
+        VectorStore.compactStopAfter = nil
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path + ".vecs.new"),
+                       "the rename did not happen, so this is testing the other case")
+        XCTAssertEqual(claim(url), before, "the claim moved before the crash point")
+
+        // The sidecar was deleted by the reclaim's own plan phase, so the reopen goes through the
+        // recovery and then through the coverage loader - which is the point.
+        let s = try VectorStore(dbURL: url); defer { s.close() }
+        XCTAssertNil(s.coverageAudit(), "audit failed after recovering an interrupted reclaim")
+        XCTAssertLessThan(claim(url), before, "the recovery did not adopt the compacted file")
+        XCTAssertEqual(s.count, files - gone.count, "rows lost")
+        for f in 0 ..< files where !gone.contains(f) {
+            let top = s.search(hot(rep(f)), topK: 4).map(\.path)
+            XCTAssertTrue(top.contains("/k/f\(f).txt"),
+                          "f\(f) lost its vector across the recovery; got \(top)")
+        }
+    }
+
     private func claim(_ db: URL) -> Int {
         var h: OpaquePointer?
         guard sqlite3_open(db.path, &h) == SQLITE_OK else { return -1 }
