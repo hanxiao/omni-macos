@@ -1059,6 +1059,69 @@ final class ContentSharingTests: XCTestCase {
         return Int(sqlite3_column_int64(st, 0))
     }
 
+    /// FULL bf16, DELETES, RELOAD - the default path for an index too small to quantize, which is
+    /// every new index and every small one for good.
+    ///
+    /// The funnel tests above force quant mode, so the GPU scatter-max reducer and the blob reload
+    /// only ever ran on a fresh, undeleted store. This is the combination an ordinary user reaches
+    /// first: share a passage, delete some files, quit, reopen.
+    func testFullPrecisionSharingSurvivesDeletesAndAReload() throws {
+        let savedQuant = VectorStore.quantBaseOverride
+        VectorStore.quantBaseOverride = nil          // full bf16
+        defer { VectorStore.quantBaseOverride = savedQuant }
+
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("share-bf16-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("index.sqlite")
+
+        let dim = 32
+        let files = 400
+        func v(_ i: Int) -> [Float] { spread(i, dim) }
+        // Every fifth file repeats the content of the file four before it.
+        func rep(_ f: Int) -> Int { f % 5 == 4 ? f - 4 : f }
+        var worst: Float = 0
+        for a in 0 ..< files where rep(a) == a {
+            for b in 0 ..< files where rep(b) == b && b != a {
+                worst = Swift.max(worst, zip(v(a + 11), v(b + 11)).reduce(Float(0)) { $0 + $1.0 * $1.1 })
+            }
+        }
+        XCTAssertLessThan(worst, 0.95, "fixture vectors collide; the ranking assertions are meaningless")
+
+        do {
+            let s = try VectorStore(dbURL: url)
+            for f in 0 ..< files {
+                try s.replace(path: "/n/f\(f).txt", chunks: [IndexedChunk(
+                    path: "/n/f\(f).txt", modified: 1, size: 1, kind: "text", chunkIndex: 0,
+                    snippet: "s\(f)", embedding: v(rep(f) + 11), locator: "Line 1",
+                    chunkKey: String(format: "%08x", rep(f) &+ 0xD000))])
+            }
+            XCTAssertEqual(s.vectorBufferUse.used / dim, files - files / 5,
+                           "the write path did not share this fixture's repeated passages")
+            // Delete a third, including some representatives whose duplicate survives.
+            for f in stride(from: 0, to: files, by: 3) { s.deletePath("/n/f\(f).txt") }
+            s.close()
+        }
+        for suffix in [".rows", ".rows-wal", ".rows-shm"] {
+            try? FileManager.default.removeItem(atPath: url.path + suffix)
+        }
+
+        let gone = Set(stride(from: 0, to: files, by: 3))
+        let s = try VectorStore(dbURL: url); defer { s.close() }
+        XCTAssertNil(s.coverageAudit(), "audit failed after deletes and a reload in full precision")
+        XCTAssertEqual(s.count, files - gone.count, "rows lost")
+        for f in 0 ..< files where !gone.contains(f) {
+            let top = s.search(v(rep(f) + 11), topK: 6).map(\.path)
+            XCTAssertTrue(top.contains("/n/f\(f).txt"),
+                          "f\(f) lost its vector across the reload; got \(top.prefix(3))")
+        }
+        for f in gone {
+            XCTAssertFalse(s.search(v(rep(f) + 11), topK: 6).map(\.path).contains("/n/f\(f).txt"),
+                           "deleted f\(f) came back")
+        }
+    }
+
     private func claim(_ db: URL) -> Int {
         var h: OpaquePointer?
         guard sqlite3_open(db.path, &h) == SQLITE_OK else { return -1 }
