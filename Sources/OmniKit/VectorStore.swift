@@ -713,7 +713,12 @@ public final class VectorStore: @unchecked Sendable {
                  /// compaction REORDERS rows and then rebuilds the dense tables from them: a slot
                  /// held only in a parallel array would be re-derived as the row's new position,
                  /// which is the identity mapping again and silently wrong for every shared vector.
-                 var slot: Int32 = -1 }
+                 var slot: Int32 = -1
+                 /// The `chunks.id` this row came from, so an operation that MOVES a slot can write
+                 /// the new numbering back. Compaction and hole reclaim both renumber, and a stored
+                 /// slot they do not update makes a reloaded index name the wrong content. 8 bytes a
+                 /// row, which is the price of a promise that survives a restart.
+                 var chunkID: Int64 = 0 }
     private var rows: [Row] = []
     // Single source of truth for embeddings: contiguous bf16 bits, [count*dim], row i = rows[i].
     // bf16 (2 bytes/dim) halves residency and disk vs fp32 with negligible recall loss on
@@ -2076,7 +2081,7 @@ public final class VectorStore: @unchecked Sendable {
             if presentPaths.contains(path) { removeRowsByPathsLocked([path], victims: victims) }
             // AFTER the removal, never before: the removal can compact, and a slot decided against
             // the pre-removal numbering would name a different content by the time it is used.
-            let assigned = appendChunksLocked(chunks, bfs: bfs)
+            let assigned = appendChunksLocked(chunks, bfs: bfs, ids: chunkIDs)
             persistSlotsLocked(ids: chunkIDs, slots: assigned)
             presentPaths.insert(path)
             rowWindowAuditLocked("replace")
@@ -2168,7 +2173,7 @@ public final class VectorStore: @unchecked Sendable {
                 removeRowsByPathsLocked(affected, victims: victims)   // one rebuild for the whole batch
             }
             for (wi, it) in work.enumerated() {
-                let assigned = appendChunksLocked(it.chunks, bfs: bfs[wi])
+                let assigned = appendChunksLocked(it.chunks, bfs: bfs[wi], ids: chunkIDsByWork[wi] ?? [])
                 if let ids = chunkIDsByWork[wi] { persistSlotsLocked(ids: ids, slots: assigned) }
                 presentPaths.insert(it.path)
             }
@@ -2292,11 +2297,15 @@ public final class VectorStore: @unchecked Sendable {
             // window somehow missed is simply a chunk that gets re-embedded.
             let window = containmentWindowLocked(id)
             flat16.withUnsafeBufferPointer { buf in
-                guard buf.count >= rows.count * wantDim else { return }
+                // Against the CONTENT count, not the row count: under sharing there are fewer
+                // vectors than rows, and comparing to rows made this return nothing at all - which
+                // reads downstream as "no chunk can be reused" and silently re-embeds the corpus.
+                guard buf.count >= slotCount * wantDim else { return }
                 for i in window where fileID[i] == id && !dead.contains(Int32(i)) {
                     guard let key = keyOf[rows[i].chunkIndex] else { continue }
                     var v = [Float](repeating: 0, count: wantDim)
-                    let base = i * wantDim
+                    let base = slotOf(i) * wantDim
+                    guard base >= 0, base + wantDim <= buf.count else { continue }
                     for k in 0 ..< wantDim { v[k] = Self.fromBF16(buf[base + k]) }
                     guard v.allSatisfy({ $0.isFinite }) else { continue }
                     out[key] = v
@@ -6546,7 +6555,8 @@ public final class VectorStore: @unchecked Sendable {
                             modified: sqlite3_column_double(stmt, 5),
                             size: Int(sqlite3_column_int64(stmt, 9)),
                             width: Int(sqlite3_column_int(stmt, 6)), height: Int(sqlite3_column_int(stmt, 7)),
-                            duration: sqlite3_column_double(stmt, 8)))
+                            duration: sqlite3_column_double(stmt, 8),
+                            chunkID: sqlite3_column_int64(stmt, 11)))
             let fid = internPath(path)
             // The STORED slot when the row has one; the walked slot otherwise. A stored slot is
             // the only way two rows can name the same vector, and -1 means the row predates
@@ -7272,6 +7282,16 @@ public final class VectorStore: @unchecked Sendable {
     /// (any mutation at all, checked by generation) just drops the copy and tries again next time.
     @discardableResult
     public func reclaimVectorHoles() -> Bool {
+        // NOT WHILE CONTENTS ARE SHARED. This pass rebuilds the vector file as "exactly the live
+        // rows in order" and then reloads from it - which is only the same thing as "the live
+        // CONTENTS in order" while a row owns its vector. Running it under sharing renumbers every
+        // content without telling the stored slots, and the reload then names the wrong one.
+        //
+        // Declining is not a regression: holes simply accumulate, which is precisely what v4 does
+        // today (its own note records 96,256 of them against 4.53M rows, never reclaimed). The
+        // answer is the free list - a released slot handed to the next new content - and it belongs
+        // in the same change as making this pass slot-aware, not bolted on beside it.
+        if Self.contentSharing { return false }
         // PHASE 1 - the plan, under the queue.
         struct Plan { var writes: [(off: Int, len: Int)]; var newCount: Int; var deadCount: Int; var gen: Int64 }
         let plan: Plan? = queue.sync {
@@ -9145,6 +9165,8 @@ public final class VectorStore: @unchecked Sendable {
             // The base is still exactly valid when no CONTENT below its boundary was dropped: every
             // such slot then remaps to itself.
             if baseSurvivors?.count == baseRows { baseSurvivors = nil }
+            // Contents were renumbered; the stored slots now name the wrong ones.
+            persistAllSlotsLocked()
         }
         // Every row index at or past `firstRemoved` just moved, so no window survives a compaction.
         // Rebuilt here, OUTSIDE the flat16 closure and AFTER the truncation, for two reasons: the
@@ -9564,7 +9586,7 @@ public final class VectorStore: @unchecked Sendable {
                 SELECT \(StoreSchema.pathExpr), c.kind, c.chunk_index,
                        COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'dim'),
                                 length(p.vec) / 2), p.vec,
-                       f.modified, f.width, f.height, f.duration, f.size, c.slot
+                       f.modified, f.width, f.height, f.duration, f.size, c.slot, c.id
                   FROM chunks c
                   JOIN files f ON f.id = c.file_id
                   JOIN dirs  d ON d.id = f.dir_id
@@ -9886,6 +9908,29 @@ public final class VectorStore: @unchecked Sendable {
         return f
     }
 
+    /// Write EVERY live row's current slot back to its chunk row. Called after any operation that
+    /// renumbers contents - compaction and hole reclaim both do - because a stored slot they do not
+    /// update makes a reloaded index name the wrong content, silently. Both are rare by
+    /// construction, which is what makes a full rewrite affordable here and is exactly the
+    /// distinction v4's note missed: it rejected a slot column over the cost of doing this on every
+    /// DELETE, not on a rare renumbering.
+    func persistAllSlotsLocked() {
+        guard Self.contentSharing, dbOpen(), !rows.isEmpty else { return }
+        if slotUpdStmt == nil {
+            _ = sqlite3_prepare_v2(db, "UPDATE chunks SET slot = ? WHERE id = ?;", -1, &slotUpdStmt, nil)
+        }
+        guard let st = slotUpdStmt else { return }
+        let inTxn = sqlite3_get_autocommit(db) == 0
+        if !inTxn { exec("BEGIN IMMEDIATE;") }
+        for (i, r) in rows.enumerated() where r.chunkID > 0 {
+            sqlite3_reset(st)
+            sqlite3_bind_int(st, 1, i < occSlot.count ? occSlot[i] : r.slot)
+            sqlite3_bind_int64(st, 2, r.chunkID)
+            _ = sqlite3_step(st)
+        }
+        if !inTxn { exec("COMMIT;") }
+    }
+
     /// Write the slots decided at append time back onto the rows that were just inserted.
     func persistSlotsLocked(ids: [Int64], slots: [Int32]) {
         // Only while sharing is on. A STORED slot is a promise that survives a reload, and every
@@ -9910,22 +9955,23 @@ public final class VectorStore: @unchecked Sendable {
     /// Assign a slot to every chunk about to be appended, appending a vector ONLY for a content the
     /// store does not already hold, and append the rows. One content, one vector - which is the
     /// whole point, and the only place it actually happens.
-    /// OFF BY DEFAULT, and the switch is the honest part of this change.
+    /// ON. Two files holding the same passage share one vector.
     ///
-    /// The machinery below is complete and tested - two files holding one passage share a vector,
-    /// survive a reload, and survive each other's deletion. What is NOT yet done is everything
-    /// downstream that still assumes one vector per row: hole reclaim walks slots as if they were
-    /// rows, chunk-reuse eviction counts them the same way, and compaction renumbers contents
-    /// without writing the remap back to SQLite - so a compacted index reloads with every stored
-    /// slot naming the wrong content. Turning sharing on produced 801 failures across those three,
-    /// which is the list of what is left rather than a reason to hide it.
+    /// It was off while the rest of the store still assumed one vector per row. Turning it on cost
+    /// 801 failures and every one of them was a place making that assumption, now fixed or
+    /// deliberately declined:
+    ///   - compaction renumbers contents and writes the remap back (persistAllSlotsLocked)
+    ///   - chunkVectors checked flat16 against the ROW count, so it returned nothing at all under
+    ///     sharing, which reads downstream as "no chunk is reusable" and re-embeds the corpus
+    ///   - reclaimVectorHoles DECLINES, because it rebuilds the file as "the live rows in order".
+    ///     Holes accumulate instead, which is exactly what v4 does today (96,256 of them, never
+    ///     reclaimed); the free list is the answer and belongs with making that pass slot-aware.
     ///
-    /// A flag, not a half-finished write path: with it off the store behaves exactly as it did,
-    /// and ContentSharingTests turns it on to prove the machinery works.
+    /// OMNI_CONTENT_SHARING=0 turns it off, which is the A/B and the escape hatch.
     nonisolated(unsafe) static var contentSharing =
-        ProcessInfo.processInfo.environment["OMNI_CONTENT_SHARING"] == "1"
+        ProcessInfo.processInfo.environment["OMNI_CONTENT_SHARING"] != "0"
 
-    func appendChunksLocked(_ chunks: [IndexedChunk], bfs: [[UInt16]]) -> [Int32] {
+    func appendChunksLocked(_ chunks: [IndexedChunk], bfs: [[UInt16]], ids: [Int64] = []) -> [Int32] {
         var assigned: [Int32] = []
         assigned.reserveCapacity(chunks.count)
         var batch: [Data: Int32] = [:]   // contents first seen in THIS call: not yet in SQLite
@@ -9944,7 +9990,8 @@ public final class VectorStore: @unchecked Sendable {
             assigned.append(slot)
             rows.append(Row(path: canonicalPath(c.path), kind: canonicalKind(c.kind),
                             chunkIndex: c.chunkIndex, modified: c.modified, size: c.size,
-                            width: c.width, height: c.height, duration: c.duration, slot: slot))
+                            width: c.width, height: c.height, duration: c.duration, slot: slot,
+                            chunkID: i < ids.count ? ids[i] : 0))
             appendRowMetaLocked(internPath(c.path), kindCode: internKind(c.kind),
                                 kind: c.kind, path: c.path, slot: slot)
         }

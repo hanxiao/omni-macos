@@ -11,14 +11,22 @@ import SQLite3
 /// it. These tests are about the states a crash can leave, because that is the only part that
 /// cannot be checked by reading the code: the happy path is one copy and two small writes.
 final class HoleReclaimTests: XCTestCase {
+
+
     private static let dim = 64
 
     private var savedQuant: Int?
     private var savedFraction: Double?
     private var savedFloor: Int?
 
+    private var savedSharing = false
     override func setUp() {
         super.setUp()
+        // This suite exercises the v4-shaped reclaim: it rebuilds the vector file as "the live ROWS
+        // in order", which is the live CONTENTS in order only while a row owns its vector. The pass
+        // declines under sharing, so pin it off - the pass itself still has to work.
+        savedSharing = VectorStore.contentSharing
+        VectorStore.contentSharing = false
         savedQuant = VectorStore.quantBaseOverride
         savedFraction = VectorStore.holeReclaimFractionOverride
         savedFloor = VectorStore.holeReclaimFloorOverride
@@ -28,6 +36,7 @@ final class HoleReclaimTests: XCTestCase {
     }
 
     override func tearDown() {
+        VectorStore.contentSharing = savedSharing
         VectorStore.quantBaseOverride = savedQuant
         VectorStore.holeReclaimFractionOverride = savedFraction
         VectorStore.holeReclaimFloorOverride = savedFloor

@@ -8,7 +8,7 @@ final class ContentSharingTests: XCTestCase {
 
     override func setUp() { super.setUp(); VectorStore.contentSharing = true }
     override func tearDown() {
-        VectorStore.contentSharing = ProcessInfo.processInfo.environment["OMNI_CONTENT_SHARING"] == "1"
+        VectorStore.contentSharing = ProcessInfo.processInfo.environment["OMNI_CONTENT_SHARING"] != "0"
         super.tearDown()
     }
 
