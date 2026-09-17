@@ -257,8 +257,11 @@ reducers, the quantized funnel, compaction, reload, and vector coverage.
 
 THE READ PATH RETURNS THE SAME ANSWERS, which is the gate the flip had to pass. On the real
 9,729,693-chunk index, `omni-verify searchreal` digests the top-10 paths and scores of ten queries
-and the digest is IDENTICAL with sharing on and off (13fd5f37d0a70140, four runs, both arms
-interleaved), at p50 4.3ms either way. It must be identical - the occurrence mirror is the identity
+and the digest is IDENTICAL with sharing on and off, at p50 4.3ms either way. The same holds with
+the FILTERED paths in the digest - kind:text, kind:image and a folder scope, which take different
+routes (a kind filter masks CONTENTS, a folder filter masks FILES and has to reach the contents
+through the occurrence mirror, which is where a scope leak would live): 134b9ff183fd2f29, four
+interleaved runs, both arms, 5.2-5.4ms p50 either way. It must be identical - the occurrence mirror is the identity
 on an index whose contents are not shared - so a digest that moves is a read-path bug rather than a
 ranking opinion, and that is what makes it a usable gate.
 

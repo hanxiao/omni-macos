@@ -450,10 +450,11 @@ follows is what a reader needs before touching this code.
 - WHAT IT COSTS: the store's write path is 11-16% slower in isolation and that is invisible end to
   end (122.4/123.2s with against 123.4/122.8s without on the same corpus), because indexing is 99%
   GPU. Search costs nothing measurable at 9,729,693 chunks: p50 4.3ms in both arms.
-- SAME ANSWERS. `omni-verify searchreal <model> <index>` digests the top-10 paths and scores of ten
-  queries; the digest is identical in both arms on the real index. It must be - the occurrence
-  mirror is the identity on an index whose contents are not shared - so a digest that moves is a
-  read-path bug, not a ranking opinion.
+- SAME ANSWERS. `omni-verify searchreal <model> <index>` digests the top-10 paths, scores and kinds
+  of ten queries across four scopes - plain, kind:text, kind:image and a folder prefix, which take
+  different routes through the reducer - and the digest is identical in both arms on the real index
+  (134b9ff183fd2f29). It must be: the occurrence mirror is the identity on an index whose contents
+  are not shared, so a digest that moves is a read-path bug, not a ranking opinion.
 - THE UPGRADE is `chunks.slot`, filled in from the RESIDENT state a slice at a time (200k rows,
   ~0.25s each; 12.2s in total on the real index) with a chunk-id watermark. Coverage refuses to
   advance until it is complete. The watermark is turned back into a row index by a SCAN, never a

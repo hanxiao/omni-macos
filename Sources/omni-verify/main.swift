@@ -4172,10 +4172,27 @@ if args.count >= 4 && args[1] == "searchreal" {
     let qvecs = probes.map { engine.embedText($0, as: .query) }
     var digest: UInt64 = 0xcbf29ce484222325
     func mix(_ s: String) { for b in s.utf8 { digest = (digest ^ UInt64(b)) &* 0x100000001b3 } }
-    for (i, q) in qvecs.enumerated() {
-        let hits = store.search(q, topK: 10)
-        mix("q\(i):")
-        for h in hits { mix(h.path); mix(String(format: "%.5f", h.score)) }
+    // FILTERED QUERIES ARE IN THE DIGEST TOO, because they take different paths. A kind filter
+    // masks CONTENTS (kind is a property of the content); a folder filter masks FILES and has to
+    // reach the contents through the occurrence mirror - which is where a scope leak would live, a
+    // content let through by an out-of-scope sibling being reported under the wrong file. Both go
+    // through the same identity argument as the plain query and must produce the same bytes.
+    var scopes: [(String, SearchFilter)] = [("plain", SearchFilter())]
+    var kindOnly = SearchFilter(); kindOnly.kinds = ["text"]
+    scopes.append(("kind:text", kindOnly))
+    var imgOnly = SearchFilter(); imgOnly.kinds = ["image"]
+    scopes.append(("kind:image", imgOnly))
+    // The deepest folder the index actually has rows under, so the scope is real rather than empty.
+    if let home = ProcessInfo.processInfo.environment["HOME"] {
+        var scoped = SearchFilter(); scoped.folderPrefix = home + "/Documents"
+        scopes.append(("in:Documents", scoped))
+    }
+    for (name, f) in scopes {
+        for (i, q) in qvecs.enumerated() {
+            let hits = store.search(q, filter: f, topK: 10)
+            mix("\(name)/q\(i):")
+            for h in hits { mix(h.path); mix(String(format: "%.5f", h.score)); mix(h.kind) }
+        }
     }
     var lat: [Double] = []
     for _ in 0 ..< reps {
@@ -4187,7 +4204,7 @@ if args.count >= 4 && args[1] == "searchreal" {
     }
     lat.sort()
     func pct(_ p: Double) -> Double { lat.isEmpty ? 0 : lat[Swift.min(lat.count - 1, Int(Double(lat.count) * p))] }
-    print(String(format: "SEARCHREAL sharing=%@ chunks=%d n=%d p50=%.1fms p90=%.1fms p99=%.1fms digest=%016llx",
+    print(String(format: "SEARCHREAL sharing=%@ chunks=%d n=%d p50=%.1fms p90=%.1fms p99=%.1fms digest=%016llx (plain+kind+folder)",
                  VectorStore.contentSharing ? "on " : "off", store.count, lat.count,
                  pct(0.5), pct(0.9), pct(0.99), digest))
     exit(0)
