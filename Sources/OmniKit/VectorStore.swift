@@ -6661,8 +6661,12 @@ public final class VectorStore: @unchecked Sendable {
             // stored slot below what has already been appended is by construction a duplicate.
             let hasStored = sqlite3_column_type(stmt, 10) == SQLITE_INTEGER
             let stored = hasStored ? Int(sqlite3_column_int(stmt, 10)) : -1
-            let appended = flat16.count / Swift.max(1, dim)
-            if stored >= 0, stored < appended, stored < slot {
+            // A row REUSES an existing position when its stored slot points below where the walk
+            // has reached - at bytes some earlier row already accounted for. Said in positions
+            // rather than in "has something been appended", because for a COVERED index nothing is
+            // appended at all: flat16 is the mapped file. Testing the append count worked only for
+            // a fresh index and silently mis-seated every row of a covered one.
+            if stored >= 0, stored < slot {
                 rows.append(Row(path: path, kind: kind, chunkIndex: Int(sqlite3_column_int(stmt, 2)),
                                 modified: sqlite3_column_double(stmt, 5),
                                 size: Int(sqlite3_column_int64(stmt, 9)),
@@ -10119,7 +10123,14 @@ public final class VectorStore: @unchecked Sendable {
     /// Assign a slot to every chunk about to be appended, appending a vector ONLY for a content the
     /// store does not already hold, and append the rows. One content, one vector - which is the
     /// whole point, and the only place it actually happens.
-    /// ON. Two files holding the same passage share one vector.
+    /// OFF, because COVERAGE still counts rows.
+    ///
+    /// Sharing is correct through the write path, both reducers, the quantized funnel, compaction
+    /// and a plain reload. It is NOT correct through coverage - the state a real index lives in.
+    /// coveredRows is advanced per ROW and the loader checks covered == coveredRows - holes, also a
+    /// row count, so once contents are shared the file holds fewer positions than there are rows
+    /// and everything past the first duplicate is mis-seated. That is a protocol change, not an
+    /// indexing fix, and it is the last place assuming one vector per row.
     ///
     /// The last thing standing between here and on was a wrong result list under the quantized
     /// funnel, and it turned out to be one line: rerankLocked wrote each candidate's exact score at
@@ -10135,7 +10146,7 @@ public final class VectorStore: @unchecked Sendable {
     ///
     /// OMNI_CONTENT_SHARING=0 turns it off, which is the A/B and the escape hatch.
     nonisolated(unsafe) static var contentSharing =
-        ProcessInfo.processInfo.environment["OMNI_CONTENT_SHARING"] != "0"
+        ProcessInfo.processInfo.environment["OMNI_CONTENT_SHARING"] == "1"
 
     func appendChunksLocked(_ chunks: [IndexedChunk], bfs: [[UInt16]], ids: [Int64] = []) -> [Int32] {
         var assigned: [Int32] = []
