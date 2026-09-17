@@ -183,12 +183,43 @@ Built, tested and pinned with a negative control each:
     ChunkDiff          15 tests   set diff, reference multiplicity
     OccurrenceIndex    16 tests   slot mask, expansion, the scope leak
     SchemaV5            9 tests   DDL, unique key index, reverse edge plan
-    ContentSharing     19 tests   the store end to end: write, search, delete, coverage, reload
+    ContentSharing     20 tests   the store end to end: write, search, delete, coverage, reload
+    StoreChunkReuse     3 tests   a content embedded once per INDEX, not once per pass
 
 SHIPPED AND ON: content sharing itself - the store's in-memory model, the write path, both
 reducers, the quantized funnel, compaction, the hole reclaim, reload, vector coverage, and the
 slot-column backfill that upgrades an existing index. Plus `OpaqueText`, the base64/payload filter,
-which is on the indexing path.
+which is on the indexing path, and `vectorsForContentKeys`, below.
+
+## What sharing does and does not save, and the lookup that changed the answer
+
+WHAT IT DOES NOT SAVE BY ITSELF: GPU time. Duplicate chunks inside one pass are already collapsed
+by the indexer's own key-keyed cache, in every build, so a ONE-PASS benchmark reports an identical
+`tokensProcessed` whatever the store does - 9,686,235 either way on the 580-file agent-log corpus.
+
+`VectorStore.vectorsForContentKeys` is what turns duplication into skipped forward passes, and it
+is the lookup v4 could not make: `chunkVectors(path:)` is scoped to one path and gated on the file
+already being known, so a brand new file whose content the index already holds was embedded in
+full. The new one asks the content index directly, which is what the partial index on
+`chunk_text.chunk_key` exists for. Bit-exact by construction - a stored vector is the bf16 rounding
+of what the encoder produced, and a fresh one is rounded the same way before it is stored or
+scored, so the bytes reaching `.vecs` and every score computed from them are the same either way.
+
+BE HONEST ABOUT THE SIZE OF IT. Measured across two different projects' agent logs, pass two saves
+0.6% of its tokens; those corpora barely overlap. The 38.5% figure is over the WHOLE 2.68M-file
+index, and most of that duplication is between files a single crawl sees together - which the
+in-pass cache was already catching. What this adds is the part that falls outside a pass: content
+indexed today meeting the encoder again in a file crawled next week. It costs one point query per
+unique key per batch and measures no slower end to end (124.7s against 127.5s on the same pass), so
+the case for it is that the window is right, not that the number is big.
+
+TEST IT ON FILES THAT DIFFER. Two byte-identical files never reach the encoder twice anyway -
+file-level dedup has done that since 0.4.9 - so a duplicate-file fixture reports zero embeddings
+whether or not chunk-level reuse exists. `StoreChunkReuseTests` uses files that differ in their
+last line only, long enough to be multi-chunk, with the difference at the END so the fixed-grid
+boundaries before it stay byte-identical. That is what the negative control caught on the first
+version of the test. `omni-verify reusebench <model> <rootA> <rootB>` is the A/B;
+`OMNI_STORE_REUSE=0` is the lever.
 
 WRITTEN, TESTED, AND NOT WIRED TO ANYTHING. Said plainly because "component status" above reads
 like a delivery list and three of those components deliver nothing yet:
@@ -197,10 +228,10 @@ like a delivery list and three of those components deliver nothing yet:
                    insertion-stability numbers at the top of this file are a measurement of what
                    CDC WOULD buy, not of what the app does. `ChunkKey.text` carries the cutter
                    fingerprint so the two generations can coexist when it does land.
-  ChunkDiff        The reuse/embed/refcount plan for a partial reindex. Nothing calls it: a file
-                   that changes is still re-chunked and re-embedded whole, and sharing then
-                   collapses whatever came back identical - which is the same vectors, at the cost
-                   of the forward passes.
+  ChunkDiff        The reuse/embed/refcount plan for a partial reindex, as a model. Nothing calls
+                   it - but the effect it was written for now falls out of the content lookup: a
+                   file that changes is still re-chunked whole, and every chunk whose bytes did not
+                   move is answered from the index instead of the encoder.
   SlotAllocator    The free list. The reclaim is the v4 answer and now works under sharing, so a
                    released position waits for a whole-file copy rather than being handed to the
                    next new content.
