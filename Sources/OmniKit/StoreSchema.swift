@@ -166,6 +166,10 @@ enum StoreSchema {
             );
             """,
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_chunk_file ON \(chunks)(file_id, chunk_index);",
+            // POSITION -> ROWS. Coverage advances by POSITION in the vector file, and once contents
+            // are shared a position's rows are not an id-prefix: a duplicate has a high id and a low
+            // slot. Partial, so it costs nothing for rows written before slots existed.
+            "CREATE INDEX IF NOT EXISTS idx_chunk_slot ON \(chunks)(slot) WHERE slot >= 0;",
             // Read for the ~40 hits a search shows, and on the reuse path when a file is re-indexed.
             // Never read by the loader, never by scoring. `kind` and `file_id` are repeated here
             // only so the media label index below can be a covering partial index, which is what

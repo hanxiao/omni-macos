@@ -252,16 +252,6 @@ final class ContentSharingTests: XCTestCase {
     /// for a duplicate" has to mean something different there than it does for a fresh index whose
     /// vectors come back as blobs. Every other reload test here runs with coverage at zero.
     func testSharingSurvivesCoverageAndReload() throws {
-        throw XCTSkip("""
-            OPEN, and the reason contentSharing is off by default. Sharing works through the write \
-            path, the reducers, the quantized funnel, compaction and a plain reload - but NOT \
-            through COVERAGE, which is the state a real index spends its life in. The coverage \
-            protocol counts ROWS: coveredRows is advanced per row, and the loader's own check \
-            (covered == coveredRows - holes) is a row count, so once contents are shared the file \
-            has fewer positions than there are rows and every row past the first duplicate is \
-            mis-seated. Making coverage content-based is the remaining work; it is the last place \
-            that assumes one vector per row, and it is a protocol change rather than an indexing fix.
-            """)
         let saved = VectorStore.coverageSliceOverride
         VectorStore.coverageSliceOverride = 40          // make coverage genuinely creep
         defer { VectorStore.coverageSliceOverride = saved }
@@ -272,8 +262,17 @@ final class ContentSharingTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: dir) }
         let url = dir.appendingPathComponent("index.sqlite")
 
-        let shared = vec(3)
+        // spread(), not vec(): vec() is dim 8 and repeats every 64, so vec(47 + 20) IS vec(3).
+        // That collision made a correct load look like a sharing bug for two rounds. Assert it
+        // cannot happen before asserting anything about ranking.
+        let dim = 32
+        let shared = spread(1_000_000, dim)
         let sharers = [7, 40, 88, 150]
+        var worst: Float = 0
+        for f in 0 ..< 200 where !sharers.contains(f) {
+            worst = Swift.max(worst, zip(spread(f + 20, dim), shared).reduce(Float(0)) { $0 + $1.0 * $1.1 })
+        }
+        XCTAssertLessThan(worst, 0.95, "fixture vectors collide; the ranking assertion is meaningless")
         do {
             let store = try VectorStore(dbURL: url)
             for f in 0 ..< 200 {
@@ -281,7 +280,7 @@ final class ContentSharingTests: XCTestCase {
                 try store.replace(path: "/c/f\(f).txt",
                                   chunks: [IndexedChunk(path: "/c/f\(f).txt", modified: 1, size: 1,
                                                         kind: "text", chunkIndex: 0, snippet: "s\(f)",
-                                                        embedding: isShared ? shared : vec(f + 20),
+                                                        embedding: isShared ? shared : spread(f + 20, dim),
                                                         locator: "Line 1",
                                                         chunkKey: isShared ? "9999aaaa"
                                                                            : String(format: "%08x", f &+ 0x3000))])
@@ -299,7 +298,7 @@ final class ContentSharingTests: XCTestCase {
         XCTAssertEqual(Set(hits.prefix(sharers.count).map(\.path)), want,
                        "the shared passage did not survive coverage")
         // And a file that shares nothing must still find its own content.
-        let solo = store.search(vec(0 + 20), topK: 1).first
+        let solo = store.search(spread(0 + 20, dim), topK: 1).first
         XCTAssertEqual(solo?.path, "/c/f0.txt", "a non-sharing row was handed the wrong vector")
     }
 }

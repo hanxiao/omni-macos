@@ -285,7 +285,24 @@ POSITIONS in the vector file, which is what it always physically was:
 79 uses of `coveredRows`, 14 of which conflate the two units, inside a 36-site protocol that also
 carries the hole list and the crash-recovery marker.
 
-WHY IT IS NOT DONE HERE. Not effort: judgement. This is the one place in the store where a subtle
+PROGRESS: THE MAIN PATH IS DONE. Coverage now advances by POSITION
+(`coverUnits = slotCount`), clears blobs by position RANGE rather than by an id watermark - which
+stopped meaning "these positions are covered" the moment a duplicate could carry a high id and a low
+slot - and `idx_chunk_slot` makes that range query O(slice) rather than O(covered), which is the
+property the watermark existed to buy. The loader's checks count positions. Both loaders skip the
+append for a reusing row, and the FALLBACK loader tests that BEFORE the blob guard: a reusing row's
+blob is cleared as soon as its content is covered, so demanding one dropped the row from the index
+entirely - that is how a shared passage lost the last file holding it while the others survived.
+`testSharingSurvivesCoverageAndReload` drives coverage the way a real index does and passes.
+
+WHAT IS LEFT: the REPAIR paths. With sharing on, seven tests still fail, all of them recovery rather
+than steady state - CoverageCRUDTests.testMigrationRunsOnceAndNeverAgain,
+CoverageClaimRepairTests.testAmbiguousMismatchWithHolesStillRefuses, OrphanTwinRepairTests. They
+reconstruct or validate a claim by counting rows, exactly as the main path used to. They are the
+same unit confusion in the code that runs when something has already gone wrong, which is the worst
+place to leave it half-converted and the reason the flag is still off.
+
+WHY THE REST IS NOT DONE HERE. Not effort: judgement. This is the one place in the store where a subtle
 error destroys data rather than returning a wrong row, and the four layers before it (the candidate
 path, the rerank's row/content write, dead-row masking, the loader's append test) each took several
 wrong diagnoses before the right one. Starting a data-loss-capable protocol change in that state is

@@ -6387,7 +6387,8 @@ public final class VectorStore: @unchecked Sendable {
                 let cleared = clearedRowsLocked()
                 return cleared == 0 ? nil : "no coverage but \(cleared) rows have no blob"
             }
-            if coveredRows > rows.count { return "coverage \(coveredRows) exceeds rows \(rows.count)" }
+            let units = Self.contentSharing ? slotCount : rows.count
+            if coveredRows > units { return "coverage \(coveredRows) exceeds positions \(units)" }
             // 1. Every recorded hole must actually be a dead row inside the covered prefix.
             for h in vecHoles {
                 if Int(h) >= coveredRows { return "hole \(h) at or past coverage \(coveredRows)" }
@@ -6556,7 +6557,7 @@ public final class VectorStore: @unchecked Sendable {
         // the two are not describing the same index and writing vectors by position would corrupt
         // every row from the first divergence on.
         guard scalarQuery("SELECT COUNT(*) FROM chunks") >= slots.count,
-              flat16.count >= Swift.min(coveredRows, rows.count) * dim else { return false }
+              flat16.count >= Swift.min(coveredRows, Self.contentSharing ? slotCount : rows.count) * dim else { return false }
         guard execChecked("BEGIN;") else { return false }
         var sel: OpaquePointer?, upd: OpaquePointer?
         defer { sqlite3_finalize(sel); sqlite3_finalize(upd) }
@@ -6728,7 +6729,10 @@ public final class VectorStore: @unchecked Sendable {
         // Every covered slot must have been claimed by a row or a hole, and the file must hold a
         // vector for every row we just built. Either failing means falling back to the blob scan,
         // which is only possible because nothing above wrote to the file.
-        guard ok, covered == coveredRows - holes, flat16.count == rows.count * dim else {
+        // flat16 holds one vector per POSITION; rows.count is only the same number while nothing
+        // is shared. `covered` above already counts positions, because a reusing row consumes none.
+        let vectorUnits = Self.contentSharing ? slotCount : rows.count
+        guard ok, covered == coveredRows - holes, flat16.count == vectorUnits * dim else {
             rows.removeAll(); flat16.removeAll(); presentPaths.removeAll(); occSlot.removeAll()
             fileID.removeAll(); pathID.removeAll(); idPath.removeAll(); fileChunkCount.removeAll()
             resetPathAllowCachesLocked()   // idPath emptied: nothing derived from it survives
@@ -7157,7 +7161,11 @@ public final class VectorStore: @unchecked Sendable {
         guard Self.vecCoverage, dbOpen(), dim > 0, !rows.isEmpty, flat16.isPersistent else { return false }
         // Coverage counts SLOTS, so it advances only over rows that are physically in the file, and
         // the file is only known good up to what the caller just made durable.
-        let target = Swift.min(rows.count, coveredRows + Swift.max(1, budget))
+        // POSITIONS, not rows. Coverage claims "the first C positions of .vecs are durable", and
+        // once contents are shared there are fewer positions than rows - bounding the target by the
+        // row count then claims coverage over positions the file does not have.
+        let coverUnits = Self.contentSharing ? slotCount : rows.count
+        let target = Swift.min(coverUnits, coveredRows + Swift.max(1, budget))
         guard target > coveredRows else { return false }
         // The covered prefix must correspond, row for row, to the live rows SQLite has in rowid
         // order. Holes are exactly the slots below `coveredRows` with no row, so this is the
@@ -7193,8 +7201,27 @@ public final class VectorStore: @unchecked Sendable {
         // vectors have their own table: after the delete, exactly `live - clearUpTo` of them must
         // remain. That is the identity the old watermark violated silently, verified per slice,
         // inside the transaction, for the cost of counting a small B-tree.
-        let advanceBy = clearUpTo - clearedBefore
+        // THE ID WATERMARK ONLY WORKS WHILE A POSITION'S ROWS ARE AN ID-PREFIX. Under sharing a
+        // duplicate has a HIGH id and a LOW slot, so "id <= boundary" stops meaning "these
+        // positions are covered": it would leave a duplicate's blob behind (harmless) while the
+        // accounting below claimed it was gone (not). Clear by POSITION RANGE instead - exactly the
+        // slice's new positions - which idx_chunk_slot makes O(slice) rather than O(covered), the
+        // property the watermark existed to buy.
         var boundary = coveredUpToID
+        if Self.contentSharing {
+            let clearedRows = scalarQuery("SELECT COUNT(*) FROM chunks WHERE slot >= 0 AND slot < \(target)")
+            guard execChecked("""
+                DELETE FROM pending_vecs WHERE chunk_id IN
+                  (SELECT id FROM chunks WHERE slot >= \(coveredRows) AND slot < \(target));
+                """),
+                  scalarQuery("SELECT COUNT(*) FROM pending_vecs") == live - clearedRows,
+                  execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.coveredRowsKey)','\(target)');"),
+                  execChecked("COMMIT;")
+            else { rollbackTxnLocked(); return false }
+            coveredRows = target
+            return true
+        }
+        let advanceBy = clearUpTo - clearedBefore
         if advanceBy > 0 {
             boundary = Int64(scalarQuery(
                 "SELECT id FROM chunks WHERE id > \(coveredUpToID) ORDER BY id LIMIT 1 OFFSET \(advanceBy - 1)"))
@@ -9611,9 +9638,28 @@ public final class VectorStore: @unchecked Sendable {
                 let width = Int(sqlite3_column_int(stmt, 6))
                 let height = Int(sqlite3_column_int(stmt, 7))
                 let duration = sqlite3_column_double(stmt, 8)
-                guard d > 0, let blob = sqlite3_column_blob(stmt, 4) else { continue }
+                guard d > 0 else { continue }
                 if dim == 0 { dim = d }
                 guard d == dim else { continue }   // skip mismatched-dimension rows
+                // BEFORE the blob guard. A reusing row's blob is cleared the moment its content's
+                // position is covered - the bytes live in the file, under another row - so
+                // demanding one here drops the row from the index altogether. That is how a shared
+                // passage lost the last file holding it while the others survived.
+                let storedSlot = sqlite3_column_type(stmt, 10) == SQLITE_INTEGER
+                    ? Int(sqlite3_column_int(stmt, 10)) : -1
+                let position = flat16.count / Swift.max(1, dim)
+                if storedSlot >= 0, storedSlot < position {
+                    rows.append(Row(path: path, kind: kind, chunkIndex: ci, modified: modified,
+                                    size: Int(sqlite3_column_int64(stmt, 9)),
+                                    width: width, height: height, duration: duration,
+                                    slot: Int32(storedSlot),
+                                    chunkID: sqlite3_column_int64(stmt, 11)))
+                    appendRowMetaLocked(internPath(path), kindCode: internKind(kind), kind: kind,
+                                        path: path, slot: Int32(storedSlot))
+                    presentPaths.insert(path)
+                    continue
+                }
+                guard let blob = sqlite3_column_blob(stmt, 4) else { continue }
                 let bytes = Int(sqlite3_column_bytes(stmt, 4))
                 if bytes == d * MemoryLayout<Float>.size {
                     // Legacy fp32 blob: round to bf16 in memory. It is re-saved as bf16 the next
@@ -9627,7 +9673,9 @@ public final class VectorStore: @unchecked Sendable {
                 }
                 rows.append(Row(path: path, kind: kind, chunkIndex: ci, modified: modified,
                                 size: Int(sqlite3_column_int64(stmt, 9)),
-                                width: width, height: height, duration: duration))
+                                width: width, height: height, duration: duration,
+                                slot: lastAppendedSlot,
+                                chunkID: sqlite3_column_int64(stmt, 11)))
                 let fid = internPath(path)
                 appendRowMetaLocked(fid, kindCode: internKind(kind), kind: kind, path: path,
                                     slot: lastAppendedSlot)
