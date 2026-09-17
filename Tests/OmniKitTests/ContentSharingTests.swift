@@ -1216,4 +1216,79 @@ final class ContentSharingTests: XCTestCase {
               sqlite3_step(st) == SQLITE_ROW else { return -1 }
         return Int(sqlite3_column_int64(st, 0))
     }
+    /// THE LAUNCH PATH, WHICH SHARING SILENTLY TURNED OFF.
+    ///
+    /// The stamp guard read `flat16.count == rows.count * dim`, which is the identity only while a
+    /// row owns its own vector. Share anything and the vector file is SHORTER than the row table,
+    /// the guard is false for ever, and no sidecar is written - so every launch scans every chunk
+    /// row out of SQLite. Nothing failed, nothing was wrong, it was just slow, on the one index
+    /// large enough for it to matter. Every existing fixture used random vectors, which share
+    /// nothing, so all 539 of them agreed it was fine.
+    ///
+    /// The cap is what puts the store in the mode that HAS a sidecar at all: below it the bf16
+    /// base never maps a file, so there is nothing to stamp and nothing to adopt.
+    func testASharingIndexStillStampsAndAdoptsItsRowSidecar() throws {
+        let saved = OmniMemoryBudget.capBytes
+        OmniMemoryBudget.capBytes = 1 << 20
+        defer { OmniMemoryBudget.capBytes = saved }
+        let url = tempDB()
+        let dim = 64
+        let shared = vec(4, dim)
+        var baseline: [SearchHit] = []
+        do {
+            let store = try VectorStore(dbURL: url)
+            var batch: [(path: String, chunks: [IndexedChunk])] = []
+            for i in 0 ..< 3000 {
+                let p = "/s/f\(i).txt"
+                batch.append((p, [chunk(p, 0, shared, key: "dddd0001"),
+                                  chunk(p, 1, vec(i + 7, dim), key: String(format: "e%07d", i))]))
+            }
+            try store.replaceMany(batch)
+            baseline = store.search(shared, topK: 40)
+            XCTAssertLessThan(store.slotsForTest.max().map { Int($0) + 1 } ?? 0, 6000,
+                              "fixture shares nothing, so it cannot test what this is about")
+            store.close()
+        }
+        let rowsURL = url.deletingLastPathComponent()
+            .appendingPathComponent(url.lastPathComponent + ".rows")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: rowsURL.path),
+                      "close() did not stamp the row sidecar for a sharing index")
+        let store = try VectorStore(dbURL: url); defer { store.close() }
+        XCTAssertTrue(store.adoptedRowSidecar, "the sidecar was written and then not adopted")
+        let hits = store.search(shared, topK: 40)
+        XCTAssertEqual(Set(hits.map(\.path)), Set(baseline.map(\.path)),
+                       "adopted rows do not answer what the stamped ones did")
+        for h in hits { XCTAssertEqual(h.score, 1.0, accuracy: 1e-2, "\(h.path) reads the wrong vector") }
+    }
+
+    /// The same table, one slot at a time: a row's SLOT has to survive the roundtrip, not just the
+    /// results. Reading it back as the row's index is the bug this record field exists to stop, and
+    /// it only shows up where the two numbers differ.
+    func testTheSidecarCarriesEachRowsSlotRatherThanItsIndex() throws {
+        let saved = OmniMemoryBudget.capBytes
+        OmniMemoryBudget.capBytes = 1 << 20
+        defer { OmniMemoryBudget.capBytes = saved }
+        let url = tempDB()
+        let dim = 64
+        var before: [Int32] = []
+        do {
+            let store = try VectorStore(dbURL: url)
+            var batch: [(path: String, chunks: [IndexedChunk])] = []
+            for i in 0 ..< 3000 {
+                let p = "/t/f\(i).txt"
+                batch.append((p, [chunk(p, 0, vec(1, dim), key: "ffff0001"),
+                                  chunk(p, 1, vec(i + 2, dim), key: String(format: "g%07d", i))]))
+            }
+            try store.replaceMany(batch)
+            _ = store.search(vec(1, dim), topK: 5)
+            before = store.slotsForTest
+            store.close()
+        }
+        let store = try VectorStore(dbURL: url); defer { store.close() }
+        XCTAssertTrue(store.adoptedRowSidecar)
+        XCTAssertEqual(store.slotsForTest, before, "slots did not survive the sidecar roundtrip")
+        XCTAssertNotEqual(before, (0 ..< before.count).map { Int32($0) },
+                          "fixture never made a slot differ from its row index")
+    }
+
 }

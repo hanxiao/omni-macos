@@ -6287,6 +6287,11 @@ public final class VectorStore: @unchecked Sendable {
     /// Fold the delta after writes go quiet (OMNI_IDLE_FOLD=0 disables, for A/B).
     nonisolated(unsafe) static var idleFold = ProcessInfo.processInfo.environment["OMNI_IDLE_FOLD"] != "0"
     private var rowSidecarURL: URL { dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".rows") }
+    /// WHICH LOAD PATH THIS OPEN TOOK. The sidecar is the whole difference between a launch that
+    /// reads one file and one that scans every chunk row, and "did it get adopted?" is otherwise
+    /// only visible in a debug print - which is how a sharing index came to pay the full scan on
+    /// every launch with 539 tests passing.
+    public private(set) var adoptedRowSidecar = false
     private var vecSidecarURL: URL { dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".vecs") }
     /// The compacted copy, before it becomes the vector file. Named beside it so the switch is a
     /// same-directory rename, which is the only kind POSIX promises is atomic.
@@ -6447,9 +6452,19 @@ public final class VectorStore: @unchecked Sendable {
         /// stamp stopped compacting has no such key, and nil is exactly right for it - it was
         /// compacted, so it had none. Lets an existing sidecar keep being adopted after an upgrade.
         var deadCount: Int?
+        /// POSITIONS IN THE VECTOR FILE, which stops being `rowCount` the moment two rows share a
+        /// vector. Optional so a sidecar written before sharing decodes as nil, which means exactly
+        /// what it meant then: one position per row.
+        var vecRows: Int?
     }
     /// Fixed-width per-row record; see stampRowSidecarLocked for the field layout.
-    private static let rowRecordSize = 48
+    ///
+    /// TWO WIDTHS, and the header's `recordBytes` is what says which - so an existing 48-byte
+    /// sidecar is still adopted rather than rejected into a full SQLite reload. The 56-byte form
+    /// carries the two facts sharing made non-derivable: the row's SLOT (under v4 it is the row's
+    /// own index, under v5 it is not) and its chunk id (needed to write a renumbering back).
+    private static let rowRecordSizeV1 = 48
+    private static let rowRecordSize = 56
 
     /// True while a stamp is already scheduled. See below for why this is arm-once rather than
     /// the supersede-the-previous-one shape every other debounce here uses.
@@ -7974,8 +7989,17 @@ public final class VectorStore: @unchecked Sendable {
         // following a delete would have had to restore gigabytes of blobs just to compact them
         // away. The sidecar carries the tombstones instead (record byte 49), which is also what
         // keeps a delete O(edit) rather than O(index).
+        // THE FILE HAS TO COVER EVERY POSITION THE RECORDS NAME, which under v4 is "one position
+        // per row" and under sharing is "one position per distinct content". Written as
+        // `flat16.count == rows.count * dim` it silently stopped stamping the moment anything
+        // shared a vector - so a sharing index paid the full SQLite load on EVERY launch, and no
+        // test saw it because every fixture used random vectors, which share nothing.
+        let vecUnits = Self.contentSharing ? slotCount : rows.count
         guard Self.rowSidecarEnabled, dbOpen(), flat16.isPersistent, dim > 0, !rows.isEmpty,
-              mutationGen != lastStampedGen, flat16.count == rows.count * dim else { return }
+              mutationGen != lastStampedGen, flat16.count == vecUnits * dim else { return }
+        // A row whose slot is still -1 has not been through the backfill, and a sidecar that
+        // records -1 would hand the next launch a row with no vector. Stamp only a resolved table.
+        if Self.contentSharing, rows.contains(where: { $0.slot < 0 }) { return }
         let t0 = omniPerfEnabled ? Date() : nil
         // The header describes rows.count vectors, so the FILE has to cover them. Rows appended
         // since the last fold live in the mapping's anonymous tail, and only the fold path
@@ -8011,10 +8035,15 @@ public final class VectorStore: @unchecked Sendable {
                 raw.storeBytes(of: Int64(r.size), toByteOffset: o + 32, as: Int64.self)
                 raw.storeBytes(of: kindCode[i], toByteOffset: o + 40, as: UInt8.self)
                 // Tombstone flag, into one of the record's spare bytes. The block is zero-filled and
-                // offsets 42..47 are never written, so this costs nothing.
+                // offsets 42..43 are never written, so this costs nothing.
                 if hasDeadRows, deadRows.contains(Int32(i)) {
                     raw.storeBytes(of: UInt8(1), toByteOffset: o + 41, as: UInt8.self)
                 }
+                // The two facts the 48-byte record could derive and this one cannot. `occSlot` is
+                // the mirror every reader scores through, so it - not `rows[i].slot` - is what the
+                // sidecar has to reproduce.
+                raw.storeBytes(of: i < occSlot.count ? occSlot[i] : r.slot, toByteOffset: o + 44, as: Int32.self)
+                raw.storeBytes(of: r.chunkID, toByteOffset: o + 48, as: Int64.self)
             }
         }
         func table(_ strings: [String]) -> (offsets: Data, blob: Data) {
@@ -8035,7 +8064,7 @@ public final class VectorStore: @unchecked Sendable {
             recordBytes: records.count,
             pathOffBytes: paths.offsets.count, pathBlobBytes: paths.blob.count,
             kindOffBytes: kinds.offsets.count, kindBlobBytes: kinds.blob.count,
-            deadCount: deadRows.count)
+            deadCount: deadRows.count, vecRows: vecUnits)
         lastStampedGen = mutationGen
         let url = rowSidecarURL
         let tmp = url.deletingLastPathComponent().appendingPathComponent(url.lastPathComponent + ".tmp")
@@ -8087,6 +8116,7 @@ public final class VectorStore: @unchecked Sendable {
     /// is skipped; the vectors are the mapped sidecar file (read on demand). Every failure path
     /// unmaps, deletes both files, and returns false for the historical full scan.
     private func tryAdoptRowSidecarLocked() -> Bool {
+        adoptedRowSidecar = false
         guard Self.rowSidecarEnabled else { return false }
         let fm = FileManager.default
         try? fm.removeItem(at: rowSidecarURL.deletingLastPathComponent()
@@ -8096,30 +8126,44 @@ public final class VectorStore: @unchecked Sendable {
         // deleted together, which was harmless while every vector also sat in a SQLite blob - and
         // is data loss the moment coverage means the file is the only copy. Rejection here falls
         // through to loadFromCoverageLocked, which needs both the file and the claim intact.
-        func reject() -> Bool { flat16.removeAll(); removeRowSidecarFiles(keepVectors: coveredRows > 0); return false }
-        guard let fh = try? FileHandle(forReadingFrom: rowSidecarURL) else { return reject() }
+        // WHY, not just THAT. A rejection is invisible - the launch simply takes the slow path -
+        // and the two bugs this sidecar has produced were both "rejected on every open, nothing
+        // wrong, 5.4 s instead of 0.6 s". OMNI_SEARCH_TIMING prints the reason.
+        func reject(_ why: String = "") -> Bool {
+            if Self.searchTiming { print("[search] REJECT row sidecar: \(why)") }
+            flat16.removeAll(); removeRowSidecarFiles(keepVectors: coveredRows > 0); return false
+        }
+        guard let fh = try? FileHandle(forReadingFrom: rowSidecarURL) else { return reject("open") }
         defer { try? fh.close() }
         guard let headChunk = try? fh.read(upToCount: 4096), let nl = headChunk.firstIndex(of: 0x0A),
               let header = try? JSONDecoder().decode(RowSidecarHeader.self, from: headChunk[headChunk.startIndex ..< nl])
-        else { return reject() }
+        else { return reject("headerdecode") }
         guard header.magic == "omni-rows-2", header.gen == mutationGen,
               header.rowCount > 0, header.dim > 0, header.dim % Self.quantGroup == 0,
               Self.quantBitsFor(baseBytes: header.rowCount * header.dim * 2, rowCount: header.rowCount) > 0,
-              header.recordBytes == header.rowCount * Self.rowRecordSize,
+              header.recordBytes == header.rowCount * Self.rowRecordSize
+                || header.recordBytes == header.rowCount * Self.rowRecordSizeV1,
               header.pathCount > 0, header.kindCount > 0,
               header.pathOffBytes == (header.pathCount + 1) * 4,
               header.kindOffBytes == (header.kindCount + 1) * 4,
               scalarQuery("SELECT COUNT(*) FROM chunks") == header.rowCount - (header.deadCount ?? 0)
-        else { return reject() }
+        else { return reject("header gen=\(header.gen) vs \(mutationGen) rows=\(header.rowCount) recB=\(header.recordBytes) dim=\(header.dim) live=\(scalarQuery("SELECT COUNT(*) FROM chunks")) dead=\(header.deadCount ?? -1)") }
+        // How wide each record is, and therefore whether it carries a slot at all. A 48-byte
+        // sidecar predates sharing, and for it slot == row index is not a guess - it is what the
+        // index it describes actually was.
+        let recSize = header.recordBytes / header.rowCount
+        let slotted = recSize == Self.rowRecordSize
+        let vecRows = header.vecRows ?? header.rowCount
+        guard vecRows > 0, slotted || vecRows == header.rowCount else { return reject("vecRows \(vecRows) slotted=\(slotted)") }
         guard flat16.mapPersistent(url: vecSidecarURL, tailSlackElements: Self.foldThreshold * header.dim,
-                                   adoptElements: header.rowCount * header.dim) else { return reject() }
+                                   adoptElements: vecRows * header.dim) else { return reject("mapPersistent \(vecRows)") }
         guard (try? fh.seek(toOffset: UInt64(nl - headChunk.startIndex + 1))) != nil,
               let records = try? fh.read(upToCount: header.recordBytes), records.count == header.recordBytes,
               let pathOffs = try? fh.read(upToCount: header.pathOffBytes), pathOffs.count == header.pathOffBytes,
               let pathBlob = try? fh.read(upToCount: header.pathBlobBytes), pathBlob.count == header.pathBlobBytes,
               let kindOffs = try? fh.read(upToCount: header.kindOffBytes), kindOffs.count == header.kindOffBytes,
               let kindBlob = try? fh.read(upToCount: header.kindBlobBytes), kindBlob.count == header.kindBlobBytes
-        else { return reject() }
+        else { return reject("blocks") }
         func strings(_ offs: Data, _ blob: Data, _ count: Int) -> [String]? {
             var out = [String](); out.reserveCapacity(count)
             var ok = true
@@ -8157,7 +8201,7 @@ public final class VectorStore: @unchecked Sendable {
             defer { sqlite3_finalize(stmt) }
             var i = 0
             while i < header.rowCount, sampleOK {
-                let o = i * Self.rowRecordSize
+                let o = i * recSize
                 let fid = Int(raw.loadUnaligned(fromByteOffset: o, as: Int32.self))
                 let ci = raw.loadUnaligned(fromByteOffset: o + 4, as: Int32.self)
                 let modified = raw.loadUnaligned(fromByteOffset: o + 16, as: Double.self)
@@ -8180,8 +8224,14 @@ public final class VectorStore: @unchecked Sendable {
                 let blobBytes = Int(sqlite3_column_bytes(stmt, 0))
                 if blobBytes == 0 { i += stride; continue }
                 guard let blob = sqlite3_column_blob(stmt, 0) else { sampleOK = false; break }
+                // WHERE THIS ROW'S VECTOR SITS, which is the row's own index only until two rows
+                // share one. Comparing position i against row i's blob under sharing fails for
+                // every row past the first duplicate - it is comparing two different contents -
+                // so the sidecar was rejected and the launch fell back to the full scan.
+                let pos = slotted ? Int(raw.loadUnaligned(fromByteOffset: o + 44, as: Int32.self)) : i
+                guard pos >= 0, (pos + 1) * header.dim <= flat16.count else { sampleOK = false; break }
                 let ok: Bool = flat16.withUnsafeBufferPointer { fb in
-                    let row = UnsafeBufferPointer(rebasing: fb[i * header.dim ..< (i + 1) * header.dim])
+                    let row = UnsafeBufferPointer(rebasing: fb[pos * header.dim ..< (pos + 1) * header.dim])
                     if blobBytes == header.dim * 2 {
                         return memcmp(row.baseAddress!, blob, header.dim * 2) == 0
                     } else if blobBytes == header.dim * 4 {   // legacy fp32 row: compare post-conversion
@@ -8224,26 +8274,29 @@ public final class VectorStore: @unchecked Sendable {
                     if onLoadProgress != nil, i % 262_144 == 0 {
                         reportLoadProgress(0.25 + 0.75 * Double(i) / Double(header.rowCount))
                     }
-                    let o = i * Self.rowRecordSize
+                    let o = i * recSize
                     let fid = raw.loadUnaligned(fromByteOffset: o, as: Int32.self)
                     let kc = raw.loadUnaligned(fromByteOffset: o + 40, as: UInt8.self)
                     let path = idPath[Int(fid)]
                     let kind = idKind[Int(kc)]
                     let isDead = raw.loadUnaligned(fromByteOffset: o + 41, as: UInt8.self) != 0
+                    let slot = slotted ? raw.loadUnaligned(fromByteOffset: o + 44, as: Int32.self) : Int32(i)
+                    let cid = slotted ? raw.loadUnaligned(fromByteOffset: o + 48, as: Int64.self) : 0
                     rows.append(Row(path: path, kind: kind,
                                     chunkIndex: Int(raw.loadUnaligned(fromByteOffset: o + 4, as: Int32.self)),
                                     modified: raw.loadUnaligned(fromByteOffset: o + 16, as: Double.self),
                                     size: Int(raw.loadUnaligned(fromByteOffset: o + 32, as: Int64.self)),
                                     width: Int(raw.loadUnaligned(fromByteOffset: o + 8, as: Int32.self)),
                                     height: Int(raw.loadUnaligned(fromByteOffset: o + 12, as: Int32.self)),
-                                    duration: raw.loadUnaligned(fromByteOffset: o + 24, as: Double.self)))
+                                    duration: raw.loadUnaligned(fromByteOffset: o + 24, as: Double.self),
+                                    slot: slot, chunkID: cid))
                     if isDead {
                         // Holds the row's SLOT without counting toward its file: the vector stays
                         // where it is (that is the point of a tombstone) but nothing may return it.
-                        appendDeadRowMetaLocked(fid, kindCode: kc, slot: Int32(i))
+                        appendDeadRowMetaLocked(fid, kindCode: kc, slot: slot)
                         deadRows.insert(Int32(i))
                     } else {
-                        appendRowMetaLocked(fid, kindCode: kc, kind: kind, path: path, slot: Int32(i))
+                        appendRowMetaLocked(fid, kindCode: kc, kind: kind, path: path, slot: slot)
                     }
                 }
             }
@@ -8253,6 +8306,7 @@ public final class VectorStore: @unchecked Sendable {
         lastStampedGen = mutationGen
         invalidateBase()
         reportLoadProgress(1)
+        adoptedRowSidecar = true
         if Self.searchTiming { print("[search] ADOPT row sidecar rows=\(header.rowCount) files=\(idPath.count)") }
         return true
     }
@@ -10108,6 +10162,8 @@ public final class VectorStore: @unchecked Sendable {
     /// Drive coverage to completion. The budget is a SLICE SIZE, and it is added to the current
     /// claim - so the old `Int.max` default trapped on overflow the moment anyone used it.
     func advanceCoverageForTest(budget: Int = 1_000_000) { queue.sync { while advanceCoverageLocked(budget: budget) {} } }
+    /// The per-row slot mirror, which is what every score is actually indexed by.
+    var slotsForTest: [Int32] { queue.sync { occSlot } }
 
     // MARK: - Layout, and the v3 -> v4 conversion
 

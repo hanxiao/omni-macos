@@ -23,8 +23,17 @@ import Foundation
 /// could be holding stale ids are done - moves them where `allocate` can see them.
 public struct SlotAllocator: Sendable {
 
-    /// Slots below `highWater` that no chunk owns and that are safe to hand out now.
-    private(set) var available: [Int] = []
+    /// Slots below `highWater` that no chunk owns and that are safe to hand out now, held as a
+    /// BINARY MIN-HEAP rather than a plain array.
+    ///
+    /// The obvious form - an array plus a linear `min` in `allocate` - is O(n) per allocation and
+    /// therefore quadratic over a reindex. At the 96,256 holes a real index carries after days of
+    /// churn that is not a slow path, it is a hang, and it would only ever appear at the scale
+    /// where the free list starts to matter. The heap makes `allocate` O(log n) and `commit` O(k
+    /// log n) in what was actually released, with no per-mutation pass over the whole list.
+    private var heap: [Int] = []
+    /// The free slots, in no particular order. Reporting and tests; the order is the heap's.
+    public var available: [Int] { heap }
     /// Released during the current transaction. Not allocatable until `commit()`.
     private(set) var quarantine: [Int] = []
     /// One past the highest slot ever allocated. The vector file is this many rows long.
@@ -34,17 +43,16 @@ public struct SlotAllocator: Sendable {
 
     /// Restore from what SQLite holds: the free list and the high-water mark.
     public init(available: [Int], highWater: Int) {
-        self.available = available.filter { $0 >= 0 && $0 < highWater }
         self.highWater = Swift.max(0, highWater)
+        heap = available.filter { $0 >= 0 && $0 < self.highWater }
+        heapify()
     }
 
     /// The next slot to write a vector into. Prefers a hole, extends the file only when there is
     /// none. Lowest first, so the file stays as dense at the front as it can and a truncation after
     /// a large delete has a chance of being worth doing.
     public mutating func allocate() -> Int {
-        if let i = available.indices.min(by: { available[$0] < available[$1] }) {
-            return available.remove(at: i)
-        }
+        if let id = popMin() { return id }
         let id = highWater
         highWater += 1
         return id
@@ -59,8 +67,46 @@ public struct SlotAllocator: Sendable {
     /// End of transaction: quarantined slots become allocatable.
     public mutating func commit() {
         guard !quarantine.isEmpty else { return }
-        available.append(contentsOf: quarantine)
+        for id in quarantine { push(id) }
         quarantine.removeAll(keepingCapacity: true)
+    }
+
+    // MARK: - Heap
+
+    private mutating func heapify() {
+        guard heap.count > 1 else { return }
+        for i in stride(from: heap.count / 2 - 1, through: 0, by: -1) { siftDown(i) }
+    }
+
+    private mutating func push(_ id: Int) {
+        heap.append(id)
+        var i = heap.count - 1
+        while i > 0 {
+            let p = (i - 1) / 2
+            guard heap[p] > heap[i] else { break }
+            heap.swapAt(p, i); i = p
+        }
+    }
+
+    private mutating func popMin() -> Int? {
+        guard let first = heap.first else { return nil }
+        if heap.count == 1 { heap.removeLast(); return first }
+        heap[0] = heap.removeLast()
+        siftDown(0)
+        return first
+    }
+
+    private mutating func siftDown(_ from: Int) {
+        var i = from
+        let n = heap.count
+        while true {
+            let l = 2 * i + 1, r = l + 1
+            var m = i
+            if l < n, heap[l] < heap[m] { m = l }
+            if r < n, heap[r] < heap[m] { m = r }
+            if m == i { return }
+            heap.swapAt(i, m); i = m
+        }
     }
 
     /// Transaction rolled back: the releases never happened, so the slots are still owned.
@@ -68,10 +114,18 @@ public struct SlotAllocator: Sendable {
         quarantine.removeAll(keepingCapacity: true)
     }
 
+    /// Hand every free slot back, keeping the high-water mark. Used where the positions moved under
+    /// the allocator - a compaction renumbers them, so the cached list describes a numbering that
+    /// no longer exists and has to be rebuilt from the table rather than adjusted.
+    public mutating func forgetFreeList() {
+        heap.removeAll(keepingCapacity: true)
+        quarantine.removeAll(keepingCapacity: true)
+    }
+
     /// Slots that are neither live nor free. A leak is invisible - the vector file simply never
     /// shrinks - so it is checked rather than assumed.
     public func leaked(liveIDs: Set<Int>) -> [Int] {
-        let free = Set(available).union(quarantine)
+        let free = Set(heap).union(quarantine)
         return (0 ..< highWater).filter { !liveIDs.contains($0) && !free.contains($0) }
     }
 
@@ -87,7 +141,7 @@ public struct SlotAllocator: Sendable {
     /// Live slots plus free slots must exactly cover the file. Anything else means a slot is owned
     /// twice or by nobody.
     public func covers(liveIDs: Set<Int>) -> Bool {
-        let free = Set(available).union(quarantine)
+        let free = Set(heap).union(quarantine)
         guard free.isDisjoint(with: liveIDs) else { return false }
         return free.count + liveIDs.count == highWater
     }
