@@ -184,6 +184,77 @@ final class ContentChunkerTests: XCTestCase {
         XCTAssertGreaterThan(shared, ka.count - 3, "only \(shared) of \(ka.count) leading chunks shared")
     }
 
+    // MARK: - Sizes are in CHARACTERS
+
+    func testCJKChunksHoldTheSameNUMBEROFCHARACTERSAsEnglishOnes() {
+        // THE CORRECTION, and it fails outright if the size gates count bytes. Chinese is 3 bytes
+        // a character, so a 1800-BYTE target holds 600 characters - a third of the context per
+        // chunk and three times the vectors, on exactly the corpora least able to spare either.
+        // The hash still sees bytes; only the gates count scalars.
+        // VARIED text, not `String(repeating:)`. A periodic string never satisfies the hash mask,
+        // so every chunk runs to the hard ceiling and the test would only ever be comparing two
+        // ceilings - which passes for the wrong reason.
+        func varied(_ words: [String], _ chars: Int, seed: UInt64) -> String {
+            var s = seed
+            var out = ""
+            var n = 0                  // tracked, not re-counted: `out.count` in the condition is
+            while n < chars {          // O(length) per turn and made this test take 33 seconds
+                s = s &* 6364136223846793005 &+ 1442695040888963407
+                let w = words[Int((s >> 33) % UInt64(words.count))]
+                out += w; n += w.count
+                if (s >> 60) % 9 == 0 { out += "\n"; n += 1 }
+            }
+            return out
+        }
+        let cjk = varied(["中文", "文档", "检索", "系统", "测试", "内容", "向量", "索引", "。", "，"],
+                         120_000, seed: 3)
+        let english = varied(["index ", "chunk ", "vector ", "search ", "embedding ", "folder ",
+                              "content ", "document ", "passage ", ". "], 120_000, seed: 3)
+        func meanChars(_ text: String) -> Double {
+            let pieces = ContentChunker.cut(text)
+            XCTAssertGreaterThan(pieces.count, 10, "too few pieces to average")
+            return Double(text.count) / Double(pieces.count)
+        }
+        let c = meanChars(cjk), e = meanChars(english)
+        XCTAssertGreaterThan(c, 1_000, "CJK chunks hold \(c) characters; the gates are counting bytes")
+        XCTAssertLessThan(abs(c - e) / e, 0.5,
+                          "CJK mean \(c) against English \(e): the cutter is not script-neutral")
+    }
+
+    func testAScalarIsNeverCountedTwice() {
+        // The scalar counter drives every gate, so an off-by-one in it silently resizes every
+        // chunk. Counted a second way - Swift's own scalar view - over a mixed-script text.
+        let text = String(repeating: "mixed 中文 and emoji 🇯🇵 and cafe\u{301} text here. ", count: 900)
+        let pieces = ContentChunker.cut(text)
+        XCTAssertEqual(pieces.map(\.text).joined(), text)
+        XCTAssertEqual(pieces.reduce(0) { $0 + $1.text.unicodeScalars.count }, text.unicodeScalars.count)
+    }
+
+    // MARK: - The user's setting
+
+    func testTheSizeSettingIsHonoured() {
+        // "Max characters per chunk" is a four-value picker in Settings, so a cutter that ignored
+        // it would make the control silently do nothing - which is what a fixed-parameter cutter
+        // would have done.
+        let text = prose(400_000)
+        var means: [Double] = []
+        for setting in [1200, 1800, 3600] {
+            let p = ContentChunker.Params.forMaxChars(setting)
+            let pieces = ContentChunker.cut(text, p)
+            means.append(Double(text.count) / Double(pieces.count))
+        }
+        XCTAssertLessThan(means[0], means[1], "1200 did not give smaller chunks than 1800")
+        XCTAssertLessThan(means[1], means[2], "1800 did not give smaller chunks than 3600")
+        XCTAssertGreaterThan(means[2] / means[0], 1.8, "tripling the setting barely moved the size")
+    }
+
+    func testTheDefaultParamsAreTheMeasuredOnes() {
+        // 900 / 1800 / 4000 is what the parameter study in docs/schema-v5.md measured; deriving
+        // them from the default setting must not quietly change them.
+        let d = ContentChunker.Params.default
+        XCTAssertEqual([d.minChars, d.targetChars, d.maxChars], [900, 1800, 4000])
+    }
+
     // MARK: - Fingerprint
 
     func testTheFingerprintNamesEveryParameter() {
@@ -192,6 +263,14 @@ final class ContentChunkerTests: XCTestCase {
             XCTAssertTrue(fp.contains(String(n)), "\(fp) does not name \(n)")
         }
         XCTAssertTrue(fp.hasPrefix("cdc"))
+    }
+
+    func testADifferentSettingIsADifferentKeySpace() {
+        // Chunks cut to different sizes are different chunks, so they must not be able to collide
+        // on a key. The grid's key already carries its `c<maxChars>`; this is the same promise.
+        let a = ContentChunker.Params.forMaxChars(1800).fingerprint
+        let b = ContentChunker.Params.forMaxChars(3600).fingerprint
+        XCTAssertNotEqual(a, b)
     }
 
 }

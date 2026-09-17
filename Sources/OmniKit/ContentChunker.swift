@@ -24,31 +24,74 @@ import Foundation
 ///     and throughput is not the constraint here: chunking is nanoseconds against milliseconds of
 ///     GPU per chunk.
 ///
-/// SIZES ARE IN UTF-8 BYTES, not Characters. The hash has to see bytes, and a Character is one to
-/// four of them. Every emitted boundary is still guaranteed to sit on a scalar boundary, so no
-/// chunk can split a multi-byte character and no chunk is ever invalid UTF-8.
+/// THE HASH SEES BYTES; THE SIZE GATES COUNT CHARACTERS. Both halves matter and they are not the
+/// same decision - see `Params`. Every emitted boundary is guaranteed to sit on a scalar boundary,
+/// so no chunk can split a multi-byte character and no chunk is ever invalid UTF-8.
 public enum ContentChunker {
 
     // MARK: - Parameters
 
-    /// No cut is looked for below this. Also the floor on chunk size, except for a file's last chunk.
-    public static let minBytes = 900
-    /// Where the mask relaxes. The average chunk lands near here.
-    public static let targetBytes = 1800
-    /// A cut is forced here whether or not the hash agrees, so one chunk cannot swallow a file.
-    public static let maxBytes = 4000
-    /// Normalized chunking level. The paper's measured sweet spot.
-    public static let normalization = 2
-    /// How far past a content cut to look for a line break. See `snapToLine`.
-    public static let lineSnapWindow = 300
+    /// The sizes a cut is measured against, and the string that names them inside a chunk key.
+    ///
+    /// SIZES ARE IN CHARACTERS, NOT BYTES, and that is a correction rather than a preference. The
+    /// hash must see bytes - it is a byte-wise rolling hash - but the SIZE GATES are what decide
+    /// how much text a chunk holds, and the grid this replaces has always counted characters. Left
+    /// in bytes, a Chinese document (3 bytes a character) cut to a 1800-BYTE target holds 600
+    /// characters where the same setting gives an English one 1800: a third of the context per
+    /// chunk, three times the chunks, three times the vectors, on exactly the corpora least able to
+    /// spare the precision. Counting scalars costs one comparison per byte - a scalar starts at
+    /// every byte that is not a 10xxxxxx continuation - and makes the cutter script-neutral.
+    ///
+    /// `lineSnapWindow` stays in BYTES: it is a search distance for the next newline, not a size.
+    public struct Params: Sendable, Equatable {
+        public let minChars: Int
+        public let targetChars: Int
+        public let maxChars: Int
+        public let normalization: Int
+        public let lineSnapWindow: Int
 
-    /// Names the cutter and its parameters inside the chunk key, so generation 1 and generation 2
-    /// chunks occupy disjoint key spaces and can coexist in one index during migration without ever
-    /// colliding. Changing any number above changes this string, which is what forces a re-cut
-    /// rather than silently serving chunks cut under different rules.
-    public static var fingerprint: String {
-        "cdc\(minBytes)-\(targetBytes)-\(maxBytes)-n\(normalization)-l\(lineSnapWindow)"
+        public init(minChars: Int, targetChars: Int, maxChars: Int,
+                    normalization: Int, lineSnapWindow: Int) {
+            self.minChars = minChars; self.targetChars = targetChars; self.maxChars = maxChars
+            self.normalization = normalization; self.lineSnapWindow = lineSnapWindow
+        }
+
+        /// Names the cutter and every number that moves a boundary, so chunks cut under different
+        /// settings occupy disjoint key spaces and can coexist in one index. Changing a size
+        /// re-cuts rather than silently mixing chunks cut under different rules into one key
+        /// space - which is what the grid's key already does with its `c<maxChars>` field.
+        public var fingerprint: String {
+            "cdc\(minChars)-\(targetChars)-\(maxChars)-n\(normalization)-l\(lineSnapWindow)"
+        }
+
+        /// DERIVED FROM THE USER'S SETTING, because that setting has to keep working. "Max
+        /// characters per chunk" is in Settings > Performance with four values, and a cutter that
+        /// ignored it would make the control silently do nothing. The target IS the setting; the
+        /// floor is half of it, and the ceiling twice it plus the line-snap slack - which at the
+        /// default 1800 reproduces the 900 / 1800 / 4000 the parameter study measured.
+        public static func forMaxChars(_ n: Int) -> Params {
+            let t = Swift.max(200, n)
+            return Params(minChars: t / 2, targetChars: t, maxChars: t * 2 + 400,
+                          normalization: 2, lineSnapWindow: 300)
+        }
+
+        public static let `default` = Params.forMaxChars(1800)
+
+        /// Bit count for the strict (pre-target) and lax (post-target) masks. The target sets the
+        /// base: a mask of b bits fires about once every 2^b characters.
+        var maskBits: UInt64 { UInt64(64 - UInt64(targetChars).leadingZeroBitCount - 1) }
+        var maskStrict: UInt64 { (1 << (maskBits + UInt64(normalization))) - 1 }
+        var maskLax: UInt64 { (1 << (maskBits - UInt64(normalization))) - 1 }
     }
+
+    /// The shipped defaults, kept as top-level names because the tests and the notes above quote
+    /// them. Every one of them is `Params.default`'s.
+    public static var minBytes: Int { Params.default.minChars }
+    public static var targetBytes: Int { Params.default.targetChars }
+    public static var maxBytes: Int { Params.default.maxChars }
+    public static var normalization: Int { Params.default.normalization }
+    public static var lineSnapWindow: Int { Params.default.lineSnapWindow }
+    public static var fingerprint: String { Params.default.fingerprint }
 
     // MARK: - Gear table
 
@@ -70,47 +113,61 @@ public enum ContentChunker {
         return table
     }()
 
-    /// Bit count for the strict (pre-target) and lax (post-target) masks. `targetBytes` sets the
-    /// base: a mask of b bits fires about once every 2^b bytes.
-    static let maskBits = 64 - UInt64(targetBytes).leadingZeroBitCount - 1   // floor(log2(target))
-    static let maskStrict: UInt64 = (1 << UInt64(maskBits + normalization)) - 1
-    static let maskLax: UInt64 = (1 << UInt64(maskBits - normalization)) - 1
-
     // MARK: - Cutting
 
     /// Byte offsets where `bytes` should be cut, excluding 0 and including `bytes.count`.
     /// Every returned offset sits on a UTF-8 scalar boundary.
-    static func cutPoints(_ bytes: [UInt8]) -> [Int] {
+    ///
+    /// The walk carries TWO cursors over the same bytes: `i` for the hash, which must see every
+    /// byte, and `chars`, the number of scalars since the chunk started, which is what the min,
+    /// target and max gates are compared against. A scalar begins at every byte that is not a
+    /// 10xxxxxx continuation, so the count is one mask and one compare per byte.
+    static func cutPoints(_ bytes: [UInt8], _ p: Params = .default) -> [Int] {
         var cuts: [Int] = []
         var start = 0
         let n = bytes.count
+        let maskStrict = p.maskStrict, maskLax = p.maskLax
+        @inline(__always) func isScalarStart(_ b: UInt8) -> Bool { b & 0xC0 != 0x80 }
         while start < n {
             // A tail that cannot reach the minimum is not worth cutting: it would leave a runt
-            // whose only content is the end of the file.
-            if n - start <= minBytes { cuts.append(n); break }
-            let hardEnd = Swift.min(start + maxBytes, n)
-            let relax = Swift.min(start + targetBytes, hardEnd)
-            var hash: UInt64 = 0
-            var i = start + minBytes          // cut-point skipping: nothing below the floor
-            var cut = 0
-            while i < relax {
-                hash = (hash << 1) &+ gear[Int(bytes[i])]
-                if hash & maskStrict == 0 { cut = i; break }
+            // whose only content is the end of the file. Measured in characters like every other
+            // gate, so the test is how much TEXT is left, not how many bytes encode it.
+            var tailChars = 0
+            var t = start
+            while t < n, tailChars <= p.minChars {
+                if isScalarStart(bytes[t]) { tailChars += 1 }
+                t += 1
+            }
+            if tailChars <= p.minChars { cuts.append(n); break }
+
+            // Cut-point skipping: no hashing at all below the floor. Walk to it counting scalars.
+            var i = start
+            var chars = 0
+            while i < n, chars < p.minChars {
+                if isScalarStart(bytes[i]) { chars += 1 }
                 i += 1
             }
-            if cut == 0 {
-                while i < hardEnd {
-                    hash = (hash << 1) &+ gear[Int(bytes[i])]
-                    if hash & maskLax == 0 { cut = i; break }
-                    i += 1
+            var hash: UInt64 = 0
+            var cut = 0
+            var hardEnd = n
+            while i < n {
+                if isScalarStart(bytes[i]) {
+                    chars += 1
+                    if chars > p.maxChars { hardEnd = i; break }
                 }
+                hash = (hash << 1) &+ gear[Int(bytes[i])]
+                let mask = chars <= p.targetChars ? maskStrict : maskLax
+                if hash & mask == 0, isScalarStart(bytes[i]) { cut = i; break }
+                i += 1
             }
             if cut == 0 { cut = hardEnd }
-            cut = snapToLine(bytes, from: cut, limit: hardEnd)
+            cut = snapToLine(bytes, from: cut, limit: Swift.min(hardEnd + p.lineSnapWindow, n), p)
             cut = alignToScalar(bytes, cut)
             // alignToScalar can only move a cut backwards, and snapToLine forwards; neither may
             // leave the cut at or before where this chunk started, or the loop cannot advance.
-            if cut <= start { cut = Swift.min(start + minBytes, n) ; cut = alignForward(bytes, cut) }
+            if cut <= start {
+                cut = alignForward(bytes, Swift.min(start + Swift.max(1, p.minChars), n))
+            }
             cuts.append(cut)
             start = cut
         }
@@ -126,8 +183,8 @@ public enum ContentChunker {
     /// content cut, so an insertion elsewhere does not move it - while landing it where the text
     /// already breaks. Measured cost: insertion re-embeds 1.5 chunks instead of 1.2, against 101.7
     /// for the grid, which is a rounding error on the win.
-    private static func snapToLine(_ bytes: [UInt8], from cut: Int, limit: Int) -> Int {
-        let stop = Swift.min(cut + lineSnapWindow, limit)
+    private static func snapToLine(_ bytes: [UInt8], from cut: Int, limit: Int, _ p: Params) -> Int {
+        let stop = Swift.min(cut + p.lineSnapWindow, limit)
         var i = cut
         while i < stop {
             if bytes[i] == 0x0A { return i + 1 }
@@ -161,15 +218,14 @@ public enum ContentChunker {
         public init(text: String, byteOffset: Int) { self.text = text; self.byteOffset = byteOffset }
     }
 
-    /// Cut `text` at content-defined boundaries. A text at or under `minBytes` is one piece.
-    public static func cut(_ text: String) -> [Piece] {
+    /// Cut `text` at content-defined boundaries. A text at or under the floor is one piece.
+    public static func cut(_ text: String, _ p: Params = .default) -> [Piece] {
         let bytes = Array(text.utf8)
-        guard bytes.count > minBytes else {
-            return text.isEmpty ? [] : [Piece(text: text, byteOffset: 0)]
-        }
+        guard !text.isEmpty else { return [] }
+        guard bytes.count > p.minChars else { return [Piece(text: text, byteOffset: 0)] }
         var out: [Piece] = []
         var start = 0
-        for cut in cutPoints(bytes) {
+        for cut in cutPoints(bytes, p) {
             guard cut > start else { continue }
             out.append(Piece(text: String(decoding: bytes[start ..< cut], as: UTF8.self),
                              byteOffset: start))
