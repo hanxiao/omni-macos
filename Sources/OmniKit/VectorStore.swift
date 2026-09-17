@@ -7954,7 +7954,13 @@ public final class VectorStore: @unchecked Sendable {
         // COVERAGE CAUGHT UP is the steady state, and it is where the other half of the work lives:
         // the slots the tombstones hold. Checked here rather than on a timer of its own because
         // "writes have gone quiet" is exactly the condition it needs, and this is what runs then.
-        guard coveredRows < rows.count else {
+        // POSITIONS, not rows. Under sharing there are fewer positions than rows, so
+        // `coveredRows < rows.count` stays true after coverage is complete - which sends every
+        // stamp down the advance path, where it finds nothing to do, and never down the caught-up
+        // one. The hole reclaim lives in that branch, so it was unreachable on exactly the indexes
+        // that accumulate holes.
+        let coverUnits = Self.contentSharing ? slotCount : rows.count
+        guard coveredRows < coverUnits else {
             // Off the queue: the reclaim takes it one chunk at a time, and this call is holding it.
             if reclaim, !yieldToSearchLocked("reclaim"), shouldReclaimHolesLocked() {
                 DispatchQueue.global(qos: .utility).async { [weak self] in self?.reclaimVectorHoles() }
@@ -10162,6 +10168,9 @@ public final class VectorStore: @unchecked Sendable {
     /// Drive coverage to completion. The budget is a SLICE SIZE, and it is added to the current
     /// claim - so the old `Int.max` default trapped on overflow the moment anyone used it.
     func advanceCoverageForTest(budget: Int = 1_000_000) { queue.sync { while advanceCoverageLocked(budget: budget) {} } }
+    /// One stamp, which is where coverage, the sync and the hole reclaim are actually triggered
+    /// from. Tests that call the pieces directly cannot see a branch that never runs.
+    func stampCoverageForTest() { queue.sync { stampVectorCoverageLocked() } }
     /// The per-row slot mirror, which is what every score is actually indexed by.
     var slotsForTest: [Int32] { queue.sync { occSlot } }
 

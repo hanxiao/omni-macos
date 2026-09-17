@@ -1291,4 +1291,62 @@ final class ContentSharingTests: XCTestCase {
                           "fixture never made a slot differ from its row index")
     }
 
+    /// THE HOLE RECLAIM WAS UNREACHABLE ON EXACTLY THE INDEXES THAT ACCUMULATE HOLES.
+    ///
+    /// The stamp asks "is coverage caught up?" as `coveredRows < rows.count` and does the reclaim
+    /// in the other branch. Under sharing there are fewer POSITIONS than rows, so that test stays
+    /// true after coverage is complete: every stamp went down the advance path, found nothing to
+    /// advance, and the branch holding the reclaim was never entered. The reclaim's own tests call
+    /// it directly, so all of them passed while nothing in the product ever called it.
+    func testTheStampReachesTheHoleReclaimOnASharingIndex() throws {
+        let savedQuant = VectorStore.quantBaseOverride
+        let savedFraction = VectorStore.holeReclaimFractionOverride
+        let savedFloor = VectorStore.holeReclaimFloorOverride
+        VectorStore.quantBaseOverride = VectorStore.scanBits     // the vector file only exists in quant mode
+        VectorStore.holeReclaimFractionOverride = 0.01
+        VectorStore.holeReclaimFloorOverride = 1
+        defer {
+            VectorStore.quantBaseOverride = savedQuant
+            VectorStore.holeReclaimFractionOverride = savedFraction
+            VectorStore.holeReclaimFloorOverride = savedFloor
+        }
+        let url = tempDB()
+        let store = try VectorStore(dbURL: url); defer { store.close() }
+        let dim = 64
+        let shared = vec(2, dim)
+        // Sharing is the point: the row table has to be LONGER than the vector file, which is what
+        // makes the old caught-up test wrong.
+        var batch: [(path: String, chunks: [IndexedChunk])] = []
+        for i in 0 ..< 40 {
+            let p = "/r/f\(i).txt"
+            batch.append((p, [chunk(p, 0, shared, key: "1111aaaa"),
+                              chunk(p, 1, vec(i + 3, dim), key: String(format: "h%07d", i))]))
+        }
+        try store.replaceMany(batch)
+        _ = store.search(shared, topK: 5)
+        store.advanceCoverageForTest()
+        XCTAssertGreaterThan(store.coveredRowsForTest, 0, "the fixture never got any coverage")
+        XCTAssertLessThan(store.vectorBufferUse.used / dim, 80,
+                          "nothing shared, so the row table is not longer than the file")
+
+        // Delete half of them: every deleted file's unique chunk leaves a hole.
+        for i in 0 ..< 20 { store.deletePath("/r/f\(i).txt") }
+        let before = store.vectorBufferUse.used / dim
+        store.stampCoverageForTest()
+        // The reclaim runs off the queue, so give it a moment to land.
+        let deadline = Date().addingTimeInterval(10)
+        while store.vectorBufferUse.used / dim == before, Date() < deadline { usleep(50_000) }
+        XCTAssertLessThan(store.vectorBufferUse.used / dim, before,
+                          "the stamp never reached the hole reclaim, so the holes are permanent")
+        XCTAssertNil(store.coverageAudit(), "the reclaim left the bookkeeping inconsistent")
+        // And every survivor still answers for its own content.
+        for i in 20 ..< 40 {
+            let hits = store.search(vec(i + 3, dim), topK: 3)
+            XCTAssertEqual(hits.first?.path, "/r/f\(i).txt", "survivor \(i) lost its vector")
+            XCTAssertEqual(hits.first?.score ?? 0, 1.0, accuracy: 1e-2)
+        }
+        XCTAssertEqual(Set(store.search(shared, topK: 40).map(\.path)).count, 20,
+                       "the shared content did not survive the reclaim under every file that holds it")
+    }
+
 }
