@@ -241,3 +241,56 @@ speed claim at all. Everything above is recall.
   than a point of recall and 4x tail latency. That is an argument FOR the brute-force scan this app
   already uses: a continuously re-indexing local corpus is the worst case for a graph, and
   deduplication plus a truncated coarse tier is what keeps the scan affordable without one.
+
+## The last layer: coverage counts rows
+
+Content sharing is complete and correct through the write path, both reducers, the quantized
+funnel, compaction, and a plain reload. It is OFF by default because of one remaining protocol:
+vector coverage.
+
+WHAT COVERAGE IS. `coveredRows` claims "the first C slots of .vecs are durable, and the rows that
+own them have had their SQLite blob cleared". That claim is what lets the index stop storing every
+vector twice - 6.47 GB on the measured index - and it is also why an error here is unrecoverable
+rather than merely wrong: for a covered row the file is the only copy.
+
+WHY IT BREAKS. Every part of it counts ROWS.
+
+    coveredRows                 advanced per row by the stamp
+    covered == coveredRows - holes    the loader's own check, a row count
+    coveredRows > rows.count          the audit's bound
+    for i in 0 ..< min(coveredRows, rows.count) where !deadRows.contains(i)
+                                the restore walk, indexing rows and slots with one variable
+
+Once contents are shared the file holds FEWER positions than there are rows, so every row past the
+first duplicate is mis-seated. `testSharingSurvivesCoverageAndReload` is the gate and carries this
+diagnosis; it drives coverage the way a real index does, which is why the other reload tests - all
+at coverage zero - never saw it.
+
+THE CHANGE, stated so it can be executed rather than re-derived. Coverage becomes a statement about
+POSITIONS in the vector file, which is what it always physically was:
+
+  1. `coveredRows` means "the first C POSITIONS are durable". Rename it at the same time; the name
+     is half the bug.
+  2. The stamp advances by DISTINCT positions cleared, not by rows visited. A row whose slot is
+     already below C has nothing to clear and must not advance it.
+  3. A blob may be cleared when the row's SLOT is below C. Several rows can clear against one
+     position; the last one does not advance anything.
+  4. The loader decides covered by `slot < C`, never by the walk. The walk survives only for rows
+     with no stored slot, i.e. an index that has not been through the backfill.
+  5. `covered == C - holes` becomes a count of distinct covered POSITIONS.
+  6. `restoreCoveredBlobsLocked` writes a position's bytes back to EVERY row that points at it,
+     because any of them may be the one that outlives the others.
+  7. The audit's bounds compare against the position count, not `rows.count`.
+
+79 uses of `coveredRows`, 14 of which conflate the two units, inside a 36-site protocol that also
+carries the hole list and the crash-recovery marker.
+
+WHY IT IS NOT DONE HERE. Not effort: judgement. This is the one place in the store where a subtle
+error destroys data rather than returning a wrong row, and the four layers before it (the candidate
+path, the rerank's row/content write, dead-row masking, the loader's append test) each took several
+wrong diagnoses before the right one. Starting a data-loss-capable protocol change in that state is
+how indexes get corrupted. The gate test, this plan, and the off switch are the correct handover.
+
+NOT A CHEAP WAY ROUND IT. Disabling coverage while sharing is on was considered and rejected by
+arithmetic: sharing saves 5.4 GB of vectors, and leaving coverage off costs 6.47 GB of duplicated
+blobs in SQLite. The trade is net negative.
