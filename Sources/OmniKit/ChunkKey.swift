@@ -46,8 +46,12 @@ public enum ChunkKey {
     /// A text chunk cut by `ContentChunker`. The cutter's fingerprint names every parameter that
     /// moves a boundary, so changing the target size re-cuts rather than silently mixing chunks cut
     /// under different rules into one key space.
-    public static func text(_ text: String, dim: Int) -> String {
-        digest("2|\(ContentChunker.fingerprint)|m\(dim)|", Data(text.utf8))
+    ///
+    /// The fingerprint is PASSED, not read from a global, because the sizes come from the user's
+    /// "max characters per chunk" setting and are therefore per-pass. A key computed against the
+    /// default while the pass cut to 3600 would claim two different chunks are the same content.
+    public static func text(_ text: String, cutter: String, dim: Int) -> String {
+        digest("2|\(cutter)|m\(dim)|", Data(text.utf8))
     }
 
     // MARK: - Media

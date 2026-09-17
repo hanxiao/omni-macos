@@ -469,6 +469,35 @@ follows is what a reader needs before touching this code.
 - `omni-verify sharebench <model> <root>` is the end-to-end A/B: chunks, vectors, tok, and search
   latency for one arm, run it twice with the env var flipped.
 
+## Content-defined chunking (OmniKit/ContentChunker.swift)
+
+ON by default; `OMNI_CDC=0` is the escape hatch. The fixed grid cut at `i * step`, so an inserted
+line moved every boundary below it; boundaries now come from the bytes around them.
+
+- THE MIGRATION COSTS NOTHING. "Unchanged" is mtime and size, so turning it on re-indexes nothing:
+  a file keeps its generation-1 chunks until it is edited. The key spaces are disjoint
+  (`ChunkKey.grid` vs `ChunkKey.text`), so one index holds both safely. `ChunkGenerationTests`
+  pins it.
+- MEASURED EDIT COST, through the real indexer on an 11-chunk file: a one-line insertion at the top
+  re-embeds 11 chunks under the grid, 3 under this cutter.
+- MEASURED CORPUS COST, same run, agent logs: 9,686,235 tokens -> 5,037,368, 20,731 vectors ->
+  10,546, 122.0s -> 65.0s. Source tree: 2.08M -> 1.62M tokens, 4,976 -> 3,833 vectors, 31.1 ->
+  24.6s. Half the vectors because content-defined boundaries make the same passage in two files
+  into the SAME chunk; the grid only manages that when the files happen to be aligned.
+- RETRIEVAL IS UNCHANGED, and it had to be measured: the grid's 200-character OVERLAP is itself the
+  mitigation for a query straddling a boundary, and this cutter has none. `omni-verify cutgate
+  <model> <root> [queries] [window]` indexes one corpus twice in one process and scores the same
+  queries against both arms PAIRED - comparing two recall rates at 2000 queries cannot see a
+  difference below ~0.023 and the differences here are 10x smaller. Six comparisons, z between
+  -0.98 and -0.10, signs mixed. RUN THE 120-CHARACTER WINDOW: shorter than the grid's overlap is
+  the adversarial case, and it is the one that came out slightly positive.
+- SIZES COUNT CHARACTERS, NOT BYTES. The hash sees bytes; the gates count scalars. In bytes, a
+  Chinese document at an 1800-byte target holds 600 characters against English's 1800 - a third of
+  the context per chunk on the corpora least able to spare it.
+- THE SIZE SETTING STILL WORKS. `Params.forMaxChars` derives the floor and ceiling from "Max
+  characters per chunk", and the fingerprint carries all of them, so changing the setting re-cuts
+  rather than mixing two cut sizes into one key space.
+
 ## Filter chips in the search field
 
 - THE PLATFORM HAS THIS CONTROL: `searchable(text:tokens:placement:prompt:token:)`, macOS 13+,

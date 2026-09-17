@@ -155,8 +155,14 @@ final class ContentSourceTests: XCTestCase {
         XCTAssertNotNil(base)
         XCTAssertEqual(base, src.contentKey(f, kind: .text, dim: 512, chunkOverlap: 200, settings: settings),
                        "same file, same settings must be stable")
-        XCTAssertNotEqual(base, src.contentKey(f, kind: .text, dim: 512, chunkOverlap: 120, settings: settings),
-                          "overlap changes the chunks")
+        // OVERLAP IS A GRID PARAMETER. The content cutter has none - its boundaries come from the
+        // bytes - so under generation 2 the key correctly does not move when it changes, and the
+        // parameter that does move it is the cutter fingerprint, which the size check below
+        // exercises for both.
+        if !Indexer.contentDefinedChunking {
+            XCTAssertNotEqual(base, src.contentKey(f, kind: .text, dim: 512, chunkOverlap: 120, settings: settings),
+                              "overlap changes the chunks")
+        }
         settings.maxCharsPerChunk = 900
         XCTAssertNotEqual(base, src.contentKey(f, kind: .text, dim: 512, chunkOverlap: 200, settings: settings),
                           "chunk size changes the chunks")

@@ -30,6 +30,58 @@ measures byte-exact chunk deduplication across three regimes - 0.16% on clean ac
 (BeIR, 22.2M passages), 24.03% on enterprise content with revisions and boilerplate, 80.34% on
 multi-turn conversation logs. This index is 40% agent session logs and lands between the last two.
 
+## The cutter: shipped, and what the gate measured
+
+ON by default; `OMNI_CDC=0` is the escape hatch and the A/B.
+
+THE MIGRATION COSTS NOTHING, which is the first thing to know. "Unchanged" is mtime and size, so
+turning the cutter on re-indexes nothing: a file keeps its generation-1 chunks until it is edited,
+and the two key spaces are disjoint by construction, so one index holds both without a chunk of
+one generation ever being served for the other. `ChunkGenerationTests` pins the whole sequence -
+build under the grid, turn the cutter on, assert zero embeddings, then edit one file.
+
+WHAT IT COSTS IN RETRIEVAL: nothing measurable, and that had to be measured rather than assumed,
+because the grid overlaps its chunks by 200 characters and that overlap is itself the mitigation
+for a query straddling a boundary. `omni-verify cutgate` indexes one corpus twice in one process -
+two arms in one run, because this machine drifts - and scores the same queries against both,
+PAIRED. Paired because comparing two recall rates at 2000 queries has a standard error of about
+0.023 on the difference and the differences here are an order of magnitude smaller; per-query it
+removes the corpus variance that dominates the rates.
+
+The queries are drawn from the corpus and from nothing else: a window of real text out of a real
+file, asked for, and the question is whether that file comes back. Windows are sampled at offsets
+fixed before either cutter runs, so neither arm is scored on its own boundaries.
+
+    corpus            window   cdc better   worse   z       meanDeltaRR
+    agent logs        120      192          194     -0.10   +0.0034
+    agent logs        250      199          219     -0.98   -0.0053
+    agent logs        600      187          206     -0.96   -0.0055
+    source tree       250       56           66     -0.91   -0.0017
+
+Six comparisons counting the two source-tree windows, not one of them significant, signs mixed.
+The 120-character window is the ADVERSARIAL case - shorter than the grid's overlap, so a straddling
+query is still whole inside one of two overlapping grid chunks and can be split by this cutter -
+and it is the one that comes out slightly positive.
+
+WHAT IT SAVES, on the same runs:
+
+    corpus            tokens              vectors            chunks           wall
+    agent logs        9,686,235 -> 5,037,368   20,731 -> 10,546   22,868 -> 19,357   122.0s -> 65.0s
+    source tree       2,078,344 -> 1,616,749    4,976 ->  3,833   28,978 -> 23,633    31.1s -> 24.6s
+
+Half the tokens and half the vectors on the agent logs. The vector count is the striking one and it
+is the dedup argument coming back: content-defined boundaries make the same passage in two files
+into the SAME chunk, where the grid only manages that when the two files happen to be aligned.
+
+AND THE EDIT COST, measured through the real indexer on an 11-chunk file: a one-line insertion at
+the top re-embeds 11 chunks under the grid and 3 under this cutter.
+
+TWO THINGS HAD TO CHANGE BEFORE IT COULD SHIP. The size gates count CHARACTERS, not bytes - the
+hash must see bytes, but a Chinese document cut to an 1800-BYTE target holds 600 characters where
+the same setting gives English 1800. And the sizes derive from the user's "max characters per
+chunk" setting, which is a four-value picker in Settings and would otherwise have silently stopped
+doing anything.
+
 ## Why the cutter has to change too
 
 Content addressing alone does not give cheap partial reindex, because the fixed grid destroys chunk
@@ -224,10 +276,7 @@ version of the test. `omni-verify reusebench <model> <rootA> <rootB>` is the A/B
 WRITTEN, TESTED, AND NOT WIRED TO ANYTHING. Said plainly because "component status" above reads
 like a delivery list and three of those components deliver nothing yet:
 
-  ContentChunker   The FastCDC cutter. The index still uses the fixed 1800/200 grid, so the
-                   insertion-stability numbers at the top of this file are a measurement of what
-                   CDC WOULD buy, not of what the app does. `ChunkKey.text` carries the cutter
-                   fingerprint so the two generations can coexist when it does land.
+  (ContentChunker is SHIPPED and ON - see the gate below.)
   ChunkDiff        The reuse/embed/refcount plan for a partial reindex, as a model. Nothing calls
                    it, and it is not needed for the APPEND case: per-file `chunkVectors(path:)`
                    reuse has answered that since v4, and measuring it with every chunk-level reuse

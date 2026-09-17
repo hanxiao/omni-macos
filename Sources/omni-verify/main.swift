@@ -4210,6 +4210,163 @@ if args.count >= 4 && args[1] == "searchreal" {
     exit(0)
 }
 
+// THE CUTTER GATE: omni-verify cutgate <modelDir> <root> [queries] [windowChars]
+//
+// Indexes one corpus twice in one process - once with the fixed grid, once with the content
+// cutter - and scores the SAME queries against both. Two arms in one run because this machine
+// drifts: a number from an hour ago is not a baseline for a number now.
+//
+// THE QUERY SET IS DRAWN FROM THE CORPUS AND FROM NOTHING ELSE. There is no labelled relevance
+// data here, so the honest proxy is: take a window of real text out of a real file, ask for it,
+// and see whether that file comes back. It is exactly the measurement chunking should move -
+// a window that straddles a boundary is in NEITHER chunk whole, so it is found by neither - and
+// the windows are sampled at offsets chosen before either cutter runs, so neither arm is
+// measured on its own boundaries.
+//
+// WHAT IS BEING TRADED. The grid overlaps its chunks by 200 characters, which is itself the
+// mitigation for a straddling query; the content cutter does not overlap at all. So this is not a
+// free win to be confirmed - it is a real trade, and the gate exists because it could go either
+// way.
+if args.count >= 4 && args[1] == "cutgate" {
+    let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[2]))
+    let root = URL(fileURLWithPath: args[3])
+    let nQueries = (args.count >= 5 ? Int(args[4]) : nil) ?? 400
+    // THE WINDOW IS THE WHOLE TRADE. The grid overlaps its chunks by 200 characters, so a query
+    // shorter than that which straddles a boundary is still whole inside one of the two; the
+    // content cutter does not overlap, so the same query can be split. A short window is therefore
+    // the ADVERSARIAL case for the cutter and the one worth running - a long window is the case
+    // that flatters it.
+    let windowArg = (args.count >= 6 ? Int(args[5]) : nil) ?? 250
+    let fm = FileManager.default
+
+    // The corpus, read once: files big enough to be multi-chunk under either cutter. Sync helper
+    // because an enumerator cannot be iterated from an async context (same trap as dedupbench).
+    func readCorpus(_ root: URL) -> [(path: String, text: String)] {
+        var out: [(path: String, text: String)] = []
+        guard let e = fm.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey])
+        else { return out }
+        // THE SAME DIRECTORIES THE CRAWLER SKIPS. Without this the corpus is whatever the
+        // enumerator reaches first - on a source tree that is .build - and every query is drawn
+        // from a file the indexer will never see, which reports recall 0.000 in both arms and
+        // looks like a model failure rather than a harness one.
+        for case let u as URL in e {
+            if u.pathComponents.contains(where: { FileCrawler.skipDirNames.contains($0) }) { continue }
+            guard FileExtractor.textExtensions.contains(u.pathExtension.lowercased()) else { continue }
+            guard let sz = (try? u.resourceValues(forKeys: [.fileSizeKey]))?.fileSize,
+                  sz > 20_000, sz < 2_000_000 else { continue }
+            guard let t = try? String(contentsOf: u, encoding: .utf8), t.count > 10_000 else { continue }
+            out.append((u.path, t))
+            if out.count >= 600 { break }
+        }
+        return out
+    }
+    let docs = readCorpus(root)
+    guard docs.count >= 10 else { print("cutgate: only \(docs.count) usable files under \(root.path)"); exit(1) }
+
+    // Sampled BEFORE either cutter runs, from a fixed seed, so both arms see identical queries.
+    var rng: UInt64 = 0x243F6A8885A308D3
+    func next() -> UInt64 { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng }
+    struct Query { let text: String; let path: String }
+    var queries: [Query] = []
+    let window = max(40, windowArg)
+    while queries.count < nQueries {
+        let d = docs[Int(next() % UInt64(docs.count))]
+        let chars = Array(d.text)
+        guard chars.count > window * 3 else { continue }
+        let at = Int(next() % UInt64(chars.count - window - 1))
+        let q = String(chars[at ..< at + window]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard q.count > window / 2 else { continue }
+        queries.append(Query(text: q, path: d.path))
+    }
+    print("cutgate  files=\(docs.count)  queries=\(queries.count)  window=\(window) chars")
+
+    // PAIRED, not two rates. Comparing recall@10 between arms at 400 queries has a standard error
+    // of about 0.023 on the difference, so it cannot see a regression smaller than that - and the
+    // differences here are an order of magnitude smaller. The same queries run against both arms,
+    // so the comparison that matters is per QUERY: how many did the cutter move up, how many did
+    // it move down. That removes the corpus variance entirely, which is what dominates the rates.
+    func arm(_ cdc: Bool) async -> [Int] {
+        Indexer.contentDefinedChunking = cdc
+        let tmp = fm.temporaryDirectory.appendingPathComponent("cutgate-\(UUID().uuidString).sqlite")
+        defer { for e in ["", "-wal", "-shm", ".rows", ".vecs", ".quant"] { try? fm.removeItem(atPath: tmp.path + e) } }
+        guard let store = try? VectorStore(dbURL: tmp) else { return [] }
+        let idx = Indexer(store: store, embedder: engine)
+        var settings = IndexSettings(enabledKinds: [.text])
+        let nonText = FileExtractor.imageExtensions.union(FileExtractor.videoExtensions).union(FileExtractor.audioExtensions)
+        settings.ignore = OmniIgnore(text: (FileCrawler.skipDirNames.map { "\($0)/" } + nonText.sorted().map { "*.\($0)" }).joined(separator: "\n"))
+        let tok0 = engine.tokensProcessed
+        let t0 = Date()
+        _ = await withCheckedContinuation { (cont: CheckedContinuation<Int, Never>) in
+            let l = NSLock(); var fired = false
+            idx.index(roots: [root], settings: settings, force: true) { p in
+                if p.done { l.lock(); let go = !fired; fired = true; l.unlock(); if go { cont.resume(returning: p.embedded) } }
+            }
+        }
+        let sec = -t0.timeIntervalSinceNow
+        let use = store.vectorBufferUse
+        // ONLY QUERIES WHOSE FILE IS ACTUALLY IN THE INDEX. A file the pass skipped - too small
+        // after extraction, filtered as opaque payload, refused by an ignore rule - can never be
+        // returned, and counting it as a miss measures the crawl rather than the cutter. Reported,
+        // because a large drop means the corpus is the wrong one.
+        let indexed = Set(store.allIndexedPaths())
+        // Rank of the owning file per query, 0-based; -1 for "not in the top 10", and -2 for a
+        // query whose file this arm never indexed at all (compared away below rather than counted
+        // as a miss: that measures the crawl, not the cutter).
+        var ranks = [Int](repeating: -2, count: queries.count)
+        var hit1 = 0, hit5 = 0, hit10 = 0
+        var mrr = 0.0
+        var scored = 0
+        for (qi, q) in queries.enumerated() {
+            guard indexed.contains(q.path) else { continue }
+            scored += 1
+            let hits = store.search(engine.embedText(q.text, as: .query), topK: 10).map(\.path)
+            if let r = hits.firstIndex(of: q.path) {
+                ranks[qi] = r
+                if r == 0 { hit1 += 1 }
+                if r < 5 { hit5 += 1 }
+                hit10 += 1
+                mrr += 1.0 / Double(r + 1)
+            } else {
+                ranks[qi] = -1
+            }
+        }
+        let n = Double(max(1, scored))
+        print(String(format: "CUTGATE %@  chunks=%d vectors=%d mean=%.0f chars  tok=%d %.1fs",
+                     cdc ? "cdc " : "grid", store.count, engine.dim > 0 ? use.used / engine.dim : 0,
+                     store.count > 0 ? Double(docs.reduce(0) { $0 + $1.text.count }) / Double(store.count) : 0,
+                     engine.tokensProcessed - tok0, sec))
+        print(String(format: "CUTGATE %@  scored=%d/%d  recall@1=%.3f  recall@5=%.3f  recall@10=%.3f  MRR=%.3f",
+                     cdc ? "cdc " : "grid", scored, queries.count,
+                     Double(hit1) / n, Double(hit5) / n, Double(hit10) / n, mrr / n))
+        store.close()
+        return ranks
+    }
+    let saved = Indexer.contentDefinedChunking
+    let gridRanks = await arm(false)
+    let cdcRanks = await arm(true)
+    Indexer.contentDefinedChunking = saved
+
+    // Reciprocal rank per query; a miss is 0. Only queries BOTH arms could score are compared.
+    func rr(_ r: Int) -> Double { r >= 0 ? 1.0 / Double(r + 1) : 0 }
+    var better = 0, worse = 0, same = 0, pairs = 0
+    var deltaSum = 0.0
+    for i in 0 ..< min(gridRanks.count, cdcRanks.count) {
+        guard gridRanks[i] != -2, cdcRanks[i] != -2 else { continue }
+        pairs += 1
+        let d = rr(cdcRanks[i]) - rr(gridRanks[i])
+        deltaSum += d
+        if d > 1e-9 { better += 1 } else if d < -1e-9 { worse += 1 } else { same += 1 }
+    }
+    // Sign test on the queries that moved: under "the cutter changes nothing", up and down are
+    // equally likely, so the two-sided p is the binomial tail. Stated as a z because the counts
+    // here are large enough for it and it needs no table.
+    let moved = better + worse
+    let z = moved > 0 ? (Double(better) - Double(moved) / 2) / (Double(moved).squareRoot() / 2) : 0
+    print(String(format: "CUTGATE paired n=%d  cdc better=%d worse=%d same=%d  meanDeltaRR=%+.4f  z=%+.2f",
+                 pairs, better, worse, same, pairs > 0 ? deltaSum / Double(pairs) : 0, z))
+    exit(0)
+}
+
 // Cross-pass chunk reuse: omni-verify reusebench <modelDir> <rootA> <rootB>
 //
 // Indexes rootA, then rootB, into ONE store, and reports what reached the encoder in each pass.

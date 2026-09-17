@@ -33,20 +33,54 @@ final class ChunkLocatorTests: XCTestCase {
         return (Indexer(store: store, embedder: NullEmbedder()), store)
     }
 
+    /// Numbered lines, so every chunk's text is UNIQUE. The helper below finds a chunk by
+    /// searching for it, which needs that: on `String(repeating:)` filler an earlier occurrence
+    /// would match and every assertion downstream would be about the wrong offset.
+    private func numbered(_ lines: Int, width: Int = 60) -> String {
+        (1 ... lines).map { i -> String in
+            let head = String(format: "line %05d ", i)
+            return head + String("abcdefghijklmnopqrstuvwxyz0123456789 ".prefix(max(1, width - head.count)))
+        }.joined(separator: "\n")
+    }
+
+    /// Character offset of each piece, found in the text rather than computed from either cutter's
+    /// arithmetic. That is the point: the grid steps by `limit - overlap` and the content cutter
+    /// steps by whatever the content says, so a test written against one of those step rules is a
+    /// test of the cutter rather than of the contract.
+    private func starts(_ pieces: [TextPiece], in text: String) -> [Int] {
+        var out: [Int] = []
+        var from = text.startIndex
+        for p in pieces {
+            guard let r = text.range(of: p.text, range: from ..< text.endIndex) else {
+                XCTFail("piece not found in the source text"); return out
+            }
+            out.append(text.distance(from: text.startIndex, to: r.lowerBound))
+            from = text.index(after: r.lowerBound)
+        }
+        return out
+    }
+
     /// The old 40-chunk cap silently truncated long files; chunking must now cover ALL the text.
     func testNoChunkCountCap() throws {
         let (indexer, store) = try makeIndexer()
         defer { store.close() }
         var settings = IndexSettings.default
         settings.maxCharsPerChunk = 1000
-        // 100k chars -> step 800 -> ~125 chunks, far past the old cap of 40.
-        let text = String(repeating: filler(99) + "\n", count: 1000)
+        let text = numbered(4000)     // ~240k characters, comfortably past any cap under either cutter
         let pieces = indexer.chunk(text, settings: settings, origin: .plain)
-        XCTAssertGreaterThan(pieces.count, 100, "long text must not be truncated to a fixed chunk cap")
+        XCTAssertGreaterThan(pieces.count, 40, "long text must not be truncated to a fixed chunk cap")
         XCTAssertTrue(text.hasSuffix(pieces.last!.text), "last chunk must end where the text ends")
-        // Every chunk starts `step` characters after the previous one (full coverage, no gaps).
-        let step = max(1, settings.maxCharsPerChunk - indexer.chunkOverlap)
-        XCTAssertEqual(pieces.count, (text.count - settings.maxCharsPerChunk + step - 1) / step + 1)
+        // COVERAGE, not a step rule: every character belongs to some chunk. The grid's chunks
+        // overlap and the content cutter's do not, so the only statement both can be held to is
+        // that the pieces leave no gap.
+        let offs = starts(pieces, in: text)
+        XCTAssertEqual(offs.first, 0, "the first chunk must start at the start")
+        var reached = 0
+        for (k, p) in pieces.enumerated() {
+            XCTAssertLessThanOrEqual(offs[k], reached, "gap before chunk \(k): starts at \(offs[k]), covered to \(reached)")
+            reached = max(reached, offs[k] + p.text.count)
+        }
+        XCTAssertEqual(reached, text.count, "the chunks do not reach the end of the text")
     }
 
     /// Plain text files get "Line N" locators that match the chunk's true starting line.
@@ -54,20 +88,15 @@ final class ChunkLocatorTests: XCTestCase {
         let (indexer, store) = try makeIndexer()
         defer { store.close() }
         var settings = IndexSettings.default
-        settings.maxCharsPerChunk = 200   // floor
-        // 50 numbered lines of 50 chars each: chunk 0 starts line 1, step is 200-200(overlap)->floored.
-        let lines = (1 ... 200).map { String(format: "line %04d ", $0) + filler(40) }
-        let text = lines.joined(separator: "\n")
+        settings.maxCharsPerChunk = 400
+        let text = numbered(400)
         let pieces = indexer.chunk(text, settings: settings, origin: .plain)
         XCTAssertGreaterThan(pieces.count, 1)
         XCTAssertEqual(pieces[0].locator, "Line 1")
-        let step = max(1, settings.maxCharsPerChunk - indexer.chunkOverlap)
-        for (i, p) in pieces.enumerated() {
-            let start = i * step
-            guard start < text.count else { break }
-            let prefix = String(Array(text)[0 ..< start])
-            let expectedLine = prefix.filter { $0 == "\n" }.count + 1
-            XCTAssertEqual(p.locator, "Line \(expectedLine)", "chunk \(i)")
+        let chars = Array(text)
+        for (k, off) in starts(pieces, in: text).enumerated() {
+            let expected = chars[0 ..< off].filter { $0 == "\n" }.count + 1
+            XCTAssertEqual(pieces[k].locator, "Line \(expected)", "chunk \(k) starting at \(off)")
         }
     }
 
@@ -76,15 +105,14 @@ final class ChunkLocatorTests: XCTestCase {
         let (indexer, store) = try makeIndexer()
         defer { store.close() }
         var settings = IndexSettings.default
-        settings.maxCharsPerChunk = 200
-        // Three "pages" of 500 chars each, page starts at 0/500/1000.
-        let text = filler(500) + filler(500) + filler(500)
-        let pieces = indexer.chunk(text, settings: settings, origin: .paged([0, 500, 1000]))
+        settings.maxCharsPerChunk = 400
+        let text = numbered(120)                    // page starts a third of the way through each
+        let pageStarts = [0, text.count / 3, 2 * text.count / 3]
+        let pieces = indexer.chunk(text, settings: settings, origin: .paged(pageStarts))
         XCTAssertGreaterThan(pieces.count, 3)
-        for (i, p) in pieces.enumerated() {
-            let start = i * max(1, settings.maxCharsPerChunk - indexer.chunkOverlap)
-            let expected = start >= 1000 ? 3 : (start >= 500 ? 2 : 1)
-            XCTAssertEqual(p.locator, "Page \(expected)", "chunk \(i) starting at \(start)")
+        for (k, off) in starts(pieces, in: text).enumerated() {
+            let expected = off >= pageStarts[2] ? 3 : (off >= pageStarts[1] ? 2 : 1)
+            XCTAssertEqual(pieces[k].locator, "Page \(expected)", "chunk \(k) starting at \(off)")
         }
     }
 

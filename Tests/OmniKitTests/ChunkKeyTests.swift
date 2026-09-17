@@ -37,19 +37,25 @@ final class ChunkKeyTests: XCTestCase {
         // chunks with different neighbours, and must never be served for each other.
         let t = "a passage that exists under both cutters"
         XCTAssertNotEqual(ChunkKey.grid(t, maxChars: 1800, overlap: 200, dim: 768),
-                          ChunkKey.text(t, dim: 768))
+                          ChunkKey.text(t, cutter: ContentChunker.fingerprint, dim: 768))
     }
 
     func testGeneration2KeysTrackTheCutter() {
         // Not a tautology: it fails if the fingerprint is left out of the prefix, which is the
-        // mistake that would let chunks cut at 1800 be served for chunks cut at 3000.
-        XCTAssertTrue(ChunkKey.text("x", dim: 768).count == 32)
-        XCTAssertNotEqual(ChunkKey.text("x", dim: 768), ChunkKey.text("x", dim: 512))
+        // mistake that would let chunks cut at 1800 be served for chunks cut at 3600.
+        let a = ContentChunker.Params.forMaxChars(1800).fingerprint
+        let b = ContentChunker.Params.forMaxChars(3600).fingerprint
+        XCTAssertEqual(ChunkKey.text("x", cutter: a, dim: 768).count, 32)
+        XCTAssertNotEqual(ChunkKey.text("x", cutter: a, dim: 768),
+                          ChunkKey.text("x", cutter: b, dim: 768))
+        XCTAssertNotEqual(ChunkKey.text("x", cutter: a, dim: 768),
+                          ChunkKey.text("x", cutter: a, dim: 512))
     }
 
     func testKeysAreStableAcrossCalls() {
         let t = String(repeating: "stability ", count: 400)
-        XCTAssertEqual(ChunkKey.text(t, dim: 768), ChunkKey.text(t, dim: 768))
+        XCTAssertEqual(ChunkKey.text(t, cutter: ContentChunker.fingerprint, dim: 768),
+                       ChunkKey.text(t, cutter: ContentChunker.fingerprint, dim: 768))
         XCTAssertEqual(ChunkKey.media(kind: .image, payload: Data([1, 2, 3]), preprocess: "p", dim: 768),
                        ChunkKey.media(kind: .image, payload: Data([1, 2, 3]), preprocess: "p", dim: 768))
     }
@@ -71,8 +77,10 @@ final class ChunkKeyTests: XCTestCase {
     }
 
     func testAKeyIs128Bits() {
-        XCTAssertEqual(ChunkKey.text("anything", dim: 768).count, 32)   // 16 bytes as hex
-        XCTAssertEqual(StoreSchema.hexToBytes(ChunkKey.text("anything", dim: 768)).count, 16)
+        XCTAssertEqual(ChunkKey.text("anything", cutter: ContentChunker.fingerprint,
+                                     dim: 768).count, 32)   // 16 bytes as hex
+        XCTAssertEqual(StoreSchema.hexToBytes(
+            ChunkKey.text("anything", cutter: ContentChunker.fingerprint, dim: 768)).count, 16)
     }
 }
 

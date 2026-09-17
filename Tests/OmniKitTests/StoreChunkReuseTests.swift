@@ -206,8 +206,10 @@ final class StoreChunkReuseTests: XCTestCase {
                 compared += 1
             }
         }
-        // Without this the loop above could compare nothing and pass.
-        XCTAssertGreaterThanOrEqual(compared, n * 5, "almost no content was shared; the fixture is wrong")
+        // Without this the loop above could compare nothing and pass. The bound is per FILE rather
+        // than per section: how many chunks a file's shared sections become is the cutter's
+        // business, and the content cutter makes fewer, larger ones out of the same text.
+        XCTAssertGreaterThanOrEqual(compared, n * 2, "almost no content was shared; the fixture is wrong")
     }
 
     /// PARTIAL REINDEX: append a line to a multi-chunk file and only the chunk that moved costs a
