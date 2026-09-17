@@ -4054,7 +4054,8 @@ public final class VectorStore: @unchecked Sendable {
         -> [String: KindScoreProfile] {
         queue.sync {
             let n = rows.count
-            guard dim > 0, n > 0, flat16.count == n * dim, fileID.count == n else { return [:] }
+            let slots = slotCount
+            guard dim > 0, n > 0, slots > 0, fileID.count == n, occSlot.count == n else { return [:] }
             let bank = nnnBankLocked(bankSize)
             guard bank.count >= 32 * dim else { return [:] }
             let Q = bank.count / dim
@@ -4068,9 +4069,15 @@ public final class VectorStore: @unchecked Sendable {
             // 128k rows per block keeps the transient [block, Q] matrix near 256 MB at Q = 512,
             // which a 16 GB machine can hold while the rest of the app runs.
             let blockRows = 128 * 1024
+            // Blocked over SLOTS, not rows. The slab read below is a contiguous stretch of flat16,
+            // which is only a contiguous stretch of ROWS while a row and its vector are the same
+            // index. It is always a contiguous stretch of contents, so the bias is computed per
+            // CONTENT and attributed to files afterwards through the pointers - which is also less
+            // work, since a content shared by four files was previously scored four times.
+            var bias = [Float](repeating: 0, count: slots)
             var off = 0
-            while off < n {
-                let m = Swift.min(blockRows, n - off)
+            while off < slots {
+                let m = Swift.min(blockRows, slots - off)
                 let scores: MLXArray = flat16.withUnsafeBytes { raw in
                     let p = raw.baseAddress!.advanced(by: off * dim * MemoryLayout<UInt16>.size)
                     let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: p),
@@ -4080,12 +4087,15 @@ public final class VectorStore: @unchecked Sendable {
                 let b = MLX.mean(MLX.top(scores, k: kk, axis: -1), axis: -1) * MLXArray(alpha)
                 MLX.eval(b)
                 let host = b.asArray(Float.self)
-                for i in 0 ..< m {
-                    let f = Int(fileID[off + i])
-                    guard f >= 0, f < sum.count else { continue }
-                    sum[f] += Swift.max(0, host[i]); cnt[f] += 1
-                }
+                for i in 0 ..< m { bias[off + i] = host[i] }
                 off += m
+            }
+            for i in 0 ..< n {
+                let f = Int(fileID[i])
+                guard f >= 0, f < sum.count else { continue }
+                let sl = Int(occSlot[i])
+                guard sl >= 0, sl < bias.count else { continue }
+                sum[f] += Swift.max(0, bias[sl]); cnt[f] += 1
             }
             var byKind: [String: [Float]] = [:]
             var seen = [Bool](repeating: false, count: sum.count)
