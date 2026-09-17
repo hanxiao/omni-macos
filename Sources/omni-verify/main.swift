@@ -7574,7 +7574,30 @@ if args.count >= 5 && args[1] == "bitrecall" {
     let deq3 = MLX.dequantized(q3.wq, scales: q3.scales, biases: q3.biases, groupSize: 64, bits: 3).asType(.float32)
     report(MLX.matmul(Q, deq3.transposed(1, 0)), "3-bit affine (shipped)", bytesPerRow: d * 3 / 8 + (d / 64) * 4)
     report(MLX.matmul(Qs, Xs.transposed(1, 0)), "1-bit symmetric", bytesPerRow: d / 8)
-    report(MLX.matmul(Qr, Xs.transposed(1, 0)), "1-bit asymmetric (RaBitQ)", bytesPerRow: d / 8)
+    report(MLX.matmul(Qr, Xs.transposed(1, 0)), "1-bit asymmetric (shipped)", bytesPerRow: d / 8)
+    // RaBitQ'S ESTIMATOR, which is the half the shipped tier does not have.
+    //
+    // The sign code is a DIRECTION, and it is a different direction for every row: a vector whose
+    // energy is spread evenly over its coordinates is represented well by its signs, one dominated
+    // by a few coordinates is not. `sum +-q_j` treats both as if the code were exact, so it
+    // systematically overrates the rows the code fits badly. RaBitQ (Gao & Long, SIGMOD 2024)
+    // divides by how good the fit actually is: with u = sign(x)/sqrt(d) the unit code direction and
+    // x the unit row, <u, x> = ||x||_1 / sqrt(d), and the unbiased estimate of <x, q> is
+    // <u, q> / <u, x> - which reduces to dividing the sign sum by ||x||_1.
+    //
+    // One scalar per row, which is the whole cost: 96 B/row becomes 98 at bf16.
+    let l1raw = MLX.abs(Xr).sum(axis: 1)
+    let l1 = l1raw.reshaped([1, n])
+    report(MLX.matmul(Qr, Xs.transposed(1, 0)) / MLX.maximum(l1, MLXArray(Float(1e-9))),
+           "1-bit + RaBitQ estimator", bytesPerRow: d / 8 + 2)
+    // HOW MUCH THERE WAS TO CORRECT. The estimator divides by ||x||_1, so it can only change a
+    // ranking to the extent that ||x||_1 VARIES between rows - and the randomized Hadamard rotation
+    // the tier already applies is precisely a spreader of energy across coordinates. Reported so
+    // "no gain" is a statement about the data rather than a shrug.
+    let mean = l1raw.mean().item(Float.self)
+    let sd = MLX.sqrt(((l1raw - MLXArray(mean)) * (l1raw - MLXArray(mean))).mean()).item(Float.self)
+    print(String(format: "  ||x||_1 after rotation: mean=%.4f sd=%.4f cv=%.4f (the correction's whole dynamic range)",
+                 mean, sd, sd / Swift.max(mean, 1e-9)))
     store.close()
     exit(0)
 }
@@ -8329,6 +8352,182 @@ if args.count >= 3 && args[1] == "querybreak" {
     exit(0)
 }
 
+
+// ===== MATRYOSHKA AS THE COARSE TIER, ON THE REAL INDEX =====
+//
+// omni-verify mrlreal <index.sqlite.vecs> [nRows] [nQueries] [dim]
+//
+// The shipped funnel scores a QUANTIZED replica and exact-reranks the top C. Truncation is the
+// other way to make a coarse tier: jina-embeddings-v5-omni is Matryoshka-trained, so the first K
+// components of a stored vector, re-normalized, ARE the K-dim embedding - no re-embedding, no
+// second file to build, just a narrower read of the one that exists.
+//
+// What has to be measured is not "is truncation lossy" (it is) but where the funnel lands: the
+// coarse tier is cheap sequential bandwidth while every extra candidate is a scattered 1.5 KB
+// gather plus host reduce work, so a tier that reaches the recall ceiling at C=200 beats one that
+// needs C=6400 even if its own scan is slower. This reports recall@10 against a bf16-exact ground
+// truth over the SAME rows, for a grid of K and C, plus what each coarse scan costs.
+//
+// Queries are stored rows, which is what makes this measurable without the model: a doc vector is
+// drawn from the same distribution the index holds, and the K=full row is the positive control -
+// it must read 1.0 by construction, and anything else means the harness is wrong before the arms.
+if args.count >= 3 && args[1] == "mrlreal" {
+    let vecsURL = URL(fileURLWithPath: args[2])
+    let dim = (args.count >= 6 ? Int(args[5]) : nil) ?? 768
+    guard let fh = try? FileHandle(forReadingFrom: vecsURL) else {
+        FileHandle.standardError.write(Data("mrlreal: cannot open \(vecsURL.path)\n".utf8)); exit(1)
+    }
+    let fileBytes = Int((try? FileManager.default.attributesOfItem(atPath: vecsURL.path)[.size] as? Int) as? Int ?? 0)
+    let availableRows = fileBytes / (dim * 2)
+    let nRows = Swift.min((args.count >= 4 ? Int(args[3]) : nil) ?? 200_000, availableRows)
+    let nQueries = (args.count >= 5 ? Int(args[4]) : nil) ?? 200
+    guard nRows > 1000, nQueries > 0 else {
+        FileHandle.standardError.write(Data("mrlreal: file holds \(availableRows) rows of dim \(dim)\n".utf8)); exit(1)
+    }
+    guard let raw = try? fh.read(upToCount: nRows * dim * 2), raw.count == nRows * dim * 2 else {
+        FileHandle.standardError.write(Data("mrlreal: short read\n".utf8)); exit(1)
+    }
+    try? fh.close()
+    print("mrlreal  file=\(vecsURL.lastPathComponent) rows=\(nRows)/\(availableRows) dim=\(dim) queries=\(nQueries)")
+
+    // bf16 throughout, because that is what the store actually scans: a float32 harness measures
+    // a representation the product does not have, and at 10M rows it also does not fit.
+    let base = MLXArray(raw, [nRows, dim], dtype: .bfloat16)
+    MLX.eval(base)
+    // Stored rows are already L2-normalized, but a truncated prefix is not - re-normalizing is
+    // what makes the prefix the model's own K-dim embedding rather than a shortened vector.
+    func normed(_ m: MLXArray) -> MLXArray {
+        let f = m.asType(.float32)
+        let n = MLX.sqrt((f * f).sum(axis: 1, keepDims: true))
+        return (f / MLX.maximum(n, MLXArray(Float(1e-9)))).asType(.bfloat16)
+    }
+    // Queries: evenly strided rows, so the set is deterministic and spread over the whole file.
+    let qStride = Swift.max(1, nRows / nQueries)
+    let qIdx = MLXArray((0 ..< nQueries).map { Int32(Swift.min(nRows - 1, $0 * qStride)) })
+    let queries = normed(base[qIdx])
+    MLX.eval(queries)
+
+    // GROUND TRUTH: exact full-dim top-10 over the same rows, IN FLOAT32 AND IN CHUNKS.
+    //
+    // bf16 carries eight mantissa bits, so at a million rows a cosine near 1.0 has thousands of
+    // exact ties and `argSort` breaks them arbitrarily. Measured against a bf16 ground truth every
+    // arm then plateaus - K=384 read 0.9485 at C=50 and 0.9485 at C=4096, which is not a recall
+    // curve, it is tie noise. The chunking is what makes the float32 version affordable: a full
+    // float32 copy of ten million rows is 30 GB, one chunk is 600 MB.
+    let topK = 10
+    let qf = queries.asType(.float32)
+    MLX.eval(qf)
+    var gtHost = [Int32](repeating: 0, count: nQueries * topK)
+    do {
+        var best = [[(Float, Int32)]](repeating: [], count: nQueries)
+        let chunk = 200_000
+        var off = 0
+        while off < nRows {
+            let n = Swift.min(chunk, nRows - off)
+            let part = base[off ..< off + n].asType(.float32)
+            let sc = MLX.matmul(qf, part.transposed(1, 0))
+            let idx = MLX.argSort(-sc, axis: 1)[0..., 0 ..< topK]
+            MLX.eval(sc, idx)
+            let ih = idx.asArray(Int32.self)
+            let sh = sc.asArray(Float.self)
+            for q in 0 ..< nQueries {
+                for j in 0 ..< topK {
+                    let r = Int(ih[q * topK + j])
+                    best[q].append((sh[q * n + r], Int32(off + r)))
+                }
+                best[q].sort { $0.0 == $1.0 ? $0.1 < $1.1 : $0.0 > $1.0 }
+                if best[q].count > topK { best[q].removeLast(best[q].count - topK) }
+            }
+            off += n
+        }
+        for q in 0 ..< nQueries { for j in 0 ..< topK { gtHost[q * topK + j] = best[q][j].1 } }
+    }
+
+    func recall(_ cand: [Int32], _ q: Int) -> Double {
+        var want = Set<Int32>()
+        for j in 0 ..< topK { want.insert(gtHost[q * topK + j]) }
+        var hit = 0
+        for j in 0 ..< topK where want.contains(cand[q * topK + j]) { hit += 1 }
+        return Double(hit) / Double(topK)
+    }
+
+    // One arm: score every row on the first K dims, keep the top C, rescore those exactly.
+    //
+    // CHUNKED, and not as an optimization. MLX routes a matmul over a multi-million-row operand
+    // through kernels whose row advance is a 32-bit product, and past `2^31 / dim` rows it wraps -
+    // the store's own `gemvSafe` splits for exactly this reason. Unchunked, the whole grid read
+    // recall 0.005 at ten million rows, which is not a measurement of truncation.
+    func arm(_ K: Int, _ C: Int) -> (recall: Double, coarseMs: Double, rerankMs: Double) {
+        let qsub = K == dim ? queries : normed(queries[0..., 0 ..< K])
+        MLX.eval(qsub)
+        let cw = Swift.min(C, nRows)
+        let scanChunk = 2_000_000
+        var pick = [[(Float, Int32)]](repeating: [], count: nQueries)
+        let t0 = Date()
+        var soff = 0
+        while soff < nRows {
+            let n = Swift.min(scanChunk, nRows - soff)
+            let slab = base[soff ..< soff + n]
+            let sub = K == dim ? slab : normed(slab[0..., 0 ..< K])
+            let sc = MLX.matmul(qsub, sub.transposed(1, 0)).asType(.float32)
+            let idx = MLX.argSort(-sc, axis: 1)[0..., 0 ..< Swift.min(cw, n)]
+            MLX.eval(sc, idx)
+            let ih = idx.asArray(Int32.self)
+            let sh = sc.asArray(Float.self)
+            let w = Swift.min(cw, n)
+            for q in 0 ..< nQueries {
+                for j in 0 ..< w {
+                    let r = Int(ih[q * w + j])
+                    pick[q].append((sh[q * n + r], Int32(soff + r)))
+                }
+                if pick[q].count > cw {
+                    pick[q].sort { $0.0 == $1.0 ? $0.1 < $1.1 : $0.0 > $1.0 }
+                    pick[q].removeLast(pick[q].count - cw)
+                }
+            }
+            soff += n
+        }
+        for q in 0 ..< nQueries {
+            pick[q].sort { $0.0 == $1.0 ? $0.1 < $1.1 : $0.0 > $1.0 }
+            if pick[q].count > cw { pick[q].removeLast(pick[q].count - cw) }
+        }
+        let coarseMs = -t0.timeIntervalSinceNow * 1000
+        let t1 = Date()
+        // Exact rescore of the candidates only, then the top 10 of those.
+        var out = [Int32](repeating: 0, count: nQueries * topK)
+        var host = [Int32](repeating: 0, count: nQueries * cw)
+        for q in 0 ..< nQueries {
+            for j in 0 ..< cw { host[q * cw + j] = j < pick[q].count ? pick[q][j].1 : pick[q][pick[q].count - 1].1 }
+        }
+        for q in 0 ..< nQueries {
+            let ids = MLXArray(Array(host[q * cw ..< (q + 1) * cw]))
+            let rows = base[ids].asType(.float32)
+            let sc = MLX.matmul(rows, qf[q].reshaped([dim, 1])).reshaped([cw])
+            let ord = MLX.argSort(-sc)[0 ..< topK]
+            MLX.eval(ord)
+            let o = ord.asArray(Int32.self)
+            for j in 0 ..< topK { out[q * topK + j] = host[q * cw + Int(o[j])] }
+        }
+        let rerankMs = -t1.timeIntervalSinceNow * 1000
+        var r = 0.0
+        for q in 0 ..< nQueries { r += recall(out, q) }
+        return (r / Double(nQueries), coarseMs, rerankMs / Double(nQueries))
+    }
+
+    print("     K   B/row      C   recall@10  coarse_ms  rerank_ms/q")
+    let cRungs = (ProcessInfo.processInfo.environment["OMNI_MRL_C"].map { $0.split(separator: ",").compactMap { Int($0) } })
+        ?? [50, 200, 1000, 4096]
+    let kRungs = (ProcessInfo.processInfo.environment["OMNI_MRL_K"].map { $0.split(separator: ",").compactMap { Int($0) } })
+        ?? [dim, 384, 256, 192, 128, 64]
+    for K in kRungs {
+        for C in cRungs {
+            let a = arm(K, C)
+            print(String(format: "%6d  %6d  %5d     %.4f     %6.1f       %6.2f",
+                         K, K * 2, C, a.recall, a.coarseMs, a.rerankMs))
+        }
+    }
+    exit(0)
+}
 
 // ===== benchmark harness: mrlbench (auto-integrated) =====
 // Matryoshka lever: omni-verify mrlbench <modelDir> <corpusFolder> [nDocs] [nQueries]

@@ -338,7 +338,71 @@ their own snippets. `testEachSharerKeepsItsOwnLocatorAndSnippet` pins it. What t
 still buy is storing that text ONCE per content plus a locator per occurrence, rather than a full
 row per occurrence - a size win, not a correctness one.
 
-## A lead worth taking, measured: Matryoshka truncation as the coarse tier
+## The two 2026 leads, measured on the real index, and both declined
+
+Both of these were written up here as promising. They are not. The numbers below are from the
+9,984,202-vector file the app actually holds, not from a simulation, and both harnesses ship
+(`omni-verify mrlreal`, `omni-verify bitrecall`) so the answers can be re-derived.
+
+### Matryoshka truncation: loses at the scale it would run at
+
+`omni-verify mrlreal <index.sqlite.vecs> <rows> <queries>` truncates the stored rows to their
+first K components, re-normalizes, scans, keeps the top C and rescores those exactly. recall@10
+against a float32-exact ground truth over the same rows:
+
+                 2,000,000 rows                 9,984,202 rows
+    K   B/row    C=4096   C=16384  C=65536      C=4096   C=16384  C=65536
+  768    1536    0.9980   1.0000   1.0000       0.9905   0.9990   0.9990
+  384     768    0.9895   1.0000   1.0000       0.9805   0.9975   0.9990
+  256     512    0.9875   0.9995   1.0000       0.9740   0.9940   0.9990
+  192     384    0.9850   0.9975   1.0000       0.9720   0.9865   0.9990
+
+READ THE K=768 ROW AS THE CONTROL. It is the shipped bf16 scan measured against a float32 ground
+truth, and it is not 1.0: bf16 carries eight mantissa bits, so at ten million rows the true top-10
+is not always inside the bf16 top-4096. Every arm has to be read against that row, not against 1.
+
+The earlier note here claimed truncation "reaches the ceiling at C=200, which is 32x fewer
+scattered gathers". That was measured at 200,000 rows, and it does not survive the scale it would
+have to run at: at ten million rows K=384 needs C=65536 to match the control, and the funnel note
+in VectorStore already measures that past roughly C=6400 the funnel is slower than the full scan
+it replaces. At the shipped C=4096 truncation to 384 dims costs a full point of recall@10.
+
+It also loses to the tier it would replace, on both axes at once: the shipped 3-bit affine replica
+is 336 B/row and reaches 1.0000 at C=1600, where K=384 is 768 B/row and reaches 0.9975 at C=16384.
+More bytes, more candidates, less recall. Not shipped.
+
+A first version of this harness read 0.005 recall at ten million rows in every arm. That is not
+truncation failing, it is MLX routing a multi-million-row matmul through a kernel whose row advance
+is a 32-bit product - the same overflow `gemvSafe` splits for. The harness chunks at 2M rows now,
+and the chunked and unchunked numbers agree exactly at 2M, which is what says the chunking is
+faithful.
+
+### RaBitQ's error correction: already done by the rotation
+
+The shipped 1-bit tier is RaBitQ-shaped - randomized Hadamard rotation, sign codes, asymmetric
+(float query) scoring - but without RaBitQ's estimator. The estimator is one stored scalar per row:
+with `u = sign(x)/sqrt(d)` the unit code direction and `x` the unit row, `<u, x> = ||x||_1/sqrt(d)`,
+and the unbiased estimate of `<x, q>` is `<u, q> / <u, x>`, i.e. divide the sign sum by `||x||_1`.
+It corrects for the fact that a sign code fits a row whose energy is spread evenly much better than
+one dominated by a few coordinates.
+
+Measured (`omni-verify bitrecall`, 269,249 real rows, 200 queries, exact top-50 target):
+
+    tier                      B/row   C=228             C=457             C=914
+    3-bit affine (shipped)      336   top50 0.9720      0.9803            0.9877
+    1-bit symmetric              96   top50 0.7687      0.8432            0.8984
+    1-bit asymmetric (shipped)   96   top50 0.8894      0.9401            0.9677
+    1-bit + RaBitQ estimator     98   top50 0.8917      0.9402            0.9684
+
++0.0023, +0.0001, +0.0007, and recall@10 identical to four places at every width. The reason is in
+the same run: after the rotation, `||x||_1` has mean 22.15 and sd 0.228 across rows - a coefficient
+of variation of 1.03%. The divisor is a constant to within one percent, so it cannot reorder
+anything. The randomized Hadamard transform is a spreader of energy across coordinates, which is
+exactly the variation RaBitQ's factor exists to correct; having one makes the other redundant.
+
+Not shipped: two bytes a row and a multiply per row in the scan kernel, for nothing measurable.
+
+## The earlier Matryoshka note, kept for the numbers it does contain
 
 `jina-embeddings-v5-omni-nano` supports Matryoshka truncation from 768 down to 32 dimensions, and
 this index is built with exactly that model. A truncated vector is a PREFIX of one already stored,
@@ -384,10 +448,8 @@ speed claim at all. Everything above is recall.
 
 ## Other leads from the 2026 literature, unevaluated
 
-- RaBitQ (SIGMOD 2024, arXiv 2405.12497) and Extended RaBitQ (arXiv 2409.09913): scalar
-  quantization with an asymptotically optimal error bound, reported to beat PQ. Notably it relies
-  on a random rotation, which is what the shipped Hadamard transform already approximates - so this
-  port is partway there and the comparison is narrow rather than a rewrite. Also
+- RaBitQ (SIGMOD 2024, arXiv 2405.12497) and Extended RaBitQ (arXiv 2409.09913): MEASURED, see
+  above. The estimator adds nothing once the rotation is there. Still unevaluated:
   arXiv 2602.23999 (GPU-native IVF-RaBitQ) and arXiv 2604.19528 (RaBitQ vs TurboQuant).
 - SPFresh (arXiv 2410.14452) measures that updating a third of the vectors costs a graph index more
   than a point of recall and 4x tail latency. That is an argument FOR the brute-force scan this app
