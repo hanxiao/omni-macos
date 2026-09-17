@@ -4866,6 +4866,7 @@ public final class VectorStore: @unchecked Sendable {
     private func searchCandidatesLocked(coarse: MLXArray, qv: MLXArray, n: Int,
                                         candidateCount C: Int, query: [Float], topK: Int,
                                         filter: SearchFilter = SearchFilter()) -> [SearchHit] {
+
         // Top-C base candidates on the GPU; delta rows are exact and all enter the reduce.
         let flat = coarse.reshaped([baseRows])
         let topIdx = Self.topCIndices(flat, rows: baseRows, C: C)
@@ -5506,6 +5507,7 @@ public final class VectorStore: @unchecked Sendable {
     /// Host work after the matmul is O(K + delta), never O(N).
     private func reduceTopKGPULocked(baseScore: MLXArray, fid: MLXArray, deltaGraph: MLXArray?, topK: Int,
                                      filter: SearchFilter = SearchFilter()) -> [SearchHit] {
+
         let F = fileIDCount
         let occ = baseOccCount
         guard F > 0, topK > 0, occ > 0, let oSlot = occSlotGPULocked() else { return [] }
@@ -6624,6 +6626,30 @@ public final class VectorStore: @unchecked Sendable {
             let d = Int(sqlite3_column_int(stmt, 3))
             guard d == dim else { continue }
             let bytes = Int(sqlite3_column_bytes(stmt, 4))
+            // A ROW THAT SHARES AN EXISTING CONTENT MUST NOT APPEND A VECTOR. SQLite keeps a blob
+            // per chunk ROW - the writer cannot know the slot yet, so it stores one for every
+            // chunk - and appending them all rebuilds a file with one vector per row while the
+            // stored slots describe one per CONTENT. Every slot past the first duplicate then
+            // reads its neighbour's vector: on a 400-file fixture with a passage shared by five,
+            // three files holding nothing like the query came back at exactly 1.00000.
+            //
+            // The representative is written first (lowest chunk id, and this walks id order), so a
+            // stored slot below what has already been appended is by construction a duplicate.
+            let hasStored = sqlite3_column_type(stmt, 10) == SQLITE_INTEGER
+            let stored = hasStored ? Int(sqlite3_column_int(stmt, 10)) : -1
+            let appended = flat16.count / Swift.max(1, dim)
+            if stored >= 0, stored < appended, stored < slot {
+                rows.append(Row(path: path, kind: kind, chunkIndex: Int(sqlite3_column_int(stmt, 2)),
+                                modified: sqlite3_column_double(stmt, 5),
+                                size: Int(sqlite3_column_int64(stmt, 9)),
+                                width: Int(sqlite3_column_int(stmt, 6)), height: Int(sqlite3_column_int(stmt, 7)),
+                                duration: sqlite3_column_double(stmt, 8),
+                                chunkID: sqlite3_column_int64(stmt, 11)))
+                appendRowMetaLocked(internPath(path), kindCode: internKind(kind), kind: kind,
+                                    path: path, slot: Int32(stored))
+                presentPaths.insert(path)
+                continue   // no vector, and the slot counter does NOT advance
+            }
             if slot < coveredRows {
                 // Covered: the file already holds this row's vector, at exactly this slot.
                 guard bytes == 0 || bytes >= d * MemoryLayout<UInt16>.size else { ok = false; break }
@@ -6651,6 +6677,15 @@ public final class VectorStore: @unchecked Sendable {
             // mine".
             let hasSlot = sqlite3_column_type(stmt, 10) == SQLITE_INTEGER
             let storedSlot = hasSlot ? Int32(sqlite3_column_int(stmt, 10)) : Int32(-1)
+            // A ROW THAT SHARES A CONTENT MUST NOT APPEND A VECTOR. SQLite keeps a blob per chunk
+            // row - the writer cannot know the slot yet, so it stores one for every chunk - and
+            // appending them all rebuilds a file with one vector per ROW while the stored slots
+            // describe one per CONTENT. Every slot past the first duplicate then points at its
+            // neighbour's vector: on a 400-file fixture with a passage shared by five, three files
+            // holding nothing like the query came back at exactly 1.00000.
+            //
+            // The representative is written first (lowest chunk id, and this walks id order), so a
+            // stored slot below what has already been appended is by construction a duplicate.
             appendRowMetaLocked(fid, kindCode: internKind(kind), kind: kind, path: path,
                                 slot: storedSlot >= 0 ? storedSlot : Int32(slot))
             presentPaths.insert(path)
