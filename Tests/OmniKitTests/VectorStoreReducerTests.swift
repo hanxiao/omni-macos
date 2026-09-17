@@ -5,6 +5,10 @@ import XCTest
 /// results identical to the original string-keyed best-per-path loop (`reduceTopKReference`), plus
 /// the CRUD corner cases from the perf-plan checklist that touch the base/delta + fileID machinery.
 final class VectorStoreReducerTests: XCTestCase {
+    /// One row, one vector - the mapping every case below assumes, and what the store holds until
+    /// contents are shared.
+    private func identity(_ n: Int) -> [Int32] { (0 ..< n).map(Int32.init) }
+
 
     // Small reproducible RNG (Date/Math.random-free, deterministic across runs).
     struct XorShift {
@@ -72,7 +76,7 @@ final class VectorStoreReducerTests: XCTestCase {
             let filter = randomFilter(&rng)
             let topK = topKs[rng.int(topKs.count)]
 
-            let got = VectorStore.reduceTopK(scores: scores, fileID: fileID, fileCount: fc, rows: rows, filter: filter, topK: topK)
+            let got = VectorStore.reduceTopK(scores: scores, fileID: fileID, occSlot: identity(fileID.count), fileCount: fc, rows: rows, filter: filter, topK: topK)
             let want = VectorStore.reduceTopKReference(scores: scores, rows: rows, filter: filter, topK: topK)
 
             // The kind-code fast path (dense per-row UInt8 + intern table, used by the store for
@@ -82,7 +86,7 @@ final class VectorStoreReducerTests: XCTestCase {
                 if let id = kindID[r.kind] { return id }
                 let id = UInt8(kindID.count); kindID[r.kind] = id; return id
             }
-            let gotKC = VectorStore.reduceTopK(scores: scores, fileID: fileID, fileCount: fc, rows: rows,
+            let gotKC = VectorStore.reduceTopK(scores: scores, fileID: fileID, occSlot: identity(fileID.count), fileCount: fc, rows: rows,
                                                filter: filter, topK: topK, kindCode: kindCode, kindID: kindID)
             XCTAssertEqual(gotKC.map(key), want.map(key), "trial \(trial): kind-code path")
 
@@ -102,7 +106,7 @@ final class VectorStoreReducerTests: XCTestCase {
         let s: [Float] = [0.9, 0.9, 0.9, 0.5, 0.5, 0.5]
         for f in 0 ..< 6 { rows.append(.init(path: "/p\(f).txt", kind: "text", chunkIndex: 0, modified: 0)); fileID.append(Int32(f)) }
         for topK in 1 ... 6 {
-            let got = VectorStore.reduceTopK(scores: s, fileID: fileID, fileCount: 6, rows: rows, filter: .init(), topK: topK)
+            let got = VectorStore.reduceTopK(scores: s, fileID: fileID, occSlot: identity(fileID.count), fileCount: 6, rows: rows, filter: .init(), topK: topK)
             let want = VectorStore.reduceTopKReference(scores: s, rows: rows, filter: .init(), topK: topK)
             XCTAssertEqual(got.count, want.count, "topK=\(topK) count")
             XCTAssertEqual(got.map(\.score).sorted(by: >), want.map(\.score).sorted(by: >), "topK=\(topK) score multiset")
@@ -116,7 +120,7 @@ final class VectorStoreReducerTests: XCTestCase {
         var rows: [VectorStore.Row] = []; var fileID: [Int32] = []
         for c in 0 ..< 5 { rows.append(.init(path: "/only.txt", kind: "text", chunkIndex: c, modified: 0)); fileID.append(0) }
         let s: [Float] = [0.3, 0.9, 0.9, 0.9, 0.2]   // max 0.9 first at chunk index 1
-        let got = VectorStore.reduceTopK(scores: s, fileID: fileID, fileCount: 1, rows: rows, filter: .init(), topK: 10)
+        let got = VectorStore.reduceTopK(scores: s, fileID: fileID, occSlot: identity(fileID.count), fileCount: 1, rows: rows, filter: .init(), topK: 10)
         let want = VectorStore.reduceTopKReference(scores: s, rows: rows, filter: .init(), topK: 10)
         XCTAssertEqual(got.count, 1)
         XCTAssertEqual(got.first?.chunkIndex, want.first?.chunkIndex)
@@ -128,7 +132,7 @@ final class VectorStoreReducerTests: XCTestCase {
         var rows: [VectorStore.Row] = []; var fileID: [Int32] = []
         for f in 0 ..< 3 { for c in 0 ..< 2 { rows.append(.init(path: "/f\(f).txt", kind: "text", chunkIndex: c, modified: 0)); fileID.append(Int32(f)) } }
         let s: [Float] = [.nan, .infinity, 0.7, 0.6, .nan, .nan]   // f0: NaN/inf, f1: 0.7/0.6, f2: NaN/NaN
-        let got = VectorStore.reduceTopK(scores: s, fileID: fileID, fileCount: 3, rows: rows, filter: .init(), topK: 10)
+        let got = VectorStore.reduceTopK(scores: s, fileID: fileID, occSlot: identity(fileID.count), fileCount: 3, rows: rows, filter: .init(), topK: 10)
         let want = VectorStore.reduceTopKReference(scores: s, rows: rows, filter: .init(), topK: 10)
         XCTAssertEqual(got.map(key), want.map(key))
         XCTAssertEqual(got.count, 1, "only f1 has a finite score")
@@ -144,7 +148,7 @@ final class VectorStoreReducerTests: XCTestCase {
         rows.append(.init(path: "/f.txt", kind: "text", chunkIndex: 1, modified: 200)); fileID.append(0)
         var filter = SearchFilter(); filter.since = 150
         let s: [Float] = [0.9, 0.8]   // chunk0 higher but modified 100 < 150 -> excluded; chunk1 wins
-        let got = VectorStore.reduceTopK(scores: s, fileID: fileID, fileCount: 1, rows: rows, filter: filter, topK: 10)
+        let got = VectorStore.reduceTopK(scores: s, fileID: fileID, occSlot: identity(fileID.count), fileCount: 1, rows: rows, filter: filter, topK: 10)
         let want = VectorStore.reduceTopKReference(scores: s, rows: rows, filter: filter, topK: 10)
         XCTAssertEqual(got.map(key), want.map(key))
         // Witness which chunk won by index (snippets are no longer resident in Row; the store fills
@@ -153,11 +157,38 @@ final class VectorStoreReducerTests: XCTestCase {
     }
 
     func testReducerEmptyAndSingle() {
-        XCTAssertTrue(VectorStore.reduceTopK(scores: [], fileID: [], fileCount: 0, rows: [], filter: .init(), topK: 10).isEmpty)
+        XCTAssertTrue(VectorStore.reduceTopK(scores: [], fileID: [], occSlot: [], fileCount: 0, rows: [], filter: .init(), topK: 10).isEmpty)
         let rows: [VectorStore.Row] = [.init(path: "/a.txt", kind: "text", chunkIndex: 0, modified: 0)]
-        let got = VectorStore.reduceTopK(scores: [0.5], fileID: [0], fileCount: 1, rows: rows, filter: .init(), topK: 10)
+        let got = VectorStore.reduceTopK(scores: [0.5], fileID: [0], occSlot: [0], fileCount: 1, rows: rows, filter: .init(), topK: 10)
         XCTAssertEqual(got.count, 1); XCTAssertEqual(got.first?.score, 0.5)
         // topK <= 0 yields nothing
-        XCTAssertTrue(VectorStore.reduceTopK(scores: [0.5], fileID: [0], fileCount: 1, rows: rows, filter: .init(), topK: 0).isEmpty)
+        XCTAssertTrue(VectorStore.reduceTopK(scores: [0.5], fileID: [0], occSlot: [0], fileCount: 1, rows: rows, filter: .init(), topK: 0).isEmpty)
+    }
+
+    /// TWO ROWS, ONE VECTOR. The shape the whole redesign exists for: the same content in two
+    /// files, stored once. Each file must still get a hit, both must carry that content's score,
+    /// and each must name its OWN row - a reducer that indexed scores by row would read past the
+    /// end of the score vector or score the wrong content entirely.
+    func testASharedVectorScoresBothFilesThatHoldIt() {
+        let rows = [VectorStore.Row(path: "/a.txt", kind: "text", chunkIndex: 0, modified: 0),
+                    VectorStore.Row(path: "/b.txt", kind: "text", chunkIndex: 0, modified: 0),
+                    VectorStore.Row(path: "/b.txt", kind: "text", chunkIndex: 1, modified: 0)]
+        let fileID: [Int32] = [0, 1, 1]
+        let occSlot: [Int32] = [0, 0, 1]        // rows 0 and 1 share slot 0
+        let scores: [Float] = [0.9, 0.2]        // ONE score per slot, not per row
+        let got = VectorStore.reduceTopK(scores: scores, fileID: fileID, occSlot: occSlot,
+                                         fileCount: 2, rows: rows, filter: .init(), topK: 10)
+        XCTAssertEqual(got.count, 2)
+        XCTAssertEqual(got.map(\.path).sorted(), ["/a.txt", "/b.txt"])
+        for h in got { XCTAssertEqual(h.score, 0.9, accuracy: 1e-6, "\(h.path) lost the shared score") }
+    }
+
+    /// A score vector SHORTER than the rows is normal once contents are shared, and must not read
+    /// out of bounds or drop the rows that do resolve.
+    func testAScoreVectorShorterThanTheRowsIsFine() {
+        let rows = (0 ..< 4).map { VectorStore.Row(path: "/f\($0).txt", kind: "text", chunkIndex: 0, modified: 0) }
+        let got = VectorStore.reduceTopK(scores: [0.5], fileID: [0, 1, 2, 3], occSlot: [0, 0, 0, 0],
+                                         fileCount: 4, rows: rows, filter: .init(), topK: 10)
+        XCTAssertEqual(got.count, 4)
     }
 }

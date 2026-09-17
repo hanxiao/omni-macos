@@ -1172,9 +1172,15 @@ public final class VectorStore: @unchecked Sendable {
     /// whose Strings are why the dense tables exist at all.
     /// INVARIANT: occSlot.count == rows.count, and occSlot[i] == rows[i].slot.
     private var occSlot: [Int32] = []
-    /// One past the highest slot ever used, i.e. the number of vectors in flat16. Equal to
-    /// rows.count while every row owns its own vector; smaller once contents are shared.
-    private var slotCount = 0
+    /// The number of vectors flat16 holds. DERIVED, not stored: flat16 shrinks in six different
+    /// places (compaction, wipe, reject, two reload paths, releaseAll) and a stored counter has to
+    /// be corrected at every one of them. It was stored first, nobody corrected it on the removal
+    /// paths, and every delete then failed `flat16.count == rows.count * dim` and made search return
+    /// nothing - 17 tests. One source of truth instead.
+    private var slotCount: Int { dim > 0 ? flat16.count / dim : 0 }
+    /// The slot a freshly appended vector landed on. Callers append to flat16 first, so this is the
+    /// last row of the file.
+    @inline(__always) private var lastAppendedSlot: Int32 { Int32(Swift.max(0, slotCount - 1)) }
     /// The vector this row reads. One Int32 load; the row's 1536-byte vector read dwarfs it.
     @inline(__always) private func slotOf(_ row: Int) -> Int { Int(occSlot[row]) }
     private var pathID: [String: Int32] = [:]
@@ -1308,17 +1314,12 @@ public final class VectorStore: @unchecked Sendable {
     /// than four copies of the same four lines that a fifth append site could forget.
     @inline(__always)
     private func appendRowMetaLocked(_ fid: Int32, kindCode kc: UInt8, kind: String, path: String,
-                                     slot: Int32? = nil) {
+                                     slot: Int32) {
         let i = fileID.count
         fileID.append(fid)
         // nil means "this row brought a new vector", which is every caller while a row and its
         // vector are the same thing. A row that SHARES a vector passes the slot it shares.
-        let s = slot ?? Int32(slotCount)
-        // The high-water mark advances whichever branch supplied the slot. Advancing it only on the
-        // nil branch left it counting hole rows alone during a coverage load - every covered row
-        // passes its slot explicitly - so slotCount fell far behind and the load's own consistency
-        // check rejected a perfectly good vector file as unreadable. 31 tests said so.
-        slotCount = Swift.max(slotCount, Int(s) + 1)
+        let s = slot
         occSlot.append(s)
         if i < rows.count { rows[i].slot = s }
         kindCode.append(kc)
@@ -1409,14 +1410,14 @@ public final class VectorStore: @unchecked Sendable {
     /// tombstone - while contributing nothing to its file's chunk count and nothing to its file's
     /// row window. A dead row is not one of the file's live rows, so widening the window for it
     /// would only make the window's containment claim looser for no gain.
-    private func appendDeadRowMetaLocked(_ fid: Int32, kindCode kc: UInt8) {
+    private func appendDeadRowMetaLocked(_ fid: Int32, kindCode kc: UInt8, slot: Int32) {
         fileID.append(fid)
         // A hole row still OCCUPIES a vector slot - that is the whole point of appending it, to
         // keep every row after the hole on the slot its vector actually sits at. Leaving it out of
         // occSlot desynchronises the mirror from `rows` and every row past the first hole then
         // reads its neighbour's vector.
-        occSlot.append(Int32(slotCount))
-        slotCount += 1
+        occSlot.append(slot)
+        if fileID.count - 1 < rows.count { rows[fileID.count - 1].slot = slot }
         kindCode.append(kc)
         rowWindowCovered += 1
     }
@@ -1639,7 +1640,6 @@ public final class VectorStore: @unchecked Sendable {
         fileID.reserveCapacity(rows.count)
         occSlot.removeAll(keepingCapacity: true)
         occSlot.reserveCapacity(rows.count)
-        slotCount = 0
         kindCode.removeAll(keepingCapacity: true)
         kindCode.reserveCapacity(rows.count)
         resetAggregatesLocked()
@@ -1649,9 +1649,8 @@ public final class VectorStore: @unchecked Sendable {
             // r.slot, NOT the loop position: compaction has already reordered `rows`, and
             // re-deriving the slot here would hand every shared vector the identity mapping.
             appendRowMetaLocked(fid, kindCode: internKind(r.kind), kind: r.kind, path: r.path,
-                                slot: r.slot >= 0 ? r.slot : nil)
+                                slot: r.slot)
         }
-        slotCount = Swift.max(slotCount, Int(occSlot.max().map { $0 + 1 } ?? 0))
     }
 
     public let dbURL: URL
@@ -2043,7 +2042,8 @@ public final class VectorStore: @unchecked Sendable {
                                 size: c.size, width: c.width, height: c.height, duration: c.duration))
                 flat16.append(contentsOf: bfs[i])
                 let fid = internPath(c.path)
-                appendRowMetaLocked(fid, kindCode: internKind(c.kind), kind: c.kind, path: c.path)
+                appendRowMetaLocked(fid, kindCode: internKind(c.kind), kind: c.kind, path: c.path,
+                                    slot: lastAppendedSlot)
             }
             presentPaths.insert(path)
             rowWindowAuditLocked("replace")
@@ -2138,7 +2138,8 @@ public final class VectorStore: @unchecked Sendable {
                                     size: c.size, width: c.width, height: c.height, duration: c.duration))
                     flat16.append(contentsOf: bfs[wi][ci])
                     let fid = internPath(c.path)
-                    appendRowMetaLocked(fid, kindCode: internKind(c.kind), kind: c.kind, path: c.path)
+                    appendRowMetaLocked(fid, kindCode: internKind(c.kind), kind: c.kind, path: c.path,
+                                    slot: lastAppendedSlot)
                 }
                 presentPaths.insert(it.path)
             }
@@ -2542,7 +2543,7 @@ public final class VectorStore: @unchecked Sendable {
             // Release the backing buffers (a wipe will not refill to the same size immediately),
             // rather than removeAll which keeps the ~1.6GB capacity reserved.
             rows = []; flat16.releaseAll(); presentPaths = []; fileID = []; pathID = [:]; idPath = []; fileChunkCount = []
-            occSlot = []; slotCount = 0
+            occSlot = []
             kindCode = []; kindID = [:]; idKind = []; resetTombstonesLocked(); invalidateBase()
             resetPathAllowCachesLocked()   // idPath is gone, so the tag-free table is gone with it
             fileRowLo = []; fileRowHi = []; rowWindowCovered = 0   // same reason: release, not removeAll
@@ -2861,7 +2862,7 @@ public final class VectorStore: @unchecked Sendable {
     /// SQL said it existed to prevent.
     private func bestChunkScoreLocked(_ paths: [String], query: [Float]) -> [String: (score: Float, chunkIndex: Int)] {
         guard dim > 0, query.count == dim, !paths.isEmpty,
-              !rows.isEmpty, flat16.count == slotCount * dim else { return [:] }
+              !rows.isEmpty, flat16.count == rows.count * dim else { return [:] }
         // Returns the winning chunk INDEX with its score: the snippet a hit shows has to come from
         // the chunk that won, the way the dense path's `fillSnippetsLocked` does it.
         var wanted = [Bool](repeating: false, count: max(1, fileChunkCount.count))
@@ -3752,7 +3753,7 @@ public final class VectorStore: @unchecked Sendable {
             // pathID is the intern table over the paths present in `rows`, so a miss means "not
             // indexed" without scanning; a hit turns the row scan into Int32 compares instead of
             // N string compares (~80B memcmp + ARC each) - 10-50x on a large index.
-            guard dim > 0, fileID.count == rows.count, flat16.count >= slotCount * dim,
+            guard dim > 0, fileID.count == rows.count, flat16.count >= rows.count * dim,
                   let id = pathID[path] else { return nil }
             var sum = [Float](repeating: 0, count: dim)
             var count = 0
@@ -4211,7 +4212,7 @@ public final class VectorStore: @unchecked Sendable {
         // AFTER the lock to avoid a re-entrant queue.sync deadlock (the same pattern as before). (F18)
         let hits: [SearchHit]? = prelimFusible ? queue.sync { () -> [SearchHit]? in
             lastSearchAt = Date()
-            let n = rows.count
+            let n = slotCount
             let fusible = quantBase == nil && bitBase == nil && mlxFileID != nil && baseRows > 0 && !baseDirty
                 && (filter.kinds.isEmpty || mlxKindCode != nil)
                 && (n - baseRows) <= Self.foldThreshold
@@ -4459,7 +4460,7 @@ public final class VectorStore: @unchecked Sendable {
             // tag: terms resolve to path sets here, on the queue (cached across keystrokes; a
             // tag-filtered query always takes this classic path - onlyKindFiltered is false).
             let filter = resolveTagFilterLocked(filter)
-            let n = rows.count
+            let n = slotCount
             guard n > 0, dim > 0, query.count == dim, flat16.count == n * dim else { return [] }
             if markActive { lastSearchAt = Date() }   // stamp AFTER the guard so an empty/invalid query never fakes a search window
             if baseDirty || (mlxBase == nil && quantBase == nil && bitBase == nil) || (n - baseRows) > Self.foldThreshold {
@@ -4606,7 +4607,7 @@ public final class VectorStore: @unchecked Sendable {
                 scores = rerankLocked(coarse: scores, n: n, query: query, filter: filter, topK: topK)
             }
             let t1 = Self.searchTiming ? Date() : nil
-            let result = fillSnippetsLocked(Self.reduceTopK(scores: scores, fileID: fileID, fileCount: fileIDCount,
+            let result = fillSnippetsLocked(Self.reduceTopK(scores: scores, fileID: fileID, occSlot: occSlot, fileCount: fileIDCount,
                                                             rows: rows, filter: filter, topK: topK,
                                                             kindCode: kindCode, kindID: kindID))
             if let t0, let t1 {
@@ -4764,7 +4765,11 @@ public final class VectorStore: @unchecked Sendable {
             flat16.withUnsafeBufferPointer { fb in
                 packed.withUnsafeMutableBufferPointer { pb in
                     guard let src = fb.baseAddress, let dst = pb.baseAddress else { return }
-                    for (j, ri) in cand.enumerated() { (dst + j * dim).update(from: src + slotOf(Int(ri)) * dim, count: dim) }
+                    // `ri` is already a SLOT: topCIndices ranks the coarse score array, which is
+                        // indexed by slot. Do NOT map it through slotOf.
+                        // TODO(v5): the candidates then travel on as if they were rows. Under
+                        // sharing they have to be expanded slot -> occurrences first.
+                        for (j, ri) in cand.enumerated() { (dst + j * dim).update(from: src + Int(ri) * dim, count: dim) }
                 }
             }
             let exact: MLXArray = packed.withUnsafeBytes { raw in
@@ -4895,7 +4900,9 @@ public final class VectorStore: @unchecked Sendable {
         coarse.withUnsafeBufferPointer { sp in
             kindCode.withUnsafeBufferPointer { kc in
                 for i in 0 ..< baseRows {
-                    let sc = sp[i]
+                    let sl = slotOf(i)
+                    guard sl >= 0, sl < sp.count else { continue }
+                    let sc = sp[sl]
                     if !sc.isFinite { continue }
                     if hScore.count >= C && sc <= hScore[0] { continue }
                     if hasKind && !kindAllowed[Int(kc[i])] { continue }
@@ -5394,11 +5401,14 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
-    static func reduceTopK(scores: [Float], fileID: [Int32], fileCount: Int,
+    /// `scores` is indexed by SLOT and everything else by ROW. Those were the same number until
+    /// contents became shareable; `occSlot` is what bridges them, and it is required rather than
+    /// defaulted precisely so a caller cannot silently get the old identity behaviour.
+    static func reduceTopK(scores: [Float], fileID: [Int32], occSlot: [Int32], fileCount: Int,
                            rows: [Row], filter: SearchFilter, topK: Int,
                            kindCode: [UInt8] = [], kindID: [String: UInt8] = [:]) -> [SearchHit] {
         let n = rows.count
-        guard n > 0, fileCount > 0, topK > 0, scores.count >= n, fileID.count >= n else { return [] }
+        guard n > 0, fileCount > 0, topK > 0, occSlot.count >= n, fileID.count >= n else { return [] }
         let tA = searchTiming ? Date() : nil
         var bestScore = [Float](repeating: -.infinity, count: fileCount)
         var bestRow = [Int32](repeating: -1, count: fileCount)
@@ -5420,6 +5430,7 @@ public final class VectorStore: @unchecked Sendable {
         // fast path over primitive buffers (no ARC, no bounds checks via unsafe pointers) and a
         // filtered path that reads only the two fields it needs. Both produce identical winners.
         scores.withUnsafeBufferPointer { sp in
+        occSlot.withUnsafeBufferPointer { os in
         fileID.withUnsafeBufferPointer { fp in
         bestScore.withUnsafeMutableBufferPointer { bs in
         bestRow.withUnsafeMutableBufferPointer { br in
@@ -5430,7 +5441,9 @@ public final class VectorStore: @unchecked Sendable {
                 for i in 0 ..< n {
                     let f = Int(fp[i])
                     rc[f] += 1
-                    let dot = sp[i]
+                    let sl = Int(os[i])
+                    guard sl >= 0, sl < sp.count else { continue }
+                    let dot = sp[sl]
                     if !dot.isFinite { continue }        // ignore degenerate (NaN/inf) stored vectors
                     if hasKind {
                         if useKindCode { if !ka[Int(kc[i])] { continue } }
@@ -5444,12 +5457,14 @@ public final class VectorStore: @unchecked Sendable {
                 for i in 0 ..< n {
                     let f = Int(fp[i])
                     rc[f] += 1
-                    let dot = sp[i]
+                    let sl = Int(os[i])
+                    guard sl >= 0, sl < sp.count else { continue }
+                    let dot = sp[sl]
                     if !dot.isFinite { continue }
                     if dot > bs[f] { bs[f] = dot; br[f] = Int32(i) }   // strict > keeps lowest row index on tie (== reference's `>=` skip)
                 }
             }
-        }}}}}
+        }}}}}}
         let tB = searchTiming ? Date() : nil
         // Bounded top-K over the per-file winners via a size-K min-heap, instead of building a
         // SearchHit for all F files and sorting them (that full sort of F String-bearing structs was
@@ -5755,7 +5770,7 @@ public final class VectorStore: @unchecked Sendable {
         try? FileManager.default.removeItem(at: url.deletingLastPathComponent().appendingPathComponent(url.lastPathComponent + ".tmp"))
         guard FileManager.default.fileExists(atPath: url.path) else { return }
         func reject() { try? FileManager.default.removeItem(at: url) }
-        let n = rows.count
+        let n = slotCount
         guard n > 0, dim > 0, dim % Self.quantGroup == 0 else { reject(); return }
         let bits = Self.quantBitsFor(baseBytes: n * dim * MemoryLayout<UInt16>.size, rowCount: n)
         guard bits > 0 else { reject(); return }
@@ -6107,7 +6122,7 @@ public final class VectorStore: @unchecked Sendable {
             let cleared = clearedRowsLocked()
             if cleared != liveCovered { return "coverage accounts for \(liveCovered) rows but \(cleared) have no blob" }
             // 4. And the vector buffer must still hold a vector for every row.
-            if dim > 0, flat16.count != slotCount * dim {
+            if dim > 0, flat16.count != rows.count * dim {
                 return "vector buffer holds \(flat16.count / Swift.max(1, dim)) rows, table has \(rows.count)"
             }
             return nil
@@ -6346,7 +6361,7 @@ public final class VectorStore: @unchecked Sendable {
             // Re-create the holes at the positions the claim says they occupy, so that every row
             // after them keeps the slot its vector actually sits at.
             while slot < coveredRows, vecHoles.contains(Int32(slot)) {
-                appendHoleRowLocked()
+                appendHoleRowLocked(slot: Int32(slot))
                 slot += 1
             }
             let path = canonicalPath(String(cString: sqlite3_column_text(stmt, 0)))
@@ -6379,14 +6394,14 @@ public final class VectorStore: @unchecked Sendable {
         // Trailing holes: a run of tombstones at the end of the covered prefix has no row after it
         // to trigger the loop above.
         while ok, slot < coveredRows, vecHoles.contains(Int32(slot)) {
-            appendHoleRowLocked()
+            appendHoleRowLocked(slot: Int32(slot))
             slot += 1
         }
         // Every covered slot must have been claimed by a row or a hole, and the file must hold a
         // vector for every row we just built. Either failing means falling back to the blob scan,
         // which is only possible because nothing above wrote to the file.
-        guard ok, covered == coveredRows - holes, flat16.count == slotCount * dim else {
-            rows.removeAll(); flat16.removeAll(); presentPaths.removeAll()
+        guard ok, covered == coveredRows - holes, flat16.count == rows.count * dim else {
+            rows.removeAll(); flat16.removeAll(); presentPaths.removeAll(); occSlot.removeAll()
             fileID.removeAll(); pathID.removeAll(); idPath.removeAll(); fileChunkCount.removeAll()
             resetPathAllowCachesLocked()   // idPath emptied: nothing derived from it survives
             kindCode.removeAll(); kindID.removeAll(); idKind.removeAll()
@@ -6791,10 +6806,10 @@ public final class VectorStore: @unchecked Sendable {
     /// Append a tombstone that exists only to hold its slot, for a vector the file still carries but
     /// no row owns. Its path/kind are the empty intern entries, and it is dead from birth, so no
     /// reader can reach it and no file counts it.
-    private func appendHoleRowLocked() {
+    private func appendHoleRowLocked(slot: Int32) {
         let i = rows.count
-        rows.append(Row(path: "", kind: "", chunkIndex: 0, modified: 0))
-        appendDeadRowMetaLocked(internPath(""), kindCode: internKind(""))
+        rows.append(Row(path: "", kind: "", chunkIndex: 0, modified: 0, slot: slot))
+        appendDeadRowMetaLocked(internPath(""), kindCode: internKind(""), slot: slot)
         deadRows.insert(Int32(i))
         deadIdxCache = nil
     }
@@ -7043,7 +7058,7 @@ public final class VectorStore: @unchecked Sendable {
     /// Are the holes worth a copy of the live file?
     private func shouldReclaimHolesLocked() -> Bool {
         guard Self.vecCoverage, Self.holeReclaimFraction > 0, dbOpen(), dim > 0, !rows.isEmpty,
-              flat16.isPersistent, flat16.count == slotCount * dim,
+              flat16.isPersistent, flat16.count == rows.count * dim,
               // Only with coverage caught up: then every live row's blob is already cleared, so the
               // switch is two writes to `meta` instead of an UPDATE over millions of rows.
               coveredRows == rows.count, vecHoles.count == deadRows.count, !vecHoles.isEmpty
@@ -7283,7 +7298,7 @@ public final class VectorStore: @unchecked Sendable {
         // away. The sidecar carries the tombstones instead (record byte 49), which is also what
         // keeps a delete O(edit) rather than O(index).
         guard Self.rowSidecarEnabled, dbOpen(), flat16.isPersistent, dim > 0, !rows.isEmpty,
-              mutationGen != lastStampedGen, flat16.count == slotCount * dim else { return }
+              mutationGen != lastStampedGen, flat16.count == rows.count * dim else { return }
         let t0 = omniPerfEnabled ? Date() : nil
         // The header describes rows.count vectors, so the FILE has to cover them. Rows appended
         // since the last fold live in the mapping's anonymous tail, and only the fold path
@@ -7521,7 +7536,7 @@ public final class VectorStore: @unchecked Sendable {
         fileRowLo = [Int32](repeating: Self.noRowLo, count: pathTable.count)
         fileRowHi = [Int32](repeating: 0, count: pathTable.count)
         rowWindowCovered = 0
-        rows.removeAll(); rows.reserveCapacity(header.rowCount); resetTombstonesLocked()
+        rows.removeAll(); rows.reserveCapacity(header.rowCount); occSlot.removeAll(); resetTombstonesLocked()
         fileID.removeAll(); fileID.reserveCapacity(header.rowCount)
         kindCode.removeAll(); kindCode.reserveCapacity(header.rowCount)
         resetAggregatesLocked()
@@ -7547,10 +7562,10 @@ public final class VectorStore: @unchecked Sendable {
                     if isDead {
                         // Holds the row's SLOT without counting toward its file: the vector stays
                         // where it is (that is the point of a tombstone) but nothing may return it.
-                        appendDeadRowMetaLocked(fid, kindCode: kc)
+                        appendDeadRowMetaLocked(fid, kindCode: kc, slot: Int32(i))
                         deadRows.insert(Int32(i))
                     } else {
-                        appendRowMetaLocked(fid, kindCode: kc, kind: kind, path: path)
+                        appendRowMetaLocked(fid, kindCode: kc, kind: kind, path: path, slot: Int32(i))
                     }
                 }
             }
@@ -7933,7 +7948,7 @@ public final class VectorStore: @unchecked Sendable {
             self.queue.sync {
                 guard self.idleFoldToken == token else { return }      // more writes arrived
                 guard !self.yieldToSearchLocked() else { return }
-                let n = self.rows.count
+                let n = self.slotCount
                 guard n > 0, self.dim > 0, self.flat16.count == n * self.dim, n > self.baseRows else { return }
                 if Self.searchTiming { print("[search] IDLE FOLD rows=\(n) delta=\(n - self.baseRows)") }
                 self.rebuildBaseLocked(rowCount: n)
@@ -7956,7 +7971,7 @@ public final class VectorStore: @unchecked Sendable {
                     self.scheduleWidthUpgradeLocked(after: 30)   // still busy: come back later
                     return
                 }
-                let n = self.rows.count
+                let n = self.slotCount
                 guard n > 0, self.dim > 0, self.flat16.count == n * self.dim, self.quantBase != nil else { return }
                 let want = Self.quantBitsFor(baseBytes: n * self.dim * MemoryLayout<UInt16>.size, rowCount: n)
                 guard want > 0, want != self.quantBits else { return }
@@ -7971,7 +7986,7 @@ public final class VectorStore: @unchecked Sendable {
 
     private func proactiveRefoldLocked() {
         guard Self.proactiveFold, searchRecentlyActiveLocked() else { return }
-        let n = rows.count
+        let n = slotCount
         guard n > 0, dim > 0, flat16.count == n * dim else { return }
         // Quant-aware, exactly like search(_:)'s rebuild condition: in quant mode mlxBase stays nil
         // (the scan replica is quantBase), so a bare `mlxBase == nil` here fires on EVERY write and
@@ -8039,7 +8054,7 @@ public final class VectorStore: @unchecked Sendable {
             // index rather than walking up from 0: the walk could not run past the arrays, a window
             // is dereferenced straight into flat16.
             guard dim > 0, query.count == dim, fileID.count == rows.count,
-                  flat16.count >= slotCount * dim, let id = pathID[path] else { return [] }
+                  flat16.count >= rows.count * dim, let id = pathID[path] else { return [] }
             // Snippets and locators are not resident (see Row): fetch this one file's display text
             // in a single indexed SELECT, keyed by chunk index.
             var snippets: [Int: String] = [:]
@@ -8115,7 +8130,7 @@ public final class VectorStore: @unchecked Sendable {
         queue.sync {
             // Skip tombstones rather than compact - see fileVector. This is an interactive path
             // (an agent's search_inline, the passages panel) and must not pay for a base rewrite.
-            let n = rows.count
+            let n = slotCount
             guard dim > 0, query.count == dim, !paths.isEmpty, n > 0, flat16.count == n * dim else { return [] }
             // Normalize each requested path ONCE (strip a single trailing slash) so the prefix test is
             // allocation-free in the loop and a folder arg with a trailing slash ("/x/Docs/") still matches.
@@ -8428,7 +8443,7 @@ public final class VectorStore: @unchecked Sendable {
     /// missing vector as "cannot compare", never as "no match".
     public func pooledVectors(paths: [String]) -> [String: [Float]] {
         queue.sync {
-            guard dim > 0, fileID.count == rows.count, flat16.count >= slotCount * dim,
+            guard dim > 0, fileID.count == rows.count, flat16.count >= rows.count * dim,
                   !paths.isEmpty else { return [:] }
             // Wanted paths -> dense file ids -> a flat id->slot table, so the row walk below compares
             // an Int32 instead of hashing a path String per row. On a 4.5M-row index that is the
@@ -8910,8 +8925,13 @@ public final class VectorStore: @unchecked Sendable {
                 }
                 if i < baseRows, baseSurvivors != nil { baseSurvivors?.append(Int32(i)) }
                 if w != i {
-                    (base + w * dim).update(from: base + i * dim, count: dim)
+                    (base + w * dim).update(from: base + slotOf(i) * dim, count: dim)
                     rows[w] = rows[i]; fileID[w] = fileID[i]; kindCode[w] = kindCode[i]
+                    // The vector just moved to row w's position, so that IS its slot now.
+                    // TODO(v5): once contents are shared this is wrong - a vector belongs to many
+                    // rows and cannot be relocated by one row's position. Row compaction and slot
+                    // compaction separate, the latter driven by the free list.
+                    rows[w].slot = Int32(w); occSlot[w] = Int32(w)
                 }
                 w += 1
             }
@@ -8923,6 +8943,7 @@ public final class VectorStore: @unchecked Sendable {
         deadIdxCache = nil
         flat16.removeLast(removed * dim)
         rows.removeLast(removed); fileID.removeLast(removed); kindCode.removeLast(removed)
+        occSlot.removeLast(removed)
         // Every row index at or past `firstRemoved` just moved, so no window survives a compaction.
         // Rebuilt here, OUTSIDE the flat16 closure and AFTER the truncation, for two reasons: the
         // closure has its own early return (a nil base address) that skips its body while the
@@ -9081,6 +9102,7 @@ public final class VectorStore: @unchecked Sendable {
 
     private func loadIntoMemory() {
         rows.removeAll(); flat16.removeAll(); presentPaths.removeAll(); fileID.removeAll(); pathID.removeAll()
+        occSlot.removeAll()
         resetTombstonesLocked()
         idPath.removeAll(); fileChunkCount.removeAll(); kindCode.removeAll(); kindID.removeAll(); idKind.removeAll(); dim = 0
         // Immediately after the wipe, so the resident kind codes ARE the stored ones. Without this
@@ -9238,7 +9260,8 @@ public final class VectorStore: @unchecked Sendable {
                                 size: Int(sqlite3_column_int64(stmt, 9)),
                                 width: width, height: height, duration: duration))
                 let fid = internPath(path)
-                appendRowMetaLocked(fid, kindCode: internKind(kind), kind: kind, path: path)
+                appendRowMetaLocked(fid, kindCode: internKind(kind), kind: kind, path: path,
+                                    slot: lastAppendedSlot)
                 presentPaths.insert(path)
             }
         }
@@ -9942,7 +9965,7 @@ public final class VectorStore: @unchecked Sendable {
         // coverage migration observes every time it advances - msync first, drop second - just
         // done once for the whole index instead of a slice at a time.
         let vectorsSafe = flat16.isPersistent && !rows.isEmpty && dim > 0
-            && flat16.count == slotCount * dim
+            && flat16.count == rows.count * dim
             && flat16.extendFileCoverage()
         if vectorsSafe { flat16.msyncFile() }
         if let freed = internPathsLocked(allowUnloaded: true, dropVectorBlobs: vectorsSafe) {
