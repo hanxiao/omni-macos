@@ -9057,42 +9057,71 @@ public final class VectorStore: @unchecked Sendable {
         // describing rows that no longer exist. Unreachable today (this is only called with dim > 0
         // and a non-empty `rows`, so flat16 is non-empty and its base address is real), but the
         // blast radius is the entire index, so the pass reports rather than the cursor implying.
-        var scanned = false
-        flat16.withUnsafeMutableBufferPointer { fb in
-            guard let base = fb.baseAddress else { return }
-            scanned = true
-            for i in 0 ..< rows.count {
-                let alreadyDead = dead.contains(Int32(i))
-                if alreadyDead || shouldRemove(i) {
-                    if i < baseRows, baseSurvivors == nil { baseSurvivors = (0 ..< Int32(i)).map { $0 } }
-                    if !alreadyDead {
-                        removedPaths.insert(rows[i].path)
-                        fileChunkDec(fileID[i], rows[i].kind, rows[i].path)
-                    }
-                    if i < firstRemoved { firstRemoved = i }
-                    continue
+        // PHASE A - ROWS. No vector moves here, deliberately. A vector belongs to every row that
+        // points at it, so it cannot be relocated by one row's position; the pointer travels with
+        // the row and is remapped in phase B, once it is known which CONTENTS still have an owner.
+        let scanned = true
+        for i in 0 ..< rows.count {
+            let alreadyDead = dead.contains(Int32(i))
+            if alreadyDead || shouldRemove(i) {
+                if !alreadyDead {
+                    removedPaths.insert(rows[i].path)
+                    fileChunkDec(fileID[i], rows[i].kind, rows[i].path)
                 }
-                if i < baseRows, baseSurvivors != nil { baseSurvivors?.append(Int32(i)) }
-                if w != i {
-                    (base + w * dim).update(from: base + slotOf(i) * dim, count: dim)
-                    rows[w] = rows[i]; fileID[w] = fileID[i]; kindCode[w] = kindCode[i]
-                    // The vector just moved to row w's position, so that IS its slot now.
-                    // TODO(v5): once contents are shared this is wrong - a vector belongs to many
-                    // rows and cannot be relocated by one row's position. Row compaction and slot
-                    // compaction separate, the latter driven by the free list.
-                    rows[w].slot = Int32(w); occSlot[w] = Int32(w)
-                }
-                w += 1
+                if i < firstRemoved { firstRemoved = i }
+                continue
             }
+            if w != i {
+                rows[w] = rows[i]; fileID[w] = fileID[i]; kindCode[w] = kindCode[i]
+                occSlot[w] = occSlot[i]
+            }
+            w += 1
         }
         guard scanned else { return removedPaths }   // nothing was examined, so nothing may be dropped
         let removed = rows.count - w
         guard removed > 0 else { return removedPaths }
         deadRows.removeAll(keepingCapacity: true)   // collected by this pass
         deadIdxCache = nil
-        flat16.removeLast(removed * dim)
         rows.removeLast(removed); fileID.removeLast(removed); kindCode.removeLast(removed)
         occSlot.removeLast(removed)
+
+        // PHASE B - CONTENTS. A content survives when at least one surviving row still points at
+        // it. Dropping a file no longer implies dropping its vectors: another file may hold the
+        // same passage, which is the whole point of the content-addressed store.
+        let oldSlots = slotCount
+        if oldSlots > 0 {
+            var live = [Bool](repeating: false, count: oldSlots)
+            for s in occSlot where s >= 0 && Int(s) < oldSlots { live[Int(s)] = true }
+            var remap = [Int32](repeating: -1, count: oldSlots)
+            var next = 0
+            for sl in 0 ..< oldSlots where live[sl] {
+                remap[sl] = Int32(next)
+                if sl < baseRows { baseSurvivors = (baseSurvivors ?? []) + [Int32(sl)] }
+                next += 1
+            }
+            if next < oldSlots {
+                // Ascending, and remap[s] <= s always, so a forward copy never overwrites a source
+                // it has not read yet.
+                var moved = false
+                flat16.withUnsafeMutableBufferPointer { fb in
+                    guard let base = fb.baseAddress else { return }
+                    moved = true
+                    for sl in 0 ..< oldSlots where live[sl] {
+                        let d = Int(remap[sl])
+                        if d != sl { (base + d * dim).update(from: base + sl * dim, count: dim) }
+                    }
+                }
+                if moved { flat16.removeLast((oldSlots - next) * dim) }
+            }
+            for i in occSlot.indices {
+                let sl = Int(occSlot[i])
+                guard sl >= 0, sl < oldSlots, remap[sl] >= 0 else { continue }
+                occSlot[i] = remap[sl]; rows[i].slot = remap[sl]
+            }
+            // The base is still exactly valid when no CONTENT below its boundary was dropped: every
+            // such slot then remaps to itself.
+            if baseSurvivors?.count == baseRows { baseSurvivors = nil }
+        }
         // Every row index at or past `firstRemoved` just moved, so no window survives a compaction.
         // Rebuilt here, OUTSIDE the flat16 closure and AFTER the truncation, for two reasons: the
         // closure has its own early return (a nil base address) that skips its body while the
