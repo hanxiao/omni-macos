@@ -185,3 +185,59 @@ Built, tested and pinned with a negative control each:
     SchemaV5            9 tests   DDL, unique key index, reverse edge plan
 
 Not yet integrated: the store's in-memory model, the write path, the migration itself.
+
+## A lead worth taking, measured: Matryoshka truncation as the coarse tier
+
+`jina-embeddings-v5-omni-nano` supports Matryoshka truncation from 768 down to 32 dimensions, and
+this index is built with exactly that model. A truncated vector is a PREFIX of one already stored,
+renormalized, so a coarse tier costs no re-embedding and no extra disk: it is a narrower read of
+the file that exists.
+
+Measured on 200,000 real vectors read straight out of `index.sqlite.vecs`, 200 queries, recall@10
+against a full-768 ground truth:
+
+    dims   B/row   direct   + exact rerank of top C
+                            C=50     C=200    C=1000
+      32      64    55.9%   79.4%    91.0%    96.2%
+      64     128    68.3%   92.0%    95.9%    97.3%
+     128     256    77.2%   95.0%    96.6%    97.2%
+     256     512    85.0%   96.6%    97.3%    97.2%
+     768    1536    98.3%   96.8%    97.0%    97.0%
+
+READ THESE AGAINST A CEILING OF ~97%, NOT 100%. The 768 row is the positive control and it must
+read 100% by construction; it reads 98.3% because re-deriving the top 10 from the same matrix
+reorders exact ties. A first version of this experiment renormalized the truncated copies but not
+the ground-truth matrix and put the control at 90.9% - the control is what caught it.
+
+WHERE THIS IS INTERESTING, and it is not where it first looks. As a STANDALONE representation
+truncation loses to the shipped bit quantization at equal bytes: MRL-256 is 512 B/row at 85.0%
+direct, where 4-bit is 432 B/row at 0.9410. Dropping dimensions entirely is worse than keeping all
+768 at lower precision, which is what one would expect.
+
+It wins on C. The funnel note in VectorStore records that the coarse tier is cheap sequential
+bandwidth while each extra candidate is "a scattered 1.5 KB gather out of a 6.5 GB mmap plus host
+reduce work - linear in C and cache-hostile", and that past roughly C=6400 the funnel is slower
+than the full scan it replaces. The shipped 2-bit tier needs C=6400-25600 to reach full recall.
+Truncation to 128 dims reaches the ceiling at C=200, which is 32x fewer scattered gathers - the
+expensive resource in that trade, by the code's own analysis.
+
+It also composes with deduplication rather than competing: 6.2M contents at 256 B/row is a 1.6 GB
+coarse tier against today's 15.4 GB file.
+
+NOT MEASURED, AND DO NOT ASSUME: truncation COMBINED with bit quantization. An attempt at it here
+produced 2-20% recall, which is not a finding - the Hadamard transform in the simulation was wrong
+and crashed outright on 768, which is not a power of two. The combination has to be measured
+against the real MLX quantizer through `omni-verify`, not simulated in numpy. Also unmeasured: any
+speed claim at all. Everything above is recall.
+
+## Other leads from the 2026 literature, unevaluated
+
+- RaBitQ (SIGMOD 2024, arXiv 2405.12497) and Extended RaBitQ (arXiv 2409.09913): scalar
+  quantization with an asymptotically optimal error bound, reported to beat PQ. Notably it relies
+  on a random rotation, which is what the shipped Hadamard transform already approximates - so this
+  port is partway there and the comparison is narrow rather than a rewrite. Also
+  arXiv 2602.23999 (GPU-native IVF-RaBitQ) and arXiv 2604.19528 (RaBitQ vs TurboQuant).
+- SPFresh (arXiv 2410.14452) measures that updating a third of the vectors costs a graph index more
+  than a point of recall and 4x tail latency. That is an argument FOR the brute-force scan this app
+  already uses: a continuously re-indexing local corpus is the worst case for a graph, and
+  deduplication plus a truncated coarse tier is what keeps the scan affordable without one.
