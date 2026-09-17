@@ -183,8 +183,16 @@ Built, tested and pinned with a negative control each:
     ChunkDiff          15 tests   set diff, reference multiplicity
     OccurrenceIndex    16 tests   slot mask, expansion, the scope leak
     SchemaV5            9 tests   DDL, unique key index, reverse edge plan
+    ContentSharing     17 tests   the store end to end: write, search, delete, coverage, reload
 
-Not yet integrated: the store's in-memory model, the write path, the migration itself.
+Integrated: the store's in-memory model, the write path, both reducers, the quantized funnel,
+compaction, reload, vector coverage, and the slot-column backfill that upgrades an existing index.
+
+Not integrated: the `chunk` / `occurrence` table split. The store shares contents through
+`chunks.slot` plus the partial index on `chunk_text.chunk_key`, which is the same content-addressed
+model reached without moving 9.7M rows; the split tables and MigrationV5's backfill remain the
+route to storing a locator per occurrence rather than per chunk, which is what a shared chunk needs
+before it can report "Line 12 of A and Line 4310 of B".
 
 ## A lead worth taking, measured: Matryoshka truncation as the coarse tier
 
@@ -242,72 +250,69 @@ speed claim at all. Everything above is recall.
   already uses: a continuously re-indexing local corpus is the worst case for a graph, and
   deduplication plus a truncated coarse tier is what keeps the scan affordable without one.
 
-## The last layer: coverage counts rows
+## Coverage, converted to positions
 
 Content sharing is complete and correct through the write path, both reducers, the quantized
-funnel, compaction, and a plain reload. It is OFF by default because of one remaining protocol:
-vector coverage.
+funnel, compaction, reload, and now vector coverage.
 
 WHAT COVERAGE IS. `coveredRows` claims "the first C slots of .vecs are durable, and the rows that
 own them have had their SQLite blob cleared". That claim is what lets the index stop storing every
 vector twice - 6.47 GB on the measured index - and it is also why an error here is unrecoverable
 rather than merely wrong: for a covered row the file is the only copy.
 
-WHY IT BREAKS. Every part of it counts ROWS.
+WHY IT BROKE. Every part of it counted ROWS, and under v4 a row index and a file position are the
+same number, so every one of those row facts was accidentally right. Once contents are shared they
+part company - the file holds FEWER positions than there are rows, and a tombstone occupies a row
+index without occupying a position - and each of the following was then wrong in a different way:
 
-    coveredRows                 advanced per row by the stamp
-    covered == coveredRows - holes    the loader's own check, a row count
-    coveredRows > rows.count          the audit's bound
-    for i in 0 ..< min(coveredRows, rows.count) where !deadRows.contains(i)
-                                the restore walk, indexing rows and slots with one variable
+    coveredRows                        advanced per row by the stamp
+    covered == coveredRows - holes     the loader's check
+    coveredRows >= rows.count          the migration-complete test
+    restoreCoveredBlobsLocked          paired rows with positions by RANK
+    recordHolesLocked(victims)         victims are ROW indices, holes are POSITIONS
+    scores[deadRow] = -inf             the delta mask, into a per-CONTENT array
+    the audit's four invariants        all four stated as row facts
 
-Once contents are shared the file holds FEWER positions than there are rows, so every row past the
-first duplicate is mis-seated. `testSharingSurvivesCoverageAndReload` is the gate and carries this
-diagnosis; it drives coverage the way a real index does, which is why the other reload tests - all
-at coverage zero - never saw it.
+WHAT IT IS NOW. Coverage is a statement about POSITIONS, which is what it always physically was:
 
-THE CHANGE, stated so it can be executed rather than re-derived. Coverage becomes a statement about
-POSITIONS in the vector file, which is what it always physically was:
+  1. The stamp advances by positions (`coverUnits = slotCount`), and clears blobs by position
+     RANGE rather than by an id watermark - which stopped meaning "these positions are covered"
+     the moment a duplicate could carry a high id and a low slot. `idx_chunk_slot` makes the range
+     query O(slice) rather than O(covered), which is the property the watermark existed to buy.
+  2. A duplicate written AFTER its content is covered has its blob dropped at write time
+     (`persistSlotsLocked`). It reuses a position the claim already covers, so no later slice will
+     ever reach it, and one stranded blob makes the per-slice identity fail forever: coverage stops
+     advancing for the life of the index while `pending_vecs` grows without bound.
+  3. A hole is a position NO LIVE ROW POINTS AT, not a dead row index. `releasedSlotsLocked` is the
+     conversion, and it is the difference between a delete that frees a vector and one that tells
+     the loader to skip bytes a surviving file still reads.
+  4. `restoreCoveredBlobsLocked` reads (id, slot) pairs out of the table instead of counting ranks,
+     and writes a position's bytes back to EVERY row that points at it - any of them may be the one
+     that outlives the others.
+  5. The delta half of the score vector is masked by ORPHANED POSITION, matching what
+     maskDeadLocked already did for the base half. It was the last row-indexed mask, and on a
+     covered index with tombstones it reliably killed every content in the delta: those files
+     scored -inf and vanished from search while their vectors sat correct on disk and every audit
+     passed.
+  6. The loader claims positions EXACTLY rather than by "is the stored slot behind the cursor".
+     A compaction that drops a representative leaves the surviving duplicate holding a slot lower
+     than its id-order neighbours', at which point "behind the cursor" means "someone else's
+     vector". The rebuild path tracks who actually took each stored slot and writes the corrected
+     numbering back; the coverage path refuses unless a live row really occupies the position.
+  7. The audit speaks positions in all four of its invariants, and its last one had to change in
+     kind: `flat16.count == slotCount * dim` is a tautology once slotCount is derived from
+     flat16's own length, so it asks instead that no stored slot points past the end of the file
+     and that the resident mirror is lockstep with the rows.
 
-  1. `coveredRows` means "the first C POSITIONS are durable". Rename it at the same time; the name
-     is half the bug.
-  2. The stamp advances by DISTINCT positions cleared, not by rows visited. A row whose slot is
-     already below C has nothing to clear and must not advance it.
-  3. A blob may be cleared when the row's SLOT is below C. Several rows can clear against one
-     position; the last one does not advance anything.
-  4. The loader decides covered by `slot < C`, never by the walk. The walk survives only for rows
-     with no stored slot, i.e. an index that has not been through the backfill.
-  5. `covered == C - holes` becomes a count of distinct covered POSITIONS.
-  6. `restoreCoveredBlobsLocked` writes a position's bytes back to EVERY row that points at it,
-     because any of them may be the one that outlives the others.
-  7. The audit's bounds compare against the position count, not `rows.count`.
+THE UPGRADE PATH. `chunks.slot` is filled in for an existing index by `backfillSlotsLocked`, using
+MigrationV5.slots - the same walk the loader performs, not a second derivation. It runs after the
+load and again after the v3 -> v4 conversion (the column is a v4 column, so the first call on an
+upgrading index runs against a table that does not have one), and is gated on a meta flag rather
+than a scan, because `WHERE slot < 0` cannot use the partial index and a full pass over a 9.7M-row
+table on every open is not a cost to hide. Both conversions that REBUILD `chunks` clear the flag,
+since the column they describe has just been replaced.
 
-79 uses of `coveredRows`, 14 of which conflate the two units, inside a 36-site protocol that also
-carries the hole list and the crash-recovery marker.
-
-PROGRESS: THE MAIN PATH IS DONE. Coverage now advances by POSITION
-(`coverUnits = slotCount`), clears blobs by position RANGE rather than by an id watermark - which
-stopped meaning "these positions are covered" the moment a duplicate could carry a high id and a low
-slot - and `idx_chunk_slot` makes that range query O(slice) rather than O(covered), which is the
-property the watermark existed to buy. The loader's checks count positions. Both loaders skip the
-append for a reusing row, and the FALLBACK loader tests that BEFORE the blob guard: a reusing row's
-blob is cleared as soon as its content is covered, so demanding one dropped the row from the index
-entirely - that is how a shared passage lost the last file holding it while the others survived.
-`testSharingSurvivesCoverageAndReload` drives coverage the way a real index does and passes.
-
-WHAT IS LEFT: the REPAIR paths. With sharing on, seven tests still fail, all of them recovery rather
-than steady state - CoverageCRUDTests.testMigrationRunsOnceAndNeverAgain,
-CoverageClaimRepairTests.testAmbiguousMismatchWithHolesStillRefuses, OrphanTwinRepairTests. They
-reconstruct or validate a claim by counting rows, exactly as the main path used to. They are the
-same unit confusion in the code that runs when something has already gone wrong, which is the worst
-place to leave it half-converted and the reason the flag is still off.
-
-WHY THE REST IS NOT DONE HERE. Not effort: judgement. This is the one place in the store where a subtle
-error destroys data rather than returning a wrong row, and the four layers before it (the candidate
-path, the rerank's row/content write, dead-row masking, the loader's append test) each took several
-wrong diagnoses before the right one. Starting a data-loss-capable protocol change in that state is
-how indexes get corrupted. The gate test, this plan, and the off switch are the correct handover.
-
-NOT A CHEAP WAY ROUND IT. Disabling coverage while sharing is on was considered and rejected by
-arithmetic: sharing saves 5.4 GB of vectors, and leaving coverage off costs 6.47 GB of duplicated
-blobs in SQLite. The trade is net negative.
+WHAT IS STILL v4 BEHAVIOUR. `reclaimVectorHoles` declines under sharing, so holes accumulate rather
+than being reclaimed. That is what v4 does in practice too (its own note records 96,256 of them
+never taken back), and the answer is the free list - a released position handed to the next new
+content - which belongs with making that pass slot-aware rather than bolted on beside it.

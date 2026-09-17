@@ -1,4 +1,5 @@
 import XCTest
+import SQLite3
 @testable import OmniKit
 
 /// ONE CONTENT, ONE VECTOR. Everything else in this change is machinery for this test: two files
@@ -217,6 +218,47 @@ final class ContentSharingTests: XCTestCase {
         }
     }
 
+    /// THE SAME EXPANSION IN FULL bf16 MODE, which is a different reducer entirely.
+    ///
+    /// The funnel test above forces quant mode, so it exercises the candidate path and its host
+    /// reducer. An index small enough to stay in full bf16 - the state every new index is in, and
+    /// every small one stays in - scores exactly and reduces on the GPU instead, and that reducer
+    /// has its own answer to "a content belongs to several files". Running only the funnel version
+    /// leaves the default path unmeasured.
+    func testTheGPUReducerExpandsSharedContents() throws {
+        let savedQuant = VectorStore.quantBaseOverride
+        VectorStore.quantBaseOverride = nil          // full bf16: the GPU scatter-max reducer
+        defer { VectorStore.quantBaseOverride = savedQuant }
+
+        let dim = 32
+        let store = try VectorStore(dbURL: tempDB()); defer { store.close() }
+        func v(_ i: Int) -> [Float] { spread(i, dim) }
+        let sharedVec = v(1_000_000)
+        for f in 0 ..< 400 {
+            let e = (f % 97 == 0) ? sharedVec : v(f + 3)
+            let key = (f % 97 == 0) ? "5555eeee" : String(format: "%08x", f &+ 0x1000)
+            try store.replace(path: "/r/f\(f).txt",
+                              chunks: [IndexedChunk(path: "/r/f\(f).txt", modified: 1, size: 1,
+                                                    kind: "text", chunkIndex: 0, snippet: "s\(f)",
+                                                    embedding: e, locator: "Line 1", chunkKey: key)])
+        }
+        var worst: Float = 0
+        for f in 0 ..< 400 where f % 97 != 0 {
+            worst = Swift.max(worst, zip(v(f + 3), sharedVec).reduce(Float(0)) { $0 + $1.0 * $1.1 })
+        }
+        XCTAssertLessThan(worst, 0.95, "fixture vectors collide; the ranking assertion would be meaningless")
+        let sharers = (0 ..< 400).filter { $0 % 97 == 0 }.map { "/r/f\($0).txt" }
+        XCTAssertEqual(store.vectorBufferUse.used / dim, 400 - sharers.count + 1,
+                       "the write path did not share this fixture's repeated passage")
+
+        let hits = store.search(sharedVec, topK: 20)
+        XCTAssertEqual(Set(hits.prefix(sharers.count).map(\.path)), Set(sharers),
+                       "the GPU reducer did not expand the shared content into every file holding it")
+        for h in hits where sharers.contains(h.path) {
+            XCTAssertEqual(h.score, 1.0, accuracy: 1e-2, "\(h.path) got someone else's score")
+        }
+    }
+
     /// Deleting one holder of a shared passage must not stop the others being found through the
     /// funnel either - that is where masking by dead ROW index against a per-CONTENT score vector
     /// goes wrong.
@@ -300,5 +342,349 @@ final class ContentSharingTests: XCTestCase {
         // And a file that shares nothing must still find its own content.
         let solo = store.search(spread(0 + 20, dim), topK: 1).first
         XCTAssertEqual(solo?.path, "/c/f0.txt", "a non-sharing row was handed the wrong vector")
+    }
+
+    /// A DUPLICATE WRITTEN AFTER ITS CONTENT IS ALREADY COVERED.
+    ///
+    /// The steady state of a live index, and the one testSharingSurvivesCoverageAndReload cannot
+    /// reach: it writes every file before coverage has moved at all, so every duplicate's blob sits
+    /// in the uncovered tail where the position-range clear finds it. Once coverage has caught up,
+    /// a new file sharing an existing passage gets a LOW slot - one the claim already covers - and
+    /// its blob is behind the range every later slice clears. If nothing removes it, the accounting
+    /// identity coverage checks per slice can never balance again and the index stops covering for
+    /// good: on a real index, `pending_vecs` growing without bound while `covered` does not move.
+    ///
+    /// The fixture recipe is CoverageClaimRepairTests.makeCoveredIndex, not a new one, and for the
+    /// reason recorded there: coverage only advances over a PERSISTENT mapping, that mapping is
+    /// created by the incremental fold, and the fold only happens in quant mode with an append
+    /// between two searches. A fixture that gets any of that wrong covers nothing and the test
+    /// passes by measuring nothing - which is what the first three versions of this one did.
+    func testADuplicateWrittenAfterCoverageStillDrains() throws {
+        let savedQuant = VectorStore.quantBaseOverride
+        VectorStore.quantBaseOverride = VectorStore.scanBits
+        defer { VectorStore.quantBaseOverride = savedQuant }
+
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("share-late-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("index.sqlite")
+
+        let d = 64
+        let files = 40
+        func hot(_ i: Int) -> [Float] {
+            var v = [Float](repeating: 0, count: d); v[i % d] = 1; return v
+        }
+        func write(_ store: VectorStore, _ path: String, _ e: [Float], key: String) throws {
+            try store.replace(path: path, chunks: [IndexedChunk(path: path, modified: 1, size: 1,
+                                                                kind: "text", chunkIndex: 0,
+                                                                snippet: "s\(key)", embedding: e,
+                                                                locator: "Line 1", chunkKey: key)])
+        }
+        do {
+            let s = try VectorStore(dbURL: url)
+            for f in 0 ..< files - 5 {
+                try write(s, "/d/f\(f).txt", hot(f), key: String(format: "%08x", f &+ 0x5000))
+            }
+            _ = s.search(hot(0), topK: 5)                  // build the base
+            for f in files - 5 ..< files {
+                try write(s, "/d/f\(f).txt", hot(f), key: String(format: "%08x", f &+ 0x5000))
+            }
+            _ = s.search(hot(0), topK: 5)                  // incremental fold -> persistent mapping
+            s.close()
+        }
+        for _ in 0 ..< 4 { let s = try VectorStore(dbURL: url); s.close() }
+        XCTAssertEqual(claim(url), files, "fixture never reached full coverage; the test would prove nothing")
+        XCTAssertEqual(pending(url), 0, "fixture never cleared the blobs")
+
+        // NOW the duplicate, against a content whose slot the claim already covers.
+        do {
+            let s = try VectorStore(dbURL: url)
+            try write(s, "/d/late.txt", hot(3), key: String(format: "%08x", 3 &+ 0x5000))
+            _ = s.search(hot(3), topK: 5)
+            s.close()
+        }
+        for _ in 0 ..< 4 { let s = try VectorStore(dbURL: url); s.close() }
+
+        let store = try VectorStore(dbURL: url); defer { store.close() }
+        XCTAssertNil(store.coverageAudit(), "coverage audit failed after a late duplicate")
+        XCTAssertEqual(pending(url), 0,
+                       "the late duplicate's blob is stranded: coverage can never balance again")
+        XCTAssertEqual(store.count, files + 1, "rows lost")
+        XCTAssertEqual(Set(store.search(hot(3), topK: 2).map(\.path)), ["/d/f3.txt", "/d/late.txt"],
+                       "the late duplicate did not share the covered content")
+    }
+
+    /// DELETING ONE SHARER OF A COVERED CONTENT.
+    ///
+    /// A hole says "the file holds a vector here that no row owns", and under v4 a tombstoned row
+    /// always means exactly that - the row and the position are the same number. Under sharing a
+    /// tombstone releases a POINTER: if another live row still points at the position, recording a
+    /// hole for it does not leak space, it tells the loader to skip bytes that a surviving file
+    /// still reads, which shifts every row after it onto its neighbour's vector. The reverse
+    /// mistake is just as bad: taking the LAST pointer and recording nothing leaves the prefix
+    /// claiming a row it no longer has, and the next open refuses to read the index at all.
+    ///
+    /// Both directions are checked here, on a covered index, because at coverage zero the hole
+    /// recorder returns before it does anything and neither can happen.
+    func testDeletingASharerOfACoveredContent() throws {
+        let savedQuant = VectorStore.quantBaseOverride
+        VectorStore.quantBaseOverride = VectorStore.scanBits
+        defer { VectorStore.quantBaseOverride = savedQuant }
+
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("share-del-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("index.sqlite")
+
+        let d = 64
+        let files = 40
+        func hot(_ i: Int) -> [Float] {
+            var v = [Float](repeating: 0, count: d); v[i % d] = 1; return v
+        }
+        func write(_ store: VectorStore, _ path: String, _ e: [Float], key: String) throws {
+            try store.replace(path: path, chunks: [IndexedChunk(path: path, modified: 1, size: 1,
+                                                                kind: "text", chunkIndex: 0,
+                                                                snippet: "s\(key)", embedding: e,
+                                                                locator: "Line 1", chunkKey: key)])
+        }
+        // f7 and f8 hold the SAME content; everything else is its own.
+        func key(_ f: Int) -> String { String(format: "%08x", (f == 8 ? 7 : f) &+ 0x6000) }
+        func vecOf(_ f: Int) -> [Float] { hot(f == 8 ? 7 : f) }
+        do {
+            let s = try VectorStore(dbURL: url)
+            for f in 0 ..< files - 5 { try write(s, "/e/f\(f).txt", vecOf(f), key: key(f)) }
+            _ = s.search(hot(0), topK: 5)
+            for f in files - 5 ..< files { try write(s, "/e/f\(f).txt", vecOf(f), key: key(f)) }
+            _ = s.search(hot(0), topK: 5)
+            s.close()
+        }
+        for _ in 0 ..< 4 { let s = try VectorStore(dbURL: url); s.close() }
+        // 39 contents for 40 files, and the claim covers all of them.
+        XCTAssertEqual(claim(url), files - 1, "fixture never reached full coverage over the contents")
+
+        // DROP ONE SHARER. The content still has an owner, so nothing is released.
+        do {
+            let s = try VectorStore(dbURL: url)
+            s.deletePath("/e/f8.txt")
+            XCTAssertNil(s.coverageAudit(), "audit failed after dropping one sharer")
+            XCTAssertEqual(s.search(hot(7), topK: 1).first?.path, "/e/f7.txt",
+                           "the survivor lost the vector it shared")
+            s.close()
+        }
+        do {
+            let s = try VectorStore(dbURL: url); defer { s.close() }
+            XCTAssertNil(s.coverageAudit(), "audit failed after reloading past the dropped sharer")
+            XCTAssertEqual(s.count, files - 1, "rows lost or kept wrongly")
+            XCTAssertEqual(s.search(hot(7), topK: 1).first?.path, "/e/f7.txt",
+                           "the survivor was mis-seated across the reload")
+            // A file well past the shared one must still answer for itself: a spurious hole shifts
+            // everything after it, and only a row past the hole can show that.
+            XCTAssertEqual(s.search(hot(37), topK: 1).first?.path, "/e/f37.txt",
+                           "a row after the deleted sharer was handed a neighbour's vector")
+        }
+
+        // DROP THE LAST SHARER. Now the position really is released.
+        do {
+            let s = try VectorStore(dbURL: url)
+            s.deletePath("/e/f7.txt")
+            XCTAssertNil(s.coverageAudit(), "audit failed after dropping the last sharer")
+            s.close()
+        }
+        let s = try VectorStore(dbURL: url); defer { s.close() }
+        XCTAssertNil(s.coverageAudit(), "audit failed after reloading past the released content")
+        XCTAssertEqual(s.count, files - 2, "rows lost")
+        XCTAssertNotEqual(s.search(hot(7), topK: 1).first?.path, "/e/f7.txt", "the deleted file came back")
+        XCTAssertEqual(s.search(hot(37), topK: 1).first?.path, "/e/f37.txt",
+                       "a row after the released position was handed a neighbour's vector")
+    }
+
+    /// BULK DELETES FROM A COVERED, SHARING INDEX, checked by asking every survivor to find itself.
+    ///
+    /// That assertion is the point. Counts and audits all balance while every vector is one
+    /// position out, so a test that checks how many rows came back proves nothing; only "does f37
+    /// still score 1.0 against its own vector" can see a shift.
+    ///
+    /// It caught a silent one. Once coverage is on, tombstones outnumber nothing - each hole is a
+    /// ROW - so the row numbering runs ahead of the position numbering, and the delta half of the
+    /// score vector was being masked with dead ROW indices against a per-CONTENT array. Every
+    /// content in the delta was reliably killed: the files holding them scored -inf and vanished
+    /// from search while their vectors sat correct on disk and every audit passed.
+    func testDeletingFromACoveredSharingIndexKeepsEveryVectorWithItsRow() throws {
+        let savedQuant = VectorStore.quantBaseOverride
+        VectorStore.quantBaseOverride = VectorStore.scanBits
+        defer { VectorStore.quantBaseOverride = savedQuant }
+
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("share-compact-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("index.sqlite")
+
+        let d = 64
+        let files = 60
+        func hot(_ i: Int) -> [Float] {
+            var v = [Float](repeating: 0, count: d); v[i % d] = 1; return v
+        }
+        // Every fourth file shares the content of the file four before it, so a quarter of the
+        // index is duplicates and the positions run well behind the rows.
+        func rep(_ f: Int) -> Int { f % 4 == 3 ? f - 3 : f }
+        func write(_ store: VectorStore, _ f: Int) throws {
+            let p = "/g/f\(f).txt"
+            try store.replace(path: p, chunks: [IndexedChunk(path: p, modified: 1, size: 1, kind: "text",
+                                                             chunkIndex: 0, snippet: "s\(f)",
+                                                             embedding: hot(rep(f)), locator: "Line 1",
+                                                             chunkKey: String(format: "%08x", rep(f) &+ 0x7000))])
+        }
+        do {
+            let s = try VectorStore(dbURL: url)
+            for f in 0 ..< files - 5 { try write(s, f) }
+            _ = s.search(hot(0), topK: 5)
+            for f in files - 5 ..< files { try write(s, f) }
+            _ = s.search(hot(0), topK: 5)
+            s.close()
+        }
+        for _ in 0 ..< 4 { let s = try VectorStore(dbURL: url); s.close() }
+        XCTAssertGreaterThan(claim(url), 0, "fixture never covered anything; the test would prove nothing")
+        XCTAssertEqual(pending(url), 0, "fixture never cleared the blobs")
+
+        // A third of the index, which on a covered store is all tombstones: under coverage a
+        // removal never falls through to a physical compaction, because the holes it just committed
+        // describe the layout the compaction would rewrite.
+        let gone = Set(stride(from: 1, to: files, by: 3))
+        do {
+            let s = try VectorStore(dbURL: url)
+            for f in gone { s.deletePath("/g/f\(f).txt") }
+            XCTAssertNil(s.coverageAudit(), "audit failed after deleting from a covered sharing index")
+            s.close()
+        }
+        let s = try VectorStore(dbURL: url); defer { s.close() }
+        XCTAssertNil(s.coverageAudit(), "audit failed after reloading past the deletes")
+        XCTAssertEqual(s.count, files - gone.count, "rows lost or kept wrongly")
+        // EVERY survivor finds itself. A file that shares its content answers under its
+        // representative's vector, so the top hit for that vector must be one of the two.
+        for f in 0 ..< files where !gone.contains(f) {
+            let top = s.search(hot(rep(f)), topK: 4).map(\.path)
+            XCTAssertTrue(top.contains("/g/f\(f).txt"),
+                          "f\(f) lost its vector across the deletes; got \(top)")
+        }
+    }
+
+    /// THE PHYSICAL COMPACTION, which is the one path that MOVES a vector.
+    ///
+    /// Under coverage a delete only ever tombstones - the fall-through to compaction is explicitly
+    /// blocked, because the holes the delete just committed describe the layout a compaction would
+    /// rewrite - so this forces it by turning tombstoning off. That makes the removal take the
+    /// compaction path, which must first write every covered vector back into SQLite: the file is
+    /// their only copy and it is about to be rebuilt.
+    ///
+    /// That restore is where sharing bites. v4 pairs rows with positions by RANK: the k-th live row
+    /// of the covered prefix with SQLite's k-th row in id order. Once several rows read one
+    /// position the rank is not the position, so a rank-paired restore hands rows their neighbours'
+    /// vectors - and the compaction then writes that in, permanently, because the blobs it just
+    /// wrote become the only copy.
+    func testCompactingACoveredSharingIndexRestoresEveryRowsBlob() throws {
+        let savedQuant = VectorStore.quantBaseOverride
+        let savedTomb = VectorStore.tombstones
+        let savedCov = VectorStore.vecCoverage
+        VectorStore.quantBaseOverride = VectorStore.scanBits
+        defer {
+            VectorStore.quantBaseOverride = savedQuant
+            VectorStore.tombstones = savedTomb
+            VectorStore.vecCoverage = savedCov
+        }
+
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("share-compact-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("index.sqlite")
+
+        let d = 64
+        let files = 60
+        func hot(_ i: Int) -> [Float] {
+            var v = [Float](repeating: 0, count: d); v[i % d] = 1; return v
+        }
+        func rep(_ f: Int) -> Int { f % 4 == 3 ? f - 3 : f }
+        func write(_ store: VectorStore, _ f: Int) throws {
+            let p = "/h/f\(f).txt"
+            try store.replace(path: p, chunks: [IndexedChunk(path: p, modified: 1, size: 1, kind: "text",
+                                                             chunkIndex: 0, snippet: "s\(f)",
+                                                             embedding: hot(rep(f)), locator: "Line 1",
+                                                             chunkKey: String(format: "%08x", rep(f) &+ 0x8000))])
+        }
+        do {
+            let s = try VectorStore(dbURL: url)
+            for f in 0 ..< files - 5 { try write(s, f) }
+            _ = s.search(hot(0), topK: 5)
+            for f in files - 5 ..< files { try write(s, f) }
+            _ = s.search(hot(0), topK: 5)
+            s.close()
+        }
+        for _ in 0 ..< 4 { let s = try VectorStore(dbURL: url); s.close() }
+        XCTAssertGreaterThan(claim(url), 0, "fixture never covered anything; the test would prove nothing")
+        XCTAssertEqual(pending(url), 0, "fixture never cleared the blobs")
+
+        VectorStore.tombstones = false          // force the compaction path
+        let gone = Set(stride(from: 2, to: files, by: 5))
+        let coveredBefore = claim(url)
+        do {
+            let s = try VectorStore(dbURL: url)
+            for f in gone { s.deletePath("/h/f\(f).txt") }
+            // THE COMPACTION RAN AND THE RESTORE WITH IT. A compaction stands coverage down,
+            // because it has just written every covered vector back into SQLite; a claim still
+            // standing here means the removal tombstoned instead and the test is measuring the
+            // path it was written to avoid.
+            XCTAssertEqual(s.coveredRowsForTest, 0, "no compaction happened; the test proves nothing")
+            // HOLD COVERAGE DOWN FROM HERE. Left running, the same session re-advances over the
+            // compacted file and deletes every blob the restore just wrote - so a restore that put
+            // them all on the wrong rows is erased before anything can read it, and the test passes
+            // whatever the restore did. This is the state a crash between the two leaves, and the
+            // state the restore exists for.
+            VectorStore.vecCoverage = false
+            s.close()
+        }
+        XCTAssertGreaterThan(coveredBefore, 0, "fixture lost its claim before the compaction")
+        XCTAssertGreaterThan(pending(url), 0, "the compaction wrote no blobs back")
+
+        // DROP THE ROW SIDECAR for the same reason. It carries the vectors straight from the file,
+        // so a reload that adopts it never reads a blob at all and a restore that wrote every blob
+        // to the wrong row looks perfect. Not a contrivance: the sidecar is a validated cache, and
+        // the state it is missing in is exactly when the restored blobs are the only copy.
+        for suffix in [".rows", ".rows-wal", ".rows-shm"] {
+            try? FileManager.default.removeItem(atPath: url.path + suffix)
+        }
+
+        let s = try VectorStore(dbURL: url); defer { s.close() }
+        XCTAssertNil(s.coverageAudit(), "audit failed after a compaction of a covered sharing index")
+        XCTAssertEqual(s.count, files - gone.count, "rows lost or kept wrongly")
+        for f in 0 ..< files where !gone.contains(f) {
+            let top = s.search(hot(rep(f)), topK: 4).map(\.path)
+            XCTAssertTrue(top.contains("/h/f\(f).txt"),
+                          "f\(f) lost its vector across the compaction; got \(top)")
+        }
+    }
+
+    private func claim(_ db: URL) -> Int {
+        var h: OpaquePointer?
+        guard sqlite3_open(db.path, &h) == SQLITE_OK else { return -1 }
+        defer { sqlite3_close(h) }
+        var st: OpaquePointer?
+        defer { sqlite3_finalize(st) }
+        guard sqlite3_prepare_v2(h, "SELECT CAST(value AS INTEGER) FROM meta WHERE key='vecs_covered_rows';",
+                                 -1, &st, nil) == SQLITE_OK, sqlite3_step(st) == SQLITE_ROW else { return -1 }
+        return Int(sqlite3_column_int64(st, 0))
+    }
+
+    private func pending(_ db: URL) -> Int {
+        var h: OpaquePointer?
+        guard sqlite3_open(db.path, &h) == SQLITE_OK else { return -1 }
+        defer { sqlite3_close(h) }
+        var st: OpaquePointer?
+        defer { sqlite3_finalize(st) }
+        guard sqlite3_prepare_v2(h, "SELECT COUNT(*) FROM pending_vecs;", -1, &st, nil) == SQLITE_OK,
+              sqlite3_step(st) == SQLITE_ROW else { return -1 }
+        return Int(sqlite3_column_int64(st, 0))
     }
 }
