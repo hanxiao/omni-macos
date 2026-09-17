@@ -4210,6 +4210,54 @@ if args.count >= 4 && args[1] == "searchreal" {
     exit(0)
 }
 
+// Cross-pass chunk reuse: omni-verify reusebench <modelDir> <rootA> <rootB>
+//
+// Indexes rootA, then rootB, into ONE store, and reports what reached the encoder in each pass.
+// That is the measurement the single-root bench cannot make: duplicates INSIDE one pass are
+// collapsed by the indexer's own key cache in every build, so a one-pass benchmark reports the
+// same token count whatever the store does. What changed is the SECOND pass - a content the index
+// already holds a vector for, meeting the encoder again in a file crawled later.
+//
+// Run it twice with OMNI_STORE_REUSE=0 for the A/B; the pass-1 numbers should be identical and
+// only pass 2 should move.
+if args.count >= 5 && args[1] == "reusebench" {
+    let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[2]))
+    let fm = FileManager.default
+    let tmp = fm.temporaryDirectory.appendingPathComponent("reusebench-\(UUID().uuidString).sqlite")
+    defer { for e in ["", "-wal", "-shm", ".rows", ".vecs", ".quant"] { try? fm.removeItem(atPath: tmp.path + e) } }
+    let store = try VectorStore(dbURL: tmp)
+    var settings = IndexSettings(enabledKinds: [.text])
+    let nonText = FileExtractor.imageExtensions.union(FileExtractor.videoExtensions).union(FileExtractor.audioExtensions)
+    settings.ignore = OmniIgnore(text: (FileCrawler.skipDirNames.map { "\($0)/" } + nonText.sorted().map { "*.\($0)" }).joined(separator: "\n"))
+    func onePass(_ label: String, _ root: URL) async {
+        let idx = Indexer(store: store, embedder: engine)
+        let tok0 = engine.tokensProcessed
+        let chunks0 = store.count
+        let t0 = Date()
+        let emb: Int = await withCheckedContinuation { cont in
+            let l = NSLock(); var fired = false
+            idx.index(roots: [root], settings: settings, force: true) { p in
+                if p.done { l.lock(); let go = !fired; fired = true; l.unlock(); if go { cont.resume(returning: p.embedded) } }
+            }
+        }
+        let sec = -t0.timeIntervalSinceNow
+        print(String(format: "REUSEBENCH %@ reuse=%@ files=%d chunks+%d tok=%d %.2fs",
+                     label, VectorStore.storeChunkReuse ? "on " : "off",
+                     emb, store.count - chunks0, engine.tokensProcessed - tok0, sec))
+    }
+    await onePass("passA", URL(fileURLWithPath: args[3]))
+    await onePass("passB", URL(fileURLWithPath: args[4]))
+    // POSITIONS, not live vectors: the buffer keeps a slot for every tombstone until a reclaim
+    // takes it back, so this can exceed the chunk count after a re-index and a "shared %" derived
+    // from it would read negative. The chunk count is what it is; the store's own audit is what
+    // says the two agree.
+    let use = store.vectorBufferUse
+    print(String(format: "REUSEBENCH total chunks=%d positions=%d",
+                 store.count, engine.dim > 0 ? use.used / engine.dim : 0))
+    store.close()
+    exit(0)
+}
+
 // Content sharing, end to end: omni-verify sharebench <modelDir> <root> [searchReps]
 //
 // The A/B for OMNI_CONTENT_SHARING, run against a REAL corpus rather than synthetic vectors,

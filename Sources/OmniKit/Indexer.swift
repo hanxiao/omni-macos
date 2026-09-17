@@ -327,6 +327,38 @@ public final class Indexer: @unchecked Sendable {
             }
         }
         chunkVecLock.unlock()
+
+        // ACROSS PASSES, NOT JUST WITHIN ONE. The cache above is armed per pass and holds what THIS
+        // crawl has embedded; the store holds what every previous one did. Without this second
+        // lookup, a content the index already has a vector for is embedded again the moment it
+        // turns up in a file crawled later - which on this corpus is 38.5% of text chunks, and is
+        // why content sharing was a disk saving and not a GPU one until it landed.
+        //
+        // One point query per unique key on a covering index, ~2.5us, against a forward pass that
+        // costs milliseconds. It runs on the uniques only, so an in-pass duplicate never reaches
+        // it. Results go into the same cache, so a key looked up once is not looked up again.
+        if !uniqKeys.isEmpty {
+            let found = store.vectorsForContentKeys(uniqKeys.filter { !$0.isEmpty }, dim: embedder.dim)
+            if !found.isEmpty {
+                var keptTexts: [String] = [], keptKeys: [String] = [], keptOwners: [[(Int, Int)]] = []
+                keptTexts.reserveCapacity(uniqTexts.count)
+                keptKeys.reserveCapacity(uniqKeys.count)
+                keptOwners.reserveCapacity(owners.count)
+                chunkVecLock.lock()
+                for u in uniqTexts.indices {
+                    let key = uniqKeys[u]
+                    if !key.isEmpty, let v = found[key] {
+                        for (g, gi) in owners[u] { out[g][gi] = v }
+                        hits += owners[u].count
+                        if chunkVecCache[key] == nil { chunkVecCache[key] = v; chunkVecOrder.append(key) }
+                        continue
+                    }
+                    keptTexts.append(uniqTexts[u]); keptKeys.append(key); keptOwners.append(owners[u])
+                }
+                chunkVecLock.unlock()
+                uniqTexts = keptTexts; uniqKeys = keptKeys; owners = keptOwners
+            }
+        }
         noteChunkReuse(hits)
         guard !uniqTexts.isEmpty else { return out }
 

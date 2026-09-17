@@ -2414,6 +2414,55 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
+    /// VECTORS THIS INDEX ALREADY HOLDS FOR THESE CONTENTS, whatever file they came from.
+    ///
+    /// The lookup `chunkVectors(path:)` could not make. That one is scoped to ONE path and gated on
+    /// the file already being known, so a brand new log identical to eight thousand indexed ones is
+    /// embedded in full; this asks the content index directly, which is what the partial index on
+    /// `chunk_text.chunk_key` exists for.
+    ///
+    /// WITHOUT IT, SHARING SAVES DISK AND NOT GPU. Duplicate chunks inside one pass are collapsed
+    /// by the indexer's own cache, so the encoder sees each content once per PASS - measured: the
+    /// same corpus reports an identical `tokensProcessed` with sharing on and off. Across passes,
+    /// and for the 38.5% of this index that repeats between files crawled at different times,
+    /// nothing was saved at all until this.
+    ///
+    /// FROM THE RESIDENT BUFFER, for the same reason chunkVectors reads it there: a covered row has
+    /// no blob, which is nearly the whole index at rest.
+    ///
+    /// BIT-EXACT, which is why it is safe to return instead of embedding. The stored vector is the
+    /// bf16 rounding of what the encoder produced, and a freshly embedded one is rounded the same
+    /// way before it is stored or scored - so the bytes that reach `.vecs` are identical either
+    /// way, and so is every score computed from them.
+    public func vectorsForContentKeys(_ keys: [String], dim wantDim: Int) -> [String: [Float]] {
+        guard Self.contentSharing, Self.storeChunkReuse, !keys.isEmpty else { return [:] }
+        return queue.sync {
+            guard dbOpen(), wantDim > 0, wantDim == dim, slotCount > 0 else { return [:] }
+            var out: [String: [Float]] = [:]
+            out.reserveCapacity(keys.count)
+            flat16.withUnsafeBufferPointer { buf in
+                guard buf.count >= slotCount * wantDim else { return }
+                for key in keys where !key.isEmpty && out[key] == nil {
+                    guard let slot = liveSlotForContentLocked(StoreSchema.hexToBytes(key)) else { continue }
+                    let base = Int(slot) * wantDim
+                    guard slot >= 0, base >= 0, base + wantDim <= buf.count else { continue }
+                    var v = [Float](repeating: 0, count: wantDim)
+                    for k in 0 ..< wantDim { v[k] = Self.fromBF16(buf[base + k]) }
+                    // A non-finite stored vector is a row that should never have been written; hand
+                    // it back and the caller stores it again. Re-embedding is the cheap repair.
+                    guard v.allSatisfy({ $0.isFinite }) else { continue }
+                    out[key] = v
+                }
+            }
+            return out
+        }
+    }
+
+    /// The A/B lever for the lookup above, and the escape hatch if a store read on the indexing
+    /// path ever turns out to cost more than the forward pass it saves.
+    nonisolated(unsafe) public static var storeChunkReuse =
+        ProcessInfo.processInfo.environment["OMNI_STORE_REUSE"] != "0"
+
     public func duplicateChunks(key: String) -> [IndexedChunk]? {
         queue.sync {
             guard dbOpen() else { return nil }

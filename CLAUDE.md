@@ -444,9 +444,15 @@ follows is what a reader needs before touching this code.
   `occSlot`, `coveredRows` or `flat16`, decide which unit you are in first.
 - WHAT IT BUYS: 38.5% of text chunks on the real 2.68M-file index are duplicates (5.4 GB of a
   15.4 GB vector file); 9.3% on one project's agent logs. The rate is a property of the corpus.
-- WHAT IT DOES NOT BUY: GPU time. Duplicates inside one pass were ALREADY collapsed by the
-  indexer's own key-keyed cache, in both arms - `tokensProcessed` is identical. Cross-pass reuse
-  before embedding is not built; it would need a store lookup on the key ahead of the encoder.
+- WHAT IT DOES NOT BUY BY ITSELF: GPU time. Duplicates inside one pass were ALREADY collapsed by
+  the indexer's own key cache, in every build, so a one-pass benchmark reports the same
+  `tokensProcessed` whatever the store does. `VectorStore.vectorsForContentKeys` adds the part that
+  falls OUTSIDE a pass - content indexed today meeting the encoder again in a file crawled next
+  week - and it is worth 0.6% across two different projects' agent logs, because those corpora
+  barely overlap. The case for it is that the window is right, not that the number is big.
+  `OMNI_STORE_REUSE=0` turns it off. TEST IT ON FILES THAT DIFFER: two identical files never reach
+  the encoder twice anyway (file-level dedup, 0.4.9), so a duplicate-file fixture reports zero
+  embeddings whether or not chunk reuse exists.
 - WHAT IT COSTS: the store's write path is 11-16% slower in isolation and that is invisible end to
   end (122.4/123.2s with against 123.4/122.8s without on the same corpus), because indexing is 99%
   GPU. Search costs nothing measurable at 9,729,693 chunks: p50 4.3ms in both arms.
