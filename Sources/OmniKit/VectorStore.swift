@@ -4994,7 +4994,11 @@ public final class VectorStore: @unchecked Sendable {
     /// hot loop (they can in principle vary per chunk); `folderPrefix`/`ext` are path-based and so
     /// identical for every chunk of a file, so applying them once to each file's winner is exact.
     /// OMNI_GPU_REDUCE=0 falls back to the host reducer (A/B + safety).
-    static let gpuReduce = ProcessInfo.processInfo.environment["OMNI_GPU_REDUCE"] != "0"
+    /// A `var` so a test can A/B the two reducers in one process, which is the only way to assert
+    /// they agree. The same reasoning as `stemCountsAsExact`. There was NO such test before the
+    /// reduce was rewritten for shared contents, so the fast path could have diverged from the
+    /// reference silently.
+    nonisolated(unsafe) static var gpuReduce = ProcessInfo.processInfo.environment["OMNI_GPU_REDUCE"] != "0"
 
     /// A filter the GPU reduce can serve: only `kinds` may be set (masked per-row via the resident
     /// kind code), while `folderPrefix`/`ext`/`since` still force the host path (they need the
