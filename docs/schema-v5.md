@@ -304,13 +304,31 @@ WHAT IT IS NOW. Coverage is a statement about POSITIONS, which is what it always
      flat16's own length, so it asks instead that no stored slot points past the end of the file
      and that the resident mirror is lockstep with the rows.
 
-THE UPGRADE PATH. `chunks.slot` is filled in for an existing index by `backfillSlotsLocked`, using
-MigrationV5.slots - the same walk the loader performs, not a second derivation. It runs after the
-load and again after the v3 -> v4 conversion (the column is a v4 column, so the first call on an
-upgrading index runs against a table that does not have one), and is gated on a meta flag rather
-than a scan, because `WHERE slot < 0` cannot use the partial index and a full pass over a 9.7M-row
-table on every open is not a cost to hide. Both conversions that REBUILD `chunks` clear the flag,
-since the column they describe has just been replaced.
+THE UPGRADE PATH, measured. `chunks.slot` is filled in for an existing index by
+`backfillSlotsLocked`, from the RESIDENT state - `occSlot[i]` is where row i's vector physically
+sits, which the loader has already worked out and every mutation since has kept in step - rather
+than from a second derivation off the id order and the hole list. That is the only version that
+stays right when the two disagree, and the only one that survives whatever happens between slices.
+
+SLICED, for the reason coverage is. On the real 9,729,693-chunk index the whole column costs 12.2
+seconds (32.6s to open with it against 20.4s without), once; the store queue is what a search waits
+on, so it is taken 200,000 rows at a time, about a quarter of a second each. Coverage refuses to
+advance until it is complete, which is what stops a position-range clear from claiming rows it
+never reached.
+
+The watermark is a chunk id, so it survives a session ending half way, and it is turned back into a
+row index by a SCAN rather than a bisection: chunk ids ascend down the row table only over the LIVE
+rows, and a hole row carries none, so a bisection over a column with 254,000 zeros scattered
+through it lands wherever the zeros put it. That version skipped whole stretches, left 666,686 rows
+with no position, and then - correctly - refused to call the column finished and started over,
+forever. The scan is one integer pass per SESSION, because the cursor is kept in memory afterwards.
+
+Two supporting pieces. `adoptChunkIDsLocked` gives the resident rows their chunk ids when the load
+scan had none to give - the v3 and legacy shapes have no `id` column, and the session that CONVERTS
+an index is exactly the session that then has to write slots back by id - pairing rows with ids by
+order, which is the correspondence the conversion itself preserves, with a count check to say so.
+And both conversions that REBUILD `chunks` clear the completion flag, since the column it describes
+has just been replaced.
 
 WHAT THE COVERAGE LOADER STILL ASSUMES, and why it was left alone. It walks a cursor and inserts
 a hole row wherever the claim says one belongs, which is exact while positions are handed out in id

@@ -6277,7 +6277,19 @@ public final class VectorStore: @unchecked Sendable {
     private var coveredUpToID: Int64 = 0
     /// Set once the `chunks.slot` column has been filled in for every row. See backfillSlotsLocked.
     private static let slotsBackfilledKey = "chunk_slots_backfilled"
+    /// How far that backfill has got, as a chunk id. Absent means "not started" or "finished".
+    private static let slotsMarkKey = "chunk_slots_upto"
     private var slotsBackfilled = false
+    /// Where the slot backfill has reached in the ROW table this session. -1 = not resolved yet;
+    /// the stored watermark is a chunk id, and turning it back into a row index is a scan.
+    private var slotBackfillCursor = -1
+    /// Rows per slice of the slot backfill. 12 seconds for the whole column on the measured index,
+    /// so this is about a third of a second a time - the same order as a coverage slice.
+    nonisolated(unsafe) public static var slotBackfillSliceOverride: Int? = nil
+    static var slotBackfillSlice: Int {
+        slotBackfillSliceOverride
+            ?? ProcessInfo.processInfo.environment["OMNI_SLOT_SLICE"].flatMap(Int.init) ?? 200_000
+    }
     /// Set once when coverage completes: a repack is owed. See reclaimAfterCoverageMigration.
     private static let vacuumPendingKey = "vecs_vacuum_pending"
     /// Set once the ONE-TIME migration has finished, and never cleared. Covering the rows that
@@ -6867,6 +6879,7 @@ public final class VectorStore: @unchecked Sendable {
         let vectorUnits = Self.contentSharing ? slotCount : rows.count
         guard ok, covered == coveredRows - holes, flat16.count == vectorUnits * dim else {
             rows.removeAll(); flat16.removeAll(); presentPaths.removeAll(); occSlot.removeAll()
+            slotBackfillCursor = -1
             fileID.removeAll(); pathID.removeAll(); idPath.removeAll(); fileChunkCount.removeAll()
             resetPathAllowCachesLocked()   // idPath emptied: nothing derived from it survives
             kindCode.removeAll(); kindID.removeAll(); idKind.removeAll()
@@ -8143,6 +8156,7 @@ public final class VectorStore: @unchecked Sendable {
         fileRowHi = [Int32](repeating: 0, count: pathTable.count)
         rowWindowCovered = 0
         rows.removeAll(); rows.reserveCapacity(header.rowCount); occSlot.removeAll(); resetTombstonesLocked()
+        slotBackfillCursor = -1
         fileID.removeAll(); fileID.reserveCapacity(header.rowCount)
         kindCode.removeAll(); kindCode.reserveCapacity(header.rowCount)
         resetAggregatesLocked()
@@ -9542,6 +9556,9 @@ public final class VectorStore: @unchecked Sendable {
         guard removed > 0 else { return removedPaths }
         deadRows.removeAll(keepingCapacity: true)   // collected by this pass
         deadIdxCache = nil
+        // Every row index at or past `firstRemoved` just moved, so a cursor into the row table
+        // means something else now.
+        slotBackfillCursor = -1
         rows.removeLast(removed); fileID.removeLast(removed); kindCode.removeLast(removed)
         occSlot.removeLast(removed)
 
@@ -9742,6 +9759,7 @@ public final class VectorStore: @unchecked Sendable {
 
     private func loadIntoMemory() {
         rows.removeAll(); flat16.removeAll(); presentPaths.removeAll(); fileID.removeAll(); pathID.removeAll()
+        slotBackfillCursor = -1
         occSlot.removeAll()
         resetTombstonesLocked()
         idPath.removeAll(); fileChunkCount.removeAll(); kindCode.removeAll(); kindID.removeAll(); idKind.removeAll(); dim = 0
@@ -10441,8 +10459,35 @@ public final class VectorStore: @unchecked Sendable {
     /// a 9.7M-row table on every open is not a cost an upgrade note gets to hide. The flag is
     /// written only after the column is VERIFIED clean, so a backfill that half-finished leaves it
     /// unset and runs again.
-    func backfillSlotsLocked() {
-        guard Self.contentSharing, dbOpen(), !slotsBackfilled else { return }
+    /// Give the resident rows their chunk ids, for a table that has just acquired some.
+    ///
+    /// The v3 and legacy load scans have no `id` column to read - there is no such column in those
+    /// shapes - so every row loaded through them carries chunkID 0, and the session that CONVERTS
+    /// an index is exactly the session that then has to write slots back by id. Rather than reload
+    /// the whole table, this pairs the rows with the ids by ORDER, which is the same correspondence
+    /// the conversion itself preserves: new chunk ids ARE the old rowids, and both sides are walked
+    /// in that order. The count check is what makes it safe to say so.
+    private func adoptChunkIDsLocked() {
+        guard dbOpen(), !rows.isEmpty else { return }
+        guard rows.contains(where: { $0.chunkID == 0 }) else { return }
+        var ids: [Int64] = []
+        ids.reserveCapacity(rows.count)
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, "SELECT id FROM chunks ORDER BY id;", -1, &stmt, nil) == SQLITE_OK else { return }
+        while sqlite3_step(stmt) == SQLITE_ROW { ids.append(sqlite3_column_int64(stmt, 0)) }
+        // One id per LIVE row, in order. Anything else means the two are not describing the same
+        // table and pairing them by position would give rows each other's ids.
+        guard ids.count == rows.count - deadRows.count else { return }
+        var k = 0
+        for i in rows.indices where !deadRows.contains(Int32(i)) {
+            rows[i].chunkID = ids[k]
+            k += 1
+        }
+    }
+
+    func backfillSlotsLocked(budget: Int = VectorStore.slotBackfillSlice) {
+        guard Self.contentSharing, dbOpen(), !slotsBackfilled, !rows.isEmpty else { return }
         if scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.slotsBackfilledKey)'") == 1 {
             slotsBackfilled = true
             return
@@ -10451,40 +10496,72 @@ public final class VectorStore: @unchecked Sendable {
         // column exists and must do nothing - the conversion calls it again afterwards. That
         // ordering is not incidental: the one session that both converts and indexes is precisely
         // the session an upgrade is, and it is the session where a half-filled column bites.
-        guard layoutLocked() == .v4, hasColumnLocked("chunks", "slot") else { return }
-        let total = scalarQuery("SELECT COUNT(*) FROM chunks")
-        guard total > 0 else { return }
-        // NOTHING MAY ALREADY OWN A SLOT. The walk below assigns the k-th chunk the k-th non-hole
-        // position, which is true of an index that has never shared a content and false the moment
-        // one has: a duplicate has a high id and a low slot, and renumbering it by rank would move
-        // it onto a neighbour's vector. An index in that state got its slots at write time and has
-        // nothing to backfill.
-        guard scalarQuery("SELECT COUNT(*) FROM chunks WHERE slot >= 0") == 0 else {
-            // Still nothing to do only if nothing is missing either; a genuine mixture is a state
-            // this cannot repair and must not paper over.
-            if scalarQuery("SELECT COUNT(*) FROM chunks WHERE slot < 0") == 0 {
-                exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.slotsBackfilledKey)','1');")
-                slotsBackfilled = true
+        guard hasColumnLocked("chunks", "slot") else { return }
+        adoptChunkIDsLocked()
+
+        // THE SOURCE IS THE RESIDENT STATE, NOT A SECOND DERIVATION. `occSlot[i]` is where row i's
+        // vector physically sits - the loader worked it out, and every mutation since has kept it
+        // in step - so this writes what is already true rather than recomputing it from the id
+        // order and the hole list. That matters because it is the only version that stays correct
+        // when the two disagree, and because a slice-by-slice pass has to survive whatever happens
+        // between slices: an append, a delete, a reload, a session ending half way.
+        //
+        // SLICED, for the same reason coverage is. Measured on the real 9,729,693-chunk index, the
+        // whole column costs 12 seconds - once - and the store queue is what a search waits on, so
+        // taking it in one block would meet a user opening the app with a twelve-second stall. At
+        // this slice it is about a third of a second a time, which is the pause coverage already
+        // budgets for.
+        //
+        // The watermark is a CHUNK ID, not a row index: row indices do not survive a reload, and a
+        // resumed pass that skipped a stretch would leave exactly the half-filled column this is
+        // written to avoid. Rows are in id order, so resuming is a binary search.
+        //
+        // FOUND BY SCANNING, NOT BY BISECTING. The chunk ids are ascending down the row table, but
+        // only over the LIVE rows: a hole row carries no id at all, and a bisection on a column
+        // with 254,000 zeros scattered through it lands wherever the zeros put it. That version
+        // skipped whole stretches, left 666,686 rows with no position, and then - correctly -
+        // refused to declare the column finished and started over, forever. The scan is one integer
+        // pass per SESSION, not per slice, because the cursor is kept in memory afterwards.
+        if slotBackfillCursor < 0 {
+            let mark = Int64(scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.slotsMarkKey)'"))
+            var i = 0
+            if mark > 0 { while i < rows.count, rows[i].chunkID <= mark { i += 1 } }
+            slotBackfillCursor = i
+        }
+        let start = Swift.min(slotBackfillCursor, rows.count)
+        let end = Swift.min(rows.count, start + Swift.max(1, budget))
+        if start < end {
+            var ids: [Int64] = []
+            var slots: [Int32] = []
+            ids.reserveCapacity(end - start)
+            slots.reserveCapacity(end - start)
+            for i in start ..< end where rows[i].chunkID > 0 {
+                ids.append(rows[i].chunkID)
+                slots.append(i < occSlot.count ? occSlot[i] : rows[i].slot)
             }
+            guard execChecked("BEGIN IMMEDIATE;") else { return }
+            persistSlotsLocked(ids: ids, slots: slots)
+            // The watermark goes in the SAME transaction as the slots it describes. Committed
+            // separately, a crash between them would record progress over rows that never got one.
+            let last = rows[end - 1].chunkID
+            guard execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.slotsMarkKey)','\(last)');"),
+                  execChecked("COMMIT;")
+            else { rollbackTxnLocked(); return }
+            slotBackfillCursor = end
+        }
+        guard end >= rows.count else { return }   // more slices to come
+        // The last slice. One scan to prove the column really is complete before anything is
+        // allowed to trust it - a mark that ran off the end of a row table that has since changed
+        // shape would otherwise declare a half-filled column finished.
+        guard scalarQuery("SELECT COUNT(*) FROM chunks WHERE slot < 0") == 0 else {
+            exec("DELETE FROM meta WHERE key = '\(Self.slotsMarkKey)';")   // start over, self-healing
+            slotBackfillCursor = 0
             return
         }
-        // THE SAME DERIVATION THE LOADER USES, not a second one. MigrationV5.slots is copied from
-        // loadIntoMemory's walk precisely so the two cannot drift: a one-position disagreement
-        // seats every row on its neighbour's vector, which no count can see.
-        var ids: [Int64] = []
-        ids.reserveCapacity(total)
-        var st: OpaquePointer?
-        if sqlite3_prepare_v2(db, "SELECT id FROM chunks ORDER BY id;", -1, &st, nil) == SQLITE_OK {
-            while sqlite3_step(st) == SQLITE_ROW { ids.append(sqlite3_column_int64(st, 0)) }
-        }
-        sqlite3_finalize(st)
-        guard ids.count == total else { return }
-        let walked = MigrationV5.slots(ids: ids, holes: vecHoles, coveredRows: coveredRows)
-        persistSlotsLocked(ids: ids, slots: walked.map { Int32($0) })
-        guard scalarQuery("SELECT COUNT(*) FROM chunks WHERE slot < 0") == 0 else { return }
         exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.slotsBackfilledKey)','1');")
+        exec("DELETE FROM meta WHERE key = '\(Self.slotsMarkKey)';")
         slotsBackfilled = true
-        if Self.searchTiming { print("[store] slot column backfilled for \(total) chunks") }
+        if Self.searchTiming { print("[store] slot column backfilled for \(rows.count) rows") }
     }
 
     /// Write the slots decided at append time back onto the rows that were just inserted.

@@ -937,6 +937,126 @@ final class ContentSharingTests: XCTestCase {
         }
     }
 
+    /// THE SLOT-COLUMN BACKFILL, SLICED - the seamless half of the upgrade.
+    ///
+    /// An index written before content addressing has `chunks.slot` at -1 for every row, and
+    /// nothing may share or cover until it is filled in. Measured on the real 9,729,693-chunk
+    /// index the whole column costs 12 seconds; the store queue is what a search waits on, so it
+    /// is taken a slice at a time, the way coverage is, with a chunk-id watermark that survives a
+    /// session ending half way.
+    ///
+    /// Three things have to hold and all three are checked: coverage REFUSES to advance while the
+    /// column is incomplete (a position-range clear cannot reach a row with no position, and the
+    /// identity it checks would pass anyway, so it would claim rows it never cleared); the pass
+    /// resumes across a close rather than starting over; and the index is correct throughout.
+    func testTheSlotBackfillIsSlicedAndResumable() throws {
+        let savedQuant = VectorStore.quantBaseOverride
+        let savedSlice = VectorStore.slotBackfillSliceOverride
+        VectorStore.quantBaseOverride = VectorStore.scanBits
+        VectorStore.slotBackfillSliceOverride = 7          // 40 rows, so at least six slices
+        defer {
+            VectorStore.quantBaseOverride = savedQuant
+            VectorStore.slotBackfillSliceOverride = savedSlice
+        }
+
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("share-backfill-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("index.sqlite")
+
+        let d = 64
+        let files = 40
+        func hot(_ i: Int) -> [Float] {
+            var v = [Float](repeating: 0, count: d); v[i % d] = 1; return v
+        }
+        do {
+            let s = try VectorStore(dbURL: url)
+            for f in 0 ..< files - 5 {
+                try s.replace(path: "/m/f\(f).txt", chunks: [IndexedChunk(
+                    path: "/m/f\(f).txt", modified: 1, size: 1, kind: "text", chunkIndex: 0,
+                    snippet: "s\(f)", embedding: hot(f), locator: "Line 1",
+                    chunkKey: String(format: "%08x", f &+ 0xC000))])
+            }
+            _ = s.search(hot(0), topK: 5)
+            for f in files - 5 ..< files {
+                try s.replace(path: "/m/f\(f).txt", chunks: [IndexedChunk(
+                    path: "/m/f\(f).txt", modified: 1, size: 1, kind: "text", chunkIndex: 0,
+                    snippet: "s\(f)", embedding: hot(f), locator: "Line 1",
+                    chunkKey: String(format: "%08x", f &+ 0xC000))])
+            }
+            _ = s.search(hot(0), topK: 5)
+            s.close()
+        }
+        for _ in 0 ..< 4 { let s = try VectorStore(dbURL: url); s.close() }
+        XCTAssertEqual(claim(url), files, "fixture never covered anything")
+
+        // Put it back to what an index written before the slot column looks like.
+        exec(url, "DELETE FROM meta WHERE key='chunk_slots_backfilled';"
+                + "DELETE FROM meta WHERE key='chunk_slots_upto';"
+                + "DELETE FROM meta WHERE key='vecs_covered_rows';"
+                + "DELETE FROM vec_holes;"
+                + "UPDATE chunks SET slot = -1;")
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM chunks WHERE slot < 0"), files,
+                       "the fixture was not put back")
+
+        // Session one: a few slices, then close mid-pass.
+        var markAfterFirst = -1
+        do {
+            let s = try VectorStore(dbURL: url)
+            for _ in 0 ..< 2 { s.advanceCoverageForTest(budget: 1000) }
+            markAfterFirst = num(url, "SELECT CAST(value AS INTEGER) FROM meta WHERE key='chunk_slots_upto'")
+            XCTAssertGreaterThan(markAfterFirst, 0, "no slice was taken")
+            XCTAssertGreaterThan(num(url, "SELECT COUNT(*) FROM chunks WHERE slot < 0"), 0,
+                                 "the whole column was written in one block; the slice size did nothing")
+            // -1 is "no meta row at all", which is the same statement: nothing was claimed.
+            XCTAssertLessThanOrEqual(claim(url), 0, "coverage advanced over rows that have no position yet")
+            s.close()
+        }
+
+        // Session two: it RESUMES rather than starting over, and then finishes.
+        do {
+            let s = try VectorStore(dbURL: url)
+            let markOnOpen = num(url, "SELECT CAST(value AS INTEGER) FROM meta WHERE key='chunk_slots_upto'")
+            XCTAssertGreaterThanOrEqual(markOnOpen, markAfterFirst, "the watermark went backwards")
+            for _ in 0 ..< 12 { s.advanceCoverageForTest(budget: 1000) }
+            s.close()
+        }
+        XCTAssertEqual(num(url, "SELECT CAST(value AS INTEGER) FROM meta WHERE key='chunk_slots_backfilled'"), 1,
+                       "the backfill never finished")
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM chunks WHERE slot < 0"), 0, "rows left with no position")
+        XCTAssertGreaterThan(claim(url), 0, "coverage never resumed once the column was complete")
+
+        for suffix in [".rows", ".rows-wal", ".rows-shm"] {
+            try? FileManager.default.removeItem(atPath: url.path + suffix)
+        }
+        let s = try VectorStore(dbURL: url); defer { s.close() }
+        XCTAssertNil(s.coverageAudit(), "audit failed after the backfill")
+        XCTAssertEqual(s.count, files, "rows lost across the backfill")
+        for f in 0 ..< files {
+            XCTAssertEqual(s.search(hot(f), topK: 1).first?.path, "/m/f\(f).txt",
+                           "f\(f) was seated on the wrong position by the backfill")
+        }
+    }
+
+    private func exec(_ db: URL, _ sql: String) {
+        var h: OpaquePointer?
+        guard sqlite3_open(db.path, &h) == SQLITE_OK else { return }
+        defer { sqlite3_close(h) }
+        sqlite3_exec(h, sql, nil, nil, nil)
+    }
+
+    private func num(_ db: URL, _ sql: String) -> Int {
+        var h: OpaquePointer?
+        guard sqlite3_open(db.path, &h) == SQLITE_OK else { return -1 }
+        defer { sqlite3_close(h) }
+        var st: OpaquePointer?
+        defer { sqlite3_finalize(st) }
+        guard sqlite3_prepare_v2(h, sql, -1, &st, nil) == SQLITE_OK,
+              sqlite3_step(st) == SQLITE_ROW else { return -1 }
+        return Int(sqlite3_column_int64(st, 0))
+    }
+
     private func claim(_ db: URL) -> Int {
         var h: OpaquePointer?
         guard sqlite3_open(db.path, &h) == SQLITE_OK else { return -1 }
