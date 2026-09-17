@@ -132,3 +132,56 @@ formula out a second time and compares.
 - Retrieval quality before and after dedup. Expected direction: boilerplate takes fewer top slots.
 - CDC retrieval quality against the 1800 grid. Variable 900-4000 char chunks are not safe to assume
   neutral; gate it the way OCR builds are gated, before it ships.
+
+## Integrating with the search path: it is one gather
+
+Read out of `reduceTopKGPULocked`, so this is the actual shape and not a sketch. v4 reduces by
+scattering row scores into a per-file maximum:
+
+    sClean  = [baseRows]            scores, NaN and disallowed kinds forced to -inf
+    fid     = [baseRows]            owning file id per row
+    bestScore = full([F], -inf)
+    bestScore = bestScore.at[fid].maximum(sClean)        // scatter-max by file
+
+This already has the right shape, because in v4 a row IS an occurrence: one chunk, one file. What
+v5 changes is that the score vector is indexed by CONTENT while the scatter is indexed by
+OCCURRENCE, and those are no longer the same length. The fix is one gather between them:
+
+    sClean   = [slotCount]                                // scores per content
+    occSlot  = [occCount]                                 // which content each occurrence points at
+    occFile  = [occCount]                                 // == v4's `fid`, unchanged
+    occScore = sClean[occSlot]                            // THE ONE NEW LINE
+    bestScore = bestScore.at[occFile].maximum(occScore)
+
+Everything downstream - the -inf NaN guard, the kind mask, `rowBest`, the unique monotone selection
+key, `topCIndices` - is untouched, except that `bestRow` now identifies the best OCCURRENCE per
+file rather than the best row, which is what carries the locator.
+
+WHY THIS IS SAFE TO DO BEFORE ANY DATA MOVES. For a v4 index `occSlot` is the identity, so
+`sClean[occSlot] == sClean` and the reduce is bit-identical to today's. That is what lets the read
+path be rewritten and shipped green against unmigrated indexes, with the migration changing only
+the DATA afterwards. `OccurrenceIndexTests.testAOneToOneIndexBehavesLikeV4` pins that equivalence
+at the model level.
+
+The one real split to make carefully: `baseRows` currently means both "rows in the score matmul"
+and "entries in the scatter". Those become `slotCount` and `occCount`. Every use has to be read and
+assigned to one of the two; they are equal today, so a mistake compiles, passes on a v4 index, and
+only misbehaves once the counts diverge - i.e. only after migration, on a user's machine. That is
+the one place in this design where a bug would be both silent and late, so each site gets read
+individually rather than by pattern replacement.
+
+The kind mask keeps working unchanged and gets slightly better: kind is a property of the CONTENT,
+so it masks slots, which is where it belongs. `mlxKindCode` becomes per-slot rather than per-row.
+
+## Component status
+
+Built, tested and pinned with a negative control each:
+
+    ContentChunker     16 tests   cutter, determinism, UTF-8 safety, insertion stability
+    ChunkKey            8 tests   generation-1 format byte-identical to v4
+    SlotAllocator      10 tests   free list, quarantine, leak and double-ownership checks
+    ChunkDiff          15 tests   set diff, reference multiplicity
+    OccurrenceIndex    16 tests   slot mask, expansion, the scope leak
+    SchemaV5            9 tests   DDL, unique key index, reverse edge plan
+
+Not yet integrated: the store's in-memory model, the write path, the migration itself.
