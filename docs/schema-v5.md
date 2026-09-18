@@ -411,8 +411,31 @@ loader reads the column instead of deriving anything, so there is nothing left t
 about and it opens. That is not obviously wrong, but it is a safety property being dropped rather
 than satisfied, and it needs deciding.
 
-And the mutation lifecycle fails on three files out of sixty, which is the same wrong-vector shape
-this file is written against. That one is a defect, not a judgement call.
+And a folded index does not survive arbitrary CRUD. The mutation lifecycle fails within one file
+RENAME - a file comes back reading another file's vector, the same shape this file is written
+against - and the failure COUNT moves run to run (10, 25, 31, 61) while the logic does not, which
+is the signature of a race rather than of arithmetic.
+
+It is worth recording what was tried, because each attempt eliminates a hypothesis:
+
+  - updating the resident mirror inside each fold slice's transaction instead of at the end, so no
+    window exists between the column and the mirror. Worse (61): the chunk-id -> row-index map it
+    needs goes stale the moment any row is appended or compacted between slices.
+  - pairing rows to slots by CHUNK ID rather than by order in `finishFoldLocked`, which cannot
+    mis-seat whatever order the table is in. Worse (53, then 31 with `adoptChunkIDsLocked` first):
+    many resident rows carry no id for it to pair on.
+  - running the fold as a one-shot migration at open, under the queue, with nothing else running -
+    no concurrency, no window at all. Unchanged (31). This is the result that matters: the problem
+    is not the fold racing anything, it is what a folded index does afterwards.
+  - retiring `vectorsForContentKeys` - the one path that reads a vector BY STORED SLOT and then
+    PERSISTS what it read - on a folded index. Unchanged (31), even though `OMNI_STORE_REUSE=0`,
+    which gates that same function one line earlier, gives 0. That discrepancy is unexplained and
+    is the thread to pull next.
+
+So the defect is in how a shared position is resolved during mutation, not in the fold. The fold
+produces a correct index at rest - digest identical, audit clean, reclaim works - and the store
+cannot yet keep it correct through a rename. That is the same conclusion the free list reached from
+the other direction, which is why both are off.
 
 So it stays behind `OMNI_CONTENT_FOLD=1`. The migration path it was built for is measured and
 works; what is not yet established is that it is harmless on every other index.
