@@ -1,4 +1,5 @@
 import Foundation
+import SQLite3
 import OmniKit
 import ImageIO
 import CoreGraphics
@@ -8368,6 +8369,64 @@ if args.count >= 3 && args[1] == "querybreak" {
     exit(0)
 }
 
+
+// EVERY FILE MUST RETRIEVE ITS OWN CONTENT. omni-verify selfretrieve <modelDir> <db> [sample]
+//
+// The failure content addressing can produce is not a crash and not an empty result: it is a row
+// seated on somebody else's vector, which comes back as a real file with a plausible score. The
+// only way to see it is to ask each file for itself - embed the text the index says that file
+// holds, search, and require the file back. Run against an index that has been through a churn of
+// adds, edits, renames, moves and deletes, this is the end-to-end form of the invariant the
+// mutation suite asserts per store call.
+if args.count >= 4 && args[1] == "selfretrieve" {
+    let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    let store = try VectorStore(dbURL: URL(fileURLWithPath: args[3]))
+    defer { store.close() }
+    let want = (args.count >= 5 ? Int(args[4]) : nil) ?? 40
+    // THE FIRST TEXT CHUNK of each file: the one carrying its title and topic. Shared boilerplate
+    // lower down would be answered correctly by any of its sharers and prove nothing, and a MEDIA
+    // chunk's "snippet" is its tag list rather than its content - embedding "emblem, red, lamp" as
+    // a query and demanding the image back measures the tagger, not the seating.
+    var probes: [(path: String, text: String)] = []
+    do {
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(args[3], &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+            print("selfretrieve: cannot read the index"); exit(1)
+        }
+        defer { sqlite3_close(db) }
+        var st: OpaquePointer?
+        defer { sqlite3_finalize(st) }
+        let sql = """
+            SELECT (CASE WHEN d.path='/' THEN '/'||f.name ELSE d.path||'/'||f.name END), t.snippet
+              FROM chunks c JOIN chunk_text t ON t.chunk_id = c.id
+              JOIN files f ON f.id = c.file_id JOIN dirs d ON d.id = f.dir_id
+             WHERE c.chunk_index = 0
+               AND c.kind = (SELECT code FROM kinds WHERE name = 'text')
+             ORDER BY f.id;
+            """
+        guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { print("selfretrieve: query failed"); exit(1) }
+        while sqlite3_step(st) == SQLITE_ROW, probes.count < want {
+            guard let p = sqlite3_column_text(st, 0), let t = sqlite3_column_text(st, 1) else { continue }
+            let text = String(cString: t)
+            guard text.count > 60 else { continue }
+            probes.append((String(cString: p), text))
+        }
+    }
+    guard !probes.isEmpty else { print("selfretrieve: no probe text available"); exit(1) }
+    var top1 = 0, top5 = 0, missing = 0
+    for (p, t) in probes {
+        let hits = store.search(engine.embedText(t, as: .query), topK: 5)
+        if hits.first?.path == p { top1 += 1 }
+        if hits.contains(where: { $0.path == p }) { top5 += 1 } else {
+            missing += 1
+            if missing <= 5 {
+                print("  MISS \((p as NSString).lastPathComponent) -> \(hits.prefix(3).map { "\(($0.path as NSString).lastPathComponent)@\(String(format: "%.2f", $0.score))" }.joined(separator: " "))")
+            }
+        }
+    }
+    print("selfretrieve files=\(probes.count) top1=\(top1) top5=\(top5) missed=\(missing)")
+    exit(missing == 0 ? 0 : 1)
+}
 
 // ===== MATRYOSHKA AS THE COARSE TIER, ON THE REAL INDEX =====
 //
