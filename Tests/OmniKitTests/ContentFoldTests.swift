@@ -197,6 +197,60 @@ final class ContentFoldTests: XCTestCase {
     /// index that would not open: "the vector slot bookkeeping is off by 3,516,335 rows". The
     /// reclaim was not at fault - it planned from a resident model the loader had already got
     /// wrong. Nothing downstream of a fold can be trusted until a folded index can be read back.
+    /// EVERY READER THAT DEREFERENCES THE BUFFER, on a folded index.
+    ///
+    /// The fold's own tests all ask "does search still answer". None of them asked the readers that
+    /// are not search, and all of those guarded their pointer arithmetic with
+    /// `flat16.count >= rows.count * dim` - a comparison that is false on a healthy folded index,
+    /// because there are fewer positions than rows. They did not crash and they did not return
+    /// wrong data. They returned NOTHING: find similar found nothing, and a filename or tag match
+    /// scored 0. Caught by a storeaudit on the real index, not here, which is why this exists.
+    func testEveryReaderStillAnswersOnAFoldedIndex() throws {
+        let savedQuant = VectorStore.quantBaseOverride
+        let savedFraction = VectorStore.holeReclaimFractionOverride
+        let savedFloor = VectorStore.holeReclaimFloorOverride
+        VectorStore.quantBaseOverride = VectorStore.scanBits
+        VectorStore.holeReclaimFractionOverride = 0.01
+        VectorStore.holeReclaimFloorOverride = 1
+        defer {
+            VectorStore.quantBaseOverride = savedQuant
+            VectorStore.holeReclaimFractionOverride = savedFraction
+            VectorStore.holeReclaimFloorOverride = savedFloor
+        }
+        let url = tempDB()
+        let store = try buildUnsharedIndex(url, files: 60, dupEvery: 5)
+        defer { store.close() }
+        _ = store.search(vec(7), topK: 3)
+        store.migrateSlotsToCompletion()
+        store.advanceCoverageForTest()
+
+        let paths = (0 ..< 8).map { "/v4/f\($0).txt" }
+        let before = store.pooledVectors(paths: paths)
+        XCTAssertEqual(before.count, paths.count, "the fixture cannot show anything: it is empty before the fold")
+
+        // FOLD AND RECLAIM BOTH. The fold only repoints, so the file still holds one position per
+        // row and every rows.count guard still passes. It is the reclaim that drops the file to one
+        // vector per CONTENT, and that is the moment the two numbers part company.
+        store.foldDuplicatesToCompletion()
+        XCTAssertTrue(store.reclaimVectorHolesForTest(), "the reclaim declined, so the file never shrank")
+        XCTAssertLessThan(store.vectorBufferUse.used / Self.dim, store.count,
+                          "the fixture did not actually shrink: rows and positions are still the same number")
+
+        // 1. The find-similar page reader.
+        let pooled = store.pooledVectors(paths: paths)
+        XCTAssertEqual(pooled.count, paths.count, "pooledVectors went silent on a folded index")
+        for p in paths {
+            XCTAssertEqual(pooled[p]?.count, Self.dim, "\(p) pooled no vector")
+            XCTAssertTrue(pooled[p]?.contains { $0 != 0 } ?? false, "\(p) pooled an all-zero vector")
+        }
+        // 2. Find similar itself, one file at a time.
+        for p in paths {
+            XCTAssertNotNil(store.fileVector(p), "fileVector went silent for \(p)")
+        }
+        // 3. And a search still answers, which is the part that never broke.
+        assertEveryFileAnswersForItself(store, files: 60, "after the fold")
+    }
+
     func testFoldThenReclaimThenReloadKeepsEveryAnswer() throws {
         let savedQuant = VectorStore.quantBaseOverride
         let savedFraction = VectorStore.holeReclaimFractionOverride

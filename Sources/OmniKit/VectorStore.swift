@@ -1315,6 +1315,16 @@ public final class VectorStore: @unchecked Sendable {
     @inline(__always) private var lastAppendedSlot: Int32 { Int32(Swift.max(0, slotCount - 1)) }
     /// The vector this row reads. One Int32 load; the row's 1536-byte vector read dwarfs it.
     @inline(__always) private func slotOf(_ row: Int) -> Int { Int(occSlot[row]) }
+    /// HOW MANY VECTORS THE BUFFER SHOULD HOLD, which is one per POSITION and not one per row.
+    ///
+    /// Every reader that dereferences `flat16` guards its pointer arithmetic first, and each of
+    /// them wrote that guard as `flat16.count >= rows.count * dim` back when a row and a position
+    /// were the same number. The moment they part company - sharing, the fold, the free list - the
+    /// guard is false on a perfectly healthy index and the reader returns nothing. That is not a
+    /// crash and not an empty result set the user can see as wrong: find similar silently finds
+    /// nothing, and a filename or tag match silently scores 0. `chunkVectors` already learned this
+    /// once; this is the same answer in one place instead of five.
+    private var vectorUnits: Int { Self.contentSharing ? slotCount : rows.count }
     private var pathID: [String: Int32] = [:]
     private var fileIDCount: Int { pathID.count }
     /// id -> canonical path String, parallel to pathID. Rows reference THESE instances so all
@@ -3087,7 +3097,7 @@ public final class VectorStore: @unchecked Sendable {
     /// SQL said it existed to prevent.
     private func bestChunkScoreLocked(_ paths: [String], query: [Float]) -> [String: (score: Float, chunkIndex: Int)] {
         guard dim > 0, query.count == dim, !paths.isEmpty,
-              !rows.isEmpty, flat16.count == rows.count * dim else { return [:] }
+              !rows.isEmpty, flat16.count == vectorUnits * dim else { return [:] }
         // Returns the winning chunk INDEX with its score: the snippet a hit shows has to come from
         // the chunk that won, the way the dense path's `fillSnippetsLocked` does it.
         var wanted = [Bool](repeating: false, count: max(1, fileChunkCount.count))
@@ -4009,7 +4019,7 @@ public final class VectorStore: @unchecked Sendable {
             // pathID is the intern table over the paths present in `rows`, so a miss means "not
             // indexed" without scanning; a hit turns the row scan into Int32 compares instead of
             // N string compares (~80B memcmp + ARC each) - 10-50x on a large index.
-            guard dim > 0, fileID.count == rows.count, flat16.count >= rows.count * dim,
+            guard dim > 0, fileID.count == rows.count, flat16.count >= vectorUnits * dim,
                   let id = pathID[path] else { return nil }
             var sum = [Float](repeating: 0, count: dim)
             var count = 0
@@ -9347,7 +9357,7 @@ public final class VectorStore: @unchecked Sendable {
             // index rather than walking up from 0: the walk could not run past the arrays, a window
             // is dereferenced straight into flat16.
             guard dim > 0, query.count == dim, fileID.count == rows.count,
-                  flat16.count >= rows.count * dim, let id = pathID[path] else { return [] }
+                  flat16.count >= vectorUnits * dim, let id = pathID[path] else { return [] }
             // Snippets and locators are not resident (see Row): fetch this one file's display text
             // in a single indexed SELECT, keyed by chunk index.
             var snippets: [Int: String] = [:]
@@ -9767,7 +9777,7 @@ public final class VectorStore: @unchecked Sendable {
     /// missing vector as "cannot compare", never as "no match".
     public func pooledVectors(paths: [String]) -> [String: [Float]] {
         queue.sync {
-            guard dim > 0, fileID.count == rows.count, flat16.count >= rows.count * dim,
+            guard dim > 0, fileID.count == rows.count, flat16.count >= vectorUnits * dim,
                   !paths.isEmpty else { return [:] }
             // Wanted paths -> dense file ids -> a flat id->slot table, so the row walk below compares
             // an Int32 instead of hashing a path String per row. On a 4.5M-row index that is the
@@ -12051,7 +12061,7 @@ public final class VectorStore: @unchecked Sendable {
         // coverage migration observes every time it advances - msync first, drop second - just
         // done once for the whole index instead of a slice at a time.
         let vectorsSafe = flat16.isPersistent && !rows.isEmpty && dim > 0
-            && flat16.count == rows.count * dim
+            && flat16.count == vectorUnits * dim
             && flat16.extendFileCoverage()
         if vectorsSafe { flat16.msyncFile() }
         if let freed = internPathsLocked(allowUnloaded: true, dropVectorBlobs: vectorsSafe) {

@@ -441,6 +441,21 @@ before closing, which is what a user does: two rows leaked per round over five r
 counts matched that arithmetic exactly. `close()` settles it directly now, and the audit stops
 counting a legitimately unsynced reuse as breakage.
 
+AND THE E2E FOUND ONE MORE, which every unit test missed. `storeaudit` on the freshly folded real
+index reported `pooledVectors` answering for 0 of 41 files - find similar, silently finding
+nothing. Five readers guarded their pointer arithmetic with `flat16.count >= rows.count * dim`,
+written when a row and a position were the same number: `bestChunkScoreLocked` (filename and tag
+matches), `fileVector` (find similar), the passage disclosure walk, `pooledVectors`, and the
+one-shot repack's durability precondition. Each is false on a healthy folded index, and each
+returns nothing rather than failing - find similar finds nothing, a tag match scores 0. They ask
+`vectorUnits` now, which is one place instead of five.
+
+The fold's own tests all asked "does search still answer" and none asked the readers that are not
+search, which is why a real-index audit found it and the suite did not. `testEveryReaderStillAnswers
+OnAFoldedIndex` closes that: it folds AND reclaims - the fold alone leaves one position per row, so
+every `rows.count` guard still passes; it is the reclaim that parts the two numbers - then exercises
+each reader. Negative control run.
+
 BOTH ARE ON BY DEFAULT NOW, and five arms of 562 tests are 0 failures each: fold alone, free list
 alone, both together, both off, and the shipping default. Every fix above was run with its negative
 control.
