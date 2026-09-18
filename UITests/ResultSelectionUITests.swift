@@ -54,13 +54,27 @@ final class ResultSelectionUITests: XCTestCase {
     }
 
     /// Type something broad enough that any real index answers it.
+    ///
+    /// RETYPED UNTIL IT ANSWERS, rather than typed once and waited on. The corpus is indexed by
+    /// THIS launch, so the first query runs against an index that is still filling - it returns
+    /// nothing, and a single wait then expires while the app is working perfectly. Both tests
+    /// skipped for that reason, which makes a guard that guards nothing.
     private func search(_ app: XCUIApplication, _ text: String) -> Bool {
-        let field = app.textFields.firstMatch
-        guard field.waitForExistence(timeout: 20) else { return false }
-        field.click()
-        field.typeText(text)
-        // The rows arrive asynchronously; wait for the first rather than a fixed sleep.
-        return app.descendants(matching: .any)["result.row"].firstMatch.waitForExistence(timeout: 30)
+        // `searchFields`, not `textFields` - Omni's box is a search field, and the wrong query
+        // simply never matched, so both tests skipped after waiting out the timeout on a perfectly
+        // healthy app. Cmd-F is the fallback the chaos suites use for the same reason.
+        _ = app.windows.firstMatch.waitForExistence(timeout: 60)
+        let rows = app.descendants(matching: .any)["result.row"].firstMatch
+        let deadline = Date().addingTimeInterval(240)
+        while Date() < deadline {
+            let field = app.windows.firstMatch.searchFields.firstMatch
+            if field.exists, field.isHittable { field.click() } else { app.typeKey("f", modifierFlags: .command) }
+            usleep(150_000)
+            app.typeKey("a", modifierFlags: .command)
+            app.typeText(text)
+            if rows.waitForExistence(timeout: 20) { return true }
+        }
+        return false
     }
 
     func testClickingAResultSelectsIt() throws {

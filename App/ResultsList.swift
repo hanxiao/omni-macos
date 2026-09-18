@@ -678,6 +678,11 @@ struct ResultRow: View {
         // NOTHING ON A RESULT ROW WAS VISIBLE TO ACCESSIBILITY, which is why the chaos suites can
         // click rows all day and never notice that the click did not select one. The identifier
         // names the row; the trait is the assertion surface.
+        // `.accessibilityElement(children: .contain)` is what makes the row QUERYABLE. An
+        // identifier on a composed view does not create an element on its own, so the identifier
+        // existed and matched nothing - the test waited four minutes and skipped against a
+        // perfectly healthy app. `.contain` keeps the labels inside reachable.
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("result.row")
         .accessibilityAddTraits(selected ? [.isSelected] : [])
     }
@@ -848,6 +853,7 @@ struct ResultGridItem: View {
                 : Color(nsColor: .unemphasizedSelectedContentBackgroundColor).opacity(0.8)) : .clear,
             in: RoundedRectangle(cornerRadius: Design.corner + 8, style: .continuous)
         )
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("result.item")
         .accessibilityAddTraits(selected ? [.isSelected] : [])
     }
