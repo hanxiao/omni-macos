@@ -2115,6 +2115,8 @@ public final class VectorStore: @unchecked Sendable {
             guard let h = db else { closed = true; return }
             sqlite3_finalize(snippetStmt); snippetStmt = nil   // finalize cached stmts before close (F3/F8)
             sqlite3_finalize(dedupStmt); dedupStmt = nil
+            sqlite3_finalize(foldGroupStmt); foldGroupStmt = nil
+            sqlite3_finalize(foldMoveStmt); foldMoveStmt = nil
             sqlite3_exec(h, "PRAGMA wal_checkpoint(TRUNCATE);", nil, nil, nil)
             sqlite3_close(h)
             db = nil
@@ -3209,7 +3211,11 @@ public final class VectorStore: @unchecked Sendable {
             guard Self.vecCoverage, dbOpen(), dim > 0, !rows.isEmpty else { return nil }
             // Once the one-time pass has completed, there is nothing to report ever again: rows
             // added later are covered by the same machinery, but that is indexing, not migrating.
-            guard scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.migratedKey)'") != 1 else { return nil }
+            // The COVERAGE migration is finished once this flag is set; the fold is a separate
+            // one-time pass with its own flag, and on an index that was migrated before content
+            // addressing existed it is the one still to run.
+            guard scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.migratedKey)'") != 1
+            else { return foldProgressLocked() }
             // AND ONLY WHEN IT CAN ACTUALLY RUN. Coverage advances only into a named vector file,
             // and below the quant crossover the buffer is an unlinked scratch mapping - so
             // `coveredRows` is 0 and stays 0, for as long as the index is small.
@@ -3224,12 +3230,35 @@ public final class VectorStore: @unchecked Sendable {
             // chunks are duplicates it reads 90% forever, having actually finished - the same
             // never-completing bar the two guards above exist to prevent, reintroduced by a unit.
             let total = Self.contentSharing ? slotCount : rows.count
-            guard total > 0, coveredRows < total else { return nil }
+            guard total > 0, coveredRows < total else { return foldProgressLocked() }
             // Each remaining position still has a bf16 blob in SQLite that the vector file holds.
             let remaining = Int64(total - coveredRows) * Int64(dim * MemoryLayout<UInt16>.size)
             return (coveredRows, total, remaining)
         }
     }
+    /// The duplicate fold, as the same three numbers the coverage migration reports - so the
+    /// Settings row that already says "Optimizing storage ... frees X when it finishes" covers
+    /// this pass too, rather than a second bar appearing for the same kind of work.
+    ///
+    /// `bytesToReclaim` is what the pointers moved SO FAR will free, not a prediction: each folded
+    /// duplicate is one position the reclaim can drop. It therefore counts UP as the pass runs,
+    /// which is the honest shape - the pass does not know how many duplicates are left until it
+    /// has looked at them.
+    private func foldProgressLocked() -> (done: Int, total: Int, bytesToReclaim: Int64)? {
+        guard Self.contentFold, Self.contentSharing, dim > 0, !rows.isEmpty else { return nil }
+        guard !contentFoldComplete, slotsBackfilled else { return nil }
+        // PROGRESS IS THE KEY SPACE, which is what the pass actually walks. The watermark is the
+        // last content key it finished, and content keys are a 128-bit digest spread evenly - so
+        // its first two bytes ARE the fraction done, to within the evenness of SHA-256.
+        let mark = foldMarkLocked()
+        let scale = 65_536
+        var done = 0
+        if mark.count >= 2 { done = (Int(mark[mark.startIndex]) << 8) | Int(mark[mark.index(after: mark.startIndex)]) }
+        let folded = contentFoldedCount >= 0 ? contentFoldedCount
+            : scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.contentFoldCountKey)'")
+        return (done, scale, Int64(Swift.max(0, folded)) * Int64(dim * MemoryLayout<UInt16>.size))
+    }
+
     public static func candidateWidth(topK: Int) -> Int { candidateCount(topK: topK) }
 
     /// PAPER SUITE ONLY: drop the resident scan matrix so the next search rebuilds it under the
@@ -6803,6 +6832,132 @@ public final class VectorStore: @unchecked Sendable {
         return true
     }
 
+    /// LOAD BY THE STORED SLOT, for an index whose `chunks.slot` column is complete.
+    ///
+    /// The walk below derives a row's position from its RANK in id order counted through the holes,
+    /// which is the only answer available while the column is empty - and an answer only while
+    /// there is one position per row. Once the fold has collapsed the duplicates there is not:
+    /// the measured index holds 9,773,827 chunks in 6,257,492 positions, the walk runs off the end
+    /// of the covered prefix, demands a blob for rows whose blob is long gone, and the index will
+    /// not open at all. Where the column is authoritative, nothing has to be derived.
+    ///
+    /// A position no row claims is simply an orphan, which `orphanSlotsLocked` already reads
+    /// straight off the pointers, so this path builds no tombstone rows to hold places with.
+    private func loadBySlotLocked() -> Bool {
+        guard Self.contentSharing, dbOpen(), coveredRows > 0 else { return false }
+        let d0 = storedDimLocked()
+        let live = scalarQuery("SELECT COUNT(*) FROM chunks")
+        guard d0 > 0, live > 0 else { return false }
+        // THE FLAG IS NOT ENOUGH. It says the backfill finished; a row written by a build that
+        // predates the column, or a conversion abandoned half way, would still carry -1 and land
+        // on position 0 along with every other such row. The partial index makes the counter-
+        // example cost one probe, so it is checked rather than trusted.
+        guard scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.slotsBackfilledKey)'") == 1,
+              scalarQuery("SELECT COUNT(*) FROM chunks WHERE slot >= 0") == live else { return false }
+        let maxSlot = scalarQuery("SELECT COALESCE(MAX(slot), -1) FROM chunks")
+        let highWater = Swift.max(coveredRows, maxSlot + 1)
+        guard highWater > 0 else { return false }
+        // ONLY WHERE THE WALK BELOW CANNOT WORK, which is where there are genuinely fewer positions
+        // than rows. That is the case the walk has no answer for - it hands out one position per
+        // row and runs off the end of the file - and it is the case the fold creates.
+        //
+        // Everywhere else the walk stays in charge, deliberately. It does not merely read the
+        // column, it RE-DERIVES the placement and rebuilds the uncovered rows from their blobs, so
+        // it is right even when the column and the file have drifted apart. Seating rows from the
+        // column is strictly more trusting, and on an index where the two numbers agree there is
+        // nothing to gain by trusting more.
+        guard highWater < live else { return false }
+        guard flat16.mapPersistent(url: vecSidecarURL, tailSlackElements: Self.foldThreshold * d0,
+                                   precommitElements: highWater * d0,
+                                   adoptElements: coveredRows * d0) else { return false }
+        dim = d0
+        // Positions past the covered prefix are written where they belong, not appended in scan
+        // order, so the buffer has to BE that long first. Zero-filled: a position nothing claims
+        // holds no vector and nothing reads it, and leaving stale bytes there would make an audit
+        // that samples the file unable to tell a hole from a live row.
+        if flat16.count < highWater * d0 {
+            flat16.append(contentsOf: repeatElement(UInt16(0), count: highWater * d0 - flat16.count))
+        }
+        rows.reserveCapacity(live)
+        presentPaths.reserveCapacity(live)
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, Self.loadScanSQL(layoutLocked()), -1, &stmt, nil) == SQLITE_OK
+        else { flat16.removeAll(); return false }
+        // Which positions past the covered prefix already have their bytes. Several rows share one
+        // content, and SQLite keeps a blob per chunk ROW, so the second sharer must not rewrite
+        // what the first one put there - identical bytes today, but "identical" is an assumption
+        // and this is the one place it would be silently wrong.
+        var filled = [Bool](repeating: false, count: highWater)
+        var ok = true
+        let bytesPerRow = d0 * MemoryLayout<UInt16>.size
+        while ok, sqlite3_step(stmt) == SQLITE_ROW {
+            let path = canonicalPath(String(cString: sqlite3_column_text(stmt, 0)))
+            let kind = canonicalKind(kindTextLocked(stmt, 1))
+            let d = Int(sqlite3_column_int(stmt, 3))
+            guard d == dim else { continue }
+            guard sqlite3_column_type(stmt, 10) == SQLITE_INTEGER else { ok = false; break }
+            let pos = Int(sqlite3_column_int(stmt, 10))
+            guard pos >= 0, pos < highWater else { ok = false; break }
+            if pos >= coveredRows, !filled[pos] {
+                // Uncovered: the blob is the only copy of these bytes.
+                guard let blob = sqlite3_column_blob(stmt, 4),
+                      Int(sqlite3_column_bytes(stmt, 4)) >= bytesPerRow else { ok = false; break }
+                flat16.withUnsafeMutableBufferPointer { buf in
+                    let src = blob.assumingMemoryBound(to: UInt16.self)
+                    for j in 0 ..< d { buf[pos * d + j] = src[j] }
+                }
+                filled[pos] = true
+            } else if pos < coveredRows, Int(sqlite3_column_bytes(stmt, 4)) >= bytesPerRow,
+                      let blob = sqlite3_column_blob(stmt, 4) {
+                // NEVER TRUST THE FILE OVER A BLOB THAT IS STILL THERE.
+                //
+                // A covered position means "the file answers for these bytes", and normally the
+                // row's blob is long gone - so this branch is empty on a healthy index and costs
+                // nothing. When the blob IS still there the two are both claiming to be the row's
+                // vector, and if they disagree the column and the file are describing different
+                // layouts: something renumbered the positions in memory and the file never caught
+                // up. Seating rows from the column then hands out other files' vectors, which is
+                // not a wrong-looking result, it is a plausible one.
+                //
+                // So it declines, and the rank walk below - which rebuilds the uncovered rows from
+                // the blobs rather than believing the file - gets its turn.
+                let agrees = flat16.withUnsafeBufferPointer { buf -> Bool in
+                    guard (pos + 1) * d <= buf.count else { return false }
+                    return memcmp(buf.baseAddress! + pos * d, blob, bytesPerRow) == 0
+                }
+                if !agrees { ok = false; break }
+            }
+            rows.append(Row(path: path, kind: kind, chunkIndex: Int(sqlite3_column_int(stmt, 2)),
+                            modified: sqlite3_column_double(stmt, 5),
+                            size: Int(sqlite3_column_int64(stmt, 9)),
+                            width: Int(sqlite3_column_int(stmt, 6)), height: Int(sqlite3_column_int(stmt, 7)),
+                            duration: sqlite3_column_double(stmt, 8),
+                            slot: Int32(pos), chunkID: sqlite3_column_int64(stmt, 11)))
+            appendRowMetaLocked(internPath(path), kindCode: internKind(kind), kind: kind,
+                                path: path, slot: Int32(pos))
+            presentPaths.insert(path)
+        }
+        guard ok, rows.count == live, flat16.count == highWater * dim else {
+            rows.removeAll(); flat16.removeAll(); presentPaths.removeAll(); occSlot.removeAll()
+            slotBackfillCursor = -1
+            fileID.removeAll(); pathID.removeAll(); idPath.removeAll(); fileChunkCount.removeAll()
+            resetPathAllowCachesLocked()
+            kindCode.removeAll(); kindID.removeAll(); idKind.removeAll()
+            seedKindsLocked()
+            resetTombstonesLocked(); resetAggregatesLocked(); resetRowWindowsLocked()
+            dim = 0
+            return false
+        }
+        invalidateBase()
+        reportLoadProgress(1)
+        rowWindowAuditLocked("loadBySlot")
+        scheduleRowStampLocked(after: 120)
+        scheduleCoverageStampLocked()
+        if Self.searchTiming { print("[store] LOAD by slot rows=\(rows.count) positions=\(highWater)") }
+        return true
+    }
+
     /// Rebuild the resident state when the row sidecar was NOT adopted but the vector file still
     /// holds rows whose blobs are gone. This is the path that makes dropping the blobs survivable:
     /// without it, a rejected sidecar plus a cleared blob is a lost vector.
@@ -6817,6 +6972,7 @@ public final class VectorStore: @unchecked Sendable {
         // is its only copy. Gating this was a one-line way to turn the safety valve into total data
         // loss - flipping the lever on a migrated index dropped all 4.5M rows.
         guard dbOpen(), coveredRows > 0 else { return false }
+        if loadBySlotLocked() { return true }
         let d0 = storedDimLocked()
         let live = scalarQuery("SELECT COUNT(*) FROM chunks")
         let holes = vecHoles.count
@@ -7670,6 +7826,9 @@ public final class VectorStore: @unchecked Sendable {
         // the claim is measured in; under v4 it is the row count and every test below reads the
         // same as it always did.
         let units = Self.contentSharing ? slotCount : rows.count
+        // NOT WHILE THE FOLD IS STILL RUNNING. The reclaim rewrites the whole vector file; doing
+        // that for the holes visible half way through a fold means doing it again for the rest.
+        guard contentFoldComplete else { return false }
         guard Self.vecCoverage, Self.holeReclaimFraction > 0, dbOpen(), dim > 0, !rows.isEmpty,
               flat16.isPersistent, flat16.count == units * dim,
               // Only with coverage caught up: then every live row's blob is already cleared, so the
@@ -7961,6 +8120,10 @@ public final class VectorStore: @unchecked Sendable {
         // that accumulate holes.
         let coverUnits = Self.contentSharing ? slotCount : rows.count
         guard coveredRows < coverUnits else {
+            // FOLD BEFORE RECLAIM. The fold turns duplicates into holes and the reclaim turns
+            // holes into space; run the other way round and the reclaim rewrites a 15 GB file for
+            // the holes it can see, then the fold makes millions more and it has to run again.
+            if !yieldToSearchLocked("fold"), foldDuplicateContentsLocked() { return }
             // Off the queue: the reclaim takes it one chunk at a time, and this call is holding it.
             if reclaim, !yieldToSearchLocked("reclaim"), shouldReclaimHolesLocked() {
                 DispatchQueue.global(qos: .utility).async { [weak self] in self?.reclaimVectorHoles() }
@@ -7986,6 +8149,10 @@ public final class VectorStore: @unchecked Sendable {
         guard flat16.isPersistent, flat16.extendFileCoverage() else { return }
         flat16.msyncFile()
         advanceCoverageLocked(budget: budget)
+        // Once the claim has caught up there is nothing left for coverage to do and the fold is
+        // what the stamp is for. Running it here as well as in the caught-up branch means an index
+        // that finishes covering mid-session starts folding in the same session.
+        foldDuplicateContentsLocked()
     }
 
     private func stampRowSidecarLocked(sync: Bool) {
@@ -9010,6 +9177,16 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     // MARK: - Metadata + stats
+
+    /// The same, already on the queue.
+    func metaGetLocked(_ key: String) -> String? {
+        guard dbOpen() else { return nil }
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, "SELECT value FROM meta WHERE key = ?;", -1, &stmt, nil) == SQLITE_OK else { return nil }
+        sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT)
+        return sqlite3_step(stmt) == SQLITE_ROW ? String(cString: sqlite3_column_text(stmt, 0)) : nil
+    }
 
     public func metaGet(_ key: String) -> String? {
         queue.sync {
@@ -10196,6 +10373,29 @@ public final class VectorStore: @unchecked Sendable {
     func stampCoverageForTest() { queue.sync { stampVectorCoverageLocked() } }
     /// The per-row slot mirror, which is what every score is actually indexed by.
     var slotsForTest: [Int32] { queue.sync { occSlot } }
+    /// One slice, for a test that has to stop half way and resume.
+    @discardableResult
+    func foldDuplicatesOneSliceForTest() -> Bool { queue.sync { foldDuplicateContentsLocked() } }
+    /// Forget that the fold finished, so a second pass can be asked to prove it is idempotent.
+    func clearFoldFlagForTest() {
+        queue.sync {
+            exec("DELETE FROM meta WHERE key = '\(Self.contentFoldDoneKey)';")
+            contentFolded = false
+            contentFoldedCount = 0
+            exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.contentFoldCountKey)','0');")
+        }
+    }
+    /// Drive the duplicate fold to completion, which in the app is a slice per coverage stamp.
+    @discardableResult
+    public func foldDuplicatesToCompletion() -> (folded: Int, seconds: Double) {
+        let t0 = Date()
+        var rounds = 0
+        while queue.sync(execute: { foldDuplicateContentsLocked() }) {
+            rounds += 1
+            if rounds > 100_000 { break }
+        }
+        return (queue.sync { Swift.max(0, contentFoldedCount) }, -t0.timeIntervalSinceNow)
+    }
 
     // MARK: - Layout, and the v3 -> v4 conversion
 
@@ -10651,6 +10851,227 @@ public final class VectorStore: @unchecked Sendable {
             rows[i].chunkID = ids[k]
             k += 1
         }
+    }
+
+    // MARK: - FOLDING THE DUPLICATES AN EXISTING INDEX ALREADY HAS
+    //
+    // Content addressing stops a duplicate from being CREATED - `appendChunksLocked` looks a
+    // content key up and points the new row at the position that content already occupies. It does
+    // nothing about the duplicates an index accumulated before it existed, and on the measured
+    // index that is most of them: 9,179,075 keyed text chunks holding 5,662,740 distinct contents,
+    // so 3,516,335 chunks - 38.3% - are a second copy of a vector already in the file. Each one
+    // costs 1536 bytes of `.vecs` and a row of every single scan.
+    //
+    // This is the pass that collapses them, and it is deliberately the SMALL version of that idea:
+    // it moves POINTERS, never bytes. A duplicate's `slot` is set to its content's representative,
+    // the position it used to own becomes a hole, and the existing reclaim - which already knows
+    // how to rewrite the vector file and renumber - takes the space back. Nothing is re-embedded,
+    // no vector moves, no table changes shape, and every reader keeps working because "several
+    // rows point at one position" is the state the store has been able to represent since sharing
+    // shipped.
+    //
+    // THE REPRESENTATIVE IS MIN(slot), and that choice is what makes the pass idempotent and
+    // resumable. It does not depend on where the cursor is, on what order slices ran in, or on
+    // what happened between them: a row is either already on the minimum or it is not. A delete of
+    // the representative does not orphan its followers either, because by then they point AT its
+    // position and `releasedSlotsLocked` only releases a position no live row reads.
+    //
+    // WHY IT IS SAFE TO CALL TWO CHUNKS THE SAME. A content key is the text plus everything that
+    // decides what the embedder does with it, so two chunks sharing a key are the same forward
+    // pass. Sampled on the real index - 2,000 duplicate groups, vectors compared byte for byte out
+    // of `.vecs` - 1,998 were identical and 2 differed at cosine 0.99995, which is the last bf16
+    // bit moving with the batch shape the chunk happened to be embedded in. Folding those two onto
+    // one representative moves a score by 5e-5, four places below what the search digest compares.
+    private static let contentFoldDoneKey = "chunk_content_folded"
+    private static let contentFoldMarkKey = "chunk_content_fold_upto"
+    private static let contentFoldCountKey = "chunk_content_folded_count"
+    private var contentFolded = false
+    /// How many pointers this pass has moved, so the progress row can say what it will free.
+    private var contentFoldedCount = -1
+    nonisolated(unsafe) public static var contentFold =
+        ProcessInfo.processInfo.environment["OMNI_CONTENT_FOLD"] != "0"
+    nonisolated(unsafe) public static var contentFoldSliceOverride: Int? = nil
+    static var contentFoldSlice: Int {
+        contentFoldSliceOverride
+            ?? ProcessInfo.processInfo.environment["OMNI_FOLD_SLICE"].flatMap(Int.init) ?? 50_000
+    }
+    private var foldGroupStmt: OpaquePointer?
+    private var foldMoveStmt: OpaquePointer?
+
+    /// True once every duplicate points at its content's representative. Read by the reclaim, which
+    /// must not rewrite the vector file half way through a fold - the holes are still arriving.
+    var contentFoldComplete: Bool {
+        if !Self.contentFold || !Self.contentSharing { return true }
+        if contentFolded { return true }
+        guard dbOpen() else { return true }
+        if scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.contentFoldDoneKey)'") == 1 {
+            contentFolded = true
+        }
+        return contentFolded
+    }
+
+    /// One slice of the fold. Returns true while there is more to do.
+    ///
+    /// WALKS THE KEY SPACE, NOT THE ROW TABLE, and that is the difference between a pass that
+    /// finishes and one that does not. Asking "what is the representative for this row's content"
+    /// per ROW re-reads the whole content group every time, so the total is the sum of the SQUARES
+    /// of the group sizes - and this corpus has a config block that occurs 8,145 times, which on
+    /// its own is 66 million lookups. Measured: 150,000 rows in half an hour, and still going.
+    /// Grouped by key it is one ordered pass over the covering index, O(rows), and each group is
+    /// resolved once.
+    ///
+    /// THE RESIDENT MIRROR IS NOT UPDATED HERE. A folded row points at a position holding exactly
+    /// the vector it pointed at before, so a stale mirror returns identical results - there is
+    /// nothing to race. What must not happen mid-pass is recording the freed positions as holes
+    /// while the mirror still says a row owns them, which is the one inconsistency the coverage
+    /// audit is built to catch. So the holes are derived in one step at the end, from the state
+    /// the whole pass leaves behind, rather than accumulated a slice at a time.
+    @discardableResult
+    func foldDuplicateContentsLocked(budget: Int = VectorStore.contentFoldSlice) -> Bool {
+        guard Self.contentFold, Self.contentSharing, dbOpen(), !rows.isEmpty, dim > 0 else { return false }
+        guard !contentFoldComplete else { return false }
+        // POSITIONS FIRST. The fold rewrites `slot`, so every row has to have one: a row still
+        // carrying -1 would be read as "no position" and silently skipped, leaving a duplicate
+        // behind that nothing would ever come back for.
+        backfillSlotsLocked()
+        guard slotsBackfilled, hasIndexLocked("idx_chunk_content") else { return false }
+        if contentFoldedCount < 0 {
+            contentFoldedCount = scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.contentFoldCountKey)'")
+        }
+        if foldGroupStmt == nil {
+            // GROUP BY over the covering index is an ordered scan with no sort step, and the
+            // watermark rides the same order, so a resumed pass picks up exactly where it stopped.
+            _ = sqlite3_prepare_v2(db, """
+                SELECT t.chunk_key, MIN(c.slot) FROM chunk_text t JOIN chunks c ON c.id = t.chunk_id
+                 WHERE length(t.chunk_key) > 0 AND c.slot >= 0 AND t.chunk_key > ?
+                 GROUP BY t.chunk_key HAVING COUNT(*) > 1
+                 ORDER BY t.chunk_key LIMIT ?;
+                """, -1, &foldGroupStmt, nil)
+        }
+        if foldMoveStmt == nil {
+            // `length(chunk_key) > 0` IS NOT REDUNDANT. idx_chunk_content is a PARTIAL index with
+            // exactly that predicate, and SQLite will only use it for a query that implies it -
+            // without the clause the subquery is a full scan of nine million chunk_text rows, per
+            // content group. The query plan says SCAN where it should say SEARCH, and the pass
+            // never finishes its first slice.
+            _ = sqlite3_prepare_v2(db, """
+                UPDATE chunks SET slot = ?1 WHERE slot > ?1
+                  AND id IN (SELECT chunk_id FROM chunk_text
+                              WHERE chunk_key = ?2 AND length(chunk_key) > 0);
+                """, -1, &foldMoveStmt, nil)
+        }
+        guard let gst = foldGroupStmt, let mst = foldMoveStmt else { return false }
+        let mark = foldMarkLocked()
+        sqlite3_reset(gst)
+        if mark.isEmpty { sqlite3_bind_zeroblob(gst, 1, 0) }
+        else { mark.withUnsafeBytes { _ = sqlite3_bind_blob(gst, 1, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT) } }
+        sqlite3_bind_int(gst, 2, Int32(Swift.max(1, budget)))
+        var groups: [(key: Data, rep: Int32)] = []
+        while sqlite3_step(gst) == SQLITE_ROW {
+            guard let kp = sqlite3_column_blob(gst, 0) else { continue }
+            let klen = Int(sqlite3_column_bytes(gst, 0))
+            guard klen > 0, sqlite3_column_type(gst, 1) == SQLITE_INTEGER else { continue }
+            groups.append((Data(bytes: kp, count: klen), sqlite3_column_int(gst, 1)))
+        }
+        sqlite3_reset(gst)
+        guard !groups.isEmpty else { return finishFoldLocked() }
+        guard execChecked("BEGIN IMMEDIATE;") else { return true }
+        var moved = 0
+        for g in groups {
+            sqlite3_reset(mst)
+            sqlite3_bind_int(mst, 1, g.rep)
+            g.key.withUnsafeBytes { _ = sqlite3_bind_blob(mst, 2, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT) }
+            guard sqlite3_step(mst) == SQLITE_DONE else { rollbackTxnLocked(); return true }
+            moved += Int(sqlite3_changes(db))
+        }
+        contentFoldedCount += moved
+        let last = groups[groups.count - 1].key
+        guard execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.contentFoldCountKey)','\(contentFoldedCount)');"),
+              setFoldMarkLocked(last),
+              execChecked("COMMIT;")
+        else { rollbackTxnLocked(); return true }
+        if Self.searchTiming, moved > 0 {
+            print("[store] fold moved \(moved) pointers over \(groups.count) contents (\(contentFoldedCount) total)")
+        }
+        return true
+    }
+
+    /// The key the last slice stopped on, as the raw bytes. Stored hex because `meta.value` is text.
+    private func foldMarkLocked() -> Data {
+        guard let hex = metaGetLocked(Self.contentFoldMarkKey), !hex.isEmpty else { return Data() }
+        return StoreSchema.hexToBytes(hex)
+    }
+    private func setFoldMarkLocked(_ key: Data) -> Bool {
+        execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.contentFoldMarkKey)','\(StoreSchema.bytesToHex(key))');")
+    }
+
+    /// THE ONE STEP THAT TOUCHES THE RESIDENT STATE, run once the key walk is done.
+    ///
+    /// Everything up to here rewrote a column in SQLite. This reads it back, puts the in-memory
+    /// mirror in step, and then DERIVES the holes: a position inside the covered prefix that no
+    /// live row points at. Derived rather than accumulated, so it does not matter how many slices
+    /// ran, in what order, or how many sessions they spanned - which is what makes the whole pass
+    /// safe to interrupt anywhere.
+    private func finishFoldLocked() -> Bool {
+        guard dbOpen(), dim > 0 else { return false }
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, "SELECT id, slot FROM chunks ORDER BY id;", -1, &stmt, nil) == SQLITE_OK
+        else { return false }
+        var ids: [Int64] = [], slots: [Int32] = []
+        ids.reserveCapacity(rows.count); slots.reserveCapacity(rows.count)
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            ids.append(sqlite3_column_int64(stmt, 0))
+            slots.append(sqlite3_column_type(stmt, 1) == SQLITE_INTEGER ? sqlite3_column_int(stmt, 1) : -1)
+        }
+        // ONE ROW PER LIVE ROW, IN THE SAME ORDER. Anything else means the table has changed shape
+        // under the pass, and pairing them by position would give rows each other's positions - so
+        // it declines and the next session reads the column again.
+        let dead = deadRows
+        let live = rows.indices.filter { !dead.contains(Int32($0)) }
+        guard ids.count == live.count else { return false }
+        for (k, i) in live.enumerated() where slots[k] >= 0 {
+            if i < occSlot.count { occSlot[i] = slots[k] }
+            rows[i].slot = slots[k]
+            rows[i].chunkID = ids[k]
+        }
+        invalidateOccurrenceMirrorsLocked()
+        // Which positions nothing live reads any more. The whole point of the fold, and the only
+        // thing that lets the reclaim take the space back.
+        let n = slotCount
+        if n > 0, coveredRows > 0 {
+            var owned = [Bool](repeating: false, count: n)
+            for (i, sl) in occSlot.enumerated() where !dead.contains(Int32(i)) {
+                if sl >= 0, Int(sl) < n { owned[Int(sl)] = true }
+            }
+            var freed: [Int32] = []
+            for p in 0 ..< Swift.min(n, coveredRows) where !owned[p] && !vecHoles.contains(Int32(p)) {
+                freed.append(Int32(p))
+            }
+            if !freed.isEmpty {
+                guard execChecked("BEGIN IMMEDIATE;") else { return false }
+                recordHolesLocked(freed)
+                guard execChecked("COMMIT;") else { rollbackTxnLocked(); return false }
+            }
+        }
+        exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.contentFoldDoneKey)','1');")
+        exec("DELETE FROM meta WHERE key = '\(Self.contentFoldMarkKey)';")
+        contentFolded = true
+        FileHandle.standardError.write(Data(
+            "[omni] folded \(contentFoldedCount) duplicate chunks onto shared vectors\n".utf8))
+        return false
+    }
+
+    /// The row -> position mirror changed, but the POSITIONS did not move: every vector is still
+    /// where it was, so the resident scan copy is untouched and only the things that translate a
+    /// score per position into a score per file are stale. Rebuilding the base here instead would
+    /// cost a 30-second requantize per slice on a large index, for nothing.
+    private func invalidateOccurrenceMirrorsLocked() {
+        bumpGenLocked()                 // slotRow, orphan and identity caches are keyed on this
+        mlxOccSlot = nil; mlxOccSlotRows = 0
+        mlxDeadOcc = nil; mlxDeadOccRows = 0
+        deadIdxCache = nil
+        baseOccCount = occCountCoveringSlotsLocked(baseRows)
     }
 
     func backfillSlotsLocked(budget: Int = VectorStore.slotBackfillSlice) {

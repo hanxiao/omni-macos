@@ -7668,6 +7668,49 @@ if args.count >= 3 && args[1] == "intern" {
 // one is a launch and quit - and reports how far coverage got, how long the quit took, and what the
 // files weigh. The interesting numbers are the per-cycle close time (must stay small) and the point
 // at which index.sqlite starts shrinking.
+// Take back the positions the fold freed. omni-verify reclaim <db>
+// In the app this runs off the coverage stamp once holes pass a tenth of the file; here it is
+// called directly so the space and the scan width it returns are measurable in one step.
+if args.count >= 3 && args[1] == "reclaim" {
+    let dbURL = URL(fileURLWithPath: args[2])
+    func vecsBytes() -> Int64 {
+        let p = dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".vecs").path
+        return ((try? FileManager.default.attributesOfItem(atPath: p)[.size]) as? Int64) ?? 0
+    }
+    let store = try VectorStore(dbURL: dbURL)
+    let before = vecsBytes()
+    let t0 = Date()
+    let ran = store.reclaimVectorHolesForTest()
+    print(String(format: "reclaim ran=%@ seconds=%.1f", ran ? "yes" : "no", -t0.timeIntervalSinceNow))
+    if let bad = store.coverageAudit() { print("AUDIT FAILED: \(bad)") } else { print("audit ok") }
+    store.close()
+    print(String(format: ".vecs %.2f GB -> %.2f GB", Double(before) / 1e9, Double(vecsBytes()) / 1e9))
+    exit(ran ? 0 : 1)
+}
+
+// Collapse the duplicates an existing index already has. omni-verify fold <db>
+// In the app this runs a slice per coverage stamp; here it is driven to completion so the one-time
+// cost, and what it actually reclaims, are numbers rather than estimates.
+if args.count >= 3 && args[1] == "fold" {
+    let dbURL = URL(fileURLWithPath: args[2])
+    func vecsBytes() -> Int64 {
+        let p = dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".vecs").path
+        return ((try? FileManager.default.attributesOfItem(atPath: p)[.size]) as? Int64) ?? 0
+    }
+    let store = try VectorStore(dbURL: dbURL)
+    let before = vecsBytes()
+    let sb = store.migrateSlotsToCompletion()
+    print(String(format: "slots ready rows=%d in %.1fs", sb.filled, sb.seconds))
+    fflush(stdout)
+    let r = store.foldDuplicatesToCompletion()
+    print(String(format: "fold folded=%d seconds=%.1f", r.folded, r.seconds))
+    if let bad = store.coverageAudit() { print("AUDIT FAILED: \(bad)") } else { print("audit ok") }
+    store.close()
+    print(String(format: ".vecs %.2f GB -> %.2f GB (the reclaim returns the space)",
+                 Double(before) / 1e9, Double(vecsBytes()) / 1e9))
+    exit(0)
+}
+
 // How long does the one-time slot backfill take on a real index? omni-verify slotfill <db>
 // This is the upgrade an existing user pays for once. In the app it runs a slice per coverage
 // stamp and nobody waits for it; here it is driven to completion so the total is a number rather
