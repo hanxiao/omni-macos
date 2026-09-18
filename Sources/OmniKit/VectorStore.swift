@@ -6459,15 +6459,13 @@ public final class VectorStore: @unchecked Sendable {
     // is the delta's idea applied to an arbitrary position rather than to the tail: the position is
     // rescored exactly from `flat16` on every query and the result written over the stale one,
     // until a full rebuild folds it in.
-    /// OPT-IN, like the fold, and for a related reason. The allocation, the in-place write, the
-    /// patch scoring and the durability of a reused blob are all tested here. What is not
-    /// established is that an index whose positions are shared out of order survives arbitrary
-    /// CRUD: the mutation lifecycle fails on it the same way it fails on a folded index, and that
-    /// defect is not in this code - disabling the fold's column rewrite entirely still fails it.
-    /// Until that is understood, handing every user a one-way change into that state is the wrong
-    /// trade. `OMNI_FREE_LIST=1` turns it on.
+    /// ON. It was opt-in while an index whose positions are shared out of order failed the
+    /// mutation lifecycle, and that defect was never in this code: `chunksForCurrentPathLocked`
+    /// read the resident buffer by ROW index, which is only the position while the two are the
+    /// same number. With that fixed, and with the reuse debt settled on close rather than left to
+    /// a stamp that yields, this arm runs the suite clean. `OMNI_FREE_LIST=0` turns it off.
     nonisolated(unsafe) public static var freeListEnabled =
-        ProcessInfo.processInfo.environment["OMNI_FREE_LIST"] == "1"
+        ProcessInfo.processInfo.environment["OMNI_FREE_LIST"] != "0"
     private var freeSlots = SlotAllocator()
     private var freeSlotsValid = false
     /// The mutation the quarantine was last released at. A position freed in one mutation becomes
@@ -11318,19 +11316,18 @@ public final class VectorStore: @unchecked Sendable {
     private var contentFoldedCount = -1
     /// OPT-IN, and that is a measurement rather than caution.
     ///
-    /// The pass itself is right: on the real index it moves 3,516,335 duplicate pointers in 76 s,
-    /// the search digest is identical on both sides of it, and a folded index reloads with the
-    /// audit clean. What is not yet right is everything that runs AFTER it on an index that also
-    /// has tombstones - coverage's advance guard counts row indices where it means positions, so
-    /// the claim stalls short of the file and the reclaim that would return the space never runs.
-    /// Three attempts at that guard each broke a safety test that refuses an ambiguous claim, and
-    /// with the fold on by default the whole mutation lifecycle fails.
+    /// ON, and `OMNI_CONTENT_FOLD=0` turns it off.
     ///
-    /// So it ships able to be turned on and off by default. A fold whose space cannot be reclaimed
-    /// buys correct pointers and nothing a user would notice, and leaving every existing index in
-    /// that half-state is worse than leaving them as they are.
+    /// It was off while two things after it were wrong. Coverage's advance guard counted row
+    /// indices where it meant positions, so the claim stalled short of the file and the reclaim
+    /// that returns the space never ran; and the mutation lifecycle failed on a folded index, which
+    /// turned out to be `chunksForCurrentPathLocked` reading the resident buffer by ROW rather than
+    /// by position - correct only while the two are the same number, which folding is precisely
+    /// what stops. Both are fixed, and the whole chain is measured end to end on two independent
+    /// real indexes: 3,515,895 duplicates folded in 120 s, coverage complete, 5.80 GB returned by
+    /// the reclaim, and the search digest identical on both sides of all of it.
     nonisolated(unsafe) public static var contentFold =
-        ProcessInfo.processInfo.environment["OMNI_CONTENT_FOLD"] == "1"
+        ProcessInfo.processInfo.environment["OMNI_CONTENT_FOLD"] != "0"
     nonisolated(unsafe) public static var contentFoldSliceOverride: Int? = nil
     static var contentFoldSlice: Int {
         contentFoldSliceOverride

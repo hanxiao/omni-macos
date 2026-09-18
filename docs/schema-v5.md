@@ -441,8 +441,9 @@ before closing, which is what a user does: two rows leaked per round over five r
 counts matched that arithmetic exactly. `close()` settles it directly now, and the audit stops
 counting a legitimately unsynced reuse as breakage.
 
-THREE ARMS, 562 TESTS, 0 FAILURES EACH: default, `OMNI_CONTENT_FOLD=1`, `OMNI_FREE_LIST=1`. Every
-fix above was run with its negative control.
+BOTH ARE ON BY DEFAULT NOW, and five arms of 562 tests are 0 failures each: fold alone, free list
+alone, both together, both off, and the shipping default. Every fix above was run with its negative
+control.
 
 AND THE CHAIN RE-RUN ON A SECOND REAL INDEX, 9,729,693 chunks, independent of the one every earlier
 measurement used:
@@ -485,7 +486,7 @@ AND MEASURE IT OVER FIVE RUNS. Several hours went into bisecting on single-run c
 53, 61) and reading movement in noise. A single run tells you whether an arm fails; it tells you
 nothing about whether a change helped. Only 0 means anything.
 
-## The free list: in the tree, and it passes
+## The free list: on by default
 
 Handing a released position to the next new content instead of waiting for a whole-file copy is
 obviously right, and it is written: `SlotAllocator` allocates from a min-heap, `placeVectorLocked`
@@ -494,8 +495,8 @@ still describes wrongly, the coverage stamp drops the reused row's blob once the
 and `loadBySlotLocked` seats rows from the stored column instead of deriving a position from a
 row's rank - which the free list makes impossible.
 
-It is committed behind `OMNI_FREE_LIST=1`. With the flag off `placeVectorLocked` is a plain append
-and the default path is byte for byte what it was, which the whole suite says.
+It is ON, with `OMNI_FREE_LIST=0` to turn it off, under which `placeVectorLocked` is a plain append
+and the path is byte for byte what it was - which the suite says at 562 tests, 0 failures.
 
 IT PASSED ONCE THE ROW-AS-POSITION READ WAS FIXED, plus two things of its own. It used to fail the
 mutation suite the bad way - a renamed file coming back holding another file's vector, a real file
@@ -505,8 +506,7 @@ it - "the content lookup reads a stale slot" - was wrong, and the fold is what d
 failing identically with its column rewrite disabled.
 
 Its own two were the reuse debt leaking on close, and the coverage audit counting a legitimately
-unsynced reuse as breakage. Both are described under the fold. `OMNI_FREE_LIST=1` now runs 562
-tests with 0 failures.
+unsynced reuse as breakage. Both are described under the fold.
 
 ## The chunk/occurrence split: built and proven, not swapped in
 
