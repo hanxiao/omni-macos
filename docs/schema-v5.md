@@ -374,22 +374,28 @@ not open. `loadBySlotLocked` seats rows from the column and takes over only on a
 everywhere else the rank walk keeps its job, because it re-derives placement and rebuilds uncovered
 rows from their blobs rather than believing the file.
 
-WHY IT IS OFF BY DEFAULT. On an index that also has tombstones, coverage stops short of the file
-after a fold: its advance guard counts dead ROW INDICES where it means POSITIONS, so the test
-becomes "positions covered <= live rows", which is false as soon as positions outnumber rows.
-Measured on the real index: stalled at 9,186,807 of 10,028,339 with 3,677,834 holes waiting, and
-the reclaim - which only runs once coverage has caught up - declining for ever.
+COVERAGE USED TO STALL AFTER A FOLD, AND NO LONGER DOES. The advance guard counted dead ROW
+INDICES where it meant POSITIONS, so the test became "positions covered <= live rows", false as
+soon as positions outnumber rows: measured on the real index, stalled at 9,186,807 of 10,028,339
+with 3,677,834 holes waiting. `deadBelow` is now the two counts it always meant - the durable hole
+list below the claim, plus the slice's own new holes, which the slice already computes - and
+coverage completes: 10,028,339 of 10,028,339 in 13.3 s, audit clean. That change is neutral with
+the fold off, which the whole suite says.
 
-Three attempts at that guard each broke a test that exists to REFUSE an ambiguous claim
-(`testAmbiguousMismatchWithHolesStillRefuses`, `testUnprovableHoleStillRefuses`), and with the fold
-on by default the whole mutation lifecycle fails. A fold whose space cannot be reclaimed buys
-correct pointers and nothing a user would notice, so it ships behind `OMNI_CONTENT_FOLD=1` until
-that guard is expressed in positions without weakening what it refuses.
+WHY IT IS STILL OFF BY DEFAULT. The reclaim that follows is not right yet. On the real folded index
+it rewrites the vector file 397,548 positions SHORT of what the column names, so the index will not
+reopen - "the vector slot bookkeeping is off by 3,516,335 rows". Its plan is built from
+`rowsOfSlotLocked` over the resident model, and on the run that produced the short file it counted
+every position as live (`reclaimed 0 vector slots`) while rewriting the file to fewer positions
+than it started with. That is the next piece of work, and it is in the plan builder rather than
+anywhere new.
 
-That guard is the next piece of work, and it is a small one. It is not a matter of relaxing the
-test: `deadBelow` has to become "positions below the claim that no live row points at", which is
-what `vec_holes` records - and the two refusal tests have to keep refusing, which means
-understanding which of them is asserting the arithmetic and which the safety.
+With the fold on by default the mutation lifecycle also fails - three tests, including two whose
+job is to REFUSE an ambiguous claim. Those are the loader becoming authoritative on an index the
+store previously declined to guess about, and they need deciding rather than relaxing.
+
+A fold whose space cannot be reclaimed buys correct pointers and nothing a user would notice, so
+it stays behind `OMNI_CONTENT_FOLD=1` until the reclaim can finish the job.
 
 ## The free list: attempted, and withheld
 
