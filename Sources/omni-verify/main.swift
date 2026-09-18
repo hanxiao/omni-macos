@@ -7862,6 +7862,25 @@ if args.count >= 3 && args[1] == "splitparity" {
         return (h, hits, withText)
     }
 
+    // HOLD THE FOLD STILL. It is on by default and it runs from the coverage stamp, so it
+    // progresses between the two measurements - and folding a near-identical duplicate (measured at
+    // cosine 0.99995, the last bf16 bit moving with the batch shape) onto its representative moves a
+    // score in the fifth decimal, which is exactly the precision below. The first run of this
+    // harness reported the split had changed the text when what had changed was the fold.
+    VectorStore.contentFold = false
+    let foldMark: () -> String = {
+        var db: OpaquePointer?
+        defer { sqlite3_close(db) }
+        guard sqlite3_open_v2(dbURL.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { return "?" }
+        var st: OpaquePointer?
+        defer { sqlite3_finalize(st) }
+        guard sqlite3_prepare_v2(db, "SELECT COALESCE((SELECT value FROM meta WHERE key='chunk_content_fold_upto'),'')",
+                                 -1, &st, nil) == SQLITE_OK, sqlite3_step(st) == SQLITE_ROW,
+              let c = sqlite3_column_text(st, 0) else { return "?" }
+        return String(cString: c)
+    }
+    let markBefore = foldMark()
+
     VectorStore.chunkSplit = false
     let before: (UInt64, Int, Int)
     do {
@@ -7887,6 +7906,11 @@ if args.count >= 3 && args[1] == "splitparity" {
 
     guard before.2 > 0 else {
         print("splitparity: no hit carried any text, so this run proves nothing"); exit(1)
+    }
+    // And say so if it moved anyway, rather than blaming the split for it a second time.
+    if foldMark() != markBefore {
+        print("splitparity: the fold advanced during the run; this comparison is not about the split")
+        exit(1)
     }
     let ok = before == after
     if !ok {

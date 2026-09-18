@@ -119,6 +119,53 @@ final class ChunkSplitTests: XCTestCase {
             """), 2, "a shared content collapsed its occurrences' locators into one")
     }
 
+    /// THE SPLIT HAS TO RETURN THE SAME TEXT. Scoring does not change - the split moves where a
+    /// snippet and a locator are READ FROM - so a run can return identical paths at identical
+    /// scores and still show the wrong text under every one of them. A parity check on the real
+    /// index failed the first time it ran; this is that check, small enough to debug.
+    func testSearchReturnsTheSameTextThroughTheSplit() throws {
+        let url = tempDB()
+        var v4: [String: [String: String]] = [:]
+
+        VectorStore.chunkSplit = false
+        do {
+            let store = try build(url, files: 30, dupEvery: 3)
+            defer { store.close() }
+            v4 = displayText(store)
+            XCTAssertFalse(v4.isEmpty, "the fixture returned no hits, so it proves nothing")
+        }
+
+        VectorStore.chunkSplit = true
+        do {
+            let store = try VectorStore(dbURL: url)
+            XCTAssertTrue(store.buildChunkSplitForTest(), "the split did not build")
+            store.close()
+        }
+        let store = try VectorStore(dbURL: url); defer { store.close() }
+        let split = displayText(store)
+
+        XCTAssertEqual(Set(v4.keys), Set(split.keys), "the split returned a different set of hits")
+        var snippetDiff: [String] = [], locatorDiff: [String] = []
+        for (k, a) in v4 {
+            guard let b = split[k] else { continue }
+            if a["snippet"] != b["snippet"] { snippetDiff.append("\(k): v4=\(a["snippet"] ?? "") split=\(b["snippet"] ?? "")") }
+            if a["locator"] != b["locator"] { locatorDiff.append("\(k): v4=\(a["locator"] ?? "") split=\(b["locator"] ?? "")") }
+        }
+        XCTAssertEqual(snippetDiff.count, 0, "snippets differ: \(snippetDiff.prefix(3).joined(separator: " | "))")
+        XCTAssertEqual(locatorDiff.count, 0, "locators differ: \(locatorDiff.prefix(3).joined(separator: " | "))")
+    }
+
+    /// Snippet and locator of every hit, keyed by path#chunkIndex.
+    private func displayText(_ store: VectorStore) -> [String: [String: String]] {
+        var out: [String: [String: String]] = [:]
+        for seed in [1000, 1001, 1005, 7, 8, 9] {
+            for hit in store.search(vec(seed), filter: SearchFilter(), topK: 20) {
+                out["\(hit.path)#\(hit.chunkIndex)"] = ["snippet": hit.snippet, "locator": hit.locator]
+            }
+        }
+        return out
+    }
+
     func testItRefusesUntilEveryRowHasASlot() throws {
         let url = tempDB()
         let store = try VectorStore(dbURL: url)
