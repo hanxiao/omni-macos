@@ -959,6 +959,30 @@ func tombstonecheckRun(_ rows: Int, _ edits: Int) throws -> Int32 {
     let ro = try reopen()
     let roBad = zip(ro.before, ro.after).filter { $0 != $1 }.count
     print("  \(roBad == 0 ? "ok  " : "FAIL") survives close/reopen: \(ro.before.count - roBad)/\(ro.before.count) identical")
+    // SCORES OR ORDER? The line above compares the exact float bit pattern, so a rebuilt base that
+    // reorders two near-ties fails it exactly as loudly as a reopen that lost a file. Say which,
+    // because only one of those is something a user can see.
+    func pathsOnly(_ row: String) -> String {
+        row.split(separator: ",").map { $0.split(separator: "|").first.map(String.init) ?? "" }
+            .joined(separator: ",")
+    }
+    let orderBad = zip(ro.before, ro.after).filter { pathsOnly($0) != pathsOnly($1) }.count
+    let setBad = zip(ro.before, ro.after).filter {
+        Set(pathsOnly($0).split(separator: ",")) != Set(pathsOnly($1).split(separator: ","))
+    }.count
+    print("  \(orderBad == 0 ? "ok  " : "FAIL") same paths in the same order: \(ro.before.count - orderBad)/\(ro.before.count)")
+    print("  \(setBad == 0 ? "ok  " : "FAIL") same set of results: \(ro.before.count - setBad)/\(ro.before.count)")
+    // RESURRECTION OR RE-SEATING? A deleted file coming back is a different bug from a live file
+    // moving onto another's vector, and the fix is in a different place for each.
+    let deletedPaths = Set(stride(from: 0, to: 200, by: 3).map { PaperVectors.path(file: $0) })
+    var ghosts = 0, newcomers = 0
+    for (b, a) in zip(ro.before, ro.after) {
+        let bs = Set(pathsOnly(b).split(separator: ",").map(String.init))
+        let asAfter = Set(pathsOnly(a).split(separator: ",").map(String.init))
+        ghosts += asAfter.filter { deletedPaths.contains($0) }.count
+        newcomers += asAfter.subtracting(bs).filter { !deletedPaths.contains($0) }.count
+    }
+    print("  after the reopen: \(ghosts) results are DELETED files, \(newcomers) are live files that were not there before")
 
     let off = try run(false)
     let control = try run(false)   // same configuration twice: separates a regression from a tie
@@ -3914,7 +3938,26 @@ if args.count >= 2 && args[1] == "sidecarcheck" {
     let stampedRows = (hdr?["rowCount"] as? Int) ?? -1
     let stampedDim = (hdr?["dim"] as? Int) ?? -1
     let vecBytes = (try? FileManager.default.attributesOfItem(atPath: vecsURL.path)[.size] as? Int) ?? 0
-    let needBytes = stampedRows * stampedDim * 2
+    // ONE VECTOR PER POSITION, not per row. The sidecar stamps a ROW count, and on a folded index
+    // there are fewer positions than rows - so expecting rowCount * dim * 2 bytes reports a healthy
+    // file as short by exactly the number of duplicates that were folded, which is what it did:
+    // "SHORT by 3515893 rows" on an index whose fold had collapsed 3,515,895 of them. The file only
+    // has to hold the highest position any row points at.
+    var maxSlot = -1
+    do {
+        var sdb: OpaquePointer?
+        if sqlite3_open_v2(tmp.path, &sdb, SQLITE_OPEN_READONLY, nil) == SQLITE_OK {
+            var st: OpaquePointer?
+            if sqlite3_prepare_v2(sdb, "SELECT COALESCE(MAX(slot), -1) FROM chunks", -1, &st, nil) == SQLITE_OK,
+               sqlite3_step(st) == SQLITE_ROW {
+                maxSlot = Int(sqlite3_column_int64(st, 0))
+            }
+            sqlite3_finalize(st)
+        }
+        sqlite3_close(sdb)
+    }
+    let needRows = maxSlot >= 0 ? maxSlot + 1 : stampedRows
+    let needBytes = needRows * stampedDim * 2
     print("sidecarcheck base=\(base) dim=\(dim) appended-after-fold=\(K)\(existing != nil ? " [real index copy]" : "")")
     print("  stamped rowCount = \(stampedRows), dim = \(stampedDim)")
     print("  .vecs bytes      = \(vecBytes)   needed = \(needBytes)   \(vecBytes >= needBytes ? "COVERED" : "SHORT by \((needBytes - vecBytes) / max(1, stampedDim * 2)) rows")")

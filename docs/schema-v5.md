@@ -456,6 +456,38 @@ OnAFoldedIndex` closes that: it folds AND reclaims - the fold alone leaves one p
 every `rows.count` guard still passes; it is the reclaim that parts the two numbers - then exercises
 each reader. Negative control run.
 
+THE E2E SWEEP ON THE FOLDED REAL INDEX, after those fixes:
+
+    storeaudit       0 failing checks   (was 2: pooledVectors answered for 0 of 41 files)
+    dedupcheck       PASS
+    sidecarcheck     PASS
+    lexcheck         top-1 90.5%, top-10 92.0% typed filename; 93.3% media; 100% CJK
+    searchunderindex warm p50 218 ms, cold p50 326 ms, contention 318 ms
+    ChaosUITests     2/2      MixedSourceChaos 1/1 (43 rounds under indexing)
+    TranscribeHandoff 4/4     BrowseChaos 2/2 (skipped)
+
+`sidecarcheck` failed first, and it was the check that was wrong: it expected `rowCount * dim * 2`
+bytes of `.vecs`, so on a folded index it reported a healthy file "SHORT by 3515893 rows" - exactly
+the number of duplicates the fold had collapsed. It asks for the highest position any row points at
+now. Everything it actually measures had been passing throughout: sidecar adopted, row count right,
+top-10 overlap 10/10, vector fidelity 0.00025 against a 0.004 bf16 tolerance.
+
+TWO THINGS THAT ARE NOT FIXED, AND ARE NOT THIS WORK:
+
+`tombstonecheck`'s close/reopen check fails 1/41, and it fails identically with the fold and the
+free list both OFF - under which every change in this work is a no-op (`vectorUnits` is `rows.count`,
+`unsyncedReuse` is always empty, `loadBySlotLocked` returns false). It was refined to say what it
+means: no deleted file comes back (0 of 2,400), the store count is unchanged, and every query simply
+returns 60 different LIVE files. On a synthetic corpus of 400,000 near-uniform vectors a top-60 is
+mostly ties, so this reads as a degenerate fixture rather than a defect - and the authoritative
+reopen evidence points the other way: on two real indexes the search digest is byte-identical across
+fold, reclaim and reopen. It is recorded rather than fixed, and it should be either given a corpus
+with real separation or retired.
+
+`OCRWorkspaceUITests` 3/3 fail in the harness, as they did before this work: the workspace reaches
+neither its readout nor its missing-model banner within 45 s. The same app launches fine for the
+other four UI suites, so it is the OCR view's own startup in an automated session, not the store.
+
 BOTH ARE ON BY DEFAULT NOW, and five arms of 562 tests are 0 failures each: fold alone, free list
 alone, both together, both off, and the shipping default. Every fix above was run with its negative
 control.
