@@ -187,6 +187,63 @@ final class FreeListTests: XCTestCase {
         return String(cString: c)
     }
 
+    /// REUSE CAN HAPPEN BEFORE THE SLOT BACKFILL HAS FINISHED, and that is a state neither loader
+    /// claims. `placeVectorLocked` asks only whether the free list is on, so an index still part way
+    /// through its one-time backfill can hand out a position out of order - while `loadBySlotLocked`
+    /// refuses to seat rows from a column that is not complete, leaving the rank walk, which is
+    /// exactly what a reused position invalidates.
+    ///
+    /// Observed live: an index mid-migration with chunk_slots_upto at 6,000,000 of 9,773,836 and
+    /// chunk_slots_out_of_order already set. Without the gate this fixture reopens with survivor 59
+    /// seated on f17's vector and position 58 owned by nobody.
+    func testReuseBeforeTheBackfillFinishesStillReloads() throws {
+        VectorStore.quantBaseOverride = VectorStore.scanBits
+        let url = tempDB()
+        do {
+            let store = try VectorStore(dbURL: url)
+            for i in 0 ..< 60 { try store.replace(path: "/a/f\(i).txt", chunks: [chunk("/a/f\(i).txt", i)]) }
+            _ = store.search(vec(1), topK: 3)
+            store.advanceCoverageForTest()
+            // PART WAY THROUGH THE BACKFILL: the resident mapping is complete, the durable column
+            // is not. Written and then CLOSED, because that is the shape a real one has - the
+            // unseated rows exist before the open that has to notice them, which is the only moment
+            // the question can be asked about pre-existing rows rather than about rows this session
+            // has yet to persist.
+            store.unbackfillSlotsAboveForTest(30)
+            store.close()
+        }
+        // ONE ROW PER SLICE, so the backfill cannot simply finish on the next open - on a fixture
+        // this size it otherwise completes instantly and the window under test never exists. On the
+        // real index it is 9.7M rows and lasts about fifteen minutes.
+        let savedSlice = VectorStore.slotBackfillSliceOverride
+        VectorStore.slotBackfillSliceOverride = 1
+        defer { VectorStore.slotBackfillSliceOverride = savedSlice }
+        do {
+            let store = try VectorStore(dbURL: url)
+            store.deletePath("/a/f7.txt")
+            store.deletePath("/a/f19.txt")
+            try store.replace(path: "/x.txt", chunks: [chunk("/x.txt", 901)])
+            try store.replace(path: "/y.txt", chunks: [chunk("/y.txt", 902)])
+            // THE FILE GROWS INSTEAD, which is the whole point: appending costs one position and is
+            // readable by the rank walk, where reusing one is not readable by anything until the
+            // column lands. v4 appended for years.
+            XCTAssertEqual(positions(store), 62, "a position was reused while the slot column was incomplete")
+            store.close()
+        }
+        for suffix in [".rows", ".quant"] { try? FileManager.default.removeItem(atPath: url.path + suffix) }
+
+        let store = try VectorStore(dbURL: url); defer { store.close() }
+        for (p, seed) in [("/x.txt", 901), ("/y.txt", 902)] {
+            XCTAssertEqual(store.search(vec(seed), topK: 3).first?.path, p,
+                           "\(p) reads the wrong vector after reopening a part-backfilled index")
+        }
+        for i in [0, 6, 8, 18, 20, 59] {
+            XCTAssertEqual(store.search(vec(i), topK: 3).first?.path, "/a/f\(i).txt",
+                           "survivor \(i) reads the wrong vector")
+        }
+        XCTAssertNil(store.coverageAudit(), "bookkeeping is inconsistent after the reopen")
+    }
+
     /// The same, through a reload: the position is not the row's rank any more, so a loader that
     /// derives one seats the row on somebody else's vector.
     func testAReusedPositionSurvivesAReload() throws {

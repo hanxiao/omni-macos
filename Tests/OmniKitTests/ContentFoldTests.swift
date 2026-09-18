@@ -18,18 +18,26 @@ final class ContentFoldTests: XCTestCase {
     private var savedSharing = true
     private var savedFold = true
     private var savedSlice: Int?
+    private var savedFoldSeconds: Double?
 
     override func setUp() {
         super.setUp()
         savedSharing = VectorStore.contentSharing
         savedFold = VectorStore.contentFold
         savedSlice = VectorStore.contentFoldSliceOverride
+        savedFoldSeconds = VectorStore.foldSliceSecondsOverride
+        // PINNED. A slice is bounded by TIME in production, because what matters there is how long
+        // it holds the queue an interactive search waits on. That makes "how much did one slice
+        // get through" a property of the machine, which a test must not depend on - unpinned, these
+        // fixtures folded 3 of 5 contents on a fast machine and a different number on a slow one.
+        VectorStore.foldSliceSecondsOverride = 3600
         VectorStore.contentFold = true
     }
     override func tearDown() {
         VectorStore.contentSharing = savedSharing
         VectorStore.contentFold = savedFold
         VectorStore.contentFoldSliceOverride = savedSlice
+        VectorStore.foldSliceSecondsOverride = savedFoldSeconds
         super.tearDown()
     }
 

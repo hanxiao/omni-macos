@@ -488,6 +488,42 @@ with real separation or retired.
 neither its readout nor its missing-model banner within 45 s. The same app launches fine for the
 other four UI suites, so it is the OCR view's own startup in an automated session, not the store.
 
+AN INTERRUPTED FOLD USED TO BRICK THE INDEX, and this is the one that would have shipped. Quit part
+way through and the index did not open again - not slow, not degraded: the coverage claim could not
+be read and the store refused to load. Found by accident on a real 9,729,693-chunk copy left
+mid-pass with 573,636 pointers moved.
+
+Two causes, in the same place, and both are boundary errors of the same kind.
+
+The fold recorded the positions it vacated only when the WHOLE pass finished. Every slice in between
+therefore left positions inside the covered prefix that no live row owned and no hole named, which
+is exactly what `coverageAudit` calls broken. They are recorded in the slice's own transaction now,
+read before the UPDATE that overwrites them.
+
+And the by-slot loader engaged only once the fold's DONE flag was set. But the point of no return is
+the FIRST moved pointer, not the last: after one slice, positions and row ranks have already parted
+company, so a loader that derives a position from a rank is wrong for the whole index while the flag
+still says nothing has happened. The fold marks the numbering non-sequential when its first move
+commits - the same marker the free list uses.
+
+PREVENTION DOES NOTHING FOR AN INDEX ALREADY IN THAT STATE, and the fold had been on by default for
+several commits, so there is a repair. `deriveUnownedPositionsAsHolesLocked` records every position
+inside coverage that no live row points at. That is the DEFINITION of a hole, not an inference, and
+it is the opposite direction from the ambiguity the loader refuses to resolve above - there, a hole
+recorded for a still-live row leaves two different states behind identical counters and the repairs
+disagree. Here ownership is read straight off the column and settles it. Gated on a fold mark with
+no done flag, so it cannot mask an unrelated bad claim. The real bricked index opens with it and
+passes every `storeaudit` check.
+
+Negative controls: with the per-slice hole recording removed the fold suite fails 14 assertions.
+The marker half is not independently covered by any test - it is correct by the argument above and
+the fixture reopens without it, which is recorded here rather than claimed as proven.
+
+THE LESSON IS THE SAME ONE AS THE ROW-VS-POSITION READS. Both defects are a boundary drawn where the
+PASS ends instead of where the INVARIANT breaks. A fold is not "safe until it finishes"; it is unsafe
+from its first committed move, and every piece of bookkeeping that describes the new state has to
+commit with that move rather than after the last one.
+
 BOTH ARE ON BY DEFAULT NOW, and five arms of 562 tests are 0 failures each: fold alone, free list
 alone, both together, both off, and the shipping default. Every fix above was run with its negative
 control.

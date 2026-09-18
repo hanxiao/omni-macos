@@ -1928,6 +1928,13 @@ public final class VectorStore: @unchecked Sendable {
         // Whether this index answers display reads from the split. Read here, once, because every
         // result row asks it and the answer cannot change without a build or a rebuild.
         refreshSplitBuiltLocked()
+        // And whether a v4 backfill is still owed. Decided HERE because the rows present at open
+        // are exactly the pre-existing ones - after this, every row written gets a slot and the
+        // question would start answering about the wrong thing.
+        v4BackfillPending = Self.contentSharing && hasColumnLocked("chunks", "slot") && !slotsBackfilled
+            && scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.slotsBackfilledKey)'") != 1
+            && scalarQuery("SELECT EXISTS(SELECT 1 FROM chunks WHERE slot < 0)") == 1
+
         // Everything below speaks v3 and is a no-op once the index is v4 - the v4 layout has no
         // such columns and never gains them.
         if layoutLocked() != .v4 {
@@ -3270,7 +3277,7 @@ public final class VectorStore: @unchecked Sendable {
             // one-time pass with its own flag, and on an index that was migrated before content
             // addressing existed it is the one still to run.
             guard scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.migratedKey)'") != 1
-            else { return foldProgressLocked() }
+            else { return slotBackfillProgressLocked() ?? foldProgressLocked() }
             // AND ONLY WHEN IT CAN ACTUALLY RUN. Coverage advances only into a named vector file,
             // and below the quant crossover the buffer is an unlinked scratch mapping - so
             // `coveredRows` is 0 and stays 0, for as long as the index is small.
@@ -3299,6 +3306,26 @@ public final class VectorStore: @unchecked Sendable {
     /// duplicate is one position the reclaim can drop. It therefore counts UP as the pass runs,
     /// which is the honest shape - the pass does not know how many duplicates are left until it
     /// has looked at them.
+    /// THE PHASE NOBODY WAS TOLD ABOUT. Between the coverage migration finishing and the fold
+    /// starting sits the slot backfill, and on a 9.7M-row index it is the LONGEST of the three - but
+    /// `foldProgressLocked` requires the backfill to be done before it will report anything, so the
+    /// panel showed no progress at all for the whole of it. Asked directly: "when will optimizing
+    /// index show?" - on an index still backfilling, the honest answer was "not yet", which is not
+    /// an answer a progress bar should ever give.
+    ///
+    /// The watermark is a chunk id and ids are dense, so the fraction is the watermark over the
+    /// highest id. Returns nil when the backfill is not the phase in progress, so the caller falls
+    /// through to the fold.
+    private func slotBackfillProgressLocked() -> (done: Int, total: Int, bytesToReclaim: Int64)? {
+        guard Self.contentSharing, !slotsBackfilled, hasColumnLocked("chunks", "slot") else { return nil }
+        let top = scalarQuery("SELECT COALESCE(MAX(id), 0) FROM chunks")
+        guard top > 0 else { return nil }
+        let mark = scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.slotsMarkKey)'")
+        // The bytes are what the FOLD will free afterwards, which is not knowable yet - so this
+        // phase promises nothing rather than promising a number it would have to take back.
+        return (Swift.max(0, Swift.min(mark, top)), top, 0)
+    }
+
     private func foldProgressLocked() -> (done: Int, total: Int, bytesToReclaim: Int64)? {
         guard Self.contentFold, Self.contentSharing, dim > 0, !rows.isEmpty else { return nil }
         guard !contentFoldComplete, slotsBackfilled else { return nil }
@@ -6534,6 +6561,16 @@ public final class VectorStore: @unchecked Sendable {
     private static let slotsOutOfOrderKey = "chunk_slots_out_of_order"
     private var slotsOutOfOrder = false
 
+    /// IS THE ONE-TIME v4 BACKFILL STILL IN FLIGHT? Decided once, at open, and it is a narrower
+    /// question than "does any row have slot < 0" - a freshly written row's slot is persisted by a
+    /// later pass, so on an index this build wrote from scratch the column lags behind constantly
+    /// and always will. Asking the broad question blocked reuse for ever on healthy indexes.
+    ///
+    /// What actually makes reuse unsafe is the MIGRATION: rows that existed before this session and
+    /// still carry -1. Those are the rows `loadBySlotLocked` refuses to seat, and reusing a position
+    /// while they exist leaves an index neither loader can read.
+    private var v4BackfillPending = false
+
     /// The free list describes a NUMBERING. Anything that renumbers positions - a compaction, a
     /// reload, a wipe - leaves it describing one that no longer exists, so it is dropped rather
     /// than adjusted and rebuilt from the pointers the next time one is needed.
@@ -6573,7 +6610,18 @@ public final class VectorStore: @unchecked Sendable {
     /// Where a brand-new content's vector goes. The end of the file unless the free list holds a
     /// position nothing owns, in which case it is written there and the file does not grow.
     private func placeVectorLocked(_ v: [UInt16]) -> Int32 {
-        guard Self.freeListEnabled, Self.contentSharing, dim > 0, v.count == dim else {
+        // NOT UNTIL THE COLUMN IS COMPLETE. Reuse makes the numbering non-sequential, and the only
+        // loader that can read a non-sequential index seats rows from `chunks.slot` - which it
+        // refuses to do while the one-time backfill is unfinished, because a row still carrying -1
+        // would land on position 0 along with every other such row. Handing out a position in that
+        // window leaves an index NEITHER loader can read: measured on a part-backfilled fixture, a
+        // reopen seated survivor 59 on f17's vector and left position 58 owned by nobody.
+        //
+        // Observed live at chunk_slots_upto 6,000,000 of 9,773,836 with the out-of-order marker
+        // already set, so this is reachable on a normal migration, not a contrived state. Appending
+        // costs the file one position until the backfill lands, which is what v4 did for years.
+        guard Self.freeListEnabled, Self.contentSharing, dim > 0, v.count == dim,
+              !v4BackfillPending else {
             flat16.append(contentsOf: v); return lastAppendedSlot
         }
         ensureFreeSlotsLocked()
@@ -6863,6 +6911,20 @@ public final class VectorStore: @unchecked Sendable {
                 // msync. `clearSyncedReuseBlobsLocked` drops them at the stamp that syncs. So they
                 // are covered rows that legitimately still have a blob, and counting them as
                 // breakage makes the audit report a bug where the design is doing its job.
+                // NOT WHILE THE COLUMN IS STILL BEING FILLED. This counts covered rows by
+                // `slot >= 0`, but a row that is covered - its blob cleared, the file answering for
+                // it - legitimately still carries -1 until the one-time backfill reaches it. The
+                // two counts therefore disagree for the whole of a v4 migration, and the audit
+                // called a perfectly healthy migrating index broken. The hole-based form below does
+                // not read the column at all, so it is the one that can answer during the window.
+                if v4BackfillPending {
+                    let liveCovered = coveredRows - vecHoles.count
+                    let cleared = clearedRowsLocked()
+                    if cleared != liveCovered {
+                        return "coverage accounts for \(liveCovered) rows but \(cleared) have no blob"
+                    }
+                    return nil
+                }
                 var exclude = ""
                 if !unsyncedReuse.isEmpty {
                     exclude = " AND slot NOT IN (\(unsyncedReuse.map(String.init).joined(separator: ",")))"
@@ -11466,6 +11528,15 @@ public final class VectorStore: @unchecked Sendable {
     nonisolated(unsafe) public static var contentFold =
         ProcessInfo.processInfo.environment["OMNI_CONTENT_FOLD"] != "0"
     nonisolated(unsafe) public static var contentFoldSliceOverride: Int? = nil
+    /// How long one fold slice may hold the store queue. A search waits behind it, so this is an
+    /// interactive-latency budget, not a throughput knob - the same reason the coverage slice is
+    /// sized in fractions of a second rather than in rows.
+    nonisolated(unsafe) public static var foldSliceSecondsOverride: Double? = nil
+    static var foldSliceSeconds: Double {
+        foldSliceSecondsOverride
+            ?? ProcessInfo.processInfo.environment["OMNI_FOLD_SLICE_MS"].flatMap { Double($0).map { $0 / 1000 } }
+            ?? 0.25
+    }
     static var contentFoldSlice: Int {
         contentFoldSliceOverride
             ?? ProcessInfo.processInfo.environment["OMNI_FOLD_SLICE"].flatMap(Int.init) ?? 50_000
@@ -11520,6 +11591,17 @@ public final class VectorStore: @unchecked Sendable {
             FileHandle.standardError.write(Data("[omni] chunk split refused: \(error)\n".utf8))
             exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.chunkSplitDoneKey)', '0');")
             return false
+        }
+    }
+
+    /// Blank the slot column above `keep` rows and clear the backfill flag, which is what an index
+    /// part way through its one-time backfill actually looks like: the resident mapping is complete,
+    /// the durable column is not.
+    public func unbackfillSlotsAboveForTest(_ keep: Int) {
+        queue.sync {
+            exec("UPDATE chunks SET slot = -1 WHERE id > (SELECT MIN(id) + \(keep) FROM chunks);")
+            exec("DELETE FROM meta WHERE key = '\(Self.slotsBackfilledKey)';")
+            slotsBackfilled = false
         }
     }
 
@@ -11618,7 +11700,16 @@ public final class VectorStore: @unchecked Sendable {
         guard execChecked("BEGIN IMMEDIATE;") else { return true }
         var moved = 0
         var freed: [Int32] = []
+        // TIME-BOUNDED, NOT COUNT-BOUNDED. A slice takes the serial queue that interactive search
+        // also waits on, so what matters is how long it HOLDS it, not how many contents it gets
+        // through. 50,000 groups is a fixed count whose duration depends entirely on how deep the
+        // duplicate groups are - and on the measured corpus one block occurs 8,145 times. Reported
+        // as search going laggy during the pass, which is exactly what a long slice feels like.
+        // The pass is resumable by watermark, so stopping early costs nothing but the next fetch.
+        let deadline = Date().addingTimeInterval(Self.foldSliceSeconds)
+        var applied = 0
         for g in groups {
+            if applied > 0, Date() >= deadline { break }
             sqlite3_reset(fst)
             sqlite3_bind_int(fst, 1, g.rep)
             g.key.withUnsafeBytes { _ = sqlite3_bind_blob(fst, 2, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT) }
@@ -11630,6 +11721,7 @@ public final class VectorStore: @unchecked Sendable {
             g.key.withUnsafeBytes { _ = sqlite3_bind_blob(mst, 2, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT) }
             guard sqlite3_step(mst) == SQLITE_DONE else { rollbackTxnLocked(); return true }
             moved += Int(sqlite3_changes(db))
+            applied += 1
         }
         // IN THIS TRANSACTION, with the move that made them holes. Recorded at the end of the pass
         // instead, every slice in between left positions inside the covered prefix that no live row
@@ -11637,7 +11729,9 @@ public final class VectorStore: @unchecked Sendable {
         // an interrupted fold left behind for good.
         recordHolesLocked(freed)
         contentFoldedCount += moved
-        let last = groups[groups.count - 1].key
+        // The last group ACTUALLY APPLIED, not the last fetched: the watermark has to name where
+        // the pass really got to or the groups after the deadline are skipped for good.
+        let last = groups[Swift.max(0, applied - 1)].key
         // THE FIRST MOVED POINTER IS THE POINT OF NO RETURN, not the last one. The moment one
         // duplicate shares its representative's position, positions and row ranks have parted
         // company - so a loader that derives a position from a rank is already wrong, for the whole
@@ -11659,8 +11753,15 @@ public final class VectorStore: @unchecked Sendable {
               execChecked("COMMIT;")
         else { rollbackTxnLocked(); return true }
         if moved > 0 { slotsOutOfOrder = true }
+        // CHECKPOINT, or every read after this one pays for the frames this one wrote. The fold is
+        // millions of small UPDATEs, and without this the WAL grows without bound - measured at
+        // 1.97 GB on a live index mid-fold, with `walFindFrame` dominating the profile because every
+        // page lookup was searching two gigabytes of frames. That cost lands on SEARCH, not on the
+        // fold, which is why the pass reads as "search got slow" rather than "the fold is slow".
+        // PASSIVE so it never blocks on a reader; it simply does what it can each time.
+        exec("PRAGMA wal_checkpoint(PASSIVE);")
         if Self.searchTiming, moved > 0 {
-            print("[store] fold moved \(moved) pointers over \(groups.count) contents (\(contentFoldedCount) total)")
+            print("[store] fold moved \(moved) pointers over \(applied) contents (\(contentFoldedCount) total)")
         }
         return true
     }
@@ -11836,6 +11937,7 @@ public final class VectorStore: @unchecked Sendable {
         exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.slotsBackfilledKey)','1');")
         exec("DELETE FROM meta WHERE key = '\(Self.slotsMarkKey)';")
         slotsBackfilled = true
+        v4BackfillPending = false   // the window this guards is closed
         if Self.searchTiming { print("[store] slot column backfilled for \(rows.count) rows") }
     }
 

@@ -952,9 +952,13 @@ private struct IndexTab: View {
                         }
                         ProgressView(value: Double(m.done), total: Double(m.total))
                             .progressViewStyle(.linear)
-                        Text("Frees \(ByteSize.file(m.bytesToReclaim)) when it finishes.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        // The backfill phase cannot know what the fold will free, and reports 0
+                        // rather than a number it would have to take back. Say nothing then.
+                        if m.bytesToReclaim > 0 {
+                            Text("Frees \(ByteSize.file(m.bytesToReclaim)) when it finishes.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
                 if let last = model.lastIndexed {
