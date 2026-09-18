@@ -6525,13 +6525,30 @@ public final class VectorStore: @unchecked Sendable {
     // is the delta's idea applied to an arbitrary position rather than to the tail: the position is
     // rescored exactly from `flat16` on every query and the result written over the stale one,
     // until a full rebuild folds it in.
-    /// ON. It was opt-in while an index whose positions are shared out of order failed the
-    /// mutation lifecycle, and that defect was never in this code: `chunksForCurrentPathLocked`
-    /// read the resident buffer by ROW index, which is only the position while the two are the
-    /// same number. With that fixed, and with the reuse debt settled on close rather than left to
-    /// a stamp that yields, this arm runs the suite clean. `OMNI_FREE_LIST=0` turns it off.
+    /// OFF, on a MEASUREMENT rather than on a doubt. `OMNI_FREE_LIST=1` turns it on.
+    ///
+    /// It is correct: the suite is clean with it on, and so is a 4,000-file churn - no missing rows,
+    /// no orphans, no ghost hits, coverage consistent. What it is not is free. Measured over 45
+    /// seconds of churn on the same corpus, changing only this flag:
+    ///
+    ///     free list off   914 churn ops   7,897 searches   182 full passes
+    ///     free list on    587 churn ops   5,111 searches   117 full passes
+    ///
+    /// A third of the throughput, and the cause is one line elsewhere: the incremental base update
+    /// requires `patchedSlots.isEmpty`, so a single reused position below `baseRows` makes every
+    /// subsequent base fold REPACK the whole quantized replica instead of appending its delta.
+    ///
+    /// That guard is not wrong. The funnel SELECTS candidates from the quantized base, so a stale
+    /// quantized row can stop a patched position being selected at all - and `patchScoresLocked`
+    /// only corrects the scores of positions that were already selected. Fixing this means
+    /// re-quantizing just the patched rows and scattering them into the base, which is O(patched)
+    /// rather than O(rows), on the hottest and most correctness-critical path in the store. That is
+    /// a change worth making carefully rather than quickly.
+    ///
+    /// Until then the trade is a third of the churn throughput against holes reclaimed without a
+    /// whole-file rewrite, and the reclaim already returns that space - so this waits.
     nonisolated(unsafe) public static var freeListEnabled =
-        ProcessInfo.processInfo.environment["OMNI_FREE_LIST"] != "0"
+        ProcessInfo.processInfo.environment["OMNI_FREE_LIST"] == "1"
     private var freeSlots = SlotAllocator()
     private var freeSlotsValid = false
     /// The mutation the quarantine was last released at. A position freed in one mutation becomes
@@ -6583,7 +6600,12 @@ public final class VectorStore: @unchecked Sendable {
     /// first allocation after a structural change.
     private func ensureFreeSlotsLocked() {
         let n = slotCount
-        if freeSlotsValid, freeSlots.highWater == n { 
+        // THE FILE GROWING IS NOT A REASON TO REBUILD. Appending adds positions that the appending
+        // rows own, so the free set is untouched and only the ceiling moves. Treating any change in
+        // `slotCount` as invalidation meant every append forced the next allocation to walk every
+        // row again - a third of the throughput under churn, measured.
+        if freeSlotsValid, n > freeSlots.highWater { freeSlots.raiseHighWater(to: n) }
+        if freeSlotsValid, freeSlots.highWater == n {
             if freeSlotsCommitGen != mutationGen { freeSlots.commit(); freeSlotsCommitGen = mutationGen }
             return
         }

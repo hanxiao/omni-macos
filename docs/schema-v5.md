@@ -569,7 +569,7 @@ AND MEASURE IT OVER FIVE RUNS. Several hours went into bisecting on single-run c
 53, 61) and reading movement in noise. A single run tells you whether an arm fails; it tells you
 nothing about whether a change helped. Only 0 means anything.
 
-## The free list: on by default
+## The free list: correct, and a third of the churn throughput
 
 Handing a released position to the next new content instead of waiting for a whole-file copy is
 obviously right, and it is written: `SlotAllocator` allocates from a min-heap, `placeVectorLocked`
@@ -578,8 +578,33 @@ still describes wrongly, the coverage stamp drops the reused row's blob once the
 and `loadBySlotLocked` seats rows from the stored column instead of deriving a position from a
 row's rank - which the free list makes impossible.
 
-It is ON, with `OMNI_FREE_LIST=0` to turn it off, under which `placeVectorLocked` is a plain append
-and the path is byte for byte what it was - which the suite says at 562 tests, 0 failures.
+IT IS OFF, ON A MEASUREMENT RATHER THAN A DOUBT. `OMNI_FREE_LIST=1` turns it on.
+
+It is correct. The suite is clean with it on, and so is a 4,000-file churn: no missing rows, no
+orphans, no ghost hits, coverage consistent, clean teardown. What it is not is free. Measured over
+45 seconds of churn on the same corpus, changing only this flag:
+
+    free list off   914 churn ops   7,897 searches   182 full passes
+    free list on    587 churn ops   5,111 searches   117 full passes
+
+A third of the throughput, and the cause is one line elsewhere: the incremental base update
+requires `patchedSlots.isEmpty`, so a single reused position below `baseRows` makes every subsequent
+base fold REPACK the whole quantized replica instead of appending its delta.
+
+That guard is not wrong. The funnel SELECTS candidates from the quantized base, so a stale
+quantized row can stop a patched position being selected at all, and `patchScoresLocked` only
+corrects the scores of positions already selected. Fixing it means re-quantizing just the patched
+rows and scattering them into the base - O(patched) rather than O(rows), on the hottest and most
+correctness-critical path in the store. Worth doing carefully rather than quickly.
+
+The first guess was wrong and is worth recording: that `ensureFreeSlotsLocked` rebuilt the free set
+on every append, because "is the allocator current" was `highWater == positions`, which is false
+after any growth. That WAS a defect and is fixed - the ceiling is raised instead - but it recovered
+none of the throughput. A sample said why: `patchScoresLocked` 47 frames against 2 for
+`ensureFreeSlotsLocked`.
+
+Until the base interaction is fixed the trade is a third of the churn throughput against holes
+reclaimed without a whole-file rewrite - and the reclaim already returns that space. So it waits.
 
 IT PASSED ONCE THE ROW-AS-POSITION READ WAS FIXED, plus two things of its own. It used to fail the
 mutation suite the bad way - a renamed file coming back holding another file's vector, a real file
