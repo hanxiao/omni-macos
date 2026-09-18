@@ -7668,6 +7668,17 @@ if args.count >= 3 && args[1] == "intern" {
 // one is a launch and quit - and reports how far coverage got, how long the quit took, and what the
 // files weigh. The interesting numbers are the per-cycle close time (must stay small) and the point
 // at which index.sqlite starts shrinking.
+// Drive the coverage claim to the end of the file. omni-verify cover <db>
+if args.count >= 3 && args[1] == "cover" {
+    let store = try VectorStore(dbURL: URL(fileURLWithPath: args[2]))
+    let r = store.advanceCoverageToCompletion()
+    print(String(format: "cover %d of %d positions in %.1fs%@", r.covered, r.positions, r.seconds,
+                 r.covered == r.positions ? "" : "  STOPPED SHORT"))
+    if let bad = store.coverageAudit() { print("AUDIT FAILED: \(bad)") } else { print("audit ok") }
+    store.close()
+    exit(r.covered == r.positions ? 0 : 1)
+}
+
 // Take back the positions the fold freed. omni-verify reclaim <db>
 // In the app this runs off the coverage stamp once holes pass a tenth of the file; here it is
 // called directly so the space and the scan width it returns are measurable in one step.

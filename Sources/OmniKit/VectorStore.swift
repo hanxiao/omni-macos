@@ -7577,7 +7577,32 @@ public final class VectorStore: @unchecked Sendable {
         // order. Holes are exactly the slots below `coveredRows` with no row, so this is the
         // arithmetic that has to balance - and if it does not, the claim is not extended.
         let live = scalarQuery("SELECT COUNT(*) FROM chunks")
-        let deadBelow = deadRows.filter { Int($0) < target }.count
+        // THE HOLES THIS SLICE IS ABOUT TO RECORD, computed here rather than after the guard,
+        // because the guard is counting them.
+        //
+        // `deadBelow` means "positions below the target that no live row points at". Read off the
+        // dead ROW indices that is the identity only while a row owns its own vector: on a folded
+        // index there are more positions than rows and the loader pads the difference with hole
+        // rows whose INDEX has nothing to do with their POSITION. Counted wrongly, the test below
+        // becomes "positions covered <= live rows" and is false as soon as positions outnumber
+        // rows - coverage then stops short of the file's end for ever, and with it the reclaim.
+        // Measured on the real index after folding: stalled at 9,186,807 of 10,028,339.
+        //
+        // The two parts are the durable hole list, which is exactly that count below `coveredRows`,
+        // and the slice's own new holes, which is the same question asked of the positions between
+        // the claim and the target. `fresh` is then reused below, so the walk is paid for once.
+        var fresh: [Int32] = []
+        let deadBelow: Int
+        if Self.contentSharing {
+            ensureSlotRowsLocked()
+            let dead = deadRows
+            fresh = (coveredRows ..< target).filter { sl in
+                !rowsOfSlotLocked(sl).contains { !dead.contains($0) }
+            }.map { Int32($0) }
+            deadBelow = vecHoles.filter { Int($0) < target }.count + fresh.count
+        } else {
+            deadBelow = deadRows.filter { Int($0) < target }.count
+        }
         guard live == rows.count - deadRows.count, target - deadBelow <= live else { return false }
         // The watermark, derived now if the claim predates it - see ensureCoveredUpToIDLocked for
         // why this cannot be left to the point where the claim is first read.
@@ -7596,11 +7621,6 @@ public final class VectorStore: @unchecked Sendable {
         // clearing, so the claim and the hole list can never disagree. Under sharing "unowned" is a
         // question about the position's rows, not about a row index that happens to equal it.
         if Self.contentSharing {
-            ensureSlotRowsLocked()
-            let dead = deadRows
-            let fresh = (coveredRows ..< target).filter { sl in
-                !rowsOfSlotLocked(sl).contains { !dead.contains($0) }
-            }.map { Int32($0) }
             recordHolesLocked(fresh, coveredOverride: target)
         } else {
             recordHolesLocked((coveredRows ..< target).map { Int32($0) }.filter { deadRows.contains($0) },
@@ -10380,6 +10400,20 @@ public final class VectorStore: @unchecked Sendable {
             if rounds > 10_000 { break }   // a backfill that cannot finish must not spin for ever
         }
         return (queue.sync { rows.count }, -t0.timeIntervalSinceNow)
+    }
+
+    /// Drive the coverage claim to the end of the file, which in the app is one slice per stamp.
+    /// Reports where it got to, so a run that STOPS short says so rather than looking finished.
+    @discardableResult
+    public func advanceCoverageToCompletion() -> (covered: Int, positions: Int, seconds: Double) {
+        let t0 = Date()
+        var rounds = 0
+        while queue.sync(execute: { advanceCoverageLocked() }) {
+            rounds += 1
+            if rounds > 1_000_000 { break }
+        }
+        return queue.sync { (coveredRows, Self.contentSharing ? slotCount : rows.count,
+                             -t0.timeIntervalSinceNow) }
     }
 
     /// Test entry point: run the rewrite on the store queue.
