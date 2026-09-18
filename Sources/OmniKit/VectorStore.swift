@@ -6410,6 +6410,10 @@ public final class VectorStore: @unchecked Sendable {
     /// only visible in a debug print - which is how a sharing index came to pay the full scan on
     /// every launch with 539 tests passing.
     public private(set) var adoptedRowSidecar = false
+    /// Whether this open seated its rows from `chunks.slot` rather than from their rank. The
+    /// by-slot path is correct everywhere but does not use the row sidecar, so it is the slow one -
+    /// which makes "did we take it, and did we need to" a thing tests have to be able to ask.
+    public private(set) var loadedBySlot = false
     private var vecSidecarURL: URL { dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".vecs") }
     /// The compacted copy, before it becomes the vector file. Named beside it so the switch is a
     /// same-directory rename, which is the only kind POSIX promises is atomic.
@@ -6494,6 +6498,17 @@ public final class VectorStore: @unchecked Sendable {
     /// content that used to be there, scoring plausibly, under the wrong file.
     private var unsyncedReuse = Set<Int32>()
 
+    /// TRUE ONCE A POSITION HAS ACTUALLY BEEN HANDED OUT OF ORDER, and durable because the loader
+    /// asks it before anything is in memory.
+    ///
+    /// The free list being ENABLED is not the same as the numbering being non-sequential. Until it
+    /// reuses its first position every vector still sits at its row's rank, and the rank walk - and
+    /// with it the row sidecar, which is what makes a large index open quickly - is still correct.
+    /// Gating the by-slot loader on the flag rather than on the fact cost 58 seconds on every open
+    /// of a 9.7M-row index, forever, for an index that had never reused anything.
+    private static let slotsOutOfOrderKey = "chunk_slots_out_of_order"
+    private var slotsOutOfOrder = false
+
     /// The free list describes a NUMBERING. Anything that renumbers positions - a compaction, a
     /// reload, a wipe - leaves it describing one that no longer exists, so it is dropped rather
     /// than adjusted and rebuilt from the pointers the next time one is needed.
@@ -6556,6 +6571,12 @@ public final class VectorStore: @unchecked Sendable {
         // The position is owned again, so it is not a hole. Committed inside the caller's
         // transaction with the row that now owns it; a rollback re-reads the table.
         if vecHoles.remove(Int32(p)) != nil { exec("DELETE FROM vec_holes WHERE slot = \(p);") }
+        // AND THE NUMBERING IS NOW NON-SEQUENTIAL. Recorded once, in this same transaction, because
+        // the next open has to know before it can choose a loader.
+        if !slotsOutOfOrder {
+            slotsOutOfOrder = true
+            exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.slotsOutOfOrderKey)', '1');")
+        }
         // A covered position's blob was cleared because the FILE answered for it. It answers for
         // different bytes now, and those bytes are not durable until the next msync - so the new
         // row keeps its pending blob, and the coverage stamp drops it once the file is synced.
@@ -6573,6 +6594,14 @@ public final class VectorStore: @unchecked Sendable {
     private var coveredUpToID: Int64 = 0
     /// Set once the `chunks.slot` column has been filled in for every row. See backfillSlotsLocked.
     private static let slotsBackfilledKey = "chunk_slots_backfilled"
+    /// The chunk/occurrence split is BUILT, not yet READ. `chunk` and `occurrence` are filled from
+    /// the v4 tables and their five invariants proven, but every reader is still pointed at
+    /// `chunk_text`. Until they are moved the split costs space rather than saving it, so this
+    /// stays off: `OMNI_CHUNK_SPLIT=1` builds it, for measuring and for the reader work to go
+    /// against something real.
+    nonisolated(unsafe) public static var chunkSplit =
+        ProcessInfo.processInfo.environment["OMNI_CHUNK_SPLIT"] == "1"
+    private static let chunkSplitDoneKey = "chunk_split_backfilled"
     /// How far that backfill has got, as a chunk id. Absent means "not started" or "finished".
     private static let slotsMarkKey = "chunk_slots_upto"
     private var slotsBackfilled = false
@@ -7120,12 +7149,17 @@ public final class VectorStore: @unchecked Sendable {
         // it is right even when the column and the file have drifted apart. Seating rows from the
         // column is strictly more trusting; on an index that has not been folded there is nothing
         // to gain by trusting more, and a whole class of drift to lose by it.
-        // TWO WAYS TO GET HERE, and both are opt-in. A FOLDED index has far fewer positions than
-        // rows, so the walk runs off the end of the file. An index with the FREE LIST on hands
-        // positions out lowest-first rather than in id order, so the walk seats a row on whichever
-        // vector happens to sit at its rank. Either way the rank is not the position any more.
+        // TWO WAYS TO GET HERE, and both are facts about THIS index rather than settings. A FOLDED
+        // index has far fewer positions than rows, so the walk runs off the end of the file. An
+        // index that has reused a position has handed one out lowest-first rather than in id order,
+        // so the walk seats a row on whichever vector happens to sit at its rank. Either way the
+        // rank is not the position any more.
+        //
+        // Asking whether the free list is TURNED ON instead would send every index down here, and
+        // this path does not use the row sidecar: 58 extra seconds on every open of a 9.7M-row
+        // index that had never reused a thing.
         guard scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.contentFoldDoneKey)'") == 1
-                || Self.freeListEnabled
+                || scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.slotsOutOfOrderKey)'") == 1
         else { return false }
         // A HOLE A LIVE ROW STILL OWNS IS A CONTRADICTION, and seating rows from the column is not
         // a licence to ignore it. That shape - a delete that recorded its hole and never committed
@@ -7242,6 +7276,7 @@ public final class VectorStore: @unchecked Sendable {
         scheduleRowStampLocked(after: 120)
         scheduleCoverageStampLocked()
         if Self.searchTiming { print("[store] LOAD by slot rows=\(rows.count) positions=\(highWater)") }
+        loadedBySlot = true
         return true
     }
 
@@ -11356,6 +11391,59 @@ public final class VectorStore: @unchecked Sendable {
             contentFolded = true
         }
         return contentFolded
+    }
+
+    /// Build the chunk/occurrence split in this database, once, when it is enabled and possible.
+    ///
+    /// It is deliberately downstream of the slot backfill and INDEPENDENT of the fold: the split
+    /// keys a content's id off the position a row already owns, so it needs the column complete and
+    /// nothing else. Running it on a folded index is fine and produces the same answer with fewer
+    /// contents to produce.
+    @discardableResult
+    func buildChunkSplitLocked(highWaterOverride: Int64? = nil) -> Bool {
+        guard Self.chunkSplit, Self.contentSharing, dbOpen(), dim > 0 else { return false }
+        guard slotsBackfilled else { return false }
+        guard scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.chunkSplitDoneKey)'") != 1
+        else { return false }
+        let maxSlot = scalarQuery("SELECT COALESCE(MAX(slot), -1) FROM chunks")
+        guard maxSlot >= 0 else { return false }
+        // The file may hold positions past the highest a row claims - coverage extends it ahead of
+        // the rows - so the free list is derived against whichever is larger, or it would call a
+        // position that exists "not covered by anything" and fail its own invariant.
+        let highWater = highWaterOverride ?? Int64(Swift.max(Int(maxSlot) + 1, slotCount))
+        do {
+            guard let r = try MigrationV5Runner.backfillInPlace(db: db!, highWater: highWater) else { return false }
+            exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.chunkSplitDoneKey)', '1');")
+            let msg = "[omni] chunk split built: \(r.contents) contents, \(r.occurrences) occurrences, "
+                + "\(r.freeSlots) free, \(String(format: "%.1f", r.seconds))s\n"
+            FileHandle.standardError.write(Data(msg.utf8))
+            return true
+        } catch {
+            // A failed build leaves a v4 database, which is the state everything else still
+            // assumes. Say so loudly and do not retry in a loop.
+            exec("DELETE FROM occurrence;"); exec("DELETE FROM chunk;")
+            exec("DELETE FROM chunk_snippet;"); exec("DELETE FROM free_slot;")
+            FileHandle.standardError.write(Data("[omni] chunk split refused: \(error)\n".utf8))
+            exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.chunkSplitDoneKey)', '0');")
+            return false
+        }
+    }
+
+    /// Put a row in `chunk` whose key the build will also insert, so its INSERT collides with the
+    /// unique key index. The only way to make the build fail at the SQL level from outside.
+    public func seedConflictingContentForTest() {
+        queue.sync {
+            exec("INSERT OR REPLACE INTO chunk(id, key, kind, bytes, refs) "
+                 + "SELECT 999999, chunk_key, 0, 0, 1 FROM chunk_text WHERE length(chunk_key) > 0 LIMIT 1;")
+        }
+    }
+
+    /// Drive the split build directly. `highWaterOverride` exists so a test can hand it a mark the
+    /// file cannot satisfy and watch the invariants refuse, which is the only way to prove the
+    /// rollback leaves a v4 database.
+    @discardableResult
+    public func buildChunkSplitForTest(highWaterOverride: Int64? = nil) -> Bool {
+        queue.sync { buildChunkSplitLocked(highWaterOverride: highWaterOverride) }
     }
 
     /// One slice of the fold. Returns true while there is more to do.

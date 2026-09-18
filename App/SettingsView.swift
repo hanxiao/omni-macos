@@ -57,14 +57,24 @@ private struct IndexStatusRow: View {
         return (rs.reduce(0) { $0 + $1.done }, rs.reduce(0) { $0 + $1.total })
     }
 
-    /// "12.3 files/sec · 45k tokens/sec" during a full pass, or "45k tokens/sec" during a background reconcile
+    /// "4.8 file/s and 22k tok/s" during a full pass, or "22k tok/s" during a background reconcile
     /// where there is no per-file count. nil when nothing is being embedded.
+    ///
+    /// THREE DIGITS IS ONE TOO MANY on a line that also carries three counts, and the decimal is
+    /// the one that earns its place least: the difference between 21.8k and 22k tokens a second is
+    /// not something anybody acts on, while the width it costs is. So a value that already has two
+    /// digits in front of the point drops the point.
+    private static func rate(_ v: Double) -> String {
+        v >= 10 ? String(format: "%.0f", v) : String(format: "%.1f", v)
+    }
     private var rateLabel: String? {
         guard model.tokensPerSec > 0 else { return nil }
-        let tok = model.tokensPerSec >= 1000 ? String(format: "%.1fk", model.tokensPerSec / 1000) : String(format: "%.0f", model.tokensPerSec)
+        let tok = model.tokensPerSec >= 1000
+            ? "\(Self.rate(model.tokensPerSec / 1000))k"
+            : String(format: "%.0f", model.tokensPerSec)
         return model.filesPerSec > 0
-            ? String(format: "%.1f files/sec \u{00B7} %@ tokens/sec", model.filesPerSec, tok)
-            : "\(tok) tokens/sec"
+            ? "\(Self.rate(model.filesPerSec)) file/s and \(tok) tok/s"
+            : "\(tok) tok/s"
     }
 
     var body: some View {
@@ -75,9 +85,6 @@ private struct IndexStatusRow: View {
                     ProgressView().controlSize(.small)
                     Text(model.isPreparing ? "Preparing\u{2026}" : "Indexing\u{2026}").fontWeight(.medium)
                     Spacer()
-                    if !model.isPreparing, let rateLabel {
-                        Text(rateLabel).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                    }
                     Button("Pause") { model.pauseIndexing() }.controlSize(.small)
                 }
                 if model.isPreparing {
@@ -89,9 +96,13 @@ private struct IndexStatusRow: View {
                     ProgressView(value: overall)
                     HStack {
                         Text("\(model.progress.embedded) added")
-                        if model.progress.unchanged > 0 { Text("\u{00B7} \(model.progress.unchanged) up to date") }
+                        if model.progress.unchanged > 0 { Text("\u{00B7} \(model.progress.unchanged) synced") }
                         if model.progress.skipped > 0 { Text("\u{00B7} \(model.progress.skipped) skipped") }
                         if model.progress.failed > 0 { Text("\u{00B7} \(model.progress.failed) failed") }
+                        // The rate rides with the counts rather than in the header: it is the same
+                        // kind of fact, it changes at the same rate, and the header was carrying it
+                        // alone against a title that never changes.
+                        if let rateLabel { Text("\u{00B7} \(rateLabel)") }
                     }
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                     Text((model.progress.currentPath as NSString).lastPathComponent)

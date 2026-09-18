@@ -124,6 +124,69 @@ final class FreeListTests: XCTestCase {
         XCTAssertFalse(store.search(vec(5), topK: 10).contains { $0.path == "/a/f5.txt" })
     }
 
+    /// TURNING THE FREE LIST ON IS NOT THE SAME AS HAVING USED IT.
+    ///
+    /// The by-slot loader exists because a reused or folded index no longer numbers its positions
+    /// by row rank. It does not use the row sidecar, which is what makes a large index open
+    /// quickly. Gating it on the SETTING rather than on whether this index has actually handed a
+    /// position out of order sent every index down it: measured at 76 s against 18 s per open on a
+    /// 9,729,693-row index that had never reused a thing, on every launch, for ever.
+    func testAnIndexThatNeverReusedKeepsTheFastLoader() throws {
+        VectorStore.quantBaseOverride = VectorStore.scanBits
+        let url = tempDB()
+        do {
+            let store = try VectorStore(dbURL: url)
+            for i in 0 ..< 40 { try store.replace(path: "/a/f\(i).txt", chunks: [chunk("/a/f\(i).txt", i)]) }
+            _ = store.search(vec(1), topK: 3)
+            // The by-slot loader refuses unless the slot column is complete, so without this the
+            // gate under test is never the deciding condition and the test proves nothing - which
+            // is exactly what its first negative control showed.
+            store.migrateSlotsToCompletion()
+            store.advanceCoverageForTest()
+            store.close()
+        }
+        XCTAssertEqual(metaValue(url, "chunk_slots_out_of_order"), nil,
+                       "nothing was reused, but the index is marked as out of order")
+        // The sidecars are removed so the by-slot loader is the only thing that COULD run: with
+        // them in place an adopt answers first and the gate under test is never consulted, which
+        // is what the first two negative controls of this test were actually showing.
+        for suffix in [".rows", ".quant"] { try? FileManager.default.removeItem(atPath: url.path + suffix) }
+        do {
+            let store = try VectorStore(dbURL: url); defer { store.close() }
+            XCTAssertFalse(store.loadedBySlot,
+                           "an index that never reused a position took the slow by-slot loader")
+        }
+
+        // And the moment one IS reused, the marker goes down and stays down.
+        do {
+            let store = try VectorStore(dbURL: url)
+            store.deletePath("/a/f7.txt")
+            try store.replace(path: "/x.txt", chunks: [chunk("/x.txt", 901)])
+            store.close()
+        }
+        XCTAssertEqual(metaValue(url, "chunk_slots_out_of_order"), "1",
+                       "a position was reused and the index does not say so")
+        for suffix in [".rows", ".quant"] { try? FileManager.default.removeItem(atPath: url.path + suffix) }
+        let store = try VectorStore(dbURL: url); defer { store.close() }
+        XCTAssertTrue(store.loadedBySlot, "a reused index did NOT take the by-slot loader, which is the only correct one for it")
+        XCTAssertEqual(store.search(vec(901), topK: 3).first?.path, "/x.txt",
+                       "the reused position reads the wrong vector after a reopen")
+    }
+
+    /// The raw meta row, so the test asserts on what the next OPEN will read rather than on memory.
+    private func metaValue(_ url: URL, _ key: String) -> String? {
+        var db: OpaquePointer?
+        defer { sqlite3_close(db) }
+        guard sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { return nil }
+        var st: OpaquePointer?
+        defer { sqlite3_finalize(st) }
+        guard sqlite3_prepare_v2(db, "SELECT value FROM meta WHERE key = ?;", -1, &st, nil) == SQLITE_OK
+        else { return nil }
+        sqlite3_bind_text(st, 1, key, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        guard sqlite3_step(st) == SQLITE_ROW, let c = sqlite3_column_text(st, 0) else { return nil }
+        return String(cString: c)
+    }
+
     /// The same, through a reload: the position is not the row's rank any more, so a loader that
     /// derives one seats the row on somebody else's vector.
     func testAReusedPositionSurvivesAReload() throws {

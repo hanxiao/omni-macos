@@ -7828,6 +7828,7 @@ if args.count >= 3 && args[1] == "covmigrate" {
         store.close()
         let closeMs = -tClose.timeIntervalSinceNow * 1000
         let reclaimed = reclaimedPre
+        print("    loader: bySlot=\(store.loadedBySlot) rowSidecar=\(store.adoptedRowSidecar)")
         print(String(format: "  cycle %d  open %7.0f ms  close %7.0f ms  rows %d  sqlite %@  vecs %@%@",
                      c, openMs, closeMs, rows, gb(size("")), gb(size(".vecs")),
                      reclaimed > 0 ? "  reclaimed \(gb(reclaimed))" : ""))

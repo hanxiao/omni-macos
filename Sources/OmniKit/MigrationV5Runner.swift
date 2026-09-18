@@ -41,12 +41,14 @@ public enum MigrationV5Runner {
         case cannotOpen(String)
         case sql(String, String)
         case notSeated(seated: Int64, rows: Int64)
+        case invariant([String])
 
         public var description: String {
             switch self {
             case .cannotOpen(let p): return "cannot open \(p)"
             case .sql(let stmt, let msg): return "\(msg) while running: \(stmt.prefix(120))"
             case .notSeated(let s, let r): return "\(s) of \(r) rows have a slot; run the slot backfill first"
+            case .invariant(let f): return "the split did not hold: " + f.joined(separator: "; ")
             }
         }
     }
@@ -170,5 +172,97 @@ public enum MigrationV5Runner {
             out.append(stmt)
         }
         return out
+    }
+}
+
+// MARK: - The backfill, in place
+
+extension MigrationV5Runner {
+
+    /// Build `chunk` / `occurrence` / `chunk_snippet` / `free_slot` in THIS database, from the v4
+    /// tables beside them, and prove the five invariants before anything is allowed to believe it.
+    ///
+    /// ALL OF IT IN ONE TRANSACTION, and that is the point rather than an oversight. The invariants
+    /// are the only thing standing between "the pointers are right" and "every occurrence reads
+    /// some other content's vector", and they can only be checked once all four tables exist. A
+    /// sliced build would have to either leave the database in a state where they do not hold yet -
+    /// so nothing could check them - or re-check all five per slice, which is a full pass each
+    /// time. Measured at 66 s on 9,729,693 chunks, which is a transaction an idle pass can afford.
+    ///
+    /// Returns nil when there is nothing to do, and throws with the tables dropped when a check
+    /// fails. A failed backfill must leave a v4 database, not a half-v5 one.
+    static func backfillInPlace(db: OpaquePointer,
+                                highWater: Int64,
+                                log: (String) -> Void = { _ in }) throws -> DryRun? {
+        func run(_ sql: String) throws {
+            if sqlite3_exec(db, sql, nil, nil, nil) != SQLITE_OK {
+                throw Failure.sql(sql, String(cString: sqlite3_errmsg(db)))
+            }
+        }
+        func num(_ sql: String) -> Int64 {
+            var st: OpaquePointer?
+            defer { sqlite3_finalize(st) }
+            guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK,
+                  sqlite3_step(st) == SQLITE_ROW else { return -1 }
+            return sqlite3_column_int64(st, 0)
+        }
+
+        // Already done, or not yet possible. Both are "nothing to do" rather than failures: the
+        // caller polls this from an idle pass and must not be told a healthy index is broken.
+        guard num("SELECT COUNT(*) FROM occurrence") == 0 else { return nil }
+        let rows = num("SELECT COUNT(*) FROM chunks")
+        let seated = num("SELECT COUNT(*) FROM chunks WHERE slot >= 0")
+        guard rows > 0, seated == rows else { return nil }
+
+        let start = Date()
+        var out = DryRun()
+        out.rows = rows
+        out.highWater = highWater
+
+        // The temp table is outside the transaction on purpose - it is scratch, it is rebuilt from
+        // the column every time, and holding it inside only enlarges the rollback.
+        try run("DROP TABLE IF EXISTS temp.slot_of;")
+        try run("CREATE TEMP TABLE slot_of(chunk_id INTEGER PRIMARY KEY, slot INTEGER NOT NULL);")
+        try run("INSERT INTO temp.slot_of SELECT id, slot FROM chunks WHERE slot >= 0;")
+        // Both directions are read: the chunk and occurrence statements join on chunk_id, which the
+        // primary key covers, and the snippet statement looks a representative up by SLOT. Without
+        // this that is a full scan of this table per content - it does not finish.
+        try run("CREATE INDEX temp.slot_of_by_slot ON slot_of(slot);")
+        defer { _ = sqlite3_exec(db, "DROP TABLE IF EXISTS temp.slot_of;", nil, nil, nil) }
+
+        try run("BEGIN IMMEDIATE;")
+        do {
+            for (label, sql) in [("chunk", buildChunkSQL()),
+                                 ("occurrence", buildOccurrenceSQL()),
+                                 ("chunk_snippet", buildSnippetSQL()),
+                                 ("free_slot", buildFreeListSQL(highWater: highWater))] {
+                let t0 = Date()
+                try run(sql)
+                log(String(format: "  %@ %6.1fs", label.padding(toLength: 16, withPad: " ", startingAt: 0),
+                           -t0.timeIntervalSinceNow))
+            }
+            for inv in MigrationV5.invariants(highWater: highWater) {
+                let got = num(inv.sql), expect = num(inv.mustEqual)
+                if got != expect { out.failures.append("\(inv.name): \(got) vs \(expect)") }
+            }
+            guard out.failures.isEmpty else { throw Failure.invariant(out.failures) }
+            try run("COMMIT;")
+        } catch {
+            _ = sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+            throw error
+        }
+
+        out.contents = num("SELECT COUNT(*) FROM chunk")
+        out.occurrences = num("SELECT COUNT(*) FROM occurrence")
+        out.freeSlots = num("SELECT COUNT(*) FROM free_slot")
+        out.seconds = -start.timeIntervalSinceNow
+        return out
+    }
+
+    private static func buildChunkSQL() -> String { MigrationV5.buildChunkSQL() }
+    private static func buildOccurrenceSQL() -> String { MigrationV5.buildOccurrenceSQL() }
+    private static func buildSnippetSQL() -> String { MigrationV5.buildSnippetSQL() }
+    private static func buildFreeListSQL(highWater: Int64) -> String {
+        MigrationV5.buildFreeListSQL(highWater: highWater)
     }
 }
