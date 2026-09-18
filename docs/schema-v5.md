@@ -402,32 +402,63 @@ a reclaim from a timer, so anything else asking for one at that moment is the se
 lock now, the copy writes at explicit offsets with `pwrite` rather than through the file handle's
 cursor, and the length is checked before the rename that commits it.
 
-WHY IT IS STILL OFF BY DEFAULT. Two things, both about what happens when the fold runs on indexes
-that are not the migration case.
+WHAT BLOCKED IT, AND WHAT IT ACTUALLY WAS. For a long time a folded index did not survive
+arbitrary CRUD: the mutation lifecycle failed within one file RENAME, a file came back reading
+another file's vector, and the failure COUNT moved run to run - 33 65 53 25 25 across five runs -
+while the logic did not. Every hypothesis about the fold itself was wrong, and the list of them is
+kept below because each one is a real dead end. The answer was one line, and it was not in the fold
+at all.
 
-`testAmbiguousMismatchWithHolesStillRefuses` and `testUnprovableHoleStillRefuses` stop refusing.
-Those fixtures build a claim that is ambiguous on purpose - a hole recorded for a row that is still
-live - and the store's job is to decline rather than guess. Once the fold has set its flag the
-loader reads the column instead of deriving anything, so there is nothing left to be ambiguous
-about and it opens. That is not obviously wrong, but it is a safety property being dropped rather
-than satisfied, and it needs deciding.
+`chunksForCurrentPathLocked` - the file-level dedup path, the one that answers "this whole file is
+a copy of one I already have, hand me its vectors" - gathered them out of the resident buffer at
+`row * dim`. `chunkVectors`, thirty lines above it in the same file, was converted to
+`slotOf(i) * dim` when sharing landed. This one was not. So it handed back whatever vector happened
+to sit at the position numbered like its row, and the caller stored that as the new file's content:
+literally "a file comes back reading another file's vector".
 
-And a folded index does not survive arbitrary CRUD. The mutation lifecycle fails within one file
-RENAME - a file comes back reading another file's vector, the same shape this file is written
-against - and the failure COUNT moves run to run (10, 25, 31, 61) while the logic does not, which
-is the signature of a race rather than of arithmetic.
+It reads correctly only while rows and positions are the same number. Sharing, the fold and the
+free list each stop that being true, and the fold makes them differ by millions - which is why it
+surfaced there and nowhere else, and why the blast radius varied with whatever else the run had
+appended. With it fixed the fold arm goes to 0 failures and stays there.
 
-MEASURE IT PROPERLY BEFORE BISECTING IT. Five runs of each arm on the committed tree:
+TWO MORE THINGS THE FOLD ARM NEEDED, both of them elsewhere:
 
-    fold off    0  0  0  0  0
-    fold on    33 65 53 25 25
+`testAmbiguousMismatchWithHolesStillRefuses` and `testUnprovableHoleStillRefuses` stopped refusing.
+Those fixtures record a hole for a position a live row still points at - what a delete that never
+committed leaves - and the rank walk declines to guess at it. Seating rows from the column made the
+mapping unambiguous, so the index opened, and the safety property was dropped rather than satisfied:
+nothing about the bookkeeping became any more consistent. `loadBySlotLocked` checks it directly now.
+It is the same invariant `coverageAudit` enforces at rest, so an index that fails it is one the
+store already considers broken, and refusing hands back to the walk, which declines with the message
+that names the cause.
 
-So it always fails and the blast radius varies. A single run tells you whether an arm fails; it
-tells you nothing about whether a change helped. Several hours went into bisecting on single-run
-counts (12, 31, 50, 53, 61) and reading movement in noise - none of those arms reached 0, which is
-the only number that means anything here.
+And the free list leaked its reuse debt on close. A position it rewrites inside the covered prefix
+keeps its blob deliberately - the file answers for that position but for the bytes that used to be
+there - and `unsyncedReuse` is the only record that the debt exists, in memory and nowhere else.
+`close()` calls the coverage stamp to settle it, but that stamp yields to a recent search and
+returns early, and on close there is no later stamp. The test that found it searches immediately
+before closing, which is what a user does: two rows leaked per round over five rounds, and the
+counts matched that arithmetic exactly. `close()` settles it directly now, and the audit stops
+counting a legitimately unsynced reuse as breakage.
 
-It is worth recording what was tried, because each attempt eliminates a hypothesis:
+THREE ARMS, 562 TESTS, 0 FAILURES EACH: default, `OMNI_CONTENT_FOLD=1`, `OMNI_FREE_LIST=1`. Every
+fix above was run with its negative control.
+
+AND THE CHAIN RE-RUN ON A SECOND REAL INDEX, 9,729,693 chunks, independent of the one every earlier
+measurement used:
+
+    baseline   digest 134b9ff183fd2f29, p50 9.7 ms
+    fold       3,515,895 duplicates, 120.5 s, audit ok
+    cover      9,984,194 of 9,984,194 positions, 7.6 s, audit ok
+    reclaim    85.6 s, .vecs 15.34 GB -> 9.54 GB, audit ok
+    reopen     digest 134b9ff183fd2f29, identical; p50 8.6 ms
+
+5.80 GB returned, every search answering exactly what it answered before, and slightly faster for
+scanning a smaller file. The already-folded index from the earlier work was re-opened under the
+same build and is also unchanged: digest ba7a13400e714f79, p50 8.8 ms.
+
+It is worth keeping what was tried before that, because each attempt eliminates a hypothesis, and
+because every one of them was looking in the wrong file:
 
   - updating the resident mirror inside each fold slice's transaction instead of at the end, so no
     window exists between the column and the mirror. Worse (61): the chunk-id -> row-index map it
@@ -436,73 +467,46 @@ It is worth recording what was tried, because each attempt eliminates a hypothes
     mis-seat whatever order the table is in. Worse (53, then 31 with `adoptChunkIDsLocked` first):
     many resident rows carry no id for it to pair on.
   - running the fold as a one-shot migration at open, under the queue, with nothing else running -
-    no concurrency, no window at all. Unchanged (31). This is the result that matters: the problem
-    is not the fold racing anything, it is what a folded index does afterwards.
+    no concurrency, no window at all. Unchanged (31).
   - retiring `vectorsForContentKeys` - the one path that reads a vector BY STORED SLOT and then
-    PERSISTS what it read - on a folded index. Still fails, even though `OMNI_STORE_REUSE=0`, which
-    gates that same function one line earlier, is the ONLY arm that reaches 0.
+    PERSISTS what it read - on a folded index. Still failed.
+  - gating the fold on writes having gone quiet, the shape `yieldToSearchLocked` already uses.
+    Unchanged (12 33 36 59 53).
   - disabling the fold's blob deletion, its mirror invalidation, its hole recording, and finally
-    its column rewrite entirely, so the pass changes no data at all. Still fails. That is the
-    result that should have been got first: the damage is not in what the fold writes.
+    its column rewrite entirely, so the pass changed no data at all. STILL FAILED.
 
-WHICH LEAVES ONE DIFFERENCE. `OMNI_STORE_REUSE=0` returns before taking the store queue; every gate
-tried returns after taking it. The indexer taking that queue mid-batch is what lets queued
-maintenance run between its read and its write, and with the fold enabled that maintenance has
-fold work to do. So the hypothesis to test next is not about slots at all: it is that the fold must
-not be reachable from a stamp while an indexing batch is in flight, and that the reuse lookup is
-simply the thing that opens the door.
+That last result is the one that should have been got first, and it is the one that points at the
+answer: if the pass changes no data and the failure persists, the damage is not in what the fold
+writes - it is in what some OTHER reader does once positions and rows have parted company. The
+search for it went to the fold anyway for several more hours. The lesson is cheap to state: when
+disabling a pass entirely does not fix what the pass "causes", stop reading the pass.
 
-TESTED, AND DISPROVEN. Gating the fold on writes having gone quiet - the same shape
-`yieldToSearchLocked` already uses for searches, with a three second window on the last mutation -
-changes nothing: 12 33 36 59 53. So it is not simply "a slice ran mid-batch" either.
+AND MEASURE IT OVER FIVE RUNS. Several hours went into bisecting on single-run counts (12, 31, 50,
+53, 61) and reading movement in noise. A single run tells you whether an arm fails; it tells you
+nothing about whether a change helped. Only 0 means anything.
 
-What is left unexplained is narrow and worth stating exactly, because it is the whole remaining
-question: the ONLY arm that reaches 0 is `OMNI_STORE_REUSE=0`, and every attempt to reproduce that
-from inside the store - returning the same empty result one line later, after the queue is taken -
-still fails. Either the queue acquisition itself matters, or the two are not as equivalent as they
-look. Nothing else survives.
-
-So the defect is in how a shared position is resolved during mutation, not in the fold. The fold
-produces a correct index at rest - digest identical, audit clean, reclaim works - and the store
-cannot yet keep it correct through a rename. That is the same conclusion the free list reached from
-the other direction, which is why both are off.
-
-So it stays behind `OMNI_CONTENT_FOLD=1`. The migration path it was built for is measured and
-works; what is not yet established is that it is harmless on every other index.
-
-## The free list: in the tree, opt-in
+## The free list: in the tree, and it passes
 
 Handing a released position to the next new content instead of waiting for a whole-file copy is
 obviously right, and it is written: `SlotAllocator` allocates from a min-heap, `placeVectorLocked`
 writes the new vector into the hole, `patchedSlots` rescores the positions the GPU-resident base
 still describes wrongly, the coverage stamp drops the reused row's blob once the file is synced,
 and `loadBySlotLocked` seats rows from the stored column instead of deriving a position from a
-row's rank - which the free list makes impossible. Seven tests cover it, four of them verified to
-fail with their fix removed.
+row's rank - which the free list makes impossible.
 
-It is committed behind `OMNI_FREE_LIST=1`, with seven tests, four of them verified to fail with
-their fix removed. With the flag off `placeVectorLocked` is a plain append and the default path is
-byte for byte what it was, which the whole suite says.
+It is committed behind `OMNI_FREE_LIST=1`. With the flag off `placeVectorLocked` is a plain append
+and the default path is byte for byte what it was, which the whole suite says.
 
-IT DOES NOT PASS THE MUTATION SUITE, and the failure is the bad kind. Driven through the real
-Indexer over add / edit / rename / move / folder-move / delete, a renamed file came back holding
-ANOTHER file's vector: not a crash, not a missing result, a real file at a plausible score. The
-chain was traced as far as the blob: the vector SQLite stored for that chunk was already wrong
-when it was written, which means the indexer's cross-file content reuse
-(`vectorsForContentKeys` -> `liveSlotForContentLocked` -> `flat16[slot]`) handed back a vector
-that was not the key's. That lookup trusts `chunks.slot` to agree with the resident numbering, and
-a reuse in flight is exactly when the two can disagree - so one bad lookup does not just return a
-wrong answer, it PERSISTS one.
+IT PASSED ONCE THE ROW-AS-POSITION READ WAS FIXED, plus two things of its own. It used to fail the
+mutation suite the bad way - a renamed file coming back holding another file's vector, a real file
+at a plausible score. That was never in this code: `chunksForCurrentPathLocked` read the resident
+buffer by row index, which is written up under the fold above. The diagnosis recorded here before
+it - "the content lookup reads a stale slot" - was wrong, and the fold is what disproved it by
+failing identically with its column rewrite disabled.
 
-THAT DIAGNOSIS TURNED OUT TO BE WRONG, and the fold is what disproved it. The fold fails the same
-suite the same way, and it fails with its column rewrite disabled entirely - so the damage is not
-in what either pass writes to `chunks.slot`, and "the content lookup reads a stale slot" cannot be
-the explanation. Both are waiting on the same unknown, which is written up under the fold above:
-the only arm that comes back clean is `OMNI_STORE_REUSE=0`, and returning the same empty result
-one line later inside the store does not reproduce it.
-
-The user-visible half of the problem - holes accumulating for ever - is fixed meanwhile by making
-the hole reclaim reachable, which is a change whose correctness is established.
+Its own two were the reuse debt leaking on close, and the coverage audit counting a legitimately
+unsynced reuse as breakage. Both are described under the fold. `OMNI_FREE_LIST=1` now runs 562
+tests with 0 failures.
 
 ## The chunk/occurrence split: built and proven, not swapped in
 
