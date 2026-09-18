@@ -643,11 +643,34 @@ old shape drops and rebuilds the empty table on open - was then run against the 
 index the earlier migration work used. It reopens with `chunk_snippet` rebuilt, the label index
 partial again, and the search digest `ba7a13400e714f79` unchanged from the baseline at p50 10.1 ms.
 
-WHAT IS NOT DONE: the swap. Building the tables and proving the invariants is the half that can be
+THE READERS ARE REPOINTED AND VERIFIED. The display path (`fillSnippetsLocked` and the passage
+disclosure walk) and both media-tag readers answer from `occurrence` / `chunk_snippet` when the
+split is built. `omni-verify splitparity` is what says so, and it exists because the search digest
+cannot: the split changes where a snippet and a locator are READ FROM, not how anything is scored,
+so a run can return identical paths at identical scores and still show the wrong text under every
+one of them. It mixes snippet and locator into the digest.
+
+    v4 tables   digest=447d158bf360009e hits=480 with-text=480
+    split       digest=447d158bf360009e hits=480 with-text=480
+
+Identical, on the 9,729,693-chunk index. `testSearchReturnsTheSameTextThroughTheSplit` asks the same
+question small enough to debug, per hit and per field.
+
+Its first run reported a failure, and the failure was the harness. The fold is on by default and
+runs off the coverage stamp, so it advanced BETWEEN the two measurements - and folding a
+near-identical duplicate onto its representative moves a score in the fifth decimal, which is
+exactly the precision the digest prints. The harness pins the fold now and compares the fold
+watermark on both sides, so it says "the fold advanced, this comparison is not about the split"
+rather than blaming the split twice.
+
+WHAT IS NOT DONE: dropping the v4 tables. Building the tables and proving the invariants is the half that can be
 checked; repointing snippets, locators, tag filters, browse, lexical and dedup at `chunk` /
 `occurrence` is a separate change with its own risk, and it also rests on the same `chunks.slot`
 trust that the fold and the free list are still blocked on. Running this first is how its size and
 its time are known before it is written.
+
+Until they are dropped the split is pure cost - both schemas in one file - which is why it stays
+behind `OMNI_CHUNK_SPLIT=1`.
 
 AND THE WIN IS SMALLER THAN THE SHAPE SUGGESTS: 0.414 GB, 15.7% of the tables it replaces. The
 split stores 3.5M fewer snippet copies, but it also adds two indexes v4 never had - `idx_chunk_key`
