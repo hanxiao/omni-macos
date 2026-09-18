@@ -235,6 +235,7 @@ Built, tested and pinned with a negative control each:
     ChunkDiff          15 tests   set diff, reference multiplicity
     OccurrenceIndex    16 tests   slot mask, expansion, the scope leak
     SchemaV5            9 tests   DDL, unique key index, reverse edge plan
+    MigrationV5        16 tests   the backfill SQL, the invariants, and that they can fail
     ContentSharing     20 tests   the store end to end: write, search, delete, coverage, reload
     StoreChunkReuse     3 tests   a content embedded once per INDEX, not once per pass
 
@@ -502,6 +503,67 @@ one line later inside the store does not reproduce it.
 
 The user-visible half of the problem - holes accumulating for ever - is fixed meanwhile by making
 the hole reclaim reachable, which is a change whose correctness is established.
+
+## The chunk/occurrence split: built and proven, not swapped in
+
+`MigrationV5`'s SQL had been unit-tested against hand-built v4 databases since it was written and
+never run on a real one. `MigrationV5Runner` runs it, and `omni-verify splitdry <db>` is the entry.
+
+The connection is inside out on purpose: the SCRATCH file is `main` and the index is ATTACHed
+read-only as `src`. ATTACH inherits the flags of the connection that opened it, so a read-only main
+cannot hold a writable attachment - the only way to have the index read-only and the output
+writable at once is for the output to be the one that was opened. It falls out well: unqualified
+names resolve to `main` first, so the v5 tables found are the scratch copies and `chunks` /
+`chunk_text` fall through to `src`, with no rewriting at all. And the scratch file IS the split with
+nothing else in it, which makes the size a measurement rather than an estimate.
+
+On `bench-index`, 9,729,693 chunks, all five invariants hold:
+
+    slot_of             2.7s
+    chunk              23.4s     6,213,798 contents
+    occurrence         24.4s     9,729,693 pointers
+    chunk_snippet       8.1s
+    free_slot           2.6s     3,770,396 slots nobody owns
+    total              66.2s     3,515,895 duplicates collapsed
+
+    v4  chunk_text + idx_chunk_content + idx_chunk_label   2.637 GB
+    v5  the four tables and their indexes                  2.223 GB
+
+Three defects, and none of them is visible on a dense two-row fixture.
+
+THE SNIPPET STATEMENT WAS QUADRATIC. It looked a content's representative up in `slot_of` by SLOT,
+and `slot_of` only had a primary key on `chunk_id` - so every one of 6.2M contents full-scanned
+9.7M rows. It did not finish. Indexing `slot_of` by slot took the phase from 124.5s to 8.1s. This
+is the same shape as the fold's per-row `MIN(slot)`, which is now twice: a join column that is a
+key in one direction and a scan in the other reads fine and does not run.
+
+THE LABEL INDEX WAS NOT PARTIAL. `chunk_snippet` had no `kind` column, so `idx_snip_label` could
+not carry v4's `WHERE kind IN (1,2,3)` and indexed every text snippet in the database instead of
+the media labels it exists to serve: 1.515 GB against 0.036 GB for v4's equivalent, and by itself
+it turned a 0.4 GB win into a 1.2 GB loss. `chunk_snippet` carries `kind` now - repeated off
+`chunk` for exactly the reason v4 repeats it off `chunks` onto `chunk_text` - and the index is
+0.032 GB. The table has never been written by anything, so a database that already has the old
+shape drops and rebuilds it on open.
+
+THE COVERAGE INVARIANT COMPARED AGAINST THE ROW COUNT. "Live and free slots exactly cover the file"
+was checked against `COUNT(chunks)`, which equals the number of positions only when the file has no
+holes. The measured index has 254,501, and the check failed by exactly that. It takes the vector
+file's high-water mark now. `testHolesAreCarriedThroughToSlots` was the single test that never
+called `assertInvariants`, which is what that silence was.
+
+WHAT IS NOT DONE: the swap. Building the tables and proving the invariants is the half that can be
+checked; repointing snippets, locators, tag filters, browse, lexical and dedup at `chunk` /
+`occurrence` is a separate change with its own risk, and it also rests on the same `chunks.slot`
+trust that the fold and the free list are still blocked on. Running this first is how its size and
+its time are known before it is written.
+
+AND THE WIN IS SMALLER THAN THE SHAPE SUGGESTS: 0.414 GB, 15.7% of the tables it replaces. The
+split stores 3.5M fewer snippet copies, but it also adds two indexes v4 never had - `idx_chunk_key`
+at 0.161 GB, which is the content lookup v4 could not do at all, and `idx_occ_chunk` at 0.126 GB -
+plus a 0.145 GB primary key on `occurrence`. The split's real payoff is not the SQLite file. It is
+that the content lookup becomes a seek instead of a scan, and that the vector file drops from
+9,984,194 positions to 6,213,798 - and the fold already delivers that second one, measured at
+5.5 GB, without any of this.
 
 ## The two 2026 leads, measured on the real index, and both declined
 
