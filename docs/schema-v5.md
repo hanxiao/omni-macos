@@ -551,6 +551,11 @@ holes. The measured index has 254,501, and the check failed by exactly that. It 
 file's high-water mark now. `testHolesAreCarriedThroughToSlots` was the single test that never
 called `assertInvariants`, which is what that silence was.
 
+The schema change this forced - `chunk_snippet` gaining `kind`, so a database already carrying the
+old shape drops and rebuilds the empty table on open - was then run against the 9,773,826-chunk
+index the earlier migration work used. It reopens with `chunk_snippet` rebuilt, the label index
+partial again, and the search digest `ba7a13400e714f79` unchanged from the baseline at p50 10.1 ms.
+
 WHAT IS NOT DONE: the swap. Building the tables and proving the invariants is the half that can be
 checked; repointing snippets, locators, tag filters, browse, lexical and dedup at `chunk` /
 `occurrence` is a separate change with its own risk, and it also rests on the same `chunks.slot`

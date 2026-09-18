@@ -4178,6 +4178,12 @@ if args.count >= 4 && args[1] == "searchreal" {
     // reach the contents through the occurrence mirror - which is where a scope leak would live, a
     // content let through by an out-of-scope sibling being reported under the wrong file. Both go
     // through the same identity argument as the plain query and must produce the same bytes.
+    // A query of the wrong width scores nothing and the run reports a perfectly stable digest of
+    // no results, which reads exactly like a passing comparison. Say so instead.
+    if let first = qvecs.first, first.count != store.vectorDim {
+        print("searchreal: model is dim \(first.count), index is dim \(store.vectorDim) - wrong model")
+        exit(1)
+    }
     var scopes: [(String, SearchFilter)] = [("plain", SearchFilter())]
     var kindOnly = SearchFilter(); kindOnly.kinds = ["text"]
     scopes.append(("kind:text", kindOnly))
