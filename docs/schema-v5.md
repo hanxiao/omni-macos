@@ -416,6 +416,16 @@ RENAME - a file comes back reading another file's vector, the same shape this fi
 against - and the failure COUNT moves run to run (10, 25, 31, 61) while the logic does not, which
 is the signature of a race rather than of arithmetic.
 
+MEASURE IT PROPERLY BEFORE BISECTING IT. Five runs of each arm on the committed tree:
+
+    fold off    0  0  0  0  0
+    fold on    33 65 53 25 25
+
+So it always fails and the blast radius varies. A single run tells you whether an arm fails; it
+tells you nothing about whether a change helped. Several hours went into bisecting on single-run
+counts (12, 31, 50, 53, 61) and reading movement in noise - none of those arms reached 0, which is
+the only number that means anything here.
+
 It is worth recording what was tried, because each attempt eliminates a hypothesis:
 
   - updating the resident mirror inside each fold slice's transaction instead of at the end, so no
@@ -428,9 +438,20 @@ It is worth recording what was tried, because each attempt eliminates a hypothes
     no concurrency, no window at all. Unchanged (31). This is the result that matters: the problem
     is not the fold racing anything, it is what a folded index does afterwards.
   - retiring `vectorsForContentKeys` - the one path that reads a vector BY STORED SLOT and then
-    PERSISTS what it read - on a folded index. Unchanged (31), even though `OMNI_STORE_REUSE=0`,
-    which gates that same function one line earlier, gives 0. That discrepancy is unexplained and
-    is the thread to pull next.
+    PERSISTS what it read - on a folded index. Still fails, even though `OMNI_STORE_REUSE=0`, which
+    gates that same function one line earlier, is the ONLY arm that reaches 0.
+  - disabling the fold's blob deletion, its mirror invalidation, its hole recording, and finally
+    its column rewrite entirely, so the pass changes no data at all. Still fails. That is the
+    result that should have been got first: the damage is not in what the fold writes.
+
+WHICH LEAVES ONE DIFFERENCE. `OMNI_STORE_REUSE=0` returns before taking the store queue; every gate
+tried returns after taking it. The indexer taking that queue mid-batch is what lets queued
+maintenance run between its read and its write, and with the fold enabled that maintenance has
+fold work to do. So the hypothesis to test next is not about slots at all: it is that the fold must
+not be reachable from a stamp while an indexing batch is in flight, and that the reuse lookup is
+simply the thing that opens the door.
+
+Testing it needs the five-run harness above, not a single run.
 
 So the defect is in how a shared position is resolved during mutation, not in the fold. The fold
 produces a correct index at rest - digest identical, audit clean, reclaim works - and the store
