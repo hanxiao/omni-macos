@@ -451,7 +451,15 @@ fold work to do. So the hypothesis to test next is not about slots at all: it is
 not be reachable from a stamp while an indexing batch is in flight, and that the reuse lookup is
 simply the thing that opens the door.
 
-Testing it needs the five-run harness above, not a single run.
+TESTED, AND DISPROVEN. Gating the fold on writes having gone quiet - the same shape
+`yieldToSearchLocked` already uses for searches, with a three second window on the last mutation -
+changes nothing: 12 33 36 59 53. So it is not simply "a slice ran mid-batch" either.
+
+What is left unexplained is narrow and worth stating exactly, because it is the whole remaining
+question: the ONLY arm that reaches 0 is `OMNI_STORE_REUSE=0`, and every attempt to reproduce that
+from inside the store - returning the same empty result one line later, after the queue is taken -
+still fails. Either the queue acquisition itself matters, or the two are not as equivalent as they
+look. Nothing else survives.
 
 So the defect is in how a shared position is resolved during mutation, not in the fold. The fold
 produces a correct index at rest - digest identical, audit clean, reclaim works - and the store
