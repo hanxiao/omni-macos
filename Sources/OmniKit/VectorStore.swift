@@ -1925,6 +1925,9 @@ public final class VectorStore: @unchecked Sendable {
         // unloaded map would mint a fresh one starting at 0 - which is 'text'. It would then have
         // relabelled every scanned PDF to the kind it was trying to move them out of.
         seedKindsLocked()
+        // Whether this index answers display reads from the split. Read here, once, because every
+        // result row asks it and the answer cannot change without a build or a rebuild.
+        refreshSplitBuiltLocked()
         // Everything below speaks v3 and is a no-op once the index is v4 - the v4 layout has no
         // such columns and never gains them.
         if layoutLocked() != .v4 {
@@ -2152,6 +2155,7 @@ public final class VectorStore: @unchecked Sendable {
             sqlite3_finalize(snippetStmt); snippetStmt = nil   // finalize cached stmts before close (F3/F8)
             sqlite3_finalize(dedupStmt); dedupStmt = nil
             sqlite3_finalize(foldGroupStmt); foldGroupStmt = nil
+            sqlite3_finalize(foldFreedStmt); foldFreedStmt = nil
             sqlite3_finalize(foldMoveStmt); foldMoveStmt = nil
             sqlite3_exec(h, "PRAGMA wal_checkpoint(TRUNCATE);", nil, nil, nil)
             sqlite3_close(h)
@@ -2943,11 +2947,20 @@ public final class VectorStore: @unchecked Sendable {
                 //
                 // chunk_id is the chunk row's primary key and chunks are inserted in chunk order,
                 // so it carries the same ordering chunk_index was reaching for.
-                guard sqlite3_prepare_v2(db, """
+                // Under the split the tag list is on the CONTENT and the file link is the
+                // OCCURRENCE, so the same question needs the join the other way round. `ordinal`
+                // carries the ordering `chunk_id` was standing in for.
+                let tagSQL = splitBuilt ? """
+                    SELECT s.snippet FROM occurrence o
+                      JOIN chunk_snippet s ON s.chunk_id = o.chunk_id
+                    WHERE o.file_id = \(StoreSchema.fileIDByPath) AND s.kind IN (\(StoreSchema.mediaKindCodes.map(String.init).joined(separator: ",")))
+                    ORDER BY o.ordinal;
+                    """ : """
                     SELECT t.snippet FROM chunk_text t
                     WHERE t.file_id = \(StoreSchema.fileIDByPath) AND t.kind IN (\(StoreSchema.mediaKindCodes.map(String.init).joined(separator: ",")))
                     ORDER BY t.chunk_id;
-                    """, -1, &stmt, nil) == SQLITE_OK else { return }
+                    """
+                guard sqlite3_prepare_v2(db, tagSQL, -1, &stmt, nil) == SQLITE_OK else { return }
                 defer { sqlite3_finalize(stmt) }
                 for p in group where presentPaths.contains(p) {
                     sqlite3_reset(stmt); sqlite3_clear_bindings(stmt)
@@ -5326,7 +5339,7 @@ public final class VectorStore: @unchecked Sendable {
         // inside the lock concurrent searches and indexing writes wait on. Only ever runs on `queue`,
         // so a single cached handle is race-free. (F3)
         if snippetStmt == nil {
-            guard sqlite3_prepare_v2(db, Self.chunkTextByPathSQL, -1, &snippetStmt, nil) == SQLITE_OK else { return hits }
+            guard sqlite3_prepare_v2(db, displayTextSQL, -1, &snippetStmt, nil) == SQLITE_OK else { return hits }
         }
         let stmt = snippetStmt
         var out = hits
@@ -5712,7 +5725,19 @@ public final class VectorStore: @unchecked Sendable {
         // this reads index pages only, exactly as the v3 partial index did. It is cheaper here for
         // a structural reason: the table it covers no longer carries the vectors and per-chunk
         // metadata that used to sit between the snippets.
-        let sql = """
+        // Both forms read index pages only: v4's idx_chunk_label is (kind, snippet, file_id)
+        // partial over the media kinds, and the split's idx_snip_label is (kind, snippet) partial
+        // the same way, with the file coming from the occurrence.
+        let sql = splitBuilt ? """
+            SELECT DISTINCT \(StoreSchema.pathExpr)
+              FROM chunk_snippet t
+              JOIN occurrence o ON o.chunk_id = t.chunk_id
+              JOIN files f ON f.id = o.file_id
+              JOIN dirs d ON d.id = f.dir_id
+             WHERE t.kind IN (\(StoreSchema.mediaKindCodes.map(String.init).joined(separator: ",")))
+               AND f.name <> t.snippet
+               AND (\(clauses));
+            """ : """
             SELECT DISTINCT \(StoreSchema.pathExpr)
               FROM chunk_text t
               JOIN files f ON f.id = t.file_id
@@ -6602,6 +6627,16 @@ public final class VectorStore: @unchecked Sendable {
     nonisolated(unsafe) public static var chunkSplit =
         ProcessInfo.processInfo.environment["OMNI_CHUNK_SPLIT"] == "1"
     private static let chunkSplitDoneKey = "chunk_split_backfilled"
+    /// Whether THIS index has the split built and proven. Cached because every result row asks it,
+    /// and a meta SELECT per displayed snippet is not free on the interactive path.
+    private var splitBuilt = false
+    /// Read the durable flag once. Set after a build and at open.
+    private func refreshSplitBuiltLocked() {
+        splitBuilt = Self.chunkSplit && dbOpen()
+            && scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.chunkSplitDoneKey)'") == 1
+    }
+    /// The display SQL this index answers with.
+    private var displayTextSQL: String { splitBuilt ? Self.chunkTextByPathSplitSQL : Self.chunkTextByPathSQL }
     /// How far that backfill has got, as a chunk id. Absent means "not started" or "finished".
     private static let slotsMarkKey = "chunk_slots_upto"
     private var slotsBackfilled = false
@@ -7808,6 +7843,35 @@ public final class VectorStore: @unchecked Sendable {
         guard votes.count == 1 else { return nil }
         _ = (claim, cleared)
         return best.key
+    }
+
+    /// Record every position inside the covered prefix that no live row owns, which is what a hole
+    /// IS. Returns how many were added, or nil when the shape says this is not that problem.
+    ///
+    /// Gated on the index actually carrying a partial fold - a fold mark with no done flag - so it
+    /// cannot fire on an index whose claim is wrong for some other reason and paper over it.
+    private func deriveUnownedPositionsAsHolesLocked() -> Int? {
+        guard dbOpen(), coveredRows > 0 else { return nil }
+        guard let mark = metaGetLocked(Self.contentFoldMarkKey), !mark.isEmpty,
+              scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.contentFoldDoneKey)'") != 1
+        else { return nil }
+        // Ownership straight off the column, which the partial index over slot >= 0 covers.
+        var owned = [Bool](repeating: false, count: coveredRows)
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, "SELECT DISTINCT slot FROM chunks WHERE slot >= 0 AND slot < \(coveredRows);",
+                                 -1, &stmt, nil) == SQLITE_OK else { return nil }
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let sl = Int(sqlite3_column_int64(stmt, 0))
+            if sl >= 0, sl < coveredRows { owned[sl] = true }
+        }
+        var missing: [Int32] = []
+        for sl in 0 ..< coveredRows where !owned[sl] && !vecHoles.contains(Int32(sl)) { missing.append(Int32(sl)) }
+        guard !missing.isEmpty else { return 0 }
+        guard execChecked("BEGIN IMMEDIATE;") else { return nil }
+        recordHolesLocked(missing)
+        guard execChecked("COMMIT;") else { rollbackTxnLocked(); return nil }
+        return missing.count
     }
 
     /// The coverage claim could not be read. Says so loudly and changes NOTHING on disk.
@@ -9567,7 +9631,7 @@ public final class VectorStore: @unchecked Sendable {
             var locatorOf: [Int: String] = [:]
             if dbOpen() {
                 var sStmt: OpaquePointer?
-                if sqlite3_prepare_v2(db, Self.chunkTextByPathSQL, -1, &sStmt, nil) == SQLITE_OK {
+                if sqlite3_prepare_v2(db, displayTextSQL, -1, &sStmt, nil) == SQLITE_OK {
                     for (i, _) in winners {
                         let r = rows[i]
                         sqlite3_reset(sStmt)
@@ -10602,6 +10666,24 @@ public final class VectorStore: @unchecked Sendable {
                 // is a repair, not a guess - and the user never sees a screen for 59 rows in 3.8M.
                 if let db, Self.deleteProvenOrphanTwins(db: db, vecURL: vecSidecarURL, dim: storedDimLocked()) > 0,
                    loadFromCoverageLocked() { return }
+                // AN INDEX LEFT MID-FOLD BY A BUILD THAT DID NOT RECORD ITS HOLES PER SLICE.
+                // Those builds moved a duplicate's pointer onto its representative and recorded the
+                // position it vacated only when the whole pass finished, so quitting part-way left
+                // positions inside the covered prefix that no live row owns and no hole names - and
+                // the claim then cannot be read at all. The fold records them in the slice's own
+                // transaction now, but that does nothing for an index already in this state.
+                //
+                // DERIVABLE, AND NOT A GUESS. "A position inside coverage that no live row points
+                // at is a hole" is the definition, not an inference - it is the same statement
+                // `coverageAudit` enforces at rest. That is the opposite direction from the
+                // ambiguity this function refuses to resolve above: THAT one is a hole recorded for
+                // a row that is still live, where two different states produce the same counters.
+                // Here ownership is read directly and settles it.
+                if let recovered = deriveUnownedPositionsAsHolesLocked(), recovered > 0 {
+                    FileHandle.standardError.write(Data(
+                        "[omni] recovered \(recovered) positions an interrupted fold left unrecorded\n".utf8))
+                    if loadFromCoverageLocked() { return }
+                }
                 reportCoverageUnreadableLocked(coverageMismatchDetailLocked())
                 return
             }
@@ -10929,6 +11011,16 @@ public final class VectorStore: @unchecked Sendable {
     ///
     /// Snippet and locator together, because they are wanted together and always have been - the
     /// locator only looked free before because it was riding along in the resident row.
+    /// THE SAME QUESTION, ASKED OF THE SPLIT. The snippet comes from the CONTENT and the locator
+    /// from the OCCURRENCE, which is the whole point: the same paragraph is "Line 1" of one file
+    /// and "Line 4310" of another, so only one of these two columns can live on the shared row.
+    static let chunkTextByPathSplitSQL = """
+        SELECT COALESCE(s.snippet, ''), o.locator
+          FROM occurrence o
+          LEFT JOIN chunk_snippet s ON s.chunk_id = o.chunk_id
+         WHERE o.file_id = \(StoreSchema.fileIDByPath) AND o.ordinal = ?;
+        """
+
     static let chunkTextByPathSQL = """
         SELECT t.snippet, t.locator
           FROM chunks c JOIN chunk_text t ON t.chunk_id = c.id
@@ -11379,6 +11471,7 @@ public final class VectorStore: @unchecked Sendable {
             ?? ProcessInfo.processInfo.environment["OMNI_FOLD_SLICE"].flatMap(Int.init) ?? 50_000
     }
     private var foldGroupStmt: OpaquePointer?
+    private var foldFreedStmt: OpaquePointer?
     private var foldMoveStmt: OpaquePointer?
 
     /// True once every duplicate points at its content's representative. Read by the reclaim, which
@@ -11414,6 +11507,7 @@ public final class VectorStore: @unchecked Sendable {
         do {
             guard let r = try MigrationV5Runner.backfillInPlace(db: db!, highWater: highWater) else { return false }
             exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.chunkSplitDoneKey)', '1');")
+            refreshSplitBuiltLocked()
             let msg = "[omni] chunk split built: \(r.contents) contents, \(r.occurrences) occurrences, "
                 + "\(r.freeSlots) free, \(String(format: "%.1f", r.seconds))s\n"
             FileHandle.standardError.write(Data(msg.utf8))
@@ -11496,7 +11590,17 @@ public final class VectorStore: @unchecked Sendable {
                               WHERE chunk_key = ?2 AND length(chunk_key) > 0);
                 """, -1, &foldMoveStmt, nil)
         }
-        guard let gst = foldGroupStmt, let mst = foldMoveStmt else { return false }
+        // WHAT A GROUP IS ABOUT TO VACATE. The UPDATE overwrites the old slots, so they have to be
+        // read first. Every row of this content moves onto `rep`, so every OTHER position that held
+        // it is unowned the moment the UPDATE commits - a position belongs to one content, so no
+        // other row can still be pointing at it.
+        if foldFreedStmt == nil {
+            _ = sqlite3_prepare_v2(db, """
+                SELECT DISTINCT c.slot FROM chunks c JOIN chunk_text t ON t.chunk_id = c.id
+                 WHERE t.chunk_key = ?2 AND length(t.chunk_key) > 0 AND c.slot > ?1;
+                """, -1, &foldFreedStmt, nil)
+        }
+        guard let gst = foldGroupStmt, let mst = foldMoveStmt, let fst = foldFreedStmt else { return false }
         let mark = foldMarkLocked()
         sqlite3_reset(gst)
         if mark.isEmpty { sqlite3_bind_zeroblob(gst, 1, 0) }
@@ -11513,19 +11617,48 @@ public final class VectorStore: @unchecked Sendable {
         guard !groups.isEmpty else { return finishFoldLocked() }
         guard execChecked("BEGIN IMMEDIATE;") else { return true }
         var moved = 0
+        var freed: [Int32] = []
         for g in groups {
+            sqlite3_reset(fst)
+            sqlite3_bind_int(fst, 1, g.rep)
+            g.key.withUnsafeBytes { _ = sqlite3_bind_blob(fst, 2, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT) }
+            while sqlite3_step(fst) == SQLITE_ROW { freed.append(sqlite3_column_int(fst, 0)) }
+            sqlite3_reset(fst)
+
             sqlite3_reset(mst)
             sqlite3_bind_int(mst, 1, g.rep)
             g.key.withUnsafeBytes { _ = sqlite3_bind_blob(mst, 2, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT) }
             guard sqlite3_step(mst) == SQLITE_DONE else { rollbackTxnLocked(); return true }
             moved += Int(sqlite3_changes(db))
         }
+        // IN THIS TRANSACTION, with the move that made them holes. Recorded at the end of the pass
+        // instead, every slice in between left positions inside the covered prefix that no live row
+        // owned and no hole named - which is precisely what `coverageAudit` calls broken, and what
+        // an interrupted fold left behind for good.
+        recordHolesLocked(freed)
         contentFoldedCount += moved
         let last = groups[groups.count - 1].key
-        guard execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.contentFoldCountKey)','\(contentFoldedCount)');"),
+        // THE FIRST MOVED POINTER IS THE POINT OF NO RETURN, not the last one. The moment one
+        // duplicate shares its representative's position, positions and row ranks have parted
+        // company - so a loader that derives a position from a rank is already wrong, for the whole
+        // index, after ONE slice. The fold's own "done" flag says the pass finished, which is a
+        // different question and arrives much later.
+        //
+        // Quitting mid-fold used to leave an index that would not open: the rank walk could not
+        // reconcile the claim, and the by-slot loader would not take over because the done flag was
+        // not set yet. Recorded here, inside the slice's own transaction, so it is true exactly
+        // when the first move is durable and not one moment earlier.
+        var marked = true
+        if moved > 0, !slotsOutOfOrder {
+            marked = execChecked(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.slotsOutOfOrderKey)', '1');")
+        }
+        guard marked,
+              execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.contentFoldCountKey)','\(contentFoldedCount)');"),
               setFoldMarkLocked(last),
               execChecked("COMMIT;")
         else { rollbackTxnLocked(); return true }
+        if moved > 0 { slotsOutOfOrder = true }
         if Self.searchTiming, moved > 0 {
             print("[store] fold moved \(moved) pointers over \(groups.count) contents (\(contentFoldedCount) total)")
         }

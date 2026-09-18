@@ -7809,6 +7809,110 @@ if args.count >= 3 && args[1] == "splitdry" {
     }
 }
 
+// Does the chunk/occurrence split return the SAME TEXT as the v4 tables it replaces?
+// omni-verify splitparity <db>
+//
+// The search digest alone cannot answer this: the split changes where a snippet and a locator are
+// READ FROM, not how anything is scored, so a run that returns identical paths and identical scores
+// can still be showing the wrong text under every one of them. This mixes the snippet and the
+// locator into the digest, which is the only way the question gets asked.
+if args.count >= 3 && args[1] == "splitparity" {
+    let dbURL = URL(fileURLWithPath: args[2])
+    let probes = (args.count >= 4 ? Int(args[3]) : nil) ?? 24
+
+    func qvec(_ seed: Int, _ dim: Int) -> [Float] {
+        var s = UInt64(seed &* 2_654_435_761 &+ 17)
+        var v = [Float](repeating: 0, count: dim)
+        for i in 0 ..< dim {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17
+            v[i] = Float(s % 2048) / 1024 - 1
+        }
+        let n = (v.reduce(0) { $0 + $1 * $1 }).squareRoot()
+        return n > 0 ? v.map { $0 / n } : v
+    }
+    // Every hit's text, so a mismatch can be shown rather than just counted.
+    func rows(_ store: VectorStore) -> [String: (String, String)] {
+        var out: [String: (String, String)] = [:]
+        let d = store.vectorDim
+        for q in 0 ..< probes {
+            for hit in store.search(qvec(q, d), filter: SearchFilter(), topK: 20) {
+                out["\(hit.path)#\(hit.chunkIndex)"] = (hit.snippet, hit.locator)
+            }
+        }
+        return out
+    }
+
+    // FNV-1a over path, score, snippet and locator of every hit.
+    func digest(_ store: VectorStore) -> (UInt64, Int, Int) {
+        var h: UInt64 = 0xcbf29ce484222325
+        func mix(_ s: String) {
+            for b in s.utf8 { h = (h ^ UInt64(b)) &* 0x100000001b3 }
+            h = (h ^ 0x7c) &* 0x100000001b3
+        }
+        var hits = 0, withText = 0
+        let d = store.vectorDim
+        for q in 0 ..< probes {
+            for hit in store.search(qvec(q, d), filter: SearchFilter(), topK: 20) {
+                mix(hit.path); mix(String(format: "%.5f", hit.score))
+                mix(hit.snippet); mix(hit.locator)
+                hits += 1
+                if !hit.snippet.isEmpty { withText += 1 }
+            }
+        }
+        return (h, hits, withText)
+    }
+
+    VectorStore.chunkSplit = false
+    let before: (UInt64, Int, Int)
+    do {
+        let s = try VectorStore(dbURL: dbURL); defer { s.close() }
+        before = digest(s)
+        print(String(format: "v4 tables   digest=%016llx hits=%d with-text=%d", before.0, before.1, before.2))
+    }
+
+    VectorStore.chunkSplit = true
+    do {
+        let s = try VectorStore(dbURL: dbURL)
+        let t0 = Date()
+        let built = s.buildChunkSplitForTest()
+        print(String(format: "split build ran=%@ seconds=%.1f", built ? "yes" : "no", -t0.timeIntervalSinceNow))
+        s.close()
+    }
+    let after: (UInt64, Int, Int)
+    do {
+        let s = try VectorStore(dbURL: dbURL); defer { s.close() }
+        after = digest(s)
+        print(String(format: "split       digest=%016llx hits=%d with-text=%d", after.0, after.1, after.2))
+    }
+
+    guard before.2 > 0 else {
+        print("splitparity: no hit carried any text, so this run proves nothing"); exit(1)
+    }
+    let ok = before == after
+    if !ok {
+        VectorStore.chunkSplit = false
+        let a = try { let s = try VectorStore(dbURL: dbURL); defer { s.close() }; return rows(s) }()
+        VectorStore.chunkSplit = true
+        let b = try { let s = try VectorStore(dbURL: dbURL); defer { s.close() }; return rows(s) }()
+        var snippetDiff = 0, locatorDiff = 0, missing = 0, shown = 0
+        for (k, v) in a {
+            guard let w = b[k] else { missing += 1; continue }
+            if v.0 != w.0 { snippetDiff += 1 }
+            if v.1 != w.1 { locatorDiff += 1 }
+            if (v.0 != w.0 || v.1 != w.1), shown < 3 {
+                shown += 1
+                print("  \(k)")
+                print("    v4    snippet=\(v.0.prefix(60).debugDescription) locator=\(v.1.debugDescription)")
+                print("    split snippet=\(w.0.prefix(60).debugDescription) locator=\(w.1.debugDescription)")
+            }
+        }
+        print("  of \(a.count) hits: \(snippetDiff) snippets differ, \(locatorDiff) locators differ, \(missing) absent")
+    }
+    print(ok ? "splitparity ok: identical paths, scores, snippets and locators"
+             : "splitparity FAILED: the split does not return what the v4 tables do")
+    exit(ok ? 0 : 1)
+}
+
 if args.count >= 3 && args[1] == "covmigrate" {
     let dbURL = URL(fileURLWithPath: args[2])
     let cycles = (args.count >= 4 ? Int(args[3]) : nil) ?? 4

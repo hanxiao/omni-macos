@@ -251,6 +251,49 @@ final class ContentFoldTests: XCTestCase {
         assertEveryFileAnswersForItself(store, files: 60, "after the fold")
     }
 
+    /// AN INTERRUPTED FOLD HAS TO REOPEN. This is the one that was found by accident, on a real
+    /// index, and it is the worst failure the fold can have: quit part-way through and the index
+    /// would not open at all.
+    ///
+    /// The cause is a boundary being drawn in the wrong place. After ONE slice some duplicates
+    /// already share a representative's position, so a loader that derives a position from a row's
+    /// rank is wrong for the whole index - but the by-slot loader would not take over, because the
+    /// only signal it had was the fold's "done" flag, which says the PASS finished and arrives much
+    /// later. Everything in between was an index neither loader would accept.
+    func testAFoldStoppedHalfWayStillOpens() throws {
+        // SAVED AND RESTORED, like every other test here that needs quant mode. Setting it and
+        // walking away leaks the mode decision into whatever runs next: it passed alone and failed
+        // in the suite, which is the signature.
+        let savedQuant = VectorStore.quantBaseOverride
+        defer { VectorStore.quantBaseOverride = savedQuant }
+        VectorStore.quantBaseOverride = VectorStore.scanBits
+        let url = tempDB()
+        do {
+            let store = try buildUnsharedIndex(url, files: 60, dupEvery: 5)
+            _ = store.search(vec(7), topK: 3)
+            store.migrateSlotsToCompletion()
+            store.advanceCoverageForTest()
+            XCTAssertGreaterThan(store.coveredRowsForTest, 0, "no coverage: the loader under test never runs")
+            // PART WAY, then stop. `foldDuplicatesToCompletion` sets the done flag and hides exactly
+            // the state this is about. Two of the five duplicate groups is enough to make positions
+            // and row ranks disagree while the pass is still unfinished.
+            VectorStore.contentFoldSliceOverride = 1
+            XCTAssertTrue(store.foldDuplicatesOneSliceForTest(), "the fixture folded nothing, so it proves nothing")
+            XCTAssertTrue(store.foldDuplicatesOneSliceForTest(), "the fixture ran out of groups after one slice")
+            XCTAssertFalse(store.contentFoldComplete, "the fold finished; this must be the half-way state")
+            XCTAssertLessThan(distinctSlots(url), store.count,
+                              "positions and rows still match, so no loader could be wrong about them yet")
+            store.close()
+        }
+        // The sidecars would answer from their own record block; this is about the loader underneath.
+        for suffix in [".rows", ".quant"] { try? FileManager.default.removeItem(atPath: url.path + suffix) }
+
+        let store = try VectorStore(dbURL: url); defer { store.close() }
+        XCTAssertEqual(store.count, 120, "the reopen lost rows")
+        assertEveryFileAnswersForItself(store, files: 60, "after reopening a half-folded index")
+        XCTAssertNil(store.coverageAudit(), "a half-folded index reopened with inconsistent bookkeeping")
+    }
+
     func testFoldThenReclaimThenReloadKeepsEveryAnswer() throws {
         let savedQuant = VectorStore.quantBaseOverride
         let savedFraction = VectorStore.holeReclaimFractionOverride
