@@ -6429,6 +6429,14 @@ public final class VectorStore: @unchecked Sendable {
     // That is not a convenience: it means every live row's blob is already cleared, so the switch
     // needs no UPDATE over the chunk table at all, just two small writes to `meta`.
     private static let compactPendingKey = "vecs_compact_pending"
+    /// How much of the copy one turn of the queue writes. One write(2) cannot exceed INT_MAX on
+    /// Darwin anyway, and this also bounds how long a search can wait behind the copy.
+    ///
+    /// A VAR so a test can make it small: a run longer than this is SPLIT, and at 64 MB that path
+    /// only exists on an index with tens of thousands of consecutive live positions - which is to
+    /// say, only on a real one. Every fixture in the suite has runs of a few rows and never
+    /// exercises the split at all.
+    nonisolated(unsafe) public static var reclaimChunkBytes = 64 << 20
     /// Reclaim once the holes are worth the copy - which is what the threshold really chooses: the
     /// copy rewrites the whole live file whatever it reclaims, so a low threshold spends gigabytes
     /// of writes on megabytes of space. Measured on the shipped 4.5M-row index: 4.8s to rewrite
@@ -7898,17 +7906,44 @@ public final class VectorStore: @unchecked Sendable {
     ///
     /// The mapping's base pointer is re-taken every time rather than captured once - a mutation can
     /// remap or grow it, and a stale pointer would be read, not rejected.
-    private func writeVectorChunkLocked(_ fh: FileHandle, srcOffset: Int, length: Int, gen: Int64) -> Bool {
-        guard mutationGen == gen else { return false }   // the plan describes rows that have moved
+    /// WRITES AT AN EXPLICIT OFFSET, AND CHECKS WHAT IT WROTE.
+    ///
+    /// This used to append through the FileHandle's implicit cursor and trust `write` to write
+    /// everything or throw. On the real index that produced a compacted file 1.16 GB shorter than
+    /// the plan while every single chunk reported success - 236,246 writes, 9,611,506,176 bytes
+    /// planned, 8,451,158,016 arriving, and no error anywhere. A copy that can come up short
+    /// without saying so is the worst possible failure for this pass, because the rename that
+    /// follows is the commit point: the index is then permanently describing vectors the file does
+    /// not have.
+    ///
+    /// `pwrite` at the destination offset the plan computed removes the cursor from the question
+    /// entirely, and the short-write loop makes a partial write finish rather than vanish.
+    private func writeVectorChunkLocked(_ fd: Int32, srcOffset: Int, dstOffset: Int, length: Int,
+                                        gen: Int64) -> Bool {
+        guard mutationGen == gen else {
+            if Self.searchTiming { print("[reclaim] STOPPED: gen \(mutationGen) != \(gen) at dst \(dstOffset)") }
+            return false   // the plan describes rows that have moved
+        }
         var ok = true
         flat16.withUnsafeBytes { raw in
-            guard let base = raw.baseAddress, srcOffset >= 0, srcOffset + length <= raw.count else { ok = false; return }
-            let d = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: base.advanced(by: srcOffset)),
-                         count: length, deallocator: .none)
-            do { try fh.write(contentsOf: d) } catch {
-                ok = false
-                FileHandle.standardError.write(Data(
-                    "[omni] slot reclaim: write failed at \(srcOffset)+\(length): \(error)\n".utf8))
+            guard let base = raw.baseAddress, srcOffset >= 0, srcOffset + length <= raw.count else {
+                if Self.searchTiming {
+                    print("[reclaim] STOPPED: src \(srcOffset)+\(length) past buffer \(raw.count) at dst \(dstOffset)")
+                }
+                ok = false; return
+            }
+            var written = 0
+            while written < length {
+                let n = pwrite(fd, base.advanced(by: srcOffset + written), length - written,
+                               off_t(dstOffset + written))
+                if n <= 0 {
+                    if n < 0, errno == EINTR { continue }
+                    ok = false
+                    FileHandle.standardError.write(Data(
+                        "[omni] slot reclaim: write of \(length - written) at \(dstOffset + written) returned \(n), errno \(errno)\n".utf8))
+                    return
+                }
+                written += n
             }
         }
         return ok
@@ -7924,8 +7959,32 @@ public final class VectorStore: @unchecked Sendable {
     ///
     /// Preemption is free because nothing durable changes until the marker: a plan that goes stale
     /// (any mutation at all, checked by generation) just drops the copy and tries again next time.
+    /// TRUE WHILE A RECLAIM IS IN FLIGHT. One at a time, and not because two would be wasteful.
+    ///
+    /// The pass writes `.vecs.new`, and it STARTS by deleting any leftover copy. Two of them
+    /// overlapping means the second unlinks the file the first is still writing into: the first
+    /// keeps writing happily to an unlinked inode, every chunk returns success, and what ends up
+    /// at the path is whatever the second managed. The result is a copy short by a varying amount
+    /// - measured on the real index at 8.40, 8.41 and 8.42 GB across three runs where the plan
+    /// said 9.61 - and before the length check below existed, the rename committed it. An index
+    /// then permanently describes vectors the file does not have.
+    ///
+    /// It gets one, because the stamp dispatches this asynchronously from a timer and callers can
+    /// ask for it directly at the same moment.
+    private var reclaimInFlight = false
+
     @discardableResult
     public func reclaimVectorHoles() -> Bool {
+        guard queue.sync(execute: { () -> Bool in
+            if reclaimInFlight { return false }
+            reclaimInFlight = true
+            return true
+        }) else { return false }
+        defer { queue.sync { reclaimInFlight = false } }
+        return reclaimVectorHolesBodyLocked()
+    }
+
+    private func reclaimVectorHolesBodyLocked() -> Bool {
         // WHAT MOVES IS A POSITION, NOT A ROW. This pass rebuilds the vector file as the live
         // positions in order and then reloads from it. Under v4 a row owns its vector outright, so
         // "the live rows in order" is the same sentence; under sharing it is not, and a plan built
@@ -7938,7 +7997,7 @@ public final class VectorStore: @unchecked Sendable {
         // therefore idempotent - the property that lets an interrupted reclaim be finished by the
         // resume path with no remap table to carry across the crash.
         // PHASE 1 - the plan, under the queue.
-        struct Plan { var writes: [(off: Int, len: Int)]; var newCount: Int; var deadCount: Int; var gen: Int64 }
+        struct Plan { var writes: [(off: Int, dst: Int, len: Int)]; var newCount: Int; var deadCount: Int; var gen: Int64 }
         let plan: Plan? = queue.sync {
             guard shouldReclaimHolesLocked() else { return nil }
             // Under sharing, every stored slot is about to be rewritten by rank, so the column has
@@ -7947,8 +8006,9 @@ public final class VectorStore: @unchecked Sendable {
             if Self.contentSharing, !slotsBackfilled { return nil }
             let dead = deadRows
             let bytesPerRow = dim * MemoryLayout<UInt16>.size
-            let chunkBytes = 64 << 20   // one write(2) cannot exceed INT_MAX on Darwin anyway
-            var writes: [(off: Int, len: Int)] = []
+            let chunkBytes = Self.reclaimChunkBytes
+            var writes: [(off: Int, dst: Int, len: Int)] = []
+            var dstCursor = 0
             var newCount = 0
             var runStart = -1, runLen = 0
             let units = Self.contentSharing ? slotCount : rows.count
@@ -7958,7 +8018,8 @@ public final class VectorStore: @unchecked Sendable {
                 let total = runLen * bytesPerRow
                 while written < total {
                     let n = Swift.min(chunkBytes, total - written)
-                    writes.append((runStart * bytesPerRow + written, n))
+                    writes.append((runStart * bytesPerRow + written, dstCursor, n))
+                    dstCursor += n
                     written += n
                 }
                 runStart = -1; runLen = 0
@@ -7990,10 +8051,19 @@ public final class VectorStore: @unchecked Sendable {
             // every vector after the first hole from the wrong place. It is a cache; losing it
             // costs one load from coverage.
             removeRowSidecarFiles(keepVectors: true)
-            return Plan(writes: writes, newCount: newCount, deadCount: dead.count, gen: mutationGen)
+            // POSITIONS RECLAIMED, not dead rows. Under sharing a tombstone releases a POINTER and
+            // several rows read one position, so `dead.count` is neither the number of positions
+            // being dropped nor the number being kept - on a folded index it read 0 while the pass
+            // was dropping 3.7 million of them. What the caller and the log both mean is how much
+            // of the file is going away.
+            return Plan(writes: writes, newCount: newCount, deadCount: units - newCount, gen: mutationGen)
         }
         guard let plan else { return false }
         let t0 = Date()
+        if Self.searchTiming {
+            let total = plan.writes.reduce(0) { $0 + $1.len }
+            print("[reclaim] newCount=\(plan.newCount) dropped=\(plan.deadCount) writes=\(plan.writes.count) bytes=\(total) expected=\(plan.newCount * dim * 2)")
+        }
 
         // PHASE 2 - the copy, one chunk per queue turn.
         let fm = FileManager.default
@@ -8002,8 +8072,25 @@ public final class VectorStore: @unchecked Sendable {
               let fh = FileHandle(forWritingAtPath: vecCompactURL.path) else { return false }
         var ok = true
         for w in plan.writes {
-            ok = queue.sync { writeVectorChunkLocked(fh, srcOffset: w.off, length: w.len, gen: plan.gen) }
+            ok = queue.sync { writeVectorChunkLocked(fh.fileDescriptor, srcOffset: w.off,
+                                                     dstOffset: w.dst, length: w.len, gen: plan.gen) }
             if !ok { break }
+        }
+        // THE FILE HAS TO BE THE LENGTH THE PLAN SAID. Checked before anything durable records that
+        // it exists, because the rename after it is the commit point and a short file there is an
+        // index that will not open.
+        if ok {
+            let want = plan.newCount * dim * MemoryLayout<UInt16>.size
+            let got = ((try? fm.attributesOfItem(atPath: vecCompactURL.path)[.size]) as? Int) ?? -1
+            if got != want {
+                ok = false
+                FileHandle.standardError.write(Data(
+                    "[omni] slot reclaim: copy is \(got) bytes, expected \(want); abandoned\n".utf8))
+            }
+        }
+        if Self.searchTiming {
+            let n = ((try? fm.attributesOfItem(atPath: vecCompactURL.path)[.size]) as? Int) ?? -1
+            print("[reclaim] copied ok=\(ok) fileBytes=\(n) positions=\(n / Swift.max(1, dim * 2))")
         }
         // Durable BEFORE the marker says it exists, so "marker present" can never mean "half a file".
         if ok, fsync(fh.fileDescriptor) != 0 {

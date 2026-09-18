@@ -382,20 +382,40 @@ list below the claim, plus the slice's own new holes, which the slice already co
 coverage completes: 10,028,339 of 10,028,339 in 13.3 s, audit clean. That change is neutral with
 the fold off, which the whole suite says.
 
-WHY IT IS STILL OFF BY DEFAULT. The reclaim that follows is not right yet. On the real folded index
-it rewrites the vector file 397,548 positions SHORT of what the column names, so the index will not
-reopen - "the vector slot bookkeeping is off by 3,516,335 rows". Its plan is built from
-`rowsOfSlotLocked` over the resident model, and on the run that produced the short file it counted
-every position as live (`reclaimed 0 vector slots`) while rewriting the file to fewer positions
-than it started with. That is the next piece of work, and it is in the plan builder rather than
-anywhere new.
+THE RECLAIM AFTER IT NOW WORKS, and the bug it was hiding was not in this work at all. Measured on
+a clean copy of the real index, end to end:
 
-With the fold on by default the mutation lifecycle also fails - three tests, including two whose
-job is to REFUSE an ambiguous claim. Those are the loader becoming authoritative on an index the
-store previously declined to guess about, and they need deciding rather than relaxing.
+    fold      3,516,335 duplicates, 141 s, audit ok
+    cover     10,028,339 of 10,028,339 positions, 26 s, audit ok
+    reclaim   3,770,848 positions, 5,523.7 MB returned, 40 s, audit ok
+    .vecs     15.40 GB -> 9.61 GB
+    reopen    digest ba7a13400e714f79, identical to the baseline; p50 11.0 ms -> 9.8 ms
 
-A fold whose space cannot be reclaimed buys correct pointers and nothing a user would notice, so
-it stays behind `OMNI_CONTENT_FOLD=1` until the reclaim can finish the job.
+Getting there took finding a race that exists WITHOUT any of this. `reclaimVectorHoles` writes
+`.vecs.new` and starts by deleting any leftover copy, so two overlapping runs mean the second
+unlinks the file the first is writing into: the first keeps writing to an unlinked inode, every
+chunk returns success, and what lands at the path is whatever the second managed. Measured at 8.40,
+8.41 and 8.42 GB across three runs where the plan said 9.61 - varying, because it is a race - with
+no error reported anywhere, and before this the rename committed it. The coverage stamp dispatches
+a reclaim from a timer, so anything else asking for one at that moment is the second. It takes a
+lock now, the copy writes at explicit offsets with `pwrite` rather than through the file handle's
+cursor, and the length is checked before the rename that commits it.
+
+WHY IT IS STILL OFF BY DEFAULT. Two things, both about what happens when the fold runs on indexes
+that are not the migration case.
+
+`testAmbiguousMismatchWithHolesStillRefuses` and `testUnprovableHoleStillRefuses` stop refusing.
+Those fixtures build a claim that is ambiguous on purpose - a hole recorded for a row that is still
+live - and the store's job is to decline rather than guess. Once the fold has set its flag the
+loader reads the column instead of deriving anything, so there is nothing left to be ambiguous
+about and it opens. That is not obviously wrong, but it is a safety property being dropped rather
+than satisfied, and it needs deciding.
+
+And the mutation lifecycle fails on three files out of sixty, which is the same wrong-vector shape
+this file is written against. That one is a defect, not a judgement call.
+
+So it stays behind `OMNI_CONTENT_FOLD=1`. The migration path it was built for is measured and
+works; what is not yet established is that it is harmless on every other index.
 
 ## The free list: attempted, and withheld
 

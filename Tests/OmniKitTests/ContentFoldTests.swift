@@ -388,4 +388,40 @@ final class ContentFoldTests: XCTestCase {
         XCTAssertNil(store.coverageAudit())
     }
 
+    /// THE COPY SPLITS LONG RUNS, AND ONLY A REAL INDEX HAS LONG RUNS.
+    ///
+    /// `reclaimVectorHoles` writes the surviving positions as runs, one queue turn per 64 MB. At
+    /// 1536 bytes a vector that is 43,690 consecutive positions, so every fixture in the suite
+    /// writes each run in a single chunk and the splitting arithmetic has never been executed.
+    /// On the real index it is executed constantly, and the compacted file came out 486,033
+    /// positions short of what the plan said it would write.
+    func testTheReclaimCopyIsExactWhenItHasToSplitRuns() throws {
+        let savedQuant = VectorStore.quantBaseOverride
+        let savedFraction = VectorStore.holeReclaimFractionOverride
+        let savedFloor = VectorStore.holeReclaimFloorOverride
+        let savedChunk = VectorStore.reclaimChunkBytes
+        VectorStore.quantBaseOverride = VectorStore.scanBits
+        VectorStore.holeReclaimFractionOverride = 0.01
+        VectorStore.holeReclaimFloorOverride = 1
+        // Three vectors to a chunk, so every run of more than three positions is split.
+        VectorStore.reclaimChunkBytes = Self.dim * 2 * 3
+        defer {
+            VectorStore.quantBaseOverride = savedQuant
+            VectorStore.holeReclaimFractionOverride = savedFraction
+            VectorStore.holeReclaimFloorOverride = savedFloor
+            VectorStore.reclaimChunkBytes = savedChunk
+        }
+        let url = tempDB()
+        let store = try buildUnsharedIndex(url, files: 60, dupEvery: 5); defer { store.close() }
+        _ = store.search(vec(7), topK: 3)
+        store.migrateSlotsToCompletion()
+        store.foldDuplicatesToCompletion()
+        store.advanceCoverageForTest()
+        XCTAssertTrue(store.reclaimVectorHolesForTest(), "the reclaim declined")
+        XCTAssertEqual(store.vectorBufferUse.used / Self.dim, 65,
+                       "the split copy wrote a file of the wrong length")
+        assertEveryFileAnswersForItself(store, files: 60, "after a split-run reclaim")
+        XCTAssertNil(store.coverageAudit())
+    }
+
 }

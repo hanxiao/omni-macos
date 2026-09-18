@@ -285,4 +285,44 @@ final class HoleReclaimTests: XCTestCase {
         assertEveryFileFindsItself(store, expect, ran ? "completed despite the write" : "abandoned for the write")
         XCTAssertNil(store.coverageAudit(), "coverage bookkeeping after a contested reclaim")
     }
+    /// TWO RECLAIMS AT ONCE TRUNCATE EACH OTHER'S WORK.
+    ///
+    /// The pass writes `.vecs.new` and STARTS by deleting any leftover copy, so an overlapping
+    /// second run unlinks the file the first is still writing into. The first keeps writing to an
+    /// unlinked inode, every chunk returns success, and what ends up at the path is whatever the
+    /// second managed - a copy short by a varying amount. Measured on the real index at 8.40, 8.41
+    /// and 8.42 GB across three runs where the plan said 9.61, with no error reported anywhere.
+    ///
+    /// It is reachable without any of the content work: the coverage stamp dispatches a reclaim
+    /// from a timer, and anything else asking for one at that moment is the second.
+    func testTwoReclaimsAtOnceDoNotTruncateEachOther() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("reclaim-race-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appendingPathComponent("test.sqlite")
+        let expect = try makeIndexWithHoles(dbURL)
+        let store = try VectorStore(dbURL: dbURL); defer { store.close() }
+        let before = store.vectorBufferUse.used / Self.dim
+        let group = DispatchGroup()
+        var ran = 0
+        let lock = NSLock()
+        for _ in 0 ..< 2 {
+            group.enter()
+            DispatchQueue.global().async {
+                let did = store.reclaimVectorHoles()
+                lock.lock(); if did { ran += 1 }; lock.unlock()
+                group.leave()
+            }
+        }
+        XCTAssertEqual(group.wait(timeout: .now() + 120), .success, "a reclaim hung")
+        XCTAssertEqual(ran, 1, "both reclaims ran; one of them was writing into an unlinked file")
+        XCTAssertLessThan(store.vectorBufferUse.used / Self.dim, before, "nothing was reclaimed")
+        XCTAssertNil(store.coverageAudit(), "the reclaim left the bookkeeping inconsistent")
+        // And every survivor still reads its own vector rather than its neighbour's.
+        for (p, seed) in expect.prefix(40) {
+            let hits = store.search(vec(seed), topK: 3)
+            XCTAssertEqual(hits.first?.path, p, "\(p) reads the wrong vector after a raced reclaim")
+        }
+    }
+
 }
