@@ -2546,9 +2546,15 @@ public final class VectorStore: @unchecked Sendable {
             let ci = Int(sqlite3_column_int(stmt, 3))
             guard let row = byIndex[ci] else { return nil }
             var vec = [Float](repeating: 0, count: d)
+            // BY POSITION, not by row. `chunkVectors` right above this was converted when sharing
+            // landed and this one was not, so it read whatever vector happened to sit at the
+            // position numbered like its row - which is the whole file coming back as some other
+            // file's content. Harmless only while rows and positions are the same number, which is
+            // exactly what sharing, the fold and the free list each stop being true.
+            let pos = slotOf(row)
             let ok: Bool = flat16.withUnsafeBufferPointer { buf in
-                guard buf.count >= (row + 1) * d else { return false }
-                for k in 0 ..< d { vec[k] = Self.fromBF16(buf[row * d + k]) }
+                guard pos >= 0, (pos + 1) * d <= buf.count else { return false }
+                for k in 0 ..< d { vec[k] = Self.fromBF16(buf[pos * d + k]) }
                 return true
             }
             guard ok else { return nil }
