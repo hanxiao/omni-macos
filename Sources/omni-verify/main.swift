@@ -7667,6 +7667,22 @@ if args.count >= 3 && args[1] == "intern" {
 // one is a launch and quit - and reports how far coverage got, how long the quit took, and what the
 // files weigh. The interesting numbers are the per-cycle close time (must stay small) and the point
 // at which index.sqlite starts shrinking.
+// How long does the one-time slot backfill take on a real index? omni-verify slotfill <db>
+// This is the upgrade an existing user pays for once. In the app it runs a slice per coverage
+// stamp and nobody waits for it; here it is driven to completion so the total is a number rather
+// than an assumption.
+if args.count >= 3 && args[1] == "slotfill" {
+    let dbURL = URL(fileURLWithPath: args[2])
+    let store = try VectorStore(dbURL: dbURL)
+    let r = store.migrateSlotsToCompletion { n in
+        if n % 10 == 0 { print("  \(n) slices"); fflush(stdout) }
+    }
+    print(String(format: "slotfill rows=%d seconds=%.1f", r.filled, r.seconds))
+    if let bad = store.coverageAudit() { print("AUDIT FAILED: \(bad)") } else { print("audit ok") }
+    store.close()
+    exit(0)
+}
+
 if args.count >= 3 && args[1] == "covmigrate" {
     let dbURL = URL(fileURLWithPath: args[2])
     let cycles = (args.count >= 4 ? Int(args[3]) : nil) ?? 4

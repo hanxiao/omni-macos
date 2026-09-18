@@ -1332,9 +1332,14 @@ final class ContentSharingTests: XCTestCase {
         // Delete half of them: every deleted file's unique chunk leaves a hole.
         for i in 0 ..< 20 { store.deletePath("/r/f\(i).txt") }
         let before = store.vectorBufferUse.used / dim
+        // MAINTENANCE STANDS ASIDE FOR A RECENT SEARCH, for two seconds. The search above is what
+        // built the base, so without this wait the stamp yields and the test measures the yield
+        // rather than the branch - which is exactly how it passed on an idle machine and failed on
+        // a loaded one.
+        Thread.sleep(forTimeInterval: 2.2)
         store.stampCoverageForTest()
-        // The reclaim runs off the queue, so give it a moment to land.
-        let deadline = Date().addingTimeInterval(10)
+        // The reclaim runs off the queue, so give it time to land even on a busy machine.
+        let deadline = Date().addingTimeInterval(60)
         while store.vectorBufferUse.used / dim == before, Date() < deadline { usleep(50_000) }
         XCTAssertLessThan(store.vectorBufferUse.used / dim, before,
                           "the stamp never reached the hole reclaim, so the holes are permanent")

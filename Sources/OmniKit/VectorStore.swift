@@ -10161,6 +10161,29 @@ public final class VectorStore: @unchecked Sendable {
     // omni-verify, which call the rewrite directly.
     nonisolated(unsafe) public static var internPathsOverride: Bool? = nil
 
+    /// Drive the slot backfill to completion, and say how long the one-time upgrade actually took.
+    ///
+    /// In the app this runs a slice at a time off the coverage stamp, so it finishes over minutes
+    /// of ordinary use and nobody waits for it. That is the right shape for a user and the wrong
+    /// one for a measurement: "does an existing 9.7M-row index migrate in seconds or in hours" is
+    /// a question about the whole column, not about one slice.
+    @discardableResult
+    public func migrateSlotsToCompletion(onSlice: ((Int) -> Void)? = nil) -> (filled: Int, seconds: Double) {
+        let t0 = Date()
+        var rounds = 0
+        while true {
+            let done: Bool = queue.sync {
+                backfillSlotsLocked()
+                return slotsBackfilled
+            }
+            rounds += 1
+            onSlice?(rounds)
+            if done { break }
+            if rounds > 10_000 { break }   // a backfill that cannot finish must not spin for ever
+        }
+        return (queue.sync { rows.count }, -t0.timeIntervalSinceNow)
+    }
+
     /// Test entry point: run the rewrite on the store queue.
     public func internPathsForTest() -> Int64? { queue.sync { internPathsLocked() } }
     /// Coverage state, for tests that have to build a specific on-disk claim.
