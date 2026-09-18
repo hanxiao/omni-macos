@@ -616,6 +616,60 @@ failing identically with its column rewrite disabled.
 Its own two were the reuse debt leaking on close, and the coverage audit counting a legitimately
 unsynced reuse as breakage. Both are described under the fold.
 
+## What the live migration found, which no fixture had
+
+Three defects surfaced only by running the real migration on a real index with the app open. Each
+is a window - a state that exists for minutes during an upgrade and never afterwards - which is
+exactly the kind of state a fixture built in one transaction cannot contain.
+
+REUSE BEFORE THE BACKFILL FINISHES. `placeVectorLocked` asked only whether the free list was on, so
+an index part way through its one-time backfill could hand out a position out of order - while
+`loadBySlotLocked` refuses to seat rows from a column that is not complete, because a row still
+carrying -1 would land on position 0 along with every other such row. The result is an index
+NEITHER loader can read. On a fixture: the reopen seated survivor 59 on f17's vector and left
+position 58 owned by nobody. Observed live at `chunk_slots_upto` 6,000,000 of 9,773,836 with the
+out-of-order marker already set. Reuse is gated on the backfill now, decided once at open, where
+the rows present are exactly the pre-existing ones.
+
+Two narrower conditions were tried first and both were wrong. "Does any row have slot < 0" is
+false constantly on a healthy index, because a freshly written row's slot is persisted by a later
+pass. And on an EMPTY database it is vacuously true, which set the flag before any rows existed and
+stopped the real backfill ever running.
+
+THE AUDIT FAILED A HEALTHY MIGRATING INDEX. Its covered-row check counts by `slot >= 0`, but a row
+that is covered - blob cleared, file answering for it - legitimately carries -1 until the backfill
+reaches it. The two counts therefore disagree for the whole migration. It uses the hole-based form,
+which does not read the column, during the window.
+
+AND THE PANEL REPORTED NOTHING FOR THE LONGEST PHASE. `foldProgressLocked` requires the backfill to
+be finished before it will report, so between the coverage migration ending and the fold starting -
+about fifteen minutes on a 9.7M-row index - the storage panel showed no progress at all. Asked
+directly: "when will optimizing index show?" The honest answer was "not yet", which is not an
+answer a progress bar should give.
+
+## What made search laggy during the fold, and what did not
+
+Reported as search being much laggier than v4 mid-migration. Sampled rather than guessed, and there
+were two causes, both in the fold and both now fixed:
+
+  - THE WAL REACHED 1.97 GB. The fold is millions of small UPDATEs and never checkpointed, so every
+    page lookup was searching two gigabytes of frames - `walFindFrame` dominated the profile. That
+    cost lands on whatever reads next, which is SEARCH, which is why it reads as "search got slow"
+    rather than "the fold is slow". `wal_checkpoint(PASSIVE)` after each slice holds it near 0.01 GB.
+  - A SLICE WAS BOUNDED BY COUNT, not by time. 50,000 contents, whose duration depends entirely on
+    how deep the duplicate groups are - and this corpus has a block occurring 8,145 times. A search
+    arriving mid-slice waited for all of it. Slices are capped at 250 ms now, which is what the
+    budget actually is: an interactive latency, not a throughput knob.
+
+WHAT IS NOT FIXED, AND IS NOT A v5 REGRESSION: search contends with indexing regardless. Measured
+on the same index, changing only the feature flags:
+
+    features on    idle 6 ms   cold 325 ms   contention 318 ms
+    features off   idle 6 ms   cold 307 ms   contention 300 ms
+
+So the new structures account for about 18 ms of 318. The rest is the indexing pass competing for
+the store queue and the GPU, it predates all of this, and it needs its own investigation.
+
 ## The chunk/occurrence split: built and proven, not swapped in
 
 `MigrationV5`'s SQL had been unit-tested against hand-built v4 databases since it was written and
