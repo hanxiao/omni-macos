@@ -321,9 +321,9 @@ like a delivery list and three of those components deliver nothing yet:
                    reuse has answered that since v4, and measuring it with every chunk-level reuse
                    path turned off still shows one embedding per edited file. What is missing is
                    the INSERTION case, and that is the cutter's problem rather than the diff's.
-  SlotAllocator    The free list. The reclaim is the v4 answer and now works under sharing, so a
-                   released position waits for a whole-file copy rather than being handed to the
-                   next new content.
+  SlotAllocator    The free list. ATTEMPTED AND WITHHELD - see below. The reclaim is the v4
+                   answer and it now actually runs under sharing, so a released position waits for
+                   a whole-file copy rather than being handed to the next new content.
   MigrationV5      The backfill for the `chunk` / `occurrence` table split, measured at 79.7s on
                    the real index. Sharing is reached through `chunks.slot` plus the partial index
                    on `chunk_text.chunk_key` instead, which needs no table to move.
@@ -337,6 +337,35 @@ it matched. Two files holding one passage report "Line 12" and "Line 4310" respe
 their own snippets. `testEachSharerKeepsItsOwnLocatorAndSnippet` pins it. What the split would
 still buy is storing that text ONCE per content plus a locator per occurrence, rather than a full
 row per occurrence - a size win, not a correctness one.
+
+## The free list: attempted, and withheld
+
+Handing a released position to the next new content instead of waiting for a whole-file copy is
+obviously right, and it is written: `SlotAllocator` allocates from a min-heap, `placeVectorLocked`
+writes the new vector into the hole, `patchedSlots` rescores the positions the GPU-resident base
+still describes wrongly, the coverage stamp drops the reused row's blob once the file is synced,
+and `loadBySlotLocked` seats rows from the stored column instead of deriving a position from a
+row's rank - which the free list makes impossible. Seven tests cover it, four of them verified to
+fail with their fix removed.
+
+IT DOES NOT PASS THE MUTATION SUITE, and the failure is the bad kind. Driven through the real
+Indexer over add / edit / rename / move / folder-move / delete, a renamed file came back holding
+ANOTHER file's vector: not a crash, not a missing result, a real file at a plausible score. The
+chain was traced as far as the blob: the vector SQLite stored for that chunk was already wrong
+when it was written, which means the indexer's cross-file content reuse
+(`vectorsForContentKeys` -> `liveSlotForContentLocked` -> `flat16[slot]`) handed back a vector
+that was not the key's. That lookup trusts `chunks.slot` to agree with the resident numbering, and
+a reuse in flight is exactly when the two can disagree - so one bad lookup does not just return a
+wrong answer, it PERSISTS one.
+
+What that says is that the free list needs a safety property the store does not have yet: the
+content lookup has to be able to verify that the position it found still holds the content it
+asked for, or the numbering has to be unfalsifiable by construction. Neither is a patch, so the
+work is on the branch and off by default (`OMNI_FREE_LIST`), and the user-visible half of the
+problem - holes accumulating for ever - is fixed instead by making the hole reclaim reachable,
+which is a change whose correctness is already established.
+
+Do not re-enable it without first making that lookup verifiable.
 
 ## The two 2026 leads, measured on the real index, and both declined
 
