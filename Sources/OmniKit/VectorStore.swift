@@ -2124,6 +2124,17 @@ public final class VectorStore: @unchecked Sendable {
             // only `closed` check sat three lines below.
             guard !closed else { return }
             stampVectorCoverageLocked(budget: Self.coverageSliceOnClose, reclaim: false)   // a quit must not stall
+            // SETTLE THE REUSE DEBT, unconditionally. A position the free list rewrote inside the
+            // covered prefix keeps its blob until the file is synced, and `unsyncedReuse` is the
+            // only record that it does - it lives in memory and nothing else. The stamp above
+            // usually settles it, but it yields to a recent search and returns early, and on close
+            // there is no later stamp to catch what it skipped. The blob then outlives every set
+            // that knew about it: pending_vecs grows for the life of the index and the coverage
+            // audit reports rows that are covered and still hold a blob, which is exactly true.
+            if flat16.isPersistent, !unsyncedReuse.isEmpty {
+                flat16.msyncFile()
+                clearSyncedReuseBlobsLocked()
+            }
             stampRowSidecarLocked(sync: true)       // durable row table; no-op if current
             persistQuantReplicaLocked(sync: true)   // durable before the handle goes away; no-op if current
             flat16.releaseFileLock()                // successor stores may now adopt the vec sidecar
@@ -6774,8 +6785,18 @@ public final class VectorStore: @unchecked Sendable {
                 }
                 // 3. A row whose position is covered has no blob, and one whose position is not
                 //    still has its own. Both directions, as one count.
+                // MINUS THE UNSYNCED REUSES. A row the free list placed on an already-covered
+                // position keeps its blob ON PURPOSE - the file answers for that position, but for
+                // the bytes that used to be there, and the new ones are not durable until the next
+                // msync. `clearSyncedReuseBlobsLocked` drops them at the stamp that syncs. So they
+                // are covered rows that legitimately still have a blob, and counting them as
+                // breakage makes the audit report a bug where the design is doing its job.
+                var exclude = ""
+                if !unsyncedReuse.isEmpty {
+                    exclude = " AND slot NOT IN (\(unsyncedReuse.map(String.init).joined(separator: ",")))"
+                }
                 let coveredRowCount = scalarQuery(
-                    "SELECT COUNT(*) FROM chunks WHERE slot >= 0 AND slot < \(coveredRows)")
+                    "SELECT COUNT(*) FROM chunks WHERE slot >= 0 AND slot < \(coveredRows)\(exclude)")
                 let cleared = clearedRowsLocked()
                 if cleared != coveredRowCount {
                     return "coverage covers \(coveredRowCount) rows but \(cleared) have no blob"

@@ -275,7 +275,15 @@ final class HoleReclaimTests: XCTestCase {
 
         while !writer.isFinished { usleep(1000) }
         if !ran {
-            XCTAssertEqual(state(dbURL).holes, before.holes, "an abandoned reclaim still emptied the hole list")
+            // The free list legitimately takes a hole back here: the interleaved write allocates a
+            // position, and with the list on that is one of the holes the reclaim was about to
+            // copy away. That is the feature working, not the reclaim leaking - so it is allowed
+            // exactly the positions the write consumed, and nothing more. With the list off the
+            // count must still be identical.
+            let consumable = VectorStore.freeListEnabled ? 1 : 0
+            XCTAssertGreaterThanOrEqual(state(dbURL).holes, before.holes - consumable,
+                                        "an abandoned reclaim still emptied the hole list")
+            XCTAssertLessThanOrEqual(state(dbURL).holes, before.holes, "holes appeared from nowhere")
             XCTAssertEqual(state(dbURL).pending, 0, "an abandoned reclaim left its marker behind")
             XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("test.sqlite.vecs.new").path),
                            "an abandoned reclaim left its copy behind")
