@@ -743,4 +743,37 @@ final class SchemaV4MigrationTests: XCTestCase {
         XCTAssertEqual(scalar(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_chunk_label'"), 1,
                        "the media label index did not come across")
     }
+
+    func testAnOldChunkSnippetIsRebuiltWithItsKindColumn() throws {
+        // `chunk_snippet` shipped without `kind`, which forced `idx_snip_label` to index every text
+        // snippet in the database rather than the media labels it serves - 1.515 GB against 0.036 GB
+        // on the measured index. Nothing has ever written the table, so the fix is to drop it; this
+        // is the proof that an index already carrying the old shape actually gets the new one.
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("snipkind-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appendingPathComponent("test.sqlite")
+        do { let s = try VectorStore(dbURL: dbURL); s.close() }
+
+        do {
+            let db = open(dbURL); defer { sqlite3_close(db) }
+            for sql in ["DROP INDEX IF EXISTS idx_snip_label;",
+                        "DROP TABLE IF EXISTS chunk_snippet;",
+                        "CREATE TABLE chunk_snippet(chunk_id INTEGER PRIMARY KEY, snippet TEXT NOT NULL DEFAULT '');",
+                        "CREATE INDEX idx_snip_label ON chunk_snippet(snippet) WHERE snippet <> '';"] {
+                XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK, sql)
+            }
+            XCTAssertEqual(scalar(db, "SELECT COUNT(*) FROM pragma_table_info('chunk_snippet') WHERE name='kind'"), 0,
+                           "the fixture is not actually the old shape")
+        }
+
+        do { let s = try VectorStore(dbURL: dbURL); s.close() }
+
+        let db = open(dbURL); defer { sqlite3_close(db) }
+        XCTAssertEqual(scalar(db, "SELECT COUNT(*) FROM pragma_table_info('chunk_snippet') WHERE name='kind'"), 1,
+                       "reopening did not rebuild chunk_snippet with its kind column")
+        XCTAssertEqual(scalar(db, "SELECT COUNT(*) FROM sqlite_master WHERE name='idx_snip_label' "
+                                  + "AND sql LIKE '%kind IN (1, 2, 3)%'"), 1,
+                       "the label index is still indexing every snippet in the database")
+    }
 }
