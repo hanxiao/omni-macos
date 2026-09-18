@@ -7119,6 +7119,14 @@ public final class VectorStore: @unchecked Sendable {
         guard scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.contentFoldDoneKey)'") == 1
                 || Self.freeListEnabled
         else { return false }
+        // A HOLE A LIVE ROW STILL OWNS IS A CONTRADICTION, and seating rows from the column is not
+        // a licence to ignore it. That shape - a delete that recorded its hole and never committed
+        // its row removal - is exactly what the rank walk refuses to guess at, and the reason this
+        // loader could open it is that the column made the mapping unambiguous, not that the
+        // bookkeeping became consistent. It is the same invariant `coverageAudit` enforces at rest.
+        // Refusing here hands back to the walk, which declines with the message that names it.
+        if scalarQuery("SELECT COUNT(*) FROM vec_holes h JOIN chunks c ON c.slot = h.slot "
+                       + "WHERE h.slot < \(coveredRows)") > 0 { return false }
         let maxSlot = scalarQuery("SELECT COALESCE(MAX(slot), -1) FROM chunks")
         let highWater = Swift.max(coveredRows, maxSlot + 1)
         guard highWater > 0 else { return false }
