@@ -1189,7 +1189,13 @@ public final class VectorStore: @unchecked Sendable {
     private func resetTombstonesLocked() { deadRows.removeAll(); deadIdxCache = nil }
 
     private func invalidateBase() { baseDirty = true; mlxBase = nil; mlxFileID = nil; mlxFileIDRows = 0; mlxKindCode = nil; mlxKindCodeRows = 0; mlxModified = nil; mlxModifiedRows = 0; quantBase = nil; bitBase = nil; baseRows = 0
-                                     mlxOccSlot = nil; mlxOccSlotRows = 0; mlxDeadOcc = nil; mlxDeadOccRows = 0; baseOccCount = 0 }
+                                     mlxOccSlot = nil; mlxOccSlotRows = 0; mlxDeadOcc = nil; mlxDeadOccRows = 0; baseOccCount = 0
+                                     // Nothing is inside the base any more, so nothing is stale in it.
+                                     patchedSlots.removeAll(keepingCapacity: true)
+                                     // CONSERVATIVE: everything that renumbers positions throws the
+                                     // base away, so dropping the free list here catches all of them
+                                     // without a list of call sites to keep in step.
+                                     invalidateFreeListLocked() }
     // Membership index of the paths currently in `rows`. Lets replace() know in O(1) whether a
     // path pre-exists, so a brand-new file skips removeRowsLocked entirely (no O(N) scan per file
     // during a full index). Rebuilt from the surviving rows whenever removeRowsLocked compacts.
@@ -2149,7 +2155,7 @@ public final class VectorStore: @unchecked Sendable {
             // the slots they keep have to be recorded inside the same transaction as their delete.
             let victims = presentPaths.contains(path) ? victimRowsForPathsLocked([path]) : []
             beginTxnLocked()
-            recordHolesLocked(releasedSlotsLocked(victims))
+            recordAndReleaseLocked(releasedSlotsLocked(victims))
             deletePathLocked(path)
             let bfs = chunks.map { bf16Row($0.embedding) }   // fp32 -> bf16 once, reused for blob + memory
             let now = Date().timeIntervalSince1970           // one indexed_at stamp for the whole call
@@ -2240,7 +2246,7 @@ public final class VectorStore: @unchecked Sendable {
             // the commit, and the slots they hold on to must be recorded inside it.
             let victims = victimRowsForPathsLocked(Set(work.map { $0.path }.filter { presentPaths.contains($0) }))
             beginTxnLocked()
-            recordHolesLocked(releasedSlotsLocked(victims))
+            recordAndReleaseLocked(releasedSlotsLocked(victims))
             setStoredDimLocked(dim)
             guard let w = prepareChunkInsertLocked() else {
                 rollbackTxnLocked()
@@ -2302,7 +2308,7 @@ public final class VectorStore: @unchecked Sendable {
             guard dbOpen() else { return }
             let victims = victimRowsForPathsLocked([path])
             beginTxnLocked()
-            recordHolesLocked(releasedSlotsLocked(victims))
+            recordAndReleaseLocked(releasedSlotsLocked(victims))
             deleteFileContentLocked(path)   // a removal drops the dedup entry; a replace keeps it
             pruneFileRowsLocked([path])
             bumpGenLocked()
@@ -2571,7 +2577,7 @@ public final class VectorStore: @unchecked Sendable {
             guard dbOpen() else { return }
             let victims = victimRowsForPathsLocked(paths)
             beginTxnLocked()
-            recordHolesLocked(releasedSlotsLocked(victims))
+            recordAndReleaseLocked(releasedSlotsLocked(victims))
             for p in paths { deleteFileContentLocked(p) }
             pruneFileRowsLocked(paths)
             bumpGenLocked()
@@ -2612,7 +2618,7 @@ public final class VectorStore: @unchecked Sendable {
                 $0.path == folder || SearchFilter.underFolderBytes($0.path, prefixBytes)
             }
             beginTxnLocked()
-            recordHolesLocked(releasedSlotsLocked(victims))
+            recordAndReleaseLocked(releasedSlotsLocked(victims))
             var stmt: OpaquePointer?
             // Range form of `path LIKE folder||'/%'`: SQLite's default case-insensitive LIKE (plus
             // the OR) defeats the index and scans; `>= '<folder>/' AND < '<folder>0'` is
@@ -2685,7 +2691,7 @@ public final class VectorStore: @unchecked Sendable {
             // slots no row owns with nothing recording which.
             let victims = victimRowsMatchingLocked { set.contains($0.kind) }
             beginTxnLocked()
-            recordHolesLocked(releasedSlotsLocked(victims))
+            recordAndReleaseLocked(releasedSlotsLocked(victims))
             // Kinds are codes on the row now, so the predicate is a small IN over integers.
             let codes = kinds.map { String(kindCodeLocked($0)) }.joined(separator: ",")
             // Side rows first, while the chunk rows they hang off are still there to name them.
@@ -2715,7 +2721,7 @@ public final class VectorStore: @unchecked Sendable {
             guard !victims.isEmpty else { return }
             let victimRows = victimRowsMatchingLocked { disabled($0.path) }
             beginTxnLocked()
-            recordHolesLocked(releasedSlotsLocked(victimRows))
+            recordAndReleaseLocked(releasedSlotsLocked(victimRows))
             for path in victims { deleteFileContentLocked(path) }
             pruneFileRowsLocked(victims)
             bumpGenLocked()
@@ -4449,11 +4455,12 @@ public final class VectorStore: @unchecked Sendable {
             let n = slotCount
             let fusible = quantBase == nil && bitBase == nil && mlxFileID != nil && baseRows > 0 && !baseDirty
                 && (filter.kinds.isEmpty || mlxKindCode != nil)
-                && (n - baseRows) <= Self.foldThreshold
+                && (n - baseRows) + patchedSlots.count <= Self.foldThreshold
                 && queryGraph.size == dim   // dim is shared state - read under the lock (self-review fix)
             guard fusible else { needClassic = true; return nil }
             guard n > 0, dim > 0, flat16.count == n * dim else { return [] }
-            if baseDirty || (mlxBase == nil && quantBase == nil && bitBase == nil) || (n - baseRows) > Self.foldThreshold { rebuildBaseLocked(rowCount: n) }
+            if baseDirty || (mlxBase == nil && quantBase == nil && bitBase == nil)
+                || (n - baseRows) + patchedSlots.count > Self.foldThreshold { rebuildBaseLocked(rowCount: n) }
             // A rebuild can flip the base to quant mode (mlxBase stays nil); the fused GPU path no
             // longer applies, so fall back to the classic quant-capable path after the lock.
             // Through the BUILDER, not the stored array: the cached copy can be sized to a
@@ -4463,7 +4470,7 @@ public final class VectorStore: @unchecked Sendable {
             let qv = queryGraph.reshaped([dim, 1]).asType(.bfloat16)
             // NOT maskDeadLocked: that masks the per-CONTENT vector, and a tombstone is a
             // property of a ROW. reduceTopKGPULocked masks dead occurrences after the gather.
-            let baseScore = gemvSafe(base, qv, rows: baseRows)
+            let baseScore = patchScoresLocked(gemvSafe(base, qv, rows: baseRows), qv: qv)
             var deltaGraph: MLXArray? = nil
             if n > baseRows {
                 let deltaCount = n - baseRows
@@ -4702,7 +4709,8 @@ public final class VectorStore: @unchecked Sendable {
             let n = slotCount
             guard n > 0, dim > 0, query.count == dim, flat16.count == n * dim else { return [] }
             if markActive { lastSearchAt = Date() }   // stamp AFTER the guard so an empty/invalid query never fakes a search window
-            if baseDirty || (mlxBase == nil && quantBase == nil && bitBase == nil) || (n - baseRows) > Self.foldThreshold {
+            if baseDirty || (mlxBase == nil && quantBase == nil && bitBase == nil)
+                || (n - baseRows) + patchedSlots.count > Self.foldThreshold {
                 rebuildBaseLocked(rowCount: n)
             }
             let t0 = Self.searchTiming ? Date() : nil
@@ -4750,7 +4758,7 @@ public final class VectorStore: @unchecked Sendable {
             }
             let baseScore: MLXArray
             if quantBits == 1, let bb = bitBase {
-                baseScore = maskDeadLocked(bitScanLocked(bb, query: query, rows: baseRows))
+                baseScore = patchScoresLocked(maskDeadLocked(bitScanLocked(bb, query: query, rows: baseRows)), qv: qv)
                 if let r = coarseFastPathLocked(baseScore) { return r }
             } else if let qb = quantBase {
                 // The replica is stored rotated when the preconditioner is on, so the query must be
@@ -4760,10 +4768,10 @@ public final class VectorStore: @unchecked Sendable {
                 // allocation: a disabled experiment must not cost the shipped path anything.
                 let qRow = Self.quantRotate ? rotateForQuantLocked(MLXArray(query, [1, dim])).asType(.bfloat16)
                                             : qv.transposed(1, 0)
-                baseScore = maskDeadLocked(
+                baseScore = patchScoresLocked(maskDeadLocked(
                     MLX.quantizedMM(qRow, qb.wq, scales: qb.scales, biases: qb.biases,
                                     transpose: true, groupSize: Self.quantGroup, bits: quantBits)
-                        .transposed(1, 0))
+                        .transposed(1, 0)), qv: qv)
                 // PLAIN-QUERY FAST PATH: select the top-C candidates ON THE GPU (argPartition) so the
                 // host never reads back or scans all N coarse scores, then exact-rescore just the
                 // candidates and reduce over candidates + delta only - O(C + delta) host work after
@@ -4781,7 +4789,7 @@ public final class VectorStore: @unchecked Sendable {
                 // mask is a per-file mask.
                 if let r = coarseFastPathLocked(baseScore) { return r }
             } else {
-                baseScore = maskDeadLocked(gemvSafe(mlxBase!, qv, rows: baseRows))
+                baseScore = patchScoresLocked(maskDeadLocked(gemvSafe(mlxBase!, qv, rows: baseRows)), qv: qv)
                 // PLAIN-QUERY FAST PATH (full mode): best-chunk-per-file reduction ON the GPU.
                 // The scores are already resident post-matmul; reading all N back and scanning
                 // them on the host was ~4ms of a ~9.5ms query at 2M rows. Delta rows (bounded by
@@ -4913,6 +4921,41 @@ public final class VectorStore: @unchecked Sendable {
     /// -inf at every tombstoned row, so no selection or reduction downstream can reach one. The
     /// scatter is over the dead rows alone, so it costs nothing at the scale of the scan it guards.
     /// Returns the argument untouched when there is nothing dead, which is the usual case.
+    /// Rescore the positions the free list wrote over since the base was built.
+    ///
+    /// The resident base is a COPY of `flat16` rows [0, baseRows). Reusing a hole inside that range
+    /// changes the bytes under the copy, so the base's score for that position describes whatever
+    /// content used to live there - a real vector, scoring plausibly, for a file that no longer
+    /// holds it. There is nothing to notice: it is not a crash, it is a wrong answer.
+    ///
+    /// So the position is treated exactly as a delta row that happens not to be at the end: its
+    /// score is recomputed from `flat16` and written over the stale one, before anything selects
+    /// candidates or reduces. Bounded by `foldThreshold` along with the delta, so the matmul stays
+    /// small, and cleared the moment a full rebuild reads those bytes again.
+    private func patchScoresLocked(_ scores: MLXArray, qv: MLXArray) -> MLXArray {
+        guard !patchedSlots.isEmpty, baseRows > 0, dim > 0 else { return scores }
+        var idx: [Int32] = []
+        var seen = Set<Int32>()
+        for p in patchedSlots where Int(p) < baseRows && seen.insert(p).inserted { idx.append(p) }
+        guard !idx.isEmpty else { return scores }
+        var gathered = [UInt16](repeating: 0, count: idx.count * dim)
+        flat16.withUnsafeBufferPointer { buf in
+            for (k, p) in idx.enumerated() {
+                let o = Int(p) * dim
+                for j in 0 ..< dim { gathered[k * dim + j] = buf[o + j] }
+            }
+        }
+        let m: MLXArray = gathered.withUnsafeBufferPointer { bp in
+            MLXArray(Data(buffer: bp), [idx.count, dim], dtype: .bfloat16)
+        }
+        var shape = scores.shape
+        shape[0] = idx.count
+        let s = MLX.matmul(m, qv).reshaped(shape).asType(scores.dtype)
+        var out = scores
+        out[MLXArray(idx)] = s
+        return out
+    }
+
     private func maskDeadLocked(_ scores: MLXArray) -> MLXArray {
         // `scores` is per CONTENT. deadRows are ROW indices, and using them to index a per-content
         // array is the identity only while a row owns its vector - under sharing it masks whichever
@@ -6124,6 +6167,16 @@ public final class VectorStore: @unchecked Sendable {
     /// (the close path) blocks until the file is durably renamed; async leaves only the write
     /// off-queue. No-op when the on-disk replica already covers the current prefix.
     private func persistQuantReplicaLocked(sync: Bool) {
+        // A PATCHED BASE DESCRIBES BYTES `flat16` NO LONGER HOLDS - corrected per query by
+        // `patchScoresLocked`, which is resident state and does not survive a quit. Persisting it
+        // would hand the next launch codes for a content the file no longer holds, and the
+        // adoption checksum samples ~512 rows out of millions, so it would usually not notice.
+        // Leaving an OLDER replica behind is the same lie, so the file goes.
+        if !patchedSlots.isEmpty {
+            try? FileManager.default.removeItem(at: quantReplicaURL)
+            lastPersistedBaseRows = -1
+            return
+        }
         // The 1-bit tier persists through the SAME file and header: its packed codes ride the `wq`
         // slot and `bits: 1` is what tells them apart. A binary that does not know the tier sees a
         // bits mismatch and rebuilds, which is the existing width-change path - so an upgrade or a
@@ -6360,6 +6413,123 @@ public final class VectorStore: @unchecked Sendable {
     private var coveredRows = 0
     /// Holes below `coveredRows`, mirrored from the vec_holes table so the hot paths need no query.
     private var vecHoles = Set<Int32>()
+
+    // MARK: - THE FREE LIST
+    //
+    // A tombstone keeps its position in the vector file, and until now the only thing that ever
+    // took one back was a whole-file copy: `reclaimVectorHoles` rewrites the live rows into a new
+    // file and renames it over the old one. That is crash-safe and it works, but it rewrites
+    // gigabytes to reclaim megabytes, so it is gated behind a 10% threshold - which means a
+    // churning index carries up to a tenth of its vector file as holes at all times and pays a
+    // ~7 GB rewrite roughly every ten days of heavy use.
+    //
+    // Handing the position to the next new content instead costs nothing and reclaims it
+    // immediately. The reason v4 rejected a free list was that a position was a row's RANK, so
+    // reusing one out of order was not expressible; with `chunks.slot` it simply is.
+    //
+    // WHAT MAKES IT HARD IS NOT THE ALLOCATION, it is that a position below `baseRows` is baked
+    // into the GPU-resident scan copy. Writing new bytes there leaves the resident score for that
+    // position describing the content that used to be there. `patchedSlots` is the answer, and it
+    // is the delta's idea applied to an arbitrary position rather than to the tail: the position is
+    // rescored exactly from `flat16` on every query and the result written over the stale one,
+    // until a full rebuild folds it in.
+    /// OPT-IN, like the fold, and for a related reason. The allocation, the in-place write, the
+    /// patch scoring and the durability of a reused blob are all tested here. What is not
+    /// established is that an index whose positions are shared out of order survives arbitrary
+    /// CRUD: the mutation lifecycle fails on it the same way it fails on a folded index, and that
+    /// defect is not in this code - disabling the fold's column rewrite entirely still fails it.
+    /// Until that is understood, handing every user a one-way change into that state is the wrong
+    /// trade. `OMNI_FREE_LIST=1` turns it on.
+    nonisolated(unsafe) public static var freeListEnabled =
+        ProcessInfo.processInfo.environment["OMNI_FREE_LIST"] == "1"
+    private var freeSlots = SlotAllocator()
+    private var freeSlotsValid = false
+    /// The mutation the quarantine was last released at. A position freed in one mutation becomes
+    /// allocatable in the next, never in the same one - see SlotAllocator on why.
+    private var freeSlotsCommitGen: Int64 = -1
+    /// Positions BELOW `baseRows` whose bytes changed since the base was built.
+    private var patchedSlots: [Int32] = []
+    /// Positions inside the COVERED prefix that the free list has written new bytes into and that
+    /// the file has not been msync'd since.
+    ///
+    /// The claim says the file answers for these positions, which is why the writer is allowed to
+    /// drop a reusing chunk's blob - and for a chunk that SHARES an existing content that is true,
+    /// the bytes were already there. For one the free list placed, the bytes are new and live only
+    /// in dirty pages. Dropping the blob there trades a durable copy for one a power loss takes,
+    /// and what comes back is not a missing vector but a stale one: the position still holds the
+    /// content that used to be there, scoring plausibly, under the wrong file.
+    private var unsyncedReuse = Set<Int32>()
+
+    /// The free list describes a NUMBERING. Anything that renumbers positions - a compaction, a
+    /// reload, a wipe - leaves it describing one that no longer exists, so it is dropped rather
+    /// than adjusted and rebuilt from the pointers the next time one is needed.
+    private func invalidateFreeListLocked() {
+        freeSlotsValid = false
+        freeSlots.forgetFreeList()
+    }
+
+    /// The free list, rebuilt from the pointers if it is not current. O(positions), and only on the
+    /// first allocation after a structural change.
+    private func ensureFreeSlotsLocked() {
+        let n = slotCount
+        if freeSlotsValid, freeSlots.highWater == n { 
+            if freeSlotsCommitGen != mutationGen { freeSlots.commit(); freeSlotsCommitGen = mutationGen }
+            return
+        }
+        var used = [Bool](repeating: false, count: n)
+        let dead = deadRows
+        for i in rows.indices where !dead.contains(Int32(i)) {
+            let sl = Int(i < occSlot.count ? occSlot[i] : rows[i].slot)
+            if sl >= 0, sl < n { used[sl] = true }
+        }
+        var free: [Int] = []
+        for sl in 0 ..< n where !used[sl] { free.append(sl) }
+        freeSlots = SlotAllocator(available: free, highWater: n)
+        freeSlotsValid = true
+        freeSlotsCommitGen = mutationGen
+    }
+
+    /// Give these positions back. Called with what `releasedSlotsLocked` computed, i.e. positions
+    /// no live row points at any more, INSIDE the transaction that made that true.
+    private func releaseFreeSlotsLocked(_ positions: [Int32]) {
+        guard Self.freeListEnabled, Self.contentSharing, freeSlotsValid, !positions.isEmpty else { return }
+        for p in positions { freeSlots.release(Int(p)) }
+    }
+
+    /// Where a brand-new content's vector goes. The end of the file unless the free list holds a
+    /// position nothing owns, in which case it is written there and the file does not grow.
+    private func placeVectorLocked(_ v: [UInt16]) -> Int32 {
+        guard Self.freeListEnabled, Self.contentSharing, dim > 0, v.count == dim else {
+            flat16.append(contentsOf: v); return lastAppendedSlot
+        }
+        ensureFreeSlotsLocked()
+        let p = freeSlots.allocate()
+        if ProcessInfo.processInfo.environment["OMNI_FREE_AUDIT"] != nil, p < slotCount {
+            let owner = rows.indices.first { !deadRows.contains(Int32($0)) && $0 < occSlot.count && occSlot[$0] == Int32(p) }
+            if let o = owner {
+                FileHandle.standardError.write(Data("[freeaudit] position \(p) handed out while row \(o) (\(rows[o].path)#\(rows[o].chunkIndex)) still owns it\n".utf8))
+            }
+        }
+        guard p < slotCount else {
+            // The allocator extended the file; so does the buffer, and the two stay in step because
+            // this is the only place either of them grows.
+            flat16.append(contentsOf: v)
+            return lastAppendedSlot
+        }
+        flat16.withUnsafeMutableBufferPointer { buf in
+            for j in 0 ..< dim { buf[p * dim + j] = v[j] }
+        }
+        // The position is owned again, so it is not a hole. Committed inside the caller's
+        // transaction with the row that now owns it; a rollback re-reads the table.
+        if vecHoles.remove(Int32(p)) != nil { exec("DELETE FROM vec_holes WHERE slot = \(p);") }
+        // A covered position's blob was cleared because the FILE answered for it. It answers for
+        // different bytes now, and those bytes are not durable until the next msync - so the new
+        // row keeps its pending blob, and the coverage stamp drops it once the file is synced.
+        if p < baseRows { patchedSlots.append(Int32(p)) }
+        if p < coveredRows { unsyncedReuse.insert(Int32(p)) }
+        return Int32(p)
+    }
+
     /// Meta key for the coverage claim. In `meta`, so it commits with the rows it describes.
     private static let coveredRowsKey = "vecs_covered_rows"
     /// The highest chunk id inside the covered prefix, committed in the SAME transaction as the
@@ -6736,6 +6906,9 @@ public final class VectorStore: @unchecked Sendable {
     /// comment claiming a property the code did not have.
     private func rollbackTxnLocked() {
         exec("ROLLBACK;")
+        // The free list describes ownership the transaction was changing in both directions - it
+        // released positions and may have handed some out - so it is dropped rather than unwound.
+        invalidateFreeListLocked()
         guard dbOpen() else { return }
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
@@ -6743,6 +6916,15 @@ public final class VectorStore: @unchecked Sendable {
         var fresh = Set<Int32>()
         while sqlite3_step(stmt) == SQLITE_ROW { fresh.insert(sqlite3_column_int(stmt, 0)) }
         vecHoles = fresh
+    }
+
+    /// Record the positions as holes AND hand them to the free list. One call because they are one
+    /// fact - "nothing owns this position any more" - recorded twice for two readers: `vec_holes`
+    /// is the durable half the coverage accounting reads, the allocator is the resident half that
+    /// hands the position to the next new content.
+    private func recordAndReleaseLocked(_ slots: [Int32]) {
+        recordHolesLocked(slots)
+        releaseFreeSlotsLocked(slots)
     }
 
     private func recordHolesLocked(_ slots: [Int32], coveredOverride: Int? = nil) {
@@ -6757,6 +6939,25 @@ public final class VectorStore: @unchecked Sendable {
         }
         sqlite3_finalize(stmt)
         for s in fresh { vecHoles.insert(s) }
+    }
+
+    /// Drop the blobs of positions the free list rewrote, now that the file has been synced.
+    ///
+    /// Ordering is the whole safety property and it is the same one coverage itself rests on: the
+    /// caller msyncs, THEN this runs, so a blob is only ever dropped once the file can answer for
+    /// the bytes that are actually there.
+    ///
+    /// Scoped through `pending_vecs`, which is empty at rest and otherwise holds only the uncovered
+    /// tail, so this is a walk of a small B-tree with one indexed lookup per row - not a scan of
+    /// the covered prefix.
+    private func clearSyncedReuseBlobsLocked() {
+        guard dbOpen(), !unsyncedReuse.isEmpty else { return }
+        let ok = execChecked("""
+            DELETE FROM pending_vecs WHERE chunk_id IN
+              (SELECT p.chunk_id FROM pending_vecs p JOIN chunks c ON c.id = p.chunk_id
+                WHERE c.slot >= 0 AND c.slot < \(coveredRows));
+            """)
+        if ok { unsyncedReuse.removeAll(keepingCapacity: true) }
     }
 
     /// Write every covered row's vector back into its SQLite blob, and stand the coverage claim
@@ -6875,7 +7076,12 @@ public final class VectorStore: @unchecked Sendable {
         // it is right even when the column and the file have drifted apart. Seating rows from the
         // column is strictly more trusting; on an index that has not been folded there is nothing
         // to gain by trusting more, and a whole class of drift to lose by it.
+        // TWO WAYS TO GET HERE, and both are opt-in. A FOLDED index has far fewer positions than
+        // rows, so the walk runs off the end of the file. An index with the FREE LIST on hands
+        // positions out lowest-first rather than in id order, so the walk seats a row on whichever
+        // vector happens to sit at its rank. Either way the rank is not the position any more.
         guard scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.contentFoldDoneKey)'") == 1
+                || Self.freeListEnabled
         else { return false }
         let maxSlot = scalarQuery("SELECT COALESCE(MAX(slot), -1) FROM chunks")
         let highWater = Swift.max(coveredRows, maxSlot + 1)
@@ -8248,6 +8454,12 @@ public final class VectorStore: @unchecked Sendable {
         // that accumulate holes.
         let coverUnits = Self.contentSharing ? slotCount : rows.count
         guard coveredRows < coverUnits else {
+            // A reused position still owes its blob back even when the claim cannot move: the file
+            // has to be synced first, which is the one thing this branch still does.
+            if flat16.isPersistent, !unsyncedReuse.isEmpty {
+                flat16.msyncFile()
+                clearSyncedReuseBlobsLocked()
+            }
             // FOLD BEFORE RECLAIM. The fold turns duplicates into holes and the reclaim turns
             // holes into space; run the other way round and the reclaim rewrites a 15 GB file for
             // the holes it can see, then the fold makes millions more and it has to run again.
@@ -8276,6 +8488,7 @@ public final class VectorStore: @unchecked Sendable {
         defer { scheduleCoverageStampLocked() }
         guard flat16.isPersistent, flat16.extendFileCoverage() else { return }
         flat16.msyncFile()
+        clearSyncedReuseBlobsLocked()
         advanceCoverageLocked(budget: budget)
         // Once the claim has caught up there is nothing left for coverage to do and the fold is
         // what the stamp is for. Running it here as well as in the caught-up branch means an index
@@ -8853,7 +9066,7 @@ public final class VectorStore: @unchecked Sendable {
         // packing the delta and concatenating is bit-identical to repacking everything. Without this
         // every fold repacks the whole index, which is both slow and observably different from a
         // full rebuild (testIncrementalFoldBitIdenticalToFullRebuild catches exactly that).
-        if bits == 1, quantBits == 1, let bb = bitBase, !baseDirty,
+        if bits == 1, quantBits == 1, let bb = bitBase, !baseDirty, patchedSlots.isEmpty,
            rowCount > baseRows, flat16.count >= rowCount * dim,
            let add = packSignBitsLocked(baseRows ..< rowCount) {
             let deltaRows = rowCount - baseRows
@@ -8866,7 +9079,7 @@ public final class VectorStore: @unchecked Sendable {
             if let tR { print(String(format: "[search] FOLD(1bit) delta=%d rows=%d %.1fms", deltaRows, rowCount, -tR.timeIntervalSinceNow * 1000)) }
             return
         }
-        if bits > 0, bits != 1, bits == quantBits, let qb = quantBase, !baseDirty,
+        if bits > 0, bits != 1, bits == quantBits, let qb = quantBase, !baseDirty, patchedSlots.isEmpty,
            rowCount > baseRows, dim % Self.quantGroup == 0, flat16.count >= rowCount * dim {
             let deltaRows = rowCount - baseRows
             let (wqs, scs, bss) = quantizeRowsLocked(baseRows ..< rowCount, bits: bits)
@@ -8951,6 +9164,10 @@ public final class VectorStore: @unchecked Sendable {
         }
         baseRows = rowCount; baseOccCount = occCountCoveringSlotsLocked(baseRows)
         baseDirty = false
+        // The base was just re-read from `flat16`, so every patched position is in it. An
+        // INCREMENTAL fold keeps the old base rows verbatim, which is why both fold branches
+        // above decline while anything is patched.
+        patchedSlots.removeAll(keepingCapacity: true)
     }
 
     /// Called at the tail of every write (under `queue`). If the user is actively searching AND the
@@ -9027,7 +9244,8 @@ public final class VectorStore: @unchecked Sendable {
         // active search - defeating foldThreshold's batching on exactly the low-end machines quant
         // mode serves. Only rebuild when NEITHER resident base exists, or the delta outgrew the fold
         // threshold, or a structural change dirtied it. (refoldprobe: quant 30 rebuilds/30 writes -> 0.)
-        guard baseDirty || (mlxBase == nil && quantBase == nil) || (n - baseRows) > Self.foldThreshold else { return }
+        guard baseDirty || (mlxBase == nil && quantBase == nil)
+                || (n - baseRows) + patchedSlots.count > Self.foldThreshold else { return }
         // Rate limit: the high-rate writers (text full pass, reconcile) batch many files per write, so
         // in practice this fires at most ~once per flush window. The floor only matters for residual
         // PER-FILE writers (media stores) - without it, ~10 stores/s during active search would spend
@@ -10056,7 +10274,17 @@ public final class VectorStore: @unchecked Sendable {
         // [baseRows, n) - the common "re-edit a recently indexed file" case - rows [0, baseRows) are
         // byte-untouched (the write cursor never diverged before `firstRemoved`), so the base stays
         // valid and we skip the ~65ms rebuild entirely. Delta-only shrink keeps baseRows correct.
-        if firstRemoved < baseRows, !compactQuantBaseLocked(baseSurvivors) { invalidateBase() }
+        // PHASE B RENUMBERED THE POSITIONS, and two resident structures name positions. The free
+        // list is a cache of the pointers, so it is dropped and rebuilt. A patch cannot be
+        // re-pointed - the compaction moves the resident codes with the vectors, so a stale code
+        // travels to the new position and stays stale - so a patched base forces the full rebuild
+        // this branch exists to avoid.
+        invalidateFreeListLocked()
+        if !patchedSlots.isEmpty {
+            invalidateBase()
+        } else if firstRemoved < baseRows, !compactQuantBaseLocked(baseSurvivors) {
+            invalidateBase()
+        }
         return removedPaths
     }
 
@@ -10513,6 +10741,8 @@ public final class VectorStore: @unchecked Sendable {
     /// One stamp, which is where coverage, the sync and the hole reclaim are actually triggered
     /// from. Tests that call the pieces directly cannot see a branch that never runs.
     func stampCoverageForTest() { queue.sync { stampVectorCoverageLocked() } }
+    /// ONE slice, so a test can build a claim that genuinely stops part way.
+    func advanceCoverageOnceForTest() { queue.sync { _ = advanceCoverageLocked() } }
     /// The per-row slot mirror, which is what every score is actually indexed by.
     var slotsForTest: [Int32] { queue.sync { occSlot } }
     /// Forget that the slot column is complete, so a fixture that has written more rows behind the
@@ -11373,7 +11603,8 @@ public final class VectorStore: @unchecked Sendable {
         if coveredRows > 0 {
             var del: OpaquePointer?
             if sqlite3_prepare_v2(db, "DELETE FROM pending_vecs WHERE chunk_id = ?;", -1, &del, nil) == SQLITE_OK {
-                for (i, cid) in ids.enumerated() where slots[i] >= 0 && Int(slots[i]) < coveredRows {
+                for (i, cid) in ids.enumerated()
+                where slots[i] >= 0 && Int(slots[i]) < coveredRows && !unsyncedReuse.contains(slots[i]) {
                     sqlite3_reset(del)
                     sqlite3_bind_int64(del, 1, cid)
                     _ = sqlite3_step(del)
@@ -11444,8 +11675,7 @@ public final class VectorStore: @unchecked Sendable {
                 else if let s = liveSlotForContentLocked(key) { slot = s }
             }
             if slot < 0 {
-                flat16.append(contentsOf: bfs[i])
-                slot = lastAppendedSlot
+                slot = placeVectorLocked(bfs[i])
                 if !key.isEmpty { seen[key] = slot }
             }
             assigned.append(slot)

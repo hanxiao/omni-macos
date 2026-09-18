@@ -469,7 +469,7 @@ the other direction, which is why both are off.
 So it stays behind `OMNI_CONTENT_FOLD=1`. The migration path it was built for is measured and
 works; what is not yet established is that it is harmless on every other index.
 
-## The free list: attempted, and withheld
+## The free list: in the tree, opt-in
 
 Handing a released position to the next new content instead of waiting for a whole-file copy is
 obviously right, and it is written: `SlotAllocator` allocates from a min-heap, `placeVectorLocked`
@@ -478,6 +478,10 @@ still describes wrongly, the coverage stamp drops the reused row's blob once the
 and `loadBySlotLocked` seats rows from the stored column instead of deriving a position from a
 row's rank - which the free list makes impossible. Seven tests cover it, four of them verified to
 fail with their fix removed.
+
+It is committed behind `OMNI_FREE_LIST=1`, with seven tests, four of them verified to fail with
+their fix removed. With the flag off `placeVectorLocked` is a plain append and the default path is
+byte for byte what it was, which the whole suite says.
 
 IT DOES NOT PASS THE MUTATION SUITE, and the failure is the bad kind. Driven through the real
 Indexer over add / edit / rename / move / folder-move / delete, a renamed file came back holding
@@ -489,14 +493,15 @@ that was not the key's. That lookup trusts `chunks.slot` to agree with the resid
 a reuse in flight is exactly when the two can disagree - so one bad lookup does not just return a
 wrong answer, it PERSISTS one.
 
-What that says is that the free list needs a safety property the store does not have yet: the
-content lookup has to be able to verify that the position it found still holds the content it
-asked for, or the numbering has to be unfalsifiable by construction. Neither is a patch, so the
-work is on the branch and off by default (`OMNI_FREE_LIST`), and the user-visible half of the
-problem - holes accumulating for ever - is fixed instead by making the hole reclaim reachable,
-which is a change whose correctness is already established.
+THAT DIAGNOSIS TURNED OUT TO BE WRONG, and the fold is what disproved it. The fold fails the same
+suite the same way, and it fails with its column rewrite disabled entirely - so the damage is not
+in what either pass writes to `chunks.slot`, and "the content lookup reads a stale slot" cannot be
+the explanation. Both are waiting on the same unknown, which is written up under the fold above:
+the only arm that comes back clean is `OMNI_STORE_REUSE=0`, and returning the same empty result
+one line later inside the store does not reproduce it.
 
-Do not re-enable it without first making that lookup verifiable.
+The user-visible half of the problem - holes accumulating for ever - is fixed meanwhile by making
+the hole reclaim reachable, which is a change whose correctness is established.
 
 ## The two 2026 leads, measured on the real index, and both declined
 
