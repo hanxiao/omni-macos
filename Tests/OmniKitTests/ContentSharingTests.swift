@@ -1337,6 +1337,11 @@ final class ContentSharingTests: XCTestCase {
         // rather than the branch - which is exactly how it passed on an idle machine and failed on
         // a loaded one.
         Thread.sleep(forTimeInterval: 2.2)
+        // THE FOLD COMES FIRST, and the stamp does one slice of it per call - so a single stamp
+        // gets the reclaim nowhere. That ordering is deliberate (folding turns duplicates into
+        // holes; reclaiming before it is finished rewrites the whole vector file twice), and a
+        // test that wants to reach the reclaim has to respect it.
+        store.foldDuplicatesToCompletion()
         store.stampCoverageForTest()
         // The reclaim runs off the queue, so give it time to land even on a busy machine.
         let deadline = Date().addingTimeInterval(60)

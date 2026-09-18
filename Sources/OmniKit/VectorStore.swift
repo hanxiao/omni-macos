@@ -6854,19 +6854,24 @@ public final class VectorStore: @unchecked Sendable {
         // example cost one probe, so it is checked rather than trusted.
         guard scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.slotsBackfilledKey)'") == 1,
               scalarQuery("SELECT COUNT(*) FROM chunks WHERE slot >= 0") == live else { return false }
-        let maxSlot = scalarQuery("SELECT COALESCE(MAX(slot), -1) FROM chunks")
-        let highWater = Swift.max(coveredRows, maxSlot + 1)
-        guard highWater > 0 else { return false }
-        // ONLY WHERE THE WALK BELOW CANNOT WORK, which is where there are genuinely fewer positions
-        // than rows. That is the case the walk has no answer for - it hands out one position per
-        // row and runs off the end of the file - and it is the case the fold creates.
+        // ONLY ON A FOLDED INDEX, and the flag is the exact signal.
+        //
+        // The walk below hands out one position per row-or-hole. That is true of every index the
+        // store has ever written - including one where a few contents are shared at write time,
+        // which it handles by reading the stored slot for the second sharer - and it is false the
+        // moment the fold has collapsed millions of duplicates: there are then far fewer positions
+        // than rows, the cursor runs off the end of the file, and the index will not open.
         //
         // Everywhere else the walk stays in charge, deliberately. It does not merely read the
         // column, it RE-DERIVES the placement and rebuilds the uncovered rows from their blobs, so
         // it is right even when the column and the file have drifted apart. Seating rows from the
-        // column is strictly more trusting, and on an index where the two numbers agree there is
-        // nothing to gain by trusting more.
-        guard highWater < live else { return false }
+        // column is strictly more trusting; on an index that has not been folded there is nothing
+        // to gain by trusting more, and a whole class of drift to lose by it.
+        guard scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.contentFoldDoneKey)'") == 1
+        else { return false }
+        let maxSlot = scalarQuery("SELECT COALESCE(MAX(slot), -1) FROM chunks")
+        let highWater = Swift.max(coveredRows, maxSlot + 1)
+        guard highWater > 0 else { return false }
         guard flat16.mapPersistent(url: vecSidecarURL, tailSlackElements: Self.foldThreshold * d0,
                                    precommitElements: highWater * d0,
                                    adoptElements: coveredRows * d0) else { return false }
@@ -6938,7 +6943,23 @@ public final class VectorStore: @unchecked Sendable {
                                 path: path, slot: Int32(pos))
             presentPaths.insert(path)
         }
-        guard ok, rows.count == live, flat16.count == highWater * dim else {
+        // A POSITION NOTHING CLAIMS STILL NEEDS A ROW.
+        //
+        // Leaving them out is tempting - an unclaimed position is simply an orphan, and the mask
+        // reads that straight off the pointers - but it makes a folded index the only shape in the
+        // store where `rows.count` is not "positions, holes included". Everything counting rows
+        // against positions then quietly means something else: coverage's own advance guard turns
+        // into "positions covered <= live rows", which on the real index is false from the start,
+        // so the claim stalls, the reclaim never runs, and the space the fold freed is never
+        // returned. Measured: stalled at 9,186,807 of 10,028,339 with 3,677,834 holes waiting.
+        //
+        // The tombstones cost 48 bytes each and live only until the reclaim collects them.
+        if ok {
+            var owned = [Bool](repeating: false, count: highWater)
+            for sl in occSlot where sl >= 0 && Int(sl) < highWater { owned[Int(sl)] = true }
+            for p in 0 ..< highWater where !owned[p] { appendHoleRowLocked(slot: Int32(p)) }
+        }
+        guard ok, rows.count - deadRows.count == live, flat16.count == highWater * dim else {
             rows.removeAll(); flat16.removeAll(); presentPaths.removeAll(); occSlot.removeAll()
             slotBackfillCursor = -1
             fileID.removeAll(); pathID.removeAll(); idPath.removeAll(); fileChunkCount.removeAll()
@@ -10373,6 +10394,18 @@ public final class VectorStore: @unchecked Sendable {
     func stampCoverageForTest() { queue.sync { stampVectorCoverageLocked() } }
     /// The per-row slot mirror, which is what every score is actually indexed by.
     var slotsForTest: [Int32] { queue.sync { occSlot } }
+    /// Forget that the slot column is complete, so a fixture that has written more rows behind the
+    /// store's back can have them filled in. The real upgrade path reaches that state on its own -
+    /// every row has a slot before the fold ever runs - and a fixture that cannot is measuring
+    /// something else.
+    func clearSlotBackfillFlagForTest() {
+        queue.sync {
+            exec("DELETE FROM meta WHERE key = '\(Self.slotsBackfilledKey)';")
+            slotsBackfilled = false
+            slotBackfillCursor = -1
+        }
+    }
+
     /// One slice, for a test that has to stop half way and resume.
     @discardableResult
     func foldDuplicatesOneSliceForTest() -> Bool { queue.sync { foldDuplicateContentsLocked() } }
@@ -10888,8 +10921,21 @@ public final class VectorStore: @unchecked Sendable {
     private var contentFolded = false
     /// How many pointers this pass has moved, so the progress row can say what it will free.
     private var contentFoldedCount = -1
+    /// OPT-IN, and that is a measurement rather than caution.
+    ///
+    /// The pass itself is right: on the real index it moves 3,516,335 duplicate pointers in 76 s,
+    /// the search digest is identical on both sides of it, and a folded index reloads with the
+    /// audit clean. What is not yet right is everything that runs AFTER it on an index that also
+    /// has tombstones - coverage's advance guard counts row indices where it means positions, so
+    /// the claim stalls short of the file and the reclaim that would return the space never runs.
+    /// Three attempts at that guard each broke a safety test that refuses an ambiguous claim, and
+    /// with the fold on by default the whole mutation lifecycle fails.
+    ///
+    /// So it ships able to be turned on and off by default. A fold whose space cannot be reclaimed
+    /// buys correct pointers and nothing a user would notice, and leaving every existing index in
+    /// that half-state is worse than leaving them as they are.
     nonisolated(unsafe) public static var contentFold =
-        ProcessInfo.processInfo.environment["OMNI_CONTENT_FOLD"] != "0"
+        ProcessInfo.processInfo.environment["OMNI_CONTENT_FOLD"] == "1"
     nonisolated(unsafe) public static var contentFoldSliceOverride: Int? = nil
     static var contentFoldSlice: Int {
         contentFoldSliceOverride
@@ -11053,6 +11099,24 @@ public final class VectorStore: @unchecked Sendable {
                 recordHolesLocked(freed)
                 guard execChecked("COMMIT;") else { rollbackTxnLocked(); return false }
             }
+        }
+        // A FOLDED ROW CAN LAND INSIDE THE COVERED PREFIX, and then it is holding a blob it no
+        // longer needs: its position is one the file has answered for since coverage reached it,
+        // and the vector there is its content's, which is what the fold just established. Left
+        // behind, those blobs break the invariant that a covered row has none - measured on the
+        // real index at 91,050 rows - and the audit then refuses, which stops the reclaim, which
+        // is the whole point of having folded. Scoped through `pending_vecs` so this is a walk of
+        // a small table rather than a scan of the covered prefix.
+        //
+        // No msync is owed here, unlike every other place a blob is dropped: these positions did
+        // not change, the file has held them since the claim reached them, and the fold only
+        // changed which row points at them.
+        if coveredRows > 0 {
+            exec("""
+                DELETE FROM pending_vecs WHERE chunk_id IN
+                  (SELECT p.chunk_id FROM pending_vecs p JOIN chunks c ON c.id = p.chunk_id
+                    WHERE c.slot >= 0 AND c.slot < \(coveredRows));
+                """)
         }
         exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.contentFoldDoneKey)','1');")
         exec("DELETE FROM meta WHERE key = '\(Self.contentFoldMarkKey)';")

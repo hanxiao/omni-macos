@@ -338,6 +338,59 @@ their own snippets. `testEachSharerKeepsItsOwnLocatorAndSnippet` pins it. What t
 still buy is storing that text ONCE per content plus a locator per occurrence, rather than a full
 row per occurrence - a size win, not a correctness one.
 
+## The duplicate fold: the pass, and what still blocks it
+
+An index that predates content addressing carries every duplicate it ever made. Measured on the
+real one: 9,179,075 keyed text chunks holding 5,662,740 distinct contents, so 3,516,335 chunks -
+38.3% - are a second copy of a vector already in the file. Each costs 1536 bytes of `.vecs` and a
+row of every scan. Sharing at write time stops the number growing; it does not shrink it.
+
+`foldDuplicateContentsLocked` is the pass that shrinks it, and it moves POINTERS, never bytes: a
+duplicate's slot becomes its content's representative, the position it owned becomes a hole, and
+the reclaim takes the space back. Nothing is re-embedded and no table changes shape.
+
+WHAT IS MEASURED AND WORKS, on a copy of the real 9,773,826-chunk index:
+
+    duplicates folded          3,516,335
+    time                       76 s
+    positions                  9,773,827 -> 6,257,492
+    search digest              ba7a13400e714f79 before, ba7a13400e714f79 after
+    reload afterwards          audit ok
+
+Three things it took to get that far, each of which reads as an obvious mistake afterwards.
+
+It walks the KEY SPACE, not the row table. Per row, "what is my content's representative" re-reads
+the whole content group, so the total is the sum of the SQUARES of the group sizes - and this
+corpus has a block occurring 8,145 times. Measured that way: 150,000 rows in half an hour.
+
+The UPDATE's subquery needs `length(chunk_key) > 0` even though it already constrains that column.
+`idx_chunk_content` is PARTIAL and SQLite only uses a partial index for a query that implies its
+predicate; without the clause the plan says SCAN and the first slice never finishes.
+
+And a folded index cannot be read by a loader that derives a position from a row's rank, because
+there are genuinely fewer positions than rows. Running the reclaim through a build without one
+produced a vector file 532,503 positions short of what the column named, and an index that would
+not open. `loadBySlotLocked` seats rows from the column and takes over only on a folded index -
+everywhere else the rank walk keeps its job, because it re-derives placement and rebuilds uncovered
+rows from their blobs rather than believing the file.
+
+WHY IT IS OFF BY DEFAULT. On an index that also has tombstones, coverage stops short of the file
+after a fold: its advance guard counts dead ROW INDICES where it means POSITIONS, so the test
+becomes "positions covered <= live rows", which is false as soon as positions outnumber rows.
+Measured on the real index: stalled at 9,186,807 of 10,028,339 with 3,677,834 holes waiting, and
+the reclaim - which only runs once coverage has caught up - declining for ever.
+
+Three attempts at that guard each broke a test that exists to REFUSE an ambiguous claim
+(`testAmbiguousMismatchWithHolesStillRefuses`, `testUnprovableHoleStillRefuses`), and with the fold
+on by default the whole mutation lifecycle fails. A fold whose space cannot be reclaimed buys
+correct pointers and nothing a user would notice, so it ships behind `OMNI_CONTENT_FOLD=1` until
+that guard is expressed in positions without weakening what it refuses.
+
+That guard is the next piece of work, and it is a small one. It is not a matter of relaxing the
+test: `deadBelow` has to become "positions below the claim that no live row points at", which is
+what `vec_holes` records - and the two refusal tests have to keep refusing, which means
+understanding which of them is asserting the arithmetic and which the safety.
+
 ## The free list: attempted, and withheld
 
 Handing a released position to the next new content instead of waiting for a whole-file copy is
