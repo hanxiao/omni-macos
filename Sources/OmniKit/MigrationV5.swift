@@ -82,8 +82,8 @@ enum MigrationV5 {
     /// copies on the measured index.
     static func buildSnippetSQL(suffix: String = "") -> String {
         """
-        INSERT INTO chunk_snippet\(suffix)(chunk_id, snippet)
-        SELECT c.id, COALESCE((SELECT ct.snippet FROM chunk_text ct
+        INSERT INTO chunk_snippet\(suffix)(chunk_id, kind, snippet)
+        SELECT c.id, c.kind, COALESCE((SELECT ct.snippet FROM chunk_text ct
                                JOIN slot_of s ON s.chunk_id = ct.chunk_id
                                WHERE s.slot = c.id), '')
         FROM chunk\(suffix) c
@@ -106,7 +106,11 @@ enum MigrationV5 {
     /// What has to be true before the swap. Each is a statement returning one number, paired with
     /// what it must equal. A migration that fails any of these must be abandoned and the v4 tables
     /// left alone, because every one of them means a pointer has gone somewhere wrong.
-    static func invariants(suffix: String = "") -> [(name: String, sql: String, mustEqual: String)] {
+    /// `highWater` is the number of POSITIONS in the vector file, which is not the number of rows:
+    /// a real index carries holes, and the measured one carried 254,501 of them. Comparing the
+    /// coverage against COUNT(chunks) instead holds only on an index with no holes, which is every
+    /// hand-built fixture and no index in the field.
+    static func invariants(suffix: String = "", highWater: Int64) -> [(name: String, sql: String, mustEqual: String)] {
         [
             ("every chunk became exactly one occurrence",
              "SELECT COUNT(*) FROM occurrence\(suffix)",
@@ -122,7 +126,7 @@ enum MigrationV5 {
              "SELECT 0"),
             ("live and free slots exactly cover the file",
              "SELECT (SELECT COUNT(*) FROM chunk\(suffix)) + (SELECT COUNT(*) FROM free_slot\(suffix))",
-             "SELECT COUNT(*) FROM chunks"),
+             "SELECT \(highWater)"),
             ("no slot is both owned and free",
              "SELECT COUNT(*) FROM free_slot\(suffix) f JOIN chunk\(suffix) c ON c.id = f.id",
              "SELECT 0"),

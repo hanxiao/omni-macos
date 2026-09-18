@@ -283,12 +283,18 @@ enum StoreSchema {
             """
             CREATE TABLE IF NOT EXISTS \(snip)(
                 chunk_id INTEGER PRIMARY KEY,
+                kind INTEGER NOT NULL DEFAULT 0,
                 snippet TEXT NOT NULL DEFAULT ''
             );
             """,
+            // `kind` is repeated off `chunk` for one reason, the same one v4 repeats it off
+            // `chunks` onto `chunk_text`: to keep this index PARTIAL. Without the predicate the
+            // index holds a copy of every text snippet in the database - measured at 1.51 GB
+            // against 0.036 GB for v4's media-only equivalent - to serve a lookup that only ever
+            // asks about media labels.
             """
-            CREATE INDEX IF NOT EXISTS idx_snip_label ON \(snip)(snippet)
-            WHERE snippet <> '';
+            CREATE INDEX IF NOT EXISTS idx_snip_label ON \(snip)(kind, snippet)
+            WHERE kind IN (1, 2, 3);
             """,
             // SLOTS NOBODY OWNS. A durable free list, so a released slot is reused instead of
             // leaking. Reconcilable from SQLite alone - it is exactly the ids in [0, highWater) with

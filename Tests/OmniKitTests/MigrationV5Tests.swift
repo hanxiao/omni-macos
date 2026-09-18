@@ -46,7 +46,12 @@ final class MigrationV5Tests: XCTestCase {
         for (i, s) in slots.enumerated() { exec("INSERT INTO slot_of VALUES(\(ids[i]), \(s));") }
     }
 
+    /// Remembered from the backfill so the invariants can be checked against the vector file's
+    /// high-water mark rather than the row count, which are not the same number once holes exist.
+    private var highWater: Int64 = 0
+
     private func runBackfill(highWater: Int64) {
+        self.highWater = highWater
         XCTAssertTrue(exec(MigrationV5.buildChunkSQL()))
         XCTAssertTrue(exec(MigrationV5.buildOccurrenceSQL()))
         XCTAssertTrue(exec(MigrationV5.buildSnippetSQL()))
@@ -54,7 +59,7 @@ final class MigrationV5Tests: XCTestCase {
     }
 
     private func assertInvariants(_ file: StaticString = #filePath, _ line: UInt = #line) {
-        for inv in MigrationV5.invariants() {
+        for inv in MigrationV5.invariants(highWater: highWater) {
             XCTAssertEqual(num(inv.sql), num(inv.mustEqual), inv.name, file: file, line: line)
         }
     }
@@ -143,6 +148,37 @@ final class MigrationV5Tests: XCTestCase {
         XCTAssertEqual(num("SELECT id FROM chunk WHERE key = x'aa'"), 1)
         XCTAssertEqual(num("SELECT id FROM chunk WHERE key = x'bb'"), 2)
         XCTAssertEqual(num("SELECT COUNT(*) FROM free_slot WHERE id = 0"), 1, "the pre-existing hole was lost")
+        assertInvariants()
+    }
+
+    func testCoverageIsAgainstTheFileNotTheRowCount() {
+        // THE DEFECT A HAND-BUILT FIXTURE CANNOT SHOW. Two rows, one pre-existing hole: the file
+        // has three positions and the table has two rows, so a coverage check written against
+        // COUNT(chunks) is off by exactly the hole count. It passed every fixture here because
+        // every other fixture is dense, and failed the first time it met a real index - which
+        // carried 254,501 holes.
+        seed(keys: ["aa", "bb"], files: [10, 20], holes: [0])
+        runBackfill(highWater: 3)
+        let cover = MigrationV5.invariants(highWater: 3).first { $0.name.hasPrefix("live and free") }!
+        XCTAssertEqual(num(cover.sql), 3, "the file has three positions")
+        XCTAssertEqual(num(cover.sql), num(cover.mustEqual))
+        XCTAssertNotEqual(num(cover.sql), num("SELECT COUNT(*) FROM chunks"),
+                          "this fixture must NOT be dense, or it cannot show the defect")
+    }
+
+    func testTheSnippetKindComesFromTheContent() {
+        // `kind` is on the snippet only to keep its label index partial. If it does not arrive,
+        // the index silently becomes a copy of every text snippet in the database - 1.51 GB on the
+        // measured index against 0.036 GB for v4's media-only equivalent.
+        exec("UPDATE chunks SET kind = 2 WHERE id = 1;")
+        seed(keys: ["aa", "bb"], files: [10, 20])
+        exec("UPDATE chunk SET kind = 2 WHERE id = 0;")
+        runBackfill(highWater: 2)
+        XCTAssertEqual(num("SELECT kind FROM chunk_snippet WHERE chunk_id = 0"),
+                       num("SELECT kind FROM chunk WHERE id = 0"))
+        XCTAssertEqual(num("SELECT COUNT(*) FROM sqlite_master WHERE name = 'idx_snip_label' "
+                           + "AND sql LIKE '%kind IN (1, 2, 3)%'"), 1,
+                       "the label index lost its media predicate")
     }
 
     func testSnippetsAreStoredOncePerContent() {
@@ -160,7 +196,7 @@ final class MigrationV5Tests: XCTestCase {
         assertInvariants()
         // Break it the way a bad slice boundary would: lose one pointer.
         exec("DELETE FROM occurrence WHERE file_id = 20;")
-        let failed = MigrationV5.invariants().filter { num($0.sql) != num($0.mustEqual) }
+        let failed = MigrationV5.invariants(highWater: highWater).filter { num($0.sql) != num($0.mustEqual) }
         XCTAssertFalse(failed.isEmpty, "a lost pointer passed every invariant")
     }
 
@@ -168,7 +204,7 @@ final class MigrationV5Tests: XCTestCase {
         seed(keys: ["aa", "bb"], files: [10, 20])
         runBackfill(highWater: 2)
         exec("INSERT INTO free_slot(id) VALUES(0);")   // slot 0 is owned AND free
-        let failed = MigrationV5.invariants().filter { num($0.sql) != num($0.mustEqual) }
+        let failed = MigrationV5.invariants(highWater: highWater).filter { num($0.sql) != num($0.mustEqual) }
         XCTAssertFalse(failed.isEmpty, "a double-owned slot passed every invariant")
     }
 

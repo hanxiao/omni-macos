@@ -1894,6 +1894,15 @@ public final class VectorStore: @unchecked Sendable {
             exec("DROP TABLE IF EXISTS files;")
         }
         if layoutLocked() == .v4 {
+            // `chunk_snippet` shipped without `kind`, which forced its label index to be
+            // unconditional - 1.51 GB of indexed text on the measured index, against 0.036 GB for
+            // v4's media-only equivalent. The table has never been written by anything, so the
+            // cheapest correct fix is to drop it and let the statements below rebuild it. Guarded
+            // on the column so this happens once.
+            if hasTableLocked("chunk_snippet"), !hasColumnLocked("chunk_snippet", "kind") {
+                exec("DROP INDEX IF EXISTS idx_snip_label;")
+                exec("DROP TABLE IF EXISTS chunk_snippet;")
+            }
             for sql in StoreSchema.createStatements() { exec(sql) }
             // Every v4 database written before content addressing predates this column. Additive
             // and free; `backfillSlotsLocked` then gives each row the slot its vector already

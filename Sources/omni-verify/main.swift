@@ -7738,6 +7738,28 @@ if args.count >= 3 && args[1] == "slotfill" {
     exit(0)
 }
 
+// Build the v5 chunk/occurrence split from a real v4 index and check that it holds.
+// omni-verify splitdry <db> [scratch]
+if args.count >= 3 && args[1] == "splitdry" {
+    let keep = args.count >= 4
+    let scratch = keep ? args[3] : NSTemporaryDirectory() + "splitdry-\(getpid()).sqlite"
+    func gb(_ b: Int64) -> String { String(format: "%.3f GB", Double(b) / 1_073_741_824) }
+    do {
+        let r = try MigrationV5Runner.dryRun(dbPath: args[2], scratchPath: scratch) { print($0); fflush(stdout) }
+        print("  contents=\(r.contents) occurrences=\(r.occurrences) free=\(r.freeSlots) "
+              + "dedup=\(r.occurrences - r.contents)")
+        print("  v5 tables on disk: \(gb(r.newBytes))")
+        print(r.oldBytes > 0 ? "  v4 chunk_text + idx_chunk_content: \(gb(r.oldBytes))"
+                             : "  v4 side unmeasured (no dbstat in this SQLite)")
+        print(String(format: "splitdry %@ in %.1fs", r.ok ? "ok" : "FAILED \(r.failures.count) invariants", r.seconds))
+        if !keep { for s in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: scratch + s) } }
+        exit(r.ok ? 0 : 1)
+    } catch {
+        print("splitdry: \(error)")
+        exit(1)
+    }
+}
+
 if args.count >= 3 && args[1] == "covmigrate" {
     let dbURL = URL(fileURLWithPath: args[2])
     let cycles = (args.count >= 4 ? Int(args[3]) : nil) ?? 4
