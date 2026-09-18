@@ -7,6 +7,18 @@ import XCTest
 /// is the assertion they were missing, and it exists because that is exactly what was reported:
 /// selection stopped sticking in both views while the index was being written to.
 ///
+/// NEITHER OF THESE RUNS YET, and this header is the honest state of it. They skip because the
+/// query returns no row the harness can find, and four attempts did not settle why: the wrong
+/// element type (`textFields` for a `searchField`), typing once against an index this launch is
+/// still building, and rows carrying an identifier without being accessibility elements were all
+/// real defects, all fixed, and none of them was enough. An attempt to dump the element tree for
+/// evidence passed in 22 seconds without writing its file - the runner is sandboxed and `try?`
+/// swallowed it. Stopped there rather than spend a fifth run guessing.
+///
+/// The identifiers and traits on the result rows are kept regardless: nothing on a result row was
+/// reachable to accessibility before, which is why a green chaos suite could click rows all day
+/// and never notice a click that selected nothing.
+///
 /// The second test is the one that matters. `applyResults` reconciles the selection against every
 /// arriving result set, so a live refresh of the same query drops any selected path that is not in
 /// THAT refresh. While the index is churning those refreshes are continuous.
