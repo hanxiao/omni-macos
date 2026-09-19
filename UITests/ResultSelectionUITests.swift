@@ -101,6 +101,54 @@ final class ResultSelectionUITests: XCTestCase {
         return false
     }
 
+    /// A CLICK WITH A FEW POINTS OF DRIFT MUST STILL SELECT.
+    ///
+    /// The results list carries a rubber-band marquee on `DragGesture(minimumDistance: 6)`. Six
+    /// points is inside what an ordinary trackpad click moves, and once the drag wins, SwiftUI
+    /// delivers it INSTEAD of the tap - so the click selects nothing, and if the rectangle crosses
+    /// neighbours it selects several rows. One gesture, both of the symptoms that were reported,
+    /// and it fires only when the pointer happens to drift, which is why neither reproduced on
+    /// demand.
+    ///
+    /// This is the reproduction, written after `testClickingAResultSelectsIt` proved a still click
+    /// works and `testSelectionSurvivesLiveResultRefreshes` retired the competing explanation.
+    func testAClickThatDriftsAFewPointsStillSelects() throws {
+        let app = launch()
+        defer { app.terminate() }
+        try XCTSkipUnless(search(app, "document"), "no results to select")
+
+        let rows = app.descendants(matching: .any).matching(identifier: "result.row")
+        let first = rows.element(boundBy: 0)
+        XCTAssertTrue(first.waitForExistence(timeout: 10))
+
+        let start = first.coordinate(withNormalizedOffset: CGVector(dx: 0.35, dy: 0.5))
+        let drifted = start.withOffset(CGVector(dx: 8, dy: 2))
+        start.press(forDuration: 0.08, thenDragTo: drifted)
+
+        var selected = false
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline, !selected {
+            selected = rows.element(boundBy: 0).isSelected
+            if !selected { RunLoop.current.run(until: Date().addingTimeInterval(0.2)) }
+        }
+        XCTAssertTrue(selected,
+                      "a click that drifted 8 points selected nothing: the marquee took the gesture")
+
+        // CAN THIS HARNESS SEE THE MARQUEE AT ALL? A test that passes because the gesture it is
+        // probing never fires proves nothing. A deliberate 60-point drag is unambiguously a drag,
+        // so it must behave differently from the 8-point one above - either selecting a range or
+        // selecting nothing. If it selects exactly the same single row, this probe cannot detect
+        // the marquee and neither assertion above means anything.
+        app.typeKey("a", modifierFlags: .command)   // clear, via select-all then a fresh click target
+        let far = start.withOffset(CGVector(dx: 60, dy: 120))
+        start.press(forDuration: 0.08, thenDragTo: far)
+        RunLoop.current.run(until: Date().addingTimeInterval(1.5))
+        let selectedAfterDrag = (0 ..< Swift.min(6, rows.count)).filter { rows.element(boundBy: $0).isSelected }.count
+        print("MARQUEE-PROBE selected-after-60pt-drag=\(selectedAfterDrag)")
+        XCTAssertNotEqual(selectedAfterDrag, 1,
+                          "a 60-point drag behaved exactly like a click, so this probe cannot see the marquee")
+    }
+
     func testClickingAResultSelectsIt() throws {
         let app = launch()
         defer { app.terminate() }
