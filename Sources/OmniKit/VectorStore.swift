@@ -7798,6 +7798,12 @@ public final class VectorStore: @unchecked Sendable {
             "DELETE FROM dedup WHERE file_id IN (\(list));",
             "DELETE FROM chunks WHERE file_id IN (\(list));",
             "DELETE FROM files WHERE id IN (\(list));",
+            // The split's rows for these files go in the SAME transaction as the v4 rows they are
+            // derived from: half a delete visible to one schema and not the other is the state
+            // every invariant in MigrationV5 exists to rule out. Unconditional because this is a
+            // static repair path with no instance to ask - and when the split is not built the
+            // table is empty and this is a no-op.
+            "DELETE FROM occurrence WHERE file_id IN (\(list));",
             "COMMIT;",
         ]
         for sql in statements where sqlite3_exec(db, sql, nil, nil, nil) != SQLITE_OK {
@@ -8672,6 +8678,15 @@ public final class VectorStore: @unchecked Sendable {
                 FROM (SELECT DISTINCT slot FROM chunks WHERE slot >= 0);
             UPDATE chunks SET slot = (SELECT r FROM slot_rank WHERE slot_rank.slot = chunks.slot)
              WHERE slot >= 0;
+            -- THE SPLIT CARRIES A POSITION TOO, and it is the same position. Separating identity
+            -- from position is what lets a content keep one id while the file is renumbered
+            -- underneath it - but only if something actually renumbers it. Missing this made the
+            -- maintained split disagree with a rebuild on every slot while agreeing on every key
+            -- and every refcount, which is exactly what the equivalence test caught.
+            -- Free slots are positions as well, and are renumbered through the same map.
+            UPDATE chunk SET slot = (SELECT r FROM slot_rank WHERE slot_rank.slot = chunk.slot)
+             WHERE slot >= 0 AND EXISTS (SELECT 1 FROM slot_rank WHERE slot_rank.slot = chunk.slot);
+            DELETE FROM free_slot;
             DELETE FROM slot_rank;
             """)
     }
@@ -10710,6 +10725,9 @@ public final class VectorStore: @unchecked Sendable {
         exec("DELETE FROM chunk_text WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id = \(fid));")
         exec("DELETE FROM pending_vecs WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id = \(fid));")
         exec("DELETE FROM chunks WHERE file_id = \(fid);")
+        // AFTER the v4 rows are gone, so regenerating this file's split rows from them correctly
+        // finds none and the refs recount drops the contents nothing points at any more.
+        if Self.chunkSplit, splitBuilt { maintainSplitForFilesLocked([fid]) }
     }
 
     /// Same, plus the file's dedup entry - for a removal, where `replace` deliberately keeps it.
@@ -11643,6 +11661,89 @@ public final class VectorStore: @unchecked Sendable {
         return contentFolded
     }
 
+    /// KEEP THE SPLIT IN STEP WITH A WRITE, for the files it touched.
+    ///
+    /// Regenerates those files' split rows FROM THE v4 ROWS rather than computing them a second
+    /// way, and out of the same `MigrationV5.keyExpr` the migration uses. That is the point: while
+    /// v4 is still authoritative the split is a derived view, and deriving it with the same
+    /// expression is what makes "maintained incrementally" and "rebuilt from scratch" the same
+    /// answer - which `splitparity` can then check after arbitrary churn.
+    ///
+    /// Scoped to the touched files and the contents they referenced BEFORE and AFTER. An
+    /// unscoped refs recount is a pass over every content in the index, per write.
+    func maintainSplitForFilesLocked(_ fileIDs: [Int64]) {
+        guard Self.chunkSplit, Self.contentSharing, dbOpen(), !fileIDs.isEmpty else { return }
+        let list = fileIDs.map(String.init).joined(separator: ",")
+        let key = MigrationV5.keyExpr
+        // The contents these files pointed at before the write. Captured first: the occurrence
+        // rows that name them are about to go.
+        exec("CREATE TEMP TABLE IF NOT EXISTS split_aff(chunk_id INTEGER PRIMARY KEY);")
+        exec("DELETE FROM split_aff;")
+        exec("INSERT OR IGNORE INTO split_aff SELECT chunk_id FROM occurrence WHERE file_id IN (\(list));")
+        exec("DELETE FROM occurrence WHERE file_id IN (\(list));")
+        // Contents for any key these files now carry that the table does not have yet. `key` is
+        // UNIQUE, so OR IGNORE is the whole of "insert it if it is new".
+        exec("""
+            INSERT OR IGNORE INTO chunk(key, kind, bytes, refs, slot)
+            SELECT \(key), MIN(ct.kind), 0, 0, MIN(c.slot)
+              FROM chunks c JOIN chunk_text ct ON ct.chunk_id = c.id
+             WHERE c.file_id IN (\(list)) AND c.slot >= 0
+             GROUP BY \(key);
+            """)
+        exec("""
+            INSERT OR REPLACE INTO occurrence(file_id, ordinal, chunk_id, locator)
+            SELECT c.file_id, c.chunk_index, k.id, ct.locator
+              FROM chunks c JOIN chunk_text ct ON ct.chunk_id = c.id
+              JOIN chunk k ON k.key = \(key)
+             WHERE c.file_id IN (\(list)) AND c.slot >= 0;
+            """)
+        exec("INSERT OR IGNORE INTO split_aff SELECT chunk_id FROM occurrence WHERE file_id IN (\(list));")
+        // OR IGNORE ABOVE NEVER UPDATES AN EXISTING CONTENT, which is right for its key and wrong
+        // for its position: a content that was already in the table keeps whatever slot it had
+        // when it was first seen, and a reopen re-derives positions densely after deletes. The
+        // equivalence test caught this as every key matching and every slot differing.
+        exec("""
+            UPDATE chunk SET slot = COALESCE((
+                SELECT MIN(c.slot) FROM chunks c JOIN chunk_text ct ON ct.chunk_id = c.id
+                 WHERE \(key) = chunk.key AND c.slot >= 0), chunk.slot)
+             WHERE id IN (SELECT chunk_id FROM split_aff);
+            """)
+        exec("""
+            UPDATE chunk SET refs = (SELECT COUNT(*) FROM occurrence o WHERE o.chunk_id = chunk.id)
+             WHERE id IN (SELECT chunk_id FROM split_aff);
+            """)
+        // A position that is owned again is not free; one whose last occurrence just went is.
+        exec("""
+            DELETE FROM free_slot WHERE id IN
+              (SELECT slot FROM chunk WHERE id IN (SELECT chunk_id FROM split_aff) AND refs > 0 AND slot >= 0);
+            """)
+        exec("""
+            INSERT OR IGNORE INTO free_slot(id)
+            SELECT slot FROM chunk WHERE id IN (SELECT chunk_id FROM split_aff) AND refs = 0 AND slot >= 0;
+            """)
+        exec("DELETE FROM chunk WHERE id IN (SELECT chunk_id FROM split_aff) AND refs = 0;")
+        exec("DELETE FROM chunk_snippet WHERE chunk_id NOT IN (SELECT id FROM chunk) "
+             + "AND chunk_id IN (SELECT chunk_id FROM split_aff);")
+        exec("""
+            INSERT OR IGNORE INTO chunk_snippet(chunk_id, kind, snippet)
+            SELECT k.id, k.kind, COALESCE((SELECT ct.snippet FROM chunk_text ct JOIN chunks c2
+                                             ON c2.id = ct.chunk_id WHERE c2.slot = k.slot LIMIT 1), '')
+              FROM chunk k WHERE k.id IN (SELECT chunk_id FROM split_aff);
+            """)
+    }
+
+    /// The files a set of v4 chunk rows belong to.
+    func filesOfChunkRowsLocked(_ ids: [Int64]) -> [Int64] {
+        guard dbOpen(), !ids.isEmpty else { return [] }
+        var out: [Int64] = []
+        var st: OpaquePointer?
+        defer { sqlite3_finalize(st) }
+        let sql = "SELECT DISTINCT file_id FROM chunks WHERE id IN (\(ids.map(String.init).joined(separator: ",")));"
+        guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { return [] }
+        while sqlite3_step(st) == SQLITE_ROW { out.append(sqlite3_column_int64(st, 0)) }
+        return out
+    }
+
     /// Build the chunk/occurrence split in this database, once, when it is enabled and possible.
     ///
     /// It is deliberately downstream of the slot backfill and INDEPENDENT of the fold: the split
@@ -11697,6 +11798,21 @@ public final class VectorStore: @unchecked Sendable {
         queue.sync {
             exec("INSERT OR REPLACE INTO chunk(id, key, kind, bytes, refs) "
                  + "SELECT 999999, chunk_key, 0, 0, 1 FROM chunk_text WHERE length(chunk_key) > 0 LIMIT 1;")
+        }
+    }
+
+    /// Read the database directly, on the queue, for a test that needs to compare raw rows.
+    public func withReadOnlyHandleForTest(_ body: (OpaquePointer?) -> Void) {
+        queue.sync { body(db) }
+    }
+
+    /// Wipe the split so it can be rebuilt from the v4 tables and the two compared.
+    public func clearSplitForTest() {
+        queue.sync {
+            exec("DELETE FROM occurrence;"); exec("DELETE FROM chunk;")
+            exec("DELETE FROM chunk_snippet;"); exec("DELETE FROM free_slot;")
+            exec("DELETE FROM meta WHERE key = '\(Self.chunkSplitDoneKey)';")
+            splitBuilt = false
         }
     }
 
@@ -12050,6 +12166,13 @@ public final class VectorStore: @unchecked Sendable {
             sqlite3_bind_int(st, 1, slots[i])
             sqlite3_bind_int64(st, 2, cid)
             _ = sqlite3_step(st)
+        }
+        // THE SPLIT, IN STEP, and here because this is the one place every write reaches with its
+        // slots already settled - `replace`, `replaceMany` and the backfill all funnel through it.
+        // Anywhere earlier and the position is not known yet; anywhere later and there is no single
+        // site that sees them all.
+        if Self.chunkSplit, splitBuilt {
+            maintainSplitForFilesLocked(filesOfChunkRowsLocked(ids))
         }
         // A CONTENT THE CLAIM ALREADY COVERS NEEDS NO BLOB, and this is the only place that can
         // know. The writer stores a pending vector for every chunk because it cannot know the slot

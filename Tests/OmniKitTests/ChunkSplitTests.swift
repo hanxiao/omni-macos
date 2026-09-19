@@ -166,6 +166,101 @@ final class ChunkSplitTests: XCTestCase {
         return out
     }
 
+    /// THE QUESTION A MIGRATION CANNOT ANSWER: can the WRITE PATH keep the split correct?
+    ///
+    /// Building the split once from v4 tables is proven. What that says nothing about is whether
+    /// adds, edits and deletes afterwards leave it equal to what a fresh build would produce. This
+    /// churns the store and then compares the incrementally-maintained tables against a rebuild
+    /// from the same v4 rows, row for row.
+    func testTheWritePathKeepsTheSplitEqualToARebuild() throws {
+        let url = tempDB()
+        let store = try build(url, files: 40, dupEvery: 4)
+        XCTAssertTrue(store.buildChunkSplitForTest(), "the split did not build")
+
+        // Churn: new files, edits that change content, edits that keep it, and deletes.
+        for i in 0 ..< 12 {
+            let p = "/new/f\(i).txt"
+            try store.replace(path: p, chunks: [
+                IndexedChunk(path: p, modified: 1, size: 10, kind: "text", chunkIndex: 0,
+                             snippet: "new \(i)", embedding: vec(5000 + i), locator: "Line 1",
+                             chunkKey: String(format: "%016x", 5000 + i)),
+                // Deliberately a key an existing file already carries, so refs must go UP.
+                IndexedChunk(path: p, modified: 1, size: 10, kind: "text", chunkIndex: 1,
+                             snippet: "shared \(7 + i % 4)", embedding: vec(7 + i % 4),
+                             locator: "Line \(200 + i)", chunkKey: String(format: "%016x", 7 + i % 4)),
+            ])
+        }
+        for i in stride(from: 0, to: 40, by: 3) { store.deletePath("/v4/f\(i).txt") }
+        for i in [1, 4, 7] {
+            let p = "/v4/f\(i).txt"
+            try store.replace(path: p, chunks: [
+                IndexedChunk(path: p, modified: 2, size: 10, kind: "text", chunkIndex: 0,
+                             snippet: "edited \(i)", embedding: vec(9000 + i), locator: "Line 1",
+                             chunkKey: String(format: "%016x", 9000 + i)),
+            ])
+        }
+        store.migrateSlotsToCompletion()
+        let maintained = splitRows(store)
+        store.close()
+
+        // Rebuild from the v4 tables the same write path produced, and demand the same answer.
+        let rebuilt = try rebuildSplitForComparison(url)
+        XCTAssertFalse(maintained.occurrences.isEmpty, "the fixture produced no occurrences")
+        XCTAssertEqual(maintained.occurrences, rebuilt.occurrences,
+                       "the maintained occurrences differ from a rebuild")
+        // KEYS, not key@slot. While v4 is authoritative the POSITION is v4's to own - a reopen
+        // re-derives it for every row after deletes, and chasing that from the split would mean
+        // mirroring a renumbering the split does not perform. At cutover the split owns positions
+        // and there is exactly one place they change, so the question disappears. What the write
+        // path owns today, and what this therefore checks, is which contents exist and what points
+        // at them.
+        XCTAssertEqual(maintained.contents.map { String($0.split(separator: "@")[0]) },
+                       rebuilt.contents.map { String($0.split(separator: "@")[0]) },
+                       "the maintained contents differ from a rebuild")
+        XCTAssertEqual(maintained.refs, rebuilt.refs, "refs drifted from the occurrence counts")
+    }
+
+    private struct SplitShape: Equatable {
+        var occurrences: [String] = []
+        var contents: [String] = []
+        var refs: [String] = []
+    }
+
+    /// The split as comparable text, ordered so two runs line up. Keyed by CONTENT KEY rather than
+    /// by id: ids are rowids now, so a rebuild legitimately numbers them differently.
+    private func splitRows(_ store: VectorStore) -> SplitShape {
+        var out = SplitShape()
+        store.withReadOnlyHandleForTest { db in
+            out.occurrences = rows(db, """
+                SELECT o.file_id || '#' || o.ordinal || '->' || hex(k.key) || '@' || o.locator
+                  FROM occurrence o JOIN chunk k ON k.id = o.chunk_id ORDER BY 1;
+                """)
+            out.contents = rows(db, "SELECT hex(key) || '@' || slot FROM chunk ORDER BY 1;")
+            out.refs = rows(db, "SELECT hex(key) || '=' || refs FROM chunk ORDER BY 1;")
+        }
+        return out
+    }
+
+    private func rows(_ db: OpaquePointer?, _ sql: String) -> [String] {
+        var out: [String] = []
+        var st: OpaquePointer?
+        defer { sqlite3_finalize(st) }
+        guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { return [] }
+        while sqlite3_step(st) == SQLITE_ROW {
+            if let c = sqlite3_column_text(st, 0) { out.append(String(cString: c)) }
+        }
+        return out
+    }
+
+    /// Wipe the split and build it again from the v4 rows, then read it back the same way.
+    private func rebuildSplitForComparison(_ url: URL) throws -> SplitShape {
+        let store = try VectorStore(dbURL: url)
+        defer { store.close() }
+        store.clearSplitForTest()
+        XCTAssertTrue(store.buildChunkSplitForTest(), "the rebuild did not run")
+        return splitRows(store)
+    }
+
     func testItRefusesUntilEveryRowHasASlot() throws {
         let url = tempDB()
         let store = try VectorStore(dbURL: url)
