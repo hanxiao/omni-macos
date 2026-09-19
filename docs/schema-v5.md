@@ -871,19 +871,53 @@ THE HALFWAY STATE IS WORSE THAN EITHER END, which is why this is not a flag flip
     split on, no cutover      +2.223 GB, both models written, fold still running. Worst of both
     cutover done, fold gone   -0.414 GB, and the machinery that caused these bugs is gone
 
-THE SEQUENCE, so this starts from a stated order rather than drifting into one:
+AND IT SHIPS IN ONE MIGRATION, WHICH IS WHAT SETS THE SCOPE.
 
-  1. Move the write path off `chunk_text` entirely (`OMNI_SPLIT_CUTOVER=1` already does this;
-     it needs the scan-kind migration and the v3 -> v4 conversion to stop depending on the table).
-  2. Make the four delete sites decrement `chunk.refs` and release the slot at zero, instead of
-     re-deriving what is still referenced.
-  3. Repoint the fold's own queries, then retire the fold - it is the step that pays for the
-     other three, and it cannot happen before them.
-  4. A migration that drops `chunk_text` and its two indexes for existing users, with the same
-     kill-and-reopen proof the v5 migration has.
+An earlier version of this section proposed landing the build now and finishing the cutover in a
+later release. That is wrong, and the rule is in CLAUDE.md now: a layout change users have to
+migrate through is written as though there will never be another chance to change the layout.
+Deferring half of it is not a schedule, it is a second forced migration for every user plus the
+compatibility paths to read both layouts in between.
 
-Each step lands on the paths that produced the defects above, so each wants its own chaos run
-rather than a single cutover commit. The build and the invariants are proven and will keep.
+Which means the target is not "chunk_text dropped". It is the shape at the top of this document,
+and `chunks` is as redundant in it as `chunk_text` is:
+
+    chunk(id, key UNIQUE, kind, bytes, refs, slot)     identity, and where its vector sits
+    occurrence(file_id, ordinal, chunk_id, locator)    THE ROW TABLE
+    chunk_snippet(chunk_id, kind, snippet)             cold payload
+    free_slot(id)                                      positions nobody owns
+    pending_vecs(chunk_id, vec)                        keyed on the CONTENT, not the row
+    files, dirs, vec_holes, meta                       unchanged
+
+    GONE: chunks, chunk_text
+
+`occurrence` says everything `chunks` says - `ordinal` is `chunk_index`, `kind` and `slot` moved
+to `chunk` where they belong to the content rather than to each of its copies. Keeping both is
+the same halfway state as keeping both text tables, one level down.
+
+THE SEQUENCE. Nothing ships until all of it is done; the checkpoints are for testing, not for
+releasing.
+
+  1. Split always built, every reader answering from it, v4 still written alongside. This is the
+     safety net that makes the rest checkable - the split can be rebuilt from v4 and compared row
+     for row - and it is the one step that must come first. DONE.
+  2. Stop writing `chunk_text`. `OMNI_SPLIT_CUTOVER=1` already does it in `writeChunksLocked`;
+     what remains is the two paths that still write v4 text directly, the scan-kind migration and
+     the v3 -> v4 conversion.
+  3. Deletes decrement `chunk.refs` and release the slot at zero, instead of re-deriving what is
+     still referenced across four sites.
+  4. Retire the fold. It cannot happen before 2 and 3, and it is what pays for them: `chunk.key`
+     is unique by construction, so there are no duplicate contents for a fold to find.
+  5. Move the resident loader, the coverage walk and the row sidecar off `chunks` onto
+     `occurrence` + `chunk`. The largest step, and the one that finally deletes rank-is-position.
+  6. `pending_vecs` keyed on content id rather than row id.
+  7. The migration contracts: drop `chunk_text`, then `chunks`, with the kill-and-reopen proof.
+  8. Both flags deleted - not defaulted, deleted. A shipped layout has no switch.
+
+Each step lands on the paths that produced the defects above, so each gets its own chaos run, and
+the whole thing gets the three proofs CLAUDE.md now requires before it ships: identical digest,
+no timing regression against the same index with the change off, and SIGKILL part-way through the
+migration at several points with a clean reopen each time.
 
 WHERE THE CUTOVER ACTUALLY STANDS, AND WHAT IS BROKEN IN IT.
 
