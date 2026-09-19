@@ -2107,11 +2107,24 @@ public final class VectorStore: @unchecked Sendable {
         var allChunksSigned: [String: Bool] = [:]
         // Both shapes, because this is about what rows SAY, not how they are stored - and it has
         // to run before the load in either case, so the resident mirrors are built relabeled.
-        let scanSQL = v4 ? """
+        let textCode = StoreSchema.knownKinds.firstIndex(of: "text") ?? 0
+        // THE READ SIDE HAS TO MOVE TOO. The write side below already relabels `chunk` and
+        // `chunk_snippet` when the split is built, but this query still asked `chunk_text` - so
+        // once that table stops being written there are no rows to find, and not one scanned PDF
+        // gets reclassified. A migration that silently does nothing is worse than one that fails.
+        let v4ScanSQL = splitBuilt ? """
+            SELECT \(StoreSchema.pathExpr), s.snippet
+              FROM chunk_snippet s
+              JOIN occurrence o ON o.chunk_id = s.chunk_id
+              JOIN files f ON f.id = o.file_id
+              JOIN dirs d ON d.id = f.dir_id
+             WHERE s.kind = \(textCode) AND f.name LIKE '%.pdf';
+            """ : """
             SELECT \(StoreSchema.pathExpr), t.snippet
               FROM chunk_text t JOIN files f ON f.id = t.file_id JOIN dirs d ON d.id = f.dir_id
-             WHERE t.kind = \(StoreSchema.knownKinds.firstIndex(of: "text") ?? 0) AND f.name LIKE '%.pdf';
-            """ : """
+             WHERE t.kind = \(textCode) AND f.name LIKE '%.pdf';
+            """
+        let scanSQL = v4 ? v4ScanSQL : """
             SELECT f.path, c.snippet FROM chunks c JOIN files f ON f.id = c.file_id
              WHERE c.kind = 'text' AND f.path LIKE '%.pdf';
             """
@@ -2220,6 +2233,13 @@ public final class VectorStore: @unchecked Sendable {
             sqlite3_finalize(foldGroupStmt); foldGroupStmt = nil
             sqlite3_finalize(foldFreedStmt); foldFreedStmt = nil
             sqlite3_finalize(foldMoveStmt); foldMoveStmt = nil
+            // ALL SEVEN, not the five that happened to be here. Any cached statement left stopped
+            // at a row holds a read transaction, and the TRUNCATE checkpoint on the next line
+            // waits for readers - so one missing finalize is a hang on quit rather than a leak.
+            // contentSelStmt and slotUpdStmt were the two missing, and contentSelStmt is the one
+            // the content lookup uses on every write.
+            sqlite3_finalize(contentSelStmt); contentSelStmt = nil
+            sqlite3_finalize(slotUpdStmt); slotUpdStmt = nil
             sqlite3_exec(h, "PRAGMA wal_checkpoint(TRUNCATE);", nil, nil, nil)
             sqlite3_close(h)
             db = nil
@@ -2234,6 +2254,11 @@ public final class VectorStore: @unchecked Sendable {
         guard !closed, let h = db else { return }
         sqlite3_finalize(snippetStmt); snippetStmt = nil
         sqlite3_finalize(dedupStmt); dedupStmt = nil
+        sqlite3_finalize(contentSelStmt); contentSelStmt = nil
+        sqlite3_finalize(slotUpdStmt); slotUpdStmt = nil
+        sqlite3_finalize(foldGroupStmt); foldGroupStmt = nil
+        sqlite3_finalize(foldFreedStmt); foldFreedStmt = nil
+        sqlite3_finalize(foldMoveStmt); foldMoveStmt = nil
         sqlite3_exec(h, "PRAGMA wal_checkpoint(TRUNCATE);", nil, nil, nil)
         sqlite3_close(h)
         db = nil
@@ -11772,6 +11797,23 @@ public final class VectorStore: @unchecked Sendable {
             guard sqlite3_step(st) == SQLITE_ROW else { return nil }
             return sqlite3_column_int(st, 0)
         }
+        // RESET NOW, NOT ON THE NEXT CALL. A statement stopped at SQLITE_ROW still holds a read
+        // transaction, and resetting lazily at the top means it holds one for the whole gap
+        // between lookups. Two costs, both real and neither obvious:
+        //
+        //   - `close()` ends in `wal_checkpoint(TRUNCATE)`, which waits for every reader. The
+        //     reader is this statement, on this same connection, so the checkpoint cannot win:
+        //     it sits in the busy handler for the full `busy_timeout=5000`, gives up, and closes
+        //     with the WAL un-truncated. Five seconds of the store queue held on every quit,
+        //     with the idle fold and the coverage stamp blocked behind it - caught by sampling a
+        //     test run that was at 0% CPU inside exactly that wait.
+        //   - between lookups, no checkpoint can ever complete, so the WAL grows unbounded while
+        //     the app is simply sitting there having found a content.
+        //
+        // A lookup that MISSES runs to SQLITE_DONE and ends its read on its own, which is why this
+        // only bites when the last thing before a quit was a successful hit - and why it showed up
+        // first under OMNI_SPLIT_CUTOVER=1, where this lookup runs on every write.
+        sqlite3_reset(st)
         // A slot the in-memory side does not have is not usable, whatever SQLite says.
         guard let f = found, f >= 0, Int(f) < slotCount else { return nil }
         return f

@@ -343,6 +343,69 @@ final class ChunkSplitTests: XCTestCase {
     /// readers I could find". This empties it and then does what a user does - search, read the
     /// text under a hit, reuse a file whose content has not changed, delete, re-add - and demands
     /// the answers still come back. Whatever still needs v4 fails here rather than in the field.
+    /// THE STORE HELD A READ TRANSACTION OPEN BETWEEN CONTENT LOOKUPS.
+    ///
+    /// The content lookup stepped its cached statement to SQLITE_ROW and returned without
+    /// resetting, resetting lazily at the top of the NEXT call instead. A statement stopped at a
+    /// row still holds a read transaction, so the store held one for the whole gap between
+    /// lookups - and `close()` ends in `wal_checkpoint(TRUNCATE)`, which waits for every reader.
+    /// The reader was this process's own statement on the same connection, so the checkpoint sat
+    /// in the busy handler for the full `busy_timeout=5000`, gave up, and closed with the WAL
+    /// un-truncated: five seconds of the store queue held on every quit, with the idle fold and
+    /// the coverage stamp blocked behind it. Between lookups, no checkpoint could complete at all.
+    ///
+    /// A lookup that MISSES runs to SQLITE_DONE and releases its read on its own, which is why
+    /// the last database operation before the close has to be a HIT for this to show. Found by
+    /// sampling a run that was at 0% CPU inside that wait under OMNI_SPLIT_CUTOVER=1, where the
+    /// lookup runs on every write; nothing about the defect is specific to the cutover.
+    ///
+    /// The checkpoint probe is the assertion that matters - it names the defect directly, and it
+    /// still fails if only the eager reset is reverted. The close-on-a-deadline below is the
+    /// backstop for the other half of the fix, `close()` finalizing all seven cached statements
+    /// rather than the five it happened to list.
+    func testCloseDoesNotHangAfterASuccessfulContentLookup() throws {
+        let url = tempDB()
+        let store = try build(url, files: 24, dupEvery: 4)
+        // The hit. Re-writing a path whose content already exists is what drives the lookup, and
+        // `dupEvery` above guarantees the content is there to be found.
+        let p = "/v4/f0.txt"
+        try store.replace(path: p, chunks: [
+            IndexedChunk(path: p, modified: 2, size: 10, kind: "text", chunkIndex: 0,
+                         snippet: "unique 0", embedding: vec(1000), locator: "Line 1",
+                         chunkKey: String(format: "%016x", 1000)),
+            IndexedChunk(path: p, modified: 2, size: 10, kind: "text", chunkIndex: 1,
+                         snippet: "shared 7", embedding: vec(7), locator: "Line 2",
+                         chunkKey: String(format: "%016x", 7)),
+        ])
+
+        // THE ROOT DEFECT, ASSERTED DIRECTLY. A TRUNCATE checkpoint from another connection
+        // reports BUSY in its first column when any reader still holds a read mark. With the
+        // statement left stopped at a row, that reader is the store - so this is the check that
+        // fails on a reset-only regression, which the close() below would otherwise mask now that
+        // it finalizes the statement either way.
+        var probe: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(url.path, &probe, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+        var ck: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(probe, "PRAGMA wal_checkpoint(TRUNCATE);", -1, &ck, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_step(ck), SQLITE_ROW)
+        XCTAssertEqual(sqlite3_column_int(ck, 0), 0,
+                       "the checkpoint was blocked: the store is still holding a read transaction "
+                       + "open between content lookups")
+        sqlite3_finalize(ck)
+        sqlite3_close(probe)
+
+        let done = XCTestExpectation(description: "close() returned")
+        Thread.detachNewThread { store.close(); done.fulfill() }
+        XCTAssertEqual(XCTWaiter().wait(for: [done], timeout: 30), .completed,
+                       "close() did not return: the checkpoint is waiting on a reader this "
+                       + "process never released")
+
+        // And the index is still usable afterwards, so the fix is not "skip the checkpoint".
+        let reopened = try VectorStore(dbURL: url)
+        defer { reopened.close() }
+        XCTAssertGreaterThan(reopened.count, 0, "the index did not survive the close")
+    }
+
     func testTheIndexWorksWithChunkTextEmptied() throws {
         let savedQuant = VectorStore.quantBaseOverride
         VectorStore.quantBaseOverride = VectorStore.scanBits

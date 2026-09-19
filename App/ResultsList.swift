@@ -1009,13 +1009,48 @@ private struct ResultItemFramesKey: PreferenceKey {
     }
 }
 
+/// Whether a marquee drag is in flight. Read by every realized row, set by `MarqueeSelect`.
+private struct MarqueeActiveKey: EnvironmentKey { static let defaultValue = false }
+
+private extension EnvironmentValues {
+    var marqueeActive: Bool {
+        get { self[MarqueeActiveKey.self] }
+        set { self[MarqueeActiveKey.self] = newValue }
+    }
+}
+
+/// Publish this item's frame (in the named viewport space) for marquee hit-testing, BUT ONLY WHILE
+/// A DRAG IS IN FLIGHT.
+///
+/// The frames are read in exactly one place - the drag handler's intersection test - and nowhere
+/// else, ever. Publishing them unconditionally meant every realized row re-measured and re-published
+/// on every scroll tick and every live results refresh, for a map nothing was going to read. Gating
+/// on the drag removes that work entirely from the 99.9% of the app's life when nobody is dragging.
+///
+/// The one behavioural change is a single frame of lag: the first `onChanged` sets `origin`, which
+/// is what flips this on, so that tick's intersection runs against an empty map and selects nothing
+/// beyond the modifier-held base. `minimumDistance: 6` means the pointer has already travelled
+/// before that tick arrives, and the next one is ~16 ms later.
+private struct ReportResultFrame: ViewModifier {
+    @Environment(\.marqueeActive) private var active
+    let path: String
+    let space: String
+
+    func body(content: Content) -> some View {
+        content.background {
+            if active {
+                GeometryReader { g in
+                    Color.clear.preference(key: ResultItemFramesKey.self,
+                                           value: [path: g.frame(in: .named(space))])
+                }
+            }
+        }
+    }
+}
+
 private extension View {
-    /// Publish this item's frame (in the named viewport space) for marquee hit-testing. A transparent
-    /// GeometryReader background measures without affecting layout or hit area.
     func reportResultFrame(_ path: String, in space: String) -> some View {
-        background(GeometryReader { g in
-            Color.clear.preference(key: ResultItemFramesKey.self, value: [path: g.frame(in: .named(space))])
-        })
+        modifier(ReportResultFrame(path: path, space: space))
     }
 
     func marqueeSelect(space: String) -> some View {
@@ -1047,6 +1082,9 @@ private struct MarqueeSelect: ViewModifier {
 
     func body(content: Content) -> some View {
         content
+            // Applied to the content, so it reaches the rows inside it. Flipping this is what
+            // attaches their GeometryReaders; flipping it back at drag end detaches them again.
+            .environment(\.marqueeActive, origin != nil)
             .coordinateSpace(name: space)
             .onPreferenceChange(ResultItemFramesKey.self) { [box] in box.frames = $0 }
             .overlay(alignment: .topLeading) {

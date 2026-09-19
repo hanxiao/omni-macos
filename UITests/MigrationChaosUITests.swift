@@ -84,6 +84,56 @@ final class MigrationChaosUITests: XCTestCase {
         return app
     }
 
+    /// FILE CHURN UNDER THE WATCHED FOLDER, for as long as the UI is being driven. Without it this
+    /// suite exercised a migration with a completely static corpus - the index was being rewritten
+    /// underneath, but nothing was ever being added to or removed from it at the same time, which
+    /// is the combination a real user produces on the day they upgrade.
+    private var churnStop = false
+    private func startChurn() {
+        churnStop = false
+        Thread.detachNewThread { [corpus] in
+            var n = 0
+            let fm = FileManager.default
+            while !self.churnStop {
+                let f = corpus.appendingPathComponent("c\(n % 30).txt")
+                switch n % 4 {
+                case 0: if let h = try? FileHandle(forWritingTo: f) { h.seekToEndOfFile()
+                            h.write(Data("\nappended \(n)\n".utf8)); try? h.close() }
+                case 1: try? "fresh document \(n) about porsche invoices"
+                            .write(to: corpus.appendingPathComponent("new\(n).txt"),
+                                   atomically: true, encoding: .utf8)
+                case 2: try? fm.removeItem(at: corpus.appendingPathComponent("new\(n - 1).txt"))
+                default: try? fm.moveItem(at: corpus.appendingPathComponent("new\(n - 3).txt"),
+                                          to: corpus.appendingPathComponent("moved\(n).txt"))
+                }
+                n += 1
+                Thread.sleep(forTimeInterval: 0.4)
+            }
+        }
+    }
+
+    /// Right-click a sidebar row by its folder name and pick one item, if the menu offers it.
+    /// Best-effort by design: which items a row carries depends on whether it is a root, whether
+    /// it is paused, and whether the drawer is showing roots or the folder tree at that moment.
+    /// A miss must not fail the run - the assertion this suite makes is that the app survives
+    /// being poked, and a menu that did not appear is a different test's job.
+    @discardableResult
+    private func sidebarMenu(_ app: XCUIApplication, row: String, pick: String) -> Bool {
+        let cell = app.windows.firstMatch.descendants(matching: .any)
+            .matching(NSPredicate(format: "label CONTAINS[c] %@", row)).firstMatch
+        guard cell.exists, cell.isHittable else { return false }
+        cell.rightClick()
+        usleep(400_000)
+        let item = app.menuItems[pick]
+        if item.waitForExistence(timeout: 2), item.isHittable {
+            item.click()
+            usleep(300_000)
+            return true
+        }
+        app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
+        return false
+    }
+
     private func focusSearch(_ app: XCUIApplication) {
         let f = app.windows.firstMatch.searchFields.firstMatch
         if f.exists, f.isHittable { f.click() } else { app.typeKey("f", modifierFlags: .command) }
@@ -93,6 +143,8 @@ final class MigrationChaosUITests: XCTestCase {
     func testChaosWhileAnOldIndexMigrates() throws {
         let app = launch()
         XCTAssertTrue(app.wait(for: .runningForeground, timeout: 120), "app did not come up on a v4 index")
+        startChurn()
+        defer { churnStop = true }
 
         let queries = ["porsche", "invoice", "quarterly revenue", "tomatoes", "memory budget",
                        "distributed vector search", "screenshot", "contract"]
@@ -100,7 +152,7 @@ final class MigrationChaosUITests: XCTestCase {
         var rounds = 0
 
         while Date() < deadline {
-            switch rounds % 12 {
+            switch rounds % 14 {
             case 0:
                 // Type, then abandon before the debounce settles.
                 focusSearch(app)
@@ -227,6 +279,42 @@ final class MigrationChaosUITests: XCTestCase {
                 app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
                 usleep(80_000)
                 app.typeKey("f", modifierFlags: .command)
+            case 12:
+                // PAUSE AND RESUME THE WATCHED FOLDER while its files are being churned and the
+                // index underneath is being rewritten. Pausing stands the crawler down mid-pass,
+                // which is the one operation that can leave a folder half-reconciled.
+                if sidebarMenu(app, row: "corpus", pick: "Pause this folder") {
+                    usleep(500_000)
+                    sidebarMenu(app, row: "corpus", pick: "Resume this folder")
+                }
+            default:
+                // REMOVE A FOLDER AND ADD A DIFFERENT ONE, mid-migration. This is the case the
+                // suite was missing outright: `addLater` was seeded in setUp and never used, so
+                // "add folder / remove folder" was covered by nothing. Removing un-indexes rows
+                // while the migration is still walking them; adding starts a fresh crawl into an
+                // index that is simultaneously being rewritten.
+                if sidebarMenu(app, row: "corpus", pick: "Remove from Omni") {
+                    usleep(600_000)
+                }
+                let add = app.windows.firstMatch.buttons["Add\u{2026}"].firstMatch
+                if add.exists, add.isHittable {
+                    add.click()
+                    // Go-to-folder inside the open panel: the only reliable way to name a path.
+                    if app.sheets.firstMatch.waitForExistence(timeout: 3)
+                        || app.dialogs.firstMatch.waitForExistence(timeout: 1) {
+                        app.typeKey("g", modifierFlags: [.command, .shift])
+                        usleep(300_000)
+                        app.typeText(addLater.path)
+                        app.typeKey(XCUIKeyboardKey.return, modifierFlags: [])
+                        usleep(400_000)
+                        app.typeKey(XCUIKeyboardKey.return, modifierFlags: [])
+                        usleep(600_000)
+                    }
+                    // Whatever happened, do not leave a modal standing over the next round.
+                    if app.sheets.firstMatch.exists || app.dialogs.firstMatch.exists {
+                        app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
+                    }
+                }
             }
             rounds += 1
             XCTAssertEqual(app.state, .runningForeground, "the app went away after \(rounds) rounds")
