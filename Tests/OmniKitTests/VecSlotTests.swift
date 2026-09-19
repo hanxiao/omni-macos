@@ -261,4 +261,59 @@ final class VecSlotTests: XCTestCase {
         XCTAssertThrowsError(try VectorStore(dbURL: dbURL),
                              "a store that cannot read the covered vectors must refuse, not open empty")
     }
+
+    /// A DELETED ROW MUST NOT COST THE SIDECAR. Adoption validates ~32 evenly spaced records
+    /// against SQLite point lookups, and the records cover tombstones too - a dead row has no
+    /// `chunks` row to look up, so sampling one rejected the whole sidecar and the launch did the
+    /// full scan instead. The stride is fixed, so it was not intermittent: the same tombstone was
+    /// sampled every time, and an index that had deleted enough to land one in the sample paid the
+    /// scan for the rest of its life. On the production index (10,057,171 records, 206,063 dead)
+    /// that was 11.5 s per open against 3.2 s.
+    ///
+    /// Asserted on adoption, not on time: the fixture is small enough that both paths are instant,
+    /// so a timing assertion here could never fail. Reverting the skip fails this test.
+    func testASampledTombstoneDoesNotRejectTheRowSidecar() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tomb-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appendingPathComponent("test.sqlite")
+
+        // Under 32 rows the sample is every row with stride 1, so a tombstone is sampled for
+        // certain rather than with the ~47% the production dead fraction happens to give.
+        var expect: [(String, Int)] = []
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            for f in 0 ..< 20 {
+                let p = "/t/f\(f).txt"
+                try store.replace(path: p, chunks: chunks(p, 1, seed: f * 100))
+                expect.append((p, f * 100))
+            }
+            store.close()
+        }
+        do { let s = try VectorStore(dbURL: dbURL); s.close() }
+
+        // Delete from the middle, so the dead records sit among live ones rather than at the end.
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            for f in [5, 9, 13] { store.deletePath("/t/f\(f).txt") }
+            store.close()
+        }
+        expect.removeAll { ["/t/f5.txt", "/t/f9.txt", "/t/f13.txt"].contains($0.0) }
+
+        let rowsURL = dbURL.deletingLastPathComponent()
+            .appendingPathComponent(dbURL.lastPathComponent + ".rows")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: rowsURL.path),
+                      "close() after a delete did not stamp the row sidecar at all")
+
+        let store = try VectorStore(dbURL: dbURL)
+        defer { store.close() }
+        XCTAssertTrue(store.adoptedRowSidecar,
+                      "a tombstone in the validation sample rejected an otherwise valid sidecar")
+        // Adopting is only worth anything if it is also right.
+        assertEveryFileFindsItself(store, expect, "after adopting with tombstones")
+        for f in [5, 9, 13] {
+            XCTAssertFalse(store.allIndexedPaths().contains("/t/f\(f).txt"),
+                           "deleted file came back through the sidecar")
+        }
+    }
 }

@@ -9116,7 +9116,7 @@ public final class VectorStore: @unchecked Sendable {
             return ok ? out : nil
         }
         guard let pathTable = strings(pathOffs, pathBlob, header.pathCount),
-              let kindTable = strings(kindOffs, kindBlob, header.kindCount) else { return reject() }
+              let kindTable = strings(kindOffs, kindBlob, header.kindCount) else { return reject("stringtable") }
 
         // SAMPLED CONTENT VALIDATION against SQLite point lookups (PK btree, ~ms total): vectors,
         // modified, size, and kind for ~32 evenly spaced rows must match byte-for-byte. This is
@@ -9124,6 +9124,7 @@ public final class VectorStore: @unchecked Sendable {
         let sampleCount = min(32, header.rowCount)
         let stride = max(1, header.rowCount / sampleCount)
         var sampleOK = true
+        var sampleWhy = ""
         records.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, """
@@ -9131,7 +9132,7 @@ public final class VectorStore: @unchecked Sendable {
                   FROM chunks c JOIN files f ON f.id = c.file_id
                   LEFT JOIN pending_vecs p ON p.chunk_id = c.id
                  WHERE c.file_id = \(StoreSchema.fileIDByPath) AND c.chunk_index = ?;
-                """, -1, &stmt, nil) == SQLITE_OK else { sampleOK = false; return }
+                """, -1, &stmt, nil) == SQLITE_OK else { sampleOK = false; sampleWhy = "prepare"; return }
             defer { sqlite3_finalize(stmt) }
             var i = 0
             while i < header.rowCount, sampleOK {
@@ -9141,7 +9142,20 @@ public final class VectorStore: @unchecked Sendable {
                 let modified = raw.loadUnaligned(fromByteOffset: o + 16, as: Double.self)
                 let size = raw.loadUnaligned(fromByteOffset: o + 32, as: Int64.self)
                 let kc = Int(raw.loadUnaligned(fromByteOffset: o + 40, as: UInt8.self))
-                guard fid >= 0, fid < pathTable.count, kc < kindTable.count else { sampleOK = false; break }
+                guard fid >= 0, fid < pathTable.count, kc < kindTable.count else { sampleOK = false; sampleWhy = "row \(i) fid/kc out of range"; break }
+                // A TOMBSTONE HAS NOTHING FOR SQLITE TO AGREE ABOUT. The records cover dead rows
+                // too - that is how a delete stays O(edit) - and a dead row's `chunks` row is gone
+                // by definition, so the point lookup below finds nothing and the sidecar is thrown
+                // away. With a fixed stride that is not a coin flip: the same tombstone is sampled
+                // on every open, so an index that has ever deleted enough to land one in the
+                // sample pays the full scan for the rest of its life. Measured on the production
+                // index (10,057,171 records, 206,063 of them dead): rejected on every open,
+                // 11.5 s instead of 0.6 s, with nothing visibly wrong.
+                //
+                // Skipped rather than checked-for-absence: re-indexing a file tombstones its old
+                // rows and writes new ones at the SAME (path, chunk_index), so "a dead record
+                // means no live row" is false, and asserting it would reject honest sidecars.
+                if raw.loadUnaligned(fromByteOffset: o + 41, as: UInt8.self) != 0 { i += stride; continue }
                 sqlite3_reset(stmt); sqlite3_clear_bindings(stmt)
                 bindPath(stmt, 1, pathTable[fid])
                 sqlite3_bind_int(stmt, 3, ci)
@@ -9149,7 +9163,7 @@ public final class VectorStore: @unchecked Sendable {
                       sqlite3_column_double(stmt, 1) == modified,
                       sqlite3_column_int64(stmt, 2) == size,
                       kindTextLocked(stmt, 3) == kindTable[kc]
-                else { sampleOK = false; break }
+                else { sampleOK = false; sampleWhy = "row \(i) dead=\(raw.loadUnaligned(fromByteOffset: o + 41, as: UInt8.self)) lookup/meta mismatch"; break }
                 // BEFORE asking for the blob pointer, not after. A covered row has no blob left to
                 // compare against - the file IS its vector - and sqlite3_column_blob returns NULL
                 // for a zero-length value, so binding it first failed the guard and rejected the
@@ -9157,13 +9171,13 @@ public final class VectorStore: @unchecked Sendable {
                 // of adopting: 5.4 s against 0.6 s at 4.5M rows, with nothing visibly wrong.
                 let blobBytes = Int(sqlite3_column_bytes(stmt, 0))
                 if blobBytes == 0 { i += stride; continue }
-                guard let blob = sqlite3_column_blob(stmt, 0) else { sampleOK = false; break }
+                guard let blob = sqlite3_column_blob(stmt, 0) else { sampleOK = false; sampleWhy = "row \(i) null blob"; break }
                 // WHERE THIS ROW'S VECTOR SITS, which is the row's own index only until two rows
                 // share one. Comparing position i against row i's blob under sharing fails for
                 // every row past the first duplicate - it is comparing two different contents -
                 // so the sidecar was rejected and the launch fell back to the full scan.
                 let pos = slotted ? Int(raw.loadUnaligned(fromByteOffset: o + 44, as: Int32.self)) : i
-                guard pos >= 0, (pos + 1) * header.dim <= flat16.count else { sampleOK = false; break }
+                guard pos >= 0, (pos + 1) * header.dim <= flat16.count else { sampleOK = false; sampleWhy = "row \(i) pos \(pos) out of file"; break }
                 let ok: Bool = flat16.withUnsafeBufferPointer { fb in
                     let row = UnsafeBufferPointer(rebasing: fb[pos * header.dim ..< (pos + 1) * header.dim])
                     if blobBytes == header.dim * 2 {
@@ -9175,11 +9189,11 @@ public final class VectorStore: @unchecked Sendable {
                     }
                     return false
                 }
-                if !ok { sampleOK = false }
+                if !ok { sampleOK = false; sampleWhy = "row \(i) pos \(pos) vector mismatch" }
                 i += stride
             }
         }
-        guard sampleOK else { return reject() }
+        guard sampleOK else { return reject("sample: \(sampleWhy)") }
         reportLoadProgress(0.25)   // files read + validated; the row rebuild below is the bulk
 
         // Commit: rebuild the derived structures exactly as loadIntoMemory would have.
