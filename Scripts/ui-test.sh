@@ -16,6 +16,24 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Shared with run-tests.sh, which moves Omni.xcodeproj out of the tree while it runs. Regenerating
+# a project while that is happening produces one with no development team, and its restore then
+# nests the backup inside ours. See the comment in run-tests.sh.
+LOCK=.build/omni-build.lock
+mkdir -p .build
+if ! mkdir "$LOCK" 2>/dev/null; then
+  holder=$(cat "$LOCK/pid" 2>/dev/null || echo "?")
+  if [ "$holder" != "?" ] && ! kill -0 "$holder" 2>/dev/null; then
+    echo "clearing a build lock left by dead pid $holder"
+    rm -rf "$LOCK"; mkdir "$LOCK"
+  else
+    echo "another build script is running (pid $holder); waiting for it..."
+    while ! mkdir "$LOCK" 2>/dev/null; do sleep 2; done
+  fi
+fi
+echo $$ > "$LOCK/pid"
+trap 'rm -rf "$LOCK"' EXIT
+
 # Overridable so a second, CONCURRENT xcodebuild (the automation-mode holder) does not fight this
 # one for the derived-data lock.
 DD=${OMNI_DD:-.build/xcode-rel}
@@ -23,9 +41,22 @@ ART="$PWD/$DD/SourcePackages/artifacts/swift-tokenizers/TokenizersRust/Tokenizer
 
 if command -v xcodegen >/dev/null 2>&1; then
   if [ ! -f Omni.xcodeproj/project.pbxproj ] || [ project.yml -nt Omni.xcodeproj/project.pbxproj ]; then
+    # RECOVER THE TEAM, AND REFUSE TO GENERATE WITHOUT ONE. project.yml writes
+    # DEVELOPMENT_TEAM = "${OMNI_TEAM_ID}" verbatim when the variable is unset, which produces a
+    # project that cannot sign - and the recovery below then reads that literal back as the team,
+    # so every later run regenerates the same broken project and the only symptom is
+    # "Signing for \"Omni\" requires selecting either a development team". Match the shape of a
+    # real team id, and stop rather than write a project that is guaranteed not to build.
     if [ -z "${OMNI_TEAM_ID:-}" ] && [ -f Omni.xcodeproj/project.pbxproj ]; then
-      OMNI_TEAM_ID=$(grep -m1 'DEVELOPMENT_TEAM = ' Omni.xcodeproj/project.pbxproj | sed -E 's/.*= ([A-Z0-9]*);/\1/')
+      OMNI_TEAM_ID=$(grep -m1 'DEVELOPMENT_TEAM = ' Omni.xcodeproj/project.pbxproj \
+                     | sed -E 's/.*= "?([A-Z0-9]{10})"?;.*/\1/')
+      case "$OMNI_TEAM_ID" in [A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9]) ;; *) OMNI_TEAM_ID="" ;; esac
       export OMNI_TEAM_ID
+    fi
+    if [ -z "${OMNI_TEAM_ID:-}" ]; then
+      echo "OMNI_TEAM_ID is not set and could not be read from Omni.xcodeproj." >&2
+      echo "Run: OMNI_TEAM_ID=<your 10-char team id> $0" >&2
+      exit 1
     fi
     xcodegen generate
   fi

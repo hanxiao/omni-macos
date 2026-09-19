@@ -18,11 +18,38 @@ DD=".build/xcode-rel"   # reuse the app's derived data so the Metal toolchain / 
 MODEL="${OMNI_MODEL_DIR:-/private/tmp/omni-model}"
 ART="$PWD/$DD/SourcePackages/artifacts/swift-tokenizers/TokenizersRust/TokenizersRust.artifactbundle"
 
+# ONE BUILD SCRIPT AT A TIME. This one moves Omni.xcodeproj out of the tree (below), so a
+# build-app.sh or ui-test.sh running concurrently finds no project, regenerates one from
+# project.yml - without OMNI_TEAM_ID, because the value it recovers lives in the project that is
+# currently in /tmp - and then this script's restore moves the backup INSIDE the regenerated
+# directory. The result is an unsignable project and a nested Omni.xcodeproj/Omni.xcodeproj.bak.NNN,
+# from a pair of commands that each look perfectly safe on their own.
+LOCK=.build/omni-build.lock
+mkdir -p .build
+if ! mkdir "$LOCK" 2>/dev/null; then
+  holder=$(cat "$LOCK/pid" 2>/dev/null || echo "?")
+  if [ "$holder" != "?" ] && ! kill -0 "$holder" 2>/dev/null; then
+    echo "clearing a build lock left by dead pid $holder"
+    rm -rf "$LOCK"; mkdir "$LOCK"
+  else
+    echo "another build script is running (pid $holder); waiting for it..."
+    while ! mkdir "$LOCK" 2>/dev/null; do sleep 2; done
+  fi
+fi
+echo $$ > "$LOCK/pid"
+
 # The generated Omni.xcodeproj shadows the SwiftPM package for xcodebuild; move it aside and restore
 # it no matter how we exit.
 moved=0
 if [ -d Omni.xcodeproj ]; then mv Omni.xcodeproj "/tmp/Omni.xcodeproj.bak.$$"; moved=1; fi
-restore() { [ "$moved" = 1 ] && mv "/tmp/Omni.xcodeproj.bak.$$" Omni.xcodeproj || true; }
+restore() {
+  # rm -rf FIRST. `mv src dst` where dst is an existing directory moves src INSIDE it, so a
+  # project that reappeared while we held ours aside would swallow the backup rather than be
+  # replaced by it. The lock above should make that impossible; this makes it non-destructive
+  # even if it is not.
+  if [ "$moved" = 1 ]; then rm -rf Omni.xcodeproj; mv "/tmp/Omni.xcodeproj.bak.$$" Omni.xcodeproj; fi
+  rm -rf "$LOCK"
+}
 trap restore EXIT
 
 # Resolve packages first so the Rust artifact exists before compile.
