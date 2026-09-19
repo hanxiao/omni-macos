@@ -6748,6 +6748,11 @@ public final class VectorStore: @unchecked Sendable {
     /// Whether THIS index has the split built and proven. Cached because every result row asks it,
     /// and a meta SELECT per displayed snippet is not free on the interactive path.
     private var splitBuilt = false
+    /// Contents a write touched, whose `refs` must be recomputed once the batch commits.
+    /// Recomputed rather than incremented: INSERT OR REPLACE on an occurrence can overwrite one,
+    /// and an increment that double-counts frees a vector another file still points at - silently,
+    /// which is the failure mode every invariant in MigrationV5 exists to rule out.
+    private var splitDirtyContents = Set<Int64>()
     /// Read the durable flag once. Set after a build and at open.
     private func refreshSplitBuiltLocked() {
         let was = splitBuilt
@@ -11427,6 +11432,16 @@ public final class VectorStore: @unchecked Sendable {
         var chunk: OpaquePointer?
         var text: OpaquePointer?
         var vec: OpaquePointer?
+        // THE SPLIT, WRITTEN DIRECTLY. Deriving it from the v4 rows after the fact was right while
+        // v4 was the only source of truth; it cannot survive dropping chunk_text, which is the
+        // point of the exercise. Separating identity from position is what makes this possible at
+        // write time: the content row can be inserted the moment its KEY is known, and its slot
+        // filled later by persistSlotsLocked, which is the only place the position is settled.
+        var chunkIns: OpaquePointer?
+        var chunkSel: OpaquePointer?
+        var occIns: OpaquePointer?
+        var snipIns: OpaquePointer?
+        var refsUpd: OpaquePointer?
         var dirIns: OpaquePointer?
         var dirSel: OpaquePointer?
         var fileUpsert: OpaquePointer?
@@ -11434,6 +11449,8 @@ public final class VectorStore: @unchecked Sendable {
         var lastDirID: Int64 = 0
         func finalize() {
             sqlite3_finalize(chunk); sqlite3_finalize(text); sqlite3_finalize(vec)
+            sqlite3_finalize(chunkIns); sqlite3_finalize(chunkSel); sqlite3_finalize(occIns)
+            sqlite3_finalize(snipIns); sqlite3_finalize(refsUpd)
             sqlite3_finalize(dirIns); sqlite3_finalize(dirSel); sqlite3_finalize(fileUpsert)
         }
     }
@@ -11447,6 +11464,14 @@ public final class VectorStore: @unchecked Sendable {
         guard sqlite3_prepare_v2(db, "INSERT INTO chunks(file_id, chunk_index, kind) VALUES(?,?,?);", -1, &w.chunk, nil) == SQLITE_OK,
               sqlite3_prepare_v2(db, "INSERT INTO chunk_text(chunk_id, kind, file_id, snippet, locator, chunk_key) VALUES(?,?,?,?,?,?);", -1, &w.text, nil) == SQLITE_OK,
               sqlite3_prepare_v2(db, "INSERT INTO pending_vecs(chunk_id, vec) VALUES(?,?);", -1, &w.vec, nil) == SQLITE_OK,
+              sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO chunk(key, kind, slot) VALUES(?,?,-1);",
+                                 -1, &w.chunkIns, nil) == SQLITE_OK,
+              sqlite3_prepare_v2(db, "SELECT id FROM chunk WHERE key = ?;", -1, &w.chunkSel, nil) == SQLITE_OK,
+              sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO occurrence(file_id, ordinal, chunk_id, locator) VALUES(?,?,?,?);",
+                                 -1, &w.occIns, nil) == SQLITE_OK,
+              sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO chunk_snippet(chunk_id, kind, snippet) VALUES(?,?,?);",
+                                 -1, &w.snipIns, nil) == SQLITE_OK,
+              sqlite3_prepare_v2(db, "UPDATE chunk SET refs = refs + 1 WHERE id = ?;", -1, &w.refsUpd, nil) == SQLITE_OK,
               sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO dirs(path) VALUES(?);", -1, &w.dirIns, nil) == SQLITE_OK,
               sqlite3_prepare_v2(db, "SELECT id FROM dirs WHERE path = ?;", -1, &w.dirSel, nil) == SQLITE_OK,
               sqlite3_prepare_v2(db, """
@@ -11508,6 +11533,46 @@ public final class VectorStore: @unchecked Sendable {
             sqlite3_bind_int64(w.vec, 1, cid)
             bfs[i].withUnsafeBytes { _ = sqlite3_bind_blob(w.vec, 2, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT) }
             guard sqlite3_step(w.vec) == SQLITE_DONE else { return nil }
+
+            // THE SPLIT, IN THE SAME TRANSACTION AS THE v4 ROWS. Written rather than derived, so
+            // that dropping chunk_text takes nothing with it.
+            if Self.chunkSplit, splitBuilt {
+                // The same synthetic key MigrationV5 uses for a chunk that carries none: a real
+                // key is a 16-byte digest, so a one-byte-prefixed row id can never collide. Both
+                // sides must agree or a chunk is stored under one key and looked up under another.
+                var ckey = key
+                if ckey.isEmpty { ckey = Data([0]) + withUnsafeBytes(of: cid.littleEndian) { Data($0) } }
+                sqlite3_reset(w.chunkIns)
+                ckey.withUnsafeBytes { _ = sqlite3_bind_blob(w.chunkIns, 1, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT) }
+                sqlite3_bind_int(w.chunkIns, 2, kc)
+                guard sqlite3_step(w.chunkIns) == SQLITE_DONE else { return nil }
+
+                sqlite3_reset(w.chunkSel)
+                ckey.withUnsafeBytes { _ = sqlite3_bind_blob(w.chunkSel, 1, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT) }
+                guard sqlite3_step(w.chunkSel) == SQLITE_ROW else { return nil }
+                let contentID = sqlite3_column_int64(w.chunkSel, 0)
+                sqlite3_reset(w.chunkSel)
+
+                sqlite3_reset(w.occIns)
+                sqlite3_bind_int64(w.occIns, 1, fid)
+                sqlite3_bind_int(w.occIns, 2, Int32(c.chunkIndex))
+                sqlite3_bind_int64(w.occIns, 3, contentID)
+                sqlite3_bind_text(w.occIns, 4, c.locator, -1, SQLITE_TRANSIENT)
+                guard sqlite3_step(w.occIns) == SQLITE_DONE else { return nil }
+
+                sqlite3_reset(w.snipIns)
+                sqlite3_bind_int64(w.snipIns, 1, contentID)
+                sqlite3_bind_int(w.snipIns, 2, kc)
+                sqlite3_bind_text(w.snipIns, 3, c.snippet, -1, SQLITE_TRANSIENT)
+                _ = sqlite3_step(w.snipIns)
+
+                // refs counts the occurrences that exist. INSERT OR REPLACE above may have
+                // overwritten one, so this is recomputed rather than incremented - an increment
+                // that double-counts frees a vector another file still points at, silently.
+                sqlite3_reset(w.refsUpd)
+                sqlite3_bind_int64(w.refsUpd, 1, contentID)
+                splitDirtyContents.insert(contentID)
+            }
 
             bytesWrittenSinceCkpt += c.embedding.count * 2 + c.snippet.utf8.count + 160   // WAL-growth estimate (F17)
         }
@@ -12260,12 +12325,27 @@ public final class VectorStore: @unchecked Sendable {
             sqlite3_bind_int64(st, 2, cid)
             _ = sqlite3_step(st)
         }
-        // THE SPLIT, IN STEP, and here because this is the one place every write reaches with its
-        // slots already settled - `replace`, `replaceMany` and the backfill all funnel through it.
-        // Anywhere earlier and the position is not known yet; anywhere later and there is no single
-        // site that sees them all.
+        // THE SPLIT, IN STEP. The rows themselves were written natively by `writeChunksLocked`;
+        // what could not be done there is the POSITION, which is only settled here, and the
+        // refcount, which depends on how many occurrences ended up pointing at each content.
+        //
+        // This is the one place every write reaches with its slots decided - `replace`,
+        // `replaceMany` and the backfill all funnel through it. Anywhere earlier and the position
+        // is not known; anywhere later and no single site sees them all.
         if Self.chunkSplit, splitBuilt {
-            maintainSplitForFilesLocked(filesOfChunkRowsLocked(ids))
+            for (i, cid) in ids.enumerated() where slots[i] >= 0 {
+                exec("UPDATE chunk SET slot = \(slots[i]) WHERE id = "
+                     + "(SELECT chunk_id FROM occurrence o JOIN chunks c ON c.file_id = o.file_id "
+                     + "AND c.chunk_index = o.ordinal WHERE c.id = \(cid));")
+            }
+            if !splitDirtyContents.isEmpty {
+                let list = splitDirtyContents.map(String.init).joined(separator: ",")
+                exec("UPDATE chunk SET refs = (SELECT COUNT(*) FROM occurrence o WHERE o.chunk_id = chunk.id) "
+                     + "WHERE id IN (\(list));")
+                exec("DELETE FROM free_slot WHERE id IN "
+                     + "(SELECT slot FROM chunk WHERE id IN (\(list)) AND refs > 0 AND slot >= 0);")
+                splitDirtyContents.removeAll(keepingCapacity: true)
+            }
         }
         // A CONTENT THE CLAIM ALREADY COVERS NEEDS NO BLOB, and this is the only place that can
         // know. The writer stores a pending vector for every chunk because it cannot know the slot
