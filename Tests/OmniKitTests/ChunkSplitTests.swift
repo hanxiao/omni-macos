@@ -331,6 +331,50 @@ final class ChunkSplitTests: XCTestCase {
                      "the lookup invented a slot for a content that does not exist")
     }
 
+    /// THE CUTOVER, REHEARSED: run with chunk_text emptied and see whether anything still needs it.
+    ///
+    /// Dropping the table is the last step and it cannot be taken on the strength of "I moved the
+    /// readers I could find". This empties it and then does what a user does - search, read the
+    /// text under a hit, reuse a file whose content has not changed, delete, re-add - and demands
+    /// the answers still come back. Whatever still needs v4 fails here rather than in the field.
+    func testTheIndexWorksWithChunkTextEmptied() throws {
+        let savedQuant = VectorStore.quantBaseOverride
+        VectorStore.quantBaseOverride = VectorStore.scanBits
+        defer { VectorStore.quantBaseOverride = savedQuant }
+        let url = tempDB()
+        let store = try build(url, files: 30, dupEvery: 3)
+        defer { store.close() }
+        XCTAssertTrue(store.buildChunkSplitForTest(), "the split did not build")
+
+        let before = store.search(vec(1000), filter: SearchFilter(), topK: 10)
+        XCTAssertFalse(before.isEmpty, "the fixture returns nothing even before the cutover")
+        XCTAssertTrue(before.contains { !$0.snippet.isEmpty }, "no hit carried text before the cutover")
+
+        store.emptyV4TextForTest()
+
+        // 1. Search still answers, with the same files.
+        let after = store.search(vec(1000), filter: SearchFilter(), topK: 10)
+        XCTAssertEqual(before.map(\.path), after.map(\.path), "the results changed once v4 text was gone")
+        // 2. And still carries its display text, which only the split can supply now.
+        XCTAssertEqual(before.map(\.snippet), after.map(\.snippet), "the snippets came from chunk_text")
+        XCTAssertEqual(before.map(\.locator), after.map(\.locator), "the locators came from chunk_text")
+        // 3. Content reuse still finds an existing content.
+        XCTAssertNotNil(store.liveSlotForContentKeyForTest(String(format: "%016x", 7)),
+                        "content reuse stopped working without chunk_text")
+        // 4. And the store still takes writes and deletes.
+        let p = "/after/new.txt"
+        try store.replace(path: p, chunks: [
+            IndexedChunk(path: p, modified: 1, size: 10, kind: "text", chunkIndex: 0,
+                         snippet: "post cutover", embedding: vec(4242), locator: "Line 1",
+                         chunkKey: String(format: "%016x", 4242)),
+        ])
+        XCTAssertEqual(store.search(vec(4242), filter: SearchFilter(), topK: 3).first?.path, p,
+                       "a file written after the cutover is not findable")
+        store.deletePath("/v4/f2.txt")
+        XCTAssertFalse(store.search(vec(1002), filter: SearchFilter(), topK: 5).contains { $0.path == "/v4/f2.txt" },
+                       "a delete after the cutover did not take")
+    }
+
     func testItRefusesUntilEveryRowHasASlot() throws {
         let url = tempDB()
         let store = try VectorStore(dbURL: url)

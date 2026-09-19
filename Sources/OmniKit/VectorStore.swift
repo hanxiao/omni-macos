@@ -2592,14 +2592,26 @@ public final class VectorStore: @unchecked Sendable {
         guard !byIndex.isEmpty else { return nil }
         var out: [IndexedChunk] = []
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, """
+        // THE SAME ROW, FROM WHICHEVER SCHEMA THIS INDEX HAS. Snippet comes from the CONTENT and
+        // locator from the OCCURRENCE, which is the split's whole point: one paragraph is Line 1
+        // of one file and Line 4310 of another. `chunk_index` is the occurrence's ordinal.
+        let reuseSQL = splitBuilt ? """
+            SELECT f.modified, f.size, k.kind, o.ordinal, COALESCE(s.snippet, ''), f.width, f.height,
+                   f.duration, o.locator, k.key
+              FROM occurrence o
+              JOIN files f ON f.id = o.file_id
+              JOIN chunk k ON k.id = o.chunk_id
+              LEFT JOIN chunk_snippet s ON s.chunk_id = k.id
+             WHERE o.file_id = \(StoreSchema.fileIDByPath) ORDER BY o.ordinal;
+            """ : """
             SELECT f.modified, f.size, c.kind, c.chunk_index, t.snippet, f.width, f.height,
                    f.duration, t.locator, t.chunk_key
               FROM chunks c
               JOIN files f ON f.id = c.file_id
               JOIN chunk_text t ON t.chunk_id = c.id
              WHERE c.file_id = \(StoreSchema.fileIDByPath) ORDER BY c.chunk_index;
-            """, -1, &stmt, nil) == SQLITE_OK else { return nil }
+            """
+        guard sqlite3_prepare_v2(db, reuseSQL, -1, &stmt, nil) == SQLITE_OK else { return nil }
         defer { sqlite3_finalize(stmt) }
         bindPath(stmt, 1, path)
         let d = dim
@@ -10763,7 +10775,7 @@ public final class VectorStore: @unchecked Sendable {
         exec("DELETE FROM chunks WHERE file_id = \(fid);")
         // AFTER the v4 rows are gone, so regenerating this file's split rows from them correctly
         // finds none and the refs recount drops the contents nothing points at any more.
-        if Self.chunkSplit, splitBuilt { maintainSplitForFilesLocked([fid]) }
+        if Self.chunkSplit, splitBuilt { dropSplitForFilesLocked([fid]) }
     }
 
     /// Same, plus the file's dedup entry - for a removal, where `replace` deliberately keeps it.
@@ -11764,6 +11776,31 @@ public final class VectorStore: @unchecked Sendable {
         return contentFolded
     }
 
+    /// A FILE'S OCCURRENCES GO, AND WHATEVER THAT ORPHANS GOES WITH THEM.
+    ///
+    /// The delete side cannot re-derive from v4 the way the write side used to: after the cutover
+    /// there is no v4 to derive from. It is also simpler stated directly - a delete removes
+    /// pointers, and a content nobody points at any more releases its position.
+    func dropSplitForFilesLocked(_ fileIDs: [Int64]) {
+        guard Self.chunkSplit, splitBuilt, dbOpen(), !fileIDs.isEmpty else { return }
+        let list = fileIDs.map(String.init).joined(separator: ",")
+        exec("CREATE TEMP TABLE IF NOT EXISTS split_aff(chunk_id INTEGER PRIMARY KEY);")
+        exec("DELETE FROM split_aff;")
+        exec("INSERT OR IGNORE INTO split_aff SELECT chunk_id FROM occurrence WHERE file_id IN (\(list));")
+        exec("DELETE FROM occurrence WHERE file_id IN (\(list));")
+        exec("""
+            UPDATE chunk SET refs = (SELECT COUNT(*) FROM occurrence o WHERE o.chunk_id = chunk.id)
+             WHERE id IN (SELECT chunk_id FROM split_aff);
+            """)
+        exec("""
+            INSERT OR IGNORE INTO free_slot(id)
+            SELECT slot FROM chunk WHERE id IN (SELECT chunk_id FROM split_aff) AND refs = 0 AND slot >= 0;
+            """)
+        exec("DELETE FROM chunk_snippet WHERE chunk_id IN "
+             + "(SELECT chunk_id FROM split_aff WHERE chunk_id IN (SELECT id FROM chunk WHERE refs = 0));")
+        exec("DELETE FROM chunk WHERE id IN (SELECT chunk_id FROM split_aff) AND refs = 0;")
+    }
+
     /// KEEP THE SPLIT IN STEP WITH A WRITE, for the files it touched.
     ///
     /// Regenerates those files' split rows FROM THE v4 ROWS rather than computing them a second
@@ -11924,6 +11961,16 @@ public final class VectorStore: @unchecked Sendable {
             exec("DELETE FROM chunk_snippet;"); exec("DELETE FROM free_slot;")
             exec("DELETE FROM meta WHERE key = '\(Self.chunkSplitDoneKey)';")
             splitBuilt = false
+        }
+    }
+
+    /// Empty chunk_text entirely, which is what dropping it will do. Cached statements go with
+    /// it, so the next read re-prepares against whatever is left.
+    public func emptyV4TextForTest() {
+        queue.sync {
+            exec("DELETE FROM chunk_text;")
+            sqlite3_finalize(contentSelStmt); contentSelStmt = nil
+            sqlite3_finalize(snippetStmt); snippetStmt = nil
         }
     }
 
