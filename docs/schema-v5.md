@@ -991,6 +991,39 @@ releasing.
      window went to v4 only, so they are given occurrences in the same store-queue turn that
      publishes the done flag - there is no instant where the split is authoritative and
      incomplete.
+  4b. PROVEN UNDER REAL-USER CHAOS, which is what steps 1-4 were for.
+
+     `Scripts/migration-chaos.sh` against a clone of the real 9,773,836-chunk v4 index with
+     OMNI_CHUNK_SPLIT, OMNI_SPLIT_CUTOVER and OMNI_FREE_LIST all on, while the index migrated
+     underneath and files were created, edited, renamed and deleted under a watched folder on a
+     0.4 s cycle:
+
+         testChaosWhileAnOldIndexMigrates passed (704.075 s), 73 rounds, 0 failures
+         === the split WAS built and in use for this run        rc=0
+
+         chunks      9773836     chunk        6257501
+         chunk_text  9773836     occurrence   9773836
+                                 snippet      6257501
+                                 free_slot    3770848
+         vec_holes    254513
+
+     The split built off-queue in 174.1 s with the app responsive throughout. Afterwards: 0
+     failing audit checks and digest ba7a13400e714f79 at p50 10.1 ms - the same digest as the
+     pre-migration baseline and as every other run in this work.
+
+     The run drove typing abandoned before the debounce, cancel storms, find-similar, grid/list,
+     back/forward, OCR mode on and off, sidebar folder walking, hard scrolling, history replay,
+     filter chips cleared mid-flight, both context menus, the drawer, escape/cmd-F alternation,
+     folder pause/resume, and folder remove/add through the picker.
+
+     THREE EARLIER RUNS REPORTED rc=2 AND WERE RIGHT TO. Two never let the migration finish; the
+     third had the churn thread running through the quiet period, so the slot backfill consumed
+     all 420 s. Each of those would have been reported as a passing chaos run over the split -
+     the suite itself passed every time - if the harness were not made to check that the thing
+     under test had actually switched on. That check is the only reason this result means
+     anything, and it is the same lesson as OMNI_CHUNK_SPLIT and OMNI_SPLIT_CUTOVER reporting
+     green for weeks without executing.
+
   5. Move the resident loader, the coverage walk and the row sidecar off `chunks` onto
      `occurrence` + `chunk`. The largest step, and the one that finally deletes rank-is-position.
      Measured rather than guessed: 121 statements across 59 functions name `chunks`. Three groups
