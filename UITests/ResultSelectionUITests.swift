@@ -149,6 +149,43 @@ final class ResultSelectionUITests: XCTestCase {
                           "a 60-point drag behaved exactly like a click, so this probe cannot see the marquee")
     }
 
+    /// THE FIRST CLICK INTO A WINDOW THAT IS NOT KEY. PASSES, WITH A CAVEAT WORTH READING.
+    ///
+    /// It passes, so this is not the reported failure as far as the harness can tell - but XCUITest
+    /// may synthesize activation before the click, where a real single physical click does not.
+    /// Treat this as "not reproduced" rather than "eliminated"; the only way to settle it is a
+    /// human clicking once into an unfocused window.
+    ///
+    /// On macOS a click into an inactive window is consumed by activating it unless the view under
+    /// the pointer accepts first mouse, and SwiftUI views do not by default. That fits the report
+    /// better than the marquee ever did: it was the FIRST search, the window was floating over
+    /// other apps, and it stopped happening afterwards - because by then the window was key.
+    func testTheFirstClickIntoAnInactiveWindowStillSelects() throws {
+        let app = launch()
+        defer { app.terminate() }
+        try XCTSkipUnless(search(app, "document"), "no results to select")
+        let rows = app.descendants(matching: .any).matching(identifier: "result.row")
+        XCTAssertTrue(rows.element(boundBy: 0).waitForExistence(timeout: 10))
+
+        // Take focus away, the way reaching for Omni from another app does.
+        let finder = XCUIApplication(bundleIdentifier: "com.apple.finder")
+        finder.activate()
+        RunLoop.current.run(until: Date().addingTimeInterval(1.5))
+        XCTAssertNotEqual(app.state, .runningForeground,
+                          "the fixture never lost focus, so it proves nothing")
+
+        // ONE click on a row - the first thing a returning user does.
+        rows.element(boundBy: 0).click()
+        var selected = false
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline, !selected {
+            selected = rows.element(boundBy: 0).isSelected
+            if !selected { RunLoop.current.run(until: Date().addingTimeInterval(0.2)) }
+        }
+        XCTAssertTrue(selected,
+                      "the first click into an inactive window selected nothing: it was spent activating")
+    }
+
     func testClickingAResultSelectsIt() throws {
         let app = launch()
         defer { app.terminate() }
