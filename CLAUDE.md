@@ -8,6 +8,12 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
 - Embeddings run in-process via MLX-Swift (mlx-swift), not via any server.
 - Indexes user files (Documents/Downloads/Desktop, user-selectable).
 - Text first; for non-extractable PDFs (scans) render page -> image -> omni image embedding.
+- NEVER REPAIR AN INDEX BY HAND. When a real index turns out to be in a bad state, the fix goes
+  into the migration or open path that SHIPS, so that every user's index repairs itself on the next
+  launch. Running SQL against the machine in front of you fixes one index and leaves everybody
+  else's broken - and it destroys the evidence that would have proved the shipped repair works. The
+  test for a repair is that it runs on a real damaged index THROUGH the app, not that the index
+  ends up healthy.
 
 ## Architecture
 - `OmniKit` (SPM library): the engine + indexer.

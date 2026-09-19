@@ -1082,6 +1082,18 @@ public final class VectorStore: @unchecked Sendable {
         scheduleCoverageStampLocked()
     }
     private static let foldThreshold = 50_000
+    /// HOW MANY PATCHED POSITIONS ARE WORTH CARRYING before rebuilding the base instead.
+    ///
+    /// A DELTA row and a PATCHED row are not the same cost and `foldThreshold` charged them the
+    /// same. A delta row is scored by the delta pass that has to run anyway; a patched one is
+    /// gathered out of `flat16`, matmul'd and scattered over the scores on EVERY QUERY. At 50,000
+    /// that is an unbounded per-query tax, and a sample of a churn run says it is the whole of the
+    /// free list's cost - `patchScoresLocked` 51 frames against 1 for `rebuildBaseLocked`.
+    nonisolated(unsafe) public static var patchedRebuildThresholdOverride: Int? = nil
+    static var patchedRebuildThreshold: Int {
+        patchedRebuildThresholdOverride
+            ?? ProcessInfo.processInfo.environment["OMNI_PATCH_MAX"].flatMap(Int.init) ?? 16
+    }
     // Last interactive search time (queue-guarded). When a write invalidates the base WHILE the user is
     // actively searching, the write rebuilds the base in place (it already holds the queue, and runs
     // right after its own embed so the rebuild's GPU eval does not wait behind in-flight indexing
@@ -4532,11 +4544,13 @@ public final class VectorStore: @unchecked Sendable {
             let fusible = quantBase == nil && bitBase == nil && mlxFileID != nil && baseRows > 0 && !baseDirty
                 && (filter.kinds.isEmpty || mlxKindCode != nil)
                 && (n - baseRows) + patchedSlots.count <= Self.foldThreshold
+                && patchedSlots.count <= Self.patchedRebuildThreshold
                 && queryGraph.size == dim   // dim is shared state - read under the lock (self-review fix)
             guard fusible else { needClassic = true; return nil }
             guard n > 0, dim > 0, flat16.count == n * dim else { return [] }
             if baseDirty || (mlxBase == nil && quantBase == nil && bitBase == nil)
-                || (n - baseRows) + patchedSlots.count > Self.foldThreshold { rebuildBaseLocked(rowCount: n) }
+                || (n - baseRows) + patchedSlots.count > Self.foldThreshold
+                || patchedSlots.count > Self.patchedRebuildThreshold { rebuildBaseLocked(rowCount: n) }
             // A rebuild can flip the base to quant mode (mlxBase stays nil); the fused GPU path no
             // longer applies, so fall back to the classic quant-capable path after the lock.
             // Through the BUILDER, not the stored array: the cached copy can be sized to a
@@ -4786,7 +4800,8 @@ public final class VectorStore: @unchecked Sendable {
             guard n > 0, dim > 0, query.count == dim, flat16.count == n * dim else { return [] }
             if markActive { lastSearchAt = Date() }   // stamp AFTER the guard so an empty/invalid query never fakes a search window
             if baseDirty || (mlxBase == nil && quantBase == nil && bitBase == nil)
-                || (n - baseRows) + patchedSlots.count > Self.foldThreshold {
+                || (n - baseRows) + patchedSlots.count > Self.foldThreshold
+                || patchedSlots.count > Self.patchedRebuildThreshold {
                 rebuildBaseLocked(rowCount: n)
             }
             let t0 = Self.searchTiming ? Date() : nil
@@ -6543,30 +6558,27 @@ public final class VectorStore: @unchecked Sendable {
     // is the delta's idea applied to an arbitrary position rather than to the tail: the position is
     // rescored exactly from `flat16` on every query and the result written over the stale one,
     // until a full rebuild folds it in.
-    /// OFF, on a MEASUREMENT rather than on a doubt. `OMNI_FREE_LIST=1` turns it on.
+    /// ON. `OMNI_FREE_LIST=0` turns it off.
     ///
-    /// It is correct: the suite is clean with it on, and so is a 4,000-file churn - no missing rows,
-    /// no orphans, no ghost hits, coverage consistent. What it is not is free. Measured over 45
-    /// seconds of churn on the same corpus, changing only this flag:
+    /// It was off for a day on a measurement: a third of the churn throughput, 587 operations
+    /// against 914 with only this flag changed. Three hypotheses about why, two of them wrong and
+    /// both fixed anyway (the free set rebuilt on every append; the incremental base refused to run
+    /// with any patched row). Neither recovered anything. A sample said what actually cost:
+    /// `patchScoresLocked` 51 frames against 1 for `rebuildBaseLocked` - the patch scoring itself,
+    /// on EVERY query, because patched positions accumulated between folds.
     ///
-    ///     free list off   914 churn ops   7,897 searches   182 full passes
-    ///     free list on    587 churn ops   5,111 searches   117 full passes
+    /// `patchedRebuildThreshold` is the fix and it is a threshold rather than an algorithm: a
+    /// patched position costs per-query work, so carrying thousands of them is never right, and
+    /// rebuilding the base to be rid of them is cheap by comparison. Swept on a 4,000-file churn:
     ///
-    /// A third of the throughput, and the cause is one line elsewhere: the incremental base update
-    /// requires `patchedSlots.isEmpty`, so a single reused position below `baseRows` makes every
-    /// subsequent base fold REPACK the whole quantized replica instead of appending its delta.
+    ///     off        770, 765 ops       (two runs, for the noise)
+    ///     max 8      752               max 32     736
+    ///     max 16     755               max 64     715
+    ///     max 50000  458   <- what charging a patched row like a delta row cost
     ///
-    /// That guard is not wrong. The funnel SELECTS candidates from the quantized base, so a stale
-    /// quantized row can stop a patched position being selected at all - and `patchScoresLocked`
-    /// only corrects the scores of positions that were already selected. Fixing this means
-    /// re-quantizing just the patched rows and scattering them into the base, which is O(patched)
-    /// rather than O(rows), on the hottest and most correctness-critical path in the store. That is
-    /// a change worth making carefully rather than quickly.
-    ///
-    /// Until then the trade is a third of the churn throughput against holes reclaimed without a
-    /// whole-file rewrite, and the reclaim already returns that space - so this waits.
+    /// At 16 it is inside run-to-run noise of not having the free list at all.
     nonisolated(unsafe) public static var freeListEnabled =
-        ProcessInfo.processInfo.environment["OMNI_FREE_LIST"] == "1"
+        ProcessInfo.processInfo.environment["OMNI_FREE_LIST"] != "0"
     private var freeSlots = SlotAllocator()
     private var freeSlotsValid = false
     /// The mutation the quarantine was last released at. A position freed in one mutation becomes

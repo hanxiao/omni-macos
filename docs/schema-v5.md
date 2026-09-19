@@ -569,7 +569,7 @@ AND MEASURE IT OVER FIVE RUNS. Several hours went into bisecting on single-run c
 53, 61) and reading movement in noise. A single run tells you whether an arm fails; it tells you
 nothing about whether a change helped. Only 0 means anything.
 
-## The free list: correct, and a third of the churn throughput
+## The free list: on, once a patched row stopped being charged like a delta row
 
 Handing a released position to the next new content instead of waiting for a whole-file copy is
 obviously right, and it is written: `SlotAllocator` allocates from a min-heap, `placeVectorLocked`
@@ -610,12 +610,28 @@ patch scoring itself, paid on EVERY QUERY - gather the patched rows out of `flat
 the results over the scores - and under churn many queries run between folds, so the list is rarely
 empty.
 
-WHICH MAKES THE OBVIOUS FIX UNSAFE. Refreshing the base at PLACEMENT time would empty the list and
-cost nothing per query, but `placeVectorLocked` runs inside a transaction that can roll back, and a
-base updated there would be ahead of the data that rolled back. Deferring is exactly why the patch
-list exists. Bounding it instead - forcing a base rebuild once the patched count passes some small
-threshold - trades many cheap queries for one expensive rebuild, and what that threshold should be
-is a measurement nobody has taken.
+THE OBVIOUS FIX IS UNSAFE, AND THE NEXT ONE WORKS. Refreshing the base at PLACEMENT time would
+empty the list and cost nothing per query, but `placeVectorLocked` runs inside a transaction that
+can roll back, and a base updated there would be ahead of data that rolled back. Deferring is
+exactly why the patch list exists.
+
+Bounding it is the answer, and the bound was the bug: `foldThreshold` charged a patched row like a
+delta row at 50,000. They are not the same cost. A delta row is scored by a pass that has to run
+anyway; a patched row is gathered, matmul'd and scattered on EVERY QUERY. `patchedRebuildThreshold`
+is separate and small, and the sweep on a 4,000-file churn is monotonic:
+
+    off        770, 765 ops   (two runs, for the noise)
+    max 8      752            max 32     736
+    max 16     755            max 64     715
+    max 50000  458            <- what charging them the same cost
+
+At 16 the free list is inside run-to-run noise of not being there, so it is ON by default:
+733 ops against 768 with it off, PASS on every churn invariant - no missing rows, no orphans, no
+ghost hits, coverage consistent. 573 tests, 0 failures.
+
+Both wrong hypotheses left real fixes behind and both are kept: the allocator raises its ceiling
+instead of rebuilding the free set on every append, and the incremental base repacks patched rows
+rather than refusing to run. Neither mattered for throughput. Both are correct.
 
 Until the base interaction is fixed the trade is a third of the churn throughput against holes
 reclaimed without a whole-file rewrite - and the reclaim already returns that space. So it waits.
