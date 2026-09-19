@@ -901,9 +901,35 @@ releasing.
   1. Split always built, every reader answering from it, v4 still written alongside. This is the
      safety net that makes the rest checkable - the split can be rebuilt from v4 and compared row
      for row - and it is the one step that must come first. DONE.
-  2. Stop writing `chunk_text`. `OMNI_SPLIT_CUTOVER=1` already does it in `writeChunksLocked`;
-     what remains is the two paths that still write v4 text directly, the scan-kind migration and
-     the v3 -> v4 conversion.
+  2. Stop writing `chunk_text`. MUCH BIGGER THAN IT LOOKED, and the reason it looked small is
+     worth recording: the cutover's guard is `chunkSplit && splitCutover && splitBuilt`, and
+     `splitBuilt` was almost never true in a unit test, because the split is built from the
+     coverage stamp and unit tests do not run one. So `OMNI_SPLIT_CUTOVER=1` reported 0 failures
+     while writing `chunk_text` on every path - it had never actually run. The same was true of
+     `OMNI_CHUNK_SPLIT=1` on its own.
+
+     Making an empty index born v5 (step 1) turned both arms real. The honest baseline:
+
+         default              590 tests, 0 failures
+         OMNI_FREE_LIST=0     590 tests, 0 failures
+         OMNI_CHUNK_SPLIT=1   590 tests, 0 failures
+         + OMNI_SPLIT_CUTOVER 590 tests, 15 tests failing (2027 assertions)
+
+     The 15 are bounded and named, which is what makes this a piece of work rather than an
+     unknown:
+
+         SchemaV4MigrationTests    8   the v3 -> v4 conversion writes chunk_text and nothing
+                                       else; under cutover an upgraded index has no text at all
+         StoredTagsBindTests       3   tag readers that still join chunk_text
+         ChunkLocatorTests         1   locator round trip
+         StoreChunkReuseTests      1   file-level reuse
+         ChunkReuseEvictionTests   1   the same, under eviction
+         ScanKindMigrationTests    1   scan reclassification
+
+     The scan-kind migration's READ side is already moved; its write side was already split-aware.
+     The v3 -> v4 conversion is the large one: it has to produce the v5 shape directly, or produce
+     v4 and be followed by the build in the same launch, and that choice decides whether `chunks`
+     can be dropped in the same pass or one after it.
   3. Deletes decrement `chunk.refs` and release the slot at zero, instead of re-deriving what is
      still referenced across four sites.
   4. Retire the fold. It cannot happen before 2 and 3, and it is what pays for them: `chunk.key`
