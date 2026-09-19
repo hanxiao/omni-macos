@@ -466,6 +466,18 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     /// Serialize MLX work. `highPriority` calls run before any waiting low-priority
     /// (indexing) calls; a low-priority call also yields whenever a high-priority call
     /// is queued, so a search waits at most one in-flight embed.
+    /// WHO HOLDS THE GATE, so a waiting search can lift them.
+    ///
+    /// `NSCondition` does not donate priority. Indexing runs at Utility and a query runs at
+    /// User-initiated, so a search that waits here waits on a thread the system has no reason to
+    /// hurry - a textbook priority inversion, and macOS's Thread Performance Checker names it
+    /// during a chaos run: "Thread running at User-initiated quality-of-service class waiting on a
+    /// lower QoS thread running at Utility". The gate already lets a query jump the QUEUE; what it
+    /// could not do is speed up the one embed already in flight, which is exactly the wait a
+    /// search pays.
+    private var holderThread: pthread_t?
+    private var holderBoost: pthread_override_t?
+
     private func run<T>(highPriority: Bool, _ work: () -> T) -> T {
         // Raised BEFORE the wait, not after it: the point is that the OCR lane stops submitting
         // while a query is queued, and a query spends most of its latency queued.
@@ -473,10 +485,17 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         defer { if highPriority { GPUInteractive.leave() } }
         let tWait = omniPerfEnabled ? Date() : nil
         cond.lock()
-        if highPriority { highWaiting += 1 }
+        if highPriority {
+            highWaiting += 1
+            // Lift the in-flight low-priority holder to the waiter's class for as long as it
+            // keeps the gate. Ended by whoever releases, so the boost never outlives the work.
+            if busy, let h = holderThread, holderBoost == nil {
+                holderBoost = pthread_override_qos_class_start_np(h, QOS_CLASS_USER_INITIATED, 0)
+            }
+        }
         while busy || (!highPriority && highWaiting > 0) { cond.wait() }
         busy = true
-        if highPriority { highWaiting -= 1 }
+        if highPriority { highWaiting -= 1 } else { holderThread = pthread_self() }
         cond.unlock()
         if highPriority, let tWait {   // how long an interactive query waited behind in-flight indexing
             let w = -tWait.timeIntervalSinceNow * 1000
@@ -488,7 +507,14 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             lastGPUWork = Date()
             gpuBusyAccum += lastGPUWork.timeIntervalSince(t0)
         }
-        cond.lock(); busy = false; cond.broadcast(); cond.unlock()
+        cond.lock()
+        busy = false
+        if !highPriority {
+            holderThread = nil
+            if let o = holderBoost { pthread_override_qos_class_end_np(o); holderBoost = nil }
+        }
+        cond.broadcast()
+        cond.unlock()
         return result
     }
 

@@ -1032,7 +1032,15 @@ private struct MarqueeSelect: ViewModifier {
     let space: String
     // Owned here, not in ResultsList: the item frames refresh on every scroll tick, so confining them to
     // this modifier means a scroll re-evaluates only this overlay, not the whole list/gallery body.
-    @State private var frames: [String: CGRect] = [:]
+    //
+    // AND NOT IN @State, which is the part that mattered. Writing the map into view state on every
+    // preference change re-rendered this overlay for every scroll tick, and the re-render let the
+    // rows republish inside the same frame - which SwiftUI reports as "Bound preference
+    // ResultItemFramesKey tried to update multiple times per frame", five times in a four-minute
+    // chaos run. The frames are only ever READ while a drag is in flight, so a reference box holds
+    // them without telling SwiftUI anything changed, and the loop has nowhere to go.
+    private final class FrameBox { var frames: [String: CGRect] = [:] }
+    @State private var box = FrameBox()
     @State private var origin: CGPoint?
     @State private var rect: CGRect?
     @State private var base: Set<String> = []
@@ -1040,7 +1048,7 @@ private struct MarqueeSelect: ViewModifier {
     func body(content: Content) -> some View {
         content
             .coordinateSpace(name: space)
-            .onPreferenceChange(ResultItemFramesKey.self) { frames = $0 }
+            .onPreferenceChange(ResultItemFramesKey.self) { [box] in box.frames = $0 }
             .overlay(alignment: .topLeading) {
                 if let rect {
                     // The native macOS rubber-band is a NEUTRAL translucent grey, not the accent: a
@@ -1067,7 +1075,7 @@ private struct MarqueeSelect: ViewModifier {
                         let r = CGRect(x: min(o.x, v.location.x), y: min(o.y, v.location.y),
                                        width: abs(v.location.x - o.x), height: abs(v.location.y - o.y))
                         rect = r
-                        let hit = Set(frames.compactMap { $0.value.intersects(r) ? $0.key : nil })
+                        let hit = Set(box.frames.compactMap { $0.value.intersects(r) ? $0.key : nil })
                         model.applyMarqueeSelection(base.union(hit))
                     }
                     .onEnded { _ in origin = nil; rect = nil }

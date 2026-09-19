@@ -91,7 +91,7 @@ final class MigrationChaosUITests: XCTestCase {
         var rounds = 0
 
         while Date() < deadline {
-            switch rounds % 10 {
+            switch rounds % 12 {
             case 0:
                 // Type, then abandon before the debounce settles.
                 focusSearch(app)
@@ -180,6 +180,39 @@ final class MigrationChaosUITests: XCTestCase {
                 usleep(300_000)
                 app.typeKey("a", modifierFlags: .command)
                 app.typeKey(XCUIKeyboardKey.delete, modifierFlags: [])
+            case 10:
+                // THE CONTEXT MENU ON A RESULT, which is the largest untested surface in the app:
+                // reveal, copy path, find similar, tags, trash, stack actions. Opened and then
+                // DISMISSED without choosing, because a menu that is built wrongly usually fails
+                // while being built.
+                focusSearch(app)
+                app.typeKey("a", modifierFlags: .command)
+                app.typeText("invoice")
+                let r = app.descendants(matching: .any)["result.row"].firstMatch
+                if r.waitForExistence(timeout: 10), r.isHittable {
+                    r.rightClick()
+                    usleep(UInt32.random(in: 250_000 ... 700_000))
+                    let menu = app.menus.firstMatch
+                    if menu.waitForExistence(timeout: 3) {
+                        XCTAssertGreaterThan(menu.menuItems.count, 0, "the result context menu came up empty")
+                    }
+                    app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
+                }
+            case 11:
+                // The SIDEBAR's own context menu, and the drawer toggling under it.
+                let rows = app.windows.firstMatch.outlines.firstMatch.cells
+                if rows.count > 1 {
+                    let r = rows.element(boundBy: Int.random(in: 0 ..< min(rows.count, 5)))
+                    if r.exists, r.isHittable {
+                        r.rightClick()
+                        usleep(300_000)
+                        app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
+                    }
+                }
+                let toggle = app.windows.firstMatch.buttons["sidebar.toggle"]
+                if toggle.exists, toggle.isHittable {
+                    toggle.click(); usleep(250_000); toggle.click()
+                }
             default:
                 // Escape and cmd-F alternating - the two things a user does when it feels slow.
                 app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
