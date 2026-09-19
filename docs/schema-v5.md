@@ -788,6 +788,35 @@ construction. That is a session of work on the paths where today's worst defects
 The recommendation is to decide that deliberately rather than drift into it. The build and the
 invariants are proven and will keep, so nothing is lost by leaving it.
 
+WHERE THE CUTOVER ACTUALLY STANDS, AND WHAT IS BROKEN IN IT.
+
+The pieces are in: the write path produces `chunk` / `occurrence` / `chunk_snippet` natively
+rather than deriving them from v4 (which the identity/position split is what made possible - a
+content can be inserted the moment its KEY is known, and its slot filled later); the content
+lookup, file-level reuse, the display path and the tag readers all answer from the split; the
+delete side states itself directly instead of re-deriving; and `OMNI_SPLIT_CUTOVER=1` stops
+chunk_text being written at all. `testTheIndexWorksWithChunkTextEmptied` empties the table and
+still gets the same paths, snippets, locators, reuse, writes and deletes.
+
+THE SPLIT ARM FAILS TWO TESTS AND IS THEREFORE STILL OFF.
+
+    OMNI_CHUNK_SPLIT=1   579 tests, 2 failures
+    default              579 tests, 0 failures
+
+    MutationLifecycleTests  "bookkeeping is off by 12 rows (48 vectors live in the
+                             file, the index accounts for 36)"
+    DatabaseRepackTests     released pages are not reused by the next batch
+
+Twelve rows have no pending blob that coverage never covered. Two hypotheses were tried and both
+were wrong: that the equivalence between maintained and rebuilt had drifted (it has not - that
+test passes), and that stale `occurrence` rows at the two bulk delete sites were making
+file-level reuse hand back content that is gone (those sites do need the cleanup, which they now
+have, and it did not move this). Guessing a third time is how several hours went today; the next
+move is to instrument which rows those twelve are and when their blobs go, not to change code.
+
+The repack failure is likely downstream of the same thing - pages are not released if rows are
+not where the pass expects them - but that is an assumption, not a measurement.
+
 WHAT IS NOT DONE: dropping the v4 tables. Building the tables and proving the invariants is the half that can be
 checked; repointing snippets, locators, tag filters, browse, lexical and dedup at `chunk` /
 `occurrence` is a separate change with its own risk, and it also rests on the same `chunks.slot`

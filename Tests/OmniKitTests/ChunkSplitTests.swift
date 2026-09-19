@@ -173,6 +173,12 @@ final class ChunkSplitTests: XCTestCase {
     /// churns the store and then compares the incrementally-maintained tables against a rebuild
     /// from the same v4 rows, row for row.
     func testTheWritePathKeepsTheSplitEqualToARebuild() throws {
+        // ONLY MEANINGFUL BEFORE THE CUTOVER. It works by rebuilding the split FROM v4 and
+        // comparing, so once the write path stops maintaining v4 there is nothing to rebuild
+        // from - the rebuild returns empty and the comparison fails for a reason that is not a
+        // defect. After the cutover the split answers for itself, which is
+        // testTheSplitStaysSelfConsistentAfterTheCutover.
+        try XCTSkipIf(VectorStore.splitCutover, "the cutover removes the v4 side of this comparison")
         let url = tempDB()
         let store = try build(url, files: 40, dupEvery: 4)
         XCTAssertTrue(store.buildChunkSplitForTest(), "the split did not build")
@@ -373,6 +379,64 @@ final class ChunkSplitTests: XCTestCase {
         store.deletePath("/v4/f2.txt")
         XCTAssertFalse(store.search(vec(1002), filter: SearchFilter(), topK: 5).contains { $0.path == "/v4/f2.txt" },
                        "a delete after the cutover did not take")
+    }
+
+    /// AFTER THE CUTOVER THERE IS NOTHING TO COMPARE AGAINST, so the split has to answer for
+    /// itself. With `splitCutover` on the write path stops maintaining chunk_text, which is the
+    /// whole point and also removes the rebuild-and-compare check that verified the write path.
+    /// What replaces it is MigrationV5's own invariants, which need only the split: every
+    /// occurrence points at a content that exists, refs equals the pointers that exist, and no
+    /// position is owned twice.
+    func testTheSplitStaysSelfConsistentAfterTheCutover() throws {
+        let savedCut = VectorStore.splitCutover
+        VectorStore.splitCutover = true
+        defer { VectorStore.splitCutover = savedCut }
+
+        let url = tempDB()
+        let store = try build(url, files: 30, dupEvery: 3)
+        defer { store.close() }
+        XCTAssertTrue(store.buildChunkSplitForTest())
+
+        let v4Before = num(url, "SELECT COUNT(*) FROM chunk_text")
+        // Churn hard: new content, shared content, edits, deletes.
+        for i in 0 ..< 14 {
+            let p = "/cut/f\(i).txt"
+            try store.replace(path: p, chunks: [
+                IndexedChunk(path: p, modified: 1, size: 10, kind: "text", chunkIndex: 0,
+                             snippet: "cut \(i)", embedding: vec(6000 + i), locator: "Line 1",
+                             chunkKey: String(format: "%016x", 6000 + i)),
+                IndexedChunk(path: p, modified: 1, size: 10, kind: "text", chunkIndex: 1,
+                             snippet: "shared", embedding: vec(7 + i % 3), locator: "Line \(300 + i)",
+                             chunkKey: String(format: "%016x", 7 + i % 3)),
+            ])
+        }
+        for i in stride(from: 0, to: 30, by: 4) { store.deletePath("/v4/f\(i).txt") }
+        store.migrateSlotsToCompletion()
+
+        // THE CUTOVER IS REAL: v4 gained nothing. Not "the count is unchanged" - deletes still
+        // clear their v4 rows while the table exists, and it legitimately shrank from 60 to 44.
+        // What must be true is that nothing NEW was written there.
+        XCTAssertLessThanOrEqual(num(url, "SELECT COUNT(*) FROM chunk_text"), v4Before,
+                                 "chunk_text grew after the cutover")
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM chunk_text t JOIN files f ON f.id = t.file_id "
+                              + "JOIN dirs d ON d.id = f.dir_id WHERE d.path LIKE '/cut%'"), 0,
+                       "the write path is still maintaining chunk_text for new files")
+
+        // And the split answers for itself.
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM occurrence o LEFT JOIN chunk c "
+                              + "ON c.id = o.chunk_id WHERE c.id IS NULL"), 0,
+                       "an occurrence points at a content that does not exist")
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM chunk c WHERE c.refs <> "
+                              + "(SELECT COUNT(*) FROM occurrence o WHERE o.chunk_id = c.id)"), 0,
+                       "refs does not equal the pointers that exist")
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM (SELECT slot FROM chunk WHERE slot >= 0 "
+                              + "GROUP BY slot HAVING COUNT(*) > 1)"), 0,
+                       "two contents claim the same position")
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM chunk WHERE refs = 0"), 0,
+                       "a content nobody points at was left behind")
+        // And it still finds things.
+        XCTAssertEqual(store.search(vec(6003), filter: SearchFilter(), topK: 3).first?.path,
+                       "/cut/f3.txt", "a file written after the cutover is not findable")
     }
 
     func testItRefusesUntilEveryRowHasASlot() throws {

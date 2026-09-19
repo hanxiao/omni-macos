@@ -2124,8 +2124,18 @@ public final class VectorStore: @unchecked Sendable {
             let scanCode = kindCodeLocked(FileKind.scan.rawValue)
             for path in scanned {
                 guard let fid = fileIDLocked(path, insert: false) else { continue }
+                // The split keeps `kind` on the CONTENT and on its snippet row, where it is what
+                // makes the media label index partial - so a reclassification has to reach both or
+                // a scanned PDF stays indexed as the kind it was moved out of.
+                if Self.chunkSplit, splitBuilt {
+                    exec("UPDATE chunk SET kind = \(scanCode) WHERE id IN "
+                         + "(SELECT chunk_id FROM occurrence WHERE file_id = \(fid));")
+                    exec("UPDATE chunk_snippet SET kind = \(scanCode) WHERE chunk_id IN "
+                         + "(SELECT chunk_id FROM occurrence WHERE file_id = \(fid));")
+                }
                 guard execChecked("UPDATE chunks SET kind = \(scanCode) WHERE file_id = \(fid);"),
-                      execChecked("UPDATE chunk_text SET kind = \(scanCode) WHERE file_id = \(fid);"),
+                      execChecked(splitBuilt ? "SELECT 1;"
+                                             : "UPDATE chunk_text SET kind = \(scanCode) WHERE file_id = \(fid);"),
                       execChecked("UPDATE files SET kind = \(scanCode) WHERE id = \(fid);")
                 else { ok = false; break }
             }
@@ -2736,7 +2746,13 @@ public final class VectorStore: @unchecked Sendable {
                 FileHandle.standardError.write(Data("[omni] folder delete aborted: could not resolve the files under \(folder)\n".utf8))
                 return
             }
-            for sql in ["DELETE FROM chunk_text WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id IN (SELECT id FROM temp.victims));",
+            // THE SPLIT'S POINTERS GO TOO. A delete that leaves occurrence rows behind is worse
+            // than a leak: file-level reuse reads occurrences, so a stale one makes the indexer
+            // hand back chunks for content that is gone - and those rows then have no pending
+            // blob while coverage has never covered them, which is the "bookkeeping is off by N
+            // rows" refusal. Found exactly that way: 48 vectors live, the index accounting for 36.
+            for sql in ["DELETE FROM occurrence WHERE file_id IN (SELECT id FROM temp.victims);",
+                        "DELETE FROM chunk_text WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id IN (SELECT id FROM temp.victims));",
                         "DELETE FROM pending_vecs WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id IN (SELECT id FROM temp.victims));",
                         "DELETE FROM dedup WHERE file_id IN (SELECT id FROM temp.victims);",
                         "DELETE FROM chunks WHERE file_id IN (SELECT id FROM temp.victims);",
@@ -2784,7 +2800,8 @@ public final class VectorStore: @unchecked Sendable {
             // Kinds are codes on the row now, so the predicate is a small IN over integers.
             let codes = kinds.map { String(kindCodeLocked($0)) }.joined(separator: ",")
             // Side rows first, while the chunk rows they hang off are still there to name them.
-            for sql in ["DELETE FROM chunk_text WHERE chunk_id IN (SELECT id FROM chunks WHERE kind IN (\(codes)));",
+            for sql in ["DELETE FROM occurrence WHERE chunk_id IN (SELECT id FROM chunk WHERE kind IN (\(codes)));",
+                        "DELETE FROM chunk_text WHERE chunk_id IN (SELECT id FROM chunks WHERE kind IN (\(codes)));",
                         "DELETE FROM pending_vecs WHERE chunk_id IN (SELECT id FROM chunks WHERE kind IN (\(codes)));",
                         "DELETE FROM dedup WHERE file_id IN (SELECT DISTINCT file_id FROM chunks WHERE kind IN (\(codes)));",
                         "DELETE FROM chunks WHERE kind IN (\(codes));"] {
@@ -6757,6 +6774,18 @@ public final class VectorStore: @unchecked Sendable {
     nonisolated(unsafe) public static var chunkSplit =
         ProcessInfo.processInfo.environment["OMNI_CHUNK_SPLIT"] == "1"
     private static let chunkSplitDoneKey = "chunk_split_backfilled"
+    /// THE LAST STEP, AND ITS OWN SWITCH. `OMNI_SPLIT_CUTOVER=1` stops the write path maintaining
+    /// `chunk_text`, after which the split is the only copy of the snippet, the locator and the
+    /// key - and the table can be dropped.
+    ///
+    /// Separate from `chunkSplit` because it takes away the thing that PROVES the split: while v4
+    /// is still written, the split can be rebuilt from it and compared row for row, which is what
+    /// `testTheWritePathKeepsTheSplitEqualToARebuild` does and how the write path was verified at
+    /// all. Stop writing v4 and that check cannot run - not because anything broke, but because
+    /// there is nothing left to compare against. A safety net that disappears the moment it
+    /// succeeds has to be removed deliberately, not as a side effect.
+    nonisolated(unsafe) public static var splitCutover =
+        ProcessInfo.processInfo.environment["OMNI_SPLIT_CUTOVER"] == "1"
     /// Whether THIS index has the split built and proven. Cached because every result row asks it,
     /// and a meta SELECT per displayed snippet is not free on the interactive path.
     private var splitBuilt = false
@@ -11531,15 +11560,22 @@ public final class VectorStore: @unchecked Sendable {
             let cid = sqlite3_last_insert_rowid(db)
             ids.append(cid)
 
-            sqlite3_reset(w.text)
-            sqlite3_bind_int64(w.text, 1, cid)
-            sqlite3_bind_int(w.text, 2, kc)
-            sqlite3_bind_int64(w.text, 3, fid)
-            sqlite3_bind_text(w.text, 4, c.snippet, -1, SQLITE_TRANSIENT)
-            sqlite3_bind_text(w.text, 5, c.locator, -1, SQLITE_TRANSIENT)
+            // ONE definition of the key, used by both schemas - they must agree or a chunk is
+            // stored under one key and looked up under another.
             let key = StoreSchema.hexToBytes(effectiveKeyLocked(c, bf16: bfs[i]))
-            key.withUnsafeBytes { _ = sqlite3_bind_blob(w.text, 6, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT) }
-            guard sqlite3_step(w.text) == SQLITE_DONE else { return nil }
+            // ONLY WHILE v4 IS STILL THE ANSWER. Once the split is built it holds the snippet,
+            // the locator and the key, every reader takes them from there, and writing them a
+            // second time is exactly the cost the split exists to remove.
+            if !(Self.chunkSplit && Self.splitCutover && splitBuilt) {
+                sqlite3_reset(w.text)
+                sqlite3_bind_int64(w.text, 1, cid)
+                sqlite3_bind_int(w.text, 2, kc)
+                sqlite3_bind_int64(w.text, 3, fid)
+                sqlite3_bind_text(w.text, 4, c.snippet, -1, SQLITE_TRANSIENT)
+                sqlite3_bind_text(w.text, 5, c.locator, -1, SQLITE_TRANSIENT)
+                key.withUnsafeBytes { _ = sqlite3_bind_blob(w.text, 6, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT) }
+                guard sqlite3_step(w.text) == SQLITE_DONE else { return nil }
+            }
 
             sqlite3_reset(w.vec)
             sqlite3_bind_int64(w.vec, 1, cid)
