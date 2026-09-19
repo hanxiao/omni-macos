@@ -134,6 +134,81 @@ final class VectorStoreFoldPersistTests: XCTestCase {
     /// vectors in 64 dimensions, where every score sits on top of every other - the worst case for
     /// any coarse tier. On the real index the two tiers agree exactly (quantrecall, 60 queries:
     /// recall@10 1.0000, score-ratio 1.00000), which is the measurement that governs shipping.
+    /// THE SAME PROPERTY, WITH ROWS THE FREE LIST OVERWROTE.
+    ///
+    /// The incremental fold used to refuse to run at all when any position below `baseRows` had
+    /// been rewritten - one reused position sent every later fold down the full-repack path, a
+    /// third of the churn throughput. The refusal protected something real: the funnel SELECTS
+    /// candidates from this base, so a stale row can stop a patched position being chosen at all,
+    /// and rescoring afterwards only fixes rows that were already chosen. The fold repacks just
+    /// those rows now, and this is the test that says the result is still what a full rebuild
+    /// would have produced - including for the file sitting on the reused position.
+    func testIncrementalFoldWithPatchedRowsMatchesFullRebuild() throws {
+        let savedBits = VectorStore.scanBitsOverride
+        let savedFree = VectorStore.freeListEnabled
+        VectorStore.scanBitsOverride = 3
+        VectorStore.freeListEnabled = true
+        defer { VectorStore.scanBitsOverride = savedBits; VectorStore.freeListEnabled = savedFree }
+        try withCap(quantCap) {
+            let url = tempDB()
+            let dim = 64
+            var rng = Rng(s: 7)
+            let store = try VectorStore(dbURL: url)
+            var shadow: [String: [[Float]]] = [:]
+
+            var batch: [(path: String, chunks: [IndexedChunk])] = []
+            for i in 0 ..< 3000 {
+                let p = "/seed/f\(i).txt"
+                let v = randUnit(dim, &rng)
+                shadow[p] = [v]
+                batch.append((p, [chunk(p, 0, v)]))
+            }
+            try store.replaceMany(batch)
+            let q = randUnit(dim, &rng)
+            _ = store.search(q, topK: 10)   // full quant rebuild: the base is now live and clean
+
+            // FREE A POSITION INSIDE THE BASE AND REUSE IT. The new file's vector now sits where a
+            // deleted one used to, so the base describes the wrong content there until refreshed.
+            for i in 0 ..< 40 { store.deletePath("/seed/f\(i).txt"); shadow["/seed/f\(i).txt"] = nil }
+            for i in 0 ..< 40 {
+                let p = "/reused/f\(i).txt"
+                let v = randUnit(dim, &rng)
+                shadow[p] = [v]
+                try store.replace(path: p, chunks: [chunk(p, 0, v)])
+            }
+
+            // Append past the fold threshold so the next search folds incrementally.
+            var delta: [(path: String, chunks: [IndexedChunk])] = []
+            for i in 0 ..< 50_100 {
+                let p = "/delta/f\(i).txt"
+                let v = randUnit(dim, &rng)
+                shadow[p] = [v]
+                delta.append((p, [chunk(p, 0, v)]))
+                if delta.count == 5000 { try store.replaceMany(delta); delta.removeAll() }
+            }
+            if !delta.isEmpty { try store.replaceMany(delta) }
+            let hitsIncremental = store.search(q, topK: 40)
+
+            // And every reused file must be findable by its OWN vector, which is the failure the
+            // stale base would produce: a real file at a plausible score, for content it no longer
+            // holds.
+            var reusedFound = 0
+            for i in 0 ..< 40 {
+                let p = "/reused/f\(i).txt"
+                guard let v = shadow[p]?.first else { continue }
+                if store.search(v, topK: 3).first?.path == p { reusedFound += 1 }
+            }
+            store.close()
+            XCTAssertEqual(reusedFound, 40, "a reused position does not answer for its own content")
+
+            let fresh = try VectorStore(dbURL: url)
+            let hitsFull = fresh.search(q, topK: 40)
+            assertEquivalentHits(hitsIncremental, hitsFull, "incremental fold with patched rows vs full rebuild")
+            assertMatchesShadow(hitsIncremental, shadow, q, "incremental fold with patched rows vs ground truth")
+            fresh.close()
+        }
+    }
+
     func testIncrementalFoldBitIdenticalToFullRebuild() throws {
         let savedBits = VectorStore.scanBitsOverride
         VectorStore.scanBitsOverride = 3

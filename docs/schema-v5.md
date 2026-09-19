@@ -587,21 +587,35 @@ orphans, no ghost hits, coverage consistent, clean teardown. What it is not is f
     free list off   914 churn ops   7,897 searches   182 full passes
     free list on    587 churn ops   5,111 searches   117 full passes
 
-A third of the throughput, and the cause is one line elsewhere: the incremental base update
-requires `patchedSlots.isEmpty`, so a single reused position below `baseRows` makes every subsequent
-base fold REPACK the whole quantized replica instead of appending its delta.
+A third of the throughput, and THREE HYPOTHESES ABOUT WHY, two of them wrong. The sequence is
+worth keeping because each wrong one was plausible, each cost a measurement, and only sampling
+settled it.
 
-That guard is not wrong. The funnel SELECTS candidates from the quantized base, so a stale
-quantized row can stop a patched position being selected at all, and `patchScoresLocked` only
-corrects the scores of positions already selected. Fixing it means re-quantizing just the patched
-rows and scattering them into the base - O(patched) rather than O(rows), on the hottest and most
-correctness-critical path in the store. Worth doing carefully rather than quickly.
+FIRST: `ensureFreeSlotsLocked` rebuilt the free set on every append, because "is the allocator
+current" was `highWater == positions`, which is false after any growth. A real defect, fixed - the
+ceiling is raised instead of rebuilding - and it recovered NONE of the throughput. A sample said
+why: `patchScoresLocked` 47 frames against 2 for `ensureFreeSlotsLocked`.
 
-The first guess was wrong and is worth recording: that `ensureFreeSlotsLocked` rebuilt the free set
-on every append, because "is the allocator current" was `highWater == positions`, which is false
-after any growth. That WAS a defect and is fixed - the ceiling is raised instead - but it recovered
-none of the throughput. A sample said why: `patchScoresLocked` 47 frames against 2 for
-`ensureFreeSlotsLocked`.
+SECOND: the incremental base update required `patchedSlots.isEmpty`, so one reused position below
+`baseRows` should have sent every later fold down the full-repack path. Also real, also fixed - the
+fold repacks just the patched rows and scatters them in, which is O(patched) rather than O(rows),
+and `testIncrementalFoldWithPatchedRowsMatchesFullRebuild` holds the correctness the old guard was
+protecting: the funnel SELECTS from this base, so a stale row can stop a patched position being
+chosen at all, which rescoring afterwards cannot repair. It too recovered nothing: 465 churn ops
+against 772 with the list off.
+
+THIRD, AND WHAT THE SAMPLE ACTUALLY SAYS: `patchScoresLocked` 51 frames, `rebuildBaseLocked` 1. The
+base was barely rebuilding, so neither of the first two could ever have been the cost. It is the
+patch scoring itself, paid on EVERY QUERY - gather the patched rows out of `flat16`, matmul, scatter
+the results over the scores - and under churn many queries run between folds, so the list is rarely
+empty.
+
+WHICH MAKES THE OBVIOUS FIX UNSAFE. Refreshing the base at PLACEMENT time would empty the list and
+cost nothing per query, but `placeVectorLocked` runs inside a transaction that can roll back, and a
+base updated there would be ahead of the data that rolled back. Deferring is exactly why the patch
+list exists. Bounding it instead - forcing a base rebuild once the patched count passes some small
+threshold - trades many cheap queries for one expensive rebuild, and what that threshold should be
+is a measurement nobody has taken.
 
 Until the base interaction is fixed the trade is a third of the churn throughput against holes
 reclaimed without a whole-file rewrite - and the reclaim already returns that space. So it waits.

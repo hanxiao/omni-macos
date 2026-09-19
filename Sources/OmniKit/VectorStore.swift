@@ -5008,6 +5008,24 @@ public final class VectorStore: @unchecked Sendable {
     /// score is recomputed from `flat16` and written over the stale one, before anything selects
     /// candidates or reduces. Bounded by `foldThreshold` along with the delta, so the matmul stays
     /// small, and cleared the moment a full rebuild reads those bytes again.
+    /// The patched positions below `baseRows`, as CONTIGUOUS RUNS.
+    ///
+    /// Runs rather than individual rows because the packers take a range and the free list hands
+    /// positions out lowest-first, so they cluster - and because one MLX call per row would trade
+    /// the full repack this exists to avoid for thousands of tiny ones.
+    private func patchedRunsLocked() -> [Range<Int>] {
+        let ps = Set(patchedSlots.filter { Int($0) < baseRows }).map(Int.init).sorted()
+        guard !ps.isEmpty else { return [] }
+        var runs: [Range<Int>] = []
+        var lo = ps[0], prev = ps[0]
+        for p in ps.dropFirst() {
+            if p == prev + 1 { prev = p; continue }
+            runs.append(lo ..< prev + 1); lo = p; prev = p
+        }
+        runs.append(lo ..< prev + 1)
+        return runs
+    }
+
     private func patchScoresLocked(_ scores: MLXArray, qv: MLXArray) -> MLXArray {
         guard !patchedSlots.isEmpty, baseRows > 0, dim > 0 else { return scores }
         var idx: [Int32] = []
@@ -9301,36 +9319,70 @@ public final class VectorStore: @unchecked Sendable {
         // packing the delta and concatenating is bit-identical to repacking everything. Without this
         // every fold repacks the whole index, which is both slow and observably different from a
         // full rebuild (testIncrementalFoldBitIdenticalToFullRebuild catches exactly that).
-        if bits == 1, quantBits == 1, let bb = bitBase, !baseDirty, patchedSlots.isEmpty,
+        // PATCHED ROWS ARE REFRESHED, NOT A REASON TO GIVE UP. This used to require
+        // `patchedSlots.isEmpty`, so one position the free list had rewritten below `baseRows` sent
+        // every later fold down the full-repack path - measured at a third of the churn throughput.
+        // The guard was there for a real reason: the funnel SELECTS candidates from this base, so a
+        // stale row can stop a patched position being chosen at all, which `patchScoresLocked`
+        // cannot repair afterwards because it only rescores what was already selected. Repacking
+        // just those rows and scattering them in is O(patched) and leaves the base correct, so the
+        // selection is too.
+        if bits == 1, quantBits == 1, let bb = bitBase, !baseDirty,
            rowCount > baseRows, flat16.count >= rowCount * dim,
            let add = packSignBitsLocked(baseRows ..< rowCount) {
             let deltaRows = rowCount - baseRows
-            let merged = MLX.concatenated([bb, add], axis: 0)
-            MLX.eval(merged)
-            bitBase = merged
-            baseRows = rowCount; baseOccCount = occCountCoveringSlotsLocked(baseRows)
-            ensureVecScratchLocked()
-            quantReplicaChangedLocked()
-            if let tR { print(String(format: "[search] FOLD(1bit) delta=%d rows=%d %.1fms", deltaRows, rowCount, -tR.timeIntervalSinceNow * 1000)) }
-            return
+            var merged = MLX.concatenated([bb, add], axis: 0)
+            var refreshed = true
+            for r in patchedRunsLocked() {
+                guard let rows = packSignBitsLocked(r) else { refreshed = false; break }
+                merged[MLXArray(r.map { Int32($0) })] = rows
+            }
+            // A failure falls THROUGH to the full rebuild below rather than committing a base with
+            // known-stale rows in it.
+            if refreshed {
+                MLX.eval(merged)
+                bitBase = merged
+                patchedSlots.removeAll(keepingCapacity: true)
+                baseRows = rowCount; baseOccCount = occCountCoveringSlotsLocked(baseRows)
+                ensureVecScratchLocked()
+                quantReplicaChangedLocked()
+                if let tR { print(String(format: "[search] FOLD(1bit) delta=%d rows=%d %.1fms", deltaRows, rowCount, -tR.timeIntervalSinceNow * 1000)) }
+                return
+            }
         }
-        if bits > 0, bits != 1, bits == quantBits, let qb = quantBase, !baseDirty, patchedSlots.isEmpty,
+        // Same treatment for the affine tier - see the sign-code path above for why a patched row
+        // must be refreshed rather than refused.
+        if bits > 0, bits != 1, bits == quantBits, let qb = quantBase, !baseDirty,
            rowCount > baseRows, dim % Self.quantGroup == 0, flat16.count >= rowCount * dim {
             let deltaRows = rowCount - baseRows
             let (wqs, scs, bss) = quantizeRowsLocked(baseRows ..< rowCount, bits: bits)
             if !wqs.isEmpty, (qb.biases == nil) == bss.isEmpty {
-                let wq = MLX.concatenated([qb.wq] + wqs, axis: 0)
-                let sc = MLX.concatenated([qb.scales] + scs, axis: 0)
-                let bi: MLXArray? = qb.biases.map { MLX.concatenated([$0] + bss, axis: 0) }
-                var toEval = [wq, sc]
-                if let bi { toEval.append(bi) }
-                MLX.eval(toEval)
-                quantBase = (wq, sc, bi)
-                baseRows = rowCount; baseOccCount = occCountCoveringSlotsLocked(baseRows)
-                ensureVecScratchLocked()
-                quantReplicaChangedLocked()
-                if let tR { print(String(format: "[search] FOLD delta=%d rows=%d %.1fms", deltaRows, rowCount, -tR.timeIntervalSinceNow * 1000)) }
-                return
+                var wq = MLX.concatenated([qb.wq] + wqs, axis: 0)
+                var sc = MLX.concatenated([qb.scales] + scs, axis: 0)
+                var bi: MLXArray? = qb.biases.map { MLX.concatenated([$0] + bss, axis: 0) }
+                var refreshed = true
+                for r in patchedRunsLocked() {
+                    let (pw, ps2, pb) = quantizeRowsLocked(r, bits: bits)
+                    guard !pw.isEmpty, (bi == nil) == pb.isEmpty else { refreshed = false; break }
+                    let idx = MLXArray(r.map { Int32($0) })
+                    wq[idx] = pw.count == 1 ? pw[0] : MLX.concatenated(pw, axis: 0)
+                    sc[idx] = ps2.count == 1 ? ps2[0] : MLX.concatenated(ps2, axis: 0)
+                    if bi != nil { bi![idx] = pb.count == 1 ? pb[0] : MLX.concatenated(pb, axis: 0) }
+                }
+                // A refresh that could not be built falls THROUGH to the full rebuild below rather
+                // than committing a base with known-stale rows in it.
+                if refreshed {
+                    var toEval = [wq, sc]
+                    if let bi { toEval.append(bi) }
+                    MLX.eval(toEval)
+                    quantBase = (wq, sc, bi)
+                    patchedSlots.removeAll(keepingCapacity: true)
+                    baseRows = rowCount; baseOccCount = occCountCoveringSlotsLocked(baseRows)
+                    ensureVecScratchLocked()
+                    quantReplicaChangedLocked()
+                    if let tR { print(String(format: "[search] FOLD delta=%d rows=%d %.1fms", deltaRows, rowCount, -tR.timeIntervalSinceNow * 1000)) }
+                    return
+                }
             }
         }
         defer { if let tR { print(String(format: "[search] REBUILD base rows=%d %.1fms", rowCount, -tR.timeIntervalSinceNow * 1000)) } }
