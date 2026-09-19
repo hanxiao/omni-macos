@@ -832,6 +832,23 @@ delete side states itself directly instead of re-deriving; and `OMNI_SPLIT_CUTOV
 chunk_text being written at all. `testTheIndexWorksWithChunkTextEmptied` empties the table and
 still gets the same paths, snippets, locators, reuse, writes and deletes.
 
+THE SPLIT ARM'S REMAINING FAILURE IS THE BUILD RUNNING FROM THE COVERAGE STAMP, isolated the same
+way the free list defect was - by disabling one thing at a time and keeping only what survives.
+With `buildChunkSplitLocked` no longer called from the stamp, `MutationLifecycleTests` passes with
+the split otherwise fully on. Everything else in the split is exonerated: the content lookup, the
+native writes, the delete hook, the persistSlots work and the file-level reuse reader were each
+disabled in turn and the failure survived all five.
+
+What is NOT yet known is why. The build does not touch `vec_holes`, `pending_vecs` or the coverage
+claim, yet the failure is a coverage refusal. The two candidates worth testing next, in order: its
+`BEGIN IMMEDIATE` interacting with a transaction the stamp's caller already holds, and the fact
+that a successful build makes the stamp RETURN EARLY - skipping the fold and the reclaim that
+would otherwise have run in that pass.
+
+An extended `ChunkSplitAccountingTests` covering rename, move, folder delete and reopen passes
+with the split on, which is what says the ordinary write and delete paths are sound and points at
+the stamp specifically.
+
 THE SPLIT ARM FAILS TWO TESTS AND IS THEREFORE STILL OFF.
 
     OMNI_CHUNK_SPLIT=1   579 tests, 2 failures

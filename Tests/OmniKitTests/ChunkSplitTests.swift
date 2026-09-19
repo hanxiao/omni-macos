@@ -595,5 +595,31 @@ final class ChunkSplitAccountingTests: XCTestCase {
         store.deletePaths(["/m/f7.txt", "/m/f8.txt"])
         store.advanceCoverageForTest()
         check("after a bulk delete")
+
+        // THE OPERATIONS THE MUTATION LIFECYCLE ADDS, which the split arm still fails on. A
+        // rename and a move are a delete plus a write at the store level, but they arrive in a
+        // different order and through a different call, and that is exactly where the accounting
+        // has gone wrong twice today.
+        let old = "/m/f11.txt", renamed = "/m/f11-renamed.txt"
+        store.deletePath(old)
+        try store.replace(path: renamed, chunks: [chunk(renamed, 0, 1011), chunk(renamed, 1, 7)])
+        store.advanceCoverageForTest()
+        check("after a rename")
+
+        let moved = "/other/f12.txt"
+        store.deletePath("/m/f12.txt")
+        try store.replace(path: moved, chunks: [chunk(moved, 0, 1012), chunk(moved, 1, 8)])
+        store.advanceCoverageForTest()
+        check("after a move to another folder")
+
+        store.deleteUnderFolder("/other")
+        store.advanceCoverageForTest()
+        check("after deleting a whole folder")
+
+        // And it must still reopen, which is what the lifecycle test actually fails on.
+        store.close()
+        let reopened = try VectorStore(dbURL: dir.appendingPathComponent("index.sqlite"))
+        defer { reopened.close() }
+        XCTAssertNil(reopened.coverageAudit(), "after a reopen")
     }
 }
