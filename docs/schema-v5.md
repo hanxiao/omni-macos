@@ -628,6 +628,21 @@ is separate and small, and the sweep on a 4,000-file churn is monotonic:
 At 16 the free list is inside run-to-run noise of not being there, and on that basis it was
 turned on.
 
+AND A SECOND COST, MEASURED ON THE REAL INDEX: ONCE IT REUSES, EVERY OPEN IS 9x SLOWER.
+
+    app-path open, free list off   ~25 s     loader: bySlot=false, row sidecar adopted
+    app-path open, free list on    228 s     loader: bySlot=true,  no sidecar
+
+The first reuse sets `chunk_slots_out_of_order`, permanently and correctly - the numbering is no
+longer the row order, so the rank walk cannot be used again on that index. But the by-slot loader
+does not adopt the row sidecar, which is the thing that makes a large index open quickly. So one
+reused position costs 200 seconds on every launch for the life of the index.
+
+That is not a bug in the marker, which is doing exactly what it must; it is that the fast loader
+and the correct loader are different code. Making the by-slot path adopt the sidecar is the work
+that has to happen before the free list can ship, on top of the cache-invalidation fix below -
+and it is a bigger piece than either.
+
 IT IS OFF AGAIN, AND NOT FOR SPEED. Chasing what looked like a defect in the chunk/occurrence
 split found this instead, by elimination. With the split OFF and the free list ON, editing a
 file's content leaves `position N inside coverage has no live row and no recorded hole` - a

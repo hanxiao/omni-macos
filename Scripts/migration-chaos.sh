@@ -17,6 +17,10 @@ for f in "$SRC"/*; do cp -c "$f" "$W/"; done
 echo "cloned $(ls -la "$W/index.sqlite" | awk '{printf "%.2f GB", $5/1073741824}') to $W"
 pkill -x Omni 2>/dev/null || true; sleep 2
 # TEST_RUNNER_ is the only prefix xcodebuild forwards into the test runner's environment.
+# Feature flags through to the app under test, same prefix rule.
+for k in OMNI_CHUNK_SPLIT OMNI_FREE_LIST OMNI_SPLIT_CUTOVER; do
+  v=$(eval echo \$$k); [ -n "$v" ] && export TEST_RUNNER_$k="$v"
+done
 export TEST_RUNNER_OMNI_MIGCHAOS_DB="$W"
 export OMNI_MIGCHAOS_DB="$W"
 # The app's own stderr, which XCUITest otherwise swallows.

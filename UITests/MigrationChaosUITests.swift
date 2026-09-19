@@ -66,6 +66,15 @@ final class MigrationChaosUITests: XCTestCase {
             "-omni.serving.enabled", "NO",
             "-omni.uiChaos", "YES",
         ]
+        // THE FEATURE FLAGS REACH THE APP, not just the runner. launchArguments land in the
+        // argument domain of NSUserDefaults; these are read from the process environment, so they
+        // have to be set as environment on the app being launched.
+        for k in ["OMNI_CHUNK_SPLIT", "OMNI_FREE_LIST", "OMNI_SPLIT_CUTOVER"] {
+            if let v = ProcessInfo.processInfo.environment[k]
+                ?? ProcessInfo.processInfo.environment["TEST_RUNNER_" + k] {
+                app.launchEnvironment[k] = v
+            }
+        }
         // The app's own diagnostics, where a shell can read them afterwards.
         if let out = ProcessInfo.processInfo.environment["OMNI_MIGCHAOS_STDERR"]
             ?? ProcessInfo.processInfo.environment["TEST_RUNNER_OMNI_MIGCHAOS_STDERR"] {
