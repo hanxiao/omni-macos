@@ -261,6 +261,39 @@ final class ChunkSplitTests: XCTestCase {
         return splitRows(store)
     }
 
+    /// THE SPLIT HAS TO BUILD ITSELF, without a test reaching in to call it.
+    ///
+    /// It is driven from the coverage stamp, the same place the fold is, so that a big index pays
+    /// its one transaction while idle instead of stalling an open. A build that only ever happens
+    /// because a test asked for it is not a feature.
+    func testTheStampBuildsTheSplitOnItsOwn() throws {
+        let savedQuant = VectorStore.quantBaseOverride
+        VectorStore.quantBaseOverride = VectorStore.scanBits
+        defer { VectorStore.quantBaseOverride = savedQuant }
+        let url = tempDB()
+        let store = try build(url, files: 30, dupEvery: 3)
+        defer { store.close() }
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM occurrence"), 0, "the fixture starts already split")
+
+        // What the app does when it goes idle: search, then let coverage stamp.
+        _ = store.search(vec(1000), filter: SearchFilter(), topK: 5)
+        store.advanceCoverageForTest()
+        // PAST THE YIELD WINDOW. The build sits behind `yieldToSearchLocked`, so that a big index
+        // does its one transaction while the user is not typing - which means a stamp fired
+        // immediately after a search deliberately declines. Eight stamps in a tight loop all land
+        // inside that window and the first version of this test read it as "never builds".
+        for _ in 0 ..< 30 {
+            store.stampCoverageForTest()
+            if num(url, "SELECT COUNT(*) FROM occurrence") > 0 { break }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+        }
+        XCTAssertGreaterThan(num(url, "SELECT COUNT(*) FROM occurrence"), 0,
+                             "the coverage stamp never built the split")
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM occurrence"),
+                       num(url, "SELECT COUNT(*) FROM chunks"),
+                       "every chunk did not become exactly one occurrence")
+    }
+
     func testItRefusesUntilEveryRowHasASlot() throws {
         let url = tempDB()
         let store = try VectorStore(dbURL: url)
@@ -269,7 +302,10 @@ final class ChunkSplitTests: XCTestCase {
             IndexedChunk(path: p, modified: 1, size: 10, kind: "text", chunkIndex: 0,
                          snippet: "s", embedding: vec(1), locator: "Line 1", chunkKey: "0000000000000001"),
         ])
-        store.clearSlotBackfillFlagForTest()
+        // GENUINELY UNSEATED, not merely unflagged. Clearing the flag alone leaves every row with
+        // a position, which is a state where building IS correct - `backfillInPlace` re-checks
+        // seated == rows rather than trusting any flag.
+        store.unbackfillSlotsAboveForTest(0)
         XCTAssertFalse(store.buildChunkSplitForTest(), "built the split on an index with no slot column filled")
         store.close()
         XCTAssertEqual(num(url, "SELECT COUNT(*) FROM occurrence"), 0, "it wrote occurrences anyway")

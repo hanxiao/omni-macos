@@ -8743,6 +8743,10 @@ public final class VectorStore: @unchecked Sendable {
             // FOLD BEFORE RECLAIM. The fold turns duplicates into holes and the reclaim turns
             // holes into space; run the other way round and the reclaim rewrites a 15 GB file for
             // the holes it can see, then the fold makes millions more and it has to run again.
+            // THE SPLIT, once, after the backfill has seated every row. It is one transaction
+            // rather than slices - the invariants can only be checked with all four tables
+            // present - so it sits behind the same yield the fold does and behind its own flag.
+            if Self.chunkSplit, !yieldToSearchLocked("split"), buildChunkSplitLocked() { return }
             if !yieldToSearchLocked("fold"), foldDuplicateContentsLocked() { return }
             // Off the queue: the reclaim takes it one chunk at a time, and this call is holding it.
             if reclaim, !yieldToSearchLocked("reclaim"), shouldReclaimHolesLocked() {
@@ -11753,7 +11757,12 @@ public final class VectorStore: @unchecked Sendable {
     @discardableResult
     func buildChunkSplitLocked(highWaterOverride: Int64? = nil) -> Bool {
         guard Self.chunkSplit, Self.contentSharing, dbOpen(), dim > 0 else { return false }
-        guard slotsBackfilled else { return false }
+        // NOT `slotsBackfilled`, which is a MIGRATION flag: an index this build wrote from scratch
+        // has a complete slot column and never enters the migration that sets it, so gating on it
+        // means the split never builds for a new user at all. The same trap the free list fell
+        // into. What matters is that no pre-existing row is still waiting for a position, and
+        // `backfillInPlace` re-checks seated == rows before it writes anything.
+        guard !v4BackfillPending else { return false }
         guard scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.chunkSplitDoneKey)'") != 1
         else { return false }
         let maxSlot = scalarQuery("SELECT COALESCE(MAX(slot), -1) FROM chunks")
@@ -11786,7 +11795,9 @@ public final class VectorStore: @unchecked Sendable {
     /// the durable column is not.
     public func unbackfillSlotsAboveForTest(_ keep: Int) {
         queue.sync {
-            exec("UPDATE chunks SET slot = -1 WHERE id > (SELECT MIN(id) + \(keep) FROM chunks);")
+            // `>=`, so `keep` means "how many rows keep their position" exactly: with `>` the
+            // first row was always spared and keep: 0 unseated nothing at all.
+            exec("UPDATE chunks SET slot = -1 WHERE id >= (SELECT MIN(id) + \(keep) FROM chunks);")
             exec("DELETE FROM meta WHERE key = '\(Self.slotsBackfilledKey)';")
             slotsBackfilled = false
         }
