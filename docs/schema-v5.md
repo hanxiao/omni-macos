@@ -970,6 +970,27 @@ releasing.
 
      So step 4 is: one freed-position list rather than two, the loader gate moved onto the split,
      and only then the fold's own code removed.
+
+     AND ONE THING AHEAD OF ALL OF IT, found by measuring rather than reading. The build ran
+     inside `queue.sync`, so it held the one queue every search goes through for its whole
+     duration:
+
+                             searches during build    p50          max
+         on the store queue            1          198,653 ms   198,653 ms
+         off-queue                 3,616                7 ms     3,047 ms
+
+     One search, three and a half minutes. `yieldToSearchLocked` is not protection: it defers
+     while someone is searching and then gives up after 120 s and runs anyway, which is right for
+     a fold that yields between slices and wrong for a single 199-second transaction. No chaos
+     run could have caught it - the suite goes quiet precisely so the migration can proceed, so
+     the build and the searches never overlap by construction.
+
+     The build runs on its own connection now. Under WAL a reader does not block on a writer, so
+     search is untouched; what waits is the index's own writes, which retry. The catch-up pass is
+     what makes that safe: the build works from a snapshot for minutes, and rows indexed in that
+     window went to v4 only, so they are given occurrences in the same store-queue turn that
+     publishes the done flag - there is no instant where the split is authoritative and
+     incomplete.
   5. Move the resident loader, the coverage walk and the row sidecar off `chunks` onto
      `occurrence` + `chunk`. The largest step, and the one that finally deletes rank-is-position.
      Measured rather than guessed: 121 statements across 59 functions name `chunks`. Three groups
