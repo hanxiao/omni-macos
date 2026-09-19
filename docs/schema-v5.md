@@ -841,21 +841,49 @@ exactly the precision the digest prints. The harness pins the fold now and compa
 watermark on both sides, so it says "the fold advanced, this comparison is not about the split"
 rather than blaming the split twice.
 
-IS THE REST WORTH DOING? Stated plainly, because the answer is not obviously yes and the work is
-not small.
+IS THE REST WORTH DOING? YES, AND NOT FOR THE REASON IT WAS ORIGINALLY JUSTIFIED ON.
 
-The split was justified on two things. One of them has already been delivered without it: a
-genuinely old v4 index carries ONLY `idx_chunk_label`, so "does this content exist" really was a
-table scan - but the current build creates `idx_chunk_content` when such an index opens, and that
-lookup is a seek now whether or not the split ever lands.
+The split was justified on two things, and taken on their own terms both have now shrunk. The
+content lookup was delivered without it: a genuinely old v4 index carries ONLY `idx_chunk_label`,
+so "does this content exist" really was a table scan, but the current build creates
+`idx_chunk_content` when such an index opens and that lookup is a seek whether or not the split
+lands. And the size is 0.414 GB against a 6.05 GB index, under 7%.
 
-What remains is the size, and it is 0.414 GB against a 6.05 GB index - under 7%. Set against that:
-the cutover has to move the write path, the four delete sites, refcounting on `chunk.refs`, and the
-fold's own queries, and it makes the fold itself largely redundant since `chunk.key` is unique by
-construction. That is a session of work on the paths where today's worst defects lived, for 7%.
+THE 7% IS SMALL FOR A REASON THAT IS ITSELF THE ARGUMENT. The split and the fold solve the SAME
+problem by opposite means. The fold finds duplicate content after the fact and collapses the
+duplicate vectors onto one representative; the split makes duplicates unrepresentable, because
+`chunk.key` is unique by construction. The fold shipped first and already took the large win -
+3,515,895 duplicates on the measured index - so all that is left for the split to win is the
+duplicate TEXT rows. The split is not a small improvement on top of the fold. It is a replacement
+for it.
 
-The recommendation is to decide that deliberately rather than drift into it. The build and the
-invariants are proven and will keep, so nothing is lost by leaving it.
+And that is the case for doing it. Every serious defect in this work has one root: v4 says a chunk
+is a row and its vector is at that row's RANK, and sharing, the fold, coverage and the free list
+were each layered onto a model that cannot say "two files hold the same passage". ROW-vs-POSITION
+came from there. So did the `ensureSlotRowsLocked` cache key, and the tombstone in the sidecar
+sample. The split says it natively - identity in one table, occurrences in another, a refcount
+instead of four delete sites re-deriving the same fact - and finishing it lets the fold be
+DELETED rather than kept alongside.
+
+THE HALFWAY STATE IS WORSE THAN EITHER END, which is why this is not a flag flip:
+
+    today, split off          the fold does the work; index smallest; v4 machinery all present
+    split on, no cutover      +2.223 GB, both models written, fold still running. Worst of both
+    cutover done, fold gone   -0.414 GB, and the machinery that caused these bugs is gone
+
+THE SEQUENCE, so this starts from a stated order rather than drifting into one:
+
+  1. Move the write path off `chunk_text` entirely (`OMNI_SPLIT_CUTOVER=1` already does this;
+     it needs the scan-kind migration and the v3 -> v4 conversion to stop depending on the table).
+  2. Make the four delete sites decrement `chunk.refs` and release the slot at zero, instead of
+     re-deriving what is still referenced.
+  3. Repoint the fold's own queries, then retire the fold - it is the step that pays for the
+     other three, and it cannot happen before them.
+  4. A migration that drops `chunk_text` and its two indexes for existing users, with the same
+     kill-and-reopen proof the v5 migration has.
+
+Each step lands on the paths that produced the defects above, so each wants its own chaos run
+rather than a single cutover commit. The build and the invariants are proven and will keep.
 
 WHERE THE CUTOVER ACTUALLY STANDS, AND WHAT IS BROKEN IN IT.
 
@@ -892,14 +920,25 @@ An extended `ChunkSplitAccountingTests` covering rename, move, folder delete and
 with the split on, which is what says the ordinary write and delete paths are sound and points at
 the stamp specifically.
 
-THE SPLIT ARM FAILS TWO TESTS AND IS THEREFORE STILL OFF.
+THE SPLIT ARM FAILED TWO TESTS. IT NO LONGER DOES.
 
-    OMNI_CHUNK_SPLIT=1   579 tests, 2 failures
+    OMNI_CHUNK_SPLIT=1   579 tests, 2 failures     <- what this section was written about
     default              579 tests, 0 failures
 
     MutationLifecycleTests  "bookkeeping is off by 12 rows (48 vectors live in the
                              file, the index accounts for 36)"
     DatabaseRepackTests     released pages are not reused by the next batch
+
+Both were the split build running from the coverage stamp, fixed by giving
+`stampVectorCoverageLocked` an `allowSplitBuild` flag that `close()` passes false. Re-measured
+after that fix:
+
+    OMNI_CHUNK_SPLIT=1   582 tests, 0 failures
+    default              582 tests, 0 failures
+
+and the UI chaos suite passes against a REAL v4 index migrating underneath it with the split and
+the free list both on: 58 interaction rounds, 258.7 s, 0 failures. The reason the split is still
+off is no longer correctness - see the section below.
 
 INSTRUMENTED RATHER THAN GUESSED AT, and the answer is narrow: it is the SPLIT AND THE FREE LIST
 TOGETHER, not the split. `ChunkSplitAccountingTests` runs the mutation sequence one operation at a

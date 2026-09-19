@@ -6640,23 +6640,46 @@ public final class VectorStore: @unchecked Sendable {
     ///     max 50000  458   <- what charging a patched row like a delta row cost
     ///
     /// At 16 it is inside run-to-run noise of not having the free list at all.
-    /// OFF AGAIN, AND THIS TIME FOR CORRECTNESS RATHER THAN SPEED.
     ///
-    /// It was turned on earlier today once `patchedRebuildThreshold` removed its throughput cost.
-    /// Chasing what looked like a split defect then found this, by elimination: with the split off
-    /// and the free list on, editing a file's content leaves `position N inside coverage has no
-    /// live row and no recorded hole` - a position the vector file still holds that nothing owns
-    /// and nothing records. With the free list off the same sequence is clean.
+    /// IT WAS OFF TWICE, FOR TWO DIFFERENT REASONS, AND BOTH ARE NOW CLOSED.
     ///
-    /// That is the shape of defect that makes an index unopenable later, and nothing in the suite
-    /// caught it because no test advanced coverage BETWEEN mutations - which is exactly what an
-    /// app does and what ChunkSplitAccountingTests now does.
+    /// The first was throughput, fixed by `patchedRebuildThreshold` above. The second was
+    /// correctness: with the free list on, editing a file's content left `position N inside
+    /// coverage has no live row and no recorded hole` - a position the file still holds that
+    /// nothing owns and nothing records, which is the shape that makes an index unopenable later.
+    /// No test caught it because none advanced coverage BETWEEN mutations, which is exactly what
+    /// the app does; `ChunkSplitAccountingTests` does now.
     ///
-    /// The cause is not yet known. What is known is that it is the free list alone: the split, its
-    /// native writes, its delete hook and its content lookup were each disabled in turn and the
-    /// failure survived all of them.
+    /// The cause was a cache key. `ensureSlotRowsLocked` is keyed on `(mutationGen, slotCount)`
+    /// and reuse changes neither - nothing is appended, and the generation was already bumped -
+    /// so the position -> rows index kept answering "nobody owns this" about a position that had
+    /// just been legitimately reused. Two sibling caches were keyed the same way and were wrong
+    /// for the same reason. All three are invalidated at the reuse site now.
+    ///
+    /// A third reason was believed and turned out not to exist: that one reuse cost 228 s on
+    /// every subsequent open because the by-slot loader cannot adopt the row sidecar. Adoption
+    /// runs before either loader and the sidecar already carries a slot per record; the arm was
+    /// reaching the slow loader because a tombstone in the sidecar's validation sample was
+    /// rejecting it, which is fixed in `tryAdoptRowSidecarLocked`.
+    ///
+    /// ON BY DEFAULT, on this evidence. `mutbench --reuse` against the migrated production index,
+    /// 500 paths deleted and rewritten per round, 4 rounds, with the same index and the same
+    /// operation with the free list off as the control:
+    ///
+    ///                     round 1    rounds 2-4          holes at end   reopen
+    ///     off              1.7 ms    1.7/1.8/1.7 ms      191,043        3.10 s
+    ///     on             224.2 ms   23.7/26.6/36.0 ms    189,043        3.21 s
+    ///
+    /// 2000 positions reclaimed, the vector file did not grow where the control's did, coverage
+    /// audit clean in both arms, and both adopt the sidecar and open in the same 3.1 s. The cost
+    /// is one O(positions) walk per session to build the free set and ~24-36 ms per 500-path
+    /// batch thereafter - 0.06 ms per file on a path that is 99% GPU, where a file takes 14 ms at
+    /// 70 file/s. Set against a ~7 GB rewrite every ten days of heavy use, which is what it
+    /// replaces.
+    ///
+    /// OMNI_FREE_LIST=0 turns it off.
     nonisolated(unsafe) public static var freeListEnabled =
-        ProcessInfo.processInfo.environment["OMNI_FREE_LIST"] == "1"
+        ProcessInfo.processInfo.environment["OMNI_FREE_LIST"] != "0"
     private var freeSlots = SlotAllocator()
     private var freeSlotsValid = false
     /// The mutation the quarantine was last released at. A position freed in one mutation becomes
