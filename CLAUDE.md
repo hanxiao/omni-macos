@@ -14,6 +14,19 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   else's broken - and it destroys the evidence that would have proved the shipped repair works. The
   test for a repair is that it runs on a real damaged index THROUGH the app, not that the index
   ends up healthy.
+- ONE MIGRATION, EVERYTHING IN IT. A data-structure change that users have to migrate through is
+  shipped ONCE. Write it as though there will never be another chance to change the layout: every
+  optimization, every design correction, every table that should be dropped, all in the same
+  migration. "Land this now and finish it in the next version" is not a schedule, it is a second
+  forced migration for every user and a pile of compatibility paths for the next person to read.
+  If something belongs in the new structure, it goes in before the structure ships - and if it
+  turns out not to be worth doing at all, it is deleted, not deferred.
+- A MIGRATION IS NOT DONE UNTIL IT IS PROVEN UNDER CHAOS, AT SPEED, AND UNDER KILL. Three things,
+  all measured on a real index and not a fixture: no UX or quality regression (search digest,
+  snippets and locators identical before and after), no performance regression (open, search and
+  write timed against the same index with the change off), and no breakage when the migration is
+  killed part-way - SIGKILL at several points, reopen, and the index must come back with zero
+  failing checks and the same digest.
 
 ## Architecture
 - `OmniKit` (SPM library): the engine + indexer.
