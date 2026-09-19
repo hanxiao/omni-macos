@@ -954,6 +954,22 @@ releasing.
      still referenced across four sites.
   4. Retire the fold. It cannot happen before 2 and 3, and it is what pays for them: `chunk.key`
      is unique by construction, so there are no duplicate contents for a fold to find.
+
+     NOT A DELETION, THOUGH. Read before writing: the fold and the split build both collapse
+     duplicates, but they record the positions they free in DIFFERENT places. The fold moves rows
+     onto a representative and records `vec_holes`, which is what `shouldReclaimHolesLocked` and
+     the whole-file reclaim read. The split build writes `free_slot`, which only the free list
+     reads. Delete the fold without reconciling those and the duplicate positions it used to free
+     stop being reclaimable at all - the file simply never shrinks, silently, which is the exact
+     failure mode the free list note at the top of this document describes.
+
+     And `loadBySlotLocked` picks its loader on `chunk_content_folded OR
+     chunk_slots_out_of_order`. The first of those is about to stop being set, so the gate has to
+     key on the split being built instead, or every folded index quietly falls back to the rank
+     walk that cannot read it.
+
+     So step 4 is: one freed-position list rather than two, the loader gate moved onto the split,
+     and only then the fold's own code removed.
   5. Move the resident loader, the coverage walk and the row sidecar off `chunks` onto
      `occurrence` + `chunk`. The largest step, and the one that finally deletes rank-is-position.
      Measured rather than guessed: 121 statements across 59 functions name `chunks`. Three groups
