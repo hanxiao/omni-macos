@@ -781,6 +781,64 @@ final class SchemaV4MigrationTests: XCTestCase {
                        "the partial index over slot still does not exist")
     }
 
+    /// AND THE SAME TRAP AGAIN, ON `chunks`, WHICH IS THE ONE THAT SHIPPED.
+    ///
+    /// The sibling above was found and fixed on `chunk`, the split's table. `chunks` - the hot
+    /// table every index has - has exactly the same problem and it was missed: the column is
+    /// added by `addColumnIfMissing` AFTER `StoreSchema.createStatements()` runs, and that list
+    /// carries `CREATE INDEX idx_chunk_slot ON chunks(slot) WHERE slot >= 0`. On the first open of
+    /// any index predating the column the index creation failed with "no such column: slot",
+    /// silently, and was never retried in that session.
+    ///
+    /// Which means it was missing for the whole of the migration - the one stretch that needs it
+    /// most, because coverage advances by position and this index is what makes each stamp
+    /// O(slice) rather than O(covered). A later open created it once the column existed, so a
+    /// finished index looks perfectly healthy and nothing pointed back at the migration.
+    ///
+    /// Caught by capturing the app's stderr during a chaos run and reading it, not by a test:
+    ///     [logging] no such column: slot in "CREATE INDEX IF NOT EXISTS idx_chunk_slot ..."
+    /// and confirmed against the live migrating index, which had idx_chunk_slot_v5 and no
+    /// idx_chunk_slot while the already-migrated copies beside it had both.
+    func testAnIndexPredatingTheSlotColumnGetsItsPartialIndexOnTheSameOpen() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("chunksslot-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appendingPathComponent("test.sqlite")
+        do { let s = try VectorStore(dbURL: dbURL); s.close() }
+
+        // Put `chunks` back into its pre-slot shape, the way an index written by an older build is.
+        do {
+            let db = open(dbURL); defer { sqlite3_close(db) }
+            for sql in ["DROP INDEX IF EXISTS idx_chunk_slot;",
+                        "DROP INDEX IF EXISTS idx_chunk_file;",
+                        "DROP TABLE IF EXISTS chunks;",
+                        """
+                        CREATE TABLE chunks(
+                            id INTEGER PRIMARY KEY,
+                            file_id INTEGER NOT NULL,
+                            chunk_index INTEGER NOT NULL,
+                            kind INTEGER NOT NULL DEFAULT 0
+                        );
+                        """,
+                        "CREATE UNIQUE INDEX idx_chunk_file ON chunks(file_id, chunk_index);"] {
+                XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK, sql)
+            }
+            XCTAssertEqual(scalar(db, "SELECT COUNT(*) FROM pragma_table_info('chunks') WHERE name='slot'"), 0,
+                           "the fixture is not actually the old shape")
+        }
+
+        // ONE open, not two. Two would pass even with the bug: the second open sees the column the
+        // first one added and creates the index then. The whole defect is that the first open -
+        // the one that runs the migration - does not.
+        do { let s = try VectorStore(dbURL: dbURL); s.close() }
+
+        let db = open(dbURL); defer { sqlite3_close(db) }
+        XCTAssertEqual(scalar(db, "SELECT COUNT(*) FROM pragma_table_info('chunks') WHERE name='slot'"), 1,
+                       "the slot column was not added")
+        XCTAssertEqual(scalar(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_chunk_slot'"), 1,
+                       "the partial index over slot was not created on the open that added the column")
+    }
+
     func testAnOldChunkSnippetIsRebuiltWithItsKindColumn() throws {
         // `chunk_snippet` shipped without `kind`, which forced `idx_snip_label` to index every text
         // snippet in the database rather than the media labels it serves - 1.515 GB against 0.036 GB

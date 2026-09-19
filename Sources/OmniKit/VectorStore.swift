@@ -1943,11 +1943,26 @@ public final class VectorStore: @unchecked Sendable {
                 exec("DROP TABLE IF EXISTS free_slot;")
                 exec("DELETE FROM meta WHERE key = '\(Self.chunkSplitDoneKey)';")
             }
+            // BEFORE createStatements, NOT AFTER - the same trap the comment above describes, in
+            // the table it was written about. Every v4 database written before content addressing
+            // predates this column, `CREATE TABLE IF NOT EXISTS` will not add it, and
+            // createStatements carries `CREATE INDEX idx_chunk_slot ON chunks(slot) WHERE
+            // slot >= 0`. Adding the column afterwards meant that index failed with "no such
+            // column: slot" on the first open of every existing index, silently, and was never
+            // retried in that session - so it was MISSING for the whole of the migration, which
+            // is the one stretch that needs it most: coverage advances by position, and this
+            // index is what makes each stamp O(slice) instead of O(covered). Confirmed on the
+            // live migrating index, which had idx_chunk_slot_v5 and no idx_chunk_slot; a later
+            // open created it once the column existed, which is why finished indexes look fine.
+            //
+            // Guarded on the table existing: on a fresh database `chunks` is created by
+            // createStatements below, already carrying the column.
+            if hasTableLocked("chunks") {
+                // `backfillSlotsLocked` then gives each row the slot its vector already occupies,
+                // after which the rank-through-holes walk is never needed again.
+                addColumnIfMissing("slot", "INTEGER NOT NULL DEFAULT -1")
+            }
             for sql in StoreSchema.createStatements() { exec(sql) }
-            // Every v4 database written before content addressing predates this column. Additive
-            // and free; `backfillSlotsLocked` then gives each row the slot its vector already
-            // occupies, after which the rank-through-holes walk is never needed again.
-            addColumnIfMissing("slot", "INTEGER NOT NULL DEFAULT -1")
         } else {
             createLegacySchemaLocked()
         }
