@@ -7,17 +7,19 @@ import XCTest
 /// is the assertion they were missing, and it exists because that is exactly what was reported:
 /// selection stopped sticking in both views while the index was being written to.
 ///
-/// NEITHER OF THESE RUNS YET, and this header is the honest state of it. They skip because the
-/// query returns no row the harness can find, and four attempts did not settle why: the wrong
-/// element type (`textFields` for a `searchField`), typing once against an index this launch is
-/// still building, and rows carrying an identifier without being accessibility elements were all
-/// real defects, all fixed, and none of them was enough. An attempt to dump the element tree for
-/// evidence passed in 22 seconds without writing its file - the runner is sandboxed and `try?`
-/// swallowed it. Stopped there rather than spend a fifth run guessing.
+/// FOUR ATTEMPTS AT THIS TEST WERE GUESSES AND THE FIFTH WAS EVIDENCE, which is the part worth
+/// remembering. It found no result row, and the blame went in turn to the wrong element type
+/// (`textFields` for a `searchField`), to typing once against an index the same launch was still
+/// building, and to rows carrying an identifier without being accessibility elements. All three
+/// were real defects and all three are fixed. None was the cause.
 ///
-/// The identifiers and traits on the result rows are kept regardless: nothing on a result row was
-/// reachable to accessibility before, which is why a green chaos suite could click rows all day
-/// and never notice a click that selected nothing.
+/// Printing the element tree settled it in one run: `No results above 50%` and `Show 40 weaker
+/// matches`. The search had worked every time - a synthetic corpus simply scores below the
+/// relevance floor, so the list renders its empty state. There were no rows to find. The harness
+/// clicks through the floor now, the way a person would.
+///
+/// (The first attempt at that evidence wrote a file and passed in 22 seconds having written
+/// nothing, because the runner is sandboxed and `try?` swallowed it. stdout reaches the log.)
 ///
 /// The second test is the one that matters. `applyResults` reconciles the selection against every
 /// arriving result set, so a live refresh of the same query drops any selected path that is not in
@@ -85,6 +87,16 @@ final class ResultSelectionUITests: XCTestCase {
             app.typeKey("a", modifierFlags: .command)
             app.typeText(text)
             if rows.waitForExistence(timeout: 20) { return true }
+            // THE RESULTS EXIST AND THE THRESHOLD IS HIDING THEM. A synthetic corpus scores below
+            // the 50% relevance floor, so the list renders "No results above 50%" and offers to
+            // show them - which is what a person clicks, and what four earlier attempts at this
+            // test missed while blaming identifiers, element types and timing in turn.
+            let weaker = app.windows.firstMatch.buttons.matching(
+                NSPredicate(format: "label CONTAINS[c] 'weaker'")).firstMatch
+            if weaker.exists, weaker.isHittable {
+                weaker.click()
+                if rows.waitForExistence(timeout: 20) { return true }
+            }
         }
         return false
     }
