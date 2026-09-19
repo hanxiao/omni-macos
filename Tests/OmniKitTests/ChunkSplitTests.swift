@@ -563,8 +563,18 @@ final class ChunkSplitAccountingTests: XCTestCase {
         store.advanceCoverageForTest()
         check("after the initial index and coverage")
 
-        if VectorStore.chunkSplit { store.buildChunkSplitForTest() }
-        check("after the split was built")
+        // THROUGH THE STAMP, not by calling the build directly. That is the one difference
+        // between this test, which passed, and MutationLifecycleTests, which did not - and
+        // disabling the stamp's call to the build is what made the lifecycle test pass.
+        if VectorStore.chunkSplit {
+            for _ in 0 ..< 30 {
+                store.stampCoverageForTest()
+                if store.splitSlotsForTest().count > 0 { break }
+                RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+            }
+            XCTAssertGreaterThan(store.splitSlotsForTest().count, 0, "the stamp never built the split")
+        }
+        check("after the split was built by the stamp")
 
         // IS IT THE CONTENT LOOKUP? That is the one thing the split changes about this path: it
         // answers "where does this content already live" from chunk.slot instead of from v4. If a

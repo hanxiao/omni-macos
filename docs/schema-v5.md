@@ -839,11 +839,19 @@ the split otherwise fully on. Everything else in the split is exonerated: the co
 native writes, the delete hook, the persistSlots work and the file-level reuse reader were each
 disabled in turn and the failure survived all five.
 
-What is NOT yet known is why. The build does not touch `vec_holes`, `pending_vecs` or the coverage
-claim, yet the failure is a coverage refusal. The two candidates worth testing next, in order: its
-`BEGIN IMMEDIATE` interacting with a transaction the stamp's caller already holds, and the fact
-that a successful build makes the stamp RETURN EARLY - skipping the fold and the reclaim that
-would otherwise have run in that pass.
+What is NOT yet known is why, and two of the three obvious answers are already eliminated.
+
+  - The early return was the best guess and it is wrong: that branch returns anyway, so a
+    successful build only defers the fold and the reclaim by one stamp.
+  - `free_slot`, the one table the build fills that nothing else writes, is read by no runtime
+    path at all - only by the migration's own invariants.
+  - Triggering the build THROUGH THE STAMP in the fast accounting test does not reproduce it
+    either. That test now does exactly that and passes.
+
+So it is the build running from the stamp WHILE THE REAL INDEXER IS DRIVING - batched writes and
+stamps interleaving - which is the one thing `MutationLifecycleTests` has that the fast test does
+not. That is where the next instrumentation belongs: inside that test, not in another probe of
+the split's parts, all five of which are exonerated.
 
 An extended `ChunkSplitAccountingTests` covering rename, move, folder delete and reopen passes
 with the split on, which is what says the ordinary write and delete paths are sound and points at
