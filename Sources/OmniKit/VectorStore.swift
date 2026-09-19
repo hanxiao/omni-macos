@@ -1986,8 +1986,19 @@ public final class VectorStore: @unchecked Sendable {
         // life go to v4 and have to be converted later. There is nothing to convert on an empty
         // database: the build is a no-op that sets one meta row, and from the first write onward
         // the index simply IS the new shape.
+        // GENUINELY NEW, not merely "no chunk rows yet". An index part way through the v3 -> v4
+        // conversion also has an empty `chunks` for a while - the conversion fills `chunks_new`
+        // and renames - and marking the split built there declares an EMPTY split authoritative
+        // over data that has not arrived. The rows then land through the conversion's own SQL,
+        // which does not write the split, and every locator and snippet reads back blank.
+        //
+        // `files` is the honest signal: a new index has no files, and an index with files has
+        // content somewhere whether or not `chunks` currently shows it.
         if Self.chunkSplit, Self.contentSharing, !v4BackfillPending, !splitBuilt,
-           layoutLocked() == .v4, scalarQuery("SELECT COUNT(*) FROM chunks") == 0 {
+           layoutLocked() == .v4,
+           scalarQuery("SELECT COUNT(*) FROM chunks") == 0,
+           scalarQuery("SELECT COUNT(*) FROM files") == 0,
+           !tableExists("chunk_text") || scalarQuery("SELECT COUNT(*) FROM chunk_text") == 0 {
             _ = buildChunkSplitLocked()
         }
 
@@ -2517,12 +2528,27 @@ public final class VectorStore: @unchecked Sendable {
             guard let id = pathID[path] else { return [:] }
             var keyOf: [Int: String] = [:]     // chunk_index -> key
             var stmt: OpaquePointer?
-            guard sqlite3_prepare_v2(db, """
+            // CHUNK KEY PER CHUNK OF ONE FILE, in both spellings. Under the split the key is the
+            // content's identity - it IS `chunk.key` - so this is a join through `occurrence`
+            // rather than a column on the text row. Left on v4 it returned nothing once
+            // `chunk_text` stopped being written, and chunk-level reuse silently stopped
+            // applying: every file re-embedded from scratch, which is correct output at several
+            // times the cost, and no test would have noticed.
+            // `c.key` raw, not hex: the reader below takes the blob and hexes it itself, and
+            // both spellings must hand it the same thing.
+            let keySQL = splitBuilt ? """
+                SELECT o.ordinal, c.key
+                  FROM occurrence o
+                  JOIN chunk c ON c.id = o.chunk_id
+                 WHERE o.file_id = \(StoreSchema.fileIDByPath) AND length(c.key) > 0
+                 LIMIT ?;
+                """ : """
                 SELECT c.chunk_index, t.chunk_key
                   FROM chunks c JOIN chunk_text t ON t.chunk_id = c.id
                  WHERE c.file_id = \(StoreSchema.fileIDByPath) AND length(t.chunk_key) > 0
                  LIMIT ?;
-                """, -1, &stmt, nil) == SQLITE_OK else { return [:] }
+                """
+            guard sqlite3_prepare_v2(db, keySQL, -1, &stmt, nil) == SQLITE_OK else { return [:] }
             defer { sqlite3_finalize(stmt) }
             bindPath(stmt, 1, path)
             sqlite3_bind_int(stmt, 3, Int32(cap))
@@ -3068,10 +3094,17 @@ public final class VectorStore: @unchecked Sendable {
                 // Under the split the tag list is on the CONTENT and the file link is the
                 // OCCURRENCE, so the same question needs the join the other way round. `ordinal`
                 // carries the ordering `chunk_id` was standing in for.
+                // KIND COMES FROM THE CONTENT, NOT FROM THE SNIPPET ROW. An untagged media
+                // chunk stores no snippet at all now - the file name it used to store there was
+                // per-path text in a content-keyed table - so keying media-ness off the existence
+                // of a `chunk_snippet` row lost the distinction this function exists to make:
+                // "media with no tags yet" (empty list) against "not a media file" (absent).
+                // `chunk.kind` is always there.
                 let tagSQL = splitBuilt ? """
-                    SELECT s.snippet FROM occurrence o
-                      JOIN chunk_snippet s ON s.chunk_id = o.chunk_id
-                    WHERE o.file_id = \(StoreSchema.fileIDByPath) AND s.kind IN (\(StoreSchema.mediaKindCodes.map(String.init).joined(separator: ",")))
+                    SELECT COALESCE(s.snippet, '') FROM occurrence o
+                      JOIN chunk c ON c.id = o.chunk_id
+                      LEFT JOIN chunk_snippet s ON s.chunk_id = o.chunk_id
+                    WHERE o.file_id = \(StoreSchema.fileIDByPath) AND c.kind IN (\(StoreSchema.mediaKindCodes.map(String.init).joined(separator: ",")))
                     ORDER BY o.ordinal;
                     """ : """
                     SELECT t.snippet FROM chunk_text t
@@ -3854,7 +3887,20 @@ public final class VectorStore: @unchecked Sendable {
             var seen: [String: Set<String>] = [:]
             var st: OpaquePointer?
             defer { sqlite3_finalize(st) }
-            guard sqlite3_prepare_v2(h, """
+            // Same question as `storedTags`, asked for a whole folder, and the same two
+            // spellings. Media-ness comes from `chunk.kind` under the split because an untagged
+            // media chunk has no snippet row at all now - see storedTags.
+            let sql = splitBuilt ? """
+                SELECT f.name, COALESCE(s.snippet, '')
+                  FROM occurrence o
+                  JOIN chunk c ON c.id = o.chunk_id
+                  JOIN files f ON f.id = o.file_id
+                  JOIN dirs d ON d.id = f.dir_id
+                  LEFT JOIN chunk_snippet s ON s.chunk_id = o.chunk_id
+                 WHERE d.path = ?1
+                   AND c.kind IN (\(StoreSchema.mediaKindCodes.map(String.init).joined(separator: ",")))
+                 ORDER BY f.name, o.ordinal;
+                """ : """
                 SELECT f.name, t.snippet
                   FROM chunk_text t
                   JOIN files f ON f.id = t.file_id
@@ -3862,7 +3908,8 @@ public final class VectorStore: @unchecked Sendable {
                  WHERE d.path = ?1
                    AND t.kind IN (\(StoreSchema.mediaKindCodes.map(String.init).joined(separator: ",")))
                  ORDER BY f.name, t.chunk_id;
-                """, -1, &st, nil) == SQLITE_OK else { return [:] }
+                """
+            guard sqlite3_prepare_v2(h, sql, -1, &st, nil) == SQLITE_OK else { return [:] }
             sqlite3_bind_text(st, 1, folder, -1, SQLITE_TRANSIENT)
             while sqlite3_step(st) == SQLITE_ROW {
                 guard let n = sqlite3_column_text(st, 0) else { continue }
@@ -6938,6 +6985,8 @@ public final class VectorStore: @unchecked Sendable {
     var splitBuiltForTest: Bool { queue.sync { splitBuilt } }
     /// The display SQL this index answers with.
     private var displayTextSQL: String { splitBuilt ? Self.chunkTextByPathSplitSQL : Self.chunkTextByPathSQL }
+    /// Snippet and locator for every chunk of one file. See fileDisplayTextSplitSQL.
+    private var fileDisplaySQL: String { splitBuilt ? Self.fileDisplayTextSplitSQL : Self.fileDisplayTextSQL }
     /// How far that backfill has got, as a chunk id. Absent means "not started" or "finished".
     private static let slotsMarkKey = "chunk_slots_upto"
     private var slotsBackfilled = false
@@ -9862,11 +9911,7 @@ public final class VectorStore: @unchecked Sendable {
             var locators: [Int: String] = [:]
             if dbOpen() {
                 var sStmt: OpaquePointer?
-                if sqlite3_prepare_v2(db, """
-                    SELECT c.chunk_index, t.snippet, t.locator
-                      FROM chunks c JOIN chunk_text t ON t.chunk_id = c.id
-                     WHERE c.file_id = \(StoreSchema.fileIDByPath);
-                    """, -1, &sStmt, nil) == SQLITE_OK {
+                if sqlite3_prepare_v2(db, fileDisplaySQL, -1, &sStmt, nil) == SQLITE_OK {
                     bindPath(sStmt, 1, path)
                     while sqlite3_step(sStmt) == SQLITE_ROW {
                         let ci = Int(sqlite3_column_int(sStmt, 0))
@@ -11428,26 +11473,57 @@ public final class VectorStore: @unchecked Sendable {
     /// untouched - its snippet IS its content, which is exactly what may be shared.
     static let chunkTextByPathSplitSQL = """
         SELECT CASE WHEN COALESCE(s.snippet, '') <> '' THEN s.snippet
-                    WHEN c.kind IN (\(StoreSchema.mediaKindCodes.map(String.init).joined(separator: ","))) THEN f.name
+                    WHEN COALESCE(c.kind, 0) IN (\(StoreSchema.mediaKindCodes.map(String.init).joined(separator: ","))) THEN COALESCE(ff.name, '')
                     ELSE '' END,
                o.locator
           FROM occurrence o
-          JOIN chunk c ON c.id = o.chunk_id
-          JOIN files f ON f.id = o.file_id
+          LEFT JOIN chunk c ON c.id = o.chunk_id
+          LEFT JOIN files ff ON ff.id = o.file_id
           LEFT JOIN chunk_snippet s ON s.chunk_id = o.chunk_id
          WHERE o.file_id = \(StoreSchema.fileIDByPath) AND o.ordinal = ?;
+        """
+
+    /// THE SAME QUESTION FOR A WHOLE FILE, keyed by chunk index. `rankChunks` and the passage
+    /// panel ask it per file rather than per chunk, and it had its own inline SQL against
+    /// `chunk_text` - so it kept reading v4 after every other reader had moved, and returned
+    /// nothing at all once v4 stopped being written. Named and paired here for the same reason
+    /// the single-chunk form is: a reader with its own private spelling is a reader that gets
+    /// left behind.
+    static let fileDisplayTextSplitSQL = """
+        SELECT o.ordinal,
+               CASE WHEN COALESCE(s.snippet, '') <> '' THEN s.snippet
+                    WHEN COALESCE(c.kind, 0) IN (\(StoreSchema.mediaKindCodes.map(String.init).joined(separator: ","))) THEN COALESCE(ff.name, '')
+                    ELSE '' END,
+               o.locator
+          FROM occurrence o
+          LEFT JOIN chunk c ON c.id = o.chunk_id
+          LEFT JOIN files ff ON ff.id = o.file_id
+          LEFT JOIN chunk_snippet s ON s.chunk_id = o.chunk_id
+         WHERE o.file_id = \(StoreSchema.fileIDByPath);
+        """
+
+    static let fileDisplayTextSQL = """
+        SELECT c.chunk_index,
+               CASE WHEN COALESCE(t.snippet, '') <> '' THEN t.snippet
+                    WHEN c.kind IN (\(StoreSchema.mediaKindCodes.map(String.init).joined(separator: ","))) THEN COALESCE(ff.name, '')
+                    ELSE '' END,
+               t.locator
+          FROM chunks c
+          JOIN chunk_text t ON t.chunk_id = c.id
+          LEFT JOIN files ff ON ff.id = c.file_id
+         WHERE c.file_id = \(StoreSchema.fileIDByPath);
         """
 
     /// Same fallback as the split form above, for the same reason: the write path no longer
     /// stores a media chunk's file name, so a v4 index written by this build has '' there too.
     static let chunkTextByPathSQL = """
         SELECT CASE WHEN COALESCE(t.snippet, '') <> '' THEN t.snippet
-                    WHEN c.kind IN (\(StoreSchema.mediaKindCodes.map(String.init).joined(separator: ","))) THEN f.name
+                    WHEN c.kind IN (\(StoreSchema.mediaKindCodes.map(String.init).joined(separator: ","))) THEN COALESCE(ff.name, '')
                     ELSE '' END,
                t.locator
           FROM chunks c
           JOIN chunk_text t ON t.chunk_id = c.id
-          JOIN files f ON f.id = c.file_id
+          LEFT JOIN files ff ON ff.id = c.file_id
          WHERE c.file_id = \(StoreSchema.fileIDByPath) AND c.chunk_index = ?;
         """
 
@@ -12140,7 +12216,8 @@ public final class VectorStore: @unchecked Sendable {
         //
         // ABOVE the `dim` guard on purpose: an empty database has no dimension yet, which is
         // exactly the state this is about.
-        if scalarQuery("SELECT COUNT(*) FROM chunks") == 0 {
+        if scalarQuery("SELECT COUNT(*) FROM chunks") == 0,
+           scalarQuery("SELECT COUNT(*) FROM files") == 0 {
             exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.chunkSplitDoneKey)', '1');")
             splitBuilt = false
             refreshSplitBuiltLocked()

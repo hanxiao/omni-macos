@@ -274,12 +274,12 @@ final class MigrationChaosUITests: XCTestCase {
                 if toggle.exists, toggle.isHittable {
                     toggle.click(); usleep(250_000); toggle.click()
                 }
-            default:
+            case 12:
                 // Escape and cmd-F alternating - the two things a user does when it feels slow.
                 app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])
                 usleep(80_000)
                 app.typeKey("f", modifierFlags: .command)
-            case 12:
+            case 13:
                 // PAUSE AND RESUME THE WATCHED FOLDER while its files are being churned and the
                 // index underneath is being rewritten. Pausing stands the crawler down mid-pass,
                 // which is the one operation that can leave a folder half-reconciled.

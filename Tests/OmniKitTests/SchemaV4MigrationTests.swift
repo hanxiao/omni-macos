@@ -110,8 +110,35 @@ final class SchemaV4MigrationTests: XCTestCase {
     /// not "v3 tables full of vectors" - it is v3 tables whose vectors have mostly been cleared,
     /// with a coverage claim and a `.vecs` file that is the only copy of them. Reconstructing that
     /// by hand is how the migration gets tested against the state it will actually meet.
+    /// FIXTURE WRITTEN BY AN OLD BINARY. Every test in this suite upgrades an index that some
+    /// earlier version wrote, and the only way to produce one is to write it with the split off:
+    /// a store that knows about the split writes it natively and, under the cutover, never writes
+    /// `chunk_text` at all - which is what `downgradeToV3` derives the v3 tables FROM. The
+    /// fixtures came out empty and the tests upgraded nothing. Correct behaviour, meaningless
+    /// fixture: no v3 index has ever been written by a binary that knew about the split.
+    ///
+    /// The UPGRADE itself must run with the flags as the arm set them, so this wraps only the
+    /// writing.
+    private func writtenByAnOldBinary<T>(_ body: () throws -> T) rethrows -> T {
+        let savedSplit = VectorStore.chunkSplit
+        let savedCutover = VectorStore.splitCutover
+        VectorStore.chunkSplit = false
+        VectorStore.splitCutover = false
+        defer { VectorStore.chunkSplit = savedSplit; VectorStore.splitCutover = savedCutover }
+        return try body()
+    }
+
+    /// A v3 INDEX WAS WRITTEN BY A v3 BINARY, so the fixture is written with the split off.
+    ///
+    /// It is built by writing through the CURRENT store and then rewriting the tables into the v3
+    /// shape, and `downgradeToV3` derives those tables from `chunk_text`. With the split on, a new
+    /// index is born v5 and writes the split natively; with the cutover on as well, `chunk_text`
+    /// is never written at all - so the "v3 index" came out empty and every one of these tests
+    /// upgraded nothing. Which is correct behaviour producing a meaningless fixture: no v3 index
+    /// has ever existed that was written by a binary that knew about the split.
     private func makeV3Index(_ dbURL: URL, files: Int, chunksPer: Int = 3) throws -> [Expected] {
         var expect: [Expected] = []
+        try writtenByAnOldBinary {
         do {
             let store = try VectorStore(dbURL: dbURL)
             var batch: [(path: String, chunks: [IndexedChunk])] = []
@@ -142,6 +169,7 @@ final class SchemaV4MigrationTests: XCTestCase {
         // them out of SQLite - which is the state that has to survive the conversion.
         for _ in 0 ..< 6 { let s = try VectorStore(dbURL: dbURL); s.close() }
         try downgradeToV3(dbURL)
+        }
         return expect
     }
 
@@ -378,13 +406,13 @@ final class SchemaV4MigrationTests: XCTestCase {
             wait(for: [done], timeout: 120)
         }
 
-        do {
+        try writtenByAnOldBinary {
             let store = try VectorStore(dbURL: dbURL)
             runPass(store)
             XCTAssertGreaterThan(store.count, 0, "the fixture indexed nothing")
             store.close()
+            for _ in 0 ..< 4 { let s = try VectorStore(dbURL: dbURL); s.close() }   // coverage settles
         }
-        for _ in 0 ..< 4 { let s = try VectorStore(dbURL: dbURL); s.close() }   // let coverage settle
         try downgradeToV3(dbURL)
 
         do { let s = try VectorStore(dbURL: dbURL); s.close() }   // converts on open
@@ -661,7 +689,7 @@ final class SchemaV4MigrationTests: XCTestCase {
             "/trail/dotted.name.with.dots.txt",
         ]
         var expect: [Expected] = []
-        do {
+        try writtenByAnOldBinary {
             let store = try VectorStore(dbURL: dbURL)
             for (i, p) in paths.enumerated() {
                 let seed = 9_000 + i
@@ -672,8 +700,8 @@ final class SchemaV4MigrationTests: XCTestCase {
                                  snippet: "s\(i)", embedding: vec(seed), locator: "L\(i)")])
             }
             store.close()
+            for _ in 0 ..< 4 { let s = try VectorStore(dbURL: dbURL); s.close() }
         }
-        for _ in 0 ..< 4 { let s = try VectorStore(dbURL: dbURL); s.close() }
 
         let store = try VectorStore(dbURL: dbURL)
         defer { store.close() }

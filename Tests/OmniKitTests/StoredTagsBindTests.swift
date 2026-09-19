@@ -175,4 +175,5 @@ final class StoredTagsBindTests: XCTestCase {
         XCTAssertEqual(browse["/pics/a/sunset.png"], [],
                        "a name-derived snippet was reported as a tag")
     }
+
 }
