@@ -6624,8 +6624,23 @@ public final class VectorStore: @unchecked Sendable {
     ///     max 50000  458   <- what charging a patched row like a delta row cost
     ///
     /// At 16 it is inside run-to-run noise of not having the free list at all.
+    /// OFF AGAIN, AND THIS TIME FOR CORRECTNESS RATHER THAN SPEED.
+    ///
+    /// It was turned on earlier today once `patchedRebuildThreshold` removed its throughput cost.
+    /// Chasing what looked like a split defect then found this, by elimination: with the split off
+    /// and the free list on, editing a file's content leaves `position N inside coverage has no
+    /// live row and no recorded hole` - a position the vector file still holds that nothing owns
+    /// and nothing records. With the free list off the same sequence is clean.
+    ///
+    /// That is the shape of defect that makes an index unopenable later, and nothing in the suite
+    /// caught it because no test advanced coverage BETWEEN mutations - which is exactly what an
+    /// app does and what ChunkSplitAccountingTests now does.
+    ///
+    /// The cause is not yet known. What is known is that it is the free list alone: the split, its
+    /// native writes, its delete hook and its content lookup were each disabled in turn and the
+    /// failure survived all of them.
     nonisolated(unsafe) public static var freeListEnabled =
-        ProcessInfo.processInfo.environment["OMNI_FREE_LIST"] != "0"
+        ProcessInfo.processInfo.environment["OMNI_FREE_LIST"] == "1"
     private var freeSlots = SlotAllocator()
     private var freeSlotsValid = false
     /// The mutation the quarantine was last released at. A position freed in one mutation becomes

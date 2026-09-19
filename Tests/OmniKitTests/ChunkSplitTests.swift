@@ -507,7 +507,7 @@ final class ChunkSplitAccountingTests: XCTestCase {
         savedSplit = VectorStore.chunkSplit
         savedQuant = VectorStore.quantBaseOverride
         VectorStore.contentSharing = true
-        VectorStore.chunkSplit = true
+        VectorStore.chunkSplit = ProcessInfo.processInfo.environment["OMNI_DIAG_NOSPLIT"] != "1"
         VectorStore.quantBaseOverride = VectorStore.scanBits
     }
     override func tearDown() {
@@ -533,12 +533,13 @@ final class ChunkSplitAccountingTests: XCTestCase {
                      chunkKey: String(format: "%016x", seed))
     }
 
-    /// KNOWN FAILING, and run only when asked. This documents an open defect - the split and the
-    /// free list together leave a position owned by nobody and unrecorded - so it must not turn
-    /// the default suite red while that is being chased. `OMNI_SPLIT_DIAG=1` runs it.
+    /// THE TEST THAT FOUND THE FREE LIST DEFECT, kept as a guard rather than a diagnostic.
+    ///
+    /// It audits after EVERY operation instead of only at the end, which is what no other test
+    /// did - and it is why a position left owned by nobody survived a green suite. It passes on
+    /// the shipping default; with `OMNI_FREE_LIST=1` it fails at "after editing a file's content",
+    /// which is the open defect that keeps the free list off.
     func testFindTheOperationThatBreaksTheAccounting() throws {
-        try XCTSkipUnless(ProcessInfo.processInfo.environment["OMNI_SPLIT_DIAG"] == "1",
-                          "diagnostic for an open split+free-list defect; set OMNI_SPLIT_DIAG=1")
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("splitacct-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -562,7 +563,7 @@ final class ChunkSplitAccountingTests: XCTestCase {
         store.advanceCoverageForTest()
         check("after the initial index and coverage")
 
-        store.buildChunkSplitForTest()
+        if VectorStore.chunkSplit { store.buildChunkSplitForTest() }
         check("after the split was built")
 
         // IS IT THE CONTENT LOOKUP? That is the one thing the split changes about this path: it

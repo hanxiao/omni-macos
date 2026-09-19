@@ -569,7 +569,7 @@ AND MEASURE IT OVER FIVE RUNS. Several hours went into bisecting on single-run c
 53, 61) and reading movement in noise. A single run tells you whether an arm fails; it tells you
 nothing about whether a change helped. Only 0 means anything.
 
-## The free list: on, once a patched row stopped being charged like a delta row
+## The free list: OFF, on a correctness defect found by auditing between mutations
 
 Handing a released position to the next new content instead of waiting for a whole-file copy is
 obviously right, and it is written: `SlotAllocator` allocates from a min-heap, `placeVectorLocked`
@@ -625,9 +625,28 @@ is separate and small, and the sweep on a 4,000-file churn is monotonic:
     max 16     755            max 64     715
     max 50000  458            <- what charging them the same cost
 
-At 16 the free list is inside run-to-run noise of not being there, so it is ON by default:
-733 ops against 768 with it off, PASS on every churn invariant - no missing rows, no orphans, no
-ghost hits, coverage consistent. 573 tests, 0 failures.
+At 16 the free list is inside run-to-run noise of not being there, and on that basis it was
+turned on.
+
+IT IS OFF AGAIN, AND NOT FOR SPEED. Chasing what looked like a defect in the chunk/occurrence
+split found this instead, by elimination. With the split OFF and the free list ON, editing a
+file's content leaves `position N inside coverage has no live row and no recorded hole` - a
+position the vector file still holds that nothing owns and nothing records. With the free list off
+the same sequence is clean.
+
+    split off, free list on    FAILS
+    split off, free list off   passes
+
+That is the shape of defect that makes an index unopenable later, which is the worst failure this
+store has. The cause is not yet known; what is known is that it is the free list alone - the
+split's native writes, its delete hook, its content lookup and its build were each disabled in
+turn and the failure survived every one of them.
+
+WHY A GREEN SUITE MISSED IT. No test advanced coverage BETWEEN mutations. They mutate, then audit
+at the end, or audit after a reopen. An app advances coverage continuously while the user works,
+so the window where a released position is neither owned nor recorded never opened in a test.
+`ChunkSplitAccountingTests` audits after EVERY operation, which is the only reason this is known
+at all - and it is now a guard on the default path rather than a diagnostic.
 
 Both wrong hypotheses left real fixes behind and both are kept: the allocator raises its ceiling
 instead of rebuilding the free set on every append, and the incremental base repacks patched rows
