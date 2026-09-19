@@ -16,7 +16,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-DD=".build/xcode-rel"
+# Overridable so a second, CONCURRENT xcodebuild (the automation-mode holder) does not fight this
+# one for the derived-data lock.
+DD=${OMNI_DD:-.build/xcode-rel}
 ART="$PWD/$DD/SourcePackages/artifacts/swift-tokenizers/TokenizersRust/TokenizersRust.artifactbundle"
 
 if command -v xcodegen >/dev/null 2>&1; then
