@@ -744,6 +744,43 @@ final class SchemaV4MigrationTests: XCTestCase {
                        "the media label index did not come across")
     }
 
+    /// THE SAME TRAP, ON `chunk`, FOUND IN AN APP LOG AND NOT BY A TEST.
+    ///
+    /// `chunk` shipped with `id` as the slot and now carries a `slot` column. CREATE TABLE IF NOT
+    /// EXISTS never alters an existing table, and these tables are created on every open whether
+    /// or not the split is enabled - so every index this build had already opened kept the old
+    /// shape, and the partial index over the new column failed with "no such column: slot". A
+    /// failed CREATE INDEX raises nothing anyone was checking, so it was invisible until the app's
+    /// stderr was captured during a chaos run.
+    func testAnOldChunkTableIsRebuiltWithItsSlotColumn() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("chunkslot-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appendingPathComponent("test.sqlite")
+        do { let s = try VectorStore(dbURL: dbURL); s.close() }
+
+        do {
+            let db = open(dbURL); defer { sqlite3_close(db) }
+            for sql in ["DROP INDEX IF EXISTS idx_chunk_slot_v5;",
+                       "DROP INDEX IF EXISTS idx_chunk_key;",
+                       "DROP TABLE IF EXISTS chunk;",
+                       "CREATE TABLE chunk(id INTEGER PRIMARY KEY, key BLOB NOT NULL, kind INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0, refs INTEGER NOT NULL DEFAULT 0);",
+                       "CREATE UNIQUE INDEX idx_chunk_key ON chunk(key);"] {
+                XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK, sql)
+            }
+            XCTAssertEqual(scalar(db, "SELECT COUNT(*) FROM pragma_table_info('chunk') WHERE name='slot'"), 0,
+                           "the fixture is not actually the old shape")
+        }
+
+        do { let s = try VectorStore(dbURL: dbURL); s.close() }
+
+        let db = open(dbURL); defer { sqlite3_close(db) }
+        XCTAssertEqual(scalar(db, "SELECT COUNT(*) FROM pragma_table_info('chunk') WHERE name='slot'"), 1,
+                       "reopening did not rebuild chunk with its slot column")
+        XCTAssertEqual(scalar(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_chunk_slot_v5'"), 1,
+                       "the partial index over slot still does not exist")
+    }
+
     func testAnOldChunkSnippetIsRebuiltWithItsKindColumn() throws {
         // `chunk_snippet` shipped without `kind`, which forced `idx_snip_label` to index every text
         // snippet in the database rather than the media labels it serves - 1.515 GB against 0.036 GB

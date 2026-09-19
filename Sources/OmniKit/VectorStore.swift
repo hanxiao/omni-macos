@@ -1925,6 +1925,24 @@ public final class VectorStore: @unchecked Sendable {
                 exec("DROP INDEX IF EXISTS idx_snip_label;")
                 exec("DROP TABLE IF EXISTS chunk_snippet;")
             }
+            // SAME AGAIN FOR `chunk`, and this one was caught in an app log rather than a test.
+            // The table shipped with `id` AS the slot; it has a `slot` column now, and
+            // CREATE TABLE IF NOT EXISTS never alters a table that already exists - so the
+            // partial index over that column failed to create with "no such column: slot" on
+            // every index this build had ever opened, since these tables are created on every
+            // open whether or not the split is enabled. Silent, because a failed CREATE INDEX is
+            // not an error anyone was checking.
+            //
+            // Safe to drop: the split is DERIVED from the v4 tables, so the only cost of losing
+            // it is rebuilding it, and its done-flag is cleared so that happens.
+            if hasTableLocked("chunk"), !hasColumnLocked("chunk", "slot") {
+                exec("DROP INDEX IF EXISTS idx_chunk_key;")
+                exec("DROP INDEX IF EXISTS idx_chunk_slot_v5;")
+                exec("DROP TABLE IF EXISTS chunk;")
+                exec("DROP TABLE IF EXISTS occurrence;")
+                exec("DROP TABLE IF EXISTS free_slot;")
+                exec("DELETE FROM meta WHERE key = '\(Self.chunkSplitDoneKey)';")
+            }
             for sql in StoreSchema.createStatements() { exec(sql) }
             // Every v4 database written before content addressing predates this column. Additive
             // and free; `backfillSlotsLocked` then gives each row the slot its vector already

@@ -392,8 +392,16 @@ final class OCRSession {
     }
 
     func closeDocument(id: Int) {
-        guard let index = documents.firstIndex(where: { $0.id == id }), documents.count > 1
-        else { clear(); return }
+        // TWO DIFFERENT SITUATIONS, and one `guard` used to treat them as the same one: a tab id
+        // that is not in the list, and a tab that is the last one. Only the second means "close
+        // the workspace". The first means the tab is already gone - which is what a second click
+        // on a close button produces, because the first click removed the tab while the pointer
+        // was still over it. So a quick double-click on one tab's close box, or two quick closes
+        // in a row, wiped every other tab as well. Reported as "closing one of the OCR tabs
+        // closes all of them", and it is not the count that is wrong, it is the lookup failing
+        // and falling into the same branch.
+        guard let index = documents.firstIndex(where: { $0.id == id }) else { return }
+        guard documents.count > 1 else { clear(); return }
         let removed = Set(documents[index].pageIDs)
         // Only the tab's presence is removed. Its pages keep their ids so nothing that captured an
         // index - a running decode, a thumbnail render - can write into the wrong page.

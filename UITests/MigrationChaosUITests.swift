@@ -66,6 +66,11 @@ final class MigrationChaosUITests: XCTestCase {
             "-omni.serving.enabled", "NO",
             "-omni.uiChaos", "YES",
         ]
+        // The app's own diagnostics, where a shell can read them afterwards.
+        if let out = ProcessInfo.processInfo.environment["OMNI_MIGCHAOS_STDERR"]
+            ?? ProcessInfo.processInfo.environment["TEST_RUNNER_OMNI_MIGCHAOS_STDERR"] {
+            app.launchArguments += ["-omni.stderrFile", out]
+        }
         app.launch()
         return app
     }
@@ -86,7 +91,7 @@ final class MigrationChaosUITests: XCTestCase {
         var rounds = 0
 
         while Date() < deadline {
-            switch rounds % 9 {
+            switch rounds % 10 {
             case 0:
                 // Type, then abandon before the debounce settles.
                 focusSearch(app)
@@ -153,6 +158,28 @@ final class MigrationChaosUITests: XCTestCase {
                 app.windows.firstMatch.scrollViews.firstMatch.swipeUp()
                 usleep(120_000)
                 app.windows.firstMatch.scrollViews.firstMatch.swipeDown()
+            case 8:
+                // HISTORY. Every query above is recorded; replaying one has to restore its text
+                // AND its filters and re-run it. Clicked by row, because what is in the list
+                // depends on what the earlier rounds happened to run.
+                let rows = app.windows.firstMatch.outlines.firstMatch.cells
+                if rows.count > 2 {
+                    let r = rows.element(boundBy: Int.random(in: 1 ..< min(rows.count, 6)))
+                    if r.exists, r.isHittable { r.click() }
+                }
+                usleep(250_000)
+                app.typeKey("[", modifierFlags: .command)
+            case 9:
+                // THE SEARCH BOX ITSELF: filter chips typed as text, then cleared mid-flight.
+                focusSearch(app)
+                app.typeKey("a", modifierFlags: .command)
+                for frag in ["kind:image ", "in:\"" + corpus.path + "\" ", "invoice"] {
+                    app.typeText(frag)
+                    usleep(UInt32.random(in: 80_000 ... 250_000))
+                }
+                usleep(300_000)
+                app.typeKey("a", modifierFlags: .command)
+                app.typeKey(XCUIKeyboardKey.delete, modifierFlags: [])
             default:
                 // Escape and cmd-F alternating - the two things a user does when it feels slow.
                 app.typeKey(XCUIKeyboardKey.escape, modifierFlags: [])

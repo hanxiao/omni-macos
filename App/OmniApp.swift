@@ -100,6 +100,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // while sibling `.task` modifiers in the same chain (`-omni.ocrOpen`, `-omni.query`) run
         // every time. So `-omni.hangwatch YES` silently did nothing, which matters because the
         // stall figures quoted in CLAUDE.md came from this instrument.
+        // `-omni.stderrFile <path>` sends the app's OWN diagnostics somewhere a shell can read
+        // them. Under XCUITest stderr goes into the test bundle's log and is not recoverable, so a
+        // chaos run could be asked "did it survive" but never "did it complain" - the whole of the
+        // store's `[omni] ...` reporting, every coverage refusal and every abandoned reclaim, was
+        // invisible to exactly the runs most likely to provoke them.
+        if let logPath = UserDefaults.standard.string(forKey: "omni.stderrFile"), !logPath.isEmpty {
+            FileManager.default.createFile(atPath: logPath, contents: nil)
+            freopen(logPath, "a", stderr)
+            setvbuf(stderr, nil, _IOLBF, 0)   // line-buffered: a crash must not eat the last lines
+        }
         if UserDefaults.standard.bool(forKey: "omni.hangwatch") {
             let ms = UserDefaults.standard.integer(forKey: "omni.hangwatchMs")
             // `-omni.hangwatchFile <path>` because under XCUITest the app's stderr goes into the
