@@ -628,20 +628,40 @@ is separate and small, and the sweep on a 4,000-file churn is monotonic:
 At 16 the free list is inside run-to-run noise of not being there, and on that basis it was
 turned on.
 
-AND A SECOND COST, MEASURED ON THE REAL INDEX: ONCE IT REUSES, EVERY OPEN IS 9x SLOWER.
+A SECOND COST WAS MEASURED ON THE REAL INDEX AND THEN DISPROVED, WHICH IS WORTH KEEPING.
 
     app-path open, free list off   ~25 s     loader: bySlot=false, row sidecar adopted
     app-path open, free list on    228 s     loader: bySlot=true,  no sidecar
 
-The first reuse sets `chunk_slots_out_of_order`, permanently and correctly - the numbering is no
-longer the row order, so the rank walk cannot be used again on that index. But the by-slot loader
-does not adopt the row sidecar, which is the thing that makes a large index open quickly. So one
-reused position costs 200 seconds on every launch for the life of the index.
+The reading was that the first reuse sets `chunk_slots_out_of_order`, so the index is stuck with
+the by-slot loader, and the by-slot loader does not adopt the row sidecar - therefore one reused
+position costs 200 seconds on every launch, and teaching that loader to adopt was the work gating
+the free list.
 
-That is not a bug in the marker, which is doing exactly what it must; it is that the fast loader
-and the correct loader are different code. Making the by-slot path adopt the sidecar is the work
-that has to happen before the free list can ship, on top of the cache-invalidation fix below -
-and it is a bigger piece than either.
+Every part of that is wrong except the numbers. Adoption runs BEFORE either loader, the sidecar
+already carries a slot per record, and the by-slot path is only the fallback. The free-list arm
+reached the fallback because the sidecar was being REJECTED - a tombstone in the 32-row validation
+sample, fixed in `tryAdoptRowSidecarLocked`. The by-slot fallback itself measures 11.3 s on that
+index, not 228 s.
+
+Measured again afterwards with `mutbench --reuse`, which deletes N paths from a real index and
+writes N back so a reuse actually happens, 500 paths per round, 4 rounds, against the same index
+with the free list off:
+
+                        round 1    rounds 2-4          holes at end   reopen
+    free list off        1.7 ms    1.7/1.8/1.7 ms      191,043        3.10 s
+    free list on       224.2 ms   23.7/26.6/36.0 ms    189,043        3.21 s
+
+2000 positions reclaimed, the vector file did not grow while the control's did, audit clean in
+both arms, and both adopt the sidecar and open in the same 3.1 s. The free list needs no loader
+work. What it does cost is one O(positions) walk per session to build the free set, then ~24-36 ms
+per 500-path batch against 1.7 ms - 0.06 ms per file on a path measured at 99% GPU, where a file
+takes 14 ms at 70 file/s.
+
+THE LESSON IS THE DIAGNOSIS, NOT THE NUMBER. A slow open was attributed to the feature being
+tested rather than to the shared thing underneath it, because the feature was the variable that
+had just changed. The control that settles it is cheap: run the same churn with the feature off
+and read the loader line in both.
 
 IT IS OFF AGAIN, AND NOT FOR SPEED. Chasing what looked like a defect in the chunk/occurrence
 split found this instead, by elimination. With the split OFF and the free list ON, editing a
