@@ -486,3 +486,113 @@ final class ChunkSplitTests: XCTestCase {
         XCTAssertGreaterThan(num(url, "SELECT COUNT(*) FROM chunk_text"), 0, "it dropped the v4 table it falls back to")
     }
 }
+
+/// WHICH OPERATION BREAKS THE ACCOUNTING, asked one operation at a time.
+///
+/// With the split on, the mutation lifecycle refuses to reopen: "bookkeeping is off by 12 rows
+/// (48 vectors live in the file, the index accounts for 36)". Two guesses at the cause were wrong,
+/// so this stops guessing: it does the same operations in order and checks, after each, that the
+/// number of rows with no pending blob still equals what the coverage claim accounts for. The
+/// first step that moves them apart is the answer.
+final class ChunkSplitAccountingTests: XCTestCase {
+
+    private static let dim = 64
+    private var savedSharing = true
+    private var savedSplit = false
+    private var savedQuant: Int?
+
+    override func setUp() {
+        super.setUp()
+        savedSharing = VectorStore.contentSharing
+        savedSplit = VectorStore.chunkSplit
+        savedQuant = VectorStore.quantBaseOverride
+        VectorStore.contentSharing = true
+        VectorStore.chunkSplit = true
+        VectorStore.quantBaseOverride = VectorStore.scanBits
+    }
+    override func tearDown() {
+        VectorStore.contentSharing = savedSharing
+        VectorStore.chunkSplit = savedSplit
+        VectorStore.quantBaseOverride = savedQuant
+        super.tearDown()
+    }
+
+    private func vec(_ seed: Int) -> [Float] {
+        var s = UInt64(seed &* 2_654_435_761 &+ 91)
+        var v = [Float](repeating: 0, count: Self.dim)
+        for i in 0 ..< Self.dim {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17
+            v[i] = Float(s % 2048) / 1024 - 1
+        }
+        let n = (v.reduce(0) { $0 + $1 * $1 }).squareRoot()
+        return n > 0 ? v.map { $0 / n } : v
+    }
+    private func chunk(_ path: String, _ idx: Int, _ seed: Int) -> IndexedChunk {
+        IndexedChunk(path: path, modified: 1, size: 10, kind: "text", chunkIndex: idx,
+                     snippet: "s\(seed)", embedding: vec(seed), locator: "Line \(idx + 1)",
+                     chunkKey: String(format: "%016x", seed))
+    }
+
+    /// KNOWN FAILING, and run only when asked. This documents an open defect - the split and the
+    /// free list together leave a position owned by nobody and unrecorded - so it must not turn
+    /// the default suite red while that is being chased. `OMNI_SPLIT_DIAG=1` runs it.
+    func testFindTheOperationThatBreaksTheAccounting() throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["OMNI_SPLIT_DIAG"] == "1",
+                          "diagnostic for an open split+free-list defect; set OMNI_SPLIT_DIAG=1")
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("splitacct-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = try VectorStore(dbURL: dir.appendingPathComponent("index.sqlite"))
+        defer { store.close() }
+
+        // THE AUDIT, not a hand-rolled formula. The first version of this compared rows against
+        // positions and reported a healthy index as broken from the very first step - the same
+        // confusion the refusal message itself carried.
+        func check(_ step: String) {
+            XCTAssertNil(store.coverageAudit(), "\(step)")
+        }
+
+        for i in 0 ..< 24 {
+            let p = "/m/f\(i).txt"
+            try store.replace(path: p, chunks: [chunk(p, 0, 1000 + i), chunk(p, 1, 7 + (i % 3))])
+        }
+        _ = store.search(vec(1000), filter: SearchFilter(), topK: 5)
+        store.migrateSlotsToCompletion()
+        store.advanceCoverageForTest()
+        check("after the initial index and coverage")
+
+        store.buildChunkSplitForTest()
+        check("after the split was built")
+
+        // IS IT THE CONTENT LOOKUP? That is the one thing the split changes about this path: it
+        // answers "where does this content already live" from chunk.slot instead of from v4. If a
+        // row there is stale, the writer seats a new row on a position the edit just released.
+        let beforeEdit = store.slotsForTest
+        try store.replace(path: "/m/f3.txt", chunks: [chunk("/m/f3.txt", 0, 9003)])
+        store.advanceCoverageForTest()
+        if let bad = store.coverageAudit() {
+            let afterEdit = store.slotsForTest
+            XCTFail("""
+                after editing a file's content: \(bad)
+                  positions before: \(beforeEdit.sorted())
+                  positions after:  \(afterEdit.sorted())
+                  holes:            \(store.holesForTest().sorted())
+                  chunk.slot rows:  \(store.splitSlotsForTest().sorted())
+                """)
+        }
+
+        store.deletePath("/m/f5.txt")
+        store.advanceCoverageForTest()
+        check("after deleting a file")
+
+        let np = "/m/new.txt"
+        try store.replace(path: np, chunks: [chunk(np, 0, 5555), chunk(np, 1, 7)])
+        store.advanceCoverageForTest()
+        check("after adding a file that shares existing content")
+
+        store.deletePaths(["/m/f7.txt", "/m/f8.txt"])
+        store.advanceCoverageForTest()
+        check("after a bulk delete")
+    }
+}

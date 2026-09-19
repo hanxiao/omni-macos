@@ -807,15 +807,30 @@ THE SPLIT ARM FAILS TWO TESTS AND IS THEREFORE STILL OFF.
                              file, the index accounts for 36)"
     DatabaseRepackTests     released pages are not reused by the next batch
 
-Twelve rows have no pending blob that coverage never covered. Two hypotheses were tried and both
-were wrong: that the equivalence between maintained and rebuilt had drifted (it has not - that
-test passes), and that stale `occurrence` rows at the two bulk delete sites were making
-file-level reuse hand back content that is gone (those sites do need the cleanup, which they now
-have, and it did not move this). Guessing a third time is how several hours went today; the next
-move is to instrument which rows those twelve are and when their blobs go, not to change code.
+INSTRUMENTED RATHER THAN GUESSED AT, and the answer is narrow: it is the SPLIT AND THE FREE LIST
+TOGETHER, not the split. `ChunkSplitAccountingTests` runs the mutation sequence one operation at a
+time and audits after each. The step that breaks it is editing a file's content, and the audit
+says `position 6 inside coverage has no live row and no recorded hole`. With `OMNI_FREE_LIST=0`
+the same test passes; with the free list on it fails. The shipping default is unaffected because
+the split is off.
 
-The repack failure is likely downstream of the same thing - pages are not released if rows are
-not where the pass expects them - but that is an assumption, not a measurement.
+Three hypotheses died on the way, each by measurement:
+
+  - that maintained and rebuilt had drifted. They have not; that test passes.
+  - that stale `occurrence` rows at the two bulk delete sites let file-level reuse hand back
+    content that is gone. Those sites genuinely did leak occurrences and now clean them, and it
+    did not move this.
+  - that one of the split's `exec` statements was failing inside someone else's transaction and
+    rolling back the hole records with it. `OMNI_SQL_DEBUG=1` prints failed statements now, and
+    there are none.
+
+AND THE DIAGNOSTIC THAT WAS GUIDING ME WAS ITSELF WRONG. `coverageMismatchDetailLocked` compares
+ROWS against POSITIONS - "48 vectors live in the file, the index accounts for 36" - and under
+sharing those differ on every healthy index. Nothing refuses because of it; it is only the text of
+a refusal decided elsewhere. It is left alone on purpose: making it sharing-aware changed the
+message that `testAmbiguousMismatchWithHolesStillRefuses` pins, and a refusal's wording is a
+safety surface - that test exists because this message once blamed a second copy of the app for a
+bookkeeping problem. Correcting the units means re-deciding what the sentence says.
 
 WHAT IS NOT DONE: dropping the v4 tables. Building the tables and proving the invariants is the half that can be
 checked; repointing snippets, locators, tag filters, browse, lexical and dedup at `chunk` /

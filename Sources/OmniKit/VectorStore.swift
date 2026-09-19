@@ -7703,6 +7703,17 @@ public final class VectorStore: @unchecked Sendable {
     private func coverageMismatchDetailLocked() -> String {
         guard dbOpen() else { return "" }
         let cleared = clearedRowsLocked()
+        // NOTE, NOT YET A FIX: this compares ROWS against POSITIONS. `cleared` counts rows whose
+        // blob is gone; `coveredRows - holes` counts positions the claim covers, and under sharing
+        // several rows read one position - 48 against 27 on a 24-file fixture, on a perfectly
+        // healthy index. It is only the refusal's TEXT, so nothing refuses because of it, but it
+        // cost an hour of debugging pointed at the wrong thing.
+        //
+        // Left alone deliberately. Making it sharing-aware changed the message on the fixture
+        // `testAmbiguousMismatchWithHolesStillRefuses` pins, and a refusal's wording is a safety
+        // surface: the test exists because this message once blamed a second copy of the app for
+        // a bookkeeping problem. Correcting the units means re-deciding what the sentence should
+        // say, which is a change to make deliberately and not at the end of a debugging session.
         let accounted = coveredRows - vecHoles.count
         guard cleared != accounted else { return "" }
         let n = abs(cleared - accounted)
@@ -12000,6 +12011,29 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
+    /// The recorded holes, for a test that needs to see them.
+    public func holesForTest() -> [Int32] { queue.sync { Array(vecHoles) } }
+
+    /// Every position the SPLIT believes it owns.
+    public func splitSlotsForTest() -> [Int] {
+        queue.sync {
+            var out: [Int] = []
+            var st: OpaquePointer?
+            defer { sqlite3_finalize(st) }
+            guard sqlite3_prepare_v2(db, "SELECT slot FROM chunk WHERE slot >= 0;", -1, &st, nil) == SQLITE_OK
+            else { return [] }
+            while sqlite3_step(st) == SQLITE_ROW { out.append(Int(sqlite3_column_int(st, 0))) }
+            return out
+        }
+    }
+
+    /// The two numbers whose disagreement makes the store refuse to open: how many rows have no
+    /// pending blob, and how many the coverage claim accounts for. Exposed so a test can ask after
+    /// each operation which one moved them apart, rather than only learning at the next open.
+    public func coverageAccountingForTest() -> (cleared: Int, accounted: Int) {
+        queue.sync { (clearedRowsLocked(), coveredRows - vecHoles.count) }
+    }
+
     /// Empty chunk_text entirely, which is what dropping it will do. Cached statements go with
     /// it, so the next read re-prepares against whatever is left.
     public func emptyV4TextForTest() {
@@ -13075,7 +13109,18 @@ public final class VectorStore: @unchecked Sendable {
         if !present { exec("ALTER TABLE chunks ADD COLUMN \(name) \(decl);") }
     }
 
-    private func exec(_ sql: String) { sqlite3_exec(db, sql, nil, nil, nil) }
+    private func exec(_ sql: String) {
+        let rc = sqlite3_exec(db, sql, nil, nil, nil)
+        // SILENT BY DESIGN, LOUD WHEN ASKED. Most callers genuinely do not care - dropping a table
+        // that is not there, clearing a temp table. But a statement that fails INSIDE someone
+        // else's transaction can abort work that had nothing to do with it, and hunting that
+        // without being able to see the failure is guesswork. OMNI_SQL_DEBUG=1 shows them.
+        if rc != SQLITE_OK, Self.sqlDebug {
+            let msg = db.map { String(cString: sqlite3_errmsg($0)) } ?? "?"
+            FileHandle.standardError.write(Data("[omni][sql] \(msg) in: \(sql.prefix(160))\n".utf8))
+        }
+    }
+    nonisolated(unsafe) static let sqlDebug = ProcessInfo.processInfo.environment["OMNI_SQL_DEBUG"] == "1"
     /// exec that reports. Used where a silent failure would leave a durable claim describing work
     /// that did not happen - the slot bookkeeping, where "it probably worked" is not good enough.
     private func execChecked(_ sql: String) -> Bool { sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK }
