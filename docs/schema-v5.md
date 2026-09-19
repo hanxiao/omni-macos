@@ -956,6 +956,12 @@ releasing.
      is unique by construction, so there are no duplicate contents for a fold to find.
   5. Move the resident loader, the coverage walk and the row sidecar off `chunks` onto
      `occurrence` + `chunk`. The largest step, and the one that finally deletes rank-is-position.
+     Measured rather than guessed: 121 statements across 59 functions name `chunks`. Three groups
+     fall away with the steps before it - `foldDuplicateContentsLocked` goes with step 4,
+     `maintainSplitForFilesLocked` is already dead code with no callers, and the 11 in
+     `migrateToV4Locked` stay, because v3 -> v4 remains the staging path. What is left is the
+     core: `loadScanSQL` and `loadBySlotLocked` (the loader), `advanceCoverageLocked` (coverage),
+     `internPathsLocked`, and the four delete sites.
   6. `pending_vecs` keyed on content id rather than row id.
   7. The migration contracts: drop `chunk_text`, then `chunks`, with the kill-and-reopen proof.
   8. Both flags deleted - not defaulted, deleted. A shipped layout has no switch.
