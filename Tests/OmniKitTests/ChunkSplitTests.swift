@@ -294,6 +294,43 @@ final class ChunkSplitTests: XCTestCase {
                        "every chunk did not become exactly one occurrence")
     }
 
+    /// THE CONTENT LOOKUP ANSWERS FROM THE SPLIT, and keeps answering correctly.
+    ///
+    /// This is the first reader moved for the CUTOVER rather than for correctness: v4 answers
+    /// "does this content exist" with a join and a partial index the query must remember to imply,
+    /// the split answers it from `chunk.key`, which is UNIQUE. The statement is cached, and the
+    /// split is built mid-session by the coverage stamp, so the cache has to be dropped when the
+    /// flag flips - otherwise a session that starts before the build keeps asking v4 for ever, and
+    /// once the v4 tables go, keeps asking a table that is not there.
+    func testTheContentLookupFollowsTheSplit() throws {
+        let url = tempDB()
+        let store = try build(url, files: 24, dupEvery: 4)
+        defer { store.close() }
+
+        // Before the split: the reuse path already works, and that is the baseline.
+        let sharedKey = String(format: "%016x", 7)
+        XCTAssertNotNil(store.liveSlotForContentKeyForTest(sharedKey),
+                        "the shared content has no slot before the split, so the fixture is wrong")
+
+        XCTAssertTrue(store.buildChunkSplitForTest())
+        let expected = store.slotOfContentInSplitForTest(sharedKey)
+        XCTAssertNotNil(expected, "the split has no row for the shared content")
+
+        // TAKE v4'S ANSWER AWAY, which is the only way to prove which table replied - with both
+        // present they agree, so an assertion that they agree passes whichever one answered. This
+        // also rehearses the cutover: after it, chunk_text is not merely ignored, it is gone.
+        store.blankV4ContentKeysForTest()
+        XCTAssertNil(store.liveSlotForContentViaV4ForTest(sharedKey),
+                     "v4 can still answer, so this proves nothing")
+
+        let after = store.liveSlotForContentKeyForTest(sharedKey)
+        XCTAssertEqual(after, expected,
+                       "the content lookup did not answer from the split once v4 could not")
+        // And a key nothing carries is still absent.
+        XCTAssertNil(store.liveSlotForContentKeyForTest(String(format: "%016x", 999_999)),
+                     "the lookup invented a slot for a content that does not exist")
+    }
+
     func testItRefusesUntilEveryRowHasASlot() throws {
         let url = tempDB()
         let store = try VectorStore(dbURL: url)

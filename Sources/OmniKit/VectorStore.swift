@@ -6750,8 +6750,17 @@ public final class VectorStore: @unchecked Sendable {
     private var splitBuilt = false
     /// Read the durable flag once. Set after a build and at open.
     private func refreshSplitBuiltLocked() {
+        let was = splitBuilt
         splitBuilt = Self.chunkSplit && dbOpen()
             && scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.chunkSplitDoneKey)'") == 1
+        // THE CACHED STATEMENTS OUTLIVE THE FLAG OTHERWISE. The split is built mid-session by the
+        // coverage stamp, so a reader that prepared its SQL against v4 at open would keep asking
+        // v4 for the rest of the session - and, once the v4 tables go, would keep asking a table
+        // that is not there. Dropped here so the next call re-prepares against whatever is true.
+        if was != splitBuilt {
+            sqlite3_finalize(contentSelStmt); contentSelStmt = nil
+            sqlite3_finalize(snippetStmt); snippetStmt = nil
+        }
     }
     /// The display SQL this index answers with.
     private var displayTextSQL: String { splitBuilt ? Self.chunkTextByPathSplitSQL : Self.chunkTextByPathSQL }
@@ -11516,10 +11525,17 @@ public final class VectorStore: @unchecked Sendable {
     func liveSlotForContentLocked(_ key: Data) -> Int32? {
         guard !key.isEmpty, dbOpen() else { return nil }
         if contentSelStmt == nil {
-            _ = sqlite3_prepare_v2(db, """
-                SELECT c.slot FROM chunk_text t JOIN chunks c ON c.id = t.chunk_id
-                 WHERE t.chunk_key = ? AND length(t.chunk_key) > 0 AND c.slot >= 0 LIMIT 1;
-                """, -1, &contentSelStmt, nil)
+            // FROM THE SPLIT WHEN IT EXISTS, and this is the first reader to move for the sake of
+            // the cutover rather than for correctness. v4 answers this with a JOIN and a PARTIAL
+            // index that the query has to remember to imply; the split answers it from `chunk.key`,
+            // which is UNIQUE, so it is one seek on the table whose whole purpose is this question.
+            let sql = splitBuilt
+                ? "SELECT slot FROM chunk WHERE key = ? AND slot >= 0 LIMIT 1;"
+                : """
+                  SELECT c.slot FROM chunk_text t JOIN chunks c ON c.id = t.chunk_id
+                   WHERE t.chunk_key = ? AND length(t.chunk_key) > 0 AND c.slot >= 0 LIMIT 1;
+                  """
+            _ = sqlite3_prepare_v2(db, sql, -1, &contentSelStmt, nil)
         }
         guard let st = contentSelStmt else { return nil }
         sqlite3_reset(st)
@@ -11792,6 +11808,7 @@ public final class VectorStore: @unchecked Sendable {
         do {
             guard let r = try MigrationV5Runner.backfillInPlace(db: db!, highWater: highWater) else { return false }
             exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.chunkSplitDoneKey)', '1');")
+            splitBuilt = false        // force refresh to notice the change and drop cached SQL
             refreshSplitBuiltLocked()
             let msg = "[omni] chunk split built: \(r.contents) contents, \(r.occurrences) occurrences, "
                 + "\(r.freeSlots) free, \(String(format: "%.1f", r.seconds))s\n"
@@ -11842,6 +11859,53 @@ public final class VectorStore: @unchecked Sendable {
             exec("DELETE FROM chunk_snippet;"); exec("DELETE FROM free_slot;")
             exec("DELETE FROM meta WHERE key = '\(Self.chunkSplitDoneKey)';")
             splitBuilt = false
+        }
+    }
+
+    /// Blank v4's content keys, so only the split can answer "does this content exist".
+    public func blankV4ContentKeysForTest() {
+        queue.sync {
+            exec("UPDATE chunk_text SET chunk_key = x'';")
+            sqlite3_finalize(contentSelStmt); contentSelStmt = nil
+        }
+    }
+
+    /// Ask v4 directly, to prove it can no longer answer.
+    public func liveSlotForContentViaV4ForTest(_ key: String) -> Int32? {
+        queue.sync {
+            var st: OpaquePointer?
+            defer { sqlite3_finalize(st) }
+            guard sqlite3_prepare_v2(db, """
+                SELECT c.slot FROM chunk_text t JOIN chunks c ON c.id = t.chunk_id
+                 WHERE t.chunk_key = ? AND length(t.chunk_key) > 0 AND c.slot >= 0 LIMIT 1;
+                """, -1, &st, nil) == SQLITE_OK else { return nil }
+            let k = StoreSchema.hexToBytes(key)
+            return k.withUnsafeBytes { raw -> Int32? in
+                sqlite3_bind_blob(st, 1, raw.baseAddress, Int32(raw.count), SQLITE_TRANSIENT)
+                guard sqlite3_step(st) == SQLITE_ROW else { return nil }
+                return sqlite3_column_int(st, 0)
+            }
+        }
+    }
+
+    /// The content lookup the write path uses, for a test that needs to see which table answers.
+    public func liveSlotForContentKeyForTest(_ key: String) -> Int32? {
+        queue.sync { liveSlotForContentLocked(StoreSchema.hexToBytes(key)) }
+    }
+
+    /// Where the SPLIT says that content lives, read straight off `chunk`.
+    public func slotOfContentInSplitForTest(_ key: String) -> Int32? {
+        queue.sync {
+            var st: OpaquePointer?
+            defer { sqlite3_finalize(st) }
+            guard sqlite3_prepare_v2(db, "SELECT slot FROM chunk WHERE key = ? LIMIT 1;", -1, &st, nil) == SQLITE_OK
+            else { return nil }
+            let k = StoreSchema.hexToBytes(key)
+            return k.withUnsafeBytes { raw -> Int32? in
+                sqlite3_bind_blob(st, 1, raw.baseAddress, Int32(raw.count), SQLITE_TRANSIENT)
+                guard sqlite3_step(st) == SQLITE_ROW else { return nil }
+                return sqlite3_column_int(st, 0)
+            }
         }
     }
 
