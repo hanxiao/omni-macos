@@ -6956,6 +6956,9 @@ public final class VectorStore: @unchecked Sendable {
     /// Whether THIS index has the split built and proven. Cached because every result row asks it,
     /// and a meta SELECT per displayed snippet is not free on the interactive path.
     private var splitBuilt = false
+    /// True while the off-queue split build is running. One at a time: the build is minutes long
+    /// and starting a second would have two connections writing the same four tables.
+    private var splitBuildInFlight = false
     /// Contents a write touched, whose `refs` must be recomputed once the batch commits.
     /// Recomputed rather than incremented: INSERT OR REPLACE on an occurrence can overwrite one,
     /// and an increment that double-counts frees a vector another file still points at - silently,
@@ -6983,6 +6986,9 @@ public final class VectorStore: @unchecked Sendable {
     /// rows" and "the store is READING them" are different claims, and only the second is the one
     /// that matters once v4 stops being written.
     public var splitBuiltForTest: Bool { queue.sync { splitBuilt } }
+    /// Whether the off-queue build is still running. Harnesses that time the build have to wait
+    /// on this: `buildChunkSplitForTest` only SCHEDULES it now and returns false immediately.
+    public var splitBuildInFlightForTest: Bool { queue.sync { splitBuildInFlight } }
     /// The display SQL this index answers with.
     private var displayTextSQL: String { splitBuilt ? Self.chunkTextByPathSplitSQL : Self.chunkTextByPathSQL }
     /// Snippet and locator for every chunk of one file. See fileDisplayTextSplitSQL.
@@ -11399,6 +11405,14 @@ public final class VectorStore: @unchecked Sendable {
             queue.sync { stampVectorCoverageLocked(budget: budget, reclaim: false) }
             n += 1
             if queue.sync(execute: { splitBuilt }) { break }
+            // The build is asynchronous now, so "nothing changed" is the NORMAL state while it
+            // runs. Waiting on it here is what keeps the harness measuring the migration rather
+            // than the stamp loop's own impatience.
+            if queue.sync(execute: { splitBuildInFlight }) {
+                while queue.sync(execute: { splitBuildInFlight }) { Thread.sleep(forTimeInterval: 1) }
+                stale = 0; last = progressKey()
+                continue
+            }
             let now = progressKey()
             stale = (now == last) ? stale + 1 : 0
             last = now
@@ -12234,6 +12248,65 @@ public final class VectorStore: @unchecked Sendable {
             """)
     }
 
+    /// ROWS THAT ARRIVED WHILE THE BUILD WAS RUNNING.
+    ///
+    /// The build works from a snapshot on its own connection and takes minutes. Anything indexed
+    /// in that window went to v4 only - `splitBuilt` was still false, so `writeChunksLocked`
+    /// skipped the native split write - so `occurrence` is missing exactly those rows. Left
+    /// alone, those files would be invisible to every reader the moment the split becomes
+    /// authoritative: present in `chunks`, absent from `occurrence`, and no error anywhere.
+    ///
+    /// Runs on the store queue in the same turn that sets the done flag, so there is no instant
+    /// at which the split is both authoritative and incomplete.
+    private func catchUpSplitLocked() {
+        guard dbOpen() else { return }
+        let media = StoreSchema.mediaKindCodes.map(String.init).joined(separator: ",")
+        _ = media
+        // A content per missing row, keyed the same way the build keys them, then the pointer,
+        // then the snippet. INSERT OR IGNORE throughout: a row whose content already exists
+        // simply joins it, which is the whole point of the table.
+        exec("""
+            CREATE TEMP TABLE IF NOT EXISTS split_catchup AS
+            SELECT c.id AS chunk_row, c.slot AS slot, c.kind AS kind, c.file_id AS file_id,
+                   c.chunk_index AS ordinal
+              FROM chunks c
+             WHERE c.slot >= 0
+               AND NOT EXISTS (SELECT 1 FROM occurrence o
+                                WHERE o.file_id = c.file_id AND o.ordinal = c.chunk_index);
+            """)
+        let missing = scalarQuery("SELECT COUNT(*) FROM split_catchup")
+        if missing > 0 {
+            exec("""
+                INSERT OR IGNORE INTO chunk(key, kind, bytes, refs, slot)
+                SELECT COALESCE(NULLIF(t.chunk_key, x''), CAST(x'00' || u.chunk_row AS BLOB)),
+                       u.kind, 0, 0, u.slot
+                  FROM split_catchup u
+                  LEFT JOIN chunk_text t ON t.chunk_id = u.chunk_row;
+                """)
+            exec("""
+                INSERT OR REPLACE INTO occurrence(file_id, ordinal, chunk_id, locator)
+                SELECT u.file_id, u.ordinal, k.id, COALESCE(t.locator, '')
+                  FROM split_catchup u
+                  JOIN chunk k ON k.slot = u.slot
+                  LEFT JOIN chunk_text t ON t.chunk_id = u.chunk_row;
+                """)
+            exec("""
+                INSERT OR IGNORE INTO chunk_snippet(chunk_id, kind, snippet)
+                SELECT k.id, u.kind, COALESCE(t.snippet, '')
+                  FROM split_catchup u
+                  JOIN chunk k ON k.slot = u.slot
+                  LEFT JOIN chunk_text t ON t.chunk_id = u.chunk_row;
+                """)
+            exec("""
+                UPDATE chunk SET refs = (SELECT COUNT(*) FROM occurrence o WHERE o.chunk_id = chunk.id)
+                 WHERE id IN (SELECT k.id FROM chunk k JOIN split_catchup u ON k.slot = u.slot);
+                """)
+            FileHandle.standardError.write(Data(
+                "[omni] split catch-up: \(missing) rows written during the build\n".utf8))
+        }
+        exec("DROP TABLE IF EXISTS split_catchup;")
+    }
+
     /// The files a set of v4 chunk rows belong to.
     func filesOfChunkRowsLocked(_ ids: [Int64]) -> [Int64] {
         guard dbOpen(), !ids.isEmpty else { return [] }
@@ -12288,40 +12361,64 @@ public final class VectorStore: @unchecked Sendable {
         // the rows - so the free list is derived against whichever is larger, or it would call a
         // position that exists "not covered by anything" and fail its own invariant.
         let highWater = highWaterOverride ?? Int64(Swift.max(Int(maxSlot) + 1, slotCount))
-        do {
-            guard let r = try MigrationV5Runner.backfillInPlace(db: db!, highWater: highWater) else { return false }
-            // THE POSITIONS IT FREED ARE NOT FREE YET, AND SAYING SO BREAKS THE INDEX.
-            //
-            // The build collapses 3,770,848 duplicate positions onto their representatives and
-            // records them in `free_slot` - which nothing reads at runtime, so that space is not
-            // reclaimed. The obvious fix, copying them into `vec_holes` where the reclaim looks,
-            // was tried and is WRONG: the build collapses a duplicate by pointing its CONTENT at
-            // the representative's slot and does not touch `chunks.slot`, which is still what
-            // the resident mapping and the loader read. So the row is alive and still sitting on
-            // the position, and the audit says exactly that:
-            //
-            //     AUDIT FAILED: hole 6990695 still has a live row
-            //
-            // The position genuinely becomes free at step 5, when the loader reads `occurrence`
-            // -> `chunk.slot` instead of `chunks.slot`. Until then `free_slot` is the honest
-            // record: the space is identified and not yet returned. Publishing it early trades
-            // a missing reclaim - which costs disk - for an index that fails its own audit.
-            exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.chunkSplitDoneKey)', '1');")
-            splitBuilt = false        // force refresh to notice the change and drop cached SQL
-            refreshSplitBuiltLocked()
-            let msg = "[omni] chunk split built: \(r.contents) contents, \(r.occurrences) occurrences, "
-                + "\(r.freeSlots) free, \(String(format: "%.1f", r.seconds))s\n"
-            FileHandle.standardError.write(Data(msg.utf8))
-            return true
-        } catch {
-            // A failed build leaves a v4 database, which is the state everything else still
-            // assumes. Say so loudly and do not retry in a loop.
-            exec("DELETE FROM occurrence;"); exec("DELETE FROM chunk;")
-            exec("DELETE FROM chunk_snippet;"); exec("DELETE FROM free_slot;")
-            FileHandle.standardError.write(Data("[omni] chunk split refused: \(error)\n".utf8))
-            exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.chunkSplitDoneKey)', '0');")
-            return false
+        // OFF THE STORE QUEUE, ON ITS OWN CONNECTION.
+        //
+        // Built inline this held the queue for its whole duration and every search queued behind
+        // it: measured at 198,653 ms for ONE search on the production index. `yieldToSearchLocked`
+        // is no defence - it defers while someone is searching and then gives up after 120 s and
+        // runs anyway, which is right for a fold that yields between slices and wrong for a
+        // single 199-second transaction.
+        //
+        // A second connection to the same file writes under WAL, where readers do not block on a
+        // writer, so search is untouched for the entire build. What does wait is the index's own
+        // WRITES, which are background work that already retries - and the catch-up pass below is
+        // what makes it safe for them to have landed while the build was running.
+        guard !splitBuildInFlight else { return false }
+        splitBuildInFlight = true
+        let url = dbURL
+        let hw = highWater
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            var side: OpaquePointer?
+            defer {
+                if side != nil { sqlite3_close(side) }
+                self?.queue.sync { self?.splitBuildInFlight = false }
+            }
+            guard sqlite3_open_v2(url.path, &side, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else { return }
+            sqlite3_exec(side, "PRAGMA journal_mode=WAL;", nil, nil, nil)
+            sqlite3_exec(side, "PRAGMA busy_timeout=120000;", nil, nil, nil)
+            do {
+                guard let r = try MigrationV5Runner.backfillInPlace(db: side!, highWater: hw) else { return }
+                self?.queue.sync {
+                    guard let self, self.dbOpen() else { return }
+                    // CATCH UP. Rows written while the build was running went to v4 only -
+                    // `splitBuilt` was still false, so the native split write was skipped - and
+                    // the build's snapshot cannot contain them. They are given occurrences here,
+                    // inside the same store queue turn that publishes the flag, so no window
+                    // exists in which the split is authoritative and incomplete.
+                    self.catchUpSplitLocked()
+                    self.exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.chunkSplitDoneKey)', '1');")
+                    self.splitBuilt = false
+                    self.refreshSplitBuiltLocked()
+                    FileHandle.standardError.write(Data(
+                        ("[omni] chunk split built off-queue: \(r.contents) contents, "
+                         + "\(r.occurrences) occurrences, \(r.freeSlots) free, "
+                         + String(format: "%.1f", r.seconds) + "s\n").utf8))
+                }
+            } catch {
+                // A FAILED BUILD LEAVES A v4 DATABASE, which is the state everything else still
+                // assumes. Carried over from the inline version, where losing it meant a
+                // collided build left its half-written tables behind and the next reader
+                // believed them. Cleaned up on the store queue so it cannot race the writer.
+                self?.queue.sync {
+                    guard let self, self.dbOpen() else { return }
+                    self.exec("DELETE FROM occurrence;"); self.exec("DELETE FROM chunk;")
+                    self.exec("DELETE FROM chunk_snippet;"); self.exec("DELETE FROM free_slot;")
+                    self.exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.chunkSplitDoneKey)', '0');")
+                }
+                FileHandle.standardError.write(Data("[omni] chunk split refused: \(error)\n".utf8))
+            }
         }
+        return false   // not built YET; the next stamp sees the flag once it is
     }
 
     /// Blank the slot column above `keep` rows and clear the backfill flag, which is what an index
@@ -12445,8 +12542,18 @@ public final class VectorStore: @unchecked Sendable {
     /// file cannot satisfy and watch the invariants refuse, which is the only way to prove the
     /// rollback leaves a v4 database.
     @discardableResult
+    /// Build the split and WAIT for it. The build runs off the store queue now, so the locked
+    /// form only schedules and returns false; a test that asked for a build and then looked at
+    /// the tables would see an empty one. Waiting here keeps every existing test asking the
+    /// question it was written to ask.
     public func buildChunkSplitForTest(highWaterOverride: Int64? = nil) -> Bool {
-        queue.sync { buildChunkSplitLocked(highWaterOverride: highWaterOverride) }
+        // "Did THIS call build it", not "is it built" - a second call on an index that already
+        // has the split must answer false, which is what `testASecondBuildIsANoOp` is for.
+        let wasBuilt = splitBuiltForTest
+        let inline = queue.sync { buildChunkSplitLocked(highWaterOverride: highWaterOverride) }
+        if inline { return !wasBuilt }   // the empty-index short-circuit builds inline
+        while splitBuildInFlightForTest { Thread.sleep(forTimeInterval: 0.01) }
+        return !wasBuilt && splitBuiltForTest
     }
 
     /// One slice of the fold. Returns true while there is more to do.

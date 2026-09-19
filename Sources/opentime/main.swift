@@ -57,7 +57,9 @@ if args.count >= 3, args[2] == "splitprobe" {
     }
     prober.start()
     let t0 = Date()
-    let ok = store.buildChunkSplitForTest()
+    _ = store.buildChunkSplitForTest()          // schedules; the work is off the store queue
+    while store.splitBuildInFlightForTest { Thread.sleep(forTimeInterval: 0.25) }
+    let ok = store.splitBuiltForTest
     let build = -t0.timeIntervalSinceNow
     // JOIN BEFORE READING. The prober is blocked INSIDE one search for the whole build, so a
     // snapshot taken before it unblocks is empty - which is the finding, reported as no data.
