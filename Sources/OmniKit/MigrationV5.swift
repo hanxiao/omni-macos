@@ -97,13 +97,20 @@ enum MigrationV5 {
     /// Slots below the high-water mark that no content owns. Derivable, and derived rather than
     /// accumulated, because a leaked slot is invisible - the vector file simply never shrinks.
     /// Joined on `slot` now that identity and position are separate columns.
+    ///
+    /// `AND c.slot >= 0` IS NOT REDUNDANT even though `v.i` is never negative. `idx_chunk_slot_v5`
+    /// is PARTIAL over exactly that predicate, and SQLite will not use a partial index unless the
+    /// query implies it - equality on the column is not enough. Without the term this join
+    /// full-scans `chunk` once per generated integer, ten million times: the statement went from
+    /// finishing in seconds to still running after twenty-four minutes. Third time this exact trap
+    /// has cost an hour today, after idx_chunk_content and slot_of.
     static func buildFreeListSQL(highWater: Int64, suffix: String = "") -> String {
         """
         INSERT INTO free_slot\(suffix)(id)
         SELECT v.i FROM (WITH RECURSIVE r(i) AS (
             SELECT 0 UNION ALL SELECT i + 1 FROM r WHERE i < \(highWater - 1)
         ) SELECT i FROM r) v
-        LEFT JOIN chunk\(suffix) c ON c.slot = v.i
+        LEFT JOIN chunk\(suffix) c ON c.slot = v.i AND c.slot >= 0
         WHERE c.id IS NULL
         """
     }
