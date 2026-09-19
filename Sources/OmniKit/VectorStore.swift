@@ -7557,8 +7557,13 @@ public final class VectorStore: @unchecked Sendable {
         // Asking whether the free list is TURNED ON instead would send every index down here, and
         // this path does not use the row sidecar: 58 extra seconds on every open of a 9.7M-row
         // index that had never reused a thing.
+        // THE SPLIT IS A THIRD WAY TO GET HERE, and it has to be listed or the gate silently
+        // stops working: with the split on the fold never runs, so `chunk_content_folded` is
+        // never set, and an index whose positions the SPLIT collapsed would fall back to the rank
+        // walk - which cannot read it, because there are fewer positions than rows.
         guard scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.contentFoldDoneKey)'") == 1
                 || scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.slotsOutOfOrderKey)'") == 1
+                || scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.chunkSplitDoneKey)'") == 1
         else { return false }
         // A HOLE A LIVE ROW STILL OWNS IS A CONTRADICTION, and seating rows from the column is not
         // a licence to ignore it. That shape - a delete that recorded its hole and never committed
@@ -9014,7 +9019,13 @@ public final class VectorStore: @unchecked Sendable {
             // rather than slices - the invariants can only be checked with all four tables
             // present - so it sits behind the same yield the fold does and behind its own flag.
             if Self.chunkSplit, allowSplitBuild, !yieldToSearchLocked("split"), buildChunkSplitLocked() { return }
-            if !yieldToSearchLocked("fold"), foldDuplicateContentsLocked() { return }
+            // NOT WHEN THE SPLIT IS ON. The fold and the split build are two implementations of
+            // one dedup - 3,516,335 duplicates collapsed against 3,770,848 positions freed, same
+            // index - and running both is worse than waste: `backfillInPlace` refuses while the
+            // fold is mid-flight renumbering slots, and the fold takes 364 s against the split's
+            // 149 s, so the split's turn never arrived inside a session and an existing user
+            // never got the split at all. Measured, after a chaos run reported it.
+            if !Self.chunkSplit, !yieldToSearchLocked("fold"), foldDuplicateContentsLocked() { return }
             // Off the queue: the reclaim takes it one chunk at a time, and this call is holding it.
             if reclaim, !yieldToSearchLocked("reclaim"), shouldReclaimHolesLocked() {
                 DispatchQueue.global(qos: .utility).async { [weak self] in self?.reclaimVectorHoles() }
@@ -9044,7 +9055,11 @@ public final class VectorStore: @unchecked Sendable {
         // Once the claim has caught up there is nothing left for coverage to do and the fold is
         // what the stamp is for. Running it here as well as in the caught-up branch means an index
         // that finishes covering mid-session starts folding in the same session.
-        foldDuplicateContentsLocked()
+        //
+        // THE SECOND CALL SITE, and gating only the first one changed nothing: the fold kept
+        // running with the split on and kept the split from ever building. Both sites, or
+        // neither.
+        if !Self.chunkSplit { foldDuplicateContentsLocked() }
     }
 
     private func stampRowSidecarLocked(sync: Bool) {
@@ -11354,6 +11369,43 @@ public final class VectorStore: @unchecked Sendable {
     /// Drive coverage to completion. The budget is a SLICE SIZE, and it is added to the current
     /// claim - so the old `Int.max` default trapped on overflow the moment anyone used it.
     func advanceCoverageForTest(budget: Int = 1_000_000) { queue.sync { while advanceCoverageLocked(budget: budget) {} } }
+
+    /// DRIVE THE MIGRATION THE WAY A LIVE SESSION DOES, one coverage stamp at a time.
+    ///
+    /// Everything about the migration's ORDER lives in `stampVectorCoverageLocked` - which step
+    /// gets the next turn, what yields to a search, what refuses while something else is mid
+    /// flight. None of the existing harnesses go through it: `omni-verify fold` calls the fold
+    /// directly and `opentime <db> split` calls the build directly, so both answer "does this
+    /// step work" and neither can answer "does this step ever get its turn". That is the question
+    /// an existing user's migration actually turns on, and it took a UI chaos run to notice it
+    /// was unanswered.
+    ///
+    /// Returns the number of stamps it took. `budget` is per stamp, as at runtime.
+    public func runMigrationStampsForTest(maxStamps: Int = 2_000,
+                                          budget: Int = 200_000) -> Int {
+        // PROGRESS IS NOT `mutationGen`. The slot backfill advances a watermark in `meta` and
+        // bumps no generation, so keying the loop on the generation stopped it after nine stamps
+        // with the backfill 6.4M rows in - reporting "the split never built" about a migration
+        // that had barely started. The signal is the migration's own markers.
+        func progressKey() -> String {
+            queue.sync {
+                let mark = scalarQuery("SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM meta "
+                                       + "WHERE key='\(Self.slotsMarkKey)'), -1)")
+                return "\(mark)/\(coveredRows)/\(splitBuilt)/\(slotsBackfilled)"
+            }
+        }
+        var n = 0, stale = 0, last = progressKey()
+        while n < maxStamps {
+            queue.sync { stampVectorCoverageLocked(budget: budget, reclaim: false) }
+            n += 1
+            if queue.sync(execute: { splitBuilt }) { break }
+            let now = progressKey()
+            stale = (now == last) ? stale + 1 : 0
+            last = now
+            if stale >= 5 { break }
+        }
+        return n
+    }
     /// One stamp, which is where coverage, the sync and the hole reclaim are actually triggered
     /// from. Tests that call the pieces directly cannot see a branch that never runs.
     func stampCoverageForTest() { queue.sync { stampVectorCoverageLocked() } }
@@ -12238,6 +12290,22 @@ public final class VectorStore: @unchecked Sendable {
         let highWater = highWaterOverride ?? Int64(Swift.max(Int(maxSlot) + 1, slotCount))
         do {
             guard let r = try MigrationV5Runner.backfillInPlace(db: db!, highWater: highWater) else { return false }
+            // THE POSITIONS IT FREED ARE NOT FREE YET, AND SAYING SO BREAKS THE INDEX.
+            //
+            // The build collapses 3,770,848 duplicate positions onto their representatives and
+            // records them in `free_slot` - which nothing reads at runtime, so that space is not
+            // reclaimed. The obvious fix, copying them into `vec_holes` where the reclaim looks,
+            // was tried and is WRONG: the build collapses a duplicate by pointing its CONTENT at
+            // the representative's slot and does not touch `chunks.slot`, which is still what
+            // the resident mapping and the loader read. So the row is alive and still sitting on
+            // the position, and the audit says exactly that:
+            //
+            //     AUDIT FAILED: hole 6990695 still has a live row
+            //
+            // The position genuinely becomes free at step 5, when the loader reads `occurrence`
+            // -> `chunk.slot` instead of `chunks.slot`. Until then `free_slot` is the honest
+            // record: the space is identified and not yet returned. Publishing it early trades
+            // a missing reclaim - which costs disk - for an index that fails its own audit.
             exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.chunkSplitDoneKey)', '1');")
             splitBuilt = false        // force refresh to notice the change and drop cached SQL
             refreshSplitBuiltLocked()

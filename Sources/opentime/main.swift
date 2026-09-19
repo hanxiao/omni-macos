@@ -14,6 +14,21 @@ omniSetMemoryLimit(6_000_000_000)
 // exactly why "does an existing index ever get the split" turned out to be unanswerable from
 // outside: the migration driver never fires one, close() is forbidden from doing it, and a live
 // session defers it while the user is searching.
+// `opentime <db> migrate` runs the migration through the coverage stamp, which is the only path
+// that decides ORDER - and therefore the only one that can show whether a step ever gets a turn.
+if args.count >= 3, args[2] == "migrate" {
+    let t0 = Date()
+    let store = try VectorStore(dbURL: url)
+    print(String(format: "opened %d rows in %.1fs", store.count, -t0.timeIntervalSinceNow))
+    let t1 = Date()
+    let stamps = store.runMigrationStampsForTest()
+    print(String(format: "%d stamps in %.1fs  splitBuilt=%@", stamps, -t1.timeIntervalSinceNow,
+                 store.splitBuiltForTest ? "yes" : "no"))
+    if let bad = store.coverageAudit() { print("AUDIT FAILED: \(bad)") } else { print("audit clean") }
+    store.close()
+    exit(store.splitBuiltForTest ? 0 : 1)
+}
+
 if args.count >= 3, args[2] == "split" {
     let t0 = Date()
     let store = try VectorStore(dbURL: url)
