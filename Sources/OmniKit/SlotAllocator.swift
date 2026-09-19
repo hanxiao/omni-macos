@@ -36,6 +36,9 @@ public struct SlotAllocator: Sendable {
     public var available: [Int] { heap }
     /// Released during the current transaction. Not allocatable until `commit()`.
     private(set) var quarantine: [Int] = []
+    /// Free slots that a sharer has taken since they were freed. `allocate` drops them instead of
+    /// handing them out; see `claim`.
+    private var claimed: Set<Int> = []
     /// One past the highest slot ever allocated. The vector file is this many rows long.
     private(set) var highWater: Int = 0
 
@@ -52,10 +55,31 @@ public struct SlotAllocator: Sendable {
     /// none. Lowest first, so the file stays as dense at the front as it can and a truncation after
     /// a large delete has a chance of being worth doing.
     public mutating func allocate() -> Int {
-        if let id = popMin() { return id }
+        // Skip anything a sharer took directly (see `claim`). Lazy deletion, because removing an
+        // arbitrary value from a binary heap is O(n) and this runs per written chunk.
+        while let id = popMin() {
+            if claimed.remove(id) != nil { continue }
+            return id
+        }
         let id = highWater
         highWater += 1
         return id
+    }
+
+    /// A SLOT TAKEN WITHOUT ASKING. A chunk whose content already exists is seated on that
+    /// content's existing position rather than allocated one - it is the same vector, so there is
+    /// nothing to write and nothing to allocate. But if that position was ALSO sitting in the free
+    /// list, because the content's last occurrence had been deleted earlier, the allocator would
+    /// hand the same position to a different content later and two contents would share one
+    /// vector: one of them scoring, and being returned, as the other.
+    ///
+    /// So a sharer says so. Cheap and idempotent: claiming something that was never free is a
+    /// no-op, and the entry is dropped when `allocate` next walks past it.
+    public mutating func claim(_ id: Int) {
+        guard id >= 0 else { return }
+        if id >= highWater { highWater = id + 1; return }   // never was in the free set
+        if let i = quarantine.firstIndex(of: id) { quarantine.remove(at: i) }
+        claimed.insert(id)
     }
 
     /// Give a slot back. It becomes allocatable at the next `commit()`, never before.
@@ -67,7 +91,7 @@ public struct SlotAllocator: Sendable {
     /// End of transaction: quarantined slots become allocatable.
     public mutating func commit() {
         guard !quarantine.isEmpty else { return }
-        for id in quarantine { push(id) }
+        for id in quarantine where !claimed.contains(id) { push(id) }
         quarantine.removeAll(keepingCapacity: true)
     }
 
@@ -132,6 +156,7 @@ public struct SlotAllocator: Sendable {
     public mutating func forgetFreeList() {
         heap.removeAll(keepingCapacity: true)
         quarantine.removeAll(keepingCapacity: true)
+        claimed.removeAll(keepingCapacity: true)
     }
 
     /// Slots that are neither live nor free. A leak is invisible - the vector file simply never

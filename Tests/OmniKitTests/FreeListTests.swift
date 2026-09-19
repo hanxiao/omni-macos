@@ -20,18 +20,28 @@ final class FreeListTests: XCTestCase {
 
     private var savedQuant: Int?
     private var savedSharing = true
+    private var savedFreeList = true
 
     override func setUp() {
         super.setUp()
         savedQuant = VectorStore.quantBaseOverride
         savedSharing = VectorStore.contentSharing
+        savedFreeList = VectorStore.freeListEnabled
         VectorStore.contentSharing = true
         VectorStore.freeListEnabled = true
     }
     override func tearDown() {
         VectorStore.quantBaseOverride = savedQuant
         VectorStore.contentSharing = savedSharing
-        VectorStore.freeListEnabled = ProcessInfo.processInfo.environment["OMNI_FREE_LIST"] == "1"
+        // CAPTURED, NOT RECOMPUTED. This used to restore the flag by re-reading the environment
+        // with the flag's own old default spelling (== "1"). The default is now "on unless 0", so
+        // the restore put back the OPPOSITE of what it found and every test that ran after this
+        // class silently lost the free list - which is invisible, because running without it is a
+        // correct configuration, just not the one the suite thought it was measuring.
+        //
+        // No restore should ever re-derive what it can remember: the expression it copies is in
+        // another file and will drift from it again.
+        VectorStore.freeListEnabled = savedFreeList
         super.tearDown()
     }
 
@@ -380,4 +390,38 @@ final class FreeListTests: XCTestCase {
         return sqlite3_step(st) == SQLITE_ROW ? Int(sqlite3_column_int(st, 0)) : -1
     }
 
+
+    /// `claim` TAKES A SLOT THE ALLOCATOR STILL THINKS IS FREE, which is what a content sharer
+    /// does: it seats a row on an existing position without allocating. Without this the same
+    /// position is handed out again to different content.
+    func testClaimingAFreeSlotStopsItBeingAllocated() {
+        var a = SlotAllocator(available: [3, 7, 11], highWater: 20)
+        a.claim(7)
+        var got: [Int] = []
+        for _ in 0 ..< 3 { got.append(a.allocate()) }
+        XCTAssertFalse(got.contains(7), "a claimed slot was allocated to something else: \(got)")
+        XCTAssertEqual(got, [3, 11, 20], "the remaining free slots were not handed out lowest first")
+    }
+
+    /// Claiming something that was never free changes nothing, and claiming past the ceiling
+    /// raises it - a sharer may be seated on a position the allocator has not seen.
+    func testClaimingIsIdempotentAndRaisesTheCeiling() {
+        var a = SlotAllocator(available: [2], highWater: 5)
+        a.claim(4)                    // in range, not free
+        a.claim(2); a.claim(2)        // free, twice
+        XCTAssertEqual(a.allocate(), 5, "a claimed slot or a never-free one was handed out")
+        a.claim(40)
+        XCTAssertEqual(a.highWater, 41, "claiming past the ceiling did not move it")
+    }
+
+    /// A slot released and then claimed inside one transaction must not become allocatable at
+    /// commit: the release says "nobody owns this", the claim says "somebody does now", and the
+    /// claim is the later fact.
+    func testAClaimAfterAReleaseWinsAtCommit() {
+        var a = SlotAllocator(available: [], highWater: 10)
+        a.release(6)
+        a.claim(6)
+        a.commit()
+        XCTAssertEqual(a.allocate(), 10, "a slot released then re-claimed was handed out anyway")
+    }
 }

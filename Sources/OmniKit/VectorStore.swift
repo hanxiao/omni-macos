@@ -1980,6 +1980,17 @@ public final class VectorStore: @unchecked Sendable {
             && scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.slotsBackfilledKey)'") != 1
             && scalarQuery("SELECT EXISTS(SELECT 1 FROM chunks WHERE slot < 0)") == 1
 
+        // A BRAND NEW INDEX IS BORN v5, HERE, because nothing else will do it. The split is
+        // otherwise built from the coverage stamp, and the stamp needs rows - so an index with no
+        // rows never gets the flag, `splitBuilt` stays false, and the first writes of a new user's
+        // life go to v4 and have to be converted later. There is nothing to convert on an empty
+        // database: the build is a no-op that sets one meta row, and from the first write onward
+        // the index simply IS the new shape.
+        if Self.chunkSplit, Self.contentSharing, !v4BackfillPending, !splitBuilt,
+           layoutLocked() == .v4, scalarQuery("SELECT COUNT(*) FROM chunks") == 0 {
+            _ = buildChunkSplitLocked()
+        }
+
         // Everything below speaks v3 and is a no-op once the index is v4 - the v4 layout has no
         // such columns and never gains them.
         if layoutLocked() != .v4 {
@@ -6917,6 +6928,14 @@ public final class VectorStore: @unchecked Sendable {
             sqlite3_finalize(snippetStmt); snippetStmt = nil
         }
     }
+    /// The recorded holes, for a test that has to ask whether one was left behind. A hole is
+    /// invisible from outside otherwise: the vectors still read correctly, right up until the
+    /// position is handed to something else.
+    var vecHolesForTest: Set<Int32> { queue.sync { vecHoles } }
+    /// Whether this index answers from the split. Tests assert on it directly: "the tables have
+    /// rows" and "the store is READING them" are different claims, and only the second is the one
+    /// that matters once v4 stops being written.
+    var splitBuiltForTest: Bool { queue.sync { splitBuilt } }
     /// The display SQL this index answers with.
     private var displayTextSQL: String { splitBuilt ? Self.chunkTextByPathSplitSQL : Self.chunkTextByPathSQL }
     /// How far that backfill has got, as a chunk id. Absent means "not started" or "finished".
@@ -11397,16 +11416,38 @@ public final class VectorStore: @unchecked Sendable {
     /// THE SAME QUESTION, ASKED OF THE SPLIT. The snippet comes from the CONTENT and the locator
     /// from the OCCURRENCE, which is the whole point: the same paragraph is "Line 1" of one file
     /// and "Line 4310" of another, so only one of these two columns can live on the shared row.
+    ///
+    /// THE FILE NAME IS NOT STORED, IT IS SUPPLIED HERE. A media chunk with no tags yet used to
+    /// store its own FILE NAME as the snippet - which is a per-PATH string sitting in a table
+    /// keyed by CONTENT. Two copies of one photo in two folders share a content, so they shared
+    /// the row, and whichever was written second displayed the other one's name. Two copies of a
+    /// photo is an ordinary thing to have.
+    ///
+    /// So nothing path-derived is stored any more: an untagged media chunk stores '' and the name
+    /// is joined in at read time, where it is free and cannot be shared by accident. Text is
+    /// untouched - its snippet IS its content, which is exactly what may be shared.
     static let chunkTextByPathSplitSQL = """
-        SELECT COALESCE(s.snippet, ''), o.locator
+        SELECT CASE WHEN COALESCE(s.snippet, '') <> '' THEN s.snippet
+                    WHEN c.kind IN (\(StoreSchema.mediaKindCodes.map(String.init).joined(separator: ","))) THEN f.name
+                    ELSE '' END,
+               o.locator
           FROM occurrence o
+          JOIN chunk c ON c.id = o.chunk_id
+          JOIN files f ON f.id = o.file_id
           LEFT JOIN chunk_snippet s ON s.chunk_id = o.chunk_id
          WHERE o.file_id = \(StoreSchema.fileIDByPath) AND o.ordinal = ?;
         """
 
+    /// Same fallback as the split form above, for the same reason: the write path no longer
+    /// stores a media chunk's file name, so a v4 index written by this build has '' there too.
     static let chunkTextByPathSQL = """
-        SELECT t.snippet, t.locator
-          FROM chunks c JOIN chunk_text t ON t.chunk_id = c.id
+        SELECT CASE WHEN COALESCE(t.snippet, '') <> '' THEN t.snippet
+                    WHEN c.kind IN (\(StoreSchema.mediaKindCodes.map(String.init).joined(separator: ","))) THEN f.name
+                    ELSE '' END,
+               t.locator
+          FROM chunks c
+          JOIN chunk_text t ON t.chunk_id = c.id
+          JOIN files f ON f.id = c.file_id
          WHERE c.file_id = \(StoreSchema.fileIDByPath) AND c.chunk_index = ?;
         """
 
@@ -12085,15 +12126,33 @@ public final class VectorStore: @unchecked Sendable {
     /// contents to produce.
     @discardableResult
     func buildChunkSplitLocked(highWaterOverride: Int64? = nil) -> Bool {
-        guard Self.chunkSplit, Self.contentSharing, dbOpen(), dim > 0 else { return false }
+        guard Self.chunkSplit, Self.contentSharing, dbOpen() else { return false }
+        guard scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.chunkSplitDoneKey)'") != 1
+        else { return false }
+        // AN EMPTY INDEX IS ALREADY MIGRATED, and saying so is what lets a new user be born v5.
+        // There is nothing to derive, so the backfill has no work to do - but every guard below
+        // reads "no rows yet" as "not ready": `dim` is 0 until the first vector arrives and
+        // MAX(slot) is NULL. So the flag stayed unset, `splitBuilt` stayed false,
+        // `writeChunksLocked` wrote v4 only, and the first writes of a new install were v4 rows
+        // that then had to be converted - a migration nobody needed, and once `chunk_text` is
+        // gone, writes with nowhere to land. One meta row here and the index simply IS the new
+        // shape from its first write.
+        //
+        // ABOVE the `dim` guard on purpose: an empty database has no dimension yet, which is
+        // exactly the state this is about.
+        if scalarQuery("SELECT COUNT(*) FROM chunks") == 0 {
+            exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.chunkSplitDoneKey)', '1');")
+            splitBuilt = false
+            refreshSplitBuiltLocked()
+            return splitBuilt
+        }
+        guard dim > 0 else { return false }
         // NOT `slotsBackfilled`, which is a MIGRATION flag: an index this build wrote from scratch
         // has a complete slot column and never enters the migration that sets it, so gating on it
         // means the split never builds for a new user at all. The same trap the free list fell
         // into. What matters is that no pre-existing row is still waiting for a position, and
         // `backfillInPlace` re-checks seated == rows before it writes anything.
         guard !v4BackfillPending else { return false }
-        guard scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.chunkSplitDoneKey)'") != 1
-        else { return false }
         let maxSlot = scalarQuery("SELECT COALESCE(MAX(slot), -1) FROM chunks")
         guard maxSlot >= 0 else { return false }
         // The file may hold positions past the highest a row claims - coverage extends it ahead of
@@ -12691,7 +12750,7 @@ public final class VectorStore: @unchecked Sendable {
             var slot: Int32 = -1
             if !key.isEmpty {
                 if let s = seen[key] { slot = s }
-                else if let s = liveSlotForContentLocked(key) { slot = s }
+                else if let s = liveSlotForContentLocked(key) { slot = s; reclaimSharedSlotLocked(s) }
             }
             if slot < 0 {
                 slot = placeVectorLocked(bfs[i])
@@ -12706,6 +12765,28 @@ public final class VectorStore: @unchecked Sendable {
                                 kind: c.kind, path: c.path, slot: slot)
         }
         return assigned
+    }
+
+    /// A ROW SEATED ON AN EXISTING CONTENT'S POSITION HAS TAKEN THAT POSITION BACK.
+    ///
+    /// Allocating is not the only way to start owning a position: a chunk whose content is already
+    /// stored is seated on that content's slot, writes no vector, and never goes near
+    /// `placeVectorLocked` - which is the only place that clears a hole or tells the free list.
+    /// So the sequence "delete the only file holding a passage, then write another file holding
+    /// the same passage" left the position recorded as a hole with a live row sitting on it, which
+    /// is what `coverageAudit` calls `hole N still has a live row`, and left it in the free list
+    /// to be handed to a DIFFERENT content later - two contents on one vector, one of them
+    /// scoring as the other.
+    ///
+    /// Only the split makes it reachable: the v4 content lookup joins `chunks`, so a deleted row
+    /// cannot answer it, while the split's lookup reads `chunk`, which outlives its occurrences
+    /// until the refs recount removes it. Every test missed it because the split was never
+    /// actually BUILT in a unit test until an empty index started being born with it.
+    private func reclaimSharedSlotLocked(_ slot: Int32) {
+        guard Self.contentSharing, slot >= 0 else { return }
+        if vecHoles.remove(slot) != nil { exec("DELETE FROM vec_holes WHERE slot = \(slot);") }
+        if Self.freeListEnabled, freeSlotsValid { freeSlots.claim(Int(slot)) }
+        exec("DELETE FROM free_slot WHERE id = \(slot);")
     }
 
     /// The file row, created or refreshed. THIS is where the watcher's common case got cheap: a

@@ -1132,13 +1132,24 @@ final class ContentSharingTests: XCTestCase {
     func testEachSharerKeepsItsOwnLocatorAndSnippet() throws {
         let store = try VectorStore(dbURL: tempDB()); defer { store.close() }
         let shared = vec(4)
+        // ONE KEY, ONE TEXT, TWO PLACES. The fixture used to give the two sharers DIFFERENT
+        // snippet text under a single content key, which is a state the index cannot reach: a
+        // text chunk's key is a digest OF ITS TEXT and its snippet is a truncation of that same
+        // text, so equal keys mean equal snippets. It also made the test arm-dependent - v4
+        // stores a row per chunk and would keep both strings, the split stores one per content
+        // and cannot - so it was asserting the storage layout rather than the behaviour.
+        //
+        // What genuinely differs between two files holding one passage is WHERE it sits. That is
+        // the locator, it is asserted below, and it is the reason the locator lives on the
+        // occurrence while the snippet lives on the content.
+        let passage = "the passage both files hold"
         try store.replace(path: "/p/a.txt", chunks: [IndexedChunk(
             path: "/p/a.txt", modified: 1, size: 1, kind: "text", chunkIndex: 0,
-            snippet: "the passage as A stores it", embedding: shared, locator: "Line 12",
+            snippet: passage, embedding: shared, locator: "Line 12",
             chunkKey: "abcd1234")])
         try store.replace(path: "/p/b.txt", chunks: [IndexedChunk(
             path: "/p/b.txt", modified: 1, size: 1, kind: "text", chunkIndex: 0,
-            snippet: "the passage as B stores it", embedding: shared, locator: "Line 4310",
+            snippet: passage, embedding: shared, locator: "Line 4310",
             chunkKey: "abcd1234")])
         XCTAssertEqual(store.vectorBufferUse.used / 8, 1, "the fixture did not actually share")
 
@@ -1148,8 +1159,28 @@ final class ContentSharingTests: XCTestCase {
         let b = try XCTUnwrap(hits.first { $0.path == "/p/b.txt" })
         XCTAssertEqual(a.locator, "Line 12", "A was given the other file's locator")
         XCTAssertEqual(b.locator, "Line 4310", "B was given the other file's locator")
-        XCTAssertEqual(a.snippet, "the passage as A stores it", "A was given the other file's snippet")
-        XCTAssertEqual(b.snippet, "the passage as B stores it", "B was given the other file's snippet")
+        XCTAssertEqual(a.snippet, passage, "A lost the shared passage's text")
+        XCTAssertEqual(b.snippet, passage, "B lost the shared passage's text")
+    }
+
+    /// AND THE SAME PASSAGE UNDER TWO DIFFERENT KEYS STAYS TWO CONTENTS, which is what keeps the
+    /// rule above from quietly meaning "snippets are approximate". Different text, different key,
+    /// each file reads its own.
+    func testDifferentContentsKeepTheirOwnSnippets() throws {
+        let store = try VectorStore(dbURL: tempDB()); defer { store.close() }
+        try store.replace(path: "/q/a.txt", chunks: [IndexedChunk(
+            path: "/q/a.txt", modified: 1, size: 1, kind: "text", chunkIndex: 0,
+            snippet: "the passage as A stores it", embedding: vec(11), locator: "Line 12",
+            chunkKey: "aaaa0001")])
+        try store.replace(path: "/q/b.txt", chunks: [IndexedChunk(
+            path: "/q/b.txt", modified: 1, size: 1, kind: "text", chunkIndex: 0,
+            snippet: "the passage as B stores it", embedding: vec(12), locator: "Line 4310",
+            chunkKey: "aaaa0002")])
+        let hits = store.search(vec(11), topK: 10)
+        let a = try XCTUnwrap(hits.first { $0.path == "/q/a.txt" })
+        let b = try XCTUnwrap(hits.first { $0.path == "/q/b.txt" })
+        XCTAssertEqual(a.snippet, "the passage as A stores it")
+        XCTAssertEqual(b.snippet, "the passage as B stores it")
     }
 
     /// TWO FILES IN ONE BATCH, sharing a passage.

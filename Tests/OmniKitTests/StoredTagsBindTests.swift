@@ -27,13 +27,49 @@ final class StoredTagsBindTests: XCTestCase {
         return dir.appendingPathComponent("index.sqlite")
     }
 
+    /// A DIFFERENT IMAGE PER PATH, which every test here means and none of them used to say.
+    ///
+    /// Each fixture had the identical vector (v[0] = 1), and a media chunk with no explicit key
+    /// takes its content key FROM THE VECTOR - so these were not several images with different
+    /// tags, they were one image claimed by several paths, and under the chunk/occurrence split
+    /// they collapse to a single content with a single tag list. That is the correct answer to
+    /// the question the fixture was actually asking: byte-identical images are the same content,
+    /// and the tagger derives tags from content, so they cannot disagree in production.
+    ///
+    /// Seeding the vector from the path makes them genuinely distinct images, which is what the
+    /// tests mean by "two files". `testIdenticalImagesShareOneTagList` pins the other case.
     private func mediaChunk(_ path: String, tags: String) -> IndexedChunk {
         var v = [Float](repeating: 0, count: 8)
-        v[0] = 1
+        var h = UInt64(truncatingIfNeeded: path.hashValue) | 1
+        for i in 0 ..< 8 { h ^= h << 13; h ^= h >> 7; h ^= h << 17; v[i] = Float(h % 2048) / 1024 - 1 }
+        let n = (v.reduce(0) { $0 + $1 * $1 }).squareRoot()
+        if n > 0 { for i in 0 ..< 8 { v[i] /= n } }
         // ", "-joined is the separator the `tag:` filter normalizes on - see storedTags.
         return IndexedChunk(path: path, modified: 1, size: 1, kind: "image",
                             chunkIndex: 0, snippet: tags, embedding: v,
                             width: 100, height: 100)
+    }
+
+    /// AND THE CASE THE OLD FIXTURE WAS ACCIDENTALLY TESTING, stated deliberately: two paths
+    /// holding the SAME image are one content, so they carry one tag list. Nothing derives a
+    /// media chunk's tags from its path, so there is no state in which the right answer is two
+    /// different lists - and the storage that makes them one is the same storage that stores the
+    /// vector once.
+    func testIdenticalImagesShareOneTagList() throws {
+        let store = try VectorStore(dbURL: tempDB())
+        defer { store.close() }
+        var v = [Float](repeating: 0, count: 8)
+        v[0] = 1
+        func same(_ path: String) -> IndexedChunk {
+            IndexedChunk(path: path, modified: 1, size: 1, kind: "image", chunkIndex: 0,
+                         snippet: "cat, sofa", embedding: v, width: 100, height: 100)
+        }
+        try store.replace(path: "/pics/a/same.png", chunks: [same("/pics/a/same.png")])
+        try store.replace(path: "/pics/b/copy.png", chunks: [same("/pics/b/copy.png")])
+        let tags = store.storedTags(paths: ["/pics/a/same.png", "/pics/b/copy.png"])
+        XCTAssertEqual(tags["/pics/a/same.png"], ["cat", "sofa"])
+        XCTAssertEqual(tags["/pics/b/copy.png"], ["cat", "sofa"],
+                       "the same image under a second path lost its tags")
     }
 
     func testTagsComeBackForAStoredMediaFile() throws {

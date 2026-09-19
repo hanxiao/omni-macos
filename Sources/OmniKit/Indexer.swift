@@ -1123,7 +1123,7 @@ public final class Indexer: @unchecked Sendable {
                         guard let vec = v else { storeChunks(b.file.path, []); continue }
                         storeChunks(b.file.path, [IndexedChunk(
                             path: b.file.path, modified: b.file.modified, size: b.file.size,
-                            kind: b.kind, chunkIndex: 0, snippet: b.file.name, embedding: vec,
+                            kind: b.kind, chunkIndex: 0, snippet: "", embedding: vec,
                             duration: b.duration)])
                     }
                     onProgress(p)
@@ -1891,7 +1891,7 @@ public final class Indexer: @unchecked Sendable {
         case .audioMel(let mel, let frames):
             guard let vec = embedder.embedAudioMel(mel, frames: frames) else { return [] }
             return [IndexedChunk(path: file.path, modified: file.modified, size: file.size, kind: kind,
-                                 chunkIndex: 0, snippet: file.name, embedding: vec, duration: meta.duration)]
+                                 chunkIndex: 0, snippet: "", embedding: vec, duration: meta.duration)]
         case .images(let images):
             // Only video frames reach here now (one temporal clip -> one embedding).
             if kind == FileKind.video.rawValue {
@@ -1907,7 +1907,7 @@ public final class Indexer: @unchecked Sendable {
                 if isCancelled { return [] }
                 guard let vec = embedder.embedImage(img) else { continue }
                 out.append(IndexedChunk(path: file.path, modified: file.modified, size: file.size, kind: kind,
-                                        chunkIndex: i, snippet: file.name, embedding: vec,
+                                        chunkIndex: i, snippet: "", embedding: vec,
                                         width: meta.width, height: meta.height,
                                         locator: images.count > 1 ? "Page \(i + 1)" : ""))
             }
@@ -2042,7 +2042,7 @@ public final class Indexer: @unchecked Sendable {
                     return []   // audio path unavailable: nothing to index
                 }
                 out.append(IndexedChunk(path: file.path, modified: file.modified, size: file.size,
-                                        kind: kind, chunkIndex: seg, snippet: file.name,
+                                        kind: kind, chunkIndex: seg, snippet: "",
                                         embedding: vec, duration: duration, locator: locator(seg)))
             }
             sync.wait()
@@ -2210,8 +2210,15 @@ public final class Indexer: @unchecked Sendable {
     /// Snippet for an image chunk: its open-vocabulary content tags when the tagger produced
     /// them ("cat, couch, crib"), else the filename - the pre-tagging behavior, and the
     /// fallback while the label cache is still building or tagging is off.
+    /// The stored snippet for a media chunk: its tags, or NOTHING.
+    ///
+    /// It used to fall back to the file name, and that name then sat in a table keyed by content
+    /// once the chunk/occurrence split landed - so two copies of one photo shared the row and the
+    /// second displayed the first one's name. The name is per PATH and is joined in at read time
+    /// now (see chunkTextByPathSplitSQL); the `fallback` parameter is kept so callers read the
+    /// same at the call site, and is only used to decide nothing.
     static func imageSnippet(_ tags: [[String]], at i: Int, fallback name: String) -> String {
-        guard i < tags.count, !tags[i].isEmpty else { return name }
+        guard i < tags.count, !tags[i].isEmpty else { return "" }
         return tags[i].joined(separator: ", ")
     }
 

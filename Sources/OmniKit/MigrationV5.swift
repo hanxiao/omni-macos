@@ -84,12 +84,36 @@ enum MigrationV5 {
 
     /// The snippet is stored once per CONTENT rather than once per occurrence, which is 3.5M fewer
     /// copies on the measured index.
+    /// A NAME-DERIVED MEDIA SNIPPET IS DROPPED HERE, not carried across.
+    ///
+    /// v4 stored a media chunk's FILE NAME as its snippet until the tagger got to it. That is a
+    /// per-PATH string, and this table is keyed by CONTENT - so two copies of one photo would
+    /// arrive at one row and whichever lost the race would display the other's name for the rest
+    /// of the index's life. The write path does not store it any more and the display joins the
+    /// name in at read time; existing indexes are repaired HERE, on the one pass that already
+    /// rewrites every snippet, rather than left carrying it.
+    ///
+    /// The three shapes are the ones `OmniTagger.nameDerivedSnippet` codifies, and the same set
+    /// the scan-kind migration uses: the bare name, "name - name", and "name - page N". Text is
+    /// untouched - its snippet IS its content, which is the thing that may legitimately be shared.
     static func buildSnippetSQL(suffix: String = "") -> String {
-        """
+        let media = StoreSchema.mediaKindCodes.map(String.init).joined(separator: ",")
+        return """
         INSERT INTO chunk_snippet\(suffix)(chunk_id, kind, snippet)
-        SELECT c.id, c.kind, COALESCE((SELECT ct.snippet FROM chunk_text ct
-                               JOIN slot_of s ON s.chunk_id = ct.chunk_id
-                               WHERE s.slot = c.slot), '')
+        SELECT c.id, c.kind, COALESCE((
+            SELECT CASE
+                     WHEN ct.kind NOT IN (\(media)) THEN ct.snippet
+                     WHEN f.name IS NULL THEN ct.snippet
+                     WHEN ct.snippet = f.name THEN ''
+                     WHEN ct.snippet = f.name || ' - ' || f.name THEN ''
+                     WHEN ct.snippet LIKE f.name || ' - page %'
+                          AND CAST(substr(ct.snippet, length(f.name) + 10) AS INTEGER) > 0 THEN ''
+                     ELSE ct.snippet
+                   END
+              FROM chunk_text ct
+              JOIN slot_of s ON s.chunk_id = ct.chunk_id
+              LEFT JOIN files f ON f.id = ct.file_id
+             WHERE s.slot = c.slot), '')
         FROM chunk\(suffix) c
         """
     }

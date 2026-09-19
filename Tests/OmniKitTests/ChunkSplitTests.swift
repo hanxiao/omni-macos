@@ -49,8 +49,24 @@ final class ChunkSplitTests: XCTestCase {
     }
 
     /// `dupEvery` files share one content, so the split has something to collapse.
+    /// A PRE-SPLIT INDEX IS WRITTEN BY A PRE-SPLIT BINARY, and that is now the only way to make
+    /// one: an empty database is born v5, so a store opened with the split ON writes the split
+    /// from its first row and there is nothing left for these tests to migrate. Writing the
+    /// fixture with the split OFF and reopening with it ON is not a workaround - it is exactly
+    /// the shape of an existing user's upgrade, which is what this suite is about.
     private func build(_ url: URL, files: Int, dupEvery: Int) throws -> VectorStore {
+        let saved = VectorStore.chunkSplit
+        VectorStore.chunkSplit = false
+        try writeFixture(url, files: files, dupEvery: dupEvery)
+        VectorStore.chunkSplit = saved
         let store = try VectorStore(dbURL: url)
+        store.migrateSlotsToCompletion()
+        return store
+    }
+
+    private func writeFixture(_ url: URL, files: Int, dupEvery: Int) throws {
+        let store = try VectorStore(dbURL: url)
+        defer { store.close() }
         for i in 0 ..< files {
             let p = "/v4/f\(i).txt"
             let shared = 7 + (i % dupEvery)
@@ -68,7 +84,6 @@ final class ChunkSplitTests: XCTestCase {
             ])
         }
         store.migrateSlotsToCompletion()
-        return store
     }
 
     private func num(_ url: URL, _ sql: String) -> Int {
@@ -343,6 +358,113 @@ final class ChunkSplitTests: XCTestCase {
     /// readers I could find". This empties it and then does what a user does - search, read the
     /// text under a hit, reuse a file whose content has not changed, delete, re-add - and demands
     /// the answers still come back. Whatever still needs v4 fails here rather than in the field.
+    /// DELETE THE ONLY HOLDER OF A PASSAGE, THEN WRITE ANOTHER FILE HOLDING IT.
+    ///
+    /// The second write does not allocate: the content is still there, so the row is seated on its
+    /// existing position. That path never went near `placeVectorLocked`, which is the only place
+    /// that clears a recorded hole and tells the free list - so the position stayed marked as a
+    /// hole with a live row sitting on it, and stayed in the free list to be handed to a DIFFERENT
+    /// content later. Two contents on one vector, one of them returned as the other.
+    ///
+    /// Reachable only through the split: the v4 content lookup joins `chunks`, so a deleted row
+    /// cannot answer it, while the split's reads `chunk`, which outlives its occurrences until the
+    /// refs recount removes it.
+    func testAContentReclaimedByANewFileIsNotStillAHole() throws {
+        let url = tempDB()
+        let store = try VectorStore(dbURL: url)
+        defer { store.close() }
+        let key = "beef0001"
+        let shared = vec(41)
+        func chunkAt(_ path: String, _ locator: String) -> IndexedChunk {
+            IndexedChunk(path: path, modified: 1, size: 10, kind: "text", chunkIndex: 0,
+                         snippet: "one passage, two files over time", embedding: shared,
+                         locator: locator, chunkKey: key)
+        }
+        // Some other content so the index is not a single row, and coverage has something to cover.
+        for i in 0 ..< 8 {
+            let p = "/filler/f\(i).txt"
+            try store.replace(path: p, chunks: [IndexedChunk(
+                path: p, modified: 1, size: 10, kind: "text", chunkIndex: 0,
+                snippet: "filler \(i)", embedding: vec(500 + i), locator: "Line 1",
+                chunkKey: String(format: "%016x", 500 + i))])
+        }
+        try store.replace(path: "/a.txt", chunks: [chunkAt("/a.txt", "Line 12")])
+        store.migrateSlotsToCompletion()
+        let slot = try XCTUnwrap(store.liveSlotForContentKeyForTest(key), "the fixture never stored the content")
+
+        store.deletePath("/a.txt")
+        // The only holder is gone, so the position is released and recorded as a hole.
+        try store.replace(path: "/b.txt", chunks: [chunkAt("/b.txt", "Line 4310")])
+
+        // NOT "it landed on slot N". Whether the new row reuses the freed position depends on
+        // the free list, and asserting the number makes the test pass for the wrong reason when
+        // the free list happens to hand back the lowest slot anyway. The invariant is the one
+        // `coverageAudit` states: no position may be recorded as a hole while a live row sits on
+        // it, however the row got there.
+        let seated = try XCTUnwrap(store.liveSlotForContentKeyForTest(key),
+                                   "the content is not readable after the re-add")
+        XCTAssertNil(store.coverageAudit(),
+                     "a position is recorded as a hole with a live row on it")
+        XCTAssertFalse(store.vecHolesForTest.contains(seated),
+                       "position \(seated) is live and still listed as a hole")
+        _ = slot
+        // And it reads back as B's, with B's locator.
+        let hits = store.search(shared, filter: SearchFilter(), topK: 5)
+        let b = try XCTUnwrap(hits.first { $0.path == "/b.txt" })
+        XCTAssertEqual(b.locator, "Line 4310")
+        XCTAssertFalse(hits.contains { $0.path == "/a.txt" }, "the deleted file came back")
+    }
+
+    /// A NEW USER NEVER MIGRATES. Their index is the new shape from its first write.
+    ///
+    /// The split is otherwise built from the coverage stamp, and the stamp needs rows - so an
+    /// empty database never got the done flag, `splitBuilt` stayed false, and the first writes of
+    /// a new install went to v4 and were converted afterwards. That is a migration nobody needed,
+    /// and once `chunk_text` is gone those writes have nowhere to land at all. An empty database
+    /// has nothing to derive, so it is marked built at open and simply starts out v5.
+    func testANewIndexIsBornSplitAndNeverWritesAV4TextRow() throws {
+        let cutover = VectorStore.splitCutover
+        VectorStore.splitCutover = true
+        defer { VectorStore.splitCutover = cutover }
+
+        let url = tempDB()
+        let store = try VectorStore(dbURL: url)
+        XCTAssertTrue(store.splitBuiltForTest,
+                      "a brand new index did not come up with the split already built")
+        let p = "/new/first.txt"
+        try store.replace(path: p, chunks: [
+            IndexedChunk(path: p, modified: 1, size: 10, kind: "text", chunkIndex: 0,
+                         snippet: "the very first chunk", embedding: vec(3), locator: "Line 1",
+                         chunkKey: String(format: "%016x", 3)),
+        ])
+        store.close()
+
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READONLY, nil), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        func scalar(_ sql: String) -> Int {
+            var st: OpaquePointer?
+            defer { sqlite3_finalize(st) }
+            guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { return -1 }
+            return sqlite3_step(st) == SQLITE_ROW ? Int(sqlite3_column_int64(st, 0)) : -1
+        }
+        XCTAssertEqual(scalar("SELECT CAST(value AS INTEGER) FROM meta WHERE key='chunk_split_backfilled'"), 1,
+                       "the done flag was not set on an empty index")
+        XCTAssertEqual(scalar("SELECT COUNT(*) FROM chunk"), 1, "the content was not written to `chunk`")
+        XCTAssertEqual(scalar("SELECT COUNT(*) FROM occurrence"), 1, "no occurrence was written")
+        XCTAssertEqual(scalar("SELECT COUNT(*) FROM chunk_snippet"), 1, "no snippet was written")
+        XCTAssertEqual(scalar("SELECT COUNT(*) FROM chunk_text"), 0,
+                       "a v4 text row was written into an index that has never needed one")
+
+        // And it reads back, so "born v5" is not just "wrote the tables".
+        let reopened = try VectorStore(dbURL: url)
+        defer { reopened.close() }
+        let hits = reopened.search(vec(3), filter: SearchFilter(), topK: 3)
+        XCTAssertEqual(hits.first?.path, p, "the first chunk of a new index is not findable")
+        XCTAssertEqual(hits.first?.snippet, "the very first chunk",
+                       "the snippet did not come back through the split")
+    }
+
     /// THE STORE HELD A READ TRANSACTION OPEN BETWEEN CONTENT LOOKUPS.
     ///
     /// The content lookup stepped its cached statement to SQLITE_ROW and returned without
@@ -504,12 +626,24 @@ final class ChunkSplitTests: XCTestCase {
 
     func testItRefusesUntilEveryRowHasASlot() throws {
         let url = tempDB()
+        // PRE-SPLIT, for the same reason `build` is: a store opened with the split on writes
+        // occurrences from its first row, so an index written that way already has the thing this
+        // test is asserting the absence of - and would fail on the write path's output rather
+        // than on the build's.
+        let saved = VectorStore.chunkSplit
+        VectorStore.chunkSplit = false
+        do {
+            let old = try VectorStore(dbURL: url)
+            let p = "/a.txt"
+            try old.replace(path: p, chunks: [
+                IndexedChunk(path: p, modified: 1, size: 10, kind: "text", chunkIndex: 0,
+                             snippet: "s", embedding: vec(1), locator: "Line 1", chunkKey: "0000000000000001"),
+            ])
+            old.close()
+        }
+        VectorStore.chunkSplit = saved
+
         let store = try VectorStore(dbURL: url)
-        let p = "/a.txt"
-        try store.replace(path: p, chunks: [
-            IndexedChunk(path: p, modified: 1, size: 10, kind: "text", chunkIndex: 0,
-                         snippet: "s", embedding: vec(1), locator: "Line 1", chunkKey: "0000000000000001"),
-        ])
         // GENUINELY UNSEATED, not merely unflagged. Clearing the flag alone leaves every row with
         // a position, which is a state where building IS correct - `backfillInPlace` re-checks
         // seated == rows rather than trusting any flag.
