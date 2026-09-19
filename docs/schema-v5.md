@@ -772,6 +772,22 @@ exactly the precision the digest prints. The harness pins the fold now and compa
 watermark on both sides, so it says "the fold advanced, this comparison is not about the split"
 rather than blaming the split twice.
 
+IS THE REST WORTH DOING? Stated plainly, because the answer is not obviously yes and the work is
+not small.
+
+The split was justified on two things. One of them has already been delivered without it: a
+genuinely old v4 index carries ONLY `idx_chunk_label`, so "does this content exist" really was a
+table scan - but the current build creates `idx_chunk_content` when such an index opens, and that
+lookup is a seek now whether or not the split ever lands.
+
+What remains is the size, and it is 0.414 GB against a 6.05 GB index - under 7%. Set against that:
+the cutover has to move the write path, the four delete sites, refcounting on `chunk.refs`, and the
+fold's own queries, and it makes the fold itself largely redundant since `chunk.key` is unique by
+construction. That is a session of work on the paths where today's worst defects lived, for 7%.
+
+The recommendation is to decide that deliberately rather than drift into it. The build and the
+invariants are proven and will keep, so nothing is lost by leaving it.
+
 WHAT IS NOT DONE: dropping the v4 tables. Building the tables and proving the invariants is the half that can be
 checked; repointing snippets, locators, tag filters, browse, lexical and dedup at `chunk` /
 `occurrence` is a separate change with its own risk, and it also rests on the same `chunks.slot`
