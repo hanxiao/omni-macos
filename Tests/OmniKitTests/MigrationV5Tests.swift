@@ -100,7 +100,9 @@ final class MigrationV5Tests: XCTestCase {
         // move bytes in the 15.4 GB vector file - the thing that makes it affordable.
         seed(keys: ["aa", "bb", "aa"], files: [10, 10, 20])
         runBackfill(highWater: 3)
-        XCTAssertEqual(num("SELECT id FROM chunk WHERE key = x'aa'"), 0, "representative did not keep slot 0")
+        // SLOT, not id. Identity is a rowid now and position is a column, which is the whole
+        // point: a content keeps one id for life while the reclaim renumbers positions.
+        XCTAssertEqual(num("SELECT slot FROM chunk WHERE key = x'aa'"), 0, "representative did not keep slot 0")
         XCTAssertEqual(num("SELECT id FROM free_slot"), 2, "the freed slot is not the duplicate's")
     }
 
@@ -145,8 +147,8 @@ final class MigrationV5Tests: XCTestCase {
         // surviving content on the slot its bytes actually occupy.
         seed(keys: ["aa", "bb"], files: [10, 20], holes: [0])
         runBackfill(highWater: 3)
-        XCTAssertEqual(num("SELECT id FROM chunk WHERE key = x'aa'"), 1)
-        XCTAssertEqual(num("SELECT id FROM chunk WHERE key = x'bb'"), 2)
+        XCTAssertEqual(num("SELECT slot FROM chunk WHERE key = x'aa'"), 1)
+        XCTAssertEqual(num("SELECT slot FROM chunk WHERE key = x'bb'"), 2)
         XCTAssertEqual(num("SELECT COUNT(*) FROM free_slot WHERE id = 0"), 1, "the pre-existing hole was lost")
         assertInvariants()
     }

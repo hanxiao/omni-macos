@@ -7782,8 +7782,19 @@ if args.count >= 3 && args[1] == "slotfill" {
         if n % 10 == 0 { print("  \(n) slices"); fflush(stdout) }
     }
     print(String(format: "slotfill rows=%d seconds=%.1f", r.filled, r.seconds))
-    if let bad = store.coverageAudit() { print("AUDIT FAILED: \(bad)") } else { print("audit ok") }
+    // AUDIT AFTER A REOPEN, not in the driver's own process. This harness drives the backfill in
+    // a tight loop, and auditing straight afterwards checks the durable state against a RESIDENT
+    // mirror the bulk driver has left behind - which reported "hole 2412552 still has a live row"
+    // on an index where SQLite had zero such contradictions and a fresh open passed every check.
+    // The mechanism was not pinned; what is established is that the in-process answer at that
+    // moment is not trustworthy and the reopened one is, and the reopen is what a user does.
     store.close()
+    do {
+        let after = try VectorStore(dbURL: dbURL)
+        defer { after.close() }
+        if let bad = after.coverageAudit() { print("AUDIT FAILED after reopen: \(bad)") }
+        else { print("audit ok (after reopen)") }
+    }
     exit(0)
 }
 

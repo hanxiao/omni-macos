@@ -54,12 +54,16 @@ enum MigrationV5 {
         return out
     }
 
-    /// One row per distinct content, keeping the representative's existing slot as its id.
+    /// One row per distinct content, taking the representative's existing slot as its SLOT - not
+    /// as its id. The id is a fresh rowid, so a content keeps one identity for life while the
+    /// reclaim is free to renumber positions underneath it. Costs the migration nothing: it stores
+    /// the same number in a column instead of in the primary key.
+    ///
     /// `refs` is the occurrence count, which the second statement then has to agree with.
     static func buildChunkSQL(suffix: String = "") -> String {
         """
-        INSERT INTO chunk\(suffix)(id, key, kind, bytes, refs)
-        SELECT MIN(s.slot), \(keyExpr), MIN(ct.kind), 0, COUNT(*)
+        INSERT INTO chunk\(suffix)(key, kind, bytes, refs, slot)
+        SELECT \(keyExpr), MIN(ct.kind), 0, COUNT(*), MIN(s.slot)
         FROM chunk_text ct JOIN slot_of s ON s.chunk_id = ct.chunk_id
         GROUP BY \(keyExpr)
         """
@@ -85,20 +89,21 @@ enum MigrationV5 {
         INSERT INTO chunk_snippet\(suffix)(chunk_id, kind, snippet)
         SELECT c.id, c.kind, COALESCE((SELECT ct.snippet FROM chunk_text ct
                                JOIN slot_of s ON s.chunk_id = ct.chunk_id
-                               WHERE s.slot = c.id), '')
+                               WHERE s.slot = c.slot), '')
         FROM chunk\(suffix) c
         """
     }
 
     /// Slots below the high-water mark that no content owns. Derivable, and derived rather than
     /// accumulated, because a leaked slot is invisible - the vector file simply never shrinks.
+    /// Joined on `slot` now that identity and position are separate columns.
     static func buildFreeListSQL(highWater: Int64, suffix: String = "") -> String {
         """
         INSERT INTO free_slot\(suffix)(id)
         SELECT v.i FROM (WITH RECURSIVE r(i) AS (
             SELECT 0 UNION ALL SELECT i + 1 FROM r WHERE i < \(highWater - 1)
         ) SELECT i FROM r) v
-        LEFT JOIN chunk\(suffix) c ON c.id = v.i
+        LEFT JOIN chunk\(suffix) c ON c.slot = v.i
         WHERE c.id IS NULL
         """
     }
@@ -125,10 +130,17 @@ enum MigrationV5 {
              """,
              "SELECT 0"),
             ("live and free slots exactly cover the file",
-             "SELECT (SELECT COUNT(*) FROM chunk\(suffix)) + (SELECT COUNT(*) FROM free_slot\(suffix))",
+             "SELECT (SELECT COUNT(*) FROM chunk\(suffix) WHERE slot >= 0) "
+                + "+ (SELECT COUNT(*) FROM free_slot\(suffix))",
              "SELECT \(highWater)"),
             ("no slot is both owned and free",
-             "SELECT COUNT(*) FROM free_slot\(suffix) f JOIN chunk\(suffix) c ON c.id = f.id",
+             "SELECT COUNT(*) FROM free_slot\(suffix) f JOIN chunk\(suffix) c ON c.slot = f.id",
+             "SELECT 0"),
+            // AND NO TWO CONTENTS SHARE A POSITION, which only becomes expressible once position
+            // is a column: when it was the primary key the schema enforced it for free.
+            ("no position is owned twice",
+             "SELECT COUNT(*) FROM (SELECT slot FROM chunk\(suffix) WHERE slot >= 0 "
+                + "GROUP BY slot HAVING COUNT(*) > 1)",
              "SELECT 0"),
         ]
     }

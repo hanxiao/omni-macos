@@ -250,9 +250,24 @@ enum StoreSchema {
                 key BLOB NOT NULL,
                 kind INTEGER NOT NULL DEFAULT 0,
                 bytes INTEGER NOT NULL DEFAULT 0,
-                refs INTEGER NOT NULL DEFAULT 0
+                refs INTEGER NOT NULL DEFAULT 0,
+                slot INTEGER NOT NULL DEFAULT -1
             );
             """,
+            // POSITION IS A COLUMN, NOT THE IDENTITY. The first cut of this schema made `id` the
+            // slot, because a migration that keeps each representative's existing slot as its id
+            // never has to move a vector. That is true and it is the wrong trade: the reclaim
+            // RENUMBERS positions, so identity-as-position means every reclaim rewrites a 6.2M-row
+            // PRIMARY KEY plus 9.7M occurrence.chunk_id values - and a rowid change rewrites the
+            // row and every index entry that carries it. The same operation today is one
+            // `UPDATE chunks SET slot`.
+            //
+            // Splitting them costs the migration nothing (it stores the same number in a column
+            // instead of in the id) and buys two things: a content keeps one identity for life, and
+            // the write path can insert a content BEFORE its position is known - which it must,
+            // because the slot depends on what is still live after the in-memory removal that runs
+            // past the commit.
+            "CREATE INDEX IF NOT EXISTS idx_chunk_slot_v5 ON \(chunk)(slot) WHERE slot >= 0;",
             // The lookup the whole design turns on, and the one v4 never had: v4 stored chunk_key on
             // all 9.13M rows and indexed none of them, so nothing could ask "does this content exist
             // already" without a full table scan.
