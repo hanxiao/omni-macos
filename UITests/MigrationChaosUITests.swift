@@ -321,6 +321,26 @@ final class MigrationChaosUITests: XCTestCase {
         }
 
         print("[migration-chaos] completed \(rounds) interaction rounds")
+
+        // LET IT BREATHE, because the migration cannot finish while we never stop typing.
+        //
+        // The split is built from the coverage stamp and the stamp YIELDS TO SEARCHES - correctly,
+        // since a 60-second build must never land on a query's latency path. This suite searches
+        // continuously for four minutes, so the stamp deferred every time and the split was never
+        // built: the run passed with both split flags on and exercised v4 the whole way. A real
+        // user does stop to read something, and that pause is when the migration gets its turn.
+        //
+        // So the pause is part of the test, not a workaround for it. Scripts/migration-chaos.sh
+        // reads the markers afterwards and fails the run if the split still is not built.
+        let quiet = ProcessInfo.processInfo.environment["OMNI_MIGCHAOS_QUIET_SECONDS"]
+            .flatMap(Double.init) ?? 150
+        print("[migration-chaos] going quiet for \(Int(quiet))s so the migration can finish")
+        let quietUntil = Date().addingTimeInterval(quiet)
+        while Date() < quietUntil {
+            Thread.sleep(forTimeInterval: 5)
+            XCTAssertEqual(app.state, .runningForeground, "the app went away while idle")
+        }
+        print("[migration-chaos] quiet period over")
         // Still answering afterwards, which is the point: the migration ran underneath all of it.
         focusSearch(app)
         app.typeKey("a", modifierFlags: .command)

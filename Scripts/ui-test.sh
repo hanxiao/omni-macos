@@ -19,6 +19,13 @@ cd "$(dirname "$0")/.."
 # Shared with run-tests.sh, which moves Omni.xcodeproj out of the tree while it runs. Regenerating
 # a project while that is happening produces one with no development team, and its restore then
 # nests the backup inside ours. See the comment in run-tests.sh.
+#
+# HELD ONLY OVER THE PROJECT, NOT OVER THE TEST RUN. Holding it for the whole invocation
+# deadlocked the automation window against itself: the holder is an ordinary ui-test.sh run that
+# stays alive for the length of the window, so it owned the lock and the run it existed to enable
+# waited behind it forever. Two ui-test.sh runs are fine together - they touch the project only to
+# read it, and take separate derived data via OMNI_DD - so the lock is released as soon as the
+# generate-and-resolve phase is done.
 LOCK=.build/omni-build.lock
 mkdir -p .build
 if ! mkdir "$LOCK" 2>/dev/null; then
@@ -33,6 +40,7 @@ if ! mkdir "$LOCK" 2>/dev/null; then
 fi
 echo $$ > "$LOCK/pid"
 trap 'rm -rf "$LOCK"' EXIT
+release_build_lock() { rm -rf "$LOCK"; trap - EXIT; }
 
 # Overridable so a second, CONCURRENT xcodebuild (the automation-mode holder) does not fight this
 # one for the derived-data lock.
@@ -64,6 +72,9 @@ fi
 
 xcodebuild -resolvePackageDependencies -project Omni.xcodeproj -scheme OmniUITests \
   -derivedDataPath "$DD" >/dev/null
+
+# The project is settled from here on; anything else may generate or move it now.
+release_build_lock
 
 # Informational only - the tests decide for themselves by asking the app, because the sandboxed
 # runner cannot see the user's Application Support.
