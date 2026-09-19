@@ -332,6 +332,11 @@ final class MigrationChaosUITests: XCTestCase {
         //
         // So the pause is part of the test, not a workaround for it. Scripts/migration-chaos.sh
         // reads the markers afterwards and fails the run if the split still is not built.
+        // THE CHURN STOPS TOO. It ran through the first quiet period and the indexer kept
+        // working, so the slot backfill contended for the whole 420 s and the split never got
+        // its turn - a "quiet" period in which the file system is still being rewritten is not
+        // quiet, and it is not what a user who walks away looks like either.
+        churnStop = true
         let quiet = ProcessInfo.processInfo.environment["OMNI_MIGCHAOS_QUIET_SECONDS"]
             .flatMap(Double.init) ?? 150
         print("[migration-chaos] going quiet for \(Int(quiet))s so the migration can finish")
