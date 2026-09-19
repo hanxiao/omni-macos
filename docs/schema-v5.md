@@ -915,21 +915,41 @@ releasing.
          OMNI_CHUNK_SPLIT=1   590 tests, 0 failures
          + OMNI_SPLIT_CUTOVER 590 tests, 15 tests failing (2027 assertions)
 
-     The 15 are bounded and named, which is what makes this a piece of work rather than an
-     unknown:
+     DONE. All of them, and the arm is 590 tests 0 failures. What the 15 were, and what each
+     turned out to be, because every one of them was a reader answering from a table that was
+     about to stop existing and no test could see it:
 
-         SchemaV4MigrationTests    8   the v3 -> v4 conversion writes chunk_text and nothing
-                                       else; under cutover an upgraded index has no text at all
-         StoredTagsBindTests       3   tag readers that still join chunk_text
-         ChunkLocatorTests         1   locator round trip
-         StoreChunkReuseTests      1   file-level reuse
-         ChunkReuseEvictionTests   1   the same, under eviction
-         ScanKindMigrationTests    1   scan reclassification
+         SchemaV4MigrationTests    8   NOT the conversion. The fixtures are written by the
+                                       CURRENT store and then rewritten into v3 shape, so under
+                                       cutover they were built from an empty chunk_text and every
+                                       test upgraded nothing. `writtenByAnOldBinary` says what a
+                                       v3 fixture is: no v3 index was ever written by a binary
+                                       that knew about the split.
+         StoredTagsBindTests       3   `browseTags` still joined chunk_text, and `storedTags`
+                                       decided media-ness from the EXISTENCE of a snippet row -
+                                       which stopped holding when untagged media stopped storing
+                                       one, collapsing "media with no tags" into "not media".
+                                       `chunk.kind` is always there.
+         ChunkLocatorTests         1   `rankChunks` had its own inline SQL for "snippet and
+                                       locator for every chunk of one file". Named and paired now
+                                       as fileDisplayTextSQL / ...SplitSQL.
+         StoreChunkReuseTests      1   `chunkVectors` read the per-chunk content key, which IS
+                                       `chunk.key` under the split. Left on v4 it returned
+                                       nothing and chunk-level reuse silently stopped applying:
+                                       every file re-embedded from scratch, correct output at
+                                       several times the cost.
+         ChunkReuseEvictionTests   1   the same reader, under eviction.
+         ScanKindMigrationTests    1   the read side, fixed earlier in the same pass.
 
-     The scan-kind migration's READ side is already moved; its write side was already split-aware.
-     The v3 -> v4 conversion is the large one: it has to produce the v5 shape directly, or produce
-     v4 and be followed by the build in the same launch, and that choice decides whether `chunks`
-     can be dropped in the same pass or one after it.
+     The v3 -> v4 conversion needed nothing: it stages into v4 and the build derives the split
+     from it in the same launch, which is one migration from the user's side. Keeping it that way
+     is deliberate - converting v3 straight to v5 would mean a second conversion path to write,
+     test and carry forever, for indexes that are years old.
+
+     THE LESSON, and it is the same one twice: a flag whose effect is gated on a condition that
+     never holds in tests reports success without executing. Both OMNI_CHUNK_SPLIT and
+     OMNI_SPLIT_CUTOVER did exactly that for weeks. Before trusting an arm, check that the thing
+     it turns on actually turned on - `splitBuiltForTest` exists for that.
   3. Deletes decrement `chunk.refs` and release the slot at zero, instead of re-deriving what is
      still referenced across four sites.
   4. Retire the fold. It cannot happen before 2 and 3, and it is what pays for them: `chunk.key`
