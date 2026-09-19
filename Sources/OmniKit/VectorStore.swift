@@ -6717,7 +6717,17 @@ public final class VectorStore: @unchecked Sendable {
     /// Give these positions back. Called with what `releasedSlotsLocked` computed, i.e. positions
     /// no live row points at any more, INSIDE the transaction that made that true.
     private func releaseFreeSlotsLocked(_ positions: [Int32]) {
-        guard Self.freeListEnabled, Self.contentSharing, freeSlotsValid, !positions.isEmpty else { return }
+        guard Self.freeListEnabled, Self.contentSharing, !positions.isEmpty else { return }
+        if Self.sqlDebug {
+            FileHandle.standardError.write(Data(
+                "[omni][free] release \(positions.sorted()) valid=\(freeSlotsValid)\n".utf8))
+        }
+        // NOT WHILE THE LIST IS STALE. `freeSlotsValid` false means the list is about to be
+        // rebuilt from the pointers, and a release into a list that is then thrown away is simply
+        // lost - the position stays out of the free list while its hole is recorded, which is a
+        // leak rather than a corruption. The rebuild picks it up because it derives from
+        // ownership, so returning early here is correct and the guard stays.
+        guard freeSlotsValid else { return }
         for p in positions { freeSlots.release(Int(p)) }
     }
 
@@ -6758,6 +6768,26 @@ public final class VectorStore: @unchecked Sendable {
         // The position is owned again, so it is not a hole. Committed inside the caller's
         // transaction with the row that now owns it; a rollback re-reads the table.
         if vecHoles.remove(Int32(p)) != nil { exec("DELETE FROM vec_holes WHERE slot = \(p);") }
+        // AND THE POSITION -> ROWS INDEX IS NOW WRONG. It is cached on (mutationGen, slotCount),
+        // and reusing a freed position changes NEITHER: nothing is appended so the count is the
+        // same, and the generation was already bumped before this row was added. Every other way
+        // of gaining a row appends, which grows slotCount and forces the rebuild - so this cache
+        // key worked for as long as reuse did not exist.
+        //
+        // The cost of missing it is not a stale read, it is an index that will not open: the
+        // audit asks that map who owns a position, is told nobody, and reports
+        // "position N inside coverage has no live row and no recorded hole" for a position that
+        // was just legitimately reused. Which is exactly what it did.
+        //
+        // ALL THREE, not just the one that was caught. Every cache over the row -> position
+        // mapping is keyed the same way, and reuse is invisible to all of them for the same
+        // reason: `orphanSlotsLocked` on (gen, n), and `occSlotIsIdentityLocked` on
+        // (gen, baseOccCount) - which would answer "positions are still the row's own index"
+        // after a reuse has made that false, and that answer decides whether whole scans can skip
+        // the indirection. Found by looking for siblings of the bug rather than only fixing it.
+        slotRowGen = -1
+        orphanCacheGen = -1
+        identityCacheGen = -1
         // AND THE NUMBERING IS NOW NON-SEQUENTIAL. Recorded once, in this same transaction, because
         // the next open has to know before it can choose a loader.
         if !slotsOutOfOrder {

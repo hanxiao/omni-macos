@@ -637,10 +637,25 @@ the same sequence is clean.
     split off, free list on    FAILS
     split off, free list off   passes
 
-That is the shape of defect that makes an index unopenable later, which is the worst failure this
-store has. The cause is not yet known; what is known is that it is the free list alone - the
-split's native writes, its delete hook, its content lookup and its build were each disabled in
-turn and the failure survived every one of them.
+FOUND, AND IT IS A CACHE KEY. `ensureSlotRowsLocked` builds the position -> rows index and caches
+it on `(mutationGen, slotCount)`. Reusing a freed position changes NEITHER: nothing is appended so
+the count is the same, and the generation was already bumped before the row was added. Every other
+way of gaining a row appends, which grows `slotCount` and forces a rebuild - so that key was
+correct for exactly as long as reuse did not exist.
+
+The trace that settled it, after four hypotheses had died:
+
+    [omni][free] release [6] valid=true
+    [omni][free] placed at 6 (hole cleared: true) slotCount=27
+    -> position 6 inside coverage has no live row and no recorded hole
+
+A row WAS placed at 6. The audit asked a stale map who owned it and was told nobody.
+
+AND IT HAD TWO SIBLINGS, found by looking for the class rather than stopping at the instance.
+`orphanSlotsLocked` caches on `(gen, n)` and `occSlotIsIdentityLocked` on `(gen, baseOccCount)` -
+the second decides whether a scan may skip the row -> position indirection entirely, so a stale
+"yes" after a reuse is worse than the bug that was caught. All three are invalidated where the
+reuse happens.
 
 WHY A GREEN SUITE MISSED IT. No test advanced coverage BETWEEN mutations. They mutate, then audit
 at the end, or audit after a reopen. An app advances coverage continuously while the user works,
