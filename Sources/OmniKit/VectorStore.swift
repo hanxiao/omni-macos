@@ -2183,7 +2183,8 @@ public final class VectorStore: @unchecked Sendable {
             // result nothing can persist, and it used to happen on every repeat close() because the
             // only `closed` check sat three lines below.
             guard !closed else { return }
-            stampVectorCoverageLocked(budget: Self.coverageSliceOnClose, reclaim: false)   // a quit must not stall
+            stampVectorCoverageLocked(budget: Self.coverageSliceOnClose, reclaim: false,
+                                      allowSplitBuild: false)   // a quit must not stall
             // SETTLE THE REUSE DEBT, unconditionally. A position the free list rewrote inside the
             // covered prefix keeps its blob until the file is synced, and `unsyncedReuse` is the
             // only record that it does - it lives in memory and nothing else. The stamp above
@@ -8851,7 +8852,13 @@ public final class VectorStore: @unchecked Sendable {
 
     /// `reclaim` is false on the close path: taking the tombstoned slots back copies the live
     /// vector file, and a quit must not wait for that.
-    private func stampVectorCoverageLocked(budget: Int = VectorStore.coverageSlice, reclaim: Bool = true) {
+    /// `allowSplitBuild` is false on the way out. The split's build is ONE transaction of
+    /// hundreds of milliseconds on a fixture and 157 seconds on a real index, and close() is the
+    /// worst possible moment to start one - a quit must not stall, which is why the coverage slice
+    /// is already shortened here. Starting it there also puts a long write between the stamp and
+    /// the row sidecar that close writes immediately afterwards.
+    private func stampVectorCoverageLocked(budget: Int = VectorStore.coverageSlice, reclaim: Bool = true,
+                                           allowSplitBuild: Bool = true) {
         guard Self.vecCoverage, Self.rowSidecarEnabled, dbOpen(), dim > 0, !rows.isEmpty else { return }
         // COVERAGE CAUGHT UP is the steady state, and it is where the other half of the work lives:
         // the slots the tombstones hold. Checked here rather than on a timer of its own because
@@ -8875,7 +8882,7 @@ public final class VectorStore: @unchecked Sendable {
             // THE SPLIT, once, after the backfill has seated every row. It is one transaction
             // rather than slices - the invariants can only be checked with all four tables
             // present - so it sits behind the same yield the fold does and behind its own flag.
-            if Self.chunkSplit, !yieldToSearchLocked("split"), buildChunkSplitLocked() { return }
+            if Self.chunkSplit, allowSplitBuild, !yieldToSearchLocked("split"), buildChunkSplitLocked() { return }
             if !yieldToSearchLocked("fold"), foldDuplicateContentsLocked() { return }
             // Off the queue: the reclaim takes it one chunk at a time, and this call is holding it.
             if reclaim, !yieldToSearchLocked("reclaim"), shouldReclaimHolesLocked() {
