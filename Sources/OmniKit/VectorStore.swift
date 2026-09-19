@@ -6982,7 +6982,7 @@ public final class VectorStore: @unchecked Sendable {
     /// Whether this index answers from the split. Tests assert on it directly: "the tables have
     /// rows" and "the store is READING them" are different claims, and only the second is the one
     /// that matters once v4 stops being written.
-    var splitBuiltForTest: Bool { queue.sync { splitBuilt } }
+    public var splitBuiltForTest: Bool { queue.sync { splitBuilt } }
     /// The display SQL this index answers with.
     private var displayTextSQL: String { splitBuilt ? Self.chunkTextByPathSplitSQL : Self.chunkTextByPathSQL }
     /// Snippet and locator for every chunk of one file. See fileDisplayTextSplitSQL.
