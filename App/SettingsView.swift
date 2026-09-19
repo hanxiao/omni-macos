@@ -57,8 +57,9 @@ private struct IndexStatusRow: View {
         return (rs.reduce(0) { $0 + $1.done }, rs.reduce(0) { $0 + $1.total })
     }
 
-    /// "4.8 file/s and 22k tok/s" during a full pass, or "22k tok/s" during a background reconcile
-    /// where there is no per-file count. nil when nothing is being embedded.
+    /// The rates as separate pieces, so the caller joins them with the SAME separator as every
+    /// other piece on the line. Returned joined by an "and" before, which made the last separator
+    /// the odd one out.
     ///
     /// THREE DIGITS IS ONE TOO MANY on a line that also carries three counts, and the decimal is
     /// the one that earns its place least: the difference between 21.8k and 22k tokens a second is
@@ -67,14 +68,29 @@ private struct IndexStatusRow: View {
     private static func rate(_ v: Double) -> String {
         v >= 10 ? String(format: "%.0f", v) : String(format: "%.1f", v)
     }
-    private var rateLabel: String? {
-        guard model.tokensPerSec > 0 else { return nil }
+    private var rateParts: [String] {
+        guard model.tokensPerSec > 0 else { return [] }
         let tok = model.tokensPerSec >= 1000
             ? "\(Self.rate(model.tokensPerSec / 1000))k"
             : String(format: "%.0f", model.tokensPerSec)
-        return model.filesPerSec > 0
-            ? "\(Self.rate(model.filesPerSec)) file/s and \(tok) tok/s"
-            : "\(tok) tok/s"
+        var out: [String] = []
+        if model.filesPerSec > 0 { out.append("\(Self.rate(model.filesPerSec)) file/s") }
+        out.append("\(tok) tok/s")
+        return out
+    }
+
+    /// "922 added \u{00B7} 2,453,451 synced \u{00B7} 3,538 skipped \u{00B7} 70 file/s \u{00B7} 24k tok/s".
+    ///
+    /// `.formatted()` on every count is load-bearing: SwiftUI's `Text("\(anInt)")` groups digits
+    /// for the locale on its own, and a plain String does not - so joining without it would have
+    /// silently turned 2,453,451 into 2453451.
+    private var progressCounts: String {
+        var parts = ["\(model.progress.embedded.formatted()) added"]
+        if model.progress.unchanged > 0 { parts.append("\(model.progress.unchanged.formatted()) synced") }
+        if model.progress.skipped > 0 { parts.append("\(model.progress.skipped.formatted()) skipped") }
+        if model.progress.failed > 0 { parts.append("\(model.progress.failed.formatted()) failed") }
+        parts.append(contentsOf: rateParts)
+        return parts.joined(separator: " \u{00B7} ")
     }
 
     var body: some View {
@@ -94,17 +110,12 @@ private struct IndexStatusRow: View {
                         .font(.caption).foregroundStyle(.secondary)
                 } else {
                     ProgressView(value: overall)
-                    HStack {
-                        Text("\(model.progress.embedded) added")
-                        if model.progress.unchanged > 0 { Text("\u{00B7} \(model.progress.unchanged) synced") }
-                        if model.progress.skipped > 0 { Text("\u{00B7} \(model.progress.skipped) skipped") }
-                        if model.progress.failed > 0 { Text("\u{00B7} \(model.progress.failed) failed") }
-                        // The rate rides with the counts rather than in the header: it is the same
-                        // kind of fact, it changes at the same rate, and the header was carrying it
-                        // alone against a title that never changes.
-                        if let rateLabel { Text("\u{00B7} \(rateLabel)") }
-                    }
-                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    // ONE Text, not a stack of them. Each piece used to carry its own leading
+                    // "\u{00B7} ", which put the HStack's spacing on the left of every separator
+                    // and a single space character on its right - visibly lopsided at caption size.
+                    // Joining one string puts the same space on both sides by construction.
+                    Text(progressCounts)
+                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                     Text((model.progress.currentPath as NSString).lastPathComponent)
                         .font(.caption2).foregroundStyle(.tertiary).lineLimit(1).truncationMode(.middle)
                 }
@@ -129,8 +140,9 @@ private struct IndexStatusRow: View {
                         ProgressView().controlSize(.small)
                         Text("Updating\u{2026}").fontWeight(.medium)
                         Spacer()
-                        if let rateLabel {
-                            Text(rateLabel).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                        if !rateParts.isEmpty {
+                            Text(rateParts.joined(separator: " \u{00B7} "))
+                                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                         }
                     }
                     if activeCounts.total > 0 {
