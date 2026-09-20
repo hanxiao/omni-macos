@@ -355,6 +355,46 @@ final class ChunkSplitLoaderTests: XCTestCase {
                        "the split was published without recording that the blobs moved with it")
     }
 
+    /// KILLED BETWEEN THE BUILD AND THE PUBLISH. The build is one transaction and the publish is
+    /// another, so this window is real - and narrow enough that a timed SIGKILL lands in it only
+    /// by luck, which is why it is produced deterministically here instead.
+    ///
+    /// It used to stall the migration for good, silently: `backfillInPlace` read a populated
+    /// `occurrence` as "already migrated, nothing to do" and returned nil, so the publish never
+    /// ran again and the index kept a complete, correct, entirely unused split for the rest of
+    /// its life. The tables are re-proven against the same invariants a fresh build must pass
+    /// and then finished, rather than rebuilt from scratch or believed on sight.
+    func testAnUnpublishedBuildIsFinishedOnTheNextOpen() throws {
+        let url = tempDB()
+        let savedCoverage = VectorStore.vecCoverage
+        VectorStore.vecCoverage = false          // leave blobs staged, so the translation has work
+        defer { VectorStore.vecCoverage = savedCoverage }
+        try writeV4Fixture(url, files: 16, dupEvery: 4)
+        do {
+            let store = try VectorStore(dbURL: url)
+            store.migrateSlotsToCompletion()
+            XCTAssertTrue(store.buildChunkSplitForTest())
+            store.tearPublishForTest()
+            store.close()
+        }
+        // The torn state: tables full, neither flag set, blobs back in the v4 space.
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM occurrence"), 32)
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM meta WHERE key='chunk_split_backfilled'"), 0)
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM meta WHERE key='pending_vecs_on_content'"), 0)
+
+        let store = try VectorStore(dbURL: url)
+        XCTAssertFalse(store.splitBuiltForTest, "the torn index opened as if it were published")
+        XCTAssertTrue(store.buildChunkSplitForTest(), "the interrupted publish was never finished")
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM meta WHERE key='pending_vecs_on_content' AND value='1'"), 1)
+        store.close()
+
+        let re = try VectorStore(dbURL: url); defer { re.close() }
+        XCTAssertTrue(re.residentIDsAreContentsForTest)
+        XCTAssertEqual(re.rowCountForTest, 32)
+        XCTAssertFalse(digest(re).isEmpty)
+        XCTAssertNil(re.coverageAudit())
+    }
+
     /// AND THE TRANSLATION RUNS ONCE. Running it twice is not a no-op: it looks a
     /// content-keyed blob up as a v4 row id, finds whichever row carries that number, and
     /// re-keys it onto THAT row's content. Reachable without any test - the build finishes and

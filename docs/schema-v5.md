@@ -1116,6 +1116,30 @@ releasing.
      or better than the v4 baseline. The 23.2 s open is the one-time hole recording and does not
      recur: the next open is 3.46 s against v4's 3.56 s.
 
+     SIGKILL AT THREE POINTS, `Scripts/kill-split-migration.sh 40 150 300`, each on its own clone
+     of the same real index. All three reopen with 0 failing checks and digest
+     ba7a13400e714f79:
+
+         40 s    mid slot backfill        reopens v4,     chunk=0        p50 4.3 ms
+         150 s   coverage complete        reopens v4,     chunk=0        p50 4.5 ms
+         300 s   past the publish         reopens split,  chunk=6257501  p50 4.7 ms
+
+     AND THE WINDOW THAT MATTERS IS NOT ONE A TIMER CAN FIND. The build is one transaction on the
+     side connection and the publish is another, so nothing is visible from outside until the
+     build commits: a kill at 150 s and a kill at 250 s look identical (`chunk=0`). The real
+     window is the few milliseconds between those two commits, and a proof that depends on a
+     timer landing in it is not one. `tearPublishForTest` produces it exactly - tables full and
+     correct, both flags absent, blobs still in the v4 space, because the translation travels
+     with the publish - and `testAnUnpublishedBuildIsFinishedOnTheNextOpen` is the assertion.
+
+     IT USED TO STALL THE MIGRATION FOR GOOD, SILENTLY. `backfillInPlace` read a populated
+     `occurrence` as "already migrated, nothing to do" and returned nil, so the publish never ran
+     again and the index kept a complete, correct, entirely unused split for the rest of its
+     life - v4 speed, v5 disk, and no error anywhere. The tables are now re-proven against the
+     same invariants a fresh build must pass and then finished, which is neither rebuilding them
+     (151 s wasted) nor believing them on sight. Negative control: with the adoption removed the
+     suite fails 3 assertions.
+
   6. `pending_vecs` keyed on content id rather than row id. DONE, with step 5 - see above.
   7. The migration contracts: drop `chunk_text`, then `chunks`, with the kill-and-reopen proof.
   8. Both flags deleted - not defaulted, deleted. A shipped layout has no switch.

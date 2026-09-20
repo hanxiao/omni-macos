@@ -191,9 +191,14 @@ extension MigrationV5Runner {
     ///
     /// Returns nil when there is nothing to do, and throws with the tables dropped when a check
     /// fails. A failed backfill must leave a v4 database, not a half-v5 one.
+    /// `adoptExisting` is what the store passes when its own done flag is UNSET: only then is a
+    /// populated `occurrence` an interrupted publish rather than an index that is simply already
+    /// migrated, and only then may these tables be re-proven and finished.
     static func backfillInPlace(db: OpaquePointer,
                                 highWater: Int64,
+                                adoptExisting: Bool = false,
                                 log: (String) -> Void = { _ in }) throws -> DryRun? {
+        let start0 = Date()
         func run(_ sql: String) throws {
             if sqlite3_exec(db, sql, nil, nil, nil) != SQLITE_OK {
                 throw Failure.sql(sql, String(cString: sqlite3_errmsg(db)))
@@ -207,9 +212,35 @@ extension MigrationV5Runner {
             return sqlite3_column_int64(st, 0)
         }
 
-        // Already done, or not yet possible. Both are "nothing to do" rather than failures: the
-        // caller polls this from an idle pass and must not be told a healthy index is broken.
-        guard num("SELECT COUNT(*) FROM occurrence") == 0 else { return nil }
+        // A BUILD THAT COMMITTED AND WAS NEVER PUBLISHED. The whole build is one transaction and
+        // the publish is another, so a kill between them leaves `occurrence` full with the done
+        // flag unset - and "occurrence is not empty, so there is nothing to do" then meant the
+        // publish never ran again either. Not corruption: a migration that silently never
+        // finishes, which this file has already recorded once as "a refusal repeated forever is
+        // still a broken index".
+        //
+        // RE-PROVEN, NOT TRUSTED. The tables are adopted only if the same invariants a fresh
+        // build has to pass still hold, which is the difference between finishing an interrupted
+        // build and believing whatever happens to be in the tables. They cost a few aggregate
+        // queries against the 151 s a rebuild costs, and the caller is off the store queue for
+        // both.
+        if num("SELECT COUNT(*) FROM occurrence") > 0 {
+            guard adoptExisting else { return nil }
+            var out = DryRun()
+            out.rows = num("SELECT COUNT(*) FROM chunks")
+            out.highWater = highWater
+            for inv in MigrationV5.invariants(highWater: highWater) {
+                let got = num(inv.sql), expect = num(inv.mustEqual)
+                if got != expect { out.failures.append("\(inv.name): \(got) vs \(expect)") }
+            }
+            guard out.failures.isEmpty else { throw Failure.invariant(out.failures) }
+            out.contents = num("SELECT COUNT(*) FROM chunk")
+            out.occurrences = num("SELECT COUNT(*) FROM occurrence")
+            out.freeSlots = num("SELECT COUNT(*) FROM free_slot")
+            out.seconds = -start0.timeIntervalSinceNow
+            log("  adopted an unpublished build: \(out.contents) contents, \(out.occurrences) occurrences")
+            return out
+        }
         let rows = num("SELECT COUNT(*) FROM chunks")
         let seated = num("SELECT COUNT(*) FROM chunks WHERE slot >= 0")
         guard rows > 0, seated == rows else { return nil }

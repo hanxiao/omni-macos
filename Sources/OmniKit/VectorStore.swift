@@ -12810,7 +12810,12 @@ public final class VectorStore: @unchecked Sendable {
             sqlite3_exec(side, "PRAGMA journal_mode=WAL;", nil, nil, nil)
             sqlite3_exec(side, "PRAGMA busy_timeout=120000;", nil, nil, nil)
             do {
-                guard let r = try MigrationV5Runner.backfillInPlace(db: side!, highWater: hw) else { return }
+                // `adoptExisting`: this whole path only runs when the done flag is unset (the guard at
+                // the top of buildChunkSplitLocked), so a populated `occurrence` here is a build
+                // that committed and never got to publish. Finished rather than rebuilt, and only
+                // if it re-proves every invariant.
+                guard let r = try MigrationV5Runner.backfillInPlace(db: side!, highWater: hw,
+                                                                    adoptExisting: true) else { return }
                 self?.queue.sync {
                     guard let self, self.dbOpen() else { return }
                     // CATCH UP. Rows written while the build was running went to v4 only -
@@ -12916,6 +12921,36 @@ public final class VectorStore: @unchecked Sendable {
             exec("DELETE FROM chunk_snippet;"); exec("DELETE FROM free_slot;")
             exec("DELETE FROM meta WHERE key = '\(Self.chunkSplitDoneKey)';")
             exec("DELETE FROM meta WHERE key = '\(Self.pendingOnContentKey)';")
+            splitBuilt = false
+            pendingOnContent = false
+        }
+    }
+
+    /// THE STATE A KILL BETWEEN THE BUILD AND THE PUBLISH LEAVES, made deterministically.
+    ///
+    /// The build is one transaction and the publish is another, so the window is real but narrow
+    /// - narrow enough that a timed SIGKILL lands in it only by luck, and a proof that depends
+    /// on luck is not one. This produces it exactly: the four tables full and correct, both
+    /// flags absent, and the staged vectors still in the v4 id space because the translation
+    /// travels with the publish.
+    public func tearPublishForTest() {
+        queue.sync {
+            exec("DELETE FROM meta WHERE key = '\(Self.chunkSplitDoneKey)';")
+            exec("DELETE FROM meta WHERE key = '\(Self.pendingOnContentKey)';")
+            if pendingOnContent {
+                exec("DROP TABLE IF EXISTS temp.pv_inv;")
+                exec("CREATE TEMP TABLE pv_inv(chunk_id INTEGER PRIMARY KEY, vec BLOB NOT NULL);")
+                exec("""
+                    INSERT OR REPLACE INTO temp.pv_inv(chunk_id, vec)
+                    SELECT c.id, p.vec
+                      FROM chunks c
+                      JOIN occurrence o ON o.file_id = c.file_id AND o.ordinal = c.chunk_index
+                      JOIN pending_vecs p ON p.chunk_id = o.chunk_id;
+                    """)
+                exec("DELETE FROM pending_vecs;")
+                exec("INSERT INTO pending_vecs(chunk_id, vec) SELECT chunk_id, vec FROM temp.pv_inv;")
+                exec("DROP TABLE IF EXISTS temp.pv_inv;")
+            }
             splitBuilt = false
             pendingOnContent = false
         }
