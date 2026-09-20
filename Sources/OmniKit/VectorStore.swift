@@ -12857,6 +12857,16 @@ public final class VectorStore: @unchecked Sendable {
         }
         splitBuilt = false
         refreshSplitBuiltLocked()
+        // AND ARM THE NEXT STAMP, because nothing else will. The caught-up branch of the stamp
+        // deliberately does not re-arm - there is normally nothing left to do - and the publish
+        // runs from the build's completion handler, off any timer. So the step AFTER this one,
+        // dropping the v4 tables, had no turn to take: measured on a chaos run that went quiet
+        // for 700 s with the split published and `chunks` still sitting there at the end.
+        //
+        // On a real machine the next write or search would have armed one eventually, which is
+        // exactly the shape this file has recorded twice as "a step that never gets a turn":
+        // it does not fail, it just never happens, and nothing says so.
+        scheduleCoverageStampLocked()
         return true
     }
 

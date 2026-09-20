@@ -537,6 +537,44 @@ final class ChunkSplitLoaderTests: XCTestCase {
         XCTAssertNil(re.coverageAudit())
     }
 
+    /// THE DROP GETS A TURN WITHOUT ANYTHING ELSE HAPPENING FIRST.
+    ///
+    /// The stamp's caught-up branch does not re-arm - there is normally nothing left to do - and
+    /// the publish runs from the build's completion handler, off any timer. So the step after it
+    /// had no turn to take: a chaos run went quiet for 700 s with the split published and
+    /// `chunks` still sitting there at the end. On a real machine the next write or search would
+    /// have armed one eventually, which is the difference between a step that works and a step
+    /// that happens to get noticed.
+    func testThePublishArmsTheStampThatDropsTheV4Tables() throws {
+        let url = tempDB()
+        try writeV4Fixture(url, files: 12, dupEvery: 3)
+        do {
+            let store = try VectorStore(dbURL: url)
+            store.migrateSlotsToCompletion()
+            store.advanceCoverageForTest()
+            // LET ANY STAMP ALREADY ARMED FIRE FIRST, or this measures that one rather than the
+            // publish's. `coverageArmed` is a one-shot, so a timer armed by the backfill above
+            // is still pending here - and with it pending the test passed whether or not the
+            // publish armed anything, which its negative control said plainly.
+            let gap = Date().addingTimeInterval(VectorStore.coverageIdleGap + 1.5)
+            while Date() < gap { RunLoop.current.run(until: Date().addingTimeInterval(0.2)) }
+            // That pending stamp may well have built the split itself, which is the path this is
+            // about - so what matters is that it IS built, not who built it.
+            if !store.splitBuiltForTest { _ = store.buildChunkSplitForTest() }
+            XCTAssertTrue(store.splitBuiltForTest, "the split did not build")
+            // NOTHING ELSE TOUCHES THE STORE from here: no write, no search, no explicit stamp.
+            // The only thing that can drop the tables is the stamp the publish armed.
+            let deadline = Date().addingTimeInterval(20)
+            while !store.v4Dropped, Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.2)) }
+            XCTAssertTrue(store.v4Dropped, "the publish never armed the stamp that drops the v4 tables")
+            store.close()
+        }
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('chunks','chunk_text')"), 0)
+        let re = try VectorStore(dbURL: url); defer { re.close() }
+        XCTAssertEqual(re.rowCountForTest, 24)
+        XCTAssertNil(re.coverageAudit())
+    }
+
     /// IT REFUSES WHEN IT CANNOT PROVE ITSELF. A v4 row with no occurrence is a row whose text
     /// and locator exist nowhere else, and dropping the table would lose it silently.
     func testTheDropRefusesWhenAV4RowHasNoOccurrence() throws {
