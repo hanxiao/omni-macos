@@ -848,7 +848,16 @@ final class SchemaV4MigrationTests: XCTestCase {
                             kind INTEGER NOT NULL DEFAULT 0
                         );
                         """,
-                        "CREATE UNIQUE INDEX idx_chunk_file ON chunks(file_id, chunk_index);"] {
+                        "CREATE UNIQUE INDEX idx_chunk_file ON chunks(file_id, chunk_index);",
+                        // AND THE MARKER THAT SAYS THERE ARE NO v4 TABLES, because this fixture
+                        // has just put one back. Under the cutover a brand new index is created
+                        // without `chunks` and records that; leaving the marker standing over a
+                        // hand-built v4 table is a shape no index can reach, and the open then
+                        // (correctly) declines to create a v4 index over a table it believes is
+                        // gone.
+                        "DELETE FROM meta WHERE key = 'v4_tables_dropped';",
+                        "DELETE FROM meta WHERE key = 'chunk_split_backfilled';",
+                        "DELETE FROM meta WHERE key = 'pending_vecs_on_content';"] {
                 XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK, sql)
             }
             XCTAssertEqual(scalar(db, "SELECT COUNT(*) FROM pragma_table_info('chunks') WHERE name='slot'"), 0,
@@ -861,6 +870,17 @@ final class SchemaV4MigrationTests: XCTestCase {
         do { let s = try VectorStore(dbURL: dbURL); s.close() }
 
         let db = open(dbURL); defer { sqlite3_close(db) }
+        // ONLY WHILE `chunks` IS STILL THERE. This pins the ORDER of two statements on the open
+        // that upgrades an index - the column before the partial index over it - and under the
+        // cutover the same launch goes on to build the split and drop the table, so by the time
+        // the store closes there is no column to find. The ordering it exists to protect still
+        // held: the split could not have been built otherwise, because its build refuses while
+        // any row is unseated.
+        guard SchemaProbe.hasTable(db, "chunks") else {
+            XCTAssertEqual(scalar(db, "SELECT COUNT(*) FROM meta WHERE key='chunk_split_backfilled' AND value='1'"), 1,
+                           "`chunks` is gone but the split was never built, so it was not the migration that removed it")
+            return
+        }
         XCTAssertEqual(scalar(db, "SELECT COUNT(*) FROM pragma_table_info('chunks') WHERE name='slot'"), 1,
                        "the slot column was not added")
         XCTAssertEqual(scalar(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_chunk_slot'"), 1,

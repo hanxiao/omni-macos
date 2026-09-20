@@ -310,8 +310,11 @@ final class ChunkSplitTests: XCTestCase {
         }
         XCTAssertGreaterThan(num(url, "SELECT COUNT(*) FROM occurrence"), 0,
                              "the coverage stamp never built the split")
-        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM occurrence"),
-                       num(url, "SELECT COUNT(*) FROM chunks"),
+        // AGAINST THE FIXTURE'S OWN COUNT, not against a live read of `chunks`. Under the
+        // cutover the migration drops that table once the split is answering for everything, so
+        // the live read answers -1 and this compared the occurrence count against a missing
+        // table.
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM occurrence"), 60,
                        "every chunk did not become exactly one occurrence")
     }
 
@@ -453,7 +456,11 @@ final class ChunkSplitTests: XCTestCase {
         XCTAssertEqual(scalar("SELECT COUNT(*) FROM chunk"), 1, "the content was not written to `chunk`")
         XCTAssertEqual(scalar("SELECT COUNT(*) FROM occurrence"), 1, "no occurrence was written")
         XCTAssertEqual(scalar("SELECT COUNT(*) FROM chunk_snippet"), 1, "no snippet was written")
-        XCTAssertEqual(scalar("SELECT COUNT(*) FROM chunk_text"), 0,
+        // -1 IS THE STRONGER ANSWER HERE. Under the cutover a brand new index is created
+        // without the v4 tables at all, so the count does not prepare; before it, the table
+        // exists and must be empty. Both mean "no v4 text row was written", and spelling it
+        // this way keeps the assertion true of an index that never had the table.
+        XCTAssertLessThanOrEqual(scalar("SELECT COUNT(*) FROM chunk_text"), 0,
                        "a v4 text row was written into an index that has never needed one")
 
         // And it reads back, so "born v5" is not just "wrote the tables".

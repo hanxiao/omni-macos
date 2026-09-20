@@ -212,7 +212,7 @@ final class PathInterningTests: XCTestCase {
         do {
             let db = open(dbURL)
             defer { sqlite3_close(db) }
-            rowsInDB = scalar(db, "SELECT COUNT(*) FROM chunks;")
+            rowsInDB = scalar(db, "SELECT COUNT(*) FROM \(SchemaProbe.rowTable(db));")
         }
         XCTAssertGreaterThan(rowsInDB, 0, "fixture is empty, so this proves nothing")
 
@@ -238,7 +238,10 @@ final class PathInterningTests: XCTestCase {
         }
         func orphans() -> Int {
             let db = open(dbURL); defer { sqlite3_close(db) }
-            return scalar(db, "SELECT COUNT(*) FROM files WHERE NOT EXISTS(SELECT 1 FROM chunks WHERE chunks.file_id = files.id);")
+            // The ROW table, whichever it is: a file with no rows is the orphan this counts,
+            // and under v5 the rows are occurrences.
+            let t = SchemaProbe.rowTable(db)
+            return scalar(db, "SELECT COUNT(*) FROM files WHERE NOT EXISTS(SELECT 1 FROM \(t) r WHERE r.file_id = files.id);")
         }
         let before = fileRows()
         XCTAssertGreaterThan(before, 10, "fixture is too small to show a leak")

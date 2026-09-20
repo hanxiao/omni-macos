@@ -1962,7 +1962,25 @@ public final class VectorStore: @unchecked Sendable {
                 // after which the rank-through-holes walk is never needed again.
                 addColumnIfMissing("slot", "INTEGER NOT NULL DEFAULT -1")
             }
-            for sql in StoreSchema.createStatements() { exec(sql) }
+            // AND `chunks` / `chunk_text` ARE NOT RECREATED once the migration has dropped them.
+            // `CREATE TABLE IF NOT EXISTS` cannot tell "deliberately gone" from "not there yet",
+            // so without this every open puts the two tables back empty and the index comes up
+            // with a full `occurrence` beside an empty `chunks`. Read straight from `meta`
+            // because this runs before the flags are cached.
+            // AND A BRAND NEW INDEX NEVER GETS THEM IN THE FIRST PLACE. Creating the two tables
+            // for a new user and dropping them at the first coverage stamp is work nobody needs,
+            // and it leaves a window in which a new index has a v4 row table that nothing writes.
+            // "Brand new" is the absence of BOTH tables, which is a genuinely empty database
+            // file - an index part way through the v3 -> v4 conversion has an empty `chunks` but
+            // it has `files`, and declaring it v5-only would take the conversion's landing table
+            // out from under it.
+            let brandNew = !hasTableLocked("chunks") && !hasTableLocked("files")
+            var v4Gone = scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.v4DroppedKey)'") == 1
+            if brandNew, Self.chunkSplit, Self.splitCutover, Self.contentSharing { v4Gone = true }
+            for sql in StoreSchema.createStatements(includeV4: !v4Gone) { exec(sql) }
+            if v4Gone {
+                exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.v4DroppedKey)', '1');")
+            }
         } else {
             createLegacySchemaLocked()
         }
@@ -1994,9 +2012,12 @@ public final class VectorStore: @unchecked Sendable {
         //
         // `files` is the honest signal: a new index has no files, and an index with files has
         // content somewhere whether or not `chunks` currently shows it.
+        // `chunks` MAY NOT EXIST AT ALL under the cutover, where a brand new index is created
+        // without it - and `scalarQuery` answers -1 for a missing table, not 0, so the plain
+        // count would read "not empty" and a new user would never be born v5.
         if Self.chunkSplit, Self.contentSharing, !v4BackfillPending, !splitBuilt,
            layoutLocked() == .v4,
-           scalarQuery("SELECT COUNT(*) FROM chunks") == 0,
+           !tableExists("chunks") || scalarQuery("SELECT COUNT(*) FROM chunks") == 0,
            scalarQuery("SELECT COUNT(*) FROM files") == 0,
            !tableExists("chunk_text") || scalarQuery("SELECT COUNT(*) FROM chunk_text") == 0 {
             _ = buildChunkSplitLocked()
@@ -2183,8 +2204,13 @@ public final class VectorStore: @unchecked Sendable {
                     exec("UPDATE chunk_snippet SET kind = \(scanCode) WHERE chunk_id IN "
                          + "(SELECT chunk_id FROM occurrence WHERE file_id = \(fid));")
                 }
-                guard execChecked("UPDATE chunks SET kind = \(scanCode) WHERE file_id = \(fid);"),
-                      execChecked(splitBuilt ? "SELECT 1;"
+                // `execChecked` on a dropped table is a FAILURE, not a no-op, and this loop
+                // breaks on one - so once v4 is gone the reclassification would stop at the
+                // first file and leave the flag unset, retrying the whole pass on every open
+                // for ever.
+                guard execChecked(v4Dropped ? "SELECT 1;"
+                                            : "UPDATE chunks SET kind = \(scanCode) WHERE file_id = \(fid);"),
+                      execChecked(splitBuilt || v4Dropped ? "SELECT 1;"
                                              : "UPDATE chunk_text SET kind = \(scanCode) WHERE file_id = \(fid);"),
                       execChecked("UPDATE files SET kind = \(scanCode) WHERE id = \(fid);")
                 else { ok = false; break }
@@ -2781,7 +2807,7 @@ public final class VectorStore: @unchecked Sendable {
             guard dbOpen() else { return false }
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
-            guard sqlite3_prepare_v2(db, "SELECT 1 FROM chunks WHERE file_id IN (\(StoreSchema.fileIDsUnderFolder)) LIMIT 1;", -1, &stmt, nil) == SQLITE_OK else { return false }
+            guard sqlite3_prepare_v2(db, "SELECT 1 FROM \(rowTableLocked) WHERE file_id IN (\(StoreSchema.fileIDsUnderFolder)) LIMIT 1;", -1, &stmt, nil) == SQLITE_OK else { return false }
             sqlite3_bind_text(stmt, 1, folder, -1, SQLITE_TRANSIENT)
             return sqlite3_step(stmt) == SQLITE_ROW
         }
@@ -2844,12 +2870,13 @@ public final class VectorStore: @unchecked Sendable {
             // unrelated live content's staged vector. For an uncovered position that blob is the
             // only copy of the bytes. Same reasoning at every other site that clears a blob by
             // v4 row id.
-            for sql in ["DELETE FROM chunk_text WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id IN (SELECT id FROM temp.victims));"]
+            for sql in (v4Dropped ? [] :
+                        ["DELETE FROM chunk_text WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id IN (SELECT id FROM temp.victims));"])
                 + (splitPendingKeyedLocked ? []
                    : ["DELETE FROM pending_vecs WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id IN (SELECT id FROM temp.victims));"])
-                + ["DELETE FROM dedup WHERE file_id IN (SELECT id FROM temp.victims);",
-                        "DELETE FROM chunks WHERE file_id IN (SELECT id FROM temp.victims);",
-                        "DELETE FROM files WHERE id IN (SELECT id FROM temp.victims);"] {
+                + ["DELETE FROM dedup WHERE file_id IN (SELECT id FROM temp.victims);"]
+                + (v4Dropped ? [] : ["DELETE FROM chunks WHERE file_id IN (SELECT id FROM temp.victims);"])
+                + ["DELETE FROM files WHERE id IN (SELECT id FROM temp.victims);"] {
                 exec(sql)
             }
             exec("DROP TABLE IF EXISTS temp.victims;")
@@ -2901,11 +2928,14 @@ public final class VectorStore: @unchecked Sendable {
                 dropSplitWhereLocked(fileIDs: "SELECT DISTINCT o.file_id FROM occurrence o "
                                      + "JOIN chunk k ON k.id = o.chunk_id WHERE k.kind IN (\(codes))")
             }
-            for sql in ["DELETE FROM chunk_text WHERE chunk_id IN (SELECT id FROM chunks WHERE kind IN (\(codes)));"]
+            for sql in (v4Dropped ? [] :
+                        ["DELETE FROM chunk_text WHERE chunk_id IN (SELECT id FROM chunks WHERE kind IN (\(codes)));"])
                 + (splitPendingKeyedLocked ? []
                    : ["DELETE FROM pending_vecs WHERE chunk_id IN (SELECT id FROM chunks WHERE kind IN (\(codes)));"])
-                + ["DELETE FROM dedup WHERE file_id IN (SELECT DISTINCT file_id FROM chunks WHERE kind IN (\(codes)));",
-                   "DELETE FROM chunks WHERE kind IN (\(codes));"] {
+                + (v4Dropped
+                   ? ["DELETE FROM dedup WHERE file_id NOT IN (SELECT DISTINCT file_id FROM occurrence);"]
+                   : ["DELETE FROM dedup WHERE file_id IN (SELECT DISTINCT file_id FROM chunks WHERE kind IN (\(codes)));",
+                      "DELETE FROM chunks WHERE kind IN (\(codes));"]) {
                 exec(sql)
             }
             bumpGenLocked()
@@ -3052,7 +3082,7 @@ public final class VectorStore: @unchecked Sendable {
                 // and it counts the narrow table.
                 guard sqlite3_prepare_v2(db, """
                     SELECT f.modified, f.size, f.kind, f.indexed_at,
-                           (SELECT COUNT(*) FROM chunks c WHERE c.file_id = f.id)
+                           (SELECT COUNT(*) FROM \(rowTableLocked) c WHERE c.file_id = f.id)
                       FROM files f JOIN dirs d ON d.id = f.dir_id
                      WHERE d.path = ? AND f.name = ?;
                     """, -1, &stmt, nil) == SQLITE_OK else { return }
@@ -3248,7 +3278,7 @@ public final class VectorStore: @unchecked Sendable {
             var st: OpaquePointer?
             guard sqlite3_prepare_v2(db, """
                 SELECT \(StoreSchema.pathExpr) FROM files f JOIN dirs d ON d.id = f.dir_id
-                 WHERE EXISTS(SELECT 1 FROM chunks WHERE chunks.file_id = f.id);
+                 WHERE EXISTS(SELECT 1 FROM \(rowTableLocked) r WHERE r.file_id = f.id);
                 """, -1, &st, nil) == SQLITE_OK else { return [] }
             defer { sqlite3_finalize(st) }
             while sqlite3_step(st) == SQLITE_ROW {
@@ -3349,7 +3379,27 @@ public final class VectorStore: @unchecked Sendable {
             // chunk only until the base is folded, so reading the score from it returned 0 for most
             // of the index. Metadata is still SQL, which is what this query is for.
             let scoreOf = query.map { bestChunkScoreLocked(paths, query: $0) } ?? [:]
-            let sql = """
+            // THE SAME NINE COLUMNS, ASKED OF THE SPLIT. This one had no split form and was
+            // missed by the step-2 sweep because it is not the DISPLAY path - it is the metadata
+            // behind a filename or tag match, which no digest covers: those hits keep their
+            // paths and their scores and simply lose their snippet, their locator and their
+            // kind. The media name fallback is the same one `fileDisplayTextSplitSQL` uses, and
+            // for the same reason: an untagged media chunk stores no snippet, because the file
+            // name it used to store there is a per-PATH string in a content-keyed table.
+            let media = StoreSchema.mediaKindCodes.map(String.init).joined(separator: ",")
+            let sql = splitBuilt ? """
+                SELECT f.modified, f.size, k.kind, o.ordinal,
+                       CASE WHEN COALESCE(s.snippet, '') <> '' THEN s.snippet
+                            WHEN k.kind IN (\(media)) THEN COALESCE(f.name, '')
+                            ELSE '' END,
+                       f.width, f.height, f.duration, o.locator
+                  FROM occurrence o
+                  JOIN chunk k ON k.id = o.chunk_id
+                  JOIN files f ON f.id = o.file_id
+                  LEFT JOIN chunk_snippet s ON s.chunk_id = o.chunk_id
+                 WHERE o.file_id = \(StoreSchema.fileIDByPath)
+                 ORDER BY o.ordinal;
+                """ : """
                 SELECT f.modified, f.size, c.kind, c.chunk_index, t.snippet, f.width, f.height,
                        f.duration, t.locator
                   FROM chunks c
@@ -3803,7 +3853,7 @@ public final class VectorStore: @unchecked Sendable {
             guard sqlite3_prepare_v2(h, """
                 SELECT f.name, f.kind, f.modified, f.indexed_at, f.size
                   FROM files f JOIN dirs d ON d.id = f.dir_id
-                 WHERE d.path = ?1 AND EXISTS(SELECT 1 FROM chunks c WHERE c.file_id = f.id);
+                 WHERE d.path = ?1 AND EXISTS(SELECT 1 FROM \(rowTableShared) c WHERE c.file_id = f.id);
                 """, -1, &st, nil) == SQLITE_OK else { return [] }
             sqlite3_bind_text(st, 1, folder, -1, SQLITE_TRANSIENT)
             var reloaded = false
@@ -3864,7 +3914,7 @@ public final class VectorStore: @unchecked Sendable {
                 SELECT 1 FROM dirs d
                  WHERE d.path >= ?1 AND d.path < ?2
                    AND EXISTS(SELECT 1 FROM files f WHERE f.dir_id = d.id
-                              AND EXISTS(SELECT 1 FROM chunks c WHERE c.file_id = f.id))
+                              AND EXISTS(SELECT 1 FROM \(rowTableShared) c WHERE c.file_id = f.id))
                  LIMIT 1;
                 """, -1, &live, nil) == SQLITE_OK else { return [] }
 
@@ -4071,7 +4121,7 @@ public final class VectorStore: @unchecked Sendable {
                 SELECT d.path, COUNT(f.id), MAX(f.indexed_at)
                   FROM dirs d JOIN files f ON f.dir_id = d.id
                  WHERE d.path >= ?1 AND d.path < ?2
-                   AND EXISTS(SELECT 1 FROM chunks c WHERE c.file_id = f.id)
+                   AND EXISTS(SELECT 1 FROM \(rowTableShared) c WHERE c.file_id = f.id)
                  GROUP BY d.path;
                 """, -1, &st, nil) == SQLITE_OK else { return [:] }
             sqlite3_bind_text(st, 1, pfx, -1, SQLITE_TRANSIENT)
@@ -4116,7 +4166,7 @@ public final class VectorStore: @unchecked Sendable {
                 SELECT d.path FROM dirs d
                  WHERE d.path LIKE ?1 ESCAPE '\\'
                    AND EXISTS(SELECT 1 FROM files f WHERE f.dir_id = d.id
-                              AND EXISTS(SELECT 1 FROM chunks c WHERE c.file_id = f.id))
+                              AND EXISTS(SELECT 1 FROM \(rowTableShared) c WHERE c.file_id = f.id))
                  ORDER BY LENGTH(d.path) ASC
                  LIMIT ?2;
                 """, -1, &st, nil) == SQLITE_OK else { return [] }
@@ -6974,6 +7024,13 @@ public final class VectorStore: @unchecked Sendable {
     /// killed before the publish commits. Written in the same transaction as the translation.
     private static let pendingOnContentKey = "pending_vecs_on_content"
     private var pendingOnContent = false
+    /// Durable: the v4 tables are gone and this index is v5 only. Read rather than inferred from
+    /// `hasTableLocked` so a half-dropped database - one table gone, one not - is still named by
+    /// the flag rather than by whichever table happened to be asked about.
+    private static let v4DroppedKey = "v4_tables_dropped"
+    public private(set) var v4Dropped = false
+    /// One drop at a time: it walks 9.7M rows to prove itself and then frees 2.6 GB of pages.
+    private var v4DropInFlight = false
     /// THE LAST STEP, AND ITS OWN SWITCH. `OMNI_SPLIT_CUTOVER=1` stops the write path maintaining
     /// `chunk_text`, after which the split is the only copy of the snippet, the locator and the
     /// key - and the table can be dropped.
@@ -7004,6 +7061,11 @@ public final class VectorStore: @unchecked Sendable {
             && scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.chunkSplitDoneKey)'") == 1
         pendingOnContent = dbOpen()
             && scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.pendingOnContentKey)'") == 1
+        v4Dropped = dbOpen()
+            && scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.v4DroppedKey)'") == 1
+        rowTableLock.lock()
+        rowTableIsOccurrence = Self.chunkSplit && splitBuilt
+        rowTableLock.unlock()
         // THE CACHED STATEMENTS OUTLIVE THE FLAG OTHERWISE. The split is built mid-session by the
         // coverage stamp, so a reader that prepared its SQL against v4 at open would keep asking
         // v4 for the rest of the session - and, once the v4 tables go, would keep asking a table
@@ -7022,6 +7084,18 @@ public final class VectorStore: @unchecked Sendable {
     /// that gets left behind is invisible: it does not fail, it declines - the index quietly takes
     /// the slow path, or coverage quietly stops advancing.
     var rowTableLocked: String { (Self.chunkSplit && splitBuilt) ? "occurrence" : "chunks" }
+    /// THE SAME ANSWER FOR THE READER LANES, which run off the store queue on their own
+    /// connections. `splitBuilt` is written on the queue, so they cannot read it directly - and
+    /// a stale `false` after `chunks` has been dropped is not a slightly old answer, it is a
+    /// statement against a table that no longer exists, which prepares to nothing and returns an
+    /// empty listing with no error. Under a lock because it is genuinely cross-thread; it is
+    /// written twice in an index's life.
+    private let rowTableLock = NSLock()
+    private var rowTableIsOccurrence = false
+    var rowTableShared: String {
+        rowTableLock.lock(); defer { rowTableLock.unlock() }
+        return rowTableIsOccurrence ? "occurrence" : "chunks"
+    }
     func liveRowCountLocked() -> Int { scalarQuery("SELECT COUNT(*) FROM \(rowTableLocked)") }
     /// Whether a staged vector is addressed by CONTENT. The two id spaces overlap numerically, so
     /// a blob delete written for the wrong one does not miss - it hits an unrelated row.
@@ -8384,6 +8458,48 @@ public final class VectorStore: @unchecked Sendable {
         let rowBytes = dim * MemoryLayout<UInt16>.size
         var st: OpaquePointer?
         defer { sqlite3_finalize(st) }
+        // UNDER v5 THE POSITION IS STORED, SO THERE IS NOTHING TO DERIVE. This whole function
+        // exists because v4 puts a row's vector at its RANK, which the recorded holes shift - so
+        // an anchor's real position, found in the file, says how many of those holes are not
+        // real. `chunk.slot` is that position outright, so the honest measurement is whether the
+        // file holds the anchor's bytes AT its stored slot: it does, and the offset is 0, or it
+        // does not, and nothing here can say by how much.
+        if !tableExists(db, "chunks"), tableExists(db, "chunk") {
+            var probe: OpaquePointer?
+            defer { sqlite3_finalize(probe) }
+            guard sqlite3_prepare_v2(db, """
+                SELECT k.slot, p.vec FROM chunk k JOIN pending_vecs p ON p.chunk_id = k.id
+                 WHERE k.slot >= 0 ORDER BY k.slot LIMIT 24;
+                """, -1, &probe, nil) == SQLITE_OK else { return nil }
+            var seen = 0, agreed = 0
+            while sqlite3_step(probe) == SQLITE_ROW {
+                let slot = Int(sqlite3_column_int64(probe, 0))
+                guard let raw = sqlite3_column_blob(probe, 1),
+                      Int(sqlite3_column_bytes(probe, 1)) >= rowBytes else { continue }
+                seen += 1
+                let want = Data(bytes: raw, count: rowBytes)
+                guard (try? fh.seek(toOffset: UInt64(slot * rowBytes))) != nil,
+                      let got = try? fh.read(upToCount: rowBytes), got == want else { continue }
+                agreed += 1
+            }
+            guard seen > 0 else { return nil }
+            guard agreed == seen else { return nil }
+            // A HOLE OVER A POSITION A LIVE CONTENT OWNS is the ambiguous shape, and under v5 it
+            // can be counted exactly rather than inferred from a drift: `chunk.slot` says which
+            // positions are owned. Reported as the same k the v4 path reports, so the refusal
+            // and its wording are one contract across both layouts - this deliberately does NOT
+            // repair by deleting those holes, even though v5 could name them, because the
+            // surrounding contract is "refuse and explain" and a safety refusal is not the place
+            // to quietly start acting.
+            var spur: OpaquePointer?
+            defer { sqlite3_finalize(spur) }
+            var spurious = 0
+            if sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM vec_holes h JOIN chunk k ON k.slot = h.slot;",
+                                  -1, &spur, nil) == SQLITE_OK, sqlite3_step(spur) == SQLITE_ROW {
+                spurious = Int(sqlite3_column_int64(spur, 0))
+            }
+            return spurious
+        }
         // Anchors are the rows past the covered prefix, in rowid order; the k-th of them should sit
         // at (coveredLive + k) + holes if every recorded hole is real.
         guard sqlite3_prepare_v2(db, """
@@ -9148,7 +9264,12 @@ public final class VectorStore: @unchecked Sendable {
     /// Must run inside the caller's transaction, with the claim it belongs to.
     private func renumberSlotsByRankLocked() -> Bool {
         guard Self.contentSharing, dbOpen() else { return true }
-        guard hasColumnLocked("chunks", "slot") else { return true }
+        // "NO SLOT COLUMN" MEANT "NOTHING TO RENUMBER" WHILE `chunks` WAS THE ONLY PLACE A
+        // POSITION LIVED. On a v5-only index there is no `chunks` at all, and returning true
+        // here left `chunk.slot` holding the PRE-compaction numbering over a file that had just
+        // been rewritten shorter - so the claim covered positions the file no longer had and the
+        // next open refused with "coverage N exceeds positions M".
+        guard !hasTableLocked("chunks") || hasColumnLocked("chunks", "slot") else { return true }
         // WHICH COLUMN SAYS WHICH POSITIONS ARE LIVE. Under the split that is `chunk.slot`, and
         // `chunks.slot` is no longer maintained at all - `persistAllSlotsLocked` writes one table
         // or the other, because the resident rows carry ids from one id space at a time. Ranking
@@ -9158,7 +9279,12 @@ public final class VectorStore: @unchecked Sendable {
         // THE OLD COLUMN IS DELIBERATELY LEFT TO ROT, which is only safe because this layout does
         // not ship with a way back: `OMNI_CHUNK_SPLIT` is deleted rather than defaulted (step 8),
         // so no build that reads `chunks.slot` will ever open an index that has the split built.
-        let onSplit = residentIDsAreContents
+        // WHICH COLUMN THE LIVE POSITIONS ARE IN, and it is two questions in one. The RESIDENT
+        // model decides it in the window where the split is published but the in-memory rows are
+        // still v4 and `chunks.slot` is what the reclaim planned over. Once `chunks` is gone
+        // there is no window and no choice - and the resume path runs at OPEN, before any loader
+        // has set `residentIDsAreContents`, so it has to be the table test that answers there.
+        let onSplit = residentIDsAreContents || !hasTableLocked("chunks")
         let liveSlots = onSplit ? "SELECT DISTINCT slot FROM chunk WHERE slot >= 0"
                                 : "SELECT DISTINCT slot FROM chunks WHERE slot >= 0"
         // AND THE OLD COLUMN IS NOT RENUMBERED WITH IT - it is skipped entirely. Under the split
@@ -9253,6 +9379,12 @@ public final class VectorStore: @unchecked Sendable {
             // rather than slices - the invariants can only be checked with all four tables
             // present - so it sits behind the same yield the fold does and behind its own flag.
             if Self.chunkSplit, allowSplitBuild, !yieldToSearchLocked("split"), buildChunkSplitLocked() { return }
+            // AND THE v4 TABLES GO, once the split has been answering for everything. A separate
+            // step from the publish on purpose: the publish is a small transaction that has to
+            // be atomic, and freeing 2.6 GB of pages is neither small nor urgent. Interrupted,
+            // it simply has not happened yet.
+            if Self.chunkSplit, Self.splitCutover, allowSplitBuild, splitBuilt,
+               !yieldToSearchLocked("dropv4"), dropV4TablesLocked() { return }
             // NOT WHEN THE SPLIT IS ON. The fold and the split build are two implementations of
             // one dedup - 3,516,335 duplicates collapsed against 3,770,848 positions freed, same
             // index - and running both is worse than waste: `backfillInPlace` refuses while the
@@ -10972,12 +11104,31 @@ public final class VectorStore: @unchecked Sendable {
         guard !r.path.isEmpty else { return true }   // already a hole row; it owns nothing
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
+        // THE ROW TABLE, WHICHEVER IT IS, AND ADDRESSED THE WAY v4 ACTUALLY STORES A PATH.
+        //
+        // The non-legacy branch read `f.path`, and `files` has had no `path` column since v4
+        // interned the directories - so it never prepared, the guard below returned false, and
+        // this has been answering "the row is still there" for every row on every v4 index
+        // since. Silent, and in the safe direction, which is why it survived: a hole that is not
+        // recorded is a position the reclaim leaves alone.
+        //
+        // Under the split it asks `occurrence`, because that is the table a delete removes from
+        // - asked of a table the index no longer has, it would answer "gone" for every live row
+        // and record a hole under each, which is the unsafe direction.
+        let onSplit = rowTableLocked == "occurrence"
         let sql = legacyLayout
             ? "SELECT EXISTS(SELECT 1 FROM chunks WHERE path = ? AND chunk_index = ?);"
-            : "SELECT EXISTS(SELECT 1 FROM chunks c JOIN files f ON f.id = c.file_id WHERE f.path = ? AND c.chunk_index = ?);"
+            : (onSplit
+               ? "SELECT EXISTS(SELECT 1 FROM occurrence o WHERE o.file_id = \(StoreSchema.fileIDByPath) AND o.ordinal = ?);"
+               : "SELECT EXISTS(SELECT 1 FROM chunks c WHERE c.file_id = \(StoreSchema.fileIDByPath) AND c.chunk_index = ?);")
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
-        sqlite3_bind_text(stmt, 1, r.path, -1, SQLITE_TRANSIENT)
-        sqlite3_bind_int(stmt, 2, Int32(r.chunkIndex))
+        if legacyLayout {
+            sqlite3_bind_text(stmt, 1, r.path, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_int(stmt, 2, Int32(r.chunkIndex))
+        } else {
+            bindPath(stmt, 1, r.path)     // fills 1 and 2
+            sqlite3_bind_int(stmt, 3, Int32(r.chunkIndex))
+        }
         guard sqlite3_step(stmt) == SQLITE_ROW else { return false }
         return sqlite3_column_int(stmt, 0) == 0
     }
@@ -11230,7 +11381,7 @@ public final class VectorStore: @unchecked Sendable {
         defer { sqlite3_finalize(stmt) }
         guard sqlite3_prepare_v2(db, """
             DELETE FROM files WHERE id = \(StoreSchema.fileIDByPath)
-              AND NOT EXISTS(SELECT 1 FROM chunks WHERE chunks.file_id = files.id);
+              AND NOT EXISTS(SELECT 1 FROM \(rowTableLocked) r WHERE r.file_id = files.id);
             """, -1, &stmt, nil) == SQLITE_OK else { return }
         for p in paths {
             sqlite3_reset(stmt)
@@ -11268,7 +11419,7 @@ public final class VectorStore: @unchecked Sendable {
         defer { sqlite3_finalize(stmt) }
         guard sqlite3_prepare_v2(db, """
             DELETE FROM files WHERE (\(clause))
-              AND NOT EXISTS(SELECT 1 FROM chunks WHERE chunks.file_id = files.id);
+              AND NOT EXISTS(SELECT 1 FROM \(rowTableLocked) r WHERE r.file_id = files.id);
             """, -1, &stmt, nil) == SQLITE_OK else { return }
         if let f = bindFolder { sqlite3_bind_text(stmt, 1, f, -1, SQLITE_TRANSIENT) }
         sqlite3_step(stmt)
@@ -11282,12 +11433,14 @@ public final class VectorStore: @unchecked Sendable {
     /// foreign key, because ON DELETE CASCADE would put a lookup on every insert as well - and
     /// these are the only places a chunk is ever removed.
     func deleteChunksOfFileLocked(_ fid: Int64) {
-        exec("DELETE FROM chunk_text WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id = \(fid));")
+        if !v4Dropped {
+            exec("DELETE FROM chunk_text WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id = \(fid));")
+        }
         // v4 row ids, so only while the blobs are keyed on them - see the folder delete.
         if !splitPendingKeyedLocked {
             exec("DELETE FROM pending_vecs WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id = \(fid));")
         }
-        exec("DELETE FROM chunks WHERE file_id = \(fid);")
+        if !v4Dropped { exec("DELETE FROM chunks WHERE file_id = \(fid);") }
         // AFTER the v4 rows are gone, so regenerating this file's split rows from them correctly
         // finds none and the refs recount drops the contents nothing points at any more.
         if Self.chunkSplit, splitBuilt { dropSplitForFilesLocked([fid]) }
@@ -12140,9 +12293,29 @@ public final class VectorStore: @unchecked Sendable {
     /// which is exactly why the per-file work is where the waste hid.
     func prepareChunkInsertLocked() -> ChunkInsert? {
         let w = ChunkInsert()
-        guard sqlite3_prepare_v2(db, "INSERT INTO chunks(file_id, chunk_index, kind) VALUES(?,?,?);", -1, &w.chunk, nil) == SQLITE_OK,
-              sqlite3_prepare_v2(db, "INSERT INTO chunk_text(chunk_id, kind, file_id, snippet, locator, chunk_key) VALUES(?,?,?,?,?,?);", -1, &w.text, nil) == SQLITE_OK,
-              sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO pending_vecs(chunk_id, vec) VALUES(?,?);", -1, &w.vec, nil) == SQLITE_OK,
+        // THE TWO v4 STATEMENTS ARE ONLY PREPARED WHILE THEIR TABLES EXIST. A prepare against a
+        // dropped table fails, and this function returns nil on any failure - so leaving them in
+        // does not degrade the write path, it stops it: every replace() throws "prepare insert
+        // failed" and nothing is ever indexed again.
+        //
+        // AND A FAILURE THERE IS TOLERATED WHEN THE SPLIT CAN ANSWER ALONE, because the drop
+        // commits on another connection and the flag is set on the store queue a moment later.
+        // In between, a batch that prepared these would fail and take the whole write with it -
+        // brief, recoverable, and pointless. Outside that window a failure still means what it
+        // always did: an index with no row table, which cannot be written to.
+        if !v4Dropped {
+            let v4Ready = sqlite3_prepare_v2(db, "INSERT INTO chunks(file_id, chunk_index, kind) VALUES(?,?,?);", -1, &w.chunk, nil) == SQLITE_OK
+                && sqlite3_prepare_v2(db, "INSERT INTO chunk_text(chunk_id, kind, file_id, snippet, locator, chunk_key) VALUES(?,?,?,?,?,?);", -1, &w.text, nil) == SQLITE_OK
+            if !v4Ready {
+                guard Self.chunkSplit, Self.splitCutover, splitBuilt, !hasTableLocked("chunks") else {
+                    w.finalize(); return nil
+                }
+                sqlite3_finalize(w.chunk); w.chunk = nil
+                sqlite3_finalize(w.text); w.text = nil
+                v4Dropped = true          // the drop landed; catch up rather than fail the batch
+            }
+        }
+        guard sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO pending_vecs(chunk_id, vec) VALUES(?,?);", -1, &w.vec, nil) == SQLITE_OK,
               sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO chunk(key, kind, slot) VALUES(?,?,-1);",
                                  -1, &w.chunkIns, nil) == SQLITE_OK,
               sqlite3_prepare_v2(db, "SELECT id FROM chunk WHERE key = ?;", -1, &w.chunkSel, nil) == SQLITE_OK,
@@ -12180,6 +12353,18 @@ public final class VectorStore: @unchecked Sendable {
     @inline(__always)
     func effectiveKeyLocked(_ c: IndexedChunk, bf16: [UInt16]) -> String {
         if !c.chunkKey.isEmpty { return c.chunkKey }
+        // MEDIA ONLY, DELIBERATELY UNCHANGED. Keying a keyless TEXT chunk by its stored vector
+        // was tried while `chunks` was being removed, on the reasoning that there was no rowid
+        // left to make a unique key from. It works, and it is a behaviour change nobody asked
+        // for: two files whose vectors happen to be identical would start sharing a position
+        // where v4 gave them one each. The occurrence's own address is a unique key that needs
+        // no row table (see writeChunksLocked), so v4's semantics are kept exactly.
+        //
+        // A key built from (file_id, ordinal) is stable across a re-index, which looks like the
+        // stale-vector hazard and is not: `replace` drops the file's occurrences first, the
+        // content falls to refs = 0 and is deleted, so the lookup that follows finds nothing and
+        // a fresh vector is appended. Its key is unique to one file, so no other occurrence can
+        // be holding it up.
         guard Self.contentSharing, !bf16.isEmpty,
               let k = FileKind(rawValue: c.kind), k != .text else { return "" }
         return ChunkKey.mediaVector(kind: k, bf16: bf16, dim: bf16.count)
@@ -12197,7 +12382,16 @@ public final class VectorStore: @unchecked Sendable {
         /// What a resident row's `chunkID` should be: the CONTENT under the split, the v4 row
         /// otherwise. One definition, because the loader, the sidecar and `persistAllSlotsLocked`
         /// all have to agree on which id space that field is in.
-        var residentIDs: [Int64] { contentIDs.count == rowIDs.count ? contentIDs : rowIDs }
+        ///
+        /// "IS THERE A CONTENT ID", NOT "DO THE TWO COUNTS MATCH". Both arrays were full when
+        /// this was written and the two tests were the same one; once the cutover stopped
+        /// writing v4 rows, `rowIDs` was EMPTY, the counts differed, and this handed back the
+        /// empty array - so every resident row kept `chunkID` 0. Nothing failed at the time:
+        /// the loader recovers the ids from SQL on the next open. What it broke is the one
+        /// place that writes positions from memory, `persistAllSlotsLocked`, which skips a row
+        /// with no id - so after a compaction `chunk.slot` still held the pre-compaction
+        /// numbering and the next open seated files on each other's vectors.
+        var residentIDs: [Int64] { contentIDs.isEmpty ? rowIDs : contentIDs }
     }
 
     func writeChunksLocked(fileID fid: Int64, chunks: [IndexedChunk], bfs: [[UInt16]], w: ChunkInsert) -> WrittenChunks? {
@@ -12205,15 +12399,23 @@ public final class VectorStore: @unchecked Sendable {
         var ids: [Int64] = []
         ids.reserveCapacity(chunks.count)
         if Self.chunkSplit, splitBuilt { out.contentIDs.reserveCapacity(chunks.count) }
+        // THE v4 ROW IS NOT WRITTEN ONCE THE SPLIT ANSWERS FOR EVERYTHING. Under the cutover
+        // `chunks` is on its way out - `dropV4TablesLocked` removes it a stamp later - and a
+        // table that is still being written is one that cannot be dropped. Before the cutover it
+        // is still the safety net the split is checked against, so it is still written.
+        let writeV4 = w.chunk != nil && !v4Dropped && !(Self.chunkSplit && Self.splitCutover && splitBuilt)
         for (i, c) in chunks.enumerated() {
             let kc = Int32(kindCodeLocked(c.kind))
-            sqlite3_reset(w.chunk)
-            sqlite3_bind_int64(w.chunk, 1, fid)
-            sqlite3_bind_int(w.chunk, 2, Int32(c.chunkIndex))
-            sqlite3_bind_int(w.chunk, 3, kc)
-            guard sqlite3_step(w.chunk) == SQLITE_DONE else { return nil }
-            let cid = sqlite3_last_insert_rowid(db)
-            ids.append(cid)
+            var cid: Int64 = 0
+            if writeV4 {
+                sqlite3_reset(w.chunk)
+                sqlite3_bind_int64(w.chunk, 1, fid)
+                sqlite3_bind_int(w.chunk, 2, Int32(c.chunkIndex))
+                sqlite3_bind_int(w.chunk, 3, kc)
+                guard sqlite3_step(w.chunk) == SQLITE_DONE else { return nil }
+                cid = sqlite3_last_insert_rowid(db)
+                ids.append(cid)
+            }
 
             // ONE definition of the key, used by both schemas - they must agree or a chunk is
             // stored under one key and looked up under another.
@@ -12221,7 +12423,7 @@ public final class VectorStore: @unchecked Sendable {
             // ONLY WHILE v4 IS STILL THE ANSWER. Once the split is built it holds the snippet,
             // the locator and the key, every reader takes them from there, and writing them a
             // second time is exactly the cost the split exists to remove.
-            if !(Self.chunkSplit && Self.splitCutover && splitBuilt) {
+            if writeV4 {
                 sqlite3_reset(w.text)
                 sqlite3_bind_int64(w.text, 1, cid)
                 sqlite3_bind_int(w.text, 2, kc)
@@ -12242,8 +12444,19 @@ public final class VectorStore: @unchecked Sendable {
                 // The same synthetic key MigrationV5 uses for a chunk that carries none: a real
                 // key is a 16-byte digest, so a one-byte-prefixed row id can never collide. Both
                 // sides must agree or a chunk is stored under one key and looked up under another.
+                // A CHUNK WITH NO KEY AND NO VECTOR still needs one, and it must never be
+                // shared. Before the cutover a v4 rowid gives that for free. After it there is
+                // no rowid, and the fallback is the occurrence's own address under a DIFFERENT
+                // one-byte prefix from the migration's, so the two cannot collide in one index.
+                // Reachable only for a chunk with an empty embedding, which shares nothing
+                // whatever its key is.
                 var ckey = key
-                if ckey.isEmpty { ckey = Data([0]) + withUnsafeBytes(of: cid.littleEndian) { Data($0) } }
+                if ckey.isEmpty {
+                    ckey = writeV4
+                        ? Data([0]) + withUnsafeBytes(of: cid.littleEndian) { Data($0) }
+                        : Data([1]) + withUnsafeBytes(of: fid.littleEndian) { Data($0) }
+                            + withUnsafeBytes(of: Int64(c.chunkIndex).littleEndian) { Data($0) }
+                }
                 sqlite3_reset(w.chunkIns)
                 ckey.withUnsafeBytes { _ = sqlite3_bind_blob(w.chunkIns, 1, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT) }
                 sqlite3_bind_int(w.chunkIns, 2, kc)
@@ -12287,6 +12500,7 @@ public final class VectorStore: @unchecked Sendable {
             // life of the index. OR REPLACE because two occurrences of one content can land in a
             // single batch, which under row keying could not collide and now can.
             sqlite3_reset(w.vec)
+            guard contentID > 0 || cid > 0 else { return nil }
             sqlite3_bind_int64(w.vec, 1, contentID > 0 ? contentID : cid)
             bfs[i].withUnsafeBytes { _ = sqlite3_bind_blob(w.vec, 2, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT) }
             guard sqlite3_step(w.vec) == SQLITE_DONE else { return nil }
@@ -12574,6 +12788,110 @@ public final class VectorStore: @unchecked Sendable {
         exec("DELETE FROM chunk WHERE id IN (SELECT chunk_id FROM split_aff) AND refs = 0;")
     }
 
+    /// DROP `chunk_text` AND `chunks`, WHICH IS THE POINT OF THE WHOLE EXERCISE.
+    ///
+    /// Until they go the split is pure cost - both layouts in one file - so this is not a
+    /// tidy-up, it is the step the 0.414 GB and the simpler model are paid out by.
+    ///
+    /// IRREVERSIBLE, SO IT PROVES ITSELF FIRST. Every v4 row must already have an occurrence,
+    /// every content must have a position, and the staged vectors must already have moved id
+    /// space. The row COUNTS are deliberately not compared: under the cutover new writes add
+    /// occurrences and no v4 rows, so the two diverge from the first write and a count check
+    /// would forbid the drop for ever. "No v4 row is unrepresented" is the statement that stays
+    /// true as the index grows.
+    ///
+    /// OFF THE STORE QUEUE, on its own connection, for the same reason the build is: the
+    /// anti-join walks 9.7M rows and freeing the pages walks 2.6 GB of them. Under WAL a reader
+    /// does not block on a writer, so search is untouched; what waits is the index's own writes,
+    /// which retry.
+    ///
+    /// THE CACHED STATEMENTS GO WITH THE TABLES. A prepared statement naming a dropped table
+    /// fails on its next step, and the ones this store holds are re-prepared lazily - so they
+    /// are dropped on the queue once the tables are, rather than discovering it later.
+    @discardableResult
+    func dropV4TablesLocked() -> Bool {
+        guard Self.chunkSplit, Self.splitCutover, splitBuilt, dbOpen(), !v4DropInFlight else { return false }
+        guard hasTableLocked("chunks") || hasTableLocked("chunk_text") else { return false }
+        // NOT WHILE v3 IS STILL BEING STAGED. `chunks` is the v3 -> v4 conversion's landing
+        // table, and it converts and then builds the split in the same launch.
+        guard layoutLocked() == .v4, !v4BackfillPending else { return false }
+        v4DropInFlight = true
+        let url = dbURL
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            var side: OpaquePointer?
+            defer {
+                if side != nil { sqlite3_close(side) }
+                self?.queue.sync { self?.v4DropInFlight = false }
+            }
+            guard sqlite3_open_v2(url.path, &side, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else { return }
+            sqlite3_exec(side, "PRAGMA journal_mode=WAL;", nil, nil, nil)
+            sqlite3_exec(side, "PRAGMA busy_timeout=120000;", nil, nil, nil)
+            func num(_ sql: String) -> Int64 {
+                var st: OpaquePointer?
+                defer { sqlite3_finalize(st) }
+                guard sqlite3_prepare_v2(side, sql, -1, &st, nil) == SQLITE_OK,
+                      sqlite3_step(st) == SQLITE_ROW else { return -1 }
+                return sqlite3_column_int64(st, 0)
+            }
+            let t0 = Date()
+            let unrepresented = num("""
+                SELECT COUNT(*) FROM chunks c
+                 WHERE NOT EXISTS (SELECT 1 FROM occurrence o
+                                    WHERE o.file_id = c.file_id AND o.ordinal = c.chunk_index);
+                """)
+            let unseated = num("SELECT COUNT(*) FROM chunk WHERE slot < 0")
+            let onContent = num("SELECT CAST(value AS INTEGER) FROM meta WHERE key='pending_vecs_on_content'")
+            guard unrepresented == 0, unseated == 0, onContent == 1 else {
+                FileHandle.standardError.write(Data(
+                    ("[omni] v4 tables kept: \(unrepresented) rows with no occurrence, "
+                     + "\(unseated) contents with no position, pendingOnContent=\(onContent)\n").utf8))
+                return
+            }
+            var ok = true
+            for sql in ["BEGIN IMMEDIATE;",
+                        "DROP TABLE IF EXISTS chunk_text;",
+                        "DROP TABLE IF EXISTS chunks;",
+                        "INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.v4DroppedKey)', '1');",
+                        // DROP frees pages, it does not shrink the file - 2.6 GB of the 6 GB
+                        // database becomes freelist and the size a user watches does not move.
+                        // This is the same signal the coverage migration raises for the same
+                        // reason, and `reclaimAfterCoverageMigration` is what spends it.
+                        "INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.vacuumPendingKey)', '1');",
+                        "COMMIT;"] where ok {
+                if sqlite3_exec(side, sql, nil, nil, nil) != SQLITE_OK {
+                    ok = false
+                    FileHandle.standardError.write(Data(
+                        "[omni] v4 drop failed: \(String(cString: sqlite3_errmsg(side)))\n".utf8))
+                }
+            }
+            guard ok else { sqlite3_exec(side, "ROLLBACK;", nil, nil, nil); return }
+            let secs = -t0.timeIntervalSinceNow
+            self?.queue.sync {
+                guard let self, self.dbOpen() else { return }
+                // Anything prepared against a table that no longer exists.
+                sqlite3_finalize(self.slotUpdStmt); self.slotUpdStmt = nil
+                sqlite3_finalize(self.contentSelStmt); self.contentSelStmt = nil
+                sqlite3_finalize(self.snippetStmt); self.snippetStmt = nil
+                self.v4Dropped = true
+                self.exec("PRAGMA wal_checkpoint(TRUNCATE);")
+                FileHandle.standardError.write(Data(String(format:
+                    "[omni] dropped chunk_text and chunks in %.1fs; the index is v5 only\n", secs).utf8))
+                // NOW, not at the next launch, for the reason the coverage migration gives: the
+                // number a user is watching is the file size, and nothing has moved it yet.
+                let url2 = self.dbURL
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5) { [weak self] in
+                    guard let self, self.dbURL == url2 else { return }
+                    let freed = self.reclaimAfterCoverageMigration()
+                    if freed > 0 {
+                        FileHandle.standardError.write(Data(
+                            "[omni] compacted after the v4 drop: \(freed / 1_048_576) MB reclaimed\n".utf8))
+                    }
+                }
+            }
+        }
+        return true
+    }
+
     /// MAKE THE SPLIT AUTHORITATIVE, IN ONE TRANSACTION.
     ///
     /// Three things have to become true together or not at all: the rows written during the
@@ -12759,7 +13077,7 @@ public final class VectorStore: @unchecked Sendable {
         //
         // ABOVE the `dim` guard on purpose: an empty database has no dimension yet, which is
         // exactly the state this is about.
-        if scalarQuery("SELECT COUNT(*) FROM chunks") == 0,
+        if !tableExists("chunks") || scalarQuery("SELECT COUNT(*) FROM chunks") == 0,
            scalarQuery("SELECT COUNT(*) FROM files") == 0 {
             exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.chunkSplitDoneKey)', '1');")
             // AND NOTHING TO TRANSLATE, EVER. A born-v5 index stages its first blob under a
@@ -12778,6 +13096,16 @@ public final class VectorStore: @unchecked Sendable {
         // into. What matters is that no pre-existing row is still waiting for a position, and
         // `backfillInPlace` re-checks seated == rows before it writes anything.
         guard !v4BackfillPending else { return false }
+        // AN INDEX WITH NO v4 TABLE HAS NOTHING TO DERIVE FROM, and that is not a failure: it is
+        // already v5, and `MAX(slot) FROM chunks` answering -1 for a missing table would send it
+        // down the "not ready yet" path for ever.
+        guard hasTableLocked("chunks") else {
+            exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.chunkSplitDoneKey)', '1');")
+            exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.pendingOnContentKey)', '1');")
+            splitBuilt = false
+            refreshSplitBuiltLocked()
+            return splitBuilt
+        }
         let maxSlot = scalarQuery("SELECT COALESCE(MAX(slot), -1) FROM chunks")
         guard maxSlot >= 0 else { return false }
         // The file may hold positions past the highest a row claims - coverage extends it ahead of
@@ -12954,6 +13282,14 @@ public final class VectorStore: @unchecked Sendable {
             splitBuilt = false
             pendingOnContent = false
         }
+    }
+
+    /// Drive the v4 drop and wait for it, rather than waiting on a coverage stamp.
+    public func dropV4TablesForTest() -> Bool {
+        let started = queue.sync { dropV4TablesLocked() }
+        guard started else { return false }
+        while queue.sync(execute: { v4DropInFlight }) { Thread.sleep(forTimeInterval: 0.01) }
+        return queue.sync { v4Dropped }
     }
 
     /// The recorded holes, for a test that needs to see them.
@@ -13304,14 +13640,22 @@ public final class VectorStore: @unchecked Sendable {
         // column exists and must do nothing - the conversion calls it again afterwards. That
         // ordering is not incidental: the one session that both converts and indexes is precisely
         // the session an upgrade is, and it is the session where a half-filled column bites.
-        guard hasColumnLocked("chunks", "slot") else { return }
-        // v4 ONLY IN A SECOND SENSE. Once the split is built, `chunk.slot` is where a position
-        // lives and the split build filled it for every content; `rows[i].chunkID` is then a
-        // CONTENT id, so running this would write positions into `chunks.slot` keyed by numbers
-        // from the other id space - the two spaces overlap, so it would not fail, it would
-        // quietly seat rows on each other's vectors at the next open. The flag is set here
-        // because there is genuinely nothing left to backfill.
-        if Self.chunkSplit, splitBuilt {
+        // THE SPLIT CHECK COMES FIRST, BEFORE THE COLUMN CHECK, and the order is the whole of
+        // it: an index that never had `chunks` has no `chunks.slot` either, so the column guard
+        // returned before this could mark the backfill done - and `advanceCoverageLocked`
+        // refuses to move until it is. Coverage then never advanced at all on a v5-only index,
+        // which is every new user.
+        //
+        // Once the split is built, `chunk.slot` is where a position lives and the build filled
+        // it for every content; `rows[i].chunkID` is then a CONTENT id, so running the v4
+        // backfill would write positions into `chunks.slot` keyed by numbers from the other id
+        // space - the two spaces overlap, so it would not fail, it would quietly seat rows on
+        // each other's vectors at the next open.
+        // NO `chunks` TABLE AT ALL is "there is nothing to fill"; a `chunks` WITHOUT the slot
+        // column is "not yet" - a v3 or legacy index, where the conversion has to run first and
+        // marking the backfill done would let coverage advance over rows that have no position.
+        // The two look the same through `hasColumnLocked` and are opposite answers.
+        if (Self.chunkSplit && splitBuilt) || !hasTableLocked("chunks") {
             if !slotsBackfilled {
                 exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.slotsBackfilledKey)','1');")
                 exec("DELETE FROM meta WHERE key = '\(Self.slotsMarkKey)';")
@@ -13320,6 +13664,7 @@ public final class VectorStore: @unchecked Sendable {
             }
             return
         }
+        guard hasColumnLocked("chunks", "slot") else { return }
         adoptChunkIDsLocked()
 
         // THE SOURCE IS THE RESIDENT STATE, NOT A SECOND DERIVATION. `occSlot[i]` is where row i's
@@ -13395,22 +13740,32 @@ public final class VectorStore: @unchecked Sendable {
         // promise by writing the new numbering back. Until they do, storing it makes a reloaded
         // index name the wrong content: 800 failures, none of them about sharing. With the flag
         // off the column stays -1 and the loader derives it exactly as it always has.
-        guard Self.contentSharing else { return }
-        guard ids.count == slots.count, !ids.isEmpty, dbOpen() else { return }
-        if slotUpdStmt == nil {
-            _ = sqlite3_prepare_v2(db, "UPDATE chunks SET slot = ? WHERE id = ?;", -1, &slotUpdStmt, nil)
+        guard Self.contentSharing, dbOpen(), !slots.isEmpty else { return }
+        // `ids` IS EMPTY UNDER THE CUTOVER, because no v4 row was written to carry a slot. The
+        // guard used to be `ids.count == slots.count`, which is false then - so it returned
+        // before the CONTENT update below and every new content kept slot -1. The by-slot
+        // loader reads that as a row with no position and refuses the whole index, at the next
+        // open, with nothing wrong at the time it was written.
+        let writeV4Slots = ids.count == slots.count
+        var st: OpaquePointer?
+        if writeV4Slots {
+            if slotUpdStmt == nil {
+                _ = sqlite3_prepare_v2(db, "UPDATE chunks SET slot = ? WHERE id = ?;", -1, &slotUpdStmt, nil)
+            }
+            st = slotUpdStmt
         }
-        guard let st = slotUpdStmt else { return }
         // ONE TRANSACTION. This runs past the write's COMMIT, so without it every UPDATE is its own
         // implicit transaction and pays a WAL write each. Measured on the store-write benchmark:
         // 2000 files went 5787 -> 1442 files/s, a 4x regression, entirely from this.
         let inTxn = sqlite3_get_autocommit(db) == 0
         if !inTxn { exec("BEGIN IMMEDIATE;") }
-        for (i, cid) in ids.enumerated() {
-            sqlite3_reset(st)
-            sqlite3_bind_int(st, 1, slots[i])
-            sqlite3_bind_int64(st, 2, cid)
-            _ = sqlite3_step(st)
+        if let st {
+            for (i, cid) in ids.enumerated() {
+                sqlite3_reset(st)
+                sqlite3_bind_int(st, 1, slots[i])
+                sqlite3_bind_int64(st, 2, cid)
+                _ = sqlite3_step(st)
+            }
         }
         // THE SPLIT, IN STEP. The rows themselves were written natively by `writeChunksLocked`;
         // what could not be done there is the POSITION, which is only settled here, and the
@@ -13427,7 +13782,12 @@ public final class VectorStore: @unchecked Sendable {
             // the split exists to delete. The writer already knows the id it inserted, so it
             // hands it over. `slotForContentLocked` below is the one caller with no such list;
             // it passes ids in the CONTENT space and no v4 ids at all.
-            let targets = contentIDs.count == ids.count ? contentIDs : []
+            // AGAINST `slots`, NOT AGAINST `ids`. Both arrays used to be full and the two
+            // comparisons were the same one; under the cutover `ids` is EMPTY, so this read
+            // false and no content was ever given its position. Every new content then kept
+            // slot -1, which the by-slot loader reads as a row with no position and refuses the
+            // whole index for - at the next open, with nothing wrong at the time it was written.
+            let targets = contentIDs.count == slots.count ? contentIDs : []
             if !targets.isEmpty {
                 var st: OpaquePointer?
                 defer { sqlite3_finalize(st) }
@@ -13462,7 +13822,7 @@ public final class VectorStore: @unchecked Sendable {
             // KEYED THE WAY THE BLOB WAS STAGED: on the content under the split, on the v4 row
             // otherwise. Deleting by the wrong id space is silent - it matches nothing, or worse
             // it matches an unrelated row that happens to share the number.
-            let keys = (Self.chunkSplit && splitBuilt && contentIDs.count == ids.count) ? contentIDs : ids
+            let keys = (Self.chunkSplit && splitBuilt && contentIDs.count == slots.count) ? contentIDs : ids
             var del: OpaquePointer?
             if sqlite3_prepare_v2(db, "DELETE FROM pending_vecs WHERE chunk_id = ?;", -1, &del, nil) == SQLITE_OK {
                 for (i, cid) in keys.enumerated()

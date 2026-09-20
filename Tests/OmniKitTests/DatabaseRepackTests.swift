@@ -69,12 +69,22 @@ final class DatabaseRepackTests: XCTestCase {
         var st: OpaquePointer?
         defer { sqlite3_finalize(st) }
         var out: [String] = []
-        guard sqlite3_prepare_v2(db, """
+        // THE ROW TABLE, WHICHEVER IT IS. `occurrence` names the same thing with `ordinal` for
+        // `chunk_index` and its rowid for `id`; against a dropped `chunks` this prepares to
+        // nothing and the helper returns an empty list, which reads as "the repack lost every
+        // row" several assertions later.
+        let rowsSQL = SchemaProbe.rowTable(db) == "occurrence" ? """
+            SELECT (CASE WHEN d.path = '/' THEN '/' || f.name ELSE d.path || '/' || f.name END)
+                   || '#' || o.ordinal
+              FROM occurrence o JOIN files f ON f.id = o.file_id JOIN dirs d ON d.id = f.dir_id
+             ORDER BY o.rowid;
+            """ : """
             SELECT (CASE WHEN d.path = '/' THEN '/' || f.name ELSE d.path || '/' || f.name END)
                    || '#' || c.chunk_index
               FROM chunks c JOIN files f ON f.id = c.file_id JOIN dirs d ON d.id = f.dir_id
              ORDER BY c.id;
-            """, -1, &st, nil) == SQLITE_OK else { return out }
+            """
+        guard sqlite3_prepare_v2(db, rowsSQL, -1, &st, nil) == SQLITE_OK else { return out }
         while sqlite3_step(st) == SQLITE_ROW { out.append(String(cString: sqlite3_column_text(st, 0))) }
         return out
     }

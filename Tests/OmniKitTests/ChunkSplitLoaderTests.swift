@@ -429,6 +429,111 @@ final class ChunkSplitLoaderTests: XCTestCase {
         }
     }
 
+    // MARK: - Dropping the v4 tables
+
+    /// STEP 7, AND THE POINT OF THE WHOLE EXERCISE. Until `chunks` and `chunk_text` go, the split
+    /// is pure cost - both layouts in one file.
+    ///
+    /// The drop proves itself first because it cannot be undone: every v4 row must already have
+    /// an occurrence, every content a position, and the staged vectors must already have moved
+    /// id space. The row COUNTS are deliberately not compared - under the cutover new writes add
+    /// occurrences and no v4 rows, so the two diverge from the first write.
+    func testTheV4TablesAreDroppedAndTheIndexStillWorks() throws {
+        try XCTSkipUnless(VectorStore.splitCutover, "the drop is what the cutover is for")
+        let url = tempDB()
+        try writeV4Fixture(url, files: 20, dupEvery: 5)
+        try migrate(url)
+
+        var before: [String] = []
+        do {
+            let store = try VectorStore(dbURL: url); defer { store.close() }
+            before = digest(store)
+            XCTAssertFalse(before.isEmpty)
+        }
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM chunks"), 40, "the fixture has no v4 rows to drop")
+
+        do {
+            let store = try VectorStore(dbURL: url); defer { store.close() }
+            XCTAssertTrue(store.dropV4TablesForTest(), "the drop never ran")
+            XCTAssertTrue(store.v4Dropped, "the drop ran but did not take effect")
+        }
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('chunks','chunk_text')"), 0,
+                       "the v4 tables are still there")
+
+        // AND THE NEXT OPEN DOES NOT PUT THEM BACK. `CREATE TABLE IF NOT EXISTS` cannot tell
+        // "deliberately gone" from "not there yet", so without the guard every open recreates
+        // them empty and the index comes up with a full `occurrence` beside an empty `chunks`.
+        let store = try VectorStore(dbURL: url); defer { store.close() }
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('chunks','chunk_text')"), 0,
+                       "the next open recreated the tables the migration dropped")
+        XCTAssertEqual(store.rowCountForTest, 40)
+        XCTAssertEqual(digest(store), before, "the drop changed what search returns")
+        XCTAssertNil(store.coverageAudit())
+    }
+
+    /// AND THE STORE STILL WRITES, DELETES AND SEARCHES WITH THEM GONE. A prepare against a
+    /// dropped table fails, and `prepareChunkInsertLocked` returns nil on any failure - so a
+    /// statement left behind there does not degrade the write path, it stops it: every
+    /// `replace()` throws and nothing is ever indexed again.
+    func testWritesAndDeletesWorkWithNoV4Tables() throws {
+        try XCTSkipUnless(VectorStore.splitCutover, "the drop is what the cutover is for")
+        let url = tempDB()
+        try writeV4Fixture(url, files: 16, dupEvery: 4)
+        try migrate(url)
+        do {
+            let store = try VectorStore(dbURL: url); defer { store.close() }
+            XCTAssertTrue(store.dropV4TablesForTest())
+        }
+
+        let store = try VectorStore(dbURL: url); defer { store.close() }
+        // WRITE
+        for i in 0 ..< 4 {
+            let p = "/v5/new\(i).txt"
+            try store.replace(path: p, chunks: [
+                IndexedChunk(path: p, modified: 9, size: 4, kind: "text", chunkIndex: 0,
+                             snippet: "fresh \(i)", embedding: vec(5000 + i), locator: "Line 1",
+                             chunkKey: String(format: "%016x", 5000 + i)),
+            ])
+        }
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM occurrence"), 36)
+        for i in 0 ..< 4 {
+            XCTAssertEqual(store.search(vec(5000 + i), filter: SearchFilter(), topK: 3).first?.path,
+                           "/v5/new\(i).txt", "a file written after the drop is not findable")
+        }
+        // Its snippet and locator come back too - the metadata path behind a hit had no split
+        // form and would return nothing here.
+        let hit = store.search(vec(5000), filter: SearchFilter(), topK: 1).first
+        XCTAssertEqual(hit?.snippet, "fresh 0")
+        XCTAssertEqual(hit?.locator, "Line 1")
+        // DELETE
+        store.deletePath("/v5/new1.txt")
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM occurrence"), 35)
+        XCTAssertTrue(store.search(vec(5001), filter: SearchFilter(), topK: 3)
+                        .filter { $0.path == "/v5/new1.txt" }.isEmpty, "a deleted file still answers")
+        XCTAssertNil(store.coverageAudit())
+        // And the whole thing survives a reopen.
+        store.close()
+        let re = try VectorStore(dbURL: url); defer { re.close() }
+        XCTAssertEqual(re.rowCountForTest, 35)
+        XCTAssertNil(re.coverageAudit())
+    }
+
+    /// IT REFUSES WHEN IT CANNOT PROVE ITSELF. A v4 row with no occurrence is a row whose text
+    /// and locator exist nowhere else, and dropping the table would lose it silently.
+    func testTheDropRefusesWhenAV4RowHasNoOccurrence() throws {
+        try XCTSkipUnless(VectorStore.splitCutover, "the drop is what the cutover is for")
+        let url = tempDB()
+        try writeV4Fixture(url, files: 12, dupEvery: 3)
+        try migrate(url)
+        // One occurrence removed behind the store's back: a v4 row nothing points at.
+        exec(url, "DELETE FROM occurrence WHERE rowid = (SELECT MIN(rowid) FROM occurrence);")
+        let store = try VectorStore(dbURL: url); defer { store.close() }
+        _ = store.dropV4TablesForTest()
+        XCTAssertGreaterThan(num(url, "SELECT COUNT(*) FROM sqlite_master WHERE name = 'chunks'"), 0,
+                             "the drop went ahead over a v4 row with no occurrence")
+        XCTAssertFalse(store.v4Dropped)
+    }
+
     // MARK: - The window where the two models disagree
 
     /// THE SESSION THE BUILD PUBLISHES IN still has v4 ids in `rows[i].chunkID` and each row on

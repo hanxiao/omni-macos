@@ -123,7 +123,14 @@ enum StoreSchema {
     ///
     /// That requires the names not to collide with v3's, which is why the label index is
     /// `idx_chunk_label` and not `idx_media_snippet` - v3's still exists while the copy is built.
-    static func createStatements(suffix: String = "", includeV5: Bool = true) -> [String] {
+    /// `includeV4: false` leaves `chunks` and `chunk_text` OUT, for an index whose migration has
+    /// already dropped them - and for a brand new one, which never needs them. Without it every
+    /// open recreates the two tables empty (`CREATE TABLE IF NOT EXISTS` cannot tell
+    /// "deliberately gone" from "not there yet") and the index comes back as one with a full
+    /// `occurrence` beside an empty `chunks`, which is a shape no reader has an opinion about
+    /// and every count disagrees with.
+    static func createStatements(suffix: String = "", includeV5: Bool = true,
+                                 includeV4: Bool = true) -> [String] {
         let dirs = "dirs\(suffix)", files = "files\(suffix)", chunks = "chunks\(suffix)"
         let text = "chunk_text\(suffix)", pend = "pending_vecs\(suffix)", dedup = "dedup\(suffix)"
         let chunk = "chunk\(suffix)", occ = "occurrence\(suffix)"
@@ -223,6 +230,21 @@ enum StoreSchema {
         // not build the v5 ones: they are not in its rename list, so they would be left behind as
         // orphaned `_new` tables - which is exactly what its own "temporary tables were left
         // behind" assertion caught the first time this was written.
+        // THE v4 ROW TABLE AND ITS PAYLOAD, DROPPED BY NAME rather than by filtering strings.
+        // They are the two the migration removes, and every index that names them goes with
+        // them - SQLite drops an index with its table, so there is nothing else to take out.
+        if !includeV4 {
+            let v4Only = ["CREATE TABLE IF NOT EXISTS \(chunks)(",
+                          "CREATE UNIQUE INDEX IF NOT EXISTS idx_chunk_file",
+                          "CREATE INDEX IF NOT EXISTS idx_chunk_slot ON",
+                          "CREATE TABLE IF NOT EXISTS \(text)(",
+                          "CREATE INDEX IF NOT EXISTS idx_chunk_label",
+                          "CREATE INDEX IF NOT EXISTS idx_chunk_content"]
+            out = out.filter { sql in
+                let t = sql.trimmingCharacters(in: .whitespacesAndNewlines)
+                return !v4Only.contains { t.hasPrefix($0) }
+            }
+        }
         guard includeV5 else { return out }
         out += [
             // MARK: v5 - CONTENT-ADDRESSED CHUNKS

@@ -56,10 +56,14 @@ final class VecSlotTests: XCTestCase {
             guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { return 0 }
             return sqlite3_step(st) == SQLITE_ROW ? Int(sqlite3_column_int64(st, 0)) : 0
         }
+        // THE ROW TABLE AND THE STAGED TABLE, ASKED OF THE DATABASE. Under v5 they are
+        // `occurrence` and `chunk`, and once the migration has dropped the v4 pair the old
+        // spelling does not merely read stale - it will not prepare, and every number here
+        // comes back 0.
         return (scalar("SELECT CAST(value AS INTEGER) FROM meta WHERE key='vecs_covered_rows'"),
                 scalar("SELECT COUNT(*) FROM vec_holes"),
-                scalar("SELECT (SELECT COUNT(*) FROM chunks) - (SELECT COUNT(*) FROM pending_vecs)"),
-                scalar("SELECT COUNT(*) FROM chunks"))
+                scalar(SchemaProbe.clearedBlobsSQL(db)),
+                scalar("SELECT COUNT(*) FROM \(SchemaProbe.rowTable(db))"))
     }
 
     /// Every stored file must still be findable by its own vector, at ~1.0. This is the assertion

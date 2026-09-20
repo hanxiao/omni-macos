@@ -51,8 +51,12 @@ final class CoverageClaimRepairTests: XCTestCase {
     private func claim(_ db: URL) -> Int {
         scalar(db, "SELECT CAST(value AS INTEGER) FROM meta WHERE key='vecs_covered_rows'")
     }
+    /// Asked of whichever table the staged vectors are keyed against - `chunk` under v5.
     private func clearedBlobs(_ db: URL) -> Int {
-        scalar(db, "SELECT (SELECT COUNT(*) FROM chunks) - (SELECT COUNT(*) FROM pending_vecs)")
+        var h: OpaquePointer?
+        defer { sqlite3_close(h) }
+        guard sqlite3_open_v2(db.path, &h, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { return -1 }
+        return scalar(db, SchemaProbe.clearedBlobsSQL(h))
     }
 
     /// Build an index whose blobs are cleared and whose vector file is the only copy.

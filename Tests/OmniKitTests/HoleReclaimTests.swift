@@ -71,7 +71,7 @@ final class HoleReclaimTests: XCTestCase {
         return (scalar("SELECT CAST(value AS INTEGER) FROM meta WHERE key='vecs_covered_rows'"),
                 scalar("SELECT COUNT(*) FROM vec_holes"),
                 scalar("SELECT CAST(value AS INTEGER) FROM meta WHERE key='vecs_compact_pending'"),
-                scalar("SELECT COUNT(*) FROM chunks"))
+                scalar("SELECT COUNT(*) FROM \(SchemaProbe.rowTable(db))"))
     }
 
     private func vecBytes(_ dir: URL) -> Int64 {

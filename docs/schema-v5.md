@@ -1132,6 +1132,29 @@ releasing.
      correct, both flags absent, blobs still in the v4 space, because the translation travels
      with the publish - and `testAnUnpublishedBuildIsFinishedOnTheNextOpen` is the assertion.
 
+     AND THE CHAOS RUN, `Scripts/migration-chaos.sh` against a clone of the same real index with
+     the split, the cutover and the free list all on, while the migration ran underneath and
+     files were created, edited, renamed and deleted on a 0.4 s cycle:
+
+         testChaosWhileAnOldIndexMigrates passed (769.9 s), 73 interaction rounds, 0 failures
+         === the split WAS built and in use for this run
+         chunk 6257501 / occurrence 9773836 / snippet 6257501 / free_slot 3770848
+
+         the session AFTER it:  rowTable=occurrence, 0 failing checks, holes 3770848
+                                digest ba7a13400e714f79, p50 5.1 ms
+
+     THE FIRST ATTEMPT PROVED NOTHING AND SAID SO. With the default quiet period the migration
+     never moved at all - `chunk_slots_upto=0` after 408 s - because the stamp yields to
+     searches and this suite searches continuously. The UI test passed. Without the harness
+     check that the split was actually built, that run would have been recorded as a passing
+     chaos run over the split, which is the same failure this document already records twice.
+     480 s of quiet is what it takes on this index.
+
+     AND THE RUN IS THE PUBLISHING SESSION, NOT THE READING ONE, which is why the harness now
+     reopens the clone afterwards: the build finishes under the chaos and the readers switch,
+     but the resident model stays v4 until the next open. A chaos run on its own says nothing
+     about the loader, and the loader is the whole of this step.
+
      IT USED TO STALL THE MIGRATION FOR GOOD, SILENTLY. `backfillInPlace` read a populated
      `occurrence` as "already migrated, nothing to do" and returned nil, so the publish never ran
      again and the index kept a complete, correct, entirely unused split for the rest of its
