@@ -225,7 +225,7 @@ final class ChunkSplitLoaderTests: XCTestCase {
     /// THE WIN, AND THE THING THE 23 RED TESTS WERE WAITING FOR. The build collapses duplicates
     /// in SQLite and does not touch a vector; the first open that reads the split is where those
     /// positions stop having a live row. Unrecorded they are what `coverageAudit` calls breakage,
-    /// and the reclaim - which reads `vec_holes`, not the build's `free_slot` - can never give
+    /// and the reclaim - which reads `vec_holes`, which the build does not write - can never give
     /// the space back.
     func testTheSplitsFreedPositionsBecomeHolesAndAreReclaimed() throws {
         let url = tempDB()

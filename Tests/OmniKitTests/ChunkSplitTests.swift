@@ -108,12 +108,13 @@ final class ChunkSplitTests: XCTestCase {
         XCTAssertEqual(num(url, "SELECT COUNT(*) FROM occurrence o LEFT JOIN chunk c "
                                 + "ON c.id = o.chunk_id WHERE c.id IS NULL"), 0,
                        "an occurrence points at a content that does not exist")
-        // ON THE SLOT, NOT ON THE ID. `free_slot.id` is a POSITION and `chunk.id` is a CONTENT,
-        // and the schema separated those deliberately - "position is a column, not the identity"
-        // - so joining them compares two unrelated numbering spaces. It read 0 for as long as
-        // the two happened not to overlap, which is not the same as the invariant holding.
-        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM free_slot f JOIN chunk c ON c.slot = f.id"), 0,
-                       "a position is both owned and free")
+        // NO TWO CONTENTS ON ONE POSITION. This used to be a join against a `free_slot` table,
+        // written as `free_slot.id = chunk.id` - a POSITION against a CONTENT id, two unrelated
+        // numbering spaces, reading 0 for as long as they happened not to overlap. The table is
+        // gone and what it was reaching for is expressible directly.
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM (SELECT slot FROM chunk WHERE slot >= 0 "
+                                + "GROUP BY slot HAVING COUNT(*) > 1)"), 0,
+                       "two contents own one position")
         // The snippet is stored once per CONTENT, which is the space the split is for.
         XCTAssertEqual(num(url, "SELECT COUNT(*) FROM chunk_snippet"), 65)
     }
@@ -624,16 +625,16 @@ final class ChunkSplitTests: XCTestCase {
     ///
     /// The failure is injected as a KEY COLLISION rather than a bad high-water mark, and the first
     /// version of this test getting that wrong is worth recording: a wrong high-water mark does not
-    /// fail any invariant. `free_slot` is DERIVED from it, so claiming 999,999 positions simply
-    /// produces 999,975 free slots and "live + free = high water" holds exactly. The invariants
-    /// check the pointers against each other; they cannot check the mark the caller passed in.
+    /// fail any invariant. The invariants check the pointers against each other, and the two that
+    /// mentioned the mark were written against a `free_slot` table built as exactly the complement
+    /// of the owned set, so each compared that statement with itself. Both are gone with the table.
     func testAFailedBuildLeavesNothingBehind() throws {
         let url = tempDB()
         let store = try build(url, files: 20, dupEvery: 4)
         store.seedConflictingContentForTest()
         XCTAssertFalse(store.buildChunkSplitForTest(), "a build whose insert collided reported success")
         store.close()
-        for t in ["chunk", "occurrence", "chunk_snippet", "free_slot"] {
+        for t in ["chunk", "occurrence", "chunk_snippet"] {
             XCTAssertEqual(num(url, "SELECT COUNT(*) FROM \(t)"), 0, "\(t) survived a failed build")
         }
         XCTAssertGreaterThan(num(url, "SELECT COUNT(*) FROM chunk_text"), 0, "it dropped the v4 table it falls back to")

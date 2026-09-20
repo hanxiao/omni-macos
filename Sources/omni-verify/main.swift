@@ -7794,7 +7794,7 @@ if args.count >= 3 && args[1] == "splitdry" {
     func gb(_ b: Int64) -> String { String(format: "%.3f GB", Double(b) / 1_073_741_824) }
     do {
         let r = try MigrationV5Runner.dryRun(dbPath: args[2], scratchPath: scratch) { print($0); fflush(stdout) }
-        print("  contents=\(r.contents) occurrences=\(r.occurrences) free=\(r.freeSlots) "
+        print("  contents=\(r.contents) occurrences=\(r.occurrences) "
               + "dedup=\(r.occurrences - r.contents)")
         print("  v5 tables on disk: \(gb(r.newBytes))")
         print(r.oldBytes > 0 ? "  v4 chunk_text + idx_chunk_content: \(gb(r.oldBytes))"

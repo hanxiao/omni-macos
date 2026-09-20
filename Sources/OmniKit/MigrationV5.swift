@@ -132,27 +132,6 @@ enum MigrationV5 {
         """
     }
 
-    /// Slots below the high-water mark that no content owns. Derivable, and derived rather than
-    /// accumulated, because a leaked slot is invisible - the vector file simply never shrinks.
-    /// Joined on `slot` now that identity and position are separate columns.
-    ///
-    /// `AND c.slot >= 0` IS NOT REDUNDANT even though `v.i` is never negative. `idx_chunk_slot_v5`
-    /// is PARTIAL over exactly that predicate, and SQLite will not use a partial index unless the
-    /// query implies it - equality on the column is not enough. Without the term this join
-    /// full-scans `chunk` once per generated integer, ten million times: the statement went from
-    /// finishing in seconds to still running after twenty-four minutes. Third time this exact trap
-    /// has cost an hour today, after idx_chunk_content and slot_of.
-    static func buildFreeListSQL(highWater: Int64, suffix: String = "") -> String {
-        """
-        INSERT INTO free_slot\(suffix)(id)
-        SELECT v.i FROM (WITH RECURSIVE r(i) AS (
-            SELECT 0 UNION ALL SELECT i + 1 FROM r WHERE i < \(highWater - 1)
-        ) SELECT i FROM r) v
-        LEFT JOIN chunk\(suffix) c ON c.slot = v.i AND c.slot >= 0
-        WHERE c.id IS NULL
-        """
-    }
-
     /// What has to be true before the swap. Each is a statement returning one number, paired with
     /// what it must equal. A migration that fails any of these must be abandoned and the v4 tables
     /// left alone, because every one of them means a pointer has gone somewhere wrong.
@@ -174,12 +153,14 @@ enum MigrationV5 {
              LEFT JOIN chunk\(suffix) c ON c.id = o.chunk_id WHERE c.id IS NULL
              """,
              "SELECT 0"),
-            ("live and free slots exactly cover the file",
-             "SELECT (SELECT COUNT(*) FROM chunk\(suffix) WHERE slot >= 0) "
-                + "+ (SELECT COUNT(*) FROM free_slot\(suffix))",
-             "SELECT \(highWater)"),
-            ("no slot is both owned and free",
-             "SELECT COUNT(*) FROM free_slot\(suffix) f JOIN chunk\(suffix) c ON c.slot = f.id",
+            // NO LIVE POSITION PAST THE END OF THE FILE. This replaces a pair that read
+            // "live + free covers the file" and "no slot is both owned and free", both of which
+            // were written against a `free_slot` table the build filled as exactly the complement
+            // of the owned set - so each tested that statement against itself and neither could
+            // fail. What they were reaching for is here and in "no position is owned twice"
+            // below: every content points inside the vector file, and no two point at one place.
+            ("no content points past the end of the vector file",
+             "SELECT COUNT(*) FROM chunk\(suffix) WHERE slot >= \(highWater)",
              "SELECT 0"),
             // AND NO TWO CONTENTS SHARE A POSITION, which only becomes expressible once position
             // is a column: when it was the primary key the schema enforced it for free.

@@ -55,7 +55,6 @@ final class MigrationV5Tests: XCTestCase {
         XCTAssertTrue(exec(MigrationV5.buildChunkSQL()))
         XCTAssertTrue(exec(MigrationV5.buildOccurrenceSQL()))
         XCTAssertTrue(exec(MigrationV5.buildSnippetSQL()))
-        XCTAssertTrue(exec(MigrationV5.buildFreeListSQL(highWater: highWater)))
     }
 
     private func assertInvariants(_ file: StaticString = #filePath, _ line: UInt = #line) {
@@ -91,7 +90,9 @@ final class MigrationV5Tests: XCTestCase {
         XCTAssertEqual(num("SELECT COUNT(*) FROM chunk"), 2)
         XCTAssertEqual(num("SELECT COUNT(*) FROM occurrence"), 3)
         XCTAssertEqual(num("SELECT refs FROM chunk WHERE key = x'aa'"), 2)
-        XCTAssertEqual(num("SELECT COUNT(*) FROM free_slot"), 1)
+        // ONE POSITION FREED, and it is derived rather than listed: there is no free-slot table,
+        // so the count is high-water minus the positions a content owns.
+        XCTAssertEqual(3 - num("SELECT COUNT(DISTINCT slot) FROM chunk WHERE slot >= 0"), 1)
         assertInvariants()
     }
 
@@ -103,7 +104,8 @@ final class MigrationV5Tests: XCTestCase {
         // SLOT, not id. Identity is a rowid now and position is a column, which is the whole
         // point: a content keeps one id for life while the reclaim renumbers positions.
         XCTAssertEqual(num("SELECT slot FROM chunk WHERE key = x'aa'"), 0, "representative did not keep slot 0")
-        XCTAssertEqual(num("SELECT id FROM free_slot"), 2, "the freed slot is not the duplicate's")
+        XCTAssertEqual(num("SELECT COUNT(*) FROM chunk WHERE slot = 2"), 0,
+                       "the freed position is not the duplicate's")
     }
 
     func testDuplicatesInsideOneFileCollapseToo() {
@@ -130,7 +132,7 @@ final class MigrationV5Tests: XCTestCase {
         seed(keys: [nil, nil, "aa"], files: [10, 20, 30])
         runBackfill(highWater: 3)
         XCTAssertEqual(num("SELECT COUNT(*) FROM chunk"), 3, "media rows were merged on their empty key")
-        XCTAssertEqual(num("SELECT COUNT(*) FROM free_slot"), 0)
+        XCTAssertEqual(num("SELECT COUNT(DISTINCT slot) FROM chunk WHERE slot >= 0"), 3, "a position was freed")
         assertInvariants()
     }
 
@@ -138,7 +140,7 @@ final class MigrationV5Tests: XCTestCase {
         seed(keys: ["aa", "bb", "cc"], files: [10, 20, 30])
         runBackfill(highWater: 3)
         XCTAssertEqual(num("SELECT COUNT(*) FROM chunk"), 3)
-        XCTAssertEqual(num("SELECT COUNT(*) FROM free_slot"), 0)
+        XCTAssertEqual(num("SELECT COUNT(DISTINCT slot) FROM chunk WHERE slot >= 0"), 3, "a position was freed")
         assertInvariants()
     }
 
@@ -149,7 +151,7 @@ final class MigrationV5Tests: XCTestCase {
         runBackfill(highWater: 3)
         XCTAssertEqual(num("SELECT slot FROM chunk WHERE key = x'aa'"), 1)
         XCTAssertEqual(num("SELECT slot FROM chunk WHERE key = x'bb'"), 2)
-        XCTAssertEqual(num("SELECT COUNT(*) FROM free_slot WHERE id = 0"), 1, "the pre-existing hole was lost")
+        XCTAssertEqual(num("SELECT COUNT(*) FROM chunk WHERE slot = 0"), 0, "the pre-existing hole was filled")
         assertInvariants()
     }
 
@@ -161,11 +163,17 @@ final class MigrationV5Tests: XCTestCase {
         // carried 254,501 holes.
         seed(keys: ["aa", "bb"], files: [10, 20], holes: [0])
         runBackfill(highWater: 3)
-        let cover = MigrationV5.invariants(highWater: 3).first { $0.name.hasPrefix("live and free") }!
-        XCTAssertEqual(num(cover.sql), 3, "the file has three positions")
-        XCTAssertEqual(num(cover.sql), num(cover.mustEqual))
-        XCTAssertNotEqual(num(cover.sql), num("SELECT COUNT(*) FROM chunks"),
-                          "this fixture must NOT be dense, or it cannot show the defect")
+        let rows = num("SELECT COUNT(*) FROM chunks")
+        XCTAssertEqual(rows, 2, "this fixture must NOT be dense, or it cannot show the defect")
+        // Against the real file size every invariant holds: the two contents sit at positions 1
+        // and 2, with the pre-existing hole at 0.
+        assertInvariants()
+        // Against the ROW COUNT they do not, because the content at position 2 is then past the
+        // end of a two-position file. That is the shape of the defect, stated as a check that
+        // fires - the pair this used to be written against could not fail at all.
+        let wrong = MigrationV5.invariants(highWater: Int64(rows))
+            .filter { num($0.sql) != num($0.mustEqual) }
+        XCTAssertFalse(wrong.isEmpty, "coverage taken from the row count instead of the file size passed")
     }
 
     func testTheSnippetKindComesFromTheContent() {
@@ -205,9 +213,20 @@ final class MigrationV5Tests: XCTestCase {
     func testTheInvariantsCatchADoubleOwnedSlot() {
         seed(keys: ["aa", "bb"], files: [10, 20])
         runBackfill(highWater: 2)
-        exec("INSERT INTO free_slot(id) VALUES(0);")   // slot 0 is owned AND free
+        exec("UPDATE chunk SET slot = 0 WHERE key = x'bb';")   // both contents on position 0
         let failed = MigrationV5.invariants(highWater: highWater).filter { num($0.sql) != num($0.mustEqual) }
-        XCTAssertFalse(failed.isEmpty, "a double-owned slot passed every invariant")
+        XCTAssertFalse(failed.isEmpty, "two contents on one position passed every invariant")
+    }
+
+    /// AND A POSITION PAST THE END OF THE FILE, which is the check that replaced the pair written
+    /// against the free-slot table. Those compared a list built as the complement of the owned set
+    /// against that same set, so neither could fail; this one can.
+    func testTheInvariantsCatchAPositionPastTheEndOfTheFile() {
+        seed(keys: ["aa", "bb"], files: [10, 20])
+        runBackfill(highWater: 2)
+        exec("UPDATE chunk SET slot = 99 WHERE key = x'bb';")
+        let failed = MigrationV5.invariants(highWater: highWater).filter { num($0.sql) != num($0.mustEqual) }
+        XCTAssertFalse(failed.isEmpty, "a content pointing past the vector file passed every invariant")
     }
 
     func testTheKeyExpressionIsSharedByBothStatements() {

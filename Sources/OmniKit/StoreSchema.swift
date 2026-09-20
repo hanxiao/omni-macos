@@ -134,7 +134,7 @@ enum StoreSchema {
         let dirs = "dirs\(suffix)", files = "files\(suffix)", chunks = "chunks\(suffix)"
         let text = "chunk_text\(suffix)", pend = "pending_vecs\(suffix)", dedup = "dedup\(suffix)"
         let chunk = "chunk\(suffix)", occ = "occurrence\(suffix)"
-        let snip = "chunk_snippet\(suffix)", free = "free_slot\(suffix)"
+        let snip = "chunk_snippet\(suffix)"
         var out: [String] = [
             "CREATE TABLE IF NOT EXISTS \(dirs)(id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);",
             // Per-FILE facts live here exactly once. In v3 every one of these was a column on
@@ -369,10 +369,6 @@ enum StoreSchema {
             CREATE INDEX IF NOT EXISTS idx_snip_label ON \(snip)(kind, snippet)
             WHERE kind IN (1, 2, 3);
             """,
-            // SLOTS NOBODY OWNS. A durable free list, so a released slot is reused instead of
-            // leaking. Reconcilable from SQLite alone - it is exactly the ids in [0, highWater) with
-            // no chunk row - which is the same property that lets vec_holes be rebuilt.
-            "CREATE TABLE IF NOT EXISTS \(free)(id INTEGER PRIMARY KEY);",
         ]
         return out
     }
@@ -397,7 +393,12 @@ enum StoreSchema {
 
     /// Tables introduced by v5. Same reasoning as `v4OnlyTables`: these exist only under the
     /// content-addressed layout, so a cleanup may drop them without touching a v4 index.
-    static let v5OnlyTables = ["free_slot", "chunk_snippet", "occurrence", "chunk"]
+    // NO `free_slot`. It was in this list, was filled by the migration with 3,770,848 rows, was
+    // maintained by every delete - and was never SELECTed by anything but the migration's own
+    // invariants. The resident allocator derives the free set from the live rows, which is the
+    // authoritative copy; a durable second one can only go stale, and this file already says so
+    // about remap tables. Removed with `chunk.bytes` in the same audit.
+    static let v5OnlyTables = ["chunk_snippet", "occurrence", "chunk"]
 
     /// SQL for "the file id of the path bound at ?i, ?i+1" (directory, then basename). Callers bind
     /// with `bindPath`, which exists so the two halves can never be bound in the wrong order.

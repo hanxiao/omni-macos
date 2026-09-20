@@ -55,7 +55,7 @@ for DELAY in "$@"; do
   echo "  meta: $(sqlite3 -readonly "$W/index.sqlite" \
       "select group_concat(key||'='||value,' ') from meta where key like '%split%' or key like '%slot%' or key like 'vecs%';" 2>&1 | cut -c1-140)"
   echo "  tables: $(sqlite3 -readonly "$W/index.sqlite" \
-      "select 'chunk='||(select count(*) from chunk)||' occ='||(select count(*) from occurrence)||' free='||(select count(*) from free_slot);" 2>&1 | cut -c1-90)"
+      "select 'chunk='||(select count(*) from chunk)||' occ='||(select count(*) from occurrence);" 2>&1 | cut -c1-90)"
   echo "  --- reopen:"
   "$V" storeaudit "$W/index.sqlite" 2>&1 | grep -E "FAIL|failing check|rowTable|unreadable|Fatal" | head -5
   "$V" searchreal "$M" "$W/index.sqlite" 3 2>&1 | grep -E "SEARCHREAL|wrong model|Fatal" | head -2

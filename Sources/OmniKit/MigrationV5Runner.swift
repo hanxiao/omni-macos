@@ -24,9 +24,8 @@ public enum MigrationV5Runner {
         public var rows: Int64 = 0
         public var contents: Int64 = 0
         public var occurrences: Int64 = 0
-        public var freeSlots: Int64 = 0
-        public var highWater: Int64 = 0
-        /// Bytes of the four v5 tables and their indexes, alone in their own file.
+            public var highWater: Int64 = 0
+        /// Bytes of the v5 tables and their indexes, alone in their own file.
         public var newBytes: Int64 = 0
         /// Bytes `chunk_text` and its content index take in the v4 file, when `dbstat` is available.
         public var oldBytes: Int64 = 0
@@ -127,7 +126,6 @@ public enum MigrationV5Runner {
         try timed("chunk") { try run(MigrationV5.buildChunkSQL()) }
         try timed("occurrence") { try run(MigrationV5.buildOccurrenceSQL()) }
         try timed("chunk_snippet") { try run(MigrationV5.buildSnippetSQL()) }
-        try timed("free_slot") { try run(MigrationV5.buildFreeListSQL(highWater: out.highWater)) }
 
         for inv in MigrationV5.invariants(highWater: out.highWater) {
             let got = num(inv.sql), expect = num(inv.mustEqual)
@@ -137,7 +135,6 @@ public enum MigrationV5Runner {
 
         out.contents = num("SELECT COUNT(*) FROM chunk")
         out.occurrences = num("SELECT COUNT(*) FROM occurrence")
-        out.freeSlots = num("SELECT COUNT(*) FROM free_slot")
 
         // `dbstat` is not compiled into every SQLite, so the v4 side reports 0 rather than an
         // invented page count when it is missing.
@@ -153,10 +150,10 @@ public enum MigrationV5Runner {
         return out
     }
 
-    /// The four v5 statements out of `StoreSchema`, unqualified: `main` is the scratch file, so
+    /// The v5 statements out of `StoreSchema`, unqualified: `main` is the scratch file, so
     /// they land there, and the index attached as `src` is never written.
     static func v5CreateStatements() -> [String] {
-        let want = Set(["chunk", "occurrence", "chunk_snippet", "free_slot"])
+        let want = Set(["chunk", "occurrence", "chunk_snippet"])
         var out: [String] = []
         for stmt in StoreSchema.createStatements() {
             guard let r = stmt.range(of: "IF NOT EXISTS ") else { continue }
@@ -179,14 +176,14 @@ public enum MigrationV5Runner {
 
 extension MigrationV5Runner {
 
-    /// Build `chunk` / `occurrence` / `chunk_snippet` / `free_slot` in THIS database, from the v4
-    /// tables beside them, and prove the five invariants before anything is allowed to believe it.
+    /// Build `chunk` / `occurrence` / `chunk_snippet` in THIS database, from the v4 tables
+    /// beside them, and prove the invariants before anything is allowed to believe it.
     ///
     /// ALL OF IT IN ONE TRANSACTION, and that is the point rather than an oversight. The invariants
     /// are the only thing standing between "the pointers are right" and "every occurrence reads
-    /// some other content's vector", and they can only be checked once all four tables exist. A
+    /// some other content's vector", and they can only be checked once every table exists. A
     /// sliced build would have to either leave the database in a state where they do not hold yet -
-    /// so nothing could check them - or re-check all five per slice, which is a full pass each
+    /// so nothing could check them - or re-check them all per slice, which is a full pass each
     /// time. Measured at 66 s on 9,729,693 chunks, which is a transaction an idle pass can afford.
     ///
     /// Returns nil when there is nothing to do, and throws with the tables dropped when a check
@@ -236,7 +233,6 @@ extension MigrationV5Runner {
             guard out.failures.isEmpty else { throw Failure.invariant(out.failures) }
             out.contents = num("SELECT COUNT(*) FROM chunk")
             out.occurrences = num("SELECT COUNT(*) FROM occurrence")
-            out.freeSlots = num("SELECT COUNT(*) FROM free_slot")
             out.seconds = -start0.timeIntervalSinceNow
             log("  adopted an unpublished build: \(out.contents) contents, \(out.occurrences) occurrences")
             return out
@@ -265,8 +261,7 @@ extension MigrationV5Runner {
         do {
             for (label, sql) in [("chunk", buildChunkSQL()),
                                  ("occurrence", buildOccurrenceSQL()),
-                                 ("chunk_snippet", buildSnippetSQL()),
-                                 ("free_slot", buildFreeListSQL(highWater: highWater))] {
+                                 ("chunk_snippet", buildSnippetSQL())] {
                 let t0 = Date()
                 try run(sql)
                 log(String(format: "  %@ %6.1fs", label.padding(toLength: 16, withPad: " ", startingAt: 0),
@@ -285,7 +280,6 @@ extension MigrationV5Runner {
 
         out.contents = num("SELECT COUNT(*) FROM chunk")
         out.occurrences = num("SELECT COUNT(*) FROM occurrence")
-        out.freeSlots = num("SELECT COUNT(*) FROM free_slot")
         out.seconds = -start.timeIntervalSinceNow
         return out
     }
@@ -293,7 +287,4 @@ extension MigrationV5Runner {
     private static func buildChunkSQL() -> String { MigrationV5.buildChunkSQL() }
     private static func buildOccurrenceSQL() -> String { MigrationV5.buildOccurrenceSQL() }
     private static func buildSnippetSQL() -> String { MigrationV5.buildSnippetSQL() }
-    private static func buildFreeListSQL(highWater: Int64) -> String {
-        MigrationV5.buildFreeListSQL(highWater: highWater)
-    }
 }

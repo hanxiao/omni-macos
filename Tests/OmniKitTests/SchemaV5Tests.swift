@@ -119,17 +119,20 @@ final class SchemaV5Tests: XCTestCase {
         XCTAssertTrue(plan.contains("idx_occ_chunk"), "reverse edge is not using its index: \(plan)")
     }
 
-    func testTheFreeListIsDerivable() {
-        // The free list is a cache of a fact SQLite already holds: the ids below the high-water mark
-        // with no chunk row. It has to be reconcilable, because a leaked slot is invisible.
-        for id in [1, 2, 5] {
-            XCTAssertTrue(exec("INSERT OR REPLACE INTO chunk(id, key, kind, refs) VALUES(\(id), x'0\(id)', 0, 1);"))
+    func testTheFreeSetIsDerivable() {
+        // THERE IS NO `free_slot` TABLE, and this is what replaced the test of one: the free set
+        // is a fact SQLite already holds - the positions below the high-water mark that no
+        // content owns - so it is derived on demand and never stored. A stored copy can go
+        // stale; this cannot, and a leaked position is invisible, which is why it matters.
+        for (id, slot) in [(1, 1), (2, 2), (3, 5)] {
+            XCTAssertTrue(exec("INSERT OR REPLACE INTO chunk(id, key, kind, refs, slot) "
+                               + "VALUES(\(id), x'0\(id)', 0, 1, \(slot));"))
         }
-        XCTAssertTrue(exec("INSERT INTO free_slot(id) VALUES(3),(4);"))
-        let derived = count("""
-            SELECT COUNT(*) FROM (SELECT 3 AS id UNION SELECT 4)
-            WHERE id NOT IN (SELECT id FROM chunk)
+        // High-water 6, owned {1,2,5}, so free is {0,3,4}.
+        let free = count("""
+            WITH RECURSIVE r(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM r WHERE i < 5)
+            SELECT COUNT(*) FROM r WHERE i NOT IN (SELECT slot FROM chunk WHERE slot >= 0)
             """)
-        XCTAssertEqual(derived, count("SELECT COUNT(*) FROM free_slot"))
+        XCTAssertEqual(free, 3)
     }
 }

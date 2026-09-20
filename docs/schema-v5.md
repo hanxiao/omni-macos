@@ -115,9 +115,11 @@ late and both are recorded under "What the final audit changed" below.
     occurrence(id, file_id, ordinal, chunk_id, locator)   -- WHERE it occurs. The pointer.
                                              -- UNIQUE(file_id, ordinal)
     chunk_snippet(chunk_id, kind, snippet)   -- cold payload, split for the same reason v4 split it
-    free_slot(id)                            -- positions nobody owns
 
     files(..., indexed_at, first_indexed_at) -- LAST and FIRST indexed, two stamps
+
+THERE IS NO `free_slot` TABLE. The sketch had one and it was built, filled and maintained for
+weeks before the audit noticed nothing ever SELECTed it - see "What the final audit changed".
 
 IDENTITY AND POSITION ARE SEPARATE COLUMNS. The sketch had `chunk.id` BE the slot, which is the
 same conflation v4 had between a row index and a position and is what every defect in this
@@ -898,10 +900,9 @@ compatibility paths to read both layouts in between.
 Which means the target is not "chunk_text dropped". It is the shape at the top of this document,
 and `chunks` is as redundant in it as `chunk_text` is:
 
-    chunk(id, key UNIQUE, kind, bytes, refs, slot)     identity, and where its vector sits
-    occurrence(file_id, ordinal, chunk_id, locator)    THE ROW TABLE
+    chunk(id, key UNIQUE, kind, refs, slot)            identity, and where its vector sits
+    occurrence(id, file_id, ordinal, chunk_id, locator) THE ROW TABLE
     chunk_snippet(chunk_id, kind, snippet)             cold payload
-    free_slot(id)                                      positions nobody owns
     pending_vecs(chunk_id, vec)                        keyed on the CONTENT, not the row
     files, dirs, vec_holes, meta                       unchanged
 
@@ -987,14 +988,16 @@ releasing.
      So step 4 is: one freed-position list rather than two, the loader gate moved onto the split,
      and only then the fold's own code removed.
 
-     WHAT SHIPPED IS NOT "ONE LIST", and the difference is worth stating plainly rather than
-     leaving this paragraph to read as a description of the result. `free_slot` and `vec_holes`
-     have DIFFERENT DOMAINS: `free_slot` may name a position past the covered prefix, while a
-     hole is defined only inside it. Merging them would mean picking one domain and losing the
-     other. They are reconciled by DERIVATION instead - `deriveUnownedPositionsAsHolesLocked`
-     reads the positions no content owns below coverage straight off `chunk.slot` on the first
-     open that reads the split, so nothing has to be accumulated by the build and an interrupted
-     build carries no bookkeeping to be wrong about.
+     WHAT SHIPPED IS ONE LIST BECAUSE THE OTHER ONE IS GONE, which is not how this paragraph
+     imagined getting there. `free_slot` and `vec_holes` have DIFFERENT DOMAINS - `free_slot` may
+     name a position past the covered prefix, a hole is defined only inside it - so merging them
+     would have meant picking one domain and losing the other. What the audit found instead is
+     that `free_slot` had no reader at all: the resident allocator derives the free set from the
+     live rows, and the durable half the reclaim needs is `vec_holes`. So the table is deleted
+     and the freed positions are DERIVED - `deriveUnownedPositionsAsHolesLocked` reads the
+     positions no content owns below coverage straight off `chunk.slot` on the first open that
+     reads the split. Nothing is accumulated by the build, so an interrupted build carries no
+     bookkeeping to be wrong about.
 
      AND ONE THING AHEAD OF ALL OF IT, found by measuring rather than reading. The build ran
      inside `queue.sync`, so it held the one queue every search goes through for its whole
@@ -1368,7 +1371,9 @@ What is NOT yet known is why, and two of the three obvious answers are already e
   - The early return was the best guess and it is wrong: that branch returns anyway, so a
     successful build only defers the fold and the reclaim by one stamp.
   - `free_slot`, the one table the build fills that nothing else writes, is read by no runtime
-    path at all - only by the migration's own invariants.
+    path at all - only by the migration's own invariants. (THAT OBSERVATION WAS RIGHT AND ITS
+    CONCLUSION WAS TOO NARROW: written here as "so it cannot be the cause", it is also the whole
+    case for the table not existing, which took another pass to see. It is gone now.)
   - Triggering the build THROUGH THE STAMP in the fast accounting test does not reproduce it
     either. That test now does exactly that and passes.
 
@@ -1747,3 +1752,26 @@ the schema was still free to change. That is the only reason this was cheap.
   failed with "error in table files after drop column: incomplete input". No shipped path drops a
   column here - it was a test fixture that found it - but a table that cannot be altered is a trap
   to leave for nobody, and `files` was the only DDL in the schema with comments inside it.
+
+- `free_slot` DELETED, the table. It was in the sketch at the top of this document, it was built
+  by the migration with 3,770,848 rows on the real index, it was maintained by every delete and
+  by the shared-slot reclaim - and nothing ever SELECTed it. The resident allocator
+  (`ensureFreeSlotsLocked`) derives the free set from the live rows, which is the copy that
+  cannot go stale; the durable half the whole-file reclaim needs is `vec_holes`. So the table was
+  a second source of truth for something derivable, which is the thing this document warns about
+  under the reclaim's remap table, and it was costing a `DELETE` per claimed position on the
+  write path.
+
+  THIS WAS VISIBLE IN THE DOCUMENT BEFORE IT WAS ACTED ON. "free_slot, the one table the build
+  fills that nothing else writes, is read by no runtime path at all" was written as an argument
+  that it could not be the cause of a different bug. It is also the whole case for deleting it,
+  and that reading took another pass.
+
+  TWO INVARIANTS WENT WITH IT AND NEITHER COULD EVER HAVE FAILED. "live and free slots exactly
+  cover the file" and "no slot is both owned and free" were both written against a table built
+  by `buildFreeListSQL` as exactly the complement of the owned set, so each compared that
+  statement with itself - this document already records the consequence, that a deliberately
+  wrong high-water mark "does not fail any invariant". What they were reaching for is now two
+  real checks: "no content points past the end of the vector file", which a wrong mark in the
+  dangerous direction does fail, and "no position is owned twice", which was already there.
+  `MigrationV5Tests` breaks the index both ways and asserts the invariants catch it.

@@ -54,7 +54,6 @@ sqlite3 -readonly "$W/index.sqlite" "
   UNION ALL SELECT 'chunk       ' || COUNT(*) FROM chunk
   UNION ALL SELECT 'occurrence  ' || COUNT(*) FROM occurrence
   UNION ALL SELECT 'snippet     ' || COUNT(*) FROM chunk_snippet
-  UNION ALL SELECT 'free_slot   ' || COUNT(*) FROM free_slot
   UNION ALL SELECT 'vec_holes   ' || COUNT(*) FROM vec_holes
   UNION ALL SELECT 'user_version' || ' ' || (SELECT * FROM pragma_user_version);" 2>&1
 echo "=== migration markers"

@@ -1969,6 +1969,12 @@ public final class VectorStore: @unchecked Sendable {
                 exec("DELETE FROM meta WHERE key = '\(Self.chunkSplitDoneKey)';")
                 exec("DELETE FROM meta WHERE key = '\(Self.pendingOnContentKey)';")
             }
+            // `free_slot` WAS A TABLE AND IS NOT ONE ANY MORE. It was written by the migration
+            // and by every delete and SELECTed by nothing but the migration's own invariants -
+            // the resident allocator derives the free set from the live rows, which is the copy
+            // that cannot go stale. Dropped where it is found so no index carries it; only
+            // unreleased builds ever created one.
+            if hasTableLocked("free_slot") { exec("DROP TABLE IF EXISTS free_slot;") }
             if hasTableLocked("chunk"), !hasColumnLocked("chunk", "slot") {
                 exec("DROP INDEX IF EXISTS idx_chunk_key;")
                 exec("DROP INDEX IF EXISTS idx_chunk_slot_v5;")
@@ -7953,7 +7959,7 @@ public final class VectorStore: @unchecked Sendable {
         // having a live row. `coverageAudit`'s definition of a hole is exactly that, so without
         // this the very next stamp reports "position N inside coverage has no live row and no
         // recorded hole" and the index refuses. It is also what hands the space back: the
-        // reclaim reads `vec_holes`, and the build only wrote `free_slot`.
+        // reclaim reads `vec_holes`, which the build does not write.
         //
         // DERIVED FROM THE COLUMN, not accumulated by the build, for the same reason the fold
         // derives its own: it then does not matter how many sessions the build spanned or where
@@ -8378,7 +8384,7 @@ public final class VectorStore: @unchecked Sendable {
                 //
                 // AND WHAT THE POINTERS ORPHAN GOES WITH THEM. Deleting occurrences alone leaves the
                 // contents they named with a refcount nobody will ever correct: their positions never
-                // reach `free_slot`, their staged vectors are never covered and never cleared, and
+                // released, their staged vectors are never covered and never cleared, and
                 // the coverage identity - staged blobs against contents that owe one - then fails for
                 // the life of the index. Spelled out rather than routed through the store's own
                 // removal because this path has no store.
@@ -8389,10 +8395,6 @@ public final class VectorStore: @unchecked Sendable {
                 """
                 UPDATE chunk SET refs = (SELECT COUNT(*) FROM occurrence o WHERE o.chunk_id = chunk.id)
                  WHERE id IN (SELECT chunk_id FROM repair_aff);
-                """,
-                """
-                INSERT OR IGNORE INTO free_slot(id)
-                SELECT slot FROM chunk WHERE id IN (SELECT chunk_id FROM repair_aff) AND refs = 0 AND slot >= 0;
                 """,
                 "DELETE FROM chunk_snippet WHERE chunk_id IN (SELECT id FROM chunk WHERE refs = 0"
                     + " AND id IN (SELECT chunk_id FROM repair_aff));",
@@ -8629,10 +8631,11 @@ public final class VectorStore: @unchecked Sendable {
         // one content each, so on the first open that reads `occurrence` there are 3.77M
         // positions on the measured index that no live row points at - by design, they are the
         // win - and `coverageAudit` calls every one of them breakage until they are recorded.
-        // This is the other half of the "one freed-position list, not two" the split needs:
-        // the build writes `free_slot`, which only the allocator reads, and the reclaim reads
-        // `vec_holes`. Without this the space the split frees is never given back and the index
-        // refuses to open besides.
+        // This is the "one freed-position list" the split needs, and it is DERIVED rather than
+        // accumulated: the build records nothing, so an interrupted build carries no bookkeeping
+        // to be wrong about, and the positions no content owns below coverage are read straight
+        // off `chunk.slot` here. Without this the space the split frees is never given back and
+        // the index refuses to open besides.
         let onSplit = splitBuilt && residentIDsAreContents
         if !onSplit {
             guard let mark = metaGetLocked(Self.contentFoldMarkKey), !mark.isEmpty,
@@ -9389,10 +9392,8 @@ public final class VectorStore: @unchecked Sendable {
             -- underneath it - but only if something actually renumbers it. Missing this made the
             -- maintained split disagree with a rebuild on every slot while agreeing on every key
             -- and every refcount, which is exactly what the equivalence test caught.
-            -- Free slots are positions as well, and are renumbered through the same map.
             UPDATE chunk SET slot = (SELECT r FROM slot_rank WHERE slot_rank.slot = chunk.slot)
              WHERE slot >= 0 AND EXISTS (SELECT 1 FROM slot_rank WHERE slot_rank.slot = chunk.slot);
-            DELETE FROM free_slot;
             DELETE FROM slot_rank;
             """)
     }
@@ -12769,7 +12770,7 @@ public final class VectorStore: @unchecked Sendable {
     /// The bulk deletes - a folder, a whole kind - name thousands of files through a temp table or
     /// a predicate, and spelling the removal a second time inline is how three of them ended up
     /// deleting `occurrence` rows and nothing else: the refcount was never recomputed, so the
-    /// contents they orphaned kept `refs > 0` for ever, their positions never reached `free_slot`,
+    /// contents they orphaned kept `refs > 0` for ever, their positions were never released,
     /// and `chunk` / `chunk_snippet` grew rows that nothing could reach. Silent, and only visible
     /// as a vector file that stops shrinking.
     func dropSplitWhereLocked(fileIDs: String) {
@@ -12791,10 +12792,6 @@ public final class VectorStore: @unchecked Sendable {
         exec("""
             UPDATE chunk SET refs = (SELECT COUNT(*) FROM occurrence o WHERE o.chunk_id = chunk.id)
              WHERE id IN (SELECT chunk_id FROM split_aff);
-            """)
-        exec("""
-            INSERT OR IGNORE INTO free_slot(id)
-            SELECT slot FROM chunk WHERE id IN (SELECT chunk_id FROM split_aff) AND refs = 0 AND slot >= 0;
             """)
         exec("DELETE FROM chunk_snippet WHERE chunk_id IN "
              + "(SELECT chunk_id FROM split_aff WHERE chunk_id IN (SELECT id FROM chunk WHERE refs = 0));")
@@ -13194,7 +13191,7 @@ public final class VectorStore: @unchecked Sendable {
                     }
                     FileHandle.standardError.write(Data(
                         ("[omni] chunk split built off-queue: \(r.contents) contents, "
-                         + "\(r.occurrences) occurrences, \(r.freeSlots) free, "
+                         + "\(r.occurrences) occurrences, "
                          + String(format: "%.1f", r.seconds) + "s\n").utf8))
                 }
             } catch {
@@ -13205,7 +13202,7 @@ public final class VectorStore: @unchecked Sendable {
                 self?.queue.sync {
                     guard let self, self.dbOpen() else { return }
                     self.exec("DELETE FROM occurrence;"); self.exec("DELETE FROM chunk;")
-                    self.exec("DELETE FROM chunk_snippet;"); self.exec("DELETE FROM free_slot;")
+                    self.exec("DELETE FROM chunk_snippet;")
                     self.exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.chunkSplitDoneKey)', '0');")
                     // The contents are gone, so no blob can be addressed by one. The publish is
                     // the only place that sets this and it never ran, but a build that FAILED
@@ -13275,7 +13272,7 @@ public final class VectorStore: @unchecked Sendable {
                 exec("DROP TABLE IF EXISTS temp.pv_inv;")
             }
             exec("DELETE FROM occurrence;"); exec("DELETE FROM chunk;")
-            exec("DELETE FROM chunk_snippet;"); exec("DELETE FROM free_slot;")
+            exec("DELETE FROM chunk_snippet;")
             exec("DELETE FROM meta WHERE key = '\(Self.chunkSplitDoneKey)';")
             exec("DELETE FROM meta WHERE key = '\(Self.pendingOnContentKey)';")
             splitBuilt = false
@@ -13625,8 +13622,6 @@ public final class VectorStore: @unchecked Sendable {
                 let list = splitDirtyContents.map(String.init).joined(separator: ",")
                 exec("UPDATE chunk SET refs = (SELECT COUNT(*) FROM occurrence o WHERE o.chunk_id = chunk.id) "
                      + "WHERE id IN (\(list));")
-                exec("DELETE FROM free_slot WHERE id IN "
-                     + "(SELECT slot FROM chunk WHERE id IN (\(list)) AND refs > 0 AND slot >= 0);")
                 splitDirtyContents.removeAll(keepingCapacity: true)
             }
         }
@@ -13760,7 +13755,6 @@ public final class VectorStore: @unchecked Sendable {
         guard slot >= 0 else { return }
         if vecHoles.remove(slot) != nil { exec("DELETE FROM vec_holes WHERE slot = \(slot);") }
         if Self.freeListEnabled, freeSlotsValid { freeSlots.claim(Int(slot)) }
-        exec("DELETE FROM free_slot WHERE id = \(slot);")
     }
 
     /// The file row, created or refreshed. THIS is where the watcher's common case got cheap: a
