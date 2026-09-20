@@ -147,9 +147,9 @@ final class FreeListTests: XCTestCase {
         // nothing else can read the index. The property this test is about, "an index that never
         // reused does not pay a slow open", is the row sidecar's job there, and
         // ChunkSplitLoaderTests is where it is asserted.
-        let savedSplitHere = VectorStore.chunkSplit
-        VectorStore.chunkSplit = false
-        defer { VectorStore.chunkSplit = savedSplitHere }
+        let savedSplitHere = VectorStore.legacyWriteForTest
+        VectorStore.legacyWriteForTest = true
+        defer { VectorStore.legacyWriteForTest = savedSplitHere }
         VectorStore.quantBaseOverride = VectorStore.scanBits
         let url = tempDB()
         do {
@@ -223,9 +223,9 @@ final class FreeListTests: XCTestCase {
         // a state no user can reach. Left on, the split arm declares the backfill done at open -
         // correctly, there is nothing to fill - and this test measures the absence of its own
         // subject.
-        let savedSplitHere = VectorStore.chunkSplit
-        VectorStore.chunkSplit = false
-        defer { VectorStore.chunkSplit = savedSplitHere }
+        let savedSplitHere = VectorStore.legacyWriteForTest
+        VectorStore.legacyWriteForTest = true
+        defer { VectorStore.legacyWriteForTest = savedSplitHere }
         VectorStore.quantBaseOverride = VectorStore.scanBits
         let url = tempDB()
         do {

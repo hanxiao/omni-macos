@@ -27,11 +27,11 @@ final class ChunkSplitLoaderTests: XCTestCase {
     override func setUp() {
         super.setUp()
         savedSharing = VectorStore.contentSharing
-        savedSplit = VectorStore.chunkSplit
+        savedSplit = VectorStore.legacyWriteForTest
         savedFreeList = VectorStore.freeListEnabled
         savedQuant = VectorStore.quantBaseOverride
         VectorStore.contentSharing = true
-        VectorStore.chunkSplit = true
+        VectorStore.legacyWriteForTest = false
         // COVERAGE ONLY ADVANCES INTO A NAMED VECTOR FILE, and below the quant crossover the
         // buffer is an unlinked scratch mapping - so on a fixture this size `coveredRows` stays
         // 0 for ever and every claim about holes, sidecars and the reclaim is vacuously true.
@@ -47,7 +47,7 @@ final class ChunkSplitLoaderTests: XCTestCase {
     }
     override func tearDown() {
         VectorStore.contentSharing = savedSharing
-        VectorStore.chunkSplit = savedSplit
+        VectorStore.legacyWriteForTest = savedSplit
         VectorStore.freeListEnabled = savedFreeList
         VectorStore.quantBaseOverride = savedQuant
         VectorStore.holeReclaimFractionOverride = savedFraction
@@ -100,7 +100,7 @@ final class ChunkSplitLoaderTests: XCTestCase {
     /// therefore something for the loader to get wrong.
     @discardableResult
     private func writeV4Fixture(_ url: URL, files: Int, dupEvery: Int) throws -> Int {
-        let savedSplit = VectorStore.chunkSplit
+        let savedSplit = VectorStore.legacyWriteForTest
         let savedShare = VectorStore.contentSharing
         // SHARING OFF TOO, and that is the whole point of the fixture rather than a detail.
         // With sharing ON the duplicates never get a position of their own, so the split has
@@ -108,9 +108,9 @@ final class ChunkSplitLoaderTests: XCTestCase {
         // every claim below about freed space was vacuously true. An index that PREDATES content
         // addressing is the one with 48 positions for 28 contents, and it is the only index an
         // existing user can be upgrading from.
-        VectorStore.chunkSplit = false
+        VectorStore.legacyWriteForTest = true
         VectorStore.contentSharing = false
-        defer { VectorStore.chunkSplit = savedSplit; VectorStore.contentSharing = savedShare }
+        defer { VectorStore.legacyWriteForTest = savedSplit; VectorStore.contentSharing = savedShare }
         let store = try VectorStore(dbURL: url)
         for i in 0 ..< files {
             let p = "/v4/f\(i).txt"
@@ -191,12 +191,12 @@ final class ChunkSplitLoaderTests: XCTestCase {
         try writeV4Fixture(url, files: 16, dupEvery: 4)
         // A sidecar written by the v4 session, before the split exists.
         do {
-            let saved = VectorStore.chunkSplit
-            VectorStore.chunkSplit = false
+            let saved = VectorStore.legacyWriteForTest
+            VectorStore.legacyWriteForTest = true
             let store = try VectorStore(dbURL: url)
             store.stampRowSidecarForTest()
             store.close()
-            VectorStore.chunkSplit = saved
+            VectorStore.legacyWriteForTest = saved
         }
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path + ".rows"),
                       "no sidecar was written, so the rejection cannot be observed")
@@ -289,8 +289,8 @@ final class ChunkSplitLoaderTests: XCTestCase {
         let savedCoverage = VectorStore.vecCoverage
         VectorStore.vecCoverage = false
         defer { VectorStore.vecCoverage = savedCoverage }
-        let saved = VectorStore.chunkSplit
-        VectorStore.chunkSplit = false
+        let saved = VectorStore.legacyWriteForTest
+        VectorStore.legacyWriteForTest = true
         do {
             let store = try VectorStore(dbURL: url)
             for i in 0 ..< 12 {
@@ -308,7 +308,7 @@ final class ChunkSplitLoaderTests: XCTestCase {
             store.migrateSlotsToCompletion()
             store.close()
         }
-        VectorStore.chunkSplit = saved
+        VectorStore.legacyWriteForTest = saved
         // NOT covered: every vector is still staged, which is the state the rekey has to survive.
         XCTAssertEqual(num(url, "SELECT COUNT(*) FROM pending_vecs"), 24)
         try {
@@ -439,7 +439,6 @@ final class ChunkSplitLoaderTests: XCTestCase {
     /// id space. The row COUNTS are deliberately not compared - under the cutover new writes add
     /// occurrences and no v4 rows, so the two diverge from the first write.
     func testTheV4TablesAreDroppedAndTheIndexStillWorks() throws {
-        try XCTSkipUnless(VectorStore.splitCutover, "the drop is what the cutover is for")
         let url = tempDB()
         try writeV4Fixture(url, files: 20, dupEvery: 5)
         try migrate(url)
@@ -476,7 +475,6 @@ final class ChunkSplitLoaderTests: XCTestCase {
     /// statement left behind there does not degrade the write path, it stops it: every
     /// `replace()` throws and nothing is ever indexed again.
     func testWritesAndDeletesWorkWithNoV4Tables() throws {
-        try XCTSkipUnless(VectorStore.splitCutover, "the drop is what the cutover is for")
         let url = tempDB()
         try writeV4Fixture(url, files: 16, dupEvery: 4)
         try migrate(url)
@@ -521,7 +519,6 @@ final class ChunkSplitLoaderTests: XCTestCase {
     /// IT REFUSES WHEN IT CANNOT PROVE ITSELF. A v4 row with no occurrence is a row whose text
     /// and locator exist nowhere else, and dropping the table would lose it silently.
     func testTheDropRefusesWhenAV4RowHasNoOccurrence() throws {
-        try XCTSkipUnless(VectorStore.splitCutover, "the drop is what the cutover is for")
         let url = tempDB()
         try writeV4Fixture(url, files: 12, dupEvery: 3)
         try migrate(url)

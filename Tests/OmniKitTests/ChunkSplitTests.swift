@@ -18,14 +18,14 @@ final class ChunkSplitTests: XCTestCase {
     override func setUp() {
         super.setUp()
         savedSharing = VectorStore.contentSharing
-        savedSplit = VectorStore.chunkSplit
+        savedSplit = VectorStore.legacyWriteForTest
         savedQuant = VectorStore.quantBaseOverride
         VectorStore.contentSharing = true
-        VectorStore.chunkSplit = true
+        VectorStore.legacyWriteForTest = false
     }
     override func tearDown() {
         VectorStore.contentSharing = savedSharing
-        VectorStore.chunkSplit = savedSplit
+        VectorStore.legacyWriteForTest = savedSplit
         VectorStore.quantBaseOverride = savedQuant
         super.tearDown()
     }
@@ -55,10 +55,10 @@ final class ChunkSplitTests: XCTestCase {
     /// fixture with the split OFF and reopening with it ON is not a workaround - it is exactly
     /// the shape of an existing user's upgrade, which is what this suite is about.
     private func build(_ url: URL, files: Int, dupEvery: Int) throws -> VectorStore {
-        let saved = VectorStore.chunkSplit
-        VectorStore.chunkSplit = false
+        let saved = VectorStore.legacyWriteForTest
+        VectorStore.legacyWriteForTest = true
         try writeFixture(url, files: files, dupEvery: dupEvery)
-        VectorStore.chunkSplit = saved
+        VectorStore.legacyWriteForTest = saved
         let store = try VectorStore(dbURL: url)
         store.migrateSlotsToCompletion()
         return store
@@ -142,7 +142,7 @@ final class ChunkSplitTests: XCTestCase {
         let url = tempDB()
         var v4: [String: [String: String]] = [:]
 
-        VectorStore.chunkSplit = false
+        VectorStore.legacyWriteForTest = true
         do {
             let store = try build(url, files: 30, dupEvery: 3)
             defer { store.close() }
@@ -150,7 +150,7 @@ final class ChunkSplitTests: XCTestCase {
             XCTAssertFalse(v4.isEmpty, "the fixture returned no hits, so it proves nothing")
         }
 
-        VectorStore.chunkSplit = true
+        VectorStore.legacyWriteForTest = false
         do {
             let store = try VectorStore(dbURL: url)
             XCTAssertTrue(store.buildChunkSplitForTest(), "the split did not build")
@@ -181,65 +181,19 @@ final class ChunkSplitTests: XCTestCase {
         return out
     }
 
-    /// THE QUESTION A MIGRATION CANNOT ANSWER: can the WRITE PATH keep the split correct?
+    /// THE REBUILD COMPARISON IS GONE WITH THE TABLE IT REBUILT FROM.
     ///
-    /// Building the split once from v4 tables is proven. What that says nothing about is whether
-    /// adds, edits and deletes afterwards leave it equal to what a fresh build would produce. This
-    /// churns the store and then compares the incrementally-maintained tables against a rebuild
-    /// from the same v4 rows, row for row.
-    func testTheWritePathKeepsTheSplitEqualToARebuild() throws {
-        // ONLY MEANINGFUL BEFORE THE CUTOVER. It works by rebuilding the split FROM v4 and
-        // comparing, so once the write path stops maintaining v4 there is nothing to rebuild
-        // from - the rebuild returns empty and the comparison fails for a reason that is not a
-        // defect. After the cutover the split answers for itself, which is
-        // testTheSplitStaysSelfConsistentAfterTheCutover.
-        try XCTSkipIf(VectorStore.splitCutover, "the cutover removes the v4 side of this comparison")
-        let url = tempDB()
-        let store = try build(url, files: 40, dupEvery: 4)
-        XCTAssertTrue(store.buildChunkSplitForTest(), "the split did not build")
+    /// `testTheWritePathKeepsTheSplitEqualToARebuild` churned the store and then rebuilt the
+    /// split from the v4 rows to compare row for row. That was the safety net the split was
+    /// developed behind, and step 7 removes what it compared against: with `chunks` dropped
+    /// there is nothing to rebuild from, and the test would compare against empty tables and
+    /// fail for a reason that is not a defect.
+    ///
+    /// It is DELETED rather than skipped, because there is no longer an arm in which it can
+    /// run. What replaces it is `testTheSplitStaysSelfConsistentAfterTheCutover` below, which
+    /// asks the question the other way round: the split has to answer for itself, because
+    /// nothing else can answer for it.
 
-        // Churn: new files, edits that change content, edits that keep it, and deletes.
-        for i in 0 ..< 12 {
-            let p = "/new/f\(i).txt"
-            try store.replace(path: p, chunks: [
-                IndexedChunk(path: p, modified: 1, size: 10, kind: "text", chunkIndex: 0,
-                             snippet: "new \(i)", embedding: vec(5000 + i), locator: "Line 1",
-                             chunkKey: String(format: "%016x", 5000 + i)),
-                // Deliberately a key an existing file already carries, so refs must go UP.
-                IndexedChunk(path: p, modified: 1, size: 10, kind: "text", chunkIndex: 1,
-                             snippet: "shared \(7 + i % 4)", embedding: vec(7 + i % 4),
-                             locator: "Line \(200 + i)", chunkKey: String(format: "%016x", 7 + i % 4)),
-            ])
-        }
-        for i in stride(from: 0, to: 40, by: 3) { store.deletePath("/v4/f\(i).txt") }
-        for i in [1, 4, 7] {
-            let p = "/v4/f\(i).txt"
-            try store.replace(path: p, chunks: [
-                IndexedChunk(path: p, modified: 2, size: 10, kind: "text", chunkIndex: 0,
-                             snippet: "edited \(i)", embedding: vec(9000 + i), locator: "Line 1",
-                             chunkKey: String(format: "%016x", 9000 + i)),
-            ])
-        }
-        store.migrateSlotsToCompletion()
-        let maintained = splitRows(store)
-        store.close()
-
-        // Rebuild from the v4 tables the same write path produced, and demand the same answer.
-        let rebuilt = try rebuildSplitForComparison(url)
-        XCTAssertFalse(maintained.occurrences.isEmpty, "the fixture produced no occurrences")
-        XCTAssertEqual(maintained.occurrences, rebuilt.occurrences,
-                       "the maintained occurrences differ from a rebuild")
-        // KEYS, not key@slot. While v4 is authoritative the POSITION is v4's to own - a reopen
-        // re-derives it for every row after deletes, and chasing that from the split would mean
-        // mirroring a renumbering the split does not perform. At cutover the split owns positions
-        // and there is exactly one place they change, so the question disappears. What the write
-        // path owns today, and what this therefore checks, is which contents exist and what points
-        // at them.
-        XCTAssertEqual(maintained.contents.map { String($0.split(separator: "@")[0]) },
-                       rebuilt.contents.map { String($0.split(separator: "@")[0]) },
-                       "the maintained contents differ from a rebuild")
-        XCTAssertEqual(maintained.refs, rebuilt.refs, "refs drifted from the occurrence counts")
-    }
 
     private struct SplitShape: Equatable {
         var occurrences: [String] = []
@@ -426,9 +380,6 @@ final class ChunkSplitTests: XCTestCase {
     /// and once `chunk_text` is gone those writes have nowhere to land at all. An empty database
     /// has nothing to derive, so it is marked built at open and simply starts out v5.
     func testANewIndexIsBornSplitAndNeverWritesAV4TextRow() throws {
-        let cutover = VectorStore.splitCutover
-        VectorStore.splitCutover = true
-        defer { VectorStore.splitCutover = cutover }
 
         let url = tempDB()
         let store = try VectorStore(dbURL: url)
@@ -574,15 +525,12 @@ final class ChunkSplitTests: XCTestCase {
     }
 
     /// AFTER THE CUTOVER THERE IS NOTHING TO COMPARE AGAINST, so the split has to answer for
-    /// itself. With `splitCutover` on the write path stops maintaining chunk_text, which is the
+    /// itself. The write path no longer maintains chunk_text, which is the
     /// whole point and also removes the rebuild-and-compare check that verified the write path.
     /// What replaces it is MigrationV5's own invariants, which need only the split: every
     /// occurrence points at a content that exists, refs equals the pointers that exist, and no
     /// position is owned twice.
     func testTheSplitStaysSelfConsistentAfterTheCutover() throws {
-        let savedCut = VectorStore.splitCutover
-        VectorStore.splitCutover = true
-        defer { VectorStore.splitCutover = savedCut }
 
         let url = tempDB()
         let store = try build(url, files: 30, dupEvery: 3)
@@ -637,8 +585,8 @@ final class ChunkSplitTests: XCTestCase {
         // occurrences from its first row, so an index written that way already has the thing this
         // test is asserting the absence of - and would fail on the write path's output rather
         // than on the build's.
-        let saved = VectorStore.chunkSplit
-        VectorStore.chunkSplit = false
+        let saved = VectorStore.legacyWriteForTest
+        VectorStore.legacyWriteForTest = true
         do {
             let old = try VectorStore(dbURL: url)
             let p = "/a.txt"
@@ -648,7 +596,7 @@ final class ChunkSplitTests: XCTestCase {
             ])
             old.close()
         }
-        VectorStore.chunkSplit = saved
+        VectorStore.legacyWriteForTest = saved
 
         let store = try VectorStore(dbURL: url)
         // GENUINELY UNSEATED, not merely unflagged. Clearing the flag alone leaves every row with
@@ -708,15 +656,15 @@ final class ChunkSplitAccountingTests: XCTestCase {
     override func setUp() {
         super.setUp()
         savedSharing = VectorStore.contentSharing
-        savedSplit = VectorStore.chunkSplit
+        savedSplit = VectorStore.legacyWriteForTest
         savedQuant = VectorStore.quantBaseOverride
         VectorStore.contentSharing = true
-        VectorStore.chunkSplit = ProcessInfo.processInfo.environment["OMNI_DIAG_NOSPLIT"] != "1"
+        VectorStore.legacyWriteForTest = ProcessInfo.processInfo.environment["OMNI_DIAG_NOSPLIT"] == "1"
         VectorStore.quantBaseOverride = VectorStore.scanBits
     }
     override func tearDown() {
         VectorStore.contentSharing = savedSharing
-        VectorStore.chunkSplit = savedSplit
+        VectorStore.legacyWriteForTest = savedSplit
         VectorStore.quantBaseOverride = savedQuant
         super.tearDown()
     }
@@ -770,7 +718,7 @@ final class ChunkSplitAccountingTests: XCTestCase {
         // THROUGH THE STAMP, not by calling the build directly. That is the one difference
         // between this test, which passed, and MutationLifecycleTests, which did not - and
         // disabling the stamp's call to the build is what made the lifecycle test pass.
-        if VectorStore.chunkSplit {
+        if true {
             for _ in 0 ..< 30 {
                 store.stampCoverageForTest()
                 if store.splitSlotsForTest().count > 0 { break }

@@ -120,11 +120,11 @@ final class SchemaV4MigrationTests: XCTestCase {
     /// The UPGRADE itself must run with the flags as the arm set them, so this wraps only the
     /// writing.
     private func writtenByAnOldBinary<T>(_ body: () throws -> T) rethrows -> T {
-        let savedSplit = VectorStore.chunkSplit
-        let savedCutover = VectorStore.splitCutover
-        VectorStore.chunkSplit = false
-        VectorStore.splitCutover = false
-        defer { VectorStore.chunkSplit = savedSplit; VectorStore.splitCutover = savedCutover }
+        let savedSplit = VectorStore.legacyWriteForTest
+        
+        VectorStore.legacyWriteForTest = true
+        VectorStore.legacyWriteForTest = true
+        defer { VectorStore.legacyWriteForTest = savedSplit; VectorStore.legacyWriteForTest = false }
         return try body()
     }
 

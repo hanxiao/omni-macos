@@ -31,7 +31,7 @@ M=${OMNI_MODEL_DIR:-/Volumes/han2tb/ai-models/jinaai/jina-embeddings-v5-omni-nan
 W=${OMNI_KILL_WORK:-/Volumes/han2tb/killsplit}
 V=./.build/release/omni-verify
 T=./.build/release/opentime
-export OMNI_CHUNK_SPLIT=1 OMNI_SPLIT_CUTOVER=1 OMNI_FREE_LIST=1
+export OMNI_FREE_LIST=1
 
 for f in "$V" "$T"; do
   [ -x "$f" ] || { echo "missing $f - swift build -c release --product omni-verify --product opentime"; exit 2; }

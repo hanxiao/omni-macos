@@ -32,7 +32,7 @@ for f in "$SRC"/*; do cp -c "$f" "$W/"; done
 : > "$LOG"
 echo "[drive] index $(ls -la "$W/index.sqlite" | awk '{printf "%.2f GB", $5/1073741824}') at $W"
 
-OMNI_CHUNK_SPLIT=${OMNI_CHUNK_SPLIT:-} OMNI_FREE_LIST=${OMNI_FREE_LIST:-} \
+OMNI_FREE_LIST=${OMNI_FREE_LIST:-} \
   "$APP" -omni.dbDir "$W" -omni.stderrFile "$LOG" -omni.ephemeralUIState YES \
          -omni.serving.enabled NO -omni.query "invoice" >/dev/null 2>&1 &
 APPPID=$!

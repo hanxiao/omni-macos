@@ -18,7 +18,7 @@ echo "cloned $(ls -la "$W/index.sqlite" | awk '{printf "%.2f GB", $5/1073741824}
 pkill -x Omni 2>/dev/null || true; sleep 2
 # TEST_RUNNER_ is the only prefix xcodebuild forwards into the test runner's environment.
 # Feature flags through to the app under test, same prefix rule.
-for k in OMNI_CHUNK_SPLIT OMNI_FREE_LIST OMNI_SPLIT_CUTOVER; do
+for k in OMNI_FREE_LIST; do
   v=$(eval echo \$$k); [ -n "$v" ] && export TEST_RUNNER_$k="$v"
 done
 for k in OMNI_MIGCHAOS_QUIET_SECONDS; do
@@ -38,11 +38,12 @@ grep -inE "error|fail|warn|refus|abandon|unreadable|corrupt|cannot|invalid" "$LO
 
 # WHAT THE RUN ACTUALLY EXERCISED, read off the index before it is thrown away.
 #
-# A chaos run that passes proves nothing about a feature the run never switched on, and both
-# split flags are gated on `chunk_split_backfilled` being set - which happens from the coverage
-# stamp, which YIELDS TO SEARCHES, which is the one thing this suite does continuously. So the
-# arm can be on, the test can pass, and the split can have sat untouched the whole time. That is
-# exactly how OMNI_CHUNK_SPLIT and OMNI_SPLIT_CUTOVER both reported green for weeks.
+# A chaos run that passes proves nothing about a step the run never reached. The split is built
+# from the coverage stamp, which YIELDS TO SEARCHES - the one thing this suite does continuously
+# - so the test can pass with the split untouched the whole time. It did, on the first run of
+# this suite after the loader landed: 408 s of chaos and `chunk_slots_upto` still 0. Give it a
+# quiet period long enough (OMNI_MIGCHAOS_QUIET_SECONDS, 480 on the real index) or this measures
+# v4. That is the same lesson the deleted OMNI_CHUNK_SPLIT flag taught twice.
 echo "=== what the index ended up as"
 sqlite3 -readonly "$W/index.sqlite" "
   SELECT 'chunks      ' || COUNT(*) FROM chunks
@@ -55,16 +56,14 @@ sqlite3 -readonly "$W/index.sqlite" "
 echo "=== migration markers"
 sqlite3 -readonly "$W/index.sqlite" \
   "SELECT key || '=' || value FROM meta WHERE key LIKE 'chunk_%' OR key LIKE 'vecs_%' ORDER BY key;" 2>&1
-if [ "${OMNI_CHUNK_SPLIT:-0}" = "1" ]; then
-  built=$(sqlite3 -readonly "$W/index.sqlite" \
-    "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='chunk_split_backfilled'),0);" 2>/dev/null)
-  if [ "$built" != "1" ]; then
-    echo "=== WARNING: OMNI_CHUNK_SPLIT=1 but the split was never built in this run."
-    echo "    The run exercised v4. Give it longer, or drive fewer searches, before believing it."
-    rc=2
-  else
-    echo "=== the split WAS built and in use for this run"
-  fi
+built=$(sqlite3 -readonly "$W/index.sqlite" \
+  "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='chunk_split_backfilled'),0);" 2>/dev/null)
+if [ "$built" != "1" ]; then
+  echo "=== WARNING: the split was never built in this run."
+  echo "    The run exercised v4. Give it longer, or drive fewer searches, before believing it."
+  rc=2
+else
+  echo "=== the split WAS built and in use for this run"
 fi
 
 # AND THE SESSION AFTER IT, which is new and is the whole of step 5. The chaos run is the
@@ -79,12 +78,10 @@ fi
 V=./.build/release/omni-verify
 if [ -x "$V" ] && [ "${OMNI_CHAOS_REOPEN:-1}" = "1" ]; then
   echo "=== the session AFTER the chaos run"
-  OMNI_CHUNK_SPLIT=${OMNI_CHUNK_SPLIT:-0} OMNI_SPLIT_CUTOVER=${OMNI_SPLIT_CUTOVER:-0} \
-    "$V" storeaudit "$W/index.sqlite" 2>&1 | grep -E "rowTable|failing check|FAIL"
+  "$V" storeaudit "$W/index.sqlite" 2>&1 | grep -E "rowTable|failing check|FAIL"
   M=${OMNI_MODEL_DIR:-/Volumes/han2tb/ai-models/jinaai/jina-embeddings-v5-omni-nano-mlx}
   if [ -d "$M" ]; then
-    OMNI_CHUNK_SPLIT=${OMNI_CHUNK_SPLIT:-0} OMNI_SPLIT_CUTOVER=${OMNI_SPLIT_CUTOVER:-0} \
-      "$V" searchreal "$M" "$W/index.sqlite" 5 2>&1 | grep -E "SEARCHREAL|wrong model"
+    "$V" searchreal "$M" "$W/index.sqlite" 5 2>&1 | grep -E "SEARCHREAL|wrong model"
     echo "    (the pre-migration index answers digest=ba7a13400e714f79)"
   fi
 fi

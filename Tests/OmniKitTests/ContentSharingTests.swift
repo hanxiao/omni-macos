@@ -960,9 +960,9 @@ final class ContentSharingTests: XCTestCase {
         // a state no user can reach. Left on, the split arm declares the backfill done at open -
         // correctly, there is nothing to fill - and this test measures the absence of its own
         // subject.
-        let savedSplitHere = VectorStore.chunkSplit
-        VectorStore.chunkSplit = false
-        defer { VectorStore.chunkSplit = savedSplitHere }
+        let savedSplitHere = VectorStore.legacyWriteForTest
+        VectorStore.legacyWriteForTest = true
+        defer { VectorStore.legacyWriteForTest = savedSplitHere }
         let savedQuant = VectorStore.quantBaseOverride
         let savedSlice = VectorStore.slotBackfillSliceOverride
         VectorStore.quantBaseOverride = VectorStore.scanBits
@@ -1379,11 +1379,9 @@ final class ContentSharingTests: XCTestCase {
         // rather than the branch - which is exactly how it passed on an idle machine and failed on
         // a loaded one.
         Thread.sleep(forTimeInterval: 2.2)
-        // THE FOLD COMES FIRST, and the stamp does one slice of it per call - so a single stamp
-        // gets the reclaim nowhere. That ordering is deliberate (folding turns duplicates into
-        // holes; reclaiming before it is finished rewrites the whole vector file twice), and a
-        // test that wants to reach the reclaim has to respect it.
-        store.foldDuplicatesToCompletion()
+        // THE FOLD USED TO COME FIRST, one slice per stamp, so a test that wanted to reach the
+        // reclaim had to drive it to completion. The pass is gone - the split makes duplicates
+        // unrepresentable - so the stamp goes straight to the reclaim.
         store.stampCoverageForTest()
         // The reclaim runs off the queue, so give it time to land even on a busy machine.
         let deadline = Date().addingTimeInterval(60)

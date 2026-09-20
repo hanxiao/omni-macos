@@ -1976,7 +1976,7 @@ public final class VectorStore: @unchecked Sendable {
             // out from under it.
             let brandNew = !hasTableLocked("chunks") && !hasTableLocked("files")
             var v4Gone = scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.v4DroppedKey)'") == 1
-            if brandNew, Self.chunkSplit, Self.splitCutover, Self.contentSharing { v4Gone = true }
+            if brandNew, Self.contentSharing, !Self.legacyWriteForTest { v4Gone = true }
             for sql in StoreSchema.createStatements(includeV4: !v4Gone) { exec(sql) }
             if v4Gone {
                 exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.v4DroppedKey)', '1');")
@@ -2015,7 +2015,7 @@ public final class VectorStore: @unchecked Sendable {
         // `chunks` MAY NOT EXIST AT ALL under the cutover, where a brand new index is created
         // without it - and `scalarQuery` answers -1 for a missing table, not 0, so the plain
         // count would read "not empty" and a new user would never be born v5.
-        if Self.chunkSplit, Self.contentSharing, !v4BackfillPending, !splitBuilt,
+        if Self.contentSharing, !Self.legacyWriteForTest, !v4BackfillPending, !splitBuilt,
            layoutLocked() == .v4,
            !tableExists("chunks") || scalarQuery("SELECT COUNT(*) FROM chunks") == 0,
            scalarQuery("SELECT COUNT(*) FROM files") == 0,
@@ -2198,7 +2198,7 @@ public final class VectorStore: @unchecked Sendable {
                 // The split keeps `kind` on the CONTENT and on its snippet row, where it is what
                 // makes the media label index partial - so a reclassification has to reach both or
                 // a scanned PDF stays indexed as the kind it was moved out of.
-                if Self.chunkSplit, splitBuilt {
+                if splitBuilt {
                     exec("UPDATE chunk SET kind = \(scanCode) WHERE id IN "
                          + "(SELECT chunk_id FROM occurrence WHERE file_id = \(fid));")
                     exec("UPDATE chunk_snippet SET kind = \(scanCode) WHERE chunk_id IN "
@@ -2278,9 +2278,6 @@ public final class VectorStore: @unchecked Sendable {
             guard let h = db else { closed = true; return }
             sqlite3_finalize(snippetStmt); snippetStmt = nil   // finalize cached stmts before close (F3/F8)
             sqlite3_finalize(dedupStmt); dedupStmt = nil
-            sqlite3_finalize(foldGroupStmt); foldGroupStmt = nil
-            sqlite3_finalize(foldFreedStmt); foldFreedStmt = nil
-            sqlite3_finalize(foldMoveStmt); foldMoveStmt = nil
             // ALL SEVEN, not the five that happened to be here. Any cached statement left stopped
             // at a row holds a read transaction, and the TRUNCATE checkpoint on the next line
             // waits for readers - so one missing finalize is a hang on quit rather than a leak.
@@ -2304,9 +2301,6 @@ public final class VectorStore: @unchecked Sendable {
         sqlite3_finalize(dedupStmt); dedupStmt = nil
         sqlite3_finalize(contentSelStmt); contentSelStmt = nil
         sqlite3_finalize(slotUpdStmt); slotUpdStmt = nil
-        sqlite3_finalize(foldGroupStmt); foldGroupStmt = nil
-        sqlite3_finalize(foldFreedStmt); foldFreedStmt = nil
-        sqlite3_finalize(foldMoveStmt); foldMoveStmt = nil
         sqlite3_exec(h, "PRAGMA wal_checkpoint(TRUNCATE);", nil, nil, nil)
         sqlite3_close(h)
         db = nil
@@ -3490,11 +3484,13 @@ public final class VectorStore: @unchecked Sendable {
             guard Self.vecCoverage, dbOpen(), dim > 0, !rows.isEmpty else { return nil }
             // Once the one-time pass has completed, there is nothing to report ever again: rows
             // added later are covered by the same machinery, but that is indexing, not migrating.
-            // The COVERAGE migration is finished once this flag is set; the fold is a separate
-            // one-time pass with its own flag, and on an index that was migrated before content
-            // addressing existed it is the one still to run.
+            // The COVERAGE migration is finished once this flag is set; the SLOT BACKFILL is a
+            // separate one-time pass with its own watermark, and on an index written before
+            // content addressing it is the one still to run. There used to be a third - the
+            // duplicate fold - and it is gone: the split collapses duplicates by construction,
+            // so there is no pass left to report after the backfill.
             guard scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.migratedKey)'") != 1
-            else { return slotBackfillProgressLocked() ?? foldProgressLocked() }
+            else { return slotBackfillProgressLocked() }
             // AND ONLY WHEN IT CAN ACTUALLY RUN. Coverage advances only into a named vector file,
             // and below the quant crossover the buffer is an unlinked scratch mapping - so
             // `coveredRows` is 0 and stays 0, for as long as the index is small.
@@ -3509,7 +3505,7 @@ public final class VectorStore: @unchecked Sendable {
             // chunks are duplicates it reads 90% forever, having actually finished - the same
             // never-completing bar the two guards above exist to prevent, reintroduced by a unit.
             let total = Self.contentSharing ? slotCount : rows.count
-            guard total > 0, coveredRows < total else { return foldProgressLocked() }
+            guard total > 0, coveredRows < total else { return nil }
             // Each remaining position still has a bf16 blob in SQLite that the vector file holds.
             let remaining = Int64(total - coveredRows) * Int64(dim * MemoryLayout<UInt16>.size)
             return (coveredRows, total, remaining)
@@ -3543,20 +3539,6 @@ public final class VectorStore: @unchecked Sendable {
         return (Swift.max(0, Swift.min(mark, top)), top, 0)
     }
 
-    private func foldProgressLocked() -> (done: Int, total: Int, bytesToReclaim: Int64)? {
-        guard Self.contentFold, Self.contentSharing, dim > 0, !rows.isEmpty else { return nil }
-        guard !contentFoldComplete, slotsBackfilled else { return nil }
-        // PROGRESS IS THE KEY SPACE, which is what the pass actually walks. The watermark is the
-        // last content key it finished, and content keys are a 128-bit digest spread evenly - so
-        // its first two bytes ARE the fraction done, to within the evenness of SHA-256.
-        let mark = foldMarkLocked()
-        let scale = 65_536
-        var done = 0
-        if mark.count >= 2 { done = (Int(mark[mark.startIndex]) << 8) | Int(mark[mark.index(after: mark.startIndex)]) }
-        let folded = contentFoldedCount >= 0 ? contentFoldedCount
-            : scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.contentFoldCountKey)'")
-        return (done, scale, Int64(Swift.max(0, folded)) * Int64(dim * MemoryLayout<UInt16>.size))
-    }
 
     public static func candidateWidth(topK: Int) -> Int { candidateCount(topK: topK) }
 
@@ -7006,14 +6988,30 @@ public final class VectorStore: @unchecked Sendable {
     private var coveredUpToID: Int64 = 0
     /// Set once the `chunks.slot` column has been filled in for every row. See backfillSlotsLocked.
     private static let slotsBackfilledKey = "chunk_slots_backfilled"
-    /// The chunk/occurrence split is BUILT, not yet READ. `chunk` and `occurrence` are filled from
-    /// the v4 tables and their five invariants proven, but every reader is still pointed at
-    /// `chunk_text`. Until they are moved the split costs space rather than saving it, so this
-    /// stays off: `OMNI_CHUNK_SPLIT=1` builds it, for measuring and for the reader work to go
-    /// against something real.
-    nonisolated(unsafe) public static var chunkSplit =
-        ProcessInfo.processInfo.environment["OMNI_CHUNK_SPLIT"] == "1"
+    /// THE LAYOUT, NOT A SETTING. `OMNI_CHUNK_SPLIT` and `OMNI_SPLIT_CUTOVER` are gone, and were
+    /// deleted rather than defaulted: a shipped layout has no switch. What decides anything now
+    /// is whether THIS index has been migrated, which is `chunkSplitDoneKey` and nothing else.
+    ///
+    /// They existed so the split could be built beside v4 and compared to it row for row while
+    /// it was being written. That check cannot run once v4 stops being written, which is exactly
+    /// why the flags had to go in the same release as the migration rather than linger: a lever
+    /// whose off position produces an index this build can no longer read is not an escape
+    /// hatch, it is a way to lose data. See docs/schema-v5.md for what each arm proved.
     private static let chunkSplitDoneKey = "chunk_split_backfilled"
+
+    /// WRITE LIKE AN OLD BINARY, FOR A FIXTURE THAT HAS TO BE ONE.
+    ///
+    /// This is NOT the flag that was deleted wearing another name, and the difference is the
+    /// whole point: there is no environment variable behind it and no shipping path sets it.
+    /// What it exists for is that every migration test needs an index in the shape an existing
+    /// user's is, and the only thing that can write that shape is this store. A test sets it,
+    /// writes its fixture, puts it back, and then opens the result with a normal store - which
+    /// is exactly the sequence an upgrade is.
+    ///
+    /// It suppresses four things, all of them "be v5": creating the index without the v4 tables,
+    /// the born-v5 hook, the native split write, and the build. It does NOT suppress reading the
+    /// split, because a fixture that has one must still be readable.
+    nonisolated(unsafe) public static var legacyWriteForTest = false
     /// HAS THE ONE-WAY TRANSLATION ALREADY RUN. Its only job, and it cannot be inferred: a
     /// staged blob's `chunk_id` is just an integer, and the v4 row space and the content space
     /// are both dense, so "does this id exist in `chunk`" is true of most v4 ids too.
@@ -7031,18 +7029,6 @@ public final class VectorStore: @unchecked Sendable {
     public private(set) var v4Dropped = false
     /// One drop at a time: it walks 9.7M rows to prove itself and then frees 2.6 GB of pages.
     private var v4DropInFlight = false
-    /// THE LAST STEP, AND ITS OWN SWITCH. `OMNI_SPLIT_CUTOVER=1` stops the write path maintaining
-    /// `chunk_text`, after which the split is the only copy of the snippet, the locator and the
-    /// key - and the table can be dropped.
-    ///
-    /// Separate from `chunkSplit` because it takes away the thing that PROVES the split: while v4
-    /// is still written, the split can be rebuilt from it and compared row for row, which is what
-    /// `testTheWritePathKeepsTheSplitEqualToARebuild` does and how the write path was verified at
-    /// all. Stop writing v4 and that check cannot run - not because anything broke, but because
-    /// there is nothing left to compare against. A safety net that disappears the moment it
-    /// succeeds has to be removed deliberately, not as a side effect.
-    nonisolated(unsafe) public static var splitCutover =
-        ProcessInfo.processInfo.environment["OMNI_SPLIT_CUTOVER"] == "1"
     /// Whether THIS index has the split built and proven. Cached because every result row asks it,
     /// and a meta SELECT per displayed snippet is not free on the interactive path.
     private var splitBuilt = false
@@ -7057,14 +7043,14 @@ public final class VectorStore: @unchecked Sendable {
     /// Read the durable flag once. Set after a build and at open.
     private func refreshSplitBuiltLocked() {
         let was = splitBuilt
-        splitBuilt = Self.chunkSplit && dbOpen()
+        splitBuilt = dbOpen()
             && scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.chunkSplitDoneKey)'") == 1
         pendingOnContent = dbOpen()
             && scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.pendingOnContentKey)'") == 1
         v4Dropped = dbOpen()
             && scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.v4DroppedKey)'") == 1
         rowTableLock.lock()
-        rowTableIsOccurrence = Self.chunkSplit && splitBuilt
+        rowTableIsOccurrence = splitBuilt
         rowTableLock.unlock()
         // THE CACHED STATEMENTS OUTLIVE THE FLAG OTHERWISE. The split is built mid-session by the
         // coverage stamp, so a reader that prepared its SQL against v4 at open would keep asking
@@ -7083,7 +7069,7 @@ public final class VectorStore: @unchecked Sendable {
     /// spread across the loader, the coverage walk, the sidecar and the disk report, and the one
     /// that gets left behind is invisible: it does not fail, it declines - the index quietly takes
     /// the slow path, or coverage quietly stops advancing.
-    var rowTableLocked: String { (Self.chunkSplit && splitBuilt) ? "occurrence" : "chunks" }
+    var rowTableLocked: String { splitBuilt ? "occurrence" : "chunks" }
     /// THE SAME ANSWER FOR THE READER LANES, which run off the store queue on their own
     /// connections. `splitBuilt` is written on the queue, so they cannot read it directly - and
     /// a stale `false` after `chunks` has been dropped is not a slightly old answer, it is a
@@ -7106,7 +7092,7 @@ public final class VectorStore: @unchecked Sendable {
     /// durable flag with a narrower job - see there - and is deliberately NOT what this reads:
     /// making every blob address depend on the translation's own guard would mean an index that
     /// simply never needed a translation addressed its blobs the other way.
-    var splitPendingKeyedLocked: Bool { Self.chunkSplit && splitBuilt }
+    var splitPendingKeyedLocked: Bool { splitBuilt }
 
     /// WHETHER THE RESIDENT MODEL IS THE SPLIT'S MODEL, which is NOT the same question as whether
     /// the split is built, and conflating them is a silent corruption.
@@ -7398,7 +7384,7 @@ public final class VectorStore: @unchecked Sendable {
                 // COUNTED IN THE SPACE THE BLOBS ARE KEYED IN, which is contents under the split
                 // and rows under v4 - see clearedRowsLocked. Asking the v4 question of a split
                 // index compares contents against occurrences and refuses every healthy one.
-                let staged = (Self.chunkSplit && splitBuilt) ? "chunk" : "chunks"
+                let staged = splitBuilt ? "chunk" : "chunks"
                 let coveredRowCount = scalarQuery(
                     "SELECT COUNT(*) FROM \(staged) WHERE slot >= 0 AND slot < \(coveredRows)\(exclude)")
                 let cleared = clearedRowsLocked()
@@ -7428,7 +7414,7 @@ public final class VectorStore: @unchecked Sendable {
             if Self.contentSharing {
                 if dim > 0 {
                     let maxSlot = scalarQuery(
-                        "SELECT COALESCE(MAX(slot), -1) FROM \((Self.chunkSplit && splitBuilt) ? "chunk" : "chunks")")
+                        "SELECT COALESCE(MAX(slot), -1) FROM \(splitBuilt ? "chunk" : "chunks")")
                     if maxSlot >= slotCount {
                         return "chunk slot \(maxSlot) is past the \(slotCount) vectors the file holds"
                     }
@@ -7509,7 +7495,7 @@ public final class VectorStore: @unchecked Sendable {
         // table this step exists to stop reading, and it would go on being taken until `chunks`
         // was dropped and the query started failing instead.
         guard dbOpen(), coveredUpToID == 0, coveredRows > vecHoles.count,
-              layoutLocked() == .v4, !(Self.chunkSplit && splitBuilt) else { return }
+              layoutLocked() == .v4, !splitBuilt else { return }
         // The k-th live row in id order, where k is how many live rows the prefix accounts for.
         let id = Int64(scalarQuery(
             "SELECT id FROM chunks ORDER BY id LIMIT 1 OFFSET \(coveredRows - vecHoles.count - 1)"))
@@ -7599,7 +7585,7 @@ public final class VectorStore: @unchecked Sendable {
     /// the covered prefix.
     private func clearSyncedReuseBlobsLocked() {
         guard dbOpen(), !unsyncedReuse.isEmpty else { return }
-        let unit = (Self.chunkSplit && splitBuilt) ? "chunk" : "chunks"
+        let unit = splitBuilt ? "chunk" : "chunks"
         let ok = execChecked("""
             DELETE FROM pending_vecs WHERE chunk_id IN
               (SELECT p.chunk_id FROM pending_vecs p JOIN \(unit) c ON c.id = p.chunk_id
@@ -7632,7 +7618,7 @@ public final class VectorStore: @unchecked Sendable {
         // gets the bytes, not just the first" exists because v4 keys a blob per row, and any of
         // those rows may outlive the others. Key the blob on the content and the question does
         // not arise, because the surviving occurrence reads the same row.
-        let unit = (Self.chunkSplit && splitBuilt) ? "chunk" : "chunks"
+        let unit = splitBuilt ? "chunk" : "chunks"
         var slots: [Int32] = []
         var expected = 0
         if sharing {
@@ -7708,7 +7694,7 @@ public final class VectorStore: @unchecked Sendable {
     /// straight off the pointers, so this path builds no tombstone rows to hold places with.
     private func loadBySlotLocked() -> Bool {
         guard Self.contentSharing, dbOpen(), coveredRows > 0 else { return false }
-        let onSplit = Self.chunkSplit && splitBuilt
+        let onSplit = splitBuilt
         let slotTable = onSplit ? "chunk" : "chunks"
         let d0 = storedDimLocked()
         let live = liveRowCountLocked()
@@ -7914,7 +7900,7 @@ public final class VectorStore: @unchecked Sendable {
         // through would not fail loudly - it would seat rows on each other's vectors. Refusing
         // hands back to the caller, which reports an index it cannot read rather than one it has
         // read wrongly.
-        if Self.chunkSplit, splitBuilt {
+        if splitBuilt {
             if Self.searchTiming { print("[store] LOAD refused: the split is built and by-slot declined") }
             return false
         }
@@ -8554,7 +8540,7 @@ public final class VectorStore: @unchecked Sendable {
         // the build writes `free_slot`, which only the allocator reads, and the reclaim reads
         // `vec_holes`. Without this the space the split frees is never given back and the index
         // refuses to open besides.
-        let onSplit = Self.chunkSplit && splitBuilt && residentIDsAreContents
+        let onSplit = splitBuilt && residentIDsAreContents
         if !onSplit {
             guard let mark = metaGetLocked(Self.contentFoldMarkKey), !mark.isEmpty,
                   scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.contentFoldDoneKey)'") != 1
@@ -8725,7 +8711,7 @@ public final class VectorStore: @unchecked Sendable {
             // question of a split index compares a count of contents against a count of
             // occurrences, which on the measured index differ by 3.5M - every slice would fail
             // its identity check and coverage would never advance at all.
-            let onSplit = Self.chunkSplit && splitBuilt
+            let onSplit = splitBuilt
             let unit = onSplit ? "chunk" : "chunks"
             let staged = onSplit ? scalarQuery("SELECT COUNT(*) FROM chunk") : live
             let clearedRows = scalarQuery("SELECT COUNT(*) FROM \(unit) WHERE slot >= 0 AND slot < \(target)")
@@ -8947,9 +8933,10 @@ public final class VectorStore: @unchecked Sendable {
         // the claim is measured in; under v4 it is the row count and every test below reads the
         // same as it always did.
         let units = Self.contentSharing ? slotCount : rows.count
-        // NOT WHILE THE FOLD IS STILL RUNNING. The reclaim rewrites the whole vector file; doing
-        // that for the holes visible half way through a fold means doing it again for the rest.
-        guard contentFoldComplete else { return false }
+        // THERE IS NO LONGER A PASS TO WAIT FOR. This used to refuse while the duplicate fold
+        // was mid-flight, because the reclaim rewrites the whole vector file and the holes were
+        // still arriving. The split frees its positions in ONE transaction and they are recorded
+        // in one go on the first open that reads it, so there is no half-way state to catch.
         guard Self.vecCoverage, Self.holeReclaimFraction > 0, dbOpen(), dim > 0, !rows.isEmpty,
               flat16.isPersistent, flat16.count == units * dim,
               // Only with coverage caught up: then every live row's blob is already cleared, so the
@@ -9378,20 +9365,17 @@ public final class VectorStore: @unchecked Sendable {
             // THE SPLIT, once, after the backfill has seated every row. It is one transaction
             // rather than slices - the invariants can only be checked with all four tables
             // present - so it sits behind the same yield the fold does and behind its own flag.
-            if Self.chunkSplit, allowSplitBuild, !yieldToSearchLocked("split"), buildChunkSplitLocked() { return }
+            if allowSplitBuild, !yieldToSearchLocked("split"), buildChunkSplitLocked() { return }
             // AND THE v4 TABLES GO, once the split has been answering for everything. A separate
             // step from the publish on purpose: the publish is a small transaction that has to
             // be atomic, and freeing 2.6 GB of pages is neither small nor urgent. Interrupted,
             // it simply has not happened yet.
-            if Self.chunkSplit, Self.splitCutover, allowSplitBuild, splitBuilt,
+            if allowSplitBuild, splitBuilt,
                !yieldToSearchLocked("dropv4"), dropV4TablesLocked() { return }
-            // NOT WHEN THE SPLIT IS ON. The fold and the split build are two implementations of
-            // one dedup - 3,516,335 duplicates collapsed against 3,770,848 positions freed, same
-            // index - and running both is worse than waste: `backfillInPlace` refuses while the
-            // fold is mid-flight renumbering slots, and the fold takes 364 s against the split's
-            // 149 s, so the split's turn never arrived inside a session and an existing user
-            // never got the split at all. Measured, after a chaos run reported it.
-            if !Self.chunkSplit, !yieldToSearchLocked("fold"), foldDuplicateContentsLocked() { return }
+            // THE FOLD IS GONE. It and the split build were two implementations of one dedup -
+            // 3,516,335 duplicates collapsed against 3,770,848 positions freed, same index - and
+            // the split does it by construction: `chunk.key` is unique, so there are no
+            // duplicate contents left for a pass to find. See docs/schema-v5.md.
             // Off the queue: the reclaim takes it one chunk at a time, and this call is holding it.
             if reclaim, !yieldToSearchLocked("reclaim"), shouldReclaimHolesLocked() {
                 DispatchQueue.global(qos: .utility).async { [weak self] in self?.reclaimVectorHoles() }
@@ -9418,14 +9402,6 @@ public final class VectorStore: @unchecked Sendable {
         flat16.msyncFile()
         clearSyncedReuseBlobsLocked()
         advanceCoverageLocked(budget: budget)
-        // Once the claim has caught up there is nothing left for coverage to do and the fold is
-        // what the stamp is for. Running it here as well as in the caught-up branch means an index
-        // that finishes covering mid-session starts folding in the same session.
-        //
-        // THE SECOND CALL SITE, and gating only the first one changed nothing: the fold kept
-        // running with the split on and kept the split from ever building. Both sites, or
-        // neither.
-        if !Self.chunkSplit { foldDuplicateContentsLocked() }
     }
 
     private func stampRowSidecarLocked(sync: Bool) {
@@ -9588,8 +9564,8 @@ public final class VectorStore: @unchecked Sendable {
         // `contentIDs` note: a v4-id sidecar adopted on a split-built index would reinstate the
         // uncollapsed positions and then re-stamp itself, so the split's freed space would never
         // be given back and nothing would report anything wrong.
-        guard (header.contentIDs ?? false) == (Self.chunkSplit && splitBuilt) else {
-            return reject("id space: sidecar contentIDs=\(header.contentIDs ?? false) split=\(Self.chunkSplit && splitBuilt)")
+        guard (header.contentIDs ?? false) == splitBuilt else {
+            return reject("id space: sidecar contentIDs=\(header.contentIDs ?? false) split=\(splitBuilt)")
         }
         guard header.magic == "omni-rows-2", header.gen == mutationGen,
               header.rowCount > 0, header.dim > 0, header.dim % Self.quantGroup == 0,
@@ -9651,7 +9627,7 @@ public final class VectorStore: @unchecked Sendable {
             // table the loader would otherwise scan - against `chunks` on a split index it finds
             // nothing, rejects every sidecar, and every launch pays the full scan it exists to
             // avoid. That failure is silent: the index opens, just slowly.
-            let sampleSQL = (Self.chunkSplit && splitBuilt) ? """
+            let sampleSQL = splitBuilt ? """
                 SELECT p.vec, f.modified, f.size, k.kind, \(header.dim)
                   FROM occurrence o JOIN chunk k ON k.id = o.chunk_id
                   JOIN files f ON f.id = o.file_id
@@ -11443,7 +11419,7 @@ public final class VectorStore: @unchecked Sendable {
         if !v4Dropped { exec("DELETE FROM chunks WHERE file_id = \(fid);") }
         // AFTER the v4 rows are gone, so regenerating this file's split rows from them correctly
         // finds none and the refs recount drops the contents nothing points at any more.
-        if Self.chunkSplit, splitBuilt { dropSplitForFilesLocked([fid]) }
+        if splitBuilt { dropSplitForFilesLocked([fid]) }
     }
 
     /// Same, plus the file's dedup entry - for a removal, where `replace` deliberately keeps it.
@@ -11578,7 +11554,7 @@ public final class VectorStore: @unchecked Sendable {
         resetCoverageLocked()
         // Pre-size the buffers to the final row/element count so the bf16 buffer is filled in place
         // rather than grown through ~log2(N) reallocations. One COUNT(*) + one dim read up front.
-        let onSplit = Self.chunkSplit && splitBuilt
+        let onSplit = splitBuilt
         residentIDsAreContents = onSplit
         let total = liveRowCountLocked()
         let d0 = storedDimLocked()
@@ -11818,19 +11794,25 @@ public final class VectorStore: @unchecked Sendable {
             queue.sync {
                 let mark = scalarQuery("SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM meta "
                                        + "WHERE key='\(Self.slotsMarkKey)'), -1)")
-                return "\(mark)/\(coveredRows)/\(splitBuilt)/\(slotsBackfilled)"
+                return "\(mark)/\(coveredRows)/\(splitBuilt)/\(slotsBackfilled)/\(v4Dropped)"
             }
         }
         var n = 0, stale = 0, last = progressKey()
         while n < maxStamps {
             queue.sync { stampVectorCoverageLocked(budget: budget, reclaim: false) }
             n += 1
-            if queue.sync(execute: { splitBuilt }) { break }
-            // The build is asynchronous now, so "nothing changed" is the NORMAL state while it
-            // runs. Waiting on it here is what keeps the harness measuring the migration rather
-            // than the stamp loop's own impatience.
-            if queue.sync(execute: { splitBuildInFlight }) {
-                while queue.sync(execute: { splitBuildInFlight }) { Thread.sleep(forTimeInterval: 1) }
+            // THE SPLIT BEING BUILT IS NOT THE END OF THE MIGRATION. The v4 tables are dropped
+            // by a LATER stamp, so stopping here measured a migration that had one step to go -
+            // and reported the drop as "never happened" when the harness had simply stopped
+            // asking. Both markers, or the loop is not driving the thing it claims to.
+            if queue.sync(execute: { splitBuilt && v4Dropped }) { break }
+            // The build and the drop are asynchronous, so "nothing changed" is the NORMAL state
+            // while either runs. Waiting on them here is what keeps the harness measuring the
+            // migration rather than the stamp loop's own impatience.
+            if queue.sync(execute: { splitBuildInFlight || v4DropInFlight }) {
+                while queue.sync(execute: { splitBuildInFlight || v4DropInFlight }) {
+                    Thread.sleep(forTimeInterval: 1)
+                }
                 stale = 0; last = progressKey()
                 continue
             }
@@ -11870,29 +11852,6 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
-    /// One slice, for a test that has to stop half way and resume.
-    @discardableResult
-    func foldDuplicatesOneSliceForTest() -> Bool { queue.sync { foldDuplicateContentsLocked() } }
-    /// Forget that the fold finished, so a second pass can be asked to prove it is idempotent.
-    func clearFoldFlagForTest() {
-        queue.sync {
-            exec("DELETE FROM meta WHERE key = '\(Self.contentFoldDoneKey)';")
-            contentFolded = false
-            contentFoldedCount = 0
-            exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.contentFoldCountKey)','0');")
-        }
-    }
-    /// Drive the duplicate fold to completion, which in the app is a slice per coverage stamp.
-    @discardableResult
-    public func foldDuplicatesToCompletion() -> (folded: Int, seconds: Double) {
-        let t0 = Date()
-        var rounds = 0
-        while queue.sync(execute: { foldDuplicateContentsLocked() }) {
-            rounds += 1
-            if rounds > 100_000 { break }
-        }
-        return (queue.sync { Swift.max(0, contentFoldedCount) }, -t0.timeIntervalSinceNow)
-    }
 
     // MARK: - Layout, and the v3 -> v4 conversion
 
@@ -12087,7 +12046,7 @@ public final class VectorStore: @unchecked Sendable {
         // the split and on the row under v4, so the total it is subtracted from has to be the one
         // it is keyed in - mixing them reports 3.5M rows "cleared" on the measured index that
         // nothing has cleared, which the audit reads as a broken claim and refuses the index for.
-        let staged = (Self.chunkSplit && splitBuilt) ? "chunk" : "chunks"
+        let staged = splitBuilt ? "chunk" : "chunks"
         return Swift.max(0, scalarQuery("SELECT COUNT(*) FROM \(staged)") - scalarQuery("SELECT COUNT(*) FROM pending_vecs"))
     }
 
@@ -12307,7 +12266,7 @@ public final class VectorStore: @unchecked Sendable {
             let v4Ready = sqlite3_prepare_v2(db, "INSERT INTO chunks(file_id, chunk_index, kind) VALUES(?,?,?);", -1, &w.chunk, nil) == SQLITE_OK
                 && sqlite3_prepare_v2(db, "INSERT INTO chunk_text(chunk_id, kind, file_id, snippet, locator, chunk_key) VALUES(?,?,?,?,?,?);", -1, &w.text, nil) == SQLITE_OK
             if !v4Ready {
-                guard Self.chunkSplit, Self.splitCutover, splitBuilt, !hasTableLocked("chunks") else {
+                guard splitBuilt, !hasTableLocked("chunks") else {
                     w.finalize(); return nil
                 }
                 sqlite3_finalize(w.chunk); w.chunk = nil
@@ -12398,12 +12357,12 @@ public final class VectorStore: @unchecked Sendable {
         var out = WrittenChunks()
         var ids: [Int64] = []
         ids.reserveCapacity(chunks.count)
-        if Self.chunkSplit, splitBuilt { out.contentIDs.reserveCapacity(chunks.count) }
+        if splitBuilt { out.contentIDs.reserveCapacity(chunks.count) }
         // THE v4 ROW IS NOT WRITTEN ONCE THE SPLIT ANSWERS FOR EVERYTHING. Under the cutover
         // `chunks` is on its way out - `dropV4TablesLocked` removes it a stamp later - and a
         // table that is still being written is one that cannot be dropped. Before the cutover it
         // is still the safety net the split is checked against, so it is still written.
-        let writeV4 = w.chunk != nil && !v4Dropped && !(Self.chunkSplit && Self.splitCutover && splitBuilt)
+        let writeV4 = w.chunk != nil && !v4Dropped && (Self.legacyWriteForTest || !splitBuilt)
         for (i, c) in chunks.enumerated() {
             let kc = Int32(kindCodeLocked(c.kind))
             var cid: Int64 = 0
@@ -12440,7 +12399,7 @@ public final class VectorStore: @unchecked Sendable {
             // BEFORE the pending vector, not after, because the staged blob is keyed on the
             // CONTENT once the split exists and the content id is not known until here.
             var contentID: Int64 = 0
-            if Self.chunkSplit, splitBuilt {
+            if splitBuilt {
                 // The same synthetic key MigrationV5 uses for a chunk that carries none: a real
                 // key is a 16-byte digest, so a one-byte-prefixed row id can never collide. Both
                 // sides must agree or a chunk is stored under one key and looked up under another.
@@ -12682,62 +12641,24 @@ public final class VectorStore: @unchecked Sendable {
     // of `.vecs` - 1,998 were identical and 2 differed at cosine 0.99995, which is the last bf16
     // bit moving with the batch shape the chunk happened to be embedded in. Folding those two onto
     // one representative moves a score by 5e-5, four places below what the search digest compares.
+    /// THE FOLD IS GONE, AND TWO OF ITS MARKERS ARE NOT.
+    ///
+    /// The pass that collapsed duplicate contents onto one representative is deleted: the split
+    /// makes duplicates unrepresentable, because `chunk.key` is unique by construction, so there
+    /// is nothing left for it to find. It shipped on by default for a while, though, so an index
+    /// in the wild may carry its marks - and two READERS still honour them, because they say
+    /// something true about that index's layout:
+    ///
+    ///   `chunk_content_folded`    positions and row ranks have parted company, so the by-slot
+    ///                             loader is the only one that can read it.
+    ///   `chunk_content_fold_upto` the pass stopped part way, so positions inside coverage may be
+    ///                             unowned and unrecorded - which `deriveUnownedPositionsAsHoles`
+    ///                             repairs.
+    ///
+    /// Nothing WRITES either of them any more. They are kept because deleting the reader would
+    /// turn a folded index into one this build cannot open, which is the opposite of a migration.
     private static let contentFoldDoneKey = "chunk_content_folded"
     private static let contentFoldMarkKey = "chunk_content_fold_upto"
-    private static let contentFoldCountKey = "chunk_content_folded_count"
-    private var contentFolded = false
-    /// How many pointers this pass has moved, so the progress row can say what it will free.
-    private var contentFoldedCount = -1
-    /// OPT-IN, and that is a measurement rather than caution.
-    ///
-    /// ON, and `OMNI_CONTENT_FOLD=0` turns it off.
-    ///
-    /// It was off while two things after it were wrong. Coverage's advance guard counted row
-    /// indices where it meant positions, so the claim stalled short of the file and the reclaim
-    /// that returns the space never ran; and the mutation lifecycle failed on a folded index, which
-    /// turned out to be `chunksForCurrentPathLocked` reading the resident buffer by ROW rather than
-    /// by position - correct only while the two are the same number, which folding is precisely
-    /// what stops. Both are fixed, and the whole chain is measured end to end on two independent
-    /// real indexes: 3,515,895 duplicates folded in 120 s, coverage complete, 5.80 GB returned by
-    /// the reclaim, and the search digest identical on both sides of all of it.
-    nonisolated(unsafe) public static var contentFold =
-        ProcessInfo.processInfo.environment["OMNI_CONTENT_FOLD"] != "0"
-    nonisolated(unsafe) public static var contentFoldSliceOverride: Int? = nil
-    /// How long one fold slice may hold the store queue. A search waits behind it, so this is an
-    /// interactive-latency budget, not a throughput knob - the same reason the coverage slice is
-    /// sized in fractions of a second rather than in rows.
-    nonisolated(unsafe) public static var foldSliceSecondsOverride: Double? = nil
-    static var foldSliceSeconds: Double {
-        foldSliceSecondsOverride
-            ?? ProcessInfo.processInfo.environment["OMNI_FOLD_SLICE_MS"].flatMap { Double($0).map { $0 / 1000 } }
-            ?? 0.25
-    }
-    static var contentFoldSlice: Int {
-        contentFoldSliceOverride
-            ?? ProcessInfo.processInfo.environment["OMNI_FOLD_SLICE"].flatMap(Int.init) ?? 50_000
-    }
-    private var foldGroupStmt: OpaquePointer?
-    private var foldFreedStmt: OpaquePointer?
-    private var foldMoveStmt: OpaquePointer?
-
-    /// True once every duplicate points at its content's representative. Read by the reclaim, which
-    /// must not rewrite the vector file half way through a fold - the holes are still arriving.
-    var contentFoldComplete: Bool {
-        if !Self.contentFold || !Self.contentSharing { return true }
-        // THE SPLIT IS THE FOLD, DONE ONCE AND BY CONSTRUCTION. `chunk.key` is unique, so there
-        // are no duplicate contents left for a fold to find and the fold never runs - which means
-        // `chunk_content_folded` is never set, and a gate that waits for it waits for ever. The
-        // reclaim is what this gate protects, so leaving it would mean the space the split frees
-        // is recorded as holes and then never given back: the vector file simply stops shrinking,
-        // silently, which is the exact failure mode this document's free-list note describes.
-        if Self.chunkSplit, splitBuilt { return true }
-        if contentFolded { return true }
-        guard dbOpen() else { return true }
-        if scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.contentFoldDoneKey)'") == 1 {
-            contentFolded = true
-        }
-        return contentFolded
-    }
 
     /// A FILE'S OCCURRENCES GO, AND WHATEVER THAT ORPHANS GOES WITH THEM.
     ///
@@ -12758,7 +12679,7 @@ public final class VectorStore: @unchecked Sendable {
     /// and `chunk` / `chunk_snippet` grew rows that nothing could reach. Silent, and only visible
     /// as a vector file that stops shrinking.
     func dropSplitWhereLocked(fileIDs: String) {
-        guard Self.chunkSplit, splitBuilt, dbOpen() else { return }
+        guard splitBuilt, dbOpen() else { return }
         exec("CREATE TEMP TABLE IF NOT EXISTS split_aff(chunk_id INTEGER PRIMARY KEY);")
         exec("DELETE FROM split_aff;")
         exec("INSERT OR IGNORE INTO split_aff SELECT chunk_id FROM occurrence WHERE file_id IN (\(fileIDs));")
@@ -12810,7 +12731,7 @@ public final class VectorStore: @unchecked Sendable {
     /// are dropped on the queue once the tables are, rather than discovering it later.
     @discardableResult
     func dropV4TablesLocked() -> Bool {
-        guard Self.chunkSplit, Self.splitCutover, splitBuilt, dbOpen(), !v4DropInFlight else { return false }
+        guard splitBuilt, !Self.legacyWriteForTest, dbOpen(), !v4DropInFlight else { return false }
         guard hasTableLocked("chunks") || hasTableLocked("chunk_text") else { return false }
         // NOT WHILE v3 IS STILL BEING STAGED. `chunks` is the v3 -> v4 conversion's landing
         // table, and it converts and then builds the split in the same launch.
@@ -13006,7 +12927,7 @@ public final class VectorStore: @unchecked Sendable {
     /// translation - which would be the corrupting direction.
     @discardableResult
     private func rekeyPendingVectorsOntoContentsLocked() -> Bool {
-        guard Self.chunkSplit, dbOpen() else { return false }
+        guard dbOpen() else { return false }
         // ONCE, AND THE FLAG IS WHAT SAYS SO. Running it twice is not a no-op, it is corruption:
         // the join goes through `chunks`, so a blob already keyed on a content is looked up as a
         // v4 row id, finds whichever unrelated row carries that number, and is re-keyed onto
@@ -13063,7 +12984,7 @@ public final class VectorStore: @unchecked Sendable {
     /// contents to produce.
     @discardableResult
     func buildChunkSplitLocked(highWaterOverride: Int64? = nil) -> Bool {
-        guard Self.chunkSplit, Self.contentSharing, dbOpen() else { return false }
+        guard Self.contentSharing, !Self.legacyWriteForTest, dbOpen() else { return false }
         guard scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.chunkSplitDoneKey)'") != 1
         else { return false }
         // AN EMPTY INDEX IS ALREADY MIGRATED, and saying so is what lets a new user be born v5.
@@ -13407,216 +13328,8 @@ public final class VectorStore: @unchecked Sendable {
     /// audit is built to catch. So the holes are derived in one step at the end, from the state
     /// the whole pass leaves behind, rather than accumulated a slice at a time.
     @discardableResult
-    func foldDuplicateContentsLocked(budget: Int = VectorStore.contentFoldSlice) -> Bool {
-        guard Self.contentFold, Self.contentSharing, dbOpen(), !rows.isEmpty, dim > 0 else { return false }
-        guard !contentFoldComplete else { return false }
-        // POSITIONS FIRST. The fold rewrites `slot`, so every row has to have one: a row still
-        // carrying -1 would be read as "no position" and silently skipped, leaving a duplicate
-        // behind that nothing would ever come back for.
-        backfillSlotsLocked()
-        guard slotsBackfilled, hasIndexLocked("idx_chunk_content") else { return false }
-        if contentFoldedCount < 0 {
-            contentFoldedCount = scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.contentFoldCountKey)'")
-        }
-        if foldGroupStmt == nil {
-            // GROUP BY over the covering index is an ordered scan with no sort step, and the
-            // watermark rides the same order, so a resumed pass picks up exactly where it stopped.
-            _ = sqlite3_prepare_v2(db, """
-                SELECT t.chunk_key, MIN(c.slot) FROM chunk_text t JOIN chunks c ON c.id = t.chunk_id
-                 WHERE length(t.chunk_key) > 0 AND c.slot >= 0 AND t.chunk_key > ?
-                 GROUP BY t.chunk_key HAVING COUNT(*) > 1
-                 ORDER BY t.chunk_key LIMIT ?;
-                """, -1, &foldGroupStmt, nil)
-        }
-        if foldMoveStmt == nil {
-            // `length(chunk_key) > 0` IS NOT REDUNDANT. idx_chunk_content is a PARTIAL index with
-            // exactly that predicate, and SQLite will only use it for a query that implies it -
-            // without the clause the subquery is a full scan of nine million chunk_text rows, per
-            // content group. The query plan says SCAN where it should say SEARCH, and the pass
-            // never finishes its first slice.
-            _ = sqlite3_prepare_v2(db, """
-                UPDATE chunks SET slot = ?1 WHERE slot > ?1
-                  AND id IN (SELECT chunk_id FROM chunk_text
-                              WHERE chunk_key = ?2 AND length(chunk_key) > 0);
-                """, -1, &foldMoveStmt, nil)
-        }
-        // WHAT A GROUP IS ABOUT TO VACATE. The UPDATE overwrites the old slots, so they have to be
-        // read first. Every row of this content moves onto `rep`, so every OTHER position that held
-        // it is unowned the moment the UPDATE commits - a position belongs to one content, so no
-        // other row can still be pointing at it.
-        if foldFreedStmt == nil {
-            _ = sqlite3_prepare_v2(db, """
-                SELECT DISTINCT c.slot FROM chunks c JOIN chunk_text t ON t.chunk_id = c.id
-                 WHERE t.chunk_key = ?2 AND length(t.chunk_key) > 0 AND c.slot > ?1;
-                """, -1, &foldFreedStmt, nil)
-        }
-        guard let gst = foldGroupStmt, let mst = foldMoveStmt, let fst = foldFreedStmt else { return false }
-        let mark = foldMarkLocked()
-        sqlite3_reset(gst)
-        if mark.isEmpty { sqlite3_bind_zeroblob(gst, 1, 0) }
-        else { mark.withUnsafeBytes { _ = sqlite3_bind_blob(gst, 1, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT) } }
-        sqlite3_bind_int(gst, 2, Int32(Swift.max(1, budget)))
-        var groups: [(key: Data, rep: Int32)] = []
-        while sqlite3_step(gst) == SQLITE_ROW {
-            guard let kp = sqlite3_column_blob(gst, 0) else { continue }
-            let klen = Int(sqlite3_column_bytes(gst, 0))
-            guard klen > 0, sqlite3_column_type(gst, 1) == SQLITE_INTEGER else { continue }
-            groups.append((Data(bytes: kp, count: klen), sqlite3_column_int(gst, 1)))
-        }
-        sqlite3_reset(gst)
-        guard !groups.isEmpty else { return finishFoldLocked() }
-        guard execChecked("BEGIN IMMEDIATE;") else { return true }
-        var moved = 0
-        var freed: [Int32] = []
-        // TIME-BOUNDED, NOT COUNT-BOUNDED. A slice takes the serial queue that interactive search
-        // also waits on, so what matters is how long it HOLDS it, not how many contents it gets
-        // through. 50,000 groups is a fixed count whose duration depends entirely on how deep the
-        // duplicate groups are - and on the measured corpus one block occurs 8,145 times. Reported
-        // as search going laggy during the pass, which is exactly what a long slice feels like.
-        // The pass is resumable by watermark, so stopping early costs nothing but the next fetch.
-        let deadline = Date().addingTimeInterval(Self.foldSliceSeconds)
-        var applied = 0
-        for g in groups {
-            if applied > 0, Date() >= deadline { break }
-            sqlite3_reset(fst)
-            sqlite3_bind_int(fst, 1, g.rep)
-            g.key.withUnsafeBytes { _ = sqlite3_bind_blob(fst, 2, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT) }
-            while sqlite3_step(fst) == SQLITE_ROW { freed.append(sqlite3_column_int(fst, 0)) }
-            sqlite3_reset(fst)
 
-            sqlite3_reset(mst)
-            sqlite3_bind_int(mst, 1, g.rep)
-            g.key.withUnsafeBytes { _ = sqlite3_bind_blob(mst, 2, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT) }
-            guard sqlite3_step(mst) == SQLITE_DONE else { rollbackTxnLocked(); return true }
-            moved += Int(sqlite3_changes(db))
-            applied += 1
-        }
-        // IN THIS TRANSACTION, with the move that made them holes. Recorded at the end of the pass
-        // instead, every slice in between left positions inside the covered prefix that no live row
-        // owned and no hole named - which is precisely what `coverageAudit` calls broken, and what
-        // an interrupted fold left behind for good.
-        recordHolesLocked(freed)
-        contentFoldedCount += moved
-        // The last group ACTUALLY APPLIED, not the last fetched: the watermark has to name where
-        // the pass really got to or the groups after the deadline are skipped for good.
-        let last = groups[Swift.max(0, applied - 1)].key
-        // THE FIRST MOVED POINTER IS THE POINT OF NO RETURN, not the last one. The moment one
-        // duplicate shares its representative's position, positions and row ranks have parted
-        // company - so a loader that derives a position from a rank is already wrong, for the whole
-        // index, after ONE slice. The fold's own "done" flag says the pass finished, which is a
-        // different question and arrives much later.
-        //
-        // Quitting mid-fold used to leave an index that would not open: the rank walk could not
-        // reconcile the claim, and the by-slot loader would not take over because the done flag was
-        // not set yet. Recorded here, inside the slice's own transaction, so it is true exactly
-        // when the first move is durable and not one moment earlier.
-        var marked = true
-        if moved > 0, !slotsOutOfOrder {
-            marked = execChecked(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.slotsOutOfOrderKey)', '1');")
-        }
-        guard marked,
-              execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.contentFoldCountKey)','\(contentFoldedCount)');"),
-              setFoldMarkLocked(last),
-              execChecked("COMMIT;")
-        else { rollbackTxnLocked(); return true }
-        if moved > 0 { slotsOutOfOrder = true }
-        // CHECKPOINT, or every read after this one pays for the frames this one wrote. The fold is
-        // millions of small UPDATEs, and without this the WAL grows without bound - measured at
-        // 1.97 GB on a live index mid-fold, with `walFindFrame` dominating the profile because every
-        // page lookup was searching two gigabytes of frames. That cost lands on SEARCH, not on the
-        // fold, which is why the pass reads as "search got slow" rather than "the fold is slow".
-        // PASSIVE so it never blocks on a reader; it simply does what it can each time.
-        exec("PRAGMA wal_checkpoint(PASSIVE);")
-        if Self.searchTiming, moved > 0 {
-            print("[store] fold moved \(moved) pointers over \(applied) contents (\(contentFoldedCount) total)")
-        }
-        return true
-    }
 
-    /// The key the last slice stopped on, as the raw bytes. Stored hex because `meta.value` is text.
-    private func foldMarkLocked() -> Data {
-        guard let hex = metaGetLocked(Self.contentFoldMarkKey), !hex.isEmpty else { return Data() }
-        return StoreSchema.hexToBytes(hex)
-    }
-    private func setFoldMarkLocked(_ key: Data) -> Bool {
-        execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.contentFoldMarkKey)','\(StoreSchema.bytesToHex(key))');")
-    }
-
-    /// THE ONE STEP THAT TOUCHES THE RESIDENT STATE, run once the key walk is done.
-    ///
-    /// Everything up to here rewrote a column in SQLite. This reads it back, puts the in-memory
-    /// mirror in step, and then DERIVES the holes: a position inside the covered prefix that no
-    /// live row points at. Derived rather than accumulated, so it does not matter how many slices
-    /// ran, in what order, or how many sessions they spanned - which is what makes the whole pass
-    /// safe to interrupt anywhere.
-    private func finishFoldLocked() -> Bool {
-        guard dbOpen(), dim > 0 else { return false }
-        var stmt: OpaquePointer?
-        defer { sqlite3_finalize(stmt) }
-        guard sqlite3_prepare_v2(db, "SELECT id, slot FROM chunks ORDER BY id;", -1, &stmt, nil) == SQLITE_OK
-        else { return false }
-        var ids: [Int64] = [], slots: [Int32] = []
-        ids.reserveCapacity(rows.count); slots.reserveCapacity(rows.count)
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            ids.append(sqlite3_column_int64(stmt, 0))
-            slots.append(sqlite3_column_type(stmt, 1) == SQLITE_INTEGER ? sqlite3_column_int(stmt, 1) : -1)
-        }
-        // ONE ROW PER LIVE ROW, IN THE SAME ORDER. Anything else means the table has changed shape
-        // under the pass, and pairing them by position would give rows each other's positions - so
-        // it declines and the next session reads the column again.
-        let dead = deadRows
-        let live = rows.indices.filter { !dead.contains(Int32($0)) }
-        guard ids.count == live.count else { return false }
-        for (k, i) in live.enumerated() where slots[k] >= 0 {
-            if i < occSlot.count { occSlot[i] = slots[k] }
-            rows[i].slot = slots[k]
-            rows[i].chunkID = ids[k]
-        }
-        invalidateOccurrenceMirrorsLocked()
-        // Which positions nothing live reads any more. The whole point of the fold, and the only
-        // thing that lets the reclaim take the space back.
-        let n = slotCount
-        if n > 0, coveredRows > 0 {
-            var owned = [Bool](repeating: false, count: n)
-            for (i, sl) in occSlot.enumerated() where !dead.contains(Int32(i)) {
-                if sl >= 0, Int(sl) < n { owned[Int(sl)] = true }
-            }
-            var freed: [Int32] = []
-            for p in 0 ..< Swift.min(n, coveredRows) where !owned[p] && !vecHoles.contains(Int32(p)) {
-                freed.append(Int32(p))
-            }
-            if !freed.isEmpty {
-                guard execChecked("BEGIN IMMEDIATE;") else { return false }
-                recordHolesLocked(freed)
-                guard execChecked("COMMIT;") else { rollbackTxnLocked(); return false }
-            }
-        }
-        // A FOLDED ROW CAN LAND INSIDE THE COVERED PREFIX, and then it is holding a blob it no
-        // longer needs: its position is one the file has answered for since coverage reached it,
-        // and the vector there is its content's, which is what the fold just established. Left
-        // behind, those blobs break the invariant that a covered row has none - measured on the
-        // real index at 91,050 rows - and the audit then refuses, which stops the reclaim, which
-        // is the whole point of having folded. Scoped through `pending_vecs` so this is a walk of
-        // a small table rather than a scan of the covered prefix.
-        //
-        // No msync is owed here, unlike every other place a blob is dropped: these positions did
-        // not change, the file has held them since the claim reached them, and the fold only
-        // changed which row points at them.
-        if coveredRows > 0 {
-            exec("""
-                DELETE FROM pending_vecs WHERE chunk_id IN
-                  (SELECT p.chunk_id FROM pending_vecs p JOIN chunks c ON c.id = p.chunk_id
-                    WHERE c.slot >= 0 AND c.slot < \(coveredRows));
-                """)
-        }
-        exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.contentFoldDoneKey)','1');")
-        exec("DELETE FROM meta WHERE key = '\(Self.contentFoldMarkKey)';")
-        contentFolded = true
-        FileHandle.standardError.write(Data(
-            "[omni] folded \(contentFoldedCount) duplicate chunks onto shared vectors\n".utf8))
-        return false
-    }
 
     /// The row -> position mirror changed, but the POSITIONS did not move: every vector is still
     /// where it was, so the resident scan copy is untouched and only the things that translate a
@@ -13655,7 +13368,7 @@ public final class VectorStore: @unchecked Sendable {
         // column is "not yet" - a v3 or legacy index, where the conversion has to run first and
         // marking the backfill done would let coverage advance over rows that have no position.
         // The two look the same through `hasColumnLocked` and are opposite answers.
-        if (Self.chunkSplit && splitBuilt) || !hasTableLocked("chunks") {
+        if splitBuilt || !hasTableLocked("chunks") {
             if !slotsBackfilled {
                 exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.slotsBackfilledKey)','1');")
                 exec("DELETE FROM meta WHERE key = '\(Self.slotsMarkKey)';")
@@ -13774,7 +13487,7 @@ public final class VectorStore: @unchecked Sendable {
         // This is the one place every write reaches with its slots decided - `replace`,
         // `replaceMany` and the backfill all funnel through it. Anywhere earlier and the position
         // is not known; anywhere later and no single site sees them all.
-        if Self.chunkSplit, splitBuilt {
+        if splitBuilt {
             // THE CONTENT IDS COME FROM THE WRITE, NOT FROM A JOIN BACK THROUGH v4.
             //
             // This used to find the content by joining `occurrence` to `chunks` on
@@ -13822,7 +13535,7 @@ public final class VectorStore: @unchecked Sendable {
             // KEYED THE WAY THE BLOB WAS STAGED: on the content under the split, on the v4 row
             // otherwise. Deleting by the wrong id space is silent - it matches nothing, or worse
             // it matches an unrelated row that happens to share the number.
-            let keys = (Self.chunkSplit && splitBuilt && contentIDs.count == slots.count) ? contentIDs : ids
+            let keys = (splitBuilt && contentIDs.count == slots.count) ? contentIDs : ids
             var del: OpaquePointer?
             if sqlite3_prepare_v2(db, "DELETE FROM pending_vecs WHERE chunk_id = ?;", -1, &del, nil) == SQLITE_OK {
                 for (i, cid) in keys.enumerated()

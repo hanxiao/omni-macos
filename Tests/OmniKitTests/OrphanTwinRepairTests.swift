@@ -111,10 +111,10 @@ final class OrphanTwinRepairTests: XCTestCase {
     /// the test would then pass or fail on an index no user can have.
     private func withQuantMode(_ body: () throws -> Void) rethrows {
         let saved = VectorStore.quantBaseOverride
-        let savedSplit = VectorStore.chunkSplit
+        let savedSplit = VectorStore.legacyWriteForTest
         VectorStore.quantBaseOverride = VectorStore.scanBits
-        VectorStore.chunkSplit = false
-        defer { VectorStore.quantBaseOverride = saved; VectorStore.chunkSplit = savedSplit }
+        VectorStore.legacyWriteForTest = true
+        defer { VectorStore.quantBaseOverride = saved; VectorStore.legacyWriteForTest = savedSplit }
         try body()
     }
 

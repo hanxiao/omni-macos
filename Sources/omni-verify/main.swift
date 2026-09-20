@@ -7758,28 +7758,6 @@ if args.count >= 3 && args[1] == "reclaim" {
     exit(ran ? 0 : 1)
 }
 
-// Collapse the duplicates an existing index already has. omni-verify fold <db>
-// In the app this runs a slice per coverage stamp; here it is driven to completion so the one-time
-// cost, and what it actually reclaims, are numbers rather than estimates.
-if args.count >= 3 && args[1] == "fold" {
-    let dbURL = URL(fileURLWithPath: args[2])
-    func vecsBytes() -> Int64 {
-        let p = dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".vecs").path
-        return ((try? FileManager.default.attributesOfItem(atPath: p)[.size]) as? Int64) ?? 0
-    }
-    let store = try VectorStore(dbURL: dbURL)
-    let before = vecsBytes()
-    let sb = store.migrateSlotsToCompletion()
-    print(String(format: "slots ready rows=%d in %.1fs", sb.filled, sb.seconds))
-    fflush(stdout)
-    let r = store.foldDuplicatesToCompletion()
-    print(String(format: "fold folded=%d seconds=%.1f", r.folded, r.seconds))
-    if let bad = store.coverageAudit() { print("AUDIT FAILED: \(bad)") } else { print("audit ok") }
-    store.close()
-    print(String(format: ".vecs %.2f GB -> %.2f GB (the reclaim returns the space)",
-                 Double(before) / 1e9, Double(vecsBytes()) / 1e9))
-    exit(0)
-}
 
 // How long does the one-time slot backfill take on a real index? omni-verify slotfill <db>
 // This is the upgrade an existing user pays for once. In the app it runs a slice per coverage
@@ -7883,12 +7861,13 @@ if args.count >= 3 && args[1] == "splitparity" {
         return (h, hits, withText)
     }
 
-    // HOLD THE FOLD STILL. It is on by default and it runs from the coverage stamp, so it
-    // progresses between the two measurements - and folding a near-identical duplicate (measured at
-    // cosine 0.99995, the last bf16 bit moving with the batch shape) onto its representative moves a
-    // score in the fifth decimal, which is exactly the precision below. The first run of this
-    // harness reported the split had changed the text when what had changed was the fold.
-    VectorStore.contentFold = false
+    // THE FOLD USED TO HAVE TO BE HELD STILL HERE. It ran from the coverage stamp, so it
+    // progressed between the two measurements - and folding a near-identical duplicate onto its
+    // representative moves a score in the fifth decimal, which is exactly the precision below.
+    // The first run of this harness reported the split had changed the text when what had
+    // changed was the fold. The pass is gone; the watermark check below is kept, because a
+    // measurement that can be invalidated by something moving underneath it should say so
+    // rather than be trusted.
     let foldMark: () -> String = {
         var db: OpaquePointer?
         defer { sqlite3_close(db) }
@@ -7902,7 +7881,6 @@ if args.count >= 3 && args[1] == "splitparity" {
     }
     let markBefore = foldMark()
 
-    VectorStore.chunkSplit = false
     let before: (UInt64, Int, Int)
     do {
         let s = try VectorStore(dbURL: dbURL); defer { s.close() }
@@ -7910,7 +7888,6 @@ if args.count >= 3 && args[1] == "splitparity" {
         print(String(format: "v4 tables   digest=%016llx hits=%d with-text=%d", before.0, before.1, before.2))
     }
 
-    VectorStore.chunkSplit = true
     do {
         let s = try VectorStore(dbURL: dbURL)
         let t0 = Date()
@@ -7935,9 +7912,7 @@ if args.count >= 3 && args[1] == "splitparity" {
     }
     let ok = before == after
     if !ok {
-        VectorStore.chunkSplit = false
         let a = try { let s = try VectorStore(dbURL: dbURL); defer { s.close() }; return rows(s) }()
-        VectorStore.chunkSplit = true
         let b = try { let s = try VectorStore(dbURL: dbURL); defer { s.close() }; return rows(s) }()
         var snippetDiff = 0, locatorDiff = 0, missing = 0, shown = 0
         for (k, v) in a {
