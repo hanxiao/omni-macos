@@ -653,7 +653,22 @@ public final class VectorStore: @unchecked Sendable {
     /// the safe direction - it would otherwise query columns that no longer exist and quietly
     /// return nothing. All three are accepted here so an upgrade never forces a reindex.
     private static let schemaVersion: Int32 = 4
-    private static let compatibleSchemaVersions: Set<Int32> = [2, 3, 4]
+    /// WHAT A MIGRATED INDEX IS STAMPED, and it is not cosmetic: it is the only thing standing
+    /// between an older build and a v5 index.
+    ///
+    /// Found by running a pre-cutover binary against a migrated index by accident. It does not
+    /// refuse - it finds no `chunks`, reads that as an empty index, and RESETS THE COVERAGE
+    /// CLAIM, which is the one piece of bookkeeping that says the vector file is the only copy
+    /// of 9.7M vectors. The file survives and nothing can find it again.
+    ///
+    /// Stamped 5 only once `v4_tables_dropped` is set, because until then the statement would be
+    /// false: the v4 tables are still there and complete, and an older build reads that index
+    /// correctly. The version follows the SHAPE, which is the same rule `layoutLocked` follows.
+    /// An older build meeting 5 takes the path this scheme already has for an unknown version -
+    /// drop and rebuild - which costs a re-index and loses nothing, because the files on disk
+    /// are the truth.
+    private static let v5SchemaVersion: Int32 = 5
+    private static let compatibleSchemaVersions: Set<Int32> = [2, 3, 4, 5]
 
     /// Which of the three layouts the database on disk is in, decided by SHAPE rather than by the
     /// recorded version - the version says what wrote it, the shape says what it is, and only the
@@ -2048,7 +2063,7 @@ public final class VectorStore: @unchecked Sendable {
         // their turn - not from what this binary would like it to be. Stamping 4 over a v3 index
         // whose migration then declined (no disk, say) would tell the NEXT old binary to drop a
         // table it could have read.
-        setUserVersion(layoutLocked() == .v4 ? Self.schemaVersion : 3)
+        setUserVersion(layoutLocked() != .v4 ? 3 : (v4Dropped ? Self.v5SchemaVersion : Self.schemaVersion))
         // UNDER THE QUEUE, because init does NOT have exclusive access the way it looks like it
         // does. migrateScanKind above reaches bumpGenLocked, which arms scheduleIdleFoldLocked - a
         // 2-second timer that hops to a background thread and enters queue.sync. It arms on the
@@ -12778,6 +12793,10 @@ public final class VectorStore: @unchecked Sendable {
                         // This is the same signal the coverage migration raises for the same
                         // reason, and `reclaimAfterCoverageMigration` is what spends it.
                         "INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.vacuumPendingKey)', '1');",
+                        // AND THE VERSION, IN THE SAME TRANSACTION AS THE DROP. This is the
+                        // moment the index stops being readable by a build that knows only v4,
+                        // so it is the moment it has to say so - see v5SchemaVersion.
+                        "PRAGMA user_version = \(Self.v5SchemaVersion);",
                         "COMMIT;"] where ok {
                 if sqlite3_exec(side, sql, nil, nil, nil) != SQLITE_OK {
                     ok = false

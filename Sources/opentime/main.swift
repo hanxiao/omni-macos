@@ -76,6 +76,22 @@ if args.count >= 3, args[2] == "splitprobe" {
     exit(0)
 }
 
+// `opentime <db> repack` spends the repack the migration asks for. DROP TABLE frees pages
+// without shrinking the file - after the v4 drop the measured index was 53% freelist - and the
+// app drives this from AppModel a few seconds later, which a one-shot tool never reaches.
+if args.count >= 3, args[2] == "repack" {
+    let store = try VectorStore(dbURL: url)
+    let before = ((try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? Int64) ?? 0
+    let t0 = Date()
+    let freed = store.reclaimAfterCoverageMigration()
+    let after = ((try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? Int64) ?? 0
+    print(String(format: "repack freed %.2f GB in %.1fs; sqlite %.2f GB -> %.2f GB",
+                 Double(freed) / 1e9, -t0.timeIntervalSinceNow, Double(before) / 1e9, Double(after) / 1e9))
+    if let bad = store.coverageAudit() { print("AUDIT FAILED: \(bad)") } else { print("audit clean") }
+    store.close()
+    exit(0)
+}
+
 if args.count >= 3, args[2] == "split" {
     let t0 = Date()
     let store = try VectorStore(dbURL: url)

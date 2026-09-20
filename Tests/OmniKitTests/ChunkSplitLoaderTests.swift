@@ -459,6 +459,27 @@ final class ChunkSplitLoaderTests: XCTestCase {
         XCTAssertEqual(num(url, "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('chunks','chunk_text')"), 0,
                        "the v4 tables are still there")
 
+        // AND THE REPACK THE DROP ASKS FOR RUNS OVER IT. `DROP TABLE` frees pages without
+        // shrinking the file, so the drop raises `vecs_vacuum_pending` and a VACUUM follows a
+        // few seconds later - in the app, usually after this process has moved on. A migration
+        // step whose own follow-up breaks the index is worse than one that does not run.
+        do {
+            let store = try VectorStore(dbURL: url); defer { store.close() }
+            _ = store.reclaimAfterCoverageMigration()
+        }
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM meta WHERE key='vecs_covered_rows'"), 1,
+                       "the repack after the drop threw the coverage claim away")
+
+        // AND THE INDEX SAYS IT IS v5, which is the only thing standing between it and an older
+        // build. Found by running a pre-cutover binary against a migrated index by accident: it
+        // does not refuse, it reads the missing `chunks` as an empty index and RESETS THE
+        // COVERAGE CLAIM - the one piece of bookkeeping that says the vector file is the only
+        // copy of every vector. The file survives and nothing can find it again. An older build
+        // meeting 5 takes the drop-and-rebuild path this scheme already has for an unknown
+        // version, which costs a re-index and loses nothing.
+        XCTAssertEqual(num(url, "PRAGMA user_version"), 5,
+                       "a migrated index is not stamped v5, so an older build would wipe its claim")
+
         // AND THE NEXT OPEN DOES NOT PUT THEM BACK. `CREATE TABLE IF NOT EXISTS` cannot tell
         // "deliberately gone" from "not there yet", so without the guard every open recreates
         // them empty and the index comes up with a full `occurrence` beside an empty `chunks`.
