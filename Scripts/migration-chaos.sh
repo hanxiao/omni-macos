@@ -66,5 +66,28 @@ if [ "${OMNI_CHUNK_SPLIT:-0}" = "1" ]; then
     echo "=== the split WAS built and in use for this run"
   fi
 fi
+
+# AND THE SESSION AFTER IT, which is new and is the whole of step 5. The chaos run is the
+# PUBLISHING session: the build finishes under it and the readers switch, but the resident model
+# stays v4 until the index is opened again - deliberately, because the build does not touch a
+# single vector or a single resident entry. So a chaos run on its own says nothing about the
+# loader. This reopens the clone and reports what the next launch actually gets.
+#
+# `storeaudit` prints `rowTable=occurrence` when the loader really read the split, and
+# `searchreal` is the quality gate: the digest must be the one the pre-migration index answered
+# with, or the migration changed what the user sees.
+V=./.build/release/omni-verify
+if [ -x "$V" ] && [ "${OMNI_CHAOS_REOPEN:-1}" = "1" ]; then
+  echo "=== the session AFTER the chaos run"
+  OMNI_CHUNK_SPLIT=${OMNI_CHUNK_SPLIT:-0} OMNI_SPLIT_CUTOVER=${OMNI_SPLIT_CUTOVER:-0} \
+    "$V" storeaudit "$W/index.sqlite" 2>&1 | grep -E "rowTable|failing check|FAIL"
+  M=${OMNI_MODEL_DIR:-/Volumes/han2tb/ai-models/jinaai/jina-embeddings-v5-omni-nano-mlx}
+  if [ -d "$M" ]; then
+    OMNI_CHUNK_SPLIT=${OMNI_CHUNK_SPLIT:-0} OMNI_SPLIT_CUTOVER=${OMNI_SPLIT_CUTOVER:-0} \
+      "$V" searchreal "$M" "$W/index.sqlite" 5 2>&1 | grep -E "SEARCHREAL|wrong model"
+    echo "    (the pre-migration index answers digest=ba7a13400e714f79)"
+  fi
+fi
+
 [ "${OMNI_KEEP_CLONE:-0}" = "1" ] || rm -rf "$W"
 exit $rc
