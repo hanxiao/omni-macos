@@ -171,7 +171,7 @@ struct ResultsList<Footer: View>: View {
                                             ? Color.clear
                                             : Color(nsColor: .alternatingContentBackgroundColors[1]),
                                             in: RoundedRectangle(cornerRadius: BrowserMetrics.selectionRadius))
-                                .onTapGesture { handleTap(hit.path) }
+                                .resultClick { handleTap(hit.path) }
                                 .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
                                 .contextMenu { menu(hit) }
                                 .reportResultFrame(hit.path, in: marqueeSpace)
@@ -210,7 +210,7 @@ struct ResultsList<Footer: View>: View {
                                                   expanded: expanded.contains(member.path),
                                                   onToggle: { toggle(member.path) })
                                             .contentShape(Rectangle())
-                                            .onTapGesture { handleTap(member.path) }
+                                            .resultClick { handleTap(member.path) }
                                             .simultaneousGesture(TapGesture(count: 2).onEnded { open(member.path) })
                                             .contextMenu { menu(member) }
                                             .reportResultFrame(member.path, in: marqueeSpace)
@@ -331,7 +331,7 @@ struct ResultsList<Footer: View>: View {
                             // (The list row already has this; the grid relied on .draggable's hit area,
                             // which was removed.)
                             .contentShape(Rectangle())
-                            .onTapGesture { handleTap(hit.path) }
+                            .resultClick { handleTap(hit.path) }
                             .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
                             .contextMenu { menu(hit) }
                             .reportResultFrame(hit.path, in: marqueeSpace)
@@ -363,7 +363,7 @@ struct ResultsList<Footer: View>: View {
                             ForEach(group.members.dropFirst(), id: \.path) { member in
                                 ResultGridItem(hit: member, selected: model.selectedPaths.contains(member.path))
                                     .contentShape(Rectangle())
-                                    .onTapGesture { handleTap(member.path) }
+                                    .resultClick { handleTap(member.path) }
                                     .simultaneousGesture(TapGesture(count: 2).onEnded { open(member.path) })
                                     .contextMenu { menu(member) }
                                     .reportResultFrame(member.path, in: marqueeSpace)
@@ -1029,7 +1029,7 @@ private extension EnvironmentValues {
 ///
 /// The one behavioural change is a single frame of lag: the first `onChanged` sets `origin`, which
 /// is what flips this on, so that tick's intersection runs against an empty map and selects nothing
-/// beyond the modifier-held base. `minimumDistance: 6` means the pointer has already travelled
+/// beyond the modifier-held base. The marquee threshold means the pointer has already travelled
 /// before that tick arrives, and the next one is ~16 ms later.
 private struct ReportResultFrame: ViewModifier {
     @Environment(\.marqueeActive) private var active
@@ -1048,7 +1048,40 @@ private struct ReportResultFrame: ViewModifier {
     }
 }
 
+/// A CLICK THAT TOLERATES THE FEW POINTS A REAL POINTER DRIFTS.
+///
+/// `onTapGesture` does not. A press that moves eight points between down and up is rejected by it
+/// and the row is never selected - which is the whole of "clicking a result sometimes does
+/// nothing", reported twice and never reproducible on demand because it depends on the hand.
+/// `ResultSelectionUITests.testAClickThatDriftsAFewPointsStillSelects` pins it.
+///
+/// THE MARQUEE WAS THE FIRST SUSPECT AND IT IS INNOCENT. Its `DragGesture` used to start at six
+/// points, inside the same drift, so it looked like the obvious thief - but raising its threshold
+/// to sixteen and re-running left the eight-point click still selecting nothing. The tap was being
+/// dropped by SwiftUI before the marquee ever entered it.
+///
+/// `DragGesture(minimumDistance: 0)` sees the whole press and `onEnded` knows how far the pointer
+/// actually travelled, which is the fact `onTapGesture` neither exposes nor forgives. Below
+/// `MarqueeSelect.clickSlop` it was a click; at or above it the marquee owns the gesture and this
+/// does nothing, so the two are exactly complementary and one number decides both. Simultaneous so
+/// it composes with the double-click gesture beside it and with the marquee above it.
+private struct ResultClick: ViewModifier {
+    let action: () -> Void
+    func body(content: Content) -> some View {
+        content.simultaneousGesture(
+            DragGesture(minimumDistance: 0)
+                .onEnded { v in
+                    if max(abs(v.translation.width), abs(v.translation.height)) < MarqueeSelect.clickSlop {
+                        action()
+                    }
+                })
+    }
+}
+
 private extension View {
+    /// Replaces `onTapGesture` on a result row. See `ResultClick`.
+    func resultClick(_ action: @escaping () -> Void) -> some View { modifier(ResultClick(action: action)) }
+
     func reportResultFrame(_ path: String, in space: String) -> some View {
         modifier(ReportResultFrame(path: path, space: space))
     }
@@ -1061,7 +1094,8 @@ private extension View {
 /// Finder-style rubber-band selection: a left-button click-drag over the results draws a rectangle and
 /// selects every item it touches. On macOS a click-drag does NOT scroll (the wheel/trackpad do), so the
 /// drag is free to mean "marquee" without fighting the scroll view. minimumDistance keeps a plain click
-/// a click (the row's own tap still fires). Holding Shift or Command adds to the existing selection.
+/// a click - the row's own tap still fires - and see `marqueeThreshold` for why 6 points was not
+/// enough of it. Holding Shift or Command adds to the existing selection.
 private struct MarqueeSelect: ViewModifier {
     @Environment(AppModel.self) private var model
     let space: String
@@ -1074,6 +1108,13 @@ private struct MarqueeSelect: ViewModifier {
     // ResultItemFramesKey tried to update multiple times per frame", five times in a four-minute
     // chaos run. The frames are only ever READ while a drag is in flight, so a reference box holds
     // them without telling SwiftUI anything changed, and the loop has nowhere to go.
+    /// WHERE A CLICK STOPS AND A RUBBER BAND STARTS, and it is one number so the two can never
+    /// both claim a gesture or both refuse it. See `ResultClick` for the bug this is half of.
+    ///
+    /// The cost of 16 rather than the 6 this shipped with is that the rubber band appears after a
+    /// slightly longer movement. Nothing is lost when it does: the rectangle is drawn from
+    /// `startLocation`, so it already covers everything the pointer crossed on the way.
+    static let clickSlop: CGFloat = 16
     private final class FrameBox { var frames: [String: CGRect] = [:] }
     @State private var box = FrameBox()
     @State private var origin: CGPoint?
@@ -1102,7 +1143,7 @@ private struct MarqueeSelect: ViewModifier {
                 }
             }
             .gesture(
-                DragGesture(minimumDistance: 6, coordinateSpace: .named(space))
+                DragGesture(minimumDistance: MarqueeSelect.clickSlop, coordinateSpace: .named(space))
                     .onChanged { v in
                         if origin == nil {
                             origin = v.startLocation
