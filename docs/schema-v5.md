@@ -1821,3 +1821,38 @@ Hold it open for the day with one password rather than paying one per invocation
 
 The quiet period is not optional: the coverage stamp yields to searches and this suite searches
 continuously, so without it a run can pass having never built the split at all.
+
+## Reading, transcribing and indexing WHILE it migrates
+
+Three gates, because the migration is not a thing that happens to an idle index. All on the real
+9,773,836-chunk index.
+
+`omni-verify migprobe <model> <index>` - THE READ GATE. Takes every answer before the migration
+starts, drives the migration on a background thread, and keeps asking the identical questions:
+search over four scopes, find similar (`fileVector`, the path that went silent when positions and
+rows diverged), and browse (`indexedChildrenDetailed`, its own read-only connection, the one that
+notices the row table being swapped). 1,979 rounds of 51 answers over 1,424 s, spanning the
+cutover in both directions, ZERO mismatches, audit clean. Per-operation latency idle against
+during: search p50 5.3 -> 5.7 ms (p95 5.9 -> 7.2, max 5.9 -> 76.5), find similar 4.9 -> 5.0 (max
+176.6), browse 67.2 -> 76.0 (max 288.5). Busline `wasted` 0 and `peakDepth` 1 on both lanes.
+
+It refuses to report OK unless it saw both sides of the cutover, and that guard fired twice before
+the run above could be believed - once when the migration thread gave up immediately, once when
+the probe's window closed before the cutover. Both had printed "every answer identical" while
+comparing one layout against itself.
+
+`Scripts/ocr-during-migration.sh` - THE GPU GATE. A transcription and the migration at once:
+byte-identical transcript (8aead74f017d9a6b), 398 against 396 tok/s, migration unaffected at
+196.9 s. Headless rather than through the UI because XCUITest cannot see the OCR workspace while a
+run is in flight - see CLAUDE.md for that diagnosis.
+
+`Scripts/migration-chaos.sh` - THE INTERACTION GATE. The app driven chaotically, with file churn
+under a watched folder, while the same clone migrates: 730 s, 0 failures, split built and v4
+dropped during the run, `rowTable=occurrence` on the next open and digest ba7a13400e714f79.
+
+WHAT THE READ GATE FOUND, which none of the others could: `maxYieldToSearch` is the whole duty
+cycle under load, not a delay. Breaking through the bound buys exactly ONE stamp, which does one
+200k-row slice and re-arms - so at 120 s the real index's slot backfill managed 2.4M of 9,773,836
+rows in 20 minutes of continuous querying, against 12.2 SECONDS on an idle store, and the
+migration never finished at all in 41. At 20 s it completes in 1,348 s under the same load. The
+worst a query can wait behind maintenance is unchanged; only its frequency moves.

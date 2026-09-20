@@ -536,6 +536,32 @@ only its frequency moves, from 0.2% of wall clock to 1.2%, against the 20% the s
 when the app is idle. In steady state it costs nothing: with the migration done the stamp finds no
 work, so the break-through is a no-op that happens six times more often.
 
+## OCR while the index migrates (Scripts/ocr-during-migration.sh, 2026-09-20)
+
+The two halves of this app that each own a scarce resource, at the same time: the OCR model
+saturating the GPU with 4.53 GB of weights resident, and the migration holding the store's serial
+queue while it rewrites a 6 GB SQLite file beside a 22 GB vector file. They are supposed to be
+independent, and that is the class of claim this file exists to stop asserting without a number.
+
+    OCR solo                    8 pages, 19.7 s, 398 tok/s, digest 8aead74f017d9a6b
+    OCR during the migration    8 pages, 19.8 s, 396 tok/s, digest 8aead74f017d9a6b
+    the migration meanwhile     48 stamps in 196.9 s, split built, audit clean
+    the index afterwards        rowTable=occurrence, 0 failing checks, digest ba7a13400e714f79
+
+Byte-identical transcript, 0.5% on throughput (this machine's run-to-run variance is ~25%), and
+the migration took its usual ~197 s. They are independent.
+
+XCUITEST CANNOT DRIVE THE OCR WORKSPACE WHILE A RUN IS IN FLIGHT, and this is the harness, not the
+app. Every XCUITest query waits for the app to go idle first, and a run streaming at 24 Hz does
+not go idle until it is over - so `ocr.readout`, `ocr.section.0` and `ocr.needsmodel` are all
+invisible for the whole run and the app logs `kAXErrorInvalidUIElement ... AXChildren` throughout.
+The shipped `OCRWorkspaceUITests` fails this way on a TINY index with no migration at all, twice,
+deterministically at exactly the deadline; raising it from 45 s to 240 s changed nothing, which is
+what says it is not a timeout. The same build, same fixture, driven by hand with `open -n`,
+transcribes in ~25 s in Release AND in Debug, including from inside the runner's own sandbox
+container. So those tests now SKIP with that explanation and point at the script above, which is
+stronger evidence than a click: it compares a digest.
+
 ## Run the app, not just the tests (2026-09-17)
 
 A whole content-sharing suite passed while the APP stored one vector per chunk. Every test drove
