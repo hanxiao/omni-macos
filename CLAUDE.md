@@ -490,6 +490,52 @@ follows is what a reader needs before touching this code.
 - `omni-verify sharebench <model> <root>` is the end-to-end A/B: chunks, vectors, tok, and search
   latency for one arm, run it twice with the env var flipped.
 
+## Reading an index WHILE it migrates (omni-verify migprobe, 2026-09-20)
+
+"Does the app still work during the migration" was only ever answered by a UI suite asserting the
+window was still there. That is SURVIVAL, not correctness: a read path that returns the wrong ten
+files, or an empty browse listing, keeps the window up and passes. `omni-verify migprobe <model>
+<index>` asks the other question - it takes every answer BEFORE the migration starts, drives the
+migration on a background thread, and keeps asking the identical questions while it runs.
+
+- THREE READ PATHS, because they fail differently and only one is a search: search over four
+  scopes (plain, two kind filters, a folder prefix - different routes through the reducer and the
+  mask); FIND SIMILAR, which pools a file's stored vectors BY ROW and is the path that went silent
+  when positions and rows diverged; and BROWSE, which is SQL on its own read-only connection and
+  is the one that notices the row table being swapped underneath it.
+- MEASURED on the real 9,773,836-chunk index: 1,979 rounds of 51 answers over 1,424 s, spanning
+  the cutover in both directions (`phases ["split=false", "split=true"]`), ZERO mismatches.
+  Latency per operation, idle against during: search p50 5.3 -> 5.7 ms (p95 5.9 -> 7.2, max 5.9 ->
+  76.5), find similar 4.9 -> 5.0 (max 176.6), browse 67.2 -> 76.0 (max 288.5). Busline `wasted` 0
+  and `peakDepth` 1 on both lanes, so nothing queued up. The maxima are a query landing behind a
+  slice or the publish transaction; they are one-time and bounded.
+- IT REFUSES TO PASS VACUOUSLY, and that guard earned its place twice in one afternoon. First run:
+  3 rounds, 2 s, "every answer identical" - the migration thread had given up immediately because
+  `runMigrationStampsForTest` stops after a few stamps make no progress and a stamp makes no
+  progress while a query is in flight. Second run: 435 rounds, 515 s, phases `["split=false"]` -
+  the active window closed before the cutover. Both compared one layout against itself. The probe
+  now fails unless it observed BOTH sides.
+- THE PROBE NEEDS THINK TIME or it is a denial of service rather than a test: with no pause the
+  slot backfill reached 2.4M of 9.77M rows in 20 MINUTES. 250 ms between rounds is still an order
+  of magnitude more aggressive than a person typing.
+
+THE YIELD BOUND WAS THE DEFECT THAT FOUND, and it is a real one. `maxYieldToSearch` is not just
+"how long until maintenance gets a turn", it is the whole DUTY CYCLE under sustained load: breaking
+through buys exactly ONE stamp, which does one 200k-row slice and re-arms, so the next call finds
+the clock reset and yields again. At 120 s that is one slice every two minutes - about 100k rows a
+minute against the 12.2 SECONDS the same backfill takes on an idle store, so a user who keeps
+searching (or an agent polling the HTTP endpoint, which is the case the bound was added for) waits
+HOURS for a migration that is minutes of work. Lowered to 20 s, `OMNI_YIELD_BOUND` A/Bs it:
+
+    yield bound   slot backfill under continuous querying      whole migration
+    120 s         2.4M of 9,773,836 rows in 20 min             never finished in 41 min
+     20 s         5.4M in 10 min                               1,348 s, complete
+
+The worst a query can wait behind maintenance is UNCHANGED by this - a slice is still ~0.25 s -
+only its frequency moves, from 0.2% of wall clock to 1.2%, against the 20% the same code spends
+when the app is idle. In steady state it costs nothing: with the migration done the stamp finds no
+work, so the break-through is a no-op that happens six times more often.
+
 ## Run the app, not just the tests (2026-09-17)
 
 A whole content-sharing suite passed while the APP stored one vector per chunk. Every test drove
@@ -1999,9 +2045,15 @@ fragment appended to the default contradicts rules the default has already given
   them apart by SCREENSHOTTING while the runner waits: the dialog reads "XCTest is trying to Enable
   UI Automation. Enter the password for the user ...". The runner gives up 60 SECONDS after putting
   it up, so there is no way to wait it out and `Scripts/automation-window.sh` cannot be made to
-  wait longer - the holder is already dead by then. The window it buys is TEN HOURS. An unattended
-  overnight UI run therefore has to be STARTED while somebody can type, and a job queued after the
-  window closes fails on the harness, not on the app.
+  wait longer - the holder is already dead by then. An unattended UI run therefore has to be
+  STARTED while somebody can type, and a job queued after the window closes fails on the harness,
+  not on the app.
+- THE WINDOW HAS NO TEN-HOUR CAP. That was written here after a 600-minute hold expired, and 600
+  was just the number passed. The deadline is the script's argument: 1500 minutes holds 1500. To
+  cover a whole day from one password, hold it with a command that outlives the work and detach:
+  `nohup ./Scripts/automation-window.sh 1500 sleep 86400 >/tmp/omni-auto.log 2>&1 & disown` - then
+  every later `xcodebuild test` finds `/var/db/com.apple.dt.automationmode/automation-enabled`
+  already there and never re-authenticates. `touch /tmp/omni-automation-window.release` ends it.
 
 ## Apple Photos (OmniKit/PhotosSource.swift)
 - Photos assets ride the file pipeline under `photos://<source>/<escaped localIdentifier>/<name>`

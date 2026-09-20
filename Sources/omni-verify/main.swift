@@ -4270,6 +4270,271 @@ if args.count >= 4 && args[1] == "searchreal" {
     exit(0)
 }
 
+// THE MIGRATION READ GATE: omni-verify migprobe <modelDir> <index.sqlite> [activeSeconds]
+//
+// "Does the app still work during the migration" was only ever answered by a UI suite asserting
+// that the window was still there. That is survival, not correctness: a read path that returns
+// the WRONG ten files, or the right ten in a different order, or an empty browse listing, keeps
+// the window up and passes. This asks the other question, which is the one a user would notice.
+//
+// THE SHAPE: take the answers BEFORE the migration starts, drive the migration on a background
+// thread, and keep asking the identical questions while it runs. Every answer must be byte
+// identical to the baseline, at every instant, through every phase - the slot backfill, the
+// off-queue split build, the publish, the v4 drop, the reclaim. That is a stronger claim than
+// the before/after digest `searchreal` prints, which cannot see a transient at all.
+//
+// THREE READ PATHS, because they fail differently and only one of them is a search:
+//   search        content scores turned into files through the occurrence mirror, four scopes -
+//                 plain, two kind filters and a folder prefix, which take different routes
+//                 through the reducer and the mask.
+//   find similar  `fileVector` pools a file's stored vectors BY ROW and searches with the result.
+//                 This is the path that went silent when positions and rows diverged, and it is
+//                 the one that reads pooled bytes straight out of the vector file.
+//   browse        `indexedChildrenDetailed`, which is SQL on its own read-only connection over
+//                 `occurrence`/`chunks` - so it is the one that notices the row table being
+//                 swapped underneath it.
+//
+// AND THE LATENCY OF EACH, idle against during, because "no regression" needs a number and the
+// busline needs to show the lanes did not silently back up.
+if args.count >= 4 && args[1] == "migprobe" {
+    let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[2]))
+    let store = try VectorStore(dbURL: URL(fileURLWithPath: args[3]))
+    let activeSeconds = (args.count >= 5 ? Double(args[4]) : nil) ?? 240
+
+    let probes = ["distributed search index", "coverage claim positions", "the vector file",
+                  "swift test failure", "chunk key content hash", "folder scoped search",
+                  "quantized funnel rerank", "tombstone dead row", "quarterly revenue report",
+                  "how do I cancel a subscription"]
+    let qvecs = probes.map { engine.embedText($0, as: .query) }
+    if let first = qvecs.first, first.count != store.vectorDim {
+        print("migprobe: model is dim \(first.count), index is dim \(store.vectorDim) - wrong model")
+        exit(1)
+    }
+    var scopes: [(String, SearchFilter)] = [("plain", SearchFilter())]
+    var kindText = SearchFilter(); kindText.kinds = ["text"]; scopes.append(("kind:text", kindText))
+    var kindImg = SearchFilter(); kindImg.kinds = ["image"]; scopes.append(("kind:image", kindImg))
+    let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+    var scoped = SearchFilter(); scoped.folderPrefix = home + "/Documents"
+    scopes.append(("in:Documents", scoped))
+
+    func hitSig(_ hits: [SearchHit]) -> String {
+        hits.map { "\($0.path)|\(String(format: "%.5f", $0.score))|\($0.kind)" }.joined(separator: "\n")
+    }
+    // SEARCH, one signature per (scope, query).
+    func searchAnswers() -> [String: String] {
+        var out: [String: String] = [:]
+        for (name, f) in scopes {
+            for (i, q) in qvecs.enumerated() {
+                out["search/\(name)/q\(i)"] = hitSig(store.search(q, filter: f, topK: 10))
+            }
+        }
+        return out
+    }
+    // FIND SIMILAR, seeded from files the baseline search actually returned, so the paths are
+    // real rows in this index rather than something invented.
+    var similarSeeds: [String] = []
+    for q in qvecs.prefix(4) {
+        if let p = store.search(q, topK: 3).first?.path, !similarSeeds.contains(p) { similarSeeds.append(p) }
+    }
+    func similarAnswers() -> [String: String] {
+        var out: [String: String] = [:]
+        for p in similarSeeds {
+            guard let v = store.fileVector(p) else { out["similar/\(p)"] = "NO VECTOR"; continue }
+            out["similar/\(p)"] = hitSig(store.search(v, topK: 10))
+        }
+        return out
+    }
+    // BROWSE. Folders picked from the seed files' own parents plus the obvious roots, keeping
+    // only the ones the index has children under - an empty listing compares equal to an empty
+    // listing forever and would prove nothing.
+    var browseFolders: [String] = [home + "/Documents", home + "/Downloads", home + "/Desktop"]
+    for p in similarSeeds { browseFolders.append((p as NSString).deletingLastPathComponent) }
+    browseFolders = browseFolders.filter { !store.indexedChildrenDetailed(ofFolder: $0).isEmpty }
+    func browseAnswers() -> [String: String] {
+        var out: [String: String] = [:]
+        for f in browseFolders {
+            let rows = store.indexedChildrenDetailed(ofFolder: f)
+                .map { "\($0.path)|\($0.isDirectory)|\($0.kind)|\($0.size)|\($0.fileCount)|"
+                       + String(format: "%.3f/%.3f", $0.indexedAt, $0.firstIndexedAt) }
+                .sorted()
+            out["browse/\(f)"] = rows.joined(separator: "\n")
+        }
+        return out
+    }
+
+    print("migprobe: split built at open = \(store.splitBuiltForTest), "
+          + "\(store.count) rows, seeds \(similarSeeds.count), browse folders \(browseFolders.count)")
+    guard !similarSeeds.isEmpty, !browseFolders.isEmpty else {
+        print("migprobe: nothing to compare - the index returned no hits for any probe"); exit(1)
+    }
+
+    var baseline = searchAnswers()
+    for (k, v) in similarAnswers() { baseline[k] = v }
+    for (k, v) in browseAnswers() { baseline[k] = v }
+    print("migprobe: baseline of \(baseline.count) answers taken before the migration")
+
+    // IDLE LATENCY FIRST, on the same index, so "during" has something to be a regression against.
+    func percentiles(_ xs: [Double]) -> (Double, Double, Double) {
+        guard !xs.isEmpty else { return (0, 0, 0) }
+        let s = xs.sorted()
+        func at(_ p: Double) -> Double { s[Swift.min(s.count - 1, Int(Double(s.count) * p))] }
+        return (at(0.5), at(0.95), s[s.count - 1])
+    }
+    // THE SAME CLOSURES THE PROBE WILL TIME, or the two columns are not comparable. The first
+    // version timed idle browse with `aggregates: false` and during-browse with the aggregates on,
+    // and duly reported 0.2 ms against 65 ms - a 300x "regression" that was two different queries.
+    let perSearch = Double(scopes.count * qvecs.count)
+    let perSimilar = Double(similarSeeds.count)
+    let perBrowse = Double(browseFolders.count)
+    var idleSearch: [Double] = [], idleSimilar: [Double] = [], idleBrowse: [Double] = []
+    for _ in 0 ..< 10 {
+        var t = Date(); _ = searchAnswers();  idleSearch.append(-t.timeIntervalSinceNow * 1000 / perSearch)
+        t = Date();     _ = similarAnswers(); idleSimilar.append(-t.timeIntervalSinceNow * 1000 / perSimilar)
+        t = Date();     _ = browseAnswers();  idleBrowse.append(-t.timeIntervalSinceNow * 1000 / perBrowse)
+    }
+    let i1 = percentiles(idleSearch), i2 = percentiles(idleSimilar), i3 = percentiles(idleBrowse)
+    print(String(format: "migprobe: idle    search p50 %.1f p95 %.1f max %.1f | similar p50 %.1f p95 %.1f max %.1f | browse p50 %.1f p95 %.1f max %.1f ms (per op)",
+                 i1.0, i1.1, i1.2, i2.0, i2.1, i2.2, i3.0, i3.1, i3.2))
+
+    // THE MIGRATION, on its own thread, while this one keeps reading.
+    store.resetBrowseBuslines()
+    // A plain `NSLock` is unavailable from an async context and this file's top level is one, so
+    // the done flag rides a serial queue instead. It is written once by the migration thread and
+    // read every round by this one.
+    final class DoneFlag: @unchecked Sendable {
+        private let q = DispatchQueue(label: "migprobe.done")
+        private var value = false
+        var isSet: Bool { q.sync { value } }
+        func set() { q.sync { value = true } }
+    }
+    let migDone = DoneFlag()
+    let t0 = Date()
+    Thread.detachNewThread {
+        // IN A LOOP, AND THAT IS NOT A DETAIL. `runMigrationStampsForTest` gives up once several
+        // stamps in a row make no progress, and a stamp makes no progress while a query is in
+        // flight - it yields, correctly, because a 150-second build must never land on a search's
+        // latency path. This probe searches continuously by construction, so the first call
+        // returned after five stamps and 0.0 s with the split unbuilt, and the whole run then
+        // compared a v4 index against itself and printed OK. That is the vacuous arm this
+        // codebase has now produced six times. Keep asking until both markers are set.
+        var stamps = 0
+        while !(store.splitBuiltForTest && store.v4DroppedForTest),
+              -t0.timeIntervalSinceNow < activeSeconds * 8 {
+            stamps += store.runMigrationStampsForTest()
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        migDone.set()
+        print(String(format: "migprobe: migration thread finished after %d stamps in %.1fs, splitBuilt=%@ v4Dropped=%@",
+                     stamps, -t0.timeIntervalSinceNow,
+                     store.splitBuiltForTest ? "yes" : "no", store.v4DroppedForTest ? "yes" : "no"))
+    }
+
+    var mismatches: [String] = []
+    var rounds = 0
+    var durSearch: [Double] = [], durSimilar: [Double] = [], durBrowse: [Double] = []
+    var phasesSeen: Set<String> = []
+    func compare(_ got: [String: String], _ lane: String) {
+        for (k, v) in got where baseline[k] != v {
+            guard mismatches.count < 12 else { return }
+            let was = baseline[k] ?? ""
+            mismatches.append("[\(lane) round \(rounds)] \(k)\n  was: "
+                              + was.split(separator: "\n").prefix(3).joined(separator: " / ")
+                              + "\n  now: " + v.split(separator: "\n").prefix(3).joined(separator: " / "))
+        }
+    }
+    // PROBE UNTIL THE MIGRATION IS DONE, THEN KEEP GOING. A fixed active window is how the second
+    // version of this measured nothing useful: the window closed at 300 s, the cutover happened at
+    // 499 s, and the run recorded phases ["split=false"] - every answer verified on one side of
+    // the change only. The load has to still be there when the readers switch models and when the
+    // v4 tables are dropped underneath them, and for a while afterwards.
+    let hardStop = Date().addingTimeInterval(activeSeconds * 8)
+    var doneAt: Date?
+    while Date() < hardStop {
+        if migDone.isSet, doneAt == nil { doneAt = Date() }
+        if let d = doneAt, Date().timeIntervalSince(d) > activeSeconds / 4 { break }
+        phasesSeen.insert("split=\(store.splitBuiltForTest)")
+        let tS = Date(); let s = searchAnswers(); durSearch.append(-tS.timeIntervalSinceNow * 1000 / perSearch)
+        compare(s, "search")
+        let tL = Date(); let l = similarAnswers(); durSimilar.append(-tL.timeIntervalSinceNow * 1000 / perSimilar)
+        compare(l, "similar")
+        // THE SUBTREE AGGREGATE IS THE EXPENSIVE ONE - 1.4 s on a 235k-directory subtree - and a
+        // browser only issues it on a folder switch, not per keystroke. Every third round.
+        if rounds % 3 == 0 {
+            let tB = Date(); let b = browseAnswers(); durBrowse.append(-tB.timeIntervalSinceNow * 1000 / perBrowse)
+            compare(b, "browse")
+        }
+        rounds += 1
+        // THINK TIME, and it is what makes this a test rather than a denial of service. With no
+        // pause at all the coverage stamp yields to the next query before it can do anything: the
+        // slot backfill reached 4.4M of 9.77M rows in 41 MINUTES and the probe could never see
+        // the cutover it exists to check. 250 ms is still an order of magnitude more aggressive
+        // than a person typing, and the whole migration lands inside the window.
+        //
+        // That the migration STILL ADVANCES under the pathological load is the reassuring half of
+        // that measurement: `yieldToSearchLocked` defers but gives up after 120 s and runs anyway,
+        // so a user who never stops searching gets a slow migration, not a stalled one.
+        try? await Task.sleep(nanoseconds: 250_000_000)
+    }
+    // THE STAMP YIELDS TO SEARCHES, so a probe that never stops reading can outlive the migration
+    // without it ever finishing. Go quiet and let it, then ask again: the answers after the whole
+    // thing has landed are the ones a user keeps.
+    while !migDone.isSet, -t0.timeIntervalSinceNow < activeSeconds * 6 {
+        try? await Task.sleep(nanoseconds: 5_000_000_000)
+    }
+    phasesSeen.insert("split=\(store.splitBuiltForTest)")
+    var after = searchAnswers()
+    for (k, v) in similarAnswers() { after[k] = v }
+    for (k, v) in browseAnswers() { after[k] = v }
+    rounds += 1
+    compare(after, "after")
+
+    let d1 = percentiles(durSearch), d2 = percentiles(durSimilar), d3 = percentiles(durBrowse)
+    print(String(format: "migprobe: during  search p50 %.1f p95 %.1f max %.1f | similar p50 %.1f p95 %.1f max %.1f | browse p50 %.1f p95 %.1f max %.1f ms (per op)",
+                 d1.0, d1.1, d1.2, d2.0, d2.1, d2.2, d3.0, d3.1, d3.2))
+    let bl = store.browseBuslines
+    print("migprobe: busline interactive \(bl.interactive) aggregate \(bl.aggregate)")
+    print("migprobe: \(rounds) rounds over \(String(format: "%.0f", -t0.timeIntervalSinceNow))s, "
+          + "phases \(phasesSeen.sorted()), splitBuilt=\(store.splitBuiltForTest)")
+    if let bad = store.coverageAudit() { print("migprobe: AUDIT FAILED: \(bad)") } else { print("migprobe: audit clean") }
+    // A PROBE THAT NEVER SAW THE MIGRATION HAPPEN MUST NOT REPORT OK. The first version of this
+    // did exactly that - 3 rounds, 2 seconds, phases ["split=false"], "every answer identical" -
+    // because the migration thread had given up immediately and there was nothing to be identical
+    // through. Comparing v4 against v4 is a real comparison of nothing.
+    let sawBoth = phasesSeen.contains("split=false") && phasesSeen.contains("split=true")
+    if !sawBoth || !store.splitBuiltForTest {
+        print("migprobe: MEASURED NOTHING - phases \(phasesSeen.sorted()), splitBuilt="
+              + "\(store.splitBuiltForTest). The migration did not run under the probe, so the "
+              + "comparison above compared one layout against itself.")
+        exit(1)
+    }
+    // AND A LATENCY GATE, because "no performance regression during the migration" is a claim
+    // and a claim needs a number that can fail. 4x the idle p50, with a 50 ms floor so a lane
+    // whose idle figure is sub-millisecond cannot trip on noise. Generous on purpose: the point
+    // is to catch a lane that has started queueing behind the migration, not to pin a percentile
+    // on a machine that drifts 25% between runs.
+    var regressions: [String] = []
+    for (name, idle, during) in [("search", i1.0, d1.0), ("similar", i2.0, d2.0), ("browse", i3.0, d3.0)] {
+        let budget = Swift.max(idle * 4, idle + 50)
+        if during > budget {
+            regressions.append(String(format: "%@ p50 %.1f ms during against %.1f ms idle (budget %.1f)",
+                                      name, during, idle, budget))
+        }
+    }
+    if !regressions.isEmpty {
+        print("migprobe: LATENCY REGRESSION")
+        for r in regressions { print("  " + r) }
+        exit(1)
+    }
+    if mismatches.isEmpty {
+        print("migprobe: OK - every answer identical through the whole migration, "
+              + "observed on both sides of the cutover, within the latency budget")
+        exit(0)
+    }
+    print("migprobe: \(mismatches.count) MISMATCHES")
+    for m in mismatches { print(m) }
+    exit(1)
+}
+
 // THE CUTTER GATE: omni-verify cutgate <modelDir> <root> [queries] [windowChars]
 //
 // Indexes one corpus twice in one process - once with the fixed grid, once with the content

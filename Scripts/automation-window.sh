@@ -12,13 +12,23 @@
 # The prompt appears once, on this script's first few seconds. If nobody answers it, the wait
 # below times out and says so rather than leaving a job running against a mode that is off.
 #
-# SOMEBODY HAS TO BE AT THE KEYBOARD WHEN IT APPEARS, and the window this buys is ten hours, not
-# forever. The runner gives up 60 SECONDS after putting the prompt up - "Failed to initialize for
-# UI testing: Timed out while enabling automation mode" - so waiting longer here cannot help: the
-# holder is already dead. Measured by screenshotting the screen while it waited, which is the only
-# way to tell "no prompt appeared" from "a prompt appeared and nobody was there": the dialog reads
-# "XCTest is trying to Enable UI Automation. Enter the password for the user ...". So an overnight
-# unattended run has to be STARTED while someone can type, and it ends when the ten hours do.
+# SOMEBODY HAS TO BE AT THE KEYBOARD WHEN IT APPEARS. The runner gives up 60 SECONDS after putting
+# the prompt up - "Failed to initialize for UI testing: Timed out while enabling automation mode" -
+# so waiting longer here cannot help: the holder is already dead by then. Measured by screenshotting
+# the screen while it waited, which is the only way to tell "no prompt appeared" from "a prompt
+# appeared and nobody was there": the dialog reads "XCTest is trying to Enable UI Automation. Enter
+# the password for the user ...".
+#
+# THERE IS NO TEN-HOUR CAP. A 600-minute hold was read as one; it was only the number passed.
+# 1500 minutes holds 1500 minutes - the deadline is this script's argument and nothing else.
+#
+# TO HOLD THE WINDOW OPEN PAST THE JOB, which is what "do not ask me again today" means, give it a
+# command that outlives the work and detach it:
+#
+#   nohup ./Scripts/automation-window.sh 1500 sleep 86400 >/tmp/omni-auto.log 2>&1 & disown
+#
+# Every later `xcodebuild test` finds the state file already there and does not re-authenticate.
+# `touch /tmp/omni-automation-window.release` ends it early.
 set -u
 cd "$(dirname "$0")/.."
 

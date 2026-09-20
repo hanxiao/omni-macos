@@ -1124,7 +1124,26 @@ public final class VectorStore: @unchecked Sendable {
     /// than the bound.
     private var yieldingSince: [String: Date] = [:]
     /// How long maintenance may be held off by continuous searching before it goes ahead anyway.
-    private static let maxYieldToSearch: TimeInterval = 120
+    ///
+    /// 20 SECONDS, MEASURED DOWN FROM 120. The bound is not just "how long until maintenance gets
+    /// a turn", it is the whole DUTY CYCLE under sustained load, because breaking through buys
+    /// exactly ONE stamp: the stamp does one slice, re-arms on the idle gap, and the next call
+    /// finds the clock reset and yields again. At 120 s that is one 200k-row slice every two
+    /// minutes - `omni-verify migprobe` measured the real index's slot backfill at 2.4M of
+    /// 9,773,836 rows after 20 minutes of continuous querying, i.e. about 100k rows a minute,
+    /// where the same backfill takes 12.2 SECONDS on an idle store. A user who keeps searching
+    /// (or an agent polling the HTTP endpoint, which is the case this bound was added for) would
+    /// wait hours for a migration that is a few minutes of work.
+    ///
+    /// The cost of lowering it is one slice landing on the queue every ~20 s instead of every
+    /// ~120 s, and a slice is ~0.25 s - so the worst a query can wait behind maintenance is
+    /// UNCHANGED, and only its frequency moves: from 0.2% of wall clock to 1.2%, against the 20%
+    /// the same code spends when the app is idle. `OMNI_YIELD_BOUND` A/Bs it in one binary.
+    ///
+    /// In steady state this costs nothing at all: with the migration done the stamp finds no work
+    /// and returns, so the break-through is a no-op that happens six times more often.
+    nonisolated(unsafe) static var maxYieldToSearch: TimeInterval =
+        ProcessInfo.processInfo.environment["OMNI_YIELD_BOUND"].flatMap(Double.init) ?? 20
 
     /// Should background maintenance stand aside right now? Yes while someone is searching - and NO
     /// once that has been true for two minutes without a break.
@@ -7220,6 +7239,11 @@ public final class VectorStore: @unchecked Sendable {
     /// Whether the off-queue build is still running. Harnesses that time the build have to wait
     /// on this: `buildChunkSplitForTest` only SCHEDULES it now and returns false immediately.
     public var splitBuildInFlightForTest: Bool { queue.sync { splitBuildInFlight } }
+
+    /// THE MIGRATION IS NOT OVER WHEN THE SPLIT IS BUILT - the v4 tables go in a later stamp. A
+    /// harness that stops at `splitBuiltForTest` measures a migration with a step to go and then
+    /// reports the drop as "never happened" when it was the harness that stopped asking.
+    public var v4DroppedForTest: Bool { queue.sync { v4Dropped } }
     /// The display SQL this index answers with.
     private var displayTextSQL: String { splitBuilt ? Self.chunkTextByPathSplitSQL : Self.chunkTextByPathSQL }
     /// Snippet and locator for every chunk of one file. See fileDisplayTextSplitSQL.

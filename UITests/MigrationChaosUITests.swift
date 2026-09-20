@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 
 /// A REAL USER OPENING A v4 INDEX AND NOT WAITING POLITELY FOR IT.
@@ -138,6 +139,148 @@ final class MigrationChaosUITests: XCTestCase {
         let f = app.windows.firstMatch.searchFields.firstMatch
         if f.exists, f.isHittable { f.click() } else { app.typeKey("f", modifierFlags: .command) }
         usleep(120_000)
+    }
+
+    /// A4 at 150 dpi with text drawn on it, which is what the OCR path actually takes: pages are
+    /// rasterised and fed to the vision tower, so a PNG is as real an input as a PDF page.
+    private func ocrPage(_ name: String, _ text: String) throws -> URL {
+        let size = NSSize(width: 1240, height: 1754)
+        let image = NSImage(size: size)
+        image.lockFocus()
+        NSColor.white.setFill()
+        NSRect(origin: .zero, size: size).fill()
+        let style = NSMutableParagraphStyle(); style.lineSpacing = 6
+        (text as NSString).draw(in: NSRect(x: 90, y: 90, width: size.width - 180, height: size.height - 180),
+                                withAttributes: [.font: NSFont.systemFont(ofSize: 26),
+                                                 .foregroundColor: NSColor.black,
+                                                 .paragraphStyle: style])
+        image.unlockFocus()
+        guard let tiff = image.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
+              let png = rep.representation(using: .png, properties: [:])
+        else { throw XCTSkip("could not render an OCR fixture page") }
+        // OUTSIDE the watched corpus on purpose: a page dropped into an indexed folder would also
+        // be crawled, and then a stall could be the indexer rather than the transcription.
+        let url = addLater.deletingLastPathComponent().appendingPathComponent("\(name).png")
+        try png.write(to: url)
+        return url
+    }
+
+    /// TRANSCRIBING WHILE THE INDEX UNDERNEATH IS BEING REWRITTEN.
+    ///
+    /// The chaos test above toggles OCR mode on and off, which stands the indexer down and up and
+    /// proves nothing about a RUN. A run is the other half of the machine: 4.53 GB of weights
+    /// loaded, the GPU saturated for a minute, `ocrRunActive` holding indexing down - all while
+    /// the coverage stamp is trying to back-fill slots, build the split off-queue and drop the v4
+    /// tables on the store queue.
+    ///
+    /// The two are supposed to be independent - one is GPU, the other is SQLite - and "supposed
+    /// to be" is exactly the class of claim this file exists to stop making. What would show a
+    /// dependency: a transcription that never produces a page because the store queue is held, or
+    /// a migration that never finishes because the OCR run starved it (the script reads the
+    /// markers afterwards and fails the run if the split is not built).
+    ///
+    /// Skips where the optional 4.5 GB model is absent, the same way the workspace suite does.
+    func testOCRRunsWhileAnOldIndexMigrates() throws {
+        let pages = try (0 ..< 4).map { i in
+            try ocrPage("ocrmig\(i)", """
+                Quarterly Reconciliation - sheet \(i + 1)
+
+                Account      Q1        Q2        Total
+                4010 Revenue 1,204,880 1,318,455 2,523,335
+                4020 Returns    48,220    51,004    99,224
+                5010 COGS      602,440   659,228 1,261,668
+
+                Prepared for the audit committee. Page \(i + 1) of 4.
+                """)
+        }
+        let app = XCUIApplication()
+        app.launchArguments = [
+            "-omni.dbDir", scratchDB.path,
+            "-omni.addedFolders", "(\"\(corpus.path)\")",
+            "-omni.roots", "(\"\(corpus.path)\")",
+            "-omni.ephemeralUIState", "YES",
+            "-omni.serving.enabled", "NO",
+            "-omni.uiChaos", "YES",
+            "-omni.ocrOpen", pages.map(\.path).joined(separator: ":"),
+        ]
+        for k in ["OMNI_FREE_LIST"] {
+            if let v = ProcessInfo.processInfo.environment[k]
+                ?? ProcessInfo.processInfo.environment["TEST_RUNNER_" + k] {
+                app.launchEnvironment[k] = v
+            }
+        }
+        if let out = ProcessInfo.processInfo.environment["OMNI_MIGCHAOS_STDERR"]
+            ?? ProcessInfo.processInfo.environment["TEST_RUNNER_OMNI_MIGCHAOS_STDERR"] {
+            app.launchArguments += ["-omni.stderrFile", out]
+        }
+        app.launch()
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 180), "app did not come up on a v4 index")
+
+        // Race the two outcomes rather than waiting out the timeout for the one that means skip.
+        let missing = app.descendants(matching: .any)["ocr.needsmodel"].firstMatch
+        let readout = app.descendants(matching: .any)["ocr.readout"].firstMatch
+        var started = false
+        let upBy = Date().addingTimeInterval(90)
+        while Date() < upBy {
+            if missing.exists { throw XCTSkip("OCR model not downloaded; skipping the OCR migration test") }
+            if readout.exists { started = true; break }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+        }
+        XCTAssertTrue(started, "the workspace neither started a run nor reported a missing model")
+
+        // FILE CHURN THROUGHOUT, so this is a transcription against a migrating index that is
+        // ALSO being written to - the three things at once, which is the combination the
+        // separate suites each miss one of.
+        startChurn()
+        defer { churnStop = true }
+
+        // A page rendered is the transcription having survived the store queue being busy.
+        let firstSection = app.descendants(matching: .any)["ocr.section.0"].firstMatch
+        XCTAssertTrue(firstSection.waitForExistence(timeout: 420),
+                      "nothing was transcribed while the index migrated")
+
+        // And the run finishing is Copy becoming available - the workspace's own statement that
+        // a page settled rather than that some text appeared.
+        let copy = app.buttons["Copy Markdown"].firstMatch
+        XCTAssertTrue(copy.waitForExistence(timeout: 60), "no Copy Markdown button")
+        let doneBy = Date().addingTimeInterval(420)
+        while !copy.isEnabled, Date() < doneBy {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+            XCTAssertEqual(app.state, .runningForeground, "the app went away during the OCR run")
+        }
+        XCTAssertTrue(copy.isEnabled, "the OCR run never finished a page while the index migrated")
+        NSPasteboard.general.clearContents()
+        copy.click()
+        var copied = ""
+        let pasteBy = Date().addingTimeInterval(10)
+        while copied.isEmpty, Date() < pasteBy {
+            copied = NSPasteboard.general.string(forType: .string) ?? ""
+            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        }
+        XCTAssertGreaterThan(copied.count, 40, "the transcript is implausibly short: \(copied)")
+
+        // LEAVING OCR RELEASES THE WEIGHTS AND STANDS INDEXING BACK UP, and the index has to be
+        // searchable straight afterwards - during whatever phase of the migration this landed in.
+        let toggle = app.windows.firstMatch.checkBoxes["ocr.toggle"]
+        if toggle.exists, toggle.isHittable { toggle.click() }
+        usleep(800_000)
+        focusSearch(app)
+        app.typeKey("a", modifierFlags: .command)
+        app.typeText("porsche")
+        let row = app.descendants(matching: .any)["result.row"].firstMatch
+        XCTAssertTrue(row.waitForExistence(timeout: 60),
+                      "the index answered nothing after an OCR run during the migration")
+
+        // Then get out of the way so the migration can land; the script checks the markers.
+        churnStop = true
+        let quiet = ProcessInfo.processInfo.environment["OMNI_MIGCHAOS_QUIET_SECONDS"]
+            .flatMap(Double.init) ?? 150
+        let quietUntil = Date().addingTimeInterval(quiet)
+        while Date() < quietUntil {
+            Thread.sleep(forTimeInterval: 5)
+            XCTAssertEqual(app.state, .runningForeground, "the app went away while idle")
+        }
+        XCTAssertEqual(app.state, .runningForeground, "the app did not survive")
     }
 
     func testChaosWhileAnOldIndexMigrates() throws {
