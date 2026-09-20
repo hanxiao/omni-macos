@@ -242,11 +242,14 @@ struct FolderBrowser: View {
             .environment(\.defaultMinListRowHeight, BrowserMetrics.rowHeight)
             .modifier(SoftTopScrollEdge())
             .alternatingRowBackgrounds()
-            // PLAIN, not `.inset`. The inset style adds ~12pt of horizontal inset of its own on
-            // top of `listRowInsets`, which is what walked the rows out of line with the header
-            // (measured: the Kind value sat 15pt left of the Kind title), and it draws the
-            // alternating bands as inset rounded capsules. Finder's bands are full-bleed and
-            // square, and its values sit exactly under their titles.
+            // INSET, for the right-click highlight - see the note on `listCore` above, which is
+            // where that trade is argued.
+            //
+            // THIS COMMENT USED TO SAY "PLAIN, not `.inset`" AND DESCRIBE THIS BUG. The style
+            // changed for the highlight and the comment stayed, so the file simultaneously said
+            // the inset style walks the values out of line with the titles and used it - and it
+            // did, by 7pt, until somebody looked at the screen. `BrowserMetrics.listInset` is
+            // what compensates and it has to match whichever style is set here.
             .listStyle(.inset)
         }
     }

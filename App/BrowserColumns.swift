@@ -117,10 +117,28 @@ enum BrowserMetrics {
     static let icon: CGFloat = 16
     static let iconGap: CGFloat = 4
     static let rowHeight: CGFloat = 20
-    /// `List` keeps 9pt of horizontal inset of its own that no API reports back: with
-    /// `listRowInsets` zeroed a row still began 9pt in from the pane edge. A header drawn ABOVE
-    /// the list has to add the same 9pt by hand or it will not line up with the rows under it.
-    static let listInset: CGFloat = 9
+    /// `List` keeps horizontal inset of its own that no API reports back: with `listRowInsets`
+    /// zeroed a row still begins this far in from the pane edge. A header drawn ABOVE the list -
+    /// ours is a safe-area bar, which is outside the list entirely - has to add the same by hand
+    /// or it will not line up with the rows under it.
+    ///
+    /// 16, NOT 9. 9 was measured under `.listStyle(.plain)`; the browser moved to `.inset` for
+    /// the rounded right-click highlight and this did not move with it, so every column was out
+    /// by the difference. Measured on a 1600x860 window, header title x against value x:
+    ///
+    ///     Name  307 / 314     Kind  1117 / 1110     Date Indexed  1206 / 1199
+    ///
+    /// The name text sits 7pt RIGHT of its title and every fixed column 7pt LEFT of its own,
+    /// which is one number in two directions: the fixed columns are anchored to the trailing
+    /// edge, so the same extra inset that pushes the name right pulls them left. 18 + 16 = 34 on
+    /// each side puts all three deltas at 0.
+    ///
+    /// CHECKED AGAINST THE THING THAT COULD MAKE IT NOT A CONSTANT: legacy scrollbars
+    /// (`AppleShowScrollBars = Always`) take layout width from a scroll view where overlay
+    /// scrollers do not, which would make any fitted number wrong for that user. Measured with
+    /// the setting on AND with a list long enough to scroll: byte-identical. It is the list
+    /// style's own inset, not the scroller's.
+    static let listInset: CGFloat = 16
     /// How far the selection fill is inset from the pane edges. Finder's runs x=208..1289 in a pane
     /// that starts at 200 and a window 1300 wide - 8pt in on the left, ~10 on the right - and is
     /// 4px narrower again at its first and last scanline, which is the corner radius.
