@@ -39,7 +39,9 @@ for T in $TESTS; do
   echo "cloned $(ls -la "$W/index.sqlite" | awk '{printf "%.2f GB", $5/1073741824}') to $W"
   pkill -x Omni 2>/dev/null || true; sleep 2
   : > "$LOGF"
-  ./Scripts/ui-test.sh "MigrationChaosUITests/$T" || rc=1
+  ./Scripts/ui-test.sh "MigrationChaosUITests/$T" > /tmp/omni-migchaos-$T.log 2>&1 || rc=1
+  grep -E "Test Case .*(passed|failed|skipped)" "/tmp/omni-migchaos-$T.log" | tail -3
+  skipped=$(grep -c "Test Case .*skipped" "/tmp/omni-migchaos-$T.log")
   echo "=== app stderr: $(grep -c "" "$LOGF" 2>/dev/null || echo 0) lines"
   grep -inE "error|fail|warn|refus|abandon|unreadable|corrupt|cannot|invalid" "$LOGF" 2>/dev/null | head -20
 
@@ -68,7 +70,11 @@ for T in $TESTS; do
     "SELECT key || '=' || value FROM meta WHERE key LIKE 'chunk_%' OR key LIKE 'vecs_%' ORDER BY key;" 2>&1
   built=$(sqlite3 -readonly "$W/index.sqlite" \
     "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='chunk_split_backfilled'),0);" 2>/dev/null)
-  if [ "$built" != "1" ]; then
+  if [ "$skipped" != "0" ]; then
+    # A SKIPPED TEST DROVE NOTHING, so "the split was never built" is not a finding about the
+    # migration - it is the skip. Saying otherwise turns every skip into a red run.
+    echo "=== the test SKIPPED, so nothing was driven and there is nothing to read off the index"
+  elif [ "$built" != "1" ]; then
     echo "=== WARNING: the split was never built in this run."
     echo "    The run exercised v4. Give it longer, or drive fewer searches, before believing it."
     rc=2
