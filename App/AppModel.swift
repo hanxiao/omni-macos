@@ -832,7 +832,7 @@ final class AppModel {
 
     /// The subfolder counts the listing deliberately skipped, fetched second. See
     /// `indexedChildrenDetailed(ofFolder:aggregates:)` for why they are split.
-    func folderCounts(under folder: URL) async -> [String: (count: Int, newest: Double)] {
+    func folderCounts(under folder: URL) async -> [String: (count: Int, newest: Double, oldest: Double)] {
         guard let store else { return [:] }
         let path = folder.path
         return await Task.detached(priority: .utility) { store.folderCounts(under: path) }.value

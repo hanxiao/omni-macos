@@ -1950,6 +1950,25 @@ public final class VectorStore: @unchecked Sendable {
             //
             // Safe to drop: the split is DERIVED from the v4 tables, so the only cost of losing
             // it is rebuilding it, and its done-flag is cleared so that happens.
+            // AND AN `occurrence` FROM BEFORE IT HAD AN IDENTITY. Same reasoning as the
+            // `chunk.slot` case below: `CREATE TABLE IF NOT EXISTS` cannot add a column, so an
+            // index built by an earlier build of this migration keeps a composite primary key
+            // and a plain rowid - readable, but without the ordering guarantee the loader rests
+            // on across a VACUUM. Only while `chunks` is still there to rebuild from: a v5-only
+            // index has nothing to derive the split from, and dropping it would be the one
+            // destructive answer available.
+            if hasTableLocked("occurrence"), !hasColumnLocked("occurrence", "id"),
+               hasTableLocked("chunks") {
+                exec("DROP INDEX IF EXISTS idx_chunk_key;")
+                exec("DROP INDEX IF EXISTS idx_chunk_slot_v5;")
+                exec("DROP INDEX IF EXISTS idx_occ_chunk;")
+                exec("DROP TABLE IF EXISTS occurrence;")
+                exec("DROP TABLE IF EXISTS chunk;")
+                exec("DROP TABLE IF EXISTS chunk_snippet;")
+                exec("DROP TABLE IF EXISTS free_slot;")
+                exec("DELETE FROM meta WHERE key = '\(Self.chunkSplitDoneKey)';")
+                exec("DELETE FROM meta WHERE key = '\(Self.pendingOnContentKey)';")
+            }
             if hasTableLocked("chunk"), !hasColumnLocked("chunk", "slot") {
                 exec("DROP INDEX IF EXISTS idx_chunk_key;")
                 exec("DROP INDEX IF EXISTS idx_chunk_slot_v5;")
@@ -1976,6 +1995,42 @@ public final class VectorStore: @unchecked Sendable {
                 // `backfillSlotsLocked` then gives each row the slot its vector already occupies,
                 // after which the rank-through-holes walk is never needed again.
                 addColumnIfMissing("slot", "INTEGER NOT NULL DEFAULT -1")
+            }
+            // WHEN A FILE WAS FIRST INDEXED, which the schema could not answer and which was
+            // asked for: `indexed_at` is overwritten by every reindex, so what it holds is LAST
+            // indexed. Written once, on the INSERT, and deliberately absent from the upsert's DO
+            // UPDATE list - that omission is the whole mechanism.
+            //
+            // SEEDED FROM `indexed_at` ON THE ONE OPEN THAT ADDS IT, which is the difference
+            // between a column that works for an existing user and one that reads "--" for
+            // 2.66M rows until each file is next edited. It is not an invention: `indexed_at`
+            // is the LAST index, so it is an exact answer for every file indexed once and never
+            // re-indexed - which is almost all of them, since a reindex needs the mtime or size
+            // to change - and an upper bound for the rest. A file cannot have been first indexed
+            // after it was last indexed. Rows written from here on carry the real stamp.
+            //
+            // Inside the `hasColumn` test on purpose: the UPDATE must run exactly once, on the
+            // open that adds the column, never again - a second pass would reset first-indexed to
+            // last-indexed and quietly undo the whole column.
+            //
+            // ONE TRANSACTION AROUND BOTH, and that is what makes the guard sound. As two
+            // statements the ALTER commits first and the UPDATE takes 4.4 s on the real index;
+            // a kill inside that window leaves the column present and empty, which the guard
+            // then reads as "already seeded" and the index carries zeros for life. SQLite runs
+            // DDL inside a transaction, so the pair either both land or neither does and the
+            // next open starts over.
+            //
+            // MEASURED, 2,678,916 files on the real index: 4410 ms, once, on the open that also
+            // starts the v5 migration - which is minutes. Open itself is 3.2 s warm, so this is
+            // the one launch that pays it.
+            if hasTableLocked("files"), !hasColumnLocked("files", "first_indexed_at") {
+                let t0 = Date()
+                let owns = sqlite3_get_autocommit(db) != 0
+                if owns { exec("BEGIN IMMEDIATE;") }
+                addColumnIfMissing("first_indexed_at", "REAL NOT NULL DEFAULT 0", table: "files")
+                exec("UPDATE files SET first_indexed_at = indexed_at;")
+                if owns { exec("COMMIT;") }
+                omniPerfLog(String(format: "first-indexed-seed %.1fms", -t0.timeIntervalSinceNow * 1000))
             }
             // AND `chunks` / `chunk_text` ARE NOT RECREATED once the migration has dropped them.
             // `CREATE TABLE IF NOT EXISTS` cannot tell "deliberately gone" from "not there yet",
@@ -3597,8 +3652,11 @@ public final class VectorStore: @unchecked Sendable {
     /// `files(dir_id, name)` and `chunks(file_id, chunk_index)` indexes.
     /// A child row for the folder browser, with the facts the index holds about it.
     ///
-    /// `indexedAt` is the LAST index time, not the first: the schema keeps one `indexed_at` stamp
-    /// per file and a reindex overwrites it. There is no first-indexed column to read.
+    /// `indexedAt` is the LAST index time and `firstIndexedAt` the first: `indexed_at` is
+    /// overwritten by every reindex, so the two differ exactly for files that have been edited
+    /// since they entered the index. For a FOLDER they are the newest and the oldest stamp
+    /// beneath it, which is the pair a listing wants - when this folder started being covered
+    /// and when it was last touched.
     public struct IndexedChild: Sendable {
         public let path: String
         public let isDirectory: Bool
@@ -3606,6 +3664,7 @@ public final class VectorStore: @unchecked Sendable {
         public let modified: Double
         public let size: Int
         public let indexedAt: Double     // last indexed; for a folder, the newest beneath it
+        public let firstIndexedAt: Double // first indexed; for a folder, the oldest beneath it
         public let fileCount: Int        // indexed files beneath a folder; 0 for a file
     }
 
@@ -3838,7 +3897,7 @@ public final class VectorStore: @unchecked Sendable {
     /// and counted each file's chunks - a count `IndexedChild` has no field for and threw away.
     private struct BrowseFile {
         let name: String, kind: String
-        let modified: Double, indexedAt: Double
+        let modified: Double, indexedAt: Double, firstIndexedAt: Double
         let size: Int
     }
 
@@ -3848,7 +3907,7 @@ public final class VectorStore: @unchecked Sendable {
             var st: OpaquePointer?
             defer { sqlite3_finalize(st) }
             guard sqlite3_prepare_v2(h, """
-                SELECT f.name, f.kind, f.modified, f.indexed_at, f.size
+                SELECT f.name, f.kind, f.modified, f.indexed_at, f.size, f.first_indexed_at
                   FROM files f JOIN dirs d ON d.id = f.dir_id
                  WHERE d.path = ?1 AND EXISTS(SELECT 1 FROM \(rowTableShared) c WHERE c.file_id = f.id);
                 """, -1, &st, nil) == SQLITE_OK else { return [] }
@@ -3860,6 +3919,7 @@ public final class VectorStore: @unchecked Sendable {
                                       kind: readKindName(interactiveLane, h, Int(sqlite3_column_int(st, 1)), &reloaded),
                                       modified: sqlite3_column_double(st, 2),
                                       indexedAt: sqlite3_column_double(st, 3),
+                                      firstIndexedAt: sqlite3_column_double(st, 5),
                                       size: Int(sqlite3_column_int64(st, 4))))
             }
             return out
@@ -4031,13 +4091,15 @@ public final class VectorStore: @unchecked Sendable {
                                     modified: f.modified,
                                     size: f.size,
                                     indexedAt: f.indexedAt,
+                                    firstIndexedAt: f.firstIndexedAt,
                                     fileCount: 0))
         }
         for path in folders {
-            let a = agg[(path as NSString).lastPathComponent] ?? (0, 0)
+            let a = agg[(path as NSString).lastPathComponent] ?? (0, 0, 0)
             out.append(IndexedChild(path: path, isDirectory: true, kind: "",
                                     modified: 0, size: 0,
-                                    indexedAt: a.newest, fileCount: a.count))
+                                    indexedAt: a.newest, firstIndexedAt: a.oldest,
+                                    fileCount: a.count))
         }
         return out
     }
@@ -4057,7 +4119,7 @@ public final class VectorStore: @unchecked Sendable {
     /// Two halves, because a backlog and a walk already in flight need different handling: a newer
     /// request interrupts the running one, and each request re-checks on entry whether it has since
     /// been superseded and drops out without touching the database.
-    public func folderCounts(under folder: String) -> [String: (count: Int, newest: Double)] {
+    public func folderCounts(under folder: String) -> [String: (count: Int, newest: Double, oldest: Double)] {
         aggTicketLock.lock()
         aggTicket &+= 1
         let mine = aggTicket
@@ -4093,13 +4155,13 @@ public final class VectorStore: @unchecked Sendable {
         return ticket == aggTicket
     }
 
-    /// Per-immediate-child totals under `folder`: indexed files beneath it, and the newest
-    /// `indexed_at` among them. One grouped pass over the `dirs` range scan the browser already
-    /// uses, so it rides the same unique index.
+    /// Per-immediate-child totals under `folder`: indexed files beneath it, the newest
+    /// `indexed_at` among them and the oldest `first_indexed_at`. One grouped pass over the
+    /// `dirs` range scan the browser already uses, so it rides the same unique index.
     /// `ticket` is the supersede token from `folderCounts`; 0 means "not on the browse path" for
     /// any other caller, which never drops out.
     private func folderAggregates(under folder: String,
-                                  ticket: UInt64 = 0) -> [String: (count: Int, newest: Double)] {
+                                  ticket: UInt64 = 0) -> [String: (count: Int, newest: Double, oldest: Double)] {
         // THE AGGREGATE LANE. This is the only caller of it: 1.4 s on a 235k-directory subtree, and
         // it must never be what an interactive listing is waiting behind.
         onReader(aggregateLane, [:]) { h in
@@ -4111,11 +4173,11 @@ public final class VectorStore: @unchecked Sendable {
             }
             self.aggWalksLock.lock(); self.aggWalks &+= 1; self.aggWalksLock.unlock()
             let pfx = folder + "/"
-            var out: [String: (count: Int, newest: Double)] = [:]
+            var out: [String: (count: Int, newest: Double, oldest: Double)] = [:]
             var st: OpaquePointer?
             defer { sqlite3_finalize(st) }
             guard sqlite3_prepare_v2(h, """
-                SELECT d.path, COUNT(f.id), MAX(f.indexed_at)
+                SELECT d.path, COUNT(f.id), MAX(f.indexed_at), MIN(NULLIF(f.first_indexed_at, 0))
                   FROM dirs d JOIN files f ON f.dir_id = d.id
                  WHERE d.path >= ?1 AND d.path < ?2
                    AND EXISTS(SELECT 1 FROM \(rowTableShared) c WHERE c.file_id = f.id)
@@ -4135,9 +4197,14 @@ public final class VectorStore: @unchecked Sendable {
                 guard let c = sqlite3_column_text(st, 0) else { continue }
                 let name = String(String(cString: c).dropFirst(pfx.count).prefix { $0 != "/" })
                 guard !name.isEmpty else { continue }
-                let prior = out[name] ?? (0, 0)
+                let prior = out[name] ?? (0, 0, 0)
+                // MIN over a NULLIF: a subtree whose rows all predate the column yields NULL,
+                // which reads back as 0 and must not win the minimum against a real date.
+                let first = sqlite3_column_double(st, 3)
                 out[name] = (prior.count + Int(sqlite3_column_int64(st, 1)),
-                             Swift.max(prior.newest, sqlite3_column_double(st, 2)))
+                             Swift.max(prior.newest, sqlite3_column_double(st, 2)),
+                             prior.oldest == 0 ? first : (first == 0 ? prior.oldest
+                                                                     : Swift.min(prior.oldest, first)))
             }
             if ticket != 0, !self.aggregateIsCurrent(ticket) {
                 self.aggregateLane.busline.noteWasted()       // finished, then found stale
@@ -12312,8 +12379,9 @@ public final class VectorStore: @unchecked Sendable {
               sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO dirs(path) VALUES(?);", -1, &w.dirIns, nil) == SQLITE_OK,
               sqlite3_prepare_v2(db, "SELECT id FROM dirs WHERE path = ?;", -1, &w.dirSel, nil) == SQLITE_OK,
               sqlite3_prepare_v2(db, """
-                INSERT INTO files(dir_id, name, modified, size, kind, width, height, duration, indexed_at)
-                  VALUES(?,?,?,?,?,?,?,?,?)
+                INSERT INTO files(dir_id, name, modified, size, kind, width, height, duration,
+                                  indexed_at, first_indexed_at)
+                  VALUES(?,?,?,?,?,?,?,?,?,?9)
                 ON CONFLICT(dir_id, name) DO UPDATE SET
                   modified = excluded.modified, size = excluded.size, kind = excluded.kind,
                   width = excluded.width, height = excluded.height, duration = excluded.duration,
@@ -12911,9 +12979,9 @@ public final class VectorStore: @unchecked Sendable {
         let missing = scalarQuery("SELECT COUNT(*) FROM split_catchup")
         if missing > 0 {
             exec("""
-                INSERT OR IGNORE INTO chunk(key, kind, bytes, refs, slot)
+                INSERT OR IGNORE INTO chunk(key, kind, refs, slot)
                 SELECT COALESCE(NULLIF(t.chunk_key, x''), CAST(x'00' || u.chunk_row AS BLOB)),
-                       u.kind, 0, 0, u.slot
+                       u.kind, 0, u.slot
                   FROM split_catchup u
                   LEFT JOIN chunk_text t ON t.chunk_id = u.chunk_row;
                 """)
@@ -13169,8 +13237,8 @@ public final class VectorStore: @unchecked Sendable {
     /// unique key index. The only way to make the build fail at the SQL level from outside.
     public func seedConflictingContentForTest() {
         queue.sync {
-            exec("INSERT OR REPLACE INTO chunk(id, key, kind, bytes, refs) "
-                 + "SELECT 999999, chunk_key, 0, 0, 1 FROM chunk_text WHERE length(chunk_key) > 0 LIMIT 1;")
+            exec("INSERT OR REPLACE INTO chunk(id, key, kind, refs) "
+                 + "SELECT 999999, chunk_key, 0, 1 FROM chunk_text WHERE length(chunk_key) > 0 LIMIT 1;")
         }
     }
 
@@ -14230,16 +14298,10 @@ public final class VectorStore: @unchecked Sendable {
 
     /// Idempotently add a column to `chunks` if it is not already present (SQLite has no
     /// ADD COLUMN IF NOT EXISTS). Used for additive, no-reindex schema migrations.
-    private func addColumnIfMissing(_ name: String, _ decl: String) {
-        var stmt: OpaquePointer?
-        var present = false
-        if sqlite3_prepare_v2(db, "PRAGMA table_info(chunks);", -1, &stmt, nil) == SQLITE_OK {
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                if let c = sqlite3_column_text(stmt, 1), String(cString: c) == name { present = true; break }
-            }
-        }
-        sqlite3_finalize(stmt)
-        if !present { exec("ALTER TABLE chunks ADD COLUMN \(name) \(decl);") }
+    private func addColumnIfMissing(_ name: String, _ decl: String, table: String = "chunks") {
+        guard hasTableLocked(table) else { return }
+        if hasColumnLocked(table, name) { return }
+        exec("ALTER TABLE \(table) ADD COLUMN \(name) \(decl);")
     }
 
     private func exec(_ sql: String) {

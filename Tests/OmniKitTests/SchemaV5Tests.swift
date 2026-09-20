@@ -85,8 +85,8 @@ final class SchemaV5Tests: XCTestCase {
         // Without this index the whole design is unenforceable: v4 stored chunk_key on 9.13M rows
         // and indexed none of them, so nothing could ask whether a content already existed.
         let k = "x'aabb'"
-        XCTAssertTrue(exec("INSERT INTO chunk(id, key, kind, bytes, refs) VALUES(1, \(k), 0, 100, 1);"))
-        XCTAssertFalse(exec("INSERT INTO chunk(id, key, kind, bytes, refs) VALUES(2, \(k), 0, 100, 1);"),
+        XCTAssertTrue(exec("INSERT INTO chunk(id, key, kind, refs) VALUES(1, \(k), 0, 1);"))
+        XCTAssertFalse(exec("INSERT INTO chunk(id, key, kind, refs) VALUES(2, \(k), 0, 1);"),
                        "a duplicate content key was accepted")
     }
 
@@ -99,7 +99,7 @@ final class SchemaV5Tests: XCTestCase {
     func testOneChunkOccursInManyFilesWithDifferentLocators() {
         // The point of the split. The same content is Line 1 of one file and Line 4310 of another,
         // and the locator travels with the OCCURRENCE.
-        XCTAssertTrue(exec("INSERT INTO chunk(id, key, kind, bytes, refs) VALUES(10, x'01', 0, 500, 0);"))
+        XCTAssertTrue(exec("INSERT INTO chunk(id, key, kind, refs) VALUES(10, x'01', 0, 0);"))
         XCTAssertTrue(exec("INSERT INTO occurrence(file_id, ordinal, chunk_id, locator) VALUES(100, 0, 10, 'Line 1');"))
         XCTAssertTrue(exec("INSERT INTO occurrence(file_id, ordinal, chunk_id, locator) VALUES(200, 5, 10, 'Line 4310');"))
         XCTAssertEqual(count("SELECT COUNT(*) FROM occurrence WHERE chunk_id = 10"), 2)
@@ -123,7 +123,7 @@ final class SchemaV5Tests: XCTestCase {
         // The free list is a cache of a fact SQLite already holds: the ids below the high-water mark
         // with no chunk row. It has to be reconcilable, because a leaked slot is invisible.
         for id in [1, 2, 5] {
-            XCTAssertTrue(exec("INSERT OR REPLACE INTO chunk(id, key, kind, bytes, refs) VALUES(\(id), x'0\(id)', 0, 1, 1);"))
+            XCTAssertTrue(exec("INSERT OR REPLACE INTO chunk(id, key, kind, refs) VALUES(\(id), x'0\(id)', 0, 1);"))
         }
         XCTAssertTrue(exec("INSERT INTO free_slot(id) VALUES(3),(4);"))
         let derived = count("""

@@ -485,7 +485,7 @@ final class BrowseReaderTests: XCTestCase {
             try store.replace(path: p, chunks: [chunk(p)])
         }
         let stale = DispatchSemaphore(value: 0)
-        var staleResult: [String: (count: Int, newest: Double)] = [:]
+        var staleResult: [String: (count: Int, newest: Double, oldest: Double)] = [:]
         DispatchQueue.global().async {
             staleResult = store.folderCounts(under: "/root/big")
             stale.signal()

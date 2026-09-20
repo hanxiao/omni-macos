@@ -853,17 +853,29 @@ Finder's header, with the index's facts instead of the filesystem's. Right-click
 choose columns, click a title to sort, click again to reverse.
 
 Offered: Kind (the modality the index filed it under - the SAME vocabulary as the filter menu),
-Date Modified, Date Indexed, Size, Files Indexed (folders), Tags (media). Default on: Kind, Date
-Indexed, Size, Files Indexed. Name is not in the menu, because Finder will not let you turn its
-Name column off either.
+Date Modified, Date Added, Date Indexed, Size, Files Indexed (folders), Tags (media). Default on:
+Kind, Date Indexed, Size, Files Indexed. Name is not in the menu, because Finder will not let you
+turn its Name column off either.
 
 FILES INDEXED is the one column Finder cannot have, and the reason the header is worth building:
 it answers "how much of this folder is searchable" at a glance. It comes from a grouped aggregate
 over the same `dirs` range scan the listing already runs, so it is free.
 
-FIRST INDEX TIME IS NOT AVAILABLE, and was asked for. The schema keeps ONE `indexed_at` stamp per
-file and a reindex overwrites it, so what exists is LAST indexed. A first-indexed column needs a
-schema column, a migration, and would read empty for every row already in the index.
+DATE ADDED IS FIRST INDEX TIME, and it exists as of v5 - this note used to say it could not. The
+schema kept ONE `indexed_at` stamp per file and a reindex overwrote it, so what existed was LAST
+indexed; `files.first_indexed_at` is a second stamp, written once on the INSERT and deliberately
+absent from the upsert's `DO UPDATE` list. That omission IS the mechanism, and nothing that
+compiles would notice if someone added it back, which is what `FirstIndexedTests` is for.
+
+An index written before the column has it added and SEEDED FROM `indexed_at` on the one open that
+adds it - exact for any file not re-indexed since, an upper bound for the rest, and strictly
+better than the 0 the ALTER's default leaves. The pair runs in ONE transaction: as two statements
+the ALTER commits, a kill inside the 4377 ms UPDATE leaves the column present and empty, and the
+"already added" guard then reads that as done and the index carries zeros for life. Measured on
+the real 2,678,916-file index: 4377 ms, once, on the same open that starts the v5 migration.
+
+A folder row shows the OLDEST stamp beneath it, against the newest for Date Indexed - the pair
+says when the folder started being covered and when it was last touched.
 
 FIX THESE BY SCREENSHOTTING FINDER AND OMNI STACKED, NOT FROM MEMORY, AND MEASURE THE PIXELS.
 Every detail below was invisible until the two windows were one above the other at the same size

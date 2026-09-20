@@ -62,8 +62,8 @@ enum MigrationV5 {
     /// `refs` is the occurrence count, which the second statement then has to agree with.
     static func buildChunkSQL(suffix: String = "") -> String {
         """
-        INSERT INTO chunk\(suffix)(key, kind, bytes, refs, slot)
-        SELECT \(keyExpr), MIN(ct.kind), 0, COUNT(*), MIN(s.slot)
+        INSERT INTO chunk\(suffix)(key, kind, refs, slot)
+        SELECT \(keyExpr), MIN(ct.kind), COUNT(*), MIN(s.slot)
         FROM chunk_text ct JOIN slot_of s ON s.chunk_id = ct.chunk_id
         GROUP BY \(keyExpr)
         """

@@ -25,8 +25,11 @@ struct FolderBrowser: View {
         /// filter menu uses. Empty for a folder.
         var kind: String = ""
         /// When Omni LAST indexed this file; for a folder, the newest stamp beneath it. 0 means the
-        /// row predates the `indexed_at` column. There is no first-indexed stamp to show.
+        /// row predates the `indexed_at` column.
         var indexedAt: Date? = nil
+        /// When Omni FIRST indexed it; for a folder, the oldest stamp beneath it. Differs from
+        /// `indexedAt` exactly for files edited since they entered the index.
+        var firstIndexedAt: Date? = nil
         /// Indexed files beneath a folder. 0 for a file.
         var fileCount: Int = 0
         var tags: [String] = []
@@ -73,6 +76,8 @@ struct FolderBrowser: View {
                     ? a.name.localizedStandardCompare(b.name) == .orderedAscending
                     : a.kind < b.kind
             case .column(.dateModified): result = a.modified < b.modified
+            case .column(.dateAdded):
+                result = (a.firstIndexedAt ?? .distantPast) < (b.firstIndexedAt ?? .distantPast)
             case .column(.dateIndexed):
                 result = (a.indexedAt ?? .distantPast) < (b.indexedAt ?? .distantPast)
             case .column(.size):         result = (a.size ?? -1) < (b.size ?? -1)
@@ -338,6 +343,8 @@ struct FolderBrowser: View {
             Text(e.isDirectory ? "Folder" : (FileKind(rawValue: e.kind)?.title ?? "--"))
         case .dateModified:
             Text(e.isDirectory ? "--" : e.modified.formatted(date: .abbreviated, time: .shortened))
+        case .dateAdded:
+            Text(e.firstIndexedAt.map { $0.formatted(date: .abbreviated, time: .shortened) } ?? "--")
         case .dateIndexed:
             Text(e.indexedAt.map { $0.formatted(date: .abbreviated, time: .shortened) } ?? "--")
         case .size:
@@ -560,6 +567,8 @@ struct FolderBrowser: View {
                   modified: Date(timeIntervalSince1970: c.modified),
                   kind: c.kind,
                   indexedAt: c.indexedAt > 0 ? Date(timeIntervalSince1970: c.indexedAt) : nil,
+                  firstIndexedAt: c.firstIndexedAt > 0
+                      ? Date(timeIntervalSince1970: c.firstIndexedAt) : nil,
                   fileCount: c.fileCount,
                   tags: tagsByPath[c.path] ?? [],
                   size: c.isDirectory ? nil : c.size)
@@ -576,7 +585,8 @@ struct FolderBrowser: View {
         // Now the expensive half, only if the column that shows it is actually on. A superseded
         // folder drops out here as well: the walk still runs (it is already on the store queue),
         // but its answer is not applied to a listing that has moved on.
-        guard columns.isOn(.filesIndexed) || columns.isOn(.dateIndexed) else {
+        guard columns.isOn(.filesIndexed) || columns.isOn(.dateIndexed)
+                || columns.isOn(.dateAdded) else {
             // No counts will arrive, so rebase here instead - otherwise the next folder's listing
             // would be compared against whatever counts this one last held.
             countsFolder = folder
@@ -590,6 +600,7 @@ struct FolderBrowser: View {
             if let a = counts[entries[i].url.lastPathComponent] {
                 entries[i].fileCount = a.count
                 if a.newest > 0 { entries[i].indexedAt = Date(timeIntervalSince1970: a.newest) }
+                if a.oldest > 0 { entries[i].firstIndexedAt = Date(timeIntervalSince1970: a.oldest) }
             }
         }
         noteGrowth()

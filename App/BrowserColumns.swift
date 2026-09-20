@@ -9,12 +9,15 @@ import SwiftUI
 /// are the ones Finder cannot show: when Omni last indexed a file, which modality it was filed
 /// under, its content tags, and how many indexed files sit beneath a folder.
 ///
-/// NOT offered, because the data does not exist: FIRST index time. The schema keeps a single
-/// `indexed_at` stamp per file and a reindex overwrites it, so "first indexed" would need a new
-/// column, a migration, and would read empty for every row already in the index.
+/// DATE ADDED is when Omni FIRST indexed the file, and it needed the v5 schema to exist:
+/// `indexed_at` is overwritten by every reindex, so `files.first_indexed_at` is a second stamp
+/// written once, on the insert. For an index that predates the column the migration seeds it from
+/// `indexed_at`, which is exact for any file that has not been re-indexed and an upper bound for
+/// the rest - so the column is populated for existing users rather than reading "--" forever.
 enum BrowserColumn: String, CaseIterable, Identifiable, Sendable {
     case kind
     case dateModified
+    case dateAdded
     case dateIndexed
     case size
     case filesIndexed
@@ -26,6 +29,7 @@ enum BrowserColumn: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .kind:         return "Kind"
         case .dateModified: return "Date Modified"
+        case .dateAdded:    return "Date Added"
         case .dateIndexed:  return "Date Indexed"
         case .size:         return "Size"
         case .filesIndexed: return "Files Indexed"
@@ -40,6 +44,7 @@ enum BrowserColumn: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .kind:         return 89
         case .dateModified: return 177
+        case .dateAdded:    return 177
         case .dateIndexed:  return 177
         case .size:         return 91
         case .filesIndexed: return 109

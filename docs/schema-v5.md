@@ -108,10 +108,21 @@ test runs on that shape now and fails at 9 of 114 when the hash is removed.
 
 ## The shape
 
-    chunk(id, key, kind, bytes, refs)        -- WHAT a chunk is. id IS the .vecs slot.
-    occurrence(file_id, ordinal, chunk_id, locator)   -- WHERE it occurs. The pointer.
-    chunk_snippet(chunk_id, snippet)         -- cold payload, split for the same reason v4 split it
-    free_slot(id)                            -- slots nobody owns
+THE SHIPPED SHAPE, which is not the one this section first described. Both differences were found
+late and both are recorded under "What the final audit changed" below.
+
+    chunk(id, key UNIQUE, kind, refs, slot)  -- WHAT a chunk is. `slot` is the .vecs position.
+    occurrence(id, file_id, ordinal, chunk_id, locator)   -- WHERE it occurs. The pointer.
+                                             -- UNIQUE(file_id, ordinal)
+    chunk_snippet(chunk_id, kind, snippet)   -- cold payload, split for the same reason v4 split it
+    free_slot(id)                            -- positions nobody owns
+
+    files(..., indexed_at, first_indexed_at) -- LAST and FIRST indexed, two stamps
+
+IDENTITY AND POSITION ARE SEPARATE COLUMNS. The sketch had `chunk.id` BE the slot, which is the
+same conflation v4 had between a row index and a position and is what every defect in this
+document is a variant of. A content keeps one identity for life; the reclaim renumbers positions
+underneath it. It costs the migration nothing - the same number in a column instead of a key.
 
 THE LOCATOR LIVES ON THE OCCURRENCE. The same paragraph is "Line 12" of one file and "Line 4310"
 of another. A locator on the chunk is what makes deduplication impossible in the obvious design.
@@ -179,11 +190,16 @@ The generation-1 key format is reproduced BYTE FOR BYTE in ChunkKey.grid and mus
 it is the identity all 9.13M existing vectors are stored under. `ChunkKeyTests` writes the v4
 formula out a second time and compares.
 
-## Still to measure
+## Both of these were measured; neither is still open
 
-- Retrieval quality before and after dedup. Expected direction: boilerplate takes fewer top slots.
-- CDC retrieval quality against the 1800 grid. Variable 900-4000 char chunks are not safe to assume
-  neutral; gate it the way OCR builds are gated, before it ships.
+- RETRIEVAL QUALITY BEFORE AND AFTER DEDUP: unchanged, and it has to be. The occurrence mirror is
+  the identity on an index whose contents are not shared, so `omni-verify searchreal`'s digest
+  moving would be a read-path bug rather than a ranking opinion. It is identical at every stage of
+  the real migration (`ba7a13400e714f79`).
+- CDC RETRIEVAL QUALITY AGAINST THE 1800 GRID: measured with `omni-verify cutgate`, paired, six
+  comparisons, z between -0.98 and -0.10 with mixed signs. The 120-character window - shorter than
+  the grid overlap, i.e. the adversarial case - came out slightly positive. Recorded in CLAUDE.md
+  under content-defined chunking.
 
 ## Integrating with the search path: it is one gather
 
@@ -971,6 +987,15 @@ releasing.
      So step 4 is: one freed-position list rather than two, the loader gate moved onto the split,
      and only then the fold's own code removed.
 
+     WHAT SHIPPED IS NOT "ONE LIST", and the difference is worth stating plainly rather than
+     leaving this paragraph to read as a description of the result. `free_slot` and `vec_holes`
+     have DIFFERENT DOMAINS: `free_slot` may name a position past the covered prefix, while a
+     hole is defined only inside it. Merging them would mean picking one domain and losing the
+     other. They are reconciled by DERIVATION instead - `deriveUnownedPositionsAsHolesLocked`
+     reads the positions no content owns below coverage straight off `chunk.slot` on the first
+     open that reads the split, so nothing has to be accumulated by the build and an interrupted
+     build carries no bookkeeping to be wrong about.
+
      AND ONE THING AHEAD OF ALL OF IT, found by measuring rather than reading. The build ran
      inside `queue.sync`, so it held the one queue every search goes through for its whole
      duration:
@@ -1658,3 +1683,67 @@ file already has one of those too many.
 WHAT IS NOT BUILT. The free list: a released position handed to the NEXT new content instead of
 waiting for a whole-file copy. `SlotAllocator` is written and tested against it. The reclaim is the
 v4 answer and now works in both arms, so this is an optimisation rather than a gap.
+
+## What the final audit changed, and why it had to happen before the ship
+
+Asked directly whether anything about the new structure was being left for a later release. The
+answer at the time was no, and auditing it said otherwise four times. All four are in, because a
+data-structure change is shipped ONCE - the whole premise of this document - and every one of
+these would otherwise have been a second forced migration for a column, a key or a delete.
+
+Nothing was on v5 yet when this ran (`PRAGMA user_version` still read 4 on the real index), so
+the schema was still free to change. That is the only reason this was cheap.
+
+- `chunk.bytes` REMOVED. It was written by the migration, written by the write path, and read by
+  nothing - the exact shape of a column that exists because it seemed like it might be useful.
+  Four bytes a content is not the point; a field nobody reads is a field nobody maintains, and
+  the next person cannot tell a dead column from a load-bearing one.
+
+- `occurrence` GAINED `id INTEGER PRIMARY KEY`, with `UNIQUE (file_id, ordinal)` keeping what the
+  composite key used to enforce. Without it the table has a PLAIN rowid, which VACUUM is free to
+  renumber - and the loader scans this table IN ROWID ORDER to decide resident row order. An
+  INTEGER PRIMARY KEY is what VACUUM is documented to preserve. The same reasoning `chunks.id`
+  already carried in v4, which is why it is embarrassing that it had to be found twice. An index
+  built by an earlier build of this migration is detected at open by the missing column and its
+  split rebuilt, which is only possible while `chunks` is still there to rebuild from.
+
+- `ChunkDiff.swift` DELETED, with its tests. Written for the split, wired to nothing.
+
+- `files.first_indexed_at` ADDED, which is the one that adds a feature rather than removing a
+  mistake. CLAUDE.md carried "FIRST INDEX TIME IS NOT AVAILABLE, and was asked for ... needs a
+  schema column, a migration, and would read empty for every row already in the index". Two of
+  those three are exactly what this migration is, and the third is answered by seeding. So it
+  goes in now or it never goes in.
+
+  It is written ONCE, on the INSERT, by being absent from the upsert's `DO UPDATE` list. That
+  omission is the entire mechanism and nothing that compiles would notice if it were undone,
+  which is what `FirstIndexedTests` is for - and its negative controls were run: adding
+  `first_indexed_at = excluded.first_indexed_at` fails 3 of the 5, removing the seed fails 2,
+  making the seed unconditional fails 2.
+
+  AN EXISTING INDEX IS SEEDED FROM `indexed_at` on the one open that adds the column. That is not
+  an invented date: `indexed_at` is LAST indexed, so it is exact for any file not re-indexed since
+  - which is most of them, a reindex needing the mtime or size to move - and an upper bound for
+  the rest. The alternative is a column reading "--" for 2,678,916 rows until each file happens to
+  be edited, which is a dead column with extra steps.
+
+  THE ALTER AND THE UPDATE ARE ONE TRANSACTION. As two statements the ALTER commits first, the
+  UPDATE takes 4377 ms on the real index, and a kill inside that window leaves the column present
+  and empty - which the "already added" guard then reads as done, for the life of the index.
+  SQLite runs DDL inside a transaction; verified that a ROLLBACK takes the column back out with
+  the rows.
+
+  MEASURED: 4377 ms, once, for 2,678,916 files, on the same open that starts the v5 migration -
+  which is minutes. Warm open of the same index is 3.2 s, so this is the one launch that pays it
+  and it is invisible beside what that launch is already doing.
+
+  A FOLDER ROW SHOWS THE OLDEST STAMP BENEATH IT, against the newest for Date Indexed. The pair
+  reads as "covered since / last touched", which is the question a folder listing can answer and
+  a file row cannot.
+
+  AND THE COLUMN COMMENTS CAME OUT OF THE `CREATE TABLE` TEXT. SQLite stores the statement
+  verbatim and `ALTER TABLE ... DROP COLUMN` works by EDITING it, so an SQL comment between two
+  columns can be left dangling over the closing paren: with the note inline, dropping the column
+  failed with "error in table files after drop column: incomplete input". No shipped path drops a
+  column here - it was a test fixture that found it - but a table that cannot be altered is a trap
+  to leave for nobody, and `files` was the only DDL in the schema with comments inside it.

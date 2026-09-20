@@ -140,6 +140,20 @@ enum StoreSchema {
             // Per-FILE facts live here exactly once. In v3 every one of these was a column on
             // `chunks`, written 3.16 times per file on average - and a file whose mtime changed
             // but whose content did not (the common watcher event) meant an UPDATE per chunk.
+            //
+            // `first_indexed_at` is WHEN THIS FILE WAS FIRST INDEXED, against `indexed_at` which
+            // every reindex overwrites and which therefore answers "last". It is written once, on
+            // the INSERT: the upsert's DO UPDATE list omits it, and that omission is the entire
+            // mechanism. An index written before the column existed has it added and seeded from
+            // `indexed_at` on the one open that adds it - exact for a file never re-indexed, an
+            // upper bound otherwise, and better than the 0 the ALTER's default would leave.
+            //
+            // THE COMMENTS ARE OUT HERE, NOT INSIDE THE CREATE TABLE TEXT, and that is not style.
+            // SQLite stores the statement verbatim and ALTER TABLE ... DROP/RENAME COLUMN works by
+            // EDITING that text, so an SQL comment between the columns can be left dangling over
+            // the closing paren: with the note inline, dropping this column failed with "error in
+            // table files after drop column: incomplete input". No shipped path drops a column
+            // here, but a schema that cannot be altered is a trap to leave for nobody.
             """
             CREATE TABLE IF NOT EXISTS \(files)(
                 id INTEGER PRIMARY KEY,
@@ -151,7 +165,8 @@ enum StoreSchema {
                 width INTEGER NOT NULL DEFAULT 0,
                 height INTEGER NOT NULL DEFAULT 0,
                 duration REAL NOT NULL DEFAULT 0,
-                indexed_at REAL NOT NULL DEFAULT 0
+                indexed_at REAL NOT NULL DEFAULT 0,
+                first_indexed_at REAL NOT NULL DEFAULT 0
             );
             """,
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_files_name ON \(files)(dir_id, name);",
@@ -266,12 +281,18 @@ enum StoreSchema {
             // `refs` is the occurrence count. It is DERIVABLE - COUNT(*) over occurrence - and is
             // stored only so the hot path need not count. An undercount frees a vector another file
             // still points at, which is silent, so it is checked rather than trusted.
+            //
+            // THERE IS NO `bytes`. There was, defaulted to 0, written as 0 by the migration and
+            // never set by the write path or read by anything - a column that would have been
+            // frozen into the layout for the life of the index because nobody looked at it while
+            // the layout could still change. The size of a content is derivable from the
+            // snippet, and the one number the storage pane wants is a count times the vector
+            // width.
             """
             CREATE TABLE IF NOT EXISTS \(chunk)(
                 id INTEGER PRIMARY KEY,
                 key BLOB NOT NULL,
                 kind INTEGER NOT NULL DEFAULT 0,
-                bytes INTEGER NOT NULL DEFAULT 0,
                 refs INTEGER NOT NULL DEFAULT 0,
                 slot INTEGER NOT NULL DEFAULT -1
             );
@@ -297,16 +318,31 @@ enum StoreSchema {
 
             // WHERE a chunk occurs. The pointer.
             //
+            // `id INTEGER PRIMARY KEY` AND NOT `PRIMARY KEY (file_id, ordinal)`, and it is free:
+            // an INTEGER PRIMARY KEY *is* the rowid, and the unique index that replaces the
+            // composite primary key is the same index the composite one created. What it buys is
+            // that the rowid is CONTRACTUAL. The loader scans this table in rowid order and that
+            // order is the resident row order - which the row-window table and the top-k
+            // selection's tie-break both rest on - and VACUUM is documented to preserve an
+            // INTEGER PRIMARY KEY where it may renumber a plain rowid. The migration runs a
+            // VACUUM itself, to return the pages the v4 drop frees.
+            //
+            // Measured before relying on it either way: on the real 9,773,836-occurrence index
+            // the search digest is unchanged across that VACUUM, so SQLite preserved the order
+            // in practice. "In practice" is not what a layout that must never change again
+            // should rest on, and the alternative costs nothing.
+            //
             // `locator` lives HERE and not on the chunk, and that is the hinge of the whole schema:
             // the same paragraph is "Line 12" of one file and "Line 4310" of another. A locator on
             // the chunk is what makes deduplication impossible in the obvious design.
             """
             CREATE TABLE IF NOT EXISTS \(occ)(
+                id INTEGER PRIMARY KEY,
                 file_id INTEGER NOT NULL,
                 ordinal INTEGER NOT NULL,
                 chunk_id INTEGER NOT NULL,
                 locator TEXT NOT NULL DEFAULT '',
-                PRIMARY KEY (file_id, ordinal)
+                UNIQUE (file_id, ordinal)
             );
             """,
             // The reverse edge: chunk -> the files that contain it. Read when a hit is expanded into
