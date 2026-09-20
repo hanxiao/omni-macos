@@ -451,9 +451,11 @@ measured on an M3 Ultra too, so they compare directly.
 
 ## Content sharing: one content, one vector (docs/schema-v5.md)
 
-ON by default since this change; `OMNI_CONTENT_SHARING=0` is the escape hatch and the A/B. Two
-files holding the same passage cost one vector and one position in `.vecs`, and both still answer
-for it. The full design, every measurement and every rejected option are in docs/schema-v5.md; what
+IT IS THE LAYOUT, NOT A SETTING. `OMNI_CONTENT_SHARING`, `OMNI_CHUNK_SPLIT` and
+`OMNI_SPLIT_CUTOVER` were the arms while it was being built and all three are DELETED - a v5 index
+has no unshared mode to fall back to, and a flag that nothing can turn off is a flag that lies
+about what it controls. The A/B lives in git history and in the numbers below. Two files holding
+the same passage cost one vector and one position in `.vecs`, and both still answer for it. The full design, every measurement and every rejected option are in docs/schema-v5.md; what
 follows is what a reader needs before touching this code.
 
 - A ROW AND A POSITION ARE DIFFERENT NUMBERS NOW, and they were the same number for four years.
@@ -1992,7 +1994,14 @@ fragment appended to the default contradicts rules the default has already given
   the user record, not the environment, so the app finds the real install and the real defaults.
 - `-omni.ocrOpen <path>[:<path>]` opens documents in the OCR workspace; launch arguments land in
   NSUserDefaults' ARGUMENT domain, so a run cannot touch the real index, roots or settings.
-- "Timed out while enabling automation mode" = a stale OmniUITests-Runner, or the display asleep.
+- "Timed out while enabling automation mode" = a stale OmniUITests-Runner, the display asleep, or
+  - most often - THE PASSWORD PROMPT WENT UNANSWERED. The three look identical from the log. Tell
+  them apart by SCREENSHOTTING while the runner waits: the dialog reads "XCTest is trying to Enable
+  UI Automation. Enter the password for the user ...". The runner gives up 60 SECONDS after putting
+  it up, so there is no way to wait it out and `Scripts/automation-window.sh` cannot be made to
+  wait longer - the holder is already dead by then. The window it buys is TEN HOURS. An unattended
+  overnight UI run therefore has to be STARTED while somebody can type, and a job queued after the
+  window closes fails on the harness, not on the app.
 
 ## Apple Photos (OmniKit/PhotosSource.swift)
 - Photos assets ride the file pipeline under `photos://<source>/<escaped localIdentifier>/<name>`

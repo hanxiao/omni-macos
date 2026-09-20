@@ -11,6 +11,14 @@
 #
 # The prompt appears once, on this script's first few seconds. If nobody answers it, the wait
 # below times out and says so rather than leaving a job running against a mode that is off.
+#
+# SOMEBODY HAS TO BE AT THE KEYBOARD WHEN IT APPEARS, and the window this buys is ten hours, not
+# forever. The runner gives up 60 SECONDS after putting the prompt up - "Failed to initialize for
+# UI testing: Timed out while enabling automation mode" - so waiting longer here cannot help: the
+# holder is already dead. Measured by screenshotting the screen while it waited, which is the only
+# way to tell "no prompt appeared" from "a prompt appeared and nobody was there": the dialog reads
+# "XCTest is trying to Enable UI Automation. Enter the password for the user ...". So an overnight
+# unattended run has to be STARTED while someone can type, and it ends when the ten hours do.
 set -u
 cd "$(dirname "$0")/.."
 

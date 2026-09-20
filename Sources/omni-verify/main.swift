@@ -4477,7 +4477,7 @@ if args.count >= 5 && args[1] == "reusebench" {
 
 // Content sharing, end to end: omni-verify sharebench <modelDir> <root> [searchReps]
 //
-// The A/B for OMNI_CONTENT_SHARING, run against a REAL corpus rather than synthetic vectors,
+// The A/B that decided content sharing, run against a REAL corpus rather than synthetic vectors,
 // because the whole question is how much of the corpus repeats itself. One pass builds the index
 // and reports what it cost and what it occupies; then the same stored vectors are searched, which
 // is where fewer positions in the file are supposed to pay for the extra work per write.
