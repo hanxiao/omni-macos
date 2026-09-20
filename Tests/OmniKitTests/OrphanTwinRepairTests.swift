@@ -104,10 +104,17 @@ final class OrphanTwinRepairTests: XCTestCase {
         for suffix in [".rows", ".rows-wal", ".rows-shm"] { try? FileManager.default.removeItem(atPath: db.path + suffix) }
     }
 
+    /// AND WITH THE SPLIT OFF, because the damage this suite repairs is a v4 shape and only a
+    /// v4 shape: it was written by 0.7.0-0.7.3, which predate the split by years, and the
+    /// fixture plants its twin by inserting straight into `chunks`. On a split-built index that
+    /// row has no occurrence, so the store never sees it and the repair has nothing to notice -
+    /// the test would then pass or fail on an index no user can have.
     private func withQuantMode(_ body: () throws -> Void) rethrows {
         let saved = VectorStore.quantBaseOverride
+        let savedSplit = VectorStore.chunkSplit
         VectorStore.quantBaseOverride = VectorStore.scanBits
-        defer { VectorStore.quantBaseOverride = saved }
+        VectorStore.chunkSplit = false
+        defer { VectorStore.quantBaseOverride = saved; VectorStore.chunkSplit = savedSplit }
         try body()
     }
 

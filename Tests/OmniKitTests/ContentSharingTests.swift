@@ -952,6 +952,17 @@ final class ContentSharingTests: XCTestCase {
     /// identity it checks would pass anyway, so it would claim rows it never cleared); the pass
     /// resumes across a close rather than starting over; and the index is correct throughout.
     func testTheSlotBackfillIsSlicedAndResumable() throws {
+        // THE v4 SLOT BACKFILL IS A v4 THING, so this runs with the split off in every arm.
+        //
+        // Not a workaround: it is the order a real upgrade goes in. `buildChunkSplitLocked`
+        // refuses while `v4BackfillPending`, so the column is always complete before the split
+        // exists, and an index that is part way through the backfill AND has the split built is
+        // a state no user can reach. Left on, the split arm declares the backfill done at open -
+        // correctly, there is nothing to fill - and this test measures the absence of its own
+        // subject.
+        let savedSplitHere = VectorStore.chunkSplit
+        VectorStore.chunkSplit = false
+        defer { VectorStore.chunkSplit = savedSplitHere }
         let savedQuant = VectorStore.quantBaseOverride
         let savedSlice = VectorStore.slotBackfillSliceOverride
         VectorStore.quantBaseOverride = VectorStore.scanBits

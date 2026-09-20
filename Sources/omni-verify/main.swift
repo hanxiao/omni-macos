@@ -1357,6 +1357,16 @@ func storeauditRun(_ path: String) throws -> Int32 {
     check(pooled.count == min(60, files.count), "pooledVectors answered for every requested path (\(pooled.count))")
     let after = store.rowWindowUse
     check(after.unproven == 0, "no read fell back to the full walk (unproven=\(after.unproven))")
+    // WHICH MODEL THIS INDEX IS ACTUALLY READ THROUGH. "The split tables have rows" and "the
+    // store is reading them" are different claims, and only the second is the one that matters -
+    // the first was true for weeks while the second was not. Printed rather than checked,
+    // because a v4 index answering "chunks" here is correct.
+    print("  split=\(store.splitBuiltForTest ? "built" : "no ")"
+          + " rowTable=\(store.residentIDsAreContentsForTest ? "occurrence" : "chunks")"
+          + " sidecar=\(store.adoptedRowSidecar ? "adopted" : "scanned")"
+          + " rows=\(store.rowCountForTest) positions=\(store.slotCountForTest)"
+          + " holes=\(store.holesForTest().count)")
+    check(store.coverageAudit() == nil, "the coverage claim is consistent (\(store.coverageAudit() ?? "ok"))")
     print("  \(bad == 0 ? "ok  " : "FAIL") \(bad) failing check(s)")
     return bad == 0 ? 0 : 1
 }

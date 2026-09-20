@@ -142,6 +142,14 @@ final class FreeListTests: XCTestCase {
     /// position out of order sent every index down it: measured at 76 s against 18 s per open on a
     /// 9,729,693-row index that had never reused a thing, on every launch, for ever.
     func testAnIndexThatNeverReusedKeepsTheFastLoader() throws {
+        // AND THE LOADER GATE IS A v4 GATE. Under the split the by-slot loader is not the slow
+        // path being avoided here, it is the ONLY path - there are fewer positions than rows, so
+        // nothing else can read the index. The property this test is about, "an index that never
+        // reused does not pay a slow open", is the row sidecar's job there, and
+        // ChunkSplitLoaderTests is where it is asserted.
+        let savedSplitHere = VectorStore.chunkSplit
+        VectorStore.chunkSplit = false
+        defer { VectorStore.chunkSplit = savedSplitHere }
         VectorStore.quantBaseOverride = VectorStore.scanBits
         let url = tempDB()
         do {
@@ -207,6 +215,17 @@ final class FreeListTests: XCTestCase {
     /// chunk_slots_out_of_order already set. Without the gate this fixture reopens with survivor 59
     /// seated on f17's vector and position 58 owned by nobody.
     func testReuseBeforeTheBackfillFinishesStillReloads() throws {
+        // THE v4 SLOT BACKFILL IS A v4 THING, so this runs with the split off in every arm.
+        //
+        // Not a workaround: it is the order a real upgrade goes in. `buildChunkSplitLocked`
+        // refuses while `v4BackfillPending`, so the column is always complete before the split
+        // exists, and an index that is part way through the backfill AND has the split built is
+        // a state no user can reach. Left on, the split arm declares the backfill done at open -
+        // correctly, there is nothing to fill - and this test measures the absence of its own
+        // subject.
+        let savedSplitHere = VectorStore.chunkSplit
+        VectorStore.chunkSplit = false
+        defer { VectorStore.chunkSplit = savedSplitHere }
         VectorStore.quantBaseOverride = VectorStore.scanBits
         let url = tempDB()
         do {
