@@ -334,6 +334,61 @@ final class ChunkSplitLoaderTests: XCTestCase {
         XCTAssertNil(store.coverageAudit())
     }
 
+    /// THE PUBLISH IS ONE TRANSACTION, and the flag that says the staged vectors moved goes down
+    /// with it. Separately committed, a crash between them leaves blobs in the content space
+    /// under a flag that still says v4 - and because both spaces are dense, every blob address
+    /// then finds an unrelated row instead of missing.
+    func testThePublishSetsBothFlagsTogether() throws {
+        let url = tempDB()
+        let savedCoverage = VectorStore.vecCoverage
+        VectorStore.vecCoverage = false          // leave the blobs staged, so there is work to move
+        defer { VectorStore.vecCoverage = savedCoverage }
+        try writeV4Fixture(url, files: 12, dupEvery: 3)
+        do {
+            let store = try VectorStore(dbURL: url)
+            store.migrateSlotsToCompletion()
+            XCTAssertTrue(store.buildChunkSplitForTest())
+            store.close()
+        }
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM meta WHERE key='chunk_split_backfilled' AND value='1'"), 1)
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM meta WHERE key='pending_vecs_on_content' AND value='1'"), 1,
+                       "the split was published without recording that the blobs moved with it")
+    }
+
+    /// AND THE TRANSLATION RUNS ONCE. Running it twice is not a no-op: it looks a
+    /// content-keyed blob up as a v4 row id, finds whichever row carries that number, and
+    /// re-keys it onto THAT row's content. Reachable without any test - the build finishes and
+    /// the process is killed before the publish commits - so the guard is a durable flag rather
+    /// than an inference from the ids themselves.
+    func testRebuildingTheSplitTwiceKeepsEveryVectorReadable() throws {
+        let url = tempDB()
+        let savedCoverage = VectorStore.vecCoverage
+        VectorStore.vecCoverage = false
+        defer { VectorStore.vecCoverage = savedCoverage }
+        try writeV4Fixture(url, files: 16, dupEvery: 4)
+        do {
+            let store = try VectorStore(dbURL: url)
+            store.migrateSlotsToCompletion()
+            XCTAssertTrue(store.buildChunkSplitForTest())
+            store.close()
+        }
+        var before: [String] = []
+        do {
+            let store = try VectorStore(dbURL: url); defer { store.close() }
+            before = digest(store)
+            XCTAssertFalse(before.isEmpty)
+        }
+        for round in 1 ... 2 {
+            let store = try VectorStore(dbURL: url)
+            store.clearSplitForTest()
+            XCTAssertTrue(store.buildChunkSplitForTest(), "rebuild \(round) did not run")
+            store.close()
+            let re = try VectorStore(dbURL: url); defer { re.close() }
+            XCTAssertEqual(digest(re), before, "rebuild \(round) changed what search returns")
+            XCTAssertNil(re.coverageAudit(), "rebuild \(round) left the index inconsistent")
+        }
+    }
+
     // MARK: - The window where the two models disagree
 
     /// THE SESSION THE BUILD PUBLISHES IN still has v4 ids in `rows[i].chunkID` and each row on

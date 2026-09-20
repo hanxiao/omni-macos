@@ -1026,13 +1026,97 @@ releasing.
 
   5. Move the resident loader, the coverage walk and the row sidecar off `chunks` onto
      `occurrence` + `chunk`. The largest step, and the one that finally deletes rank-is-position.
-     Measured rather than guessed: 121 statements across 59 functions name `chunks`. Three groups
-     fall away with the steps before it - `foldDuplicateContentsLocked` goes with step 4,
-     `maintainSplitForFilesLocked` is already dead code with no callers, and the 11 in
-     `migrateToV4Locked` stay, because v3 -> v4 remains the staging path. What is left is the
-     core: `loadScanSQL` and `loadBySlotLocked` (the loader), `advanceCoverageLocked` (coverage),
-     `internPathsLocked`, and the four delete sites.
-  6. `pending_vecs` keyed on content id rather than row id.
+     DONE, and it took step 6 with it - the loader has to read a staged vector, and reading one
+     through `chunks` is the thing being removed.
+
+         default                             598 tests, 0 failures
+         OMNI_CHUNK_SPLIT=1                  598 tests, 0 failures   (was 23)
+         + OMNI_SPLIT_CUTOVER=1              598 tests, 0 failures
+
+     `internPathsLocked` turned out not to be in scope after all: it is gated on
+     `chunks.path`, so it only ever runs on a LEGACY index, and the v3 staging path stays.
+
+     THE STATEMENT, AND THE ONLY ONE THAT CANNOT BE FAKED: empty `chunks` and the index still
+     opens, still holds every row and still answers with the same text
+     (`testTheIndexOpensWithTheV4RowTableEmptied`). While both tables are written they AGREE, so
+     no other assertion distinguishes "reads the split" from "reads v4 and the split happens to
+     match" - which is exactly how the flag reported green for weeks while executing nothing.
+
+     WHAT IT UNBLOCKED is the 23 red tests, and they were one fact: the build collapses
+     duplicates in SQLite and does not touch a vector, so the FIRST OPEN THAT READS THE SPLIT is
+     the moment 3.5M positions stop having a live row. Unrecorded they are what `coverageAudit`
+     calls breakage, and the reclaim reads `vec_holes` where the build only wrote `free_slot` -
+     so the space was freed and then never given back. Derived from the column on that open
+     rather than accumulated by the build, so an interrupted build carries no bookkeeping.
+
+     TWO GATES HAD TO MOVE WITH IT or the space is recorded and still never returned.
+     `contentFoldComplete` waits for a fold flag that the split means will never be set. And the
+     rank renumber must SKIP `chunks.slot`: most of those positions are not in the new map, the
+     subquery returns NULL on a NOT NULL column, the statement fails, and the whole commit rolls
+     back with the compacted file already renamed into place. Measured exactly that way -
+     "coverage 28 exceeds positions 0", an index that will not open.
+
+     THREE ID-SPACE HAZARDS, all silent, because the v4 row space and the content space are both
+     dense: a statement written for the wrong one does not miss, it hits an unrelated row.
+
+       - `pending_vecs` is keyed on the CONTENT. One blob per position rather than one per
+         sharer, and the only version coverage can settle - it clears by POSITION, and a position
+         has one content and N rows, so row-keyed blobs mean the slice clears whichever row it
+         reached and strands the rest. One stranded blob makes the per-slice identity fail for
+         the life of the index.
+       - `Row.chunkID` becomes the content id. `WrittenChunks.residentIDs` decides that in one
+         place, so the loader, the sidecar and `persistAllSlotsLocked` cannot disagree.
+       - the v4 blob deletes at the four delete sites are SKIPPED rather than left to match by
+         number.
+
+     AND THE SESSION THAT BUILDS THE SPLIT IS NOT THE SESSION THAT READS IT. `splitBuilt` and
+     `residentIDsAreContents` are different questions and conflating them is silent corruption:
+     the build publishes mid-session while the resident rows still carry v4 ids and their own
+     uncollapsed positions. The collapse takes effect at the next open, so that session behaves
+     exactly as a split-built session does today - the configuration the earlier chaos run
+     already proved. The row sidecar records which id space it was stamped in, because a v4 one
+     adopted afterwards would reinstate the old positions AND THEN RE-STAMP ITSELF: the freed
+     space would never arrive, on any launch, with nothing failing anywhere.
+
+     THE PUBLISH IS ONE TRANSACTION. The catch-up, the blob translation and both flags commit
+     together or not at all. Separately committed, the worst of the three windows is a
+     translated `pending_vecs` under a flag that still says v4, where every blob address finds an
+     unrelated row rather than missing. And the translation is guarded by a DURABLE FLAG rather
+     than by inspecting the ids, because it cannot be inferred - "does this id exist in `chunk`"
+     is true of most v4 ids too. Running it twice is not a no-op: it looks a content-keyed blob
+     up as a v4 row id and re-keys it onto whatever content that row reads. Reachable with no
+     test at all - the build finishes and the process is killed before the publish commits.
+
+     THE MISSING `ORDER BY` WAS FOUND BY THE REAL-INDEX DIGEST AND BY NOTHING ELSE.
+     `buildOccurrenceSQL` had no ordering, so `occurrence` rowids - and therefore the resident
+     row order of every migrated index - were whatever join order the planner picked. Two things
+     broke, and the whole suite was green through both:
+
+         spanned/live   1.0001 -> 1.4306      widest window   1,250 -> 4,208,690 rows
+         digest         ba7a13400e714f79 -> 5317b3663285d3bd
+
+     The row-window table records one contiguous span per file and every per-file read rides it;
+     and the top-k selection breaks score ties by row, so a reordered row table returns a
+     different, equally correct tenth hit. `ORDER BY c.id` is v4's own order, so a migrated index
+     comes up with exactly the row order it had before, and both numbers return to baseline.
+
+     THE WHOLE CHAIN ON THE REAL 9,773,836-CHUNK INDEX, split + cutover + free list, against the
+     same index measured with the change off:
+
+         baseline (v4)   digest ba7a13400e714f79   p50 5.2 ms   open 3.56 s   .vecs 22.12 GB
+         migrate         split built off-queue 151.1 s, 45 stamps in 202.7 s, audit clean
+         first open      3,516,335 freed positions recorded, 23.2 s once
+         reopen          rowTable=occurrence, sidecar adopted, spanned/live 1.0001
+                         digest ba7a13400e714f79   p50 4.9 ms   open 3.46 s
+         reclaim         3,770,848 slots, 5,523.7 MB, 44.0 s, audit ok
+         after           positions 10,028,349 -> 6,257,501, holes 0
+                         digest ba7a13400e714f79   p50 4.5 ms   open 2.61 s   .vecs 9.61 GB
+
+     Identical digest at every stage, 0 failing audit checks at every stage, and every timing at
+     or better than the v4 baseline. The 23.2 s open is the one-time hole recording and does not
+     recur: the next open is 3.46 s against v4's 3.56 s.
+
+  6. `pending_vecs` keyed on content id rather than row id. DONE, with step 5 - see above.
   7. The migration contracts: drop `chunk_text`, then `chunks`, with the kill-and-reopen proof.
   8. Both flags deleted - not defaulted, deleted. A shipped layout has no switch.
 

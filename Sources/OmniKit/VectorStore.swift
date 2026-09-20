@@ -6964,6 +6964,16 @@ public final class VectorStore: @unchecked Sendable {
     nonisolated(unsafe) public static var chunkSplit =
         ProcessInfo.processInfo.environment["OMNI_CHUNK_SPLIT"] == "1"
     private static let chunkSplitDoneKey = "chunk_split_backfilled"
+    /// HAS THE ONE-WAY TRANSLATION ALREADY RUN. Its only job, and it cannot be inferred: a
+    /// staged blob's `chunk_id` is just an integer, and the v4 row space and the content space
+    /// are both dense, so "does this id exist in `chunk`" is true of most v4 ids too.
+    ///
+    /// Running the translation twice is not a no-op, it is corruption - it looks a content-keyed
+    /// blob up as a v4 row id, finds whichever row carries that number, and re-keys it onto THAT
+    /// row's content. Reachable with no test at all: the build finishes and the process is
+    /// killed before the publish commits. Written in the same transaction as the translation.
+    private static let pendingOnContentKey = "pending_vecs_on_content"
+    private var pendingOnContent = false
     /// THE LAST STEP, AND ITS OWN SWITCH. `OMNI_SPLIT_CUTOVER=1` stops the write path maintaining
     /// `chunk_text`, after which the split is the only copy of the snippet, the locator and the
     /// key - and the table can be dropped.
@@ -6992,6 +7002,8 @@ public final class VectorStore: @unchecked Sendable {
         let was = splitBuilt
         splitBuilt = Self.chunkSplit && dbOpen()
             && scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.chunkSplitDoneKey)'") == 1
+        pendingOnContent = dbOpen()
+            && scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.pendingOnContentKey)'") == 1
         // THE CACHED STATEMENTS OUTLIVE THE FLAG OTHERWISE. The split is built mid-session by the
         // coverage stamp, so a reader that prepared its SQL against v4 at open would keep asking
         // v4 for the rest of the session - and, once the v4 tables go, would keep asking a table
@@ -7013,6 +7025,13 @@ public final class VectorStore: @unchecked Sendable {
     func liveRowCountLocked() -> Int { scalarQuery("SELECT COUNT(*) FROM \(rowTableLocked)") }
     /// Whether a staged vector is addressed by CONTENT. The two id spaces overlap numerically, so
     /// a blob delete written for the wrong one does not miss - it hits an unrelated row.
+    ///
+    /// It follows `splitBuilt` because the two are set in ONE transaction and an index is never
+    /// in between: a born-v5 index content-keys from its first write, a migrated one flips both
+    /// at the publish, and a failed build has neither. `pendingOnContentKey` is a separate
+    /// durable flag with a narrower job - see there - and is deliberately NOT what this reads:
+    /// making every blob address depend on the translation's own guard would mean an index that
+    /// simply never needed a translation addressed its blobs the other way.
     var splitPendingKeyedLocked: Bool { Self.chunkSplit && splitBuilt }
 
     /// WHETHER THE RESIDENT MODEL IS THE SPLIT'S MODEL, which is NOT the same question as whether
@@ -11292,6 +11311,11 @@ public final class VectorStore: @unchecked Sendable {
 
     private func loadIntoMemory() {
         rows.removeAll(); flat16.removeAll(); presentPaths.removeAll(); fileID.removeAll(); pathID.removeAll()
+        // WITH THE ROWS IT DESCRIBES. Every loader below assigns it, but the paths that give up -
+        // a coverage claim that cannot be read - return without loading anything, and a stale
+        // "these ids are contents" outliving the rows it was true of is the one way this flag
+        // could lie. Cleared here so the only way it is true is that a loader has just set it.
+        residentIDsAreContents = false
         slotBackfillCursor = -1
         occSlot.removeAll()
         resetTombstonesLocked()
@@ -12550,75 +12574,32 @@ public final class VectorStore: @unchecked Sendable {
         exec("DELETE FROM chunk WHERE id IN (SELECT chunk_id FROM split_aff) AND refs = 0;")
     }
 
-    /// KEEP THE SPLIT IN STEP WITH A WRITE, for the files it touched.
+    /// MAKE THE SPLIT AUTHORITATIVE, IN ONE TRANSACTION.
     ///
-    /// Regenerates those files' split rows FROM THE v4 ROWS rather than computing them a second
-    /// way, and out of the same `MigrationV5.keyExpr` the migration uses. That is the point: while
-    /// v4 is still authoritative the split is a derived view, and deriving it with the same
-    /// expression is what makes "maintained incrementally" and "rebuilt from scratch" the same
-    /// answer - which `splitparity` can then check after arbitrary churn.
+    /// Three things have to become true together or not at all: the rows written during the
+    /// build get their occurrences, the staged vectors move into the content id space, and the
+    /// flags that say both of those happened go down. Committed separately, each pair has a
+    /// crash window with its own silent failure - the worst being a translated `pending_vecs`
+    /// under a flag that still says v4, where every blob address finds an unrelated row rather
+    /// than missing. One transaction is the only shape with no such window, and it is short:
+    /// the build's minutes of work are already committed on the other connection.
     ///
-    /// Scoped to the touched files and the contents they referenced BEFORE and AFTER. An
-    /// unscoped refs recount is a pass over every content in the index, per write.
-    func maintainSplitForFilesLocked(_ fileIDs: [Int64]) {
-        guard Self.chunkSplit, Self.contentSharing, dbOpen(), !fileIDs.isEmpty else { return }
-        let list = fileIDs.map(String.init).joined(separator: ",")
-        let key = MigrationV5.keyExpr
-        // The contents these files pointed at before the write. Captured first: the occurrence
-        // rows that name them are about to go.
-        exec("CREATE TEMP TABLE IF NOT EXISTS split_aff(chunk_id INTEGER PRIMARY KEY);")
-        exec("DELETE FROM split_aff;")
-        exec("INSERT OR IGNORE INTO split_aff SELECT chunk_id FROM occurrence WHERE file_id IN (\(list));")
-        exec("DELETE FROM occurrence WHERE file_id IN (\(list));")
-        // Contents for any key these files now carry that the table does not have yet. `key` is
-        // UNIQUE, so OR IGNORE is the whole of "insert it if it is new".
-        exec("""
-            INSERT OR IGNORE INTO chunk(key, kind, bytes, refs, slot)
-            SELECT \(key), MIN(ct.kind), 0, 0, MIN(c.slot)
-              FROM chunks c JOIN chunk_text ct ON ct.chunk_id = c.id
-             WHERE c.file_id IN (\(list)) AND c.slot >= 0
-             GROUP BY \(key);
-            """)
-        exec("""
-            INSERT OR REPLACE INTO occurrence(file_id, ordinal, chunk_id, locator)
-            SELECT c.file_id, c.chunk_index, k.id, ct.locator
-              FROM chunks c JOIN chunk_text ct ON ct.chunk_id = c.id
-              JOIN chunk k ON k.key = \(key)
-             WHERE c.file_id IN (\(list)) AND c.slot >= 0;
-            """)
-        exec("INSERT OR IGNORE INTO split_aff SELECT chunk_id FROM occurrence WHERE file_id IN (\(list));")
-        // OR IGNORE ABOVE NEVER UPDATES AN EXISTING CONTENT, which is right for its key and wrong
-        // for its position: a content that was already in the table keeps whatever slot it had
-        // when it was first seen, and a reopen re-derives positions densely after deletes. The
-        // equivalence test caught this as every key matching and every slot differing.
-        exec("""
-            UPDATE chunk SET slot = COALESCE((
-                SELECT MIN(c.slot) FROM chunks c JOIN chunk_text ct ON ct.chunk_id = c.id
-                 WHERE \(key) = chunk.key AND c.slot >= 0), chunk.slot)
-             WHERE id IN (SELECT chunk_id FROM split_aff);
-            """)
-        exec("""
-            UPDATE chunk SET refs = (SELECT COUNT(*) FROM occurrence o WHERE o.chunk_id = chunk.id)
-             WHERE id IN (SELECT chunk_id FROM split_aff);
-            """)
-        // A position that is owned again is not free; one whose last occurrence just went is.
-        exec("""
-            DELETE FROM free_slot WHERE id IN
-              (SELECT slot FROM chunk WHERE id IN (SELECT chunk_id FROM split_aff) AND refs > 0 AND slot >= 0);
-            """)
-        exec("""
-            INSERT OR IGNORE INTO free_slot(id)
-            SELECT slot FROM chunk WHERE id IN (SELECT chunk_id FROM split_aff) AND refs = 0 AND slot >= 0;
-            """)
-        exec("DELETE FROM chunk WHERE id IN (SELECT chunk_id FROM split_aff) AND refs = 0;")
-        exec("DELETE FROM chunk_snippet WHERE chunk_id NOT IN (SELECT id FROM chunk) "
-             + "AND chunk_id IN (SELECT chunk_id FROM split_aff);")
-        exec("""
-            INSERT OR IGNORE INTO chunk_snippet(chunk_id, kind, snippet)
-            SELECT k.id, k.kind, COALESCE((SELECT ct.snippet FROM chunk_text ct JOIN chunks c2
-                                             ON c2.id = ct.chunk_id WHERE c2.slot = k.slot LIMIT 1), '')
-              FROM chunk k WHERE k.id IN (SELECT chunk_id FROM split_aff);
-            """)
+    /// A failure leaves a v4 index with some orphaned split rows, which is exactly the state the
+    /// next build starts from - so the retry is the ordinary path rather than a repair.
+    private func publishSplitLocked() -> Bool {
+        guard dbOpen() else { return false }
+        guard execChecked("BEGIN IMMEDIATE;") else { return false }
+        guard catchUpSplitLocked(),
+              execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.pendingOnContentKey)', '1');"),
+              execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.chunkSplitDoneKey)', '1');"),
+              execChecked("COMMIT;")
+        else {
+            rollbackTxnLocked()
+            return false
+        }
+        splitBuilt = false
+        refreshSplitBuiltLocked()
+        return true
     }
 
     /// ROWS THAT ARRIVED WHILE THE BUILD WAS RUNNING.
@@ -12631,8 +12612,9 @@ public final class VectorStore: @unchecked Sendable {
     ///
     /// Runs on the store queue in the same turn that sets the done flag, so there is no instant
     /// at which the split is both authoritative and incomplete.
-    private func catchUpSplitLocked() {
-        guard dbOpen() else { return }
+    @discardableResult
+    private func catchUpSplitLocked() -> Bool {
+        guard dbOpen() else { return false }
         let media = StoreSchema.mediaKindCodes.map(String.init).joined(separator: ",")
         _ = media
         // A content per missing row, keyed the same way the build keys them, then the pointer,
@@ -12661,7 +12643,8 @@ public final class VectorStore: @unchecked Sendable {
                 SELECT u.file_id, u.ordinal, k.id, COALESCE(t.locator, '')
                   FROM split_catchup u
                   JOIN chunk k ON k.slot = u.slot
-                  LEFT JOIN chunk_text t ON t.chunk_id = u.chunk_row;
+                  LEFT JOIN chunk_text t ON t.chunk_id = u.chunk_row
+                 ORDER BY u.chunk_row;
                 """)
             exec("""
                 INSERT OR IGNORE INTO chunk_snippet(chunk_id, kind, snippet)
@@ -12678,7 +12661,7 @@ public final class VectorStore: @unchecked Sendable {
                 "[omni] split catch-up: \(missing) rows written during the build\n".utf8))
         }
         exec("DROP TABLE IF EXISTS split_catchup;")
-        rekeyPendingVectorsOntoContentsLocked()
+        return rekeyPendingVectorsOntoContentsLocked()
     }
 
     /// THE STAGED BLOBS MOVE ID SPACES WITH EVERYTHING ELSE.
@@ -12703,10 +12686,17 @@ public final class VectorStore: @unchecked Sendable {
     /// Idempotent. A blob already keyed on a content joins `chunk` by the content's own slot and
     /// comes back as itself, so a re-run after an interrupted one is a no-op rather than a second
     /// translation - which would be the corrupting direction.
-    private func rekeyPendingVectorsOntoContentsLocked() {
-        guard Self.chunkSplit, dbOpen() else { return }
-        guard scalarQuery("SELECT COUNT(*) FROM pending_vecs") > 0 else { return }
-        guard execChecked("BEGIN IMMEDIATE;") else { return }
+    @discardableResult
+    private func rekeyPendingVectorsOntoContentsLocked() -> Bool {
+        guard Self.chunkSplit, dbOpen() else { return false }
+        // ONCE, AND THE FLAG IS WHAT SAYS SO. Running it twice is not a no-op, it is corruption:
+        // the join goes through `chunks`, so a blob already keyed on a content is looked up as a
+        // v4 row id, finds whichever unrelated row carries that number, and is re-keyed onto
+        // THAT row's content. Both spaces are dense, so it does not miss. Reachable without any
+        // test: the build finishes, the process is killed before the publish commits, and the
+        // next open builds again.
+        if pendingOnContent { return true }
+        guard scalarQuery("SELECT COUNT(*) FROM pending_vecs") > 0 else { return true }
         let ok = execChecked("DROP TABLE IF EXISTS temp.pv_rekey;")
             && execChecked("CREATE TEMP TABLE pv_rekey(chunk_id INTEGER PRIMARY KEY, vec BLOB NOT NULL);")
             && execChecked("""
@@ -12722,18 +12712,17 @@ public final class VectorStore: @unchecked Sendable {
         // EVERY UNCOVERED CONTENT MUST STILL HAVE ITS BYTES. A blob that fell out of the join -
         // a row whose slot is -1, a content the build did not reach - is a vector that exists
         // nowhere else, because the file does not answer for an uncovered position. There is no
-        // safe way to continue past that, so the whole translation rolls back and the index stays
-        // v4-keyed: slower, and correct.
+        // safe way to continue past that, so the caller rolls the whole publish back and the
+        // index stays v4: slower, and correct.
         let owed = scalarQuery("SELECT COUNT(*) FROM chunk WHERE slot >= \(coveredRows)")
         let have = scalarQuery("SELECT COUNT(*) FROM pending_vecs")
-        guard ok, have >= owed, execChecked("COMMIT;") else {
-            rollbackTxnLocked()
-            exec("DROP TABLE IF EXISTS temp.pv_rekey;")
+        guard ok, have >= owed else {
             FileHandle.standardError.write(Data(
-                "[omni] pending vectors left v4-keyed: \(have) staged for \(owed) uncovered contents\n".utf8))
-            return
+                "[omni] pending vectors not translated: \(have) staged for \(owed) uncovered contents\n".utf8))
+            return false
         }
         exec("DROP TABLE IF EXISTS temp.pv_rekey;")
+        return true
     }
 
     /// The files a set of v4 chunk rows belong to.
@@ -12773,6 +12762,11 @@ public final class VectorStore: @unchecked Sendable {
         if scalarQuery("SELECT COUNT(*) FROM chunks") == 0,
            scalarQuery("SELECT COUNT(*) FROM files") == 0 {
             exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.chunkSplitDoneKey)', '1');")
+            // AND NOTHING TO TRANSLATE, EVER. A born-v5 index stages its first blob under a
+            // content id, so the one-way translation has no work here and must never run: left
+            // unset, the first build of a LATER session would find the flag down and translate
+            // blobs that are already in the content space.
+            exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.pendingOnContentKey)', '1');")
             splitBuilt = false
             refreshSplitBuiltLocked()
             return splitBuilt
@@ -12824,10 +12818,18 @@ public final class VectorStore: @unchecked Sendable {
                     // the build's snapshot cannot contain them. They are given occurrences here,
                     // inside the same store queue turn that publishes the flag, so no window
                     // exists in which the split is authoritative and incomplete.
-                    self.catchUpSplitLocked()
-                    self.exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.chunkSplitDoneKey)', '1');")
-                    self.splitBuilt = false
-                    self.refreshSplitBuiltLocked()
+                    // AND THE FLAG IS NOT SET IF THE CATCH-UP COULD NOT FINISH. The staged
+                    // vectors move id space in the same turn, and publishing over a translation
+                    // that rolled back would leave every blob keyed on a v4 row while every
+                    // reader addressed it by content - two spaces that overlap numerically, so
+                    // the reads would not miss, they would return another content's bytes. An
+                    // unpublished split is a v4 index: slower, and correct. The next stamp
+                    // tries again.
+                    guard self.publishSplitLocked() else {
+                        FileHandle.standardError.write(Data(
+                            "[omni] chunk split built but not published; the next stamp retries\n".utf8))
+                        return
+                    }
                     FileHandle.standardError.write(Data(
                         ("[omni] chunk split built off-queue: \(r.contents) contents, "
                          + "\(r.occurrences) occurrences, \(r.freeSlots) free, "
@@ -12843,6 +12845,12 @@ public final class VectorStore: @unchecked Sendable {
                     self.exec("DELETE FROM occurrence;"); self.exec("DELETE FROM chunk;")
                     self.exec("DELETE FROM chunk_snippet;"); self.exec("DELETE FROM free_slot;")
                     self.exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.chunkSplitDoneKey)', '0');")
+                    // The contents are gone, so no blob can be addressed by one. The publish is
+                    // the only place that sets this and it never ran, but a build that FAILED
+                    // after a previous one succeeded would otherwise leave the flag standing
+                    // over an empty `chunk` table.
+                    self.exec("DELETE FROM meta WHERE key = '\(Self.pendingOnContentKey)';")
+                    self.refreshSplitBuiltLocked()
                 }
                 FileHandle.standardError.write(Data("[omni] chunk split refused: \(error)\n".utf8))
             }
@@ -12878,12 +12886,38 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     /// Wipe the split so it can be rebuilt from the v4 tables and the two compared.
+    ///
+    /// THE STAGED VECTORS GO BACK TO v4 KEYS WITH IT, and they have to: the rebuild mints fresh
+    /// content ids, so blobs left keyed on the old ones name contents that no longer exist - and
+    /// the translation, which is now skipped once its flag is up, would not move them again.
+    ///
+    /// THE INVERSE GOES THROUGH `occurrence`, NOT THROUGH THE SLOT. Written by slot first, and
+    /// it silently dropped every duplicate: a content's slot is its REPRESENTATIVE's, so
+    /// `chunks.slot = chunk.slot` matches one v4 row per content and leaves the other 20 of 32
+    /// with no blob at all. The occurrence is the pointer and says exactly which content a v4
+    /// row reads - which is the same reason the forward direction cannot be run twice.
     public func clearSplitForTest() {
         queue.sync {
+            if pendingOnContent {
+                exec("DROP TABLE IF EXISTS temp.pv_inv;")
+                exec("CREATE TEMP TABLE pv_inv(chunk_id INTEGER PRIMARY KEY, vec BLOB NOT NULL);")
+                exec("""
+                    INSERT OR REPLACE INTO temp.pv_inv(chunk_id, vec)
+                    SELECT c.id, p.vec
+                      FROM chunks c
+                      JOIN occurrence o ON o.file_id = c.file_id AND o.ordinal = c.chunk_index
+                      JOIN pending_vecs p ON p.chunk_id = o.chunk_id;
+                    """)
+                exec("DELETE FROM pending_vecs;")
+                exec("INSERT INTO pending_vecs(chunk_id, vec) SELECT chunk_id, vec FROM temp.pv_inv;")
+                exec("DROP TABLE IF EXISTS temp.pv_inv;")
+            }
             exec("DELETE FROM occurrence;"); exec("DELETE FROM chunk;")
             exec("DELETE FROM chunk_snippet;"); exec("DELETE FROM free_slot;")
             exec("DELETE FROM meta WHERE key = '\(Self.chunkSplitDoneKey)';")
+            exec("DELETE FROM meta WHERE key = '\(Self.pendingOnContentKey)';")
             splitBuilt = false
+            pendingOnContent = false
         }
     }
 

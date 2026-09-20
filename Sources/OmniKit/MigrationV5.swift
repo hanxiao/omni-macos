@@ -72,6 +72,19 @@ enum MigrationV5 {
     /// Every v4 chunk becomes a pointer at its content's representative. The locator travels with
     /// the OCCURRENCE, which is the whole point of the split: the same content is "Line 1" of one
     /// file and "Line 4310" of another.
+    /// ORDER BY THE v4 CHUNK ID, AND IT IS NOT COSMETIC. `occurrence` is a rowid table and the
+    /// loader scans it in rowid order, so this statement decides the RESIDENT ROW ORDER of every
+    /// migrated index - and without an ORDER BY that is whatever join order the planner picked.
+    ///
+    /// Two things break when it is not v4's order. The row-window table records one contiguous
+    /// span of rows per file and every per-file read rides it; scattered, the measured index went
+    /// from spanned/live 1.0001 and a widest window of 1,250 rows to 1.4306 and 4,208,690. And
+    /// the top-k selection breaks score ties by row, so a reordered row table returns a different
+    /// (equally correct) tenth hit and the search digest moves - which is the gate that says a
+    /// migration changed nothing, so it has to be able to mean that.
+    ///
+    /// `chunks.id` is the order the v4 loader used, so a migrated index comes up with exactly the
+    /// row order it had before. The sort costs the build a few seconds, once, off the store queue.
     static func buildOccurrenceSQL(suffix: String = "") -> String {
         """
         INSERT INTO occurrence\(suffix)(file_id, ordinal, chunk_id, locator)
@@ -79,6 +92,7 @@ enum MigrationV5 {
         FROM chunks c
         JOIN chunk_text ct ON ct.chunk_id = c.id
         JOIN chunk\(suffix) rep ON rep.key = \(keyExpr)
+        ORDER BY c.id
         """
     }
 
