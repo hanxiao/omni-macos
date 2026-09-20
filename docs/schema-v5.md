@@ -1165,14 +1165,126 @@ releasing.
 
   6. `pending_vecs` keyed on content id rather than row id. DONE, with step 5 - see above.
   7. The migration contracts: drop `chunk_text`, then `chunks`, with the kill-and-reopen proof.
-  8. Both flags deleted - not defaulted, deleted. A shipped layout has no switch.
+     DONE. Until they go the split is pure cost - both layouts in one file - so this is not a
+     tidy-up, it is the step the space and the simpler model are paid out by.
+
+     IRREVERSIBLE, SO IT PROVES ITSELF FIRST: every v4 row must already have an occurrence,
+     every content a position, and the staged vectors must already have moved id space. The row
+     COUNTS are deliberately NOT compared - after the cutover new writes add occurrences and no
+     v4 rows, so the two diverge from the first write and a count check would forbid the drop
+     for ever. "No v4 row is unrepresented" is the statement that stays true as the index grows.
+     Off the store queue on its own connection, for the same reason the build is.
+
+     AND A BRAND NEW INDEX NEVER GETS THE TABLES AT ALL, which is both less work and one fewer
+     state: creating them for a new user and dropping them at the first stamp leaves a window in
+     which a new index has a v4 row table that nothing writes.
+
+     FIVE THINGS ONLY FAIL ONCE THE TABLES ARE REALLY GONE. The arm went 90 failures to 0
+     finding them, and every one was silent in the sense this document keeps meeting:
+
+       - `WrittenChunks.residentIDs` compared the two arrays' COUNTS, and `rowIDs` is empty after
+         the cutover - so it returned the empty one and every resident row kept `chunkID` 0.
+         Nothing failed then: the loader recovers the ids from SQL at the next open. What broke
+         is `persistAllSlotsLocked`, the one place that writes positions FROM MEMORY, which skips
+         a row with no id - so after a compaction `chunk.slot` still held the pre-compaction
+         numbering and the next open seated files on each other's vectors. Found by the shadow
+         chaos test, the only one that scores every hit against an independent model.
+       - `persistSlotsLocked` gated the CONTENT update on the same comparison, so no new content
+         was given its position at all.
+       - `backfillSlotsLocked` returned on the missing `chunks.slot` column before it could mark
+         the backfill done, and coverage refuses to advance until it is - so coverage never moved
+         on a v5-only index, which is every new user. "No `chunks` at all" and "a `chunks` with
+         no slot column" look identical through `hasColumnLocked` and are OPPOSITE answers: the
+         second is a v3 index whose conversion has to run first.
+       - `renumberSlotsByRankLocked` read that same check as "nothing to renumber".
+       - `prepareChunkInsertLocked` returns nil on any failed prepare, so a v4 statement left in
+         it does not degrade the write path, it STOPS it.
+
+     TWO READERS WERE ALREADY WRONG BEFORE ANY OF THIS, and only came out when the tables did.
+     `hitsForPaths` had no split form - missed by the step-2 sweep because it is not the display
+     path, it is the metadata behind a filename or tag match, which no digest covers: those hits
+     keep their paths and their scores and lose their snippet, locator and kind. And
+     `rowIsGoneFromTableLocked` read `f.path`, a column `files` has not had since v4 interned the
+     directories, so it never prepared and has been answering "the row is still there" for every
+     row on every v4 index since. Silent, and in the safe direction, which is why it survived.
+
+     AND A MIGRATED INDEX SAYS IT IS v5. Found by running a pre-cutover binary against one by
+     accident, which is exactly what a downgrade does: it does not refuse, it finds no `chunks`,
+     reads that as an empty index, and RESETS THE COVERAGE CLAIM - the one record that says the
+     vector file is the only copy of every vector. The file survives and nothing can find it
+     again. The scheme already had the answer and the index was not using it: an unknown
+     `user_version` is dropped and rebuilt, which costs a re-index and loses nothing. Stamped 5
+     in the same transaction as the drop, and 4 until then, because until then an older build
+     reads the index correctly. The version follows the SHAPE.
+
+  8. Both flags deleted - not defaulted, deleted. A shipped layout has no switch. DONE.
+
+         592 tests, 0 failures - one arm, because there is only one now
+
+     They had to go in the same release as the migration rather than linger: a lever whose off
+     position produces an index this build can no longer read is not an escape hatch, it is a way
+     to lose data. Defaulting them on would leave that off position reachable.
+
+     THE FOLD IS DELETED WITH THEM - the pass, its three prepared statements, its slice budgets,
+     `OMNI_CONTENT_FOLD`, the progress reporter, `contentFoldComplete` and the reclaim's gate on
+     it, the `omni-verify fold` mode, `Scripts/kill-migration-test.sh` and ContentFoldTests. It
+     and the split build were two implementations of one dedup and the split does it by
+     construction.
+
+     TWO OF ITS MARKERS STAY, AND ARE READ. `chunk_content_folded` means positions and row ranks
+     have parted company on that index, so the by-slot loader is the only one that can read it;
+     `chunk_content_fold_upto` means the pass stopped part way, so positions inside coverage may
+     be unowned and unrecorded. Nothing writes either any more. Deleting the READERS would turn a
+     folded index into one this build cannot open, which is the opposite of a migration.
+
+     `legacyWriteForTest` REPLACES THE FLAG IN THE TESTS and is not the same thing renamed: no
+     environment variable reaches it and no shipping path sets it. Every migration test needs an
+     index in the shape an existing user's is, and the only thing that can write that shape is
+     this store - so a test sets it, writes its fixture, puts it back, and opens the result with
+     a normal store, which is the sequence an upgrade is.
+
+     `testTheWritePathKeepsTheSplitEqualToARebuild` is DELETED, not skipped. It rebuilt the split
+     from the v4 rows to compare, and step 7 removes what it compared against; there is no arm
+     left in which it can run. Its successor asks the question the other way round - the split
+     answers for itself, because nothing else can.
+
+## The whole migration, end to end, on the real index
+
+No flags: this is simply what the app does now. 9,773,836 chunks, 2,678,905 files.
+
+    before (v4)  sqlite 6.09 GB  vecs 22.12 GB  p50 5.2 ms  open 3.56 s  digest ba7a13400e714f79
+    migrate      split built off-queue 145.3 s; v4 dropped in 3.4 s; 48 stamps in 196.3 s
+    first open   3,516,335 freed positions recorded, 20.9 s once
+    reclaim      3,770,848 slots, 5,523.7 MB, 45.0 s
+    repack       3.59 GB of freelist returned in 10.0 s
+    after  (v5)  sqlite 2.92 GB  vecs  9.61 GB  p50 3.7 ms  open 2.51 s  digest ba7a13400e714f79
+
+    tables: chunk occurrence chunk_snippet free_slot  (chunks and chunk_text gone)
+    user_version 4 -> 5;  0 failing audit checks at every stage
+
+28.2 GB to 12.5 GB, the search digest identical at every stage, and every timing at or better
+than the v4 baseline. The 20.9 s open is the one-time hole recording and does not recur.
+
+SIGKILL AT THREE POINTS, each on its own clone (`Scripts/kill-split-migration.sh 40 180 320`).
+All three reopen with 0 failing checks and digest ba7a13400e714f79:
+
+    40 s    mid slot backfill     reopens v4,    chunk=0        p50 4.7 ms
+    180 s   coverage complete     reopens v4,    chunk=0        p50 4.5 ms
+    320 s   split published, v4 still present    chunk=6257501  p50 4.9 ms
+
+The window a timer cannot find is between the build's commit and the publish's, and it is
+produced deterministically instead - see `tearPublishForTest` under step 5. The drop has no such
+window: it is one transaction, so either both tables are gone with both flags and the version
+stamp, or none of it happened.
 
 Each step lands on the paths that produced the defects above, so each gets its own chaos run, and
 the whole thing gets the three proofs CLAUDE.md now requires before it ships: identical digest,
 no timing regression against the same index with the change off, and SIGKILL part-way through the
 migration at several points with a clean reopen each time.
 
-WHERE THE CUTOVER ACTUALLY STANDS, AND WHAT IS BROKEN IN IT.
+WHERE THE CUTOVER STOOD WHILE IT WAS BEING BUILT. Kept because each dead end below cost a
+measurement and eliminates a hypothesis; every "not done" and "still off" in this section and the
+next is now finished - see the eight-step sequence above and the end-to-end numbers at the end.
 
 The pieces are in: the write path produces `chunk` / `occurrence` / `chunk_snippet` natively
 rather than deriving them from v4 (which the identity/position split is what made possible - a
@@ -1252,22 +1364,22 @@ message that `testAmbiguousMismatchWithHolesStillRefuses` pins, and a refusal's 
 safety surface - that test exists because this message once blamed a second copy of the app for a
 bookkeeping problem. Correcting the units means re-deciding what the sentence says.
 
-WHAT IS NOT DONE: dropping the v4 tables. Building the tables and proving the invariants is the half that can be
-checked; repointing snippets, locators, tag filters, browse, lexical and dedup at `chunk` /
-`occurrence` is a separate change with its own risk, and it also rests on the same `chunks.slot`
-trust that the fold and the free list are still blocked on. Running this first is how its size and
-its time are known before it is written.
+WHAT WAS NOT DONE THEN, AND IS NOW: dropping the v4 tables. Written at the time as "a separate
+change with its own risk", which was right - it turned up five defects that only fail once the
+tables are really gone, and two readers that had been wrong for longer than the split has
+existed. Step 7 above has them.
 
-Until they are dropped the split is pure cost - both schemas in one file - which is why it stays
-behind `OMNI_CHUNK_SPLIT=1`.
-
-AND THE WIN IS SMALLER THAN THE SHAPE SUGGESTS: 0.414 GB, 15.7% of the tables it replaces. The
+AND THE WIN IS SMALLER THAN THE SHAPE SUGGESTS - AS A TABLE-FOR-TABLE SWAP. Measured that way it
+is 0.414 GB, 15.7% of what it replaces. The
 split stores 3.5M fewer snippet copies, but it also adds two indexes v4 never had - `idx_chunk_key`
 at 0.161 GB, which is the content lookup v4 could not do at all, and `idx_occ_chunk` at 0.126 GB -
 plus a 0.145 GB primary key on `occurrence`. The split's real payoff is not the SQLite file. It is
 that the content lookup becomes a seek instead of a scan, and that the vector file drops from
-9,984,194 positions to 6,213,798 - and the fold already delivers that second one, measured at
-5.5 GB, without any of this.
+9,984,194 positions to 6,213,798 - which the fold also delivered, at 5.5 GB, without any of this.
+
+WHAT THE WHOLE MIGRATION ACTUALLY MOVES, once the v4 tables are gone and the pages are returned,
+is 28.2 GB to 12.5 GB on the measured index. The table-for-table figure above is the right number
+for the question it answers and the wrong one for "what does this cost a user".
 
 ## The two 2026 leads, measured on the real index, and both declined
 
