@@ -1277,6 +1277,27 @@ produced deterministically instead - see `tearPublishForTest` under step 5. The 
 window: it is one transaction, so either both tables are gone with both flags and the version
 stamp, or none of it happened.
 
+AND THE CHAOS RUN, against a clone of the same index while it migrated underneath and files were
+created, edited, renamed and deleted on a 0.4 s cycle:
+
+    testChaosWhileAnOldIndexMigrates passed (982.2 s), 0 failures
+    === the split WAS built and in use for this run
+    v4 tables  dropped      chunk 6257501   occurrence 9773836   user_version 5
+
+    the session AFTER it:  rowTable=occurrence, 0 failing checks
+                           digest ba7a13400e714f79, p50 4.9 ms
+
+THE RUN BEFORE IT PASSED AND PROVED LESS. Same 700 s of quiet, same identical digest, same zero
+failing checks - and `chunks` still sitting there at the end, because nothing had scheduled the
+stamp that drops it. The harness reported the table counts and they looked right, which is how
+a step that never happens survives a green run. It is the third time this sequence has produced
+"a step that never gets a turn", and the only reason it was caught is that the summary prints
+what the index ENDED UP AS rather than only whether the test passed.
+
+That summary then had to stop asking `chunks` for a count, because on a complete migration the
+question is an error rather than a number. It reports the two tables by NAME now: their absence
+is the result.
+
 Each step lands on the paths that produced the defects above, so each gets its own chaos run, and
 the whole thing gets the three proofs CLAUDE.md now requires before it ships: identical digest,
 no timing regression against the same index with the change off, and SIGKILL part-way through the

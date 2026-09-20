@@ -45,14 +45,18 @@ grep -inE "error|fail|warn|refus|abandon|unreadable|corrupt|cannot|invalid" "$LO
 # quiet period long enough (OMNI_MIGCHAOS_QUIET_SECONDS, 480 on the real index) or this measures
 # v4. That is the same lesson the deleted OMNI_CHUNK_SPLIT flag taught twice.
 echo "=== what the index ended up as"
+# THE v4 TABLES ARE GONE BY THE END OF A COMPLETE MIGRATION, so asking them for a count is not
+# a summary, it is an error that aborts the rest of the summary. Reported by NAME instead: their
+# absence is the result, not a failure to measure.
 sqlite3 -readonly "$W/index.sqlite" "
-  SELECT 'chunks      ' || COUNT(*) FROM chunks
-  UNION ALL SELECT 'chunk_text  ' || COUNT(*) FROM chunk_text
+  SELECT 'v4 tables   ' || COALESCE((SELECT group_concat(name, ' ') FROM sqlite_master
+                                      WHERE name IN ('chunks','chunk_text')), 'dropped')
   UNION ALL SELECT 'chunk       ' || COUNT(*) FROM chunk
   UNION ALL SELECT 'occurrence  ' || COUNT(*) FROM occurrence
   UNION ALL SELECT 'snippet     ' || COUNT(*) FROM chunk_snippet
   UNION ALL SELECT 'free_slot   ' || COUNT(*) FROM free_slot
-  UNION ALL SELECT 'vec_holes   ' || COUNT(*) FROM vec_holes;" 2>&1
+  UNION ALL SELECT 'vec_holes   ' || COUNT(*) FROM vec_holes
+  UNION ALL SELECT 'user_version' || ' ' || (SELECT * FROM pragma_user_version);" 2>&1
 echo "=== migration markers"
 sqlite3 -readonly "$W/index.sqlite" \
   "SELECT key || '=' || value FROM meta WHERE key LIKE 'chunk_%' OR key LIKE 'vecs_%' ORDER BY key;" 2>&1
