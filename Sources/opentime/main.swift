@@ -92,6 +92,31 @@ if args.count >= 3, args[2] == "repack" {
     exit(0)
 }
 
+// `opentime <db> idle [seconds]` opens the index and then does NOTHING for a while, which is
+// the one thing a one-shot tool never does and a user always does. Everything after the split
+// publishes - recording the freed positions, dropping the v4 tables, taking the space back - is
+// driven by a scheduled stamp, so a process that exits immediately measures a migration that
+// stops half way and looks finished.
+if args.count >= 3, args[2] == "idle" {
+    let seconds = args.count >= 4 ? (Double(args[3]) ?? 120) : 120
+    func vecs() -> Int64 {
+        let p = url.deletingLastPathComponent().appendingPathComponent(url.lastPathComponent + ".vecs").path
+        return ((try? FileManager.default.attributesOfItem(atPath: p)[.size]) as? Int64) ?? 0
+    }
+    let t0 = Date()
+    let store = try VectorStore(dbURL: url)
+    print(String(format: "opened %d rows in %.1fs; vecs %.2f GB, holes %d",
+                 store.count, -t0.timeIntervalSinceNow, Double(vecs()) / 1e9, store.holesForTest().count))
+    fflush(stdout)
+    let until = Date().addingTimeInterval(seconds)
+    while Date() < until { RunLoop.current.run(until: Date().addingTimeInterval(1)) }
+    print(String(format: "after %.0fs idle: vecs %.2f GB, holes %d, positions %d",
+                 seconds, Double(vecs()) / 1e9, store.holesForTest().count, store.slotCountForTest))
+    if let bad = store.coverageAudit() { print("AUDIT FAILED: \(bad)") } else { print("audit clean") }
+    store.close()
+    exit(0)
+}
+
 if args.count >= 3, args[2] == "split" {
     let t0 = Date()
     let store = try VectorStore(dbURL: url)

@@ -1265,6 +1265,22 @@ No flags: this is simply what the app does now. 9,773,836 chunks, 2,678,905 file
 28.2 GB to 12.5 GB, the search digest identical at every stage, and every timing at or better
 than the v4 baseline. The 20.9 s open is the one-time hole recording and does not recur.
 
+WHAT A USER ACTUALLY GETS, WITHOUT INVOKING ANYTHING. Every step after the split publishes is
+driven by a scheduled stamp, so a tool that opens the index and exits measures a migration that
+stops half way and looks finished. `opentime <db> idle <seconds>` opens and then does nothing,
+which is the one thing a one-shot tool never does and a user always does:
+
+    session 1   the migration: backfill, coverage, split built, v4 dropped
+    session 2   opens in 21.0 s, records 3,516,335 freed positions, and then - with nothing
+                touching it - RECLAIMS THEM: 5,523.7 MB in 96.9 s, vecs 15.40 -> 9.61 GB,
+                holes 0, audit clean
+    session 3   opens in 2.5 s, nothing left to do
+
+The repack is the one step a tool cannot show: `reclaimAfterCoverageMigration` is called by
+AppModel on every launch and by nothing in `opentime`, so the 3.59 GB of freelist the drop
+leaves is returned on the user's next launch rather than in session 2. Measured directly with
+`opentime <db> repack`: 3.59 GB in 10.0 s, sqlite 6.52 -> 2.92 GB.
+
 SIGKILL AT THREE POINTS, each on its own clone (`Scripts/kill-split-migration.sh 40 180 320`).
 All three reopen with 0 failing checks and digest ba7a13400e714f79:
 
