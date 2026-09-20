@@ -17,14 +17,11 @@ final class ChunkSplitTests: XCTestCase {
 
     override func setUp() {
         super.setUp()
-        savedSharing = VectorStore.contentSharing
         savedSplit = VectorStore.legacyWriteForTest
         savedQuant = VectorStore.quantBaseOverride
-        VectorStore.contentSharing = true
         VectorStore.legacyWriteForTest = false
     }
     override func tearDown() {
-        VectorStore.contentSharing = savedSharing
         VectorStore.legacyWriteForTest = savedSplit
         VectorStore.quantBaseOverride = savedQuant
         super.tearDown()
@@ -111,7 +108,11 @@ final class ChunkSplitTests: XCTestCase {
         XCTAssertEqual(num(url, "SELECT COUNT(*) FROM occurrence o LEFT JOIN chunk c "
                                 + "ON c.id = o.chunk_id WHERE c.id IS NULL"), 0,
                        "an occurrence points at a content that does not exist")
-        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM free_slot f JOIN chunk c ON c.id = f.id"), 0,
+        // ON THE SLOT, NOT ON THE ID. `free_slot.id` is a POSITION and `chunk.id` is a CONTENT,
+        // and the schema separated those deliberately - "position is a column, not the identity"
+        // - so joining them compares two unrelated numbering spaces. It read 0 for as long as
+        // the two happened not to overlap, which is not the same as the invariant holding.
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM free_slot f JOIN chunk c ON c.slot = f.id"), 0,
                        "a position is both owned and free")
         // The snippet is stored once per CONTENT, which is the space the split is for.
         XCTAssertEqual(num(url, "SELECT COUNT(*) FROM chunk_snippet"), 65)
@@ -655,15 +656,12 @@ final class ChunkSplitAccountingTests: XCTestCase {
 
     override func setUp() {
         super.setUp()
-        savedSharing = VectorStore.contentSharing
         savedSplit = VectorStore.legacyWriteForTest
         savedQuant = VectorStore.quantBaseOverride
-        VectorStore.contentSharing = true
         VectorStore.legacyWriteForTest = ProcessInfo.processInfo.environment["OMNI_DIAG_NOSPLIT"] == "1"
         VectorStore.quantBaseOverride = VectorStore.scanBits
     }
     override func tearDown() {
-        VectorStore.contentSharing = savedSharing
         VectorStore.legacyWriteForTest = savedSplit
         VectorStore.quantBaseOverride = savedQuant
         super.tearDown()

@@ -58,13 +58,10 @@ final class StoreChunkReuseTests: XCTestCase {
     private var savedReuse = false
     override func setUp() {
         super.setUp()
-        savedSharing = VectorStore.contentSharing
         savedReuse = VectorStore.storeChunkReuse
-        VectorStore.contentSharing = true
         VectorStore.storeChunkReuse = true
     }
     override func tearDown() {
-        VectorStore.contentSharing = savedSharing
         VectorStore.storeChunkReuse = savedReuse
         super.tearDown()
     }

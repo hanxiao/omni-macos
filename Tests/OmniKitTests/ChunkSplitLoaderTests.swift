@@ -26,11 +26,9 @@ final class ChunkSplitLoaderTests: XCTestCase {
 
     override func setUp() {
         super.setUp()
-        savedSharing = VectorStore.contentSharing
         savedSplit = VectorStore.legacyWriteForTest
         savedFreeList = VectorStore.freeListEnabled
         savedQuant = VectorStore.quantBaseOverride
-        VectorStore.contentSharing = true
         VectorStore.legacyWriteForTest = false
         // COVERAGE ONLY ADVANCES INTO A NAMED VECTOR FILE, and below the quant crossover the
         // buffer is an unlinked scratch mapping - so on a fixture this size `coveredRows` stays
@@ -46,7 +44,6 @@ final class ChunkSplitLoaderTests: XCTestCase {
         VectorStore.holeReclaimFloorOverride = 1
     }
     override func tearDown() {
-        VectorStore.contentSharing = savedSharing
         VectorStore.legacyWriteForTest = savedSplit
         VectorStore.freeListEnabled = savedFreeList
         VectorStore.quantBaseOverride = savedQuant
@@ -101,7 +98,6 @@ final class ChunkSplitLoaderTests: XCTestCase {
     @discardableResult
     private func writeV4Fixture(_ url: URL, files: Int, dupEvery: Int) throws -> Int {
         let savedSplit = VectorStore.legacyWriteForTest
-        let savedShare = VectorStore.contentSharing
         // SHARING OFF TOO, and that is the whole point of the fixture rather than a detail.
         // With sharing ON the duplicates never get a position of their own, so the split has
         // nothing to collapse - it built 28 contents over 28 positions and freed nothing, and
@@ -109,8 +105,7 @@ final class ChunkSplitLoaderTests: XCTestCase {
         // addressing is the one with 48 positions for 28 contents, and it is the only index an
         // existing user can be upgrading from.
         VectorStore.legacyWriteForTest = true
-        VectorStore.contentSharing = false
-        defer { VectorStore.legacyWriteForTest = savedSplit; VectorStore.contentSharing = savedShare }
+        defer { VectorStore.legacyWriteForTest = savedSplit; }
         let store = try VectorStore(dbURL: url)
         for i in 0 ..< files {
             let p = "/v4/f\(i).txt"

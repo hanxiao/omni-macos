@@ -7,13 +7,7 @@ import SQLite3
 /// and deleting one must not take the other's vector with it.
 final class ContentSharingTests: XCTestCase {
 
-    override func setUp() { super.setUp(); VectorStore.contentSharing = true }
-    override func tearDown() {
-        // Back to whatever the arm is, which is the same expression VectorStore uses: sharing is ON
-        // unless the env says otherwise.
-        VectorStore.contentSharing = ProcessInfo.processInfo.environment["OMNI_CONTENT_SHARING"] != "0"
-        super.tearDown()
-    }
+    // No setUp/tearDown: sharing is not a lever any more, it is the layout.
 
     private func tempDB() -> URL {
         let d = FileManager.default.temporaryDirectory

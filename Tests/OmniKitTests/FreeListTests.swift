@@ -25,14 +25,11 @@ final class FreeListTests: XCTestCase {
     override func setUp() {
         super.setUp()
         savedQuant = VectorStore.quantBaseOverride
-        savedSharing = VectorStore.contentSharing
         savedFreeList = VectorStore.freeListEnabled
-        VectorStore.contentSharing = true
         VectorStore.freeListEnabled = true
     }
     override func tearDown() {
         VectorStore.quantBaseOverride = savedQuant
-        VectorStore.contentSharing = savedSharing
         // CAPTURED, NOT RECOMPUTED. This used to restore the flag by re-reading the environment
         // with the flag's own old default spelling (== "1"). The default is now "on unless 0", so
         // the restore put back the OPPOSITE of what it found and every test that ran after this

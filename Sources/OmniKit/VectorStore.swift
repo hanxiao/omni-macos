@@ -1309,7 +1309,7 @@ public final class VectorStore: @unchecked Sendable {
     /// Called BEFORE the tombstones are applied, so the victims are still live in `deadRows` and
     /// have to be treated as dying here.
     private func releasedSlotsLocked(_ victims: [Int32]) -> [Int32] {
-        guard Self.contentSharing else { return victims }
+        
         guard !victims.isEmpty else { return [] }
         ensureSlotRowsLocked()
         let dying = Set(victims)
@@ -1351,7 +1351,7 @@ public final class VectorStore: @unchecked Sendable {
     /// crash and not an empty result set the user can see as wrong: find similar silently finds
     /// nothing, and a filename or tag match silently scores 0. `chunkVectors` already learned this
     /// once; this is the same answer in one place instead of five.
-    private var vectorUnits: Int { Self.contentSharing ? slotCount : rows.count }
+    private var vectorUnits: Int { slotCount }
     private var pathID: [String: Int32] = [:]
     private var fileIDCount: Int { pathID.count }
     /// id -> canonical path String, parallel to pathID. Rows reference THESE instances so all
@@ -1991,7 +1991,7 @@ public final class VectorStore: @unchecked Sendable {
             // out from under it.
             let brandNew = !hasTableLocked("chunks") && !hasTableLocked("files")
             var v4Gone = scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.v4DroppedKey)'") == 1
-            if brandNew, Self.contentSharing, !Self.legacyWriteForTest { v4Gone = true }
+            if brandNew, !Self.legacyWriteForTest { v4Gone = true }
             for sql in StoreSchema.createStatements(includeV4: !v4Gone) { exec(sql) }
             if v4Gone {
                 exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.v4DroppedKey)', '1');")
@@ -2009,7 +2009,7 @@ public final class VectorStore: @unchecked Sendable {
         // And whether a v4 backfill is still owed. Decided HERE because the rows present at open
         // are exactly the pre-existing ones - after this, every row written gets a slot and the
         // question would start answering about the wrong thing.
-        v4BackfillPending = Self.contentSharing && hasColumnLocked("chunks", "slot") && !slotsBackfilled
+        v4BackfillPending = hasColumnLocked("chunks", "slot") && !slotsBackfilled
             && scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.slotsBackfilledKey)'") != 1
             && scalarQuery("SELECT EXISTS(SELECT 1 FROM chunks WHERE slot < 0)") == 1
 
@@ -2030,7 +2030,7 @@ public final class VectorStore: @unchecked Sendable {
         // `chunks` MAY NOT EXIST AT ALL under the cutover, where a brand new index is created
         // without it - and `scalarQuery` answers -1 for a missing table, not 0, so the plain
         // count would read "not empty" and a new user would never be born v5.
-        if Self.contentSharing, !Self.legacyWriteForTest, !v4BackfillPending, !splitBuilt,
+        if !Self.legacyWriteForTest, !v4BackfillPending, !splitBuilt,
            layoutLocked() == .v4,
            !tableExists("chunks") || scalarQuery("SELECT COUNT(*) FROM chunks") == 0,
            scalarQuery("SELECT COUNT(*) FROM files") == 0,
@@ -2648,7 +2648,7 @@ public final class VectorStore: @unchecked Sendable {
     /// way before it is stored or scored - so the bytes that reach `.vecs` are identical either
     /// way, and so is every score computed from them.
     public func vectorsForContentKeys(_ keys: [String], dim wantDim: Int) -> [String: [Float]] {
-        guard Self.contentSharing, Self.storeChunkReuse, !keys.isEmpty else { return [:] }
+        guard Self.storeChunkReuse, !keys.isEmpty else { return [:] }
         return queue.sync {
             guard dbOpen(), wantDim > 0, wantDim == dim, slotCount > 0 else { return [:] }
             var out: [String: [Float]] = [:]
@@ -3519,7 +3519,7 @@ public final class VectorStore: @unchecked Sendable {
             // bar tops out at the SHARE ratio and sits there: on an index where a tenth of the
             // chunks are duplicates it reads 90% forever, having actually finished - the same
             // never-completing bar the two guards above exist to prevent, reintroduced by a unit.
-            let total = Self.contentSharing ? slotCount : rows.count
+            let total = slotCount
             guard total > 0, coveredRows < total else { return nil }
             // Each remaining position still has a bf16 blob in SQLite that the vector file holds.
             let remaining = Int64(total - coveredRows) * Int64(dim * MemoryLayout<UInt16>.size)
@@ -3545,7 +3545,7 @@ public final class VectorStore: @unchecked Sendable {
     /// highest id. Returns nil when the backfill is not the phase in progress, so the caller falls
     /// through to the fold.
     private func slotBackfillProgressLocked() -> (done: Int, total: Int, bytesToReclaim: Int64)? {
-        guard Self.contentSharing, !slotsBackfilled, hasColumnLocked("chunks", "slot") else { return nil }
+        guard !slotsBackfilled, hasColumnLocked("chunks", "slot") else { return nil }
         let top = scalarQuery("SELECT COALESCE(MAX(id), 0) FROM chunks")
         guard top > 0 else { return nil }
         let mark = scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.slotsMarkKey)'")
@@ -5151,7 +5151,7 @@ public final class VectorStore: @unchecked Sendable {
                 // ahead of the position numbering (hole rows occupy an index each), and the delta
                 // contents were reliably killed. Every file holding them then scored -inf and
                 // vanished from search while its vector sat correct on disk.
-                if Self.contentSharing {
+                if true {
                     ensureSlotRowsLocked()
                     let dead = deadRows
                     for sl in baseRows ..< scores.count
@@ -5286,7 +5286,7 @@ public final class VectorStore: @unchecked Sendable {
         // array is the identity only while a row owns its vector - under sharing it masks whichever
         // contents happen to sit at those offsets. Mask the contents nothing live points at instead,
         // which is the same set when nothing is shared and the correct one when something is.
-        if Self.contentSharing {
+        if true {
             var out = scores
             if let orphans = orphanSlotsLocked(upTo: baseRows), orphans.size > 0 {
                 out[orphans] = MLXArray(-Float.infinity)
@@ -6909,7 +6909,7 @@ public final class VectorStore: @unchecked Sendable {
     /// Give these positions back. Called with what `releasedSlotsLocked` computed, i.e. positions
     /// no live row points at any more, INSIDE the transaction that made that true.
     private func releaseFreeSlotsLocked(_ positions: [Int32]) {
-        guard Self.freeListEnabled, Self.contentSharing, !positions.isEmpty else { return }
+        guard Self.freeListEnabled, !positions.isEmpty else { return }
         if Self.sqlDebug {
             FileHandle.standardError.write(Data(
                 "[omni][free] release \(positions.sorted()) valid=\(freeSlotsValid)\n".utf8))
@@ -6936,7 +6936,7 @@ public final class VectorStore: @unchecked Sendable {
         // Observed live at chunk_slots_upto 6,000,000 of 9,773,836 with the out-of-order marker
         // already set, so this is reachable on a normal migration, not a contrived state. Appending
         // costs the file one position until the backfill lands, which is what v4 did for years.
-        guard Self.freeListEnabled, Self.contentSharing, dim > 0, v.count == dim,
+        guard Self.freeListEnabled, dim > 0, v.count == dim,
               !v4BackfillPending else {
             flat16.append(contentsOf: v); return lastAppendedSlot
         }
@@ -7023,9 +7023,20 @@ public final class VectorStore: @unchecked Sendable {
     /// writes its fixture, puts it back, and then opens the result with a normal store - which
     /// is exactly the sequence an upgrade is.
     ///
-    /// It suppresses four things, all of them "be v5": creating the index without the v4 tables,
-    /// the born-v5 hook, the native split write, and the build. It does NOT suppress reading the
-    /// split, because a fixture that has one must still be readable.
+    /// It suppresses the four things that make a write v5 - creating the index without the v4
+    /// tables, the born-v5 hook, the native split write, the build - AND CONTENT SHARING, which
+    /// is the one that is easy to forget and the one that matters most. An old binary gave every
+    /// chunk its own position, so an index it wrote has duplicates for the migration to
+    /// collapse; written WITH sharing there is nothing to collapse and every test of the
+    /// migration passes vacuously. Four of them did.
+    ///
+    /// IT DOES NOT SUPPRESS `persistSlotsLocked`, which a pre-sharing binary genuinely did not
+    /// run at write time. Tried, and it is the wrong boundary: the slot BACKFILL - the migration
+    /// itself - writes the column through that same function, so suppressing it means the
+    /// fixture can never be migrated. The tests that care about an empty column blank it
+    /// explicitly, which is also how a real one gets there.
+    ///
+    /// It does NOT suppress READING the split, because a fixture that has one must still open.
     nonisolated(unsafe) public static var legacyWriteForTest = false
     /// HAS THE ONE-WAY TRANSLATION ALREADY RUN. Its only job, and it cannot be inferred: a
     /// staged blob's `chunk_id` is just an integer, and the v4 row space and the content space
@@ -7347,14 +7358,14 @@ public final class VectorStore: @unchecked Sendable {
                 let cleared = clearedRowsLocked()
                 return cleared == 0 ? nil : "no coverage but \(cleared) rows have no blob"
             }
-            let units = Self.contentSharing ? slotCount : rows.count
+            let units = slotCount
             if coveredRows > units { return "coverage \(coveredRows) exceeds positions \(units)" }
             // EVERY CHECK BELOW IS ABOUT POSITIONS, and under v4 a position and a row index are the
             // same number - which is why they could be written as row facts and be right. Under
             // sharing they part company: a hole is a position no LIVE ROW points at, not a dead row
             // index, and a cleared blob belongs to a row whose position is covered, of which there
             // may be several per position.
-            if Self.contentSharing {
+            if true {
                 ensureSlotRowsLocked()
                 let dead = deadRows
                 func owned(_ sl: Int32) -> Bool { rowsOfSlotLocked(Int(sl)).contains { !dead.contains($0) } }
@@ -7426,7 +7437,7 @@ public final class VectorStore: @unchecked Sendable {
             //    `units` IS flat16's own length, so that comparison would prove nothing; the real
             //    statement is that no stored slot points past the end of the file and the resident
             //    mirror is still lockstep with the rows.
-            if Self.contentSharing {
+            if true {
                 if dim > 0 {
                     let maxSlot = scalarQuery(
                         "SELECT COALESCE(MAX(slot), -1) FROM \(splitBuilt ? "chunk" : "chunks")")
@@ -7627,7 +7638,7 @@ public final class VectorStore: @unchecked Sendable {
         // fact rather than its rank - so the pairs are read from the table instead of counted out.
         // Every row pointing at a covered position gets the bytes, not just the first: any of them
         // may be the one that outlives the others, and the survivor with no blob is a lost vector.
-        let sharing = Self.contentSharing
+        let sharing = true
         // WHOSE BLOB IS BEING PUT BACK. Under the split, one per CONTENT - which is what the
         // paragraph above wanted and could not have: "every row pointing at a covered position
         // gets the bytes, not just the first" exists because v4 keys a blob per row, and any of
@@ -7708,7 +7719,7 @@ public final class VectorStore: @unchecked Sendable {
     /// A position no row claims is simply an orphan, which `orphanSlotsLocked` already reads
     /// straight off the pointers, so this path builds no tombstone rows to hold places with.
     private func loadBySlotLocked() -> Bool {
-        guard Self.contentSharing, dbOpen(), coveredRows > 0 else { return false }
+        guard dbOpen(), coveredRows > 0 else { return false }
         let onSplit = splitBuilt
         let slotTable = onSplit ? "chunk" : "chunks"
         let d0 = storedDimLocked()
@@ -8052,7 +8063,7 @@ public final class VectorStore: @unchecked Sendable {
         // which is only possible because nothing above wrote to the file.
         // flat16 holds one vector per POSITION; rows.count is only the same number while nothing
         // is shared. `covered` above already counts positions, because a reusing row consumes none.
-        let vectorUnits = Self.contentSharing ? slotCount : rows.count
+        let vectorUnits = slotCount
         guard ok, covered == coveredRows - holes, flat16.count == vectorUnits * dim else {
             rows.removeAll(); flat16.removeAll(); presentPaths.removeAll(); occSlot.removeAll()
             slotBackfillCursor = -1
@@ -8633,7 +8644,7 @@ public final class VectorStore: @unchecked Sendable {
         // POSITIONS, not rows. Coverage claims "the first C positions of .vecs are durable", and
         // once contents are shared there are fewer positions than rows - bounding the target by the
         // row count then claims coverage over positions the file does not have.
-        let coverUnits = Self.contentSharing ? slotCount : rows.count
+        let coverUnits = slotCount
         let target = Swift.min(coverUnits, coveredRows + Swift.max(1, budget))
         guard target > coveredRows else { return false }
         // NO CLAIM OVER ROWS WHOSE POSITION SQLITE DOES NOT KNOW. The sharing clear works by
@@ -8641,7 +8652,7 @@ public final class VectorStore: @unchecked Sendable {
         // below would PASS anyway, because a row with no slot is missing from both sides of it.
         // The result would be a claim that says the file answers for vectors still sitting in
         // SQLite. Backfill first; until it has run, coverage does not move.
-        if Self.contentSharing {
+        if true {
             backfillSlotsLocked()
             guard slotsBackfilled else { return false }
         }
@@ -8665,7 +8676,7 @@ public final class VectorStore: @unchecked Sendable {
         // the claim and the target. `fresh` is then reused below, so the walk is paid for once.
         var fresh: [Int32] = []
         let deadBelow: Int
-        if Self.contentSharing {
+        if true {
             ensureSlotRowsLocked()
             let dead = deadRows
             fresh = (coveredRows ..< target).filter { sl in
@@ -8692,7 +8703,7 @@ public final class VectorStore: @unchecked Sendable {
         // the file holds a vector there that no row reads. Recorded in the same transaction as the
         // clearing, so the claim and the hole list can never disagree. Under sharing "unowned" is a
         // question about the position's rows, not about a row index that happens to equal it.
-        if Self.contentSharing {
+        if true {
             recordHolesLocked(fresh, coveredOverride: target)
         } else {
             recordHolesLocked((coveredRows ..< target).map { Int32($0) }.filter { deadRows.contains($0) },
@@ -8719,7 +8730,7 @@ public final class VectorStore: @unchecked Sendable {
         // slice's new positions - which idx_chunk_slot makes O(slice) rather than O(covered), the
         // property the watermark existed to buy.
         var boundary = coveredUpToID
-        if Self.contentSharing {
+        if true {
             // THE STAGED BLOBS ARE COUNTED IN THE SPACE THEY ARE KEYED IN. Under v4 that is rows,
             // because a row stages its own vector; under the split it is CONTENTS, because a
             // position's bytes are staged once however many files read them. Asking the v4
@@ -8806,7 +8817,7 @@ public final class VectorStore: @unchecked Sendable {
         guard scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.migratedKey)'") != 1 else { return false }
         guard !hasColumnLocked("chunks", "path"),       // paths interned
               !hasIndexLocked("idx_path"),              // redundant index gone
-              coveredRows >= (Self.contentSharing ? slotCount : rows.count)   // duplicate vectors removed
+              coveredRows >= (slotCount)   // duplicate vectors removed
         else { return false }
         exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.migratedKey)','1');")
         exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.vacuumPendingKey)','1');")
@@ -8947,7 +8958,7 @@ public final class VectorStore: @unchecked Sendable {
         // POSITIONS, like everything else about coverage. `units` is what the file holds and what
         // the claim is measured in; under v4 it is the row count and every test below reads the
         // same as it always did.
-        let units = Self.contentSharing ? slotCount : rows.count
+        let units = slotCount
         // THERE IS NO LONGER A PASS TO WAIT FOR. This used to refuse while the duplicate fold
         // was mid-flight, because the reclaim rewrites the whole vector file and the holes were
         // still arriving. The split frees its positions in ONE transaction and they are recorded
@@ -8961,7 +8972,7 @@ public final class VectorStore: @unchecked Sendable {
         // The hole list has to account for every position nothing owns, or the copy below would
         // keep bytes it thinks are live. Under v4 that is exactly the tombstone count; under
         // sharing a tombstone releases a POINTER, so the question is asked of the positions.
-        if Self.contentSharing {
+        if true {
             ensureSlotRowsLocked()
             let dead = deadRows
             var unowned = 0
@@ -9077,7 +9088,7 @@ public final class VectorStore: @unchecked Sendable {
             // Under sharing, every stored slot is about to be rewritten by rank, so the column has
             // to exist and be complete first. It always is by here - coverage cannot advance
             // without it - but the pass that rewrites it should not be the one that assumes it.
-            if Self.contentSharing, !slotsBackfilled { return nil }
+            if !slotsBackfilled { return nil }
             let dead = deadRows
             let bytesPerRow = dim * MemoryLayout<UInt16>.size
             let chunkBytes = Self.reclaimChunkBytes
@@ -9085,7 +9096,7 @@ public final class VectorStore: @unchecked Sendable {
             var dstCursor = 0
             var newCount = 0
             var runStart = -1, runLen = 0
-            let units = Self.contentSharing ? slotCount : rows.count
+            let units = slotCount
             func flushRun() {
                 guard runStart >= 0, runLen > 0 else { return }
                 var written = 0
@@ -9101,7 +9112,7 @@ public final class VectorStore: @unchecked Sendable {
             // A position is live when at least ONE live row still points at it, which is the same
             // test as "not a dead row" whenever a row owns its vector.
             var live: [Bool]
-            if Self.contentSharing {
+            if true {
                 ensureSlotRowsLocked()
                 live = [Bool](repeating: false, count: units)
                 for (i, sl) in occSlot.enumerated() where !dead.contains(Int32(i)) {
@@ -9265,7 +9276,7 @@ public final class VectorStore: @unchecked Sendable {
     ///
     /// Must run inside the caller's transaction, with the claim it belongs to.
     private func renumberSlotsByRankLocked() -> Bool {
-        guard Self.contentSharing, dbOpen() else { return true }
+        guard dbOpen() else { return true }
         // "NO SLOT COLUMN" MEANT "NOTHING TO RENUMBER" WHILE `chunks` WAS THE ONLY PLACE A
         // POSITION LIVED. On a v5-only index there is no `chunks` at all, and returning true
         // here left `chunk.slot` holding the PRE-compaction numbering over a file that had just
@@ -9366,7 +9377,7 @@ public final class VectorStore: @unchecked Sendable {
         // stamp down the advance path, where it finds nothing to do, and never down the caught-up
         // one. The hole reclaim lives in that branch, so it was unreachable on exactly the indexes
         // that accumulate holes.
-        let coverUnits = Self.contentSharing ? slotCount : rows.count
+        let coverUnits = slotCount
         guard coveredRows < coverUnits else {
             // A reused position still owes its blob back even when the claim cannot move: the file
             // has to be synced first, which is the one thing this branch still does.
@@ -9431,12 +9442,12 @@ public final class VectorStore: @unchecked Sendable {
         // `flat16.count == rows.count * dim` it silently stopped stamping the moment anything
         // shared a vector - so a sharing index paid the full SQLite load on EVERY launch, and no
         // test saw it because every fixture used random vectors, which share nothing.
-        let vecUnits = Self.contentSharing ? slotCount : rows.count
+        let vecUnits = slotCount
         guard Self.rowSidecarEnabled, dbOpen(), flat16.isPersistent, dim > 0, !rows.isEmpty,
               mutationGen != lastStampedGen, flat16.count == vecUnits * dim else { return }
         // A row whose slot is still -1 has not been through the backfill, and a sidecar that
         // records -1 would hand the next launch a row with no vector. Stamp only a resolved table.
-        if Self.contentSharing, rows.contains(where: { $0.slot < 0 }) { return }
+        if rows.contains(where: { $0.slot < 0 }) { return }
         let t0 = omniPerfEnabled ? Date() : nil
         // The header describes rows.count vectors, so the FILE has to cover them. Rows appended
         // since the last fold live in the mapping's anonymous tail, and only the fold path
@@ -10570,9 +10581,9 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     /// What one stored vector corresponds to, for the Storage pane's caption.
-    static var vectorUnitPhrase: String {
-        contentSharing ? "one fp16 vector per distinct passage" : "one fp16 vector per chunk"
-    }
+    /// "per chunk" stopped being true when contents started sharing a vector: a passage in
+    /// eight files costs one.
+    static var vectorUnitPhrase: String { "one fp16 vector per distinct passage" }
 
     public func diskUse() -> DiskUse {
         let dir = dbURL.deletingLastPathComponent()
@@ -10613,7 +10624,7 @@ public final class VectorStore: @unchecked Sendable {
             // (live rows minus covered live rows) subtracts one unit from the other. It overstates
             // by exactly the number of duplicates, which then comes off "Snippets", because that
             // slice is the rest of the database file.
-            if Self.contentSharing {
+            if true {
                 // ONE BLOB PER CONTENT ONCE THEY ARE KEYED THAT WAY, so the count is of
                 // uncovered POSITIONS rather than of the rows reading them. Counting rows here
                 // overstates by the duplicate count - 3.5M on the measured index - and the
@@ -11608,7 +11619,7 @@ public final class VectorStore: @unchecked Sendable {
         // and nothing else.
         var claimedPos: [Int32] = []
         var renumbered = false
-        if Self.contentSharing, total > 0 {
+        if total > 0 {
             let maxSlot = scalarQuery("SELECT COALESCE(MAX(slot), -1) FROM \(onSplit ? "chunk" : "chunks")")
             if maxSlot >= 0 { claimedPos = [Int32](repeating: -1, count: maxSlot + 1) }
         }
@@ -11699,7 +11710,7 @@ public final class VectorStore: @unchecked Sendable {
         // Where they differ from what the column said - a compaction that renumbered, an index
         // whose slots predate the backfill - the column is stale, and a stale slot is the one thing
         // that makes the NEXT load seat a row on someone else's vector.
-        if Self.contentSharing, renumbered { persistAllSlotsLocked() }
+        if renumbered { persistAllSlotsLocked() }
         invalidateBase()
         reportLoadProgress(1)
         // A read-only session (open, search, quit) would otherwise never earn a sidecar; stamp
@@ -11776,7 +11787,7 @@ public final class VectorStore: @unchecked Sendable {
             rounds += 1
             if rounds > 1_000_000 { break }
         }
-        return queue.sync { (coveredRows, Self.contentSharing ? slotCount : rows.count,
+        return queue.sync { (coveredRows, slotCount,
                              -t0.timeIntervalSinceNow) }
     }
 
@@ -12339,7 +12350,7 @@ public final class VectorStore: @unchecked Sendable {
         // content falls to refs = 0 and is deleted, so the lookup that follows finds nothing and
         // a fresh vector is appended. Its key is unique to one file, so no other occurrence can
         // be holding it up.
-        guard Self.contentSharing, !bf16.isEmpty,
+        guard !bf16.isEmpty,
               let k = FileKind(rawValue: c.kind), k != .text else { return "" }
         return ChunkKey.mediaVector(kind: k, bf16: bf16, dim: bf16.count)
     }
@@ -12544,7 +12555,7 @@ public final class VectorStore: @unchecked Sendable {
     /// distinction v4's note missed: it rejected a slot column over the cost of doing this on every
     /// DELETE, not on a rare renumbering.
     func persistAllSlotsLocked() {
-        guard Self.contentSharing, dbOpen(), !rows.isEmpty else { return }
+        guard dbOpen(), !rows.isEmpty else { return }
         // WHICH TABLE HOLDS THE PROMISE. Under the split the position is a property of the
         // CONTENT, so it is written once per content on `chunk`; under v4 it is a column on the
         // row. `rows[i].chunkID` is in whichever id space the loader read, which is the same
@@ -13013,7 +13024,7 @@ public final class VectorStore: @unchecked Sendable {
     /// contents to produce.
     @discardableResult
     func buildChunkSplitLocked(highWaterOverride: Int64? = nil) -> Bool {
-        guard Self.contentSharing, !Self.legacyWriteForTest, dbOpen() else { return false }
+        guard !Self.legacyWriteForTest, dbOpen() else { return false }
         guard scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.chunkSplitDoneKey)'") != 1
         else { return false }
         // AN EMPTY INDEX IS ALREADY MIGRATED, and saying so is what lets a new user be born v5.
@@ -13373,7 +13384,7 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     func backfillSlotsLocked(budget: Int = VectorStore.slotBackfillSlice) {
-        guard Self.contentSharing, dbOpen(), !slotsBackfilled, !rows.isEmpty else { return }
+        guard dbOpen(), !slotsBackfilled, !rows.isEmpty else { return }
         if scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.slotsBackfilledKey)'") == 1 {
             slotsBackfilled = true
             return
@@ -13482,7 +13493,7 @@ public final class VectorStore: @unchecked Sendable {
         // promise by writing the new numbering back. Until they do, storing it makes a reloaded
         // index name the wrong content: 800 failures, none of them about sharing. With the flag
         // off the column stays -1 and the loader derives it exactly as it always has.
-        guard Self.contentSharing, dbOpen(), !slots.isEmpty else { return }
+        guard dbOpen(), !slots.isEmpty else { return }
         // `ids` IS EMPTY UNDER THE CUTOVER, because no v4 row was written to carry a slot. The
         // guard used to be `ids.count == slots.count`, which is false then - so it returned
         // before the CONTENT update below and every new content kept slot -1. The by-slot
@@ -13610,9 +13621,15 @@ public final class VectorStore: @unchecked Sendable {
     /// unrelated file owning slot 194 came back a perfect match. Coverage was the layer after that,
     /// and every part of it counted rows; docs/schema-v5.md records what each of them became.
     ///
-    /// OMNI_CONTENT_SHARING=0 turns it off, which is the A/B and the escape hatch.
-    nonisolated(unsafe) public static var contentSharing =
-        ProcessInfo.processInfo.environment["OMNI_CONTENT_SHARING"] != "0"
+    /// THE LEVER IS GONE, for the same reason the two split flags are: off is not a state a
+    /// migrated index can be in. `chunk.slot` IS the sharing - one position per content, several
+    /// occurrences reading it - so an index that has been through the migration and is then
+    /// opened with sharing disabled has a loader that derives a position from a row's rank over
+    /// a file that has millions fewer positions than rows. It does not degrade, it does not
+    /// open.
+    ///
+    /// It was an honest A/B while the two models coexisted and there was a v4 index to compare
+    /// against. There no longer is.
 
     /// `seen` CARRIES ACROSS THE FILES OF ONE BATCH, and it has to.
     ///
@@ -13631,8 +13648,11 @@ public final class VectorStore: @unchecked Sendable {
         var assigned: [Int32] = []
         assigned.reserveCapacity(chunks.count)
         for (i, c) in chunks.enumerated() {
-            let key = Self.contentSharing
-                ? StoreSchema.hexToBytes(effectiveKeyLocked(c, bf16: bfs[i])) : Data()
+            // A PRE-SHARING BINARY GAVE EVERY CHUNK ITS OWN POSITION. `chunk_text` still stores
+            // the content key - v4 wrote it on all 9.13M rows, it simply never indexed it - so
+            // the fixture this produces is exactly an index the migration has work to do on.
+            let key = Self.legacyWriteForTest
+                ? Data() : StoreSchema.hexToBytes(effectiveKeyLocked(c, bf16: bfs[i]))
             var slot: Int32 = -1
             if !key.isEmpty {
                 if let s = seen[key] { slot = s }
@@ -13669,7 +13689,7 @@ public final class VectorStore: @unchecked Sendable {
     /// until the refs recount removes it. Every test missed it because the split was never
     /// actually BUILT in a unit test until an empty index started being born with it.
     private func reclaimSharedSlotLocked(_ slot: Int32) {
-        guard Self.contentSharing, slot >= 0 else { return }
+        guard slot >= 0 else { return }
         if vecHoles.remove(slot) != nil { exec("DELETE FROM vec_holes WHERE slot = \(slot);") }
         if Self.freeListEnabled, freeSlotsValid { freeSlots.claim(Int(slot)) }
         exec("DELETE FROM free_slot WHERE id = \(slot);")

@@ -4265,7 +4265,7 @@ if args.count >= 4 && args[1] == "searchreal" {
     lat.sort()
     func pct(_ p: Double) -> Double { lat.isEmpty ? 0 : lat[Swift.min(lat.count - 1, Int(Double(lat.count) * p))] }
     print(String(format: "SEARCHREAL sharing=%@ chunks=%d n=%d p50=%.1fms p90=%.1fms p99=%.1fms digest=%016llx (plain+kind+folder)",
-                 VectorStore.contentSharing ? "on " : "off", store.count, lat.count,
+                 true ? "on " : "off", store.count, lat.count,
                  pct(0.5), pct(0.9), pct(0.99), digest))
     exit(0)
 }
@@ -4516,7 +4516,7 @@ if args.count >= 4 && args[1] == "sharebench" {
         ((try? fm.attributesOfItem(atPath: tmp.path + suffix)[.size]) as? Int64) ?? 0
     }
     print(String(format: "SHAREBENCH index  sharing=%@  files=%d  chunks=%d  vectors=%d  tok=%d  %.2fs",
-                 VectorStore.contentSharing ? "on" : "off", emb, store.count, vectors, toks, sec))
+                 true ? "on" : "off", emb, store.count, vectors, toks, sec))
     print(String(format: "SHAREBENCH store  vecs=%.1f MB  db=%.1f MB  saved=%.1f%%",
                  Double(bytes(".vecs")) / 1_048_576, Double(bytes("")) / 1_048_576,
                  store.count > 0 ? 100 * (1 - Double(vectors) / Double(store.count)) : 0))
@@ -4539,7 +4539,7 @@ if args.count >= 4 && args[1] == "sharebench" {
     lat.sort()
     func pct(_ p: Double) -> Double { lat.isEmpty ? 0 : lat[Swift.min(lat.count - 1, Int(Double(lat.count) * p))] }
     print(String(format: "SHAREBENCH search sharing=%@  n=%d  p50=%.2fms  p90=%.2fms  p99=%.2fms",
-                 VectorStore.contentSharing ? "on" : "off", lat.count, pct(0.5), pct(0.9), pct(0.99)))
+                 true ? "on" : "off", lat.count, pct(0.5), pct(0.9), pct(0.99)))
     store.close()
     exit(0)
 }
