@@ -1775,3 +1775,50 @@ the schema was still free to change. That is the only reason this was cheap.
   real checks: "no content points past the end of the vector file", which a wrong mark in the
   dangerous direction does fail, and "no position is owned twice", which was already there.
   `MigrationV5Tests` breaks the index both ways and asserts the invariants catch it.
+
+## The gate, re-run on the final schema
+
+Every number below is the real 9,773,836-chunk index, cloned from
+`/Volumes/han2tb/omni-index-backup-premigration`, with the audit changes above in. The digest is
+the gate: it is the top-10 paths, scores and kinds of ten queries across four scopes, and it must
+not move, because the occurrence mirror is the identity on an index whose contents are not shared.
+
+    before                digest ba7a13400e714f79   p50 4.4 ms   sqlite 6.09 GB   vecs 22.12 GB
+    split build           6,257,501 contents / 9,773,836 occurrences, 145.6 s, off-queue
+    v4 tables dropped     3.3 s, user_version 4 -> 5
+    stamps                44 in 194.9 s, audit clean
+    repack                3.58 GB freed in 11.6 s
+    reclaim (idle)        3,770,848 positions, 5,523.7 MB, 41.6 s, unprompted
+    after                 digest ba7a13400e714f79   p50 3.6 ms   sqlite 2.99 GB   vecs 9.61 GB
+                          0 failing checks, holes 0, no free_slot table,
+                          first_indexed_at set on 2,678,906 of 2,678,916 files
+
+The ten files without a first-indexed stamp are the ones whose `indexed_at` is 0 - rows that
+predate that column too. They read "--", which is the truth about them.
+
+SIGKILL AT THREE PHASES, each on a fresh clone, each reopened afterwards: 40 s (slot backfill),
+180 s (coverage advancing), 320 s (inside the off-queue build). All three come back with 0 failing
+checks and digest ba7a13400e714f79. The 40 s and 180 s kills reopen as v4 with the split unbuilt;
+the 320 s kill reopens on `occurrence` with 3,770,848 positions to record.
+
+AND A FOURTH KILL POINT FOR THE NEW COLUMN, which the three above are all far past: the seed runs
+in the first seconds of the first open. Killed at 2 s and 4 s the column is ABSENT afterwards -
+rolled back with its UPDATE - and the next open seeds all 2,678,906 rows; killed at 6 s it has
+committed and is already complete. Never present-and-empty, which is the state the guard cannot
+distinguish from done.
+
+    kill  2s   seed not reached   column present: no    reopen -> 2,678,906 seeded
+    kill  4s   seed not reached   column present: no    reopen -> 2,678,906 seeded
+    kill  6s   seed 4371 ms       column present: yes   2,678,906 already seeded
+
+UNIT SUITE: 584 tests, 16 skipped, 0 failures.
+
+STILL OWED: the UI chaos run against a migrating index on this exact tree. It needs macOS
+automation mode, which is a password prompt with a 60-second answer window, and the ten-hour
+window opened for this work expired at 06:18. The command is one line and everything after the
+password is unattended:
+
+    OMNI_MIGCHAOS_QUIET_SECONDS=480 ./Scripts/automation-window.sh 60 ./Scripts/migration-chaos.sh
+
+The quiet period is not optional: the coverage stamp yields to searches and this suite searches
+continuously, so without it a run can pass having never built the split at all.
