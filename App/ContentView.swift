@@ -1150,6 +1150,12 @@ struct SearchWaysPrompt: View {
     /// pane's rows are all ways to START a search; these now match.
     static let transcribeWays: [(icon: String, text: String)] = [
         ("arrow.down.doc", "Drop a PDF or images"),
+        // PASTE WAS ALREADY WIRED AND NOWHERE ON SCREEN. `pasteCommand` has handled Cmd-V in OCR
+        // mode since the router was split - it even checks OCR before the search test, so a
+        // pasted image does not leave the document being read - but this list never said so, and
+        // an affordance nobody can see may as well not exist. The search pane has carried the
+        // same row all along; these two are meant to match.
+        ("doc.on.clipboard", "Paste an image  \u{2318}V"),
         ("folder", "Choose a document  \u{2318}O"),
     ]
 

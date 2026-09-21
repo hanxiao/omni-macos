@@ -983,16 +983,20 @@ private struct IndexTab: View {
                 // screen saying so. `user_version` is set to 5 in the same transaction that drops
                 // the v4 tables, so it is the one number that means "finished" and nothing else.
                 if model.indexSchemaVersion > 0 {
-                    LabeledContent("Format") {
-                        Text(model.indexSchemaVersion >= VectorStore.currentSchemaVersion
-                             ? "v\(model.indexSchemaVersion)"
-                             : "v\(model.indexSchemaVersion), upgrading to v\(VectorStore.currentSchemaVersion)")
-                            .foregroundStyle(model.indexSchemaVersion >= VectorStore.currentSchemaVersion
-                                             ? .primary : .secondary)
-                    }
+                    // `LabeledContent(_:value:)`, NOT the closure form. The closure form draws
+                    // whatever view it is given with the default body styling, so a plain `Text`
+                    // in it comes out darker and heavier than the value on every other row here -
+                    // "v5" did not match "5 seconds ago" one line above it. The value initializer
+                    // is what applies the platform's own value treatment, and every other row in
+                    // this pane already uses it.
+                    // THE VERSION, AND NOTHING ELSE. It read "v4, upgrading to v5" - a sentence
+                    // in a column of values, where every neighbour is a date, a size or a count.
+                    // The number already says which one it is; v5 is current and anything less is
+                    // still on the way, and the tooltip is where that belongs if anywhere.
+                    LabeledContent("Format", value: "v\(model.indexSchemaVersion)")
                     .help(model.indexSchemaVersion >= VectorStore.currentSchemaVersion
-                          ? "The index is in the current format."
-                          : "The index is being upgraded in the background. Searching works throughout.")
+                          ? "Current format."
+                          : "Upgrading to v\(VectorStore.currentSchemaVersion) in the background.")
                 }
                 // Manual row instead of LabeledContent: a long path makes LabeledContent
                 // wrap the value side under the label. The path gets the whole value side
