@@ -490,6 +490,37 @@ follows is what a reader needs before touching this code.
 - `omni-verify sharebench <model> <root>` is the end-to-end A/B: chunks, vectors, tok, and search
   latency for one arm, run it twice with the env var flipped.
 
+## 717 "failed" files, and both reasons were the same lock (2026-09-20)
+
+Found by watching the status line during a real migration, not by a test: `717 failed`. Every one
+of them was `SQLITE_BUSY`, and no file had anything wrong with it.
+
+- THE MAIN WRITE PATH OPENED A DEFERRED TRANSACTION. `beginTxnLocked` was `exec("BEGIN;")`, which
+  takes no lock, so the first statement that writes has to UPGRADE - and SQLite returns
+  SQLITE_BUSY *immediately* there rather than calling the busy handler, because the connection
+  already holds a read snapshot and waiting could deadlock. So `PRAGMA busy_timeout=5000` never
+  applied to the write path at all. Measured, and it is not subtle: with `BEGIN;` a contended
+  write gives up in 0.13 MILLISECONDS; with `BEGIN IMMEDIATE;` it waits the full five seconds.
+  Every other write transaction in VectorStore already used IMMEDIATE; the main one predated the
+  idiom. `StoreBusyTests` asserts the elapsed time, which is the one signal that separates them.
+- THE ERROR THREW AWAY THE REASON. `upsertFileLocked` returned nil and the caller raised
+  "store: file id failed" - so a lock, a constraint and a full disk were indistinguishable in the
+  log. Worse, the DIRECTORY insert's return code was not checked at all: a BUSY there left the
+  `dirs` row unwritten, the SELECT after it found nothing, and the failure surfaced as
+  "no dir id" with `sqlite3_errmsg` saying "not an error" - because the SELECT had succeeded in
+  finding no rows. The codes are carried now (`insRC=5 selRC=101` is what cracked it).
+- A LOCK IS NOT A FAILED FILE. `OmniError.storeBusy` is its own case and
+  `Indexer.writeWaitingOutLocks` waits it out with backoff past the longest maintenance
+  transaction there is (the split build's ~150 s), because the vectors have ALREADY been computed
+  - failing threw a batch of GPU work away AND told the user their files had failed. The sleeping
+  happens on the indexing thread, never inside the store's serial queue, where it would block
+  searches. Any other store error still fails the file at once.
+
+    same clone, same migration, 15-18 min of a live pass
+    before                 717 failed
+    BEGIN IMMEDIATE        14 failed
+    + wait out the lock    0 failed, 23 locks waited out
+
 ## Reading an index WHILE it migrates (omni-verify migprobe, 2026-09-20)
 
 "Does the app still work during the migration" was only ever answered by a UI suite asserting the

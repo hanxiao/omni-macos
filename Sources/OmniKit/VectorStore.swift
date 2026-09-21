@@ -2427,7 +2427,9 @@ public final class VectorStore: @unchecked Sendable {
             guard let first = chunks.first,
                   let fid = upsertFileLocked(path: path, from: first, indexedAt: now, w: w) else {
                 rollbackTxnLocked()
-                throw OmniError.store("file id failed")
+                throw lastFileUpsertWasBusy
+                    ? OmniError.storeBusy(lastFileUpsertError)
+                    : OmniError.store("file id failed: \(lastFileUpsertError)")
             }
             guard let written = writeChunksLocked(fileID: fid, chunks: chunks, bfs: bfs, w: w) else {
                 rollbackTxnLocked()
@@ -2517,7 +2519,9 @@ public final class VectorStore: @unchecked Sendable {
                 guard let first = it.chunks.first,
                       let fid = upsertFileLocked(path: it.path, from: first, indexedAt: now, w: w) else {
                     rollbackTxnLocked()
-                    throw OmniError.store("file id failed")
+                    throw lastFileUpsertWasBusy
+                        ? OmniError.storeBusy("\(it.path): \(lastFileUpsertError)")
+                        : OmniError.store("file id failed for \(it.path): \(lastFileUpsertError)")
                 }
                 deleteChunksOfFileLocked(fid)
                 guard let written = writeChunksLocked(fileID: fid, chunks: it.chunks, bfs: bfs[wi], w: w) else {
@@ -7634,7 +7638,24 @@ public final class VectorStore: @unchecked Sendable {
     /// the file has slots and nothing says which slot went missing - and from that slot onward every
     /// row would resolve to its neighbour's vector. Slots at or above `coveredRows` are ignored:
     /// those rows still carry their own blob, so the file's copy of them is not load-bearing.
-    private func beginTxnLocked() { exec("BEGIN;") }
+    /// IMMEDIATE, NOT DEFERRED, AND THE DIFFERENCE IS NOT THEORETICAL.
+    ///
+    /// A deferred `BEGIN` takes no lock. The first statement that writes then has to UPGRADE, and
+    /// when another connection holds the write lock SQLite returns SQLITE_BUSY *immediately* -
+    /// it deliberately does NOT call the busy handler there, because this connection already holds
+    /// a read snapshot and waiting could deadlock. So `PRAGMA busy_timeout=5000` never applied to
+    /// the main write path at all: the batch failed on the spot.
+    ///
+    /// What that looked like from outside was 717 FAILED FILES on the status line during a
+    /// migration. One `INSERT OR IGNORE INTO dirs` returning 5, unchecked, left the directory row
+    /// unwritten; the SELECT after it then found nothing and the whole batch was thrown away and
+    /// counted as failed files - with `sqlite3_errmsg` reporting "not an error", because the
+    /// SELECT had succeeded in finding no rows. Captured as `insRC=5 selRC=101`.
+    ///
+    /// `BEGIN IMMEDIATE` takes the write lock at BEGIN, which is where the busy handler DOES
+    /// apply, so a contended write waits its turn instead of failing. Every other write
+    /// transaction in this file already did it this way; the main one predated the idiom.
+    private func beginTxnLocked() { exec("BEGIN IMMEDIATE;") }
 
     /// Roll back, and put the resident hole set back in step with the table.
     ///
@@ -7646,7 +7667,7 @@ public final class VectorStore: @unchecked Sendable {
     ///
     /// RE-READ, RATHER THAN UNDO A DELTA. The first attempt tracked "slots added by this
     /// transaction" and subtracted them here, cleared at BEGIN. That is correct only if EVERY
-    /// begin clears - and several transactions open with execChecked("BEGIN;"), which the helper
+    /// begin clears - and several transactions open with execChecked("BEGIN IMMEDIATE;"), which the helper
     /// never saw. advanceCoverageLocked is one of them, and it both records holes and rolls back:
     /// its rollback would delete holes a PREVIOUS, COMMITTED transaction had added, leaving the
     /// resident set short. That direction is far worse than the bug it replaced - a phantom hole
@@ -7759,7 +7780,7 @@ public final class VectorStore: @unchecked Sendable {
         // every row from the first divergence on.
         guard scalarQuery("SELECT COUNT(*) FROM \(unit)") >= expected,
               flat16.count >= Swift.min(coveredRows, sharing ? slotCount : rows.count) * dim else { return false }
-        guard execChecked("BEGIN;") else { return false }
+        guard execChecked("BEGIN IMMEDIATE;") else { return false }
         var sel: OpaquePointer?, upd: OpaquePointer?
         defer { sqlite3_finalize(sel); sqlite3_finalize(upd) }
         // Putting a vector BACK is now an insert into the pending table rather than an UPDATE
@@ -8392,7 +8413,7 @@ public final class VectorStore: @unchecked Sendable {
         // work would stop working on exactly the oldest indexes.
         let hasSplit = tableExists(db, "occurrence") && tableExists(db, "chunk")
         var statements: [String] = [
-            "BEGIN;",
+            "BEGIN IMMEDIATE;",
             "DELETE FROM chunk_text WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id IN (\(list)));",
             "DELETE FROM dedup WHERE file_id IN (\(list));",
             "DELETE FROM chunks WHERE file_id IN (\(list));",
@@ -8789,7 +8810,7 @@ public final class VectorStore: @unchecked Sendable {
         let clearedBefore = coveredRows - vecHoles.count
         let clearUpTo = target - deadBelow            // how many live rows the prefix accounts for
         guard clearUpTo >= clearedBefore else { return false }
-        guard execChecked("BEGIN;") else { return false }
+        guard execChecked("BEGIN IMMEDIATE;") else { return false }
         // A row that is already a tombstone when its slot becomes covered IS a hole from the moment
         // coverage reaches it: the file holds a vector there that no row owns. Recorded in the same
         // transaction as the clearing, so the claim and the hole list can never disagree.
@@ -9300,7 +9321,7 @@ public final class VectorStore: @unchecked Sendable {
         // fsync, once per reclaim, is the price of the ordering the comments already claim.
         exec("PRAGMA synchronous=FULL;")
         defer { exec("PRAGMA synchronous=NORMAL;") }
-        guard execChecked("BEGIN;"),
+        guard execChecked("BEGIN IMMEDIATE;"),
               execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.compactPendingKey)','\(newCount)');"),
               execChecked("COMMIT;")
         else {
@@ -9326,7 +9347,7 @@ public final class VectorStore: @unchecked Sendable {
         if dirFD >= 0 { fsync(dirFD); Darwin.close(dirFD) }
         if Self.compactStopAfter == "rename" { return false }   // TEST: crash before the claim
 
-        guard execChecked("BEGIN;"),
+        guard execChecked("BEGIN IMMEDIATE;"),
               renumberSlotsByRankLocked(),
               execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.coveredRowsKey)','\(newCount)');"),
               execChecked("DELETE FROM vec_holes;"),
@@ -13793,12 +13814,22 @@ public final class VectorStore: @unchecked Sendable {
         if dirID == 0 {
             sqlite3_reset(w.dirIns)
             sqlite3_bind_text(w.dirIns, 1, dir, -1, SQLITE_TRANSIENT)
-            sqlite3_step(w.dirIns)
+            // THE RETURN CODE IS THE DIAGNOSIS. Ignored, a BUSY here means the directory row is
+            // never written, the SELECT below then finds nothing, and the caller reports an
+            // unexplained "file id failed" for every file in the batch - while `sqlite3_errmsg`
+            // says "not an error", because the SELECT itself succeeded in finding no rows.
+            let insRC = sqlite3_step(w.dirIns)
             sqlite3_reset(w.dirSel)
             sqlite3_bind_text(w.dirSel, 1, dir, -1, SQLITE_TRANSIENT)
-            if sqlite3_step(w.dirSel) == SQLITE_ROW { dirID = sqlite3_column_int64(w.dirSel, 0) }
+            let selRC = sqlite3_step(w.dirSel)
+            if selRC == SQLITE_ROW { dirID = sqlite3_column_int64(w.dirSel, 0) }
             sqlite3_reset(w.dirSel)
-            guard dirID > 0 else { return nil }
+            guard dirID > 0 else {
+                lastFileUpsertError = "no dir id for \(dir): insRC=\(insRC) selRC=\(selRC) "
+                    + "extended=\(sqlite3_extended_errcode(db)) msg=\(String(cString: sqlite3_errmsg(db)))"
+                lastFileUpsertWasBusy = insRC == SQLITE_BUSY || insRC == SQLITE_LOCKED
+                return nil
+            }
             w.lastDir = dir; w.lastDirID = dirID
         }
         let stmt = w.fileUpsert
@@ -13812,10 +13843,26 @@ public final class VectorStore: @unchecked Sendable {
         sqlite3_bind_int(stmt, 7, Int32(c.height))
         sqlite3_bind_double(stmt, 8, c.duration)
         sqlite3_bind_double(stmt, 9, indexedAt)
-        let id = sqlite3_step(stmt) == SQLITE_ROW ? sqlite3_column_int64(stmt, 0) : nil
+        // WHY IT FAILED, NOT JUST THAT IT DID. `replaceMany` turns a nil here into
+        // "store: file id failed", the whole batch is counted as failed files, and the log says
+        // nothing about the cause - 717 files reported failed on a real index with no way to tell
+        // a busy database from a constraint from a full disk. The step code and SQLite's own
+        // message are the entire diagnosis and they cost nothing to carry.
+        let rc = sqlite3_step(stmt)
+        let id = rc == SQLITE_ROW ? sqlite3_column_int64(stmt, 0) : nil
+        if id == nil {
+            lastFileUpsertError = "step rc=\(rc) \(String(cString: sqlite3_errmsg(db)))"
+            lastFileUpsertWasBusy = rc == SQLITE_BUSY || rc == SQLITE_LOCKED
+        }
         sqlite3_reset(stmt)   // RETURNING keeps the statement live until it is reset
         return id
     }
+
+    /// Why the last `upsertFileLocked` returned nil, for the throw that reports it. Written on the
+    /// store queue and read on it, in the same call.
+    var lastFileUpsertError = ""
+    /// Whether that reason was a lock rather than the data. Decides which error the caller gets.
+    var lastFileUpsertWasBusy = false
 
     /// Rows copied per committed batch during the conversion. Small enough that the WAL stays
     /// bounded and a kill costs at most this much repeated work; large enough that the per-batch
@@ -14341,12 +14388,20 @@ public final class VectorStore: @unchecked Sendable {
 
 public enum OmniError: Error, CustomStringConvertible {
     case store(String)
+    /// THE WRITE LOST TO A LOCK, NOT TO THE DATA. Its own case because the caller's answer is
+    /// completely different: a store error means the file cannot be indexed and should be counted
+    /// as failed, while a busy database means a maintenance transaction is in flight - the split
+    /// build holds one for about 150 s - and the right response is to WAIT and write the same
+    /// already-computed vectors again, rather than throw a GPU minute away and tell the user that
+    /// hundreds of their files failed.
+    case storeBusy(String)
     case model(String)
     case extraction(String)
 
     public var description: String {
         switch self {
         case .store(let m): return "store: \(m)"
+        case .storeBusy(let m): return "store busy: \(m)"
         case .model(let m): return "model: \(m)"
         case .extraction(let m): return "extraction: \(m)"
         }

@@ -192,6 +192,35 @@ private final class ReadyBox: @unchecked Sendable {
 /// Crawl -> extract -> chunk -> embed -> store, incrementally.
 public final class Indexer: @unchecked Sendable {
     static let log = Logger(subsystem: "io.hanxiao.omni", category: "indexer")
+
+    /// A STORE WRITE THAT LOST TO A LOCK IS RETRIED, NOT COUNTED AS A FAILED FILE.
+    ///
+    /// Measured on a real v4 index migrating under a live pass: 717 files on the status line as
+    /// FAILED, every one of them `SQLITE_BUSY`. The migration's own maintenance holds a write
+    /// transaction - the split build's is about 150 s - and the write path's `busy_timeout` of
+    /// 5 s expires inside it. Two things were wrong with throwing then: the vectors had ALREADY
+    /// been computed, so a whole batch of GPU work was discarded (and redone on the next pass),
+    /// and the user was told their files had failed when nothing was wrong with them.
+    ///
+    /// So a lock is waited out. The backoff runs a little past the longest maintenance
+    /// transaction there is, and the sleeping happens HERE, on the indexing thread, never inside
+    /// the store's serial queue - a wait in there would block searches, which is the one thing
+    /// this whole design refuses to do.
+    ///
+    /// `storeBusy` only. Any other store error still fails the file immediately: it means the
+    /// write cannot succeed, and repeating it would just take longer to say so.
+    static func writeWaitingOutLocks(_ write: () throws -> Void) throws {
+        let backoff: [Double] = [0.25, 1, 3, 8, 20, 45, 90]
+        for (i, pause) in backoff.enumerated() {
+            do { return try write() }
+            catch let e as OmniError {
+                guard case .storeBusy(let why) = e else { throw e }
+                log.info("store busy, waiting \(pause, privacy: .public)s (attempt \(i + 1, privacy: .public)): \(why, privacy: .public)")
+                Thread.sleep(forTimeInterval: pause)
+            }
+        }
+        try write()   // the last attempt's error is the one the caller sees
+    }
     static func isFinite(_ v: [Float]) -> Bool { v.allSatisfy { $0.isFinite } }
 
     private let store: VectorStore
@@ -920,7 +949,8 @@ public final class Indexer: @unchecked Sendable {
                 p.skipped += 1
                 if raw.isEmpty { Self.log.info("skip \(path, privacy: .public)") }
             } else {
-                do { try self.store.replace(path: path, chunks: chunks); p.embedded += 1 }
+                do { try Self.writeWaitingOutLocks { try self.store.replace(path: path, chunks: chunks) }
+                     p.embedded += 1 }
                 catch { p.failed += 1; Self.log.error("fail \(path, privacy: .public): \(String(describing: error), privacy: .public)") }
             }
         }
@@ -1002,7 +1032,8 @@ public final class Indexer: @unchecked Sendable {
                 }
                 func flushStagedStores() {
                     guard !stagedStores.isEmpty else { return }
-                    do { try store.replaceMany(stagedStores); p.embedded += stagedStores.count }
+                    do { try Self.writeWaitingOutLocks { try store.replaceMany(stagedStores) }
+                         p.embedded += stagedStores.count }
                     catch {
                         p.failed += stagedStores.count
                         Self.log.error("fail batch(\(stagedStores.count, privacy: .public)): \(String(describing: error), privacy: .public)")

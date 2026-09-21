@@ -99,7 +99,7 @@ final class LexicalIndex: @unchecked Sendable {
             return
         }
         let all = paths()
-        exec("BEGIN;")
+        exec("BEGIN IMMEDIATE;")
         // RESET THE TERM INDEX THE ONLY WAY FTS5 ACCEPTS. `DELETE FROM names` fails on a
         // CONTENTLESS table - "table does not support scanning", because a plain DELETE has to
         // read each row back to know which postings to remove, and there are no rows to read. The
@@ -171,7 +171,7 @@ final class LexicalIndex: @unchecked Sendable {
             // Safe to interrupt: `stamp` is written only at the very end, so a partial rebuild is
             // simply "stale" and the next open redoes it from the DELETEs above. `lock` is held for
             // the whole function, so no reader can observe a half-built index either.
-            if (i + 1) % 20_000 == 0 { exec("COMMIT;"); exec("BEGIN;") }
+            if (i + 1) % 20_000 == 0 { exec("COMMIT;"); exec("BEGIN IMMEDIATE;") }
         }
         sqlite3_finalize(ins); sqlite3_finalize(insMap)
         exec("INSERT OR REPLACE INTO meta(k,v) VALUES('recipe','\(Self.termRecipe)');")
