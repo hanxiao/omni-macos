@@ -88,6 +88,19 @@ final class SplitStartsWhileBusyTests: XCTestCase {
         XCTAssertTrue(store.splitBuiltForTest,
                       "the split never built while coverage stayed behind - a busy index would never migrate")
         XCTAssertNil(store.coverageAudit(), "the index did not survive building the split mid-pass")
+
+        // AND IT HAS TO FINISH, not just start. The drop is the step that sets user_version = 5,
+        // and leaving it behind the caught-up gate shipped in 0.13.1: a real idle index built its
+        // split and then said "v4, upgrading to v5" for ever.
+        for _ in 0 ..< 60 where !store.v4DroppedForTest {
+            store.stampCoverageBehindForTest(budget: 1)
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        XCTAssertTrue(store.v4DroppedForTest,
+                      "the v4 tables were never dropped, so the index stays on v4 for ever")
+        XCTAssertEqual(store.schemaVersion, VectorStore.currentSchemaVersion,
+                       "the migration did not reach the current format")
+        XCTAssertNil(store.coverageAudit(), "the index did not survive the drop")
     }
 
     /// And the ordering the caught-up branch exists to protect still holds: the split comes first,

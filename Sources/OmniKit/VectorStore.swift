@@ -9582,6 +9582,22 @@ public final class VectorStore: @unchecked Sendable {
            !yieldToSearchLocked("split") {
             _ = buildChunkSplitLocked()
         }
+        // AND THE v4 DROP WITH IT, WHICH IS WHAT ACTUALLY ENDS THE MIGRATION. Moving only the
+        // build left the same bug one step later and it shipped in 0.13.1: an index built its
+        // split, kept both v4 tables, and reported "v4, upgrading to v5" for ever, because the
+        // drop is the step that sets `user_version = 5`. Seen on a real 69,260-chunk index that
+        // was completely idle - no `vecs_migrated` key at all, so `coveredRows` is 0 while
+        // `slotCount` is not, and the caught-up branch it used to live in can never be reached.
+        //
+        // `dropV4TablesLocked` proves itself before it drops anything - every v4 row represented
+        // by an occurrence, every content seated, the staged blobs re-keyed - on its own
+        // connection, off this queue. None of that reads coverage.
+        if allowSplitBuild, splitBuilt,
+           !yieldToSearchLocked("dropv4"), dropV4TablesLocked() { return }
+        // THE RECLAIM STAYS BEHIND THE CAUGHT-UP GATE, deliberately. It rewrites the vector file
+        // and renumbers every position, which is a claim about the file that only means anything
+        // once coverage describes it - and an index that cannot reach caught-up has no persistent
+        // file to reclaim in the first place.
         guard flat16.isPersistent, flat16.extendFileCoverage() else { return }
         flat16.msyncFile()
         clearSyncedReuseBlobsLocked()
