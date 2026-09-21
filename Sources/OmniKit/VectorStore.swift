@@ -7855,13 +7855,36 @@ public final class VectorStore: @unchecked Sendable {
     ///
     /// A position no row claims is simply an orphan, which `orphanSlotsLocked` already reads
     /// straight off the pointers, so this path builds no tombstone rows to hold places with.
+    /// WHY THE BY-SLOT LOADER DECLINED. It has eleven ways to return false and used to report
+    /// none of them: the caller falls through to a refusal screen whose message is about
+    /// something else entirely ("the vector slot bookkeeping is off by N rows", which compares
+    /// rows against positions and differs on every healthy shared index). Two separate debugging
+    /// sessions went at the wrong number because of it. Set on every decline, printed under
+    /// OMNI_SEARCH_TIMING, and carried into the refusal text.
+    private(set) var bySlotDeclineReason = ""
+    /// How many rows the last by-slot load had to place because they carried no slot. A POSITIVE
+    /// signal: `bySlotDeclineReason` being empty is also what "the loader never ran" looks like,
+    /// which is how a test of this path passed while testing nothing.
+    private(set) var lastUnseatedPlaced = -1
+    @inline(__always) private func declineBySlot(_ why: @autoclosure () -> String) -> Bool {
+        let r = why()
+        bySlotDeclineReason = r
+        // stderr, NOT print: `print` is block-buffered when stdout is a pipe, and the refusal path
+        // ends in a fatalError that never flushes it - so the one line that explains the failure
+        // was written and then thrown away. Cost a diagnosis.
+        // ALWAYS, not behind a debug lever. This is the sentence that explains a refusal screen,
+        // and a user who hits one cannot be asked to set an environment variable and reproduce.
+        FileHandle.standardError.write(Data("[omni] by-slot load declined: \(r)\n".utf8))
+        return false
+    }
+
     private func loadBySlotLocked() -> Bool {
-        guard dbOpen(), coveredRows > 0 else { return false }
+        guard dbOpen(), coveredRows > 0 else { return declineBySlot("no coverage claim") }
         let onSplit = splitBuilt
         let slotTable = onSplit ? "chunk" : "chunks"
         let d0 = storedDimLocked()
         let live = liveRowCountLocked()
-        guard d0 > 0, live > 0 else { return false }
+        guard d0 > 0, live > 0 else { return declineBySlot("dim=\(d0) live=\(live)") }
         // THE FLAG IS NOT ENOUGH. It says the backfill finished; a row written by a build that
         // predates the column, or a conversion abandoned half way, would still carry -1 and land
         // on position 0 along with every other such row. The partial index makes the counter-
@@ -7871,9 +7894,32 @@ public final class VectorStore: @unchecked Sendable {
         // content and several occurrences read it, so "every row has a slot" is
         // "every CONTENT has a slot" - comparing the seated count against the occurrence count
         // would be false on every healthy shared index and refuse all of them.
-        guard scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.slotsBackfilledKey)'") == 1,
-              scalarQuery("SELECT COUNT(*) FROM \(slotTable) WHERE slot >= 0")
-                == (onSplit ? scalarQuery("SELECT COUNT(*) FROM chunk") : live) else { return false }
+        guard scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.slotsBackfilledKey)'") == 1
+        else { return declineBySlot("the slot backfill has not finished") }
+        let seated = scalarQuery("SELECT COUNT(*) FROM \(slotTable) WHERE slot >= 0")
+        let expected = onSplit ? scalarQuery("SELECT COUNT(*) FROM chunk") : live
+        if seated != expected {
+            // A ROW WITH NO SLOT IS NOT A BROKEN INDEX IF ITS VECTOR IS STILL IN ITS BLOB.
+            //
+            // This used to demand exact equality, and ONE row out of 10,540,581 carrying -1 took
+            // a 28 GB index off the air: the guard failed, every repair below it was skipped, and
+            // the user got "Omni can't open its index" quoting a bookkeeping number that had
+            // nothing to do with the cause. Seen on the real index, and the row's 1536-byte
+            // vector was sitting in `pending_vecs` the whole time.
+            //
+            // What the guard is actually for is the shape it names above: rows that predate the
+            // column, which would all land on position 0 together. That is still refused - but
+            // the test is whether a row can be PLACED, not whether it already has been. The walk
+            // below puts a placeable row past every position the column names, which cannot
+            // collide with anything, and the next stamp writes the assignment back.
+            let unplaceable = scalarQuery(
+                "SELECT COUNT(*) FROM \(slotTable) c WHERE c.slot < 0 "
+                + "AND NOT EXISTS (SELECT 1 FROM pending_vecs p WHERE p.chunk_id = c.id)")
+            guard unplaceable == 0 else {
+                return declineBySlot("\(expected - seated) row(s) have no slot and "
+                                     + "\(unplaceable) of them have no vector to place either")
+            }
+        }
         // ONLY ON A FOLDED INDEX, and the flag is the exact signal.
         //
         // The walk below hands out one position per row-or-hole. That is true of every index the
@@ -7911,13 +7957,16 @@ public final class VectorStore: @unchecked Sendable {
         // bookkeeping became consistent. It is the same invariant `coverageAudit` enforces at rest.
         // Refusing here hands back to the walk, which declines with the message that names it.
         if scalarQuery("SELECT COUNT(*) FROM vec_holes h JOIN \(slotTable) c ON c.slot = h.slot "
-                       + "WHERE h.slot < \(coveredRows)") > 0 { return false }
+                       + "WHERE h.slot < \(coveredRows)") > 0 {
+            return declineBySlot("a recorded hole still has a live row on it")
+        }
         let maxSlot = scalarQuery("SELECT COALESCE(MAX(slot), -1) FROM \(slotTable)")
         let highWater = Swift.max(coveredRows, maxSlot + 1)
-        guard highWater > 0 else { return false }
+        guard highWater > 0 else { return declineBySlot("high water is 0") }
         guard flat16.mapPersistent(url: vecSidecarURL, tailSlackElements: Self.foldThreshold * d0,
                                    precommitElements: highWater * d0,
-                                   adoptElements: coveredRows * d0) else { return false }
+                                   adoptElements: coveredRows * d0)
+        else { return declineBySlot("could not map the vector file for \(highWater) positions") }
         dim = d0
         // Positions past the covered prefix are written where they belong, not appended in scan
         // order, so the buffer has to BE that long first. Zero-filled: a position nothing claims
@@ -7931,7 +7980,7 @@ public final class VectorStore: @unchecked Sendable {
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
         guard sqlite3_prepare_v2(db, Self.loadScanSQL(layoutLocked(), split: onSplit), -1, &stmt, nil) == SQLITE_OK
-        else { flat16.removeAll(); return false }
+        else { flat16.removeAll(); return declineBySlot("could not prepare the load scan") }
         // Which positions past the covered prefix already have their bytes. Several rows share one
         // content, and SQLite keeps a blob per chunk ROW, so the second sharer must not rewrite
         // what the first one put there - identical bytes today, but "identical" is an assumption
@@ -7939,19 +7988,58 @@ public final class VectorStore: @unchecked Sendable {
         // blob per content, so the second sharer reads the same row and the guard is free.)
         var filled = [Bool](repeating: false, count: highWater)
         var ok = true
+        var why = ""
         let bytesPerRow = d0 * MemoryLayout<UInt16>.size
+        // WHERE A ROW THAT NEVER GOT A POSITION IS PUT. Past everything the column names, so it
+        // cannot land on a position another row owns; `unseatedPlaced` says whether any did.
+        var appendCursor = highWater
+        var unseatedPlaced = 0
         while ok, sqlite3_step(stmt) == SQLITE_ROW {
             let path = canonicalPath(String(cString: sqlite3_column_text(stmt, 0)))
             let kind = canonicalKind(kindTextLocked(stmt, 1))
             let d = Int(sqlite3_column_int(stmt, 3))
             guard d == dim else { continue }
-            guard sqlite3_column_type(stmt, 10) == SQLITE_INTEGER else { ok = false; break }
-            let pos = Int(sqlite3_column_int(stmt, 10))
-            guard pos >= 0, pos < highWater else { ok = false; break }
+            guard sqlite3_column_type(stmt, 10) == SQLITE_INTEGER else { ok = false; why = "a row has no slot value at all"; break }
+            var pos = Int(sqlite3_column_int(stmt, 10))
+            if pos < 0 {
+                // ONE UNSEATED ROW MUST NOT COST THE WHOLE INDEX, and it did: a single `slot = -1`
+                // out of 10,540,581 rows failed this guard, which returned false from here, which
+                // fell through every repair below it, and the user got "Omni can't open its index"
+                // on a 28 GB index where nothing was actually wrong. Seen on the real index.
+                //
+                // -1 means "not placed yet", not "broken". The row still has its blob - that is
+                // the whole reason a position has not been handed out yet - so the bytes are
+                // right here and the only thing missing is somewhere to put them. Placing it past
+                // every position the column names cannot collide with anything, and the ordinary
+                // slot persistence writes the assignment back on the next stamp.
+                //
+                // Refusing to open is the WORST available answer: the blob is the only copy of
+                // those bytes, and a user who re-indexes to escape the screen destroys them.
+                guard let blob = sqlite3_column_blob(stmt, 4),
+                      Int(sqlite3_column_bytes(stmt, 4)) >= bytesPerRow
+                else { ok = false; why = "a row past the covered prefix has no usable blob"; break }
+                pos = appendCursor
+                appendCursor += 1
+                if flat16.count < (pos + 1) * d {
+                    flat16.append(contentsOf: repeatElement(UInt16(0), count: (pos + 1) * d - flat16.count))
+                }
+                flat16.withUnsafeMutableBufferPointer { buf in
+                    let src = blob.assumingMemoryBound(to: UInt16.self)
+                    for j in 0 ..< d { buf[pos * d + j] = src[j] }
+                }
+                while filled.count <= pos { filled.append(false) }
+                filled[pos] = true
+                unseatedPlaced += 1
+            } else {
+                guard pos < highWater else {
+                    ok = false; why = "a row claims position \(pos), past the high water \(highWater)"; break
+                }
+            }
             if pos >= coveredRows, !filled[pos] {
                 // Uncovered: the blob is the only copy of these bytes.
                 guard let blob = sqlite3_column_blob(stmt, 4),
-                      Int(sqlite3_column_bytes(stmt, 4)) >= bytesPerRow else { ok = false; break }
+                      Int(sqlite3_column_bytes(stmt, 4)) >= bytesPerRow
+                else { ok = false; why = "a row past the covered prefix has no usable blob"; break }
                 flat16.withUnsafeMutableBufferPointer { buf in
                     let src = blob.assumingMemoryBound(to: UInt16.self)
                     for j in 0 ..< d { buf[pos * d + j] = src[j] }
@@ -7975,7 +8063,7 @@ public final class VectorStore: @unchecked Sendable {
                     guard (pos + 1) * d <= buf.count else { return false }
                     return memcmp(buf.baseAddress! + pos * d, blob, bytesPerRow) == 0
                 }
-                if !agrees { ok = false; break }
+                if !agrees { ok = false; why = "a covered position and a surviving blob disagree at \(pos)"; break }
             }
             rows.append(Row(path: path, kind: kind, chunkIndex: Int(sqlite3_column_int(stmt, 2)),
                             modified: sqlite3_column_double(stmt, 5),
@@ -7986,6 +8074,16 @@ public final class VectorStore: @unchecked Sendable {
             appendRowMetaLocked(internPath(path), kindCode: internKind(kind), kind: kind,
                                 path: path, slot: Int32(pos))
             presentPaths.insert(path)
+        }
+        // EVERY POSITION THE FILE NOW HOLDS, which is the column's high water plus however many
+        // unseated rows had to be placed past it. Written down once: the hole sweep, the length
+        // check and the claim all have to mean the same number, and using `highWater` in some of
+        // them and not others is how a placed row turns into "the buffer is the wrong length".
+        let placedHighWater = appendCursor
+        lastUnseatedPlaced = unseatedPlaced
+        if unseatedPlaced > 0 {
+            FileHandle.standardError.write(Data(
+                "[omni] placed \(unseatedPlaced) row(s) that had no slot; the index opened normally\n".utf8))
         }
         // A POSITION NOTHING CLAIMS STILL NEEDS A ROW.
         //
@@ -7999,11 +8097,14 @@ public final class VectorStore: @unchecked Sendable {
         //
         // The tombstones cost 48 bytes each and live only until the reclaim collects them.
         if ok {
-            var owned = [Bool](repeating: false, count: highWater)
-            for sl in occSlot where sl >= 0 && Int(sl) < highWater { owned[Int(sl)] = true }
-            for p in 0 ..< highWater where !owned[p] { appendHoleRowLocked(slot: Int32(p)) }
+            var owned = [Bool](repeating: false, count: placedHighWater)
+            for sl in occSlot where sl >= 0 && Int(sl) < placedHighWater { owned[Int(sl)] = true }
+            for p in 0 ..< placedHighWater where !owned[p] { appendHoleRowLocked(slot: Int32(p)) }
         }
-        guard ok, rows.count - deadRows.count == live, flat16.count == highWater * dim else {
+        guard ok, rows.count - deadRows.count == live, flat16.count == placedHighWater * dim else {
+            _ = declineBySlot(why.isEmpty
+                ? "rows \(rows.count - deadRows.count) against live \(live), buffer \(flat16.count) against \(placedHighWater * dim)"
+                : why)
             rows.removeAll(); flat16.removeAll(); presentPaths.removeAll(); occSlot.removeAll()
             residentIDsAreContents = false
             slotBackfillCursor = -1
