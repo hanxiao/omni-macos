@@ -3578,6 +3578,25 @@ public final class VectorStore: @unchecked Sendable {
     /// Deliberately NOT something the app can wait on. The migration rewrites rows a slice at a
     /// time precisely so it never gates readiness - blocking launch on background maintenance is
     /// what made 0.3.8 hang a base M-chip - so this reports, and the app keeps working throughout.
+    /// THE ON-DISK FORMAT, as a number a person can read back to you.
+    ///
+    /// Asked for because the v4 -> v5 migration has no other visible sign: "Optimizing storage"
+    /// only ever knew the two older passes, and once those finish the row disappears while the
+    /// split build, the v4 drop and the reclaim - the part that frees the space - are still to
+    /// come. So an index can sit mid-migration for an entire session with nothing on screen
+    /// saying so, which is the same "the work looks broken" failure the size row already warns
+    /// about one phase earlier.
+    ///
+    /// Straight from `PRAGMA user_version`, which is the one authority: it is set to 5 in the
+    /// same transaction that drops the v4 tables, so 5 means finished and nothing else does.
+    /// What a finished index reads. The UI compares against this rather than hard-coding 5, so
+    /// the day there is a v6 the Storage row does not quietly keep calling v5 current.
+    public static var currentSchemaVersion: Int32 { v5SchemaVersion }
+
+    public var schemaVersion: Int32 {
+        queue.sync { dbOpen() ? Int32(scalarQuery("PRAGMA user_version")) : 0 }
+    }
+
     public var storageMigration: (done: Int, total: Int, bytesToReclaim: Int64)? {
         queue.sync {
             guard Self.vecCoverage, dbOpen(), dim > 0, !rows.isEmpty else { return nil }
@@ -9537,6 +9556,32 @@ public final class VectorStore: @unchecked Sendable {
             return
         }
         defer { scheduleCoverageStampLocked() }
+        // THE SPLIT, FROM HERE TOO, OR AN INDEX THAT IS STILL INDEXING NEVER MIGRATES.
+        //
+        // The build lives in the caught-up branch above, which needs `coveredRows >= slotCount`.
+        // A store that is still writing never holds that at the instant a stamp runs: the slice
+        // just above closes the gap to zero, and in the two seconds before the next stamp the
+        // indexer adds another handful of positions. Observed on the real index at v0.13.0 - the
+        // gap oscillated between 6 and 30 for as long as the pass ran, every chunk seated, and
+        // the migration simply never started. It is a race the migration loses by single digits,
+        // for ever.
+        //
+        // Safe here because the build reads `chunks.slot` and nothing else: it derives its high
+        // water from the slots themselves, so a coverage claim that is a few positions behind
+        // says nothing about it. What it does need is every row SEATED, which is the backfill,
+        // and `buildChunkSplitLocked` checks that itself and returns false when it is not.
+        //
+        // Ordering with the reclaim is preserved - the reclaim still only runs from the caught-up
+        // branch, so the split still happens first, which is the ordering that matters ("fold
+        // before reclaim": turn duplicates into holes before rewriting the file for them).
+        //
+        // AND ABOVE THE COVERAGE GUARDS BELOW, not after them, because neither has anything to do
+        // with the split: `flat16.isPersistent` is false for the whole life of a small index, and
+        // returning there took the build with it.
+        if allowSplitBuild, slotsBackfilled, !splitBuilt,
+           !yieldToSearchLocked("split") {
+            _ = buildChunkSplitLocked()
+        }
         guard flat16.isPersistent, flat16.extendFileCoverage() else { return }
         flat16.msyncFile()
         clearSyncedReuseBlobsLocked()
@@ -11965,6 +12010,11 @@ public final class VectorStore: @unchecked Sendable {
     /// One stamp, which is where coverage, the sync and the hole reclaim are actually triggered
     /// from. Tests that call the pieces directly cannot see a branch that never runs.
     func stampCoverageForTest() { queue.sync { stampVectorCoverageLocked() } }
+    /// A stamp whose coverage slice is DELIBERATELY TOO SMALL to catch up, which is what a store
+    /// that is still indexing looks like from the migration's point of view: every slice closes
+    /// the gap and the writer reopens it before the next stamp. See the split-build call in
+    /// `stampVectorCoverageLocked`'s advance path.
+    func stampCoverageBehindForTest(budget: Int) { queue.sync { stampVectorCoverageLocked(budget: budget) } }
     /// ONE slice, so a test can build a claim that genuinely stops part way.
     func advanceCoverageOnceForTest() { queue.sync { _ = advanceCoverageLocked() } }
     /// The per-row slot mirror, which is what every score is actually indexed by.

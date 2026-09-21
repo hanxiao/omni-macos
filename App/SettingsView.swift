@@ -976,6 +976,24 @@ private struct IndexTab: View {
                 if let last = model.lastIndexed {
                     LabeledContent("Last indexed", value: last.formatted(.relative(presentation: .named)))
                 }
+                // THE MIGRATION'S ONLY VISIBLE FINISH LINE. "Optimizing storage" above knows the
+                // two older one-time passes and disappears when they are done - while the split
+                // build, the v4 drop and the reclaim that frees the space are all still to come.
+                // An index can therefore sit mid-migration for a whole session with nothing on
+                // screen saying so. `user_version` is set to 5 in the same transaction that drops
+                // the v4 tables, so it is the one number that means "finished" and nothing else.
+                if model.indexSchemaVersion > 0 {
+                    LabeledContent("Format") {
+                        Text(model.indexSchemaVersion >= VectorStore.currentSchemaVersion
+                             ? "v\(model.indexSchemaVersion)"
+                             : "v\(model.indexSchemaVersion), upgrading to v\(VectorStore.currentSchemaVersion)")
+                            .foregroundStyle(model.indexSchemaVersion >= VectorStore.currentSchemaVersion
+                                             ? .primary : .secondary)
+                    }
+                    .help(model.indexSchemaVersion >= VectorStore.currentSchemaVersion
+                          ? "The index is in the current format."
+                          : "The index is being upgraded in the background. Searching works throughout.")
+                }
                 // Manual row instead of LabeledContent: a long path makes LabeledContent
                 // wrap the value side under the label. The path gets the whole value side
                 // of the label line; the buttons drop to a second line so they never

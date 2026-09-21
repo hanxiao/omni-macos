@@ -1601,6 +1601,10 @@ final class AppModel {
     /// it were - after the migration the database is the smallest of the three that matter.
     var diskUse: [VectorStore.DiskUse.Entry] = []
     var lastIndexed: Date?
+    /// The index's on-disk format, straight from `PRAGMA user_version`. Shown in Storage so the
+    /// v4 -> v5 migration has a visible finish line: 5 means it is done, anything less means it
+    /// is still on the way. 0 while no index is open.
+    var indexSchemaVersion: Int32 = 0
     var indexObsolete = false
     var indexStoredDim = 0                  // actual vector dim of the current index (0 if empty)
     var indexModelVariantRaw: String?       // model variant recorded when the index was built
@@ -3533,10 +3537,12 @@ final class AppModel {
             let lastTs = store.metaGet("last_indexed").flatMap { Double($0) }
             let migration = store.storageMigration
             let disk = store.diskUse().entries
+            let schema = store.schemaVersion
             let stampedVersion = store.metaGet("embedding_version")
             let storedDim = store.vectorDim   // ACTUAL stored vector dim - ground truth
             let builtVariant = store.metaGet("index_model_variant")
             await MainActor.run {
+                self.indexSchemaVersion = schema
                 self.indexStoredDim = storedDim
                 self.indexModelVariantRaw = builtVariant
                 self.indexedFiles = stats.fileCount

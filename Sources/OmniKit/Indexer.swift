@@ -210,16 +210,36 @@ public final class Indexer: @unchecked Sendable {
     /// `storeBusy` only. Any other store error still fails the file immediately: it means the
     /// write cannot succeed, and repeating it would just take longer to say so.
     static func writeWaitingOutLocks(_ write: () throws -> Void) throws {
-        let backoff: [Double] = [0.25, 1, 3, 8, 20, 45, 90]
-        for (i, pause) in backoff.enumerated() {
+        // POLL, DO NOT BACK OFF. An exponential backoff is for a contended resource whose waiters
+        // must spread out; this is ONE writer waiting for ONE maintenance transaction, and nobody
+        // else is queueing behind it. Backing off only means sleeping long after the lock is free.
+        //
+        // Measured on the shipped 0.13.0, 25 minutes of a real indexing pass: steps of
+        // 0.25/1/3/8/20/45 s fired 5/5/5/4/5/4 times, which is 333 SECONDS of sleeping - over a
+        // fifth of the pass - to wait out locks that are mostly gone within a second. Polling at
+        // 0.4 s costs at most that per contended batch and the indexer stays at full rate.
+        //
+        // The budget still has to clear the longest maintenance transaction there is (the split
+        // build's single ~150 s transaction), because the whole point is not to discard vectors
+        // the GPU has already produced.
+        let poll = 0.4
+        let deadline = Date().addingTimeInterval(210)
+        var waited = 0.0
+        while true {
             do { return try write() }
             catch let e as OmniError {
                 guard case .storeBusy(let why) = e else { throw e }
-                log.info("store busy, waiting \(pause, privacy: .public)s (attempt \(i + 1, privacy: .public)): \(why, privacy: .public)")
-                Thread.sleep(forTimeInterval: pause)
+                guard Date() < deadline else {
+                    log.error("store busy for \(waited, privacy: .public)s, giving up: \(why, privacy: .public)")
+                    throw e
+                }
+                // One line per contended batch, not per poll: at 0.4 s a long hold would otherwise
+                // write hundreds of identical lines and os_log would quarantine the subsystem.
+                if waited == 0 { log.info("store busy, polling until it frees: \(why, privacy: .public)") }
+                Thread.sleep(forTimeInterval: poll)
+                waited += poll
             }
         }
-        try write()   // the last attempt's error is the one the caller sees
     }
     static func isFinite(_ v: [Float]) -> Bool { v.allSatisfy { $0.isFinite } }
 
