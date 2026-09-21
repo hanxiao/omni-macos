@@ -505,7 +505,27 @@ private struct PerformanceTab: View {
     @Environment(AppModel.self) private var model: AppModel
     /// Only for the hidden paper run: its sheet lives on the main window, which may be closed.
     @Environment(\.openWindow) private var openWindow
-    private var memoryCeiling: Double { max(8, min(model.physicalMemoryGB.rounded(), 128)) }
+    /// HALF THE MACHINE, not all of it. This was `min(physicalMemory, 128)`, which means the
+    /// slider's maximum was 100% OF RAM on every Mac up to 128 GB - a 16 GB laptop could be
+    /// dragged to a 16 GB cap. It only came out sub-proportional on the very large machines,
+    /// where 128 of 550 GB is 23%, which is the opposite of where the restraint is needed.
+    ///
+    /// The DEFAULT was always proportional and conservative - `min(6, max(2, RAM * 0.4))`, so
+    /// 3 GB on 8 GB and 6 GB on anything from 16 GB up - and that is what people actually live
+    /// with. This is about how far the control lets you go, not about what it starts at.
+    ///
+    /// NOT `recommendedMaxWorkingSetSize`, which was the obvious anchor and is the wrong one:
+    /// measured at 498 GB of 550 here, 91% of RAM. It is a device capability - what the GPU can
+    /// address - not advice about leaving room for everything else, which is the same trap the
+    /// OCR notes in CLAUDE.md already record about sizing the batch from it.
+    ///
+    /// The `max(model.maxMemoryGB, ...)` keeps a cap somebody has ALREADY chosen reachable: a
+    /// stored 100 GB on a 128 GB Mac would otherwise sit above a 64 GB ceiling, pinning the thumb
+    /// at the end while the label read 100 - and silently narrowing a choice the user made is not
+    /// this change's business.
+    private var memoryCeiling: Double {
+        max(4, min(max((model.physicalMemoryGB * 0.5).rounded(), model.maxMemoryGB), 128))
+    }
     var body: some View {
         Form {
             Section {
