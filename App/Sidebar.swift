@@ -574,25 +574,31 @@ struct CloudSyncPie: View {
     var tint: Color = .secondary
 
     var body: some View {
-        // ONE ELEMENT, not two. `nil` - queued behind another pass, or still being counted - is the
-        // SAME indicator with no wedge yet: same circle, same size, same stroke, zero progress. It
-        // was briefly a smaller bare circle of its own, which read as a different kind of thing
-        // sitting in the column where progress belongs, and the row visibly changed shape the
-        // moment counting finished. The ring is drawn once, outside the branch, so that cannot
-        // drift again.
-        ZStack {
-            Circle().strokeBorder(tint.opacity(0.4), lineWidth: 1)
-            if let fraction {
+        // NOTHING UNTIL THERE IS SOMETHING TO SHOW. `nil` means queued behind another pass, or
+        // still being counted - there is no k of n yet - and this used to draw the ring anyway,
+        // on the argument that one element cannot drift out of step with two. That argument was
+        // about the wrong risk: an empty ring in the column where progress lives does not read as
+        // "no number yet", it reads as 0% AND STUCK, and on a big folder it sits there saying so
+        // for as long as the count takes. Absence is the honest state; the ring arrives with its
+        // first real wedge.
+        //
+        // The same rule the browse view already states for a different empty ring: "an empty ring
+        // that never fills is not progress."
+        if let fraction {
+            ZStack {
+                Circle().strokeBorder(tint.opacity(0.4), lineWidth: 1)
                 PieWedge(fraction: max(0.03, min(1, fraction)))
                     .fill(tint)
                     .padding(1)
                     .animation(.easeInOut(duration: 0.2), value: fraction)
             }
+            // A solid hover target so the .help tooltip fires anywhere over the glyph (the shapes
+            // alone leave transparent gaps), and no accessibilityHidden - which would drop the
+            // help. Inside the branch: with no ring there is nothing to hover, and a 16pt
+            // invisible hit area in a row that shows nothing would swallow clicks meant for it.
+            .frame(width: 16, height: 16)
+            .contentShape(Rectangle())
         }
-        // A solid hover target so the .help tooltip fires anywhere over the glyph (the shapes
-        // alone leave transparent gaps), and no accessibilityHidden - which would drop the help.
-        .frame(width: 16, height: 16)
-        .contentShape(Rectangle())
     }
 }
 

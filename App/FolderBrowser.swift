@@ -184,7 +184,10 @@ struct FolderBrowser: View {
                     // THE TRAILING EDGE OF THE NAME COLUMN, where the sidebar puts the same pie at
                     // the trailing edge of its row. Between the name and the first fixed column, so
                     // it never overlaps a value and never moves when columns are turned on or off.
-                    if entry.isDirectory, let p = rowProgress[entry.url.path] {
+                    // `p.wedge != nil`: while a folder is still being counted there is no k of n,
+                    // and the padding below would otherwise reserve a column for a ring that is
+                    // not drawn. See CloudSyncPie.
+                    if entry.isDirectory, let p = rowProgress[entry.url.path], p.wedge != nil {
                         CloudSyncPie(fraction: p.wedge, tint: isSelected ? .white : .secondary)
                             .help(p.help)
                             .padding(.trailing, 6)
@@ -366,7 +369,9 @@ struct FolderBrowser: View {
                             // Same indicator as the list, badged on the icon's trailing corner -
                             // a grid cell has no name column to hang it off.
                             .overlay(alignment: .bottomTrailing) {
-                                if entry.isDirectory, let p = rowProgress[entry.url.path] {
+                                // Same `wedge != nil` test as the list: without it the badge's
+                                // own backing circle is drawn around nothing.
+                                if entry.isDirectory, let p = rowProgress[entry.url.path], p.wedge != nil {
                                     CloudSyncPie(fraction: p.wedge)
                                         .background(Circle().fill(.background))
                                         .help(p.help)
