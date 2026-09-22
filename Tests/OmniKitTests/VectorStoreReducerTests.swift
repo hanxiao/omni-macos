@@ -20,7 +20,11 @@ struct Corpus {
         if let e = kid[kind] { k = e } else { k = UInt8(idKind.count); kid[kind] = k; idKind.append(kind) }
         return VectorStore.Row(fid: f, kc: k, chunkIndex: chunkIndex)
     }
-    var tables: VectorStore.RowTables { .init(idPath: idPath, idKind: idKind, fileMeta: meta) }
+    var tables: VectorStore.RowTables {
+        var t = PathTable()
+        for p in idPath { t.append(p) }
+        return .init(paths: t, idKind: idKind, fileMeta: meta)
+    }
 }
 
 /// Differential + corner-case tests for the Fix #2 search reducer (`reduceTopK`), proving it returns

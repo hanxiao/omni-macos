@@ -77,22 +77,21 @@ final class MemoryAccountingTests: XCTestCase {
                        "the row table is the thing that scales with occurrences")
     }
 
-    /// The incremental counter in `internPath` must agree with a full walk. The counter is the
-    /// steady-state path (one add per file) and the walk is what a wholesale `idPath` rewrite falls
-    /// back to; if they disagree, the number silently depends on how the index was loaded.
-    func testIncrementalPathBytesMatchAFullWalk() throws {
+    /// Path bytes are the path table's own text, which is exactly the UTF-8 of every path with each
+    /// directory counted once. Pinned against that figure computed independently, so a table that
+    /// stored a directory per file - the String layout it replaced - would fail here.
+    func testPathBytesAreTheTextWithDirectoriesStoredOnce() throws {
         let store = try VectorStore(dbURL: tempDB())
         defer { store.close() }
         try fill(store, files: 50, chunksPerFile: 2)
-        let incremental = store.residentSearchMemory().pathBytes
-
-        var walked = 0
+        var dirs = Set<String>(), names = 0
         for f in 0 ..< 50 {
-            let n = path(f).utf8.count
-            walked += n <= 15 ? 0 : malloc_good_size(32 + n)
+            let p = path(f), cut = p.lastIndex(of: "/")!
+            dirs.insert(String(p[...cut])); names += p[p.index(after: cut)...].utf8.count
         }
-        XCTAssertEqual(incremental, walked, "the running total must equal the walk it replaces")
-        XCTAssertGreaterThan(walked, 50 * 32, "fixture paths must be heap Strings, or this proves nothing")
+        let want = dirs.reduce(0) { $0 + $1.utf8.count } + names
+        XCTAssertEqual(store.residentSearchMemory().pathBytes, want)
+        XCTAssertEqual(dirs.count, 1, "the fixture shares one directory, or this proves nothing")
     }
 
     /// NEGATIVE CONTROL FOR THE WHOLE EXERCISE. The old accounting was
@@ -123,15 +122,5 @@ final class MemoryAccountingTests: XCTestCase {
         XCTAssertEqual(m.parts.reduce(0) { $0 + $1.bytes }, m.total,
                        "every non-zero field appears in parts exactly once")
         XCTAssertEqual(m.total, m.cpu + m.gpu)
-    }
-
-    /// The hash-table estimate has to invert Swift's 3/4 load factor. Using `capacity` directly
-    /// under-reports a full table by a third, which is the kind of error that makes a breakdown
-    /// look plausible and be wrong.
-    func testHashTableBytesInvertTheLoadFactor() {
-        // 3 elements fit in 4 buckets; 4 do not, so the table is 8 buckets wide.
-        XCTAssertEqual(VectorStore.hashTableBytes(capacity: 3, entryStride: 16), 4 * 16 + 0)
-        XCTAssertEqual(VectorStore.hashTableBytes(capacity: 4, entryStride: 16), 8 * 16 + 1)
-        XCTAssertEqual(VectorStore.hashTableBytes(capacity: 0, entryStride: 16), 0)
     }
 }

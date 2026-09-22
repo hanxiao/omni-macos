@@ -1583,6 +1583,118 @@ if args.count >= 2 && args[1] == "storemem" {
     exit(try storememRun(n, realPaths: real))
 }
 
+// Path-table A/B: omni-verify pathbench [files]
+//
+// Everything the resident path table serves, timed and digested on one deterministic store with
+// paths shaped like a real index's (realisticPath: ~10 files a directory, ~140 characters). Run the
+// same command on two builds: the digests must be identical and the times say what it cost. A
+// digest is FNV over the full answer - paths, scores, counts - so any changed answer moves it.
+func pathbenchRun(_ files: Int) throws -> Int32 {
+    let dim = 64
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("omni-pathbench-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+    try? FileManager.default.removeItem(at: root)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let db = root.appendingPathComponent("p.sqlite")
+    var fnv: UInt64 = 0xcbf2_9ce4_8422_2325
+    func mix(_ s: String) { for b in s.utf8 { fnv = (fnv ^ UInt64(b)) &* 0x0000_0100_0000_01b3 } }
+    func digest() -> String { let d = String(fnv, radix: 16); fnv = 0xcbf2_9ce4_8422_2325; return d }
+    func ms(_ t: Date) -> String { String(format: "%8.1f ms", -t.timeIntervalSinceNow * 1000) }
+    func unit(_ i: Int) -> [Float] {
+        var x = UInt64(0x9E37_79B9_7F4A_7C15) &+ UInt64(i) &* 0xBF58_476D_1CE4_E5B9
+        var v = [Float](repeating: 0, count: dim), n: Float = 0
+        for k in 0 ..< dim { x ^= x << 13; x ^= x >> 7; x ^= x << 17
+            v[k] = Float(Int32(truncatingIfNeeded: x)) / Float(Int32.max); n += v[k] * v[k] }
+        n = n.squareRoot(); return v.map { $0 / n }
+    }
+    let exts = ["txt", "PDF", "md", "jpg"]
+    // Two levels, so a folder can select 1% of the index as well as one directory or all of it:
+    // 100 groups, then directories of 10 files, names and directory names at real-index lengths.
+    let perGroup = max(10, files / 100)
+    func path(_ f: Int) -> String {
+        let d = "d\(f / 10)", pad = String(repeating: "x", count: max(0, 90 - d.utf8.count))
+        return "/Users/u/Documents/g\(f / perGroup)/\(d)\(pad)/file-\(f)-" + String(repeating: "y", count: 20)
+            + "." + exts[f % exts.count]
+    }
+    print("pathbench   files=\(files) dim=\(dim)")
+    let m0 = churnFootprintMB()
+    var t = Date()
+    // PATHBENCH_SRC=<dir>: build the store once and give every run its own copy. The build is not
+    // what is being measured, it takes minutes at scale, and two builds from the same code
+    // produce the same database - so an A/B across builds should share one.
+    let src = ProcessInfo.processInfo.environment["PATHBENCH_SRC"].map { URL(fileURLWithPath: $0) }
+    let fm = FileManager.default
+    if let src, fm.fileExists(atPath: src.appendingPathComponent("p.sqlite").path) {
+        for name in try fm.contentsOfDirectory(atPath: src.path) {
+            try fm.copyItem(at: src.appendingPathComponent(name), to: root.appendingPathComponent(name))
+        }
+        print("  build      (copied from \(src.path))")
+    } else {
+        let store = try VectorStore(dbURL: db)
+        var batch: [(path: String, chunks: [IndexedChunk])] = []
+        for f in 0 ..< files {
+            let p = path(f)
+            batch.append((p, [IndexedChunk(path: p, modified: Double(1_600_000_000 + f % 1000), size: f,
+                                           kind: f % 4 == 3 ? "image" : "text", chunkIndex: 0,
+                                           snippet: "s\(f)", embedding: unit(f))]))
+            if batch.count == 20_000 { try store.replaceMany(batch); batch.removeAll(keepingCapacity: true) }
+        }
+        try store.replaceMany(batch)
+        print("  build      \(ms(t))")
+        store.close()
+        if let src {
+            try? fm.removeItem(at: src)
+            try fm.createDirectory(at: src, withIntermediateDirectories: true)
+            for name in try fm.contentsOfDirectory(atPath: root.path) {
+                try fm.copyItem(at: root.appendingPathComponent(name), to: src.appendingPathComponent(name))
+            }
+        }
+    }
+    t = Date()
+    let store = try VectorStore(dbURL: db)
+    defer { store.close() }
+    print("  reopen     \(ms(t))")
+    print(String(format: "  footprint  %+8.1f MB after reopen", churnFootprintMB() - m0))
+    let mem = store.residentSearchMemory()
+    print(String(format: "  path text + tables  %.1f MB", Double(mem.pathBytes + mem.pathTables) / 1_048_576))
+
+    // Folders at three depths: a dir with ~10 files, a subtree of ~1%, and a top-level ~50%.
+    let one = (path(files / 2) as NSString).deletingLastPathComponent
+    let folders = [one, "/Users/u/Documents/g1", "/Users/u/Documents"]
+    for folder in folders {
+        var f = SearchFilter(); f.folderPrefix = folder
+        t = Date(); let a = store.search(unit(7), filter: f, topK: 40); let first = ms(t)
+        t = Date(); let b = store.search(unit(8), filter: f, topK: 40); let warm = ms(t)
+        for h in a + b { mix("\(h.path)|\(h.score)|\(h.chunkIndex)") }
+        print("  search in: first \(first)  warm \(warm)  hits \(a.count)  digest \(digest())  [\(folder.suffix(24))]")
+    }
+    var fe = SearchFilter(); fe.ext = "pdf"; fe.folderPrefix = "/Users/u/Documents"
+    t = Date(); let e = store.search(unit(9), filter: fe, topK: 40)
+    for h in e { mix("\(h.path)|\(h.score)") }
+    print("  search in+ext  \(ms(t))  hits \(e.count)  digest \(digest())")
+    t = Date(); let l = store.listMatching(filter: fe, topK: 200)
+    for h in l { mix("\(h.path)|\(h.modified)") }
+    print("  listMatching   \(ms(t))  hits \(l.count)  digest \(digest())")
+    t = Date(); let c = store.fileCounts(underFolders: folders)
+    for k in folders { mix("\(k)=\(c[k] ?? -1)") }
+    print("  fileCounts     \(ms(t))  \(folders.map { c[$0] ?? -1 })  digest \(digest())")
+    t = Date(); let s = store.indexSummary(folders: folders)
+    mix("\(s.fileCount)|\(s.chunkCount)|\(s.exts.sorted())|\(folders.map { s.folderCounts[$0] ?? -1 })")
+    print("  indexSummary   \(ms(t))  digest \(digest())")
+    t = Date(); store.deleteExtensions(["md"])
+    let after = store.fileCounts(underFolders: ["/Users/u/Documents"])["/Users/u/Documents"] ?? -1
+    print("  deleteExt md   \(ms(t))  remaining \(after)")
+    t = Date(); store.deleteUnderFolder("/Users/u/Documents/g1")
+    let after2 = store.fileCounts(underFolders: ["/Users/u/Documents"])["/Users/u/Documents"] ?? -1
+    mix("\(after)|\(after2)")
+    print("  deleteUnder    \(ms(t))  remaining \(after2)  digest \(digest())")
+    return 0
+}
+if args.count >= 2 && args[1] == "pathbench" {
+    exit(try pathbenchRun((args.count >= 3 ? Int(args[2]) : nil) ?? 200_000))
+}
+
 // Folder-map cost against the buffer cache: omni-verify mapbench [files] [dim]
 // The comment on the cache limit names folder maps as the sustained variable-shape work the cache
 // exists for, so shrinking it has to be tested here and not only on the indexing pass. Runs the
