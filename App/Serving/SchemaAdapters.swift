@@ -67,6 +67,45 @@ func normalizeStorePath(_ raw: String) -> String {
     return "/" + parts.joined(separator: "/")
 }
 
+// MARK: - Query or document
+
+/// Omni embeds a text one of two ways: as a QUERY (what a searcher types) or as a DOCUMENT (what
+/// gets searched). The two are not interchangeable - a query embedded as a document scores
+/// noticeably worse against an index of documents - so every schema's role field is honoured, and
+/// a value that names neither role is refused rather than silently embedded as a document.
+enum EmbedRole {
+    /// Jina `task`, or the `input_type` of Voyage and NVIDIA-style OpenAI servers. nil when neither
+    /// is present, which means document: the OpenAI schema has no role field and embeds content.
+    struct Invalid: Error { let message: String }
+
+    static func parse(task: Any?, inputType: Any?) -> Result<Bool, Invalid> {
+        for raw in [task, inputType] {
+            guard let value = raw as? String, !value.isEmpty else { continue }
+            let v = value.lowercased()
+            if v == "query" || v == "search_query" || v.hasSuffix(".query") { return .success(true) }
+            if ["document", "passage", "search_document", "text-matching", "classification",
+                "clustering", "separation"].contains(v) || v.hasSuffix(".passage") || v.hasSuffix(".document") {
+                return .success(false)
+            }
+            return .failure(Invalid(message: "unknown role '\(value)': use task 'retrieval.query' or 'retrieval.passage' (Jina), or input_type 'query' or 'document'"))
+        }
+        return .success(false)
+    }
+}
+
+/// Embed a batch whose items carry their own roles, keeping input order. Queries and documents go
+/// to the engine as two batches, because the role is per call there.
+private func embedMixed(_ texts: [String], queries: [Bool], _ backend: any ServingBackend) -> [[Float]] {
+    let q = texts.indices.filter { queries[$0] }
+    let d = texts.indices.filter { !queries[$0] }
+    let qv = backend.embedBatch(q.map { texts[$0] }, query: true)
+    let dv = backend.embedBatch(d.map { texts[$0] }, query: false)
+    var out = [[Float]](repeating: [], count: texts.count)
+    for (k, i) in q.enumerated() where k < qv.count { out[i] = qv[k] }
+    for (k, i) in d.enumerated() where k < dv.count { out[i] = dv[k] }
+    return out
+}
+
 // MARK: - OpenAI + Jina (one OpenAI-shaped emitter)
 
 /// One request must not occupy the engine for minutes: cap the batch like hosted APIs do
@@ -92,9 +131,11 @@ enum OpenAIJinaAdapter {
             return badRequest("'dimensions' must equal \(backend.dim) for \(backend.modelName)")
         }
 
-        // task suffix ".query" or == "query" -> query path. Field is "task" (Jina).
-        let task = (body["task"] as? String)?.lowercased() ?? ""
-        let asQuery = task == "query" || task.hasSuffix(".query")
+        let asQuery: Bool
+        switch EmbedRole.parse(task: body["task"], inputType: body["input_type"]) {
+        case .success(let q): asQuery = q
+        case .failure(let e): return badRequest(e.message)
+        }
 
         // base64 if either OpenAI's encoding_format or Jina's embedding_type asks for it.
         let wantsBase64 = matchesBase64(body["encoding_format"]) || matchesBase64(body["embedding_type"])
@@ -156,13 +197,19 @@ enum CohereAdapter {
     static func handle(_ req: HTTPRequest, _ backend: any ServingBackend, v2: Bool) -> HTTPResponse {
         guard let body = JSONBody.object(req) else { return cohereError("invalid JSON body") }
 
-        let texts = parseTexts(body)
-        if texts.count > servingMaxInputs { return badRequest("'texts' exceeds \(servingMaxInputs) items") }
+        guard let texts = parseTexts(body) else {
+            return cohereError("'texts' must be an array of strings, and every 'inputs' item must carry text")
+        }
+        if texts.count > servingMaxInputs { return cohereError("'texts' exceeds \(servingMaxInputs) items") }
         if texts.isEmpty { return cohereError("'texts' is required") }
 
         let inputType = (body["input_type"] as? String)?.lowercased()
         if v2, inputType == nil {
             return cohereError("input_type is required")
+        }
+        // Cohere's four text roles; `image` is refused because this endpoint embeds text only.
+        if let t = inputType, !["search_query", "search_document", "classification", "clustering"].contains(t) {
+            return cohereError("unsupported input_type '\(t)': use search_query or search_document")
         }
         let asQuery = inputType == "search_query"
 
@@ -186,6 +233,8 @@ enum CohereAdapter {
         let tokens = tokenEstimate(texts)
         let payload: [String: Any] = [
             "id": UUID().uuidString,
+            // The Cohere SDK tells its two embed response types apart by this field.
+            "response_type": v2 || !requestedTypes.isEmpty ? "embeddings_by_type" : "embeddings_floats",
             "embeddings": embeddings,
             "texts": texts,
             "meta": [
@@ -196,15 +245,15 @@ enum CohereAdapter {
         return HTTPResponse.json(payload)
     }
 
-    /// texts from "texts", or inputs[].text (v4 multimodal item form, text parts only).
-    private static func parseTexts(_ body: [String: Any]) -> [String] {
-        if let texts = body["texts"] as? [String] { return texts }
+    /// texts from "texts", or inputs[].text (v4 multimodal item form, text parts only). nil when an
+    /// item is not text: dropping it would shift every later embedding onto the wrong input.
+    private static func parseTexts(_ body: [String: Any]) -> [String]? {
+        if let raw = body["texts"] { return raw as? [String] }
         if let inputs = body["inputs"] as? [Any] {
             var out: [String] = []
             for item in inputs {
-                if let obj = item as? [String: Any], let t = obj["text"] as? String {
-                    out.append(t)
-                }
+                guard let obj = item as? [String: Any], let t = obj["text"] as? String else { return nil }
+                out.append(t)
             }
             return out
         }
@@ -231,22 +280,29 @@ enum GeminiAdapter {
                 return geminiError("'requests' is required")
             }
             if requests.count > servingMaxInputs { return geminiError("'requests' exceeds \(servingMaxInputs) items") }
+            // Each request carries its OWN taskType. A batch mixing queries and documents used to
+            // embed every row as a query if any one of them was.
             var texts: [String] = []
-            var anyQuery = false
-            for item in requests {
-                guard let obj = item as? [String: Any] else { continue }
-                texts.append(partsText(obj["content"]))
-                if let tt = obj["taskType"] as? String, queryTaskTypes.contains(tt) { anyQuery = true }
+            var queries: [Bool] = []
+            for (i, item) in requests.enumerated() {
+                guard let obj = item as? [String: Any] else {
+                    return geminiError("requests[\(i)] is not an object")
+                }
+                let text = partsText(obj["content"])
+                if text.isEmpty { return geminiError("requests[\(i)].content has no text part") }
+                texts.append(text)
+                queries.append((obj["taskType"] as? String).map { queryTaskTypes.contains($0) } ?? false)
                 if let dimErr = checkDimension(obj["outputDimensionality"], backend) { return dimErr }
             }
             if texts.isEmpty { return geminiError("no content to embed") }
 
-            let vectors = backend.embedBatch(texts, query: anyQuery)
+            let vectors = embedMixed(texts, queries: queries, backend)
             let embeddings = vectors.map { ["values": $0] }
             return HTTPResponse.json(["embeddings": embeddings])
         } else {
             if let dimErr = checkDimension(body["outputDimensionality"], backend) { return dimErr }
             let text = partsText(body["content"])
+            if text.isEmpty { return geminiError("'content' has no text part") }
             let tt = body["taskType"] as? String
             let asQuery = tt.map { queryTaskTypes.contains($0) } ?? false
             let vectors = backend.embedBatch([text], query: asQuery)
@@ -297,17 +353,24 @@ enum SearchAdapter {
         var filter = SearchFilter()
         if let filters = body["filters"] as? [String: Any] {
             if let kinds = filters["kinds"] as? [String] {
-                var set = Set(kinds)
+                var set = Set(kinds.map { $0.lowercased() })
                 // Same superset rule as the app: text documents include scanned PDFs ('scan'),
                 // so API clients asking for text don't silently lose them.
                 if set.contains(FileKind.text.rawValue) { set.insert(FileKind.scan.rawValue) }
                 filter.kinds = set
             }
             // `folder` (one) and `folders` (several) - see issue #18. Both are accepted and merged.
+            // Lexically normalized the way the store keys paths: a trailing slash built the prefix
+            // "…//" and "~" matched nothing, and both came back as a 200 with no results - which
+            // a caller reads as "not on this Mac". MCP search already did this.
             var scoped: [String] = []
-            if let folder = filters["folder"] as? String, !folder.isEmpty { scoped.append(folder) }
-            for folder in (filters["folders"] as? [String] ?? [])
-            where !folder.isEmpty && !scoped.contains(folder) { scoped.append(folder) }
+            let named = [filters["folder"] as? String].compactMap { $0 } + (filters["folders"] as? [String] ?? [])
+            for raw in named {
+                let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !t.isEmpty else { continue }
+                let folder = normalizeStorePath(t)
+                if !scoped.contains(folder) { scoped.append(folder) }
+            }
             if !scoped.isEmpty { filter.folderPrefixes = scoped }
             if let ext = filters["ext"] as? String, !ext.isEmpty { filter.ext = ext }
             if let since = filters["since"] as? Double { filter.since = since }
@@ -467,13 +530,21 @@ private let tagMaxImageDimension = 1568
 /// /v1/search, so tagging adds no new exposure. Read per request rather than snapshotted at attach
 /// time: ServingController.attach runs once at engine load (AppModel.swift), and the user can add
 /// or remove roots at any point afterwards.
-private func pathIsInIndexedRoot(_ path: String) -> Bool {
-    let roots = (UserDefaults.standard.array(forKey: "omni.roots") as? [String]) ?? []
-    for r in roots {
-        let root = normalizeStorePath(r)
-        if path == root || path.hasPrefix(root.hasSuffix("/") ? root : root + "/") { return true }
+///
+/// BY WHERE THE FILE REALLY IS, TOO. The path is checked as written and again with its symlinks
+/// resolved, because reading it follows them: a link inside an indexed folder that points at
+/// ~/.ssh would otherwise pass the check on its name and hand over what it points at. A root that
+/// is itself reached through a link is compared in its resolved form as well.
+func pathIsInIndexedRoot(_ path: String) -> Bool {
+    let roots = ((UserDefaults.standard.array(forKey: "omni.roots") as? [String]) ?? []).map(normalizeStorePath)
+    func inside(_ p: String, _ roots: [String]) -> Bool {
+        roots.contains { root in p == root || p.hasPrefix(root.hasSuffix("/") ? root : root + "/") }
     }
-    return false
+    guard inside(path, roots) else { return false }
+    let real = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+    if real == path { return true }
+    let realRoots = roots.map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path }
+    return inside(real, roots) || inside(real, realRoots)
 }
 
 /// Decode one request image to a CGImage, downscaled the way the indexer does.
@@ -708,10 +779,10 @@ enum HealthAdapter {
                 "running": true
             ])
         }
-        // /v1/models
-        return HTTPResponse.json([
-            "object": "list",
-            "data": [["id": backend.modelName, "object": "model"]]
-        ])
+        // /v1/models. The OCR model is listed once it is installed: it is what /v1/chat/completions
+        // and /v1/ocr answer with, and a client that checks the list before calling should find it.
+        var models: [[String: Any]] = [["id": backend.modelName, "object": "model"]]
+        if let ocr = OCRServing.modelID { models.append(["id": ocr, "object": "model"]) }
+        return HTTPResponse.json(["object": "list", "data": models])
     }
 }

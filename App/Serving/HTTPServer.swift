@@ -13,6 +13,11 @@ final class HTTPServer: @unchecked Sendable {
 
     typealias Handler = @Sendable (HTTPRequest) async -> HTTPResponse
 
+    /// Whether a request, judged by its head alone, may send a body past the default 8 MB cap.
+    /// Checked BEFORE the body is buffered, so a caller without the token cannot make the server
+    /// hold 48 MB per connection on the LAN scope just by declaring it.
+    var admitsLargeBody: @Sendable (HTTPRequest) -> Bool = { _ in false }
+
     /// Called when the listener fails to come up or dies (e.g. port in use). The
     /// controller installs this to flip its state. Always invoked on `queue`.
     var onFailure: (@Sendable (String) -> Void)?
@@ -124,7 +129,7 @@ final class HTTPServer: @unchecked Sendable {
             switch state {
             case .ready:
                 self?.touchIdle(conn)
-                self?.readRequest(on: conn, buffer: Data())
+                self?.readRequest(on: conn, buffer: ReadBuffer())
             case .failed, .cancelled:
                 self?.idleTimers.removeValue(forKey: ObjectIdentifier(conn))?.cancel()
                 self?.conns[ObjectIdentifier(conn)] = nil
@@ -155,31 +160,32 @@ final class HTTPServer: @unchecked Sendable {
 
     /// Accumulate bytes until a full request is buffered, then service it. Drains
     /// pipelined requests already sitting in `buffer` before reading more.
-    private func readRequest(on conn: NWConnection, buffer: Data) {
+    private func readRequest(on conn: NWConnection, buffer: ReadBuffer) {
         if cancelled { conn.cancel(); return }   // server stopped: stop the read loop / GPU feed
         // First, try to satisfy from what we already have (handles pipelining and the
         // case where the head+body arrived in one receive).
-        if drain(on: conn, buffer: buffer) { return }
+        if drain(on: conn, buffer: buffer.data) { return }
 
         conn.receive(minimumIncompleteLength: 1, maximumLength: receiveChunk) { [weak self] data, _, isComplete, error in
             guard let self else { return }
             self.touchIdle(conn)
-            var buf = buffer
-            if let data, !data.isEmpty { buf.append(data) }
-
-            if buf.count > self.maxBody {
-                self.write(HTTPResponse.json(["error": "payload too large"], status: 413), to: conn, keepAlive: false) {
-                    conn.cancel()
-                }
-                return
-            }
+            if let data, !data.isEmpty { buffer.data.append(data) }
 
             if error != nil {
                 conn.cancel()
                 return
             }
 
-            if self.drain(on: conn, buffer: buf) { return }
+            // Parse BEFORE the size check: the cap is on the body, and a complete request whose
+            // head takes the buffer a few bytes past it was being refused.
+            if self.drain(on: conn, buffer: buffer.data) { return }
+
+            if buffer.data.count > self.maxBody && !self.mayBuffer(buffer.data) {
+                self.write(HTTPResponse.json(["error": "payload too large"], status: 413), to: conn, keepAlive: false) {
+                    conn.cancel()
+                }
+                return
+            }
 
             if isComplete {
                 // Peer closed without a complete request.
@@ -187,9 +193,33 @@ final class HTTPServer: @unchecked Sendable {
                 return
             }
 
+            self.answerContinue(conn, buffer)
             // Need more bytes.
-            self.readRequest(on: conn, buffer: buf)
+            self.readRequest(on: conn, buffer: buffer)
         }
+    }
+
+    /// `Expect: 100-continue`, answered once the head is in. curl sends it for any body over a
+    /// megabyte and then waits a full second for this line before sending the body, so every inline
+    /// document upload paid a second for nothing. Sent only for a body the server would accept;
+    /// anything else goes on to its 413.
+    private func answerContinue(_ conn: NWConnection, _ buffer: ReadBuffer) {
+        guard !buffer.continued, let (head, bodyStart, length) = try? HTTPParse.parseHead(buffer.data),
+              head.headers["expect"]?.lowercased() == "100-continue",
+              buffer.data.distance(from: bodyStart, to: buffer.data.endIndex) < length else { return }
+        buffer.continued = true
+        guard length <= maxBody || admitsLargeBody(head) else { return }
+        conn.send(content: Data("HTTP/1.1 100 Continue\r\n\r\n".utf8), completion: .contentProcessed { _ in })
+    }
+
+    /// A buffer past the default cap may keep growing only for a route that takes documents, from a
+    /// caller the router would admit, and only up to what its head declared.
+    private func mayBuffer(_ buf: Data) -> Bool {
+        guard buf.count <= HTTPParse.maxAnyBody + receiveChunk,
+              let parsed = try? HTTPParse.parseHead(buf) else { return false }
+        let (head, bodyStart, length) = parsed
+        guard HTTPParse.bodyCap(forTarget: head.path) > maxBody, admitsLargeBody(head) else { return false }
+        return buf.distance(from: bodyStart, to: buf.endIndex) <= length + receiveChunk
     }
 
     /// Attempt to parse and service exactly one request from `buffer`. Returns true if a
@@ -219,29 +249,44 @@ final class HTTPServer: @unchecked Sendable {
         let client = self.remoteDescription(conn)
         let keepAlive = req.wantsKeepAlive
         let started = DispatchTime.now()
+        // The idle deadline is for a client that SENDS nothing. While the handler works the client
+        // is waiting on us, and an OCR request runs for minutes - the timer used to close the
+        // socket under it at 60 s. Re-armed once the response is out.
+        idleTimers.removeValue(forKey: ObjectIdentifier(conn))?.cancel()
 
         // Hand off the (thread-safe) handler to a detached Task. The engine/store are
         // documented thread-safe, so they are called directly off the main actor here.
         Task { [weak self] in
             guard let self else { return }
             let resp = await self.handler(req)
-            let ms = Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1_000_000.0
-            let entry = LogEntry(
-                time: Date(),
-                method: req.method,
-                path: req.routePath,
-                status: resp.status,
-                ms: ms,
-                client: client
-            )
-            self.onLog(entry)
+            let finish: @Sendable () -> Void = {
+                let ms = Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1_000_000.0
+                self.onLog(LogEntry(time: Date(), method: req.method, path: req.routePath,
+                                    status: resp.status, ms: ms, client: client))
+            }
+
+            if let produce = resp.stream {
+                let alive = await self.streamBody(produce, head: resp, to: conn, keepAlive: keepAlive)
+                finish()
+                self.queue.async {
+                    if keepAlive && alive {
+                        self.touchIdle(conn)
+                        self.readRequest(on: conn, buffer: ReadBuffer(residual))
+                    } else {
+                        conn.cancel()
+                    }
+                }
+                return
+            }
+            finish()
 
             // Hop back to the network queue to write and continue the loop.
             self.queue.async {
                 self.write(resp, to: conn, keepAlive: keepAlive,
                            acceptEncoding: req.headers["accept-encoding"]) {
                     if keepAlive {
-                        self.readRequest(on: conn, buffer: residual)
+                        self.touchIdle(conn)
+                        self.readRequest(on: conn, buffer: ReadBuffer(residual))
                     } else {
                         conn.cancel()
                     }
@@ -249,6 +294,31 @@ final class HTTPServer: @unchecked Sendable {
             }
         }
         return true
+    }
+
+    /// Write a streamed response: the head, then one chunk per `send`, then the terminator.
+    /// Returns false if the client went away part-way, in which case the connection is not reused.
+    private func streamBody(_ produce: @Sendable (@escaping @Sendable (Data) async -> Bool) async -> Void,
+                            head: HTTPResponse, to conn: NWConnection, keepAlive: Bool) async -> Bool {
+        let broken = Flag()
+        let send: @Sendable (Data) async -> Bool = { bytes in
+            if broken.isSet { return false }
+            let ok = await withCheckedContinuation { (c: CheckedContinuation<Bool, Never>) in
+                conn.send(content: bytes, completion: .contentProcessed { error in c.resume(returning: error == nil) })
+            }
+            if !ok { broken.set() }
+            return ok
+        }
+        // The producer runs EVEN IF the head could not be sent. It may hold something only its own
+        // run gives back - an OCR job holds the decode slot from before the response began - so
+        // skipping it here leaked that slot and stalled OCR and indexing until the app restarted.
+        // With the client gone every send is false, which is the producer's cue to stop at once.
+        _ = await send(head.serializeStreamHead(keepAlive: keepAlive))
+        await produce { payload in
+            guard !payload.isEmpty else { return !broken.isSet }
+            return await send(HTTPResponse.chunk(payload))
+        }
+        return await send(HTTPResponse.chunk(Data()))
     }
 
     private func write(_ resp: HTTPResponse, to conn: NWConnection, keepAlive: Bool,
@@ -280,4 +350,22 @@ final class HTTPServer: @unchecked Sendable {
             return "\(error)"
         }
     }
+}
+
+/// A one-way latch readable from any thread.
+private final class Flag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    var isSet: Bool { lock.withLock { value } }
+    func set() { lock.withLock { value = true } }
+}
+
+/// A connection's unread bytes, appended in place. A `Data` handed down the read loop by value was
+/// copied whole on every 64 KB receive, which is quadratic in the body: about 18 GB of copying to
+/// take in one 48 MB document. Only ever touched on the server's queue.
+private final class ReadBuffer {
+    var data: Data
+    /// This request's `100 Continue` has been dealt with.
+    var continued = false
+    init(_ data: Data = Data()) { self.data = data }
 }

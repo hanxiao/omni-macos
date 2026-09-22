@@ -11,8 +11,9 @@ import AppKit
 /// transport - `claude mcp add --transport http`, Cursor, VS Code, etc. - with zero setup
 /// beyond the URL.
 ///
-/// Three tools are exposed: `search` (whole-index), `search_inline` (rank passages within
-/// given paths), and `file_status` (index coverage/freshness per file). Agents that want raw
+/// Tools: `search` (whole-index), `search_inline` (rank passages within given paths),
+/// `file_status` (index coverage/freshness per file), `tag_image`, `ocr` (transcribe a scan to
+/// Markdown), and the four source tools when the app has wired them. Agents that want raw
 /// vectors use the OpenAI-style /v1/embeddings endpoint instead; MCP is for the things agents
 /// actually do with Omni - reach the user's files by meaning and trust what the index covers.
 enum MCPAdapter {
@@ -70,7 +71,7 @@ enum MCPAdapter {
                 "capabilities": ["tools": [:] as [String: Any]],
                 "serverInfo": ["name": "omni", "title": "Omni - local semantic file search",
                                "version": appVersion],
-                "instructions": "Search the user's local files by meaning. Files of every kind - text, code, PDFs, images, audio, video - share one embedding space, so describe the CONTENT you want in natural language (any language). `search` finds files across the whole index; `search_inline` ranks the best passages WITHIN a specific set of files or folders you already know; `file_status` reports whether given files are indexed and whether the index is still fresh for them. Results are file paths with scores, snippets, and media metadata (resolution, duration, size); read the files yourself if you need their full contents.\n\nOmni only finds what it has indexed. If a search comes back empty for something the user says is on their Mac, check `list_sources` before concluding the file is not there - the folder may simply not be a source yet. `list_sources` also reports what is still indexing, which explains a result set that looks incomplete. `add_source` adds a folder (or the Apple Photos library, whole or by album) and indexing starts immediately; `pause_source` stops work on one without losing what it already indexed; `remove_source` drops it and its rows. These change what the user sees in the app, so treat add and especially remove as actions to take on request rather than on your own initiative."
+                "instructions": "Search the user's local files by meaning. Files of every kind - text, code, PDFs, images, audio, video - share one embedding space, so describe the CONTENT you want in natural language (any language). `search` finds files across the whole index; `search_inline` ranks the best passages WITHIN a specific set of files or folders you already know; `file_status` reports whether given files are indexed and whether the index is still fresh for them. `ocr` transcribes a scanned PDF or an image to Markdown, page by page. Results are file paths with scores, snippets, and media metadata (resolution, duration, size); read the files yourself if you need their full contents.\n\nOmni only finds what it has indexed. If a search comes back empty for something the user says is on their Mac, check `list_sources` before concluding the file is not there - the folder may simply not be a source yet. `list_sources` also reports what is still indexing, which explains a result set that looks incomplete. `add_source` adds a folder (or the Apple Photos library, whole or by album) and indexing starts immediately; `pause_source` stops work on one without losing what it already indexed; `remove_source` drops it and its rows. These change what the user sees in the app, so treat add and especially remove as actions to take on request rather than on your own initiative."
             ])
 
         case "ping":
@@ -78,7 +79,7 @@ enum MCPAdapter {
 
         case "tools/list":
             var tools = [searchToolDescriptor(), searchInlineToolDescriptor(),
-                         fileStatusToolDescriptor(), tagImageToolDescriptor()]
+                         fileStatusToolDescriptor(), tagImageToolDescriptor(), ocrToolDescriptor()]
             // Only advertised when the app has wired the control: a tool a client can see but not
             // call is worse than one that is absent.
             if sources != nil {
@@ -97,6 +98,7 @@ enum MCPAdapter {
             case "search_inline": return callSearchInline(id: id, args: args, backend: backend)
             case "file_status":   return callFileStatus(id: id, args: args, backend: backend)
             case "tag_image":     return callTagImage(id: id, args: args, backend: backend)
+            case "ocr":           return await callOCR(id: id, args: args)
             case "list_sources", "add_source", "pause_source", "remove_source":
                 guard let sources else {
                     return toolError(id: id, "\(name) failed: indexing control is unavailable (the index is still loading)")
@@ -155,7 +157,7 @@ enum MCPAdapter {
                     ],
                     "min_score": [
                         "type": "number",
-                        "description": "Relevance floor, 0 to 1. Defaults to 0.5, the same floor the app's window applies, so weak matches are dropped rather than padding the page - semantic search always returns its nearest neighbours, and most of them are not answers. The floor is scaled per kind (a text query scores a photo on a lower scale than a document), so images are not deleted by a text-shaped cut. Pass 0 for everything.",
+                        "description": "Relevance floor, 0 to 1. Defaults to the floor the app's window applies (0.5 unless the user changed it), so weak matches are dropped rather than padding the page - semantic search always returns its nearest neighbours, and most of them are not answers. The floor is scaled per kind (a text query scores a photo on a lower scale than a document), so images are not deleted by a text-shaped cut. Pass 0 for everything.",
                         "minimum": 0, "maximum": 1
                     ],
                     "group_duplicates": [
@@ -282,8 +284,6 @@ enum MCPAdapter {
         let groups = backend.groupedResults(hits, enabled: group, limit: topK)
         let reps = groups.map(\.representative)
         let dupesByPath = Dictionary(uniqueKeysWithValues: groups.map { ($0.representative.path, $0) })
-        // Lockstep rule keeps stale sidecar rows from mislabeling.
-        let contentKeys = backend.contentKeys(paths: reps.map { $0.path })
 
         // One text block per result, and nothing else.
         //
@@ -599,6 +599,102 @@ enum MCPAdapter {
             "content": content,
             "isError": false
         ])
+    }
+
+    // MARK: - The ocr tool
+
+    private static func ocrToolDescriptor() -> [String: Any] {
+        [
+            "name": "ocr",
+            "title": "Transcribe a scanned document or image to Markdown",
+            "description": "Read the text of a scanned PDF, a photographed page or a screenshot on this Mac with Omni's on-device OCR model, as Markdown: tables as HTML, formulas as LaTeX, headers and footers dropped. Use it when a file's text is not otherwise readable - a PDF with no text layer, or an image of a document. Give an absolute path inside the user's indexed folders. At most \(OCRServing.maxPagesMCP) pages per call, the first \(OCRServing.maxPagesMCP) by default; the reply says which pages remain, so call again with `pages` for the next ones. Pages Omni has transcribed before come back instantly. A page takes a few seconds on the GPU, and the first call loads the model.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "path": [
+                        "type": "string",
+                        "description": "Absolute path of a PDF or image inside the user's indexed folders."
+                    ],
+                    "pages": [
+                        "type": "string",
+                        "description": "Pages to transcribe, counted from 1 as search results name them: \"3\", \"1-5\" or \"2,7-9\". Default: the first \(OCRServing.maxPagesMCP)."
+                    ]
+                ] as [String: Any],
+                "required": ["path"]
+            ] as [String: Any],
+            "annotations": ["readOnlyHint": true, "destructiveHint": false,
+                            "idempotentHint": true, "openWorldHint": false]
+        ]
+    }
+
+    private static func callOCR(id: Any, args: [String: Any]) async -> HTTPResponse {
+        guard let path = args["path"] as? String, !path.isEmpty else {
+            return toolError(id: id, "ocr failed: 'path' (an absolute file path) is required")
+        }
+        let document: OCRServing.Document
+        switch OCRServing.open(path: path, inlineHint: false) {
+        case .success(let d): document = d
+        case .failure(let f): return toolError(id: id, "ocr failed: \(f.message)")
+        }
+        let count = document.pageCount
+        var selected: [Int]
+        switch OCRServing.parsePages(args["pages"], count: count, oneBased: true) {
+        case .success(let p): selected = p ?? Array(0 ..< min(count, OCRServing.maxPagesMCP))
+        case .failure(let f): return toolError(id: id, "ocr failed: \(f.message)")
+        }
+        guard selected.count <= OCRServing.maxPagesMCP else {
+            return toolError(id: id, "ocr failed: \(selected.count) pages asked for; at most \(OCRServing.maxPagesMCP) per call")
+        }
+        let job: OCRServing.Job
+        switch await OCRServing.prepare([(document, selected)]) {
+        case .success(let j): job = j
+        case .failure(let f): return toolError(id: id, "ocr failed: \(f.message)")
+        }
+        let pages: [OCRServing.Page]
+        switch await job.run() {
+        case .success(let p): pages = p
+        case .failure(let f): return toolError(id: id, "ocr failed: \(f.message)")
+        }
+
+        // The path `open` resolved, not the argument: a file:// URL run through the path cleanup
+        // came out as "/file:/...".
+        let name = document.url?.path ?? path
+        var head = count == 1 ? "\(name) (1 page)" : "\(name) (\(count) pages)"
+        if count > 1 {
+            head += ". This reply: pages \(Self.ranges(selected.map { $0 + 1 }))."
+            let after = (selected.max() ?? -1) + 1
+            if after < count {
+                head += " Next: pages \"\(after + 1)-\(min(after + OCRServing.maxPagesMCP, count))\"."
+            }
+        }
+        var content: [[String: Any]] = [["type": "text", "text": head]]
+        for p in pages {
+            let body: String
+            if p.failed {
+                body = "(this page could not be transcribed)"
+            } else if p.markdown.isEmpty {
+                body = "(no text on this page)"
+            } else {
+                body = p.markdown
+            }
+            let label = count == 1 ? "" : "## Page \(p.index + 1)\n\n"
+            content.append(["type": "text", "text": label + body])
+        }
+        return result(id: id, ["content": content, "isError": false])
+    }
+
+    /// "1-3, 7" for [1, 2, 3, 7].
+    private static func ranges(_ pages: [Int]) -> String {
+        var out: [String] = []
+        var start: Int?
+        var prev = 0
+        for p in pages.sorted() {
+            if start != nil, p == prev + 1 { prev = p; continue }
+            if let s = start { out.append(s == prev ? "\(s)" : "\(s)-\(prev)") }
+            start = p; prev = p
+        }
+        if let s = start { out.append(s == prev ? "\(s)" : "\(s)-\(prev)") }
+        return out.joined(separator: ", ")
     }
 
     // mimeType(forPath:) is shared with the HTTP adapters - see SchemaAdapters.swift.

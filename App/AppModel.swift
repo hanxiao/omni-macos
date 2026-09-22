@@ -3068,14 +3068,24 @@ final class AppModel {
     /// budget whose buffer cache is a quarter of it, so nearly every step misses.
     private var indexingPausedForOCR = false
     private var ocrHoldsMemory = false
+    enum OCRHolder: Hashable { case session, served }
+    private var ocrResidentHolders: Set<OCRHolder> = []
+    /// Runs in flight: the workspace's, plus one per served decode. `ocrRunActive` is their OR.
+    private var ocrRuns = 0
 
     /// Called when OCR mode is entered and left. Entering lifts the compute cap (the reclaimable
     /// buffer cache stays bounded); leaving restores it and drops the weights' buffers, so the
     /// 4.53 GB is actually returned rather than lingering in MLX's cache.
-    func setOCRResident(_ resident: Bool) {
-        guard resident != ocrHoldsMemory else { return }
-        ocrHoldsMemory = resident
-        if resident {
+    ///
+    /// TWO HOLDERS: the workspace (entering and leaving OCR mode) and `OCRModelHost` (weights
+    /// resident for a served request). The cap comes back only when neither holds it, or a served
+    /// request finishing would put the cap back under a workspace that is still transcribing.
+    func setOCRResident(_ resident: Bool, holder: OCRHolder = .session) {
+        if resident { ocrResidentHolders.insert(holder) } else { ocrResidentHolders.remove(holder) }
+        let held = !ocrResidentHolders.isEmpty
+        guard held != ocrHoldsMemory else { return }
+        ocrHoldsMemory = held
+        if held {
             omniSetMemoryLimit(0)
         } else {
             applyMemoryLimit()
@@ -3094,6 +3104,7 @@ final class AppModel {
     /// would sit there doing nothing; instead OCR starts immediately - slower while the pass winds
     /// down - and reaches full speed the moment it does.
     func beginOCRRun() {
+        ocrRuns += 1
         ocrRunActive = true
         if isIndexing {
             indexingPausedForOCR = true
@@ -3106,6 +3117,8 @@ final class AppModel {
     /// and nothing else would come back for them - a Photos change debounce or a file edit during a
     /// transcription would otherwise sit in its buffer until the next unrelated trigger.
     func endOCRRun() {
+        ocrRuns = max(0, ocrRuns - 1)
+        guard ocrRuns == 0 else { return }
         ocrRunActive = false
         if indexingPausedForOCR {
             indexingPausedForOCR = false
@@ -3424,6 +3437,26 @@ final class AppModel {
             // Set before attach(), so a server that auto-starts inside it is already wired.
             self.serving.onServedSearch = { [weak self] q, surface in self?.recordServedSearch(q, surface: surface) }
             self.serving.sources = self.makeSourcesControl()
+            // A served OCR request holds the same two things a workspace run does: the lifted
+            // memory cap while the weights are up, and indexing stood down while it decodes.
+            // POSTED, NOT AWAITED: a served request must not wait on the main thread, which a
+            // folder-access prompt can hold for as long as nobody answers it. The main queue is
+            // FIFO, so an end is never applied before the start it closes.
+            Task {
+                await OCRModelHost.shared.setHooks(.init(
+                    resident: { on in
+                        DispatchQueue.main.async {
+                            MainActor.assumeIsolated { AppModel.shared?.setOCRResident(on, holder: .served) }
+                        }
+                    },
+                    running: { on in
+                        DispatchQueue.main.async {
+                            MainActor.assumeIsolated {
+                                if on { AppModel.shared?.beginOCRRun() } else { AppModel.shared?.endOCRRun() }
+                            }
+                        }
+                    }))
+            }
             EngineServingBackend.minScore = self.minScore   // one floor, window and server
             self.serving.attach(engine: engine, store: store, modelName: "omni-\(modelVariant.rawValue)")
             if let oldStore { Task.detached(priority: .utility) { _ = oldIndexer; oldStore.close() } }

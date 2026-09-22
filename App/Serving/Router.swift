@@ -52,6 +52,10 @@ struct Router: Sendable {
             return FileTagsAdapter.handle(req, backend)
         case ("POST", "/v1/tag"):
             return TagAdapter.handle(req, backend)
+        case ("POST", "/v1/chat/completions"):
+            return await ChatOCRAdapter.handle(req)
+        case ("POST", "/v1/ocr"):
+            return await DocumentOCRAdapter.handle(req)
         default:
             break
         }
@@ -83,7 +87,8 @@ struct Router: Sendable {
                 "error": ["code": 401, "message": "Unauthorized", "status": "UNAUTHENTICATED"]
             ], status: 401)
         }
-        if route.hasPrefix("/v1/embed") || route.hasPrefix("/v2/embed") {
+        // Exact routes: "/v1/embeddings" also starts with "/v1/embed", and is OpenAI-shaped.
+        if route == "/v1/embed" || route == "/v2/embed" {
             return HTTPResponse.json([
                 "message": "invalid api token"
             ], status: 401)

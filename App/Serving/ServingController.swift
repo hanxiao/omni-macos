@@ -139,6 +139,7 @@ final class ServingController {
         }
 
         let srv = HTTPServer(handler: { req in await router.handle(req) }, onLog: sink)
+        srv.admitsLargeBody = auth
         srv.onFailure = { [weak self, weak srv] msg in
             Task { @MainActor in
                 // Ignore a late failure from a DISCARDED server (rapid toggle / port edit): it must not

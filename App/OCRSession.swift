@@ -959,11 +959,13 @@ final class OCRSession {
         runToken += 1
         // Releasing 4.5 GB of weights is 80 ms of work with nothing to show for it, and it was
         // happening between the click and the next frame - measured on a 40-page transcript, where
-        // toggling out of OCR mode stalled visibly. Hand it to a background queue; nothing here
-        // waits on it.
-        let dropped = Farewell(model)
-        model = nil
-        DispatchQueue.global(qos: .utility).async { dropped.release() }
+        // toggling out of OCR mode stalled visibly. The host drops the last reference on its own
+        // executor; nothing here waits on it. A served request still holding a lease keeps the
+        // weights up until it is done.
+        if model != nil {
+            model = nil
+            Task { await OCRModelHost.shared.release() }
+        }
         onModelResident?(false)
     }
 
@@ -1121,6 +1123,13 @@ final class OCRSession {
         }
         work = Task { [weak self] in
             guard let self else { return }
+            // Exactly one `didFinishRun` per `willRun`, on every way out. AppModel counts runs now
+            // that a served request can hold one too, and the early return below used to skip it,
+            // which left indexing stood down after a stop during the model load.
+            defer { self.didFinishRun?() }
+            // The decode slot is shared with served requests - see OCRModelHost.
+            var holdsDecode = false
+            defer { if holdsDecode { Task { await OCRModelHost.shared.endDecode() } } }
             do {
                 let loaded: OCRModel
                 if let model = self.model {
@@ -1139,10 +1148,22 @@ final class OCRSession {
                         }
                     }
                     defer { sampler.cancel() }
-                    loaded = try await OCRModel(modelDir: modelDir)
-                    self.model = loaded
+                    // From the shared host, not loaded here: a served request may already have the
+                    // weights up, and two copies would not fit a 16 GB Mac.
+                    loaded = try await OCRModelHost.shared.acquire(dir: modelDir)
                     self.loadProgress = nil
+                    // Left OCR mode while the weights were loading: `deactivate` found no model to
+                    // let go of, so the lease is returned here instead of being held out of mode.
+                    guard self.runToken == token else {
+                        await OCRModelHost.shared.release()
+                        return
+                    }
+                    self.model = loaded
                 }
+                guard self.runToken == token else { return }
+                // A served request may be decoding; the workspace waits for it (never the reverse,
+                // see OCRModelHost), still showing the loading state.
+                holdsDecode = await OCRModelHost.shared.beginDecode(.session)
                 guard self.runToken == token else { return }
                 // The two boundaries a stop can land between: the weights are up, but no page has
                 // produced a token yet. That window is the group prologue - every page of the
@@ -1303,14 +1324,12 @@ final class OCRSession {
                                        done.count, tokens, secs, secs > 0 ? Double(tokens) / secs : 0))
                 }
                 self.noteRunEnded()
-                self.didFinishRun?()
                 if self.runToken == token {
                     self.phase = .finished
                     self.scheduleReadoutDismissal()
                 }
             } catch {
                 self.ticker?.cancel()
-                self.didFinishRun?()
                 guard self.runToken == token else { return }
                 self.phase = .failed("Loading \(modelDir.lastPathComponent): \(error)")
             }
@@ -1763,14 +1782,6 @@ final class OCRSession {
     }
 }
 
-/// Carries a model off the main thread to be released there. `@unchecked` because nothing reads
-/// it: the box exists only so the last reference is dropped somewhere else.
-private final class Farewell: @unchecked Sendable {
-    private var model: OCRModel?
-    init(_ model: OCRModel?) { self.model = model }
-    func release() { model = nil }
-}
-
 /// Stop and pause signals the decode loop can read from its own thread. `Task.isCancelled` cannot
 /// serve here: the decode runs in a detached task, which a parent's cancellation does not reach.
 private final class OCRRunGate: @unchecked Sendable {
@@ -1804,7 +1815,7 @@ extension OCRSession {
 
     /// The variant to use when several are installed: highest fidelity first, since the user who
     /// downloaded two is unlikely to want the weaker one silently chosen.
-    static func installedModel() -> InstalledModel? {
+    nonisolated static func installedModel() -> InstalledModel? {
         for variant in OCRModelCatalog.Variant.allCases {
             if OCRModelCatalog.isInstalled(variant), let dir = OCRModelCatalog.installDir(for: variant) {
                 return InstalledModel(variant: variant, dir: dir)

@@ -15,7 +15,7 @@ struct ServingTab: View {
 
     /// Top-level example category: the search endpoint, or an embedding endpoint.
     private enum ExampleKind: String, CaseIterable, Identifiable {
-        case search = "Search", embed = "Embed", tags = "Tags"
+        case search = "Search", embed = "Embed", tags = "Tags", ocr = "OCR"
         var id: String { rawValue }
     }
     /// The embedding API schema styles the server speaks (all served at once).
@@ -37,7 +37,7 @@ struct ServingTab: View {
         // other tab has.
         .sheet(isPresented: $showMCPSheet) {
             AgentConfigSheet(title: "Connect agents over MCP",
-                             subtitle: "For any MCP client with HTTP transport. Eight tools: search, search_inline, file_status, tag_image, list_sources, add_source, pause_source, remove_source.",
+                             subtitle: "For any MCP client with HTTP transport. Nine tools: search, search_inline, file_status, tag_image, ocr, list_sources, add_source, pause_source, remove_source.",
                              text: mcpConfigText, saveAs: nil)
         }
         .sheet(isPresented: $showSkillSheet) {
@@ -143,7 +143,7 @@ struct ServingTab: View {
         } header: {
             Text("Server")
         } footer: {
-            Text("A local HTTP API for search, tags, embeddings, and the folders Omni indexes. Local network needs a token; changes restart the server.")
+            Text("A local HTTP API for search, tags, OCR, embeddings, and the folders Omni indexes. Local network needs a token; changes restart the server.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }
@@ -274,9 +274,10 @@ struct ServingTab: View {
         `N. /path  (kind, score%, locator, N passages, yyyy-MM-dd)`, followed by the snippet.
         `score` runs 0 to 1. Compare it only within a kind: a text query scores a photo on a
         different scale than a document, so a 0.50 image and a 0.80 document are comparable matches.
-        Hits below 50% are dropped by default (scaled per kind, so media is not deleted by a
-        text-shaped floor). Pass `min_score` to change it - `0` returns everything. Over HTTP it
-        goes in `filters`; over MCP it is a top-level argument. `locator` is where the best match sits inside the file, such as `Page 3` or
+        Hits below the app's relevance floor are dropped: 0.5 unless the user changed it in the
+        window, scaled per kind so media is not deleted by a text-shaped floor. Pass `min_score` to
+        set it per request - `0` returns everything. Over HTTP it goes in `filters`; over MCP it is
+        a top-level argument. `locator` is where the best match sits inside the file, such as `Page 3` or
         `Line 1240`, and is empty when the file has no meaningful position. `chunk_count` is how
         many pages or passages the file has in the index. Hits also carry `bytes` for the indexed
         file size and `mime_type`. Media hits add `width` and `height` in pixels and `duration` in
@@ -339,9 +340,12 @@ struct ServingTab: View {
         curl -s \(base)/v1/sources\(authFlag)
         ```
 
-        Response: `{"sources": [{"key", "title", "path", "kind", "indexed", "paused", "indexing"}]}`.
-        `kind` is `folder` or `photos`. Call this before concluding a file is not on the Mac: a
-        folder that is not a source is simply not indexed.
+        Response: `{"indexing", "photos_authorized", "sources": [{"key", "kind", "name", "paused",
+        "indexing", "queued", "indexed_files", "progress"?: {"done", "total"}}],
+        "available_photo_albums": [{"id", "title", "count", "smart"}]}`. `kind` is `folder` or
+        `photos`; `key` is the folder path or `photos://<id>`. A folder that is not a source is not
+        indexed. `available_photo_albums` lists the albums not yet added, with the ids
+        `{"album": ...}` takes.
 
         Add a folder, or the Apple Photos library whole or by album:
 
@@ -357,31 +361,87 @@ struct ServingTab: View {
         Both keys come from the list above. Adding and especially removing change what the user
         sees in the app, so do them on request, not on your own initiative.
 
+        ## OCR
+
+        Transcribes a scanned PDF or an image to Markdown on this Mac: tables as HTML, formulas as
+        LaTeX, headers and footers dropped. The model's instruction is fixed, so text parts in a
+        request are ignored. A page takes seconds; the first call also loads the model.
+
+        OpenAI chat shape, streamable:
+
+        ```bash
+        curl -sN \(base)/v1/chat/completions\(authFlag) -H 'Content-Type: application/json' \\
+          -d '{"model": "jina-ocr-v1", "stream": true, "messages": [{"role": "user", "content":
+               [{"type": "image_url", "image_url": {"url": "file:///abs/scan.pdf"}}]}]}'
+        ```
+
+        An attachment is an `image_url` part or a `file` part with `file_data`. Its URL is a
+        `file://` path inside the indexed folders, or a `data:` URI of an image or a PDF
+        (`data:application/pdf;base64,...`). Remote URLs are refused. Every page of every
+        attachment is transcribed, in order, joined by `\n\n---\n\n`; at most 200 pages, request
+        bodies up to 48 MB. `finish_reason` is `length` when a page hit the token budget. The
+        stream is standard `chat.completion.chunk` events ending in `data: [DONE]`;
+        `stream_options.include_usage` adds a usage chunk.
+
+        Page by page, Mistral OCR shape:
+
+        ```bash
+        curl -s \(base)/v1/ocr\(authFlag) -H 'Content-Type: application/json' \\
+          -d '{"document": {"type": "document_url", "document_url": "file:///abs/scan.pdf"}, "pages": "0-4"}'
+        ```
+
+        `document` is `{"type": "document_url", "document_url": ...}` or
+        `{"type": "image_url", "image_url": ...}` with the same URL forms; `{"path": "/abs/scan.pdf"}`
+        is shorthand. `pages` counts from 0: a list `[0, 2]` or a string `"0,2-4"`; default all.
+        Response: `{"pages": [{"index", "markdown", "images": [], "dimensions": {"dpi", "height",
+        "width"}}], "model", "usage_info": {"pages_processed", "doc_size_bytes"}}`. `dimensions` is
+        null for a page answered by the transcript cache.
+
+        Pages the app has transcribed before, in its OCR workspace or here, return from the cache
+        at once. 503 with `Retry-After` means the app's OCR workspace is transcribing a document;
+        503 without it means the OCR model is not installed (it downloads from OCR mode in the app).
+
         ## Health and model
 
         `GET \(base)/health` -> `{"status":"ok", ...}`. A refused connection means the server is
         off; ask the user to enable Settings -> Serving in the Omni app.
-        `GET \(base)/v1/models` lists the loaded model.
+        `GET \(base)/v1/models` lists the embedding model, and the OCR model when it is installed.
 
         ## Embeddings
 
-        Four request schemas, all returning L2-normalized vectors over the same model. Use them to
-        build your own similarity logic; searching Omni's index does not need them.
+        L2-normalized vectors from the model behind the index, for your own similarity logic;
+        searching Omni's index does not need them. Queries and documents are embedded differently:
+        embed what you search WITH as a query and what you search IN as a document. A missing role
+        means document.
 
-        - `POST \(base)/v1/embeddings` - OpenAI and Jina bodies, `{"model":"omni","input":[...]}`,
-          with an optional Jina `task` such as `retrieval.query`.
-        - `POST \(base)/v1/embed` and `POST \(base)/v2/embed` - Cohere v1 and v2 bodies.
-        - `POST \(base)/v1beta/models/omni:embedContent` and `:batchEmbedContents` - Gemini bodies,
-          authenticated with `x-goog-api-key` rather than a bearer header.
+        | Schema | Endpoint | Query | Document |
+        |---|---|---|---|
+        | OpenAI, Jina | `POST /v1/embeddings` | `"input_type": "query"` or `"task": "retrieval.query"` | `"input_type": "document"` or `"task": "retrieval.passage"` |
+        | Cohere v1, v2 | `POST /v1/embed`, `POST /v2/embed` | `"input_type": "search_query"` | `"input_type": "search_document"` |
+        | Gemini | `POST /v1beta/models/omni:embedContent`, `:batchEmbedContents` | `"taskType": "RETRIEVAL_QUERY"` | `"taskType": "RETRIEVAL_DOCUMENT"` |
+
+        ```bash
+        curl -s \(base)/v1/embeddings\(authFlag) -H 'Content-Type: application/json' \\
+          -d '{"model": "omni", "input": ["what to find"], "input_type": "query"}'
+        curl -s \(base)/v1/embeddings\(authFlag) -H 'Content-Type: application/json' \\
+          -d '{"model": "omni", "input": ["text to be found", "another passage"], "input_type": "document"}'
+        ```
+
+        An unknown role is a 400. A Gemini batch takes each request's own `taskType`. Gemini
+        authenticates with `x-goog-api-key` rather than a bearer header.
 
         ## MCP
 
         The server also speaks MCP over streamable HTTP at `\(base)/mcp`. Point any MCP client at
-        that URL. Eight tools, each one the call of the same name above:
-        `search`, `search_inline`, `file_status`, `tag_image`, `list_sources`, `add_source`,
-        `pause_source`, `remove_source`.
+        that URL. Nine tools: `search` (`/v1/search`), `search_inline` (MCP only), `file_status`
+        (`/v1/files/status`), `tag_image` (`/v1/files/tags`, or `/v1/tag` with `recompute`), `ocr`
+        (`/v1/ocr`), `list_sources`, `add_source`, `pause_source` and `remove_source`
+        (`/v1/sources`, `/v1/sources/add`, `/v1/sources/pause`, `/v1/sources/remove`).
 
-        Two differ from their HTTP form. `search` takes `include_images`, which attaches an inline
+        Three differ from their HTTP form. `ocr` takes a `path` inside the indexed folders and
+        `pages` counted from 1, as search results name them (`"3"`, `"1-5"`), at most 10 per call
+        and the first 10 by default; it returns one Markdown text per page and names the pages
+        still to fetch. `search` takes `include_images`, which attaches an inline
         JPEG thumbnail to image and scanned-PDF hits so they render in the client, and returns one
         text line per hit rather than JSON rows: `N. /path  (kind, score%, locator, N passages,
         yyyy-MM-dd)` followed by the snippet. Open a result by its path. `search_inline` ranks the
@@ -409,16 +469,28 @@ struct ServingTab: View {
         if exampleKind == .tags {
             return "curl \(base)/v1/files/tags\(ct)\(auth) -d '{\"path\":\"/path/to/photo.jpg\"}'"
         }
+        if exampleKind == .ocr {
+            return "curl -N \(base)/v1/chat/completions\(ct)\(auth) -d '{\"model\":\"jina-ocr-v1\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"file:///path/to/scan.pdf\"}}]}]}'"
+        }
+        // QUERY AND DOCUMENT, both, in every schema. The two roles embed differently, and a single
+        // example taught one of them: the OpenAI line had no role at all, which is the document
+        // side, so a reader copying it for their queries got document vectors without being told.
+        let pair: (query: String, document: String)
         switch embedSchema {
         case .openai:
-            return "curl \(base)/v1/embeddings\(ct)\(auth) -d '{\"model\":\"omni\",\"input\":[\"your text\"]}'"
+            pair = ("curl \(base)/v1/embeddings\(ct)\(auth) -d '{\"model\":\"omni\",\"input\":[\"what to find\"],\"input_type\":\"query\"}'",
+                    "curl \(base)/v1/embeddings\(ct)\(auth) -d '{\"model\":\"omni\",\"input\":[\"text to be found\"],\"input_type\":\"document\"}'")
         case .jina:
-            return "curl \(base)/v1/embeddings\(ct)\(auth) -d '{\"model\":\"omni\",\"input\":\"your text\",\"task\":\"retrieval.query\"}'"
+            pair = ("curl \(base)/v1/embeddings\(ct)\(auth) -d '{\"model\":\"omni\",\"input\":[\"what to find\"],\"task\":\"retrieval.query\"}'",
+                    "curl \(base)/v1/embeddings\(ct)\(auth) -d '{\"model\":\"omni\",\"input\":[\"text to be found\"],\"task\":\"retrieval.passage\"}'")
         case .cohere:
-            return "curl \(base)/v2/embed\(ct)\(auth) -d '{\"model\":\"omni\",\"texts\":[\"your text\"],\"input_type\":\"search_document\",\"embedding_types\":[\"float\"]}'"
+            pair = ("curl \(base)/v2/embed\(ct)\(auth) -d '{\"model\":\"omni\",\"texts\":[\"what to find\"],\"input_type\":\"search_query\",\"embedding_types\":[\"float\"]}'",
+                    "curl \(base)/v2/embed\(ct)\(auth) -d '{\"model\":\"omni\",\"texts\":[\"text to be found\"],\"input_type\":\"search_document\",\"embedding_types\":[\"float\"]}'")
         case .gemini:
-            return "curl \(base)/v1beta/models/omni:embedContent\(ct)\(geminiAuth) -d '{\"content\":{\"parts\":[{\"text\":\"your text\"}]}}'"
+            pair = ("curl \(base)/v1beta/models/omni:embedContent\(ct)\(geminiAuth) -d '{\"content\":{\"parts\":[{\"text\":\"what to find\"}]},\"taskType\":\"RETRIEVAL_QUERY\"}'",
+                    "curl \(base)/v1beta/models/omni:embedContent\(ct)\(geminiAuth) -d '{\"content\":{\"parts\":[{\"text\":\"text to be found\"}]},\"taskType\":\"RETRIEVAL_DOCUMENT\"}'")
         }
+        return "# query\n\(pair.query)\n\n# document\n\(pair.document)"
     }
 
     // MARK: - Requests

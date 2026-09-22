@@ -2306,3 +2306,38 @@ three collections over those Strings; and 465 MB of `MALLOC_LARGE (empty)`.
   maintenance scans stretch it further.
 - OPEN, NOT FIXED: `deleteExtensions` takes 72 s to drop 25k of 100k files, identical before and
   after this work. Found by pathbench, not investigated.
+
+## OCR over HTTP and MCP (issue #22, 2026-09-22)
+
+Three surfaces, one core (`App/Serving/OCRServing.swift`): `POST /v1/chat/completions` (OpenAI
+shape, SSE streaming), `POST /v1/ocr` (Mistral OCR shape, 0-based `pages`), MCP `ocr` (1-based
+`pages`, 10 per call, paths only). Text parts are ignored: the model does not act on prompts.
+- ONE MODEL, ONE DECODE. `OCRModelHost` leases the weights to the workspace and to served
+  requests (served lease lingers 120 s) and owns a FIFO decode slot. A served request never queues
+  behind the workspace: 503 + `Retry-After` in ~2 ms. A served request after a workspace run
+  reuses the loaded model (1.3 s for one image, no reload).
+- NEVER AWAIT THE MAIN ACTOR ON THE SERVED PATH. A folder-access prompt on a fresh build held the
+  main thread in `open()` and a served request hung behind `MainActor.run` for 11 minutes. Hooks
+  into AppModel are posted to the main queue (FIFO), never awaited.
+- THE LIVE TAIL IS HELD BACK (`OCROrderedText.holdback`). A streamed update can carry a token past
+  the page end that the final result drops (1 page in 40 streamed a trailing "skap"). With 32 bytes
+  held back, 40 freshly decoded pages stream byte-identical to the non-streamed answer.
+- A JOB THAT TOOK THE SLOT MUST RUN. `streamBody` calls the producer even when the head fails to
+  send, and `Job.deinit` returns an unrun slot; otherwise OCR and indexing stall until restart.
+- Batched decoding is not bit-identical across batch compositions: two runs of the same 40 pages
+  (37 vs 40 fresh) differ by one character on one page. The workspace behaves the same.
+- Served decode footprint matches the workspace: the 0.13.6 control reads 22-23 GB during and
+  48 GB after a 40-page run (MLX buffer cache with the cap lifted); a served 10-page request reads
+  24 GB and returns to 2.6 GB when the linger ends.
+- Test the server ISOLATED: `-omni.dbDir`, `-omni.addedFolders`/`-omni.roots` on a scratch corpus,
+  `-omni.ephemeralUIState YES`, `-omni.serving.port 51299`, `-omni.ocr.cache.dir <scratch>`. A dev
+  build on the real roots raises folder prompts that must not be answered for the user.
+
+Serving review fixes in the same change: every embedding schema honours the query/document role
+and refuses an unknown one (query vs document cosine for one text: 0.876); a Gemini batch embeds
+each row by its own `taskType`; malformed batch items are 400s, not dropped rows; `/v1/search`
+normalizes folders and kinds; the idle timer no longer closes a connection while its handler works;
+upload buffering is in place (was quadratic), answers `100-continue`, and allows 48 MB only on the
+OCR routes for an authorized caller; symlinks cannot lead a path argument out of the indexed folders.
+
+SKILL.md (`ServingTab.skillMarkdown`) is reference, not manners: endpoints, fields, limits, errors.

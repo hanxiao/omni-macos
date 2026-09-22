@@ -52,12 +52,37 @@ struct HTTPRequest {
 enum HTTPParse {
     /// Body cap shared by the parser (head-time refusal) and the server (buffer-time refusal).
     static let maxBody = 8 * 1024 * 1024
+    /// The OCR routes take a whole document inline - a scanned PDF outside the indexed folders has
+    /// no other way in - and 8 MB of base64 is a 6 MB file, smaller than an ordinary scan.
+    static let maxDocumentBody = 48 * 1024 * 1024
+    /// The largest body any route accepts: what the server may buffer before the head is parsed.
+    static let maxAnyBody = maxDocumentBody
+
+    static func bodyCap(forTarget target: String) -> Int {
+        let route = target.split(separator: "?", maxSplits: 1).first.map(String.init) ?? target
+        return route == "/v1/ocr" || route == "/v1/chat/completions" ? maxDocumentBody : maxBody
+    }
 
     /// Try to parse one full request from the head of `buf`.
     /// Returns (request, bytesConsumed) once the head and the Content-Length body are
     /// fully buffered; returns nil to signal "read more bytes"; throws HTTPError.badRequest
     /// on a malformed head, non-UTF8 head, or a chunked transfer encoding (unsupported).
     static func tryParse(_ buf: Data) throws -> (HTTPRequest, Int)? {
+        guard let (head, bodyStart, contentLength) = try parseHead(buf) else { return nil }
+        let available = buf.distance(from: bodyStart, to: buf.endIndex)
+        if available < contentLength { return nil } // need more bytes
+
+        let bodyEnd = buf.index(bodyStart, offsetBy: contentLength)
+        var req = head
+        req.body = buf.subdata(in: bodyStart..<bodyEnd)
+        let consumed = buf.distance(from: buf.startIndex, to: bodyEnd)
+        return (req, consumed)
+    }
+
+    /// The request head alone, once it is buffered - with an empty body, where the body starts, and
+    /// how long it will be. The server reads it before the body is in, to decide whether a caller
+    /// may send a body larger than the default cap at all.
+    static func parseHead(_ buf: Data) throws -> (HTTPRequest, Data.Index, Int)? {
         // Find the CRLFCRLF that ends the head.
         guard let headerEnd = rangeOfHeaderTerminator(in: buf) else { return nil }
         let headData = buf.subdata(in: buf.startIndex..<headerEnd.lowerBound)
@@ -102,15 +127,7 @@ enum HTTPParse {
             }
             contentLength = cl
         }
-        if contentLength > maxBody { throw HTTPError.payloadTooLarge }
-
-        let bodyStart = headerEnd.upperBound
-        let available = buf.distance(from: bodyStart, to: buf.endIndex)
-        if available < contentLength { return nil } // need more bytes
-
-        let bodyEnd = buf.index(bodyStart, offsetBy: contentLength)
-        let body = buf.subdata(in: bodyStart..<bodyEnd)
-        let consumed = buf.distance(from: buf.startIndex, to: bodyEnd)
+        if contentLength > bodyCap(forTarget: target) { throw HTTPError.payloadTooLarge }
 
         let (routePath, query) = splitTarget(target)
         let req = HTTPRequest(
@@ -119,10 +136,10 @@ enum HTTPParse {
             routePath: routePath,
             query: query,
             headers: headers,
-            body: body,
+            body: Data(),
             httpVersion: version
         )
-        return (req, consumed)
+        return (req, headerEnd.upperBound, contentLength)
     }
 
     /// Locate the "\r\n\r\n" head terminator. Returns the Range covering those 4 bytes.
@@ -154,11 +171,47 @@ struct HTTPResponse {
     var status: Int
     var headers: [String: String]
     var body: Data
+    /// A streamed body, written with chunked transfer encoding as it is produced. `send` returns
+    /// false once the client has gone, which is the producer's cue to stop spending the GPU on it.
+    /// When set, `body` is ignored.
+    var stream: (@Sendable (_ send: @escaping @Sendable (Data) async -> Bool) async -> Void)?
 
     init(status: Int, headers: [String: String] = [:], body: Data = Data()) {
         self.status = status
         self.headers = headers
         self.body = body
+    }
+
+    /// Server-sent events: `text/event-stream`, one `data:` line per event, produced by `produce`.
+    static func eventStream(
+        _ produce: @escaping @Sendable (_ send: @escaping @Sendable (Data) async -> Bool) async -> Void
+    ) -> HTTPResponse {
+        var r = HTTPResponse(status: 200, headers: ["Content-Type": "text/event-stream",
+                                                   "Cache-Control": "no-cache"])
+        r.stream = produce
+        return r
+    }
+
+    /// The head of a streamed response: no Content-Length, chunked framing, never compressed.
+    func serializeStreamHead(keepAlive: Bool) -> Data {
+        var head = "HTTP/1.1 \(status) \(Self.reason(status))\r\n"
+        var h = headers
+        if h["Content-Type"] == nil { h["Content-Type"] = "application/json" }
+        h["Transfer-Encoding"] = "chunked"
+        h["Connection"] = keepAlive ? "keep-alive" : "close"
+        h["Date"] = Self.httpDate()
+        for (k, v) in h { head += "\(k): \(v)\r\n" }
+        head += "\r\n"
+        return Data(head.utf8)
+    }
+
+    /// One chunk of a chunked body. An empty payload is the terminating chunk.
+    static func chunk(_ payload: Data) -> Data {
+        var out = Data((String(payload.count, radix: 16) + "\r\n").utf8)
+        out.append(payload)
+        out.append(contentsOf: [0x0d, 0x0a])
+        if payload.isEmpty { out.append(contentsOf: [0x0d, 0x0a]) }
+        return out
     }
 
     /// Build a JSON response from a JSONSerialization-compatible object.
@@ -233,6 +286,7 @@ struct HTTPResponse {
         case 405: return "Method Not Allowed"
         case 413: return "Payload Too Large"
         case 500: return "Internal Server Error"
+        case 503: return "Service Unavailable"
         default: return "OK"
         }
     }
