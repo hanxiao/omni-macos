@@ -2252,3 +2252,57 @@ fragment appended to the default contradicts rules the default has already given
 ## Style
 - Site (site/omni): keep the homepage Features section lean - exactly 4 cards.
 - No emojis, no em dashes. Lean commits and docs. License is Apache 2.0.
+
+## Resident memory is v5-shaped too (2026-09-22)
+
+v5 normalised the DATABASE (dirs -> files -> occurrence -> chunk); memory stayed one flat
+occurrence-shaped table until this. Measured on a live 2,738,897-file / 10,702,966-occurrence index
+with `footprint`/`vmmap`/`heap` (7.6 GB): a 96-byte `Row` per occurrence carrying the path, the kind
+as a String and five per-FILE facts (1,027 MB); 2,742,399 path Strings (549 MB for 393 MB of text);
+three collections over those Strings; and 465 MB of `MALLOC_LARGE (empty)`.
+
+- THE SETTINGS PANEL NAMES EVERY TABLE (`VectorStore.SearchMemory`, grouped by what sets the size:
+  occurrence, file, content). It used to report two numbers, and because `Model` is computed as
+  MLX's active total MINUS what the store reports, every unnamed index array was billed to the model
+  weights (628 MB of `bitBase` on that index). Add a resident table, add it there.
+- A ROW IS 24 BYTES OF IDS (`fid`, `ci`, `slot`, `kc`, `chunkID`), `_isPOD`. Path, kind and the
+  per-file facts are read through `filePaths`, `idKind` and `fileMeta` (`pathOf`/`kindOf`/`metaOf`,
+  or `RowTables` where there is no store). `fileMeta` moves in lockstep with the path table at every
+  site that writes it. Metadata is per file, last write wins; a tombstone writes only while no live
+  row of its file has.
+- THE PATH TABLE IS `PathTable`: directories once, names once, a directory id per file, a hash index.
+  LOOKUP IS CANONICAL, NOT BYTES - `storedSpellingLocked` maps an NFC watcher path onto the NFD bytes
+  an older build wrote, and a byte-keyed table would index that file twice. Entries are hashed with
+  Swift's String hash and confirmed by bytes only when both sides are ASCII.
+- FOLDER TESTS ARE PER DIRECTORY, AND EXACT: a folder's closing "/" must fall inside the directory
+  part because a name has no "/". Two semantics exist and each call site keeps its own - BYTES for
+  the search filter and folder delete, `String.hasPrefix` for counts and the folder map. The one
+  case they differ per file (a name starting with a combining mark, directly in the folder) is
+  judged on the full String. `PathTableTests` pins both against the original expressions on paths
+  chosen to separate them.
+- NEVER BUILD A PATH STRING PER ROW OR PER FILE IN A LOOP. `filePaths[i]` allocates. Loops use
+  `filesUnder`, `acceptedFilesLocked`, the byte accessors, or collect file ids and convert once.
+- `PaperVectors.path` IS "f<k>" - at most 8 characters, which Swift stores INSIDE the String struct.
+  Every memory benchmark built on it measured path tables that cost zero bytes, which is how 549 MB
+  stayed invisible. Use `omni-verify storemem --real-paths` / `pathbench`, never the paper corpus,
+  for anything about memory.
+- TWO CRASHES THIS FOUND, both per-row GPU arrays sized by CONTENT count and used at OCCURRENCE
+  count: a `type:` filter on a full-mode index with shared content, and a date filter on every
+  quantized tier (the 1-bit tier of a large index included). Both were MLX shape errors, i.e.
+  fatalError. `FilteredSharedSearchTests`; `reducecheck` with `OMNI_GPU_REDUCE=1` must complete.
+- `malloc_zone_pressure_relief` runs after one-shot phases (open, compaction, vacuum, split build,
+  v4 drop) - never per query. It returns free pages only, so it cannot change an answer.
+- A FILTER ASKED LAZILY STAYS LAZY. The host reducer tests only files that could still enter the
+  top K, and under a narrow folder filter the top K never fills - so its old `accepts(path: ...)`
+  built a String for EVERY file on EVERY query (+130 ms at 2.7M files). `CompiledPathFilter` compiles
+  the path clauses once per query and answers per file id from bytes. Precomputing a full [Bool]
+  there would be the wrong fix: O(files) per query where the old code was nearly free on a broad
+  filter. Full arrays (`acceptedFilesLocked`) are for callers that read every file anyway.
+- MEASURED, `omni-verify pathbench 100000` on one shared store (`PATHBENCH_SRC`), before/after, two
+  reps, every digest identical: path memory 26.3 -> 12.5 MB, footprint after open 62 -> 43 MB,
+  `fileCounts`/`indexSummary` 51 -> 1.5 ms (the stats tick during indexing), a one-directory search
+  53 -> 1.5 ms warm, listing 15 -> 12.5 ms, open 338 -> 332 ms. Build the store ONCE: its build is
+  minutes at this size and is not what is measured; set OMNI_IDLE_FOLD=0 OMNI_VEC_COVERAGE=0 or idle
+  maintenance scans stretch it further.
+- OPEN, NOT FIXED: `deleteExtensions` takes 72 s to drop 25k of 100k files, identical before and
+  after this work. Found by pathbench, not investigated.

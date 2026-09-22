@@ -11380,6 +11380,25 @@ public final class VectorStore: @unchecked Sendable {
 
 
 
+    /// Hand freed heap pages back to the OS after a phase that has just released large buffers.
+    ///
+    /// malloc keeps freed LARGE regions mapped and dirty for reuse, and they count against the
+    /// process's footprint - what Activity Monitor and the Settings panel show - until something
+    /// asks for them back. Measured on a live 2.7M-file index with `vmmap`: 465 MB of
+    /// `MALLOC_LARGE (empty)`, regions with no allocation left in them at all, still resident after
+    /// the open and the migration. `malloc_zone_pressure_relief` returns exactly those pages; it
+    /// frees nothing that is allocated and changes no data structure, so it cannot affect an
+    /// answer. It walks the zones, so it runs only after one-shot phases - open, compaction,
+    /// vacuum, the migration's split build and v4 drop - and never on a query path.
+    static func releaseFreedHeap(_ phase: String) {
+        let t0 = omniPerfEnabled ? Date() : nil
+        let released = malloc_zone_pressure_relief(nil, 0)
+        if let t0 {
+            omniPerfLog(String(format: "heap-relief %@ released=%.1fMB %.1fms", phase,
+                               Double(released) / 1_048_576, -t0.timeIntervalSinceNow * 1000))
+        }
+    }
+
     private func memoryLocked() -> SearchMemory {
         var m = SearchMemory()
         let i32 = MemoryLayout<Int32>.stride
@@ -11452,6 +11471,7 @@ public final class VectorStore: @unchecked Sendable {
     /// vacuuming for - see repackIfHollowLocked.
     @discardableResult
     private func vacuumLocked() -> Int64 {
+        defer { Self.releaseFreedHeap("vacuum") }
         guard dbOpen() else { return 0 }
     let before = onDiskBytes()
         // VACUUM rewrites the whole database through this connection, and it does that with
@@ -11753,6 +11773,7 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     private func compactRowsLocked(_ shouldRemove: (Int) -> Bool) -> Set<String> {
+        defer { Self.releaseFreedHeap("compaction") }
         // Physical compaction is the ONLY thing that moves a row's vector within the file, so it is
         // the only thing that can falsify the coverage claim. Covered rows have no blob in SQLite -
         // the file IS their only copy - so their bytes have to be written back BEFORE they move.
@@ -12030,6 +12051,7 @@ public final class VectorStore: @unchecked Sendable {
     private var legacyLayout: Bool { hasColumnLocked("chunks", "path") }
 
     private func loadIntoMemory() {
+        defer { Self.releaseFreedHeap("open") }
         rows.removeAll(); flat16.removeAll(); fileID.removeAll(); filePaths.removeAll()
         // WITH THE ROWS IT DESCRIBES. Every loader below assigns it, but the paths that give up -
         // a coverage claim that cannot be read - return without loading anything, and a stale
@@ -13319,6 +13341,7 @@ public final class VectorStore: @unchecked Sendable {
     /// are dropped on the queue once the tables are, rather than discovering it later.
     @discardableResult
     func dropV4TablesLocked() -> Bool {
+        defer { Self.releaseFreedHeap("v4-drop") }
         guard splitBuilt, !Self.legacyWriteForTest, dbOpen(), !v4DropInFlight else { return false }
         guard hasTableLocked("chunks") || hasTableLocked("chunk_text") else { return false }
         // NOT WHILE v3 IS STILL BEING STAGED. `chunks` is the v3 -> v4 conversion's landing
@@ -13586,6 +13609,7 @@ public final class VectorStore: @unchecked Sendable {
     /// contents to produce.
     @discardableResult
     func buildChunkSplitLocked(highWaterOverride: Int64? = nil) -> Bool {
+        defer { Self.releaseFreedHeap("split-build") }
         guard !Self.legacyWriteForTest, dbOpen() else { return false }
         guard scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.chunkSplitDoneKey)'") != 1
         else { return false }
