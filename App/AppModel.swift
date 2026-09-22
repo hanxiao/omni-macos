@@ -1637,6 +1637,13 @@ final class AppModel {
     /// `other` is the REMAINDER (UI, thumbnails, SQLite page cache, frameworks), so the parts
     /// always add up to the total exactly and no slice is ever invented.
     struct MemorySample: Equatable {
+        static func == (a: MemorySample, b: MemorySample) -> Bool {
+            a.total == b.total && a.model == b.model && a.cache == b.cache && a.index == b.index
+                && a.other == b.other && a.indexGPU == b.indexGPU && a.indexCPU == b.indexCPU
+                && a.viz == b.viz && a.indexFresh == b.indexFresh
+                && a.parts.count == b.parts.count
+                && zip(a.parts, b.parts).allSatisfy { $0.name == $1.name && $0.bytes == $1.bytes }
+        }
         var total = 0, model = 0, cache = 0, index = 0, other = 0
         /// The Index slice split by where it lives, kept for the log and for anyone asking why a
         /// mostly-mmapped index costs RAM at all: `indexGPU` is the quantized base held as
@@ -1644,6 +1651,10 @@ final class AppModel {
         /// The big bf16 base is mapped from the on-disk sidecar and appears in NEITHER - clean
         /// file-backed pages cost no footprint.
         var indexGPU = 0, indexCPU = 0
+        /// The store's own table-by-table accounting, biggest first. This is what turns "Other is
+        /// 2.7 GB" into a list of structures a person can act on, and it is the only thing in this
+        /// struct that is not a single number.
+        var parts: [(name: String, bytes: Int)] = []
         /// The folder map's RETAINED state: the live layout, its kNN graph, and every layout the
         /// projection cache is holding for instant revisits. This is what the map still costs once
         /// it is drawn - roughly 100 B per dot. It is deliberately NOT the peak: showing a map also
@@ -1673,9 +1684,11 @@ final class AppModel {
             while let self, !Task.isCancelled {
                 let s = await self.sampleMemory()
                 let mb = { (b: Int) in String(format: "%.0f", Double(b) / 1_048_576) }
-                FileHandle.standardError.write(Data(
+                let parts = s.parts.map { "\($0.name)=\(mb($0.bytes))" }.joined(separator: " ")
+                let line =
                     "[mem] total=\(mb(s.total))MB model=\(mb(s.model))MB cache=\(mb(s.cache))MB index=\(mb(s.index))MB (gpu=\(mb(s.indexGPU)) cpu=\(mb(s.indexCPU))) viz=\(mb(s.viz))MB other=\(mb(s.other))MB sample=\(String(format: "%.0f", s.sampleUs))us fresh=\(s.indexFresh ? 1 : 0)\n"
-                        .utf8))
+                    + "[mem-parts] \(parts)\n"
+                FileHandle.standardError.write(Data(line.utf8))
                 try? await Task.sleep(for: .seconds(5))
             }
         }
@@ -1725,6 +1738,7 @@ final class AppModel {
             s.indexGPU = search.gpu
             s.indexCPU = search.cpu
             s.index = search.cpu + search.gpu
+            s.parts = search.parts
             s.model = max(0, omniGPUActiveMemory() - search.gpu)
             // Clamp before subtracting: the three measured parts come from different clocks (MLX
             // can allocate between the footprint read and its own), so a momentary overshoot must

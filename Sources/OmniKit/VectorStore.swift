@@ -1242,10 +1242,27 @@ public final class VectorStore: @unchecked Sendable {
                                      // base away, so dropping the free list here catches all of them
                                      // without a list of call sites to keep in step.
                                      invalidateFreeListLocked() }
-    // Membership index of the paths currently in `rows`. Lets replace() know in O(1) whether a
-    // path pre-exists, so a brand-new file skips removeRowsLocked entirely (no O(N) scan per file
-    // during a full index). Rebuilt from the surviving rows whenever removeRowsLocked compacts.
-    private var presentPaths: Set<String> = []
+    /// Does `path` currently have live rows? Lets replace() know in O(1) whether a path pre-exists,
+    /// so a brand-new file skips removeRowsLocked entirely (no O(N) scan per file during a full
+    /// index).
+    ///
+    /// THIS WAS A THIRD COPY OF THE PATH TABLE and is now derived. `presentPaths` was a
+    /// `Set<String>` holding one entry per live file - 2.7M of them on a large index, roughly 68 MB
+    /// of hash buckets beside `pathID`'s and `idPath`'s, all three keyed on the same strings and all
+    /// three answering questions about the same files. It was never independent: `dropFromPresent`
+    /// removed a path exactly when `fileChunkCount` hit zero, every insert sat immediately after an
+    /// `appendRowMetaLocked` that had just incremented it, and the one full rebuild spelled the
+    /// identity out as `fileChunkCount[i] > 0`. So the set was a materialisation of this expression,
+    /// maintained by hand at seven sites.
+    ///
+    /// Deriving it also retires a live hazard the old code documented and could not fix: a removal
+    /// predicate matching SOME of a file's rows evicted a path that still had rows, after which
+    /// `replace()` skipped its remove-before-append and stored the file's chunks twice. Nothing can
+    /// drift out of step with a value that is read rather than stored.
+    @inline(__always) private func pathIsPresentLocked(_ path: String) -> Bool {
+        guard let id = pathID[path].map(Int.init), id < fileChunkCount.count else { return false }
+        return fileChunkCount[id] > 0
+    }
 
     // Dense per-row file id (row-aligned with `rows`), plus its path->id intern table. Search
     // results are per FILE, but the index stores one vector per CHUNK; the reducer groups N chunk
@@ -1431,6 +1448,12 @@ public final class VectorStore: @unchecked Sendable {
     @inline(__always) private func internPath(_ p: String) -> Int32 {
         if let id = pathID[p] { return id }
         let id = Int32(pathID.count); pathID[p] = id; idPath.append(p); fileChunkCount.append(0)
+        // Keep the resident-bytes total current for one more path instead of leaving it to be
+        // re-walked. Only valid if it was current BEFORE the append; otherwise the next read
+        // recomputes anyway, and bumping a stale total would make it look fresh.
+        if pathBytesCacheCount == idPath.count - 1 {
+            pathBytesCache += Self.stringHeapBytes(p); pathBytesCacheCount = idPath.count
+        }
         // Grown HERE and not in the row loops, because a file id can outlive every one of its rows
         // and can even be born without any: loadIntoMemory interns the path (line ~4359) before the
         // guards that skip a dim-mismatched row, so idPath/fileChunkCount can be longer than the
@@ -2412,7 +2435,7 @@ public final class VectorStore: @unchecked Sendable {
             try validateDimLocked(chunks)
             // Holes first: this path's existing rows become tombstones after the commit below, and
             // the slots they keep have to be recorded inside the same transaction as their delete.
-            let victims = presentPaths.contains(path) ? victimRowsForPathsLocked([path]) : []
+            let victims = pathIsPresentLocked(path) ? victimRowsForPathsLocked([path]) : []
             beginTxnLocked()
             recordAndReleaseLocked(releasedSlotsLocked(victims))
             deletePathLocked(path)
@@ -2440,13 +2463,12 @@ public final class VectorStore: @unchecked Sendable {
             // Only rebuild the in-memory buffer if this path already had rows. For a new file
             // (the dominant indexing case) there is nothing to remove, so skip the O(N) scan and
             // just append. `append` grows flat16/rows geometrically (amortized O(1)).
-            if presentPaths.contains(path) { removeRowsByPathsLocked([path], victims: victims) }
+            if pathIsPresentLocked(path) { removeRowsByPathsLocked([path], victims: victims) }
             // AFTER the removal, never before: the removal can compact, and a slot decided against
             // the pre-removal numbering would name a different content by the time it is used.
             var seen: [Data: Int32] = [:]
             let assigned = appendChunksLocked(chunks, bfs: bfs, ids: written.residentIDs, seen: &seen)
             persistSlotsLocked(ids: written.rowIDs, contentIDs: written.contentIDs, slots: assigned)
-            presentPaths.insert(path)
             rowWindowAuditLocked("replace")
             // No invalidateBase(): a new path's rows append past baseRows and are scored as delta.
             // A pre-existing path already triggered removeRowsLocked above, which invalidates.
@@ -2505,7 +2527,7 @@ public final class VectorStore: @unchecked Sendable {
             let tSql = Self.searchTiming ? Date() : nil
             // Same reason as replace(): the rows these paths already have become tombstones after
             // the commit, and the slots they hold on to must be recorded inside it.
-            let victims = victimRowsForPathsLocked(Set(work.map { $0.path }.filter { presentPaths.contains($0) }))
+            let victims = victimRowsForPathsLocked(Set(work.map { $0.path }.filter { pathIsPresentLocked($0) }))
             beginTxnLocked()
             recordAndReleaseLocked(releasedSlotsLocked(victims))
             setStoredDimLocked(dim)
@@ -2534,7 +2556,7 @@ public final class VectorStore: @unchecked Sendable {
             exec("COMMIT;")
             let tRm = Self.searchTiming ? Date() : nil
             let affected = Set(work.map { $0.path })
-            if affected.contains(where: { presentPaths.contains($0) }) {
+            if affected.contains(where: { pathIsPresentLocked($0) }) {
                 removeRowsByPathsLocked(affected, victims: victims)   // one rebuild for the whole batch
             }
             // Accumulated across the WHOLE batch and written once. Per file it was one transaction
@@ -2555,7 +2577,6 @@ public final class VectorStore: @unchecked Sendable {
                     allContentIDs += written.contentIDs
                     allSlots += assigned
                 }
-                presentPaths.insert(it.path)
             }
             persistSlotsLocked(ids: allIDs, contentIDs: allContentIDs, slots: allSlots)
             rowWindowAuditLocked("replaceMany")
@@ -3071,7 +3092,7 @@ public final class VectorStore: @unchecked Sendable {
             exec("COMMIT;")
             // Release the backing buffers (a wipe will not refill to the same size immediately),
             // rather than removeAll which keeps the ~1.6GB capacity reserved.
-            rows = []; flat16.releaseAll(); presentPaths = []; fileID = []; pathID = [:]; idPath = []; fileChunkCount = []
+            rows = []; flat16.releaseAll(); fileID = []; pathID = [:]; idPath = []; fileChunkCount = []
             occSlot = []
             kindCode = []; kindID = [:]; idKind = []; resetTombstonesLocked(); invalidateBase()
             resetPathAllowCachesLocked()   // idPath is gone, so the tag-free table is gone with it
@@ -3126,7 +3147,7 @@ public final class VectorStore: @unchecked Sendable {
 
     /// Prior stored state for ONLY the given paths - the FSEvents reconcile touches a handful of files,
     /// so this avoids the full `GROUP BY path` scan over the whole index that `indexedFiles()` does.
-    /// `presentPaths` short-circuits brand-new files (no SQL); the rest are O(log N) lookups via `idx_path`.
+    /// The live-rows check short-circuits brand-new files (no SQL); the rest are O(log N) via `idx_path`.
     public func storedFiles(paths: Set<String>) -> [String: StoredFile] {
         guard !paths.isEmpty else { return [:] }
         return queue.sync {
@@ -3139,7 +3160,7 @@ public final class VectorStore: @unchecked Sendable {
                  WHERE d.path = ? AND f.name = ?;
                 """, -1, &stmt, nil) == SQLITE_OK else { return out }
             defer { sqlite3_finalize(stmt) }
-            for p in paths where presentPaths.contains(p) {   // not present -> definitely not stored, skip the query
+            for p in paths where pathIsPresentLocked(p) {   // not present -> definitely not stored, skip the query
                 sqlite3_reset(stmt); sqlite3_clear_bindings(stmt)
                 bindPath(stmt, 1, p)
                 if sqlite3_step(stmt) == SQLITE_ROW, sqlite3_column_type(stmt, 0) != SQLITE_NULL {
@@ -3153,7 +3174,7 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     /// Index status for ONLY the given paths, for the serving layer's per-file lookup. Same shape
-    /// as storedFiles(paths:) - presentPaths short-circuits misses with no SQL, hits are idx_path
+    /// as storedFiles(paths:) - the live-rows check short-circuits misses with no SQL, hits are idx_path
     /// B-tree aggregates - plus the chunk count and the newest indexed_at stamp. Read-only metadata:
     /// never touches vectors or the GPU. The batch is deduplicated and processed in fixed slices,
     /// each under its OWN queue.sync, so a concurrent per-keystroke search waits at most one slice -
@@ -3180,7 +3201,7 @@ public final class VectorStore: @unchecked Sendable {
                      WHERE d.path = ? AND f.name = ?;
                     """, -1, &stmt, nil) == SQLITE_OK else { return }
                 defer { sqlite3_finalize(stmt) }
-                for p in group where presentPaths.contains(p) {
+                for p in group where pathIsPresentLocked(p) {
                     sqlite3_reset(stmt); sqlite3_clear_bindings(stmt)
                     bindPath(stmt, 1, p)
                     if sqlite3_step(stmt) == SQLITE_ROW, sqlite3_column_type(stmt, 0) != SQLITE_NULL {
@@ -3259,7 +3280,7 @@ public final class VectorStore: @unchecked Sendable {
                     """
                 guard sqlite3_prepare_v2(db, tagSQL, -1, &stmt, nil) == SQLITE_OK else { return }
                 defer { sqlite3_finalize(stmt) }
-                for p in group where presentPaths.contains(p) {
+                for p in group where pathIsPresentLocked(p) {
                     sqlite3_reset(stmt); sqlite3_clear_bindings(stmt)
                     // bindPath, NOT one bind of the whole path. `fileIDByPath` is a two-parameter
                     // form (d.path = ?, f.name = ?); binding the full path to the first and leaving
@@ -4049,7 +4070,7 @@ public final class VectorStore: @unchecked Sendable {
 
     /// Tags for every media file sitting directly in `folder`, for the browser's Tags column.
     ///
-    /// Folder-scoped, so it needs no path binding and no `presentPaths` guard: it is one statement
+    /// Folder-scoped, so it needs no path binding and no live-rows guard: it is one statement
     /// over the same `dirs` row the listing already used, where `storedTags(paths:)` issues a
     /// prepared lookup per file. That API stays on the writer's queue because the serving layer
     /// hands it arbitrary paths, which have to resolve through `pathID` for the NFC/NFD spelling -
@@ -5948,6 +5969,10 @@ public final class VectorStore: @unchecked Sendable {
     func resetPathAllowCachesLocked() {
         invalidatePathAllowCacheLocked()
         pathAllowPureKey = nil; pathAllowPureGPU = nil
+        // These are exactly the paths that replace `idPath` itself, so the resident-path-bytes
+        // total is stale here and nowhere else. Riding the audited seam rather than adding a
+        // fifth thing for a future rewrite to remember.
+        pathBytesCacheCount = -1
     }
 
     /// The COMBINED per-row keep mask for a filtered query, cached across keystrokes.
@@ -7976,7 +8001,6 @@ public final class VectorStore: @unchecked Sendable {
             flat16.append(contentsOf: repeatElement(UInt16(0), count: highWater * d0 - flat16.count))
         }
         rows.reserveCapacity(live)
-        presentPaths.reserveCapacity(live)
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
         guard sqlite3_prepare_v2(db, Self.loadScanSQL(layoutLocked(), split: onSplit), -1, &stmt, nil) == SQLITE_OK
@@ -8073,7 +8097,6 @@ public final class VectorStore: @unchecked Sendable {
                             slot: Int32(pos), chunkID: sqlite3_column_int64(stmt, 11)))
             appendRowMetaLocked(internPath(path), kindCode: internKind(kind), kind: kind,
                                 path: path, slot: Int32(pos))
-            presentPaths.insert(path)
         }
         // EVERY POSITION THE FILE NOW HOLDS, which is the column's high water plus however many
         // unseated rows had to be placed past it. Written down once: the hole sweep, the length
@@ -8105,7 +8128,7 @@ public final class VectorStore: @unchecked Sendable {
             _ = declineBySlot(why.isEmpty
                 ? "rows \(rows.count - deadRows.count) against live \(live), buffer \(flat16.count) against \(placedHighWater * dim)"
                 : why)
-            rows.removeAll(); flat16.removeAll(); presentPaths.removeAll(); occSlot.removeAll()
+            rows.removeAll(); flat16.removeAll(); occSlot.removeAll()
             residentIDsAreContents = false
             slotBackfillCursor = -1
             fileID.removeAll(); pathID.removeAll(); idPath.removeAll(); fileChunkCount.removeAll()
@@ -8187,7 +8210,6 @@ public final class VectorStore: @unchecked Sendable {
                                    adoptElements: coveredRows * d0) else { return false }
         dim = d0
         rows.reserveCapacity(live + holes)
-        presentPaths.reserveCapacity(live)
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
         guard sqlite3_prepare_v2(db, Self.loadScanSQL(layoutLocked()), -1, &stmt, nil) == SQLITE_OK
@@ -8244,7 +8266,6 @@ public final class VectorStore: @unchecked Sendable {
                                 chunkID: sqlite3_column_int64(stmt, 11)))
                 appendRowMetaLocked(internPath(path), kindCode: internKind(kind), kind: kind,
                                     path: path, slot: Int32(stored))
-                presentPaths.insert(path)
                 continue   // no vector, and the slot counter does NOT advance
             }
             if slot < coveredRows {
@@ -8286,7 +8307,6 @@ public final class VectorStore: @unchecked Sendable {
             let claimed = storedSlot >= 0 ? Int(storedSlot) : slot
             appendRowMetaLocked(fid, kindCode: internKind(kind), kind: kind, path: path,
                                 slot: Int32(claimed))
-            presentPaths.insert(path)
             if claimed < occupied.count { occupied[claimed] = true }
             slot += 1
         }
@@ -8303,7 +8323,7 @@ public final class VectorStore: @unchecked Sendable {
         // is shared. `covered` above already counts positions, because a reusing row consumes none.
         let vectorUnits = slotCount
         guard ok, covered == coveredRows - holes, flat16.count == vectorUnits * dim else {
-            rows.removeAll(); flat16.removeAll(); presentPaths.removeAll(); occSlot.removeAll()
+            rows.removeAll(); flat16.removeAll(); occSlot.removeAll()
             slotBackfillCursor = -1
             fileID.removeAll(); pathID.removeAll(); idPath.removeAll(); fileChunkCount.removeAll()
             resetPathAllowCachesLocked()   // idPath emptied: nothing derived from it survives
@@ -10059,7 +10079,6 @@ public final class VectorStore: @unchecked Sendable {
             }
         }
         deadIdxCache = nil
-        presentPaths = Set(idPath.enumerated().compactMap { fileChunkCount[$0.offset] > 0 ? $0.element : nil })
         lastStampedGen = mutationGen
         invalidateBase()
         reportLoadProgress(1)
@@ -10981,18 +11000,88 @@ public final class VectorStore: @unchecked Sendable {
         return freed
     }
 
-    /// What the SEARCH DATA costs in memory right now, split by where it lives. Feeds the Settings
-    /// breakdown, which would otherwise file both halves under the wrong heading: the quantized
-    /// base is MLXArrays, so it shows up inside MLX's active total and reads as "the model", when
-    /// it is the index. Takes the store queue like sizeBytes(), so call it OFF the main actor -
-    /// a bulk index write can hold that queue for a while.
+    /// What the SEARCH DATA costs in memory right now, table by table.
     ///
-    /// Under-reports rather than guesses: row path strings on the heap are not counted, and the
-    /// file-backed part of the vector arena is excluded (clean pages, no footprint).
+    /// EVERY FIELD IS A NAMED STRUCTURE, NOT AN APPORTIONMENT. The previous version reported two
+    /// numbers - a `cpu` that was the row table and a `gpu` that was the quantized base - and the
+    /// store holds fourteen resident MLXArrays and a dozen host tables. Everything it did not name
+    /// did not vanish from the process; it landed in the Settings panel's `Other` remainder, or
+    /// worse, inside `Model`, because that slice is computed as MLX's active total MINUS whatever
+    /// this struct claims. On a 2.7M-file index that mislabelled roughly 760 MB of index as model
+    /// weights, and left 2.7 GB of a 7.6 GB process with no explanation at all.
+    ///
+    /// The fields are grouped by WHAT SETS THEIR SIZE, because that is the question worth asking of
+    /// a number that looks too big. v5 stores a path once per directory, a file's metadata once per
+    /// file and a vector once per distinct content; anything here that scales with occurrences but
+    /// describes a file or a content is paying a multiplier it should not.
     public struct SearchMemory: Sendable {
-        public var cpu = 0   // vector-arena tail + row table
-        public var gpu = 0   // quantized base held as MLXArrays
-        public init(cpu: Int = 0, gpu: Int = 0) { self.cpu = cpu; self.gpu = gpu }
+        // ---- host, sized by OCCURRENCE (one per file-chunk pointer)
+        /// `rows`, live bytes.
+        public var rowTable = 0
+        /// `rows`, allocated and not yet used. Swift arrays grow geometrically, so a table that
+        /// doubled at 5.3M entries holds a second 5.3M entries' worth of address space; the part of
+        /// it that has ever been written stays dirty and counts against the process for good.
+        public var rowSlack = 0
+        /// The dense mirrors the hot loops read instead of `rows`: `fileID`, `occSlot`, `kindCode`.
+        public var rowMirrors = 0
+        /// `slotRowStart` + `slotRowIdx`: the v5 reverse edge, content -> the rows holding it.
+        public var contentEdge = 0
+        // ---- host, sized by FILE
+        /// Heap bytes of the interned path strings themselves.
+        public var pathBytes = 0
+        /// The collections that REFERENCE those strings: `idPath` and `pathID`. Counted apart
+        /// from the bytes because the references and the text scale differently - a shorter path
+        /// shrinks one and not the other.
+        public var pathTables = 0
+        /// `fileChunkCount`, `fileRowLo`, `fileRowHi`.
+        public var fileTables = 0
+        // ---- host, vectors
+        /// The part of the vector arena that is NOT backed by the sidecar file. File-backed pages
+        /// are clean and cost no footprint; this tail is anonymous and costs every byte.
+        public var vectorTail = 0
+        // ---- GPU
+        /// The resident scan matrix, whichever form is live: `mlxBase` (bf16), `quantBase`
+        /// (group-quantized) or `bitBase` (packed sign bits).
+        public var scanBase = 0
+        /// Per-row GPU sidecars: `mlxFileID`, `mlxKindCode`, `mlxModified`, `mlxOccSlot`,
+        /// `mlxDeadOcc`, `deadIdxCache`, `orphanCache`.
+        public var gpuMirrors = 0
+        /// Cached filter tables and sign scratch: `pathAllowGPU`, `pathAllowPureGPU`,
+        /// `selectMaskGPU`, `quantSigns`, `bitSigns`.
+        public var gpuFilters = 0
+
+        public var cpu: Int {
+            rowTable + rowSlack + rowMirrors + contentEdge
+                + pathBytes + pathTables + fileTables + vectorTail
+        }
+        public var gpu: Int { scanBase + gpuMirrors + gpuFilters }
+        public var total: Int { cpu + gpu }
+
+        public init() {}
+
+        /// Named parts, biggest first - for the memory log and for anyone printing a breakdown.
+        public var parts: [(name: String, bytes: Int)] {
+            [("rows", rowTable), ("rows-slack", rowSlack), ("row-mirrors", rowMirrors),
+             ("content-edge", contentEdge), ("path-bytes", pathBytes), ("path-tables", pathTables),
+             ("file-tables", fileTables), ("vector-tail", vectorTail),
+             ("scan-base", scanBase), ("gpu-mirrors", gpuMirrors), ("gpu-filters", gpuFilters)]
+                .filter { $0.bytes > 0 }.sorted { $0.bytes > $1.bytes }
+        }
+    }
+
+    /// The three counts that set every resident table's size. Reported next to the byte totals
+    /// because "is this table too big" is unanswerable without knowing which of the three it is
+    /// sized by - that is the whole v5 question, in the one place it can be seen.
+    public struct ResidentCounts: Sendable {
+        public var occurrences = 0   // rows: one per file-chunk pointer
+        public var files = 0         // interned paths
+        public var contents = 0      // distinct vectors (slots)
+    }
+
+    public var residentCounts: ResidentCounts {
+        queue.sync {
+            ResidentCounts(occurrences: rows.count, files: idPath.count, contents: slotCount)
+        }
     }
 
     public func residentSearchMemory() -> SearchMemory {
@@ -11105,18 +11194,96 @@ public final class VectorStore: @unchecked Sendable {
         queue.async { completion(self.memoryLocked()) }
     }
 
+    /// Swift's native hash tables are a power-of-two bucket array held at 3/4 max load, with one
+    /// occupancy bit per bucket and keys/values stored inline in the buckets. `capacity` is the
+    /// element count the table reports, so the bucket count has to be inverted back out of it -
+    /// using `capacity` directly under-reports a full table by a third.
+    @inline(__always) static func hashTableBytes(capacity: Int, entryStride: Int) -> Int {
+        guard capacity > 0 else { return 0 }
+        var buckets = 1
+        while (buckets * 3) / 4 < capacity { buckets <<= 1 }
+        return buckets * entryStride + buckets / 8
+    }
+
+    /// Heap bytes one String costs. Up to 15 UTF-8 bytes live INSIDE the String struct with no
+    /// allocation at all, which is why this is not simply `utf8.count`: on an index of short names
+    /// the difference is the whole number. Anything longer is a heap object carrying a 32-byte
+    /// header, rounded up to malloc's size class - so this matches what the allocator actually
+    /// took, not what was asked for.
+    @inline(__always) private static func stringHeapBytes(_ s: String) -> Int {
+        let n = s.utf8.count
+        return n <= 15 ? 0 : malloc_good_size(32 + n)
+    }
+
+    /// Total heap bytes of the interned paths, maintained incrementally.
+    ///
+    /// `internPath` is the only place a path is appended, so the steady-state cost is one add.
+    /// The four places that replace `idPath` wholesale all call `resetPathAllowCachesLocked`
+    /// (audited at `pathAllowPureGPU`), which invalidates this; the count check is a second net
+    /// under that audit rather than a substitute for it. Recomputing walks 2.7M Strings at roughly
+    /// 10 ms, which is affordable once after a reload and is not affordable once a second on the
+    /// queue interactive search shares.
+    private var pathBytesCache = 0
+    private var pathBytesCacheCount = -1
+
+    private func pathBytesLocked() -> Int {
+        if pathBytesCacheCount == idPath.count { return pathBytesCache }
+        var n = 0
+        for p in idPath { n += Self.stringHeapBytes(p) }
+        pathBytesCache = n
+        pathBytesCacheCount = idPath.count
+        return n
+    }
+
     private func memoryLocked() -> SearchMemory {
         var m = SearchMemory()
-        // Two capacity reads, no walk: this runs once a second from the Settings panel, on the queue
-        // interactive search contends for, and is documented at ~6us. 8 bytes per FILE, so 1.6MB at
-        // 212k files - reported rather than left in the UI's "Other" remainder. CAPACITY, not count:
-        // internPath appends one file at a time, so the arrays grow geometrically and up to twice
-        // the counted bytes are actually resident.
-        m.cpu = flat16.anonymousBytes + rows.count * MemoryLayout<Row>.stride
-              + (fileRowLo.capacity + fileRowHi.capacity) * MemoryLayout<Int32>.stride
+        let i32 = MemoryLayout<Int32>.stride
+
+        // HOST, per occurrence. CAPACITY, not count, everywhere a Swift array is involved: they
+        // grow geometrically, so a table that doubled holds up to twice the counted bytes and every
+        // page of it that was ever written stays dirty for the life of the process.
+        let rowStride = MemoryLayout<Row>.stride
+        m.rowTable = rows.count * rowStride
+        m.rowSlack = max(0, rows.capacity - rows.count) * rowStride
+        m.rowMirrors = (fileID.capacity + occSlot.capacity) * i32 + kindCode.capacity
+        m.contentEdge = (slotRowStart.capacity + slotRowIdx.capacity) * i32
+
+        // HOST, per file.
+        m.pathBytes = pathBytesLocked()
+        m.pathTables = idPath.capacity * MemoryLayout<String>.stride
+            + Self.hashTableBytes(capacity: pathID.capacity,
+                                  entryStride: MemoryLayout<String>.stride + i32)
+        m.fileTables = (fileChunkCount.capacity + fileRowLo.capacity + fileRowHi.capacity) * i32
+
+        // HOST, vectors. The file-backed prefix is clean and costs no footprint; only the
+        // anonymous append tail does.
+        m.vectorTail = flat16.anonymousBytes
+
+        // GPU. Every resident MLXArray is named here. One that is added later and not added here
+        // does not disappear - it silently reappears inside the Settings panel's Model slice,
+        // which is computed as MLX's active total minus what this reports.
         if let q = quantBase {
-            m.gpu = q.wq.nbytes + q.scales.nbytes + (q.biases?.nbytes ?? 0)
+            m.scanBase += q.wq.nbytes
+            m.scanBase += q.scales.nbytes
+            m.scanBase += q.biases?.nbytes ?? 0
         }
+        m.scanBase += mlxBase?.nbytes ?? 0
+        m.scanBase += bitBase?.nbytes ?? 0
+        func nb(_ a: MLXArray?) -> Int { a?.nbytes ?? 0 }
+        var mirrors = nb(mlxFileID)
+        mirrors += nb(mlxKindCode)
+        mirrors += nb(mlxModified)
+        mirrors += nb(mlxOccSlot)
+        mirrors += nb(mlxDeadOcc)
+        mirrors += nb(deadIdxCache)
+        mirrors += nb(orphanCache)
+        m.gpuMirrors = mirrors
+        var filters = nb(pathAllowGPU)
+        filters += nb(pathAllowPureGPU)
+        filters += nb(selectMaskGPU)
+        filters += nb(quantSigns)
+        filters += nb(bitSigns)
+        m.gpuFilters = filters
         return m
     }
 
@@ -11234,7 +11401,7 @@ public final class VectorStore: @unchecked Sendable {
             // of every cleared blob - for a delete with nothing to delete. Same shape as the
             // repeated folder delete, and reachable from the more common event: a second
             // notification for a file that is already gone.
-            guard !pre.isEmpty else { dropFromPresentLocked(paths); return }
+            guard !pre.isEmpty else { return }
             if let r = tombstoneOnlyLocked(victims: pre) { removed = r; tombstoned = true }
         } else {
             idMask.withUnsafeBufferPointer { m in
@@ -11252,26 +11419,7 @@ public final class VectorStore: @unchecked Sendable {
             }
             removed = removeRow.withUnsafeBufferPointer { rm in compactRowsLocked { rm[$0] } }
         }
-        dropFromPresentLocked(removed.isEmpty ? paths : removed)
         rowWindowAuditLocked("removeRowsByPaths")
-    }
-
-    /// Drop `paths` from `presentPaths`, but only the ones that have no live chunk left.
-    ///
-    /// The removal helpers report every path they touched, not every path they emptied, and the old
-    /// `presentPaths.subtract(removed)` took that at face value. A predicate that matched SOME of a
-    /// file's rows therefore evicted a path that still had rows, and `replace()` keys its
-    /// remove-before-append on exactly this set (`if presentPaths.contains(path)`) - so the next save
-    /// of that file would skip the removal and append a second copy of its chunks beside the first.
-    /// No shipped predicate is partial today (kind and extension and folder are all per-file
-    /// properties, and one path carries one kind), which is why this has never fired; it is one
-    /// mixed-kind file away from firing, and it fails silently and unboundedly when it does.
-    @inline(__always) private func dropFromPresentLocked(_ paths: Set<String>) {
-        for p in paths {
-            let id = pathID[p].map(Int.init) ?? -1
-            let stillLive = id >= 0 && id < fileChunkCount.count && fileChunkCount[id] > 0
-            if !stillLive { presentPaths.remove(p) }
-        }
     }
 
     /// `victims` is the caller's already-resolved list of live rows to remove - the same list it had
@@ -11297,7 +11445,6 @@ public final class VectorStore: @unchecked Sendable {
                 // dim > 0 (tombstoneOnlyLocked), so a non-empty deadRows implies dim > 0 implies we
                 // are not in this branch. If that guard ever moves, this line resurrects rows.
                 rows.removeAll(where: predicate); resetTombstonesLocked()
-                presentPaths = Set(rows.map { $0.path })
                 rebuildFileIDsLocked()
                 invalidateBase()
             }
@@ -11314,8 +11461,7 @@ public final class VectorStore: @unchecked Sendable {
         } else {
             guard rows.contains(where: predicate) else { return }
         }
-        let removed = removeRowsFastLocked(victims: victims) { predicate(rows[$0]) }
-        dropFromPresentLocked(removed)
+        _ = removeRowsFastLocked(victims: victims) { predicate(rows[$0]) }
         rowWindowAuditLocked("removeRows")
     }
 
@@ -11326,7 +11472,7 @@ public final class VectorStore: @unchecked Sendable {
     /// re-densified: surviving file-ids stay valid (ids are never reused), a re-added path reuses its
     /// id, a fully-removed id just goes unreferenced (fileIDCount becomes an upper bound -> the
     /// reducer's per-file array is merely oversized, never wrong); loadIntoMemory rebuilds them densely
-    /// next launch. Returns the set of removed paths (for presentPaths maintenance). Invalidates base.
+    /// next launch. Returns the set of removed paths. Invalidates base.
     /// Remove rows without moving the index: what falls inside the resident base is tombstoned,
     /// what falls in the delta compacts as before. Falls back to a full compaction when the
     /// tombstones would pass `deadBudget`, which also collects the ones already standing.
@@ -11740,7 +11886,7 @@ public final class VectorStore: @unchecked Sendable {
     private var legacyLayout: Bool { hasColumnLocked("chunks", "path") }
 
     private func loadIntoMemory() {
-        rows.removeAll(); flat16.removeAll(); presentPaths.removeAll(); fileID.removeAll(); pathID.removeAll()
+        rows.removeAll(); flat16.removeAll(); fileID.removeAll(); pathID.removeAll()
         // WITH THE ROWS IT DESCRIBES. Every loader below assigns it, but the paths that give up -
         // a coverage claim that cannot be read - return without loading anything, and a stale
         // "these ids are contents" outliving the rows it was true of is the one way this flag
@@ -11884,7 +12030,6 @@ public final class VectorStore: @unchecked Sendable {
                 }
             }
             flat16.reserveCapacity(total * d0)   // no-op when mapped
-            presentPaths.reserveCapacity(total)
             fileID.reserveCapacity(total)
             kindCode.reserveCapacity(total)
         }
@@ -11952,7 +12097,6 @@ public final class VectorStore: @unchecked Sendable {
                                     chunkID: sqlite3_column_int64(stmt, 11)))
                     appendRowMetaLocked(internPath(path), kindCode: internKind(kind), kind: kind,
                                         path: path, slot: Int32(reusePosition))
-                    presentPaths.insert(path)
                     continue
                 }
                 guard let blob = sqlite3_column_blob(stmt, 4) else { continue }
@@ -11977,7 +12121,6 @@ public final class VectorStore: @unchecked Sendable {
                                     slot: lastAppendedSlot)
                 if storedSlot >= 0, storedSlot < claimedPos.count { claimedPos[storedSlot] = lastAppendedSlot }
                 renumbered = renumbered || (storedSlot >= 0 && Int(lastAppendedSlot) != storedSlot)
-                presentPaths.insert(path)
             }
         }
         sqlite3_finalize(stmt)
@@ -12453,7 +12596,7 @@ public final class VectorStore: @unchecked Sendable {
     /// The spelling SQLite actually holds for `path`.
     ///
     /// Swift's String equality is CANONICAL: "Eigentümer" written NFC (U+00FC) and NFD (u +
-    /// U+0308) compare equal, hash equal, and are ONE key in pathID and presentPaths. SQLite
+    /// U+0308) compare equal, hash equal, and are ONE key in pathID. SQLite
     /// compares BYTES, so those same two spellings are TWO rows. Every in-memory map therefore
     /// answers "present" for a spelling the SQL lookup then misses.
     ///
@@ -12462,7 +12605,7 @@ public final class VectorStore: @unchecked Sendable {
     /// readily as for an NFD one - so every non-ASCII path indexed then is NFD on disk. Since
     /// 9ca0817 the crawler's raw string is stored instead (photos:// paths cannot go through URL),
     /// and that is the filesystem's own form, usually NFC. A watcher event on such a file then
-    /// took the worst of both: storedFiles() cleared the presentPaths guard and missed in SQL, so
+    /// took the worst of both: storedFiles() cleared the live-rows guard and missed in SQL, so
     /// the file looked new and was re-embedded, while replaceMany's victim lookup found the OLD
     /// row through pathID and released its vector slots as holes - holes over rows the byte-keyed
     /// DELETE had failed to remove. The result is a duplicate file row plus bookkeeping that

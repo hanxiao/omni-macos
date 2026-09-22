@@ -688,6 +688,11 @@ private struct MemoryBreakdown: View {
 
     private func fmt(_ bytes: Int) -> String { ByteSize.memory(bytes) }
 
+    /// The Index slice, itemised. Shown on demand rather than always: four slices answer "where did
+    /// it go", and this answers the follow-up, which only some people have. The store names its own
+    /// tables (VectorStore.SearchMemory) so nothing here is apportioned or guessed.
+    @State private var showParts = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
@@ -697,6 +702,24 @@ private struct MemoryBreakdown: View {
             }
             bar
             legend
+            if !sample.parts.isEmpty {
+                DisclosureGroup(isExpanded: $showParts) {
+                    LazyVGrid(columns: [GridItem(.flexible(), alignment: .leading),
+                                        GridItem(.flexible(), alignment: .leading)], spacing: 4) {
+                        ForEach(sample.parts, id: \.name) { p in
+                            HStack(spacing: 5) {
+                                Text(p.name)
+                                Spacer(minLength: 4)
+                                Text(fmt(p.bytes)).foregroundStyle(.secondary).monospacedDigit()
+                            }
+                        }
+                    }
+                    .font(.caption)
+                    .padding(.top, 4)
+                } label: {
+                    Text("Index detail").font(.caption)
+                }
+            }
         }
         // Keyed on isVisible: SwiftUI cancels and restarts the task whenever it flips, so leaving
         // the tab stops the loop at the next await and re-entering starts a fresh one.

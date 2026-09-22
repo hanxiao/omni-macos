@@ -1473,7 +1473,25 @@ if args.count >= 2 && args[1] == "rowwindowbench" {
 // The vectors are the obvious cost and are already as small as bf16 allows. This reports what the
 // row bookkeeping costs beside them, measured as resident footprint across each build stage rather
 // than computed from struct sizes, so String heap allocations are counted where they actually land.
-func storememRun(_ rows: Int) throws -> Int32 {
+/// A path shaped like one in a real index, for the memory cases only.
+///
+/// `PaperVectors.path` is "f<k>" - at most eight characters, which Swift stores INSIDE the String
+/// struct with no heap allocation at all. Its own comment says a realistic path "would add bytes to
+/// every row and measure nothing", which is exactly right for the vector cases and exactly wrong
+/// here: it means every memory benchmark in this repo has measured a store whose path tables cost
+/// literally zero bytes. That is how 549 MB of interned paths stayed invisible on a 7.6 GB process.
+///
+/// The shape is taken from a real 2,738,897-file index: 279,097 directories (9.8 files each),
+/// full path 143.5 characters mean, file name 32.6 characters mean.
+func realisticPath(file k: Int) -> String {
+    let dir = k / 10
+    let stem = "d\(dir)"
+    let pad = String(repeating: "x", count: max(0, 100 - stem.utf8.count))
+    let name = "file-\(k)-" + String(repeating: "y", count: 20)
+    return "/Users/u/Documents/\(stem)\(pad)/\(name).txt"
+}
+
+func storememRun(_ rows: Int, realPaths: Bool = false) throws -> Int32 {
     let dim = 768, chunksPerFile = 8
     omniSetMemoryLimit(6_000_000_000)
     let root = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -1486,7 +1504,25 @@ func storememRun(_ rows: Int) throws -> Int32 {
           + "  -> \(Double(VectorStore.rowStride * rows) / 1e6) MB for `rows` alone")
     let m0 = churnFootprintMB()
     let store = try VectorStore(dbURL: root.appendingPathComponent("m.sqlite"))
-    _ = try PaperVectors.buildStore(rows: rows, into: store, chunksPerFile: chunksPerFile, dim: dim)
+    if realPaths {
+        var done = 0
+        while done < rows {
+            let next = min(rows, done + 65_536)
+            var batch: [(path: String, chunks: [IndexedChunk])] = []
+            batch.reserveCapacity((next - done) / chunksPerFile)
+            for f in (done / chunksPerFile) ..< (next / chunksPerFile) {
+                let p = realisticPath(file: f)
+                batch.append((p, (0 ..< chunksPerFile).map { c in
+                    IndexedChunk(path: p, modified: 0, size: 0, kind: "text", chunkIndex: c,
+                                 snippet: "", embedding: PaperVectors.vec(f * chunksPerFile + c, dim: dim))
+                }))
+            }
+            try store.replaceMany(batch)
+            done = next
+        }
+    } else {
+        _ = try PaperVectors.buildStore(rows: rows, into: store, chunksPerFile: chunksPerFile, dim: dim)
+    }
     let m1 = churnFootprintMB()
     _ = store.search(PaperVectors.query(0, dim: dim), topK: 60)
     let m2 = churnFootprintMB()
@@ -1498,11 +1534,52 @@ func storememRun(_ rows: Int) throws -> Int32 {
     print(String(format: "  vector buffer used %.0f MB, reserved %.0f MB (%.2fx), mapped=%@",
                  Double(vb.used * 2) / 1e6, Double(vb.capacity * 2) / 1e6,
                  Double(vb.capacity) / Double(max(1, vb.used)), vb.mapped ? "yes" : "no"))
+    printStoreMemory(store)
     store.close()
     return 0
 }
+
+/// The store's own table-by-table accounting, printed the same way wherever it is asked for.
+///
+/// This is the number the Settings panel shows, from the same call, so a discrepancy between what a
+/// user reports and what a bench prints is a real discrepancy rather than two different estimates.
+/// The per-unit columns are the point of the exercise: a table sized by OCCURRENCE that describes a
+/// FILE is paying the v5 sharing factor in reverse, and that only shows up as bytes-per-row next to
+/// bytes-per-file.
+func printStoreMemory(_ store: VectorStore) {
+    let m = store.residentSearchMemory()
+    let c = store.residentCounts
+    let mb = { (b: Int) in String(format: "%8.1f MB", Double(b) / 1_048_576) }
+    print("  resident tables   occurrences=\(c.occurrences) files=\(c.files) contents=\(c.contents)")
+    for p in m.parts {
+        let perOcc = c.occurrences > 0 ? Double(p.bytes) / Double(c.occurrences) : 0
+        let perFile = c.files > 0 ? Double(p.bytes) / Double(c.files) : 0
+        print(String(format: "    %-14@ %@   %6.1f B/occ  %7.1f B/file",
+                     p.name as NSString, mb(p.bytes), perOcc, perFile))
+    }
+    print("    \("-- total" as NSString) \(mb(m.total))   host \(mb(m.cpu)) gpu \(mb(m.gpu))")
+}
+
 if args.count >= 2 && args[1] == "storemem" {
-    exit(try storememRun((args.count >= 3 ? Int(args[2]) : nil) ?? 1_000_000))
+    // storemem --db <index.sqlite>   opens an EXISTING index and reports only.
+    //
+    // WORK ON A COPY. This opens the store read-write (there is no read-only mode: the open path
+    // is also the repair path, by design), so pointing it at an index another process has live is
+    // not a measurement, it is two writers.
+    if args.count >= 4, args[2] == "--db" {
+        let url = URL(fileURLWithPath: args[3])
+        omniSetMemoryLimit(6_000_000_000)
+        let t0 = Date()
+        let store = try VectorStore(dbURL: url)
+        print(String(format: "storemem --db %@  loaded in %.1fs", url.path as NSString,
+                     -t0.timeIntervalSinceNow))
+        printStoreMemory(store)
+        store.close()
+        exit(0)
+    }
+    let real = args.contains("--real-paths")
+    let n = args.count >= 3 ? (Int(args[2]) ?? 1_000_000) : 1_000_000
+    exit(try storememRun(n, realPaths: real))
 }
 
 // Folder-map cost against the buffer cache: omni-verify mapbench [files] [dim]
