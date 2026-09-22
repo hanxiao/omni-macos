@@ -28,7 +28,7 @@ import Foundation
 /// decision per DIRECTORY: a name cannot contain "/", so a path lies under `folder/` exactly when
 /// its directory part does. On the index above that is 279,097 decisions instead of 2,738,897
 /// String prefix tests.
-struct PathTable {
+struct PathTable: Sendable {
     // Directories: the path up to and including its last "/", interned. "" for a path with none.
     private var dirBlob: [UInt8] = []
     private var dirEnd: [Int] = []           // dir d spans dirBlob[dirStart(d) ..< dirEnd[d]]

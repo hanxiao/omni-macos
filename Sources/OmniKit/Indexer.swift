@@ -652,11 +652,11 @@ public final class Indexer: @unchecked Sendable {
         // and join just before its first consumer (the first pipeline / the stale reconcile), so
         // time-to-first-embed is max(crawl, query) instead of their sum - most visible at startup on
         // a large existing index. (F6)
-        final class KnownBox: @unchecked Sendable { var v: [String: StoredFile] = [:] }
+        final class KnownBox: @unchecked Sendable { var v: VectorStore.KnownFiles = .empty }
         let knownBox = KnownBox()
         let knownReady = DispatchSemaphore(value: 0)
         DispatchQueue.global(qos: .utility).async { [store = store] in
-            knownBox.v = store.indexedFiles()
+            knownBox.v = store.knownFiles()
             knownReady.signal()
         }
         // WHAT THE CRAWL TOUCHED, as digests rather than paths.
@@ -1580,7 +1580,7 @@ public final class Indexer: @unchecked Sendable {
                 off += b.raws.count
             }
         }
-        pipeline(work, force: true, known: [:], settings: settings) { item in
+        pipeline(work, force: true, known: .empty, settings: settings) { item in
             let path = item.file.path
             switch item.payload {
             case .text(let pieces) where !pieces.isEmpty:
@@ -1656,7 +1656,7 @@ public final class Indexer: @unchecked Sendable {
     /// Bounded concurrent-decode -> serial-consume. `consume` is invoked in file order,
     /// serially, on the calling thread; decode runs on up to `activeProcessorCount`
     /// background cores. At most that many items are outstanding (bounds memory).
-    private func pipeline(_ files: [CrawledFile], force: Bool, known: [String: StoredFile],
+    private func pipeline(_ files: [CrawledFile], force: Bool, known: VectorStore.KnownFiles,
                           settings: IndexSettings, consume: (DecodedItem) -> Void) {
         if files.isEmpty { return }
         let maxInFlight = max(2, ProcessInfo.processInfo.activeProcessorCount)

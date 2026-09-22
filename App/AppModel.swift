@@ -2439,9 +2439,9 @@ final class AppModel {
         let candidate = OmniIgnore(text: text)
         let rootPaths = roots.map { $0.path }
         Task.detached(priority: .userInitiated) {
-            let files = store.indexedFiles()
+            // Iterated, not materialised: a path String exists only while it is being tested.
             var kept = 0, removed = 0, samples: [String] = []
-            for path in files.keys {
+            store.knownFiles().forEach { path, _ in
                 if candidate.isIgnored(path, isDir: false) {
                     removed += 1
                     if samples.count < 12 { samples.append(path) }
@@ -2486,8 +2486,7 @@ final class AppModel {
         ignorePreview = nil
         guard changed, let store else { return }
         Task.detached(priority: .utility) {
-            let files = store.indexedFiles()
-            let drop = Set(files.keys.filter { new.isIgnored($0, isDir: false) })
+            let drop = Set(store.knownFiles().compactMap { path, _ in new.isIgnored(path, isDir: false) ? path : nil })
             if !drop.isEmpty { store.deletePaths(drop); store.compact() }
             await MainActor.run {
                 self.refreshIndexStats(store)

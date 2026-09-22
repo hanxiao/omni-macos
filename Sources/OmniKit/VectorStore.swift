@@ -3206,43 +3206,112 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
-    /// path -> (modified, size) for incremental change detection. Served from the RESIDENT rows,
-    /// not SQLite: the old `GROUP BY path` dragged the entire chunks B-tree - whose leaves carry
-    /// the vec blobs, gigabytes of pages - through the page cache ON the store queue. Caught live
-    /// at 3.8M rows on a base M-chip: minutes of pread with every search queued behind it, at the
-    /// start of every catch-up pass. The in-memory pass reproduces MAX(modified)/MAX(size)/
-    /// MAX(kind) per path in a few hundred ms with zero disk. Rows whose stored dim mismatched the
-    /// index (skipped at load) now report as unindexed and re-embed - self-healing where the SQL
-    /// form kept them stale forever.
-    public func indexedFiles() -> [String: StoredFile] {
+    /// The files the index knows, answerable by path WITHOUT a String per file.
+    ///
+    /// An index pass takes this at its start and holds it until the stale sweep at the end - which
+    /// on a large index is most of the pass. It used to be `[String: StoredFile]`, whose keys were
+    /// the store's own interned Strings and so cost nothing extra. Once the store stopped keeping a
+    /// String per path, that dictionary had to BUILD one per file: 2.7M fresh Strings, ~550 MB,
+    /// alive for the whole pass that every launch starts. Measured on the shipped 0.13.5.
+    ///
+    /// Here the path table is shared copy-on-write with the store, so it costs nothing until the
+    /// store next interns a path, and then one compact copy of the table rather than a String per
+    /// file. The per-file values are copied compactly. Lookup is the table's CANONICAL lookup, the
+    /// same equality the dictionary's String keys gave; a path with no live rows is absent, as it
+    /// was. `compactMap`/`forEach` build each path String only for the duration of one call.
+    public struct KnownFiles: Sendable {
+        fileprivate let paths: PathTable
+        fileprivate let modified: [Double]
+        fileprivate let size: [Int64]
+        fileprivate let kindIndex: [Int16]      // -1: no live rows, not known
+        fileprivate let kindNames: [String]
+        public let count: Int
+
+        public static let empty = KnownFiles(paths: PathTable(), modified: [], size: [], kindIndex: [],
+                                             kindNames: [], count: 0)
+
+        public var isEmpty: Bool { count == 0 }
+
+        @inline(__always) private func value(_ i: Int) -> StoredFile? {
+            guard i < kindIndex.count, kindIndex[i] >= 0 else { return nil }
+            return StoredFile(modified: modified[i], size: Int(size[i]), kind: kindNames[Int(kindIndex[i])])
+        }
+
+        public subscript(path: String) -> StoredFile? {
+            guard let id = paths.id(path) else { return nil }
+            return value(Int(id))
+        }
+
+        /// Every known file, in id order. One path String per call, released after it.
+        public func forEach(_ body: (String, StoredFile) throws -> Void) rethrows {
+            // Duplicated ids exist only when a sidecar table interned a path twice, which shows as
+            // more ids than keys; only then is the per-entry lookup worth paying.
+            let mayDuplicate = paths.count != paths.keyCount
+            for i in 0 ..< Swift.min(paths.count, kindIndex.count) {
+                // An id a duplicated path left behind is not what its key names; skip it, as the
+                // dictionary's last-write-wins did.
+                guard let v = value(i) else { continue }
+                let p = paths[i]
+                if mayDuplicate, let k = paths.id(p), Int(k) != i { continue }
+                try body(p, v)
+            }
+        }
+
+        public func compactMap<T>(_ transform: (String, StoredFile) throws -> T?) rethrows -> [T] {
+            var out: [T] = []
+            try forEach { p, v in if let t = try transform(p, v) { out.append(t) } }
+            return out
+        }
+
+        /// The old dictionary, for callers that genuinely need one (verification tools).
+        public var dictionary: [String: StoredFile] {
+            var d: [String: StoredFile] = [:]
+            d.reserveCapacity(count)
+            forEach { d[$0] = $1 }
+            return d
+        }
+    }
+
+    /// Served from the RESIDENT rows, not SQLite: the old `GROUP BY path` dragged the entire chunks
+    /// B-tree - whose leaves carry the vec blobs, gigabytes of pages - through the page cache ON the
+    /// store queue. Caught live at 3.8M rows on a base M-chip: minutes of pread with every search
+    /// queued behind it, at the start of every catch-up pass. Rows whose stored dim mismatched the
+    /// index (skipped at load) report as unindexed and re-embed - self-healing where the SQL form
+    /// kept them stale forever.
+    ///
+    /// Per file: the newest modified time, the largest size and the greatest kind name over its
+    /// LIVE rows. Tombstones are filtered rather than collected - compaction MOVES vectors, and a
+    /// row whose blob has been cleared cannot move without that blob coming back first, so a cold
+    /// reader must not be able to trigger one.
+    public func knownFiles() -> KnownFiles {
         queue.sync {
-            // Filters tombstones rather than collecting them. Compaction MOVES vectors, and a row
-            // whose blob has been cleared cannot move without that blob coming back first - so a
-            // cold reader must not be able to trigger one. Skipping dead rows costs one Set lookup
-            // per row on a path that already walks every row, and it is empty in the common case.
-            guard dbOpen() else { return [:] }
-            let n = filePaths.keyCount
+            guard dbOpen() else { return .empty }
+            let n = filePaths.count
             var modified = [Double](repeating: -.greatestFiniteMagnitude, count: n)
-            var size = [Int](repeating: Int.min, count: n)
-            var kind = [String?](repeating: nil, count: n)
+            var size = [Int64](repeating: Int64.min, count: n)
+            var kindIndex = [Int16](repeating: -1, count: n)
             let dead = deadRows
             let hasDead = !dead.isEmpty
             for i in 0 ..< rows.count {
                 if hasDead, dead.contains(Int32(i)) { continue }
                 let f = Int(fileID[i])
-                let r = rows[i]
-                if metaOf(r).modified > modified[f] { modified[f] = metaOf(r).modified }
-                if Int(metaOf(r).size) > size[f] { size[f] = Int(metaOf(r).size) }
-                if kind[f] == nil || kindOf(r) > kind[f]! { kind[f] = kindOf(r) }
+                guard f < n else { continue }
+                let r = rows[i], m = metaOf(r)
+                if m.modified > modified[f] { modified[f] = m.modified }
+                if m.size > size[f] { size[f] = m.size }
+                let k = Int16(r.kc)
+                if kindIndex[f] < 0 || idKind[Int(k)] > idKind[Int(kindIndex[f])] { kindIndex[f] = k }
             }
-            var out: [String: StoredFile] = [:]
-            out.reserveCapacity(liveFiles)
-            for f in 0 ..< n where kind[f] != nil {   // nil = interned path with no live rows
-                out[filePaths[f]] = StoredFile(modified: modified[f], size: size[f], kind: kind[f] ?? "")
-            }
-            return out
+            var known = 0
+            for f in 0 ..< n where kindIndex[f] >= 0 { known += 1 }
+            return KnownFiles(paths: filePaths, modified: modified, size: size, kindIndex: kindIndex,
+                              kindNames: idKind, count: known)
         }
     }
+
+    /// `knownFiles()` as a dictionary. Builds a String per file - for verification tools only; the
+    /// app's own callers iterate `knownFiles()` instead.
+    public func indexedFiles() -> [String: StoredFile] { knownFiles().dictionary }
 
     /// Prior stored state for ONLY the given paths - the FSEvents reconcile touches a handful of files,
     /// so this avoids the full `GROUP BY path` scan over the whole index that `indexedFiles()` does.
