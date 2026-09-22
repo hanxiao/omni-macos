@@ -1554,10 +1554,11 @@ func printStoreMemory(_ store: VectorStore) {
     for p in m.parts {
         let perOcc = c.occurrences > 0 ? Double(p.bytes) / Double(c.occurrences) : 0
         let perFile = c.files > 0 ? Double(p.bytes) / Double(c.files) : 0
-        print(String(format: "    %-14@ %@   %6.1f B/occ  %7.1f B/file",
-                     p.name as NSString, mb(p.bytes), perOcc, perFile))
+        print("    " + p.name.padding(toLength: 14, withPad: " ", startingAt: 0)
+              + String(format: " %@   %6.1f B/occ  %7.1f B/file", mb(p.bytes), perOcc, perFile))
     }
-    print("    \("-- total" as NSString) \(mb(m.total))   host \(mb(m.cpu)) gpu \(mb(m.gpu))")
+    print("    " + "total".padding(toLength: 14, withPad: " ", startingAt: 0)
+          + " \(mb(m.total))   host \(mb(m.cpu))   gpu \(mb(m.gpu))")
 }
 
 if args.count >= 2 && args[1] == "storemem" {
