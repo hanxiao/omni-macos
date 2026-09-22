@@ -5340,7 +5340,7 @@ public final class VectorStore: @unchecked Sendable {
                 // Through the builder, for the same reason as the fused path above: the stored
                 // array can be sized to a different occurrence prefix than the reduce will gather.
                 if onlyKindFiltered(filter), Self.gpuReduce, let fid = fileIDGPULocked(), baseRows > 0,
-                   filter.kinds.isEmpty || mlxKindCode != nil {
+                   filter.kinds.isEmpty || kindCodeGPULocked() != nil {
                     var deltaGraph: MLXArray? = nil
                     if n > baseRows {
                         let deltaCount = n - baseRows
@@ -6151,8 +6151,8 @@ public final class VectorStore: @unchecked Sendable {
             combine(pa[fid].reshaped([baseOccCount]))
         }
         if let cut = sinceCut {
-            guard let md = modifiedGPULocked() else { return nil }
-            combine((md .>= MLXArray(cut)).asType(Float.self).reshaped([baseOccCount]))
+            guard let fid = fileIDGPULocked(), let md = modifiedGPULocked() else { return nil }
+            combine((md .>= MLXArray(cut)).asType(Float.self)[fid].reshaped([baseOccCount]))
         }
         guard let mask = keep else { return nil }
         MLX.eval(mask)
@@ -6162,29 +6162,39 @@ public final class VectorStore: @unchecked Sendable {
         return mask
     }
 
-    /// Per-row `modified` as Int32 seconds since 2000-01-01, on the GPU, sized to baseRows.
+    /// Per-FILE `modified` as Int32 seconds since 2000-01-01, on the GPU, one entry per file id.
+    /// A date filter gathers it through `fileIDGPULocked`, the way a folder filter gathers the
+    /// per-file path table.
     ///
     /// Int32 and not Float32 deliberately: epoch seconds today are ~8.3e8, well past float32's
     /// 2^24 exact-integer range, so a float mask would quantise the boundary to ~64-second steps
     /// and a file modified near it could fall on the wrong side. Int32 is exact to 2068.
     ///
-    /// Built from `rows`, which is the one lockstep array with no primitive twin - kindCode and
-    /// fileID have one, `modified` does not - so this pass touches the Row structs once and then
-    /// caches. Only the first date-filtered query after a fold pays it.
+    /// PER FILE, NOT PER ROW, and that fixes a crash. It used to be built per row and sized to
+    /// `baseRows` - the CONTENT count - then reshaped to the OCCURRENCE count by the select mask.
+    /// On any index that shares a passage the two differ, and MLX's reshape error is a fatalError:
+    /// picking a date range quit the app on every v5 index with duplicated content, in every
+    /// quantized tier. `modified` belongs to the file (it lives in `files`), so the table is sized
+    /// by the one count that describes it, and costs 4 bytes a file instead of 4 a row.
+    ///
+    /// Keyed on the file count alone, which is enough. The table is only ever gathered at BASE
+    /// occurrences, and a base occurrence's file either still has the modified time it had at the
+    /// build, or was re-indexed - in which case replace() tombstoned that occurrence (masked
+    /// before any filter reads it) and appended the new rows past the base, where the host reads
+    /// `fileMeta` directly. Keying on the mutation generation as well would rebuild a 2.7M-entry
+    /// table on the first date query after every indexing write, for no answer that differs.
     private static let modifiedEpochBase = 946_684_800.0   // 2000-01-01T00:00:00Z
     private var mlxModified: MLXArray? = nil
     private var mlxModifiedRows = 0
     private func modifiedGPULocked() -> MLXArray? {
-        guard baseRows > 0, rows.count >= baseRows else { return nil }
-        if let m = mlxModified, mlxModifiedRows == baseRows { return m }
-        var v = [Int32](repeating: 0, count: baseRows)
-        rows.withUnsafeBufferPointer { rp in
-            for i in 0 ..< baseRows { v[i] = Int32(clamping: Int((metaOf(rp[i]).modified - Self.modifiedEpochBase).rounded(.down))) }
-        }
+        let f = fileMeta.count
+        guard f > 0 else { return nil }
+        if let m = mlxModified, mlxModifiedRows == f { return m }
+        let v = fileMeta.map { Int32(clamping: Int(($0.modified - Self.modifiedEpochBase).rounded(.down))) }
         let m = MLXArray(v)
         MLX.eval(m)
         mlxModified = m
-        mlxModifiedRows = baseRows
+        mlxModifiedRows = f
         return m
     }
     private func invalidateModifiedGPULocked() { mlxModified = nil; mlxModifiedRows = 0 }
@@ -6299,11 +6309,16 @@ public final class VectorStore: @unchecked Sendable {
         // the host reducer's per-row kind `continue`. The delta rows get the same skip on the host side.
         // A file is exactly one kind, so this per-row mask is a per-file mask (bit-exact, no tie shift).
         var kindAllowed: [Bool]? = nil
-        if !filter.kinds.isEmpty, let kc = mlxKindCode {
+        // THROUGH THE BUILDER, never the stored array: `kindCodeGPULocked` sizes it to the
+        // occurrence prefix this reduce gathers. The stored one could be a different length - the
+        // fold used to build it with one entry per CONTENT - and a shape mismatch here is not a
+        // wrong answer, it is MLX's fatalError: a `type:` search quit the app on any full-mode
+        // index that shared a passage between two files.
+        if !filter.kinds.isEmpty, let kc = kindCodeGPULocked() {
             var allowF = [Float](repeating: 0, count: 256)   // 256-slot gather table (kindCode is UInt8)
             var allowB = [Bool](repeating: false, count: 256)
             for k in filter.kinds { if let id = kindID[k] { allowF[Int(id)] = 1; allowB[Int(id)] = true } }
-            let mask = MLXArray(allowF)[kc]                  // [baseRows] gather: 1 allowed, 0 disallowed
+            let mask = MLXArray(allowF)[kc]                  // [occ] gather: 1 allowed, 0 disallowed
             sClean = MLX.which(mask .> 0.5, sClean, MLXArray(-Float.infinity))
             kindAllowed = allowB
         }
@@ -10546,24 +10561,15 @@ public final class VectorStore: @unchecked Sendable {
                                 count: byteCount, deallocator: .none)
                 mlxBase = MLXArray(data, [rowCount, dim], dtype: .bfloat16)
             }
-            // GPU fileID in lockstep (~4 bytes/row - trivial next to the bf16 base).
-            let fid = fileID.withUnsafeBufferPointer { fp in
-                MLXArray(Array(UnsafeBufferPointer(rebasing: fp[0 ..< rowCount])))
-            }
-            mlxFileID = fid
-            mlxFileIDRows = rowCount
-            // GPU kind code in lockstep (Int32 [rowCount], ~4 bytes/row): lets a kind-filtered query
-            // mask disallowed-kind rows to -inf on the GPU and stay on the fast reduce path. kindCode
-            // is UInt8 (<=256 kinds); widen to Int32 for use as a gather index into the 256-slot mask.
-            let kc = kindCode.withUnsafeBufferPointer { kp in
-                MLXArray(UnsafeBufferPointer(rebasing: kp[0 ..< rowCount]).map { Int32($0) })
-            }
-            mlxKindCode = kc
-            mlxKindCodeRows = rowCount
-            MLX.eval(mlxBase!, fid, kc)
+            MLX.eval(mlxBase!)
             quantBits = 0
         }
         baseRows = rowCount; baseOccCount = occCountCoveringSlotsLocked(baseRows)
+        // The per-OCCURRENCE GPU arrays, through their builders, now that the occurrence count is
+        // known. These used to be built above with `rowCount` entries - the CONTENT count - which
+        // was right while a row and a vector were the same thing and is short by every shared
+        // passage since. Eager in full mode because the fused path checks `mlxFileID != nil`.
+        if mlxBase != nil { _ = fileIDGPULocked(); _ = kindCodeGPULocked() }
         baseDirty = false
         // The base was just re-read from `flat16`, so every patched position is in it. An
         // INCREMENTAL fold keeps the old base rows verbatim, which is why both fold branches
