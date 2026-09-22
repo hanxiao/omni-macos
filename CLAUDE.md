@@ -2341,3 +2341,5 @@ upload buffering is in place (was quadratic), answers `100-continue`, and allows
 OCR routes for an authorized caller; symlinks cannot lead a path argument out of the indexed folders.
 
 SKILL.md (`ServingTab.skillMarkdown`) is reference, not manners: endpoints, fields, limits, errors.
+It is for agents that call the HTTP API, so it NEVER describes MCP - no MCP section, no "over MCP"
+asides. MCP clients get their docs from the tool descriptors and the initialize instructions.

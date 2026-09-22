@@ -270,15 +270,13 @@ struct ServingTab: View {
         instead does not work, because an indexed parent folder already covers its children.
 
         Response: `{"results": [{"path", "score", "snippet", "kind", "modified", "locator",
-        "chunk_count", ...}]}` over HTTP. Over MCP the same facts arrive as one text line per hit,
-        `N. /path  (kind, score%, locator, N passages, yyyy-MM-dd)`, followed by the snippet.
+        "chunk_count", ...}]}`.
         `score` runs 0 to 1. Compare it only within a kind: a text query scores a photo on a
         different scale than a document, so a 0.50 image and a 0.80 document are comparable matches.
         Hits below the app's relevance floor are dropped: 0.5 unless the user changed it in the
         window, scaled per kind so media is not deleted by a text-shaped floor. Pass `min_score` to
-        set it per request - `0` returns everything. Over HTTP it goes in `filters`; over MCP it is
-        a top-level argument. `locator` is where the best match sits inside the file, such as `Page 3` or
-        `Line 1240`, and is empty when the file has no meaningful position. `chunk_count` is how
+        set it per request in `filters` - `0` returns everything. `locator` is where the best
+        match sits inside the file, such as `Page 3` or `Line 1240`, and is empty when the file has no meaningful position. `chunk_count` is how
         many pages or passages the file has in the index. Hits also carry `bytes` for the indexed
         file size and `mime_type`. Media hits add `width` and `height` in pixels and `duration` in
         seconds, recorded at index time, so you can prefer a 4032x3024 original over a 192px
@@ -429,25 +427,6 @@ struct ServingTab: View {
 
         An unknown role is a 400. A Gemini batch takes each request's own `taskType`. Gemini
         authenticates with `x-goog-api-key` rather than a bearer header.
-
-        ## MCP
-
-        The server also speaks MCP over streamable HTTP at `\(base)/mcp`. Point any MCP client at
-        that URL. Nine tools: `search` (`/v1/search`), `search_inline` (MCP only), `file_status`
-        (`/v1/files/status`), `tag_image` (`/v1/files/tags`, or `/v1/tag` with `recompute`), `ocr`
-        (`/v1/ocr`), `list_sources`, `add_source`, `pause_source` and `remove_source`
-        (`/v1/sources`, `/v1/sources/add`, `/v1/sources/pause`, `/v1/sources/remove`).
-
-        Three differ from their HTTP form. `ocr` takes a `path` inside the indexed folders and
-        `pages` counted from 1, as search results name them (`"3"`, `"1-5"`), at most 10 per call
-        and the first 10 by default; it returns one Markdown text per page and names the pages
-        still to fetch. `search` takes `include_images`, which attaches an inline
-        JPEG thumbnail to image and scanned-PDF hits so they render in the client, and returns one
-        text line per hit rather than JSON rows: `N. /path  (kind, score%, locator, N passages,
-        yyyy-MM-dd)` followed by the snippet. Open a result by its path. `search_inline` ranks the
-        best passages within an explicit set of files or folders, taking `query` and `paths` plus
-        `top_k` and `max_snippet`; only the query is embedded, so use it to pinpoint where a topic
-        is discussed across documents you already know.
         """
     }
 
