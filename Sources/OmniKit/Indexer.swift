@@ -921,7 +921,14 @@ public final class Indexer: @unchecked Sendable {
             // store are competing hardest for memory. One dictionary probe per crawled file, on a
             // path that is about to be hashed anyway.
             if known[path] != nil { seen.insert(pathDigest(path)) }
-            p.scanned += 1; p.currentPath = path
+            // NO `currentPath` HERE ANY MORE. `tick` is called from a `defer`, so it runs when an
+            // item is FINISHED - which made the caption name the file just completed rather than
+            // the one being worked on. Invisible while files are quick, and a freeze exactly when
+            // they are not: a big PDF, a video, a large image sits on its predecessor's name for
+            // as long as it takes, which is when somebody is most likely to be looking. Reported
+            // as "some stuck there for quite long time". The name is set at the START of an item
+            // now, below.
+            p.scanned += 1
             // The RESOLVED root, for the same reason the deletion sweep uses it: the crawl returns
             // paths with the root's symlinks followed, and matching them against the raw root finds
             // nothing - the per-folder progress would sit at zero for the whole pass.
@@ -1098,6 +1105,8 @@ public final class Indexer: @unchecked Sendable {
                 }
                 pipeline(files, force: force, known: known, settings: settings) { item in
                     let path = item.file.path
+                    // What is being indexed RIGHT NOW, which is what the caption claims to show.
+                    p.currentPath = path
                     defer { tick(path) }
                     if item.unchanged { p.unchanged += 1; return }
                     switch item.payload {
@@ -1181,6 +1190,8 @@ public final class Indexer: @unchecked Sendable {
                 }
                 pipeline(files, force: force, known: known, settings: settings) { item in
                     let path = item.file.path
+                    // What is being indexed RIGHT NOW, which is what the caption claims to show.
+                    p.currentPath = path
                     defer { tick(path) }
                     if item.unchanged { p.unchanged += 1; return }
                     if case .duplicate(let chunks) = item.payload { storeChunks(path, chunks); return }
@@ -1255,6 +1266,8 @@ public final class Indexer: @unchecked Sendable {
                 }
                 pipeline(files, force: force, known: known, settings: settings) { item in
                     let path = item.file.path
+                    // What is being indexed RIGHT NOW, which is what the caption claims to show.
+                    p.currentPath = path
                     defer { tick(path) }
                     if item.unchanged { p.unchanged += 1; return }
                     guard case .imagePatches(let raws) = item.payload, !raws.isEmpty else {
@@ -1268,6 +1281,7 @@ public final class Indexer: @unchecked Sendable {
                 flushImages()
             } else {
                 pipeline(files, force: force, known: known, settings: settings) { item in
+                    p.currentPath = item.file.path
                     if item.unchanged { p.unchanged += 1 } else { storeChunks(item.file.path, self.embed(item)) }
                     tick(item.file.path)
                 }
