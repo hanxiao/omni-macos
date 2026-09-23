@@ -10,7 +10,9 @@ import OmniKit
 /// logs the main thread's own CPU time for each step (`OMNI_PERF_LOG=1` to see it).
 ///
 /// Steps: `browse:<folder>`, `view:list|grid`, `sidebar` (toggle), `search:<text>`, `clear`,
-/// `wait:<seconds>`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
+/// `wait:<seconds>`. For recording the intro video: `type:<text>` (a key at a time, searching at
+/// each word), `similar:<path>`, `select:<result index>`, `map:<folder>`, `frame:<w>x<h>`
+/// (window size, centered), `front` and `appearance:light|dark`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
 /// CPU is read, so what it set in motion is counted too. `repeat:<n>` before a step repeats it.
 @MainActor
 enum PerfScript {
@@ -27,7 +29,8 @@ enum PerfScript {
                 for i in 0 ..< times {
                     let cpu0 = HangWatch.threadCPU()
                     let t0 = Date()
-                    perform(raw, model)
+                    if raw.hasPrefix("type:") { await type(String(raw.dropFirst(5)), model) }
+                    else { perform(raw, model) }
                     let pause = raw.hasPrefix("wait:") ? Double(raw.dropFirst(5)) ?? 0 : settle
                     try? await Task.sleep(for: .seconds(pause))
                     let cpu = (HangWatch.threadCPU() - cpu0) * 1000
@@ -55,8 +58,35 @@ enum PerfScript {
         case "search": model.applyParsedQuery(arg); model.search()
         case "clear": model.clearSearch()
         case "wait": break   // the wait is the sleep after the step
+        case "similar": model.searchBySimilar(to: arg)
+        case "select":
+            if let i = Int(arg), model.results.indices.contains(i) { model.selectSingle(model.results[i].path) }
+        case "map": model.visualizeFolder(URL(fileURLWithPath: arg, isDirectory: true), umap: true)
+        case "frame":
+            let wh = arg.split(separator: "x").compactMap { Double($0) }
+            if wh.count == 2, let w = NSApp.windows.first(where: { $0.isVisible && $0.toolbar != nil }) {
+                w.setContentSize(NSSize(width: wh[0], height: wh[1])); w.center()
+            }
+        case "front":
+            // A covered window is not redrawn (occlusion), so a recording of it freezes.
+            NSApp.activate(ignoringOtherApps: true)
+            NSApp.windows.first(where: { $0.isVisible && $0.toolbar != nil })?.orderFrontRegardless()
+        case "appearance": NSApp.appearance = NSAppearance(named: arg == "dark" ? .darkAqua : .aqua)
         default: omniPerfLog("script: unknown step \(step)")
         }
+    }
+
+    /// A key at a time, as a person types: the box shows each character and a search runs at each
+    /// word boundary, so results change the way they do under real typing.
+    private static func type(_ text: String, _ model: AppModel) async {
+        var typed = ""
+        for ch in text {
+            typed.append(ch)
+            model.query = typed
+            if ch == " " { model.applyParsedQuery(typed); model.search() }
+            try? await Task.sleep(for: .milliseconds(ch == " " ? 140 : 75))
+        }
+        model.applyParsedQuery(typed); model.search()
     }
 
     private static func splitView(in view: NSView?) -> NSSplitView? {

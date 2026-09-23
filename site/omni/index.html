@@ -216,7 +216,7 @@
       box-shadow: var(--shot-shadow), 0 0 0 1px var(--line);
       background: var(--bg-alt);
     }
-    .shot img { width: 100%; }
+    .shot img, .shot video { width: 100%; height: auto; display: block; }
 
     /* Sections */
     section { padding: 120px 0 0; }
@@ -399,10 +399,9 @@
       </div>
       <div class="hero-shot">
         <div class="shot">
-          <picture>
-            <source srcset="assets/shot-hero.webp" type="image/webp" />
-            <img src="assets/shot-hero.jpg" width="1600" height="748" alt="Omni searching for porsche 911 across 2.7 million files, showing a gallery of matching photos with relevance scores and generated tags" fetchpriority="high" />
-          </picture>
+          <video src="assets/omni-hero.mp4" poster="assets/omni-hero-poster.jpg" width="1920" height="1080"
+                 autoplay muted loop playsinline preload="metadata"
+                 aria-label="Omni: searching photos by meaning, in any language, finding similar files, and transcribing a PDF"></video>
         </div>
       </div>
     </section>
