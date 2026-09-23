@@ -253,7 +253,7 @@ private struct OCRToolbar: ViewModifier {
                 // NSToolbar reported this item at 152pt across four segments.
                 .frame(width: CGFloat(OCRSession.ViewMode.allCases.count) * 38)
                 .fixedSize()
-                .help("Raw text, Markdown, both, or the page beside them")
+                .help("View")
             }
             if #available(macOS 26.0, *) { ToolbarSpacer(.fixed) }
             // Closing lives in the File menu only (Shift-Cmd-W). It is rare, it is undone by
@@ -268,14 +268,14 @@ private struct OCRToolbar: ViewModifier {
                 Button { session.exportMarkdown() } label: {
                     Label("Save Markdown\u{2026}", systemImage: "square.and.arrow.down")
                 }
-                .help("Save the transcription as a .md file  \u{2318}S")
+                .help("Save as Markdown  \u{2318}S")
                 .disabled(session.completedPages == 0)
             }
             ToolbarItem(id: "ocr.copy", placement: .primaryAction) {
                 Button { session.copyMarkdownToPasteboard() } label: {
                     Label("Copy Markdown", systemImage: "doc.on.doc")
                 }
-                .help("Copy the whole document as Markdown  \u{21e7}\u{2318}C")
+                .help("Copy as Markdown  \u{21e7}\u{2318}C")
                 .disabled(session.completedPages == 0)
             }
             ToolbarItem(id: "ocr.share", placement: .primaryAction) {
@@ -394,15 +394,21 @@ private struct PageThumb: View {
         // them. Reveal and Open are the same `PhotoActions` calls the results list makes, so a
         // page behaves like any other file the app knows about.
         .contextMenu {
-            Button("Quick Look") { onPreview() }
+            Button { onPreview() } label: { Label("Quick Look", systemImage: "eye") }
+            if page.state == .done {
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(session.pageText(at: page.id), forType: .string)
+                } label: { Label("Copy Page as Markdown", systemImage: "doc.on.clipboard") }
+            }
             if let url = session.sourceURL(for: page.id) {
                 Divider()
-                Button("Open in Preview") { PhotoActions.open(url.path) }
-                Button("Reveal in Finder") { PhotoActions.reveal(paths: [url.path]) }
-                Button("Copy Path") {
+                Button { PhotoActions.open(url.path) } label: { Label("Open", systemImage: "arrow.up.forward.app") }
+                Button { PhotoActions.reveal(paths: [url.path]) } label: { Label("Show in Finder", systemImage: "folder") }
+                Button {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(url.path, forType: .string)
-                }
+                } label: { Label("Copy Path", systemImage: "doc.on.doc") }
             }
         }
         // Content OUT. A transcribed page drags into Notes, Mail, TextEdit or any editor as its
@@ -411,7 +417,7 @@ private struct PageThumb: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(page.label)
         .accessibilityValue(stateDescription)
-        .help("\(page.label) - \(stateDescription).  Space or double-click to preview")
+        .help("\(page.label) - \(stateDescription)")
     }
 
     /// The page itself, at its own proportions.
@@ -458,7 +464,7 @@ private struct PageThumb: View {
         case .running: return "transcribing"
         case .failed: return "could not be transcribed"
         case .pending: return "not transcribed yet"
-        case .stopped: return "not transcribed - click to transcribe it"
+        case .stopped: return "not transcribed"
         }
     }
 }
@@ -1543,9 +1549,6 @@ private struct ModelMissing: View {
                 .font(.system(size: 44, weight: .light))
                 .foregroundStyle(.tertiary)
             Text("The OCR model is not downloaded").font(.title)
-            Text("It runs entirely on this Mac.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
             OCRDownloadAction().padding(.top, 4)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

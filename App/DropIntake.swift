@@ -188,7 +188,7 @@ enum DropRouter {
         if DropIntake.read(providers: providers, accepts: accepts, wantsText: !toOCR, handle: handle) { return true }
         // Only the transcription pane says so. A search surface that ignores an unusable drag is
         // behaving normally; a transcription pane that swallows one looks broken.
-        if toOCR { ocr.reject("Nothing here to transcribe. Drop or copy a PDF, an image file, or an image.") }
+        if toOCR { ocr.reject("Unsupported file type.") }
         return false
     }
 }

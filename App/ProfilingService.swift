@@ -117,11 +117,7 @@ enum ProfilingService {
         if UserDefaults.standard.bool(forKey: consentKey) { return uploadsEnabled }
         let a = NSAlert()
         a.messageText = "Share your benchmark results?"
-        a.informativeText = """
-        Omni can submit this benchmark to the public results on hanxiao.io/omni so you can compare \
-        Macs. It sends only hardware facts (chip, memory, macOS version) and timing numbers - never \
-        your files, paths, or any personal information. You can turn this off anytime in Settings.
-        """
+        a.informativeText = "Sends chip, memory, macOS version and timings to hanxiao.io/omni. Never files or paths."
         a.addButton(withTitle: "Share results")
         a.addButton(withTitle: "Keep local")
         let share = a.runModal() == .alertFirstButtonReturn

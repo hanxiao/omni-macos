@@ -49,8 +49,7 @@ struct PhotoSourceBrowser: View {
                 Spacer(); ProgressView().controlSize(.small); Spacer()
             } else if hits.isEmpty {
                 Spacer()
-                ContentUnavailableView("Nothing indexed here", systemImage: "photo.on.rectangle.angled",
-                                       description: Text("Nothing from \(source.title) is indexed yet."))
+                ContentUnavailableView("Nothing indexed here", systemImage: "photo.on.rectangle.angled")
                 Spacer()
             } else if model.viewMode == .grid {
                 gridBody

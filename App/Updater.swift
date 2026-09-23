@@ -76,11 +76,11 @@ enum Updater {
         let notes = await fetchReleaseNotes(from: currentVersion, to: m.version)
         let a = NSAlert()
         a.messageText = "Omni \(m.version) is available"
-        a.informativeText = "You have \(currentVersion). Omni will download the update, install it, and relaunch."
+        a.informativeText = "You have \(currentVersion)."
         if !notes.isEmpty { a.accessoryView = notesView(notes) }
-        a.addButton(withTitle: "Update and relaunch")          // default (rightmost, Return)
+        a.addButton(withTitle: "Install and Relaunch")          // default (rightmost, Return)
         a.addButton(withTitle: "Later").keyEquivalent = "\u{1b}"  // Esc dismisses (HIG: cancel-equivalent)
-        a.addButton(withTitle: "Skip this version")
+        a.addButton(withTitle: "Skip This Version")
         switch a.runModal() {
         case .alertFirstButtonReturn:
             startUpdate(m)
@@ -312,8 +312,8 @@ enum Updater {
     private static func fallback(_ m: Manifest, dmg: URL?, reason: String) {
         let a = NSAlert()
         a.messageText = "Couldn't install the update automatically"
-        a.informativeText = "\(reason)\n\nYou can finish manually: Omni will open the downloaded disk image so you can drag it onto Applications."
-        a.addButton(withTitle: "Open installer")
+        a.informativeText = reason
+        a.addButton(withTitle: "Open Disk Image")
         a.addButton(withTitle: "Cancel")
         guard a.runModal() == .alertFirstButtonReturn else { if let dmg { try? FileManager.default.removeItem(at: dmg) }; return }
         if let dmg {

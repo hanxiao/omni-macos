@@ -37,9 +37,9 @@ enum PhotoActions {
         if files.isEmpty, let first = paths.first { reveal(first) }
     }
 
-    /// The menu wording for `path` - "Reveal in Photos" reads as a lie for a file, and vice versa.
+    /// The menu wording for `path` - "Show in Photos" reads as a lie for a file, and vice versa.
     static func revealTitle(_ path: String) -> String {
-        PhotoLibrary.isPhotoPath(path) ? "Reveal in Photos" : "Reveal in Finder"
+        PhotoLibrary.isPhotoPath(path) ? "Show in Photos" : "Show in Finder"
     }
 
     /// A real file for a result, exporting a Photos asset if it has to. NEVER call this on the main

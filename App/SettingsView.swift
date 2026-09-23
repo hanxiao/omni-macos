@@ -113,10 +113,8 @@ private struct IndexStatusRow: View {
                     Button("Pause") { model.pauseIndexing() }.controlSize(.small)
                 }
                 if model.isPreparing {
-                    // No file processed yet: scanning folders / warming up the model. Show an
-                    // explanation rather than a 0% bar that looks frozen.
-                    Text("Scanning folders, warming up the model\u{2026}")
-                        .font(.caption).foregroundStyle(.secondary)
+                    // No file processed yet. An indeterminate bar, not a 0% one that looks frozen.
+                    ProgressView().progressViewStyle(.linear)
                 } else {
                     ProgressView(value: overall)
                     // ONE Text, not a stack of them. Each piece used to carry its own leading
@@ -200,9 +198,6 @@ private struct ActivityTab: View {
                 }
             } header: {
                 Text("File types")
-            } footer: {
-                Text("Off stops indexing a type and unloads its model. Drag to reorder.")
-                    .font(.caption).foregroundStyle(.secondary)
             }
 
             Section("iCloud") {
@@ -278,7 +273,7 @@ private struct ActivityTab: View {
             Button("Keep in index") { model.applyKind(pd.kind, on: false, purge: false) }
             Button("Cancel", role: .cancel) { model.pendingDisable = nil }
         } message: { pd in
-            Text("\(pd.count) \(pd.kind.rawValue) \(pd.count == 1 ? "file is" : "files are") already indexed. Remove them, or keep them searchable and stop indexing new ones.")
+            Text("\(pd.count) \(pd.kind.rawValue) \(pd.count == 1 ? "file is" : "files are") already indexed.")
         }
     }
 
@@ -322,9 +317,6 @@ private struct ContentTypesTab: View {
                 .toggleStyle(.switch)
             } header: {
                 Text("Image & video tagging")
-            } footer: {
-                Text("Short labels such as \"cat, couch, crib\", made on this Mac while indexing.")
-                    .font(.caption).foregroundStyle(.secondary)
             }
 
             // "Skip small files" left the direction to the reader: is 300 the floor or the ceiling?
@@ -446,7 +438,7 @@ private struct ContentTypesTab: View {
     private func importIgnoreFile() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = true; panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
-        panel.message = "Choose a .omniignore or text file of ignore patterns"
+        panel.prompt = "Import"
         if panel.runModal() == .OK, let url = panel.url, let text = try? String(contentsOf: url, encoding: .utf8) {
             draft = text
         }
@@ -552,9 +544,6 @@ private struct PerformanceTab: View {
                 .help("Off: only identical copies stack")
             } header: {
                 Text("Search")
-            } footer: {
-                Text("With search as you type off, a search runs on Return.")
-                    .font(.caption).foregroundStyle(.secondary)
             }
 
             Section {
@@ -580,9 +569,6 @@ private struct PerformanceTab: View {
                 }
             } header: {
                 Text("Throughput")
-            } footer: {
-                Text("Smaller chunks index faster, with less detail.")
-                    .font(.caption).foregroundStyle(.secondary)
             }
             Section {
                 VStack(alignment: .leading, spacing: 6) {
@@ -614,11 +600,8 @@ private struct PerformanceTab: View {
             } header: {
                 Text("Memory")
             } footer: {
-                // Names the two slices the cap actually governs, now that the bar above makes the
-                // difference visible: the cap is an MLX limit, so a total above it is normal.
-                Text(model.isPaperRunning
-                     ? "Locked while the benchmark runs."
-                     : "Caps Model and Cache, not the whole app.")
+                // The cap is an MLX limit, so a total above it is normal; the legend names the parts.
+                Text(model.isPaperRunning ? "Locked while the benchmark runs." : "Applies to Model and Cache.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
@@ -644,7 +627,7 @@ private struct PerformanceTab: View {
                             }
                             .controlSize(.small)
                             .disabled(model.isPaperRunning || model.isProfilingRunning || model.phase != .ready)
-                            .help("Paper benchmark: up to 25 min on synthetic data. The index is not touched.")
+                            .help("Up to 25 minutes on synthetic data")
                         }
                     }
                 }
@@ -661,7 +644,7 @@ private struct PerformanceTab: View {
             } header: {
                 Text("Profiling")
             } footer: {
-                Text("Indexes a fixed 300-file dataset. Sharing sends hardware and timings, never files, to hanxiao.io/omni.")
+                Text("Sharing sends hardware and timings to hanxiao.io/omni, never files.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -689,7 +672,7 @@ private struct MemoryBreakdown: View {
         // Index - so a fifth colour bought a legend row the eye cannot find in the bar. It stays in
         // `Other`, and `sample.viz` still carries the number for the OMNI_MEM_LOG trace.
         [("Model", .blue, sample.model, "Weights and activations held by MLX"),
-         ("Cache", .teal, sample.cache, "Freed MLX buffers kept for reuse - reclaimed under memory pressure"),
+         ("Cache", .teal, sample.cache, "Reusable buffers, freed under memory pressure"),
          ("Index", .purple, sample.index, "Vectors and row table the search reads"),
          ("Other", Color(nsColor: .systemGray), sample.other, "App, thumbnails, database cache, frameworks")]
     }
@@ -840,7 +823,6 @@ private struct DiskBreakdown: View {
                         Spacer(minLength: 4)
                         Text(fmt(e.bytes)).foregroundStyle(.secondary)
                     }
-                    .help(e.irreplaceable ? e.detail : "\(e.detail) - rebuilt automatically if deleted")
                 }
             }
             .font(.caption)
@@ -993,7 +975,7 @@ private struct IndexTab: View {
                 if model.progress.photosNotLocal > 0 {
                     LabeledContent("Photos not on this Mac",
                                    value: model.progress.photosNotLocal.formatted())
-                        .help("In iCloud only. Files > iCloud decides whether they download.")
+                        .help("Stored in iCloud only")
                 }
                 if model.diskUse.isEmpty {
                     LabeledContent("Size", value: ByteSize.file(model.dbSizeBytes))
@@ -1071,7 +1053,7 @@ private struct IndexTab: View {
                             // its filesystem must refuse to open, and a swap mid-run would move the
                             // index out from under that list.
                             .disabled(model.isPaperRunning)
-                        Button("Reveal in Finder") {
+                        Button("Show in Finder") {
                             NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.dbPath)])
                         }
                         .disabled(model.dbPath.isEmpty)
@@ -1121,7 +1103,7 @@ private struct IndexTab: View {
                         HStack(spacing: 8) {
                             Spacer()
                             Button("Change\u{2026}") { pickModel() }
-                            Button("Reveal in Finder") {
+                            Button("Show in Finder") {
                                 NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.modelPath)])
                             }
                         }
@@ -1141,7 +1123,7 @@ private struct IndexTab: View {
     private func pickModel() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true; panel.canChooseFiles = false
-        panel.message = "Choose the model folder (model.safetensors, config.json, tokenizer.json)"
+        panel.prompt = "Choose"
         if panel.runModal() == .OK, let url = panel.url { model.setModelDir(url) }
     }
     /// Choosing a folder MOVES the index into it. It used to only repoint the setting, which
@@ -1150,7 +1132,7 @@ private struct IndexTab: View {
     private func pickDatabase() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true; panel.canChooseFiles = false
-        panel.message = "Choose a folder to store the search index"
+        panel.prompt = "Choose"
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
         let src = URL(fileURLWithPath: model.dbPath).deletingLastPathComponent()
@@ -1165,9 +1147,7 @@ private struct IndexTab: View {
         }
         let confirm = NSAlert()
         confirm.messageText = "Move the index to \(url.lastPathComponent)?"
-        confirm.informativeText = "\(ByteSize.file(payload)) will be copied. Searching and indexing "
-            + "stop until it finishes, and the current copy is left in place so you can check the "
-            + "move before deleting it."
+        confirm.informativeText = "\(ByteSize.file(payload)) will be copied. The original is kept."
         confirm.addButton(withTitle: "Move Index"); confirm.addButton(withTitle: "Cancel")
         guard confirm.runModal() == .alertFirstButtonReturn else { return }
 
@@ -1175,14 +1155,13 @@ private struct IndexTab: View {
             if let failure = await model.moveDatabaseDir(to: url) {
                 let a = NSAlert()
                 a.messageText = "The index was not moved"
-                a.informativeText = failure + " Nothing changed - the index is still where it was."
+                a.informativeText = failure
                 a.runModal()
             } else {
                 let a = NSAlert()
                 a.messageText = "Index moved"
-                a.informativeText = "The old copy is still at \(src.path). Delete it yourself once "
-                    + "you are satisfied the move worked."
-                a.addButton(withTitle: "OK"); a.addButton(withTitle: "Reveal Old Copy")
+                a.informativeText = "The original is still at \(src.path)."
+                a.addButton(withTitle: "OK"); a.addButton(withTitle: "Show Original")
                 if a.runModal() == .alertSecondButtonReturn {
                     NSWorkspace.shared.activateFileViewerSelecting([src])
                 }
@@ -1251,9 +1230,6 @@ private struct OCRTab: View {
                 .onChange(of: batch) { _, new in OCRSession.Settings.batchWidth = new }
             } header: {
                 Text("Transcription")
-            } footer: {
-                Text("More pages at once is faster and uses more memory. Automatic fits this Mac.")
-                    .font(.caption).foregroundStyle(.secondary)
             }
 
             OCRCacheSection()
@@ -1291,7 +1267,7 @@ private struct OCRCacheSection: View {
                 HStack(spacing: 8) {
                     Spacer()
                     Button("Change\u{2026}") { choose() }
-                    Button("Reveal in Finder") {
+                    Button("Show in Finder") {
                         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
                         NSWorkspace.shared.activateFileViewerSelecting([folder])
                     }
@@ -1300,9 +1276,6 @@ private struct OCRCacheSection: View {
             }
         } header: {
             Text("Cache")
-        } footer: {
-            Text("Pages are saved as Markdown and reused until the file or the model changes.")
-                .font(.caption).foregroundStyle(.secondary)
         }
     }
 
@@ -1327,20 +1300,13 @@ private struct OCRCacheSection: View {
             return
         }
         do {
-            let moved = try OCRCache.move(to: url)
+            _ = try OCRCache.move(to: url)
             OCRCache.directory = url
             folder = url
-            if moved > 0 {
-                let a = NSAlert()
-                a.messageText = "Moved \(moved) transcript\(moved == 1 ? "" : "s")"
-                a.informativeText = url.path
-                a.runModal()
-            }
         } catch {
             let a = NSAlert()
             a.messageText = "The transcripts were not moved"
             a.informativeText = error.localizedDescription
-                + " The cache folder is unchanged."
             a.runModal()
         }
     }

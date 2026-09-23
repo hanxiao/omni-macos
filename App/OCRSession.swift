@@ -1907,10 +1907,9 @@ final class OCRSession {
         let text = urls.filter { isAlreadyText($0) }
         if !text.isEmpty {
             let name = text.count == 1 ? "\(text[0].lastPathComponent) is" : "Those files are"
-            return "\(name) already text - there is nothing to transcribe. "
-                + "OCR is for scans, photographs and PDFs with no text layer."
+            return "\(name) already text."
         }
-        return "That is not a document this can read. Drop a PDF or an image."
+        return "Unsupported file type."
     }
 }
 

@@ -305,7 +305,7 @@ struct OmniApp: App {
                 // The OCR toggle's tooltip names this chord, so the menu bar has to own it:
                 // a key equivalent declared only on a toolbar button never fires on macOS, and
                 // an advertised-but-dead shortcut is worse than none.
-                Button(model.ocrMode ? "Back to Search" : "Transcribe a Document\u{2026}") {
+                Button(model.ocrMode ? "Back to Search" : "Transcribe a Document") {
                     model.ocrMode.toggle()
                 }
                 .keyboardShortcut("o", modifiers: [.command, .option])
@@ -363,7 +363,7 @@ struct OmniApp: App {
                 Button("Quick Look") { model.toggleQuickLook() }
                     .keyboardShortcut("y", modifiers: .command)
                     .disabled(!model.hasSelection || multi)
-                Button("Reveal in Finder") { model.revealSelected() }
+                Button("Show in Finder") { model.revealSelected() }
                     .keyboardShortcut("r", modifiers: [.command, .shift])
                     .disabled(!model.hasSelection)
                 // The menu bar owns these shortcuts too: keyboard equivalents declared only
@@ -388,7 +388,7 @@ struct OmniApp: App {
                 Divider()
                 // Search-level actions in one group: start a search from a file, save the
                 // current one. (A lone item between two separators reads as over-separation.)
-                Button("Search by a File\u{2026}") { model.searchByFilePanel() }
+                Button("Search by File\u{2026}") { model.searchByFilePanel() }
                     .keyboardShortcut("o", modifiers: [.command, .shift])
                     .disabled(model.phase != .ready)
                 // Bookmark the current search. The menu bar owns the Cmd-D shortcut (always present,
@@ -456,9 +456,8 @@ struct OmniApp: App {
                 // menu with no sidebar item at all, so on Tahoe the only way to unhide the sidebar
                 // was the toolbar button. Same responder-chain action and chord as the system item,
                 // so if AppKit ever does add one back this is the same command twice, not a clash.
-                Button("Toggle Sidebar") { NSApp.sendAction(Selector(("toggleSidebar:")), to: nil, from: nil) }
+                Button(model.sidebarShown ? "Hide Sidebar" : "Show Sidebar") { NSApp.sendAction(Selector(("toggleSidebar:")), to: nil, from: nil) }
                     .keyboardShortcut("s", modifiers: [.command, .control])
-                Divider()
                 // Back / Forward used to live here. They are in GO now, where Finder keeps them,
                 // and they cannot be in both: two menu items with one key equivalent make AppKit
                 // strip the chord from one of them, which shows up as Cmd-[ silently doing nothing.
@@ -471,8 +470,7 @@ struct OmniApp: App {
                 }
                 .pickerStyle(.inline)
                 .labelsHidden()
-                Divider()
-                Picker("Sort by", selection: Binding(get: { model.sortOrder }, set: { model.sortOrder = $0 })) {
+                Picker("Sort By", selection: Binding(get: { model.sortOrder }, set: { model.sortOrder = $0 })) {
                     ForEach(SortOrder.allCases) { Text($0.title).tag($0) }
                 }
             }
@@ -521,7 +519,6 @@ struct OmniApp: App {
             // below Save, where nobody looks for Cmd-G. "Search for Selected Text" is this app's
             // Use Selection for Find, so it joins them.
             CommandGroup(after: .textEditing) {
-                Divider()
                 Button("Find") {
                     guard let w = NSApp.keyWindow ?? NSApp.mainWindow,
                           let item = w.toolbar?.items.compactMap({ $0 as? NSSearchToolbarItem }).first else { return }
@@ -581,7 +578,7 @@ struct OmniApp: App {
             w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return
         }
         let win = NSWindow(contentViewController: NSHostingController(rootView: ShortcutsView()))
-        win.title = "Keyboard shortcuts"
+        win.title = "Keyboard Shortcuts"
         win.styleMask = [.titled, .closable]
         win.isReleasedWhenClosed = false      // keep the retained instance so reopening is instant
         win.center()
@@ -591,18 +588,21 @@ struct OmniApp: App {
     }
 
     private func showAbout() {
-        let credits = NSAttributedString(
-            string: "On-device semantic search over all your files - private by design, nothing leaves your Mac.",
-            attributes: [
-                .font: NSFont.systemFont(ofSize: 11),
-                .foregroundColor: NSColor.secondaryLabelColor,
-            ])
+        // A native About panel: name, version, a link. The mole without its tile, which is lighter
+        // at this size than the full app icon.
+        let para = NSMutableParagraphStyle(); para.alignment = .center
+        let credits = NSAttributedString(string: "hanxiao.io/omni", attributes: [
+            .font: NSFont.systemFont(ofSize: 11),
+            .link: URL(string: "https://hanxiao.io/omni/")!,
+            .paragraphStyle: para,
+        ])
         let marketingVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
         NSApplication.shared.orderFrontStandardAboutPanel(options: [
             .applicationName: "Omni",
             .applicationVersion: marketingVersion,   // "Version 0.1.16"
             .version: "",                            // suppress the build-number "(1)" in parens
             .credits: credits,
+            .applicationIcon: NSImage(named: "Mole") ?? NSApp.applicationIconImage as Any,
         ])
     }
 
@@ -669,18 +669,20 @@ struct OmniApp: App {
 /// replacing the old tab-aligned NSAlert text.
 private struct ShortcutsView: View {
     private let rows: [(action: String, keys: [String])] = [
-        ("Focus search", ["\u{2318}F"]),
-        ("Search by a file", ["\u{21E7}\u{2318}O"]),
-        ("Find similar", ["\u{2325}\u{2318}F"]),
-        ("Bookmark search", ["\u{2318}D"]),
+        ("Find", ["\u{2318}F"]),
+        ("Search by File", ["\u{21E7}\u{2318}O"]),
+        ("Find Similar", ["\u{2325}\u{2318}F"]),
+        ("Bookmark Search", ["\u{2318}D"]),
         ("Open", ["\u{2318}O", "\u{21A9}"]),
         ("Quick Look", ["\u{2318}Y", "Space"]),
-        ("Reveal in Finder", ["\u{21E7}\u{2318}R"]),
-        ("Copy path(s)", ["\u{2325}\u{2318}C"]),
+        ("Show in Finder", ["\u{21E7}\u{2318}R"]),
+        ("Copy Path", ["\u{2325}\u{2318}C"]),
         ("Move to Trash", ["\u{2318}\u{232B}"]),
-        ("Gallery / List", ["\u{2318}1", "\u{2318}2"]),
-        ("Index / Update / Resume", ["\u{21E7}\u{2318}I"]),
-        ("Move selection", ["\u{2191}\u{2193}\u{2190}\u{2192}"]),
+        ("Transcribe", ["\u{2325}\u{2318}T"]),
+        ("Transcribe a Document", ["\u{2325}\u{2318}O"]),
+        ("View as Gallery / List", ["\u{2318}1", "\u{2318}2"]),
+        ("Index", ["\u{21E7}\u{2318}I"]),
+        ("Move Selection", ["\u{2191}\u{2193}\u{2190}\u{2192}"]),
         ("Back / Forward", ["\u{2318}[", "\u{2318}]"]),
     ]
     var body: some View {

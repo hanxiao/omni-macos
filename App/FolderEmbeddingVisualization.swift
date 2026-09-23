@@ -67,7 +67,7 @@ struct FolderEmbeddingVisualization: View {
                     // (CenteredStatus) - the system ContentUnavailableView used different
                     // typography, so the pane's empty states visibly changed style.
                     CenteredStatus(symbol: "circle.grid.cross", title: "No files to map",
-                                   subtitle: "Nothing under \(folderName) is indexed yet.")
+                                   subtitle: "")
                         .allowsHitTesting(false)
                 }
 
@@ -212,7 +212,7 @@ struct FolderEmbeddingVisualization: View {
             }
             // Right-click a dot for the same file actions as a search result. The target is the dot
             // under the cursor (hover tracks it); over empty space there's nothing to act on.
-            .contextMenu { if let h = hovered { dotMenu(h.path) } }
+            .contextMenu { if let h = hovered { dotMenu(h) } }
             // Mouse-wheel / two-finger-scroll zoom (anchored at the cursor), gated to the map's frame.
             .onAppear {
                 scroller.vizFrame = geo.frame(in: .global)
@@ -349,7 +349,7 @@ struct FolderEmbeddingVisualization: View {
             }
             .pickerStyle(.inline)
             Divider()
-            Toggle("Grid layout", isOn: Binding(get: { model.mapNoOverlap }, set: { model.mapNoOverlap = $0 }))
+            Toggle("Grid Layout", isOn: Binding(get: { model.mapNoOverlap }, set: { model.mapNoOverlap = $0 }))
         } label: {
             Image(systemName: "chevron.down")
                 .font(.caption2.weight(.semibold))
@@ -523,26 +523,10 @@ struct FolderEmbeddingVisualization: View {
         dataVersion &+= 1
     }
 
-    /// File actions for a dot - the same set (and shortcuts) as a search result's context menu.
-    /// "Find similar" reuses `setFileQuery`, which runs a file-as-query search: that activates a query,
-    /// so ContentView precedence swaps the map out for the live results (clearing it returns to the map).
-    @ViewBuilder private func dotMenu(_ path: String) -> some View {
-        Button("Open") { NSWorkspace.shared.openAsync(URL(fileURLWithPath: path)) }
-            .keyboardShortcut("o", modifiers: .command)
-        Button("Quick Look") { model.showPreview(URL(fileURLWithPath: path)) }
-            .keyboardShortcut("y", modifiers: .command)
-        Divider()
-        Button("Find similar") { model.setFileQuery(URL(fileURLWithPath: path), similar: true) }
-            .keyboardShortcut("f", modifiers: [.command, .option])
-        Divider()
-        Button("Reveal in Finder") { NSWorkspace.shared.revealAsync(URL(fileURLWithPath: path)) }
-            .keyboardShortcut("r", modifiers: [.command, .shift])
-        Divider()
-        Button("Copy path") {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(path, forType: .string)
-        }
-        .keyboardShortcut("c", modifiers: [.command, .option])
+    /// File actions for a dot: the shared per-file menu, so a dot offers exactly what a search
+    /// result or a browsed file does (and handles a Photos asset the way they do).
+    @ViewBuilder private func dotMenu(_ point: ProjectionPoint) -> some View {
+        FileMenuItems(path: point.path, kind: point.kind)
     }
 
     @ViewBuilder private func hoverChip(for h: ProjectionPoint, in size: CGSize) -> some View {

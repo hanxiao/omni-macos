@@ -2592,3 +2592,19 @@ reader. `FolderMapSharedContentTests` fails without the fix. All other `flat16` 
 - OPEN: AppKit's once-per-process "layoutSubtreeIfNeeded on a view which is already being laid
   out" follows a browse step in most runs; lldb on `_NSDetectedLayoutRecursion` did not catch it.
   The rest of a streaming page's cost is window layout AppKit does for the toolbar on each change.
+
+## UI text and menus (2026-09-23)
+- NO PROSE WHERE macOS HAS NONE. Open panels set no `message` (a verb `prompt` at most); alerts
+  are a title plus one factual clause; launch screens, empty states and Settings footers do not
+  explain internals or restate their control. Tooltips name the thing, not how to use it.
+- MENUS ARE TITLE CASE, context menus included ("Find Similar", "Copy Path", "Show in Finder").
+  Reveal is "Show in Finder" / "Show in Photos" everywhere. An ellipsis only where a panel or
+  dialog follows. Destructive items are the last group; one trash item per menu (a stack's
+  "Move All N Copies to Trash" rides `FileMenuItems.trashAll`). Every Tahoe context-menu item has
+  an icon; a checkable item is a `Toggle`, not a checkmark icon. `FileMenuItems` is THE file menu
+  - results, both browsers and folder-map dots - so a file offers the same actions everywhere.
+- CHECK THE LIVE MENU BAR, not the source: `osascript ... get name of every menu item of menu "X"
+  of menu bar item "X" of menu bar 1` on the dev pid. It showed doubled separators that no code
+  reading does - an inline `Picker` and a new `CommandGroup` bring their own.
+- The About panel shows the mole without its tile (`Mole` in Assets.xcassets) and a link, no
+  tagline.

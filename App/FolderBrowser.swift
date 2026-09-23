@@ -108,8 +108,7 @@ struct FolderBrowser: View {
                 Spacer()
                 // "Empty folder" would be a lie: the folder on disk may be full, and what is
                 // missing is an INDEX entry for anything in it. Say which.
-                ContentUnavailableView("Nothing indexed here", systemImage: "folder",
-                                       description: Text("Nothing under \(folder.lastPathComponent) is indexed yet."))
+                ContentUnavailableView("Nothing indexed here", systemImage: "folder")
                 Spacer()
             } else if model.viewMode == .grid {
                 gridBody
@@ -338,15 +337,16 @@ struct FolderBrowser: View {
     /// The header's right-click menu. Name is absent on purpose - Finder will not let you turn it
     /// off either, because a row with no name is not a row.
     @ViewBuilder private var columnMenu: some View {
+        // A Toggle, which a menu draws as Finder's own checkmark column. A checkmark ICON on the
+        // "on" rows and plain text on the rest read as a half-iconed menu on Tahoe.
         ForEach(BrowserColumn.allCases) { col in
-            Button {
-                columns.toggle(col)
-                // Tags are only fetched when the column is on, so switching it on has to reload.
-                if col == .tags { Task { await reload() } }
-            } label: {
-                if columns.isOn(col) { Label(col.title, systemImage: "checkmark") }
-                else { Text(col.title) }
-            }
+            Toggle(col.title, isOn: Binding(
+                get: { columns.isOn(col) },
+                set: { _ in
+                    columns.toggle(col)
+                    // Tags are only fetched when the column is on, so switching it on has to reload.
+                    if col == .tags { Task { await reload() } }
+                }))
         }
     }
 

@@ -177,6 +177,42 @@ final class TranscribeHandoffUITests: XCTestCase {
                       + "(placeholder was \(searchField(app).placeholderValue ?? "nil"))")
     }
 
+    /// Reported: after Transcribe from a result's RIGHT-CLICK menu, the workspace ignored the mouse -
+    /// toolbar buttons, tabs and the page rail - while arrow keys still worked. Two files through
+    /// the context menu, then a click on each tab must select it.
+    func testWorkspaceTakesClicksAfterContextMenuTranscribe() throws {
+        let app = launchIsolated()
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 60), "app did not come up")
+        XCTAssertTrue(waitForResults(app), "the corpus never produced a PDF result")
+        let gallery = ProcessInfo.processInfo.environment["OMNI_HANDOFF_GALLERY"] == "1"
+        for name in ["scan0.pdf", "scan1.pdf"] {
+            if inOCRMode(app) { backToSearch(app) }
+            app.typeKey(gallery ? "1" : "2", modifierFlags: .command); sleep(1)
+            let r = row(app, name)
+            XCTAssertTrue(r.waitForExistence(timeout: 20), "\(name) is not in the results")
+            r.rightClick()
+            // Two items carry that title - the File menu's and the context menu's - and only the
+            // open context menu's is hittable.
+            let items = app.menuItems.matching(NSPredicate(format: "title == 'Transcribe'"))
+            XCTAssertTrue(items.firstMatch.waitForExistence(timeout: 5), "no Transcribe in \(name)'s menu")
+            guard let item = items.allElementsBoundByIndex.first(where: { $0.isHittable }) else {
+                return XCTFail("no visible Transcribe item in \(name)'s menu")
+            }
+            item.click()
+            sleep(3)
+        }
+        XCTAssertTrue(inOCRMode(app), "the context menu did not open the workspace")
+        sleep(15)   // one line a page: both finish, and XCUITest can see the workspace once idle
+        let tabs = app.windows.firstMatch.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier BEGINSWITH 'ocr.tab.'"))
+        XCTAssertEqual(tabs.count, 2, "expected a tab per transcribed file")
+        let first = tabs.element(boundBy: 0), second = tabs.element(boundBy: 1)
+        first.click(); sleep(1)
+        XCTAssertTrue(first.isSelected, "a click on the first tab did not select it")
+        second.click(); sleep(1)
+        XCTAssertTrue(second.isSelected, "a click on the second tab did not select it")
+    }
+
     /// What the File menu's Transcribe item is TITLED, which is the only readable statement of how
     /// many results the app thinks are selected: `Transcribe.title` renders "Transcribe 3 Items".
     /// Asserting on it turns "did the workspace open" into "did the app see the selection I built".

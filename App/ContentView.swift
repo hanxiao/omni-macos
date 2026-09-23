@@ -98,6 +98,10 @@ struct ContentView: View {
                 withAnimation(.easeOut(duration: 0.2)) { columns = target }
             }
         }
+        .onChange(of: columns, initial: true) { _, c in
+            let shown = c != .detailOnly
+            if model.sidebarShown != shown { model.sidebarShown = shown }
+        }
         // Spotlight-style: put the caret in the search field as soon as the app can search.
         .onChange(of: showsSearch, initial: true) { _, shows in if shows { focusSearchField() } }
         // Benchmark progress and the paper result as ONE native sheet on the main window (not a
@@ -207,15 +211,8 @@ struct ContentView: View {
     @ViewBuilder private var detail: some View {
         switch model.phase {
         case .loadingModel:
-            // The subtitle sets expectations for something that happens AFTER this screen is gone:
-            // going .ready does not await the warm-up (see AppModel - gating readiness on it made
-            // launch look hung on an M2), so a search fired in that window queues behind it.
-            //
-            // It says "loads into memory", not "compiles", because that is where the time measured
-            // as: omni-verify warmbench <model> <db>, 4.5M rows / 6.9 GB of bf16. Metal pipelines
-            // cost 4 ms (they ship precompiled in default.metallib); the first search costs 621 ms
-            // with the vector file cold and 17 ms once the page cache holds it. It is paging, so no
-            // duration is promised - a Mac that cannot cache 6.9 GB pays it on every launch.
+            // No subtitle: the title names the phase and the bar shows how far along it is. The
+            // sentences that used to sit here explained internals (paging, warm-up) to the user.
             // A one-time index upgrade is a different thing from loading the model, and takes tens
             // of seconds on a large index - saying "loading the model" through a database rewrite
             // is how a working upgrade reads as a hang.
@@ -224,7 +221,7 @@ struct ContentView: View {
             // change with the phase, so a database rewrite is never described as loading the model.
             CenteredStatus(symbol: model.launchSymbol,
                            title: model.launchTitle,
-                           subtitle: model.launchSubtitle,
+                           subtitle: "",
                            showSpinner: true, progress: model.loadingProgress)
         case .noModel:
             OnboardingView()
@@ -367,7 +364,7 @@ struct ContentView: View {
             // button underneath it.
             CenteredStatus(symbol: "line.3.horizontal.decrease.circle", title: "No matches with these filters",
                            subtitle: "", showSpinner: false,
-                           action: ("Clear filters", { model.clearFilters() }))
+                           action: ("Clear Filters", { model.clearFilters() }))
         } else {
             // No subtitle. "Try a different phrase" is the only thing anyone could do here, so
             // saying it adds a line and no information.
@@ -606,8 +603,8 @@ struct ContentView: View {
                 // `folder`, the same symbol OCR's Open Document uses. The two are the same verb.
                 Label("Search by File\u{2026}", systemImage: "folder")
             }
-            .help("Search by a file  \u{21e7}\u{2318}O")
-            .accessibilityLabel("Search by a file")
+            .help("Search by File  \u{21e7}\u{2318}O")
+            .accessibilityLabel("Search by File")
         }
         ToolbarItem(id: "search.share", placement: trailingPlacement) {
             // The system share sheet, not a menu of our own - same as OCR's. Disabled rather than
@@ -728,16 +725,16 @@ struct ContentView: View {
                     // applied only when bookmarked, where the lit status color is intentional.
                     // Titled, so the item sizes on Sequoia - see sidebarToggleButton.
                     if model.currentSearchIsBookmarked {
-                        Label("Remove bookmark", systemImage: "star.fill").foregroundStyle(.yellow)
+                        Label("Remove Bookmark", systemImage: "star.fill").foregroundStyle(.yellow)
                     } else {
-                        Label("Bookmark search", systemImage: "star")
+                        Label("Bookmark Search", systemImage: "star")
                     }
                 }
-                // Cmd-D is owned by the File-menu "Bookmark search" command (single owner, avoids a
+                // Cmd-D is owned by the File-menu "Bookmark Search" command (single owner, avoids a
                 // duplicate-shortcut conflict); the tooltip names it, and accessibilityLabel is what
                 // VoiceOver reads and what the toolbar-overflow menu shows for this icon-only button.
-                .help(model.currentSearchIsBookmarked ? "Remove bookmark  \u{2318}D" : "Bookmark this search  \u{2318}D")
-                .accessibilityLabel(model.currentSearchIsBookmarked ? "Remove bookmark" : "Bookmark search")
+                .help(model.currentSearchIsBookmarked ? "Remove Bookmark  \u{2318}D" : "Bookmark Search  \u{2318}D")
+                .accessibilityLabel(model.currentSearchIsBookmarked ? "Remove Bookmark" : "Bookmark Search")
             }
         }
         // Progressive disclosure: the filter/sort/view chrome appears only once there are results
@@ -775,7 +772,7 @@ struct ContentView: View {
                 // Tahoe: the inline sort menu + segmented view toggle render and overflow cleanly.
                 ControlGroup {
                     Menu {
-                        Picker("Sort by", selection: Binding(get: { model.sortOrder }, set: { model.sortOrder = $0 })) {
+                        Picker("Sort By", selection: Binding(get: { model.sortOrder }, set: { model.sortOrder = $0 })) {
                             ForEach(SortOrder.allCases) { Text($0.title).tag($0) }
                         }
                     } label: { Image(systemName: "arrow.up.arrow.down") }
@@ -794,11 +791,11 @@ struct ContentView: View {
                         Label("as List", systemImage: "list.bullet").tag(ResultViewMode.list)
                     }
                     Divider()
-                    Picker("Sort by", selection: Binding(get: { model.sortOrder }, set: { model.sortOrder = $0 })) {
+                    Picker("Sort By", selection: Binding(get: { model.sortOrder }, set: { model.sortOrder = $0 })) {
                         ForEach(SortOrder.allCases) { Text($0.title).tag($0) }
                     }
                 } label: {
-                    Label("View options", systemImage: "slider.horizontal.3")
+                    Label("View Options", systemImage: "slider.horizontal.3")
                 }
                 .help("Sort and view")
             }
@@ -834,9 +831,9 @@ struct ContentView: View {
                                          set: { _ in model.toggleLiteralQuery() })) {
                         // Quotation marks, not "Aa": the question is whether `type:image` is a
                         // filter or four literal characters, which is quoting, not formatting.
-                        Label("As plain query", systemImage: "quote.opening")
+                        Label("As Plain Query", systemImage: "quote.opening")
                     }
-                    .help("Search for the text as written, instead of reading type: and in: as filters")
+                    .help("Ignore filters in the query")
                 }
             }
             Section("Show") {
@@ -862,11 +859,11 @@ struct ContentView: View {
                 get: { model.filterFolder?.path ?? "" },
                 set: { model.filterFolder = $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
             )) {
-                Text("All folders").tag("")
+                Text("All Folders").tag("")
                 ForEach(model.roots, id: \.self) { Text($0.lastPathComponent).tag($0.path) }
             }
             Picker("Extension", selection: Binding(get: { model.filterExt }, set: { model.filterExt = $0 })) {
-                Text("Any extension").tag("")
+                Text("Any Extension").tag("")
                 ForEach(model.indexedExts, id: \.self) { Text(".\($0)").tag($0) }
             }
             Picker("Date", selection: Binding(get: { model.dateRange }, set: { model.dateRange = $0 })) {
@@ -878,11 +875,11 @@ struct ContentView: View {
             // delete the media (see AppModel.defaultMinScore). `score:` in the query language
             // still sets any other floor.
             Picker("Relevance", selection: Binding(get: { model.minScore }, set: { model.minScore = $0 })) {
-                Text("Only strong matches").tag(0.5)
+                Text("Only Strong Matches").tag(0.5)
                 Text("All").tag(0.0)
             }
             Divider()
-            Button("Clear filters") { model.clearFilters() }.disabled(!model.filtersActive)
+            Button("Clear Filters") { model.clearFilters() }.disabled(!model.filtersActive)
         } label: {
             Image(systemName: model.filtersActive ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
         }
@@ -1076,13 +1073,13 @@ private struct QualifierBar: View {
             }
             Spacer(minLength: 8)
             Button { model.toggleLiteralQuery() } label: {
-                Label(model.literalQuery ? "Use filters" : "As plain query",
+                Label(model.literalQuery ? "Use Filters" : "As Plain Query",
                       systemImage: model.literalQuery ? "line.3.horizontal.decrease.circle" : "quote.opening")
             }
             .buttonStyle(.bordered).controlSize(.small)
             .help(model.literalQuery
-                  ? "Read type: and in: as filters again"
-                  : "Search for the text as written, instead of reading type: and in: as filters")
+                  ? "Use filters in the query"
+                  : "Ignore filters in the query")
         }
         .font(.callout)
         .padding(.horizontal, 16).padding(.vertical, 6)
@@ -1184,7 +1181,7 @@ struct SearchWaysPrompt: View {
         ("character.cursor.ibeam", "Type a phrase"),
         ("arrow.down.doc", "Drag in an image, file, or text"),
         ("doc.on.clipboard", "Paste an image or text  \u{2318}V"),
-        ("doc.viewfinder", "Search by a file  \u{21E7}\u{2318}O"),
+        ("doc.viewfinder", "Search by File  \u{21E7}\u{2318}O"),
         ("square.on.square", "Right-click a result for Find Similar"),
     ]
 
@@ -1294,7 +1291,7 @@ struct IndexFailedView: View {
                     .buttonStyle(.bordered)
                     .tint(.red)
                     .disabled(model.repairRunning || model.dbPath.isEmpty)
-                Button("Reveal in Finder") {
+                Button("Show in Finder") {
                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.dbPath)])
                 }
                 .disabled(model.dbPath.isEmpty)
@@ -1307,7 +1304,7 @@ struct IndexFailedView: View {
             Button("Delete and reindex", role: .destructive) { model.reindexFromScratch() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Your files are not touched. Omni reads them again, which can take a while on a large library.")
+            Text("Your files are not affected.")
         }
     }
 }

@@ -483,15 +483,15 @@ struct ResultsList<Footer: View>: View {
         if count > 1, model.selectedPaths.contains(path) {
             Button { model.openSelected() } label: { Label("Open", systemImage: "arrow.up.forward.app") }
                 .keyboardShortcut("o", modifiers: .command)
-            Button { model.revealSelected() } label: { Label("Reveal in Finder", systemImage: "folder") }
-                .keyboardShortcut("r", modifiers: [.command, .shift])
-            Button { model.copySelectedPaths() } label: { Label("Copy \(count) paths", systemImage: "doc.on.doc") }
-                .keyboardShortcut("c", modifiers: .command)
-            // Native macOS share picker (AirDrop, Mail, Messages, ...) over the whole selection - the
-            // same system sheet Finder's Share opens, anchored to the menu. (ShareLink, no deprecated API.)
-            ShareLink(items: model.selectedURLsOrdered) { Label("Share\u{2026}", systemImage: "square.and.arrow.up") }
+            // The whole selection, in result order, each file its own tab in the workspace. Absent
+            // when nothing in the selection is a PDF or an image.
+            let transcribable = Transcribe.candidates(model.selectedPathsForMenu)
+            if !transcribable.isEmpty {
+                Button { Transcribe.send(transcribable, model: model, ocr: ocr) } label: {
+                    Label(Transcribe.title(transcribable.count), systemImage: "text.viewfinder")
+                }
+            }
             // (Re)generate content tags for the selected media - explicit request, HQ quality.
-            // Shown only when the selection contains taggable media and the tagger is ready.
             // Read HERE, in the multi-selection branch only. It scans `rawResults`, and reading that
             // from every row's menu - which macOS builds eagerly - re-rendered every visible row
             // whenever a search's hits changed below the threshold, i.e. on almost every keystroke.
@@ -499,46 +499,43 @@ struct ResultsList<Footer: View>: View {
                 model.selectedPaths.contains($0.path) && taggableKinds.contains($0.kind)
             }
             if model.canGenerateTags, selectionHasMedia {
+                Divider()
                 Button { model.requestTags(Array(model.selectedPaths)) } label: { Label("Generate Tags", systemImage: "tag") }
             }
-            // The whole selection, in result order, each file its own tab in the workspace - the
-            // same shape as Open and Reveal above. Absent when nothing in the selection is a PDF
-            // or an image.
-            let transcribable = Transcribe.candidates(model.selectedPathsForMenu)
-            if !transcribable.isEmpty {
-                Button { Transcribe.send(transcribable, model: model, ocr: ocr) } label: {
-                    Label(Transcribe.title(transcribable.count), systemImage: "text.viewfinder")
-                }
-            }
             Divider()
-            Button(role: .destructive) { model.moveSelectedToTrash() } label: { Label("Move \(count) items to Trash", systemImage: "trash") }
-                .keyboardShortcut(.delete, modifiers: .command)
+            Button { model.revealSelected() } label: { Label("Show in Finder", systemImage: "folder") }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+            Button { model.copySelectedPaths() } label: { Label("Copy \(count) Paths", systemImage: "doc.on.doc") }
+                .keyboardShortcut("c", modifiers: [.command, .option])
+            // Native macOS share picker (AirDrop, Mail, Messages, ...) over the whole selection.
+            ShareLink(items: model.selectedURLsOrdered) { Label("Share\u{2026}", systemImage: "square.and.arrow.up") }
             Divider()
-            Button { model.selectAllResults() } label: { Label("Select all", systemImage: "checkmark.circle") }
+            Button { model.selectAllResults() } label: { Label("Select All", systemImage: "checkmark.circle") }
                 .keyboardShortcut("a", modifiers: .command)
+            Divider()
+            Button(role: .destructive) { model.moveSelectedToTrash() } label: { Label("Move \(count) Items to Trash", systemImage: "trash") }
+                .keyboardShortcut(.delete, modifiers: .command)
         } else {
             // Stack actions, above the per-file ones. Everything else in this menu acts on the
             // REPRESENTATIVE only - a collapsed stack is one file as far as opening, previewing and
             // trashing go - so the two stack-wide actions are stated explicitly with their count.
             // Deleting copies you cannot see is exactly the mistake this wording exists to prevent.
-            if let group = model.groups.first(where: { $0.id == path }), group.isStack {
+            let stack = model.groups.first(where: { $0.id == path && $0.isStack })
+            if let group = stack {
                 Button { toggleStack(group.id) } label: {
-                    Label(model.expandedStacks.contains(group.id) ? "Hide \(group.count - 1) copies" : "Show \(group.count - 1) copies",
+                    Label(model.expandedStacks.contains(group.id) ? "Hide \(group.count - 1) Copies" : "Show \(group.count - 1) Copies",
                           systemImage: "square.stack.3d.down.right")
                 }
                 Button { model.selectPaths(group.paths) } label: {
-                    Label("Select all \(group.count)", systemImage: "checkmark.circle")
-                }
-                Divider()
-                Button(role: .destructive) { model.moveToTrash(group.paths) } label: {
-                    Label("Move all \(group.count) copies to Trash", systemImage: "trash")
+                    Label("Select All \(group.count)", systemImage: "checkmark.circle")
                 }
                 Divider()
             }
             // The shared per-file menu (App/FileMenu.swift): the folder and Photos browsers show
             // exactly these items, in this order. Only what is specific to a ranked result list
             // stays here - the stack block above, and the passages slot below.
-            FileMenuItems(path: path, kind: hit.kind, showsSelectAll: true) {
+            FileMenuItems(path: path, kind: hit.kind, showsSelectAll: true,
+                          trashAll: stack.map { g in ("Move All \(g.count) Copies to Trash", { model.moveToTrash(g.paths) }) }) {
                 // Per-chunk breakdown (pages of a PDF, passages of a long doc) - only for files
                 // that actually have several chunks. The list expands inline; the grid opens a
                 // popover.
@@ -546,7 +543,7 @@ struct ResultsList<Footer: View>: View {
                     switch model.viewMode {
                     case .list:
                         Button { toggle(path) } label: {
-                            Label(expanded.contains(path) ? "Hide matching passages" : "Show matching passages",
+                            Label(expanded.contains(path) ? "Hide Matching Passages" : "Show Matching Passages",
                                   systemImage: "text.alignleft")
                         }
                     case .grid:
@@ -567,7 +564,7 @@ struct ResultsList<Footer: View>: View {
                                 if let ranked { passagesCache[path] = ranked }
                                 passagesPopover = path
                             }
-                        } label: { Label("Show matching passages", systemImage: "text.alignleft") }
+                        } label: { Label("Show Matching Passages", systemImage: "text.alignleft") }
                     }
                 }
             }
@@ -941,8 +938,8 @@ extension ResultRow {
         // 321); this one was the only row that did, and a chaos run hung in lazy-stack placement.
         .padding(.vertical, -2)
         .help(stack.reason == .exact
-              ? "\(stack.count) byte-identical copies - click to show them"
-              : "\(stack.count) near-identical files - click to show them")
+              ? "\(stack.count) identical copies"
+              : "\(stack.count) near-identical files")
     }
 }
 

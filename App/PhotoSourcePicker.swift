@@ -47,8 +47,6 @@ struct PhotoSourcePicker: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Add Photos").font(.headline)
-            Text("Omni reads your Photos library directly - nothing is exported or copied.")
-                .font(.callout).foregroundStyle(.secondary)
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -174,7 +172,7 @@ struct PhotoAccessDenied: View {
         VStack(spacing: 14) {
             Image(systemName: "lock.fill").font(.largeTitle).foregroundStyle(.secondary)
             Text("Omni doesn't have access to your Photos library").font(.headline)
-            Text("macOS asks for this once. Allow Omni under Privacy & Security \u{203A} Photos, then add your library again.")
+            Text("Allow Omni in Privacy & Security \u{203A} Photos.")
                 .font(.callout).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
             HStack {

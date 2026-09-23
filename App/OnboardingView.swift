@@ -22,11 +22,8 @@ struct OnboardingView: View {
                 .accessibilityHidden(true)   // the headline right below already names the app
             Text("Welcome to Omni")
                 .font(.title).fontWeight(.semibold)
-            // Says WHAT is downloading and WHY there is a download at all: people who just
-            // installed the app read a second download as a mistake or a trick. It also carries the
-            // privacy claim, which is why the lock.shield block that used to close this screen is
-            // gone rather than reworded.
-            Text("Searching by meaning needs an embedding model. It downloads once, then runs on this Mac - your files never leave it.")
+            // Names what downloads, so a second download right after install is not read as a mistake.
+            Text("Omni needs its search model before it can start.")
                 .font(.callout).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center).frame(maxWidth: 440)
 

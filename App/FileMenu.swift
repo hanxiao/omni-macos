@@ -33,9 +33,14 @@ struct FileMenuItems<Passages: View>: View {
     let kind: String
     /// Whether the list this menu came from can select more than one row.
     var showsSelectAll: Bool = false
+    /// A stack row's "Move All N Copies to Trash", placed with the other destructive item so the
+    /// menu never carries two trash groups.
+    var trashAll: (title: String, action: () -> Void)? = nil
     /// List-specific items that belong directly under Quick Look.
     @ViewBuilder var passages: () -> Passages
 
+    // ORDER, as Finder groups a file's menu: open it; find related; hand it elsewhere; selection;
+    // and what removes it, last, so the destructive items are never in the middle.
     var body: some View {
         Button { model.selectSingle(path); PhotoActions.open(path) } label: {
             Label("Open", systemImage: "arrow.up.forward.app")
@@ -56,7 +61,7 @@ struct FileMenuItems<Passages: View>: View {
         Divider()
         // Use this file itself as the query - doc-vs-doc "more like this" across all modalities.
         Button { model.searchBySimilar(to: path) } label: {
-            Label("Find similar", systemImage: "sparkle.magnifyingglass")
+            Label("Find Similar", systemImage: "sparkle.magnifyingglass")
         }
         .keyboardShortcut("f", modifiers: [.command, .option])
         // (Re)generate this file's content tags - explicit request, HQ quality.
@@ -65,6 +70,7 @@ struct FileMenuItems<Passages: View>: View {
                 Label("Generate Tags", systemImage: "tag")
             }
         }
+        Divider()
         Button { model.selectSingle(path); PhotoActions.reveal(path) } label: {
             Label(PhotoActions.revealTitle(path), systemImage: "folder")
         }
@@ -72,7 +78,7 @@ struct FileMenuItems<Passages: View>: View {
         Button {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(path, forType: .string)
-        } label: { Label("Copy path", systemImage: "doc.on.doc") }
+        } label: { Label("Copy Path", systemImage: "doc.on.doc") }
         // Opt-Cmd-C, matching the File menu, because that is the chord that actually fires. A
         // chord declared inside a context menu never fires on macOS, so this label is decoration -
         // and it read "Cmd-C", which IS bound, to Edit > Copy, and does something else entirely.
@@ -86,29 +92,37 @@ struct FileMenuItems<Passages: View>: View {
                 Label("Share\u{2026}", systemImage: "square.and.arrow.up")
             }
         }
-        Divider()
-        // Deleting a Photos asset means deleting it from the library and every synced device -
-        // Photos.app's decision to offer, not Omni's.
-        if !PhotoLibrary.isPhotoPath(path) {
-            Button(role: .destructive) { model.moveToTrash([path]) } label: {
-                Label("Move to Trash", systemImage: "trash")
-            }
-            .keyboardShortcut(.delete, modifiers: .command)
-        }
         if showsSelectAll {
+            Divider()
             Button { model.selectAllResults() } label: {
-                Label("Select all", systemImage: "checkmark.circle")
+                Label("Select All", systemImage: "checkmark.circle")
             }
             .keyboardShortcut("a", modifiers: .command)
         }
         // Exclude this file's folder from indexing - the "stop showing me this build/cache noise"
         // action. Routes through the same apply path as the Settings ignore editor. Hidden when the
         // folder is an indexed root: removing a whole root belongs to the sidebar, with its
-        // confirmation.
-        if model.canIgnoreEnclosingFolder(ofPath: path) {
+        // confirmation. Deleting a Photos asset means deleting it from the library and every
+        // synced device - Photos.app's decision to offer, not Omni's.
+        let ignorable = model.canIgnoreEnclosingFolder(ofPath: path)
+        let trashable = !PhotoLibrary.isPhotoPath(path)
+        if ignorable || trashable || trashAll != nil {
             Divider()
+        }
+        if ignorable {
             Button { model.ignoreEnclosingFolder(ofPath: path) } label: {
-                Label("Ignore folder \u{201C}\(enclosingName)\u{201D}", systemImage: "eye.slash")
+                Label("Ignore Folder \u{201C}\(enclosingName)\u{201D}", systemImage: "eye.slash")
+            }
+        }
+        if trashable {
+            Button(role: .destructive) { model.moveToTrash([path]) } label: {
+                Label("Move to Trash", systemImage: "trash")
+            }
+            .keyboardShortcut(.delete, modifiers: .command)
+        }
+        if let trashAll {
+            Button(role: .destructive, action: trashAll.action) {
+                Label(trashAll.title, systemImage: "trash")
             }
         }
     }
@@ -130,8 +144,9 @@ struct FileMenuItems<Passages: View>: View {
 }
 
 extension FileMenuItems where Passages == EmptyView {
-    init(path: String, kind: String, showsSelectAll: Bool = false) {
-        self.init(path: path, kind: kind, showsSelectAll: showsSelectAll) { EmptyView() }
+    init(path: String, kind: String, showsSelectAll: Bool = false,
+         trashAll: (title: String, action: () -> Void)? = nil) {
+        self.init(path: path, kind: kind, showsSelectAll: showsSelectAll, trashAll: trashAll) { EmptyView() }
     }
 }
 
@@ -233,7 +248,7 @@ struct FolderMenuItems: View {
         // looking at the listing, this one leaves you ready to type a query against it. Without
         // that the two items were literally the same call under two labels.
         Button { model.enterFolder(url); SearchFieldFocus.focus() } label: {
-            Label("Search in this folder", systemImage: "magnifyingglass")
+            Label("Search in This Folder", systemImage: "magnifyingglass")
         }
         // ADD, not replace - issue #18. With one indexed root you could scope a search to that
         // root or to a single folder under it, never to two siblings, because adding the children
@@ -253,24 +268,25 @@ struct FolderMenuItems: View {
         } label: { Label("Visualize", systemImage: "chart.dots.scatter") }
         Divider()
         Button { NSWorkspace.shared.revealAsync(url) } label: {
-            Label("Reveal in Finder", systemImage: "folder")
+            Label("Show in Finder", systemImage: "folder")
         }
         Button {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(url.path, forType: .string)
-        } label: { Label("Copy path", systemImage: "doc.on.doc") }
-        Divider()
+        } label: { Label("Copy Path", systemImage: "doc.on.doc") }
+        ShareLink(item: url) { Label("Share\u{2026}", systemImage: "square.and.arrow.up") }
         // PAUSE IS ROOT-SCOPED IN THE ENGINE. `pausedRoots` is consulted when roots are collected
         // into a pass; nothing tests a crawled path against it, so pausing a subfolder would set a
         // flag that changes nothing. Shown where it works, omitted where it would be a lie.
         if isRoot {
+            Divider()
             if model.isFolderPaused(url) {
                 Button { model.setFolderPaused(url, false) } label: {
-                    Label("Resume this folder", systemImage: "play.circle")
+                    Label("Resume Indexing", systemImage: "play.circle")
                 }
             } else {
                 Button { model.setFolderPaused(url, true) } label: {
-                    Label("Pause this folder", systemImage: "pause.circle")
+                    Label("Pause Indexing", systemImage: "pause.circle")
                 }
             }
         }
@@ -279,6 +295,7 @@ struct FolderMenuItems: View {
         // such record, so the equivalent is an ignore rule - which also prunes what is already
         // indexed under it, and is revertible in Settings > Content.
         if isRoot || model.canIgnoreFolder(url) {
+            Divider()
             Button(role: .destructive) {
                 willRemove()
                 if isRoot { model.removeRoot(url) } else { model.ignoreFolder(url) }

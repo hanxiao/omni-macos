@@ -209,9 +209,9 @@ final class PerfTourUITests: XCTestCase {
             XCTAssertGreaterThan(rows.count, 2, "no results to right-click")
             // The third row: not the first, which the search may have left under the pointer.
             rows.element(boundBy: 2).rightClick()
-            let item = app.menuItems["Find similar"]
-            XCTAssertTrue(item.waitForExistence(timeout: 3), "right-click showed no Find similar in view \(mode)")
-            XCTAssertTrue(app.menuItems["Copy path"].exists, "the menu is not the full one in view \(mode)")
+            let item = app.menuItems["Find Similar"]
+            XCTAssertTrue(item.waitForExistence(timeout: 3), "right-click showed no Find Similar in view \(mode)")
+            XCTAssertTrue(app.menuItems["Copy Path"].exists, "the menu is not the full one in view \(mode)")
             app.typeKey(.escape, modifierFlags: [])
             settle(0.8)
         }

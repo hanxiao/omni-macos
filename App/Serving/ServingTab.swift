@@ -41,8 +41,8 @@ struct ServingTab: View {
                              text: mcpConfigText, saveAs: nil)
         }
         .sheet(isPresented: $showSkillSheet) {
-            AgentConfigSheet(title: "SKILL.md for instruction-following agents",
-                             subtitle: "For agents that read skills, e.g. ~/.claude/skills/omni-local-search/SKILL.md.",
+            AgentConfigSheet(title: "SKILL.md",
+                             subtitle: "~/.claude/skills/omni-local-search/SKILL.md",
                              text: skillMarkdown, saveAs: "SKILL.md")
         }
     }
@@ -143,7 +143,7 @@ struct ServingTab: View {
         } header: {
             Text("Server")
         } footer: {
-            Text("Local network access requires a token. Changes restart the server.")
+            Text("Local network access requires a token.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }

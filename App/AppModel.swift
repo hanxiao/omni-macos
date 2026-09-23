@@ -149,7 +149,7 @@ enum SortOrder: String, CaseIterable, Identifiable {
         switch self {
         case .relevance: return "Relevance"
         case .name: return "Name"
-        case .dateModified: return "Date modified"
+        case .dateModified: return "Date Modified"
         }
     }
 }
@@ -159,10 +159,10 @@ enum DateRange: String, CaseIterable, Identifiable {
     var id: String { rawValue }
     var title: String {
         switch self {
-        case .any: return "Any time"
-        case .week: return "Past week"
-        case .month: return "Past month"
-        case .year: return "Past year"
+        case .any: return "Any Time"
+        case .week: return "Past Week"
+        case .month: return "Past Month"
+        case .year: return "Past Year"
         }
     }
     var since: Double? {
@@ -1039,7 +1039,6 @@ final class AppModel {
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
         panel.prompt = "Search"
-        panel.message = "Choose an image, audio, video, or text file to search by"
         if panel.runModal() == .OK, let url = panel.url { setFileQuery(url) }
     }
     /// Show Quick Look for `url`, or dismiss it when nil.
@@ -1515,6 +1514,9 @@ final class AppModel {
     /// Content area shows the OCR workspace instead of search results. Not persisted: it is a
     /// mode you step into for a task, and a relaunch should land back in search.
     var ocrMode = false
+    /// Whether the window's sidebar is showing, mirrored from ContentView's split state so the View
+    /// menu can say Show Sidebar or Hide Sidebar, as Finder's does.
+    var sidebarShown = true
 
     // Optional OCR model (jina-ocr-v1). Separate from the embedding variants in every way that
     // matters: a different model family, ~4 GB, not on the indexing path, and NEVER fetched
@@ -1606,15 +1608,6 @@ final class AppModel {
         case .compactingIndex: return "Compacting your index"
         case .loadingIndex:   return "Loading your index"
         case nil:             return "Loading the Omni model"
-        }
-    }
-    var launchSubtitle: String {
-        if warmingIndex { return "Reading your index so the first search is fast." }
-        switch storePhase {
-        case .upgradingIndex: return "One-time change to make search faster and the index smaller."
-        case .compactingIndex: return "Reclaiming space the index no longer needs."
-        case .loadingIndex:   return "Reading your index into memory. The model is loading alongside it."
-        case nil:             return "Your first search may be slower while the index loads into memory."
         }
     }
     var launchSymbol: String { storePhase == .upgradingIndex ? "internaldrive" : "brain" }
@@ -3830,7 +3823,7 @@ final class AppModel {
     /// Storage-tab model picker action: switch if the variant is installed, otherwise confirm and
     /// download it (no separate Download button - selecting the variant is the trigger).
     func selectVariant(_ v: ModelVariant) {
-        let rebuildNote = "Your search index will be rebuilt, because the two models store results differently."
+        let rebuildNote = "The index will be rebuilt."
         if installedVariants[v] != nil {
             guard v != modelVariant else { return }
             // Switching back to the variant the index was built with is the RECOVERY action for a
@@ -3841,15 +3834,13 @@ final class AppModel {
             // Any other switch wipes and rebuilds the whole index - never on a bare menu click.
             let a = NSAlert()
             a.messageText = "Switch to \(v.title)?"
-            a.informativeText = "\(rebuildNote) Files will reindex from scratch, which can take a while on a large library."
-            a.addButton(withTitle: "Switch and rebuild index"); a.addButton(withTitle: "Cancel")
+            a.informativeText = rebuildNote
+            a.addButton(withTitle: "Switch"); a.addButton(withTitle: "Cancel")
             if a.runModal() == .alertFirstButtonReturn { switchVariant(v) }
         } else if !isDownloading {
             let a = NSAlert()
             a.messageText = "Download \(v.title)?"
-            let character = v == .small ? "\(v.title) is larger and gives higher-quality results."
-                                        : "\(v.title) is smaller and faster."
-            a.informativeText = "\(character) It downloads once to your Mac and becomes the active model. \(rebuildNote)"
+            a.informativeText = rebuildNote
             a.addButton(withTitle: "Download"); a.addButton(withTitle: "Cancel")
             if a.runModal() == .alertFirstButtonReturn { downloadModel(v) }
         }

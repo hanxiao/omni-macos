@@ -245,12 +245,12 @@ private struct HistorySections: View {
                     .help(item.isFile ? (item.filePath ?? item.displayLabel) : item.displayText)
                     .contextMenu {
                         Button { model.toggleHistoryBookmark(item) } label: {
-                            Label(item.bookmarked ? "Remove bookmark" : "Bookmark",
+                            Label(item.bookmarked ? "Remove Bookmark" : "Bookmark Search",
                                   systemImage: item.bookmarked ? "star.slash" : "star")
                         }
                         Divider()
                         Button(role: .destructive) { model.removeHistory(item) } label: {
-                            Label("Remove", systemImage: "trash")
+                            Label("Remove from History", systemImage: "trash")
                         }
                     }
                     .tag(SidebarSelection.history(item.id))
@@ -447,7 +447,7 @@ private struct PhotoSourceRow: View {
                 Label("Open", systemImage: "arrow.up.forward.app")
             }
             Button { model.enterPhotoSource(source); SearchFieldFocus.focus() } label: {
-                Label("Search in this source", systemImage: "magnifyingglass")
+                Label("Search in This Source", systemImage: "magnifyingglass")
             }
             Divider()
             // By bundle id, not by path: /System/Applications is Apple's to rearrange,
@@ -460,13 +460,14 @@ private struct PhotoSourceRow: View {
             Divider()
             if model.isFolderPaused(path: source.key) {
                 Button { model.setFolderPaused(path: source.key, false) } label: {
-                    Label("Resume this source", systemImage: "play.circle")
+                    Label("Resume Indexing", systemImage: "play.circle")
                 }
             } else {
                 Button { model.setFolderPaused(path: source.key, true) } label: {
-                    Label("Pause this source", systemImage: "pause.circle")
+                    Label("Pause Indexing", systemImage: "pause.circle")
                 }
             }
+            Divider()
             Button(role: .destructive) { deselect(); model.removePhotoSource(source) } label: {
                 Label("Remove from Omni", systemImage: "minus.circle")
             }
@@ -498,7 +499,9 @@ private struct CoveredFolderRow: View {
             Divider()
             // NOT "Remove from Omni". This is not a root, so there is nothing to un-index - the
             // parent still covers these files. It only forgets the shortcut.
-            Button("Remove from Sidebar") { model.removeCoveredFolder(url) }
+            Button { model.removeCoveredFolder(url) } label: {
+                Label("Remove from Sidebar", systemImage: "sidebar.leading")
+            }
         }
     }
 }
@@ -542,7 +545,7 @@ private struct FolderRow: View {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
                 }
                 .buttonStyle(.plain)
-                .help("No permission to read this folder. Click to open Privacy & Security > Files and Folders.")
+                .help("No permission to read this folder")
             } else if model.indexedFiles > 0, let c = model.folderFileCounts[url.path] {
                 // Once anything is indexed, show every folder's real count - a
                 // plain "0" is an unambiguous "nothing here yet" rather than blank.
