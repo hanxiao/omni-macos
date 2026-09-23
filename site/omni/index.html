@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 
-  <title>Omni - search your Mac by meaning</title>
+  <title>Omni - Search your Mac by meaning</title>
   <meta name="description" content="Omni searches text, code, PDFs, images, audio and video on your Mac by meaning, in any language. On-device on Apple silicon, offline after one model download. Free and open source." />
   <link rel="canonical" href="https://hanxiao.io/omni/" />
   <meta name="color-scheme" content="light dark" />
@@ -12,16 +12,17 @@
   <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)" />
 
   <meta property="og:type" content="website" />
+  <meta property="og:locale" content="en_US" />
   <meta property="og:site_name" content="Omni" />
-  <meta property="og:title" content="Omni - search your Mac by meaning" />
-  <meta property="og:description" content="Text, code, PDFs, images, audio and video in one on-device index. Any language, offline, open source." />
+  <meta property="og:title" content="Omni" />
+  <meta property="og:description" content="Omni searches every file on your Mac by meaning, in any language, entirely on device." />
   <meta property="og:url" content="https://hanxiao.io/omni/" />
   <meta property="og:image" content="https://hanxiao.io/omni/assets/og-image.png" />
   <meta property="og:image:width" content="1200" />
   <meta property="og:image:height" content="630" />
   <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:title" content="Omni - search your Mac by meaning" />
-  <meta name="twitter:description" content="Text, code, PDFs, images, audio and video in one on-device index. Any language, offline, open source." />
+  <meta name="twitter:title" content="Omni" />
+  <meta name="twitter:description" content="Omni searches every file on your Mac by meaning, in any language, entirely on device." />
   <meta name="twitter:image" content="https://hanxiao.io/omni/assets/og-image.png" />
 
   <script type="application/ld+json">
@@ -224,6 +225,15 @@
     .head-center { text-align: center; }
     .head-center .sub { margin-left: auto; margin-right: auto; }
 
+    /* Stats band: the figures carry the claim, a few words each. */
+    .band { margin-top: 64px; }
+    .band h2 { text-align: center; }
+    .stats { margin: 48px auto 0; max-width: var(--wide); display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+    .stat { text-align: center; padding: 8px 6px; }
+    .stat b { display: block; font-size: clamp(40px, 5.4vw, 64px); line-height: 1; font-weight: 700; letter-spacing: -0.035em; font-variant-numeric: tabular-nums; }
+    .stat span { display: block; margin-top: 12px; font-size: 15px; color: var(--text-2); letter-spacing: -0.01em; text-wrap: balance; }
+    .foot-note { margin: 28px auto 0; text-align: center; font-size: 12px; color: var(--text-3); max-width: 60ch; letter-spacing: -0.005em; }
+
     /* Feature grid */
     .features { margin-top: 56px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
     .feature {
@@ -344,6 +354,7 @@
       .shot { border-radius: 10px; }
       section { padding-top: 88px; }
       .features { grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 40px; }
+      .stats { grid-template-columns: 1fr 1fr; gap: 32px 12px; margin-top: 36px; }
       .feature { padding: 16px 16px 18px; border-radius: 18px; }
       .feature h3 { font-size: 16px; margin-bottom: 4px; }
       .feature p { font-size: 14px; }
@@ -390,6 +401,19 @@
             <img src="assets/shot-hero.jpg" width="1600" height="748" alt="Omni searching for porsche 911 across 2.7 million files, showing a gallery of matching photos with relevance scores and generated tags" fetchpriority="high" />
           </picture>
         </div>
+      </div>
+    </section>
+
+    <section class="band" aria-labelledby="band-title">
+      <div class="wrap">
+        <h2 id="band-title">Built for files that never sit still.</h2>
+        <div class="stats">
+          <div class="stat"><b>2.7M</b><span>files in one index</span></div>
+          <div class="stat"><b>19 ms</b><span>to search all of them</span></div>
+          <div class="stat"><b>90%</b><span>less work when a file grows</span></div>
+          <div class="stat"><b>Live</b><span>edits, moves and deletes apply in place</span></div>
+        </div>
+        <p class="foot-note">A personal index of 2,739,209 files on Mac Studio with M3 Ultra, median of 20 queries including the query embedding. Re-encoding measured on appends in the technical report.</p>
       </div>
     </section>
 
