@@ -1136,7 +1136,7 @@ struct CenteredStatus: View {
                 // The app's own mark, as a template: it takes .tertiary the way a symbol does, so it
                 // sits in the same place and weight, and reads as the brand without a coloured icon.
                 Image("MoleGlyph").renderingMode(.template).resizable().scaledToFit()
-                    .frame(width: 72, height: 72).foregroundStyle(.tertiary)
+                    .frame(width: 60, height: 60).foregroundStyle(.tertiary)
             } else {
                 Image(systemName: symbol).font(.system(size: 44, weight: .light)).foregroundStyle(.tertiary)
             }
