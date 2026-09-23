@@ -17,6 +17,9 @@
 set -u
 cd "$(dirname "$0")/.."
 CORPUS=$1; BASE=$2; OUT=$3; RESERVE=${4:-}
+# A missing index is not an error the app reports: it opens an empty one, every search returns
+# nothing, and the tour measures an app with no rows to draw.
+[ -f "$BASE/index.sqlite" ] || { echo "no index at $BASE"; exit 2; }
 mkdir -p "$OUT"; rm -f "$OUT"/*.log(N); true
 osascript -e 'tell application id "io.hanxiao.omni" to quit' >/dev/null 2>&1
 for _ in $(seq 1 30); do pgrep -x Omni >/dev/null || break; sleep 1; done

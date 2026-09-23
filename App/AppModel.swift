@@ -211,8 +211,29 @@ final class AppModel {
     private func refreshLoadingProgress() {
         // No trustworthy denominator: leave it nil so the screen stays indeterminate.
         guard phase == .loadingModel, engineTotalBytes != nil else { return }
-        let combined = min(Self.launchBarCeiling, 0.5 * storeLoadFrac + 0.5 * engineLoadFrac)
-        loadingProgress = max(loadingProgress ?? 0, combined)
+        // The index and the model load together; reading the vectors ahead comes after both. Its
+        // slice is only reserved when the launch will actually do it.
+        let load = 0.5 * storeLoadFrac + 0.5 * engineLoadFrac
+        let combined = min(Self.launchBarCeiling, warmPlanned ? 0.8 * load + 0.2 * warmFrac : load)
+        let before = loadingProgress ?? 0
+        loadingProgress = max(before, combined)
+        if omniPerfEnabled, Int(combined * 10) > Int(before * 10) {
+            omniPerfLog(String(format: "launch bar %.0f%% (index %.0f%%, model %.0f%%, read %.0f%%)",
+                               combined * 100, storeLoadFrac * 100, engineLoadFrac * 100, warmFrac * 100))
+        }
+    }
+    @ObservationIgnored private var warmFrac = 0.0
+    @ObservationIgnored private var warmPlanned = false
+    private func noteWarmFrac(_ f: Double) { warmFrac = max(warmFrac, min(1, f)); refreshLoadingProgress() }
+    /// The last stage of a launch: reading the vector file so the first search does not page it in.
+    private(set) var warmingIndex = false
+    /// How long a launch waits for that read before going ready anyway. It then carries on in the
+    /// background. A launch that blocked on warm-up without a bound is what looked hung on an M2.
+    private static let warmBudget: TimeInterval = 4
+    /// Whether this Mac should read the vector file ahead at all: only when it fits comfortably in
+    /// memory. Where it does not, the pages would be evicted again before the first search.
+    private static func shouldPrefetchVectors(bytes: Int) -> Bool {
+        bytes > 0 && bytes <= Int(ProcessInfo.processInfo.physicalMemory) / 4
     }
     /// Total GPU bytes this launch will materialize: the weights file plus the persisted quant
     /// replica. The denominator for the engine-side fraction.
@@ -1579,6 +1600,7 @@ final class AppModel {
     /// Title for the launch screen. The store's phase when it has one, because that is the part
     /// that can take tens of seconds; the model otherwise, which is what a normal launch is doing.
     var launchTitle: String {
+        if warmingIndex { return "Preparing search" }
         switch storePhase {
         case .upgradingIndex: return "Upgrading your index"
         case .compactingIndex: return "Compacting your index"
@@ -1587,6 +1609,7 @@ final class AppModel {
         }
     }
     var launchSubtitle: String {
+        if warmingIndex { return "Reading your index so the first search is fast." }
         switch storePhase {
         case .upgradingIndex: return "One-time change to make search faster and the index smaller."
         case .compactingIndex: return "Reclaiming space the index no longer needs."
@@ -1792,6 +1815,10 @@ final class AppModel {
     static weak var shared: AppModel?
 
     init() {
+        // The store's OMNI_SEARCH_TIMING lines are `print`s; piped, stdout is block-buffered and the
+        // app leaves through `_exit`, so without this they never arrive.
+        if ProcessInfo.processInfo.environment["OMNI_SEARCH_TIMING"] == "1" { setvbuf(stdout, nil, _IONBF, 0) }
+        omniPerfLog("launch model-init")
         Self.shared = self
         Self.sweepDroppedImageTemps()
         // Reclaim the stores a paper run left behind if it was killed mid-run. Off the main thread:
@@ -1809,8 +1836,8 @@ final class AppModel {
         loadIgnore()
         loadPerf()
         loadHistory()
-        sweepUnsavedQueryImages()   // after loadHistory: keep bookmarked query images, drop the rest
-        pruneDeadFileRecents()      // clear dangling file recents (e.g. older temp-path image searches)
+        sweepUnsavedQueryImages() 
+        pruneDeadFileRecents()    
         if let raw = UserDefaults.standard.string(forKey: "omni.historyMode"), let m = HistoryMode(rawValue: raw) { historyMode = m }
         if UserDefaults.standard.object(forKey: "omni.saveServingHistory") != nil {
             saveServingHistory = UserDefaults.standard.bool(forKey: "omni.saveServingHistory")
@@ -1820,6 +1847,7 @@ final class AppModel {
         let retain = UserDefaults.standard.integer(forKey: "omni.historyRetentionDays")
         if retain > 0 { historyRetentionDays = retain } else { pruneHistory(); persistHistory() }
         if let raw = UserDefaults.standard.string(forKey: "omni.viewMode"), let m = ResultViewMode(rawValue: raw) { viewMode = m }
+        omniPerfLog("launch model-init done")
         Task { await bootstrap() }
     }
 
@@ -1831,12 +1859,24 @@ final class AppModel {
     /// the paste path, which is how the second prefix got here.
     private static let stagingTempPrefixes = ["omni-drop-", "omni-paste-"]
 
+    ///
+    /// OFF THE MAIN THREAD. It lists the whole temporary directory, which is shared with every other
+    /// process of the user's and can hold tens of thousands of entries: 50,793 on the development
+    /// Mac, where the listing cost 2.3 s of the launch before the index had even started to open.
+    /// Because it now runs alongside this session, it only removes what is OLDER than the launch -
+    /// a file dropped in the first seconds must not be swept out from under the search it started.
     private static func sweepDroppedImageTemps() {
-        let tmp = FileManager.default.temporaryDirectory
-        guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: tmp, includingPropertiesForKeys: nil) else { return }
-        for url in entries where stagingTempPrefixes.contains(where: url.lastPathComponent.hasPrefix) {
-            try? FileManager.default.removeItem(at: url)
+        let launched = Date()
+        let prefixes = stagingTempPrefixes
+        DispatchQueue.global(qos: .utility).async {
+            let tmp = FileManager.default.temporaryDirectory
+            guard let entries = try? FileManager.default.contentsOfDirectory(
+                at: tmp, includingPropertiesForKeys: [.creationDateKey]) else { return }
+            for url in entries where prefixes.contains(where: url.lastPathComponent.hasPrefix) {
+                let created = (try? url.resourceValues(forKeys: [.creationDateKey]))?.creationDate
+                if let created, created >= launched { continue }
+                try? FileManager.default.removeItem(at: url)
+            }
         }
     }
 
@@ -3365,6 +3405,7 @@ final class AppModel {
     func cancelDownload() { downloader?.cancel() }
 
     private func bootstrap() async {
+        omniPerfLog("launch bootstrap")
         applyMemoryLimit()
         startMemoryLogIfRequested()
         watchActivationForDeniedRoots()
@@ -3389,13 +3430,19 @@ final class AppModel {
         if UserDefaults.standard.bool(forKey: "omni.forceOnboarding") { phase = .noModel; return }
         guard let dir = await Task.detached(priority: .userInitiated, operation: { Self.resolvedModelDir() }).value
         else { phase = .noModel; return }
+        omniPerfLog("launch model-dir")
         modelPath = dir.path
         modelVariant = dir.path.contains("nano") ? .nano : .small
         // REAL launch progress, not an animation: the store reports its row-load fraction directly,
         // and the engine side is MLX's live GPU allocation against the total bytes KNOWN up front
         // (weights file + persisted quant replica - everything that must materialize before ready).
-        storeLoadFrac = 0; engineLoadFrac = 0
+        storeLoadFrac = 0; engineLoadFrac = 0; warmFrac = 0
         engineTotalBytes = Self.expectedGPULoadBytes(modelDir: dir)
+        warmPlanned = (try? Self.indexURL()).map { idx in
+            let vecs = idx.deletingLastPathComponent().appendingPathComponent(idx.lastPathComponent + ".vecs")
+            let bytes = ((try? FileManager.default.attributesOfItem(atPath: vecs.path)[.size]) as? Int) ?? 0
+            return Self.shouldPrefetchVectors(bytes: bytes)
+        } ?? false
         // nil until there is something real to show: with no denominator the screen stays on the
         // indeterminate bar rather than starting a determinate one at zero and never moving it.
         loadingProgress = engineTotalBytes == nil ? nil : 0
@@ -3421,10 +3468,16 @@ final class AppModel {
             // (cold) load hit the MLX uninitialized-memory NaN, so media indexes reliably. Only load
             // the towers for enabled modalities so a turned-off kind never occupies VRAM.
             let towers = enabledKindTowers
-            async let engineC = OmniEngine.loadValidated(modelDir: dir, keepVision: towers.vision, keepAudio: towers.audio)
+            async let engineC: OmniEngine = {
+                let e = try await OmniEngine.loadValidated(modelDir: dir, keepVision: towers.vision, keepAudio: towers.audio)
+                omniPerfLog("launch engine done")
+                return e
+            }()
             let store = try await storeC
+            omniPerfLog("launch store-open")
             await MainActor.run { self.storePhase = nil }   // store done; only the model can be left
             let engine = try await engineC
+            omniPerfLog("launch engine-loaded")
             // On a model/db switch, close the PREVIOUS store off the main actor: dropping its last ref
             // here would run a synchronous WAL checkpoint(TRUNCATE) + sqlite_close in deinit on @MainActor
             // (disk IO, worse on a slow/external volume). oldIndexer is kept alive in the task so its
@@ -3495,6 +3548,31 @@ final class AppModel {
                 store.metaSet("embedding_version", fingerprint)
             }
             refreshIndexStats(store)
+            // READ THE VECTORS AHEAD, as the last part of the launch bar. See
+            // VectorStore.prefetchVectorFile: the first search otherwise pays for faulting in the
+            // rows it touches (877 ms against 143 ms measured on a 10 GB file, which reads in 1.45 s).
+            // Bounded by `warmBudget` and skipped where the file would not stay cached, so this can
+            // lengthen a launch by a few seconds at most and never on a small Mac.
+            if warmPlanned, Self.shouldPrefetchVectors(bytes: store.vectorFileBytes) {
+                warmingIndex = true
+                let deadline = Date().addingTimeInterval(Self.warmBudget)
+                let tWarm = Date()
+                let report: @Sendable (Double) -> Void = { [weak self] f in
+                    Task { @MainActor in self?.noteWarmFrac(f) }
+                }
+                let finished = await Task.detached(priority: .userInitiated) {
+                    store.prefetchVectorFile(until: deadline, progress: report)
+                }.value
+                omniPerfLog(String(format: "launch vectors read %.0fms finished=%@",
+                                   -tWarm.timeIntervalSinceNow * 1000, finished ? "yes" : "no"))
+                if !finished {
+                    // What was read is cached; re-reading it is fast, so just start over quietly.
+                    Task.detached(priority: .utility) {
+                        _ = store.prefetchVectorFile(until: .distantFuture) { _ in }
+                    }
+                }
+                warmingIndex = false
+            }
             // Warm the text-query Metal kernels + the compiled query graph + the GPU reduce/base-fold
             // in the BACKGROUND, and go .ready immediately - do NOT await it.
             //
@@ -3513,7 +3591,9 @@ final class AppModel {
             // markActive: false: warm the reduce + base fold without faking a search-active window.
             let warm = Task.detached(priority: .userInitiated) {
                 engine.warmText()
+                omniPerfLog("launch warm-text")
                 _ = store.search([Float](repeating: 0, count: engine.dim), topK: 10, markActive: false)
+                omniPerfLog("launch warm-search")
                 // Filename channel: derived from paths already in the store, so it needs no
                 // re-index. Built here, off the main actor and off the store's serial queue, and
                 // skipped entirely when already current. Search works without it; it just cannot
@@ -3521,6 +3601,7 @@ final class AppModel {
                 Task.detached(priority: .utility) { [store] in store.prepareLexicalIndex() }
             }
             self.phase = .ready
+            omniPerfLog("launch ready")
             restartWatcher()
             PhotoLibrary.cleanExportScratch()
             startPhotoLibraryObserver()
@@ -5001,6 +5082,7 @@ final class AppModel {
             let hits: [SearchHit]
             let tSearch = omniPerfEnabled ? Date() : nil
             if let g = engine.queryVectorGraph(q) {
+                if let tSearch { omniPerfLog(String(format: "search query-graph %.0fms", -tSearch.timeIntervalSinceNow * 1000)) }
                 if Task.isCancelled { return }
                 (hits, vec) = store.search(queryGraph: g, filter: filter, topK: Self.searchTopK, textQuery: q)
             } else {
@@ -5621,7 +5703,16 @@ final class AppModel {
     /// is meant to prevent. The guarded entry points below all early-return while this is true.
     private var isTerminating = false
 
-    func quiesceForQuit() { isTerminating = true; indexer?.cancel() }
+    func quiesceForQuit() {
+        isTerminating = true
+        indexer?.cancel()
+        // See VectorStore.stampRowSidecarBeforeExit: without it, the next launch of a large index
+        // that was being written to reads every row out of SQLite.
+        let t0 = Date()
+        let finished = store?.stampRowSidecarBeforeExit(timeout: 5) ?? true
+        omniPerfLog(String(format: "quit row-stamp %.0fms finished=%@", -t0.timeIntervalSinceNow * 1000,
+                           finished ? "yes" : "no"))
+    }
 
     // MARK: - Profiling
 

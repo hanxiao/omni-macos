@@ -1576,12 +1576,38 @@ public final class VectorStore: @unchecked Sendable {
     ///
     /// The path is read from the table INSIDE the transition, not passed in: it is needed once per
     /// file (for the extension count) and a caller that had to supply it built a String per ROW.
+    /// Per file, the kind code of its first live row, filled only while a bulk load defers the
+    /// aggregates. Empty otherwise.
+    private var firstKindCode: [UInt8] = []
+
+    /// The per-file aggregates `fileChunkInc` keeps, computed in ONE pass after a bulk load that
+    /// deferred them - the same counts, file by file. Doing it per row cost a path-table copy and
+    /// an extension lookup for each of 2.7M files inside the row loop.
+    private func settleAggregatesLocked() {
+        invalidateTagFilterCacheLocked()
+        let paths = filePaths
+        var kinds = [Int](repeating: 0, count: idKind.count)
+        var exts: [String: Int] = [:]
+        var live = 0
+        for f in 0 ..< fileChunkCount.count where fileChunkCount[f] > 0 {
+            live += 1
+            let k = Int(firstKindCode[f])
+            if k < kinds.count { kinds[k] += 1 }
+            let e = paths.lowercasedExtension(f)
+            if !e.isEmpty { exts[e, default: 0] += 1 }
+        }
+        liveFiles += live
+        for (k, n) in kinds.enumerated() where n > 0 { kindFileCounts[idKind[k], default: 0] += n }
+        for (e, n) in exts { extFileCounts[e, default: 0] += n }
+        firstKindCode = []
+    }
+
     @inline(__always) private func fileChunkInc(_ fid: Int32, _ kind: String) {
         invalidateTagFilterCacheLocked()   // any row change can add/remove a tag match
         if fileChunkCount[Int(fid)] == 0 {
             liveFiles += 1
             kindFileCounts[kind, default: 0] += 1
-            let e = extOf(filePaths[Int(fid)]); if !e.isEmpty { extFileCounts[e, default: 0] += 1 }
+            let e = filePaths.lowercasedExtension(Int(fid)); if !e.isEmpty { extFileCounts[e, default: 0] += 1 }
         }
         fileChunkCount[Int(fid)] += 1
     }
@@ -1593,7 +1619,7 @@ public final class VectorStore: @unchecked Sendable {
         if n == 0 {
             liveFiles -= 1
             if let c = kindFileCounts[kind] { if c <= 1 { kindFileCounts[kind] = nil } else { kindFileCounts[kind] = c - 1 } }
-            let e = extOf(filePaths[Int(fid)]); if !e.isEmpty, let c = extFileCounts[e] { if c <= 1 { extFileCounts[e] = nil } else { extFileCounts[e] = c - 1 } }
+            let e = filePaths.lowercasedExtension(Int(fid)); if !e.isEmpty, let c = extFileCounts[e] { if c <= 1 { extFileCounts[e] = nil } else { extFileCounts[e] = c - 1 } }
             // The file has no live rows left, so its window can be forgotten - and MUST be, or a
             // re-index would union the old position with the new tail rows and hand back a window
             // spanning most of the index. This is the tombstone case: the dead rows are still
@@ -1609,7 +1635,7 @@ public final class VectorStore: @unchecked Sendable {
     /// than four copies of the same four lines that a fifth append site could forget.
     @inline(__always)
     private func appendRowMetaLocked(_ fid: Int32, kindCode kc: UInt8, kind: String,
-                                     slot: Int32) {
+                                     slot: Int32, deferAggregates: Bool = false) {
         let i = fileID.count
         fileID.append(fid)
         // nil means "this row brought a new vector", which is every caller while a row and its
@@ -1618,7 +1644,13 @@ public final class VectorStore: @unchecked Sendable {
         occSlot.append(s)
         if i < rows.count { rows[i].slot = s }
         kindCode.append(kc)
-        fileChunkInc(fid, kind)
+        // Deferred: the chunk count only, and the file's first kind for `settleAggregatesLocked`.
+        if deferAggregates {
+            if fileChunkCount[Int(fid)] == 0 { firstKindCode[Int(fid)] = kc }
+            fileChunkCount[Int(fid)] += 1
+        } else {
+            fileChunkInc(fid, kind)
+        }
         if fileRowLo[Int(fid)] > Int32(i) { fileRowLo[Int(fid)] = Int32(i) }
         if fileRowHi[Int(fid)] < Int32(i) + 1 { fileRowHi[Int(fid)] = Int32(i) + 1 }
         rowWindowCovered += 1
@@ -2011,6 +2043,7 @@ public final class VectorStore: @unchecked Sendable {
         self.dbURL = dbURL
         self.onLoadProgress = onLoadProgress
         self.onPhase = onPhase
+        let tOpen = Date()
         try FileManager.default.createDirectory(at: dbURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         guard sqlite3_open(dbURL.path, &db) == SQLITE_OK else {
             throw OmniError.store("open failed: \(String(cString: sqlite3_errmsg(db)))")
@@ -2275,9 +2308,14 @@ public final class VectorStore: @unchecked Sendable {
             // phases without saturating on the load and without jumping when the upgrade starts.
             // `legacyLayout` is a column check, so this costs nothing.
             upgradePending = legacyLayout
+            omniPerfLog(String(format: "store prologue %.0fms", -tOpen.timeIntervalSinceNow * 1000))
+            let tCount = Date()
             let rowsToLoad = liveRowCountLocked()
+            omniPerfLog(String(format: "store row count %.0fms rows=%d", -tCount.timeIntervalSinceNow * 1000, rowsToLoad))
             if upgradePending || rowsToLoad > Self.announceLoadAboveRows { onPhase?(.loadingIndex) }
+            let tLoad = Date()
             loadIntoMemory()
+            omniPerfLog(String(format: "store load %.0fms rows=%d", -tLoad.timeIntervalSinceNow * 1000, rows.count))
             // ONE PASS, and it has to be here rather than before the load. Converting first meant
             // copying the table while the duplicate vectors were still in it: measured on a real
             // 0.4.x index, 147s and a database that swelled to 18.56 GB holding two fat copies at
@@ -2459,6 +2497,24 @@ public final class VectorStore: @unchecked Sendable {
     /// orphaned indexing pass would otherwise hand sqlite a NULL handle - defined-but-misuse on
     /// Apple's API-armored build, UB elsewhere. Memory-only readers (search etc.) need no guard.
     @inline(__always) private func dbOpen() -> Bool { !closed && db != nil }
+
+    /// Write the row sidecar before the process exits, waiting at most `timeout`.
+    ///
+    /// The app quits with `_exit(0)` and never calls `close()`, so the sidecar was only ever written
+    /// by the 90 s quiet-period stamp - which a watched home folder resets for as long as the app
+    /// runs. On a 2.7M-file index that meant no sidecar at quit and the full SQLite scan on the
+    /// next launch: 24 s cold for 10.7M rows, where adopting the sidecar is under a second.
+    /// Bounded because the queue may be finishing an index write; a stamp cut off by the exit
+    /// leaves only a `.tmp`, which the next open deletes. Returns whether it finished.
+    @discardableResult
+    public func stampRowSidecarBeforeExit(timeout: TimeInterval) -> Bool {
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            queue.sync { if dbOpen() { stampRowSidecarLocked(sync: true) } }
+            done.signal()
+        }
+        return done.wait(timeout: .now() + timeout) == .success
+    }
 
     /// Fold the WAL into the main db and close the connection, ON the serial queue (so it cannot race a
     /// reader/writer or a new same-path connection). Idempotent. Call this when switching model/db so the
@@ -3559,7 +3615,29 @@ public final class VectorStore: @unchecked Sendable {
     private lazy var lexical = LexicalIndex(indexURL: dbURL)
 
     /// Distinct indexed paths. Used to build the filename index; runs on the queue like any read.
+    /// FROM MEMORY, not SQLite. This is the filename index's input, built right after launch; as a
+    /// join over every file on a cold database it held the store queue for ~3 s on a 2.7M-file index,
+    /// and the user's first search waited behind it (lockwait=2895ms measured). The resident path
+    /// table and live chunk counts already say the same thing: a file is listed while it has a live
+    /// chunk. `OMNI_VERIFY_PATHS=1` computes both and logs any difference.
     public func allIndexedPaths() -> [String] {
+        let fromMemory: [String]? = queue.sync {
+            guard !rows.isEmpty, fileChunkCount.count <= filePaths.count else { return nil }
+            var out: [String] = []; out.reserveCapacity(liveFiles)
+            for fid in fileChunkCount.indices where fileChunkCount[fid] > 0 { out.append(filePaths[fid]) }
+            return out
+        }
+        if let fromMemory, ProcessInfo.processInfo.environment["OMNI_VERIFY_PATHS"] != "1" { return fromMemory }
+        let fromSQL = allIndexedPathsFromSQL()
+        if let fromMemory {
+            let a = Set(fromMemory), b = Set(fromSQL)
+            omniPerfLog("allIndexedPaths memory=\(a.count) sql=\(b.count) onlyMemory=\(a.subtracting(b).count) onlySQL=\(b.subtracting(a).count)")
+            return fromMemory
+        }
+        return fromSQL
+    }
+
+    private func allIndexedPathsFromSQL() -> [String] {
         queue.sync {
             guard dbOpen() else { return [] }
             var out: [String] = []; out.reserveCapacity(liveFiles)
@@ -7096,6 +7174,41 @@ public final class VectorStore: @unchecked Sendable {
     /// which makes "did we take it, and did we need to" a thing tests have to be able to ask.
     public private(set) var loadedBySlot = false
     private var vecSidecarURL: URL { dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".vecs") }
+
+    /// Bytes of the vector file a launch would pre-read, or 0 when there is none.
+    public var vectorFileBytes: Int {
+        ((try? FileManager.default.attributesOfItem(atPath: vecSidecarURL.path)[.size]) as? Int) ?? 0
+    }
+
+    /// Read the vector file through once so the page cache holds it, reporting the fraction read.
+    /// Stops at `deadline` and returns false; `keepGoing` false stops it quietly.
+    ///
+    /// Why. The store maps this file and a search reads it on demand, so the first search after a
+    /// launch faults in the rows it touches - measured on a 10 GB file, 877 ms for that first search
+    /// against 143 ms once the file had been read (1.45 s to read it whole). Every query touches
+    /// different rows, so warming "a query" does not help the next one; reading the file does.
+    /// Not on the store queue: a plain read of a file the mapping also covers.
+    public func prefetchVectorFile(until deadline: Date, keepGoing: () -> Bool = { true },
+                                   progress: (Double) -> Void) -> Bool {
+        let total = vectorFileBytes
+        guard total > 0 else { return true }
+        let fd = open(vecSidecarURL.path, O_RDONLY)
+        guard fd >= 0 else { return true }
+        defer { Darwin.close(fd) }
+        let chunk = 64 << 20
+        let buf = UnsafeMutableRawPointer.allocate(byteCount: chunk, alignment: 16384)
+        defer { buf.deallocate() }
+        var done = 0
+        while done < total {
+            guard keepGoing() else { return false }
+            if Date() >= deadline { return false }
+            let n = pread(fd, buf, min(chunk, total - done), off_t(done))
+            if n <= 0 { break }
+            done += n
+            progress(Double(done) / Double(total))
+        }
+        return true
+    }
     /// The compacted copy, before it becomes the vector file. Named beside it so the switch is a
     /// same-directory rename, which is the only kind POSIX promises is atomic.
     private var vecCompactURL: URL { dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".vecs.new") }
@@ -9976,11 +10089,14 @@ public final class VectorStore: @unchecked Sendable {
         // shared a vector - so a sharing index paid the full SQLite load on EVERY launch, and no
         // test saw it because every fixture used random vectors, which share nothing.
         let vecUnits = slotCount
-        guard Self.rowSidecarEnabled, dbOpen(), flat16.isPersistent, dim > 0, !rows.isEmpty,
-              mutationGen != lastStampedGen, flat16.count == vecUnits * dim else { return }
+        guard Self.rowSidecarEnabled, dbOpen(), !rows.isEmpty, mutationGen != lastStampedGen else { return }
+        guard flat16.isPersistent, dim > 0, flat16.count == vecUnits * dim else {
+            omniPerfLog("row-stamp SKIPPED: persistent \(flat16.isPersistent) count \(flat16.count) want \(vecUnits * dim)")
+            return
+        }
         // A row whose slot is still -1 has not been through the backfill, and a sidecar that
         // records -1 would hand the next launch a row with no vector. Stamp only a resolved table.
-        if rows.contains(where: { $0.slot < 0 }) { return }
+        if rows.contains(where: { $0.slot < 0 }) { omniPerfLog("row-stamp SKIPPED: unresolved slots"); return }
         let t0 = omniPerfEnabled ? Date() : nil
         // The header describes rows.count vectors, so the FILE has to cover them. Rows appended
         // since the last fold live in the mapping's anonymous tail, and only the fold path
@@ -9994,7 +10110,7 @@ public final class VectorStore: @unchecked Sendable {
         // OMNI_SIDECAR_COVER=0 restores the pre-fix behaviour so the regression test can A/B the
         // bug inside one binary; it is a test switch, not a tuning knob.
         if Self.sidecarCoverEnabled {
-            guard flat16.extendFileCoverage() else { return }
+            guard flat16.extendFileCoverage() else { omniPerfLog("row-stamp SKIPPED: coverage"); return }
         }
         flat16.msyncFile()
         let n = rows.count
@@ -10097,12 +10213,16 @@ public final class VectorStore: @unchecked Sendable {
     /// is skipped; the vectors are the mapped sidecar file (read on demand). Every failure path
     /// unmaps, deletes both files, and returns false for the historical full scan.
     private func tryAdoptRowSidecarLocked() -> Bool {
+        let tAdopt = Date()
         adoptedRowSidecar = false
         guard Self.rowSidecarEnabled else { return false }
         let fm = FileManager.default
         try? fm.removeItem(at: rowSidecarURL.deletingLastPathComponent()
             .appendingPathComponent(rowSidecarURL.lastPathComponent + ".tmp"))   // _exit stranded write
-        guard fm.fileExists(atPath: rowSidecarURL.path), fm.fileExists(atPath: vecSidecarURL.path) else { return false }
+        guard fm.fileExists(atPath: rowSidecarURL.path), fm.fileExists(atPath: vecSidecarURL.path) else {
+            omniPerfLog("store no row sidecar (rows \(fm.fileExists(atPath: rowSidecarURL.path)), vecs \(fm.fileExists(atPath: vecSidecarURL.path)))")
+            return false
+        }
         // Rejecting the ROW table must not take the VECTOR file with it. The two were always
         // deleted together, which was harmless while every vector also sat in a SQLite blob - and
         // is data loss the moment coverage means the file is the only copy. Rejection here falls
@@ -10112,6 +10232,7 @@ public final class VectorStore: @unchecked Sendable {
         // wrong, 5.4 s instead of 0.6 s". OMNI_SEARCH_TIMING prints the reason.
         func reject(_ why: String = "") -> Bool {
             if Self.searchTiming { print("[search] REJECT row sidecar: \(why)") }
+            omniPerfLog("store REJECT row sidecar: \(why)")
             flat16.removeAll(); removeRowSidecarFiles(keepVectors: coveredRows > 0); return false
         }
         guard let fh = try? FileHandle(forReadingFrom: rowSidecarURL) else { return reject("open") }
@@ -10152,6 +10273,12 @@ public final class VectorStore: @unchecked Sendable {
               let kindOffs = try? fh.read(upToCount: header.kindOffBytes), kindOffs.count == header.kindOffBytes,
               let kindBlob = try? fh.read(upToCount: header.kindBlobBytes), kindBlob.count == header.kindBlobBytes
         else { return reject("blocks") }
+        omniPerfLog(String(format: "store adopt read %.0fms", -tAdopt.timeIntervalSinceNow * 1000))
+        // THE BAR MOVES THROUGH EVERY STEP, weighted by what each costs, measured cold on a
+        // 10.7M-row, 2.7M-file index: read 0.15 s, the path table 0.9 s, the 32 sampled lookups
+        // 0.05 s, the row rebuild 0.33 s. It used to sit still until the lookups were done - over a
+        // second in which a launch looks stuck.
+        reportLoadProgress(0.10)
         func strings(_ offs: Data, _ blob: Data, _ count: Int) -> [String]? {
             var out = [String](); out.reserveCapacity(count)
             var ok = true
@@ -10169,8 +10296,10 @@ public final class VectorStore: @unchecked Sendable {
             }
             return ok ? out : nil
         }
-        guard let pathTable = PathTable.decode(offsets: pathOffs, blob: pathBlob, count: header.pathCount),
+        guard let pathTable = PathTable.decode(offsets: pathOffs, blob: pathBlob, count: header.pathCount,
+                                                progress: { self.reportLoadProgress(0.10 + 0.63 * $0) }),
               let kindTable = strings(kindOffs, kindBlob, header.kindCount) else { return reject("stringtable") }
+        omniPerfLog(String(format: "store adopt tables decoded %.0fms", -tAdopt.timeIntervalSinceNow * 1000))
 
         // SAMPLED CONTENT VALIDATION against SQLite point lookups (PK btree, ~ms total): vectors,
         // modified, size, and kind for ~32 evenly spaced rows must match byte-for-byte. This is
@@ -10257,11 +10386,13 @@ public final class VectorStore: @unchecked Sendable {
                     return false
                 }
                 if !ok { sampleOK = false; sampleWhy = "row \(i) pos \(pos) vector mismatch" }
+                reportLoadProgress(0.73 + 0.04 * Double(i) / Double(max(1, header.rowCount)))
                 i += stride
             }
         }
         guard sampleOK else { return reject("sample: \(sampleWhy)") }
-        reportLoadProgress(0.25)   // files read + validated; the row rebuild below is the bulk
+        omniPerfLog(String(format: "store adopt validated %.0fms", -tAdopt.timeIntervalSinceNow * 1000))
+        reportLoadProgress(0.77)   // files read + validated; the row rebuild below is the rest
 
         // Commit: rebuild the derived structures exactly as loadIntoMemory would have.
         dim = header.dim
@@ -10271,6 +10402,7 @@ public final class VectorStore: @unchecked Sendable {
         kindID = [:]
         for (i, k) in kindTable.enumerated() { kindID[k] = UInt8(i) }
         fileChunkCount = [Int32](repeating: 0, count: pathTable.count)
+        firstKindCode = [UInt8](repeating: 0, count: pathTable.count)
         fileMeta = [FileMeta](repeating: FileMeta(), count: pathTable.count)
         // Sized off the sidecar's path table, exactly like fileChunkCount, because `fid` is read
         // straight out of each record and indexes THAT table - it is not re-interned here.
@@ -10286,7 +10418,7 @@ public final class VectorStore: @unchecked Sendable {
             do {
                 for i in 0 ..< header.rowCount {
                     if onLoadProgress != nil, i % 262_144 == 0 {
-                        reportLoadProgress(0.25 + 0.75 * Double(i) / Double(header.rowCount))
+                        reportLoadProgress(0.77 + 0.23 * Double(i) / Double(header.rowCount))
                     }
                     let o = i * recSize
                     let fid = raw.loadUnaligned(fromByteOffset: o, as: Int32.self)
@@ -10313,12 +10445,14 @@ public final class VectorStore: @unchecked Sendable {
                         appendDeadRowMetaLocked(fid, kindCode: kc, slot: slot)
                         deadRows.insert(Int32(i))
                     } else {
-                        appendRowMetaLocked(fid, kindCode: kc, kind: kind, slot: slot)
+                        appendRowMetaLocked(fid, kindCode: kc, kind: kind, slot: slot, deferAggregates: true)
                     }
                 }
             }
         }
+        settleAggregatesLocked()
         deadIdxCache = nil
+        omniPerfLog(String(format: "store adopt rows built %.0fms", -tAdopt.timeIntervalSinceNow * 1000))
         lastStampedGen = mutationGen
         invalidateBase()
         reportLoadProgress(1)
@@ -12151,6 +12285,7 @@ public final class VectorStore: @unchecked Sendable {
         resumeVectorCompactionLocked()
         loadCoverageLocked()
         if tryAdoptRowSidecarLocked() {
+            omniPerfLog("store adopted row sidecar")
             // Arm the coverage stamp HERE too. It used to be armed only at the end of the scan path
             // below and by bumpGenLocked, so on a launch that adopted the sidecar and then sat idle,
             // nothing ever scheduled one: coverage advanced a single slice per QUIT and otherwise
@@ -12528,6 +12663,10 @@ public final class VectorStore: @unchecked Sendable {
     public var residentIDsAreContentsForTest: Bool { queue.sync { residentIDsAreContents } }
     /// Write the row sidecar now, rather than waiting out the stamp's debounce.
     func stampRowSidecarForTest() { queue.sync { stampRowSidecarLocked(sync: true) } }
+    /// Live files, and files per kind and per extension - what the filter menu is built from.
+    func aggregatesForTest() -> (live: Int, kinds: [String: Int], exts: [String: Int]) {
+        queue.sync { (liveFiles, kindFileCounts, extFileCounts) }
+    }
     /// Forget that the slot column is complete, so a fixture that has written more rows behind the
     /// store's back can have them filled in. The real upgrade path reaches that state on its own -
     /// every row has a slot before the fold ever runs - and a fixture that cannot is measuring

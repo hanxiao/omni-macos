@@ -2490,3 +2490,40 @@ reader. `FolderMapSharedContentTests` fails without the fix. All other `flat16` 
   (`eventCheckpointIsShared`). Negative control: 0.13.8 on a scratch index moved it
   578500264 -> 584312543; the fix left it alone. An earlier checkpoint is the safe direction to
   repair toward: it only replays more events.
+
+## Launch and the first search (2026-09-23, real 2.7M-file / 10.7M-row index, cold clones)
+- A COLD CLONE IS A COLD START: `cp -c -R` gives new vnodes, so the page cache does not carry over.
+  Timelines come from `OMNI_PERF_LOG=1` "launch ..." / "store ..." lines (now in bootstrap and the
+  store open) and `OMNI_SEARCH_TIMING=1` (stdout is made unbuffered when it is set).
+- 0.13.8 AS SHIPPED: ready 28 s, first search 3.5 s. Causes, each fixed:
+  - NO ROW SIDECAR EVER EXISTED AT LAUNCH. Quit is `_exit(0)` without `close()`, and the idle stamp
+    waits 90 s of no mutations, which a watched home folder never gives. Every launch scanned 10.7M
+    rows out of SQLite (24 s cold). `quiesceForQuit` now stamps it, bounded at 5 s (measured 0.54-0.59 s).
+  - `sweepDroppedImageTemps` listed $TMPDIR (50,793 entries) on the main thread in `AppModel.init`:
+    2.3 s before bootstrap. Off-main now, deleting only entries older than the launch.
+  - The adopt's row rebuild computed each file's extension through a new path String and NSString
+    (plus a PathTable struct copy per access): 2.2 s. Aggregates are deferred to one pass after the
+    loop (`settleAggregatesLocked`) and `PathTable.lowercasedExtension` reads the name bytes,
+    deferring to NSString for anything but plain ASCII alphanumerics (0 mismatches on 2,739,258 real
+    paths; `PathExtensionTests`, `testAdoptedAggregatesMatchTheScan`): 0.33 s.
+  - The first search waited 2.9 s on the store queue behind `allIndexedPaths()` - a SQLite join over
+    every file for the filename index rebuild. Built from the resident tables now; identical set
+    (`OMNI_VERIFY_PATHS=1` compares).
+  - The rest of the first search was faulting in the 10 GB vector file (877 ms vs 143 ms after a
+    read-through). The launch now reads it as the bar's last stage (`prefetchVectorFile`, 1.6 s here)
+    when it is at most a quarter of RAM, waiting at most `warmBudget` (4 s) and finishing in the
+    background after that - bounded and skipped on small Macs, per the M2 lesson.
+- RESULT, same cold clone with a sidecar: 0.13.8 ready ~9 s, first search 2.3 s; new ready 4.2-5.1 s
+  including the read, first search 0.14-0.22 s. Remaining: path table decode 0.9 s (String hashing
+  per path; progress is reported through it), row count 0.56 s, process start ~0.9 s.
+- THE BAR: index share weighted by measured cost (read 10%, paths 63%, samples 4%, rows 23%); the
+  vector read gets the last 20% only when it will run. `OMNI_PERF_LOG` logs every 10% crossing.
+- RESULT CONTEXT MENUS ARE BUILT ON HOVER (`LazyContextMenu`): macOS builds `.contextMenu` eagerly
+  per rendered row. Armed on first hover and never disarmed, and always armed for a selected row or
+  with VoiceOver on. `PerfTourUITests.testRightClickShowsTheFullMenu` right-clicks an unhovered row in
+  both views; it fails with the menus never armed. Per result arrival in the gallery on the real
+  index: 347-410 ms of main thread on 0.13.8, 279-289 ms now.
+- MEASURING TYPING ON THE REAL INDEX: totals swing with how many searches complete while the harness
+  types (33-62 per run), so compare stall time over 150 ms PER ARRIVAL, and give the base clone a
+  row sidecar first or the launch's scan lands inside the typing phase. A missing base index opens
+  an empty one and every search returns 0 hits - `perf-tour.sh` now refuses to run without it.

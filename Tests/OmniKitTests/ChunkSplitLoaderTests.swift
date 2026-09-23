@@ -220,6 +220,53 @@ final class ChunkSplitLoaderTests: XCTestCase {
         XCTAssertTrue(store.residentIDsAreContentsForTest)
     }
 
+    /// THE ADOPTED ROW TABLE COUNTS FILES THE WAY THE SCAN DOES. Adoption defers the per-file
+    /// tallies (live files, files per kind, files per extension) and settles them in one pass after
+    /// the rows are built; the scan keeps them row by row. Mixed kinds and awkward extensions, so a
+    /// wrong first-kind or a different extension rule would show.
+    func testAdoptedAggregatesMatchTheScan() throws {
+        let url = tempDB()
+        let paths = ["/m/a.txt", "/m/b.JPG", "/m/c.jpg", "/m/.bashrc", "/m/noext", "/m/d.tar.gz",
+                     "/m/e.MD", "/m/f. x", "/m/ü.PnG", "/m/g.wav", "/m/h.pdf", "/m/i.txt"]
+        let kinds = ["text", "image", "image", "text", "text", "text",
+                     "text", "text", "image", "audio", "scan", "text"]
+        do {
+            let saved = VectorStore.legacyWriteForTest
+            VectorStore.legacyWriteForTest = true
+            defer { VectorStore.legacyWriteForTest = saved }
+            let store = try VectorStore(dbURL: url)
+            for (i, p) in paths.enumerated() {
+                try store.replace(path: p, chunks: (0 ..< 1 + i % 3).map { c in
+                    IndexedChunk(path: p, modified: 1, size: 10, kind: kinds[i], chunkIndex: c,
+                                 snippet: "s \(i) \(c)", embedding: vec(500 + i * 4 + c), locator: "",
+                                 chunkKey: String(format: "%016x", 500 + i * 4 + c))
+                })
+            }
+            store.advanceCoverageForTest()
+            store.close()
+        }
+        try migrate(url)
+        do {
+            let store = try VectorStore(dbURL: url)
+            store.stampRowSidecarForTest()
+            store.close()
+        }
+        let adopted: (live: Int, kinds: [String: Int], exts: [String: Int])
+        do {
+            let store = try VectorStore(dbURL: url); defer { store.close() }
+            XCTAssertTrue(store.adoptedRowSidecar, "the sidecar was not adopted, so this compares the scan with itself")
+            adopted = store.aggregatesForTest()
+        }
+        try? FileManager.default.removeItem(atPath: url.path + ".rows")
+        let store = try VectorStore(dbURL: url); defer { store.close() }
+        XCTAssertFalse(store.adoptedRowSidecar)
+        let scanned = store.aggregatesForTest()
+        XCTAssertEqual(adopted.live, scanned.live)
+        XCTAssertEqual(adopted.kinds, scanned.kinds)
+        XCTAssertEqual(adopted.exts, scanned.exts)
+        XCTAssertEqual(scanned.live, paths.count)
+    }
+
     // MARK: - The positions the split freed
 
     /// THE WIN, AND THE THING THE 23 RED TESTS WERE WAITING FOR. The build collapses duplicates

@@ -185,4 +185,36 @@ final class PerfTourUITests: XCTestCase {
         settle(2)
         app.terminate()
     }
+
+    /// THE MENUS ARE BUILT ON HOVER NOW (LazyContextMenu), so a right-click has to still find a full
+    /// menu - in the list and in the gallery, on a row nobody had hovered before the click.
+    func testRightClickShowsTheFullMenu() throws {
+        let app = XCUIApplication()
+        app.launchArguments = [
+            "-omni.dbDir", env["OMNI_PERF_DB"]!,
+            "-omni.addedFolders", "(\"\(env["OMNI_PERF_CORPUS"]!)\")",
+            "-omni.roots", "(\"\(env["OMNI_PERF_CORPUS"]!)\")",
+            "-omni.ephemeralUIState", "YES", "-omni.serving.enabled", "NO",
+        ]
+        app.launch()
+        defer { app.terminate() }
+        XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 60))
+        settle(3)
+        search(app, "sunset over mountains")
+        for mode in ["2", "1"] {
+            app.typeKey(mode, modifierFlags: .command)
+            settle(1.5)
+            let rows = app.descendants(matching: .any).matching(
+                NSPredicate(format: "identifier == 'result.row' OR identifier == 'result.item'"))
+            XCTAssertGreaterThan(rows.count, 2, "no results to right-click")
+            // The third row: not the first, which the search may have left under the pointer.
+            rows.element(boundBy: 2).rightClick()
+            let item = app.menuItems["Find similar"]
+            XCTAssertTrue(item.waitForExistence(timeout: 3), "right-click showed no Find similar in view \(mode)")
+            XCTAssertTrue(app.menuItems["Copy path"].exists, "the menu is not the full one in view \(mode)")
+            app.typeKey(.escape, modifierFlags: [])
+            settle(0.8)
+        }
+    }
 }
+

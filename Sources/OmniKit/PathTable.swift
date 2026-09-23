@@ -380,7 +380,8 @@ struct PathTable: Sendable {
     /// index no longer holds every path twice at its peak. Appends in order, so duplicated entries
     /// re-point their key exactly as the dictionary assignment they replace did. nil on a
     /// malformed table.
-    static func decode(offsets: Data, blob: Data, count n: Int) -> PathTable? {
+    static func decode(offsets: Data, blob: Data, count n: Int,
+                       progress: ((Double) -> Void)? = nil) -> PathTable? {
         guard offsets.count >= (n + 1) * 4 else { return nil }
         var t = PathTable()
         t.reserveCapacity(n)
@@ -394,10 +395,38 @@ struct PathTable: Sendable {
                     t.append(String(decoding: UnsafeRawBufferPointer(rebasing: bp[Int(prev) ..< Int(end)]),
                                     as: UTF8.self))
                     prev = end
+                    if let progress, i % 131_072 == 0 { progress(Double(i) / Double(n)) }
                 }
             }
         }
         return ok ? t : nil
+    }
+
+    /// `(self[i] as NSString).pathExtension.lowercased()`, read off the name's bytes.
+    ///
+    /// The index load asks this once per file - 2.7M times on a large index - and building the
+    /// path String to hand to NSString was about half of the row rebuild's 2.2 s. Only a plain
+    /// ASCII letters-and-digits extension is decided here; everything else (a leading dot as in
+    /// `.bashrc`, a space, non-ASCII, a trailing dot) is answered by NSString itself, so the result
+    /// is identical by construction. Checked against NSString on 2,739,258 real paths: 0 mismatches.
+    func lowercasedExtension(_ i: Int) -> String {
+        let ns = nameStart(i), ne = nameEnd[i]
+        let fast: String? = nameBlob.withUnsafeBufferPointer { b in
+            var dot = -1
+            var j = ne - 1
+            while j >= ns { if b[j] == UInt8(ascii: ".") { dot = j; break }; j -= 1 }
+            if dot < 0 { return "" }
+            if dot == ns || dot == ne - 1 { return nil }
+            var out = [UInt8](); out.reserveCapacity(ne - dot - 1)
+            for k in (dot + 1) ..< ne {
+                let c = b[k]
+                if (c >= 48 && c <= 57) || (c >= 97 && c <= 122) { out.append(c) }
+                else if c >= 65 && c <= 90 { out.append(c + 32) }
+                else { return nil }
+            }
+            return String(decoding: out, as: UTF8.self)
+        }
+        return fast ?? (self[i] as NSString).pathExtension.lowercased()
     }
 
     // MARK: - Accounting

@@ -181,7 +181,7 @@ struct ResultsList<Footer: View>: View {
                                             in: RoundedRectangle(cornerRadius: BrowserMetrics.selectionRadius))
                                 .resultClick { handleTap(hit.path) }
                                 .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
-                                .contextMenu { menu(hit) }
+                                .lazyContextMenu(armed: model.selectedPaths.contains(hit.path)) { menu(hit) }
                                 .reportResultFrame(hit.path, in: marqueeSpace)
                             // chunkCount guard: if a reindex turned the file single-chunk while its
                             // path sat in `expanded` (same result set, so the reset below does not
@@ -220,7 +220,7 @@ struct ResultsList<Footer: View>: View {
                                             .contentShape(Rectangle())
                                             .resultClick { handleTap(member.path) }
                                             .simultaneousGesture(TapGesture(count: 2).onEnded { open(member.path) })
-                                            .contextMenu { menu(member) }
+                                            .lazyContextMenu(armed: model.selectedPaths.contains(member.path)) { menu(member) }
                                             .reportResultFrame(member.path, in: marqueeSpace)
                                         if expanded.contains(member.path), member.chunkCount > 1 {
                                             PassagesView(passages: passagesCache[member.path],
@@ -341,7 +341,7 @@ struct ResultsList<Footer: View>: View {
                             .contentShape(Rectangle())
                             .resultClick { handleTap(hit.path) }
                             .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
-                            .contextMenu { menu(hit) }
+                            .lazyContextMenu(armed: model.selectedPaths.contains(hit.path)) { menu(hit) }
                             .reportResultFrame(hit.path, in: marqueeSpace)
                             // The grid's counterpart of the list's inline expansion: a popover
                             // anchored to the cell (the Photos/Finder info pattern - cells stay
@@ -373,7 +373,7 @@ struct ResultsList<Footer: View>: View {
                                     .contentShape(Rectangle())
                                     .resultClick { handleTap(member.path) }
                                     .simultaneousGesture(TapGesture(count: 2).onEnded { open(member.path) })
-                                    .contextMenu { menu(member) }
+                                    .lazyContextMenu(armed: model.selectedPaths.contains(member.path)) { menu(member) }
                                     .reportResultFrame(member.path, in: marqueeSpace)
                                     // Level 2 in the gallery: a copy opens its own passages popover,
                                     // anchored to its own cell, exactly like the representative.
@@ -595,6 +595,36 @@ struct ResultsList<Footer: View>: View {
 /// list and every visible row (each with an eagerly built context menu) re-ran: ~2 ms a row, 50 rows
 /// in a tall window. Everything the list shows, the footer included, is read from the model inside
 /// its own body, so observation re-renders it exactly when one of those values changes.
+/// A context menu that is built once the pointer has been over its row, not for every visible row
+/// on every render.
+///
+/// macOS evaluates a `.contextMenu` builder eagerly, as part of rendering the view it is attached to,
+/// so each result row paid for building its whole menu - Open, Quick Look, Transcribe, Find Similar,
+/// Reveal and the rest - on every redraw, whether anyone right-clicked or not. Measured on a
+/// 2.7M-file index while typing: dropping the menus entirely took the stalls from 12.0 s to 10.7 s.
+///
+/// Right-clicking a row needs the pointer on it, which arms it first, and an armed row stays armed
+/// - disarming on exit could rebuild the menu while it is open. `armed` covers the ways a menu is
+/// asked for without hovering: VoiceOver, and a selected row (keyboard and other assistive routes).
+private struct LazyContextMenu<Menu: View>: ViewModifier {
+    let armed: Bool
+    @ViewBuilder let menu: () -> Menu
+    @State private var hovered = false
+    @Environment(\.accessibilityVoiceOverEnabled) private var voiceOver
+
+    func body(content: Content) -> some View {
+        content
+            .onHover { if $0, !hovered { hovered = true } }
+            .contextMenu { if hovered || armed || voiceOver { menu() } }
+    }
+}
+
+extension View {
+    fileprivate func lazyContextMenu<Menu: View>(armed: Bool, @ViewBuilder _ menu: @escaping () -> Menu) -> some View {
+        modifier(LazyContextMenu(armed: armed, menu: menu))
+    }
+}
+
 /// See `ResultsList.scrollGate`.
 @MainActor
 final class ScrollGate { var token: String? }
