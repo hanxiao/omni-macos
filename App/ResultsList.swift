@@ -818,22 +818,18 @@ struct ResultGridItem: View {
             StackedThumbnail(path: hit.path, side: 128, corner: Design.corner,
                              depth: stack.map { min(2, $0.count - 1) } ?? 0)
                 .overlay {
-                    // Glass chips over imagery (the one legitimate in-content use of vibrancy):
-                    // legible over bright and dark thumbnails, appearance-adaptive. The pair shares
-                    // one GlassEffectContainer per cell, so a visible grid renders one glass pass
-                    // per cell instead of two - and on a narrow cell where a long locator nears the
-                    // score, the effects blend instead of seaming.
-                    GlassGroup(spacing: 10) {
+                    // Badges over imagery: a material, not glass - they are content (see mediaBadge).
+                    Group {
                         ZStack {
                             Text(scoreText(hit.score)).font(.caption2.monospacedDigit()).foregroundStyle(.primary)
                                 .padding(.horizontal, 5).padding(.vertical, 2)
-                                .glassChip().padding(5)
+                                .mediaBadge().padding(5)
                                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
                             // Match position inside the file (page/line), mirroring the score chip.
                             if !hit.locator.isEmpty {
                                 Text(hit.locator).font(.caption2.monospacedDigit()).foregroundStyle(.primary)
                                     .padding(.horizontal, 5).padding(.vertical, 2)
-                                    .glassChip().padding(5)
+                                    .mediaBadge().padding(5)
                                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
                             }
                             // Stack count, bottom-trailing so it never collides with the locator or
@@ -847,7 +843,7 @@ struct ResultGridItem: View {
                                     .font(.caption2)
                                     .foregroundStyle(.primary)
                                     .padding(.horizontal, 5).padding(.vertical, 2)
-                                    .glassChip(interactive: true)
+                                    .mediaBadge()
                                     .contentShape(Capsule())
                                 }
                                 .buttonStyle(.plain)

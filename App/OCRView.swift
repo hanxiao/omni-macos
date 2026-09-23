@@ -99,11 +99,12 @@ struct OCRView: View {
                 DocumentTabs()
                 Divider()
             }
+            // On the transcript, not the stack: over the stack it sat on the tab strip.
             content
+                .overlay(alignment: .top) {
+                    if !session.find.isEmpty { FindBar() }
+                }
         }
-            .overlay(alignment: .top) {
-                if !session.find.isEmpty { FindBar() }
-            }
             .overlay(alignment: .bottom) {
                 if session.readoutVisible { ProgressReadout() }
             }
@@ -1321,7 +1322,7 @@ private struct ProgressReadout: View {
             .padding(.vertical, 9)
             .glassChip(interactive: session.isBusy)
         }
-        .shadow(color: .black.opacity(0.16), radius: 10, y: 3)
+        .chipShadow(opacity: 0.16, radius: 10, y: 3)
         .accessibilityIdentifier("ocr.readout")
         .padding(.bottom, 18)
         .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -1478,7 +1479,7 @@ private struct FindBar: View {
             .padding(.vertical, 7)
             .glassChip(interactive: session.matchCount > 0)
         }
-        .shadow(color: .black.opacity(0.14), radius: 8, y: 2)
+        .chipShadow()
         .padding(.top, 12)
         .transition(.move(edge: .top).combined(with: .opacity))
         .accessibilityIdentifier("ocr.findbar")
@@ -1496,7 +1497,7 @@ private struct NoticeChip: View {
             .padding(.horizontal, 14)
             .padding(.vertical, 9)
             .glassChip()
-            .shadow(color: .black.opacity(0.14), radius: 8, y: 2)
+            .chipShadow()
             .padding(.top, 14)
             .transition(.move(edge: .top).combined(with: .opacity))
     }

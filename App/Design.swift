@@ -70,6 +70,52 @@ extension View {
     }
 }
 
+extension View {
+    /// A small badge over a thumbnail: score, page, stack count. CONTENT, not a control, so it is a
+    /// standard material and not Liquid Glass - "Don't use Liquid Glass in the content layer" (HIG,
+    /// Materials), and a gallery of glass badges meant one GlassEffectContainer per visible cell,
+    /// each re-sampling on every scroll frame. `.thinMaterial` stays legible over both bright and
+    /// dark photos and follows the appearance.
+    func mediaBadge() -> some View {
+        background(.thinMaterial, in: Capsule())
+    }
+}
+
+/// A drop shadow for a floating chip, drawn only where the chip is a material. Liquid Glass renders
+/// its own depth; a shadow on top of it is a second offscreen composite for nothing.
+private struct ChipShadow: ViewModifier {
+    var opacity: Double, radius: CGFloat, y: CGFloat
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    func body(content: Content) -> some View {
+        if #available(macOS 26, *), !reduceTransparency {
+            content
+        } else {
+            content.shadow(color: .black.opacity(opacity), radius: radius, y: y)
+        }
+    }
+}
+
+extension View {
+    func chipShadow(opacity: Double = 0.14, radius: CGFloat = 8, y: CGFloat = 2) -> some View {
+        modifier(ChipShadow(opacity: opacity, radius: radius, y: y))
+    }
+}
+
+/// The accent ring that marks a drop target, 6pt inside its pane. On Tahoe its corners are
+/// concentric with the window's (HIG: nested shapes share the container's curvature); before, a
+/// fixed 8pt continuous corner.
+struct DropRing: View {
+    var body: some View {
+        if #available(macOS 26.0, *) {
+            ConcentricRectangle(corners: .concentric(minimum: .fixed(8)), isUniform: true)
+                .stroke(Color.accentColor, lineWidth: 2).padding(7).allowsHitTesting(false)
+        } else {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(Color.accentColor, lineWidth: 2).padding(6).allowsHitTesting(false)
+        }
+    }
+}
+
 /// Groups sibling Liquid Glass surfaces into one `GlassEffectContainer` on macOS 26 - Apple's
 /// requirement when several glass elements coexist: the container renders them in a single
 /// effect pass (cheaper than N independent passes) and lets effects that approach each other

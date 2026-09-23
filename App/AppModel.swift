@@ -1610,7 +1610,7 @@ final class AppModel {
         case nil:             return "Loading the Omni model"
         }
     }
-    var launchSymbol: String { storePhase == .upgradingIndex ? "internaldrive" : "brain" }
+    var launchSymbol: String { CenteredStatus.mole }
     /// One-time storage migration: rows already converted, rows total, bytes still to reclaim.
     /// nil when there is nothing to do, so a finished index shows no banner at all.
     var storageMigration: (done: Int, total: Int, bytesToReclaim: Int64)? = nil

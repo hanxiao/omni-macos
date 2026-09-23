@@ -2311,10 +2311,15 @@ public final class VectorStore: @unchecked Sendable {
             omniPerfLog(String(format: "store prologue %.0fms", -tOpen.timeIntervalSinceNow * 1000))
             let tCount = Date()
             let rowsToLoad = liveRowCountLocked()
+            // Nothing writes between this count and the load's sidecar check, which counts again:
+            // hand it this one instead (0.56 s of COUNT on a 10.7M-occurrence index). Cleared after
+            // the load, so no later check can read a stale count.
+            openRowCount = (mutationGen, rowsToLoad)
             omniPerfLog(String(format: "store row count %.0fms rows=%d", -tCount.timeIntervalSinceNow * 1000, rowsToLoad))
             if upgradePending || rowsToLoad > Self.announceLoadAboveRows { onPhase?(.loadingIndex) }
             let tLoad = Date()
             loadIntoMemory()
+            openRowCount = nil
             omniPerfLog(String(format: "store load %.0fms rows=%d", -tLoad.timeIntervalSinceNow * 1000, rows.count))
             // ONE PASS, and it has to be here rather than before the load. Converting first meant
             // copying the table while the duplicate vectors were still in it: measured on a real
@@ -7602,6 +7607,9 @@ public final class VectorStore: @unchecked Sendable {
         return rowTableIsOccurrence ? "occurrence" : "chunks"
     }
     func liveRowCountLocked() -> Int { scalarQuery("SELECT COUNT(*) FROM \(rowTableLocked)") }
+    /// The open's own row count, valid only between the count and the end of `loadIntoMemory`.
+    /// Tagged with `mutationGen`, so any write in between makes it unusable.
+    private var openRowCount: (gen: Int64, count: Int)?
     /// Whether a staged vector is addressed by CONTENT. The two id spaces overlap numerically, so
     /// a blob delete written for the wrong one does not miss - it hits an unrelated row.
     ///
@@ -7938,7 +7946,7 @@ public final class VectorStore: @unchecked Sendable {
             if true {
                 if dim > 0 {
                     let maxSlot = scalarQuery(
-                        "SELECT COALESCE(MAX(slot), -1) FROM \(splitBuilt ? "chunk" : "chunks")")
+                        "SELECT COALESCE(MAX(slot), -1) FROM \(splitBuilt ? "chunk" : "chunks") WHERE slot >= 0")
                     if maxSlot >= slotCount {
                         return "chunk slot \(maxSlot) is past the \(slotCount) vectors the file holds"
                     }
@@ -8334,11 +8342,14 @@ public final class VectorStore: @unchecked Sendable {
         // loader could open it is that the column made the mapping unambiguous, not that the
         // bookkeeping became consistent. It is the same invariant `coverageAudit` enforces at rest.
         // Refusing here hands back to the walk, which declines with the message that names it.
-        if scalarQuery("SELECT COUNT(*) FROM vec_holes h JOIN \(slotTable) c ON c.slot = h.slot "
-                       + "WHERE h.slot < \(coveredRows)") > 0 {
+        // EXISTS with `c.slot >= 0`, not a JOIN: the join scanned the content table (0.53 s on a
+        // 6.55M-content index), the probe uses the partial slot index per hole (0.005 s).
+        if scalarQuery("SELECT COUNT(*) FROM vec_holes h WHERE h.slot < \(coveredRows) AND EXISTS "
+                       + "(SELECT 1 FROM \(slotTable) c WHERE c.slot = h.slot AND c.slot >= 0)") > 0 {
             return declineBySlot("a recorded hole still has a live row on it")
         }
-        let maxSlot = scalarQuery("SELECT COALESCE(MAX(slot), -1) FROM \(slotTable)")
+        // `WHERE slot >= 0` reaches the partial slot index: 0.18 s scan -> 0.000 s, same answer.
+        let maxSlot = scalarQuery("SELECT COALESCE(MAX(slot), -1) FROM \(slotTable) WHERE slot >= 0")
         let highWater = Swift.max(coveredRows, maxSlot + 1)
         guard highWater > 0 else { return declineBySlot("high water is 0") }
         guard flat16.mapPersistent(url: vecSidecarURL, tailSlackElements: Self.foldThreshold * d0,
@@ -9111,7 +9122,7 @@ public final class VectorStore: @unchecked Sendable {
             var spur: OpaquePointer?
             defer { sqlite3_finalize(spur) }
             var spurious = 0
-            if sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM vec_holes h JOIN chunk k ON k.slot = h.slot;",
+            if sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM vec_holes h WHERE EXISTS (SELECT 1 FROM chunk k WHERE k.slot = h.slot AND k.slot >= 0);",
                                   -1, &spur, nil) == SQLITE_OK, sqlite3_step(spur) == SQLITE_ROW {
                 spurious = Int(sqlite3_column_int64(spur, 0))
             }
@@ -9347,9 +9358,12 @@ public final class VectorStore: @unchecked Sendable {
             let unit = onSplit ? "chunk" : "chunks"
             let staged = onSplit ? scalarQuery("SELECT COUNT(*) FROM chunk") : live
             let clearedRows = scalarQuery("SELECT COUNT(*) FROM \(unit) WHERE slot >= 0 AND slot < \(target)")
+            // `AND slot >= 0` LAST: it is what lets SQLite use the partial `idx_chunk_slot_v5`
+            // (which cannot prove `slot >= C` implies it), and placed FIRST it becomes the range's
+            // lower bound instead of C. On a 6.55M-content clone: 0.21 s scan, 0.004 s last, 0.08 s first.
             guard execChecked("""
                 DELETE FROM pending_vecs WHERE chunk_id IN
-                  (SELECT id FROM \(unit) WHERE slot >= \(coveredRows) AND slot < \(target));
+                  (SELECT id FROM \(unit) WHERE slot >= \(coveredRows) AND slot < \(target) AND slot >= 0);
                 """),
                   scalarQuery("SELECT COUNT(*) FROM pending_vecs") == staged - clearedRows,
                   execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.coveredRowsKey)','\(target)');"),
@@ -10255,7 +10269,8 @@ public final class VectorStore: @unchecked Sendable {
               header.pathCount > 0, header.kindCount > 0,
               header.pathOffBytes == (header.pathCount + 1) * 4,
               header.kindOffBytes == (header.kindCount + 1) * 4,
-              liveRowCountLocked() == header.rowCount - (header.deadCount ?? 0)
+              (openRowCount.flatMap { $0.gen == mutationGen ? $0.count : nil } ?? liveRowCountLocked())
+                == header.rowCount - (header.deadCount ?? 0)
         else { return reject("header gen=\(header.gen) vs \(mutationGen) rows=\(header.rowCount) recB=\(header.recordBytes) dim=\(header.dim) live=\(liveRowCountLocked()) dead=\(header.deadCount ?? -1)") }
         // How wide each record is, and therefore whether it carries a slot at all. A 48-byte
         // sidecar predates sharing, and for it slot == row index is not a guess - it is what the
@@ -12415,7 +12430,7 @@ public final class VectorStore: @unchecked Sendable {
         var claimedPos: [Int32] = []
         var renumbered = false
         if total > 0 {
-            let maxSlot = scalarQuery("SELECT COALESCE(MAX(slot), -1) FROM \(onSplit ? "chunk" : "chunks")")
+            let maxSlot = scalarQuery("SELECT COALESCE(MAX(slot), -1) FROM \(onSplit ? "chunk" : "chunks") WHERE slot >= 0")
             if maxSlot >= 0 { claimedPos = [Int32](repeating: -1, count: maxSlot + 1) }
         }
         var stmt: OpaquePointer?
@@ -13525,10 +13540,14 @@ public final class VectorStore: @unchecked Sendable {
             UPDATE chunk SET refs = (SELECT COUNT(*) FROM occurrence o WHERE o.chunk_id = chunk.id)
              WHERE id IN (SELECT chunk_id FROM split_aff);
             """)
-        exec("DELETE FROM chunk_snippet WHERE chunk_id IN "
-             + "(SELECT chunk_id FROM split_aff WHERE chunk_id IN (SELECT id FROM chunk WHERE refs = 0));")
-        exec("DELETE FROM pending_vecs WHERE chunk_id IN "
-             + "(SELECT chunk_id FROM split_aff WHERE chunk_id IN (SELECT id FROM chunk WHERE refs = 0));")
+        // NARROW THE AFFECTED LIST, THEN DELETE BY IT. The old spelling asked
+        // `... IN (SELECT id FROM chunk WHERE refs = 0)`, which no index answers: two full scans
+        // of `chunk` on EVERY file write, new files included. Measured on a clone of a
+        // 6.55M-content index: 0.32 s per file against under 1 ms, same rows changed. A still-shared
+        // content leaves the temp list by one primary-key probe each.
+        exec("DELETE FROM split_aff WHERE (SELECT refs FROM chunk WHERE id = split_aff.chunk_id) > 0;")
+        exec("DELETE FROM chunk_snippet WHERE chunk_id IN (SELECT chunk_id FROM split_aff);")
+        exec("DELETE FROM pending_vecs WHERE chunk_id IN (SELECT chunk_id FROM split_aff);")
         exec("DELETE FROM chunk WHERE id IN (SELECT chunk_id FROM split_aff) AND refs = 0;")
     }
 

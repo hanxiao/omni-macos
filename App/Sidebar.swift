@@ -196,10 +196,7 @@ struct Sidebar: View {
         } isTargeted: { dropTargeted = $0 }
         .overlay {
             if dropTargeted {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .strokeBorder(Color.accentColor, lineWidth: 2)
-                    .padding(6)
-                    .allowsHitTesting(false)
+                DropRing()
             }
         }
     }

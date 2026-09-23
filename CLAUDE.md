@@ -748,6 +748,15 @@ In use: `glassEffect(_:in:)` with `.regular` and `.regular.interactive()`, `Glas
 fallback to `.ultraThinMaterial` - which is both the HIG-correct behaviour and a real GPU saving,
 since it removes a live glass pass per visible cell.
 
+GALLERY BADGES ARE A MATERIAL, NOT GLASS (2026-09-23, reverses the note below that called them "the
+one legitimate in-content use"). The HIG says "Don't use Liquid Glass in the content layer", and a
+grid of glass badges was one GlassEffectContainer per visible cell, each re-sampling on scroll.
+`mediaBadge()` is `.thinMaterial`. Glass stays for controls that float over content: the OCR readout,
+find bar, notice chip, map overlays. Also: the bars in `TopBar` have no fill or rule on Tahoe (a
+background behind a scroll-edge bar blocks the soft edge, WWDC25 323); shadows on glass chips are
+drawn only in the material fallback (`chipShadow`); the back/forward capsule is `.interactive()`;
+drop rings are `ConcentricRectangle` on Tahoe (`DropRing`).
+
 Deliberately NOT used, so nobody "fixes" this later:
 - `.buttonStyle(.glass)` / `.glassProminent` - every button we would apply it to already sits
   INSIDE a glass chip, and glass inside glass is the thing Apple tells you not to do. Standard
@@ -2358,8 +2367,10 @@ Sequoia machine and did not fix it: 0.13.6, which has both, still dumps 10x10 in
 - FIX: one split view with one mode-aware `.searchable` (OCR binds it to find-in-document), and a
   `ZStack` owner for `.toolbar`. Items measure 34x28 / 31x28 / 29x28 at launch, through OCR on/off
   cycles and with results showing. Tahoe dumps identical to 0.13.6 in search and OCR mode.
-- KEEP THE STOCK TITLE on 14/15 (`toolbar(removing: .title)` is Tahoe-only). It is the item that
-  fills the free space there: removing it packed the search field against the leading buttons.
+- NO TITLE ON 14/15 EITHER (2026-09-23). The title item was what filled the free space; hiding it
+  alone packed the search field against the leading buttons. `titleVisibility = .hidden` plus an
+  empty `.principal` toolbar item fixes both: AppKit gives a centre item flexible room on each side.
+  Checked on 15.7 in idle, results and OCR mode; the window keeps its name for the Window menu.
   The stretched-item recipe (low-priority 8000pt width) does fill it, but AppKit's overflow reads
   the request and pushes Search by File and Share into ». Trailing items are `.primaryAction` pre-26.
 - The launch animation: `onChange(of: ocrDrawerWanted, initial: true)` set `columns` from
@@ -2608,3 +2619,22 @@ reader. `FolderMapSharedContentTests` fails without the fix. All other `flat16` 
   reading does - an inline `Picker` and a new `CommandGroup` bring their own.
 - The About panel shows the mole without its tile (`Mole` in Assets.xcassets) and a link, no
   tagline.
+
+## v5 write path: queries the partial slot index could not see (2026-09-23)
+
+Measured on APFS clones of the real 6.55M-content / 10.7M-occurrence index, no schema change:
+- EVERY FILE WRITE SCANNED `chunk` TWICE. `dropOrphanedContentsLocked` asked `IN (SELECT id FROM
+  chunk WHERE refs = 0)`, which no index answers, on every `replaceMany`, new files included. Now it
+  narrows the temp `split_aff` list by primary-key probes and deletes by it. Same rows changed.
+  `[replaceMany] sql=` on the same batches: 1,084-1,922 ms (0.13.8) against 1.1-1.9 ms; 20 edits
+  in 23 ms. After adds, edits and deletes: 0 orphaned contents, snippets or staged vectors, 0 wrong
+  refs. Probably also the open "deleteExtensions takes 72 s" item below; not re-measured.
+- THE PARTIAL INDEX `idx_chunk_slot_v5 ... WHERE slot >= 0` IS ONLY USED WHEN THE QUERY SAYS SO, and
+  where it says so matters: `slot >= C AND slot < T` scans (0.21 s); `... AND slot >= 0` LAST uses
+  the index (0.004 s); `slot >= 0 AND ...` FIRST makes 0 the range start (0.08 s). Applied to the
+  coverage stamp, `MAX(slot)` (0.18 s -> 0.000 s) and the holes check, which is an EXISTS now
+  (0.53 s -> 0.005 s).
+- The open counts occurrences once; the row-cache check reuses it while `mutationGen` is unchanged.
+- Not done, from the same review: PASSIVE routine checkpoints (needs a measurement under browse
+  traffic), per-row path strings in the SQL fallback loader, and for the next migration only:
+  `occurrence.locator` out of the hot table, dropping `chunk.refs`.

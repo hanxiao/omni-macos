@@ -155,9 +155,8 @@ struct ContentView: View {
             // middle of SwiftUI's commit is what took the system sidebar toggle and the toolbar's
             // sidebar/detail sectioning down with it on Sequoia - see the tuner's notes below.
             //
-            // Tahoe only. On macOS 14/15 the title item is what fills the toolbar's free space:
-            // removing it (checked on 15.7 in a VM) packed the search field and every trailing
-            // button against the leading ones, and no replacement spacer survives there.
+            // Tahoe only. On macOS 14/15 the title text is hidden by the tuner instead, and an empty
+            // `.principal` item fills the space the title item used to (see `toolbar`).
             //
             // A ZSTACK, NOT A GROUP, AND THAT IS THE SEQUOIA TOOLBAR FIX. A Group is not a view: its
             // modifiers are applied to each child, so `.toolbar` landed on the CONDITIONAL content
@@ -202,8 +201,7 @@ struct ContentView: View {
         .overlay {
             // The transcription pane draws its own chip; this border is the search pane's.
             if fileDropTargeted && !model.ocrMode {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .strokeBorder(Color.accentColor, lineWidth: 2).padding(6).allowsHitTesting(false)
+                DropRing()
             }
         }
     }
@@ -442,7 +440,9 @@ struct ContentView: View {
     private struct NavPill: ViewModifier {
         func body(content: Content) -> some View {
             if #available(macOS 26.0, *) {
-                content.glassEffect(.regular, in: .capsule)
+                // Interactive: it holds buttons, and the glass should answer the pointer the way the
+                // system's own toolbar capsules do.
+                content.glassEffect(.regular.interactive(), in: .capsule)
             } else {
                 content
             }
@@ -699,6 +699,12 @@ struct ContentView: View {
                 .sharedBackgroundVisibility(.hidden)
         } else {
             ToolbarItem(id: "nav.title", placement: .navigation) { navAndTitle }
+            // macOS 14/15: the window title is hidden (the tuner), and the title item was what
+            // filled the free space - without it the search field packed against the leading
+            // buttons. An empty centre item takes that job: AppKit gives a principal item flexible
+            // room on both sides. Checked on 15.7 in search, results and OCR mode; the window keeps
+            // its name "Omni" for the Window menu and Mission Control.
+            ToolbarItem(id: "center", placement: .principal) { Color.clear.frame(width: 1, height: 1) }
         }
         // Flexible space after back/forward pushes every other control to the trailing edge (chevrons
         // own the left, everything else is right-aligned), and on Tahoe it's also the correct separator
@@ -1083,8 +1089,6 @@ private struct QualifierBar: View {
         }
         .font(.callout)
         .padding(.horizontal, 16).padding(.vertical, 6)
-        .background(.bar)
-        .overlay(alignment: .bottom) { Divider() }
     }
 }
 
@@ -1106,12 +1110,12 @@ private struct FileQueryChip: View {
         }
         .font(.callout)
         .padding(.horizontal, 16).padding(.vertical, 8)
-        .background(.bar)
-        .overlay(alignment: .bottom) { Divider() }
     }
 }
 
 struct CenteredStatus: View {
+    /// Pass as `symbol` for the monochrome Omni mark instead of an SF Symbol.
+    static let mole = "omni.mole"
     let symbol: String
     let title: String
     let subtitle: String
@@ -1128,7 +1132,14 @@ struct CenteredStatus: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            Image(systemName: symbol).font(.system(size: 44, weight: .light)).foregroundStyle(.tertiary)
+            if symbol == CenteredStatus.mole {
+                // The app's own mark, as a template: it takes .tertiary the way a symbol does, so it
+                // sits in the same place and weight, and reads as the brand without a coloured icon.
+                Image("MoleGlyph").renderingMode(.template).resizable().scaledToFit()
+                    .frame(width: 72, height: 72).foregroundStyle(.tertiary)
+            } else {
+                Image(systemName: symbol).font(.system(size: 44, weight: .light)).foregroundStyle(.tertiary)
+            }
             Text(title).font(.title)
             if !subtitle.isEmpty {
                 Text(subtitle).font(.callout).foregroundStyle(.secondary)
@@ -1351,8 +1362,12 @@ private struct WindowTitleHider: NSViewRepresentable {
             guard observers.isEmpty, window != nil else { return }
             scheduleApply()
             let nc = NotificationCenter.default
+            // didUpdate fires after EVERY event (each key, each mouse move), and a pass re-sets the
+            // window chrome and walks the titlebar views. Toolbar adds/removes and width changes
+            // still apply at once; plain window updates at most once a second, as a backstop.
             observers.append(nc.addObserver(forName: NSWindow.didUpdateNotification, object: window, queue: nil) { [weak self] _ in
-                self?.scheduleApply()
+                guard let self, CFAbsoluteTimeGetCurrent() - self.lastApply > 1 else { return }
+                self.scheduleApply()
             })
             for name in [NSToolbar.didRemoveItemNotification, NSToolbar.willAddItemNotification] {
                 observers.append(nc.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in
@@ -1367,18 +1382,23 @@ private struct WindowTitleHider: NSViewRepresentable {
         // nonisolated(unsafe): touched from notification closures that are main-thread in practice
         // (window updates, toolbar mutations); a stale read only coalesces one extra pass.
         nonisolated(unsafe) private var applyScheduled = false
+        nonisolated(unsafe) private var lastApply: CFAbsoluteTime = 0
         private nonisolated func scheduleApply() {
             guard !applyScheduled else { return }
             applyScheduled = true
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.applyScheduled = false
+                self.lastApply = CFAbsoluteTimeGetCurrent()
                 if let w = self.window { self.apply(w) }
             }
         }
 
         private func apply(_ w: NSWindow) {
             applySidebarWidth(w)
+            // macOS 14/15 draw the window title in the toolbar; Tahoe removes it with
+            // `.toolbar(removing: .title)`. See the `center` item in the toolbar for the space.
+            if #unavailable(macOS 26.0), w.titleVisibility != .hidden { w.titleVisibility = .hidden }
             // No rule under the toolbar. Finder's column header sits on the SAME surface as the
             // chrome with no seam between them; the automatic separator drew a hairline there and
             // made the header read as a second bar stuck underneath. The header keeps its OWN
@@ -1478,10 +1498,16 @@ private struct TopBar<Bar: View>: ViewModifier {
     @ViewBuilder var bar: () -> Bar
 
     func body(content: Content) -> some View {
+        // No fill and no rule on Tahoe: the bar sits in the scroll-edge pocket, and a background
+        // behind it blocks the soft edge ("remove extra backgrounds behind bar items", WWDC25 323).
+        // Before Tahoe it stacks above the content, where the bar material and a divider separate it.
         if #available(macOS 26.0, *) {
             content.safeAreaBar(edge: .top, spacing: 0) { bar() }
         } else {
-            VStack(spacing: 0) { bar(); content }
+            VStack(spacing: 0) {
+                bar().background(.bar).overlay(alignment: .bottom) { Divider() }
+                content
+            }
         }
     }
 }
