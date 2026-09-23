@@ -5,7 +5,7 @@ import OmniKit
 /// A search result after duplicate collapsing: one file the user sees, plus the copies it stands
 /// for. `members` always contains `representative` as its first element, so a group of one is the
 /// ordinary case and needs no special handling anywhere downstream.
-struct ResultGroup: Identifiable {
+struct ResultGroup: Identifiable, Equatable {
     var members: [SearchHit]
     /// How the members were established - decides the wording ("2 copies" vs "2 near-identical").
     var reason: Reason

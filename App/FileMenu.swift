@@ -154,7 +154,9 @@ extension FileMenuItems where Passages == EmptyView {
 enum Transcribe {
     /// The paths in a selection that transcription can actually take.
     static func candidates(_ paths: [String]) -> [String] {
-        paths.filter { PhotoLibrary.isPhotoPath($0) || OCRSession.isSupported(URL(fileURLWithPath: $0)) }
+        // `isDirectory: false`: the answer is the extension, and the plain initialiser stats every
+        // path to learn what the menu bar - which asks on each selection change - does not need.
+        paths.filter { PhotoLibrary.isPhotoPath($0) || OCRSession.isSupported(URL(fileURLWithPath: $0, isDirectory: false)) }
     }
 
     static func send(_ paths: [String], model: AppModel, ocr: OCRSession) {

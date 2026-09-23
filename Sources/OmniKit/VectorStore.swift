@@ -43,7 +43,7 @@ public struct IndexedChunk: Sendable {
     }
 }
 
-public struct SearchHit: Sendable {
+public struct SearchHit: Sendable, Equatable {
     public let path: String
     /// The number this hit is RANKED by. Dense-only searches put the cosine here; a fused search
     /// puts the fused score here, so order and score can never disagree (see `fuseLexical`).
@@ -11101,7 +11101,7 @@ public final class VectorStore: @unchecked Sendable {
     /// `other` sweeps up anything in the folder that is not accounted for, which is how a stray
     /// file from an older version becomes visible rather than mysterious.
     public struct DiskUse: Sendable {
-        public struct Entry: Sendable {
+        public struct Entry: Sendable, Equatable {
             public let name: String
             public let bytes: Int64
             /// False for anything the store can rebuild by itself.

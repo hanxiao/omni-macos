@@ -313,11 +313,11 @@ final class AppModel {
     var phase: Phase = .loadingModel
     /// The semantic (embedding) query - the free-text remainder after `key:value` qualifiers are
     /// stripped out by `applyParsedQuery`. This is what actually gets embedded and searched.
-    var query: String = ""
+    var query: String = "" { didSet { refreshSearchFlags() } }
     /// The literal search-box text (what the user typed, qualifiers and all). `.searchable` binds to
     /// this; `query` is derived from it. Programmatic changes here are reflected in the field but do
     /// NOT re-parse (only user edits, routed through `applyParsedQuery`, do).
-    var rawQuery: String = ""
+    var rawQuery: String = "" { didSet { refreshSearchFlags() } }
     /// Whether the typeahead/autocomplete dropdown may open. True only while the user is editing the
     /// box directly; cleared on any PROGRAMMATIC box change (history replay, filter-menu sync, folder
     /// map) so restoring a query's text doesn't pop the suggestions. The `.searchable` suggestions
@@ -336,7 +336,7 @@ final class AppModel {
         /// user picked and the file we embed have different paths and only this knows the former.
         var sourcePath: String? = nil
     }
-    var fileQuery: FileQuery? = nil
+    var fileQuery: FileQuery? = nil { didSet { refreshSearchFlags() } }
     /// Presented by the sidebar, triggered from anywhere that can add a source (see SourcePicker).
     var showPhotoPicker = false
     var showPhotoDenied = false
@@ -661,7 +661,8 @@ final class AppModel {
     /// following shift-click) on a member of the set - the existing active item if it is still inside
     /// the rectangle, else the topmost hit in result order - and pins the anchor there too.
     func applyMarqueeSelection(_ paths: Set<String>) {
-        selectedPaths = paths
+        // Called on every drag tick; an unchanged set must not notify every row and the menu bar.
+        if selectedPaths != paths { selectedPaths = paths }
         if selection == nil || !paths.contains(selection!) {
             selection = results.first { paths.contains($0.path) }?.path
         }
@@ -1232,7 +1233,7 @@ final class AppModel {
         didSet { ProfilingService.setShareEnabled(shareProfilingResults) }
     }
     /// Past searches shown in the sidebar (recents auto-pruned; bookmarks pinned and kept).
-    private(set) var searchHistory: [HistoryItem] = []
+    private(set) var searchHistory: [HistoryItem] = [] { didSet { refreshSearchFlags() } }
     private let historyKey = "omni.searchHistory"
     private let maxRecentHistory = 200   // hard ceiling on recents; the day window is the real control
     /// When searches enter History (Settings > History). Default: automatic, as before.
@@ -1445,8 +1446,8 @@ final class AppModel {
     var filterFilename: String = "" { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
     /// Content-tag filter (`tag:bear`, comma-separated any-of; exclude via `-tag:x`). Matched
     /// whole-tag against the generated media tag snippets, resolved store-side.
-    var filterTags: String = "" { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
-    var filterTagsExclude: String = "" { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
+    var filterTags: String = "" { didSet { refreshSearchFlags(); if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
+    var filterTagsExclude: String = "" { didSet { refreshSearchFlags(); if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
     var dateRange: DateRange = .any { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
     var minScore: Double = defaultMinScore {
         didSet {
@@ -2068,16 +2069,32 @@ final class AppModel {
     // MARK: - Bookmark / clear (the explicit, mode-independent entry points)
 
     /// Is the search currently shown already saved as a bookmark?
-    var currentSearchIsBookmarked: Bool {
-        if let fq = fileQuery { return searchHistory.contains { $0.filePath == fq.url.path && $0.bookmarked } }
-        let raw = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !raw.isEmpty else { return false }
-        return searchHistory.contains { !$0.isFile && $0.displayText.caseInsensitiveCompare(raw) == .orderedSame && $0.bookmarked }
-    }
+    private(set) var currentSearchIsBookmarked = false
 
     /// Is there a search to act on (text typed or a file query active)?
-    var hasActiveSearch: Bool {
-        fileQuery != nil || !rawQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    private(set) var hasActiveSearch = false
+
+    /// STORED, and written only when they change (with `hasQuery`). They were computed from `rawQuery`, and the menu
+    /// bar reads both, so every keystroke re-ran the app's whole `.commands` block - the menu bar
+    /// rebuilt once a character. Stored flags that keep their value notify nobody.
+    private func refreshSearchFlags() {
+        let raw = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        let active = fileQuery != nil || !raw.isEmpty
+        if active != hasActiveSearch { hasActiveSearch = active }
+        let any = fileQuery != nil || !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !filterTags.isEmpty || !filterTagsExclude.isEmpty
+        if any != hasQuery { hasQuery = any }
+        let marked: Bool
+        if let fq = fileQuery {
+            marked = searchHistory.contains { $0.filePath == fq.url.path && $0.bookmarked }
+        } else if raw.isEmpty {
+            marked = false
+        } else {
+            marked = searchHistory.contains {
+                !$0.isFile && $0.displayText.caseInsensitiveCompare(raw) == .orderedSame && $0.bookmarked
+            }
+        }
+        if marked != currentSearchIsBookmarked { currentSearchIsBookmarked = marked }
     }
 
     var recentHistoryCount: Int { searchHistory.lazy.filter { !$0.bookmarked }.count }
@@ -2261,26 +2278,31 @@ final class AppModel {
     }
 
     private func recomputeResults() {
+        // EVERY ASSIGNMENT BELOW IS GUARDED. This runs twice per search - when the hits land and
+        // again when `loadGroupingInputs` brings the grouping keys - and on every live refresh of
+        // the same query, and an @Observable property notifies on every write, equal or not. Each
+        // unguarded pass re-rendered the results list and every visible row for nothing.
         let above = rawResults.filter { Self.relevance($0.score) >= VectorStore.relevanceFloor(kind: $0.kind, base: minScore) }
-        hiddenByThreshold = rawResults.count - above.count
+        let hidden = rawResults.count - above.count
+        if hiddenByThreshold != hidden { hiddenByThreshold = hidden }
         // Collapse duplicates BEFORE sorting, on the relevance order the store produced: grouping is
         // anchor-first, and the anchor must be the best-ranked member, not whichever file happens to
         // sort first by name. Grouping only ever runs over hits that already passed the threshold,
         // so a copy below the cut can never resurrect its stack.
         let collapsed = collapse(above)
-        collapsedCount = above.count - collapsed.count
-        let reps = collapsed.map(\.representative)
+        if collapsedCount != above.count - collapsed.count { collapsedCount = above.count - collapsed.count }
+        let ordered: [ResultGroup]
         switch sortOrder {
         case .relevance:
-            results = reps
-            groups = collapsed
+            ordered = collapsed
         case .name:
-            groups = collapsed.sorted { ($0.representative.path as NSString).lastPathComponent.localizedCaseInsensitiveCompare(($1.representative.path as NSString).lastPathComponent) == .orderedAscending }
-            results = groups.map(\.representative)
+            ordered = collapsed.sorted { ($0.representative.path as NSString).lastPathComponent.localizedCaseInsensitiveCompare(($1.representative.path as NSString).lastPathComponent) == .orderedAscending }
         case .dateModified:
-            groups = collapsed.sorted { $0.representative.modified > $1.representative.modified }
-            results = groups.map(\.representative)
+            ordered = collapsed.sorted { $0.representative.modified > $1.representative.modified }
         }
+        if groups != ordered { groups = ordered }
+        let reps = ordered.map(\.representative)
+        if results != reps { results = reps }
         // Drop expansion state for stacks that no longer exist, so the set cannot grow unbounded
         // across a session of typing.
         if !expandedStacks.isEmpty {
@@ -3590,13 +3612,17 @@ final class AppModel {
             let storedDim = store.vectorDim   // ACTUAL stored vector dim - ground truth
             let builtVariant = store.metaGet("index_model_variant")
             await MainActor.run {
-                self.indexSchemaVersion = schema
-                self.indexStoredDim = storedDim
-                self.indexModelVariantRaw = builtVariant
-                self.indexedFiles = stats.fileCount
-                self.indexedChunks = stats.chunkCount
-                self.indexedKinds = stats.kinds
-                self.indexedExts = stats.exts.sorted()
+                // ASSIGNED ONLY WHEN CHANGED, all of them. This runs every 1.5 s while indexing and an
+                // @Observable property notifies on every write, so each tick re-rendered the toolbar,
+                // the filter menu and the window around the results - usually to show the same
+                // numbers - and a search typed during indexing competed with it.
+                self.assign(\.indexSchemaVersion, schema)
+                self.assign(\.indexStoredDim, storedDim)
+                self.assign(\.indexModelVariantRaw, builtVariant)
+                self.assign(\.indexedFiles, stats.fileCount)
+                self.assign(\.indexedChunks, stats.chunkCount)
+                self.assign(\.indexedKinds, stats.kinds)
+                self.assign(\.indexedExts, stats.exts.sorted())
                 // Invalidate any cached embedding-map layout for a folder whose indexed file count
                 // changed (its vectors moved), so the next selection refits instead of showing stale.
                 for (path, count) in folders where self.folderFileCounts[path] != count {
@@ -3617,13 +3643,16 @@ final class AppModel {
                         }
                     }
                 }
-                self.folderFileCounts = folders
+                self.assign(\.folderFileCounts, folders)
                 self.refreshDeniedRoots()
-                self.dbPath = path
-                self.dbSizeBytes = size
-                self.storageMigration = migration
-                self.diskUse = disk
-                if let lastTs { self.lastIndexed = Date(timeIntervalSince1970: lastTs) }
+                self.assign(\.dbPath, path)
+                self.assign(\.dbSizeBytes, size)
+                if self.storageMigration.map({ [$0.done, $0.total, Int($0.bytesToReclaim)] })
+                    != migration.map({ [$0.done, $0.total, Int($0.bytesToReclaim)] }) {
+                    self.storageMigration = migration
+                }
+                self.assign(\.diskUse, disk)
+                if let lastTs { self.assign(\.lastIndexed, Date(timeIntervalSince1970: lastTs)) }
                 // Require engineDim > 0: before the engine reports its dimension the fingerprint is
                 // "...|dim0|model0-0", which would spuriously flag obsolete and wipe a valid index.
                 let hasIndex = dimReady && stats.fileCount > 0
@@ -3636,9 +3665,14 @@ final class AppModel {
                 // matching model obsolete and wipe the index.
                 let stringTrustworthy = stampedVersion?.contains("dim\(self.engineDim)") == true
                 let stringMismatch = hasIndex && stringTrustworthy && stampedVersion != fp
-                self.indexObsolete = dimMismatch || stringMismatch
+                self.assign(\.indexObsolete, dimMismatch || stringMismatch)
             }
         }
+    }
+
+    /// Write only a changed value: an @Observable property notifies its readers on every write.
+    private func assign<T: Equatable>(_ key: ReferenceWritableKeyPath<AppModel, T>, _ value: T) {
+        if self[keyPath: key] != value { self[keyPath: key] = value }
     }
 
     static func indexURL() throws -> URL {
@@ -4205,8 +4239,18 @@ final class AppModel {
             if rp.total > 0, rp.done >= rp.total { return nil }
             return rp.total > 0 ? .fraction(rp.fraction) : .indeterminate
         }
-        if pendingCatchUpRoots.contains(URL(fileURLWithPath: path)) { return .indeterminate }
+        // By path, not `URL(fileURLWithPath:)`: that stats the path, and the browser asks this for
+        // every subfolder twice a second.
+        if pendingCatchUpRoots.contains(where: { $0.path == path }) { return .indeterminate }
         return nil
+    }
+
+    /// False when no folder can have a ring: nothing queued, no root clock short of its total,
+    /// nothing active. The same inputs `browseProgress` and `enclosingRootProgress` read, so while
+    /// this is false both answer nil for every path and the browser can skip asking.
+    var mayHaveBrowseProgress: Bool {
+        !pendingCatchUpRoots.isEmpty || !workingRootPaths.isEmpty
+            || progress.perRoot.contains { $0.value.total == 0 || $0.value.done < $0.value.total }
     }
 
     /// The clock of the root whose pass is filling `path` - what a SUBFOLDER's ring shows.
@@ -4420,10 +4464,9 @@ final class AppModel {
     /// dimension counts because search() treats it as a query in its own right (`tag:beard` with no
     /// text lists every match); without it an active, empty tag search read as "no query at all",
     /// which suppressed the spinner and, with a folder selected, handed the pane to the folder map.
-    var hasQuery: Bool {
-        fileQuery != nil || !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            || !filterTags.isEmpty || !filterTagsExclude.isEmpty
-    }
+    /// Stored for the reason `hasActiveSearch` is: the window's body reads it, and computed from
+    /// `query` it re-rendered the window on every keystroke. See `refreshSearchFlags`.
+    private(set) var hasQuery = false
     /// Stable resolvedQuery token for a file subject (distinct from any typed text).
     private func fileToken(_ url: URL) -> String { "\u{0000}file:\(url.path)" }
 
@@ -4780,13 +4823,18 @@ final class AppModel {
 
     private func applyResults(_ hits: [SearchHit], resolved: String) {
         let isNewQuery = resolvedQuery != resolved
-        rawResults = hits
-        resolvedQuery = resolved
-        resultsToken = resolved + "\u{1}" + filterSignature()
+        // A live refresh that found exactly what is on screen changes nothing; see recomputeResults.
+        if rawResults != hits { rawResults = hits }
+        if resolvedQuery != resolved { resolvedQuery = resolved }
+        let token = resolved + "\u{1}" + filterSignature()
+        if resultsToken != token { resultsToken = token }
         loadGroupingInputs(for: hits, token: resultsToken)
         enqueueRetagCandidates(hits)
         if isNewQuery {
-            selection = nil; selectedPaths = []; selectionAnchor = nil
+            // Guarded: clearing an already-empty selection still notifies, and the menu bar reads it.
+            if selection != nil { selection = nil }
+            if !selectedPaths.isEmpty { selectedPaths = [] }
+            if selectionAnchor != nil { selectionAnchor = nil }
         } else {
             // A live refresh of the same query keeps the selection, minus any rows that vanished.
             // Tested against `results`, the collection the list actually renders, not the raw store
@@ -4795,7 +4843,7 @@ final class AppModel {
             // recomputed `results` above, so it is current here.
             if let sel = selection, !results.contains(where: { $0.path == sel }) { selection = nil }
             let live = Set(results.map { $0.path })
-            selectedPaths.formIntersection(live)
+            if !selectedPaths.isSubset(of: live) { selectedPaths.formIntersection(live) }
             if let a = selectionAnchor, !live.contains(a) { selectionAnchor = nil }
         }
         // Back/forward integration. When THIS settling search is the navigated one (its token matches),
@@ -4830,7 +4878,7 @@ final class AppModel {
         if fileQuery != nil || !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             cancelFolderVizFit()
         }
-        queryError = nil
+        if queryError != nil { queryError = nil }   // a no-op write still re-renders the window
         let filter = currentFilter()
         searchToken += 1
         let token = searchToken

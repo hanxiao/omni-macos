@@ -5,8 +5,9 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @Environment(AppModel.self) private var model: AppModel
-    @State private var debounce: Task<Void, Never>?
-    @State private var historyDebounce: Task<Void, Never>?
+    /// The two typing timers, in a reference the view holds rather than as `@State`: they are
+    /// replaced on every keystroke, and a state write is a reason to re-render the window.
+    @State private var timers = TypingTimers()
     @State private var fileDropTargeted = false
     /// Owned rather than left to the system, so the toggle that hides the drawer can also bring it
     /// back - see `sidebarToggleButton`.
@@ -29,7 +30,7 @@ struct ContentView: View {
     /// filters, clear a file query if real text was typed, and schedule the (debounced) search. The
     /// box binds to the RAW typed string; `set` (user edits only) routes here.
     private func handleQueryEdit(_ typed: String) {
-        model.suggestionsAllowed = true   // this fires only on real keystrokes (the .searchable set:), so arm the dropdown
+        if !model.suggestionsAllowed { model.suggestionsAllowed = true }   // this fires only on real keystrokes (the .searchable set:), so arm the dropdown
         // The field holds the SEMANTIC text; finished filters live beside it as chips. A qualifier
         // becomes a chip only once a space ends it - mid-word, `type:i` has to stay editable text
         // or the chip is made from half a word and cannot be corrected.
@@ -60,44 +61,11 @@ struct ContentView: View {
         // collapsed to 10x10 - present, and invisible. The search field is configured by MODE
         // instead: OCR mode binds it to find-in-document, search mode to the query.
         split
-            .searchable(text: Binding(get: { model.ocrMode ? ocr.find : model.query },
-                                      set: { if model.ocrMode { ocr.find = $0 } else { handleQueryEdit($0) } }),
-                        tokens: Binding(get: { model.ocrMode ? [] : model.searchTokens },
-                                        set: { if !model.ocrMode { model.setSearchTokens($0) } }),
-                        placement: .toolbar,
-                        prompt: model.ocrMode ? "Find in document" : "Search by meaning") { token in
-                // Text, not Label: a token chip renders its title only on macOS, so an icon here
-                // is carried and then thrown away.
-                Text(token.label)
-            }
-            .searchSuggestions {
-                ForEach(!model.ocrMode && model.suggestionsAllowed ? searchSuggestions(model.query) : [], id: \.completion) { sug in
-                    HStack(spacing: 6) {
-                        Image(systemName: sug.icon).foregroundStyle(.secondary)
-                        Text(sug.label).lineLimit(1).truncationMode(.middle)
-                        if let chip = sug.chip {
-                            // Shaped and weighted to match the token the SEARCH FIELD
-                            // draws for the same qualifier, so the field and its
-                            // suggestions speak one language: a rounded rect, not a
-                            // capsule, and a light wash rather than `.quaternary` - which
-                            // measured far heavier than the system token (a ~3% wash on
-                            // its own surface) and read as a grey block.
-                            //
-                            // Deliberately NOT a glass effect: this popover is already a
-                            // vibrant surface, and glass inside glass is the one thing
-                            // Apple's guidance rules out (see the Liquid Glass notes).
-                            Text(chip)
-                                .font(.caption)
-                                .foregroundStyle(.primary)
-                                .padding(.horizontal, 5).padding(.vertical, 1)
-                                .background(.primary.opacity(0.06),
-                                            in: RoundedRectangle(cornerRadius: 5, style: .continuous))
-                                .lineLimit(1)
-                        }
-                    }
-                    .searchCompletion(sug.completion)
-                }
-            }
+            // The field, its chips and its suggestions, in a MODIFIER: the field's binding reads the
+            // query, and read from this body every keystroke re-ran the whole window - the split
+            // view, the results list and each visible row, ~60 ms a character (measured with the
+            // stall detector's body counters, 2026-09-22). A modifier re-runs without its content.
+            .modifier(SearchField(onEdit: handleQueryEdit, suggest: searchSuggestions))
             .onSubmit(of: .search) {
                 // In OCR mode Return steps to the next match, Preview's find. In search mode it
                 // finishes the word too: a qualifier typed without a trailing space still becomes
@@ -321,7 +289,8 @@ struct ContentView: View {
     @ViewBuilder private var contentBody: some View {
         VStack(spacing: 0) {
             if !model.results.isEmpty {
-                ResultsList(results: model.results) { belowThresholdFooter }
+                // `.equatable()`: see the conformance on ResultsList.
+                ResultsList { belowThresholdFooter }.equatable()
             } else if showsPhotoBrowser {
                 PhotoSourceBrowser(source: model.browsedPhotoSource!)
             } else if showsFolderBrowser {
@@ -648,8 +617,8 @@ struct ContentView: View {
                 Label("Share\u{2026}", systemImage: "square.and.arrow.up")
             }
             // Both states say something true and useful: what it will do, or what is missing.
-            .help(model.selectedURLsOrdered.isEmpty ? "Select a file to share" : "Share the selection")
-            .disabled(model.selectedURLsOrdered.isEmpty)
+            .help(model.selectedPathsForMenu.isEmpty ? "Select a file to share" : "Share the selection")
+            .disabled(model.selectedPathsForMenu.isEmpty)
         }
     }
 
@@ -922,8 +891,8 @@ struct ContentView: View {
     }
 
     private func scheduleSearch() {
-        debounce?.cancel()
-        debounce = Task {
+        timers.search?.cancel()
+        timers.search = Task {
             try? await Task.sleep(nanoseconds: 180_000_000)
             if !Task.isCancelled { model.search() }
         }
@@ -934,8 +903,8 @@ struct ContentView: View {
     // Cancelled on every keystroke, so it only fires once typing stops. (No effect in .onSubmit /
     // .manual modes, which record on Return / the bookmark button instead.)
     private func scheduleHistoryRecord() {
-        historyDebounce?.cancel()
-        historyDebounce = Task {
+        timers.history?.cancel()
+        timers.history = Task {
             try? await Task.sleep(nanoseconds: 3_000_000_000)
             if !Task.isCancelled { model.recordCurrentSearchToHistory() }
         }
@@ -1027,6 +996,71 @@ struct ContentView: View {
 
 /// A thin bar under the search field showing the qualifiers Omni parsed from the box (or the
 /// literal-mode state), with a one-click toggle to treat the box as plain text instead of filters.
+/// The toolbar search field. See its use in `ContentView.body` for why it is a modifier.
+private struct SearchField: ViewModifier {
+    @Environment(AppModel.self) private var model
+    @Environment(OCRSession.self) private var ocr
+    let onEdit: (String) -> Void
+    let suggest: (String) -> [ContentView.Suggestion]
+
+    func body(content: Content) -> some View {
+        content
+            .searchable(text: Binding(get: { model.ocrMode ? ocr.find : model.query },
+                                      set: { if model.ocrMode { ocr.find = $0 } else { onEdit($0) } }),
+                        tokens: Binding(get: { model.ocrMode ? [] : model.searchTokens },
+                                        set: { if !model.ocrMode { model.setSearchTokens($0) } }),
+                        placement: .toolbar,
+                        prompt: model.ocrMode ? "Find in document" : "Search by meaning") { token in
+                // Text, not Label: a token chip renders its title only on macOS, so an icon here
+                // is carried and then thrown away.
+                Text(token.label)
+            }
+            .searchSuggestions { QuerySuggestions(suggest: suggest) }
+    }
+}
+
+@MainActor
+private final class TypingTimers {
+    var search: Task<Void, Never>?
+    var history: Task<Void, Never>?
+}
+
+/// The search field's suggestion list. See `.searchSuggestions` in ContentView for why it is its own
+/// view.
+private struct QuerySuggestions: View {
+    @Environment(AppModel.self) private var model
+    let suggest: (String) -> [ContentView.Suggestion]
+
+    var body: some View {
+            ForEach(!model.ocrMode && model.suggestionsAllowed ? suggest(model.query) : [], id: \.completion) { sug in
+                HStack(spacing: 6) {
+                    Image(systemName: sug.icon).foregroundStyle(.secondary)
+                    Text(sug.label).lineLimit(1).truncationMode(.middle)
+                    if let chip = sug.chip {
+                        // Shaped and weighted to match the token the SEARCH FIELD
+                        // draws for the same qualifier, so the field and its
+                        // suggestions speak one language: a rounded rect, not a
+                        // capsule, and a light wash rather than `.quaternary` - which
+                        // measured far heavier than the system token (a ~3% wash on
+                        // its own surface) and read as a grey block.
+                        //
+                        // Deliberately NOT a glass effect: this popover is already a
+                        // vibrant surface, and glass inside glass is the one thing
+                        // Apple's guidance rules out (see the Liquid Glass notes).
+                        Text(chip)
+                            .font(.caption)
+                            .foregroundStyle(.primary)
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(.primary.opacity(0.06),
+                                        in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                            .lineLimit(1)
+                    }
+                }
+                .searchCompletion(sug.completion)
+            }
+    }
+}
+
 private struct QualifierBar: View {
     @Environment(AppModel.self) private var model: AppModel
     /// Qualifier keys another view is already showing, better. While browsing, the breadcrumb

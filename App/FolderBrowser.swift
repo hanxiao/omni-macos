@@ -60,9 +60,20 @@ struct FolderBrowser: View {
     @State private var ascending = true
     @State private var selected: URL?
 
-    /// Folders before files, then the toolbar's Sort. `.relevance` has no meaning for a directory
+    /// The listing in display order. STORED, and rebuilt only when the entries or the sort change:
+    /// it was a computed property read from `body` (twice for an arrow key), so every render of a
+    /// 1,158-entry folder - a selection, a progress tick, a view-mode switch - sorted it again with
+    /// `localizedStandardCompare`.
+    @State private var sorted: [Entry] = []
+
+    private func setEntries(_ next: [Entry]) {
+        entries = next
+        sorted = Self.order(next, by: sort, ascending: ascending)
+    }
+
+    /// Folders before files, then the column's order. `.relevance` has no meaning for a directory
     /// listing, so it reads as Name - which is also Finder's default.
-    private var sorted: [Entry] {
+    private static func order(_ entries: [Entry], by sort: BrowserSort, ascending: Bool) -> [Entry] {
         // Folders first, the way Finder's "Keep folders on top" is set by default; the chosen
         // column decides the rest.
         entries.sorted { a, b in
@@ -320,6 +331,7 @@ struct FolderBrowser: View {
             .contentShape(.rect)
             .onTapGesture {
                 if sort == target { ascending.toggle() } else { sort = target; ascending = true }
+                sorted = Self.order(entries, by: sort, ascending: ascending)
             }
     }
 
@@ -453,11 +465,23 @@ struct FolderBrowser: View {
         if entry.isDirectory { model.enterFolder(entry.url) } else { PhotoActions.open(entry.url.path) }
     }
 
+    /// The list's row icon, per PATH so a folder's own icon (Downloads, Desktop, an app bundle)
+    /// survives. Fetched once: it asked the icon services daemon for every visible row on every
+    /// render, and resized the image it was handed each time.
     private func icon(_ entry: Entry) -> NSImage {
+        let key = entry.url.path as NSString
+        if let hit = Self.rowIcons.object(forKey: key) { return hit }
         let image = NSWorkspace.shared.icon(forFile: entry.url.path)
         image.size = NSSize(width: 48, height: 48)
+        Self.rowIcons.setObject(image, forKey: key)
         return image
     }
+
+    private static let rowIcons: NSCache<NSString, NSImage> = {
+        let cache = NSCache<NSString, NSImage>()
+        cache.countLimit = 4096
+        return cache
+    }()
 
     /// One icon for every folder, fetched once. `NSWorkspace.icon(forFile:)` hits the icon
     /// services daemon per call, and a gallery of a few hundred directories asks it a few hundred
@@ -494,6 +518,13 @@ struct FolderBrowser: View {
     private func followProgress() async {
         while !Task.isCancelled {
             let now = Date()
+            // Nothing indexing, nothing queued, no folder still marked as growing: no row can have
+            // a ring, so skip the walk over every subfolder.
+            if !model.mayHaveBrowseProgress, !growingUntil.values.contains(where: { $0 > now }) {
+                if !rowProgress.isEmpty { rowProgress = [:] }
+                try? await Task.sleep(for: .milliseconds(500))
+                continue
+            }
             let next = Dictionary(uniqueKeysWithValues: entries.lazy
                 .filter(\.isDirectory)
                 .compactMap { e -> (String, AppModel.BrowseProgress)? in
@@ -566,8 +597,10 @@ struct FolderBrowser: View {
             tagsByPath = await model.tags(inFolder: url)
             guard url == folder else { return }
         }
-        entries = children.map { c in
-            Entry(url: URL(fileURLWithPath: c.path),
+        setEntries(children.map { c in
+            // `isDirectory:` given: the plain initialiser stats the path to find out, once per
+            // child, on the main thread, when the listing already says what it is.
+            Entry(url: URL(fileURLWithPath: c.path, isDirectory: c.isDirectory),
                   isDirectory: c.isDirectory,
                   modified: Date(timeIntervalSince1970: c.modified),
                   kind: c.kind,
@@ -577,7 +610,7 @@ struct FolderBrowser: View {
                   fileCount: c.fileCount,
                   tags: tagsByPath[c.path] ?? [],
                   size: c.isDirectory ? nil : c.size)
-        }
+        })
         // NOT noteGrowth() HERE. This pass carries fileCount 0 for every folder - the counts are
         // the expensive half, fetched below - so comparing it against the previous listing's real
         // numbers makes every folder look like it grew the moment they arrive, and the whole
@@ -601,13 +634,17 @@ struct FolderBrowser: View {
         }
         let counts = await model.folderCounts(under: url)
         guard url == folder, !counts.isEmpty else { return }
-        for i in entries.indices where entries[i].isDirectory {
-            if let a = counts[entries[i].url.lastPathComponent] {
-                entries[i].fileCount = a.count
-                if a.newest > 0 { entries[i].indexedAt = Date(timeIntervalSince1970: a.newest) }
-                if a.oldest > 0 { entries[i].firstIndexedAt = Date(timeIntervalSince1970: a.oldest) }
+        // On a copy, assigned once. Writing `entries[i]` on the @State array copied the whole
+        // listing for every folder in it.
+        var next = entries
+        for i in next.indices where next[i].isDirectory {
+            if let a = counts[next[i].url.lastPathComponent] {
+                next[i].fileCount = a.count
+                if a.newest > 0 { next[i].indexedAt = Date(timeIntervalSince1970: a.newest) }
+                if a.oldest > 0 { next[i].firstIndexedAt = Date(timeIntervalSince1970: a.oldest) }
             }
         }
+        setEntries(next)
         noteGrowth()
     }
 

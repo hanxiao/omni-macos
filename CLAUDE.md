@@ -2434,3 +2434,52 @@ reader. `FolderMapSharedContentTests` fails without the fix. All other `flat16` 
   behind it and the clicks land in his terminal. `screencapture -l` captures a covered window, so
   a screenshot does not show that it is covered.
 
+
+## Search and browse responsiveness (2026-09-23, Scripts/perf-tour.sh)
+- THE TOOL: `Scripts/perf-tour.sh <corpus|-> <index> <out> [reserve]` drives
+  `UITests/PerfTourUITests` (typing, gallery, list, selection, Find Similar, folder browser) in a
+  RELEASE build (`OMNI_UI_CONFIG=Release`; Debug stalls are not the shipped app's) and records the
+  stall log, the perf log and phys_footprint; `Scripts/perf-tour-analyze.py <out>` buckets them by phase. `-`
+  tours the app's own folders; it then snapshots and restores the user's prefs around the run.
+- FOR A REAL INDEX: APFS-clone it (`cp -c -R`, instant) with the app quit, and run a copy of the
+  build re-signed with the Developer ID identity: that copy satisfies the installed app's designated
+  requirement, so it inherits the folder and Photos grants and raises no TCC prompt (the Apple
+  Development build does, and nobody may answer those for Han).
+- READ THE STALLS BY WHAT RAN IN THEM. XCUITest serves every query and keystroke through the app's
+  accessibility tree on the main thread: ~75 ms per keystroke with no app code in it, and 1-3 s per
+  scroll on a 1,158-row folder listing (64% of the samples in accessibility). Temporary
+  `UIProbe.count("body.X")` lines in view bodies attach counts to each stall; a stall with no
+  bodies is the harness. A `sample` taken during the tour perturbs it enough to time XCUITest out.
+- EVERY KEYSTROKE RE-RENDERED THE WINDOW: the split view, the results list, every visible row, the
+  sidebar and the whole menu bar, ~60 ms a character. Causes, each fixed: `.searchable`'s binding
+  and suggestions read the query from ContentView's body (now the `SearchField` modifier and
+  `QuerySuggestions` view); the sidebar's `onChange(of: rawQuery)` (now `RawQueryWatcher`);
+  `hasQuery`/`hasActiveSearch`/`currentSearchIsBookmarked` computed from the query and read by the
+  window and the menu bar (now stored, written only on change); `@State` typing timers.
+- AN @Observable PROPERTY NOTIFIES ON EVERY WRITE, EQUAL OR NOT. Unguarded no-op writes were the
+  other half: `recomputeResults` (twice per search), `applyResults` on a same-query refresh,
+  selection clears, `queryError = nil`, the 1.5 s index-stats tick (`assign(_:_:)`), and the
+  results list's own `@State` resets. `SearchHit`/`ResultGroup`/`DiskUse.Entry` are Equatable for this.
+- THE ROW'S CONTEXT MENU IS PART OF THE ROW. macOS builds it eagerly, so what the menu reads
+  re-renders the row: it read `rawResults` (which changes below the threshold on nearly every
+  keystroke) for a multi-selection check. `ResultsList` takes no arguments and is `.equatable()`,
+  so only observation re-renders it: one list pass per result set instead of two or three.
+- MEASURED AND NOT DONE: dropping `.id(resultsToken)` halves row renders per new result set (27
+  instead of 54 on the real index) but only moves typing stalls 11.3 -> 9.9 s, and the id fixes a
+  real scroll-position bug. Empty context menus save ~10% (12.0 -> 10.7 s): not worth lazy menus
+  and their VoiceOver risk. Fetching the grouping inputs inside the search task would remove the
+  second publish but costs 440-620 ms of cold vector reads before any result shows on the real
+  index; grouping stays a refinement after the list is up.
+- FOLDER BROWSER (fixed from reading the code, the harness cannot see them): the listing was sorted
+  in `body` on every render (now `sorted` in state), the counts were applied one element at a time
+  to a `@State` array, row icons hit the icon services daemon per row per render (now a per-path
+  cache, keeping Downloads' own icon), each child `URL` stat'ed its path, and the 500 ms ring
+  sampler walked every subfolder with nothing indexing (`mayHaveBrowseProgress`).
+- NUMBERS, main-thread blocked time over the tour, same clone, back to back. Real index (2.7M
+  files, indexing paused): 0.13.8 49.4 s, new 37.1 s; typing 32.2 -> 22.8 s, worst stall
+  2352 -> 370 ms; Find Similar 8.1 -> 5.5 s. Scratch corpus while indexing 5.7k new files: 28.4 ->
+  19.2 s; typing 12.0 -> 7.0 s, Find Similar 6.6 -> 3.2 s. Both include the harness's own cost.
+- FOUND, NOT FIXED: the filename index (`LexicalIndex.rebuildIfStale`) rebuilds from scratch on
+  launch whenever the store changed since it was built: ~80 s of one core on the 2.7M index, with
+  filename matches absent from search until it finishes. And the first search after launch is
+  2.4-3 s on that index (cold), against ~250 ms warm.

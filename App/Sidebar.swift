@@ -152,18 +152,22 @@ struct Sidebar: View {
         // the smart-folder highlight the same way). This also fixes a dead click - selection is
         // sticky, so re-clicking the still-selected row never fired onChange and the results
         // stayed on the typed query.
-        .onChange(of: model.rawQuery) { _, raw in
+        //
+        // Keep the highlight in sync with the ACTIVE query (text or file). When the active query no
+        // longer matches the selected history row, drop the selection - otherwise the row stays
+        // "stuck" selected and clicking it again is a no-op (no selection change = no re-run), which
+        // is why re-running a file history item sometimes did nothing.
+        //
+        // Watched from a child view: an `.onChange(of: model.rawQuery)` here makes the sidebar's
+        // own body read the query, so it re-rendered on every keystroke.
+        .background(RawQueryWatcher { raw in
             if case .history(let id) = selection,
                let item = model.searchHistory.first(where: { $0.id == id }),
                item.displayText != raw {
                 selection = nil
             }
-        }
-        // Keep the highlight in sync with the ACTIVE query (text or file). When the active query no
-        // longer matches the selected history row, drop the selection - otherwise the row stays
-        // "stuck" selected and clicking it again is a no-op (no selection change = no re-run), which
-        // is why re-running a file history item sometimes did nothing.
-        .onChange(of: model.rawQuery) { _, _ in reconcileSelection() }
+            reconcileSelection()
+        })
         .onChange(of: model.fileQuery) { _, _ in reconcileSelection() }
         .sheet(isPresented: Binding(get: { model.showPhotoPicker }, set: { model.showPhotoPicker = $0 })) { PhotoSourcePicker() }
         .sheet(isPresented: Binding(get: { model.showPhotoDenied }, set: { model.showPhotoDenied = $0 })) { PhotoAccessDenied() }
@@ -620,5 +624,16 @@ struct PieWedge: Shape {
                  clockwise: false)
         p.closeSubpath()
         return p
+    }
+}
+
+/// Calls `action` when the typed query changes, from a view of its own so the view that owns it
+/// does not re-render on every keystroke just to watch it.
+private struct RawQueryWatcher: View {
+    @Environment(AppModel.self) private var model
+    let action: (String) -> Void
+    var body: some View {
+        Color.clear.frame(width: 0, height: 0)
+            .onChange(of: model.rawQuery) { _, raw in action(raw) }
     }
 }

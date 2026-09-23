@@ -6,8 +6,10 @@ import OmniKit
 struct ResultsList<Footer: View>: View {
     @Environment(AppModel.self) private var model: AppModel
     @Environment(OCRSession.self) private var ocr: OCRSession
-    let results: [SearchHit]
     @ViewBuilder var footer: Footer
+    /// Read from the model, not passed in: a parameter made every new result set render the list
+    /// twice - once because the argument changed and once because the model it observes did.
+    private var results: [SearchHit] { model.results }
     @State private var expanded: Set<String> = []
     @State private var passagesCache: [String: [ChunkHit]] = [:]
     @State private var gridWidth: CGFloat = 0
@@ -19,7 +21,9 @@ struct ResultsList<Footer: View>: View {
     /// and the view stayed put - visible when replaying a history item from a scrolled list.
     /// Scrolling when that identity is republished, which happens in the same block that assigns
     /// the rows, fires once per new result set and never on a same-query refresh from live indexing.
-    @State private var scrolledForQuery: String?
+    /// A reference, not a value: it is only a gate, never drawn, and as `@State` its write on each
+    /// new result set re-rendered the list and every visible row once more.
+    @State private var scrollGate = ScrollGate()
     /// One name shared by the frame reporters, the drag gesture, and the rubber-band overlay. The list
     /// and gallery are never on screen together, so reusing the string is safe. The realized-item frames
     /// themselves live as @State INSIDE the marquee modifier - they refresh on every scroll tick
@@ -107,10 +111,14 @@ struct ResultsList<Footer: View>: View {
         // panel; and it can come back byte-identical across a genuinely NEW query (a small or
         // filtered index whose hits all fit under topK, in a content-derived sort order), which
         // left the cache holding a ranking computed against the previous query's vector.
+        //
+        // Every write below is guarded: a state write re-renders the list and each visible row, and
+        // these fire on every result arrival while typing - three unconditional writes here were two
+        // extra passes over every row per search, on a panel state that was almost always empty.
         .onChange(of: model.resolvedQuery) { _, _ in
-            expanded = []
-            passagesCache = [:]
-            passagesPopover = nil
+            if !expanded.isEmpty { expanded = [] }
+            if !passagesCache.isEmpty { passagesCache = [:] }
+            if passagesPopover != nil { passagesPopover = nil }
         }
         // A row that vanished under the SAME query takes its own state with it, and nothing else's:
         // the remaining panels are still ranked against the query that is still on screen.
@@ -118,7 +126,7 @@ struct ResultsList<Footer: View>: View {
             // renderedPaths, not the representative list: a copy inside an OPEN stack is on screen
             // and its passages panel must survive a re-rank exactly like any other row's.
             let live = model.renderedPaths
-            expanded.formIntersection(live)
+            if !expanded.isSubset(of: live) { expanded.formIntersection(live) }
             if let p = passagesPopover, !live.contains(p) { passagesPopover = nil }
         }
     }
@@ -285,8 +293,8 @@ struct ResultsList<Footer: View>: View {
             // query, and the next same-query row change (a background reindex, "show N more", a
             // trashed row) would yank a scrolled list back to the top.
             .onChange(of: model.resultsToken, initial: true) { _, _ in
-                guard scrolledForQuery != model.resultsToken else { return }
-                scrolledForQuery = model.resultsToken
+                guard scrollGate.token != model.resultsToken else { return }
+                scrollGate.token = model.resultsToken
                 // Scrolled on the NEXT turn, not in this one. The token is published in the same
                 // synchronous block that assigns the rows, so this handler runs while the list is
                 // still laid out for the OUTGOING result set: the new first row has no frame yet,
@@ -435,8 +443,8 @@ struct ResultsList<Footer: View>: View {
             // query, and the next same-query row change (a background reindex, "show N more", a
             // trashed row) would yank a scrolled list back to the top.
             .onChange(of: model.resultsToken, initial: true) { _, _ in
-                guard scrolledForQuery != model.resultsToken else { return }
-                scrolledForQuery = model.resultsToken
+                guard scrollGate.token != model.resultsToken else { return }
+                scrollGate.token = model.resultsToken
                 // Scrolled on the NEXT turn, not in this one. The token is published in the same
                 // synchronous block that assigns the rows, so this handler runs while the list is
                 // still laid out for the OUTGOING result set: the new first row has no frame yet,
@@ -466,9 +474,6 @@ struct ResultsList<Footer: View>: View {
         // real key handling lives on the Edit/File menus.)
         let path = hit.path
         let count = model.selectedPaths.count
-        let selectionHasMedia = model.rawResults.contains {
-            model.selectedPaths.contains($0.path) && taggableKinds.contains($0.kind)
-        }
         // Right-clicking a row that is part of a multi-selection acts on the WHOLE selection (Finder
         // behavior); only the actions that extend to many are shown - the single-item ones (Quick
         // Look, passages, Find similar, Ignore folder) are hidden so the menu stays coherent.
@@ -487,6 +492,12 @@ struct ResultsList<Footer: View>: View {
             ShareLink(items: model.selectedURLsOrdered) { Label("Share\u{2026}", systemImage: "square.and.arrow.up") }
             // (Re)generate content tags for the selected media - explicit request, HQ quality.
             // Shown only when the selection contains taggable media and the tagger is ready.
+            // Read HERE, in the multi-selection branch only. It scans `rawResults`, and reading that
+            // from every row's menu - which macOS builds eagerly - re-rendered every visible row
+            // whenever a search's hits changed below the threshold, i.e. on almost every keystroke.
+            let selectionHasMedia = model.rawResults.contains {
+                model.selectedPaths.contains($0.path) && taggableKinds.contains($0.kind)
+            }
             if model.canGenerateTags, selectionHasMedia {
                 Button { model.requestTags(Array(model.selectedPaths)) } label: { Label("Generate Tags", systemImage: "tag") }
             }
@@ -576,6 +587,20 @@ struct ResultsList<Footer: View>: View {
         // (moveSelection) deliberately don't, so browsing the list doesn't flood the trail.
         model.captureNavStop()
     }
+}
+
+/// ALWAYS EQUAL: the list has no inputs of its own. The window re-renders for many reasons that are
+/// not the results - a search starting and finishing, the stats of a running index, the query
+/// itself - and each time it built a new list whose footer closure SwiftUI cannot compare, so the
+/// list and every visible row (each with an eagerly built context menu) re-ran: ~2 ms a row, 50 rows
+/// in a tall window. Everything the list shows, the footer included, is read from the model inside
+/// its own body, so observation re-renders it exactly when one of those values changes.
+/// See `ResultsList.scrollGate`.
+@MainActor
+final class ScrollGate { var token: String? }
+
+extension ResultsList: Equatable {
+    nonisolated static func == (a: ResultsList, b: ResultsList) -> Bool { true }
 }
 
 struct ResultRow: View {

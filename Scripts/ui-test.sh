@@ -94,7 +94,9 @@ done
 ONLY=()
 if [ $# -gt 0 ]; then ONLY=(-only-testing:"OmniUITests/$1"); fi
 
-xcodebuild -project Omni.xcodeproj -scheme OmniUITests -configuration Debug \
+# OMNI_UI_CONFIG=Release for a run that measures anything: a Debug build's main thread is several
+# times slower and its stalls are not the shipped app's.
+xcodebuild -project Omni.xcodeproj -scheme OmniUITests -configuration "${OMNI_UI_CONFIG:-Debug}" \
   -destination 'platform=macOS' -derivedDataPath "$DD" \
   ${ONLY[@]+"${ONLY[@]}"} \
   OTHER_SWIFT_FLAGS="\$(inherited) -Xcc -fmodule-map-file=$ART/include/module.modulemap -Xcc -I$ART/include" \
