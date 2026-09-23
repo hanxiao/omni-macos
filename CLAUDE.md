@@ -2483,3 +2483,10 @@ reader. `FolderMapSharedContentTests` fails without the fix. All other `flat16` 
   launch whenever the store changed since it was built: ~80 s of one core on the 2.7M index, with
   filename matches absent from search until it finishes. And the first search after launch is
   2.4-3 s on that index (cold), against ~250 ms warm.
+- DEV AND TEST LAUNCHES MOVED THE REAL APP'S FSEVENTS CHECKPOINT. `-omni.dbDir` in the argument
+  domain changes what is read, not where `UserDefaults.set` writes, so every UI test and scratch run
+  wrote `omni.fsEventId` into the user's defaults, and the installed app then resumed past changes
+  it had never indexed. Now kept in memory when `-omni.dbDir` is a launch argument
+  (`eventCheckpointIsShared`). Negative control: 0.13.8 on a scratch index moved it
+  578500264 -> 584312543; the fix left it alone. An earlier checkpoint is the safe direction to
+  repair toward: it only replays more events.

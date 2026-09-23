@@ -5126,10 +5126,27 @@ final class AppModel {
 
     // MARK: - Live updates (FSEvents)
 
+    /// The FSEvents checkpoint lives in the user's defaults - UNLESS this launch was pointed at
+    /// another index with `-omni.dbDir` on the command line, which every test and dev run does and
+    /// the installed app never does. A launch argument overrides what is READ, not where a write
+    /// goes, so those runs advanced the real app's checkpoint past events it had never processed: on
+    /// its next launch it resumed from the test's position and never saw the changes in between
+    /// (found 2026-09-23, an hour of test runs had moved it). Such a run keeps its own, in memory.
+    private static let eventCheckpointIsShared =
+        UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)["omni.dbDir"] == nil
+    @ObservationIgnored private var sessionEventCheckpoint: String?
+    private var eventCheckpoint: String? {
+        get { Self.eventCheckpointIsShared ? UserDefaults.standard.string(forKey: "omni.fsEventId") : sessionEventCheckpoint }
+        set {
+            if Self.eventCheckpointIsShared { UserDefaults.standard.set(newValue, forKey: "omni.fsEventId") }
+            else { sessionEventCheckpoint = newValue }
+        }
+    }
+
     private func restartWatcher() {
         watcher?.stop(); watcher = nil
         guard engine != nil, !roots.isEmpty else { return }
-        let since = UserDefaults.standard.string(forKey: "omni.fsEventId").flatMap { UInt64($0) }
+        let since = eventCheckpoint.flatMap { UInt64($0) }
         let w = FSWatcher(paths: roots.map { $0.path }, since: since) { [weak self] paths in
             Task { @MainActor in self?.handleFSChange(paths) }
         }
@@ -5576,7 +5593,7 @@ final class AppModel {
         Task.detached(priority: .utility) {
             indexer.update(paths: drained, settings: settings)
             await MainActor.run {
-                if eid > 0 { UserDefaults.standard.set(String(eid), forKey: "omni.fsEventId") }
+                if eid > 0 { self.eventCheckpoint = String(eid) }
                 self.activeRoots.subtract(touched)
                 self.markIndexed(store)   // a reconcile brought the index current just now
                 self.refreshIndexStats(store)
