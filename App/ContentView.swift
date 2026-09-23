@@ -390,7 +390,7 @@ struct ContentView: View {
             CenteredStatus(symbol: "line.3.horizontal.decrease.circle",
                            title: "No results above \(Int(model.minScore * 100))%",
                            subtitle: "", showSpinner: false,
-                           action: ("Show \(model.hiddenByThreshold) weaker \(model.hiddenByThreshold == 1 ? "match" : "matches")",
+                           action: (Self.weakerMatchesTitle(model.hiddenByThreshold),
                                     { model.showAllBelowThreshold() }))
         } else if model.filtersActive {
             // Filters can hide every result; the empty state is the only place left to escape
@@ -406,6 +406,11 @@ struct ContentView: View {
         }
     }
 
+    /// One title for the one action, wherever it is offered.
+    static func weakerMatchesTitle(_ n: Int) -> String {
+        "Show \(n.formatted()) weaker \(n == 1 ? "match" : "matches")"
+    }
+
     @ViewBuilder private var belowThresholdFooter: some View {
         // Collapsing is never silent: if the list is shorter than the matches behind it, the
         // difference is stated here. Not a button - the copies are reachable from their own stack,
@@ -417,14 +422,14 @@ struct ContentView: View {
                 .padding(.top, 8)
         }
         if model.hiddenByThreshold > 0 {
-            Button { model.showAllBelowThreshold() } label: {
-                Label("Show \(model.hiddenByThreshold) more \(model.hiddenByThreshold == 1 ? "match" : "matches")", systemImage: "chevron.down")
-                    .font(.callout)
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 10)
+            // THE SAME BUTTON as the empty state's, same words, same style, same size - it is the
+            // same action, so it should not look like two. It was a `.plain` text label, and a
+            // plain button is hit only on its drawn glyphs: a click between the letters or beside
+            // them did nothing, which is how it "sometimes did not respond".
+            Button(Self.weakerMatchesTitle(model.hiddenByThreshold)) { model.showAllBelowThreshold() }
+                .controlSize(.large)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 10)
         }
     }
 

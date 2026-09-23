@@ -2370,3 +2370,14 @@ TESTING ON SEQUOIA: tart VM `sequoia` (macOS 15.7.7), TART_HOME=/Volumes/han2tb/
 SSH admin/admin. The shared folder serves STALE content for an overwritten path - copy every build
 to a new directory name, or you test the previous build. `OMNI_UI_DEBUG=1` + `kill -USR2` dumps the
 toolbar to /tmp/omni-debug-toolbar.txt inside the VM. The nano model runs in the VM (MLX works).
+
+## Settings type system; one "weaker matches" button (2026-09-22)
+
+- Settings fonts follow one rule, written at `SettingsView`'s root: row text body (values
+  secondary), detail lines and footers caption secondary, code callout monospaced (the request log
+  caption monospaced), paths never monospaced, no weight changes, no caption2, tabular digits set
+  once at the root.
+- "Show N weaker matches" is ONE button (`ContentView.weakerMatchesTitle`), bordered and large, in
+  both the empty state and the results footer. The footer used to be a `.plain` label ("Show N more
+  matches"); a plain button is hit only on its glyphs, so clicks between or beside the letters did
+  nothing - the "sometimes not responding" report. Verified by clicking the button's edge.

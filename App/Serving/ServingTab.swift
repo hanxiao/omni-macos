@@ -489,7 +489,7 @@ struct ServingTab: View {
                 Text("Requests")
                 Spacer()
                 Text("\(model.serving.requestCount) served \u{00B7} \(model.serving.errorCount) failed")
-                    .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                    .font(.caption).foregroundStyle(.secondary)
                 Button("Clear") { model.serving.clearLog() }
                     .buttonStyle(.link)
                     .disabled(model.serving.log.isEmpty)
@@ -534,7 +534,6 @@ private struct LogRow: View {
                 .frame(width: 56, alignment: .trailing)
         }
         .font(.caption.monospaced())
-        .monospacedDigit()
         .padding(.vertical, 1)
     }
 }

@@ -32,6 +32,15 @@ struct SettingsView: View {
         // first section header clear of the tab strip and removes dead space on short tabs.
         .frame(width: 480)
         .fixedSize(horizontal: false, vertical: true)
+        // ONE TYPE SYSTEM FOR EVERY PANE, so a new row does not invent a sixth style:
+        //   row text (labels, values)            body; values .secondary
+        //   detail line under a row, legends     .caption, .secondary (red/orange only for errors)
+        //   section footer                       .caption, .secondary
+        //   code (curl, config, ignore rules,    .callout monospaced; the request log, a dense
+        //     server address)                     list, is .caption monospaced. Paths are NOT code
+        // No weight changes and no caption2. Digits are tabular everywhere, set once here, so
+        // counts and sizes that tick while indexing do not jitter.
+        .monospacedDigit()
     }
 }
 
@@ -99,7 +108,7 @@ private struct IndexStatusRow: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     ProgressView().controlSize(.small)
-                    Text(model.isPreparing ? "Preparing\u{2026}" : "Indexing\u{2026}").fontWeight(.medium)
+                    Text(model.isPreparing ? "Preparing\u{2026}" : "Indexing\u{2026}")
                     Spacer()
                     Button("Pause") { model.pauseIndexing() }.controlSize(.small)
                 }
@@ -115,9 +124,9 @@ private struct IndexStatusRow: View {
                     // and a single space character on its right - visibly lopsided at caption size.
                     // Joining one string puts the same space on both sides by construction.
                     Text(progressCounts)
-                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                        .font(.caption).foregroundStyle(.secondary)
                     Text((model.progress.currentPath as NSString).lastPathComponent)
-                        .font(.caption2).foregroundStyle(.tertiary).lineLimit(1).truncationMode(.middle)
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
                 }
             }
         case .paused:
@@ -138,17 +147,17 @@ private struct IndexStatusRow: View {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
                         ProgressView().controlSize(.small)
-                        Text("Updating\u{2026}").fontWeight(.medium)
+                        Text("Updating\u{2026}")
                         Spacer()
                         if !rateParts.isEmpty {
                             Text(rateParts.joined(separator: " \u{00B7} "))
-                                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                                .font(.caption).foregroundStyle(.secondary)
                         }
                     }
                     if activeCounts.total > 0 {
                         ProgressView(value: overall)
                         Text("\(activeCounts.done.formatted()) of \(activeCounts.total.formatted()) files")
-                            .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                            .font(.caption).foregroundStyle(.secondary)
                     }
                 }
             } else if model.ocrRunActive {
@@ -214,7 +223,7 @@ private struct ActivityTab: View {
                         if let rp, rp.total > 0, rp.done < rp.total,
                            model.isIndexing || model.activeRoots.contains(url.path) {
                             Text("\(rp.done.formatted()) of \(rp.total.formatted())")
-                                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                                .foregroundStyle(.secondary)
                         } else if (model.activeRoots.contains(url.path) || model.isFolderQueued(url)
                                     || (model.isIndexing && (rp?.total ?? 0) == 0))
                                     && !((rp?.total ?? 0) > 0 && (rp?.done ?? 0) >= (rp?.total ?? 0)) {
@@ -224,7 +233,7 @@ private struct ActivityTab: View {
                             ProgressView().controlSize(.small)
                                 .help(model.isFolderQueued(url) ? "Waiting to be indexed" : "Counting files\u{2026}")
                         } else if let c = model.folderFileCounts[url.path] {
-                            Text("\(c.formatted()) file\(c == 1 ? "" : "s")").font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
+                            Text("\(c.formatted()) file\(c == 1 ? "" : "s")").foregroundStyle(.secondary)
                         }
                     }
                 }
@@ -242,12 +251,12 @@ private struct ActivityTab: View {
                             if let rp, rp.total > 0, rp.done < rp.total,
                                model.isIndexing || model.activeRoots.contains(source.key) {
                                 Text("\(rp.done.formatted()) of \(rp.total.formatted())")
-                                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                                    .foregroundStyle(.secondary)
                             } else if model.activeRoots.contains(source.key) || model.isPhotoSourceQueued(source) {
                                 ProgressView().controlSize(.small)
                                     .help(model.isPhotoSourceQueued(source) ? "Waiting to be indexed" : "Counting items\u{2026}")
                             } else if let c = model.folderFileCounts[source.key] {
-                                Text("\(c.formatted()) item\(c == 1 ? "" : "s")").font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
+                                Text("\(c.formatted()) item\(c == 1 ? "" : "s")").foregroundStyle(.secondary)
                             }
                         }
                     }
@@ -416,17 +425,16 @@ private struct ContentTypesTab: View {
                 // The draft is kept, so Apply works the moment the run ends.
                 .disabled(!dirty || model.isPaperRunning)
             }
-            .font(.callout)
         }
     }
 
     @ViewBuilder private func samplePopover(_ samples: [String]) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Files this removes (sample)")
-                .font(.caption.bold()).foregroundStyle(.secondary)
+                .font(.caption).foregroundStyle(.secondary)
             ForEach(samples, id: \.self) { path in
                 Text((path as NSString).abbreviatingWithTildeInPath)
-                    .font(.system(.caption, design: .monospaced))
+                    .font(.caption)
                     .lineLimit(1).truncationMode(.middle)
             }
         }
@@ -582,7 +590,7 @@ private struct PerformanceTab: View {
                         Text("Maximum memory")
                         Spacer()
                         Text(model.maxMemoryGB == 0 ? "Unlimited" : "\(Int(model.maxMemoryGB)) GB")
-                            .foregroundStyle(.secondary).monospacedDigit()
+                            .foregroundStyle(.secondary)
                     }
                     Slider(value: Binding(
                         get: { model.maxMemoryGB },
@@ -590,9 +598,9 @@ private struct PerformanceTab: View {
                     ), in: 0 ... memoryCeiling) {
                         Text("Maximum memory")
                     } minimumValueLabel: {
-                        Text("Off").font(.caption2).foregroundStyle(.tertiary)
+                        Text("Off").font(.caption).foregroundStyle(.secondary)
                     } maximumValueLabel: {
-                        Text("\(Int(memoryCeiling)) GB").font(.caption2).foregroundStyle(.tertiary)
+                        Text("\(Int(memoryCeiling)) GB").font(.caption).foregroundStyle(.secondary)
                     }
                     .labelsHidden()
                     // Locked while the paper run holds the cap. Settings is its own window, so this
@@ -647,7 +655,7 @@ private struct PerformanceTab: View {
                     LabeledContent("Last run") {
                         Text(String(format: "%.0f files/sec \u{00B7} %.1f GB peak memory",
                                     r.metrics.filesPerSec, Double(r.metrics.peakVramDeltaBytes) / 1_073_741_824))
-                            .foregroundStyle(.secondary).monospacedDigit()
+                            .foregroundStyle(.secondary)
                     }
                 }
             } header: {
@@ -698,7 +706,7 @@ private struct MemoryBreakdown: View {
             HStack {
                 Text("Omni is using")
                 Spacer()
-                Text(fmt(sample.total)).foregroundStyle(.secondary).monospacedDigit()
+                Text(fmt(sample.total)).foregroundStyle(.secondary)
             }
             bar
             legend
@@ -710,7 +718,7 @@ private struct MemoryBreakdown: View {
                             HStack(spacing: 5) {
                                 Text(p.name)
                                 Spacer(minLength: 4)
-                                Text(fmt(p.bytes)).foregroundStyle(.secondary).monospacedDigit()
+                                Text(fmt(p.bytes)).foregroundStyle(.secondary)
                             }
                         }
                     }
@@ -764,7 +772,7 @@ private struct MemoryBreakdown: View {
                     Circle().fill(s.color).frame(width: 7, height: 7)
                     Text(s.name)
                     Spacer(minLength: 4)
-                    Text(fmt(s.bytes)).foregroundStyle(.secondary).monospacedDigit()
+                    Text(fmt(s.bytes)).foregroundStyle(.secondary)
                 }
                 .help(s.help)
             }
@@ -803,7 +811,7 @@ private struct DiskBreakdown: View {
                 Text("Size")
                 Spacer()
                 Text(fmt(entries.reduce(0) { $0 + $1.bytes }))
-                    .foregroundStyle(.secondary).monospacedDigit()
+                    .foregroundStyle(.secondary)
             }
             GeometryReader { geo in
                 HStack(spacing: 0) {
@@ -830,7 +838,7 @@ private struct DiskBreakdown: View {
                         Circle().fill(color(e)).frame(width: 7, height: 7)
                         Text(e.name)
                         Spacer(minLength: 4)
-                        Text(fmt(e.bytes)).foregroundStyle(.secondary).monospacedDigit()
+                        Text(fmt(e.bytes)).foregroundStyle(.secondary)
                     }
                     .help(e.irreplaceable ? e.detail : "\(e.detail) - rebuilt automatically if deleted")
                 }
@@ -921,7 +929,7 @@ private struct HistoryTab: View {
                     Text("Saved searches")
                     Spacer()
                     Text("\(model.recentHistoryCount) recent \u{00B7} \(model.bookmarkCount) bookmarked")
-                        .foregroundStyle(.secondary).monospacedDigit()
+                        .foregroundStyle(.secondary)
                     Button("Clear\u{2026}", role: .destructive) { confirmClear = true }
                         .controlSize(.small)
                         .disabled(model.recentHistoryCount == 0)
@@ -948,7 +956,7 @@ private struct IndexTab: View {
                     HStack(alignment: .top, spacing: 8) {
                         Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
                         VStack(alignment: .leading, spacing: 6) {
-                            Text("Index doesn't match the loaded model").fontWeight(.medium)
+                            Text("Index doesn't match the loaded model")
                             if let v = model.indexBuiltVariant {
                                 // The FACT. The clause that followed it named the two buttons in
                                 // the row below, which already say what they do.
@@ -1003,7 +1011,6 @@ private struct IndexTab: View {
                             Spacer()
                             Text("\(Int(Double(m.done) / Double(m.total) * 100))%")
                                 .foregroundStyle(.secondary)
-                                .monospacedDigit()
                         }
                         ProgressView(value: Double(m.done), total: Double(m.total))
                             .progressViewStyle(.linear)
@@ -1094,7 +1101,7 @@ private struct IndexTab: View {
                     VStack(alignment: .leading, spacing: 4) {
                         ProgressView(value: model.downloadFraction)
                         HStack {
-                            Text(model.downloadLabel).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                            Text(model.downloadLabel).font(.caption).foregroundStyle(.secondary)
                             Spacer()
                             Button("Cancel") { model.cancelDownload() }.controlSize(.small)
                         }
@@ -1201,10 +1208,10 @@ private struct OCRModelRow: View {
                     ProgressView(value: model.ocrDownloadFraction)
                     HStack(spacing: 8) {
                         Text(model.ocrDownloadLabel)
-                            .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                            .font(.caption).foregroundStyle(.secondary)
                         Spacer()
                         Text(model.ocrDownloadSpeed)
-                            .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                            .font(.caption).foregroundStyle(.secondary)
                         Button("Cancel") { model.cancelOCRDownload() }.controlSize(.small)
                     }
                 }
