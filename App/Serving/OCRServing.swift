@@ -110,11 +110,23 @@ enum OCRServing {
             return .success(Document(pdf: pdf, image: nil, url: url, bytes: data.count))
         }
         guard let src = CGImageSourceCreateWithData(data as CFData, nil),
-              let cg = CGImageSourceCreateImageAtIndex(src, 0, [kCGImageSourceShouldCache: false] as CFDictionary)
+              let cg = orientedImage(src)
         else {
             return .failure(.badInput("\(label) is neither a PDF nor a decodable image"))
         }
         return .success(Document(pdf: nil, image: cg, url: url, bytes: data.count))
+    }
+
+    /// EXIF orientation applied, as the workspace does: a phone photo of a page arrives upright.
+    private static func orientedImage(_ src: CGImageSource) -> CGImage? {
+        let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
+        guard ((props?[kCGImagePropertyOrientation] as? UInt32) ?? 1) != 1 else {
+            return CGImageSourceCreateImageAtIndex(src, 0, [kCGImageSourceShouldCache: false] as CFDictionary)
+        }
+        let w = (props?[kCGImagePropertyPixelWidth] as? Int) ?? 0, h = (props?[kCGImagePropertyPixelHeight] as? Int) ?? 0
+        return CGImageSourceCreateThumbnailAtIndex(src, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                                          kCGImageSourceCreateThumbnailWithTransform: true,
+                                                          kCGImageSourceThumbnailMaxPixelSize: max(w, h, 1)] as CFDictionary)
     }
 
     /// Page selection: a list of numbers or a string of numbers and ranges ("0,2-4"). Mistral's

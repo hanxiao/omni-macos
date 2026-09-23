@@ -389,6 +389,7 @@ final class OCRSession {
         userPinnedDocument = true
         selection = nil
         userPinnedSelection = false
+        if !find.isEmpty { rebuildMatches() }
     }
 
     func closeDocument(id: Int) {
@@ -410,6 +411,7 @@ final class OCRSession {
         if selectedDocumentID == id {
             selectedDocumentID = documents[min(index, documents.count - 1)].id
         }
+        if !find.isEmpty { rebuildMatches() }
     }
 
     /// How far through its pages a tab is, for its progress ring.
@@ -480,6 +482,7 @@ final class OCRSession {
         documentEdits[id] = text
         editSectionsByDocument[id] = text.components(separatedBy: "\n---\n")
             .map { $0.trimmingCharacters(in: .newlines) }
+        if !find.isEmpty { rebuildMatches() }
     }
 
     var elapsedText: String {
@@ -749,6 +752,9 @@ final class OCRSession {
             pages[hit.id].restored = true
             lastDoneIndex = hit.id
             restored += 1
+            // Counted, or a fully cached document could not be copied, saved or edited: every
+            // one of those is gated on `completedPages > 0`.
+            completedPages += 1
         }
         awaitingCache.subtract(ids)
         if restored > 0 {
@@ -954,6 +960,13 @@ final class OCRSession {
             ? Set(pages.filter { $0.state == .pending || $0.state == .running }.map(\.id))
             : []
         cancel()
+        // Pages IN FLIGHT are settled by the run when it winds down - but the token bumped below
+        // makes it drop those writes, so they sat RUNNING forever and `resumeAfterStandDown`
+        // (which re-queues `.stopped` only) never took them back. They are stopped here instead.
+        for index in pages.indices where owed.contains(pages[index].id) && pages[index].state == .running {
+            liveTokens[index] = nil
+            pages[index].state = .stopped
+        }
         stoodDown = owed
         work = nil
         runToken += 1
@@ -1052,12 +1065,16 @@ final class OCRSession {
     }
 
     func step(by delta: Int) {
-        let start = visibleIndex ?? 0
-        var next = start + delta
-        while pages.indices.contains(next) {
-            if pages[next].state == .done || pages[next].state == .failed
+        // Within the tab on screen. Page ids are global across tabs, so walking them stepped off
+        // the last page of one document onto the first page of the next.
+        let ids = visibleDocument?.pageIDs ?? Array(pages.indices)
+        guard let here = ids.firstIndex(of: visibleIndex ?? ids.first ?? 0) else { return }
+        var k = here + delta
+        while ids.indices.contains(k) {
+            let next = ids[k]
+            if pages.indices.contains(next), pages[next].state == .done || pages[next].state == .failed
                 || pages[next].state == .running { select(next); return }
-            next += delta
+            k += delta
         }
     }
 
@@ -1158,7 +1175,13 @@ final class OCRSession {
                         await OCRModelHost.shared.release()
                         return
                     }
-                    self.model = loaded
+                    // A Stop during the load lets a second run start and acquire again; whichever
+                    // arrives second hands its lease back, so the session holds exactly one.
+                    if self.model != nil {
+                        Task { await OCRModelHost.shared.release() }
+                    } else {
+                        self.model = loaded
+                    }
                 }
                 guard self.runToken == token else { return }
                 // A served request may be decoding; the workspace waits for it (never the reverse,
@@ -1364,25 +1387,34 @@ final class OCRSession {
 
         let jobs = group.map { self.jobs[$0] }
         let started = Date()
-        let results: [OCRModel.Result] = await Task.detached(priority: .userInitiated) {
+        // (results, the group indices that actually loaded, the ones that did not, whether the
+        // decode threw). Positions in `results` and in every callback's `slot` are positions in
+        // `live`, NOT in `group`: a page that fails to load is left out rather than failing the
+        // group, which used to return nothing and leave every page PENDING - in continuous mode
+        // the run loop then picked the same group up again, forever, re-rasterising each time.
+        let outcome: (results: [OCRModel.Result], live: [Int], unreadable: [Int], threw: Bool) =
+            await Task.detached(priority: .userInitiated) {
             // The whole group is rasterised before a single token is decoded - a PDF page render
             // at 2384 px plus the Pillow-exact resample, per page - so on a wide group this is
             // seconds of work with no stop check in it. Bail between pages: a stop pressed here
             // used to wait for every page of the group to be rasterised AND the ramp prefilled.
             let tRaster = omniPerfEnabled ? Date() : nil
             var images: [OCRImage] = []
+            var live: [Int] = []
+            var unreadable: [Int] = []
             images.reserveCapacity(jobs.count)
-            for job in jobs {
-                if gate.isStopped { return [] }
-                guard let image = Self.load(job, documents: documents) else { continue }
+            for (k, job) in jobs.enumerated() {
+                if gate.isStopped { return ([], [], [], false) }
+                guard let image = Self.load(job, documents: documents) else { unreadable.append(group[k]); continue }
                 images.append(image)
+                live.append(group[k])
             }
             if let tRaster {
                 omniPerfLog(String(format: "ocr-group-rasterise %.0fms pages=%d",
                                    -tRaster.timeIntervalSinceNow * 1000, images.count))
             }
-            guard images.count == jobs.count else { return [] }
-            return (try? loaded.transcribeBatched(
+            guard !images.isEmpty else { return ([], [], unreadable, false) }
+            let decoded = try? loaded.transcribeBatched(
                 images: images,
                 prompt: settings.prompt,
                 width: width,
@@ -1390,8 +1422,8 @@ final class OCRSession {
                 onStream: { slot, update in
                     Task { @MainActor [weak self] in
                         guard let self, self.runToken == token,
-                              slot < group.count else { return }
-                        let index = group[slot]
+                              slot < live.count else { return }
+                        let index = live[slot]
                         guard self.texts.indices.contains(index) else { return }
                         if self.firstTokenPending { self.firstTokenPending = false; omniPerfLog("ocr-first-token") }
                         self.texts[index] = update.text
@@ -1417,8 +1449,8 @@ final class OCRSession {
                     // tab ring, the rail and the counter all read the same page states, so holding
                     // ten finished pages back until the slowest one stops froze every one of them.
                     Task { @MainActor [weak self] in
-                        guard let self, self.runToken == token, slot < group.count else { return }
-                        let index = group[slot]
+                        guard let self, self.runToken == token, slot < live.count else { return }
+                        let index = live[slot]
                         guard self.pages.indices.contains(index),
                               self.pages[index].state == .running,
                               !result.text.isEmpty else { return }
@@ -1429,8 +1461,8 @@ final class OCRSession {
                     // Continuous decoding brings rows in as it goes, so a page becomes running
                     // when its row is admitted rather than when the group starts.
                     Task { @MainActor [weak self] in
-                        guard let self, self.runToken == token, page < group.count else { return }
-                        let index = group[page]
+                        guard let self, self.runToken == token, page < live.count else { return }
+                        let index = live[page]
                         guard self.pages.indices.contains(index),
                               self.pages[index].state == .pending else { return }
                         self.pages[index].state = .running
@@ -1449,12 +1481,28 @@ final class OCRSession {
                 shouldContinue: {
                     GPUInteractive.yieldWhileBusy()
                     return !gate.isStopped
-                })) ?? []
+                })
+            return (decoded ?? [], live, unreadable, decoded == nil)
         }.value
+        let results = outcome.results
+        let live = outcome.live
 
         guard runToken == token else { return }
+        for index in outcome.unreadable where pages.indices.contains(index) {
+            liveTokens[index] = nil
+            pages[index].state = .failed
+        }
+        // A decode that threw produced nothing for the pages it never admitted; they are failures
+        // too, or the loop would hand them straight back to it.
+        if outcome.threw {
+            for index in live where pages.indices.contains(index)
+                && (pages[index].state == .pending || pages[index].state == .running) {
+                liveTokens[index] = nil
+                pages[index].state = .failed
+            }
+        }
         let seconds = Date().timeIntervalSince(started) / Double(max(group.count, 1))
-        for (slot, index) in group.enumerated() {
+        for (slot, index) in live.enumerated() {
             guard texts.indices.contains(index) else { continue }
             // Most of these are already settled by `onFinish`; this is the backstop for a page
             // whose callback lost the race with the group returning, and for the ones that failed.
@@ -1489,6 +1537,11 @@ final class OCRSession {
         completedPages += 1
         settledTokens += result.tokens.count
         liveTokens[index] = nil
+        // Following moves on with the run. In continuous decoding `runningIndex` was the group's
+        // first page for the whole queue, so the transcript sat on page 1 while page 30 decoded.
+        if runningIndex == index || runningIndex.map({ pages[$0].state != .running }) == true {
+            runningIndex = pages.indices.first { pages[$0].state == .running }
+        }
         noteRate()
         if !find.isEmpty { rebuildMatches() }
         cacheStore(index)
@@ -1568,7 +1621,8 @@ final class OCRSession {
             else { return nil }
             return try? OCRPreprocess.rgb(from: cg)
         case .image(let url):
-            return try? OCRPreprocess.load(contentsOf: url)
+            // Oriented: a phone photo of a page must reach the model upright.
+            return try? OCRPreprocess.loadOriented(contentsOf: url)
         }
     }
 

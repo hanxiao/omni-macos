@@ -108,13 +108,23 @@ struct OCRView: View {
             .animation(.easeOut(duration: 0.28), value: session.readoutVisible)
     }
 
+    /// Every page of the tab on screen failed and none produced text - a corrupt or unreadable
+    /// file. The Raw pane shows only transcribed text, so it was simply blank.
+    private var visibleDocumentUnreadable: Bool {
+        guard let doc = session.visibleDocument, !doc.pageIDs.isEmpty else { return false }
+        return doc.pageIDs.allSatisfy { session.pages.indices.contains($0) && session.pages[$0].state == .failed }
+    }
+
     @ViewBuilder private var content: some View {
-        if session.sectionIDs.isEmpty {
+        if visibleDocumentUnreadable {
+            CenteredHint(symbol: "exclamationmark.triangle", title: "Could not read this file", detail: "")
+        } else if session.sectionIDs.isEmpty {
             // Say which of the two waits this is. "Queued" was shown for both, and for the first
             // run of a session it was simply wrong: nothing is queued behind anything, the app is
             // reading four and a half gigabytes of weights off disk.
             CenteredHint(symbol: session.phase == .loading ? "gearshape.arrow.trianglehead.2.clockwise.rotate.90" : "text.viewfinder",
-                         title: waitingTitle, detail: "", spinner: session.isBusy)
+                         title: waitingTitle, detail: "", spinner: session.isBusy,
+                         progress: session.phase == .loading ? session.loadProgress : nil)
         } else {
             switch session.mode {
             case .rendered:
@@ -1544,6 +1554,9 @@ private struct CenteredHint: View {
     let title: String
     let detail: String
     var spinner: Bool = false
+    /// A determinate bar when there is an honest denominator (the weights' known size while they
+    /// load), in place of the spinner. It was computed and never drawn: 13 s of spinner.
+    var progress: Double? = nil
 
     var body: some View {
         VStack(spacing: 10) {
@@ -1558,7 +1571,11 @@ private struct CenteredHint: View {
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 380)
             }
-            if spinner { ProgressView().controlSize(.small).padding(.top, 2) }
+            if let progress {
+                ProgressView(value: progress).frame(width: 220).padding(.top, 4)
+            } else if spinner {
+                ProgressView().controlSize(.small).padding(.top, 2)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }

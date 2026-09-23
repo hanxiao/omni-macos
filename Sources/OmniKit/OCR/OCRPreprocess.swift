@@ -199,6 +199,46 @@ public enum OCRPreprocess {
         return try rgb(from: cg)
     }
 
+    /// The image the way a person sees it: EXIF orientation APPLIED. For the app, not for parity.
+    ///
+    /// `load` matches the reference, which does not rotate - right for a benchmark, wrong for a
+    /// photo of a page: an iPhone stores a portrait shot as landscape pixels plus an orientation
+    /// tag, so the page reached the model on its side while its thumbnail looked upright. Files
+    /// with no tag (every scan, every screenshot) decode to the same pixels either way.
+    public static func loadOriented(contentsOf url: URL) throws -> OCRImage {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+            throw OmniError.model("cannot decode image at \(url.path)")
+        }
+        return try oriented(source, label: url.path)
+    }
+
+    /// `loadOriented` for bytes already in memory (a paste, an API upload).
+    public static func loadOriented(data: Data) throws -> OCRImage {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
+            throw OmniError.model("cannot decode image data")
+        }
+        return try oriented(source, label: "image data")
+    }
+
+    private static func oriented(_ source: CGImageSource, label: String) throws -> OCRImage {
+        let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+        let orientation = (props?[kCGImagePropertyOrientation] as? UInt32) ?? 1
+        guard orientation != 1 else {
+            guard let cg = CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCache: false] as CFDictionary)
+            else { throw OmniError.model("cannot decode \(label)") }
+            return try rgb(from: cg)
+        }
+        // A full-size "thumbnail" is ImageIO's one call that applies the orientation transform.
+        let w = (props?[kCGImagePropertyPixelWidth] as? Int) ?? 0, h = (props?[kCGImagePropertyPixelHeight] as? Int) ?? 0
+        let opts: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                     kCGImageSourceCreateThumbnailWithTransform: true,
+                                     kCGImageSourceShouldCacheImmediately: false,
+                                     kCGImageSourceThumbnailMaxPixelSize: max(w, h, 1)]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, opts as CFDictionary)
+        else { throw OmniError.model("cannot decode \(label)") }
+        return try rgb(from: cg)
+    }
+
     public static func rgb(from cg: CGImage) throws -> OCRImage {
         let w = cg.width, h = cg.height
         var rgba = [UInt8](repeating: 0, count: w * h * 4)

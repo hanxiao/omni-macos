@@ -176,6 +176,14 @@ enum DropRouter {
         let toOCR = model.ocrMode
         let accepts: (URL) -> Bool = toOCR ? OCRSession.isSupported : AppModel.searchableFile
         let handle: (DroppedItem) -> Void = toOCR ? { ocr.accept($0) } : { model.accept($0) }
+        // EVERY file, for the transcription pane. `read` takes one file, which is right for a
+        // search (one query) and was silently wrong here: a drop of three PDFs and two images
+        // opened one tab and ignored four files. `open(urls:)` makes a tab per file.
+        if toOCR, let pb,
+           let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] {
+            let usable = urls.filter(OCRSession.isSupported)
+            if !usable.isEmpty { ocr.open(urls: usable); return true }
+        }
         if let pb, DropIntake.read(pb, accepts: accepts, wantsText: !toOCR, handle: handle) { return true }
         if DropIntake.read(providers: providers, accepts: accepts, wantsText: !toOCR, handle: handle) { return true }
         // Only the transcription pane says so. A search surface that ignores an unusable drag is
