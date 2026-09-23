@@ -53,88 +53,82 @@ struct ContentView: View {
     }
 
     var body: some View {
-        Group {
-            if model.ocrMode {
-                // The same field, a different question. Searching the vector index while reading a
-                // transcript answers something nobody asked; what a reader wants here is Preview's
-                // find - matches marked where they are, with a way to step through them. No
-                // suggestions: there is nothing to complete against one document.
-                split
-                    .searchable(text: Binding(get: { ocr.find }, set: { ocr.find = $0 }),
-                                placement: .toolbar,
-                                prompt: "Find in document")
-                    .onSubmit(of: .search) { ocr.stepMatch(by: 1) }
-            } else if showsSearch {
-                split
-                    // Filters are CHIPS in the field, not text the reader has to retype and step
-                    // over. `searchable(text:tokens:)` is the platform's own control for this
-                    // (macOS 13+), so there is no token-field component to import and no second
-                    // source of truth: the chips are a projection of the canonical query string,
-                    // which is still the thing history and back/forward replay.
-                    .searchable(text: Binding(get: { model.query }, set: { handleQueryEdit($0) }),
-                                tokens: Binding(get: { model.searchTokens },
-                                                set: { model.setSearchTokens($0) }),
-                                placement: .toolbar, prompt: "Search by meaning") { token in
-                        // Text, not Label: a token chip renders its title only on macOS, so an
-                        // icon here is carried and then thrown away.
-                        Text(token.label)
-                    }
-                    // Typeahead: keys (ty -> type:), values (type: -> image/...), and matching past
-                    // queries as instant (cached) shortcuts. Navigate with arrows + Return. Only while
-                    // the user is typing - a programmatic box change (history replay, filter menu) keeps
-                    // the dropdown closed (suggestionsAllowed is false unless handleQueryEdit armed it).
-                    .searchSuggestions {
-                        ForEach(model.suggestionsAllowed ? searchSuggestions(model.query) : [], id: \.completion) { sug in
-                            HStack(spacing: 6) {
-                                Image(systemName: sug.icon).foregroundStyle(.secondary)
-                                Text(sug.label).lineLimit(1).truncationMode(.middle)
-                                if let chip = sug.chip {
-                                    // Shaped and weighted to match the token the SEARCH FIELD
-                                    // draws for the same qualifier, so the field and its
-                                    // suggestions speak one language: a rounded rect, not a
-                                    // capsule, and a light wash rather than `.quaternary` - which
-                                    // measured far heavier than the system token (a ~3% wash on
-                                    // its own surface) and read as a grey block.
-                                    //
-                                    // Deliberately NOT a glass effect: this popover is already a
-                                    // vibrant surface, and glass inside glass is the one thing
-                                    // Apple's guidance rules out (see the Liquid Glass notes).
-                                    Text(chip)
-                                        .font(.caption)
-                                        .foregroundStyle(.primary)
-                                        .padding(.horizontal, 5).padding(.vertical, 1)
-                                        .background(.primary.opacity(0.06),
-                                                    in: RoundedRectangle(cornerRadius: 5, style: .continuous))
-                                        .lineLimit(1)
-                                }
-                            }
-                            .searchCompletion(sug.completion)
+        // ONE split view, never swapped. This used to be three branches - OCR, search, neither -
+        // each holding its own `split` with a different `.searchable`, so turning OCR mode on (and
+        // the launch going ready) replaced the whole split view and rebuilt the window's toolbar
+        // from nothing. On macOS 14 and 15 a rebuilt toolbar comes back with every SwiftUI item
+        // collapsed to 10x10 - present, and invisible. The search field is configured by MODE
+        // instead: OCR mode binds it to find-in-document, search mode to the query.
+        split
+            .searchable(text: Binding(get: { model.ocrMode ? ocr.find : model.query },
+                                      set: { if model.ocrMode { ocr.find = $0 } else { handleQueryEdit($0) } }),
+                        tokens: Binding(get: { model.ocrMode ? [] : model.searchTokens },
+                                        set: { if !model.ocrMode { model.setSearchTokens($0) } }),
+                        placement: .toolbar,
+                        prompt: model.ocrMode ? "Find in document" : "Search by meaning") { token in
+                // Text, not Label: a token chip renders its title only on macOS, so an icon here
+                // is carried and then thrown away.
+                Text(token.label)
+            }
+            .searchSuggestions {
+                ForEach(!model.ocrMode && model.suggestionsAllowed ? searchSuggestions(model.query) : [], id: \.completion) { sug in
+                    HStack(spacing: 6) {
+                        Image(systemName: sug.icon).foregroundStyle(.secondary)
+                        Text(sug.label).lineLimit(1).truncationMode(.middle)
+                        if let chip = sug.chip {
+                            // Shaped and weighted to match the token the SEARCH FIELD
+                            // draws for the same qualifier, so the field and its
+                            // suggestions speak one language: a rounded rect, not a
+                            // capsule, and a light wash rather than `.quaternary` - which
+                            // measured far heavier than the system token (a ~3% wash on
+                            // its own surface) and read as a grey block.
+                            //
+                            // Deliberately NOT a glass effect: this popover is already a
+                            // vibrant surface, and glass inside glass is the one thing
+                            // Apple's guidance rules out (see the Liquid Glass notes).
+                            Text(chip)
+                                .font(.caption)
+                                .foregroundStyle(.primary)
+                                .padding(.horizontal, 5).padding(.vertical, 1)
+                                .background(.primary.opacity(0.06),
+                                            in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                                .lineLimit(1)
                         }
                     }
-                    // Return finishes the word too: a qualifier typed without a trailing space
-                    // still becomes a chip rather than being embedded as prose.
-                    .onSubmit(of: .search) {
-                        model.promoteQualifiers()
-                        model.search(); model.recordCurrentSearchToHistory(viaSubmit: true)
-                    }
-                    // Escape clears the whole query, not just the text: the chips and filters are
-                    // the same query, so leaving them behind is what made a "cleared" box still
-                    // return a filtered, empty result set.
-                    .onKeyPress(.escape) {
-                        guard model.hasActiveSearch || !model.searchTokens.isEmpty else { return .ignored }
-                        model.clearSearch()
-                        return .handled
-                    }
-            } else {
-                split
+                    .searchCompletion(sug.completion)
+                }
             }
-        }
+            .onSubmit(of: .search) {
+                // In OCR mode Return steps to the next match, Preview's find. In search mode it
+                // finishes the word too: a qualifier typed without a trailing space still becomes
+                // a chip rather than being embedded as prose.
+                if model.ocrMode { ocr.stepMatch(by: 1); return }
+                model.promoteQualifiers()
+                model.search(); model.recordCurrentSearchToHistory(viaSubmit: true)
+            }
+            // Escape clears the whole query, not just the text: the chips and filters are the
+            // same query, so leaving them behind is what made a "cleared" box still return a
+            // filtered, empty result set.
+            .onKeyPress(.escape) {
+                guard !model.ocrMode, model.hasActiveSearch || !model.searchTokens.isEmpty else { return .ignored }
+                model.clearSearch()
+                return .handled
+            }
         // An empty page rail is a column of nothing: fold it when OCR mode opens with no document
         // and unfold it the moment one arrives. On the BODY, not on the split - the split is a
         // branch of the Group above, so flipping the mode replaces it and takes any `onChange`
         // declared there with it, which is why the drawer stayed open.
-        .onChange(of: ocrDrawerWanted, initial: true) { _, wanted in
-            withAnimation(.easeOut(duration: 0.2)) { columns = wanted ? .all : .detailOnly }
+        //
+        // The INITIAL call is not animated. `columns` starts `.automatic`, so the launch call
+        // changes it, and doing that inside `withAnimation` animated the window's first layout -
+        // the centered "Search N files" prompt flew in from the top-left corner on every launch.
+        .onChange(of: ocrDrawerWanted, initial: true) { old, wanted in
+            let target: NavigationSplitViewVisibility = wanted ? .all : .detailOnly
+            if old == wanted {
+                columns = target
+            } else {
+                withAnimation(.easeOut(duration: 0.2)) { columns = target }
+            }
         }
         // Spotlight-style: put the caret in the search field as soon as the app can search.
         .onChange(of: showsSearch, initial: true) { _, shows in if shows { focusSearchField() } }
@@ -189,12 +183,20 @@ struct ContentView: View {
             // middle of SwiftUI's commit is what took the system sidebar toggle and the toolbar's
             // sidebar/detail sectioning down with it on Sequoia - see the tuner's notes below.
             //
-            // Gated to macOS 26 because that is the only system this was verified on. The API
-            // itself exists from macOS 15, so widening the check is a one-token change once the
-            // same pass (title gone, system toggle present, divider drag clean, trailing cluster
-            // right-aligned) has been run on a Sequoia machine. macOS 14/15 keep stock chrome,
-            // which is the known-good state there.
-            Group {
+            // Tahoe only. On macOS 14/15 the title item is what fills the toolbar's free space:
+            // removing it (checked on 15.7 in a VM) packed the search field and every trailing
+            // button against the leading ones, and no replacement spacer survives there.
+            //
+            // A ZSTACK, NOT A GROUP, AND THAT IS THE SEQUOIA TOOLBAR FIX. A Group is not a view: its
+            // modifiers are applied to each child, so `.toolbar` landed on the CONDITIONAL content
+            // inside it (search / OCR, and under that the phase switch). On macOS 14 and 15, toolbar
+            // items attached to a split view's detail content are dropped for good when that content
+            // is replaced (FB13106004, bdewey.com/til/2023/09/04/toolbar-bugs) - and the launch
+            // replaces it once, loading -> ready - so every toolbar item was gone before the window
+            // was usable. Tahoe re-registers them, which is why it only ever looked right here. A
+            // ZStack is a real container whose identity never changes, so the toolbar has a stable
+            // owner.
+            ZStack {
                 if #available(macOS 26.0, *) {
                     detailOrOCR.toolbar(removing: .title)
                 } else {
@@ -614,8 +616,18 @@ struct ContentView: View {
     /// installed inside the search field itself, which had two problems: it was invisible as an
     /// affordance, and it had to hide whenever the field held text, so it disappeared exactly when
     /// a query was on screen. A toolbar button is always there and always the same size.
+    /// Tahoe lays the trailing cluster out after its `ToolbarSpacer`. macOS 14/15 have no spacer
+    /// that survives (a SwiftUI `Spacer` item is dropped, an injected `.flexibleSpace` is pruned on
+    /// every state change, and a stretched item's width request pushes its neighbours into the
+    /// overflow menu), so there the trailing items say `.primaryAction`, which puts them on the
+    /// trailing side of the leading group. Verified on macOS 15.7 in a VM.
+    private var trailingPlacement: ToolbarItemPlacement {
+        if #available(macOS 26.0, *) { return .automatic }
+        return .primaryAction
+    }
+
     @ToolbarContentBuilder private var fileActions: some ToolbarContent {
-        ToolbarItem(id: "search.open") {
+        ToolbarItem(id: "search.open", placement: trailingPlacement) {
             Button { model.searchByFilePanel() } label: {
                 // `folder`, the same symbol OCR's Open Document uses. The two are the same verb.
                 Label("Search by File\u{2026}", systemImage: "folder")
@@ -623,7 +635,7 @@ struct ContentView: View {
             .help("Search by a file  \u{21e7}\u{2318}O")
             .accessibilityLabel("Search by a file")
         }
-        ToolbarItem(id: "search.share") {
+        ToolbarItem(id: "search.share", placement: trailingPlacement) {
             // The system share sheet, not a menu of our own - same as OCR's. Disabled rather than
             // hidden when nothing is selected, so the group does not change width as you click
             // around; that is how the OCR group behaves too.
@@ -701,28 +713,21 @@ struct ContentView: View {
         // writes Markdown, and touches neither the vector index nor the embedding model. Gating
         // it on the index would strand the feature exactly when it is most useful - while a large
         // index loads, or when another copy of Omni holds it open.
-        // SEQUOIA DROPS EVERY `.navigation` ITEM. On macOS 15 the sidebar toggle, the OCR toggle,
-        // the serve toggle and the back/forward group are all absent from the toolbar, while every
-        // `.primaryAction` item renders - `browse.view` included, which carries an `id` too, so the
-        // discriminator is the PLACEMENT and not the identifier. The mechanism fits the window
-        // structure: in a NavigationSplitView the leading edge belongs to the SIDEBAR column and
-        // these are declared from the DETAIL's toolbar, which Tahoe's unified toolbar flattens and
-        // Sequoia's real toolbar sections do not. It is the same class of Sequoia sectioning
-        // failure e8ec400 recorded when the tuner still touched the titlebar.
-        //
-        // Pre-Tahoe therefore puts the same four controls in `.primaryAction` - the one placement
-        // there is positive evidence for on that system, from the same screenshot that showed the
-        // others missing - declared FIRST so they lead the trailing cluster and keep their order.
-        // The position differs from Tahoe; what was broken was REACHABILITY, and these four are
-        // the drawer, the transcription workspace, the HTTP server and the whole back/forward
-        // trail. NOT VERIFIED ON SEQUOIA - there is no macOS 15 machine or VM here.
+        // THE SAME PLACEMENT ON EVERY SYSTEM, VERIFIED ON macOS 15.7 (tart VM, 2026-09-22). The
+        // leading items were moved to `.primaryAction` pre-Tahoe on the theory that Sequoia drops
+        // `.navigation` items, and then given titled labels on the theory that an untitled label
+        // cannot be sized. Neither was the cause: the items were present and collapsed to 10x10
+        // because the TOOLBAR WAS REBUILT - the root swapped whole split views between modes and
+        // the detail swapped its content under a Group - and macOS 14/15 do not size SwiftUI items
+        // in a rebuilt toolbar. With one stable split view and a ZStack owner (see `body` and
+        // `split`) they measure 34x28 / 31x28 / 29x28 at launch and through OCR on/off cycles, at
+        // the leading edge where Tahoe puts them.
+        leadingModeItems(.navigation)
         if #available(macOS 26.0, *) {
-            leadingModeItems(.navigation)
             ToolbarItem(id: "nav.title", placement: .navigation) { navAndTitle }
                 .sharedBackgroundVisibility(.hidden)
         } else {
-            leadingModeItems(.primaryAction)
-            ToolbarItem(id: "nav.title", placement: .primaryAction) { navAndTitle }
+            ToolbarItem(id: "nav.title", placement: .navigation) { navAndTitle }
         }
         // Flexible space after back/forward pushes every other control to the trailing edge (chevrons
         // own the left, everything else is right-aligned), and on Tahoe it's also the correct separator
@@ -738,8 +743,7 @@ struct ContentView: View {
         // `ToolbarItem { Spacer() }` is genuinely dropped on macOS 14/15 (verified against the live
         // NSToolbar's item list), which is why the AppKit item was there.
         //
-        // It is moot now: pre-Tahoe every item this toolbar declares is `.primaryAction`, which is
-        // trailing by definition, so there is nothing on the leading edge to push away from.
+        // Pre-Tahoe the trailing cluster is `.primaryAction` instead - see `trailingPlacement`.
         // Bookmark the current search. The only way into History when recording is set to "Only when
         // I bookmark", and a quick save otherwise. Appears once there's a search to keep.
         if model.phase == .ready, !model.ocrMode, model.hasActiveSearch {
@@ -1165,6 +1169,10 @@ struct SearchWaysPrompt: View {
             Text(title)
                 .font(.title)
                 .contentTransition(.numericText(value: Double(count)))
+                // Rolling digits are for a count that ticks while indexing. The first count to
+                // arrive replaces the words "your files", and rolling letters into digits read as
+                // scrambled text - so that one change is a new view, not a transition.
+                .id(count > 0)
                 .animation(.snappy(duration: 0.3), value: count)
             VStack(alignment: .leading, spacing: 10) {
                 ForEach(ways, id: \.icon) { w in

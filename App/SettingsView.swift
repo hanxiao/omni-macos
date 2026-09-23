@@ -192,7 +192,7 @@ private struct ActivityTab: View {
             } header: {
                 Text("File types")
             } footer: {
-                Text("Turn off to stop indexing a type and free its model. Drag to reorder.")
+                Text("Off stops indexing a type and unloads its model. Drag to reorder.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -314,7 +314,7 @@ private struct ContentTypesTab: View {
             } header: {
                 Text("Image & video tagging")
             } footer: {
-                Text("A few words per photo, video, or scan (\"cat, couch, crib\"), on-device while indexing.")
+                Text("Short labels such as \"cat, couch, crib\", made on this Mac while indexing.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -348,7 +348,7 @@ private struct ContentTypesTab: View {
             } header: {
                 Text("Ignore rules")
             } footer: {
-                Text("One .gitignore pattern per line: leading ! re-includes, trailing / matches folders.")
+                Text(".gitignore syntax, one pattern per line.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -392,7 +392,7 @@ private struct ContentTypesTab: View {
                 } else if dirty {
                     Text("Calculating\u{2026}").foregroundStyle(.secondary)
                 } else {
-                    Text("Rules active.").foregroundStyle(.secondary)
+                    Text("Rules applied").foregroundStyle(.secondary)
                 }
                 Spacer()
                 Button("Import\u{2026}") { importIgnoreFile() }
@@ -541,11 +541,11 @@ private struct PerformanceTab: View {
                     set: { model.groupNearDuplicates = $0 }
                 ))
                 .toggleStyle(.switch)
-                .help("Off: only byte-identical copies are stacked")
+                .help("Off: only identical copies stack")
             } header: {
                 Text("Search")
             } footer: {
-                Text("Off: results update on Return.")
+                Text("With search as you type off, a search runs on Return.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -609,8 +609,8 @@ private struct PerformanceTab: View {
                 // Names the two slices the cap actually governs, now that the bar above makes the
                 // difference visible: the cap is an MLX limit, so a total above it is normal.
                 Text(model.isPaperRunning
-                     ? "Locked while the benchmark runs; your cap is restored after."
-                     : "The cap covers Model and Cache above, not the whole app. 0 is unlimited.")
+                     ? "Locked while the benchmark runs."
+                     : "Caps Model and Cache, not the whole app.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
@@ -636,7 +636,7 @@ private struct PerformanceTab: View {
                             }
                             .controlSize(.small)
                             .disabled(model.isPaperRunning || model.isProfilingRunning || model.phase != .ready)
-                            .help("Paper suite - up to 25 min, synthetic data, your index untouched")
+                            .help("Paper benchmark: up to 25 min on synthetic data. The index is not touched.")
                         }
                     }
                 }
@@ -653,7 +653,7 @@ private struct PerformanceTab: View {
             } header: {
                 Text("Profiling")
             } footer: {
-                Text("Indexes a fixed 300-file dataset. Sharing sends hardware and timing only - never your files - to hanxiao.io/omni.")
+                Text("Indexes a fixed 300-file dataset. Sharing sends hardware and timings, never files, to hanxiao.io/omni.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -906,14 +906,14 @@ private struct HistoryTab: View {
                 .help(model.historyMode.detail)
                 Toggle("Save serving history", isOn: Binding(get: { model.saveServingHistory },
                                                             set: { model.saveServingHistory = $0 }))
-                .help("Searches that reach Omni over the server, from an agent or a script, are kept too")
+                .help("Searches from agents and scripts")
                 Picker("Keep history for", selection: Binding(get: { model.historyRetentionDays }, set: { model.historyRetentionDays = $0 })) {
                     Text("3 days").tag(3)
                     Text("7 days").tag(7)
                     Text("14 days").tag(14)
                     Text("31 days").tag(31)
                 }
-                .help("Older searches are removed automatically; bookmarks are kept")
+                .help("Bookmarks are never removed")
                 // ONE ROW, and the button on the trailing edge. As two rows the Form drew a
                 // separator between the count and the control that acts on it, and left the button
                 // hanging on the leading edge - the only left-aligned button in Settings.
@@ -925,7 +925,7 @@ private struct HistoryTab: View {
                     Button("Clear\u{2026}", role: .destructive) { confirmClear = true }
                         .controlSize(.small)
                         .disabled(model.recentHistoryCount == 0)
-                        .help("Remove all recent searches; bookmarks are kept")
+                        .help("Bookmarks are kept")
                 }
             }
         }
@@ -934,7 +934,7 @@ private struct HistoryTab: View {
             Button("Clear search history", role: .destructive) { model.clearSearchHistory() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Your bookmarked searches will be kept.")
+            Text("Bookmarks are kept.")
         }
     }
 }
@@ -1038,7 +1038,7 @@ private struct IndexTab: View {
                     // still on the way, and the tooltip is where that belongs if anywhere.
                     LabeledContent("Format", value: "v\(model.indexSchemaVersion)")
                     .help(model.indexSchemaVersion >= VectorStore.currentSchemaVersion
-                          ? "Current format."
+                          ? "Current"
                           : "Upgrading to v\(VectorStore.currentSchemaVersion) in the background.")
                 }
                 // Manual row instead of LabeledContent: a long path makes LabeledContent
@@ -1051,7 +1051,7 @@ private struct IndexTab: View {
                         Spacer()
                         if !model.dbPath.isEmpty {
                             Text((model.dbPath as NSString).abbreviatingWithTildeInPath)
-                                .font(.caption.monospaced()).foregroundStyle(.secondary)
+                                .foregroundStyle(.secondary)
                                 .lineLimit(1).truncationMode(.middle)
                                 .help(model.dbPath)
                         }
@@ -1059,7 +1059,7 @@ private struct IndexTab: View {
                     HStack(spacing: 8) {
                         Spacer()
                         Button("Change\u{2026}") { pickDatabase() }
-                            .help("Where the index is stored; changing loads the index from there")
+                            .help("Load the index from another folder")
                             // isPaperRunning: the run captured the CURRENT index paths as the ones
                             // its filesystem must refuse to open, and a swap mid-run would move the
                             // index out from under that list.
@@ -1107,7 +1107,7 @@ private struct IndexTab: View {
                             Text("Location")
                             Spacer()
                             Text((model.modelPath as NSString).abbreviatingWithTildeInPath)
-                                .font(.caption.monospaced()).foregroundStyle(.secondary)
+                                .foregroundStyle(.secondary)
                                 .lineLimit(1).truncationMode(.middle)
                                 .help(model.modelPath)
                         }
@@ -1124,7 +1124,7 @@ private struct IndexTab: View {
             } header: {
                 Text("Model")
             } footer: {
-                Text("Switching the embedding model rebuilds the index. OCR is optional.")
+                Text("Switching the embedding model rebuilds the index.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -1243,9 +1243,9 @@ private struct OCRTab: View {
                 }
                 .onChange(of: batch) { _, new in OCRSession.Settings.batchWidth = new }
             } header: {
-                Text("Parallelization")
+                Text("Transcription")
             } footer: {
-                Text("Decoding pages together is faster per page and costs memory. Automatic sizes it to this Mac.")
+                Text("More pages at once is faster and uses more memory. Automatic fits this Mac.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -1277,7 +1277,7 @@ private struct OCRCacheSection: View {
                     Text("Location")
                     Spacer()
                     Text((folder.path as NSString).abbreviatingWithTildeInPath)
-                        .font(.caption.monospaced()).foregroundStyle(.secondary)
+                        .foregroundStyle(.secondary)
                         .lineLimit(1).truncationMode(.middle)
                         .help(folder.path)
                 }
@@ -1294,7 +1294,7 @@ private struct OCRCacheSection: View {
         } header: {
             Text("Cache")
         } footer: {
-            Text("Pages are saved as Markdown and reused while the file and the model are unchanged.")
+            Text("Pages are saved as Markdown and reused until the file or the model changes.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }

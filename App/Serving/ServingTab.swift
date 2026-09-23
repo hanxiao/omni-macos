@@ -37,12 +37,12 @@ struct ServingTab: View {
         // other tab has.
         .sheet(isPresented: $showMCPSheet) {
             AgentConfigSheet(title: "Connect agents over MCP",
-                             subtitle: "For any MCP client with HTTP transport. Nine tools: search, search_inline, file_status, tag_image, ocr, list_sources, add_source, pause_source, remove_source.",
+                             subtitle: "For MCP clients with HTTP transport.",
                              text: mcpConfigText, saveAs: nil)
         }
         .sheet(isPresented: $showSkillSheet) {
             AgentConfigSheet(title: "SKILL.md for instruction-following agents",
-                             subtitle: "Save where your agent reads skills (e.g. ~/.claude/skills/omni-search/SKILL.md), or paste into its instructions.",
+                             subtitle: "For agents that read skills, e.g. ~/.claude/skills/omni-local-search/SKILL.md.",
                              text: skillMarkdown, saveAs: "SKILL.md")
         }
     }
@@ -114,7 +114,7 @@ struct ServingTab: View {
                     model.serving.bearerToken = ServingController.generateToken()
                 } label: { Image(systemName: "arrow.clockwise") }
                 .buttonStyle(.borderless).foregroundStyle(.secondary)
-                .help("Replace the token with a new one")
+                .help("New token")
               }
             }
 
@@ -134,16 +134,16 @@ struct ServingTab: View {
                 }
                 Spacer()
                 Button("MCP") { showMCPSheet = true }
-                    .help("Connection config for MCP clients such as Claude Code, Cursor or VS Code")
+                    .help("Config for MCP clients")
                 Button("SKILL.md") { showSkillSheet = true }
-                    .help("A ready skill file for instruction-following agents")
+                    .help("Skill file for agents")
             }
             .buttonStyle(.bordered).controlSize(.small)
             .disabled(!model.serving.enabled)
         } header: {
             Text("Server")
         } footer: {
-            Text("A local HTTP API for search, tags, OCR, embeddings, and the folders Omni indexes. Local network needs a token; changes restart the server.")
+            Text("Local network access requires a token. Changes restart the server.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }
@@ -201,9 +201,6 @@ struct ServingTab: View {
             }
         } header: {
             Text("Example")
-        } footer: {
-            Text("Run this in a terminal with the server on.")
-                .font(.caption).foregroundStyle(.secondary)
         }
     }
 
@@ -497,9 +494,6 @@ struct ServingTab: View {
                     .buttonStyle(.link)
                     .disabled(model.serving.log.isEmpty)
             }
-        } footer: {
-            Text("Recent requests, newest first.")
-                .font(.caption).foregroundStyle(.secondary)
         }
     }
 }

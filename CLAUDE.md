@@ -2343,3 +2343,30 @@ OCR routes for an authorized caller; symlinks cannot lead a path argument out of
 SKILL.md (`ServingTab.skillMarkdown`) is reference, not manners: endpoints, fields, limits, errors.
 It is for agents that call the HTTP API, so it NEVER describes MCP - no MCP section, no "over MCP"
 asides. MCP clients get their docs from the tool descriptors and the initialize instructions.
+
+## macOS 14/15 toolbar: the real cause (2026-09-22, verified in a macOS 15.7 VM)
+
+The leading buttons (sidebar, OCR, serving) were present but COLLAPSED TO 10x10 on Sequoia.
+68921d7 (move to `.primaryAction`) and db9c2a5 (titled labels) were reasoned from a dump without a
+Sequoia machine and did not fix it: 0.13.6, which has both, still dumps 10x10 in the VM.
+- CAUSE: the toolbar was REBUILT, and macOS 14/15 do not size SwiftUI items in a rebuilt toolbar.
+  Two rebuild triggers: (1) the root was `Group { if ocrMode { split.searchable(A) } else if
+  showsSearch { split.searchable(B) } else { split } }` - three split views, swapped on OCR toggle
+  and on launch going ready; (2) `.toolbar` sat on a `Group` inside the detail, and a Group applies
+  modifiers to each CHILD, so the toolbar belonged to the phase switch's content (FB13106004).
+- FIX: one split view with one mode-aware `.searchable` (OCR binds it to find-in-document), and a
+  `ZStack` owner for `.toolbar`. Items measure 34x28 / 31x28 / 29x28 at launch, through OCR on/off
+  cycles and with results showing. Tahoe dumps identical to 0.13.6 in search and OCR mode.
+- KEEP THE STOCK TITLE on 14/15 (`toolbar(removing: .title)` is Tahoe-only). It is the item that
+  fills the free space there: removing it packed the search field against the leading buttons.
+  The stretched-item recipe (low-priority 8000pt width) does fill it, but AppKit's overflow reads
+  the request and pushes Search by File and Share into ». Trailing items are `.primaryAction` pre-26.
+- The launch animation: `onChange(of: ocrDrawerWanted, initial: true)` set `columns` from
+  `.automatic` inside `withAnimation`, animating the first layout (content slid in from the
+  top-left). The initial call is now unanimated; a 60 fps recording shows no motion.
+
+TESTING ON SEQUOIA: tart VM `sequoia` (macOS 15.7.7), TART_HOME=/Volumes/han2tb/tart/home, binary
+/Volumes/han2tb/tart/tart.app/Contents/MacOS/tart, run with `--dir=share:/Volumes/han2tb/tart/share`,
+SSH admin/admin. The shared folder serves STALE content for an overwritten path - copy every build
+to a new directory name, or you test the previous build. `OMNI_UI_DEBUG=1` + `kill -USR2` dumps the
+toolbar to /tmp/omni-debug-toolbar.txt inside the VM. The nano model runs in the VM (MLX works).
