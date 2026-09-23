@@ -662,9 +662,13 @@ struct ResultRow: View {
                     Text(fileName).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
                     if let stack { stackBadge(stack) }
                 }
-                if !hit.snippet.isEmpty, hit.snippet != fileName {
-                    Text(hit.snippet).font(.body).foregroundStyle(.secondary).lineLimit(1)
-                }
+                // The line is always there, blank when there is nothing to say: an image's tags are
+                // generated after the search that shows it, and a row that gained its snippet line
+                // on screen grew from 52 to 61 pt. Lazy-stack rows must not change size after they
+                // appear (see stackBadge).
+                let showSnippet = !hit.snippet.isEmpty && hit.snippet != fileName
+                Text(showSnippet ? hit.snippet : " ").font(.body).foregroundStyle(.secondary).lineLimit(1)
+                    .accessibilityHidden(!showSnippet)
                 HStack(spacing: 5) {
                     KindGlyph(kind: hit.kind)
                     MediaInfoLabel(path: hit.path, kind: hit.kind, width: hit.width, height: hit.height, duration: hit.duration, separator: true)
@@ -931,6 +935,11 @@ extension ResultRow {
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
+        // Drawn exactly as before, but it must not make the title line taller. A stack forms when
+        // the grouping inputs land, AFTER the row is on screen, and the badge grew that row from 61
+        // to 63 pt. A lazy stack's rows must not change size after they appear (WWDC26 session
+        // 321); this one was the only row that did, and a chaos run hung in lazy-stack placement.
+        .padding(.vertical, -2)
         .help(stack.reason == .exact
               ? "\(stack.count) byte-identical copies - click to show them"
               : "\(stack.count) near-identical files - click to show them")
@@ -1081,6 +1090,8 @@ private extension EnvironmentValues {
     }
 }
 
+@MainActor enum RowHeightProbe { static var first: [String: Int] = [:]; static var logged = Set<String>() }
+
 private struct ReportResultFrame: ViewModifier {
     @Environment(\.resultFrames) private var frames
     let path: String
@@ -1090,6 +1101,14 @@ private struct ReportResultFrame: ViewModifier {
         content
             .onGeometryChange(for: CGRect.self, of: { $0.frame(in: .named(space)) }) { [frames, path] r in
                 frames?.frames[path] = r
+                // A row that changes size after it appears unsettles the lazy stack (see stackBadge);
+                // OMNI_PERF_LOG names any that do, once each.
+                if omniPerfEnabled {
+                    let h = Int(r.height.rounded())
+                    if let old = RowHeightProbe.first[path], old != h, RowHeightProbe.logged.insert(path).inserted {
+                        omniPerfLog("row-height-changed \(old)->\(h) \((path as NSString).lastPathComponent)")
+                    } else if RowHeightProbe.first[path] == nil { RowHeightProbe.first[path] = h }
+                }
             }
             // A row the lazy stack let go of is not where it last was.
             .onDisappear { [frames, path] in frames?.frames[path] = nil }

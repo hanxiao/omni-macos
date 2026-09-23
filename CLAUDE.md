@@ -2577,17 +2577,18 @@ reader. `FolderMapSharedContentTests` fails without the fix. All other `flat16` 
   preferredHeights" follows the system's Window > Move & Resize submenu. The Security and Hang Risk
   runtime issues are framework-side or the engine gate's known, boosted inversion. Opening Settings
   is 150-190 ms; the open panel's first show waits ~0.6 s on its out-of-process service.
-- OPEN, A RARE HANG: typing `-type:text porsche` key by key in list view over results (after two
-  sidebar toggles, seed 777) left the main thread 100% busy for 30 s+ in SwiftUI graph updates -
-  LazySubviewPlacements, RootGeometry sizeThatFits, a fresh transaction flushed on every run-loop
-  turn - until XCUITest gave up. `ReportResultFrame`'s geometry action is 6% of that sample: it runs
-  because layout does, it is not shown to cause it. `testTypingANegatedQualifierAfterSidebarToggles`
-  replays it (`OMNI_REPRO_ROUNDS` repeats the sequence in one launch). The busy loop is SwiftUI's
-  lazy prefetch: `LazyLayoutViewCache.signalPrefetch` -> asyncTransaction -> placement -> prefetch
-  again, no row bodies re-evaluated. RULED OUT, measured: duplicate ForEach ids (every prefix of the
-  query, logged - none) and width-dependent row heights (61/63 pt at every width). Seen twice (seed
-  777's chaos run, the replay's first run), then not in ~690 chaos actions with churn, 18 replays and
-  12 looped rounds. Not yet known whether 0.13.8 has it; do not ship a fix for it without a repro.
+- A RARE HANG, FIXED BY MEASURING WHAT RESIZES: typing `-type:text porsche` in list view over results
+  left the main thread 100% busy for 30 s+ in SwiftUI's lazy prefetch loop
+  (`LazyLayoutViewCache.signalPrefetch` -> transaction -> placement -> prefetch), no row bodies in
+  the sample. Seen twice, then not in ~690 chaos actions, so no repro to A/B. WWDC26 session 321:
+  lazy-stack rows must not change size after they appear. Logging every row whose height changed
+  after its first layout (`row-height-changed`, OMNI_PERF_LOG) found two that did: a row becoming a
+  stack when grouping lands (the badge made the title line 61 -> 63 pt) and an image row whose tags
+  arrived after the search (52 -> 61 pt, the snippet line appearing). The badge no longer adds
+  height and the snippet line is always there, blank when empty: 0 rows change over 13 searches in
+  list view and 9 in the gallery, against 1 and 2 with the same probe before. Ruled out on the way,
+  measured: duplicate ForEach ids and width-dependent heights. The replay is
+  `testTypingANegatedQualifierAfterSidebarToggles` (`OMNI_REPRO_ROUNDS` repeats it in one launch).
 - OPEN: AppKit's once-per-process "layoutSubtreeIfNeeded on a view which is already being laid
   out" follows a browse step in most runs; lldb on `_NSDetectedLayoutRecursion` did not catch it.
   The rest of a streaming page's cost is window layout AppKit does for the toolbar on each change.
