@@ -137,7 +137,9 @@ struct OCRView: View {
                 // granularity both panes share - the same text sets to different heights.
                 HStack(spacing: 0) {
                     // The page itself beside what was read off it. The image column follows
-                    // whichever text column is being scrolled, which the split's sync knows.
+                    // whichever text column is being scrolled, which the split's sync knows -
+                    // and a page picked in the navigator resets that sync (see below), or the
+                    // image kept showing whatever a text pane last reported.
                     if session.mode == .triple {
                         PageImage(id: split.section ?? session.visibleIndex)
                             .frame(maxWidth: .infinity)
@@ -148,6 +150,14 @@ struct OCRView: View {
                     Divider()
                     RenderedDocument(side: 1, sync: $split)
                         .frame(maxWidth: .infinity)
+                }
+                // A PAGE PICKED IN THE NAVIGATOR IS THE NEW POSITION FOR ALL THREE COLUMNS. The
+                // image read `split.section`, which only the text panes wrote, so after a thumbnail
+                // click it stayed on the page a pane had last reported - measured: page 2 picked,
+                // image on 36, source on 35, rendered on 8. Driver nil: neither pane is leading.
+                .onChange(of: session.selection) { _, id in
+                    guard let id else { return }
+                    split = SplitScroll(driver: nil, section: id, fraction: 0)
                 }
             }
         }
@@ -960,6 +970,12 @@ private struct DocumentScroll<Content: View>: View {
             // anything that moves outside that window is a reader scrolling.
             .onPreferenceChange(SectionTopKey.self) { tops in
                 guard let side, quietUntil < Date(), let now = Self.position(tops) else { return }
+                // ONE LEADER AT A TIME. Moving one pane re-lays-out the other, and the other's probe
+                // fired in that same update - BEFORE its follow handler could set `quietUntil` - so
+                // it reported its stale position as a lead of its own. Traced: the panes then
+                // followed each other 2<->2, 3<->1, 1<->3, 3<->0 and settled on different pages. A
+                // lead held by another pane (or by the navigator) is left alone until it goes quiet.
+                if sync.driver != side, Date().timeIntervalSince(sync.at) < 0.35 { return }
                 sync = SplitScroll(driver: side, section: now.section, fraction: now.fraction)
             }
             .onChange(of: sync) { _, now in
@@ -970,6 +986,18 @@ private struct DocumentScroll<Content: View>: View {
                 // the page boundary left the follower a whole page behind by the time the driver
                 // reached the end of one.
                 proxy.scrollTo(id, anchor: UnitPoint(x: 0, y: now.fraction))
+                // Same lazy-stack estimate as a navigator jump: a follower several pages away
+                // lands short. Re-aim once the target is built, if the leader has not moved on.
+                // Up to three times: each pass builds the pages the last one skipped over, so a long
+                // fast scroll converges instead of settling a page short.
+                Task { @MainActor in
+                    for _ in 0 ..< 3 {
+                        try? await Task.sleep(for: .milliseconds(160))
+                        guard sync == now else { return }
+                        quietUntil = Date().addingTimeInterval(0.2)
+                        proxy.scrollTo(id, anchor: UnitPoint(x: 0, y: now.fraction))
+                    }
+                }
             }
             .onChange(of: session.streamTick) { _, _ in
                 guard session.isFollowingRun else { return }
@@ -993,7 +1021,19 @@ private struct DocumentScroll<Content: View>: View {
             // boundary. Following is the tail's job, below.
             .onChange(of: session.visibleIndex) { _, id in
                 guard let id, !session.isFollowingRun else { return }
+                // A jump is not a reader scrolling. Without the quiet window each pane reported
+                // the position its jump passed through as a lead, the other pane followed that,
+                // and the two chased each other onto different pages.
+                quietUntil = Date().addingTimeInterval(0.8)
                 withAnimation(.easeOut(duration: 0.25)) { proxy.scrollTo(id, anchor: .top) }
+                // A far jump in a lazy stack lands on ESTIMATED heights for the pages it skips,
+                // and narrow columns make the estimate worse. Once the target page has been built
+                // the second call lands exactly.
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(320))
+                    guard session.visibleIndex == id else { return }
+                    proxy.scrollTo(id, anchor: .top)
+                }
             }
             // Follow the text as it is written, not just when the page turns. A long page grows
             // well past the fold, and a reader watching it transcribe should not have to chase it
@@ -1035,6 +1075,9 @@ struct SplitScroll: Equatable {
     var driver: Int?
     var section: Int?
     var fraction: Double = 0
+    /// When this lead was taken. A pane may only take the lead from ANOTHER pane once that lead
+    /// has gone quiet - see `DocumentScroll`.
+    var at = Date()
 }
 
 private struct SectionTopKey: PreferenceKey {
@@ -1520,5 +1563,6 @@ private struct CenteredHint: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
+
 
 
