@@ -213,7 +213,10 @@ struct OmniApp: App {
                     if let mode = UserDefaults.standard.string(forKey: "omni.ocrMode").flatMap(OCRSession.ViewMode.init(rawValue:)) {
                         ocr.mode = mode
                     }
-                    ocr.open(urls: key.split(separator: ":").map { URL(fileURLWithPath: String($0)) })
+                    // `::` separates DROPS, so a test can open a file that is already open.
+                    for drop in key.components(separatedBy: "::") {
+                        ocr.open(urls: drop.split(separator: ":").map { URL(fileURLWithPath: String($0)) })
+                    }
                 }
                 // The same seam for CLICKING THE PAGE RAIL. `-omni.ocrClickPages 3,17,5` walks
                 // those pages once enough of them are transcribed to be selectable, through

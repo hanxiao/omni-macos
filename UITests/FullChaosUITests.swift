@@ -39,15 +39,42 @@ final class FullChaosUITests: XCTestCase {
                                  "update", "download", "profil", "paper", "benchmark", "hide omni",
                                  "hide others", "close", "minimi", "zoom", "uninstall", "empty",
                                  "log out", "services", "enter full screen", "ignore", "report",
-                                 "move to", "clear history", "clear all", "forget", "export", "save"]
+                                 "move to", "clear history", "clear all", "forget", "export", "save",
+                                 // System items and hand-offs to other apps: Start Dictation raised a
+                                 // microphone dialog, and an opened or revealed file put Preview or
+                                 // Finder over the window, after which every action missed the app.
+                                 "dictation", "emoji", "autofill", "reveal", "open with",
+                                 // File panels: only ocr() opens one, because it also fills it in and
+                                 // closes it. Left open, every accessibility query waits on the panel's
+                                 // remote service - one run sat 413 s on a single click.
+                                 "open document", "search by", "choose", "website", "github"]
 
     private func allowed(_ e: XCUIElement) -> Bool {
         let words = [e.identifier, e.title, e.label].map { $0.lowercased() }
         if e.identifier.hasPrefix("_XCUI") { return false }
+        if e.title == "Open" { return false }   // the file's own app, not Omni
         return !words.contains { w in Self.denied.contains { w.contains($0) } }
     }
 
-    private var window: XCUIElement { app.windows.firstMatch }
+    /// The MAIN window, by title. `app.windows.firstMatch` is whichever window is in front, and a
+    /// run that opened Help > Keyboard Shortcuts or Settings drove that window for minutes: every
+    /// typed query and click went there or found nothing, and the trail still logged them as done.
+    private var window: XCUIElement {
+        let main = app.windows["Omni"]
+        return main.exists ? main : app.windows.firstMatch
+    }
+
+    /// Close every window but the main one before an action, so keys land in the main window.
+    /// (landed, attempted) typed queries; the run fails if most never reached the box.
+    private var typed = (0, 0)
+
+    private func closeAuxWindows() {
+        guard app.windows.count > 1 else { return }
+        for w in app.windows.allElementsBoundByIndex where w.exists && w.title != "Omni" {
+            let close = w.buttons[XCUIIdentifierCloseWindow]
+            if close.exists, close.isHittable { note("close window \(w.title)"); close.click(); settle(0.4) }
+        }
+    }
     private var app: XCUIApplication!
 
     // MARK: - surfaces
@@ -67,11 +94,17 @@ final class FullChaosUITests: XCTestCase {
         note("type query")
         focusSearch()
         app.typeKey("a", modifierFlags: .command)
-        let q = (rng.int(3) == 0 ? pick(qualifiers) : "") + pick(queries)
+        let words = pick(queries)
+        let q = (rng.int(3) == 0 ? pick(qualifiers) : "") + words
         for ch in q {
             app.typeText(String(ch))
             if rng.int(4) == 0 { settle(0.05 + Double(rng.int(20)) / 100) }
         }
+        // Proof the keys reached the box. A qualifier becomes a chip, so check the words only.
+        let field = window.searchFields.firstMatch
+        let landed = field.exists && ((field.value as? String) ?? "").contains(words)
+        typed.0 += landed ? 1 : 0; typed.1 += 1
+        if !landed { note("typed MISS") }
         switch rng.int(4) {
         case 0: app.typeKey(.return, modifierFlags: [])
         case 1: app.typeKey(.downArrow, modifierFlags: []); settle(0.2); app.typeKey(.return, modifierFlags: [])
@@ -104,7 +137,7 @@ final class FullChaosUITests: XCTestCase {
         guard r.exists, r.isHittable else { return }
         note("result \(r.label)")
         switch rng.int(5) {
-        case 0: r.doubleClick(); settle(1); app.activate()            // opens in its app
+        case 0: r.typeKey(" ", modifierFlags: []); settle(0.6); app.typeKey(" ", modifierFlags: [])  // Quick Look
         case 1: XCUIElement.perform(withKeyModifiers: .command) { r.click() }
         case 2: XCUIElement.perform(withKeyModifiers: .shift) { r.click() }
         default: r.click()
@@ -249,6 +282,7 @@ final class FullChaosUITests: XCTestCase {
                              "Documents/download (1).jpg", "Downloads/DOC-20251107-WA0005..pdf"])
             note("ocr open \(file)")
             if !window.descendants(matching: .any)["ocr.choosefiles"].exists,
+               window.searchFields.firstMatch.exists,
                window.searchFields.firstMatch.placeholderValue?.contains("meaning") == true,
                toggle.exists, toggle.isHittable {
                 toggle.click(); settle(1.5)
@@ -340,6 +374,46 @@ final class FullChaosUITests: XCTestCase {
         print("REPRO box=\(value.debugDescription)")
     }
 
+    /// Seed 777: typing `-type:text porsche` in list view, after two sidebar toggles, left the main
+    /// thread in lazy-stack placement for 30 s and XCUITest gave up on the app.
+    func testTypingANegatedQualifierAfterSidebarToggles() throws {
+        app = XCUIApplication()
+        app.launchArguments = [
+            "-omni.dbDir", env["OMNI_PERF_DB"]!,
+            "-omni.addedFolders", "(\"\(env["OMNI_PERF_CORPUS"]!)\")",
+            "-omni.roots", "(\"\(env["OMNI_PERF_CORPUS"]!)\")",
+            "-omni.ephemeralUIState", "YES", "-omni.serving.enabled", "NO",
+            "-omni.hangwatch", "YES", "-omni.hangwatchMs", "250",
+            "-omni.hangwatchFile", env["OMNI_PERF_HANG"] ?? "/tmp/omni-chaos-hang.log",
+        ]
+        app.launchEnvironment["OMNI_PERF_LOG"] = "1"
+        app.launch()
+        defer { app.terminate() }
+        XCTAssertTrue(window.waitForExistence(timeout: 60))
+        settle(4)
+        func type(_ text: String, submit: Bool) {
+            focusSearch()
+            app.typeKey("a", modifierFlags: .command)
+            for ch in text { app.typeText(String(ch)); settle(0.1) }
+            if submit { app.typeKey(.return, modifierFlags: []) }
+            settle(1)
+        }
+        let toggle = window.descendants(matching: .any)["sidebar.toggle"]
+        app.typeKey("1", modifierFlags: .command); settle(0.5)
+        type("python script that parses json", submit: true)
+        type("dog on the beach", submit: false)
+        let variant = env["OMNI_REPRO_VARIANT"] ?? ""
+        app.typeKey(variant == "grid" ? "1" : "2", modifierFlags: .command); settle(0.8)
+        if variant != "nosidebar" {
+            for _ in 0 ..< 2 { if toggle.exists { toggle.click(); settle(1.5) } }
+        }
+        type(variant == "plain" ? "porsche" : "-type:text porsche", submit: false)
+        settle(3)
+        let value = (window.searchFields.firstMatch.value as? String) ?? ""
+        print("REPRO box=\(value.debugDescription)")
+        XCTAssertTrue(value.contains("porsche"), "the box did not answer: \(value.debugDescription)")
+    }
+
     /// The marquee's band is gesture state now; a drag across rows still selects them, in both views.
     func testMarqueeDragSelectsRows() throws {
         app = XCUIApplication()
@@ -419,9 +493,12 @@ final class FullChaosUITests: XCTestCase {
         while Date() < deadline {
             var r = rng.int(total)
             let chosen = actions.first { r -= $0.0; return r < 0 }!
+            closeAuxWindows()
             chosen.2()
             checkAlive(chosen.1)
         }
+        print("CHAOS typed \(typed.0) of \(typed.1) queries reached the box")
+        XCTAssertGreaterThanOrEqual(typed.0 * 4, typed.1 * 3, "most typed queries never reached the search box")
         // What a user types still lands in the box at the end. Escape FIRST: in a toolbar search
         // field it ends the search and gives up focus (native, as in Notes and Mail), so the order
         // focus-Escape-type types into nothing and says nothing about the app.

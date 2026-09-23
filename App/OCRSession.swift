@@ -405,6 +405,19 @@ final class OCRSession {
         visibleDocument.map { $0.pageIDs.compactMap { id in pages.indices.contains(id) ? pages[id] : nil } } ?? []
     }
 
+    /// The open tabs by the file they came from.
+    private func openDocumentIDs() -> [URL: Int] {
+        var out: [URL: Int] = [:]
+        for doc in documents {
+            guard let first = doc.pageIDs.first, first < pages.count else { continue }
+            switch pages[first].source {
+            case .file(let url), .pdfPage(let url, _): out[url.standardizedFileURL] = out[url.standardizedFileURL] ?? doc.id
+            case .none: break
+            }
+        }
+        return out
+    }
+
     func selectDocument(id: Int) {
         guard documents.contains(where: { $0.id == id }) else { return }
         defer { logDocumentState("after selectDocument(\(id))") }
@@ -640,7 +653,8 @@ final class OCRSession {
     /// one gesture rather than of what is open - the opposite of how every document app on the Mac
     /// behaves, and a way to lose a finished transcript by aiming a drag badly.
     func open(urls: [URL]) {
-        let sources = urls.filter { Self.isSupported($0) }
+        var seen = Set<URL>()
+        var sources = urls.filter { Self.isSupported($0) && seen.insert($0.standardizedFileURL).inserted }
         guard !sources.isEmpty else {
             // Do NOT tear down a document the user is reading because they dropped the wrong file
             // on it. Only an empty workspace has nothing to lose.
@@ -657,6 +671,19 @@ final class OCRSession {
 
         let adding = !pages.isEmpty
         if !adding { reset() }
+
+        // A file that is already open comes forward in its tab, as it does in Preview. Opening it
+        // again made a second tab over the same pages and queued them again (found by chaos: two
+        // "Invoice (4).pdf" tabs side by side).
+        if adding {
+            let open = openDocumentIDs()
+            if let id = sources.lazy.compactMap({ open[$0.standardizedFileURL] }).first,
+               sources.allSatisfy({ open[$0.standardizedFileURL] != nil }) {
+                selectDocument(id: id)
+                return
+            }
+            sources.removeAll { open[$0.standardizedFileURL] != nil }
+        }
 
         // Enumerate pages first so the sidebar has something to show while the model loads. A
         // 200-page PDF must not be rasterised here - only counted.
@@ -710,6 +737,7 @@ final class OCRSession {
         userPinnedDocument = adding
         selection = nil
         userPinnedSelection = false
+        logDocumentState("after open")
 
         renderThumbnails(from: firstNewPage, token: runToken)
 
@@ -946,7 +974,7 @@ final class OCRSession {
             return "\(id):\(st):\(texts.indices.contains(id) ? texts[id].count : -1)"
         }
         omniPerfLog("ocr-doc \(when) phase=\(phase) edit=\(documentEdit == nil ? "nil" : "\(documentEdit!.count)ch") "
-                    + "sections=\(ids.count) pages=[\(states.joined(separator: " "))]")
+                    + "tabs=\(documents.count) sections=\(ids.count) pages=[\(states.joined(separator: " "))]")
     }
 
     /// Transcribe one page that a stop left behind.

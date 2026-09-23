@@ -2561,11 +2561,28 @@ reader. `FolderMapSharedContentTests` fails without the fix. All other `flat16` 
     `OCRToolbar` modifier now, reading only what it shows.
   - HangWatch ran its timer in the default mode only, so an open menu read as a main-thread block
     for as long as it stayed open (112 s once, main thread idle). Common modes now.
+- Opening a file that is already open made a second tab over the same pages and queued them again
+  (two "Invoice (4).pdf" tabs in a chaos screenshot). It now selects the open tab, as Preview does,
+  and a drop naming one file twice opens it once. `-omni.ocrOpen a::b` opens a and b as two drops.
+- WATCH THE SCREEN, NOT JUST THE TRAIL. A run logged 44 typed queries, clicks and scrolls over two
+  minutes while screenshots showed the same frame: Help > Keyboard Shortcuts was in front, and
+  `app.windows.firstMatch` is the FRONT window, so every action went there or found nothing. The
+  suite now addresses the main window by title, closes other windows before each action, and fails
+  unless typed queries reach the box (43 of 43 on the run after). Two more ways it lost the app:
+  opening a result handed it to Preview, and Edit > Start Dictation raised a system dialog; both
+  are denied now. A file panel left open by a random toolbar click made every accessibility query
+  wait on the panel's remote service (413 s on one click), so only the OCR-open step opens panels.
 - NOT BUGS, checked: Escape in the toolbar search field ends the search and gives up focus (native,
   Notes and Mail do it; the app's own escape handler never runs). "prevented access of index N in
   preferredHeights" follows the system's Window > Move & Resize submenu. The Security and Hang Risk
   runtime issues are framework-side or the engine gate's known, boosted inversion. Opening Settings
   is 150-190 ms; the open panel's first show waits ~0.6 s on its out-of-process service.
+- OPEN, A RARE HANG: typing `-type:text porsche` key by key in list view over results (after two
+  sidebar toggles, seed 777) left the main thread 100% busy for 30 s+ in SwiftUI graph updates -
+  LazySubviewPlacements, RootGeometry sizeThatFits, a fresh transaction flushed on every run-loop
+  turn - until XCUITest gave up. `ReportResultFrame`'s geometry action is 6% of that sample: it runs
+  because layout does, it is not shown to cause it. `testTypingANegatedQualifierAfterSidebarToggles`
+  replays it: 1 hang in 7 runs, so a pass proves little. Not yet known whether 0.13.8 has it.
 - OPEN: AppKit's once-per-process "layoutSubtreeIfNeeded on a view which is already being laid
   out" follows a browse step in most runs; lldb on `_NSDetectedLayoutRecursion` did not catch it.
   The rest of a streaming page's cost is window layout AppKit does for the toolbar on each change.
