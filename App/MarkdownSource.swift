@@ -19,6 +19,28 @@ enum MarkdownSource {
         Cache.shared.highlighted(text)
     }
 
+    /// `text` as pieces for a view that renders them separately: ONE LINE each, so the pieces stacked
+    /// lay out exactly as the whole would (a line wraps the same on its own as inside the whole).
+    /// Lines, not paragraphs: this model writes tables as HTML with no blank line in them, so a page
+    /// that is one big table would be one paragraph. A fenced block stays one piece - the fence rule
+    /// highlights across its lines, and a fence cut up would colour differently.
+    static func lines(_ text: String) -> [String] {
+        var out: [String] = []
+        var fence: [Substring] = []
+        var inFence = false
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.hasPrefix("```") {
+                inFence.toggle()
+                fence.append(line)
+                if !inFence { out.append(fence.joined(separator: "\n")); fence = [] }
+                continue
+            }
+            if inFence { fence.append(line) } else { out.append(String(line)) }
+        }
+        if !fence.isEmpty { out.append(fence.joined(separator: "\n")) }
+        return out
+    }
+
     // MARK: - The scheme
 
     private static let punctuation = NSColor.tertiaryLabelColor

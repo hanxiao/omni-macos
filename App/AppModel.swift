@@ -1849,6 +1849,7 @@ final class AppModel {
         if let raw = UserDefaults.standard.string(forKey: "omni.viewMode"), let m = ResultViewMode(rawValue: raw) { viewMode = m }
         omniPerfLog("launch model-init done")
         Task { await bootstrap() }
+        PerfScript.runIfRequested(self)
     }
 
     /// Reclaim leftover staging temp dirs from previous sessions. Two kinds, and both are written
@@ -3603,7 +3604,10 @@ final class AppModel {
             self.phase = .ready
             omniPerfLog("launch ready")
             restartWatcher()
-            PhotoLibrary.cleanExportScratch()
+            // Off the main thread: it lists the shared temporary directory, which measured 2.7 s of
+            // main-thread block at 50k entries - the stall every launch showed right after ready.
+            // It skips this session's own export folder, so running alongside the session is safe.
+            Task.detached(priority: .utility) { PhotoLibrary.cleanExportScratch() }
             startPhotoLibraryObserver()
             // Reclaim space left by a previously-emptied or heavily-pruned index. compact()
             // self-skips unless a large fraction of the file is free, so a healthy index is
@@ -3877,7 +3881,8 @@ final class AppModel {
                 catch let e as NSError where e.domain == NSCocoaErrorDomain && e.code == 257 { denied.insert(path) }
                 catch {}
             }
-            await MainActor.run { self.deniedRoots = denied }
+            // Guarded: this runs on every stats tick, and the sidebar reads it.
+            await MainActor.run { if self.deniedRoots != denied { self.deniedRoots = denied } }
         }
     }
 

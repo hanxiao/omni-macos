@@ -606,7 +606,7 @@ struct ResultsList<Footer: View>: View {
 /// Right-clicking a row needs the pointer on it, which arms it first, and an armed row stays armed
 /// - disarming on exit could rebuild the menu while it is open. `armed` covers the ways a menu is
 /// asked for without hovering: VoiceOver, and a selected row (keyboard and other assistive routes).
-private struct LazyContextMenu<Menu: View>: ViewModifier {
+struct LazyContextMenu<Menu: View>: ViewModifier {
     let armed: Bool
     @ViewBuilder let menu: () -> Menu
     @State private var hovered = false
@@ -620,7 +620,7 @@ private struct LazyContextMenu<Menu: View>: ViewModifier {
 }
 
 extension View {
-    fileprivate func lazyContextMenu<Menu: View>(armed: Bool, @ViewBuilder _ menu: @escaping () -> Menu) -> some View {
+    func lazyContextMenu<Menu: View>(armed: Bool, @ViewBuilder _ menu: @escaping () -> Menu) -> some View {
         modifier(LazyContextMenu(armed: armed, menu: menu))
     }
 }
@@ -1057,69 +1057,45 @@ private func scoreText(_ score: Float) -> String { String(format: "%.0f%%", max(
 
 /// Frames of the realized result rows/cells, keyed by path, gathered in the scroll viewport's
 /// coordinate space. Each item publishes its own frame; the modifier reduces them into one map.
-private struct ResultItemFramesKey: PreferenceKey {
-    static let defaultValue: [String: CGRect] = [:]
-    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
-        value.merge(nextValue(), uniquingKeysWith: { $1 })
-    }
+/// Where the visible result rows are, for the marquee to hit-test against. A reference, written by
+/// the rows and read only while a band is being dragged, so recording a frame tells SwiftUI nothing.
+///
+/// IT WAS A PREFERENCE, and that could hang the app. Each row published its frame through a
+/// `GeometryReader` preference while a marquee was active, and inside a lazy stack those values never
+/// settled: the stack re-placed its rows, the frames changed, the preference changed, the stack
+/// re-placed. A chaos run caught it twice with the main thread in LazyVStack placement and
+/// `ResultItemFramesKey` in every sample until XCUITest gave up on the app; a click whose mouse-up
+/// never arrived was enough to leave the marquee active. `onGeometryChange` writes straight here.
+@MainActor final class ResultFrames {
+    var frames: [String: CGRect] = [:]
+    /// The selection a Shift/Cmd drag extends, captured as the drag starts.
+    var base: Set<String> = []
 }
 
-/// Whether a marquee drag is in flight. Read by every realized row, set by `MarqueeSelect`.
-private struct MarqueeActiveKey: EnvironmentKey { static let defaultValue = false }
+private struct ResultFramesKey: EnvironmentKey { static let defaultValue: ResultFrames? = nil }
 
 private extension EnvironmentValues {
-    var marqueeActive: Bool {
-        get { self[MarqueeActiveKey.self] }
-        set { self[MarqueeActiveKey.self] = newValue }
+    var resultFrames: ResultFrames? {
+        get { self[ResultFramesKey.self] }
+        set { self[ResultFramesKey.self] = newValue }
     }
 }
 
-/// Publish this item's frame (in the named viewport space) for marquee hit-testing, BUT ONLY WHILE
-/// A DRAG IS IN FLIGHT.
-///
-/// The frames are read in exactly one place - the drag handler's intersection test - and nowhere
-/// else, ever. Publishing them unconditionally meant every realized row re-measured and re-published
-/// on every scroll tick and every live results refresh, for a map nothing was going to read. Gating
-/// on the drag removes that work entirely from the 99.9% of the app's life when nobody is dragging.
-///
-/// The one behavioural change is a single frame of lag: the first `onChanged` sets `origin`, which
-/// is what flips this on, so that tick's intersection runs against an empty map and selects nothing
-/// beyond the modifier-held base. The marquee threshold means the pointer has already travelled
-/// before that tick arrives, and the next one is ~16 ms later.
 private struct ReportResultFrame: ViewModifier {
-    @Environment(\.marqueeActive) private var active
+    @Environment(\.resultFrames) private var frames
     let path: String
     let space: String
 
     func body(content: Content) -> some View {
-        content.background {
-            if active {
-                GeometryReader { g in
-                    Color.clear.preference(key: ResultItemFramesKey.self,
-                                           value: [path: g.frame(in: .named(space))])
-                }
+        content
+            .onGeometryChange(for: CGRect.self, of: { $0.frame(in: .named(space)) }) { [frames, path] r in
+                frames?.frames[path] = r
             }
-        }
+            // A row the lazy stack let go of is not where it last was.
+            .onDisappear { [frames, path] in frames?.frames[path] = nil }
     }
 }
 
-/// A CLICK THAT TOLERATES THE FEW POINTS A REAL POINTER DRIFTS.
-///
-/// `onTapGesture` does not. A press that moves eight points between down and up is rejected by it
-/// and the row is never selected - which is the whole of "clicking a result sometimes does
-/// nothing", reported twice and never reproducible on demand because it depends on the hand.
-/// `ResultSelectionUITests.testAClickThatDriftsAFewPointsStillSelects` pins it.
-///
-/// THE MARQUEE WAS THE FIRST SUSPECT AND IT IS INNOCENT. Its `DragGesture` used to start at six
-/// points, inside the same drift, so it looked like the obvious thief - but raising its threshold
-/// to sixteen and re-running left the eight-point click still selecting nothing. The tap was being
-/// dropped by SwiftUI before the marquee ever entered it.
-///
-/// `DragGesture(minimumDistance: 0)` sees the whole press and `onEnded` knows how far the pointer
-/// actually travelled, which is the fact `onTapGesture` neither exposes nor forgives. Below
-/// `MarqueeSelect.clickSlop` it was a click; at or above it the marquee owns the gesture and this
-/// does nothing, so the two are exactly complementary and one number decides both. Simultaneous so
-/// it composes with the double-click gesture beside it and with the marquee above it.
 private struct ResultClick: ViewModifier {
     let action: () -> Void
     func body(content: Content) -> some View {
@@ -1154,15 +1130,8 @@ private extension View {
 private struct MarqueeSelect: ViewModifier {
     @Environment(AppModel.self) private var model
     let space: String
-    // Owned here, not in ResultsList: the item frames refresh on every scroll tick, so confining them to
-    // this modifier means a scroll re-evaluates only this overlay, not the whole list/gallery body.
-    //
-    // AND NOT IN @State, which is the part that mattered. Writing the map into view state on every
-    // preference change re-rendered this overlay for every scroll tick, and the re-render let the
-    // rows republish inside the same frame - which SwiftUI reports as "Bound preference
-    // ResultItemFramesKey tried to update multiple times per frame", five times in a four-minute
-    // chaos run. The frames are only ever READ while a drag is in flight, so a reference box holds
-    // them without telling SwiftUI anything changed, and the loop has nowhere to go.
+    // The row frames live in a reference (`ResultFrames`) the rows write and only a drag reads, never
+    // in view state: see ResultFrames for the hang a preference-based version of this caused.
     /// WHERE A CLICK STOPS AND A RUBBER BAND STARTS, and it is one number so the two can never
     /// both claim a gesture or both refuse it. See `ResultClick` for the bug this is half of.
     ///
@@ -1170,19 +1139,22 @@ private struct MarqueeSelect: ViewModifier {
     /// slightly longer movement. Nothing is lost when it does: the rectangle is drawn from
     /// `startLocation`, so it already covers everything the pointer crossed on the way.
     static let clickSlop: CGFloat = 16
-    private final class FrameBox { var frames: [String: CGRect] = [:] }
-    @State private var box = FrameBox()
-    @State private var origin: CGPoint?
-    @State private var rect: CGRect?
-    @State private var base: Set<String> = []
+    @State private var box = ResultFrames()
+    /// GESTURE state, not view state: SwiftUI resets it when the drag ends AND when it is cancelled.
+    /// It was `@State` cleared in `onEnded`, which a cancelled gesture never calls.
+    @GestureState private var rect: CGRect?
+
+    private static func band(_ v: DragGesture.Value) -> CGRect {
+        let o = v.startLocation
+        return CGRect(x: min(o.x, v.location.x), y: min(o.y, v.location.y),
+                      width: abs(v.location.x - o.x), height: abs(v.location.y - o.y))
+    }
 
     func body(content: Content) -> some View {
         content
-            // Applied to the content, so it reaches the rows inside it. Flipping this is what
-            // attaches their GeometryReaders; flipping it back at drag end detaches them again.
-            .environment(\.marqueeActive, origin != nil)
+            // Applied to the content, so it reaches the rows inside it.
+            .environment(\.resultFrames, box)
             .coordinateSpace(name: space)
-            .onPreferenceChange(ResultItemFramesKey.self) { [box] in box.frames = $0 }
             .overlay(alignment: .topLeading) {
                 if let rect {
                     // The native macOS rubber-band is a NEUTRAL translucent grey, not the accent: a
@@ -1199,20 +1171,18 @@ private struct MarqueeSelect: ViewModifier {
             }
             .gesture(
                 DragGesture(minimumDistance: MarqueeSelect.clickSlop, coordinateSpace: .named(space))
-                    .onChanged { v in
-                        if origin == nil {
-                            origin = v.startLocation
+                    .updating($rect) { [box, model] v, state, _ in
+                        if state == nil {
                             let m = NSEvent.modifierFlags
-                            base = (m.contains(.shift) || m.contains(.command)) ? model.selectedPaths : []
+                            box.base = (m.contains(.shift) || m.contains(.command)) ? model.selectedPaths : []
                         }
-                        let o = origin ?? v.startLocation
-                        let r = CGRect(x: min(o.x, v.location.x), y: min(o.y, v.location.y),
-                                       width: abs(v.location.x - o.x), height: abs(v.location.y - o.y))
-                        rect = r
-                        let hit = Set(box.frames.compactMap { $0.value.intersects(r) ? $0.key : nil })
-                        model.applyMarqueeSelection(base.union(hit))
+                        state = Self.band(v)
                     }
-                    .onEnded { _ in origin = nil; rect = nil }
+                    .onChanged { [box] v in
+                        let r = Self.band(v)
+                        let hit = Set(box.frames.compactMap { $0.value.intersects(r) ? $0.key : nil })
+                        model.applyMarqueeSelection(box.base.union(hit))
+                    }
             )
     }
 }

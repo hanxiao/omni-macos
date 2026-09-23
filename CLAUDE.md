@@ -2527,3 +2527,39 @@ reader. `FolderMapSharedContentTests` fails without the fix. All other `flat16` 
   types (33-62 per run), so compare stall time over 150 ms PER ARRIVAL, and give the base clone a
   row sidecar first or the launch's scan lands inside the typing phase. A missing base index opens
   an empty one and every search returns 0 hits - `perf-tour.sh` now refuses to run without it.
+
+## Chaos over every surface (2026-09-23, Scripts/chaos-run.sh, UITests/FullChaosUITests)
+- THE TOOL: seeded chaos over the search box, qualifier chips, the sidebar, the folder browser,
+  results in both views, the OCR workspace (it opens one-page corpus files through its own panel),
+  every toolbar control and the menu bar, with files added and removed under the corpus all run.
+  `chaos-run.sh <corpus> <index> <out> [reserve]` records the CHAOS action trail, the stall log, the
+  perf log, footprint, crash reports and the app's error/fault os_log (`/usr/bin/log`: in zsh `log`
+  is a builtin and the capture silently recorded nothing), and SAMPLES THE APP whenever the trail
+  goes quiet for 20 s - a stall is only written when it ends, which a real hang never does.
+- READ IT WITH THE HARNESS IN MIND. XCUITest's accessibility queries run on the app's main thread:
+  58-68% of the busy time during a folder-listing stall, 2.8 s + 1.2 s per keystroke over 1,156 rows.
+  Anything a chaos run times has to be re-measured without it: `OMNI_PERF_SCRIPT` (App/PerfScript.
+  swift) runs `browse:/view:/sidebar/search:/clear/wait:` steps in-process and logs each step's
+  main-thread CPU. Sidebar toggle over that folder is ~190 ms there, not the 4 s the chaos run saw.
+- FIXED, found by chaos:
+  - A HANG: the results marquee published row frames through a GeometryReader preference while
+    active, and in a lazy stack those values never settled - minutes in LazyStack placement with
+    ResultItemFramesKey in every sample, until XCUITest gave up on the app. A click whose mouse-up
+    never arrived left the marquee active. Rows now write frames with `onGeometryChange` into a
+    reference (`ResultFrames`); the band is `@GestureState`, which cancellation resets.
+  - `PhotoLibrary.cleanExportScratch()` listed $TMPDIR on the main thread at every launch: 2.7 s.
+  - `refreshDeniedRoots` assigned `deniedRoots` every stats tick; the sidebar reads it.
+  - OCR source pane while streaming: one Text of the whole page's highlighted source, re-measured
+    and redrawn 24 times a second - main thread 93% busy on a 3,702-token page. One Text per line
+    while a page runs (a fence stays whole; HTML tables have no blank lines, so paragraphs were not
+    enough), one Text when it finishes: 45%. Same tok/s.
+  - HangWatch ran its timer in the default mode only, so an open menu read as a main-thread block
+    for as long as it stayed open (112 s once, main thread idle). Common modes now.
+- NOT BUGS, checked: Escape in the toolbar search field ends the search and gives up focus (native,
+  Notes and Mail do it; the app's own escape handler never runs). "prevented access of index N in
+  preferredHeights" follows the system's Window > Move & Resize submenu. The Security and Hang Risk
+  runtime issues are framework-side or the engine gate's known, boosted inversion. Opening Settings
+  is 150-190 ms; the open panel's first show waits ~0.6 s on its out-of-process service.
+- OPEN: AppKit's once-per-process "layoutSubtreeIfNeeded on a view which is already being laid
+  out" follows a browse step in most runs; lldb on `_NSDetectedLayoutRecursion` did not catch it.
+  The rest of a streaming page's cost is window layout AppKit does for the toolbar on each change.

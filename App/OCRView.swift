@@ -915,10 +915,39 @@ private struct RawSection: View {
     @Environment(OCRSession.self) private var session
 
     var body: some View {
-        Text(FindHighlight.mark(session.find, in: MarkdownSource.highlighted(session.sectionText(id))))
-            .font(.system(.body, design: .monospaced))
-            .textSelection(.enabled)
-            .frame(maxWidth: .infinity, alignment: .leading)
+        let text = session.sectionText(id)
+        Group {
+            if session.sectionState(id) == .running {
+                // WHILE A PAGE STREAMS, one Text per line, the way RenderedSection splits by block.
+                // As one Text the whole page's highlighted source was re-measured and redrawn on
+                // every update, 24 a second: measured on a 3,702-token page, the main thread was
+                // busy 93% of the decode, three quarters of it laying out and drawing that string.
+                // Split, only the line still being written changes; the others compare equal and
+                // are left alone. A running page is not something to select across, and once it
+                // finishes it is one Text again, so a drag still selects the whole section.
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(MarkdownSource.lines(text).enumerated()), id: \.offset) { _, part in
+                        RawLine(text: part, find: session.find).equatable()
+                    }
+                }
+            } else {
+                Text(FindHighlight.mark(session.find, in: MarkdownSource.highlighted(text)))
+            }
+        }
+        .font(.system(.body, design: .monospaced))
+        .textSelection(.enabled)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// One line of a streaming source section. Equatable on its inputs, so a line that is already
+/// finished is not highlighted, measured or drawn again when the one after it grows.
+private struct RawLine: View, Equatable {
+    let text: String
+    let find: String
+    var body: some View {
+        // A blank line as an empty Text has no height; a space keeps the line's.
+        Text(text.isEmpty ? AttributedString(" ") : FindHighlight.mark(find, in: MarkdownSource.highlighted(text)))
     }
 }
 

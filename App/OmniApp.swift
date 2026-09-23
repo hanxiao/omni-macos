@@ -719,7 +719,7 @@ enum HangWatch {
     private static var cpuAtLast: Double = 0
 
     /// Seconds of CPU this thread has actually consumed, user plus system.
-    private static func threadCPU() -> Double {
+    static func threadCPU() -> Double {
         var info = thread_basic_info()
         var count = mach_msg_type_number_t(MemoryLayout<thread_basic_info>.size / MemoryLayout<integer_t>.size)
         let result = withUnsafeMutablePointer(to: &info) {
@@ -749,7 +749,10 @@ enum HangWatch {
         // burying the handful of real stalls in it. The tick now follows the threshold, so the
         // floor is always below what is being asked about.
         let tick = min(0.05, max(0.005, seconds / 3))
-        Timer.scheduledTimer(withTimeInterval: tick, repeats: true) { _ in
+        // COMMON MODES: a timer in the default mode does not fire while a menu is open (menu tracking
+        // runs its own mode), so every open menu read as a main-thread block as long as it stayed open
+        // - 112 s once, with the main thread idle. In the common modes it measures real blocks only.
+        let timer = Timer(timeInterval: tick, repeats: true) { _ in
             MainActor.assumeIsolated {
                 let now = Date()
                 let gap = now.timeIntervalSince(last)
@@ -777,6 +780,7 @@ enum HangWatch {
                             UIProbe.drain()))
             }
         }
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     private static func emit(_ line: String) {
