@@ -403,12 +403,17 @@ final class FullChaosUITests: XCTestCase {
         type("python script that parses json", submit: true)
         type("dog on the beach", submit: false)
         let variant = env["OMNI_REPRO_VARIANT"] ?? ""
-        app.typeKey(variant == "grid" ? "1" : "2", modifierFlags: .command); settle(0.8)
-        if variant != "nosidebar" {
-            for _ in 0 ..< 2 { if toggle.exists { toggle.click(); settle(1.5) } }
+        let rounds = Int(env["OMNI_REPRO_ROUNDS"] ?? "") ?? 1
+        for round in 0 ..< rounds {
+            print("REPRO round \(round)")
+            if round > 0 { type(["dog on the beach", "python script that parses json", "invoice total"][round % 3], submit: round % 2 == 0) }
+            app.typeKey(variant == "grid" ? "1" : "2", modifierFlags: .command); settle(0.8)
+            if variant != "nosidebar" {
+                for _ in 0 ..< 2 { if toggle.exists { toggle.click(); settle(1.5) } }
+            }
+            type(variant == "plain" ? "porsche" : "-type:text porsche", submit: false)
+            settle(3)
         }
-        type(variant == "plain" ? "porsche" : "-type:text porsche", submit: false)
-        settle(3)
         let value = (window.searchFields.firstMatch.value as? String) ?? ""
         print("REPRO box=\(value.debugDescription)")
         XCTAssertTrue(value.contains("porsche"), "the box did not answer: \(value.debugDescription)")

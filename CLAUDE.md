@@ -2582,7 +2582,12 @@ reader. `FolderMapSharedContentTests` fails without the fix. All other `flat16` 
   LazySubviewPlacements, RootGeometry sizeThatFits, a fresh transaction flushed on every run-loop
   turn - until XCUITest gave up. `ReportResultFrame`'s geometry action is 6% of that sample: it runs
   because layout does, it is not shown to cause it. `testTypingANegatedQualifierAfterSidebarToggles`
-  replays it: 1 hang in 7 runs, so a pass proves little. Not yet known whether 0.13.8 has it.
+  replays it (`OMNI_REPRO_ROUNDS` repeats the sequence in one launch). The busy loop is SwiftUI's
+  lazy prefetch: `LazyLayoutViewCache.signalPrefetch` -> asyncTransaction -> placement -> prefetch
+  again, no row bodies re-evaluated. RULED OUT, measured: duplicate ForEach ids (every prefix of the
+  query, logged - none) and width-dependent row heights (61/63 pt at every width). Seen twice (seed
+  777's chaos run, the replay's first run), then not in ~690 chaos actions with churn, 18 replays and
+  12 looped rounds. Not yet known whether 0.13.8 has it; do not ship a fix for it without a repro.
 - OPEN: AppKit's once-per-process "layoutSubtreeIfNeeded on a view which is already being laid
   out" follows a browse step in most runs; lldb on `_NSDetectedLayoutRecursion` did not catch it.
   The rest of a streaming page's cost is window layout AppKit does for the toolbar on each change.
