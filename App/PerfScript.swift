@@ -79,11 +79,13 @@ enum PerfScript {
     /// A key at a time, as a person types: the box shows each character and a search runs at each
     /// word boundary, so results change the way they do under real typing.
     private static func type(_ text: String, _ model: AppModel) async {
+        // The box shows what is left after parsing: a finished qualifier becomes a chip and leaves the
+        // text, so each key is appended to the box and the whole typed string is parsed at each space.
         var typed = ""
         for ch in text {
             typed.append(ch)
-            model.query = typed
             if ch == " " { model.applyParsedQuery(typed); model.search() }
+            else { model.query += String(ch) }
             try? await Task.sleep(for: .milliseconds(ch == " " ? 140 : 75))
         }
         model.applyParsedQuery(typed); model.search()

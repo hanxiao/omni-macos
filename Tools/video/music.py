@@ -6,14 +6,14 @@ import wave, sys
 SR = 48000
 BPM = 116.0
 BEAT = 60.0 / BPM
-TOTAL_BEATS = 62
+TOTAL_BEATS = 78
 DUR = TOTAL_BEATS * BEAT + 2.5
 N = int(DUR * SR)
 t_all = np.arange(N) / SR
 rng = np.random.default_rng(7)
 
-DROP, OUTRO = 6, 52                  # drums from the drop to the outro
-TRANSITIONS = [6, 20, 30, 38, 52]    # scene boundaries, in beats
+DROP, OUTRO = 6, 72
+TRANSITIONS = [6, 20, 38, 44, 52, 64, 72]
 
 def midi(n): return 440.0 * 2 ** ((n - 69) / 12)
 def at(beat): return int(beat * BEAT * SR)

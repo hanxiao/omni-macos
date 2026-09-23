@@ -22,6 +22,9 @@ Text, code, PDFs, images, audio and video in one vector space, so any query find
 file. The embedding model is `jina-embeddings-v5-omni`, ported to MLX-Swift and running
 in-process on the GPU. No Python, no server, no cloud.
 
+It browses like Finder, runs on Metal, keeps up as files change, and works with the network
+cable pulled.
+
 ## Install
 
 Download the DMG from [hanxiao.io/omni](https://hanxiao.io/omni) or
