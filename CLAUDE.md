@@ -161,8 +161,9 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   the OCR settings tab (0 = Automatic, 1 = the page-at-a-time path, then 8/12/16/24/32). Measured
   IN THE APP on the same 40-page scan, final chip readings: 182 tok/s / 2:09 at one page at a time,
   245 / 1:39 at 8, 323 / 1:15 at 16, 381 / 1:03 at 32. That is 4-6% under the headless figures
-  (193 / 259 / 339 / 399 at the same widths, all with digest 772db0f94e0ae106), which is what the
-  workspace costs: every live slot decodes its whole id list per emission at 24 Hz.
+  (193 / 259 / 339 / 399 at the same widths, all with digest 772db0f94e0ae106). NOT the stream's
+  detokenizing: re-decoding every live page's whole id list at 24 Hz measured 457 tok/s against
+  459 with no stream at all (2026-09-22), and an incremental detokenizer bought nothing.
 - The chip's rate is the run's AGGREGATE - all tokens over the wall clock since the first page
   started decoding, model load excluded. It used to be the last streaming update's own rate, which
   is per-SLOT: at B = 32 that reads ~13 tok/s while the run is doing 400. Mid-run it also reads low
@@ -2402,3 +2403,34 @@ reader. `FolderMapSharedContentTests` fails without the fix. All other `flat16` 
   index> -omni.addedFolders/-omni.roots` limited to Desktop, Documents, Downloads (no private folder
   names, no history), window captured at 1600x860 with `screencapture -o -l`. WebP with alpha plus
   a JPEG fallback.
+
+## OCR memory, first page, closed tabs (2026-09-22)
+- A 200-page scan held 179 GB after the run (188 GB peak) on 0.13.8. Two causes, both measured.
+  (1) OCR mode set MLX's buffer cache to physical/3 (170 GB here), and batched decode churns it:
+  every step's attention and mask are sized by a cursor that moves. `omniSetOCRMemory` bounds it at
+  physical/16 in [1, 4] GB, and `endOCRRun` clears it. 40 pages at width 32: 379 tok/s with no
+  cache, 445 at 1 GB, 451 at 2, 462 at 4, 466 at 170; 200 pages 675 at 4 against 678 at 170.
+  (2) the continuous batch's shared KV cursor counts the steps of the whole RUN, so the buffer
+  followed the document. `OCRBatchKVCache.compact` packs each row's live history under the
+  longest row instead of growing (keys are rotated by logical position, so moving them is free).
+  200 pages: MLX peak 25.0 -> 16.5 GB, 636 -> 678 tok/s, digest 69c75ca3faff9f0d unchanged.
+  In the app, back to back: footprint 15-20 GB for the whole run and 7.6 GB after, against
+  23 -> 188 GB and 179 GB after.
+- `decodeContinuous` held every admitted page's pixels and visual features until the document
+  returned; it now keeps only ids and grid after admission. Pages are rendered when admitted
+  (`transcribeBatched(sources:)`, `PreparedPage.source`), not all before the first token; a page
+  whose source returns nil finishes as `.unreadable` and the batch carries on.
+- RAMP PACING (`OCRRuntimeFlags.rampDecodeShare`, 0.25): while the batch widens, decode that share
+  of the last admission's time before admitting the next page. The pure one-admission-per-step
+  ramp is almost all prefill, so no page finishes until every row is in. Numbers are in the flag's
+  comment; 0.25 moves the first finished page 15.3 -> 12.1 s in the app at no measurable cost, 0.5
+  costs 4-10% there. hard2 CER is identical at every share. A narrow batch (width <= 4) starts
+  full and never paces, so grade it at width 10 or the gate measures nothing.
+- Closing a tab mid-run drops its pages from the batch (`shouldDrop`, `OCRRunGate.drop`): a running
+  row is freed at the next step and a queued page is never rendered. `ocr-verify --grade-batch
+  --drop-after S` checks it headlessly: 24.2 s -> 13.1 s, the kept pages unchanged.
+- An edited tab shows pages finished after the edit (`editBaseByDocument`), after its own text.
+- Do not drive the dev app with cliclick while Han's terminal is full-screen: the dev window is
+  behind it and the clicks land in his terminal. `screencapture -l` captures a covered window, so
+  a screenshot does not show that it is covered.
+

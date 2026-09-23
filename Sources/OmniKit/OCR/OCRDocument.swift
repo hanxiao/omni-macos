@@ -76,6 +76,46 @@ public enum OCRRuntimeFlags {
     public static func resetOccupancy() {
         rowLock.lock(); rowSteps.removeAll(); rowLock.unlock()
     }
+
+    /// The largest shared-cursor position and buffer length a batch KV cache reached in this
+    /// process. What a batch holds is rows x buffer length, so this is the number that says
+    /// whether KV memory follows the PAGE or the whole DOCUMENT.
+    nonisolated(unsafe) private static var kvPeak = (cursor: 0, length: 0)
+
+    static func noteKV(cursor: Int, length: Int) {
+        rowLock.lock()
+        kvPeak = (max(kvPeak.cursor, cursor), max(kvPeak.length, length))
+        rowLock.unlock()
+    }
+
+    /// While the batch widens, decode at least this many seconds per second of the last page's
+    /// admission before admitting the next. 0 admits one page per decode step, which makes the
+    /// ramp almost all prefill: on a 32-wide batch the first pages sit at a few tokens each until
+    /// every row is in. Measured on the 40-page scan at width 32 (first page done / aggregate):
+    /// 0: 23.6 s / 459 tok/s, 0.25: 12.8 / 453, 0.5: 7.9 / 446, 1: 5.8 / 438, 2: 5.1 / 426.
+    /// In the app (first page done from the first decode / run tok/s): 0: 15.3 s / 363,
+    /// 0.25: 12.1 / 364, 0.5: 10.8 / 327-357 - the app's admissions also render the page, so the
+    /// ramp is longer and pacing costs more there. 0.25 is the point that costs nothing measurable.
+    /// hard2 at width 10 is 8/10 exact, mean CER 0.0086, at 0, 0.5 and 1 alike. The long_scan
+    /// digest moves at 0.5 (bf64913d vs b16f69c9, same length): the batch-shape tie flip.
+    /// OMNI_OCR_RAMP_SHARE or ocr-verify `--ramp-share X` to measure.
+    nonisolated(unsafe) public static var rampDecodeShare: Double =
+        ProcessInfo.processInfo.environment["OMNI_OCR_RAMP_SHARE"].flatMap { Double($0) } ?? 0.25
+
+    /// Seconds from a batch's start to its first page finishing, for ocr-verify.
+    nonisolated(unsafe) private static var firstFinish: Double?
+    static func noteFirstFinish(_ seconds: Double) {
+        rowLock.lock(); if firstFinish == nil { firstFinish = seconds }; rowLock.unlock()
+    }
+    public static func firstFinishSeconds() -> Double? {
+        rowLock.lock(); defer { rowLock.unlock() }
+        return firstFinish
+    }
+
+    public static func kvHighWater() -> (cursor: Int, length: Int) {
+        rowLock.lock(); defer { rowLock.unlock() }
+        return kvPeak
+    }
 }
 
 extension OCRModel {

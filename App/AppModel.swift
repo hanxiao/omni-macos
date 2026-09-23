@@ -3086,7 +3086,7 @@ final class AppModel {
         guard held != ocrHoldsMemory else { return }
         ocrHoldsMemory = held
         if held {
-            omniSetMemoryLimit(0)
+            omniSetOCRMemory()
         } else {
             applyMemoryLimit()
             // Off the main thread for the same reason the weights are: reclaiming the buffer cache
@@ -3120,6 +3120,8 @@ final class AppModel {
         ocrRuns = max(0, ocrRuns - 1)
         guard ocrRuns == 0 else { return }
         ocrRunActive = false
+        // The cache limit bounds a run; this returns what it left behind once none is decoding.
+        DispatchQueue.global(qos: .utility).async { omniClearGPUCache() }
         if indexingPausedForOCR {
             indexingPausedForOCR = false
             startIndexing()

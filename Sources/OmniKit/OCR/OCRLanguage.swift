@@ -209,6 +209,7 @@ final class OCRBatchKVCache {
         // and the row's own history are guaranteed to line up.
         for b in 0 ..< n where startedAt[b] < 0 { startedAt[b] = cursor }
         cursor += 1
+        OCRRuntimeFlags.noteKV(cursor: cursor, length: keys!.dim(2))
         if OCRRuntime.evalCacheWrites { eval(keys!, values!) }
     }
 
@@ -238,6 +239,14 @@ final class OCRBatchKVCache {
     private func grow(to need: Int, like k: MLXArray) {
         let current = keys?.dim(2) ?? 0
         guard keys == nil || need > current else { return }
+        // COMPACT BEFORE GROWING. Every row writes at the one shared cursor, and the cursor only
+        // moves forward, so under continuous batching it counts the steps of the WHOLE RUN, not of
+        // any page: on a 200-page scan at width 32 the buffer followed the document and reached
+        // several thousand positions of which each row could see at most one page's worth. The
+        // rest is dead span - masked, never read for the answer, and still allocated and still
+        // walked by every attention step. Packing each row's live history down to the shortest
+        // common cursor keeps the buffer the length of the longest PAGE in flight.
+        if keys != nil, compact(need: need, capacity: current) { return }
         let h = k.dim(1), d = k.dim(3)
         // Geometric, for the reason the single cache is: each growth copies the whole buffer.
         let target = max(need, max(current * 2, Self.step))
@@ -251,6 +260,49 @@ final class OCRBatchKVCache {
             keys = newK
             values = newV
         }
+    }
+
+    /// Rewrite the buffer so every row's history is contiguous at its two ends: the prompt at
+    /// `[0, promptLen)` as before, and the generated tokens ending at the new cursor. The new cursor
+    /// is the longest row's logical length, which is the shortest one every row still fits under.
+    /// Returns false, changing nothing, when that would free less than a quarter of the buffer - a
+    /// batch whose rows really are that long needs the room and is grown instead. A compaction is
+    /// one gather over the buffer, so a quarter means one every few hundred steps at most.
+    ///
+    /// Keys are stored already rotated by their LOGICAL position (`rowPos`), not their buffer
+    /// index, so moving a token within the buffer changes nothing it means; the only index-keyed
+    /// state is `startedAt`, which moves with it, and the dead span `mask()` hides in between.
+    private func compact(need: Int, capacity: Int) -> Bool {
+        guard let k = keys, let v = values else { return false }
+        let rows = batchCount
+        let outputs = (0 ..< rows).map { b -> Int in
+            b < active && startedAt[b] >= 0 ? cursor - startedAt[b] : 0
+        }
+        let live = (0 ..< rows).map { b in b < active ? promptLen[b] + outputs[b] : 0 }
+        let packed = live.max() ?? 0
+        // `need - cursor` more positions are about to be written after the packed cursor.
+        guard packed + (need - cursor) <= capacity * 3 / 4 else { return false }
+        var index = [Int32](repeating: 0, count: rows * packed)
+        for b in 0 ..< rows where b < active {
+            for j in 0 ..< promptLen[b] { index[b * packed + j] = Int32(j) }
+            let out = outputs[b]
+            for j in 0 ..< out { index[b * packed + packed - out + j] = Int32(startedAt[b] + j) }
+        }
+        let idx = MLXArray(index, [rows, 1, packed, 1])
+        let shape = [rows, k.dim(1), packed, k.dim(3)]
+        let tail = capacity - packed
+        let pk = takeAlong(k, broadcast(idx, to: shape), axis: 2)
+        let pv = takeAlong(v, broadcast(idx, to: [rows, v.dim(1), packed, v.dim(3)]), axis: 2)
+        keys = concatenated([pk, MLXArray.zeros([rows, k.dim(1), tail, k.dim(3)], dtype: k.dtype)],
+                            axis: 2)
+        values = concatenated([pv, MLXArray.zeros([rows, v.dim(1), tail, v.dim(3)], dtype: v.dtype)],
+                              axis: 2)
+        eval(keys!, values!)
+        for b in 0 ..< rows where b < active && startedAt[b] >= 0 {
+            startedAt[b] = packed - outputs[b]
+        }
+        cursor = packed
+        return true
     }
 
     var view: (keys: MLXArray, values: MLXArray)? {

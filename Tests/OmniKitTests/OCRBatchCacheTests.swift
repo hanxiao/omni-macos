@@ -79,4 +79,70 @@ final class OCRBatchCacheTests: XCTestCase {
         XCTAssertFalse(cache.canAdmit(promptTokens: 500),
                        "a prompt past the cursor would overwrite itself on the next step")
     }
+
+    // MARK: - compaction
+
+    /// Each row's step token carries its own value, so what a row can see identifies itself.
+    private func stamped(_ cache: OCRBatchKVCache, rows: Int, _ n: inout Int) {
+        n += 1
+        let k = MLXArray((0 ..< rows).map { Float(10_000 * ($0 + 1) + n) }, [rows, 1, 1, 1])
+            * MLX.ones([rows, heads, 1, dim], dtype: .float32)
+        cache.appendStep(k, k)
+    }
+
+    /// The keys a row attends, in buffer order: its columns below the cursor that the mask
+    /// leaves open.
+    private func visible(_ cache: OCRBatchKVCache, row: Int) -> [Float] {
+        guard let view = cache.view else { return [] }
+        let t = cache.cursor
+        let keys = view.keys[row, 0, 0 ..< t, 0].asArray(Float.self)
+        let mask = cache.mask()?.asArray(Float.self)
+        return (0 ..< t).compactMap { j in
+            mask.map { $0[row * t + j] == 0 } ?? true ? keys[j] : nil
+        }
+    }
+
+    /// Under continuous batching the shared cursor counts the steps of the whole RUN, so without
+    /// compaction the buffer follows the document: a 200-page scan at width 32 reached thousands
+    /// of positions, each row able to see at most one page's worth of them. Compaction must hand
+    /// every row exactly the history it had.
+    func testCompactionKeepsEveryRowsHistory() {
+        let cache = OCRBatchKVCache(batch: 2)
+        var n = 0
+        cache.seed(slot: 0, keys: block(10), values: block(10))
+        cache.seed(slot: 1, keys: block(10), values: block(10))
+        for _ in 0 ..< 150 { stamped(cache, rows: 2, &n) }
+        // Both rows are recycled: new, shorter pages, admitted at different points.
+        cache.seed(slot: 1, keys: block(5) + 1, values: block(5) + 1)
+        for _ in 0 ..< 40 { stamped(cache, rows: 2, &n) }
+        cache.seed(slot: 0, keys: block(8) + 2, values: block(8) + 2)
+        while cache.cursor < (cache.keys?.dim(2) ?? 0) { stamped(cache, rows: 2, &n) }
+
+        let length = cache.keys!.dim(2)
+        let before = [visible(cache, row: 0), visible(cache, row: 1)]
+        let lengths = cache.lengths
+        let cursor = cache.cursor
+        stamped(cache, rows: 2, &n)                      // the write that has to make room
+
+        XCTAssertEqual(cache.keys!.dim(2), length, "room came from packing, not from growing")
+        XCTAssertLessThan(cache.cursor, cursor, "the cursor came down to the longest live row")
+        XCTAssertEqual(cache.lengths, lengths.map { $0 + 1 })
+        for row in 0 ..< 2 {
+            XCTAssertEqual(visible(cache, row: row),
+                           before[row] + [Float(10_000 * (row + 1) + n)],
+                           "row \(row) sees what it saw before, plus its new token")
+        }
+    }
+
+    func testRowsLongerThanTheRoomAreGrownNotPacked() {
+        let cache = OCRBatchKVCache(batch: 1)
+        var n = 0
+        cache.seed(slot: 0, keys: block(10), values: block(10))
+        while cache.cursor < (cache.keys?.dim(2) ?? 0) { stamped(cache, rows: 1, &n) }
+        let length = cache.keys!.dim(2)
+        let before = visible(cache, row: 0)
+        stamped(cache, rows: 1, &n)
+        XCTAssertGreaterThan(cache.keys!.dim(2), length, "a row that fills the buffer needs it grown")
+        XCTAssertEqual(visible(cache, row: 0), before + [Float(10_000 + n)])
+    }
 }

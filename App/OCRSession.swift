@@ -187,8 +187,27 @@ final class OCRSession {
     /// frame.
     private var editSectionsByDocument: [Int: [String]] = [:]
 
+    /// The pages each edit already contains: every page that was done when it was last written.
+    /// A page that finishes AFTER the edit (a stopped page clicked back into the queue) is not in
+    /// it, and used to be invisible - in the panes, in Copy and in Save - because the edit was the
+    /// whole document. Such pages follow the edit instead, in page order.
+    private var editBaseByDocument: [Int: Set<Int>] = [:]
+
     var documentEdit: String? { visibleDocument.flatMap { documentEdits[$0.id] } }
     private var editSections: [String] { visibleDocument.flatMap { editSectionsByDocument[$0.id] } ?? [] }
+
+    /// Pages of the visible tab that are not in its edit, in the form `sectionIDs` lists pages.
+    private var pagesAfterEdit: [Int] {
+        guard let doc = visibleDocument, let base = editBaseByDocument[doc.id] else { return [] }
+        return doc.pageIDs.filter { id in
+            guard !base.contains(id), pages.indices.contains(id) else { return false }
+            switch pages[id].state {
+            case .done: return true
+            case .running: return !texts[id].isEmpty
+            case .failed, .pending, .stopped: return false
+            }
+        }
+    }
 
     /// The current page: what the navigator highlights and what the panes scroll to. It follows
     /// the page being decoded until the user picks one, then stays put - a document that scrolls
@@ -341,7 +360,11 @@ final class OCRSession {
     /// Pending pages contribute nothing; rendering them would stack empty sections and their rules
     /// at the end of the document.
     var sectionIDs: [Int] {
-        if documentEdit != nil { return Array(editSections.indices) }
+        // Edited: its own sections, then any page finished since, as `editSections.count + page`
+        // so the two ranges cannot collide.
+        if documentEdit != nil {
+            return Array(editSections.indices) + pagesAfterEdit.map { editSections.count + $0 }
+        }
         // A page that is decoding but has produced nothing yet is NOT a section. With one page in
         // flight that was a single empty gap; with a group of eight it is eight page rules and no
         // text, which reads as a broken document rather than a starting one.
@@ -407,7 +430,13 @@ final class OCRSession {
         // Only the tab's presence is removed. Its pages keep their ids so nothing that captured an
         // index - a running decode, a thumbnail render - can write into the wrong page.
         documents.remove(at: index)
-        for id in removed where pages.indices.contains(id) { pages[id].state = .failed }
+        // The run is told as well as the page states: a closed tab's pages kept decoding in the
+        // batch, and the tabs still open waited behind work nobody could see.
+        gate.drop(removed)
+        for id in removed where pages.indices.contains(id) {
+            liveTokens[id] = nil
+            pages[id].state = .failed
+        }
         if selectedDocumentID == id {
             selectedDocumentID = documents[min(index, documents.count - 1)].id
         }
@@ -427,16 +456,22 @@ final class OCRSession {
 
     func sectionText(_ id: Int) -> String {
         if documentEdit != nil {
-            return editSections.indices.contains(id) ? editSections[id] : ""
+            return editSections.indices.contains(id) ? editSections[id]
+                : pageText(at: id - editSections.count)
         }
         return pageText(at: id)
     }
 
-    /// A section's state, for the caret and the failure note. An edited document has no page
-    /// running, so its sections are simply settled text.
+    /// A section's state, for the caret and the failure note. The edit's own sections are settled
+    /// text; a page that follows it is whatever that page is.
     func sectionState(_ id: Int) -> PageState {
-        guard documentEdit == nil, pages.indices.contains(id) else { return .done }
-        return pages[id].state
+        var page = id
+        if documentEdit != nil {
+            guard !editSections.indices.contains(id) else { return .done }
+            page = id - editSections.count
+        }
+        guard pages.indices.contains(page) else { return .done }
+        return pages[page].state
     }
 
     /// Markdown for the whole document, pages separated by a rule. `---` is the source form of the
@@ -465,7 +500,13 @@ final class OCRSession {
                                                          to: rule.upperBound)
                 cursor = rule.upperBound
             }
-            return (documentEdit, offsets)
+            var text = documentEdit
+            for id in pagesAfterEdit where pages[id].state == .done {
+                text += separator
+                offsets[editSections.count + id] = text.count
+                text += texts[id]
+            }
+            return (text, offsets)
         }
         var text = ""
         var offsets: [Int: Int] = [:]
@@ -478,7 +519,11 @@ final class OCRSession {
     }
 
     func setDocumentEdit(_ text: String) {
-        guard let id = visibleDocument?.id else { return }
+        guard let doc = visibleDocument else { return }
+        let id = doc.id
+        // The editor is only editable once nothing is decoding, and it shows every done page, so
+        // what was just written contains all of them.
+        editBaseByDocument[id] = Set(doc.pageIDs.filter { pages.indices.contains($0) && pages[$0].state == .done })
         documentEdits[id] = text
         editSectionsByDocument[id] = text.components(separatedBy: "\n---\n")
             .map { $0.trimmingCharacters(in: .newlines) }
@@ -827,6 +872,7 @@ final class OCRSession {
         resetRate()
         documentEdits = [:]
         editSectionsByDocument = [:]
+        editBaseByDocument = [:]
         previewCache = [:]
         pageImages = [:]
         pageImageOrder = []
@@ -1014,6 +1060,7 @@ final class OCRSession {
         texts = []
         documentEdits = [:]
         editSectionsByDocument = [:]
+        editBaseByDocument = [:]
         documentName = ""
         selection = nil
         userPinnedSelection = false
@@ -1313,12 +1360,13 @@ final class OCRSession {
                             },
                             shouldContinue: {
                                 GPUInteractive.yieldWhileBusy()
-                                return !gate.isStopped
+                                return !gate.isStopped && !gate.isDropped(index)
                             })
                     }.value
 
                     guard self.runToken == token, self.texts.indices.contains(index) else { return }
                     self.liveTokens[index] = nil
+                    if gate.isDropped(index) { continue }
                     if let result, !result.text.isEmpty {
                         self.texts[index] = result.text
                         self.pages[index].truncatedByStop = result.stoppedBy == .cancelled
@@ -1387,51 +1435,43 @@ final class OCRSession {
 
         let jobs = group.map { self.jobs[$0] }
         let started = Date()
-        // (results, the group indices that actually loaded, the ones that did not, whether the
-        // decode threw). Positions in `results` and in every callback's `slot` are positions in
-        // `live`, NOT in `group`: a page that fails to load is left out rather than failing the
-        // group, which used to return nothing and leave every page PENDING - in continuous mode
-        // the run loop then picked the same group up again, forever, re-rasterising each time.
-        let outcome: (results: [OCRModel.Result], live: [Int], unreadable: [Int], threw: Bool) =
+        // Positions in `results` and in every callback's `slot` are positions in `group`. A page is
+        // rendered when the batch admits it, not before: rendering the whole queue up front was
+        // 4.5 s before the first token on a 200-page scan, with ~1.2 GB of pixels held for the run.
+        // A page that cannot be rendered finishes as `.unreadable` and the rest carry on - it used
+        // to fail the group, leaving every page PENDING for the run loop to pick up again forever.
+        let live = group
+        let inbox = StreamInbox()
+        let sources: [@Sendable () -> OCRImage?] = jobs.map { job in
+            { Self.load(job, documents: documents) }
+        }
+        let outcome: (results: [OCRModel.Result], threw: Bool) =
             await Task.detached(priority: .userInitiated) {
-            // The whole group is rasterised before a single token is decoded - a PDF page render
-            // at 2384 px plus the Pillow-exact resample, per page - so on a wide group this is
-            // seconds of work with no stop check in it. Bail between pages: a stop pressed here
-            // used to wait for every page of the group to be rasterised AND the ramp prefilled.
-            let tRaster = omniPerfEnabled ? Date() : nil
-            var images: [OCRImage] = []
-            var live: [Int] = []
-            var unreadable: [Int] = []
-            images.reserveCapacity(jobs.count)
-            for (k, job) in jobs.enumerated() {
-                if gate.isStopped { return ([], [], [], false) }
-                guard let image = Self.load(job, documents: documents) else { unreadable.append(group[k]); continue }
-                images.append(image)
-                live.append(group[k])
-            }
-            if let tRaster {
-                omniPerfLog(String(format: "ocr-group-rasterise %.0fms pages=%d",
-                                   -tRaster.timeIntervalSinceNow * 1000, images.count))
-            }
-            guard !images.isEmpty else { return ([], [], unreadable, false) }
             let decoded = try? loaded.transcribeBatched(
-                images: images,
+                sources: sources,
                 prompt: settings.prompt,
                 width: width,
                 loopGuard: settings.loopGuard,
+                // ONE main-actor turn per emission tick, not one per page: every live row emits on
+                // the same tick, and 32 separate hops each mutating `texts` invalidated the panes 32
+                // times where once carries the same text.
                 onStream: { slot, update in
+                    guard inbox.put(slot, update) else { return }
                     Task { @MainActor [weak self] in
-                        guard let self, self.runToken == token,
-                              slot < live.count else { return }
-                        let index = live[slot]
-                        guard self.texts.indices.contains(index) else { return }
+                        let updates = inbox.take()
+                        guard let self, self.runToken == token else { return }
+                        for (slot, update) in updates where slot < live.count {
+                            let index = live[slot]
+                            guard self.texts.indices.contains(index),
+                                  self.pages[index].state == .running else { continue }
+                            self.texts[index] = update.text
+                            // NOT `pages[index].tokens`: it is only read once a page is `.done`,
+                            // and `settle` sets it from the final result. Writing it per update
+                            // mutated the whole `pages` array 24 times a second, which invalidates
+                            // every row of the rail - `PageThumb.body` was all over the profile.
+                            self.liveTokens[index] = update.tokens
+                        }
                         if self.firstTokenPending { self.firstTokenPending = false; omniPerfLog("ocr-first-token") }
-                        self.texts[index] = update.text
-                        // NOT `pages[index].tokens`: it is only read once a page is `.done`, and
-                        // `settle` sets it from the final result. Writing it per update mutated
-                        // the whole `pages` array 24 times a second, which invalidates every row
-                        // of the rail - `PageThumb.body` was all over the main-thread profile.
-                        self.liveTokens[index] = update.tokens
                         self.prefillTarget = 0
                         self.noteRate()
                         self.streamTick &+= 1
@@ -1451,8 +1491,12 @@ final class OCRSession {
                     Task { @MainActor [weak self] in
                         guard let self, self.runToken == token, slot < live.count else { return }
                         let index = live[slot]
-                        guard self.pages.indices.contains(index),
-                              self.pages[index].state == .running,
+                        guard self.pages.indices.contains(index) else { return }
+                        if result.stoppedBy == .unreadable {
+                            self.fail(index)
+                            return
+                        }
+                        guard self.pages[index].state == .running,
                               !result.text.isEmpty else { return }
                         self.settle(index, with: result)
                     }
@@ -1477,30 +1521,24 @@ final class OCRSession {
                 // and a query landing behind one waits it out. Holding admission while interactive
                 // work is in flight is what keeps a search from queueing behind a prefill.
                 shouldAdmit: { !gate.isPaused && !GPUInteractive.isBusy },
+                shouldDrop: { slot in slot < live.count && gate.isDropped(live[slot]) },
                 // Polled once per decode step, so this is the finest granularity the loop has.
                 shouldContinue: {
                     GPUInteractive.yieldWhileBusy()
                     return !gate.isStopped
                 })
-            return (decoded ?? [], live, unreadable, decoded == nil)
+            return (decoded ?? [], decoded == nil)
         }.value
         let results = outcome.results
-        let live = outcome.live
 
         guard runToken == token else { return }
-        for index in outcome.unreadable where pages.indices.contains(index) {
-            liveTokens[index] = nil
-            pages[index].state = .failed
+        for (slot, index) in live.enumerated()
+        where slot < results.count && results[slot].stoppedBy == .unreadable {
+            fail(index)
         }
         // A decode that threw produced nothing for the pages it never admitted; they are failures
         // too, or the loop would hand them straight back to it.
-        if outcome.threw {
-            for index in live where pages.indices.contains(index)
-                && (pages[index].state == .pending || pages[index].state == .running) {
-                liveTokens[index] = nil
-                pages[index].state = .failed
-            }
-        }
+        if outcome.threw { for index in live { fail(index) } }
         let seconds = Date().timeIntervalSince(started) / Double(max(group.count, 1))
         for (slot, index) in live.enumerated() {
             guard texts.indices.contains(index) else { continue }
@@ -1526,6 +1564,14 @@ final class OCRSession {
         isGroupRunning = false
     }
 
+    /// A page that could not be read, or whose decode failed. Never handed back to the run loop.
+    private func fail(_ index: Int) {
+        guard pages.indices.contains(index),
+              pages[index].state == .pending || pages[index].state == .running else { return }
+        liveTokens[index] = nil
+        pages[index].state = .failed
+    }
+
     /// Record a finished page: its text, its counters, and the rate they feed.
     private func settle(_ index: Int, with result: OCRModel.Result) {
         texts[index] = result.text
@@ -1535,6 +1581,9 @@ final class OCRSession {
         pages[index].state = .done
         lastDoneIndex = index
         completedPages += 1
+        if completedPages == 1, let decodeStart {
+            omniPerfLog(String(format: "ocr-first-page-done %.1fs", Date().timeIntervalSince(decodeStart)))
+        }
         settledTokens += result.tokens.count
         liveTokens[index] = nil
         // Following moves on with the run. In continuous decoding `runningIndex` was the group's
@@ -1847,6 +1896,32 @@ private final class OCRRunGate: @unchecked Sendable {
     func stop() { lock.withLock { stopped = true; paused = false } }
     func pause() { lock.withLock { paused = true } }
     func resume() { lock.withLock { paused = false } }
+    /// Pages of a closed tab. The batch drops their rows and never admits them.
+    private var dropped = Set<Int>()
+    func drop(_ pages: Set<Int>) { lock.withLock { dropped.formUnion(pages) } }
+    func isDropped(_ page: Int) -> Bool { lock.withLock { dropped.contains(page) } }
+}
+
+/// Stream updates from the decode thread, held until the main actor takes them all at once. The
+/// latest update per page wins; `put` returns true when the caller should schedule the take.
+private final class StreamInbox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending: [Int: OCRModel.StreamUpdate] = [:]
+    private var scheduled = false
+    func put(_ slot: Int, _ update: OCRModel.StreamUpdate) -> Bool {
+        lock.withLock {
+            pending[slot] = update
+            if scheduled { return false }
+            scheduled = true
+            return true
+        }
+    }
+    func take() -> [Int: OCRModel.StreamUpdate] {
+        lock.withLock {
+            defer { pending = [:]; scheduled = false }
+            return pending
+        }
+    }
 }
 
 /// One `PDFDocument` per file for the lifetime of a lane. Confined to a single serial consumer;

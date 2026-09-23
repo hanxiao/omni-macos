@@ -172,6 +172,24 @@ public func omniSetMemoryLimit(_ bytes: Int) {
     }
 }
 
+/// OCR's memory settings: no compute cap (see CLAUDE.md, a cap halves decode throughput) and a
+/// SMALL buffer cache. The Unlimited branch above keeps a third of physical memory as cache, and a
+/// batched OCR run fills whatever it is given: every decode step's attention and mask are sized by
+/// a cursor that moves each step, so freed buffers rarely fit the next request and pile up. On this
+/// 512 GB Mac a 200-page run held 145-180 GB of cache and kept it after the run. Measured on the
+/// 40-page scan at width 32, same digest at every limit: 379 tok/s with no cache, 445 at 1 GB, 451
+/// at 2, 462 at 4, 466 at 170. A sixteenth of RAM, between 1 and 4 GB.
+public func omniSetOCRMemory() {
+    let physical = Int(ProcessInfo.processInfo.physicalMemory)
+    OmniMemoryBudget.capBytes = physical
+    MLX.Memory.memoryLimit = physical
+    MLX.Memory.cacheLimit = min(max(physical / 16, 1 << 30), 4 << 30)
+}
+
+/// Return MLX's buffer cache to the system. Used when an OCR run ends: the cache limit bounds
+/// what is kept DURING a run; this is what makes the footprint fall once nothing is decoding.
+public func omniClearGPUCache() { MLX.Memory.clearCache() }
+
 /// The cap currently in force, in bytes. Read by the paper suite to stamp `pin.memory_cap_gb`, and
 /// by the headless runner to restore the cap it pinned. The APP restores through applyMemoryLimit()
 /// instead: this getter cannot distinguish "Unlimited" from "capped at exactly physical RAM", and

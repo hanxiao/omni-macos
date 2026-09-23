@@ -161,6 +161,7 @@ extension OCRModel {
                      onFinish: (@Sendable (Int, Result) -> Void)? = nil,
                      onAdmit: (@Sendable (Int) -> Void)? = nil,
                      shouldAdmit: (@Sendable () -> Bool)? = nil,
+                     shouldDrop: (@Sendable (Int) -> Bool)? = nil,
                      shouldContinue: (@Sendable () -> Bool)? = nil) throws -> [Result] {
         if OCRRuntimeFlags.continuousBatch, width > 1 {
             return try decodeContinuous(prepared, width: width, maxNewTokens: requested,
@@ -168,7 +169,7 @@ extension OCRModel {
                                         loopGrace: loopGrace, onStream: onStream,
                                         onPrefill: onPrefill,
                                         onFinish: onFinish, onAdmit: onAdmit,
-                                        shouldAdmit: shouldAdmit,
+                                        shouldAdmit: shouldAdmit, shouldDrop: shouldDrop,
                                         shouldContinue: shouldContinue)
         }
         var out = [Result?](repeating: nil, count: prepared.count)
@@ -215,6 +216,7 @@ extension OCRModel {
                                   onFinish: (@Sendable (Int, Result) -> Void)? = nil,
                                   onAdmit: (@Sendable (Int) -> Void)? = nil,
                                   shouldAdmit: (@Sendable () -> Bool)? = nil,
+                                  shouldDrop: (@Sendable (Int) -> Bool)? = nil,
                                   shouldContinue: (@Sendable () -> Bool)? = nil) throws -> [Result] {
         let n = pages.count
         let w = min(width, n)
@@ -236,18 +238,43 @@ extension OCRModel {
         // static path does before a group; continuous batching only changes WHEN it happens.
         var pages = pages
 
-        /// Run the vision tower for a page that arrived as pixels, and report its prompt length.
-        /// It has to happen BEFORE `canAdmit` can be asked anything: a pending page has no
-        /// `prep` at all, and reaching for one traps.
-        func ensurePrepared(_ p: Int) throws -> Int {
+        /// Render (if the page is only a source) and run the vision tower for a page, and report
+        /// its prompt length; nil when the source could not be read. It has to happen BEFORE
+        /// `canAdmit` can be asked anything: a pending page has no `prep` at all, and reaching
+        /// for one traps.
+        func ensurePrepared(_ p: Int) throws -> Int? {
+            if pages[p].prep == nil, pages[p].pending == nil, let source = pages[p].source {
+                guard let image = source() else { return nil }
+                pages[p].pending = image
+                pages[p].source = nil
+            }
             if let pixels = pages[p].pending {
                 pages[p] = try preparePage(image: pixels, prompt: pages[p].pendingPrompt)
             }
             return pages[p].prep.ids.count
         }
 
+        /// The prompt length of the next page that can be read. A page that cannot is reported
+        /// and passed over here, so one damaged page neither stops the batch nor comes back.
+        func nextReadable() throws -> Int? {
+            while nextPage < n {
+                // A page its caller no longer wants (a closed tab) is never rendered or prefilled.
+                if shouldDrop?(nextPage) == true {
+                    stopped[nextPage] = .cancelled
+                    nextPage += 1
+                    continue
+                }
+                if let t = try ensurePrepared(nextPage) { return t }
+                stopped[nextPage] = .unreadable
+                onFinish?(nextPage, Result(text: "", tokens: [], promptTokens: 0, ttft: 0,
+                                           decodeTokensPerSecond: 0, stoppedBy: .unreadable,
+                                           tiles: (w: 0, h: 0)))
+                nextPage += 1
+            }
+            return nil
+        }
+
         func admit(row: Int, page p: Int) throws {
-            _ = try ensurePrepared(p)
             let page = pages[p]
             let count = page.prep.ids.count
             promptLengths[p] = count
@@ -262,6 +289,11 @@ extension OCRModel {
             }
             rowPage[row] = p
             rowPos[row] = count
+            // Only the ids and the grid are read from here on. The pixels (tens of MB a page) and
+            // the visual features were held for every admitted page until the whole document
+            // returned, which on a long scan is gigabytes for nothing.
+            pages[p].prep = Prepared(global: nil, tiles: nil, grid: page.prep.grid, ids: page.prep.ids)
+            pages[p].visual = nil
             onAdmit?(p)
         }
 
@@ -292,6 +324,7 @@ extension OCRModel {
                 for r in 0 ..< rowPage.count where rowPage[r] >= 0 { stopped[rowPage[r]] = .cancelled }
                 break
             }
+            guard try nextReadable() != nil else { break }
             rowPage.append(-1)
             rowPos.append(0)
             try admit(row: row, page: nextPage)
@@ -313,6 +346,10 @@ extension OCRModel {
         let tDecode = Date()
         var lastEmit = Date.distantPast
         var finishedAt = [Double](repeating: 0, count: n)
+        // Ramp pacing: seconds the last widening admission took, and decode seconds since it.
+        var admitCost = 0.0
+        var decodedSince = 0.0
+        var firstFinish = true
 
         while batchCaches[0].batch > 0 {
             if let shouldContinue, !shouldContinue() {
@@ -329,18 +366,24 @@ extension OCRModel {
             // the run renumbers the rows, and `filled` then indexed past the end. The buffer
             // cannot grow past what was allocated either, so admission is capped by it.
             if rowPage.count < w, rowPage.count < batchCaches[0].batch,
-               nextPage < n, shouldAdmit?() ?? true {
-                let t = try ensurePrepared(nextPage)
-                if batchCaches[0].canAdmit(promptTokens: t) {
-                    rowPage.append(-1)
-                    rowPos.append(0)
-                    try admit(row: rowPage.count - 1, page: nextPage)
-                    nextPage += 1
-                    noteAdmitted()
-                }
+               decodedSince >= OCRRuntimeFlags.rampDecodeShare * admitCost,
+               shouldAdmit?() ?? true, let t = try nextReadable(),
+               batchCaches[0].canAdmit(promptTokens: t) {
+                let tAdmit = Date()
+                rowPage.append(-1)
+                rowPos.append(0)
+                try admit(row: rowPage.count - 1, page: nextPage)
+                nextPage += 1
+                noteAdmitted()
+                admitCost = Date().timeIntervalSince(tAdmit)
+                decodedSince = 0
             }
+            // Every page so far was unreadable, or a stop landed before the first admission.
+            if rowPage.isEmpty { break }
 
             let rows = 0 ..< rowPage.count
+            let tStep = Date()
+            defer { decodedSince += Date().timeIntervalSince(tStep) }
             OCRRuntimeFlags.noteDecodeStep(rows: rowPage.count)
             let ids = rows.map { tokens[rowPage[$0]].last! }
             let x = llm.embed(ids)
@@ -357,6 +400,12 @@ extension OCRModel {
                 let id = Int(ids32[row])
                 tokens[p].append(id)
                 rowPos[row] += 1
+                // Dropped by the caller: the row is freed for the next page like a finished one.
+                if let shouldDrop, shouldDrop(p) {
+                    stopped[p] = .cancelled
+                    done.append(row)
+                    continue
+                }
                 if id == eosID {
                     stopped[p] = .eos
                     done.append(row)
@@ -397,6 +446,10 @@ extension OCRModel {
             guard !done.isEmpty else { continue }
 
             let now = Date()
+            if firstFinish, done.contains(where: { stopped[rowPage[$0]] != .cancelled }) {
+                firstFinish = false
+                OCRRuntimeFlags.noteFirstFinish(now.timeIntervalSince(t0))
+            }
             for row in done {
                 let p = rowPage[row]
                 finishedAt[p] = now.timeIntervalSince(tDecode)
@@ -420,8 +473,8 @@ extension OCRModel {
                 // (it needs a longer prompt than anything decoded so far) and the row is simply
                 // dropped, leaving the page for the next group.
                 var took = false
-                if nextPage < n, shouldAdmit?() ?? true,
-                   batchCaches[0].canAdmit(promptTokens: try ensurePrepared(nextPage)) {
+                if shouldAdmit?() ?? true, let t = try nextReadable(),
+                   batchCaches[0].canAdmit(promptTokens: t) {
                     try admit(row: row, page: nextPage)
                     nextPage += 1
                     took = true
@@ -712,7 +765,14 @@ extension OCRModel {
         for (gi, g) in groups.enumerated() {
             let waitStart = Date()
             var prepared: [PreparedPage]
-            if let ahead { prepared = await_(ahead) } else { prepared = try prepareHere(g) }
+            if let ahead {
+                prepared = await_(ahead)
+            } else if OCRRuntimeFlags.continuousBatch, width > 1 {
+                // Rendered as each page is admitted, the way the app runs it.
+                prepared = g.map { i in PreparedPage(source: { renderer.render(i) }, prompt: prompt) }
+            } else {
+                prepared = try prepareHere(g)
+            }
             // Host-ahead hands back pixels; the tower still has to run, here, on the main stream.
             for i in prepared.indices where prepared[i].pending != nil {
                 prepared[i] = try preparePage(image: prepared[i].pending!, prompt: prompt)
@@ -781,4 +841,69 @@ extension OCRModel {
                                onFinish: onFinish, onAdmit: onAdmit,
                                shouldAdmit: shouldAdmit, shouldContinue: shouldContinue)
     }
+
+    /// Transcribe pages that are rendered only when they are admitted. `sources[i]` returns the
+    /// page's pixels, or nil when it cannot be read; such a page finishes as `.unreadable` through
+    /// `onFinish` and in the results, and the rest carry on. Every index in the callbacks and the
+    /// results is an index into `sources`.
+    ///
+    /// Why not render first: the continuous batch reads one page at a time anyway, and rendering
+    /// a 200-page scan up front was 4.5 s before the first token plus ~1.2 GB of pixels held for
+    /// the whole run. The static path still wants every page before it starts, so it renders here.
+    public func transcribeBatched(sources: [@Sendable () -> OCRImage?], prompt: String? = nil,
+                                  maxNewTokens: Int = 0, width: Int? = nil, loopGuard: Bool = true,
+                                  loopReps: Int = 24, loopGrace: Int = 96,
+                                  onStream: (@Sendable (Int, StreamUpdate) -> Void)? = nil,
+                                  onPrefill: (@Sendable (Int, Int) -> Void)? = nil,
+                                  onFinish: (@Sendable (Int, Result) -> Void)? = nil,
+                                  onAdmit: (@Sendable (Int) -> Void)? = nil,
+                                  shouldAdmit: (@Sendable () -> Bool)? = nil,
+                                  shouldDrop: (@Sendable (Int) -> Bool)? = nil,
+                                  shouldContinue: (@Sendable () -> Bool)? = nil) throws -> [Result] {
+        let width = width ?? OCRBatchPlan.recommendedWidth(modelBytes: weightBytes,
+                                                           pageCount: sources.count)
+        if OCRRuntimeFlags.continuousBatch, width > 1 {
+            return try decodeBatch(sources.map { PreparedPage(source: $0, prompt: prompt) },
+                                   width: width, maxNewTokens: maxNewTokens,
+                                   loopGuard: loopGuard, loopReps: loopReps, loopGrace: loopGrace,
+                                   onStream: onStream, onPrefill: onPrefill,
+                                   onFinish: onFinish, onAdmit: onAdmit,
+                                   shouldAdmit: shouldAdmit, shouldDrop: shouldDrop,
+                                   shouldContinue: shouldContinue)
+        }
+        let unreadable = Result(text: "", tokens: [], promptTokens: 0, ttft: 0,
+                                decodeTokensPerSecond: 0, stoppedBy: .unreadable, tiles: (w: 0, h: 0))
+        var images: [OCRImage] = []
+        var live: [Int] = []
+        var skipped = Set<Int>()
+        for (i, source) in sources.enumerated() {
+            if let shouldContinue, !shouldContinue() { break }
+            if let image = source() {
+                images.append(image); live.append(i)
+            } else {
+                skipped.insert(i); onFinish?(i, unreadable)
+            }
+        }
+        let map = live
+        var stream: (@Sendable (Int, StreamUpdate) -> Void)?
+        if let onStream { stream = { slot, u in onStream(map[slot], u) } }
+        var finish: (@Sendable (Int, Result) -> Void)?
+        if let onFinish { finish = { slot, r in onFinish(map[slot], r) } }
+        var admit: (@Sendable (Int) -> Void)?
+        if let onAdmit { admit = { slot in onAdmit(map[slot]) } }
+        let out = try transcribeBatched(
+            images: images, prompt: prompt, maxNewTokens: maxNewTokens, width: width,
+            loopGuard: loopGuard, loopReps: loopReps, loopGrace: loopGrace,
+            onStream: stream, onPrefill: onPrefill, onFinish: finish, onAdmit: admit,
+            shouldAdmit: shouldAdmit, shouldContinue: shouldContinue)
+        // A page never reached (a stop while rendering) is cancelled, not unreadable.
+        var results = (0 ..< sources.count).map { i in
+            skipped.contains(i) ? unreadable
+                : Result(text: "", tokens: [], promptTokens: 0, ttft: 0, decodeTokensPerSecond: 0,
+                         stoppedBy: .cancelled, tiles: (w: 0, h: 0))
+        }
+        for (slot, r) in out.enumerated() where slot < map.count { results[map[slot]] = r }
+        return results
+    }
 }
+

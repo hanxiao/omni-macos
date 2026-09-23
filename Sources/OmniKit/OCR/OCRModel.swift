@@ -31,6 +31,9 @@ public final class OCRModel: @unchecked Sendable {
         /// The caller asked to stop mid-page. Whatever had decoded is returned rather than thrown
         /// away, so a stopped page still shows what it got.
         case cancelled
+        /// The page's source produced no image (a damaged PDF page, an unreadable file). It never
+        /// reached the model; the rest of the batch carries on without it.
+        case unreadable
     }
 
     /// A live view of a page being transcribed.
@@ -175,9 +178,18 @@ public final class OCRModel: @unchecked Sendable {
         /// later must not silently fall back to the default one the reader edited away.
         var pendingPrompt: String? = nil
 
+        /// Set when not even the pixels exist yet: the page is rendered when it is admitted. A
+        /// 200-page scan rendered up front was 4.5 s before the first token and ~1.2 GB of pixels
+        /// held for the whole run. nil from the closure means the page could not be read.
+        var source: (@Sendable () -> OCRImage?)? = nil
+
         init(prep: Prepared, visual: MLXArray) { self.prep = prep; self.visual = visual }
         init(pending: OCRImage, prompt: String? = nil) {
             self.pending = pending
+            self.pendingPrompt = prompt
+        }
+        init(source: @escaping @Sendable () -> OCRImage?, prompt: String? = nil) {
+            self.source = source
             self.pendingPrompt = prompt
         }
     }

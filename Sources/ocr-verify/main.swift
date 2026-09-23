@@ -289,6 +289,9 @@ if await OCRWorker.runIfRequested(CommandLine.arguments) { exit(0) }
 // one, which then reported the static path's CER under a "continuous" heading.
 OCRRuntimeFlags.continuousBatch = !args.contains("--static")
 OCRRuntimeFlags.forceBatchMask = args.contains("--force-mask")
+if let i = args.firstIndex(of: "--ramp-share"), i + 1 < args.count, let x = Double(args[i + 1]) {
+    OCRRuntimeFlags.rampDecodeShare = x
+}
 
 func intAfter(_ flag: String, in args: [String]) -> Int? {
     guard let i = args.firstIndex(of: flag), i + 1 < args.count else { return nil }
@@ -328,6 +331,9 @@ if let i = args.firstIndex(of: "--pdf") {
         // --twice runs the same document a second time in the same process, which is the only
         // way to see what the visual cache is worth: on a first pass it is worth nothing.
         let passes = args.contains("--twice") ? 2 : 1
+        // The app bounds MLX's buffer cache; a headless run left at MLX's default does not, so
+        // pass the app's figure to see what the app would hold.
+        if let gb = intAfter("--cache-limit-gb", in: args) { MLX.Memory.cacheLimit = gb << 30 }
         var out: OCRModel.DocumentResult!
         var elapsed = 0.0
         for pass in 1 ... passes {
@@ -374,6 +380,13 @@ if let i = args.firstIndex(of: "--pdf") {
             for page in out.pages { print("----- page \(page.page)\n\(page.text)\n") }
         }
         print("document digest: \(digest(out.markdown()))  chars \(out.markdown().count)")
+        let kv = OCRRuntimeFlags.kvHighWater()
+        print(String(format: "memory: MLX peak %.1f GB, active %.1f GB, cache %.1f GB; KV cursor peak %d, buffer %d",
+                     Double(MLX.Memory.peakMemory) / 1e9, Double(MLX.Memory.activeMemory) / 1e9,
+                     Double(MLX.Memory.cacheMemory) / 1e9, kv.cursor, kv.length))
+        if let f = OCRRuntimeFlags.firstFinishSeconds() {
+            print(String(format: "first page finished %.1f s after the batch started", f))
+        }
         if OCRRuntimeFlags.reportOccupancy {
             let occ = OCRRuntimeFlags.occupancy()
             let steps = occ.reduce(0) { $0 + $1.steps }
@@ -588,8 +601,22 @@ if args.contains("--grade-batch") {
     // The SAME cap the greedy gate uses (--max-new, default 1024). Two hard2 pages never reach
     // EOS, so with the budget-derived cap they run to 31753 tokens of repetition and the two
     // paths are not comparable at all - which is what the first attempt at this measured.
-    let out = try model.transcribeBatched(images: images, maxNewTokens: maxNew, width: width,
-                                          loopGuard: false)
+    // `--drop-after S`: pages in the second half are dropped S seconds in, the way closing a tab
+    // drops its pages in the app. They must stop decoding and never be admitted.
+    let dropAfter = intAfter("--drop-after", in: args)
+    let half = references.count / 2
+    let sources: [@Sendable () -> OCRImage?] = images.map { image in { image } }
+    var drop: (@Sendable (Int) -> Bool)?
+    if let dropAfter {
+        drop = { page in page >= half && Date().timeIntervalSince(started) > Double(dropAfter) }
+    }
+    let out = try model.transcribeBatched(sources: sources, maxNewTokens: maxNew, width: width,
+                                          loopGuard: false, shouldDrop: drop)
+    if dropAfter != nil {
+        for (n, r) in out.enumerated() {
+            print("page \(n) \(r.stoppedBy) \(r.tokens.count) tok")
+        }
+    }
     let elapsed = Date().timeIntervalSince(started)
     var cers: [Double] = []
     var exact = 0
@@ -603,7 +630,8 @@ if args.contains("--grade-batch") {
     let mean = cers.isEmpty ? 0 : cers.reduce(0, +) / Double(cers.count)
     let mode = OCRRuntimeFlags.continuousBatch ? "continuous" : "static"
     print("\nbatch width \(width) \(mode): \(exact)/\(references.count) exact vs torch bf16, "
-          + String(format: "mean CER %.4f, %.1f s", mean, elapsed))
+          + String(format: "mean CER %.4f, %.1f s, first page done at %.1f s", mean, elapsed,
+                   OCRRuntimeFlags.firstFinishSeconds() ?? -1))
     exit(0)
 }
 print("")
