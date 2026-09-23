@@ -176,6 +176,7 @@ jobs:
           git config --global user.email "han.xiao@jina.ai"
           git config --global user.name "Han Xiao"
           MD5=$(md5 -q "$DMG")
+          UPDATED=$(python3 -c 'import datetime; d = datetime.date.today(); print(f"{d:%B} {d.day}, {d.year}")')
           # The DMG ships under a VERSIONED filename (Omni-<version>.dmg). Each release is therefore a
           # brand-new URL Cloudflare has never cached, so a download can never serve a stale binary -
           # which the old fixed Omni.dmg name did (CF caches the binary on a long TTL). The page stamps
@@ -184,6 +185,9 @@ jobs:
             sed -i '' "s#<span class=\"dl-ver\">v[0-9.]*</span>#<span class=\"dl-ver\">${VER}</span>#g" "$1"
             sed -i '' "s#href=\"Omni[^\"]*\.dmg\"#href=\"Omni-${VERSION}.dmg\"#g" "$1"
             sed -i '' "s#<span class=\"dl-md5\">[^<]*</span>#<span class=\"dl-md5\">${MD5}</span>#g" "$1"
+            # The link-preview labels Slack shows under the title: version, and the day it shipped.
+            sed -i '' "s#<meta name=\"twitter:data1\" content=\"[^\"]*\"#<meta name=\"twitter:data1\" content=\"${VER}\"#" "$1"
+            sed -i '' "s#<meta name=\"twitter:data2\" content=\"[^\"]*\"#<meta name=\"twitter:data2\" content=\"${UPDATED}\"#" "$1"
           }
           # Self-healing deploy: the page (index.html + all assets) is owned by this repo's site/omni/
           # and pushed in full every release, so a dropped asset or an outside clobber self-repairs.

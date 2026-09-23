@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 
   <title>Omni - Search your Mac by meaning</title>
-  <meta name="description" content="Omni searches text, code, PDFs, images, audio and video on your Mac by meaning, in any language. On-device on Apple silicon, offline after one model download. Free and open source." />
+  <meta name="description" content="Omni searches text, code, PDFs, images, audio and video on your Mac by meaning, in any language. On-device, offline after one model download. Free and open source." />
   <link rel="canonical" href="https://hanxiao.io/omni/" />
   <meta name="color-scheme" content="light dark" />
   <meta name="theme-color" content="#fbfbfd" media="(prefers-color-scheme: light)" />
@@ -24,13 +24,17 @@
   <meta name="twitter:title" content="Omni" />
   <meta name="twitter:description" content="Omni searches every file on your Mac by meaning, in any language, entirely on device." />
   <meta name="twitter:image" content="https://hanxiao.io/omni/assets/og-image.png" />
+  <meta name="twitter:label1" content="Version" />
+  <meta name="twitter:data1" content="v0.14.0" />
+  <meta name="twitter:label2" content="Updated" />
+  <meta name="twitter:data2" content="September 23, 2026" />
 
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
     "@type": "SoftwareApplication",
     "name": "Omni",
-    "operatingSystem": "macOS 14 or later, Apple silicon",
+    "operatingSystem": "macOS",
     "applicationCategory": "UtilitiesApplication",
     "description": "On-device semantic search for macOS across text, code, PDFs, images, audio and video, with OCR and a local HTTP and MCP API.",
     "url": "https://hanxiao.io/omni/",
@@ -156,7 +160,7 @@
     }
     .brand { display: flex; align-items: center; gap: 8px; color: var(--text); font-weight: 600; font-size: 17px; margin-right: auto; }
     .brand:hover { text-decoration: none; }
-    .brand img { width: 26px; height: 26px; }
+    .brand img { width: 28px; height: 26px; object-fit: contain; }
     .nav-links { display: flex; gap: 2px; }
     .nav-links a {
       color: var(--text); font-size: 14px; padding: 6px 11px; border-radius: 999px;
@@ -191,7 +195,7 @@
         radial-gradient(44% 38% at 55% 78%, var(--wash-3), transparent 72%);
       filter: blur(8px);
     }
-    .app-icon { width: 104px; height: 104px; margin: 0 auto 22px; filter: drop-shadow(0 14px 22px rgba(0, 0, 0, 0.18)); }
+    .app-icon { width: 130px; height: 120px; object-fit: contain; margin: 0 auto 20px; filter: drop-shadow(0 12px 18px rgba(60, 40, 20, 0.16)); }
     .hero h1 {
       margin: 0 auto; max-width: 13ch;
       font-size: clamp(44px, 7.4vw, 84px); line-height: 1.04; letter-spacing: -0.035em; font-weight: 700;
@@ -348,7 +352,7 @@
       body { font-size: 16px; }
       .nav-links { display: none; }
       .hero { padding-top: 48px; }
-      .app-icon { width: 84px; height: 84px; }
+      .app-icon { width: 104px; height: 96px; }
       .hero-shot { margin-top: 40px; }
       .shot { border-radius: 10px; }
       section { padding-top: 88px; }
@@ -366,7 +370,7 @@
 <body>
   <header class="nav">
     <div class="nav-bar glass">
-      <a class="brand" href="/omni/"><img src="assets/icon.png" alt="" width="26" height="26" />Omni</a>
+      <a class="brand" href="/omni/"><img src="assets/omni-mole.png" alt="" width="28" height="26" />Omni</a>
       <nav class="nav-links" aria-label="Sections">
         <a href="#features">Features</a>
         <a href="#agents">Agents</a>
@@ -385,13 +389,13 @@
     <section class="hero" aria-labelledby="hero-title">
       <div class="wash" aria-hidden="true"></div>
       <div class="wrap">
-        <img class="app-icon" src="assets/icon.png" alt="Omni app icon" width="104" height="104" />
+        <img class="app-icon" src="assets/omni-mole.png" alt="Omni" width="130" height="120" />
         <h1 id="hero-title">Search your Mac by meaning.</h1>
         <p class="lede">Every file. Any language. On device.</p>
         <div class="hero-actions">
           <a class="btn btn-primary btn-lg" href="Omni-0.13.8.dmg">Download for macOS <span class="dl-ver">v0.13.8</span></a>
         </div>
-        <p class="hero-note mono">Apple silicon &middot; macOS 14+ &middot; MD5 <span class="dl-md5">d7187a2b198005c82b8ae3a820184236</span></p>
+        <p class="hero-note mono">MD5 <span class="dl-md5">d7187a2b198005c82b8ae3a820184236</span></p>
       </div>
       <div class="hero-shot">
         <div class="shot">

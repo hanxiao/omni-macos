@@ -35,7 +35,13 @@ jobs:
           VERSION=$(printf '%s' "$LATEST" | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')
           MD5=$(printf '%s' "$LATEST" | python3 -c 'import json,sys; print(json.load(sys.stdin)["md5"])')
           VER="v${VERSION}"
-          echo "stamping ${VER} md5 ${MD5}"
+          # The day this version shipped, from the published DMG, so a site-only deploy does not
+          # restamp "Updated" with today.
+          UPDATED=$(curl -fsSI "https://hanxiao.io/omni/Omni-${VERSION}.dmg" | python3 -c '
+          import sys, email.utils as eu
+          h = [l.split(":", 1)[1].strip() for l in sys.stdin if l.lower().startswith("last-modified:")]
+          d = eu.parsedate_to_datetime(h[0]); print(f"{d:%B} {d.day}, {d.year}")')
+          echo "stamping ${VER} md5 ${MD5} updated ${UPDATED}"
           rm -rf /tmp/site-only
           git clone --depth 1 "https://x-access-token:${SITE_TOKEN}@github.com/hanxiao/hanxiao.github.io.git" /tmp/site-only
           # The DMGs, the benchmark data and latest.json belong to releases and the benchmark
@@ -47,6 +53,9 @@ jobs:
           sed -i '' "s#<span class=\"dl-ver\">v[0-9.]*</span>#<span class=\"dl-ver\">${VER}</span>#g" "$f"
           sed -i '' "s#href=\"Omni[^\"]*\.dmg\"#href=\"Omni-${VERSION}.dmg\"#g" "$f"
           sed -i '' "s#<span class=\"dl-md5\">[^<]*</span>#<span class=\"dl-md5\">${MD5}</span>#g" "$f"
+          # The link-preview labels Slack shows under the title: version, and the day it shipped.
+          sed -i '' "s#<meta name=\"twitter:data1\" content=\"[^\"]*\"#<meta name=\"twitter:data1\" content=\"${VER}\"#" "$f"
+          sed -i '' "s#<meta name=\"twitter:data2\" content=\"[^\"]*\"#<meta name=\"twitter:data2\" content=\"${UPDATED}\"#" "$f"
           ( cd /tmp/site-only && git add -A omni && (git diff --cached --quiet || (git commit -m "omni: site update (${VER})" && git push)) )
 
       - name: Purge Cloudflare cache for /omni
