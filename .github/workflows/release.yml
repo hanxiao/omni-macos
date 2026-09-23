@@ -224,7 +224,7 @@ jobs:
           # when they do CF would otherwise serve the stale copy for the full max-age (4h).
           curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
             -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" \
-            --data "{\"files\":[\"https://hanxiao.io/omni/\",\"https://hanxiao.io/omni/index.html\",\"https://hanxiao.io/omni/${DMG_NAME}\",\"https://hanxiao.io/omni/latest.json\",\"https://hanxiao.io/omni/assets/icon.png\",\"https://hanxiao.io/omni/assets/og-image.png\"]}" \
+            --data "{\"files\":[\"https://hanxiao.io/omni/\",\"https://hanxiao.io/omni/index.html\",\"https://hanxiao.io/omni/${DMG_NAME}\",\"https://hanxiao.io/omni/latest.json\",\"https://hanxiao.io/omni/faq.json\",\"https://hanxiao.io/omni/assets/icon.png\",\"https://hanxiao.io/omni/assets/og-image.png\"]}" \
             && echo "purged Cloudflare cache for /omni" || echo "Cloudflare purge failed (non-fatal)"
 
       # Self-hosted hygiene: the cert import adds a temp build.keychain to the user search list -

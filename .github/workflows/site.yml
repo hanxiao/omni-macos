@@ -1,0 +1,69 @@
+name: Site
+
+# Deploy hanxiao.io/omni from site/omni WITHOUT cutting an app release. The page, its assets and
+# faq.json change more often than the app; before this, the only way to publish them was a release.
+#
+# Same deploy as release.yml's "Update hanxiao.io/omni download page" step, minus the DMG: the
+# version and MD5 stamped into the download block come from the LIVE latest.json, which only a
+# release writes, so the page always points at the DMG that is actually published.
+# Run with: gh workflow run site.yml
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: release   # never interleave with a release pushing the same files
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  site:
+    runs-on: [self-hosted, macOS, arm64]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Deploy site/omni
+        env:
+          SITE_TOKEN: ${{ secrets.SITE_TOKEN }}
+        run: |
+          if [ -z "$SITE_TOKEN" ]; then echo "no SITE_TOKEN secret"; exit 1; fi
+          git config --global user.email "han.xiao@jina.ai"
+          git config --global user.name "Han Xiao"
+          LATEST=$(curl -fsS "https://hanxiao.io/omni/latest.json?t=$(date +%s)")
+          VERSION=$(printf '%s' "$LATEST" | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')
+          MD5=$(printf '%s' "$LATEST" | python3 -c 'import json,sys; print(json.load(sys.stdin)["md5"])')
+          VER="v${VERSION}"
+          echo "stamping ${VER} md5 ${MD5}"
+          rm -rf /tmp/site-only
+          git clone --depth 1 "https://x-access-token:${SITE_TOKEN}@github.com/hanxiao/hanxiao.github.io.git" /tmp/site-only
+          # The DMGs, the benchmark data and latest.json belong to releases and the benchmark
+          # service, not to this repo's site/omni - keep them.
+          rsync -a --delete --exclude='*.dmg' --exclude='profiling-v*' --exclude='latest.json' \
+            site/omni/ /tmp/site-only/omni/
+          test -f "/tmp/site-only/omni/Omni-${VERSION}.dmg" || { echo "Omni-${VERSION}.dmg is not published"; exit 1; }
+          f=/tmp/site-only/omni/index.html
+          sed -i '' "s#<span class=\"dl-ver\">v[0-9.]*</span>#<span class=\"dl-ver\">${VER}</span>#g" "$f"
+          sed -i '' "s#href=\"Omni[^\"]*\.dmg\"#href=\"Omni-${VERSION}.dmg\"#g" "$f"
+          sed -i '' "s#<span class=\"dl-md5\">[^<]*</span>#<span class=\"dl-md5\">${MD5}</span>#g" "$f"
+          ( cd /tmp/site-only && git add -A omni && (git diff --cached --quiet || (git commit -m "omni: site update (${VER})" && git push)) )
+
+      - name: Purge Cloudflare cache for /omni
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+        run: |
+          if [ -z "$CF_API_TOKEN" ] || [ -z "$CF_ZONE_ID" ]; then echo "no Cloudflare secrets; CF catches up on TTL"; exit 0; fi
+          FILES=$( { echo "https://hanxiao.io/omni/"; echo "https://hanxiao.io/omni/index.html"; echo "https://hanxiao.io/omni/faq.json";
+                     for a in site/omni/assets/*; do echo "https://hanxiao.io/omni/assets/$(basename "$a")"; done; } \
+                   | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
+          # Cloudflare takes at most 30 URLs per purge call.
+          printf '%s' "$FILES" | python3 -c '
+          import json,sys
+          u=json.load(sys.stdin)
+          for i in range(0,len(u),30): print(json.dumps({"files":u[i:i+30]}))' | while read -r body; do
+            curl -fsS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" --data "$body" >/dev/null \
+              && echo "purged a batch" || echo "Cloudflare purge failed (non-fatal)"
+          done

@@ -2389,3 +2389,16 @@ buffer indexed by CONTENT slot. Since v5 shares content, rows outnumber slots: e
 pooled other files' vectors, and on a large folder the read ran off the buffer (Visualize > UMAP
 on a 66,762-file folder: EXC_BAD_ACCESS in `accumulateBF16`). Now `slotOf(i)`, like every other
 reader. `FolderMapSharedContentTests` fails without the fix. All other `flat16` readers audited.
+
+## hanxiao.io/omni (redesigned 2026-09-22)
+
+- `site/omni` is the page. `gh workflow run site.yml` deploys it WITHOUT an app release: it reads
+  version and MD5 from the live latest.json, stamps the same three hooks a release stamps
+  (`dl-ver`, every `href="Omni*.dmg"`, `dl-md5`) and purges Cloudflare for the page, faq.json and
+  every asset. Keep those three hooks in any redesign; the release step rewrites them.
+- Copy is lean: a headline and a few words per item, no explanatory paragraphs. FAQ answers live in
+  faq.json and were fact-checked against the code; keep them true when features change.
+- Screenshots: the installed release relaunched with `-omni.ephemeralUIState YES -omni.dbDir <real
+  index> -omni.addedFolders/-omni.roots` limited to Desktop, Documents, Downloads (no private folder
+  names, no history), window captured at 1600x860 with `screencapture -o -l`. WebP with alpha plus
+  a JPEG fallback.

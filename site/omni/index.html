@@ -2,958 +2,526 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 
-  <title>Omni - local semantic search for your Mac</title>
-  <meta name="description" content="Omni searches your local files by meaning - text, code, PDFs, images, audio, and video in one vector space, in any language. Runs on-device on Apple silicon. Private, offline." />
+  <title>Omni - search your Mac by meaning</title>
+  <meta name="description" content="Omni searches text, code, PDFs, images, audio and video on your Mac by meaning, in any language. On-device on Apple silicon, offline after one model download. Free and open source." />
   <link rel="canonical" href="https://hanxiao.io/omni/" />
-  <meta name="theme-color" content="#f9fafc" />
+  <meta name="color-scheme" content="light dark" />
+  <meta name="theme-color" content="#fbfbfd" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)" />
 
   <meta property="og:type" content="website" />
   <meta property="og:site_name" content="Omni" />
-  <meta property="og:title" content="Omni - local semantic search for your Mac" />
-  <meta property="og:description" content="Search your files by meaning - text, code, PDFs, images, audio, and video in one vector space, in any language. On-device on Apple silicon. Private and offline." />
+  <meta property="og:title" content="Omni - search your Mac by meaning" />
+  <meta property="og:description" content="Text, code, PDFs, images, audio and video in one on-device index. Any language, offline, open source." />
   <meta property="og:url" content="https://hanxiao.io/omni/" />
   <meta property="og:image" content="https://hanxiao.io/omni/assets/og-image.png" />
   <meta property="og:image:width" content="1200" />
   <meta property="og:image:height" content="630" />
-
   <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:title" content="Omni - local semantic search for your Mac" />
-  <meta name="twitter:description" content="Search your files by meaning - in any language, across every modality. On-device, private, offline." />
+  <meta name="twitter:title" content="Omni - search your Mac by meaning" />
+  <meta name="twitter:description" content="Text, code, PDFs, images, audio and video in one on-device index. Any language, offline, open source." />
   <meta name="twitter:image" content="https://hanxiao.io/omni/assets/og-image.png" />
 
-  <!-- Product video (Open Graph + Twitter player) -->
-  <meta property="og:video" content="https://hanxiao.io/omni/assets/omni-intro.mp4" />
-  <meta property="og:video:secure_url" content="https://hanxiao.io/omni/assets/omni-intro.mp4" />
-  <meta property="og:video:type" content="video/mp4" />
-  <meta property="og:video:width" content="1920" />
-  <meta property="og:video:height" content="1080" />
-  <meta name="twitter:player:stream" content="https://hanxiao.io/omni/assets/omni-intro.mp4" />
-  <meta name="twitter:player:stream:content_type" content="video/mp4" />
-
-  <!-- VideoObject structured data, so the demo is eligible for video rich results -->
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
-    "@type": "VideoObject",
-    "name": "Omni - search every file on your Mac by meaning",
-    "description": "A 37-second tour of Omni: type what you mean and it finds the file; any file type searches any other in one shared embedding space; deep PDF search jumps to the matching page; folders become a similarity map; and an MLX model runs entirely on the Apple silicon GPU with a single-matmul search. Free, open source, Apache 2.0.",
-    "thumbnailUrl": "https://hanxiao.io/omni/assets/omni-poster.jpg",
-    "uploadDate": "2026-06-10",
-    "duration": "PT37S",
-    "contentUrl": "https://hanxiao.io/omni/assets/omni-intro.mp4",
-    "embedUrl": "https://hanxiao.io/omni/",
-    "publisher": {
-      "@type": "Organization",
-      "name": "Omni",
-      "url": "https://hanxiao.io/omni/"
-    }
+    "@type": "SoftwareApplication",
+    "name": "Omni",
+    "operatingSystem": "macOS 14 or later, Apple silicon",
+    "applicationCategory": "UtilitiesApplication",
+    "description": "On-device semantic search for macOS across text, code, PDFs, images, audio and video, with OCR and a local HTTP and MCP API.",
+    "url": "https://hanxiao.io/omni/",
+    "license": "https://www.apache.org/licenses/LICENSE-2.0",
+    "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+    "author": { "@type": "Person", "name": "Han Xiao" }
   }
   </script>
 
   <link rel="icon" href="assets/icon.png" />
   <link rel="apple-touch-icon" href="assets/icon.png" />
   <style>
-/* Omni - local semantic search for your Mac
-   Light theme, turbopuffer-inspired: cream background, near-black slate text,
-   system-font-first with a monospace accent, thin borders, small radii. */
+    :root {
+      --bg: #fbfbfd;
+      --bg-alt: #f5f5f7;
+      --text: #1d1d1f;
+      --text-2: #6e6e73;
+      --text-3: #86868b;
+      --line: rgba(0, 0, 0, 0.08);
+      --accent: #0071e3;
+      --accent-hover: #0077ed;
+      --link: #0066cc;
+      --glass: rgba(255, 255, 255, 0.66);
+      --glass-strong: rgba(255, 255, 255, 0.82);
+      --glass-edge: rgba(255, 255, 255, 0.85);
+      --glass-shade: rgba(0, 0, 0, 0.06);
+      --code-bg: rgba(0, 0, 0, 0.035);
+      --shot-shadow: 0 40px 90px -30px rgba(20, 30, 60, 0.35), 0 12px 30px -12px rgba(20, 30, 60, 0.18);
+      --wash-1: rgba(90, 160, 255, 0.28);
+      --wash-2: rgba(255, 150, 190, 0.22);
+      --wash-3: rgba(120, 220, 200, 0.22);
+      --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Helvetica Neue", Helvetica, Arial, sans-serif;
+      --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+      --radius: 22px;
+      --wide: 1120px;
+      --narrow: 760px;
+      --gutter: 22px;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]) {
+        --bg: #000000;
+        --bg-alt: #0d0d0f;
+        --text: #f5f5f7;
+        --text-2: #a1a1a6;
+        --text-3: #6e6e73;
+        --line: rgba(255, 255, 255, 0.1);
+        --accent: #0a84ff;
+        --accent-hover: #409cff;
+        --link: #2997ff;
+        --glass: rgba(30, 30, 32, 0.6);
+        --glass-strong: rgba(28, 28, 30, 0.8);
+        --glass-edge: rgba(255, 255, 255, 0.14);
+        --glass-shade: rgba(0, 0, 0, 0.4);
+        --code-bg: rgba(255, 255, 255, 0.06);
+        --shot-shadow: 0 40px 90px -30px rgba(0, 0, 0, 0.8), 0 12px 30px -12px rgba(0, 0, 0, 0.6);
+        --wash-1: rgba(40, 110, 255, 0.24);
+        --wash-2: rgba(200, 70, 150, 0.18);
+        --wash-3: rgba(40, 170, 150, 0.16);
+      }
+    }
+    :root[data-theme="dark"] {
+      --bg: #000000;
+      --bg-alt: #0d0d0f;
+      --text: #f5f5f7;
+      --text-2: #a1a1a6;
+      --text-3: #6e6e73;
+      --line: rgba(255, 255, 255, 0.1);
+      --accent: #0a84ff;
+      --accent-hover: #409cff;
+      --link: #2997ff;
+      --glass: rgba(30, 30, 32, 0.6);
+      --glass-strong: rgba(28, 28, 30, 0.8);
+      --glass-edge: rgba(255, 255, 255, 0.14);
+      --glass-shade: rgba(0, 0, 0, 0.4);
+      --code-bg: rgba(255, 255, 255, 0.06);
+      --shot-shadow: 0 40px 90px -30px rgba(0, 0, 0, 0.8), 0 12px 30px -12px rgba(0, 0, 0, 0.6);
+      --wash-1: rgba(40, 110, 255, 0.24);
+      --wash-2: rgba(200, 70, 150, 0.18);
+      --wash-3: rgba(40, 170, 150, 0.16);
+    }
 
-:root {
-  --bg: #f9fafc;
-  --fg: #111827;
-  --muted: #6b7280;
-  --border: #d1d5db;
-  --border-soft: #e5e7eb;
-  --panel: #ffffff;
-  --accent: #fdba74;          /* warm orange, used sparingly */
-  --accent-fg: #7c2d12;       /* burnt orange */
-  --selection: #fed7aa;
-  --selection-fg: #7c2d12;
-  --radius: 0.5rem;
-  --radius-sm: 6px;
-  --maxw: 1080px;
+    *, *::before, *::after { box-sizing: border-box; }
+    html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; scroll-padding-top: 64px; }
+    @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 17px;
+      line-height: 1.47;
+      letter-spacing: -0.022em;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+    a { color: var(--link); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    img { display: block; max-width: 100%; height: auto; }
+    code, pre, .mono { font-family: var(--mono); letter-spacing: 0; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 6px; }
 
-  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro",
-    "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco,
-    Consolas, "Liberation Mono", monospace;
-}
+    .wrap { width: 100%; max-width: calc(var(--wide) + 2 * var(--gutter)); margin: 0 auto; padding: 0 var(--gutter); }
+    .wrap.narrow { max-width: calc(var(--narrow) + 2 * var(--gutter)); }
 
-* { box-sizing: border-box; }
+    /* Liquid Glass: translucent fill, a bright top edge, a soft shade underneath. */
+    .glass {
+      background: var(--glass);
+      -webkit-backdrop-filter: saturate(180%) blur(24px);
+      backdrop-filter: saturate(180%) blur(24px);
+      box-shadow: inset 0 1px 0 var(--glass-edge), inset 0 0 0 1px var(--line), 0 8px 24px -12px var(--glass-shade);
+    }
 
-html { -webkit-text-size-adjust: 100%; }
+    /* Nav */
+    .nav {
+      position: sticky; top: 0; z-index: 50;
+      padding: 10px var(--gutter);
+    }
+    .nav-bar {
+      max-width: var(--wide); margin: 0 auto;
+      height: 48px; border-radius: 999px;
+      display: flex; align-items: center; gap: 6px;
+      padding: 0 8px 0 14px;
+    }
+    .brand { display: flex; align-items: center; gap: 8px; color: var(--text); font-weight: 600; font-size: 17px; margin-right: auto; }
+    .brand:hover { text-decoration: none; }
+    .brand img { width: 26px; height: 26px; }
+    .nav-links { display: flex; gap: 2px; }
+    .nav-links a {
+      color: var(--text); font-size: 14px; padding: 6px 11px; border-radius: 999px;
+    }
+    .nav-links a:hover { background: var(--code-bg); text-decoration: none; }
+    .nav-gh { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 999px; color: var(--text); }
+    .nav-gh:hover { background: var(--code-bg); }
+    .nav-gh svg { width: 18px; height: 18px; fill: currentColor; }
 
-body {
-  margin: 0;
-  background-color: var(--bg);
-  /* subtle graph-paper texture */
-  background-image:
-    linear-gradient(to right, rgba(17, 24, 39, 0.025) 1px, transparent 1px),
-    linear-gradient(to bottom, rgba(17, 24, 39, 0.025) 1px, transparent 1px);
-  background-size: 28px 28px;
-  color: var(--fg);
-  font-family: var(--font-sans);
-  font-size: 16px;
-  line-height: 1.55;
-  -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
-}
+    /* Buttons: capsules, the shape Tahoe gives every standalone control. */
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+      border-radius: 999px; font-weight: 500; white-space: nowrap;
+      transition: background-color 0.2s ease, transform 0.2s ease;
+    }
+    .btn:hover { text-decoration: none; }
+    .btn:active { transform: scale(0.98); }
+    .btn-primary { background: var(--accent); color: #fff; box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25); }
+    .btn-primary:hover { background: var(--accent-hover); }
+    .nav .btn-primary { height: 32px; padding: 0 16px; font-size: 14px; }
+    .btn-lg { height: 50px; padding: 0 26px; font-size: 17px; }
+    .btn-ghost { height: 50px; padding: 0 22px; font-size: 17px; color: var(--text); }
+    .dl-ver { opacity: 0.72; font-weight: 400; font-variant-numeric: tabular-nums; }
 
-::selection { background: var(--selection); color: var(--selection-fg); }
+    /* Hero */
+    .hero { position: relative; padding: 72px 0 0; text-align: center; }
+    .wash {
+      position: absolute; inset: -160px 0 auto; height: 1100px; z-index: -1; pointer-events: none;
+      background:
+        radial-gradient(40% 36% at 22% 42%, var(--wash-1), transparent 70%),
+        radial-gradient(38% 34% at 80% 36%, var(--wash-2), transparent 70%),
+        radial-gradient(44% 38% at 55% 78%, var(--wash-3), transparent 72%);
+      filter: blur(8px);
+    }
+    .app-icon { width: 104px; height: 104px; margin: 0 auto 22px; filter: drop-shadow(0 14px 22px rgba(0, 0, 0, 0.18)); }
+    .hero h1 {
+      margin: 0 auto; max-width: 13ch;
+      font-size: clamp(44px, 7.4vw, 84px); line-height: 1.04; letter-spacing: -0.035em; font-weight: 700;
+      text-wrap: balance;
+    }
+    .hero .lede {
+      margin: 20px auto 0; max-width: 34ch;
+      font-size: clamp(19px, 2.2vw, 24px); line-height: 1.35; color: var(--text-2); letter-spacing: -0.02em;
+      text-wrap: balance;
+    }
+    .hero-actions { margin-top: 34px; display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; }
+    .hero-note { margin: 16px 0 0; font-size: 13px; color: var(--text-3); letter-spacing: 0; overflow-wrap: anywhere; }
+    .hero-note .dl-md5 { font-variant-numeric: tabular-nums; }
 
-.mono { font-family: var(--font-mono); }
+    .hero-shot { margin: 56px auto 0; max-width: var(--wide); padding: 0 var(--gutter); }
+    .shot {
+      border-radius: 14px; overflow: hidden;
+      box-shadow: var(--shot-shadow), 0 0 0 1px var(--line);
+      background: var(--bg-alt);
+    }
+    .shot img { width: 100%; }
 
-.container {
-  width: 100%;
-  max-width: var(--maxw);
-  margin: 0 auto;
-  padding: 0 24px;
-}
+    /* Sections */
+    section { padding: 120px 0 0; }
+    .eyebrow { font-size: 14px; font-weight: 600; color: var(--text-2); margin: 0 0 10px; letter-spacing: -0.01em; }
+    h2 {
+      margin: 0; font-size: clamp(34px, 5vw, 56px); line-height: 1.07; letter-spacing: -0.03em; font-weight: 700;
+      text-wrap: balance;
+    }
+    .sub { margin: 16px 0 0; font-size: clamp(18px, 2vw, 21px); color: var(--text-2); max-width: 46ch; text-wrap: pretty; }
+    .head-center { text-align: center; }
+    .head-center .sub { margin-left: auto; margin-right: auto; }
 
-a { color: inherit; text-decoration: none; }
+    /* Feature grid */
+    .features { margin-top: 56px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+    .feature {
+      border-radius: var(--radius); padding: 26px 26px 28px;
+      background: var(--bg-alt);
+    }
+    .feature h3 { margin: 0 0 8px; font-size: 19px; line-height: 1.25; font-weight: 600; letter-spacing: -0.02em; }
+    .feature p { margin: 0; font-size: 15px; line-height: 1.47; color: var(--text-2); letter-spacing: -0.01em; }
+    .feature code { font-size: 13px; }
 
-img { max-width: 100%; display: block; }
+    /* Showcase rows */
+    .show { margin-top: 64px; }
+    .show + .show { margin-top: 96px; }
+    .show-text { max-width: var(--narrow); margin: 0 auto 32px; text-align: center; }
+    .show-text h3 { margin: 0; font-size: clamp(26px, 3.4vw, 36px); line-height: 1.12; letter-spacing: -0.028em; font-weight: 700; text-wrap: balance; }
+    .show-text p { margin: 12px auto 0; font-size: 17px; color: var(--text-2); max-width: 50ch; text-wrap: pretty; }
 
-/* ---------- Section labels ---------- */
-.section-label {
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  font-size: 12px;
-  color: var(--muted);
-  margin: 0 0 20px;
-}
+    /* Agents */
+    .code {
+      margin: 40px auto 0; max-width: var(--narrow);
+      border-radius: 16px; padding: 18px 20px; overflow-x: auto;
+      background: var(--code-bg); box-shadow: inset 0 0 0 1px var(--line);
+      font-size: 13.5px; line-height: 1.6; color: var(--text);
+    }
+    .code .c { color: var(--text-3); }
+    .api { margin: 40px auto 0; max-width: var(--narrow); border-top: 1px solid var(--line); }
+    .api-row { display: grid; grid-template-columns: 150px 1fr; gap: 16px; padding: 16px 2px; border-bottom: 1px solid var(--line); }
+    .api-row dt { font-weight: 600; font-size: 15px; }
+    .api-row dd { margin: 0; font-size: 15px; color: var(--text-2); }
+    .api-row code { font-size: 13px; color: var(--text); }
 
-/* ---------- Buttons ---------- */
-.btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-family: var(--font-mono);
-  font-size: 14px;
-  font-weight: 500;
-  letter-spacing: -0.01em;
-  padding: 9px 16px;
-  border-radius: var(--radius-sm);
-  border: 1px solid transparent;
-  cursor: pointer;
-  transition: opacity 0.15s ease, transform 0.05s ease;
-  white-space: nowrap;
-}
-.btn:active { transform: translateY(1px); }
+    /* Benchmark */
+    .bench { margin-top: 44px; }
+    .profiling-meta { margin: 14px 0 0; text-align: center; font-size: 13px; color: var(--text-3); }
+    .profiling-meta .dot { margin: 0 7px; }
+    .bench-toggle { display: flex; width: max-content; margin: 0 auto 18px; padding: 3px; border-radius: 999px; background: var(--code-bg); box-shadow: inset 0 0 0 1px var(--line); }
+    .bench-toggle button {
+      font: 500 13px/1 var(--font); letter-spacing: -0.01em; color: var(--text-2);
+      border: 0; background: transparent; padding: 8px 16px; border-radius: 999px; cursor: pointer;
+    }
+    .bench-toggle button.on { background: var(--glass-strong); color: var(--text); box-shadow: 0 1px 3px var(--glass-shade), inset 0 0 0 1px var(--line); }
+    .bench-panel { border-radius: var(--radius); background: var(--bg-alt); padding: 24px 20px 18px; }
+    .bench-svg { width: 100%; height: auto; display: block; overflow: visible; }
+    .bench-grid line { stroke: var(--line); stroke-width: 1; }
+    .bench-axis text { fill: var(--text-3); font: 12px var(--font); letter-spacing: 0; }
+    .bench-axis .axis-name { fill: var(--text-2); font-size: 12px; }
+    .bench-series polyline { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; opacity: 0.9; }
+    .bench-dot { cursor: pointer; stroke: var(--bg-alt); stroke-width: 1.5; }
+    .bench-svg.focusing .bench-series { opacity: 0.18; transition: opacity 0.15s; }
+    .bench-svg.focusing .bench-series.focus { opacity: 1; }
+    .bench-legend { display: flex; flex-wrap: wrap; gap: 8px 18px; justify-content: center; margin-top: 14px; font-size: 13px; color: var(--text-2); }
+    .bench-legend > span { display: inline-flex; align-items: center; gap: 7px; }
+    .bench-legend .sw { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+    .bench-legend .chip-year { color: var(--text-3); margin-left: 4px; }
+    .profiling-empty { border-radius: var(--radius); background: var(--bg-alt); padding: 48px 20px; text-align: center; color: var(--text-2); font-size: 15px; display: grid; gap: 6px; }
+    #bench-tip {
+      position: fixed; z-index: 100; pointer-events: none; max-width: 280px;
+      padding: 10px 12px; border-radius: 12px; font-size: 12.5px; line-height: 1.45; color: var(--text);
+      background: var(--glass-strong); -webkit-backdrop-filter: blur(20px) saturate(180%); backdrop-filter: blur(20px) saturate(180%);
+      box-shadow: inset 0 0 0 1px var(--line), 0 10px 30px -8px var(--glass-shade);
+    }
+    #bench-tip .t { font-weight: 600; margin-bottom: 2px; }
 
-.btn-primary {
-  background: var(--fg);
-  color: #f8fafc;
-  border-color: var(--fg);
-}
-.btn-primary:hover { opacity: 0.88; }
+    /* FAQ */
+    .faq-content { margin-top: 44px; }
+    .faq-cat + .faq-cat { margin-top: 36px; }
+    .faq-cat-title { margin: 0 0 6px; font-size: 14px; font-weight: 600; color: var(--text-2); letter-spacing: -0.01em; }
+    .faq-item { border-bottom: 1px solid var(--line); }
+    .faq-item summary {
+      list-style: none; cursor: pointer; padding: 15px 30px 15px 0; position: relative;
+      font-size: 17px; font-weight: 500; letter-spacing: -0.02em;
+    }
+    .faq-item summary::-webkit-details-marker { display: none; }
+    .faq-item summary::after {
+      content: ""; position: absolute; right: 6px; top: 50%; width: 8px; height: 8px; margin-top: -6px;
+      border-right: 1.6px solid var(--text-3); border-bottom: 1.6px solid var(--text-3); transform: rotate(45deg);
+      transition: transform 0.2s ease;
+    }
+    .faq-item[open] summary::after { transform: rotate(225deg); margin-top: -2px; }
+    .faq-a { padding: 0 0 18px; color: var(--text-2); font-size: 15px; max-width: 64ch; }
+    .faq-kbd {
+      font: 500 12px var(--font); color: var(--text-2); margin-left: 8px; padding: 2px 7px; border-radius: 6px;
+      background: var(--code-bg); box-shadow: inset 0 0 0 1px var(--line); vertical-align: 1px; white-space: nowrap;
+    }
+    .faq-loading { color: var(--text-3); font-size: 14px; }
 
-.btn-lg {
-  font-size: 15px;
-  padding: 12px 22px;
-}
+    /* Paper */
+    .paper-title { margin: 36px 0 0; font-size: 19px; font-weight: 600; letter-spacing: -0.02em; }
+    .paper-title a { color: var(--text); }
+    .paper-meta { margin: 4px 0 0; font-size: 15px; color: var(--text-2); }
+    .cite { position: relative; margin-top: 22px; }
+    .cite pre {
+      margin: 0; border-radius: 16px; padding: 18px 20px; overflow-x: auto;
+      background: var(--code-bg); box-shadow: inset 0 0 0 1px var(--line);
+      font-size: 13px; line-height: 1.6;
+    }
+    .copy {
+      position: absolute; top: 10px; right: 10px; height: 30px; padding: 0 12px; border: 0; cursor: pointer;
+      border-radius: 999px; font: 500 12.5px var(--font); color: var(--text);
+    }
 
-/* ---------- Header ---------- */
-.site-header {
-  position: sticky;
-  top: 0;
-  z-index: 50;
-  background: rgba(249, 250, 252, 0.85);
-  backdrop-filter: saturate(180%) blur(10px);
-  border-bottom: 1px solid var(--border-soft);
-}
-.header-inner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  height: 60px;
-}
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.brand-icon { border-radius: 7px; }
-.brand-name {
-  font-weight: 600;
-  font-size: 17px;
-  letter-spacing: -0.02em;
-}
-.header-nav {
-  display: flex;
-  align-items: center;
-  gap: 22px;
-}
-.nav-link {
-  font-family: var(--font-mono);
-  font-size: 13px;
-  color: var(--muted);
-  transition: color 0.15s ease;
-}
-.nav-link:hover { color: var(--fg); }
-.gh-link {
-  display: inline-flex;
-  align-items: center;
-  color: var(--muted);
-  transition: color 0.15s ease;
-}
-.gh-link:hover { color: var(--fg); }
+    footer { margin-top: 120px; padding: 28px 0 40px; border-top: 1px solid var(--line); font-size: 12.5px; color: var(--text-3); letter-spacing: -0.01em; }
+    .foot { display: flex; flex-wrap: wrap; gap: 8px 22px; justify-content: space-between; }
+    .foot nav { display: flex; flex-wrap: wrap; gap: 8px 18px; }
+    .foot a { color: var(--text-2); }
 
-/* ---------- Hero ---------- */
-.hero {
-  padding-bottom: 4px;
-}
-.hero-inner {
-  text-align: center;
-  padding: 72px 24px 80px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-}
-.hero-mascot {
-  width: 180px;
-  height: 180px;
-  object-fit: contain;
-  margin-bottom: 28px;
-}
-.hero-title {
-  font-size: clamp(2rem, 5vw, 3.25rem);
-  line-height: 1.05;
-  letter-spacing: -0.03em;
-  font-weight: 650;
-  margin: 0 0 18px;
-  max-width: 14ch;
-}
-.hero-sub {
-  font-size: clamp(1rem, 2vw, 1.15rem);
-  color: var(--muted);
-  margin: 0 0 30px;
-  max-width: 60ch;
-}
-.hero-actions {
-  display: flex;
-  gap: 12px;
-  margin-bottom: 18px;
-}
-.hero-note {
-  margin: 0;
-  font-size: 12px;
-  color: var(--muted);
-  letter-spacing: 0.02em;
-}
-
-/* ---------- Intro ---------- */
-.intro {
-  border-bottom: 1px solid var(--border-soft);
-}
-.intro-inner {
-  padding: 56px 24px;
-}
-.intro-text {
-  margin: 0 auto;
-  max-width: 70ch;
-  font-size: clamp(1.05rem, 2vw, 1.3rem);
-  line-height: 1.6;
-  letter-spacing: -0.01em;
-}
-
-/* ---------- Hero video ---------- */
-.hero-video {
-  padding: 4px 0 56px;           /* no divider lines - just breathing room */
-}
-.hero-video-inner {
-  max-width: 960px;
-  margin: 0 auto;
-  padding: 0 24px;
-}
-.hero-video figure { margin: 0; }
-.hero-video video {
-  display: block;
-  width: 100%;
-  height: auto;                  /* derive height from the true 16:9 source - no square box */
-  aspect-ratio: 16 / 9;          /* hold the shape before the poster loads (no layout shift) */
-  object-fit: cover;             /* fill the frame; source is already 16:9 so nothing is cropped */
-  border-radius: 14px;
-  /* deep, soft elevation so the dark film sits above the cream page */
-  box-shadow: 0 24px 60px rgba(17, 24, 39, 0.20), 0 2px 8px rgba(17, 24, 39, 0.08);
-  background: #0a0b0e;            /* matches the film's gradient before load/poster */
-  outline: none;
-}
-.hero-video figcaption {
-  margin: 14px 0 0;
-  text-align: center;
-  color: var(--muted);
-  font-size: 0.9rem;
-}
-
-/* ---------- Features ---------- */
-.features {
-  padding: 64px 0;
-  border-bottom: 1px solid var(--border-soft);
-}
-.feature-grid {
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 1px;
-  background: var(--border-soft);
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius);
-  overflow: hidden;
-}
-.feature-card {
-  background: var(--panel);
-  padding: 28px;
-}
-.feature-title {
-  margin: 0 0 10px;
-  font-size: 1.05rem;
-  font-weight: 600;
-  letter-spacing: -0.02em;
-}
-.feature-body {
-  margin: 0;
-  color: var(--muted);
-  font-size: 0.95rem;
-  line-height: 1.6;
-}
-.feature-body a {
-  color: var(--fg);
-  border-bottom: 1px solid var(--accent);
-}
-.feature-body a:hover { background: var(--accent); color: var(--accent-fg); }
-
-/* ---------- Private band ---------- */
-.band {
-  padding: 72px 0;
-  border-bottom: 1px solid var(--border-soft);
-}
-.band-inner { max-width: 760px; margin: 0 auto; }
-.band-title {
-  margin: 0 0 18px;
-  font-size: clamp(1.6rem, 3.5vw, 2.25rem);
-  letter-spacing: -0.03em;
-  font-weight: 650;
-}
-.band-body {
-  margin: 0 0 24px;
-  font-size: 1.05rem;
-  color: var(--muted);
-  line-height: 1.6;
-}
-.band-list {
-  list-style: none;
-  padding: 0;
-  margin: 0;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-}
-.band-list li {
-  font-size: 12px;
-  letter-spacing: 0.01em;
-  border: 1px solid var(--border);
-  border-radius: 9999px;
-  padding: 6px 14px;
-  background: var(--panel);
-  color: var(--fg);
-}
-
-/* ---------- Screenshots ---------- */
-.screenshots {
-  padding: 72px 0;
-  border-bottom: 1px solid var(--border-soft);
-}
-.shot { margin: 0; }
-.shot img {
-  width: 100%;
-  height: auto;
-  display: block;
-  /* captured by window id, so the macOS window corners are already transparent - just a soft
-     shadow that follows the rounded shape (drop-shadow respects the alpha). */
-  filter: drop-shadow(0 16px 38px rgba(17, 24, 39, 0.15));
-}
-.shot-caption {
-  margin: 18px 4px 0;
-  font-size: 0.9rem;
-  color: var(--muted);
-  text-align: center;
-}
-/* main UI shot - large, centered */
-/* the any-file screenshot sits inside its own section, so tighten the margins */
-
-/* ---------- Carousel (multimodal search) ---------- */
-.carousel-wrap { max-width: 920px; margin: 0 auto 72px; }
-.carousel {
-  position: relative;
-  width: 100%;
-  aspect-ratio: 1180 / 760;       /* matches the window-ID captures */
-}
-/* captured by window id, so corners are already transparent - no clipping, shadow follows shape */
-.cframe {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-  opacity: 0;
-  filter: drop-shadow(0 16px 38px rgba(17, 24, 39, 0.15));
-  animation: cfade 36s infinite;
-}
-.cframe:nth-child(1) { animation-delay: 0s; }
-.cframe:nth-child(2) { animation-delay: 6s; }
-.cframe:nth-child(3) { animation-delay: 12s; }
-.cframe:nth-child(4) { animation-delay: 18s; }
-.cframe:nth-child(5) { animation-delay: 24s; }
-.cframe:nth-child(6) { animation-delay: 30s; }
-@keyframes cfade {     /* 36s cycle, 6 frames at 6s each: ~5s visible + a short crossfade */
-  0%    { opacity: 0; }
-  2%    { opacity: 1; }
-  14.7% { opacity: 1; }
-  18.7% { opacity: 0; }
-  100%  { opacity: 0; }
-}
-/* captions crossfade in sync with the frames */
-.carousel-cap { position: relative; height: 1.4em; }
-.carousel-cap > span {
-  position: absolute;
-  left: 0; right: 0;
-  opacity: 0;
-  animation: cfade 36s infinite;
-}
-.carousel-cap > span:nth-child(1) { animation-delay: 0s; }
-.carousel-cap > span:nth-child(2) { animation-delay: 6s; }
-.carousel-cap > span:nth-child(3) { animation-delay: 12s; }
-.carousel-cap > span:nth-child(4) { animation-delay: 18s; }
-.carousel-cap > span:nth-child(5) { animation-delay: 24s; }
-.carousel-cap > span:nth-child(6) { animation-delay: 30s; }
-@media (prefers-reduced-motion: reduce) {
-  .cframe, .carousel-cap > span { animation: none; }
-  .cframe:nth-child(1), .carousel-cap > span:nth-child(1) { opacity: 1; }
-}
-/* every Settings tab: a waterfall (masonry) of the small settings windows. CSS columns keep it
-   dependency-free; break-inside guards each card from splitting across columns. */
-.waterfall {
-  columns: 3;
-  column-gap: 28px;
-  max-width: 980px;
-  margin: 0 auto;
-}
-.wf-item {
-  break-inside: avoid;
-  margin: 0 0 28px;
-}
-.wf-item img { width: 100%; height: auto; display: block; }
-@media (max-width: 900px) { .waterfall { columns: 2; } }
-@media (max-width: 560px) { .waterfall { columns: 1; max-width: 340px; } }
-
-/* ---------- Serving ---------- */
-.serving {
-  padding: 72px 0;
-  border-bottom: 1px solid var(--border-soft);
-}
-.serving-title {
-  margin: 0 0 18px;
-  font-size: clamp(1.6rem, 3.5vw, 2.25rem);
-  letter-spacing: -0.03em;
-  font-weight: 650;
-}
-.serving-body {
-  margin: 0 0 32px;
-  max-width: 70ch;
-  font-size: 1.05rem;
-  color: var(--muted);
-  line-height: 1.6;
-}
-.serving-grid {
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 1px;
-  background: var(--border-soft);
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius);
-  overflow: hidden;
-}
-.serving-item {
-  background: var(--panel);
-  padding: 24px;
-}
-.serving-item-label {
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  font-size: 11px;
-  color: var(--muted);
-  margin: 0 0 10px;
-}
-.serving-item-body {
-  margin: 0;
-  font-size: 0.95rem;
-  line-height: 1.55;
-}
-.serving-item-body strong { font-weight: 600; }
-
-/* ---------- Profiling ---------- */
-.profiling {
-  padding: 72px 0;
-  border-bottom: 1px solid var(--border-soft);
-}
-.profiling-title {
-  margin: 0 0 18px;
-  font-size: clamp(1.6rem, 3.5vw, 2.25rem);
-  letter-spacing: -0.03em;
-  font-weight: 650;
-}
-.profiling-body {
-  margin: 0 0 14px;
-  max-width: 70ch;
-  font-size: 1.05rem;
-  color: var(--muted);
-  line-height: 1.6;
-}
-.profiling-meta {
-  margin: 0 0 32px;
-  font-size: 12px;
-  color: var(--muted);
-  letter-spacing: 0.02em;
-}
-.profiling-meta .dot { margin: 0 8px; opacity: 0.5; }
-/* empty / error state card */
-.profiling-empty {
-  background: var(--panel);
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius);
-  padding: 40px 28px;
-  text-align: center;
-  color: var(--muted);
-  font-size: 0.98rem;
-}
-.profiling-empty strong { color: var(--fg); font-weight: 600; display: block; margin-bottom: 6px; }
-/* version-vs-throughput scatter: one colored line per chip */
-.bench-panel {
-  background: var(--panel);
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius);
-  padding: 18px 16px 6px;
-}
-.bench-svg { width: 100%; height: auto; display: block; }
-.bench-grid line { stroke: var(--border-soft); }
-.bench-axis text {
-  fill: var(--muted);
-  font-family: var(--font-mono);
-  font-size: 11px;
-}
-.bench-axis .axis-name { font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; }
-.bench-series polyline {
-  fill: none;
-  stroke-width: 2;
-  opacity: 0.85;
-  transition: opacity 0.15s ease;
-}
-.bench-series circle {
-  stroke: var(--panel);
-  stroke-width: 1.5;
-  cursor: pointer;
-  transition: opacity 0.15s ease;
-}
-/* hovering a dot spotlights its chip's line, dims the rest */
-.bench-svg.focusing .bench-series { opacity: 0.15; }
-.bench-svg.focusing .bench-series.focus { opacity: 1; }
-.bench-toggle {
-  display: inline-flex;
-  gap: 0;
-  margin: 0 0 14px;
-  border: 1px solid var(--border-soft);
-  border-radius: 8px;
-  overflow: hidden;
-}
-.bench-toggle button {
-  appearance: none;
-  border: 0;
-  background: var(--panel);
-  color: var(--muted);
-  font-family: var(--font-mono);
-  font-size: 12px;
-  padding: 6px 14px;
-  cursor: pointer;
-}
-.bench-toggle button + button { border-left: 1px solid var(--border-soft); }
-.bench-toggle button.on { background: var(--accent); color: var(--accent-fg); }
-.bench-legend {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px 18px;
-  margin: 12px 6px 10px;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  color: var(--fg);
-}
-.bench-legend .sw {
-  width: 10px; height: 10px;
-  border-radius: 3px;
-  display: inline-block;
-  margin-right: 7px;
-  vertical-align: -1px;
-}
-.bench-legend .chip-year {
-  color: var(--muted);
-  font-size: 11px;
-  margin-left: 6px;
-}
-#bench-tip {
-  position: fixed;
-  z-index: 50;
-  pointer-events: none;
-  background: var(--panel);
-  border: 1px solid var(--border-soft);
-  border-radius: 8px;
-  padding: 10px 12px;
-  font-family: var(--font-mono);
-  font-size: 11.5px;
-  line-height: 1.55;
-  color: var(--muted);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
-  max-width: 280px;
-}
-#bench-tip .t { color: var(--fg); font-weight: 600; font-size: 12px; margin-bottom: 4px; }
-#bench-tip strong { color: var(--fg); font-weight: 500; }
-@media (max-width: 720px) {
-  .bench-toggle {
-  display: inline-flex;
-  gap: 0;
-  margin: 0 0 14px;
-  border: 1px solid var(--border-soft);
-  border-radius: 8px;
-  overflow: hidden;
-}
-.bench-toggle button {
-  appearance: none;
-  border: 0;
-  background: var(--panel);
-  color: var(--muted);
-  font-family: var(--font-mono);
-  font-size: 12px;
-  padding: 6px 14px;
-  cursor: pointer;
-}
-.bench-toggle button + button { border-left: 1px solid var(--border-soft); }
-.bench-toggle button.on { background: var(--accent); color: var(--accent-fg); }
-.bench-legend { gap: 4px 14px; font-size: 11px; }
-}
-
-/* ---------- Download ---------- */
-.faq { padding: 72px 0; border-bottom: 1px solid var(--border-soft); }
-.faq-title {
-  margin: 0 0 8px;
-  font-size: clamp(1.6rem, 3.5vw, 2.25rem);
-  letter-spacing: -0.03em;
-  font-weight: 650;
-}
-.faq-sub { margin: 0 0 28px; color: var(--muted); font-size: 15px; }
-.faq-loading { color: var(--muted); font-size: 13px; }
-.faq-cat { margin-top: 30px; }
-.faq-cat:first-child { margin-top: 0; }
-.faq-cat-title {
-  margin: 0 0 6px;
-  font-size: 12px;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--muted);
-  font-weight: 600;
-}
-.faq-item { border-bottom: 1px solid var(--border-soft); }
-.faq-item > summary {
-  list-style: none;
-  cursor: pointer;
-  padding: 13px 30px 13px 0;
-  position: relative;
-  font-size: 15px;
-  font-weight: 500;
-  color: var(--fg);
-}
-.faq-item > summary::-webkit-details-marker { display: none; }
-.faq-item > summary::after {
-  content: "+";
-  position: absolute;
-  right: 4px;
-  top: 11px;
-  color: var(--muted);
-  font-size: 17px;
-  font-weight: 400;
-}
-.faq-item[open] > summary::after { content: "\2212"; }
-.faq-a { padding: 0 30px 16px 0; color: var(--muted); font-size: 14px; line-height: 1.6; }
-.faq-kbd {
-  margin-left: 8px;
-  padding: 1px 6px;
-  border-radius: 5px;
-  background: var(--border-soft);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  font-weight: 500;
-  color: var(--fg);
-  white-space: nowrap;
-}
-.dl-md5 { color: var(--fg); opacity: 0.7; user-select: all; word-break: break-all; }
-/* version pill inside the download button */
-.dl-ver {
-  margin-left: 8px;
-  padding: 2px 7px;
-  border-radius: 6px;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  background: rgba(255, 255, 255, 0.16);
-  color: inherit;
-}
-
-/* ---------- Footer ---------- */
-.site-footer {
-  padding: 36px 0;
-}
-.footer-inner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 12px;
-}
-.footer-brand {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 14px;
-}
-.footer-brand .brand-icon { border-radius: 5px; }
-.footer-note {
-  margin: 0;
-  font-size: 12px;
-  color: var(--muted);
-}
-
-/* ---------- Responsive ---------- */
-@media (max-width: 720px) {
-  .header-nav { gap: 14px; }
-  .nav-link { display: none; }
-  .feature-grid { grid-template-columns: 1fr; }
-  .serving-grid { grid-template-columns: 1fr; }
-  .req-row { grid-template-columns: 1fr; gap: 4px; }
-  .hero-inner { padding: 48px 20px 56px; }
-  .hero-mascot { width: 140px; height: 140px; }
-}
-
-</style>
+    /* Tablet and phone */
+    @media (max-width: 1000px) {
+      .features { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (max-width: 734px) {
+      :root { --gutter: 16px; }
+      body { font-size: 16px; }
+      .nav-links { display: none; }
+      .hero { padding-top: 48px; }
+      .app-icon { width: 84px; height: 84px; }
+      .hero-shot { margin-top: 40px; }
+      .shot { border-radius: 10px; }
+      section { padding-top: 88px; }
+      .features { grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 40px; }
+      .feature { padding: 16px 16px 18px; border-radius: 18px; }
+      .feature h3 { font-size: 16px; margin-bottom: 4px; }
+      .feature p { font-size: 14px; }
+      .api-row { grid-template-columns: 1fr; gap: 4px; }
+      .bench-panel { padding: 14px 8px 12px; }
+      .btn-lg, .btn-ghost { width: 100%; max-width: 360px; }
+    }
+  </style>
 </head>
 <body>
-
-  <header class="site-header">
-    <div class="container header-inner">
-      <a class="brand" href="/omni">
-        <img class="brand-icon" src="assets/icon.png" alt="Omni app icon" width="26" height="26" />
-        <span class="brand-name">Omni</span>
-      </a>
-      <nav class="header-nav">
-        <a class="nav-link" href="#features">Features</a>
-        <a class="nav-link" href="#serving">Serving</a>
-        <a class="nav-link" href="#profiling">Benchmark</a>
-        <a class="nav-link" href="#faq">FAQ</a>
-        <a class="gh-link" href="https://github.com/hanxiao/omni-macos" target="_blank" rel="noopener" aria-label="View source on GitHub" title="View source on GitHub">
-          <svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.02-1.49-2.01.44-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
-        </a>
-        <a class="btn btn-primary" href="Omni-0.1.15.dmg">Download</a>
+  <header class="nav">
+    <div class="nav-bar glass">
+      <a class="brand" href="/omni/"><img src="assets/icon.png" alt="" width="26" height="26" />Omni</a>
+      <nav class="nav-links" aria-label="Sections">
+        <a href="#features">Features</a>
+        <a href="#agents">Agents</a>
+        <a href="#benchmark">Benchmark</a>
+        <a href="#faq">FAQ</a>
+        <a href="#paper">Paper</a>
       </nav>
+      <a class="nav-gh" href="https://github.com/hanxiao/omni-macos" target="_blank" rel="noopener" aria-label="Source on GitHub" title="Source on GitHub">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      </a>
+      <a class="btn btn-primary" href="Omni-0.13.8.dmg">Download</a>
     </div>
   </header>
 
   <main>
-
-    <!-- HERO -->
-    <section class="hero">
-      <div class="container hero-inner">
-        <img class="hero-mascot" src="assets/omni-mascot.png" alt="Omni mascot, a small 3D mole" width="160" height="148" />
-        <h1 class="hero-title">Search every file on your Mac by meaning.</h1>
-        <p class="hero-sub">Text, code, PDFs, images, audio, and video - in any language, entirely on-device. Download the model once, then run fully offline.</p>
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="wash" aria-hidden="true"></div>
+      <div class="wrap">
+        <img class="app-icon" src="assets/icon.png" alt="Omni app icon" width="104" height="104" />
+        <h1 id="hero-title">Search your Mac by meaning.</h1>
+        <p class="lede">Every file. Any language. On device.</p>
         <div class="hero-actions">
-          <a class="btn btn-primary btn-lg" href="Omni-0.1.15.dmg">Download for macOS <span class="dl-ver">v0.1.10</span></a>
+          <a class="btn btn-primary btn-lg" href="Omni-0.13.8.dmg">Download for macOS <span class="dl-ver">v0.13.8</span></a>
         </div>
-        <p class="hero-note mono">Apple silicon &middot; macOS 14+ &middot; MD5 <span class="dl-md5">&hellip;</span></p>
+        <p class="hero-note mono">Apple silicon &middot; macOS 14+ &middot; MD5 <span class="dl-md5">d7187a2b198005c82b8ae3a820184236</span></p>
       </div>
-    </section>
-
-    <!-- VIDEO -->
-    <section class="hero-video" aria-label="Omni product demo">
-      <div class="hero-video-inner">
-        <figure>
-          <video
-            controls playsinline loop preload="none"
-            poster="assets/omni-poster.jpg"
-            aria-label="Omni demo: search every file on your Mac by meaning - cross-modal search, deep PDF search, folder maps, and an on-device MLX architecture">
-            <source src="assets/omni-intro.mp4" type="video/mp4" />
-            Your browser cannot play this video.
-            <a href="assets/omni-intro.mp4">Download the Omni intro (MP4)</a>.
-          </video>
-          <figcaption>37 seconds: search by meaning, any file to any file, deep PDF search, folder maps, and the on-device architecture.</figcaption>
-        </figure>
-      </div>
-    </section>
-
-    <!-- FEATURES -->
-    <section id="features" class="features">
-      <div class="container">
-        <p class="section-label mono">Features</p>
-        <div class="feature-grid">
-
-          <article class="feature-card">
-            <h3 class="feature-title">Any language</h3>
-            <p class="feature-body">Search in English, match notes in German, Chinese, or Japanese - queries and files meet by meaning, not by keyword, scanned pages included.</p>
-          </article>
-
-          <article class="feature-card">
-            <h3 class="feature-title">See a folder as a map</h3>
-            <p class="feature-body">Every file becomes a dot, clustered by similarity and colored by type. Click a dot to spotlight its nearest neighbors - duplicates, drafts, and forgotten corners stand out at a glance.</p>
-          </article>
-
-          <article class="feature-card">
-            <h3 class="feature-title">Fast on Apple silicon</h3>
-            <p class="feature-body">A native MLX-Swift port of <span class="mono">jina-embeddings-v5-omni</span> runs in-process on the GPU - tens of thousands of tokens per second on recent chips, <a href="#profiling">measured in the open</a> rather than claimed.</p>
-          </article>
-
-          <article class="feature-card">
-            <h3 class="feature-title">Native to macOS</h3>
-            <p class="feature-body">List and Gallery views, real QuickLook thumbnails, drag and drop, keyboard-first navigation, and filters by kind, folder, date, and score.</p>
-          </article>
+      <div class="hero-shot">
+        <div class="shot">
+          <picture>
+            <source srcset="assets/shot-hero.webp" type="image/webp" />
+            <img src="assets/shot-hero.jpg" width="1600" height="748" alt="Omni searching for porsche 911 across 2.7 million files, showing a gallery of matching photos with relevance scores and generated tags" fetchpriority="high" />
+          </picture>
         </div>
       </div>
     </section>
 
-    <!-- PRIVATE BAND -->
-    <section class="band">
-      <div class="container band-inner">
-        <p class="section-label mono">Private by design</p>
-        <h2 class="band-title">Everything stays on your Mac.</h2>
-        <p class="band-body">The model download is the only time Omni touches the network. From then on your files, their embeddings, and every query stay on this Mac - pull the plug and search still works.</p>
-        <ul class="band-list mono">
-          <li>One model download, then fully offline</li>
-          <li>No accounts, no telemetry</li>
-          <li>Local SQLite vector store you can inspect or delete</li>
-          <li>Open source on GitHub</li>
-        </ul>
-      </div>
-    </section>
+    <section id="features" aria-labelledby="features-title">
+      <div class="wrap">
+        <div class="head-center">
+          <h2 id="features-title">One index for everything.</h2>
+        </div>
+        <div class="features">
+          <div class="feature"><h3>Every file</h3><p>Text, code, PDFs, images, audio, video.</p></div>
+          <div class="feature"><h3>Any language</h3><p>Matched by meaning, not keywords.</p></div>
+          <div class="feature"><h3>Search by file</h3><p>Drop an image, a clip or a document.</p></div>
+          <div class="feature"><h3>To the passage</h3><p><code>Page 12</code>, <code>Line 1240</code>.</p></div>
+          <div class="feature"><h3>OCR</h3><p>Scans to Markdown, on device.</p></div>
+          <div class="feature"><h3>Filters</h3><p><code>type:</code> <code>in:</code> <code>date:</code> <code>tag:</code> <code>score:</code></p></div>
+          <div class="feature"><h3>Duplicates</h3><p>Stacked into one result.</p></div>
+          <div class="feature"><h3>Folders and Photos</h3><p>Kept in sync as they change.</p></div>
+          <div class="feature"><h3>Private</h3><p>Offline after one download.</p></div>
+        </div>
 
-    <!-- SCREENSHOTS -->
-    <section id="screenshots" class="screenshots">
-      <div class="container">
-        <p class="section-label mono">A look inside</p>
-        <h2 class="serving-title">Search with any file, find any file.</h2>
-        <p class="serving-body">Every file - image, audio, video, text - lands in one shared vector space, so a query is just another file. Drop in a photo to find related screenshots, a voice memo to surface where it came from, a PDF to pull up everything near it. Right-click any result and choose <strong>Find Similar</strong>, or drop a file onto the search. One model, one space, any direction.</p>
-
-        <figure class="carousel-wrap">
-          <div class="carousel" aria-label="Searching across images, text, audio, video, by an example file, plus a folder mapped by similarity">
-            <img class="cframe" src="assets/search-image.png" alt="Searching images - Porsche 911 photos" />
-            <img class="cframe" src="assets/search-text.png" alt="Searching text and code - jina omni embeddings" />
-            <img class="cframe" src="assets/search-audio.png" alt="Searching audio files" />
-            <img class="cframe" src="assets/search-video.png" alt="Searching video clips" />
-            <img class="cframe" src="assets/search-anyfile.png" alt="Searching Omni by an example file, returning matches across modalities" />
-            <img class="cframe" src="assets/map.png" alt="Folder embedding map: 56,318 files clustered by similarity and colored by type" />
+        <div class="show">
+          <div class="show-text">
+            <h3>Scans become Markdown.</h3>
           </div>
-          <figcaption class="shot-caption carousel-cap">
-            <span><span class="mono">porsche 911</span> &middot; images</span>
-            <span><span class="mono">jina omni embeddings</span> &middot; text</span>
-            <span><span class="mono">podcast interview</span> &middot; audio</span>
-            <span><span class="mono">screen recording demo</span> &middot; video</span>
-            <span><span class="mono">this file</span> &middot; results across every modality</span>
-            <span><span class="mono">Documents</span> &middot; mapped by similarity</span>
-          </figcaption>
-        </figure>
-
-        <!-- every Settings tab, waterfall layout -->
-        <div class="waterfall" aria-label="Every Settings tab">
-          <figure class="shot wf-item">
-            <img src="assets/settings-content.png" alt="Settings - Content: file types to index, size thresholds, ignore rules" loading="lazy" />
-            <figcaption class="shot-caption">Choose what to index.</figcaption>
-          </figure>
-          <figure class="shot wf-item">
-            <img src="assets/settings-performance.png" alt="Settings - Performance: model choice, memory cap, folder map layout" loading="lazy" />
-            <figcaption class="shot-caption">Tune memory and speed.</figcaption>
-          </figure>
-          <figure class="shot wf-item">
-            <img src="assets/settings-serving.png" alt="Settings - Serving: the local HTTP embedding server" loading="lazy" />
-            <figcaption class="shot-caption">Run a local embedding server.</figcaption>
-          </figure>
-          <figure class="shot wf-item">
-            <img src="assets/settings-indexing.png" alt="Settings - Indexing: live activity and throughput" loading="lazy" />
-            <figcaption class="shot-caption">Watch indexing live.</figcaption>
-          </figure>
-          <figure class="shot wf-item">
-            <img src="assets/settings-storage.png" alt="Settings - Storage: where the index lives and how big it is" loading="lazy" />
-            <figcaption class="shot-caption">One index, on your disk.</figcaption>
-          </figure>
-          <figure class="shot wf-item">
-            <img src="assets/settings-history.png" alt="Settings - History: search history retention" loading="lazy" />
-            <figcaption class="shot-caption">History on your terms.</figcaption>
-          </figure>
-        </div>
-      </div>
-    </section>
-
-    <!-- SERVING -->
-    <section id="serving" class="serving">
-      <div class="container">
-        <p class="section-label mono">Serving</p>
-        <h2 class="serving-title">Give your local agents search.</h2>
-        <p class="serving-body">Omni exposes its search over your indexed files as a local endpoint - loopback-only and token-guarded. Agents like <strong>Hermes</strong> and <strong>OpenClaw</strong> search the index you already built - on your machine, with no cloud round-trip.</p>
-        <div class="serving-grid">
-          <div class="serving-item">
-            <p class="serving-item-label mono">Search endpoint</p>
-            <p class="serving-item-body">The same semantic search the app uses - how agents actually reach your files.</p>
+          <div class="shot">
+            <picture>
+              <source srcset="assets/shot-ocr.webp" type="image/webp" />
+              <img src="assets/shot-ocr.jpg" width="1600" height="860" alt="The OCR workspace transcribing a 40-page scan, with page thumbnails, the Markdown source and the rendered page side by side" loading="lazy" />
+            </picture>
           </div>
-          <div class="serving-item">
-            <p class="serving-item-label mono">Embeddings &middot; add-on</p>
-            <p class="serving-item-body">Raw vectors too, via OpenAI-, Jina-, Cohere-, and Gemini-compatible APIs.</p>
+        </div>
+
+        <div class="show">
+          <div class="show-text">
+            <h3>Folders become maps.</h3>
+          </div>
+          <div class="shot">
+            <picture>
+              <source srcset="assets/shot-map.webp" type="image/webp" />
+              <img src="assets/shot-map.jpg" width="1600" height="860" alt="A folder of tens of thousands of files laid out as a map by embedding similarity, colored by file kind" loading="lazy" />
+            </picture>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- PROFILING -->
-    <section id="profiling" class="profiling">
-      <div class="container">
-        <p class="section-label mono">Benchmark</p>
-        <h2 class="profiling-title">How fast is Omni on your Mac?</h2>
-        <p class="profiling-body">Community benchmarks on a fixed 300-file dataset. One line per chip, one dot per Omni version - hover for details. Add your Mac: <span class="mono">File &rarr; Run Profiling</span> in the app.</p>
-        <p class="profiling-meta mono" id="profiling-meta" hidden></p>
-        <div id="profiling-content">
-          <div class="profiling-empty" id="profiling-loading">
-            <span class="mono">Loading community benchmarks&hellip;</span>
-          </div>
+    <section id="agents" aria-labelledby="agents-title">
+      <div class="wrap">
+        <div class="head-center">
+          <h2 id="agents-title">Built for agents.</h2>
+          <p class="sub">HTTP and MCP, on this Mac.</p>
+        </div>
+        <pre class="code"><span class="c"># Claude Code</span>
+claude mcp add --transport http omni http://127.0.0.1:51234/mcp
+
+<span class="c"># Any HTTP client</span>
+curl http://127.0.0.1:51234/v1/search -d '{"query": "invoice from february", "top_k": 5}'</pre>
+        <dl class="api">
+          <div class="api-row"><dt>Search</dt><dd><code>/v1/search</code></dd></div>
+          <div class="api-row"><dt>OCR</dt><dd><code>/v1/chat/completions</code> &middot; <code>/v1/ocr</code></dd></div>
+          <div class="api-row"><dt>Embeddings</dt><dd>OpenAI &middot; Jina &middot; Cohere &middot; Gemini</dd></div>
+          <div class="api-row"><dt>Tags</dt><dd><code>/v1/tag</code> &middot; <code>/v1/files/tags</code></dd></div>
+          <div class="api-row"><dt>Index</dt><dd><code>/v1/sources</code> &middot; <code>/v1/files/status</code></dd></div>
+          <div class="api-row"><dt>MCP</dt><dd>9 tools &middot; SKILL.md</dd></div>
+        </dl>
+      </div>
+    </section>
+
+    <section id="benchmark" aria-labelledby="bench-title">
+      <div class="wrap">
+        <div class="head-center">
+          <h2 id="bench-title">Benchmarks.</h2>
+          <p class="sub">300 files, community runs.</p>
+        </div>
+        <p class="profiling-meta" id="profiling-meta" hidden></p>
+        <div class="bench" id="profiling-content">
+          <div class="profiling-empty" id="profiling-loading">Loading community benchmarks&hellip;</div>
         </div>
       </div>
     </section>
 
-    <!-- DOWNLOAD -->
-    <!-- FAQ (content is faq.json; rendered + structured-data emitted by the script below) -->
-    <section id="faq" class="faq">
-      <div class="container">
-        <h2 class="faq-title">Questions &amp; how-to</h2>
-        <p class="faq-sub">Everything Omni does, and how. Click a question to expand.</p>
+    <section id="faq" aria-labelledby="faq-title">
+      <div class="wrap narrow">
+        <h2 id="faq-title">FAQ</h2>
         <div id="faq-content" class="faq-content">
-          <p class="faq-loading mono">Loading&hellip;</p>
+          <p class="faq-loading">Loading&hellip;</p>
         </div>
       </div>
     </section>
 
+    <section id="paper" aria-labelledby="paper-title">
+      <div class="wrap narrow">
+        <h2 id="paper-title">Paper</h2>
+        <p class="paper-title"><a href="https://arxiv.org/abs/2608.05543" target="_blank" rel="noopener">omni-macos: On-Device Omni-Modal Search on Apple Silicon</a></p>
+        <p class="paper-meta">Han Xiao &middot; arXiv:2608.05543 &middot; 2026</p>
+        <div class="cite">
+          <pre id="bibtex">@article{xiao2026omnimacos,
+  title   = {omni-macos: On-Device Omni-Modal Search on Apple Silicon},
+  author  = {Xiao, Han},
+  journal = {arXiv preprint arXiv:2608.05543},
+  year    = {2026},
+  url     = {https://arxiv.org/abs/2608.05543}
+}</pre>
+          <button class="copy glass" type="button" data-copy="bibtex">Copy</button>
+        </div>
+      </div>
+    </section>
   </main>
 
-  <footer class="site-footer">
-    <div class="container footer-inner">
-      <div class="footer-brand">
-        <img class="brand-icon" src="assets/icon.png" alt="" width="18" height="18" />
-        <span class="mono">Omni</span>
-      </div>
-      <p class="footer-note mono">On-device semantic search for macOS.</p>
+  <footer>
+    <div class="wrap foot">
+      <span>Apache 2.0 &middot; weights CC BY-NC 4.0</span>
+      <nav aria-label="Links">
+        <a href="https://github.com/hanxiao/omni-macos" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://github.com/hanxiao/omni-macos/releases" target="_blank" rel="noopener">Releases</a>
+        <a href="https://arxiv.org/abs/2608.05543" target="_blank" rel="noopener">arXiv</a>
+              </nav>
     </div>
   </footer>
 
-  <!-- Profiling: fetch community benchmarks, render the version-vs-throughput scatter -->
+  <script>
+  (function () {
+    var b = document.querySelector("[data-copy]");
+    if (!b) return;
+    b.addEventListener("click", function () {
+      var t = document.getElementById(b.getAttribute("data-copy")).textContent;
+      var done = function () { b.textContent = "Copied"; setTimeout(function () { b.textContent = "Copy"; }, 1600); };
+      if (navigator.clipboard) navigator.clipboard.writeText(t).then(done, function () {});
+    });
+  })();
+  </script>
+
   <script>
   (function () {
     var ENDPOINT = "https://hanxiao.io/omni/profiling";
@@ -1014,7 +582,7 @@ img { max-width: 100%; display: block; }
         content.innerHTML =
           '<div class="profiling-empty">' +
           '<strong>No results yet</strong>' +
-          '<span class="mono">Be the first to run profiling - File &rarr; Run Profiling in the app.</span>' +
+          '<span>Run one in Settings &rsaquo; Performance &rsaquo; Run benchmark.</span>' +
           "</div>";
       }
     }
@@ -1241,7 +809,6 @@ img { max-width: 100%; display: block; }
   })();
   </script>
 
-  <!-- FAQ: content lives in faq.json; render collapsible items + emit schema.org FAQPage -->
   <script>
   (function () {
     function esc(s) {
@@ -1283,6 +850,5 @@ img { max-width: 100%; display: block; }
       });
   })();
   </script>
-
 </body>
 </html>
