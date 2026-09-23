@@ -1472,7 +1472,8 @@ final class OCRSession {
                             self.liveTokens[index] = update.tokens
                         }
                         if self.firstTokenPending { self.firstTokenPending = false; omniPerfLog("ocr-first-token") }
-                        self.prefillTarget = 0
+                        // Guarded: the workspace's body reads it, and this runs on every update.
+                        if self.prefillTarget != 0 { self.prefillTarget = 0 }
                         self.noteRate()
                         self.streamTick &+= 1
                     }

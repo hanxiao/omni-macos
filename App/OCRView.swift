@@ -84,7 +84,11 @@ struct OCRView: View {
                 return true
             },
             isPreviewOpen: { session.previewing != nil }))
-        .toolbar { toolbar }
+        // A modifier, not `.toolbar` on this body: the body re-runs as the transcript streams (it
+        // reads the section list), and every re-run handed SwiftUI a new toolbar - the platform
+        // items and their menu forms were rebuilt, symbol images resolved again, on every update.
+        // Sampled on a 40-page run: ~1,000 samples a minute in toolbar item layout alone.
+        .modifier(OCRToolbar())
     }
 
     // MARK: - Workspace
@@ -210,6 +214,17 @@ struct OCRView: View {
     /// and the navigator toggle. `ToolbarSpacer` is what separates them into distinct Liquid Glass
     /// surfaces on Tahoe - without it every OCR control shares one pill with the mode toggle that
     /// belongs to the window, and the picker reads as part of the same control.
+}
+
+/// The workspace's toolbar, in a modifier of its own so it re-renders when what it shows changes -
+/// the view mode, whether pages are done, the document's name - and not with every streamed token.
+private struct OCRToolbar: ViewModifier {
+    @Environment(OCRSession.self) private var session
+
+    func body(content: Content) -> some View {
+        content.toolbar { toolbar }
+    }
+
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
         if hasDocument {
             if #available(macOS 26.0, *) { ToolbarSpacer(.fixed) }
@@ -244,13 +259,13 @@ struct OCRView: View {
             // Closing lives in the File menu only (Shift-Cmd-W). It is rare, it is undone by
             // reopening, and a toolbar earns its density from what people reach for often.
             ToolbarItem(id: "ocr.open", placement: .primaryAction) {
-                Button { chooseFiles() } label: {
+                Button { session.chooseAndOpen() } label: {
                     Label("Open Document", systemImage: "folder")
                 }
                 .help("Open another document  \u{2318}O")
             }
             ToolbarItem(id: "ocr.export", placement: .primaryAction) {
-                Button { exportMarkdown() } label: {
+                Button { session.exportMarkdown() } label: {
                     Label("Save Markdown\u{2026}", systemImage: "square.and.arrow.down")
                 }
                 .help("Save the transcription as a .md file  \u{2318}S")
@@ -287,7 +302,6 @@ struct OCRView: View {
         session.phase != .empty && session.phase != .needsModel && !session.pages.isEmpty
     }
 
-    private func exportMarkdown() { session.exportMarkdown() }
 }
 
 // MARK: - Page navigator

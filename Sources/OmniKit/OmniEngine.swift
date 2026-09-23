@@ -178,12 +178,16 @@ public func omniSetMemoryLimit(_ bytes: Int) {
 /// a cursor that moves each step, so freed buffers rarely fit the next request and pile up. On this
 /// 512 GB Mac a 200-page run held 145-180 GB of cache and kept it after the run. Measured on the
 /// 40-page scan at width 32, same digest at every limit: 379 tok/s with no cache, 445 at 1 GB, 451
-/// at 2, 462 at 4, 466 at 170. A sixteenth of RAM, between 1 and 4 GB.
+/// at 2, 462 at 4, 466 at 170. IN THE APP the bound costs more, because the UI and the embedding
+/// model allocate beside the run: 348 tok/s at 4 GB, 371 at 16, against 385 for 0.13.8 (whole-run
+/// peak footprint 28 GB at 16, 46 GB for 0.13.8). A sixteenth of RAM, between 1 and 16 GB, so a
+/// Mac under 128 GB keeps the smaller bound. OMNI_OCR_CACHE_GB overrides it, to measure.
 public func omniSetOCRMemory() {
     let physical = Int(ProcessInfo.processInfo.physicalMemory)
     OmniMemoryBudget.capBytes = physical
     MLX.Memory.memoryLimit = physical
-    MLX.Memory.cacheLimit = min(max(physical / 16, 1 << 30), 4 << 30)
+    let override = ProcessInfo.processInfo.environment["OMNI_OCR_CACHE_GB"].flatMap { Int($0) }.map { $0 << 30 }
+    MLX.Memory.cacheLimit = override ?? min(max(physical / 16, 1 << 30), 16 << 30)
 }
 
 /// Return MLX's buffer cache to the system. Used when an OCR run ends: the cache limit bounds

@@ -2408,7 +2408,9 @@ reader. `FolderMapSharedContentTests` fails without the fix. All other `flat16` 
 - A 200-page scan held 179 GB after the run (188 GB peak) on 0.13.8. Two causes, both measured.
   (1) OCR mode set MLX's buffer cache to physical/3 (170 GB here), and batched decode churns it:
   every step's attention and mask are sized by a cursor that moves. `omniSetOCRMemory` bounds it at
-  physical/16 in [1, 4] GB, and `endOCRRun` clears it. 40 pages at width 32: 379 tok/s with no
+  physical/16 in [1, 16] GB, and `endOCRRun` clears it. The ceiling was 4 GB first, which cost 8%
+  IN THE APP (346-351 tok/s against 374-386 for 0.13.8, installed and source-built alike) though
+  only 1% headless: the app allocates beside the run. At 16: 371, peak footprint 28 GB against 46. 40 pages at width 32: 379 tok/s with no
   cache, 445 at 1 GB, 451 at 2, 462 at 4, 466 at 170; 200 pages 675 at 4 against 678 at 170.
   (2) the continuous batch's shared KV cursor counts the steps of the whole RUN, so the buffer
   followed the document. `OCRBatchKVCache.compact` packs each row's live history under the
@@ -2423,7 +2425,8 @@ reader. `FolderMapSharedContentTests` fails without the fix. All other `flat16` 
 - RAMP PACING (`OCRRuntimeFlags.rampDecodeShare`, 0.25): while the batch widens, decode that share
   of the last admission's time before admitting the next page. The pure one-admission-per-step
   ramp is almost all prefill, so no page finishes until every row is in. Numbers are in the flag's
-  comment; 0.25 moves the first finished page 15.3 -> 12.1 s in the app at no measurable cost, 0.5
+  comment; 0.25 moves the first finished page 15.3 -> 12.1 s in the app (re-measured 14.9 -> 12.0 s
+  with the 16 GB cache: 371 against 366 tok/s, noise), 0.5
   costs 4-10% there. hard2 CER is identical at every share. A narrow batch (width <= 4) starts
   full and never paces, so grade it at width 10 or the gate measures nothing.
 - Closing a tab mid-run drops its pages from the batch (`shouldDrop`, `OCRRunGate.drop`): a running
@@ -2552,7 +2555,10 @@ reader. `FolderMapSharedContentTests` fails without the fix. All other `flat16` 
   - OCR source pane while streaming: one Text of the whole page's highlighted source, re-measured
     and redrawn 24 times a second - main thread 93% busy on a 3,702-token page. One Text per line
     while a page runs (a fence stays whole; HTML tables have no blank lines, so paragraphs were not
-    enough), one Text when it finishes: 45%. Same tok/s.
+    enough), one Text when it finishes: 45%. Same tok/s (362 against 364 with one Text, interleaved).
+  - The OCR toolbar was `.toolbar` on the workspace body, which re-runs per streamed update, so every
+    update rebuilt the platform toolbar items (~1,000 samples a minute in item layout). It is the
+    `OCRToolbar` modifier now, reading only what it shows.
   - HangWatch ran its timer in the default mode only, so an open menu read as a main-thread block
     for as long as it stayed open (112 s once, main thread idle). Common modes now.
 - NOT BUGS, checked: Escape in the toolbar search field ends the search and gives up focus (native,
