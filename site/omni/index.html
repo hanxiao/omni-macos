@@ -195,7 +195,7 @@
         radial-gradient(44% 38% at 55% 78%, var(--wash-3), transparent 72%);
       filter: blur(8px);
     }
-    .app-icon { width: 130px; height: 120px; object-fit: contain; margin: 0 auto 20px; filter: drop-shadow(0 12px 18px rgba(60, 40, 20, 0.16)); }
+    .app-icon { width: 150px; height: 140px; object-fit: contain; margin: 0 auto 8px; }  /* shadow baked into the PNG: WebKit draws a CSS drop-shadow on an img as a visible box over the wash */
     .hero h1 {
       margin: 0 auto; max-width: 13ch;
       font-size: clamp(44px, 7.4vw, 84px); line-height: 1.04; letter-spacing: -0.035em; font-weight: 700;
@@ -352,7 +352,7 @@
       body { font-size: 16px; }
       .nav-links { display: none; }
       .hero { padding-top: 48px; }
-      .app-icon { width: 104px; height: 96px; }
+      .app-icon { width: 120px; height: 112px; }
       .hero-shot { margin-top: 40px; }
       .shot { border-radius: 10px; }
       section { padding-top: 88px; }
@@ -389,7 +389,7 @@
     <section class="hero" aria-labelledby="hero-title">
       <div class="wash" aria-hidden="true"></div>
       <div class="wrap">
-        <img class="app-icon" src="assets/omni-mole.png" alt="Omni" width="130" height="120" />
+        <img class="app-icon" src="assets/omni-mole-hero.png" alt="Omni" width="150" height="140" />
         <h1 id="hero-title">Search your Mac by meaning.</h1>
         <p class="lede">Every file. Any language. On device.</p>
         <div class="hero-actions">
