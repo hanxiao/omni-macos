@@ -4685,7 +4685,12 @@ public final class VectorStore: @unchecked Sendable {
                         // SIMD8 widen-and-add. Bit-identical to the scalar `dst[k] += fromBF16(src[k])`
                         // loop the whole-folder pass runs: the lanes are independent, so nothing is
                         // reassociated, and bf16 -> fp32 is an exact 16-bit shift.
-                        Self.accumulateBF16(base + i * d, into: s.baseAddress! + Int(li) * d, count: d)
+                        //
+                        // BY SLOT, NOT BY ROW. The buffer holds one vector per CONTENT; `i` is an
+                        // occurrence. Reading `base + i * d` pooled other files' vectors into every
+                        // dot and, on an index that shares content, ran past the buffer - 0.13.7
+                        // crashed on Visualize for a large folder. FolderMapSharedContentTests.
+                        Self.accumulateBF16(base + slotOf(i) * d, into: s.baseAddress! + Int(li) * d, count: d)
                         counts[Int(li)] += 1
                     }
                 }

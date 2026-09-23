@@ -2381,3 +2381,11 @@ toolbar to /tmp/omni-debug-toolbar.txt inside the VM. The nano model runs in the
   both the empty state and the results footer. The footer used to be a `.plain` label ("Show N more
   matches"); a plain button is hit only on its glyphs, so clicks between or beside the letters did
   nothing - the "sometimes not responding" report. Verified by clicking the button's edge.
+
+## Folder map read rows as slots (fixed 2026-09-22)
+
+`pooledFilesLocked` - the streaming pull every folder map uses - read `base + row * dim` from a
+buffer indexed by CONTENT slot. Since v5 shares content, rows outnumber slots: every 0.13.x map
+pooled other files' vectors, and on a large folder the read ran off the buffer (Visualize > UMAP
+on a 66,762-file folder: EXC_BAD_ACCESS in `accumulateBF16`). Now `slotOf(i)`, like every other
+reader. `FolderMapSharedContentTests` fails without the fix. All other `flat16` readers audited.

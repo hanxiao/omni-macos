@@ -505,9 +505,11 @@ struct OmniApp: App {
                     }
                 }
                 Divider()
+                // Off in OCR mode: there ⇧⌘G is Find Previous (Edit menu), the same pair every find
+                // bar uses, and two enabled items on one shortcut left AppKit to pick by menu order.
                 Button("Go to Folder\u{2026}") { showGoToFolder = true }
                     .keyboardShortcut("g", modifiers: [.command, .shift])
-                    .disabled(model.phase != .ready)
+                    .disabled(model.phase != .ready || model.ocrMode)
             }
             // Focus the toolbar search field (.searchable doesn't bind ⌘F on its own).
             // THE WHOLE FIND GROUP, in the menu Mac users look in for it. Find focuses the
