@@ -71,7 +71,7 @@ enum MCPAdapter {
                 "capabilities": ["tools": [:] as [String: Any]],
                 "serverInfo": ["name": "omni", "title": "Omni - local semantic file search",
                                "version": appVersion],
-                "instructions": "Search the user's local files by meaning. Files of every kind - text, code, PDFs, images, audio, video - share one embedding space, so describe the CONTENT you want in natural language (any language). `search` finds files across the whole index; `search_inline` ranks the best passages WITHIN a specific set of files or folders you already know; `file_status` reports whether given files are indexed and whether the index is still fresh for them. `ocr` transcribes a scanned PDF or an image to Markdown, page by page. Results are file paths with scores, snippets, and media metadata (resolution, duration, size); read the files yourself if you need their full contents.\n\nOmni only finds what it has indexed. If a search comes back empty for something the user says is on their Mac, check `list_sources` before concluding the file is not there - the folder may simply not be a source yet. `list_sources` also reports what is still indexing, which explains a result set that looks incomplete. `add_source` adds a folder (or the Apple Photos library, whole or by album) and indexing starts immediately; `pause_source` stops work on one without losing what it already indexed; `remove_source` drops it and its rows. These change what the user sees in the app, so treat add and especially remove as actions to take on request rather than on your own initiative."
+                "instructions": "Search the user's local files by meaning. Files of every kind - text, code, PDFs, images, audio, video - share one embedding space, so describe the CONTENT you want in natural language (any language). `search` finds files across the whole index; `search_inline` ranks the best passages WITHIN a specific set of files or folders you already know; `file_status` reports whether given files are indexed and whether the index is still fresh for them. `ocr` transcribes a scanned PDF or an image to Markdown, page by page. Results are file paths with scores, snippets, and media metadata (resolution, duration, size); read the files yourself if you need their full contents.\n\nOmni only finds what it has indexed. If a search comes back empty for something the user says is on their Mac, check `list_sources` before concluding the file is not there - the folder may simply not be a source yet. `add_source` adds a folder (or the Apple Photos library, whole or by album) and indexing starts immediately; `pause_source` stops work on one without losing what it already indexed; `remove_source` drops it and its rows. These change what the user sees in the app, so treat add and especially remove as actions to take on request rather than on your own initiative."
             ])
 
         case "ping":
@@ -299,10 +299,10 @@ enum MCPAdapter {
         // Implementing resources/read instead would be the other way out, and it would mean serving
         // bytes the client can already open for itself.
         let snap = await snapshot
-        let building = indexStateLine(snap)
+        let note = indexStateLine(snap)
 
         var content: [[String: Any]] = []
-        if let building { content.append(["type": "text", "text": building]) }
+        if let note { content.append(["type": "text", "text": note]) }
         if hits.isEmpty {
             // Say WHICH kind of nothing this is, so the agent's next move is right.
             var text = "No results for \"\(query)\"."
@@ -310,9 +310,6 @@ enum MCPAdapter {
                 if snap.sources.isEmpty {
                     text += " Omni has no sources yet, so nothing is searchable"
                         + " - add_source indexes a folder or the Photos library."
-                } else if snap.indexing {
-                    text += " Indexing is still running, so this is not yet evidence the file is absent"
-                        + " - retry, or call list_sources for progress."
                 }
             }
             content.append(["type": "text", "text": text])
@@ -943,20 +940,14 @@ enum MCPAdapter {
 
     // MARK: - Freshness
 
-    /// One line describing why a result set may be incomplete, or nil when the index is settled.
-    /// Kept to a single short sentence: it is prepended to every search response, so it has to
-    /// earn its tokens.
+    /// One line when the index has nothing to search, or nil. Prepended to every search response,
+    /// so it has to earn its tokens. There is deliberately no "still indexing" line: the index is
+    /// updated continuously (the watcher, the launch pass, tag refinement), so "indexing" is true
+    /// most of the time and said nothing about whether this answer was complete - agents read it
+    /// as a reason to distrust good results. Per-file freshness is on each hit and in file_status.
     private static func indexStateLine(_ snap: SourcesSnapshot?) -> String? {
-        guard let snap else { return nil }
-        if snap.sources.isEmpty {
-            return "index: empty - no folders or photo sources are indexed yet (see list_sources / add_source)."
-        }
-        guard snap.indexing else { return nil }
-        let active = snap.sources.filter { $0.indexing }
-        let done = active.reduce(0) { $0 + $1.done }
-        let total = active.reduce(0) { $0 + $1.total }
-        let scope = total > 0 ? " (\(done) of \(total) files in this pass)" : ""
-        return "index: still building\(scope) - results may be incomplete, and an empty result is not proof a file is absent."
+        guard let snap, snap.sources.isEmpty else { return nil }
+        return "index: empty - no folders or photo sources are indexed yet (see list_sources / add_source)."
     }
 
     private enum DiskState { case upToDate, changed, missing }
