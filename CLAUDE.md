@@ -2652,3 +2652,13 @@ welcome mole read darker than the rest.
 All are rendered from the full 100x100 canvas, never cropped, so the mole keeps one size and place
 across screens. `StatusGlyph` draws any `symbol` starting with "Mole" as one of these. Change the
 drawing in `mole_family.py`, not the PNGs.
+
+## Ignore defaults (2026-09-23)
+
+- New default rules go in `OmniIgnore.addedDefaults` and ship by bumping `ignoreDefaultsVersion`
+  in AppModel: an existing `.omniignore` gets only the missing lines, once, silently; a rule the
+  user later deletes stays deleted. The excluded files are pruned at the next launch.
+- Prune with `OmniIgnore.excludesIndexedFile()`, never `isIgnored(file, isDir: false)`: the latter
+  skips every directory rule.
+- An isolated run (`-omni.dbDir` launch argument) keeps its `.omniignore` beside its index and never
+  writes the migration marker, so tests cannot migrate the user's real policy.
