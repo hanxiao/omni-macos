@@ -5486,7 +5486,9 @@ public final class VectorStore: @unchecked Sendable {
             // in-scope match outside it - the `offer` re-check keeps such results sound, so the
             // loss would show up as missing results and nothing else.
             let needsMask = !filter.kinds.isEmpty || pathFilter || filter.since != nil
+            let tMask = Self.searchTiming ? Date() : nil
             let selectMask = needsMask ? selectMaskLocked(filter, pathFilter: pathFilter) : nil
+            if let tMask, needsMask { print(String(format: "[search] select-mask %.1fms", -tMask.timeIntervalSinceNow * 1000)) }
             let maskable = !needsMask || selectMask != nil
             if maskable, baseRows > C {
                 // ONE `which` against the cached combined mask, not one per filter clause with
@@ -5508,7 +5510,9 @@ public final class VectorStore: @unchecked Sendable {
             }
             let baseScore: MLXArray
             if quantBits == 1, let bb = bitBase {
+                let tDead = Self.searchTiming ? Date() : nil
                 baseScore = patchScoresLocked(maskDeadLocked(bitScanLocked(bb, query: query, rows: baseRows)), qv: qv)
+                if let tDead { print(String(format: "[search] bitscan+dead graph %.1fms", -tDead.timeIntervalSinceNow * 1000)) }
                 if let r = coarseFastPathLocked(baseScore) { return r }
             } else if let qb = quantBase {
                 // The replica is stored rotated when the preconditioner is on, so the query must be
@@ -5802,6 +5806,9 @@ public final class VectorStore: @unchecked Sendable {
                                         filter: SearchFilter = SearchFilter()) -> [SearchHit] {
 
         // Top-C base candidates on the GPU; delta rows are exact and all enter the reduce.
+        let tPh = Self.searchTiming ? Date() : nil
+        var phases: [(String, Date)] = []
+        func mark(_ name: String) { if tPh != nil { phases.append((name, Date())) } }
         let flat = coarse.reshaped([baseRows])
         let topIdx = Self.topCIndices(flat, rows: baseRows, C: C)
         var deltaScores: [Float] = []
@@ -5819,21 +5826,34 @@ public final class VectorStore: @unchecked Sendable {
             MLX.eval(topIdx)
         }
         let cand = topIdx.asType(.int32).asArray(Int32.self)
+        mark("coarse+topC")
 
         // Exact rescore of the C candidates (host gather + one small matmul). This is the OTHER
         // half of the funnel: rerankLocked serves filtered queries, this serves plain ones, so an
         // A/B that only disables one of them measures nothing on the path most queries take.
         var exScores: [Float]
         if Self.quantRerank {
-            var packed = [UInt16](repeating: 0, count: cand.count * dim)
-            flat16.withUnsafeBufferPointer { fb in
-                packed.withUnsafeMutableBufferPointer { pb in
-                    guard let src = fb.baseAddress, let dst = pb.baseAddress else { return }
+            // Uninitialized: every element is written below. Striped across cores: C random rows of
+            // the mapped vector file (7680 x dim bf16, ~12 MB at the shipped topK) were copied on one
+            // thread, measured 2.4-7.1 ms of a ~21 ms search on a 6.5M-content index.
+            let total = cand.count * dim
+            let packed = [UInt16](unsafeUninitializedCapacity: total) { pb, initialized in
+                flat16.withUnsafeBufferPointer { fb in
+                    guard let src = fb.baseAddress, let dst = pb.baseAddress else { pb.initialize(repeating: 0); return }
                     // `ri` is already a SLOT: topCIndices ranks the coarse score array, which is
-                        // indexed by slot. Do NOT map it through slotOf. The reduce below
-                        // expands each slot to its occurrences (rowsOfSlotLocked).
-                        for (j, ri) in cand.enumerated() { (dst + j * dim).update(from: src + Int(ri) * dim, count: dim) }
+                    // indexed by slot. Do NOT map it through slotOf. The reduce below
+                    // expands each slot to its occurrences (rowsOfSlotLocked).
+                    let stripes = Swift.min(8, Swift.max(1, cand.count / 512))
+                    let per = (cand.count + stripes - 1) / stripes
+                    cand.withUnsafeBufferPointer { cb in
+                        DispatchQueue.concurrentPerform(iterations: stripes) { st in
+                            let lo = st * per, hi = Swift.min(cand.count, lo + per)
+                            guard lo < hi else { return }
+                            for j in lo ..< hi { (dst + j * dim).update(from: src + Int(cb[j]) * dim, count: dim) }
+                        }
+                    }
                 }
+                initialized = total
             }
             let exact: MLXArray = packed.withUnsafeBytes { raw in
                 let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!),
@@ -5841,8 +5861,10 @@ public final class VectorStore: @unchecked Sendable {
                 let tile = Self.exactTile(MLXArray(data, [cand.count, dim], dtype: .bfloat16), group: Self.quantGroup)
                 return MLX.matmul(tile, qv)
             }
+            mark("gather")
             MLX.eval(exact)
             exScores = exact.reshaped([cand.count]).asType(.float32).asArray(Float.self)
+            mark("exact")
         } else {
             let cs = MLX.take(flat, topIdx, axis: 0)   // keep the coarse scores as final
             MLX.eval(cs)
@@ -5909,6 +5931,15 @@ public final class VectorStore: @unchecked Sendable {
         // reduce path already breaks ties this way; this makes the two agree.
         let winners = best.sorted { $0.value.score != $1.value.score ? $0.value.score > $1.value.score : $0.key < $1.key }
             .prefix(topK).map { $0.value }
+        mark("reduce")
+        if let tPh {
+            var prev = tPh
+            let parts = phases.map { p -> String in
+                defer { prev = p.1 }
+                return String(format: "%@=%.1f", p.0, p.1.timeIntervalSince(prev) * 1000)
+            }
+            print("[search] candidates C=\(cand.count) delta=\(deltaScores.count) " + parts.joined(separator: " ") + " ms")
+        }
         return winners.map { w in
             let r = rows[Int(w.row)]
             return SearchHit(path: pathOf(r), score: w.score, snippet: "", kind: kindOf(r),
@@ -6045,6 +6076,8 @@ public final class VectorStore: @unchecked Sendable {
         }
         let stmt = snippetStmt
         var out = hits
+        let tSnip = Self.searchTiming ? Date() : nil
+        defer { if let tSnip { print(String(format: "[search] snippets n=%d %.1fms", hits.count, -tSnip.timeIntervalSinceNow * 1000)) } }
         for i in 0 ..< out.count {
             sqlite3_reset(stmt); sqlite3_clear_bindings(stmt)
             bindPath(stmt, 1, out[i].path)
