@@ -2386,8 +2386,8 @@ toolbar to /tmp/omni-debug-toolbar.txt inside the VM. The nano model runs in the
 ## Settings type system; one "weaker matches" button (2026-09-22)
 
 - Settings fonts follow one rule, written at `SettingsView`'s root: row text body (values
-  secondary), detail lines and footers caption secondary, code callout monospaced (the request log
-  caption monospaced), paths never monospaced, no weight changes, no caption2, tabular digits set
+  secondary), detail lines and footers caption secondary, code callout monospaced (the serving log
+  small monospaced, backed by ~/Library/Logs/Omni/serving.log), paths never monospaced, no weight changes, no caption2, tabular digits set
   once at the root.
 - "Show N weaker matches" is ONE button (`ContentView.weakerMatchesTitle`), bordered and large, in
   both the empty state and the results footer. The footer used to be a `.plain` label ("Show N more
