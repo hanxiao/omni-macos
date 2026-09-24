@@ -31,9 +31,10 @@ final class Qwen3Backbone: @unchecked Sendable {
     /// so recompile churn + per-graph memory outweigh the ~4% throughput gain. nil = this default;
     /// OMNI_COMPILE_BLOCK="1" forces compile for ALL batches (bench), "0" forces eager everywhere.
     private let compileEnv: String?
-    /// Compiled block cache keyed by the shape variant `(B, Lmax, hasArrayMask)`. Bucketing keeps
-    /// the number of distinct keys small (a handful of near-uniform Lmax), so compile cost amortizes.
-    /// If this map grows without bound on a workload, compile is recompiling too much -> turn the
+    /// Compiled block cache keyed by the shape variant `(B, Lmax, hasArrayMask, causal)`. By default
+    /// only B==1 forwards of <=512 tokens compile (see forward), so there is one key per distinct
+    /// length: queries cluster in a few and reuse them, while each image under the cap with a new
+    /// length adds a key of its own. If this map grows without bound on a workload, compile is recompiling too much -> turn the
     /// flag off (it then costs more than it saves). NSLock-guarded; the engine serializes anyway.
     private let blockCacheLock = NSLock()
     private var blockCache: [BlockKey: @Sendable ([MLXArray]) -> [MLXArray]] = [:]
@@ -56,7 +57,7 @@ final class Qwen3Backbone: @unchecked Sendable {
         self.compileEnv = ProcessInfo.processInfo.environment["OMNI_COMPILE_BLOCK"]
     }
 
-    /// Embed token ids -> [1, L, dim] (fp32, batch 1).
+    /// Embed token ids -> [1, L, dim] (computeDType, batch 1).
     func embed(_ ids: [Int]) -> MLXArray {
         let idArray = MLXArray(ids.map { Int32($0) })
         let rows = w["language_model.embed_tokens.weight"][idArray]  // [L, dim]
@@ -64,7 +65,7 @@ final class Qwen3Backbone: @unchecked Sendable {
     }
 
     /// Embed a batch of token-id sequences, right-padded to the longest, with the pad
-    /// id 0. Returns [B, Lmax, dim] (fp32) and the real lengths.
+    /// id 0. Returns [B, Lmax, dim] (computeDType) and the real lengths.
     func embedBatch(_ idsList: [[Int]]) -> (embeds: MLXArray, lengths: [Int]) {
         let lengths = idsList.map { $0.count }
         let lmax = lengths.max() ?? 0
@@ -120,10 +121,13 @@ final class Qwen3Backbone: @unchecked Sendable {
         let mask = attentionMask(inputsEmbeds, lengths: lengths)
         var h = inputsEmbeds.asType(computeDType)
         // Compile policy: B==1 SHORT forwards (interactive queries, <=512 tokens) by default; env can
-        // force all/none. The L cap keeps MEDIA off the compiled path: image/audio injections are
-        // B==1 too but ~1.2k tokens with near-unique lengths, so each image would cold-compile a new
-        // (1, L) graph (~1ms on a ~19ms backbone pass) and grow the cache without reuse. Queries
-        // cluster in a handful of short lengths and reuse their graphs (measured 8 keys, 15-17% win).
+        // force all/none. The L cap keeps LARGE media off the compiled path: image/audio injections
+        // are B==1 too, and one past 512 tokens would cold-compile a new (1, L) graph (~1ms on a
+        // ~19ms backbone pass) with little chance of reuse. It does not keep all media off: the
+        // 262,144 px floor puts an image at 256 visual tokens or more, and the many small images
+        // that land in 256-512 DO take the compiled path, each new length compiling and caching a
+        // graph. Queries cluster in a handful of short lengths and reuse their graphs (measured
+        // 8 keys, 15-17% win).
         let B = inputsEmbeds.dim(0)
         let useCompiled = compileEnv == "1" || (compileEnv != "0" && B == 1 && inputsEmbeds.dim(1) <= 512)
         if useCompiled {

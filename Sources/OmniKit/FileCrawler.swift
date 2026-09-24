@@ -110,6 +110,31 @@ public struct FileCrawler: Sendable {
         return false
     }
 
+    /// Whether a crawl from `root` would reach `path`: the rules `walkBulk` applies on the way
+    /// down, for a path that arrives on its own (a watcher event). No hidden component below the
+    /// root, no package on the way, not Omni's own data, and a file within its kind's size cap.
+    /// The ignore rules are checked by the caller (isIgnoredIncludingAncestors). Without this the
+    /// watcher indexed what the crawl refuses - the contents of a .app unzipped into a root, files
+    /// under .vscode or .mypy_cache - and the next full pass swept them out again, so every save
+    /// paid an embed that was always going to be deleted.
+    func admitsEventPath(_ path: String, isDir: Bool, size: Int, root: String) -> Bool {
+        if isOwnData(path) { return false }
+        if path == root { return true }                       // a root is always descended into
+        guard path.hasPrefix(root + "/") else { return true } // not under this root: nothing to add
+        var comps = path.dropFirst(root.count + 1).split(separator: "/")
+        guard let last = comps.popLast() else { return true }
+        var dir = root
+        for c in comps {
+            dir += "/" + c
+            if c.hasPrefix(".") || PackageProbe.isPackage(dir) { return false }
+        }
+        if last.hasPrefix(".") { return false }
+        if isDir { return !PackageProbe.isPackage(path) }
+        if let kind = FileExtractor.kind(forExtension: (path as NSString).pathExtension),
+           let cap = maxFileSize[kind], size > cap { return false }
+        return true
+    }
+
     /// Default user folders to index.
     /// Engine selector. OMNI_CRAWLER=legacy restores the FileManager enumerator, so the two can be
     /// A/B'd in one build - and so a user who hits trouble with the fast walk has a way back.

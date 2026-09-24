@@ -1,9 +1,10 @@
 import Foundation
 import CryptoKit
 
-/// THE SHAPE OF THE INDEX (schema v4). See docs/schema-v4.md for the measurements behind it.
+/// THE SHAPE OF THE INDEX. v4 is below; v5 (content-addressed chunks, `includeV5`) is layered on
+/// top of it. See docs/schema-v4.md and docs/schema-v5.md for the measurements behind them.
 ///
-/// The short version, from `dbstat` on a real 2.36M-chunk index: v3 spent 460 MB of 1308 storing
+/// The v4 short version, from `dbstat` on a real 2.36M-chunk index: v3 spent 460 MB of 1308 storing
 /// the same 746k paths four times over, and another ~120 MB restating per-FILE facts once per
 /// CHUNK. What it did NOT spend much on was vectors - those live in the `.vecs` file. So the
 /// redesign is about the things around the vectors, and it comes down to three moves:
@@ -19,9 +20,6 @@ import CryptoKit
 ///   search displays. They were sitting in the table the loader has to scan end to end, which is
 ///   why a cold open read 615 MB to recover 2.4M rows of (file, index, kind).
 enum StoreSchema {
-    /// Bumped when the layout changes in a way an older binary must not read as its own.
-    static let version: Int32 = 4
-
     // MARK: - Kinds as codes
     //
     // `kind` was a TEXT column repeated on every chunk row - 9 MB of the string "text" - and the
@@ -270,11 +268,12 @@ enum StoreSchema {
             // twice. Nearly all of that is cross-file (only 2,261 duplicates sit inside one file),
             // which is exactly what the old path-scoped reuse could not see.
             //
-            // `id` IS THE .vecs SLOT. v4 derived a row's slot from its rank in rowid order counted
-            // through the hole list, a correspondence this file's own notes call unobservably false
-            // once the two drift. A slot column was rejected then because "compaction renumbers
-            // everything" - a 4.5M-row UPDATE measured at 33.8s. That objection does not apply to an
-            // explicit id plus a free list: a freed slot is handed to the next new chunk instead of
+            // THE .vecs SLOT IS STORED (`slot`; see below for why it is a column and not `id`). v4
+            // derived a row's slot from its rank in rowid order counted through the hole list, a
+            // correspondence this file's own notes call unobservably false once the two drift. A
+            // slot column was rejected then because "compaction renumbers everything" - a 4.5M-row
+            // UPDATE measured at 33.8s. That objection does not apply to a stored slot plus a free
+            // list: a freed slot is handed to the next new chunk instead of
             // being reclaimed by a renumbering pass, so the pass never has to run and the file only
             // grows past its high-water mark. v4 accumulated 96,256 holes that nothing ever took back.
             //

@@ -159,13 +159,15 @@ public let omniCacheFraction: Double =
     ProcessInfo.processInfo.environment["OMNI_MLX_CACHE_FRACTION"].flatMap { Double($0) } ?? 0.25
 
 /// Hard-cap MLX memory usage (bytes). 0 = library default (no explicit cap). The
-/// buffer cache is set to half the limit. Takes effect immediately and globally.
+/// buffer cache is set to `omniCacheFraction` of the limit (a quarter by default). Takes effect
+/// immediately and globally.
 public func omniSetMemoryLimit(_ bytes: Int) {
     OmniMemoryBudget.capBytes = bytes > 0 ? bytes : Int(ProcessInfo.processInfo.physicalMemory)
     if bytes > 0 {
         MLX.Memory.memoryLimit = bytes
-        // Half the cap is reclaimable buffer cache, and it is by far the largest single thing the
-        // cap hands out: at the 6 GB default that is 3 GB the user sees as resident. A/B this
+        // A quarter of the cap (`omniCacheFraction`) is reclaimable buffer cache, and it is by far
+        // the largest single thing the cap hands out: at the 6 GB default that is 1.5 GB the user
+        // sees as resident. A/B this
         // fraction with OMNI_MLX_CACHE_FRACTION to weigh what it buys against what it holds.
         MLX.Memory.cacheLimit = max(Int(Double(bytes) * omniCacheFraction), 256 * 1024 * 1024)
     } else {
@@ -559,9 +561,9 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
 
     // MARK: - GPU buffer-cache trim at idle
 
-    // MLX's buffer cache keeps freed Metal buffers for reuse, up to cacheLimit (half the user's
-    // memory cap). That is right for sustained indexing, but between passes those buffers are
-    // dead weight in the app's footprint while it sits idle in the menu bar. The indexer signals
+    // MLX's buffer cache keeps freed Metal buffers for reuse, up to cacheLimit (a quarter of the
+    // user's memory cap, see omniCacheFraction). That is right for sustained indexing, but between
+    // passes those buffers are dead weight in the app's footprint while it sits idle. The indexer signals
     // end-of-pass via indexingIdle(); after a debounce with no further GPU work the cache is
     // returned to the OS. The next burst re-allocates from Metal, which is invisible against a
     // pass. OMNI_IDLE_TRIM=0 disables; a numeric value overrides the delay (seconds).
@@ -651,7 +653,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     // Interactive-query activity stamp. embedQuery refreshes it; the indexer reads
     // `interactiveQueryActive` to shrink its per-forward batch and split the flush into per-batch gate
     // windows WHILE the user is actively searching - so an interactive query's embed + matmul wait
-    // behind a short GPU command buffer instead of a full 96-chunk indexing forward. Reverts to full
+    // behind a short GPU command buffer instead of a full indexing forward. Reverts to full
     // batch + double-buffered flush (max indexing throughput) ~2s after the last keystroke.
     private let queryStampLock = NSLock()
     private var _lastQueryAt = Date.distantPast
@@ -699,7 +701,8 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     }
 
     /// Embed several pre-bucketed batches as ONE serialized embed, double-buffering each batch's
-    /// GPU forward over the prior batch's host readout when OMNI_ASYNC_EVAL=1 (else a plain loop).
+    /// GPU forward over the prior batch's host readout (on by default; OMNI_ASYNC_EVAL=0 makes it a
+    /// plain loop).
     /// Tokenization runs in parallel up front, off the GPU path. Output order matches input.
     public func embedTextBatches(_ batches: [[String]], as type: OmniInputType) -> [[[Float]]] {
         if batches.isEmpty { return [] }
@@ -746,10 +749,11 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         let tokenized = batches.map { textEncoder.tokenizeParallel($0, type) }
         // The gate only yields to a waiting high-priority query BETWEEN run() calls. On a low-RAM/
         // few-core Mac, running a whole multi-batch indexing flush as ONE run() makes an interactive
-        // search wait behind every batch. Split the flush into two gated halves there so a query can
-        // preempt mid-window. Per-batch vectors are independent, so the result is bit-identical; only
-        // the cross-half double-buffering is lost (acceptable on low-end). High-RAM keeps the single
-        // full-window call - no throughput change.
+        // search wait behind every batch. Split the flush into gate windows of `indexGateWindow`
+        // batches there (2 on a GPU with fewer than 16 cores) so a query can preempt mid-flush.
+        // Per-batch vectors are independent, so the result is bit-identical; only the cross-window
+        // double-buffering is lost (acceptable on low-end). Wide GPUs keep the single full-flush
+        // call - no throughput change.
         // While the user is actively searching, run each batch as its OWN gate window so an
         // interactive query (high priority) preempts after one short forward instead of after the
         // whole multi-batch staging flush. Combined with the indexer's shrunk per-forward batch, this
@@ -760,7 +764,8 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         // (i.e. one gate hold). The gate only yields to a waiting high-priority query BETWEEN
         // run() calls, so this is the WORST-CASE number of indexing batches a search waits behind.
         //   - actively searching: 1 batch (the tightest latency; the indexer also shrinks each batch)
-        //   - otherwise: `indexGateWindow` batches (default 2). Measured: a search firing during
+        //   - otherwise: `indexGateWindow` batches (2 on a GPU with fewer than 16 cores or an unknown
+        //     one, uncapped on wider parts; see defaultGateWindow). Measured: a search firing during
         //     indexing in a type-wait cadence (the 2s "active" window already expired) waited behind
         //     the WHOLE flush (~6 batches / ~0.3s here, multiples of that on a low-end GPU). Capping
         //     the window collapses that wait to ~2 batches. The async double-buffered pipeline still
@@ -811,7 +816,8 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     }
 
     /// Batches embedded per gate hold for a NON-actively-searched indexing flush (see embedTextBatches).
-    /// Off by default (whole flush). noteInteractive() - fired on every keystroke - puts the indexer in
+    /// Device-aware (see below): uncapped (whole flush) on wide GPUs, 2 on narrow ones. This first
+    /// paragraph is the wide-GPU reasoning. noteInteractive() - fired on every keystroke - puts the indexer in
     /// per-batch (window 1) mode while the user is interacting, and that ALONE keeps search responsive
     /// during indexing. A/B with the keystroke signal present (including low-end paths + slow flushes):
     /// capping vs whole-flush is within noise (cold+signal 227ms vs 236ms), because the active path
@@ -859,9 +865,6 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         return run(highPriority: false) { let v = enc.encode(image, prefixIds: docPrefix, suffixIds: mediaSuffix); addTokens(enc.lastSequenceLength); return v }
     }
 
-    /// Batch-N image embedding from already-preprocessed (Sendable) raw patches. The CPU preprocess
-    /// runs in the indexer's concurrent decode stage; this call only does the GPU tower+backbone.
-    /// One block-diagonal vision forward per `patchBudget` chunk; returns one vector per input.
     /// The optional image tagger (open-vocabulary tags from the same forward pass). Set once by
     /// the app after the label cache is built/loaded; read on the serialized GPU path.
     private let taggerLock = NSLock()
@@ -1003,6 +1006,9 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         return (vecs, tags)
     }
 
+    /// Batch-N image embedding from already-preprocessed (Sendable) raw patches. The CPU preprocess
+    /// runs in the indexer's concurrent decode stage; this call only does the GPU tower+backbone.
+    /// One block-diagonal vision forward per `patchBudget` chunk; returns one vector per input.
     public func embedImages(_ raws: [OmniVisionPreprocess.RawPatches]) -> [[Float]]? {
         guard let enc = imageEncoder, !raws.isEmpty else { return nil }
         // While the user is searching, embed ONE image per gate hold so an interactive query preempts

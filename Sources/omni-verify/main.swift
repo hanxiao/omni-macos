@@ -3556,7 +3556,7 @@ if args.count >= 3 && args[1] == "embbench" {
     default: .userInitiated
     }
     // OMNI_BENCH_CACHE_MB: clamp MLX's buffer cache to emulate a low-end machine's memory budget
-    // (the app sets cacheLimit = userCap/2, ~1.5GB at the 8GB-Mac default cap; tighter = more
+    // (the app sets cacheLimit = omniCacheFraction x userCap, a quarter by default; tighter = more
     // allocation churn if the working set does not fit).
     if let mb = ProcessInfo.processInfo.environment["OMNI_BENCH_CACHE_MB"].flatMap({ Int($0) }) {
         MLX.Memory.cacheLimit = mb * 1_048_576

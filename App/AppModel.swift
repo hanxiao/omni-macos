@@ -189,7 +189,8 @@ final class AppModel {
 
     /// Determinate launch progress (0...1) while phase == .loadingModel; nil once ready/failed
     /// (or before bootstrap has begun). Combined 50/50 from the store's row-load fraction and the
-    /// engine's GPU materialization fraction - both real measurements (see bootstrap). Monotonic:
+    /// engine's GPU materialization fraction - both real measurements (see bootstrap) - and, when the
+    /// launch reads the vector file ahead, that load takes 0.8 of the bar and the read 0.2. Monotonic:
     /// only ever moves forward within one launch.
     ///
     /// NIL ALSO MEANS "NO HONEST TOTAL", and the launch screen then shows the indeterminate bar.
@@ -561,7 +562,6 @@ final class AppModel {
 
     // MARK: - Selected-result actions (shared by the context menu, the File menu, and key handlers)
 
-    var selectedURL: URL? { selection.map { URL(fileURLWithPath: $0) } }
     var hasSelection: Bool { selection != nil }
 
     /// Every selected result path in result order (falls back to the active item).
@@ -831,26 +831,6 @@ final class AppModel {
         rawResults = []
         searchToken += 1          // an in-flight search cannot repopulate the list behind us
         searching = false
-    }
-
-    /// The browsed folder and its ancestors, never above the indexed root that contains it - the
-    /// app has no permission up there and a dead crumb is worse than none. Lives here rather than
-    /// in the browser because the TOOLBAR draws it now, the way Finder puts the folder name beside
-    /// the back/forward buttons instead of spending a content row on it.
-    var browseCrumbs: [URL] {
-        guard let folder = filterFolder else { return [] }
-        guard let root = roots.first(where: { folder.path == $0.path || folder.path.hasPrefix($0.path + "/") })
-        else { return [folder] }
-        var chain: [URL] = []
-        var cur = folder
-        while cur.path.hasPrefix(root.path) {
-            chain.append(cur)
-            if cur.path == root.path { break }
-            let parent = cur.deletingLastPathComponent()
-            if parent.path == cur.path { break }
-            cur = parent
-        }
-        return chain.reversed()
     }
 
     /// The folder browser's rows, with the facts its columns show. Off the main actor.
@@ -1270,9 +1250,6 @@ final class AppModel {
     var historyMode: HistoryMode = .auto {
         didSet { UserDefaults.standard.set(historyMode.rawValue, forKey: "omni.historyMode") }
     }
-    /// Recent (non-bookmarked) searches older than this many days are pruned. Default 31 (about a
-    /// month), so the sidebar's day buckets - Yesterday, Previous 7 Days, Previous 30 Days - actually
-    /// fill in. Users who picked a shorter window in Settings keep it.
     /// Whether searches that arrive over the HTTP/MCP server are remembered too.
     ///
     /// SEPARATE from historyMode on purpose. That setting is about when a search the user is TYPING
@@ -1282,6 +1259,9 @@ final class AppModel {
     var saveServingHistory: Bool = true {
         didSet { UserDefaults.standard.set(saveServingHistory, forKey: "omni.saveServingHistory") }
     }
+    /// Recent (non-bookmarked) searches older than this many days are pruned. Default 31 (about a
+    /// month), so the sidebar's day buckets - Yesterday, Previous 7 Days, Previous 30 Days - actually
+    /// fill in. Users who picked a shorter window in Settings keep it.
     var historyRetentionDays: Int = 31 {
         didSet {
             UserDefaults.standard.set(historyRetentionDays, forKey: "omni.historyRetentionDays")
@@ -1331,7 +1311,7 @@ final class AppModel {
     var settings = IndexSettings.default
     /// In-memory text of the central `.omniignore` (gitignore syntax) - the single source of truth for
     /// the crawl's EXCLUDE policy. Migrated on first launch from the legacy kind/extension settings plus
-    /// the well-known noise dirs (see `synthesizeIgnoreText`). Handed to the indexer via effectiveSettings.
+    /// the well-known noise dirs (see `OmniIgnore.synthesize`). Handed to the indexer via effectiveSettings.
     private(set) var ignoreText: String = ""
     /// Compiled form of `ignoreText`.
     private(set) var ignore = OmniIgnore(text: "")
@@ -1700,10 +1680,10 @@ final class AppModel {
     }
 
     /// Opt-in memory trace, same idiom as OMNI_PERF_LOG: one line every 5 s with the SAME numbers
-    /// (`omniMemLogEnabled` also gates the Settings sampler's own tick line, so the gating can be
-    /// watched from the log rather than inferred).
     /// the Settings breakdown shows, so the attribution can be checked on a real index without a
-    /// screenshot (and while a long index pass runs unattended). Launch from a terminal with
+    /// screenshot (and while a long index pass runs unattended). `omniMemLogEnabled` also gates the
+    /// Settings sampler's own tick line, so the gating can be watched from the log rather than
+    /// inferred. Launch from a terminal with
     ///   OMNI_MEM_LOG=1 /Applications/Omni.app/Contents/MacOS/Omni 2> ~/omni-mem.log
     func startMemoryLogIfRequested() {
         guard omniMemLogEnabled else { return }
@@ -1724,11 +1704,6 @@ final class AppModel {
     /// Last store reading, reused when the store queue is busy - see sampleMemory().
     @ObservationIgnored private var lastSearchMemory = VectorStore.SearchMemory()
 
-    /// Sample the breakdown. Nothing here runs on the main actor, and nothing BLOCKS on a lock the
-    /// app's real work uses: the footprint and MLX reads are mach/allocator counters (19 us for the
-    /// whole sample, measured), and the one shared lock - the store queue - is taken ASYNC with a
-    /// deadline. A bulk index write can own that queue for tens of ms (23 ms measured); rather than
-    /// park a thread there once a second, the sample gives up and reuses the previous numbers.
     /// Bytes the visualization owns. Points and kNN only - the paths inside ProjectionPoint are
     /// heap strings this deliberately does not chase (they are the store's own row strings, shared
     /// not copied), so this under-reports rather than guesses. The view's own GPU/host arrays
@@ -1747,6 +1722,11 @@ final class AppModel {
         return n
     }
 
+    /// Sample the breakdown. Nothing here runs on the main actor, and nothing BLOCKS on a lock the
+    /// app's real work uses: the footprint and MLX reads are mach/allocator counters (19 us for the
+    /// whole sample, measured), and the one shared lock - the store queue - is taken ASYNC with a
+    /// deadline. A bulk index write can own that queue for tens of ms (23 ms measured); rather than
+    /// park a thread there once a second, the sample gives up and reuses the previous numbers.
     nonisolated func sampleMemory() async -> MemorySample {
         let store = await self.store
         let vizBytes = await self.vizBytes
@@ -1846,7 +1826,7 @@ final class AppModel {
             saveServingHistory = UserDefaults.standard.bool(forKey: "omni.saveServingHistory")
         }
         // Setting historyRetentionDays runs the day-based prune via didSet, so stale recents are
-        // cleaned up at launch. integer(forKey:) returns 0 when unset -> keep the 7-day default.
+        // cleaned up at launch. integer(forKey:) returns 0 when unset -> keep the 31-day default.
         let retain = UserDefaults.standard.integer(forKey: "omni.historyRetentionDays")
         if retain > 0 { historyRetentionDays = retain } else { pruneHistory(); persistHistory() }
         if let raw = UserDefaults.standard.string(forKey: "omni.viewMode"), let m = ResultViewMode(rawValue: raw) { viewMode = m }
@@ -2808,9 +2788,6 @@ final class AppModel {
 
     // MARK: - Filters
 
-    func toggleFilterKind(_ k: FileKind) {
-        if filterKinds.contains(k) { filterKinds.remove(k) } else { filterKinds.insert(k) }
-    }
     func clearFilters() {
         suppressFilterEffects = true
         resetAllFilters()
@@ -3262,8 +3239,10 @@ final class AppModel {
 
     // MARK: - OCR model (optional add-on)
 
-    /// Refresh which OCR variants are on disk. Called from Settings, never at launch: it stats a
-    /// handful of files, but the point is that an add-on nobody enabled costs nothing.
+    /// Refresh which OCR variants are on disk. Called from Settings and the OCR workspace, after a
+    /// download, and when the watched Application Support folder changes (modelFolderChanged, a
+    /// watch installed at launch). It stats a handful of files, so an add-on nobody enabled costs
+    /// next to nothing.
     func refreshOCRInstalled() {
         Task.detached {
             OCRModelCatalog.migrateLegacyInstall()
@@ -3589,8 +3568,8 @@ final class AppModel {
             // being faulted in, not GPU work. That is why it is per-launch and why it hurts a small
             // Mac: 6.9 GB does not stay cached next to a 1.9 GB model on 8-16 GB, so the fault is
             // paid again and again. Gating .ready behind it made launch look hung on an M2
-            // (regressed in 0.3.8). Going ready right away restores the fast 0.3.7 startup on
-            // every machine, high- and low-end alike. The first user query still lands on warm kernels:
+            // (regressed in 0.3.8). So .ready does not wait for this warm-up, on any machine, high-
+            // or low-end alike. The first user query still lands on warm kernels:
             // warmText grabs the serialized GPU gate within milliseconds of launch - long before a human
             // can click into the search box and submit a query - so a query fired during startup queues
             // behind the in-flight warm and runs on the now-compiled kernels instead of cold-compiling.
@@ -3802,7 +3781,7 @@ final class AppModel {
         // sqlite + mmapped vector sidecar is a corrupt index, not a slow one.
         migratingIndex = true
         defer { migratingIndex = false }
-        isTerminating = true                 // blocks new passes the way the quit drain does
+        isTerminating = true                 // blocks new passes the way a quit does
         indexer?.cancel()
         // isIndexWorkInFlight, not isIndexing: a watcher reconcile, a tag batch or a folder
         // catch-up never sets indexState, and each writes the store. Still busy after a minute:
@@ -4786,9 +4765,6 @@ final class AppModel {
         }
     }
 
-    /// Clear any active search (query, file-query, results) and filters so a freshly selected folder
-    /// shows its clean map. Suppresses the per-field filter didSet so it doesn't kick off a search,
-    /// and bumps the search token so any in-flight search can't repopulate the list afterwards.
     /// Publish a finished projection (points + kNN graph) so the view rebuilds.
     private func applyProjection(_ r: ProjectionResult) {
         folderProjection = r.points
@@ -4832,10 +4808,6 @@ final class AppModel {
         }
     }
 
-    /// Search-completion bookkeeping shared by the text and file-query paths. A genuinely NEW
-    /// query starts clean - the selection clears so the list reads top-down from the best hit -
-    /// while a refresh of the SAME query (live re-runs while indexing) keeps the selection if
-    /// its row survived, so a watcher tick never yanks the user's focus.
     /// Identity of the result set now on screen: the resolved query PLUS the filters that produced
     /// it. resolvedQuery alone is not that identity - a toolbar filter change replaces every row
     /// while leaving the semantic text untouched, so anything gated on resolvedQuery treats a
@@ -4917,6 +4889,10 @@ final class AppModel {
         }
     }
 
+    /// Search-completion bookkeeping shared by the text and file-query paths. A genuinely NEW
+    /// query starts clean - the selection clears so the list reads top-down from the best hit -
+    /// while a refresh of the SAME query (live re-runs while indexing) keeps the selection if
+    /// its row survived, so a watcher tick never yanks the user's focus.
     private func applyResults(_ hits: [SearchHit], resolved: String) {
         let isNewQuery = resolvedQuery != resolved
         // A live refresh that found exactly what is on screen changes nothing; see recomputeResults.
@@ -5361,7 +5337,7 @@ final class AppModel {
             store.metaSet("embedding_version", fp)
             store.metaSet("index_model_variant", variant)
             // Coalesce UI updates by wall-clock time. onProgress fires per ~10 scanned files;
-            // on a fast crawl of a large index that floods the main actor (thousands of @Published
+            // on a fast crawl of a large index that floods the main actor (thousands of observed-property
             // writes + O(n) stats), which hangs the app and kills the Pause button. Publish the
             // progress at most ~12x/sec and the heavy stats at most ~every 1.5s. (These clocks are
             // local to this single producer thread, so no cross-actor isolation is involved.)
@@ -5469,9 +5445,6 @@ final class AppModel {
         filesPerSec = 0; tokensPerSec = 0
     }
 
-    /// Apply file-system changes that were buffered while a full index was running. Called
-    /// only after a completed (non-cancelled) pass, so a paused index never advances
-    /// omni.fsEventId past work it has not processed.
     /// Drain work that was deferred while a catch-up pass or FS reconcile ran, in fixed priority:
     /// folder removals first (the pass that re-inserted their vectors has stopped), then a deferred
     /// full pass (modality/ignore change or resume queued via restartAfterPause), then queued
@@ -5691,7 +5664,11 @@ final class AppModel {
         activeRoots.formUnion(touched)
         fsReconcileInFlight = true
         startRateSampler()   // show throughput during the background reconcile too, not only full passes
-        let rootPaths = roots.map(\.path)
+        // Both spellings: FSEvents reports real paths (/private/var/..., a symlinked root's
+        // target), and a root that matched neither would lose update()'s root protections.
+        let rootPaths = Array(Set(roots.flatMap { u -> [String] in
+            [u.path, u.resolvingSymlinksInPath().path, (realpath(u.path, nil).map { p in defer { free(p) }; return String(cString: p) }) ?? u.path]
+        }))
         Task.detached(priority: .utility) {
             indexer.update(paths: drained, settings: settings, roots: rootPaths)
             let cancelled = indexer.isCancelled
@@ -5721,15 +5698,15 @@ final class AppModel {
     /// This is the call an OCR run makes, which is the most frequent cancel in the app.
     func pauseIndexing() { indexer?.cancel(.pause) }
 
-    /// Stop indexing for an orderly quit. The quit handler holds termination until `isIndexing`
-    /// clears - i.e. the worker has left MLX - so MLX's global C++ teardown on exit() can't race a
-    /// live embed and fault on the half-destroyed compiler cache.
-    /// Set once the app is terminating so no new index pass starts after the quit drain begins. Without
-    /// it, quiesceForQuit's single cancel() is undone by the next pass's resetCancelled() (a catch-up or
-    /// FS-reconcile re-kicked from a completion) which re-enters MLX - the exact teardown race the drain
-    /// is meant to prevent. The guarded entry points below all early-return while this is true.
+    /// Set once the app is terminating so no new index pass starts after quiesceForQuit. Without it,
+    /// quiesceForQuit's cancel() could be undone by the next pass's resetCancelled() (a catch-up or
+    /// FS-reconcile re-kicked from a completion) re-entering MLX during the few milliseconds before
+    /// the process exits. The guarded entry points below all early-return while this is true.
     private var isTerminating = false
 
+    /// Stop indexing for a quit and stamp the row sidecar (bounded at 5 s). The quit handler
+    /// (AppDelegate.applicationShouldTerminate) then calls `_exit(0)` immediately, which skips
+    /// MLX's C++ teardown altogether, so nothing waits for the indexing worker to leave MLX.
     func quiesceForQuit() {
         isTerminating = true
         indexer?.cancel()

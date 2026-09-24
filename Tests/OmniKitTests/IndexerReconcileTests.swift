@@ -150,6 +150,34 @@ final class IndexerReconcileTests: XCTestCase {
         XCTAssertEqual(store.fileCount(underFolder: root.path), 3, "a deleted subfolder is still pruned")
     }
 
+    /// A watcher event admits exactly what the crawl admits: nothing under a hidden folder or
+    /// inside a package, so a save there is not embedded only for the next full pass to delete it.
+    func testEventPathsFollowCrawlAdmission() throws {
+        let root = try makeRoot("admit", files: 1)   // admit0.txt
+        let fm = FileManager.default
+        try fm.createDirectory(at: root.appendingPathComponent(".vscode"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: root.appendingPathComponent("Tool.app/Contents"), withIntermediateDirectories: true)
+        try "settings for the editor".write(to: root.appendingPathComponent(".vscode/notes.txt"), atomically: true, encoding: .utf8)
+        try "bundle resource text".write(to: root.appendingPathComponent("Tool.app/Contents/readme.txt"), atomically: true, encoding: .utf8)
+        defer { try? fm.removeItem(at: root) }
+        func freshStore() throws -> VectorStore {
+            try VectorStore(dbURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent("omni-reconcile-db-\(UUID().uuidString)", isDirectory: true)
+                .appendingPathComponent("index.sqlite"))
+        }
+        let pass = try freshStore()
+        runPass(Indexer(store: pass, embedder: UnitTextEmbedder()), roots: [root])
+        let events = [root.appendingPathComponent("admit0.txt").path,
+                      root.appendingPathComponent(".vscode/notes.txt").path,
+                      root.appendingPathComponent("Tool.app").path,
+                      root.appendingPathComponent("Tool.app/Contents/readme.txt").path]
+        let live = try freshStore()
+        Indexer(store: live, embedder: UnitTextEmbedder())
+            .update(paths: events, settings: IndexSettings(), roots: [root.path])
+        XCTAssertEqual(Set(live.indexedFiles().keys), Set(pass.indexedFiles().keys))
+        XCTAssertEqual(live.fileCount(underFolder: root.path), 1)
+    }
+
     /// The paused-root flow: a full pass excludes paused roots; their files must survive.
     func testPassExcludingPausedRootKeepsItsFiles() throws {
         let a = try makeRoot("a", files: 4)

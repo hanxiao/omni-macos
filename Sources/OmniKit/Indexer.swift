@@ -87,8 +87,8 @@ public extension Embedder {
     }
 
     /// Default: preprocess each raw to a tensor and embed serially via embedImage's CGImage path is
-    /// not possible here (raws are already preprocessed), so fall back to one-at-a-time using the
-    /// batched call with a single element. OmniEngine overrides with the true batched forward.
+    /// not possible here (raws are already preprocessed), so the default reports the vision path as
+    /// unavailable (nil). OmniEngine overrides with the true batched forward.
     func embedImages(_ raws: [OmniVisionPreprocess.RawPatches]) -> [[Float]]? { nil }
 }
 
@@ -647,8 +647,8 @@ public final class Indexer: @unchecked Sendable {
         beginChunkReuse(settings)
         queue.sync { cancelled = false; cancelReason = .discard }
         var p = IndexProgress()
-        // The known-files snapshot is a whole-table GROUP BY (O(rows)) that shares no resource with
-        // the filesystem crawl below, yet it ran strictly before the crawl. Compute it concurrently
+        // The known-files snapshot is an O(rows) walk of the resident row table that shares no
+        // resource with the filesystem crawl below, yet it ran strictly before the crawl. Compute it concurrently
         // and join just before its first consumer (the first pipeline / the stale reconcile), so
         // time-to-first-embed is max(crawl, query) instead of their sum - most visible at startup on
         // a large existing index. (F6)
@@ -1023,7 +1023,8 @@ public final class Indexer: @unchecked Sendable {
                 var acc: [Int: (file: CrawledFile, kind: String, total: Int, done: [IndexedChunk])] = [:]
                 var nextFid = 0
                 // Buffer several batches before draining so we can LENGTH-BUCKET them: sorting the
-                // staging window by length makes each 48-wide GPU batch pad to a near-uniform Lmax,
+                // staging window by length makes each textBatchSize-wide GPU batch (8 by default) pad
+                // to a near-uniform Lmax,
                 // cutting the compute wasted on right-padding (~1.5-1.7x on varied-length corpora).
                 // Reordering is output-neutral: vectors are scattered back by (fid,idx), so each
                 // file's chunks reassemble identically regardless of batch composition.
@@ -1072,8 +1073,8 @@ public final class Indexer: @unchecked Sendable {
                     guard buf.count > floor else { return }
                     buf.sort { $0.text.count < $1.text.count }
                     // Carve the sorted window into textBatchSize buckets, then hand the WHOLE set to
-                    // embedTextBatches in one serialized call. With OMNI_ASYNC_EVAL=1 that double-
-                    // buffers batch K+1's GPU forward over batch K's host readout; otherwise it is a
+                    // embedTextBatches in one serialized call. By default that double-buffers batch
+                    // K+1's GPU forward over batch K's host readout; with OMNI_ASYNC_EVAL=0 it is a
                     // plain per-batch loop. Same vectors either way (just scheduling).
                     // While the user is actively searching, carve into smaller buckets so each GPU
                     // forward is a short command buffer an interactive query's matmul can slip behind
@@ -1231,7 +1232,7 @@ public final class Indexer: @unchecked Sendable {
                     let allRaws = batch.flatMap { $0.raws }
                     let tFlush = omniPerfEnabled ? Date() : nil
                     // Tags ride the same forward pass (empty when no tagger is attached); a tagged
-                    // image's snippet becomes its content tags instead of the bare filename.
+                    // image's snippet becomes its content tags; an untagged one stores none.
                     guard let (vecs, tags) = self.embedder.embedImagesTagged(allRaws), vecs.count == allRaws.count else {
                         for b in batch { storeChunks(b.file.path, []) }   // vision unavailable/fault
                         return
@@ -1376,9 +1377,9 @@ public final class Indexer: @unchecked Sendable {
         let fm = FileManager.default
         // Resolve the concrete files first: the explicit events, plus a crawl of any directory event
         // (a new folder / bulk move-in carries only the folder path). Then look up the PRIOR stored
-        // state for just these paths - an index-backed query (storedFiles) instead of a full
-        // `GROUP BY path` scan over the entire index, which a few touched files do not justify and
-        // which would stall any concurrent search behind it on the store's serial queue.
+        // state for just these paths - an index-backed query (storedFiles) instead of knownFiles'
+        // walk over every resident row, which a few touched files do not justify and which would
+        // stall any concurrent search behind it on the store's serial queue.
         // ONE stat(2) PER EVENT, and none at all for the files a directory event crawls.
         //
         // This asked the filesystem the same questions twice: fileExists for "is it there, is it a
@@ -1396,11 +1397,19 @@ public final class Indexer: @unchecked Sendable {
         // the one that does not would quietly stop indexing symlinked files.
         var files: [CrawledFile] = []
         var deletedTop = Set<String>()
+        // The crawl's own admission rules, for paths that arrive one at a time (admitsEventPath).
+        // Keyed on the deepest root holding the path; a path under no known root is not gated.
+        let gate = FileCrawler(roots: [], ignore: settings.ignore, enabledKinds: settings.enabledKinds,
+                               ownDataPaths: settings.ownDataPaths)
+        func rootOf(_ p: String) -> String? {
+            roots.filter { p == $0 || p.hasPrefix($0 + "/") }.max { $0.count < $1.count }
+        }
         for path in Set(paths) {
             if isCancelled { break }
             var st = stat()
             guard stat(path, &st) == 0 else { deletedTop.insert(path); continue }
             if st.st_mode & S_IFMT == S_IFDIR {
+                if let r = rootOf(path), !gate.admitsEventPath(path, isDir: true, size: 0, root: r) { continue }
                 FileCrawler(roots: [URL(fileURLWithPath: path)], ignore: settings.ignore,
                             enabledKinds: settings.enabledKinds,
                             ownDataPaths: settings.ownDataPaths)
@@ -1468,7 +1477,8 @@ public final class Indexer: @unchecked Sendable {
             let kind = FileExtractor.kind(forExtension: crawled.ext)
             // Ancestor-aware: an explicit file event for `.../.build/x/y.json` must honor the
             // dirOnly rule on `.build/` - the crawl prunes at the directory, this path never sees it.
-            if kind == nil || settings.ignore.isIgnoredIncludingAncestors(path, isDir: false) {
+            if kind == nil || settings.ignore.isIgnoredIncludingAncestors(path, isDir: false)
+                || rootOf(path).map({ !gate.admitsEventPath(path, isDir: false, size: crawled.size, root: $0) }) == true {
                 if known[path] != nil { toDelete.insert(path) }   // now unsupported/excluded -> remove
                 continue
             }
@@ -1602,9 +1612,9 @@ public final class Indexer: @unchecked Sendable {
             switch item.payload {
             case .text(let pieces) where !pieces.isEmpty:
                 let fid = tNextFid; tNextFid += 1
-                // Chunk-level reuse. chunk() cuts a fixed grid from the START of the text, so an
-                // edit leaves every chunk boundary before it byte-identical, and an append leaves
-                // all of them identical except the tail. Those chunks already have a vector in the
+                // Chunk-level reuse. The default content-defined chunker takes its boundaries from
+                // the bytes around them, so an edit leaves the chunks away from it byte-identical
+                // (the legacy fixed grid, OMNI_CDC=0, keeps every chunk before the edit). Those chunks already have a vector in the
                 // store, and taking it back is exactly the substitution file-level content dedup
                 // makes (which only fires when the WHOLE file is unchanged), one level finer.
                 //
@@ -1930,7 +1940,8 @@ public final class Indexer: @unchecked Sendable {
     }
 
     /// Rewrite a duplicate source's rows for this file: same vectors, snippets and locators, new
-    /// path/mtime/size. Media rows use the filename as their snippet - swap in ours.
+    /// path/mtime/size. A media row written before snippets stopped carrying the file name still
+    /// has the source's name as its snippet - swap in ours.
     private static func rewrite(_ src: [IndexedChunk], to file: CrawledFile) -> [IndexedChunk] {
         let srcName = (src.first?.path as NSString?)?.lastPathComponent
         return src.map { c in
@@ -2293,9 +2304,6 @@ public final class Indexer: @unchecked Sendable {
         return OpaqueText.filter(pieces) { $0.text }
     }
 
-    /// Snippet for an image chunk: its open-vocabulary content tags when the tagger produced
-    /// them ("cat, couch, crib"), else the filename - the pre-tagging behavior, and the
-    /// fallback while the label cache is still building or tagging is off.
     /// The stored snippet for a media chunk: its tags, or NOTHING.
     ///
     /// It used to fall back to the file name, and that name then sat in a table keyed by content

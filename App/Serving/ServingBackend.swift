@@ -68,8 +68,8 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
     /// have to be added again for each new provider, and forgotten once.
     var onSearch: (@Sendable (String, ServedSurface) -> Void)? = nil
 
-    /// Matches the indexer's forward-pass width so we never exceed the engine's batch
-    /// expectations; large client batches are split into groups of this size.
+    /// Large client batches are split into groups of this size, one forward pass each. Not the
+    /// indexer's forward-pass width (textBatchSize, 8 by default): a served group is 48.
     private let groupCap = 48
 
     var dim: Int { engine.dim }

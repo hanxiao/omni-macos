@@ -643,7 +643,7 @@ final class Vec16Buffer {
     deinit { unmapScratch() }
 }
 
-/// Accelerate GEMV (cblas_sgemv) per query; SQLite is the durable source of truth.
+/// Resident vectors scanned with MLX on the GPU per query; SQLite is the durable source of truth.
 public final class VectorStore: @unchecked Sendable {
     /// 2 = a path on every chunk. 3 = paths interned into `files`. 4 = directories interned too,
     /// per-file facts on the file row, and the chunk row narrowed to four integers with its payload
@@ -652,7 +652,8 @@ public final class VectorStore: @unchecked Sendable {
     /// An index at 2 or 3 is converted on open, in place, with nothing re-embedded. An index at 4
     /// opened by a binary that only knows 2 and 3 is DROPPED and rebuilt by that binary, which is
     /// the safe direction - it would otherwise query columns that no longer exist and quietly
-    /// return nothing. All three are accepted here so an upgrade never forces a reindex.
+    /// return nothing. Every version in `compatibleSchemaVersions` (2 through 5, see
+    /// `v5SchemaVersion`) is accepted here so an upgrade never forces a reindex.
     private static let schemaVersion: Int32 = 4
     /// WHAT A MIGRATED INDEX IS STAMPED, and it is not cosmetic: it is the only thing standing
     /// between an older build and a v5 index.
@@ -681,9 +682,8 @@ public final class VectorStore: @unchecked Sendable {
     private let queue = DispatchQueue(label: "omni.vectorstore")
     private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-    // RESIDENT-SLIM: `path`/`kind` hold the CANONICAL shared String instance from the intern tables
-    // (one heap allocation per distinct file/kind, 16-byte refs per row - NOT a per-row copy), and
-    // the snippet is NOT resident at all: at ~220 chars x N chunks it dominated resident metadata
+    // RESIDENT-SLIM: a row holds ids only; path, kind and the per-file facts are read through the
+    // file-indexed tables (`filePaths`, `idKind`, `fileMeta`), and the snippet is NOT resident at all: at ~220 chars x N chunks it dominated resident metadata
     // (~800B/chunk measured at 2M realistic rows), yet it is only read for a search's <=60 winners
     // and one file's chunks in rankChunks - both fetched lazily from SQLite by primary key.
     /// Byte cost of one row of bookkeeping, for `omni-verify storemem`.
@@ -857,6 +857,12 @@ public final class VectorStore: @unchecked Sendable {
     // the normal reducer over exact scores. Quality is gated by concbench's recall-vs-fp32-exact.
     private var quantBase: (wq: MLXArray, scales: MLXArray, biases: MLXArray?)? = nil
     private var quantBits = 0          // active bits of quantBase (0 = full bf16 base)
+    /// The result count the shipped interface asks for. Declared here rather than in the app so the
+    /// paper suite measures the shortlist the product actually builds: C is a function of this
+    /// number, and a harness that asked for its own top-k measured a net a third the shipped width
+    /// while reporting it as the shipped one.
+    public static let shippedTopK = 120
+    static let candidateOverride: Int? = ProcessInfo.processInfo.environment["OMNI_CANDIDATES"].flatMap(Int.init)
     /// Candidates the coarse tier hands the exact rerank. The 4096 ceiling is the untested part of
     /// the funnel: it was sized when the coarse tier was 4-bit, and the whole point of a cheaper
     /// coarse tier is that you can BUY BACK its recall by oversampling more before reranking.
@@ -878,14 +884,9 @@ public final class VectorStore: @unchecked Sendable {
     /// 6.5 GB mmap plus host reduce work - linear in C and cache-hostile. Trading the cheap resource
     /// for the expensive one at 16:1 cannot win, which is what the 4096 ceiling was already encoding.
     ///
-    /// (1-bit is not reachable here at all: MLX's affine quantize supports 2-8 bits, and a true
-    /// binary tier would need a popcount kernel, not quantizedMM.)
-    /// The result count the shipped interface asks for. Declared here rather than in the app so the
-    /// paper suite measures the shortlist the product actually builds: C is a function of this
-    /// number, and a harness that asked for its own top-k measured a net a third the shipped width
-    /// while reporting it as the shipped one.
-    public static let shippedTopK = 120
-    static let candidateOverride: Int? = ProcessInfo.processInfo.environment["OMNI_CANDIDATES"].flatMap(Int.init)
+    /// These numbers are for the affine tier (2-8 bits through quantizedMM). The default 1-bit
+    /// sign-code tier (`scanBits`) is cheaper per row and widens C by `bitCandidateMultiplier`,
+    /// so its net reaches 8192 at the default 2x.
     static func candidateCount(topK: Int) -> Int {
         if let c = candidateOverride { return max(topK, c) }
         let base = min(4096, max(1024, topK * 32))
@@ -894,7 +895,7 @@ public final class VectorStore: @unchecked Sendable {
         return scanBits == 1 ? base * max(1, bitCandidateMultiplier) : base
     }
 
-    /// A/B lever: 0 skips the exact rerank so the coarse 4-bit scores are final. See search().
+    /// A/B lever: 0 skips the exact rerank so the coarse scores are final. See search().
     static let quantRerank = ProcessInfo.processInfo.environment["OMNI_QUANT_RERANK"] != "0"
 
     /// EXACT-TIER PRECISION EXPERIMENT. The rerank reads bf16 rows out of `flat16`, and `flat16`
@@ -1052,16 +1053,17 @@ public final class VectorStore: @unchecked Sendable {
     /// Measured on one machine with ~800 GB/s of peak bandwidth; a part with a different ALU-to-
     /// bandwidth ratio could move the crossover, so re-run qmmbench before trusting it elsewhere.
     ///
-    /// Policy: OMNI_QUANT_BASE forces (0=off, 4, 8); unset = auto-on at 4 bits when the full base
-    /// would exceed a quarter of the user's memory cap (Settings > Performance), OR when the corpus
-    /// is past the row count at which the replica is simply the faster scan on this device.
+    /// Policy: OMNI_QUANT_BASE forces a width (0=off); unset = auto-on at `scanBits` (1 by default)
+    /// when the full base would exceed a quarter of the user's memory cap (Settings > Performance),
+    /// OR when the corpus is past the row count at which the replica is simply the faster scan on this device.
     static func quantBitsFor(baseBytes: Int, rowCount: Int = 0) -> Int {
         if let v = quantBaseOverride { return v }
         if let s = ProcessInfo.processInfo.environment["OMNI_QUANT_BASE"], let v = Int(s) { return v }
         if baseBytes > OmniMemoryBudget.capBytes / 4 { return Self.scanBits }
         return rowCount > deviceCrossoverRows ? Self.scanBits : 0
     }
-    /// Width of the quantized scan replica. 3, not 4: measured on a 4.5M-row index it is the
+    /// Width of the quantized scan replica: 1 by default (OMNI_SCAN_BITS, below). Within the affine
+    /// quantizedMM tier, 3 and not 4: measured on a 4.5M-row index it is the
     /// minimum of the latency curve (see the table above), 22% smaller on disk and in memory, and
     /// at least as accurate on every arm - equal on text (mean 0.9723 vs 0.9597 path recall, score
     /// ratio 0.99998 vs 0.99995) and strictly better on image queries, where 3-bit reproduces the
@@ -1111,20 +1113,21 @@ public final class VectorStore: @unchecked Sendable {
     //
     // Rows inside the resident base [0, baseRows) are therefore marked dead and left where they are.
     // Nothing can select them: every place a base score is produced masks them to -inf, which the
-    // isFinite checks the reducers already apply then discard. Rows in the delta [baseRows, n) still
-    // compact physically, which is cheap because the delta is bounded by foldThreshold.
+    // isFinite checks the reducers already apply then discard. Rows in the delta [baseRows, n) are
+    // tombstoned the same way (see tombstoneOnlyLocked).
     //
-    // Dead rows are collected by the next full rebuild, and forced to collect once they pass
-    // `deadBudget`, so the store cannot drift into scanning mostly-dead rows. Cold paths that walk
-    // `rows` directly rather than through a score compact first, so their logic is untouched.
+    // Dead rows are collected only by a physical compaction, which a removal falls back to when it
+    // would push them past `deadBudget` - and only on an index with no coverage claim. Under
+    // coverage nothing collects them (see the note after maskDeadLocked). Paths that walk `rows`
+    // directly rather than through a score filter dead rows themselves.
     nonisolated(unsafe) public static var tombstones =
         ProcessInfo.processInfo.environment["OMNI_TOMBSTONE"] != "0"
     private var deadRows = Set<Int32>()
-    /// Resident int32 index list for the GPU mask, rebuilt when `deadRows` OR the base boundary changes.
+    /// Was the resident dead-row index list for the GPU mask. Never set any more: maskDeadLocked
+    /// masks orphaned slots instead. Still cleared where tombstone state resets.
     private var deadIdxCache: MLXArray?
-    /// The `baseRows` the cache above was filtered for. -1 forces a rebuild.
-    private var deadIdxCacheRows = -1
-    /// Past this many tombstones the next base build collects them: 5% of the base, never fewer
+    /// Past this many tombstones a removal falls back to a physical compaction, which collects
+    /// them (not under coverage, where the budget does not apply): 5% of the rows, never fewer
     /// than 4096, so a small store does not compact on every save and a large one cannot accumulate
     /// a scan whose rows are mostly discarded.
     /// Sized off the WHOLE row table, not the base. Tombstones now cover the delta as well, and a
@@ -1168,8 +1171,9 @@ public final class VectorStore: @unchecked Sendable {
     /// transaction - so it moves atomically with the rows it describes. The row-table sidecar is
     /// stamped with this value; at open, a stamp that does not match the db's counter means the
     /// sidecar predates some committed change (or a crash landed between them) and it is rejected.
-    /// VACUUM (compact) is deliberately unbumped: it renumbers rowids but preserves logical content
-    /// and row order. Loaded from meta at open, 0 for pre-counter indexes.
+    /// VACUUM (compact) is deliberately unbumped: it preserves logical content and row order. The
+    /// v4 and v5 tables have an explicit INTEGER PRIMARY KEY, which VACUUM keeps; only a v3 `chunks`
+    /// has its rowids renumbered, in order. Loaded from meta at open, 0 for pre-counter indexes.
     private var mutationGen: Int64 = 0
     private func bumpGenLocked() {
         mutationGen += 1
@@ -2504,7 +2508,7 @@ public final class VectorStore: @unchecked Sendable {
     private var snippetStmt: OpaquePointer?   // cached SELECT reused by fillSnippetsLocked (F3)
     private var dedupStmt: OpaquePointer?
     private var contentSelStmt: OpaquePointer?
-    private var slotUpdStmt: OpaquePointer?     // cached SELECT reused by duplicateChunks (F8)
+    private var slotUpdStmt: OpaquePointer?     // cached `UPDATE chunks SET slot` for persistSlotsLocked
     private var bytesWrittenSinceCkpt = 0     // in-process WAL-growth estimate, gates the per-write stat (F17)
     private var ckptCounterSeeded = false
 
@@ -2819,16 +2823,11 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
-    /// Stored chunks of a CURRENT file whose content key matches, for reuse instead of a fresh
-    /// decode + embed. Returns the source rows as-is (the caller rewrites path/mtime/size).
-    /// "Current" = the candidate's chunks rows still carry the same `modified` that was recorded
-    /// with its key (lockstep), so a stale key row - the path re-embedded by an old app version,
-    /// deleted, or mid-replace - can never leak wrong vectors. The file's OWN row is a valid
-    /// source: a touched-but-identical file (git checkout, re-save) reuses its own chunks.
     /// Prior per-chunk vectors for one path, keyed by chunk hash. The live-update path uses this
-    /// to skip forward passes for the chunks an edit did not touch: the chunker cuts a fixed grid
-    /// from the start of the text, so an edit leaves every chunk before it byte-identical, and an
-    /// append leaves all but the tail identical.
+    /// to skip forward passes for the chunks an edit did not touch: the default content-defined
+    /// chunker takes its boundaries from the bytes around them, so an edit leaves the chunks away
+    /// from it byte-identical. (The legacy fixed grid, OMNI_CDC=0, cuts from the start of the
+    /// text, so there an edit leaves every chunk before it identical.)
     ///
     /// Only rows whose stored dim matches the caller's and whose vector is finite are returned -
     /// the same guard chunksForCurrentPathLocked applies - so a dim change or a poisoned row can
@@ -2908,8 +2907,8 @@ public final class VectorStore: @unchecked Sendable {
     ///
     /// The lookup `chunkVectors(path:)` could not make. That one is scoped to ONE path and gated on
     /// the file already being known, so a brand new log identical to eight thousand indexed ones is
-    /// embedded in full; this asks the content index directly, which is what the partial index on
-    /// `chunk_text.chunk_key` exists for.
+    /// embedded in full; this asks the content index directly, which is what the unique index on
+    /// `chunk.key` exists for (the partial index on `chunk_text.chunk_key` before the split).
     ///
     /// WITHOUT IT, SHARING SAVES DISK AND NOT GPU. Duplicate chunks inside one pass are collapsed
     /// by the indexer's own cache, so the encoder sees each content once per PASS - measured: the
@@ -2953,6 +2952,12 @@ public final class VectorStore: @unchecked Sendable {
     nonisolated(unsafe) public static var storeChunkReuse =
         ProcessInfo.processInfo.environment["OMNI_STORE_REUSE"] != "0"
 
+    /// Stored chunks of a CURRENT file whose content key matches, for reuse instead of a fresh
+    /// decode + embed. Returns the source rows as-is (the caller rewrites path/mtime/size).
+    /// "Current" = the candidate's chunks rows still carry the same `modified` that was recorded
+    /// with its key (lockstep), so a stale key row - the path re-embedded by an old app version,
+    /// deleted, or mid-replace - can never leak wrong vectors. The file's OWN row is a valid
+    /// source: a touched-but-identical file (git checkout, re-save) reuses its own chunks.
     public func duplicateChunks(key: String) -> [IndexedChunk]? {
         queue.sync {
             guard dbOpen() else { return nil }
@@ -3677,8 +3682,6 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
-    /// Build the filename index if it is missing or stale. Safe to call at any time; it is a no-op
-    /// when current. Never call it on the store's queue - it takes its own lock and does its own IO.
     /// Raw name-sidecar candidates for a query. Diagnostics only (`omni-verify`): it exposes the
     /// RETRIEVAL half of the filename channel, which the recall numbers cannot separate from the
     /// ranking half.
@@ -3686,13 +3689,13 @@ public final class VectorStore: @unchecked Sendable {
         lexical.match(q, limit: limit)
     }
 
+    /// Build the filename index if it is missing or stale. Safe to call at any time; it is a no-op
+    /// when current. Never call it on the store's queue - it takes its own lock and does its own IO.
     public func prepareLexicalIndex() {
         let stamp = queue.sync { mutationGen }
         lexical.rebuildIfStale(paths: self.allIndexedPaths(), stamp: stamp)
     }
 
-    /// Materialize display rows for paths the dense scan did not return. Indexed by the chunks
-    /// primary key, so this is a handful of point lookups, not a scan.
     /// Best chunk score per path, read from the MAPPED vectors. Must run on `queue`.
     ///
     /// `hitsForPaths` used to score from `LEFT JOIN pending_vecs`, which is a staging table: a
@@ -3758,6 +3761,8 @@ public final class VectorStore: @unchecked Sendable {
         return best
     }
 
+    /// Materialize display rows for paths the dense scan did not return. One lookup per path by
+    /// its file id, so this is a handful of indexed point lookups, not a scan.
     private func hitsForPaths(_ paths: [String], query: [Float]? = nil) -> [SearchHit] {
         guard !paths.isEmpty else { return [] }
         return queue.sync {
@@ -4685,12 +4690,8 @@ public final class VectorStore: @unchecked Sendable {
     /// file itself, and never re-parses the file (so it can't diverge from how the indexer parsed it).
     public func fileVector(_ path: String) -> [Float]? {
         queue.sync {
-            // NOT ensureCompactLocked(). Compaction rewrites the whole base, and measured on a
-            // 4.5M-row index that is ~1 SECOND held on the serial queue - paid by whoever calls
-            // first after an index pass, which for this function is the user pressing Find similar,
-            // and it blocks concurrent searches for the duration. Tombstones are collected by the
-            // base build on the search path anyway; here it is enough to skip them, exactly as
-            // pooledVectors does.
+            // Tombstones are skipped here, exactly as pooledVectors does. Nothing compacts them
+            // away (see the note after maskDeadLocked), so every reader of `rows` filters them.
             // pathID is the intern table over the paths present in `rows`, so a miss means "not
             // indexed" without scanning; a hit turns the row scan into Int32 compares instead of
             // N string compares (~80B memcmp + ARC each) - 10-50x on a large index.
@@ -4770,8 +4771,7 @@ public final class VectorStore: @unchecked Sendable {
         defer { for g in gids { scratch.map[Int(g)] = -1 } }   // O(tile) reset, not O(index)
         guard !gids.isEmpty else { return out }
         var counts = [Int](repeating: 0, count: t)
-        // No ensureCompactLocked() here: a tile must not trigger a whole-index compaction mid-fit,
-        // so unlike the whole-folder pass this one filters tombstones itself.
+        // Tombstones are filtered here, as in every reader of `rows`: nothing compacts them away.
         let dead = deadRows
         flat16.withUnsafeBufferPointer { fb in
             guard let base = fb.baseAddress else { return }
@@ -5125,7 +5125,7 @@ public final class VectorStore: @unchecked Sendable {
         base * (kindScoreScale[kind] ?? 1.0)
     }
 
-    // MARK: - Search (Accelerate GEMV)
+    // MARK: - Search (MLX scan)
 
     /// Top-K cosine search over all indexed files. Scores via base matmul + delta matmul on the GPU,
     /// then collapses to the best chunk per file. Runs under `queue` (the original locking model):
@@ -5433,7 +5433,7 @@ public final class VectorStore: @unchecked Sendable {
             quantizedHint.withLock { $0 = quantized }
             let t0 = Self.searchTiming ? Date() : nil
             let qv = MLXArray(query, [dim, 1]).asType(.bfloat16)
-            // Full mode: exact bf16 scores. Quant mode: COARSE scores from the 4-bit replica
+            // Full mode: exact bf16 scores. Quant mode: COARSE scores from the quantized replica
             // (x @ w.T via quantizedMM wants x as [1, dim]); exact rerank happens below.
             // SHARED between the coarse tiers. It used to live inside the affine branch, so the
             // 1-bit tier fell straight past it to the host reducer - reading back and scanning all
@@ -5441,10 +5441,9 @@ public final class VectorStore: @unchecked Sendable {
             // top-C on the GPU. Same funnel, whichever tier produced the coarse scores.
             func coarseFastPathLocked(_ baseScore: MLXArray) -> [SearchHit]? {
             let C = min(baseRows, Self.candidateCount(topK: topK))
-            // `since` is the one filter that cannot be masked here - it needs per-row
-            // `modified`, which is not resident - so it keeps the host path. Everything else
-            // (kind via the kind code, folder/ext/tag via the per-file path table) becomes a
-            // GPU mask, and the query then takes the same candidate selection a plain one does.
+            // Every filter clause becomes a GPU mask - kind via the kind code, folder/ext/tag via
+            // the per-file path table, `since` via the per-file `modified` table - and the query
+            // then takes the same candidate selection a plain one does.
             let pathFilter = !filter.folderPrefixes.isEmpty || (filter.ext?.isEmpty == false)
                 || filter.tagAllow != nil || filter.tagDeny != nil
             // The mask itself decides whether this path is usable, rather than a separate
@@ -5562,15 +5561,11 @@ public final class VectorStore: @unchecked Sendable {
                 // ahead of the position numbering (hole rows occupy an index each), and the delta
                 // contents were reliably killed. Every file holding them then scored -inf and
                 // vanished from search while its vector sat correct on disk.
-                if true {
-                    ensureSlotRowsLocked()
-                    let dead = deadRows
-                    for sl in baseRows ..< scores.count
-                    where !rowsOfSlotLocked(sl).contains(where: { !dead.contains($0) }) {
-                        scores[sl] = -.infinity
-                    }
-                } else {
-                    for r in deadRows where Int(r) >= baseRows && Int(r) < scores.count { scores[Int(r)] = -.infinity }
+                ensureSlotRowsLocked()
+                let dead = deadRows
+                for sl in baseRows ..< scores.count
+                where !rowsOfSlotLocked(sl).contains(where: { !dead.contains($0) }) {
+                    scores[sl] = -.infinity
                 }
             } else {
                 MLX.eval(baseScore)
@@ -5699,27 +5694,11 @@ public final class VectorStore: @unchecked Sendable {
         // array is the identity only while a row owns its vector - under sharing it masks whichever
         // contents happen to sit at those offsets. Mask the contents nothing live points at instead,
         // which is the same set when nothing is shared and the correct one when something is.
-        if true {
-            var out = scores
-            if let orphans = orphanSlotsLocked(upTo: baseRows), orphans.size > 0 {
-                out[orphans] = MLXArray(-Float.infinity)
-            }
-            return out
+        var out = scores
+        if let orphans = orphanSlotsLocked(upTo: baseRows), orphans.size > 0 {
+            out[orphans] = MLXArray(-Float.infinity)
         }
-        guard !deadRows.isEmpty else { return scores }
-        // BASE ROWS ONLY. `scores` is [baseRows], and tombstones now reach the delta as well, so
-        // scattering the raw dead set would index past the end of the array it is masking - a write
-        // MLX does not bounds-check into whatever that resolves to, silently. The delta half is
-        // masked by its own consumers (the two reducers), which is where the delta scores live.
-        // Cached against baseRows too, not just against the dead set: a fold changes the boundary
-        // without touching deadRows, and a cache keyed only on the latter would outlive its shape.
-        if deadIdxCache == nil || deadIdxCacheRows != baseRows {
-            deadIdxCache = MLXArray(deadRows.filter { Int($0) < baseRows }.sorted())
-            deadIdxCacheRows = baseRows
-        }
-        guard deadIdxCache!.size > 0 else { return scores }
-        scores[deadIdxCache!] = MLXArray(-Float.infinity)
-        return scores
+        return out
     }
 
     // ensureCompactLocked USED TO LIVE HERE - "drop the tombstones for real", called by every reader
@@ -5783,7 +5762,8 @@ public final class VectorStore: @unchecked Sendable {
     /// row indices (no full readback). Host: gather those C rows' exact bf16 vectors from flat16,
     /// rescore in one [C, dim] matmul, then reduce best-chunk-per-file over ONLY the C candidates
     /// plus the (already exact) delta rows. chunkCount comes from the lockstep fileChunkCount, so
-    /// nothing here touches all N rows. Unfiltered only - the caller guarantees filter.isEmpty.
+    /// nothing here touches all N rows. Filtered queries come here too: the caller has already
+    /// masked the base on the GPU, and `offer` re-checks every clause for base and delta rows.
     private func searchCandidatesLocked(coarse: MLXArray, qv: MLXArray, n: Int,
                                         candidateCount C: Int, query: [Float], topK: Int,
                                         filter: SearchFilter = SearchFilter()) -> [SearchHit] {
@@ -5817,9 +5797,8 @@ public final class VectorStore: @unchecked Sendable {
                 packed.withUnsafeMutableBufferPointer { pb in
                     guard let src = fb.baseAddress, let dst = pb.baseAddress else { return }
                     // `ri` is already a SLOT: topCIndices ranks the coarse score array, which is
-                        // indexed by slot. Do NOT map it through slotOf.
-                        // TODO(v5): the candidates then travel on as if they were rows. Under
-                        // sharing they have to be expanded slot -> occurrences first.
+                        // indexed by slot. Do NOT map it through slotOf. The reduce below
+                        // expands each slot to its occurrences (rowsOfSlotLocked).
                         for (j, ri) in cand.enumerated() { (dst + j * dim).update(from: src + Int(ri) * dim, count: dim) }
                 }
             }
@@ -5832,7 +5811,7 @@ public final class VectorStore: @unchecked Sendable {
             MLX.eval(exact)
             exScores = exact.reshaped([cand.count]).asType(.float32).asArray(Float.self)
         } else {
-            let cs = MLX.take(flat, topIdx, axis: 0)   // keep the coarse 4-bit scores as final
+            let cs = MLX.take(flat, topIdx, axis: 0)   // keep the coarse scores as final
             MLX.eval(cs)
             exScores = cs.reshaped([cand.count]).asType(.float32).asArray(Float.self)
         }
@@ -5875,7 +5854,7 @@ public final class VectorStore: @unchecked Sendable {
         // base candidates, not the K-th best row score: K rows above a threshold can all belong to
         // one file, so a row-level threshold would not bound the file-level result and could drop
         // a delta row that belongs in the top-K. Selecting it costs one bounded pass over at most
-        // C = 4096 entries and then saves a hash lookup on each of up to 50,000 delta rows.
+        // C entries (8192 on the 1-bit tier) and then saves a hash lookup on each of up to 50,000 delta rows.
         // Strict <: an equal score can still displace the K-th file on the fileID tie-break.
         // Only worth computing when the delta is large enough to pay for the selection: sorting
         // at most C scores costs tens of microseconds, and below a few thousand delta rows the
@@ -5914,8 +5893,8 @@ public final class VectorStore: @unchecked Sendable {
     /// them in ONE small matmul, and returns a dense score array where non-candidates are -inf
     /// (the reducer's isFinite check skips them; its per-file chunk counts still see every row).
     /// Delta rows [baseRows, n) were scored exactly by the delta matmul and pass through as-is.
-    /// C scales with topK and never exceeds 4096; when the base has <= C rows every row is a
-    /// candidate and the result is exactly the full bf16 search.
+    /// C scales with topK (see candidateCount: at most 4096, doubled on the 1-bit tier); when the
+    /// base has <= C rows every row is a candidate and the result is exactly the full bf16 search.
     private func rerankLocked(coarse: [Float], n: Int, query: [Float], filter: SearchFilter, topK: Int) -> [Float] {
         let C = min(baseRows, Self.candidateCount(topK: topK))
         let kinds = filter.kinds, hasKind = !kinds.isEmpty, since = filter.since
@@ -7247,19 +7226,16 @@ public final class VectorStore: @unchecked Sendable {
     //
     //   coveredRows  the first C slots of .vecs are durable, and the rows that own them have had
     //                their blob cleared. Rows past C keep their blob and are the only copy.
-    //   vec_holes    slots below C whose row has since been deleted. A tombstone leaves the vector
-    //                in place, so the file keeps a slot the table no longer has a row for.
+    //   vec_holes    slots below C that no live content owns any more. A delete leaves the vector
+    //                in place, so the file keeps a position nothing points at; the free list
+    //                (below) hands these back out, and the list commits inside the delete that
+    //                creates the hole.
     //
-    // A covered row's slot is therefore its rank in rowid order counted THROUGH the holes, which is
-    // recoverable from SQLite alone - hence the hole list committing inside the delete that creates
-    // it. The correspondence used to be implied ("row i of the file is the i-th row in rowid order"),
-    // which is true only while the two move in lockstep and unobservably false afterwards: from the
-    // first hole onward, every row reads its NEIGHBOUR's vector, and no size or COUNT(*) check can
-    // see it.
-    //
-    // Why a hole list and not a slot column: compaction renumbers everything. Per row that is a
-    // 4.5M-row UPDATE, measured at 33.8s, which cannot run inside close(). As a hole list it is
-    // "holes = none, C = n" - two metadata writes. That is the whole reason this shape was chosen.
+    // Under v4 a covered row's slot was its rank in rowid order counted THROUGH the holes, and a hole
+    // list was chosen over a slot column because compaction renumbered everything: per row that was
+    // a 4.5M-row UPDATE, measured at 33.8s, which cannot run inside close(). v5 stores the position
+    // itself (`chunk.slot`), so nothing is ranked any more; the hole list remains as the record of
+    // which positions below C are free, which is not a property of any row.
     //
     // C only ever advances at a stamp, in bounded slices, so an existing index migrates a piece at a
     // time with no reindex and no long pause - and an index that never finishes migrating is simply
@@ -7887,91 +7863,70 @@ public final class VectorStore: @unchecked Sendable {
             // sharing they part company: a hole is a position no LIVE ROW points at, not a dead row
             // index, and a cleared blob belongs to a row whose position is covered, of which there
             // may be several per position.
-            if true {
-                ensureSlotRowsLocked()
-                let dead = deadRows
-                func owned(_ sl: Int32) -> Bool { rowsOfSlotLocked(Int(sl)).contains { !dead.contains($0) } }
-                // 1. Every recorded hole is a position inside the prefix that nothing live points at.
-                for h in vecHoles {
-                    if Int(h) >= coveredRows { return "hole \(h) at or past coverage \(coveredRows)" }
-                    if owned(h) { return "hole \(h) still has a live row" }
+            ensureSlotRowsLocked()
+            let dead = deadRows
+            func owned(_ sl: Int32) -> Bool { rowsOfSlotLocked(Int(sl)).contains { !dead.contains($0) } }
+            // 1. Every recorded hole is a position inside the prefix that nothing live points at.
+            for h in vecHoles {
+                if Int(h) >= coveredRows { return "hole \(h) at or past coverage \(coveredRows)" }
+                if owned(h) { return "hole \(h) still has a live row" }
+            }
+            // 2. And every unowned position inside the prefix is a recorded hole - the half a
+            //    missed removal breaks, leaving the file holding a vector no row owns.
+            for sl in 0 ..< coveredRows where !owned(Int32(sl)) {
+                if !vecHoles.contains(Int32(sl)) {
+                    return "position \(sl) inside coverage has no live row and no recorded hole"
                 }
-                // 2. And every unowned position inside the prefix is a recorded hole - the half a
-                //    missed removal breaks, leaving the file holding a vector no row owns.
-                for sl in 0 ..< coveredRows where !owned(Int32(sl)) {
-                    if !vecHoles.contains(Int32(sl)) {
-                        return "position \(sl) inside coverage has no live row and no recorded hole"
-                    }
-                }
-                // 3. A row whose position is covered has no blob, and one whose position is not
-                //    still has its own. Both directions, as one count.
-                // MINUS THE UNSYNCED REUSES. A row the free list placed on an already-covered
-                // position keeps its blob ON PURPOSE - the file answers for that position, but for
-                // the bytes that used to be there, and the new ones are not durable until the next
-                // msync. `clearSyncedReuseBlobsLocked` drops them at the stamp that syncs. So they
-                // are covered rows that legitimately still have a blob, and counting them as
-                // breakage makes the audit report a bug where the design is doing its job.
-                // NOT WHILE THE COLUMN IS STILL BEING FILLED. This counts covered rows by
-                // `slot >= 0`, but a row that is covered - its blob cleared, the file answering for
-                // it - legitimately still carries -1 until the one-time backfill reaches it. The
-                // two counts therefore disagree for the whole of a v4 migration, and the audit
-                // called a perfectly healthy migrating index broken. The hole-based form below does
-                // not read the column at all, so it is the one that can answer during the window.
-                if v4BackfillPending {
-                    let liveCovered = coveredRows - vecHoles.count
-                    let cleared = clearedRowsLocked()
-                    if cleared != liveCovered {
-                        return "coverage accounts for \(liveCovered) rows but \(cleared) have no blob"
-                    }
-                    return nil
-                }
-                var exclude = ""
-                if !unsyncedReuse.isEmpty {
-                    exclude = " AND slot NOT IN (\(unsyncedReuse.map(String.init).joined(separator: ",")))"
-                }
-                // COUNTED IN THE SPACE THE BLOBS ARE KEYED IN, which is contents under the split
-                // and rows under v4 - see clearedRowsLocked. Asking the v4 question of a split
-                // index compares contents against occurrences and refuses every healthy one.
-                let staged = splitBuilt ? "chunk" : "chunks"
-                let coveredRowCount = scalarQuery(
-                    "SELECT COUNT(*) FROM \(staged) WHERE slot >= 0 AND slot < \(coveredRows)\(exclude)")
-                let cleared = clearedRowsLocked()
-                if cleared != coveredRowCount {
-                    return "coverage covers \(coveredRowCount) rows but \(cleared) have no blob"
-                }
-            } else {
-                // 1. Every recorded hole must actually be a dead row inside the covered prefix.
-                for h in vecHoles {
-                    if Int(h) >= coveredRows { return "hole \(h) at or past coverage \(coveredRows)" }
-                    if !deadRows.contains(h) { return "hole \(h) is not a dead row" }
-                }
-                // 2. And every dead row inside the prefix must be a recorded hole. This is the half
-                //    a missed removal breaks: gone from SQLite, dead in memory, and unrecorded.
-                for d in deadRows where Int(d) < coveredRows {
-                    if !vecHoles.contains(d) { return "dead row \(d) inside coverage is not a recorded hole" }
-                }
-                // 3. The covered prefix must account for exactly the SQLite rows whose blob is gone.
+            }
+            // 3. A row whose position is covered has no blob, and one whose position is not
+            //    still has its own. Both directions, as one count.
+            // MINUS THE UNSYNCED REUSES. A row the free list placed on an already-covered
+            // position keeps its blob ON PURPOSE - the file answers for that position, but for
+            // the bytes that used to be there, and the new ones are not durable until the next
+            // msync. `clearSyncedReuseBlobsLocked` drops them at the stamp that syncs. So they
+            // are covered rows that legitimately still have a blob, and counting them as
+            // breakage makes the audit report a bug where the design is doing its job.
+            // NOT WHILE THE COLUMN IS STILL BEING FILLED. This counts covered rows by
+            // `slot >= 0`, but a row that is covered - its blob cleared, the file answering for
+            // it - legitimately still carries -1 until the one-time backfill reaches it. The
+            // two counts therefore disagree for the whole of a v4 migration, and the audit
+            // called a perfectly healthy migrating index broken. The hole-based form below does
+            // not read the column at all, so it is the one that can answer during the window.
+            if v4BackfillPending {
                 let liveCovered = coveredRows - vecHoles.count
                 let cleared = clearedRowsLocked()
-                if cleared != liveCovered { return "coverage accounts for \(liveCovered) rows but \(cleared) have no blob" }
+                if cleared != liveCovered {
+                    return "coverage accounts for \(liveCovered) rows but \(cleared) have no blob"
+                }
+                return nil
+            }
+            var exclude = ""
+            if !unsyncedReuse.isEmpty {
+                exclude = " AND slot NOT IN (\(unsyncedReuse.map(String.init).joined(separator: ",")))"
+            }
+            // COUNTED IN THE SPACE THE BLOBS ARE KEYED IN, which is contents under the split
+            // and rows under v4 - see clearedRowsLocked. Asking the v4 question of a split
+            // index compares contents against occurrences and refuses every healthy one.
+            let staged = splitBuilt ? "chunk" : "chunks"
+            let coveredRowCount = scalarQuery(
+                "SELECT COUNT(*) FROM \(staged) WHERE slot >= 0 AND slot < \(coveredRows)\(exclude)")
+            let cleared = clearedRowsLocked()
+            if cleared != coveredRowCount {
+                return "coverage covers \(coveredRowCount) rows but \(cleared) have no blob"
             }
             // 4. And the vector buffer must still hold a vector for every position. Under sharing
             //    `units` IS flat16's own length, so that comparison would prove nothing; the real
             //    statement is that no stored slot points past the end of the file and the resident
             //    mirror is still lockstep with the rows.
-            if true {
-                if dim > 0 {
-                    let maxSlot = scalarQuery(
-                        "SELECT COALESCE(MAX(slot), -1) FROM \(splitBuilt ? "chunk" : "chunks") WHERE slot >= 0")
-                    if maxSlot >= slotCount {
-                        return "chunk slot \(maxSlot) is past the \(slotCount) vectors the file holds"
-                    }
+            if dim > 0 {
+                let maxSlot = scalarQuery(
+                    "SELECT COALESCE(MAX(slot), -1) FROM \(splitBuilt ? "chunk" : "chunks") WHERE slot >= 0")
+                if maxSlot >= slotCount {
+                    return "chunk slot \(maxSlot) is past the \(slotCount) vectors the file holds"
                 }
-                if occSlot.count != rows.count {
-                    return "slot mirror holds \(occSlot.count) entries, the table has \(rows.count) rows"
-                }
-            } else if dim > 0, flat16.count != units * dim {
-                return "vector buffer holds \(flat16.count / Swift.max(1, dim)) vectors, index has \(units) positions"
+            }
+            if occSlot.count != rows.count {
+                return "slot mirror holds \(occSlot.count) entries, the table has \(rows.count) rows"
             }
             return nil
         }
@@ -9285,10 +9240,8 @@ public final class VectorStore: @unchecked Sendable {
         // below would PASS anyway, because a row with no slot is missing from both sides of it.
         // The result would be a claim that says the file answers for vectors still sitting in
         // SQLite. Backfill first; until it has run, coverage does not move.
-        if true {
-            backfillSlotsLocked()
-            guard slotsBackfilled else { return false }
-        }
+        backfillSlotsLocked()
+        guard slotsBackfilled else { return false }
         // The covered prefix must correspond, row for row, to the live rows SQLite has in rowid
         // order. Holes are exactly the slots below `coveredRows` with no row, so this is the
         // arithmetic that has to balance - and if it does not, the claim is not extended.
@@ -9309,16 +9262,12 @@ public final class VectorStore: @unchecked Sendable {
         // the claim and the target. `fresh` is then reused below, so the walk is paid for once.
         var fresh: [Int32] = []
         let deadBelow: Int
-        if true {
-            ensureSlotRowsLocked()
-            let dead = deadRows
-            fresh = (coveredRows ..< target).filter { sl in
-                !rowsOfSlotLocked(sl).contains { !dead.contains($0) }
-            }.map { Int32($0) }
-            deadBelow = vecHoles.filter { Int($0) < target }.count + fresh.count
-        } else {
-            deadBelow = deadRows.filter { Int($0) < target }.count
-        }
+        ensureSlotRowsLocked()
+        let dead = deadRows
+        fresh = (coveredRows ..< target).filter { sl in
+            !rowsOfSlotLocked(sl).contains { !dead.contains($0) }
+        }.map { Int32($0) }
+        deadBelow = vecHoles.filter { Int($0) < target }.count + fresh.count
         guard live == rows.count - deadRows.count, target - deadBelow <= live else { return false }
         // The watermark, derived now if the claim predates it - see ensureCoveredUpToIDLocked for
         // why this cannot be left to the point where the claim is first read.
@@ -9329,87 +9278,47 @@ public final class VectorStore: @unchecked Sendable {
         let clearUpTo = target - deadBelow            // how many live rows the prefix accounts for
         guard clearUpTo >= clearedBefore else { return false }
         guard execChecked("BEGIN IMMEDIATE;") else { return false }
-        // A row that is already a tombstone when its slot becomes covered IS a hole from the moment
-        // coverage reaches it: the file holds a vector there that no row owns. Recorded in the same
-        // transaction as the clearing, so the claim and the hole list can never disagree.
         // A position that is already unowned when coverage reaches it IS a hole from that moment:
         // the file holds a vector there that no row reads. Recorded in the same transaction as the
         // clearing, so the claim and the hole list can never disagree. Under sharing "unowned" is a
         // question about the position's rows, not about a row index that happens to equal it.
-        if true {
-            recordHolesLocked(fresh, coveredOverride: target)
-        } else {
-            recordHolesLocked((coveredRows ..< target).map { Int32($0) }.filter { deadRows.contains($0) },
-                              coveredOverride: target)
-        }
-        // WHERE THE COVERED PREFIX ENDS, as a chunk id.
-        //
-        // v3 re-walked the whole prefix on every slice - `UPDATE chunks SET vec = x'' ... ORDER BY
-        // rowid LIMIT clearUpTo` - which is O(covered), not O(slice), and took the one-time
-        // migration on a 4.5M-row index from 100 seconds to twenty minutes. A watermark had been
-        // tried before and reverted, because the arithmetic tying it to the slot count was wrong
-        // and the claim ran ahead of the rows actually cleared.
-        //
-        // Two things make it safe here that were not true then. The id is STABLE (an explicit
-        // INTEGER PRIMARY KEY, which VACUUM preserves), so a watermark keeps meaning the same row.
-        // And the result is CHECKED against a count that is cheap precisely because the pending
-        // vectors have their own table: after the delete, exactly `live - clearUpTo` of them must
-        // remain. That is the identity the old watermark violated silently, verified per slice,
-        // inside the transaction, for the cost of counting a small B-tree.
+        recordHolesLocked(fresh, coveredOverride: target)
+        // WHERE THE COVERED PREFIX ENDS. v3 re-walked the whole prefix on every slice, which is
+        // O(covered), not O(slice); v4 cleared up to a chunk-id watermark.
         // THE ID WATERMARK ONLY WORKS WHILE A POSITION'S ROWS ARE AN ID-PREFIX. Under sharing a
         // duplicate has a HIGH id and a LOW slot, so "id <= boundary" stops meaning "these
         // positions are covered": it would leave a duplicate's blob behind (harmless) while the
         // accounting below claimed it was gone (not). Clear by POSITION RANGE instead - exactly the
         // slice's new positions - which idx_chunk_slot makes O(slice) rather than O(covered), the
-        // property the watermark existed to buy.
-        var boundary = coveredUpToID
-        if true {
-            // THE STAGED BLOBS ARE COUNTED IN THE SPACE THEY ARE KEYED IN. Under v4 that is rows,
-            // because a row stages its own vector; under the split it is CONTENTS, because a
-            // position's bytes are staged once however many files read them. Asking the v4
-            // question of a split index compares a count of contents against a count of
-            // occurrences, which on the measured index differ by 3.5M - every slice would fail
-            // its identity check and coverage would never advance at all.
-            let onSplit = splitBuilt
-            let unit = onSplit ? "chunk" : "chunks"
-            let staged = onSplit ? scalarQuery("SELECT COUNT(*) FROM chunk") : live
-            let clearedRows = scalarQuery("SELECT COUNT(*) FROM \(unit) WHERE slot >= 0 AND slot < \(target)")
-            // `AND slot >= 0` LAST: it is what lets SQLite use the partial `idx_chunk_slot_v5`
-            // (which cannot prove `slot >= C` implies it), and placed FIRST it becomes the range's
-            // lower bound instead of C. On a 6.55M-content clone: 0.21 s scan, 0.004 s last, 0.08 s first.
-            guard execChecked("""
-                DELETE FROM pending_vecs WHERE chunk_id IN
-                  (SELECT id FROM \(unit) WHERE slot >= \(coveredRows) AND slot < \(target) AND slot >= 0);
-                """),
-                  scalarQuery("SELECT COUNT(*) FROM pending_vecs") == staged - clearedRows,
-                  execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.coveredRowsKey)','\(target)');"),
-                  execChecked("COMMIT;")
-            else { rollbackTxnLocked(); return false }
-            coveredRows = target
-            return finishIfCoverageCompleteLocked(target: target, coverUnits: coverUnits)
-        }
-        let advanceBy = clearUpTo - clearedBefore
-        if advanceBy > 0 {
-            boundary = Int64(scalarQuery(
-                "SELECT id FROM chunks WHERE id > \(coveredUpToID) ORDER BY id LIMIT 1 OFFSET \(advanceBy - 1)"))
-            guard boundary > coveredUpToID else { rollbackTxnLocked(); return false }
-        }
-        guard execChecked("DELETE FROM pending_vecs WHERE chunk_id <= \(boundary);"),
-              scalarQuery("SELECT COUNT(*) FROM pending_vecs") == live - clearUpTo,
+        // property the watermark existed to buy. The result is CHECKED against the count of staged
+        // blobs, inside the transaction.
+        // THE STAGED BLOBS ARE COUNTED IN THE SPACE THEY ARE KEYED IN. Under v4 that is rows,
+        // because a row stages its own vector; under the split it is CONTENTS, because a
+        // position's bytes are staged once however many files read them. Asking the v4
+        // question of a split index compares a count of contents against a count of
+        // occurrences, which on the measured index differ by 3.5M - every slice would fail
+        // its identity check and coverage would never advance at all.
+        let onSplit = splitBuilt
+        let unit = onSplit ? "chunk" : "chunks"
+        let staged = onSplit ? scalarQuery("SELECT COUNT(*) FROM chunk") : live
+        let clearedRows = scalarQuery("SELECT COUNT(*) FROM \(unit) WHERE slot >= 0 AND slot < \(target)")
+        // `AND slot >= 0` LAST: it is what lets SQLite use the partial `idx_chunk_slot_v5`
+        // (which cannot prove `slot >= C` implies it), and placed FIRST it becomes the range's
+        // lower bound instead of C. On a 6.55M-content clone: 0.21 s scan, 0.004 s last, 0.08 s first.
+        guard execChecked("""
+            DELETE FROM pending_vecs WHERE chunk_id IN
+              (SELECT id FROM \(unit) WHERE slot >= \(coveredRows) AND slot < \(target) AND slot >= 0);
+            """),
+              scalarQuery("SELECT COUNT(*) FROM pending_vecs") == staged - clearedRows,
               execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.coveredRowsKey)','\(target)');"),
-              execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.coveredUpToIDKey)','\(boundary)');"),
               execChecked("COMMIT;")
-        else {
-            rollbackTxnLocked()
-            return false
-        }
-        coveredUpToID = boundary
+        else { rollbackTxnLocked(); return false }
         coveredRows = target
         return finishIfCoverageCompleteLocked(target: target, coverUnits: coverUnits)
     }
 
-    /// The tail both advance paths share: a slice that draws level with the unit count is what
-    /// completes the migration.
+    /// The tail of an advance: a slice that draws level with the unit count is what completes the
+    /// migration.
     ///
     /// THE UNIT IS `coverUnits`, NOT `rows.count`. Under sharing the claim is over POSITIONS and
     /// there are fewer of them than rows, so a completed migration never reached the row count and
@@ -9519,10 +9428,10 @@ public final class VectorStore: @unchecked Sendable {
     ///   there. A failed VACUUM is itself harmless - SQLite keeps the original until the new file is
     ///   complete - but "skipped" beats "rolled back" for something running at launch.
     ///
-    ///   Row order. Coverage addresses a vector by its row's RANK in rowid order, and VACUUM is
+    ///   Row order. v3 coverage addressed a vector by its row's RANK in rowid order, and VACUUM is
     ///   documented to change rowid VALUES for tables without an explicit INTEGER PRIMARY KEY -
-    ///   which `chunks` is. What it does not change is their ORDER: it copies rows in rowid order
-    ///   into the new file. The distinction is the whole safety argument here, so it is tested
+    ///   which the v3 `chunks` is (v4 and v5 declare one, and v5 stores the slot itself). What it
+    ///   does not change is their ORDER: it copies rows in rowid order into the new file. The distinction is the whole safety argument here, so it is tested
     ///   rather than asserted (DatabaseRepackTests).
     @discardableResult
     private func repackIfHollowLocked() -> Int64 {
@@ -9592,8 +9501,7 @@ public final class VectorStore: @unchecked Sendable {
     /// Are the holes worth a copy of the live file?
     private func shouldReclaimHolesLocked() -> Bool {
         // POSITIONS, like everything else about coverage. `units` is what the file holds and what
-        // the claim is measured in; under v4 it is the row count and every test below reads the
-        // same as it always did.
+        // the claim is measured in.
         let units = slotCount
         // THERE IS NO LONGER A PASS TO WAIT FOR. This used to refuse while the duplicate fold
         // was mid-flight, because the reclaim rewrites the whole vector file and the holes were
@@ -9606,19 +9514,15 @@ public final class VectorStore: @unchecked Sendable {
               coveredRows == units, !vecHoles.isEmpty
         else { return false }
         // The hole list has to account for every position nothing owns, or the copy below would
-        // keep bytes it thinks are live. Under v4 that is exactly the tombstone count; under
-        // sharing a tombstone releases a POINTER, so the question is asked of the positions.
-        if true {
-            ensureSlotRowsLocked()
-            let dead = deadRows
-            var unowned = 0
-            for sl in 0 ..< units where !rowsOfSlotLocked(sl).contains(where: { !dead.contains($0) }) {
-                unowned += 1
-            }
-            guard vecHoles.count == unowned else { return false }
-        } else {
-            guard vecHoles.count == deadRows.count else { return false }
+        // keep bytes it thinks are live. A tombstone releases a POINTER, not a position, so the
+        // question is asked of the positions.
+        ensureSlotRowsLocked()
+        let dead = deadRows
+        var unowned = 0
+        for sl in 0 ..< units where !rowsOfSlotLocked(sl).contains(where: { !dead.contains($0) }) {
+            unowned += 1
         }
+        guard vecHoles.count == unowned else { return false }
         let threshold = Swift.max(Self.holeReclaimFloor, Int(Double(units) * Self.holeReclaimFraction))
         return vecHoles.count >= threshold
     }
@@ -9748,15 +9652,10 @@ public final class VectorStore: @unchecked Sendable {
             // A position is live when at least ONE live row still points at it, which is the same
             // test as "not a dead row" whenever a row owns its vector.
             var live: [Bool]
-            if true {
-                ensureSlotRowsLocked()
-                live = [Bool](repeating: false, count: units)
-                for (i, sl) in occSlot.enumerated() where !dead.contains(Int32(i)) {
-                    if sl >= 0, Int(sl) < units { live[Int(sl)] = true }
-                }
-            } else {
-                live = [Bool](repeating: true, count: units)
-                for d in dead where Int(d) < units { live[Int(d)] = false }
+            ensureSlotRowsLocked()
+            live = [Bool](repeating: false, count: units)
+            for (i, sl) in occSlot.enumerated() where !dead.contains(Int32(i)) {
+                if sl >= 0, Int(sl) < units { live[Int(sl)] = true }
             }
             for i in 0 ..< units {
                 if !live[i] { flushRun(); continue }
@@ -10505,12 +10404,15 @@ public final class VectorStore: @unchecked Sendable {
     //
     // A sign code per dimension instead of a 3-bit affine quantization: 96 B/row against 336, so the
     // resident scan replica goes 1.25 GB -> 0.40 GB on a 4.5M-row index. That is the reason it is
-    // here. It is NOT faster end to end, and the numbers are recorded rather than hoped for:
+    // here, and it costs no latency end to end:
     //
     //   scan itself      2.26 ms -> 1.39 ms   at 4.5M rows (bitscanbench)
-    //   but it needs 2x the candidate width to hold recall (bitrecall, 120 queries, real vectors):
+    //   it needs 2x the candidate width to hold recall (bitrecall, 120 queries, real vectors):
     //     3-bit  top10 0.9783 at 1x      1-bit  top10 0.9642 at 1x, 0.9792 at 2x
-    //   and doubling the candidate width costs more than the scan saves (querybreak).
+    //   and at that width, end to end on the real index: p50 4.41 ms against 4.43 for 3-bit, both
+    //   recall@10 1.0000 on 60 queries. An estimate composed from querybreak on a synthetic base
+    //   had priced the wider net as slower; the direct measurement replaced it. The shipped widths
+    //   are tabled at `scanBits`.
     //
     // ASYMMETRIC means only the DATABASE side is binarized; the query stays float and the kernel
     // accumulates +-q[j] per bit. Binarizing the query too (pure XOR+popcount) is much faster and
@@ -10963,8 +10865,10 @@ public final class VectorStore: @unchecked Sendable {
     /// into the db once it exceeds the soft cap, but only when no search ran recently - the checkpoint
     /// is the same 40-70ms it always was, it just no longer fires in the middle of a write txn that a
     /// live search is queued behind. The hard cap bounds WAL growth if the user searches continuously
-    /// (a checkpoint then runs anyway; one bounded stall beats unbounded disk). Single-connection
-    /// store: TRUNCATE never waits on other readers. Crash-durability is unchanged in kind - the index
+    /// (a checkpoint then runs anyway; one bounded stall beats unbounded disk). Not single-connection:
+    /// the two read-only browse connections hold read transactions of their own, so TRUNCATE can
+    /// wait up to busy_timeout (5 s) behind a browse statement in flight, and gives up without
+    /// truncating if it is still running then. Crash-durability is unchanged in kind - the index
     /// is a rebuildable cache, and a lost WAL tail just means the next pass re-embeds those files.
     private func checkpointIfDueLocked(forceStat: Bool = false) {
         // The WAL only grows by the bytes we insert, so below the soft cap we cannot be due. Gate the
@@ -11315,8 +11219,6 @@ public final class VectorStore: @unchecked Sendable {
         //
         // Counted from the resident rows rather than a COUNT(*): this feeds a Settings pane, the
         // number is the same, and it costs nothing.
-        // live rows minus the live rows the file already covers - the same identity the coverage
-        // audit checks, and it needs no special case for bf16 mode, where covered is simply 0.
         let pendingVectors = queue.sync { () -> Int64 in
             guard dim > 0 else { return 0 }
             // A ROW HAS A BLOB UNTIL ITS POSITION IS COVERED, and several rows can point at one
@@ -11324,26 +11226,21 @@ public final class VectorStore: @unchecked Sendable {
             // (live rows minus covered live rows) subtracts one unit from the other. It overstates
             // by exactly the number of duplicates, which then comes off "Snippets", because that
             // slice is the rest of the database file.
-            if true {
-                // ONE BLOB PER CONTENT ONCE THEY ARE KEYED THAT WAY, so the count is of
-                // uncovered POSITIONS rather than of the rows reading them. Counting rows here
-                // overstates by the duplicate count - 3.5M on the measured index - and the
-                // overstatement is taken straight off the "Snippets" slice beside it, so the
-                // chart reports two wrong numbers rather than one.
-                let dead = deadRows
-                let perContent = splitPendingKeyedLocked
-                var pending = 0
-                var seen = Set<Int32>()
-                for (i, sl) in occSlot.enumerated() where !dead.contains(Int32(i)) {
-                    guard sl < 0 || Int(sl) >= coveredRows else { continue }
-                    if perContent, sl >= 0, !seen.insert(sl).inserted { continue }
-                    pending += 1
-                }
-                return Int64(pending) * Int64(dim * MemoryLayout<UInt16>.size)
+            // ONE BLOB PER CONTENT ONCE THEY ARE KEYED THAT WAY, so the count is of
+            // uncovered POSITIONS rather than of the rows reading them. Counting rows here
+            // overstates by the duplicate count - 3.5M on the measured index - and the
+            // overstatement is taken straight off the "Snippets" slice beside it, so the
+            // chart reports two wrong numbers rather than one.
+            let dead = deadRows
+            let perContent = splitPendingKeyedLocked
+            var pending = 0
+            var seen = Set<Int32>()
+            for (i, sl) in occSlot.enumerated() where !dead.contains(Int32(i)) {
+                guard sl < 0 || Int(sl) >= coveredRows else { continue }
+                if perContent, sl >= 0, !seen.insert(sl).inserted { continue }
+                pending += 1
             }
-            let live = Swift.max(0, rows.count - deadRows.count)
-            let coveredLive = Swift.max(0, coveredRows - vecHoles.count)
-            return Int64(Swift.max(0, live - coveredLive)) * Int64(dim * MemoryLayout<UInt16>.size)
+            return Int64(pending) * Int64(dim * MemoryLayout<UInt16>.size)
         }
         var entries: [DiskUse.Entry] = [
             .init(name: "Vectors", bytes: size(base + ".vecs") + pendingVectors, irreplaceable: true,
@@ -11553,12 +11450,11 @@ public final class VectorStore: @unchecked Sendable {
             // the front, which is the difference between a bounded cost and a full-index cost.
             var remaining = 0
             for gid in wantedIds { remaining += Int(fileChunkCount[Int(gid)]) }
-            // Tombstones: `rows` keeps deleted chunks until a compaction collects them, and
-            // fileChunkCount counts only LIVE ones. Pooling a dead row would fold a deleted chunk
-            // into the file's vector, and would also spend one of `remaining` on it and stop the
-            // walk before the live rows were all in. Readers that can afford it call
-            // ensureCompactLocked() first; this one runs on a keystroke, so it filters instead -
-            // and the check costs nothing in the overwhelmingly common case of a clean base.
+            // Tombstones: `rows` keeps deleted chunks, and fileChunkCount counts only LIVE ones.
+            // Pooling a dead row would fold a deleted chunk into the file's vector, and would also
+            // spend one of `remaining` on it and stop the walk before the live rows were all in.
+            // So it filters them - and the check costs nothing in the overwhelmingly common case
+            // of a clean base.
             let dead = deadRows
             let hasDead = !dead.isEmpty
             // Only the wanted files' row windows, merged, ascending - so each file's chunks are
@@ -12900,7 +12796,8 @@ public final class VectorStore: @unchecked Sendable {
     ///
     /// In v3 this was `COUNT(*) WHERE length(vec) = 0`, a scan of the 615 MB table to count rows by
     /// the absence of a blob. With the pending vectors in their own table it is the difference of
-    /// two counts, and both are counts of small B-trees.
+    /// two counts and reads no blobs: `pending_vecs` is small, but the total is a COUNT(*) over
+    /// `chunk` (or `chunks`), which is millions of rows on a real index.
     func clearedRowsLocked() -> Int {
         guard layoutLocked() == .v4 else { return scalarQuery("SELECT COUNT(*) FROM chunks WHERE length(vec) = 0") }
         // THE DIFFERENCE OF TWO COUNTS IN ONE SPACE. `pending_vecs` is keyed on the content under
@@ -14322,11 +14219,9 @@ public final class VectorStore: @unchecked Sendable {
 
     /// Write the slots decided at append time back onto the rows that were just inserted.
     func persistSlotsLocked(ids: [Int64], contentIDs: [Int64] = [], slots: [Int32]) {
-        // Only while sharing is on. A STORED slot is a promise that survives a reload, and every
-        // operation that moves a slot afterwards - hole reclaim, compaction - has to keep that
-        // promise by writing the new numbering back. Until they do, storing it makes a reloaded
-        // index name the wrong content: 800 failures, none of them about sharing. With the flag
-        // off the column stays -1 and the loader derives it exactly as it always has.
+        // A STORED slot is a promise that survives a reload, so every operation that moves a slot
+        // afterwards - hole reclaim, compaction - has to keep that promise by writing the new
+        // numbering back, or a reloaded index names the wrong content.
         guard dbOpen(), !slots.isEmpty else { return }
         // `ids` IS EMPTY UNDER THE CUTOVER, because no v4 row was written to carry a slot. The
         // guard used to be `ids.count == slots.count`, which is false then - so it returned

@@ -3,9 +3,11 @@ import MLX
 
 /// Loads jina-embeddings-v5-omni-small-mlx weights and merges the retrieval LoRA
 /// adapter at load time, mirroring `utils.JinaMultiTaskModel` + `sanitize`:
-///   - `language_model.*` upcast bf16 -> fp32 (the reference does this for fidelity)
-///   - retrieval LoRA merged in place: W += (alpha/r) * (B @ A)
-///   - vision/merger kept in their stored dtype; audio dropped (not used here)
+///   - retrieval LoRA merged in place in fp32: W += (alpha/r) * (B @ A)
+///   - `language_model.*` then stored in bf16 by default (only the LoRA targets take the fp32
+///     round-trip); OMNI_BACKBONE_DTYPE picks fp16 or fp32, and OMNI_BACKBONE_BF16=0 keeps it
+///     fp32 as the reference does
+///   - vision/merger and audio kept in their stored dtype, unless `keepVision` / `keepAudio` is false
 public struct WeightStore {
     public private(set) var weights: [String: MLXArray]
 
@@ -15,7 +17,8 @@ public struct WeightStore {
     /// - Parameters:
     ///   - modelDir: directory with model.safetensors and adapters/retrieval/adapter_model.safetensors
     ///   - loraScale: alpha / r (retrieval = 1.0)
-    ///   - keepVision: also keep vision_tower.* / merger.* (image path); audio always dropped
+    ///   - keepVision: also keep vision_tower.* / merger.* (image path)
+    ///   - keepAudio: also keep audio_tower.* / audio_projector.* (audio path)
     public init(modelDir: URL, loraScale: Float = 1.0, keepVision: Bool = true, keepAudio: Bool = true) throws {
         var w = try loadArrays(url: modelDir.appendingPathComponent("model.safetensors"))
 

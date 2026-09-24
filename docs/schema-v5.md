@@ -340,9 +340,9 @@ like a delivery list and three of those components deliver nothing yet:
                    reuse has answered that since v4, and measuring it with every chunk-level reuse
                    path turned off still shows one embedding per edited file. What is missing is
                    the INSERTION case, and that is the cutter's problem rather than the diff's.
-  SlotAllocator    The free list. ATTEMPTED AND WITHHELD - see below. The reclaim is the v4
-                   answer and it now actually runs under sharing, so a released position waits for
-                   a whole-file copy rather than being handed to the next new content.
+  SlotAllocator    The free list. ON since cb07bb4 (2026-09-19); `OMNI_FREE_LIST=0` turns it
+                   off. A released position is handed to the next new content instead of waiting
+                   for a whole-file copy. It was off twice first - see below.
   MigrationV5      The backfill for the `chunk` / `occurrence` table split, measured at 79.7s on
                    the real index. Sharing is reached through `chunks.slot` plus the partial index
                    on `chunk_text.chunk_key` instead, which needs no table to move.
@@ -587,7 +587,7 @@ AND MEASURE IT OVER FIVE RUNS. Several hours went into bisecting on single-run c
 53, 61) and reading movement in noise. A single run tells you whether an arm fails; it tells you
 nothing about whether a change helped. Only 0 means anything.
 
-## The free list: OFF, on a correctness defect found by auditing between mutations
+## The free list: ON, after being off twice (a throughput cost, then a correctness defect)
 
 Handing a released position to the next new content instead of waiting for a whole-file copy is
 obviously right, and it is written: `SlotAllocator` allocates from a min-heap, `placeVectorLocked`
@@ -596,7 +596,7 @@ still describes wrongly, the coverage stamp drops the reused row's blob once the
 and `loadBySlotLocked` seats rows from the stored column instead of deriving a position from a
 row's rank - which the free list makes impossible.
 
-IT IS OFF, ON A MEASUREMENT RATHER THAN A DOUBT. `OMNI_FREE_LIST=1` turns it on.
+IT WAS OFF FIRST ON A MEASUREMENT RATHER THAN A DOUBT. It is on now; `OMNI_FREE_LIST=0` turns it off.
 
 It is correct. The suite is clean with it on, and so is a 4,000-file churn: no missing rows, no
 orphans, no ghost hits, coverage consistent, clean teardown. What it is not is free. Measured over
@@ -681,7 +681,7 @@ tested rather than to the shared thing underneath it, because the feature was th
 had just changed. The control that settles it is cheap: run the same churn with the feature off
 and read the loader line in both.
 
-IT IS OFF AGAIN, AND NOT FOR SPEED. Chasing what looked like a defect in the chunk/occurrence
+IT WAS OFF AGAIN, AND NOT FOR SPEED. Chasing what looked like a defect in the chunk/occurrence
 split found this instead, by elimination. With the split OFF and the free list ON, editing a
 file's content leaves `position N inside coverage has no live row and no recorded hole` - a
 position the vector file still holds that nothing owns and nothing records. With the free list off
@@ -720,8 +720,8 @@ Both wrong hypotheses left real fixes behind and both are kept: the allocator ra
 instead of rebuilding the free set on every append, and the incremental base repacks patched rows
 rather than refusing to run. Neither mattered for throughput. Both are correct.
 
-Until the base interaction is fixed the trade is a third of the churn throughput against holes
-reclaimed without a whole-file rewrite - and the reclaim already returns that space. So it waits.
+Until the base interaction was fixed the trade was a third of the churn throughput against holes
+reclaimed without a whole-file rewrite - and the reclaim already returned that space. So it waited.
 
 IT PASSED ONCE THE ROW-AS-POSITION READ WAS FIXED, plus two things of its own. It used to fail the
 mutation suite the bad way - a renamed file coming back holding another file's vector, a real file
