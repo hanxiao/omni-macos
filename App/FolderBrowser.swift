@@ -113,7 +113,7 @@ struct FolderBrowser: View {
                 Spacer()
                 // "Empty folder" would be a lie: the folder on disk may be full, and what is
                 // missing is an INDEX entry for anything in it. Say which.
-                ContentUnavailableView("Nothing indexed here", systemImage: "folder")
+                CenteredStatus(symbol: CenteredStatus.moleEmpty, title: "Nothing indexed here", subtitle: "")
                 Spacer()
             } else if model.viewMode == .grid {
                 gridBody

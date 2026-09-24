@@ -25,6 +25,10 @@ def svg(v):
         eyes = ('<path d="M36.6,39 L43.4,39 A3.4,3.4 0 0 1 36.6,39 Z" fill="black"/>'
                 '<path d="M56.6,39 L63.4,39 A3.4,3.4 0 0 1 56.6,39 Z" fill="black"/>'
                 '<path d="M34.5,31.5 L45,35.5 M65.5,31.5 L55,35.5" fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round"/>')
+    elif v == "empty":
+        # x x eyes: nothing here
+        eyes = ('<path d="M36.4,35.4 L43.6,42.6 M43.6,35.4 L36.4,42.6" fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round"/>'
+                '<path d="M56.4,35.4 L63.6,42.6 M63.6,35.4 L56.4,42.6" fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round"/>')
     elif v == "welcome":
         eyes = ('<path d="M36.2,41 Q40,36.5 43.8,41" fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round"/>'
                 '<path d="M56.2,41 Q60,36.5 63.8,41" fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round"/>')
@@ -55,5 +59,5 @@ def svg(v):
  <path mask="url(#mound)" d="M9,89 C9,79 27,75 50,75 C73,75 91,79 91,89 C91,92 89,94 86,94 L14,94 C11,94 9,92 9,89 Z"/>
  {pawfill}{extra_fill}
 </svg>'''
-for v in ["base", "search", "ocr", "sleep", "serious"]:
+for v in ["base", "search", "ocr", "sleep", "serious", "empty"]:
     open(f"fam-{v}.svg", "w").write(svg(v))
