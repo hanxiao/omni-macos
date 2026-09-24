@@ -2,7 +2,7 @@ import SwiftUI
 import AppKit
 import OmniKit
 
-private enum SettingsTab: Hashable { case files, content, performance, storage, ocr, history, serving }
+private enum SettingsTab: String, Hashable { case files, content, performance, storage, ocr, history, serving }
 
 struct SettingsView: View {
     // Selection is BOUND, not left to the TabView, purely so the live memory sampler can be gated
@@ -36,11 +36,14 @@ struct SettingsView: View {
         //   row text (labels, values)            body; values .secondary
         //   detail line under a row, legends     .caption, .secondary (red/orange only for errors)
         //   section footer                       .caption, .secondary
-        //   code (curl, config, ignore rules,    .callout monospaced; the request log, a dense
-        //     server address)                     list, is .caption monospaced. Paths are NOT code
+        //   code (curl, config, ignore rules,    .callout monospaced; the serving log, dense
+        //     server address)                     text, is small monospaced. Paths are NOT code
         // No weight changes and no caption2. Digits are tabular everywhere, set once here, so
         // counts and sizes that tick while indexing do not jitter.
         .monospacedDigit()
+        .onReceive(NotificationCenter.default.publisher(for: .omniPerfSettingsTab)) { note in
+            if let raw = note.object as? String, let t = SettingsTab(rawValue: raw) { tab = t }
+        }
     }
 }
 

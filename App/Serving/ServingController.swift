@@ -6,8 +6,8 @@ import Security
 /// The single serving controller AppModel owns. The SwiftUI tab binds only to the members
 /// documented here; AppModel wires the engine/store via attach(). @MainActor so all
 /// published state lives on the main actor; the HTTP server and its handler run entirely
-/// off it (on the server's own DispatchQueue and detached Tasks), and only LogEntry +
-/// counters are marshalled back here, coalesced one invalidation per runloop tick.
+/// off it (on the server's own DispatchQueue and detached Tasks), and only LogEntry values are
+/// marshalled back here.
 @MainActor
 @Observable
 final class ServingController {
@@ -34,9 +34,8 @@ final class ServingController {
     private(set) var state: State = .stopped
     private(set) var isRunning: Bool = false      // mirrors state == .running
     private(set) var boundAddress: String = ""    // e.g. "http://127.0.0.1:51234"; "" when stopped
-    private(set) var requestCount: Int = 0
-    private(set) var errorCount: Int = 0
-    private(set) var log: [LogEntry] = []         // newest first, capped at 200
+    /// The tail of serving.log, oldest first, capped at `logCap`. Seeded from the file at launch.
+    private(set) var logLines: [String] = []
 
     // MARK: Private state
 
@@ -52,13 +51,15 @@ final class ServingController {
     private var backend: (any ServingBackend)?
     private var server: HTTPServer?
 
-    private let logCap = 200
+    private let logCap = 100
+    private let logFile = ServingLogFile()
     private let defaults = UserDefaults.standard
     /// True while load() is assigning persisted values, so each property's didSet does not
     /// persist() back a half-loaded snapshot (which would clobber fields not yet read).
     private var isLoading = false
 
     init() {
+        logLines = ServingLogFile.tail(logCap)
         load()
     }
 
@@ -86,14 +87,6 @@ final class ServingController {
     func detach() {
         stopServer()
         backend = nil
-    }
-
-    // MARK: Actions the view triggers
-
-    func clearLog() {
-        log.removeAll()
-        requestCount = 0
-        errorCount = 0
     }
 
     // MARK: Reconciliation
@@ -147,6 +140,7 @@ final class ServingController {
                 // listener keeps serving, and the next toggle binds over the orphan -> EADDRINUSE wedge.
                 guard let self, let srv, self.server === srv else { return }
                 self.state = msg == "port in use" ? .portInUse : .failed(msg)
+                self.note(.error, "Server failed: \(msg)")
                 self.isRunning = false
                 self.boundAddress = ""
                 // Deliberately do NOT flip `enabled` (it persists to defaults): a transient bind
@@ -163,7 +157,9 @@ final class ServingController {
             state = .running
             isRunning = true
             boundAddress = "http://\(isPublic ? lanAddress() : "127.0.0.1"):\(port)"
+            note(.info, "Starting on \(host):\(port)\(requireToken ? " with a bearer token" : "")")
         } catch {
+            note(.error, "Port \(port) is in use")
             state = .portInUse
             isRunning = false
             boundAddress = ""
@@ -173,6 +169,7 @@ final class ServingController {
     }
 
     private func stopServer() {
+        if server != nil { note(.info, "Stopped") }
         server?.stop()
         server = nil
         isRunning = false
@@ -180,12 +177,18 @@ final class ServingController {
         if state == .running { state = .stopped }
     }
 
-    /// Coalesced log ingest: one main-actor invalidation per tick. Newest first, capped.
     private func ingest(_ e: LogEntry) {
-        requestCount += 1
-        if e.status >= 400 { errorCount += 1 }
-        log.insert(e, at: 0)
-        if log.count > logCap { log.removeLast(log.count - logCap) }
+        append(ServingLogFile.line(for: e))
+    }
+
+    private func note(_ level: ServingLogFile.Level, _ message: String) {
+        append(ServingLogFile.line(level, message))
+    }
+
+    private func append(_ line: String) {
+        logFile.append(line)
+        logLines.append(line)
+        if logLines.count > logCap { logLines.removeFirst(logLines.count - logCap) }
     }
 
     // MARK: Persistence

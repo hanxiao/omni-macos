@@ -13,7 +13,7 @@ import OmniKit
 /// `wait:<seconds>`. For recording the intro video: `type:<text>` (a key at a time, searching at
 /// each word), `similar:<path>`, `select:<result index>`, `map:<folder>`, `frame:<w>x<h>`
 /// (window size, centered), `front`, `appearance:light|dark`, `history:<n>`, `sort:<order>`,
-/// `bsort:<name|column rawValue>`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
+/// `bsort:<name|column rawValue>`, `settings:<tab>`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
 /// CPU is read, so what it set in motion is counted too. `repeat:<n>` before a step repeats it.
 @MainActor
 enum PerfScript {
@@ -79,6 +79,15 @@ enum PerfScript {
         case "sort": model.sortOrder = SortOrder(rawValue: arg) ?? .relevance
         case "bsort":     // a column-header click in the folder browser
             NotificationCenter.default.post(name: .omniPerfBrowseSort, object: arg)
+        case "settings":  // open Settings on a tab: files, content, performance, storage, ocr, history, serving
+            NSApp.activate(ignoringOtherApps: true)
+            // The app menu's own item: a launch from the shell has no key window for the
+            // responder-chain action to reach.
+            if let menu = NSApp.mainMenu?.items.first?.submenu,
+               let i = menu.items.firstIndex(where: { $0.keyEquivalent == "," }) {
+                menu.performActionForItem(at: i)
+            }
+            NotificationCenter.default.post(name: .omniPerfSettingsTab, object: arg)
         case "appearance": NSApp.appearance = NSAppearance(named: arg == "dark" ? .darkAqua : .aqua)
         default: omniPerfLog("script: unknown step \(step)")
         }
@@ -110,4 +119,5 @@ enum PerfScript {
 extension Notification.Name {
     /// PerfScript's `bsort:` step: the folder browser treats it as a click on that column header.
     static let omniPerfBrowseSort = Notification.Name("omni.perf.browseSort")
+    static let omniPerfSettingsTab = Notification.Name("omni.perf.settingsTab")
 }

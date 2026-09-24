@@ -3,9 +3,8 @@ import AppKit
 import OmniKit
 
 /// Settings > Serving. Binds only to the shared ServingController surface AppModel owns:
-/// read-write enabled/scope/port/bearerToken, read-only state/boundAddress/counters/log, and the
-/// clearLog() action. Follows the same Form { Section }.formStyle(.grouped) idiom and the explicit
-/// Binding(get:set:) pattern as the other tabs - never $model, since AppModel is @Observable.
+/// read-write enabled/scope/port/bearerToken and read-only state/boundAddress/logLines. Follows the
+/// same Form { Section }.formStyle(.grouped) idiom and the explicit Binding(get:set:) pattern as the other tabs - never $model, since AppModel is @Observable.
 struct ServingTab: View {
     @Environment(AppModel.self) private var model: AppModel
     @State private var exampleKind: ExampleKind = .search
@@ -28,7 +27,7 @@ struct ServingTab: View {
         Form {
             serverSection
             exampleSection
-            requestsSection
+            logsSection
         }
         .formStyle(.grouped)
         // NO FIXED HEIGHT. The Settings TabView sizes itself to the selected tab
@@ -471,70 +470,88 @@ struct ServingTab: View {
 
     // MARK: - Requests
 
-    @ViewBuilder private var requestsSection: some View {
-        Section {
-            if model.serving.log.isEmpty {
-                Text("No requests yet")
-                    .foregroundStyle(.secondary)
-            } else {
-                List(model.serving.log) { entry in
-                    LogRow(entry: entry)
-                        .listRowSeparator(.hidden)
-                }
-                .listStyle(.plain)
+    @ViewBuilder private var logsSection: some View {
+        Section("Logs") {
+            LogTextView(lines: model.serving.logLines)
                 .frame(height: 200)
-            }
-        } header: {
-            HStack {
-                Text("Requests")
-                Spacer()
-                Text("\(model.serving.requestCount) served \u{00B7} \(model.serving.errorCount) failed")
-                    .font(.caption).foregroundStyle(.secondary)
-                Button("Clear") { model.serving.clearLog() }
-                    .buttonStyle(.link)
-                    .disabled(model.serving.log.isEmpty)
+            LabeledContent("Log file") {
+                HStack(spacing: 6) {
+                    Text(ServingLogFile.url.path.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                        .textSelection(.enabled)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Button {
+                        NSWorkspace.shared.activateFileViewerSelecting([ServingLogFile.url])
+                    } label: { Image(systemName: "folder") }
+                    .buttonStyle(.borderless).foregroundStyle(.secondary)
+                    .help("Show in Finder")
+                }
             }
         }
     }
 }
 
-/// One row in the live request log: time, method, path, status, and latency. Kept fixed-height and
-/// monospaced so the columns line up and the List inside the grouped Form scrolls cleanly.
-private struct LogRow: View {
-    let entry: LogEntry
+/// The tail of serving.log as plain read-only text: selectable and copyable like any text view,
+/// one line per event, colored by level. Follows the end while the reader is at the end, and
+/// leaves the scroll position alone once they scroll up to read something.
+private struct LogTextView: NSViewRepresentable {
+    let lines: [String]
 
-    private static let timeFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "HH:mm:ss"
-        return f
-    }()
-
-    private var statusColor: Color {
-        switch entry.status {
-        case 200 ..< 300: return .green
-        case 400 ..< 500: return .orange
-        default: return .red
-        }
+    func makeNSView(context: Context) -> NSScrollView {
+        let scroll = NSTextView.scrollableTextView()
+        scroll.drawsBackground = false
+        scroll.autohidesScrollers = true
+        let text = scroll.documentView as! NSTextView
+        text.isEditable = false
+        text.isSelectable = true
+        text.isRichText = false
+        text.drawsBackground = false
+        text.textContainerInset = NSSize(width: 0, height: 4)
+        // No wrapping: a log line reads as one row, and a long path scrolls sideways.
+        text.isHorizontallyResizable = true
+        text.textContainer?.widthTracksTextView = false
+        text.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
+                                                   height: CGFloat.greatestFiniteMagnitude)
+        scroll.hasHorizontalScroller = true
+        return scroll
     }
 
-    var body: some View {
-        HStack(spacing: 10) {
-            Text(Self.timeFormatter.string(from: entry.time))
-                .foregroundStyle(.secondary)
-            Text(entry.method)
-                .frame(width: 44, alignment: .leading)
-            Text(entry.path)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            Text("\(entry.status)")
-                .foregroundStyle(statusColor)
-            Text(String(format: "%.0f ms", entry.ms))
-                .foregroundStyle(.secondary)
-                .frame(width: 56, alignment: .trailing)
+    func updateNSView(_ scroll: NSScrollView, context: Context) {
+        guard let text = scroll.documentView as? NSTextView, context.coordinator.shown != lines else { return }
+        let atEnd = context.coordinator.shown.isEmpty
+            || scroll.documentVisibleRect.maxY >= text.bounds.maxY - 4
+        context.coordinator.shown = lines
+        text.textStorage?.setAttributedString(Self.render(lines))
+        if atEnd { text.scrollToEndOfDocument(nil) }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    final class Coordinator { var shown: [String] = [] }
+
+    private static func render(_ lines: [String]) -> NSAttributedString {
+        let font = NSFont.monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+        let out = NSMutableAttributedString()
+        for (i, line) in lines.enumerated() {
+            let color: NSColor
+            switch ServingLogFile.level(of: Substring(line)) {
+            case .error: color = .systemRed
+            case .warn: color = .systemOrange
+            default: color = .labelColor
+            }
+            // Time of day only: the pane is 480 pt wide, and the date and milliseconds pushed the
+            // status and latency off its edge. The file keeps the full stamp.
+            let shown = line.count > 23 && line.dropFirst(10).first == " "
+                ? String(line.dropFirst(11).prefix(8) + line.dropFirst(23)) : line
+            let row = NSMutableAttributedString(string: i == lines.count - 1 ? shown : shown + "\n",
+                                                attributes: [.font: font, .foregroundColor: color])
+            // The time recedes on every line; the level color carries the rest.
+            if color == .labelColor {
+                row.addAttribute(.foregroundColor, value: NSColor.secondaryLabelColor,
+                                 range: NSRange(location: 0, length: min(8, (shown as NSString).length)))
+            }
+            out.append(row)
         }
-        .font(.caption.monospaced())
-        .padding(.vertical, 1)
+        return out
     }
 }
 
