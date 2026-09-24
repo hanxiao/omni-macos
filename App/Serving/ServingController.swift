@@ -34,8 +34,6 @@ final class ServingController {
     private(set) var state: State = .stopped
     private(set) var isRunning: Bool = false      // mirrors state == .running
     private(set) var boundAddress: String = ""    // e.g. "http://127.0.0.1:51234"; "" when stopped
-    /// The tail of serving.log, oldest first, capped at `logCap`. Seeded from the file at launch.
-    private(set) var logLines: [String] = []
 
     // MARK: Private state
 
@@ -51,7 +49,7 @@ final class ServingController {
     private var backend: (any ServingBackend)?
     private var server: HTTPServer?
 
-    private let logCap = 100
+    /// The log lives only in the file; the Serving tab tails it.
     private let logFile = ServingLogFile()
     private let defaults = UserDefaults.standard
     /// True while load() is assigning persisted values, so each property's didSet does not
@@ -59,7 +57,6 @@ final class ServingController {
     private var isLoading = false
 
     init() {
-        logLines = ServingLogFile.tail(logCap)
         load()
     }
 
@@ -187,8 +184,6 @@ final class ServingController {
 
     private func append(_ line: String) {
         logFile.append(line)
-        logLines.append(line)
-        if logLines.count > logCap { logLines.removeFirst(logLines.count - logCap) }
     }
 
     // MARK: Persistence

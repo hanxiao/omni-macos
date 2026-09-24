@@ -3,7 +3,7 @@ import AppKit
 import OmniKit
 
 /// Settings > Serving. Binds only to the shared ServingController surface AppModel owns:
-/// read-write enabled/scope/port/bearerToken and read-only state/boundAddress/logLines. Follows the
+/// read-write enabled/scope/port/bearerToken and read-only state/boundAddress. Follows the
 /// same Form { Section }.formStyle(.grouped) idiom and the explicit Binding(get:set:) pattern as the other tabs - never $model, since AppModel is @Observable.
 struct ServingTab: View {
     @Environment(AppModel.self) private var model: AppModel
@@ -472,30 +472,24 @@ struct ServingTab: View {
 
     @ViewBuilder private var logsSection: some View {
         Section("Logs") {
-            LogTextView(lines: model.serving.logLines)
+            LogTextView()
                 .frame(height: 200)
             LabeledContent("Log file") {
-                HStack(spacing: 6) {
-                    Text(ServingLogFile.url.path.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
-                        .textSelection(.enabled)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Button {
-                        NSWorkspace.shared.activateFileViewerSelecting([ServingLogFile.url])
-                    } label: { Image(systemName: "folder") }
-                    .buttonStyle(.borderless).foregroundStyle(.secondary)
-                    .help("Show in Finder")
-                }
+                Text(ServingLogFile.url.path.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                    .textSelection(.enabled)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
         }
     }
 }
 
-/// The tail of serving.log as plain read-only text: selectable and copyable like any text view,
-/// one line per event, colored by level. Follows the end while the reader is at the end, and
-/// leaves the scroll position alone once they scroll up to read something.
+/// `tail -n 100` of serving.log as plain read-only text: selectable and copyable, colored by level.
+/// The file is the only log; this re-reads its tail when it changes, so what is shown is what is
+/// on disk. Follows the end while the reader is at the end, and leaves the scroll position alone
+/// once they scroll up to read something.
 private struct LogTextView: NSViewRepresentable {
-    let lines: [String]
+    static let lineCount = 100
 
     func makeNSView(context: Context) -> NSScrollView {
         let scroll = NSTextView.scrollableTextView()
@@ -507,28 +501,55 @@ private struct LogTextView: NSViewRepresentable {
         text.isRichText = false
         text.drawsBackground = false
         text.textContainerInset = NSSize(width: 0, height: 4)
-        // No wrapping: a log line reads as one row, and a long path scrolls sideways.
+        // No wrapping: a log line reads as one row, and its payload scrolls sideways.
         text.isHorizontallyResizable = true
         text.textContainer?.widthTracksTextView = false
         text.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
                                                    height: CGFloat.greatestFiniteMagnitude)
         scroll.hasHorizontalScroller = true
+        context.coordinator.start(scroll)
         return scroll
     }
 
-    func updateNSView(_ scroll: NSScrollView, context: Context) {
-        guard let text = scroll.documentView as? NSTextView, context.coordinator.shown != lines else { return }
-        let atEnd = context.coordinator.shown.isEmpty
-            || scroll.documentVisibleRect.maxY >= text.bounds.maxY - 4
-        context.coordinator.shown = lines
-        text.textStorage?.setAttributedString(Self.render(lines))
-        if atEnd { text.scrollToEndOfDocument(nil) }
-    }
+    func updateNSView(_ scroll: NSScrollView, context: Context) {}
+
+    static func dismantleNSView(_ scroll: NSScrollView, coordinator: Coordinator) { coordinator.stop() }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
-    final class Coordinator { var shown: [String] = [] }
 
-    private static func render(_ lines: [String]) -> NSAttributedString {
+    /// Polls the file's size and date twice a second, which is a stat call: it survives the file
+    /// being created, rotated or deleted without re-arming a file watch for each case.
+    @MainActor final class Coordinator {
+        private var timer: Timer?
+        private var seen: (size: Int, date: Date)?
+        private weak var scroll: NSScrollView?
+
+        func start(_ scroll: NSScrollView) {
+            self.scroll = scroll
+            refresh()
+            let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.refresh() }
+            }
+            RunLoop.main.add(t, forMode: .common)
+            timer = t
+        }
+
+        func stop() { timer?.invalidate(); timer = nil }
+
+        private func refresh() {
+            let attrs = try? FileManager.default.attributesOfItem(atPath: ServingLogFile.url.path)
+            let now = (size: attrs?[.size] as? Int ?? 0, date: attrs?[.modificationDate] as? Date ?? .distantPast)
+            if let seen, seen == now { return }
+            let first = seen == nil
+            seen = now
+            guard let scroll, let text = scroll.documentView as? NSTextView else { return }
+            let atEnd = first || scroll.documentVisibleRect.maxY >= text.bounds.maxY - 4
+            text.textStorage?.setAttributedString(LogTextView.render(ServingLogFile.tail(LogTextView.lineCount)))
+            if atEnd { text.scrollToEndOfDocument(nil) }
+        }
+    }
+
+    static func render(_ lines: [String]) -> NSAttributedString {
         let font = NSFont.monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
         let out = NSMutableAttributedString()
         for (i, line) in lines.enumerated() {
@@ -538,16 +559,12 @@ private struct LogTextView: NSViewRepresentable {
             case .warn: color = .systemOrange
             default: color = .labelColor
             }
-            // Time of day only: the pane is 480 pt wide, and the date and milliseconds pushed the
-            // status and latency off its edge. The file keeps the full stamp.
-            let shown = line.count > 23 && line.dropFirst(10).first == " "
-                ? String(line.dropFirst(11).prefix(8) + line.dropFirst(23)) : line
-            let row = NSMutableAttributedString(string: i == lines.count - 1 ? shown : shown + "\n",
+            let row = NSMutableAttributedString(string: i == lines.count - 1 ? line : line + "\n",
                                                 attributes: [.font: font, .foregroundColor: color])
-            // The time recedes on every line; the level color carries the rest.
+            // The timestamp recedes on every line; the level color carries the rest.
             if color == .labelColor {
                 row.addAttribute(.foregroundColor, value: NSColor.secondaryLabelColor,
-                                 range: NSRange(location: 0, length: min(8, (shown as NSString).length)))
+                                 range: NSRange(location: 0, length: min(23, (line as NSString).length)))
             }
             out.append(row)
         }

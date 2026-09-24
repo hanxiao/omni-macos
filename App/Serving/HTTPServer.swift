@@ -259,14 +259,25 @@ final class HTTPServer: @unchecked Sendable {
         Task { [weak self] in
             guard let self else { return }
             let resp = await self.handler(req)
+            // A streamed body is only seen as it goes out, so its first bytes are kept for the log.
+            let tap = BodyTap()
             let finish: @Sendable () -> Void = {
                 let ms = Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1_000_000.0
+                let streamed = resp.stream != nil
                 self.onLog(LogEntry(time: Date(), method: req.method, path: req.routePath,
-                                    status: resp.status, ms: ms, client: client))
+                                    status: resp.status, ms: ms, client: client,
+                                    target: LogEntry.redact(req.path),
+                                    userAgent: req.headers["user-agent"] ?? "",
+                                    request: LogEntry.summarize(req.body, type: req.headers["content-type"]),
+                                    response: streamed
+                                        ? LogEntry.summarize(tap.head, type: resp.headers["Content-Type"], total: tap.total)
+                                        : LogEntry.summarize(resp.body, type: resp.headers["Content-Type"])))
             }
 
             if let produce = resp.stream {
-                let alive = await self.streamBody(produce, head: resp, to: conn, keepAlive: keepAlive)
+                let alive = await self.streamBody({ send in
+                    await produce { payload in tap.add(payload); return await send(payload) }
+                }, head: resp, to: conn, keepAlive: keepAlive)
                 finish()
                 self.queue.async {
                     if keepAlive && alive {
@@ -353,6 +364,21 @@ final class HTTPServer: @unchecked Sendable {
 }
 
 /// A one-way latch readable from any thread.
+/// The first bytes of a streamed response, and how many went out in all.
+private final class BodyTap: @unchecked Sendable {
+    private let lock = NSLock()
+    private var bytes = Data()
+    private var count = 0
+    var head: Data { lock.withLock { bytes } }
+    var total: Int { lock.withLock { count } }
+    func add(_ d: Data) {
+        lock.withLock {
+            count += d.count
+            if bytes.count < LogEntry.bodyLimit { bytes.append(d.prefix(LogEntry.bodyLimit - bytes.count)) }
+        }
+    }
+}
+
 private final class Flag: @unchecked Sendable {
     private let lock = NSLock()
     private var value = false
