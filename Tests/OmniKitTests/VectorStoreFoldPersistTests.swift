@@ -430,6 +430,46 @@ final class VectorStoreFoldPersistTests: XCTestCase {
         }
     }
 
+    /// The quit shape with REUSE: new contents written into freed positions inside the replica's
+    /// prefix, then the process exits without close(). The replica on disk still holds the codes
+    /// of the contents that used to live there; the next launch must not score the new ones by them.
+    func testReplicaAfterReuseAndExitStillFindsNewContent() throws {
+        try withCap(quantCap) {
+            let url = tempDB()
+            let dim = 64
+            var rng = Rng(s: 11)
+            do {
+                let store = try VectorStore(dbURL: url)
+                var batch: [(path: String, chunks: [IndexedChunk])] = []
+                for i in 0 ..< 20000 { let p = "/docs/f\(i).md"; batch.append((p, [chunk(p, 0, randUnit(dim, &rng))])) }
+                try store.replaceMany(batch)
+                _ = store.search(randUnit(dim, &rng), topK: 10)
+                store.close()   // replica written for the 20000-row prefix
+            }
+            var fresh: [(String, [Float])] = []
+            do {
+                let store = try VectorStore(dbURL: url)
+                _ = store.search(randUnit(dim, &rng), topK: 10)
+                store.deletePaths(Set((0 ..< 5000).map { "/docs/f\($0).md" }))
+                for round in 0 ..< 3 {
+                    var batch: [(path: String, chunks: [IndexedChunk])] = []
+                    for j in 0 ..< 400 {
+                        let p = "/new/r\(round)-\(j).md", v = randUnit(dim, &rng)
+                        fresh.append((p, v)); batch.append((p, [chunk(p, 0, v)]))
+                    }
+                    try store.replaceMany(batch)
+                    _ = store.search(randUnit(dim, &rng), topK: 10)
+                }
+                _ = store.stampRowSidecarBeforeExit(timeout: 5)   // what quiesceForQuit does, then _exit
+            }
+            let store = try VectorStore(dbURL: url)
+            defer { store.close() }
+            var missed = 0
+            for (p, v) in fresh where store.search(v, topK: 5).first?.path != p { missed += 1 }
+            XCTAssertEqual(missed, 0, "\(missed) of \(fresh.count) new contents not found by their own vector")
+        }
+    }
+
     func testCorruptReplicaBlobRejected() throws {
         try withCap(quantCap) {
             let url = tempDB()
