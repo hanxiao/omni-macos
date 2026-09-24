@@ -1370,6 +1370,16 @@ public final class Indexer: @unchecked Sendable {
     /// `force: true` (the tag backfill) re-embeds the given files even when their (mtime, size)
     /// signature is unchanged - everything else (deletion/exclusion handling, batching, store
     /// writes) is identical to a watcher reconcile.
+    /// True when `path` names an existing item only through case-insensitive lookup: its last
+    /// component differs from the stored name in case alone.
+    static func isStaleCaseSpelling(_ path: String) -> Bool {
+        var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
+        guard realpath(path, &buf) != nil else { return false }
+        let stored = (String(cString: buf) as NSString).lastPathComponent
+        let given = (path as NSString).lastPathComponent
+        return stored != given && stored.lowercased() == given.lowercased()
+    }
+
     /// `roots`: the indexed folders. A vanished path that is one of them, or sits above one, is
     /// never deleted by prefix here - see the vanished-path loop.
     public func update(paths: [String], settings: IndexSettings, force: Bool = false, roots: [String] = []) {
@@ -1410,6 +1420,11 @@ public final class Indexer: @unchecked Sendable {
             if isCancelled { break }
             var st = stat()
             guard stat(path, &st) == 0 else { deletedTop.insert(path); continue }
+            // THE OLD SIDE OF A CASE-ONLY RENAME STILL STATS. APFS is case-insensitive, so after
+            // `doc.txt` -> `DOC.txt` the old path resolves to the same file, and it stayed indexed
+            // beside the new one - two rows, one file, until the next full pass. realpath(3) returns
+            // the name as stored; a spelling that differs from it only in case is the stale one.
+            if Self.isStaleCaseSpelling(path) { deletedTop.insert(path); continue }
             if st.st_mode & S_IFMT == S_IFDIR {
                 if let r = rootOf(path), !gate.admitsEventPath(path, isDir: true, size: 0, root: r) { continue }
                 FileCrawler(roots: [URL(fileURLWithPath: path)], ignore: settings.ignore,

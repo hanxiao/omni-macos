@@ -178,6 +178,26 @@ final class IndexerReconcileTests: XCTestCase {
         XCTAssertEqual(live.fileCount(underFolder: root.path), 1)
     }
 
+    /// A case-only rename on a case-insensitive volume: the old spelling still stats (it is the same
+    /// file), and it used to stay indexed beside the new one.
+    func testCaseOnlyRenameLeavesOneRow() throws {
+        let root = try makeRoot("case", files: 0)
+        let old = root.appendingPathComponent("notes.txt"), new = root.appendingPathComponent("NOTES.TXT")
+        try "minutes of the planning meeting".write(to: old, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dbURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omni-reconcile-db-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("index.sqlite")
+        let store = try VectorStore(dbURL: dbURL)
+        let indexer = Indexer(store: store, embedder: UnitTextEmbedder())
+        runPass(indexer, roots: [root])
+        XCTAssertEqual(Set(store.indexedFiles().keys), [old.path])
+
+        try FileManager.default.moveItem(at: old, to: new)
+        indexer.update(paths: [old.path, new.path], settings: IndexSettings(), roots: [root.path])
+        XCTAssertEqual(Set(store.indexedFiles().keys), [new.path], "only the stored spelling stays indexed")
+    }
+
     /// The paused-root flow: a full pass excludes paused roots; their files must survive.
     func testPassExcludingPausedRootKeepsItsFiles() throws {
         let a = try makeRoot("a", files: 4)
