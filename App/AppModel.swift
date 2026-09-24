@@ -2427,8 +2427,16 @@ final class AppModel {
 
     /// The central policy file, in the fixed app-support dir (NOT the custom db volume - the exclude
     /// policy is app-level, not tied to where the vectors live).
+    ///
+    /// An isolated run (`-omni.dbDir` as a launch argument: tests, benchmarks) keeps its own policy
+    /// beside its index, so it can neither read nor rewrite the user's.
     static func ignoreFileURL() -> URL? {
         let fm = FileManager.default
+        if isolatedByLaunchArgument,
+           let dir = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)["omni.dbDir"] as? String {
+            try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            return URL(fileURLWithPath: dir).appendingPathComponent(".omniignore")
+        }
         guard let base = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
             .appendingPathComponent("Omni", isDirectory: true) else { return nil }
         try? fm.createDirectory(at: base, withIntermediateDirectories: true)
@@ -2439,14 +2447,66 @@ final class AppModel {
     /// kind/extension settings (+ seeded noise dirs) and write it. The synthesized policy excludes
     /// exactly what the old crawl excluded, so the first pass after upgrade prunes/indexes nothing new.
     private func loadIgnore() {
+        let defaults = UserDefaults.standard
         if let url = Self.ignoreFileURL(), let text = try? String(contentsOf: url, encoding: .utf8) {
             ignoreText = text
+            // Defaults shipped after this file was seeded, added once. A rule the user later
+            // deletes stays deleted: the version is recorded, so this never runs again.
+            if defaults.integer(forKey: Self.ignoreDefaultsKey) < Self.ignoreDefaultsVersion {
+                let merged = OmniIgnore.withAddedDefaults(text)
+                if merged != text { ignoreText = merged; saveIgnoreText(); ignorePrunePending = true }
+            }
         } else {
             ignoreText = OmniIgnore.synthesize(enabledKinds: settings.enabledKinds, disabledExtensions: settings.disabledExtensions)
             saveIgnoreText()
         }
+        if !Self.isolatedByLaunchArgument { defaults.set(Self.ignoreDefaultsVersion, forKey: Self.ignoreDefaultsKey) }
         ignore = OmniIgnore(text: ignoreText)
         ignoreHasBackup = Self.ignoreFileURL().map { FileManager.default.fileExists(atPath: $0.appendingPathExtension("bak").path) } ?? false   // one stat at launch, then cached
+    }
+
+    private static let ignoreDefaultsKey = "omni.ignoreDefaultsVersion"
+    /// 2: OmniIgnore.addedDefaults.
+    private static let ignoreDefaultsVersion = 2
+    /// The policy gained rules at launch; the indexed files they exclude are dropped once the
+    /// store is open (bootstrap).
+    @ObservationIgnored private var ignorePrunePending = false
+
+    /// Drop every indexed file the policy excludes, then give back the space. Folder rules count:
+    /// a file under an excluded folder is excluded (see OmniIgnore.excludesIndexedFile).
+    private func pruneExcluded(_ store: VectorStore, policy: OmniIgnore, then: (@MainActor () -> Void)? = nil) {
+        Task.detached(priority: .utility) {
+            let t0 = Date()
+            let excluded = policy.excludesIndexedFile()
+            let drop = store.knownFiles().compactMap { path, _ in excluded(path) ? path : nil }
+            let tScan = -t0.timeIntervalSinceNow
+            // In batches: deletePaths holds the store queue for its whole run, and a search waits
+            // behind it. One call over 2.4M files held it for minutes.
+            let batch = 50_000
+            var tDel = 0.0
+            for start in stride(from: 0, to: drop.count, by: batch) {
+                let tb = Date()
+                store.deletePaths(Set(drop[start ..< min(drop.count, start + batch)]),
+                                  checkpoint: start + batch >= drop.count)
+                tDel += -tb.timeIntervalSinceNow
+                omniPerfLog(String(format: "ignore-prune batch %d/%d %.1fs", start / batch + 1,
+                                   (drop.count + batch - 1) / batch, -tb.timeIntervalSinceNow))
+            }
+            let tc = Date()
+            if !drop.isEmpty {
+                store.compact()
+                store.prepareLexicalIndex()   // the filename channel stops naming the dropped files
+            }
+            omniPerfLog(String(format: "ignore-prune files=%d scan=%.1fs delete=%.1fs compact=%.1fs total=%.1fs",
+                               drop.count, tScan, tDel, -tc.timeIntervalSinceNow, -t0.timeIntervalSinceNow))
+            await MainActor.run {
+                if !drop.isEmpty {
+                    self.refreshIndexStats(store)
+                    self.refreshSearchAfterBackgroundChange()
+                }
+                then?()
+            }
+        }
     }
 
     private func saveIgnoreText() {
@@ -2487,8 +2547,9 @@ final class AppModel {
         Task.detached(priority: .userInitiated) {
             // Iterated, not materialised: a path String exists only while it is being tested.
             var kept = 0, removed = 0, samples: [String] = []
+            let excluded = candidate.excludesIndexedFile()
             store.knownFiles().forEach { path, _ in
-                if candidate.isIgnored(path, isDir: false) {
+                if excluded(path) {
                     removed += 1
                     if samples.count < 12 { samples.append(path) }
                 } else { kept += 1 }
@@ -2531,15 +2592,7 @@ final class AppModel {
         saveIgnoreText()
         ignorePreview = nil
         guard changed, let store else { return }
-        Task.detached(priority: .utility) {
-            let drop = Set(store.knownFiles().compactMap { path, _ in new.isIgnored(path, isDir: false) ? path : nil })
-            if !drop.isEmpty { store.deletePaths(drop); store.compact() }
-            await MainActor.run {
-                self.refreshIndexStats(store)
-                self.refreshSearchAfterBackgroundChange()
-                self.requestIndexPass()   // pick up files the new policy now allows
-            }
-        }
+        pruneExcluded(store, policy: new) { self.requestIndexPass() }   // then pick up what the policy now allows
     }
 
 
@@ -3587,6 +3640,7 @@ final class AppModel {
             }
             self.phase = .ready
             omniPerfLog("launch ready")
+            if ignorePrunePending { ignorePrunePending = false; pruneExcluded(store, policy: ignore) }
             restartWatcher()
             // Off the main thread: it lists the shared temporary directory, which measured 2.7 s of
             // main-thread block at 50k entries - the stall every launch showed right after ready.

@@ -180,6 +180,14 @@ final class LexicalIndex: @unchecked Sendable {
         // And return the high-water mark to the filesystem now that the build is done, rather than
         // leaving a multi-GB file parked next to a small database until the next open.
         exec("PRAGMA wal_checkpoint(TRUNCATE);")
+        // THE DATABASE FILE TOO, when the rebuild left most of it empty. The reset frees pages
+        // without returning them, so a sidecar keeps its largest size for good: 1.03 GB after an
+        // ignore rule dropped 2.4M of 2.7M files. Only past half free, so an ordinary rebuild
+        // (which refills what it freed) never pays for a VACUUM.
+        if let free = scalar("PRAGMA freelist_count;").flatMap(Int.init),
+           let pages = scalar("PRAGMA page_count;").flatMap(Int.init), pages > 0, free * 2 > pages {
+            exec("VACUUM;")
+        }
         fileCount = all.count
         ready = true
     }

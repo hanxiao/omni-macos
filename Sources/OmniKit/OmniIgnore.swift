@@ -81,6 +81,7 @@ public struct OmniIgnore: Sendable, Equatable {
             "# Noise directories (build output, caches, dependencies). Delete a line to start indexing it.",
         ]
         for name in FileCrawler.skipDirNames { lines.append("\(name)/") }
+        lines.append(contentsOf: addedDefaults)
         let disabledKinds = FileKind.indexable.filter { !enabledKinds.contains($0) }
         let kindExts = Set(disabledKinds.flatMap { FileExtractor.extensions(for: $0) })
         if !disabledKinds.isEmpty {
@@ -98,6 +99,61 @@ public struct OmniIgnore: Sendable, Equatable {
             for ext in looseExts { lines.append("*.\(ext)") }
         }
         return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// Noise rules shipped after the policy file was first seeded. A new install gets them from
+    /// `synthesize`; an existing file gets them once through `withAddedDefaults`. Chosen from a
+    /// real 2.7M-file index: installed Python packages, vendored code, Android density renders of
+    /// one icon, build metadata, lockfiles and minified bundles - nothing anyone searches for.
+    /// Only indexed extensions appear: a rule for a type that is never indexed would do nothing.
+    public static let addedDefaults: [String] = [
+        "site-packages/", "third_party/", "third-party/", "*.egg-info/",
+        "drawable-*dpi*/", "mipmap-*dpi*/",
+        "package-lock.json", "pnpm-lock.yaml", "*.min.js", "*.min.css",
+    ]
+
+    /// `text` with every added default it lacks, placed at the end of the noise-directory block
+    /// (or at the end of the file when that block is gone). A rule the user negated (`!rule`) is
+    /// left out, and nothing already present is duplicated or moved.
+    public static func withAddedDefaults(_ text: String) -> String {
+        var lines = text.components(separatedBy: "\n")
+        let present = Set(lines.map { $0.trimmingCharacters(in: .whitespaces) })
+        let missing = addedDefaults.filter { !present.contains($0) && !present.contains("!" + $0) }
+        guard !missing.isEmpty else { return text }
+        var at = lines.count
+        if let head = lines.firstIndex(where: { $0.hasPrefix("# Noise directories") }) {
+            var i = head + 1
+            while i < lines.count, !lines[i].trimmingCharacters(in: .whitespaces).isEmpty,
+                  !lines[i].hasPrefix("#") { i += 1 }
+            at = i
+        } else {
+            while at > 0, lines[at - 1].trimmingCharacters(in: .whitespaces).isEmpty { at -= 1 }
+        }
+        lines.insert(contentsOf: missing, at: at)
+        var out = lines.joined(separator: "\n")
+        if !out.hasSuffix("\n") { out += "\n" }
+        return out
+    }
+
+    /// For pruning indexed FILES after a policy change: a file is excluded when it matches, or when
+    /// any folder above it does. `isIgnored(file, isDir: false)` skips every directory rule, so it
+    /// pruned nothing for `site-packages/` or an excluded folder. Folder answers are cached, because
+    /// a whole index is millions of files in far fewer folders.
+    public func excludesIndexedFile() -> (String) -> Bool {
+        var dirCache: [Substring: Bool] = [:]
+        func dirExcluded(_ dir: Substring) -> Bool {
+            if dir.isEmpty || dir == "/" { return false }
+            if let hit = dirCache[dir] { return hit }
+            let parent = dir[..<(dir.lastIndex(of: "/") ?? dir.startIndex)]
+            let v = dirExcluded(parent) || isIgnored(String(dir), isDir: true)
+            dirCache[dir] = v
+            return v
+        }
+        return { path in
+            guard !self.rules.isEmpty else { return false }
+            let dir = path[..<(path.lastIndex(of: "/") ?? path.startIndex)]
+            return dirExcluded(dir) || self.isIgnored(path, isDir: false)
+        }
     }
 
     /// Whether `path` (absolute) is excluded. `isDir` gates directory-only rules. Last match wins.

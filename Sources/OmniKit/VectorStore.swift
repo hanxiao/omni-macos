@@ -3071,21 +3071,65 @@ public final class VectorStore: @unchecked Sendable {
     /// Delete many paths at once. Critical for reconcile: deleting K paths via deletePath would
     /// rebuild the in-memory vector buffer K times (O(N*K), multi-GB memmoves on a large index).
     /// This deletes all rows in one transaction and rebuilds the buffer exactly once.
-    public func deletePaths(_ paths: Set<String>) {
+    /// `checkpoint: false` for all but the last of a run of batches: the forced WAL checkpoint
+    /// copies the log back into the database, ~15 s per call on a 4.4 GB index on a spinning
+    /// disk, and a batched prune paid it once per batch.
+    public func deletePaths(_ paths: Set<String>, checkpoint: Bool = true) {
         guard !paths.isEmpty else { return }
         queue.sync {
             guard dbOpen() else { return }
             let victims = victimRowsForPathsLocked(paths)
             beginTxnLocked()
             recordAndReleaseLocked(releasedSlotsLocked(victims))
-            for p in paths { deleteFileContentLocked(p) }
+            guard deleteFileContentsLocked(paths) else {
+                rollbackTxnLocked()
+                FileHandle.standardError.write(Data("[omni] delete aborted: could not stage the victims\n".utf8))
+                return
+            }
             pruneFileRowsLocked(paths)
             bumpGenLocked()
             exec("COMMIT;")
             removeRowsByPathsLocked(paths, victims: victims)   // one rebuild for the whole set
             proactiveRefoldLocked()
-            checkpointIfDueLocked(forceStat: true)   // deletes carry no byte estimate (F17)
+            if checkpoint { checkpointIfDueLocked(forceStat: true) }   // deletes carry no byte estimate (F17)
         }
+    }
+
+    /// Every stored trace of these files except the `files` rows themselves (the caller prunes
+    /// those): occurrences, then whatever contents that orphans, dedup entries, v4 rows. SET-BASED,
+    /// as the folder delete is: the file ids go into a temp table once and each delete reads it.
+    /// Per file, each paid its own orphan recount and ~10 statements - 25k files took 1.5 s, and an
+    /// ignore rule excluding 2.5M files ran for hours. Returns false, having deleted nothing, when
+    /// the ids could not be staged; the caller rolls back.
+    private func deleteFileContentsLocked(_ paths: Set<String>) -> Bool {
+        exec("DROP TABLE IF EXISTS temp.victims;")
+        exec("CREATE TEMP TABLE victims(id INTEGER PRIMARY KEY);")
+        var ins: OpaquePointer?
+        var built = sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO temp.victims(id) VALUES(?);", -1, &ins, nil) == SQLITE_OK
+        if built {
+            for path in paths {
+                guard let fid = fileIDLocked(path, insert: false) else { continue }
+                sqlite3_reset(ins)
+                sqlite3_bind_int64(ins, 1, fid)
+                if sqlite3_step(ins) != SQLITE_DONE { built = false; break }
+            }
+        }
+        sqlite3_finalize(ins)
+        // Checked for the folder delete's reason: an unbuilt table makes every delete below a
+        // silent no-op while memory drops the rows anyway.
+        guard built else { exec("DROP TABLE IF EXISTS temp.victims;"); return false }
+        dropSplitWhereLocked(fileIDs: "SELECT id FROM temp.victims")
+        // v4 row ids, only while they exist - see the folder delete.
+        for sql in (v4Dropped ? [] :
+                    ["DELETE FROM chunk_text WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id IN (SELECT id FROM temp.victims));"])
+            + (splitPendingKeyedLocked ? []
+               : ["DELETE FROM pending_vecs WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id IN (SELECT id FROM temp.victims));"])
+            + ["DELETE FROM dedup WHERE file_id IN (SELECT id FROM temp.victims);"]
+            + (v4Dropped ? [] : ["DELETE FROM chunks WHERE file_id IN (SELECT id FROM temp.victims);"]) {
+            exec(sql)
+        }
+        exec("DROP TABLE IF EXISTS temp.victims;")
+        return true
     }
 
     /// Does anything under `folder` have rows? Index-driven: the byte range resolves on the unique
@@ -3256,40 +3300,11 @@ public final class VectorStore: @unchecked Sendable {
             let victimRows = victimRowsMatchingLocked { disabled($0) }
             beginTxnLocked()
             recordAndReleaseLocked(releasedSlotsLocked(victimRows))
-            // SET-BASED, as the folder delete is: the victim file ids go into a temp table once and
-            // each delete reads it. Per file (deleteFileContentLocked in a loop) every file paid its
-            // own orphan recount and ~10 statements - 72 s to drop 25k of 100k files.
-            exec("DROP TABLE IF EXISTS temp.victims;")
-            exec("CREATE TEMP TABLE victims(id INTEGER PRIMARY KEY);")
-            var ins: OpaquePointer?
-            var built = sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO temp.victims(id) VALUES(?);", -1, &ins, nil) == SQLITE_OK
-            if built {
-                for path in victims {
-                    guard let fid = fileIDLocked(path, insert: false) else { continue }
-                    sqlite3_reset(ins)
-                    sqlite3_bind_int64(ins, 1, fid)
-                    if sqlite3_step(ins) != SQLITE_DONE { built = false; break }
-                }
-            }
-            sqlite3_finalize(ins)
-            // Checked for the folder delete's reason: an unbuilt table makes every delete below a
-            // silent no-op while memory drops the rows anyway.
-            guard built else {
+            guard deleteFileContentsLocked(victims) else {
                 rollbackTxnLocked()
                 FileHandle.standardError.write(Data("[omni] extension delete aborted: could not stage the victims\n".utf8))
                 return
             }
-            dropSplitWhereLocked(fileIDs: "SELECT id FROM temp.victims")
-            // v4 row ids, only while they exist - see the folder delete.
-            for sql in (v4Dropped ? [] :
-                        ["DELETE FROM chunk_text WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id IN (SELECT id FROM temp.victims));"])
-                + (splitPendingKeyedLocked ? []
-                   : ["DELETE FROM pending_vecs WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id IN (SELECT id FROM temp.victims));"])
-                + ["DELETE FROM dedup WHERE file_id IN (SELECT id FROM temp.victims);"]
-                + (v4Dropped ? [] : ["DELETE FROM chunks WHERE file_id IN (SELECT id FROM temp.victims);"]) {
-                exec(sql)
-            }
-            exec("DROP TABLE IF EXISTS temp.victims;")
             pruneFileRowsLocked(victims)
             bumpGenLocked()
             exec("COMMIT;")
