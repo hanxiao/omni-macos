@@ -13,7 +13,7 @@ import OmniKit
 /// `wait:<seconds>`. For recording the intro video: `type:<text>` (a key at a time, searching at
 /// each word), `similar:<path>`, `select:<result index>`, `map:<folder>`, `frame:<w>x<h>`
 /// (window size, centered), `front`, `appearance:light|dark`, `history:<n>`, `sort:<order>`,
-/// `bsort:<name|column rawValue>`, `settings:<tab>`, `sidebarselect:<n>`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
+/// `bsort:<name|column rawValue>`, `settings:<tab>`, `sidebarselect:<n>`, `dumpui:<path>`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
 /// CPU is read, so what it set in motion is counted too. `repeat:<n>` before a step repeats it.
 @MainActor
 enum PerfScript {
@@ -94,6 +94,17 @@ enum PerfScript {
             if let w = NSApp.windows.first(where: { $0.isVisible && $0.toolbar != nil }),
                let outline = firstView(of: NSOutlineView.self, in: w.contentView) {
                 w.makeFirstResponder(outline)
+            }
+        case "dumpui":   // what the window shows, as JSON at <path>: results with their copies, browser rows
+            let groups = model.groups.map { g in g.members.map(\.path) }
+            let payload: [String: Any] = [
+                "time": Date().timeIntervalSince1970, "query": model.query,
+                "results": groups,
+                "browseFolder": model.browserListingForPerf.folder,
+                "browse": model.browserListingForPerf.paths,
+            ]
+            if let data = try? JSONSerialization.data(withJSONObject: payload) {
+                try? data.write(to: URL(fileURLWithPath: arg), options: .atomic)
             }
         case "appearance": NSApp.appearance = NSAppearance(named: arg == "dark" ? .darkAqua : .aqua)
         default: omniPerfLog("script: unknown step \(step)")

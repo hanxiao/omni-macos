@@ -618,7 +618,22 @@ final class AppModel {
     /// The browsers keep their own `entries`, which `rawResults` pruning does not touch, so without
     /// this a trashed file stayed on screen until the next indexing refresh (up to 30 s away).
     private(set) var browserReloadTick = 0
+    /// What the folder browser last put on screen (folder, row paths). Written only under
+    /// OMNI_PERF_LOG, for the perf script's `dumpui`, which compares it with the disk.
+    @ObservationIgnored var browserListingForPerf: (folder: String, paths: [String]) = ("", [])
     func requestBrowserReload() { browserReloadTick &+= 1 }
+
+    /// After a watcher reconcile: reload the folder on screen if any changed path is in it, is it,
+    /// or is above it (a rename or move of an ancestor). The browser otherwise only polls while a
+    /// pass runs, and a reconcile finishes in milliseconds - measured by a chaos run, the listing
+    /// never reloaded through 150 changes inside the folder on screen.
+    private func reloadBrowserIfTouched(_ paths: [String]) {
+        guard let shown = filterFolder?.path else { return }
+        let inside = shown + "/"
+        if paths.contains(where: { $0 == shown || $0.hasPrefix(inside) || shown.hasPrefix($0 + "/") }) {
+            requestBrowserReload()
+        }
+    }
 
     func moveToTrash(_ paths: [String]) {
         // A Photos asset is not a file Omni may move: deleting it means deleting it from the
@@ -5418,6 +5433,9 @@ final class AppModel {
                         // folder-removal restart - updated the index just now; a clean finish with
                         // nothing left to do also confirms it is current as of now.
                         if p.embedded > 0 || !p.cancelled { self.markIndexed(store) }
+                        // The browser follows a pass by polling (followIndexing), and its last
+                        // poll can land before the pass's last write: settle it once here.
+                        self.requestBrowserReload()
                         // A paper run cancelled this pass to quiesce the app. Leave every deferred
                         // request QUEUED - this is the one completion that acts on them without
                         // going through drainDeferredAfterPass, and its removals branch would run a
@@ -5741,6 +5759,7 @@ final class AppModel {
                 self.markIndexed(store)   // a reconcile brought the index current just now
                 self.refreshIndexStats(store)
                 self.refreshSearchAfterBackgroundChange()
+                self.reloadBrowserIfTouched(drained)
                 self.fsReconcileInFlight = false
                 // Work queued while this reconcile ran (folder removals, a deferred full pass,
                 // added roots, more FS events) drains in one place, in fixed priority.

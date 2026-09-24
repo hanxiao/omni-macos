@@ -72,6 +72,7 @@ struct FolderBrowser: View {
 
     private func setEntries(_ next: [Entry]) {
         entries = next
+        if omniPerfEnabled { model.browserListingForPerf = (folder.path, next.map(\.url.path)) }
         sorted = Self.order(next, by: sort, ascending: ascending)
     }
 
