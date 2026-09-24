@@ -2646,7 +2646,9 @@ Measured on APFS clones of the real 6.55M-content / 10.7M-occurrence index, no s
 One drawn mole, template-rendered so it takes `.tertiary` like an SF Symbol, with one gag per
 screen: `MoleGlyph` (plain) onboarding, `MoleSerious` (determined brows) "Loading your index",
 `MoleSearch` (star eyes) the search prompt, `MoleOCR` (reading glasses) the OCR drop zone,
-`MoleSleep` (z z) "Add folders to search". SAME SIZE AND COLOUR EVERYWHERE: every screen draws it
+`MoleSleep` (z z) "Add folders to search", `MoleEmpty` (x x eyes) "Nothing indexed here".
+PNGs are rendered with `rsvg-convert -w 80/160/240` from the generator's SVG (matches the shipped
+assets to 0.6/255 mean alpha difference). SAME SIZE AND COLOUR EVERYWHERE: every screen draws it
 through `StatusGlyph` (68 pt, `.tertiary`); a one-off size or style on one screen is what made the
 welcome mole read darker than the rest.
 All are rendered from the full 100x100 canvas, never cropped, so the mole keeps one size and place
