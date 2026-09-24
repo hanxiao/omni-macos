@@ -1369,7 +1369,9 @@ public final class Indexer: @unchecked Sendable {
     /// `force: true` (the tag backfill) re-embeds the given files even when their (mtime, size)
     /// signature is unchanged - everything else (deletion/exclusion handling, batching, store
     /// writes) is identical to a watcher reconcile.
-    public func update(paths: [String], settings: IndexSettings, force: Bool = false) {
+    /// `roots`: the indexed folders. A vanished path that is one of them, or sits above one, is
+    /// never deleted by prefix here - see the vanished-path loop.
+    public func update(paths: [String], settings: IndexSettings, force: Bool = false, roots: [String] = []) {
         beginChunkReuse(settings)
         let fm = FileManager.default
         // Resolve the concrete files first: the explicit events, plus a crawl of any directory event
@@ -1438,9 +1440,19 @@ public final class Indexer: @unchecked Sendable {
         // it can exist either. For a file the prefix range matches nothing extra, which is why this
         // does not need to know which it was. hasRowsUnder keeps it to an index probe when there is
         // nothing to do, which is the common case for an ordinary file event.
+        //
+        // EXCEPT a root, or a folder above one. Renaming a root's parent, moving the root, or
+        // unmounting its volume reports that path as gone, and deleting under it dropped the whole
+        // root's index - which came back only by embedding every file again once the folder was
+        // back (reproduced: rename the parent of a 3-file root, 3 rows -> 0, rename back, all 3
+        // re-embedded). The full pass already keeps a missing root's rows (blindRoots); a watcher
+        // event must not be the one place that decides otherwise.
         var vanishedPrefixes: [String] = []
         for path in deletedTop {
             if known[path] != nil { toDelete.insert(path) }         // deleted / moved away
+            else if roots.contains(where: { $0 == path || $0.hasPrefix(path + "/") }) {
+                Self.log.info("update: indexed folder at or under \(path, privacy: .public) is gone; rows kept")
+            }
             else if store.hasRowsUnder(path) { vanishedPrefixes.append(path) }
         }
         // Resolve which files actually need (re)embedding - stat-level checks only, no decode.

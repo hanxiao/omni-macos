@@ -68,6 +68,38 @@ final class IndexerReconcileTests: XCTestCase {
                        "adding root B must not reconcile-delete root A's index")
     }
 
+    /// A watcher event naming a root's PARENT as gone (the parent was renamed, or the volume
+    /// unmounted) must not delete the root's rows; a vanished subfolder inside the root still must.
+    func testVanishedAncestorOfRootKeepsRows() throws {
+        let parent = try makeRoot("parent", files: 0)
+        let root = parent.appendingPathComponent("docs", isDirectory: true)
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("sub"), withIntermediateDirectories: true)
+        for i in 0 ..< 3 {
+            try "notes \(i) on design reviews".write(to: root.appendingPathComponent("n\(i).txt"), atomically: true, encoding: .utf8)
+        }
+        try "a file about budgets".write(to: root.appendingPathComponent("sub/s.txt"), atomically: true, encoding: .utf8)
+        let moved = parent.deletingLastPathComponent().appendingPathComponent(parent.lastPathComponent + "-moved")
+        defer { try? FileManager.default.removeItem(at: parent); try? FileManager.default.removeItem(at: moved) }
+        let dbURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omni-reconcile-db-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("index.sqlite")
+        let store = try VectorStore(dbURL: dbURL)
+        let indexer = Indexer(store: store, embedder: UnitTextEmbedder())
+        runPass(indexer, roots: [root])
+        XCTAssertEqual(store.fileCount(underFolder: root.path), 4)
+
+        try FileManager.default.moveItem(at: parent, to: moved)
+        indexer.update(paths: [parent.path], settings: IndexSettings(), roots: [root.path])
+        XCTAssertEqual(store.fileCount(underFolder: root.path), 4, "a moved parent must not wipe the root")
+        indexer.update(paths: [root.path], settings: IndexSettings(), roots: [root.path])
+        XCTAssertEqual(store.fileCount(underFolder: root.path), 4, "a missing root must not be wiped")
+
+        try FileManager.default.moveItem(at: moved, to: parent)
+        try FileManager.default.removeItem(at: root.appendingPathComponent("sub"))
+        indexer.update(paths: [root.appendingPathComponent("sub").path], settings: IndexSettings(), roots: [root.path])
+        XCTAssertEqual(store.fileCount(underFolder: root.path), 3, "a deleted subfolder is still pruned")
+    }
+
     /// The paused-root flow: a full pass excludes paused roots; their files must survive.
     func testPassExcludingPausedRootKeepsItsFiles() throws {
         let a = try makeRoot("a", files: 4)

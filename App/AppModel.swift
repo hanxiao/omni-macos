@@ -5668,10 +5668,18 @@ final class AppModel {
         activeRoots.formUnion(touched)
         fsReconcileInFlight = true
         startRateSampler()   // show throughput during the background reconcile too, not only full passes
+        let rootPaths = roots.map(\.path)
         Task.detached(priority: .utility) {
-            indexer.update(paths: drained, settings: settings)
+            indexer.update(paths: drained, settings: settings, roots: rootPaths)
+            let cancelled = indexer.isCancelled
             await MainActor.run {
-                if eid > 0 { self.eventCheckpoint = String(eid) }
+                // A cancelled batch (a folder removal or a restart chain) did not finish: put its
+                // paths back and keep the checkpoint, or its edits stay stale until next launch.
+                // Paths no longer under a root are dropped, so a removed folder is not re-indexed.
+                if cancelled {
+                    self.pendingFSPaths.formUnion(drained.filter { self.rootKey(for: $0) != nil })
+                    self.pendingFSEventId = max(self.pendingFSEventId, eid)
+                } else if eid > 0 { self.eventCheckpoint = String(eid) }
                 self.activeRoots.subtract(touched)
                 self.markIndexed(store)   // a reconcile brought the index current just now
                 self.refreshIndexStats(store)

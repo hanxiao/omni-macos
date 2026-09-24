@@ -5351,10 +5351,15 @@ public final class VectorStore: @unchecked Sendable {
             lexPos[p] = i
         }
         // Only admit lexical-only files that pass the same filter the dense path applied, or a
-        // filtered search would silently gain rows the filter excluded.
+        // filtered search would silently gain rows the filter excluded. The tag clause is resolved
+        // here as the dense path resolves it (cached across keystrokes); unresolved, a tag filter
+        // admitted every name match.
         let denseSet = Set(dense.map { $0.path })
         let extra = names.filter { !denseSet.contains($0) }
-        let materialized = hitsForPaths(extra, query: denseQuery).filter { passesFilterForLexical($0, filter) }
+        let resolved = filter.tagTerms.isEmpty && filter.tagExcludeTerms.isEmpty
+            ? filter : queue.sync { resolveTagFilterLocked(filter) }
+        let materialized = hitsForPaths(extra, query: denseQuery)
+            .filter { resolved.accepts(path: $0.path, kind: $0.kind, modified: $0.modified) }
         // Scope: only files the clause names. Boost: the dense list plus what the name found.
         var pool = explicit ? dense.filter { strength[$0.path] != nil } + materialized
                             : dense + materialized
@@ -5381,22 +5386,6 @@ public final class VectorStore: @unchecked Sendable {
             return $0.path < $1.path
         }
         return Array(pool.prefix(topK))
-    }
-
-    /// The subset of SearchFilter that can be evaluated on a materialized hit without the resident
-    /// row tables. Kind, recency and extension are all present on the hit; folder is a path prefix.
-    private func passesFilterForLexical(_ h: SearchHit, _ f: SearchFilter) -> Bool {
-        if !f.kinds.isEmpty, !f.kinds.contains(h.kind) { return false }
-        if let since = f.since, h.modified < since { return false }
-        // `underAnyFolder`, not `hasPrefix`: a bare prefix test also accepts a SIBLING whose name
-        // merely starts with the same characters ("~/Docs2" under a "~/Docs" scope). The boundary
-        // form has always been what `acceptsPath` uses; this path was the odd one out.
-        if !f.underAnyFolder(h.path) { return false }
-        if let ext = f.ext, !ext.isEmpty {
-            let e = (h.path as NSString).pathExtension.lowercased()
-            if !ext.contains(e) { return false }
-        }
-        return true
     }
 
     private func searchDense(_ query: [Float], filter: SearchFilter = SearchFilter(), topK: Int = 40,

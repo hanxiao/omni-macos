@@ -14,10 +14,19 @@ public enum ModelVariant: String, CaseIterable, Sendable {
 
 /// Locates a usable model directory (one containing model.safetensors).
 public enum ModelLocator {
+    // The developer's external drive and /private/tmp staging dirs are DEBUG-only. A release build
+    // probed them on every launch: a spun-down USB volume blocks the stat for seconds, and
+    // /private/tmp is world-writable, so a model planted there would have been loaded.
+    #if DEBUG
     private static let hubRoots = [
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cache/huggingface/hub"),
         URL(fileURLWithPath: "/Volumes/One Touch/ai-models/huggingface/hub"),
     ]
+    #else
+    private static let hubRoots = [
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cache/huggingface/hub"),
+    ]
+    #endif
 
     /// Explicit overrides that win regardless of variant: an env pointer and the legacy
     /// single-model path.
@@ -51,10 +60,12 @@ public enum ModelLocator {
         if let appSup = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false) {
             dirs.append(appSup.appendingPathComponent("Omni/\(variant.rawValue)"))
         }
+        #if DEBUG
         switch variant {
         case .small: dirs.append(URL(fileURLWithPath: "/private/tmp/omni-model"))
         case .nano: dirs.append(URL(fileURLWithPath: "/private/tmp/omni-nano"))
         }
+        #endif
         dirs.append(contentsOf: variantSnapshots(variant))
         return firstWithWeights(dirs)
     }
