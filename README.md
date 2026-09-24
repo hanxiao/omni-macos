@@ -4,7 +4,7 @@
 
 <h1 align="center">Omni</h1>
 
-<p align="center">Search every file on your Mac by meaning. On device.</p>
+<p align="center">Search every file on your Mac by meaning. Fully airgapped.</p>
 
 <p align="center">
   <a href="https://hanxiao.io/omni"><b>Download</b></a>

@@ -5,7 +5,7 @@
       "items": [
         {
           "q": "What is Omni?",
-          "a": "A native macOS app that searches your files by meaning. An on-device embedding model indexes text, PDFs, images, audio, and video into one vector space, and search ranks files by similarity to your query.",
+          "a": "A native macOS app that searches your files by meaning. A fully local embedding model indexes text, PDFs, images, audio, and video into one vector space, and search ranks files by similarity to your query.",
           "shortcut": ""
         },
         {
