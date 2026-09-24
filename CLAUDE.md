@@ -2316,8 +2316,9 @@ three collections over those Strings; and 465 MB of `MALLOC_LARGE (empty)`.
   53 -> 1.5 ms warm, listing 15 -> 12.5 ms, open 338 -> 332 ms. Build the store ONCE: its build is
   minutes at this size and is not what is measured; set OMNI_IDLE_FOLD=0 OMNI_VEC_COVERAGE=0 or idle
   maintenance scans stretch it further.
-- OPEN, NOT FIXED: `deleteExtensions` takes 72 s to drop 25k of 100k files, identical before and
-  after this work. Found by pathbench, not investigated.
+- `deleteExtensions` is set-based like `deleteUnderFolder` (temp.victims, one orphan recount):
+  pathbench 100k, dropping 25k files, 1483 -> 479 ms, same digests (2026-09-23). The per-file
+  loop paid a recount and ~10 statements per file.
 
 ## OCR over HTTP and MCP (issue #22, 2026-09-22)
 
@@ -2630,7 +2631,7 @@ Measured on APFS clones of the real 6.55M-content / 10.7M-occurrence index, no s
   narrows the temp `split_aff` list by primary-key probes and deletes by it. Same rows changed.
   `[replaceMany] sql=` on the same batches: 1,084-1,922 ms (0.13.8) against 1.1-1.9 ms; 20 edits
   in 23 ms. After adds, edits and deletes: 0 orphaned contents, snippets or staged vectors, 0 wrong
-  refs. Probably also the open "deleteExtensions takes 72 s" item below; not re-measured.
+  refs. That fix is what took `deleteExtensions` from 72 s to 1.5 s; set-based, it is now 0.48 s.
 - THE PARTIAL INDEX `idx_chunk_slot_v5 ... WHERE slot >= 0` IS ONLY USED WHEN THE QUERY SAYS SO, and
   where it says so matters: `slot >= C AND slot < T` scans (0.21 s); `... AND slot >= 0` LAST uses
   the index (0.004 s); `slot >= 0 AND ...` FIRST makes 0 the range start (0.08 s). Applied to the

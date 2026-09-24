@@ -3256,7 +3256,40 @@ public final class VectorStore: @unchecked Sendable {
             let victimRows = victimRowsMatchingLocked { disabled($0) }
             beginTxnLocked()
             recordAndReleaseLocked(releasedSlotsLocked(victimRows))
-            for path in victims { deleteFileContentLocked(path) }
+            // SET-BASED, as the folder delete is: the victim file ids go into a temp table once and
+            // each delete reads it. Per file (deleteFileContentLocked in a loop) every file paid its
+            // own orphan recount and ~10 statements - 72 s to drop 25k of 100k files.
+            exec("DROP TABLE IF EXISTS temp.victims;")
+            exec("CREATE TEMP TABLE victims(id INTEGER PRIMARY KEY);")
+            var ins: OpaquePointer?
+            var built = sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO temp.victims(id) VALUES(?);", -1, &ins, nil) == SQLITE_OK
+            if built {
+                for path in victims {
+                    guard let fid = fileIDLocked(path, insert: false) else { continue }
+                    sqlite3_reset(ins)
+                    sqlite3_bind_int64(ins, 1, fid)
+                    if sqlite3_step(ins) != SQLITE_DONE { built = false; break }
+                }
+            }
+            sqlite3_finalize(ins)
+            // Checked for the folder delete's reason: an unbuilt table makes every delete below a
+            // silent no-op while memory drops the rows anyway.
+            guard built else {
+                rollbackTxnLocked()
+                FileHandle.standardError.write(Data("[omni] extension delete aborted: could not stage the victims\n".utf8))
+                return
+            }
+            dropSplitWhereLocked(fileIDs: "SELECT id FROM temp.victims")
+            // v4 row ids, only while they exist - see the folder delete.
+            for sql in (v4Dropped ? [] :
+                        ["DELETE FROM chunk_text WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id IN (SELECT id FROM temp.victims));"])
+                + (splitPendingKeyedLocked ? []
+                   : ["DELETE FROM pending_vecs WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id IN (SELECT id FROM temp.victims));"])
+                + ["DELETE FROM dedup WHERE file_id IN (SELECT id FROM temp.victims);"]
+                + (v4Dropped ? [] : ["DELETE FROM chunks WHERE file_id IN (SELECT id FROM temp.victims);"]) {
+                exec(sql)
+            }
+            exec("DROP TABLE IF EXISTS temp.victims;")
             pruneFileRowsLocked(victims)
             bumpGenLocked()
             exec("COMMIT;")
@@ -13422,7 +13455,9 @@ public final class VectorStore: @unchecked Sendable {
     /// pointers, and a content nobody points at any more releases its position.
     func dropSplitForFilesLocked(_ fileIDs: [Int64]) {
         guard !fileIDs.isEmpty else { return }
-        dropSplitWhereLocked(fileIDs: "SELECT " + fileIDs.map(String.init).joined(separator: " UNION ALL SELECT "))
+        // A plain list: a UNION ALL chain hits SQLite's 500-term compound-select limit, and exec()
+        // swallows that error - the occurrences would stay while memory dropped the rows.
+        dropSplitWhereLocked(fileIDs: fileIDs.map(String.init).joined(separator: ","))
     }
 
     /// The same removal, for a victim set the caller has as a QUERY rather than as a list.
