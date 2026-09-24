@@ -289,7 +289,7 @@ public final class Indexer: @unchecked Sendable {
         let file = CrawledFile(url: url,
                                modified: vals.contentModificationDate?.timeIntervalSince1970 ?? 0,
                                size: vals.fileSize ?? 0)
-        let again = embed(decode(file, settings: settings))
+        let again = embed(decode(file, settings: settings), settings: settings)
         guard !again.isEmpty, again.allSatisfy({ Self.isFinite($0.embedding) }) else { return nil }
         Self.log.info("recovered after non-finite embedding: \(path, privacy: .public)")
         if Self.nanDebug { FileHandle.standardError.write(Data("NANDEBUG recovered path=\(path)\n".utf8)) }
@@ -1411,7 +1411,12 @@ public final class Indexer: @unchecked Sendable {
                                          size: Int(st.st_size)))
             }
         }
-        var lookup = Set(files.map { $0.path }); lookup.formUnion(deletedTop)
+        // One entry per file. A batch naming a folder and something inside it (every folder and
+        // file of a copied-in tree is its own event) reaches the same file more than once, and each
+        // copy was embedded: media carries no chunk key, so nothing downstream merged them.
+        var seenPaths = Set<String>()
+        files = files.filter { seenPaths.insert($0.path).inserted }
+        var lookup = seenPaths; lookup.formUnion(deletedTop)
         let known = store.storedFiles(paths: lookup)
 
         // Accumulate the batch's deletions and re-embeds, then apply each as ONE batched store call.
@@ -1942,7 +1947,10 @@ public final class Indexer: @unchecked Sendable {
     /// partial set would be stored under the file's current mtime, making the next pass skip it
     /// as "unchanged" and silently truncating the file in the index forever. An empty return
     /// leaves the file unindexed, and the next pass redoes it from scratch.
-    private func embed(_ item: DecodedItem) -> [IndexedChunk] {
+    /// `settings` is needed only for `.text`, which only the non-finite retry sends here (the
+    /// passes batch text across files themselves): without it the retried file's chunks were
+    /// stored with no chunk key, so they were never shared or reused on the next edit.
+    private func embed(_ item: DecodedItem, settings: IndexSettings? = nil) -> [IndexedChunk] {
         let file = item.file, kind = item.kind
         let meta = item.meta   // captured during decode; never re-open the file header here
         switch item.payload {
@@ -1960,7 +1968,8 @@ public final class Indexer: @unchecked Sendable {
                 for (j, vec) in vecs.enumerated() {
                     out.append(IndexedChunk(path: file.path, modified: file.modified, size: file.size, kind: kind,
                                             chunkIndex: i + j, snippet: snippet(group[j].text), embedding: vec,
-                                            locator: group[j].locator))
+                                            locator: group[j].locator,
+                                            chunkKey: settings.map { chunkKey(group[j].text, settings: $0) } ?? ""))
                 }
                 i += textBatchSize
             }

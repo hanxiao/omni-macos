@@ -96,6 +96,9 @@ public final class OmniVisionTower: @unchecked Sendable {
             fp32WeightCache[key] = c
             return c
         }
+        // The cap came back down (an OCR run raised it to all of RAM while it lasted): let the
+        // cache go instead of holding its copy (~352 MB on Nano) beside the per-forward casts.
+        if !fp32WeightCache.isEmpty { fp32WeightCache.removeAll() }
         return a.asType(.float32)
     }
 

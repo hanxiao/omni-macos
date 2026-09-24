@@ -1,5 +1,6 @@
 import XCTest
 import CoreGraphics
+import ImageIO
 @testable import OmniKit
 
 /// Regression tests for the reconcile-deletion scope: a pass given a SUBSET of the user's roots
@@ -66,6 +67,55 @@ final class IndexerReconcileTests: XCTestCase {
         XCTAssertEqual(store.fileCount(underFolder: b.path), 3, "new root indexed")
         XCTAssertEqual(store.fileCount(underFolder: a.path), 5,
                        "adding root B must not reconcile-delete root A's index")
+    }
+
+    final class CountingEmbedder: Embedder, @unchecked Sendable {
+        let dim = 8
+        private let lock = NSLock()
+        private var n = 0, m = 0
+        var texts: Int { lock.withLock { n } }
+        var images: Int { lock.withLock { m } }
+        private func unit() -> [Float] { var v = [Float](repeating: 0, count: 8); v[0] = 1; return v }
+        func embedText(_ text: String, as type: OmniInputType) -> [Float] { lock.withLock { n += 1 }; return unit() }
+        func embedTextBatch(_ t: [String], as type: OmniInputType) -> [[Float]] { lock.withLock { n += t.count }; return t.map { _ in unit() } }
+        func embedImage(_ image: CGImage) -> [Float]? { nil }
+        func embedImages(_ raws: [OmniVisionPreprocess.RawPatches]) -> [[Float]]? {
+            lock.withLock { m += raws.count }; return raws.map { _ in unit() }
+        }
+        func embedVideoFrames(_ frames: [CGImage]) -> [Float]? { nil }
+        func embedAudio(_ url: URL) -> [Float]? { nil }
+        func embedAudioMel(_ mel: [Float], frames: Int) -> [Float]? { nil }
+        func embedAudioMelBatch(_ mels: [[Float]], frames: [Int]) -> [[Float]]? { nil }
+    }
+
+    private func writePNG(_ url: URL, seed: Int) throws {
+        let ctx = CGContext(data: nil, width: 64, height: 64, bitsPerComponent: 8, bytesPerRow: 0,
+                            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        ctx.setFillColor(CGColor(red: CGFloat(seed % 7) / 7, green: CGFloat(seed % 5) / 5, blue: 0.5, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: 64, height: 32))
+        let dest = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil)!
+        CGImageDestinationAddImage(dest, ctx.makeImage()!, nil)
+        guard CGImageDestinationFinalize(dest) else { throw CocoaError(.fileWriteUnknown) }
+    }
+
+    /// A copied-in tree arrives as one event per folder and file. Each file is embedded once.
+    func testNestedEventsEmbedEachFileOnce() throws {
+        let root = try makeRoot("nested", files: 0)
+        let deep = root.appendingPathComponent("a/b", isDirectory: true)
+        try FileManager.default.createDirectory(at: deep, withIntermediateDirectories: true)
+        for i in 0 ..< 4 { try writePNG(deep.appendingPathComponent("d\(i).png"), seed: i) }
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dbURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omni-reconcile-db-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("index.sqlite")
+        let store = try VectorStore(dbURL: dbURL)
+        let embedder = CountingEmbedder()
+        let indexer = Indexer(store: store, embedder: embedder)
+        let events = [root.path, root.appendingPathComponent("a").path, deep.path]
+            + (0 ..< 4).map { deep.appendingPathComponent("d\($0).png").path }
+        indexer.update(paths: events, settings: IndexSettings(), roots: [root.path])
+        XCTAssertEqual(store.fileCount(underFolder: root.path), 4)
+        XCTAssertEqual(embedder.images, 4, "each image embedded once, not once per covering event")
     }
 
     /// A watcher event naming a root's PARENT as gone (the parent was renamed, or the volume

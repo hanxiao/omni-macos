@@ -3,6 +3,7 @@ import SQLite3
 import Accelerate
 import MLX
 import MLXFast
+import os
 
 /// A single indexed chunk: one file may produce several chunks.
 public struct IndexedChunk: Sendable {
@@ -2048,6 +2049,15 @@ public final class VectorStore: @unchecked Sendable {
         guard sqlite3_open(dbURL.path, &db) == SQLITE_OK else {
             throw OmniError.store("open failed: \(String(cString: sqlite3_errmsg(db)))")
         }
+        // A NEWER FORMAT IS REFUSED, NOT REWRITTEN. The version check below only drops the v2/v3
+        // tables, which a later format would not have, so this build would go on to treat it as
+        // v5 and stamp it 5 - corrupting an index the newer build can read. Nothing past 5 exists
+        // yet; this has to ship before anything does.
+        if userVersion() > Self.v5SchemaVersion {
+            let v = userVersion()
+            sqlite3_close(db); db = nil
+            throw OmniError.store("This index was written by a newer version of Omni (format \(v)). Update Omni to open it.")
+        }
         exec("PRAGMA journal_mode=WAL;")
         // The index is a rebuildable cache, so NORMAL sync under WAL is safe (a crash at worst
         // loses the tail of an in-progress reindex, which the next pass redoes). mmap_size and a
@@ -2620,9 +2630,15 @@ public final class VectorStore: @unchecked Sendable {
             if pathIsPresentLocked(path) { removeRowsByPathsLocked([path], victims: victims) }
             // AFTER the removal, never before: the removal can compact, and a slot decided against
             // the pre-removal numbering would name a different content by the time it is used.
+            // ONE TRANSACTION for placing and recording the slots: placement clears vec_holes rows
+            // and may set the out-of-order flag, and each of those was its own autocommit ahead of
+            // persistSlotsLocked's. A crash between them left a covered position with no hole and
+            // no seated row - the shape the open-time audit refuses.
             var seen: [Data: Int32] = [:]
+            beginTxnLocked()
             let assigned = appendChunksLocked(chunks, bfs: bfs, ids: written.residentIDs, seen: &seen)
             persistSlotsLocked(ids: written.rowIDs, contentIDs: written.contentIDs, slots: assigned)
+            exec("COMMIT;")
             rowWindowAuditLocked("replace")
             // No invalidateBase(): a new path's rows append past baseRows and are scored as delta.
             // A pre-existing path already triggered removeRowsLocked above, which invalidates.
@@ -2722,6 +2738,7 @@ public final class VectorStore: @unchecked Sendable {
             // ONE map for the whole batch: see appendChunksLocked. Per file, two files in one
             // batch holding the same passage stored it twice.
             var seen: [Data: Int32] = [:]
+            beginTxnLocked()   // placement and slot records commit together - see replace()
             for (wi, it) in work.enumerated() {
                 let written = writtenByWork[wi] ?? WrittenChunks()
                 let assigned = appendChunksLocked(it.chunks, bfs: bfs[wi], ids: written.residentIDs,
@@ -2733,6 +2750,7 @@ public final class VectorStore: @unchecked Sendable {
                 }
             }
             persistSlotsLocked(ids: allIDs, contentIDs: allContentIDs, slots: allSlots)
+            exec("COMMIT;")
             rowWindowAuditLocked("replaceMany")
             // No invalidateBase(): appended rows are scored as delta. Any pre-existing path in the
             // batch already triggered removeRowsLocked above, which invalidates the base.
@@ -5142,7 +5160,11 @@ public final class VectorStore: @unchecked Sendable {
         // Preconditions that read no shared state - resolved off the lock. A filtered query or a
         // disabled GPU reduce skips the lock entirely and takes the classic path. (queryGraph.size == dim
         // is checked INSIDE the lock below, since `dim` is mutable shared state - self-review fix.)
-        let prelimFusible = Self.gpuReduce && onlyKindFiltered(filter)
+        // quantizedHint: the last classic search found a quantized base, which the fused path
+        // cannot score. Skipping straight to the classic path saves a whole lock round trip -
+        // one more wait behind an indexing write - on every uncached query of a large index. A
+        // stale hint only picks the other path; both return the same hits.
+        let prelimFusible = Self.gpuReduce && onlyKindFiltered(filter) && !quantizedHint.withLock { $0 }
         var needClassic = !prelimFusible
         // ONE locked snapshot does the fusibility decision AND the execution. The old code took the
         // queue twice (a probe sync then an execute sync) and had to re-check inside because "a write
@@ -5189,7 +5211,10 @@ public final class VectorStore: @unchecked Sendable {
         if needClassic {
             MLX.eval(queryGraph)
             let q = queryGraph.asArray(Float.self)
-            return (search(q, filter: filter, topK: topK), q)
+            // searchDense, not the public search(): that one fuses an explicit `filename:` scope
+            // itself, and the caller fuses this result again - on a quantized base (every large
+            // index) a filename query was fused twice, its scores clamped to 1 in between.
+            return (searchDense(q, filter: filter, topK: topK), q)
         }
         // Evaluated as an ancestor of the scan - this readback is a copy, not a GPU sync.
         let q = queryGraph.asArray(Float.self)
@@ -5404,6 +5429,8 @@ public final class VectorStore: @unchecked Sendable {
                 || patchedSlots.count > Self.patchedRebuildThreshold {
                 rebuildBaseLocked(rowCount: n)
             }
+            let quantized = quantBase != nil || bitBase != nil
+            quantizedHint.withLock { $0 = quantized }
             let t0 = Self.searchTiming ? Date() : nil
             let qv = MLXArray(query, [dim, 1]).asType(.bfloat16)
             // Full mode: exact bf16 scores. Quant mode: COARSE scores from the 4-bit replica
@@ -10495,6 +10522,9 @@ public final class VectorStore: @unchecked Sendable {
     // across dimensions first, which is what makes one bit per dimension informative at all. It is
     // orthogonal, so it changes no inner product - only the basis the signs are taken in.
     private var bitBase: MLXArray? = nil            // [rows, dim/32] packed sign bits
+    /// Whether the base was quantized at the last classic search - read off the lock by
+    /// searchGraphDense to skip a fused attempt that cannot succeed.
+    private let quantizedHint = OSAllocatedUnfairLock(initialState: false)
     private var bitWords: Int { dim / 32 }
     /// Signs for the 1-bit tier's rotation. Independent of `quantSignsLocked`, which is gated on an
     /// off-by-default experiment; this tier always rotates, so it always has them.
@@ -13062,7 +13092,6 @@ public final class VectorStore: @unchecked Sendable {
         var chunkSel: OpaquePointer?
         var occIns: OpaquePointer?
         var snipIns: OpaquePointer?
-        var refsUpd: OpaquePointer?
         var dirIns: OpaquePointer?
         var dirSel: OpaquePointer?
         var fileUpsert: OpaquePointer?
@@ -13071,7 +13100,7 @@ public final class VectorStore: @unchecked Sendable {
         func finalize() {
             sqlite3_finalize(chunk); sqlite3_finalize(text); sqlite3_finalize(vec)
             sqlite3_finalize(chunkIns); sqlite3_finalize(chunkSel); sqlite3_finalize(occIns)
-            sqlite3_finalize(snipIns); sqlite3_finalize(refsUpd)
+            sqlite3_finalize(snipIns)
             sqlite3_finalize(dirIns); sqlite3_finalize(dirSel); sqlite3_finalize(fileUpsert)
         }
     }
@@ -13112,7 +13141,6 @@ public final class VectorStore: @unchecked Sendable {
                                  -1, &w.occIns, nil) == SQLITE_OK,
               sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO chunk_snippet(chunk_id, kind, snippet) VALUES(?,?,?);",
                                  -1, &w.snipIns, nil) == SQLITE_OK,
-              sqlite3_prepare_v2(db, "UPDATE chunk SET refs = refs + 1 WHERE id = ?;", -1, &w.refsUpd, nil) == SQLITE_OK,
               sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO dirs(path) VALUES(?);", -1, &w.dirIns, nil) == SQLITE_OK,
               sqlite3_prepare_v2(db, "SELECT id FROM dirs WHERE path = ?;", -1, &w.dirSel, nil) == SQLITE_OK,
               sqlite3_prepare_v2(db, """
@@ -13273,10 +13301,9 @@ public final class VectorStore: @unchecked Sendable {
                 _ = sqlite3_step(w.snipIns)
 
                 // refs counts the occurrences that exist. INSERT OR REPLACE above may have
-                // overwritten one, so this is recomputed rather than incremented - an increment
-                // that double-counts frees a vector another file still points at, silently.
-                sqlite3_reset(w.refsUpd)
-                sqlite3_bind_int64(w.refsUpd, 1, contentID)
+                // overwritten one, so it is recounted for every dirty content in
+                // persistSlotsLocked rather than incremented here - an increment that double-counts
+                // frees a vector another file still points at, silently.
                 splitDirtyContents.insert(contentID)
             }
 

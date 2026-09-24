@@ -165,13 +165,16 @@ enum DateRange: String, CaseIterable, Identifiable {
         case .year: return "Past Year"
         }
     }
+    /// "Now" rounded down to the minute. The store caches the date mask per cutoff second, and a
+    /// cutoff that moved with every keystroke rebuilt the mask on every search.
     var since: Double? {
         let day: TimeInterval = 86_400
+        let now = (Date().timeIntervalSince1970 / 60).rounded(.down) * 60
         switch self {
         case .any: return nil
-        case .week: return Date().timeIntervalSince1970 - 7 * day
-        case .month: return Date().timeIntervalSince1970 - 30 * day
-        case .year: return Date().timeIntervalSince1970 - 365 * day
+        case .week: return now - 7 * day
+        case .month: return now - 30 * day
+        case .year: return now - 365 * day
         }
     }
 }
@@ -363,7 +366,14 @@ final class AppModel {
     var showPhotoDenied = false
     var queryError: String? = nil   // a file query that couldn't be embedded (decode/missing)
     var rawResults: [SearchHit] = [] { didSet { recomputeResults() } }   // kind/folder/ext/date filtered, score-sorted
-    var searching = false
+    var searching = false {
+        // A stats refresh skipped for this search is owed, and the one-shot callers (pass end,
+        // tag batch, purge, folder removal) have no next tick to pay it - see refreshIndexStats.
+        didSet {
+            if oldValue, !searching, statsRefreshOwed, let store { statsRefreshOwed = false; refreshIndexStats(store) }
+        }
+    }
+    @ObservationIgnored private var statsRefreshOwed = false
     /// The query text the currently displayed results actually correspond to. Lets the UI tell
     /// "results not ready for what you just typed" apart from "this query genuinely has no matches",
     /// so it never flashes "No matches" during the debounce/search window.
@@ -3166,6 +3176,7 @@ final class AppModel {
             indexingPausedForOCR = true
             pauseIndexing()
         }
+        yieldRetagToSearch()   // a tag batch in flight gives the GPU back too; its files re-queue
     }
 
     /// THREE THINGS RESUME, not one. Indexing is only the path that was actually paused; the
@@ -3185,6 +3196,7 @@ final class AppModel {
         if omniPerfEnabled { omniPerfLog("gpu-standdown lifted (ocr run ended)") }
         catchUpPendingRoots()
         drainPendingFSChanges()
+        scheduleTagBackfill()
     }
 
     private func applyMemoryLimit() {
@@ -3668,9 +3680,9 @@ final class AppModel {
     /// thread is what hung the app during a fast crawl of a large index.
     private func refreshIndexStats(_ store: VectorStore) {
         // A search in flight is about to queue on the store's serial queue; indexSummary's full row
-        // scan in front of it would add tens of ms to that query's tail on a large index. Stats are
-        // a progress nicety - skip this tick, the next one (1.5s) catches up.
-        if searching { return }
+        // scan in front of it would add tens of ms to that query's tail on a large index. Deferred
+        // to the search's end, not dropped: a pass completion has no next tick to catch up on.
+        if searching { statsRefreshOwed = true; return }
         let rootPaths = roots.map(\.path) + photoSources.map(\.key)
         let fp = fingerprint
         let dimReady = engineDim > 0
@@ -3792,7 +3804,14 @@ final class AppModel {
         defer { migratingIndex = false }
         isTerminating = true                 // blocks new passes the way the quit drain does
         indexer?.cancel()
-        for _ in 0 ..< 600 where isIndexing { try? await Task.sleep(for: .milliseconds(100)) }
+        // isIndexWorkInFlight, not isIndexing: a watcher reconcile, a tag batch or a folder
+        // catch-up never sets indexState, and each writes the store. Still busy after a minute:
+        // refuse rather than copy under a live writer.
+        for _ in 0 ..< 600 where isIndexWorkInFlight { try? await Task.sleep(for: .milliseconds(100)) }
+        if isIndexWorkInFlight {
+            isTerminating = false
+            return "Indexing did not stop in time. Try again in a moment."
+        }
         serving.detach()
         store?.close()
         store = nil
@@ -5596,7 +5615,11 @@ final class AppModel {
     /// real work always wins between batches. The GPU work itself is the engine's normal
     /// low-priority gate - an interactive search preempts per image.
     private func scheduleTagBackfill() {
-        guard !isTerminating, !isPaperRunning, imageTagsEnabled, !tagBackfillActive, !searching,
+        // !ocrRunActive, !indexObsolete, !isProfilingRunning: the same stand-downs the watcher
+        // drain and the catch-up pass observe. This calls indexer.update() directly too, so it
+        // took the GPU from a transcription and wrote into an index waiting to be rebuilt.
+        guard !isTerminating, !isPaperRunning, !ocrRunActive, !indexObsolete, !isProfilingRunning,
+              imageTagsEnabled, !tagBackfillActive, !searching,
               indexState != .indexing, indexState != .paused,
               activeRoots.isEmpty, !fsReconcileInFlight, pendingFSPaths.isEmpty,
               let engine, engine.tagger != nil, let indexer, let store else { return }
