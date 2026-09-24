@@ -1131,7 +1131,8 @@ struct StatusGlyph: View {
 
 struct CenteredStatus: View {
     /// The Omni mole glyphs (asset names), for `symbol`.
-    static let mole = "MoleGlyph", moleSearch = "MoleSearch", moleOCR = "MoleOCR", moleSleep = "MoleSleep"
+    static let mole = "MoleGlyph", moleSearch = "MoleSearch", moleOCR = "MoleOCR", moleSleep = "MoleSleep",
+               moleSerious = "MoleSerious"
     let symbol: String
     let title: String
     let subtitle: String

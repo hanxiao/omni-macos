@@ -12,11 +12,8 @@ struct OnboardingView: View {
     // - ONE decision: which model to download. Nothing else is offered here.
     var body: some View {
         VStack(spacing: 18) {
-            // The mole waving hello: the same glyph family as every other status screen, in
-            // .secondary here because it is the one screen where the app introduces itself.
-            Image("MoleWelcome").renderingMode(.template).resizable().scaledToFit()
-                .frame(width: 96, height: 96).foregroundStyle(.secondary)
-                .accessibilityHidden(true)   // the headline right below already names the app
+            // The plain mole, through the same view as every status screen: one size, one colour.
+            StatusGlyph(symbol: CenteredStatus.mole)
             Text("Welcome to Omni")
                 .font(.title).fontWeight(.semibold)
             // Names what downloads, so a second download right after install is not read as a mistake.

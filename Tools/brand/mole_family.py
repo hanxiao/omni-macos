@@ -20,6 +20,11 @@ def svg(v):
                 '<path d="M56.2,39.5 Q60,43 63.8,39.5" fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round"/>')
         extra_fill = ('<path d="M80,14 L89,14 L80,23 L89,23" fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>'
                       '<path d="M89.5,28 L95,28 L89.5,33.5 L95,33.5" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>')
+    elif v == "serious":
+        # focused, determined: flat-topped eyes under brows angled down toward the nose
+        eyes = ('<path d="M36.6,39 L43.4,39 A3.4,3.4 0 0 1 36.6,39 Z" fill="black"/>'
+                '<path d="M56.6,39 L63.4,39 A3.4,3.4 0 0 1 56.6,39 Z" fill="black"/>'
+                '<path d="M34.5,31.5 L45,35.5 M65.5,31.5 L55,35.5" fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round"/>')
     elif v == "welcome":
         eyes = ('<path d="M36.2,41 Q40,36.5 43.8,41" fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round"/>'
                 '<path d="M56.2,41 Q60,36.5 63.8,41" fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round"/>')
@@ -50,5 +55,5 @@ def svg(v):
  <path mask="url(#mound)" d="M9,89 C9,79 27,75 50,75 C73,75 91,79 91,89 C91,92 89,94 86,94 L14,94 C11,94 9,92 9,89 Z"/>
  {pawfill}{extra_fill}
 </svg>'''
-for v in ["base", "search", "ocr", "welcome", "sleep"]:
+for v in ["base", "search", "ocr", "sleep", "serious"]:
     open(f"fam-{v}.svg", "w").write(svg(v))

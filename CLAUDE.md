@@ -2641,8 +2641,11 @@ Measured on APFS clones of the real 6.55M-content / 10.7M-occurrence index, no s
 
 ## The mole glyph family (App/Assets.xcassets/Mole*, Tools/brand/mole_family.py)
 One drawn mole, template-rendered so it takes `.tertiary` like an SF Symbol, with one gag per
-screen: `MoleGlyph` launch, `MoleSearch` (star eyes) the search prompt, `MoleOCR` (reading glasses)
-the OCR drop zone, `MoleSleep` (z z) "Add folders to search", `MoleWelcome` (waving) onboarding.
+screen: `MoleGlyph` (plain) onboarding, `MoleSerious` (determined brows) "Loading your index",
+`MoleSearch` (star eyes) the search prompt, `MoleOCR` (reading glasses) the OCR drop zone,
+`MoleSleep` (z z) "Add folders to search". SAME SIZE AND COLOUR EVERYWHERE: every screen draws it
+through `StatusGlyph` (68 pt, `.tertiary`); a one-off size or style on one screen is what made the
+welcome mole read darker than the rest.
 All are rendered from the full 100x100 canvas, never cropped, so the mole keeps one size and place
 across screens. `StatusGlyph` draws any `symbol` starting with "Mole" as one of these. Change the
 drawing in `mole_family.py`, not the PNGs.
