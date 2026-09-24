@@ -65,6 +65,10 @@ struct FolderBrowser: View {
     /// 1,158-entry folder - a selection, a progress tick, a view-mode switch - sorted it again with
     /// `localizedStandardCompare`.
     @State private var sorted: [Entry] = []
+    /// Where the rows' last column actually ends and where the header strip ends, in window
+    /// coordinates. See `headerTrailingPad`.
+    @State private var rowCellsMaxX: CGFloat = 0
+    @State private var headerMaxX: CGFloat = 0
 
     private func setEntries(_ next: [Entry]) {
         entries = next
@@ -217,6 +221,9 @@ struct FolderBrowser: View {
                 }
                 .padding(.leading, BrowserMetrics.rowLead)
                 .padding(.trailing, BrowserMetrics.rowTrail)
+                .onGeometryChange(for: CGFloat.self, of: { $0.frame(in: .global).maxX }) { x in
+                    if abs(x - rowCellsMaxX) > 0.5 { rowCellsMaxX = x }
+                }
                 // Hit shape only. It does NOT govern the right-click highlight on macOS: that is
                 // drawn by AppKit as a square, full-bleed rect, measured as a 22pt band with an
                 // all-zero corner profile against the selection's rounded 20pt. SwiftUI's
@@ -302,7 +309,10 @@ struct FolderBrowser: View {
         }
         .font(.caption)
         .padding(.leading, BrowserMetrics.rowLead + BrowserMetrics.listInset)
-        .padding(.trailing, BrowserMetrics.rowTrail + BrowserMetrics.listInset)
+        .padding(.trailing, headerTrailingPad)
+        .onGeometryChange(for: CGFloat.self, of: { $0.frame(in: .global).maxX }) { x in
+            if abs(x - headerMaxX) > 0.5 { headerMaxX = x }
+        }
         .padding(.vertical, 5)
         // NO fill. In Finder the header sits on the same surface as the toolbar - there is no seam
         // between them - so painting a grey band here is what made it read as a separate component
@@ -310,6 +320,17 @@ struct FolderBrowser: View {
         // divides the header from the ROWS, not from the toolbar.
         .contentShape(.rect)
         .contextMenu { columnMenu }
+    }
+
+    /// The header's trailing padding, MEASURED from the rows rather than assumed. A visible
+    /// scroller (the Automatic setting with a mouse attached, or Always) takes its 17pt from the
+    /// rows and not from the header, so a fixed padding put every column title 17pt right of the
+    /// values under it while the names still lined up. Without a scroller this equals the fixed
+    /// value it replaces.
+    private var headerTrailingPad: CGFloat {
+        let fixed = BrowserMetrics.rowTrail + BrowserMetrics.listInset
+        guard rowCellsMaxX > 0, headerMaxX > 0 else { return fixed }
+        return max(0, headerMaxX - rowCellsMaxX + BrowserMetrics.rowTrail)
     }
 
     /// One header cell. LEFT-ALIGNED IN EVERY COLUMN, including the numeric ones - Finder sorted by

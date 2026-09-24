@@ -1374,6 +1374,8 @@ public final class Indexer: @unchecked Sendable {
     /// never deleted by prefix here - see the vanished-path loop.
     public func update(paths: [String], settings: IndexSettings, force: Bool = false, roots: [String] = []) {
         beginChunkReuse(settings)
+        let tUpdate = Date()
+        let tok0 = (embedder as? OmniEngine)?.tokensProcessed ?? 0
         let fm = FileManager.default
         // Resolve the concrete files first: the explicit events, plus a crawl of any directory event
         // (a new folder / bulk move-in carries only the folder path). Then look up the PRIOR stored
@@ -1675,6 +1677,11 @@ public final class Indexer: @unchecked Sendable {
         flushReplace()
         let dedupHits = takeDedupHits()
         if dedupHits > 0 { Self.log.info("content dedup (update): \(dedupHits, privacy: .public) file(s) reused stored vectors") }
+        // What one watcher batch cost: files examined, files decoded, how many of those reused
+        // stored vectors, what was removed, and the tokens that actually reached the model.
+        omniPerfLog(String(format: "update events=%d files=%d work=%d dedup=%d deleted=%d prefixes=%d tokens=%d %.0fms",
+                           paths.count, files.count, work.count, dedupHits, toDelete.count, vanishedPrefixes.count,
+                           ((embedder as? OmniEngine)?.tokensProcessed ?? 0) - tok0, -tUpdate.timeIntervalSinceNow * 1000))
         embedder.indexingIdle()   // arm the debounced GPU buffer-cache trim
     }
 

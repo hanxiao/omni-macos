@@ -13,7 +13,7 @@ import OmniKit
 /// `wait:<seconds>`. For recording the intro video: `type:<text>` (a key at a time, searching at
 /// each word), `similar:<path>`, `select:<result index>`, `map:<folder>`, `frame:<w>x<h>`
 /// (window size, centered), `front`, `appearance:light|dark`, `history:<n>`, `sort:<order>`,
-/// `bsort:<name|column rawValue>`, `settings:<tab>`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
+/// `bsort:<name|column rawValue>`, `settings:<tab>`, `sidebarselect:<n>`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
 /// CPU is read, so what it set in motion is counted too. `repeat:<n>` before a step repeats it.
 @MainActor
 enum PerfScript {
@@ -88,9 +88,23 @@ enum PerfScript {
                 menu.performActionForItem(at: i)
             }
             NotificationCenter.default.post(name: .omniPerfSettingsTab, object: arg)
+        case "sidebarselect":   // select the n-th indexed folder in the sidebar, as a click would
+            NotificationCenter.default.post(name: .omniPerfSidebarSelect, object: Int(arg) ?? 0)
+        case "sidebarfocus":    // give the sidebar keyboard focus, which a click on a row does
+            if let w = NSApp.windows.first(where: { $0.isVisible && $0.toolbar != nil }),
+               let outline = firstView(of: NSOutlineView.self, in: w.contentView) {
+                w.makeFirstResponder(outline)
+            }
         case "appearance": NSApp.appearance = NSAppearance(named: arg == "dark" ? .darkAqua : .aqua)
         default: omniPerfLog("script: unknown step \(step)")
         }
+    }
+
+    private static func firstView<T: NSView>(of type: T.Type, in root: NSView?) -> T? {
+        guard let root else { return nil }
+        if let hit = root as? T { return hit }
+        for sub in root.subviews { if let hit = firstView(of: type, in: sub) { return hit } }
+        return nil
     }
 
     /// A key at a time, as a person types: the box shows each character and a search runs at each
@@ -120,4 +134,5 @@ extension Notification.Name {
     /// PerfScript's `bsort:` step: the folder browser treats it as a click on that column header.
     static let omniPerfBrowseSort = Notification.Name("omni.perf.browseSort")
     static let omniPerfSettingsTab = Notification.Name("omni.perf.settingsTab")
+    static let omniPerfSidebarSelect = Notification.Name("omni.perf.sidebarSelect")
 }

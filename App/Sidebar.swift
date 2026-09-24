@@ -21,6 +21,86 @@ private struct SidebarMaterial: ViewModifier {
     }
 }
 
+/// FINDER'S TAHOE SELECTION, measured side by side on one display: a light grey rounded fill
+/// (239 on the 250 sidebar, where AppKit's own is 220) with the row's icon AND title in the accent
+/// colour, where ours kept them black and grey. AppKit's highlight is switched off on this outline
+/// view (SidebarHighlightOff) and the row draws Finder's instead, so the pill does not change with
+/// keyboard focus the way AppKit's does - Finder's never does either.
+private struct SidebarSelectionKey: EnvironmentKey { static let defaultValue: SidebarSelection? = nil }
+private struct SidebarRowSelectedKey: EnvironmentKey { static let defaultValue = false }
+extension EnvironmentValues {
+    fileprivate var sidebarSelection: SidebarSelection? {
+        get { self[SidebarSelectionKey.self] } set { self[SidebarSelectionKey.self] = newValue }
+    }
+    /// True inside the selected row: its icon and title take the accent colour.
+    fileprivate var sidebarRowSelected: Bool {
+        get { self[SidebarRowSelectedKey.self] } set { self[SidebarRowSelectedKey.self] = newValue }
+    }
+}
+
+private struct SidebarRow: ViewModifier {
+    let tag: SidebarSelection
+    @Environment(\.sidebarSelection) private var selection
+    @Environment(\.colorScheme) private var scheme
+    func body(content: Content) -> some View {
+        let on = selection == tag
+        content
+            .environment(\.sidebarRowSelected, on)
+            .tag(tag)
+            .listRowBackground(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(on ? Color.primary.opacity(scheme == .dark ? 0.10 : 0.045) : .clear)
+                    .padding(.horizontal, 10)
+            )
+    }
+}
+
+extension View {
+    fileprivate func sidebarRow(_ tag: SidebarSelection) -> some View { modifier(SidebarRow(tag: tag)) }
+    /// The selected row's icon and title: the accent colour, laid on the pill with a plus-darker
+    /// blend in light mode. That is Finder's sidebar vibrancy, and what makes its blue (0,104,236)
+    /// rather than the flat accent (0,122,255) - 122+239-255 and 255+239-255 over its 239 pill.
+    fileprivate func sidebarTint(_ on: Bool, else other: some ShapeStyle) -> some View {
+        modifier(SidebarTint(on: on, other: AnyShapeStyle(other)))
+    }
+}
+
+private struct SidebarTint: ViewModifier {
+    let on: Bool
+    let other: AnyShapeStyle
+    @Environment(\.colorScheme) private var scheme
+    func body(content: Content) -> some View {
+        content
+            .foregroundStyle(on ? AnyShapeStyle(.tint) : other)
+            .blendMode(on && scheme == .light ? .plusDarker : .normal)
+    }
+}
+
+/// Turns AppKit's selection highlight off on the sidebar's table; SidebarRow draws it. Attached as
+/// the List's background, so the nearest table above it is the sidebar's own - the walk goes up one
+/// container at a time and takes the first table inside it. Re-applied on update: SwiftUI can
+/// rebuild the table when the section structure changes (nested vs flat folders).
+private struct SidebarHighlightOff: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView { NSView() }
+    func updateNSView(_ view: NSView, context: Context) {
+        DispatchQueue.main.async {
+            var container = view.superview
+            while let c = container {
+                if let table = Self.firstTable(in: c) {
+                    if table.selectionHighlightStyle != .none { table.selectionHighlightStyle = .none }
+                    return
+                }
+                container = c.superview
+            }
+        }
+    }
+    private static func firstTable(in root: NSView) -> NSTableView? {
+        if let t = root as? NSTableView { return t }
+        for sub in root.subviews { if let t = firstTable(in: sub) { return t } }
+        return nil
+    }
+}
+
 struct Sidebar: View {
     @Environment(AppModel.self) private var model: AppModel
     @State private var dropTargeted = false
@@ -76,13 +156,13 @@ struct Sidebar: View {
                     ForEach(model.folderTree) { node in
                         OutlineGroup(node, children: \.children) { item in
                             folderRow(item.url)
-                                .tag(SidebarSelection.folder(item.url))
+                                .sidebarRow(.folder(item.url))
                         }
                     }
                 } else {
                     ForEach(model.folderTree) { node in
                         folderRow(node.url)
-                            .tag(SidebarSelection.folder(node.url))
+                            .sidebarRow(.folder(node.url))
                     }
                 }
                 photoRows
@@ -100,7 +180,7 @@ struct Sidebar: View {
         ForEach(model.photoSources) { source in
             PhotoSourceRow(source: source,
                            deselect: { if selection == .photos(source.key) { selection = nil } })
-            .tag(SidebarSelection.photos(source.key))
+            .sidebarRow(.photos(source.key))
         }
     }
 
@@ -120,6 +200,8 @@ struct Sidebar: View {
     var body: some View {
         list
             .listStyle(.sidebar)
+            .environment(\.sidebarSelection, selection)
+            .background(SidebarHighlightOff())
         // Let the window's own sidebar material show through instead of the List's opaque fill.
         // The trailing inspector gets that for free because the system draws its background; a
         // sidebar List paints its own on top of it, which is what made this column read as a flat
@@ -169,6 +251,9 @@ struct Sidebar: View {
             reconcileSelection()
         })
         .onChange(of: model.fileQuery) { _, _ in reconcileSelection() }
+        .onReceive(NotificationCenter.default.publisher(for: .omniPerfSidebarSelect)) { note in
+            if let i = note.object as? Int, model.roots.indices.contains(i) { selection = .folder(model.roots[i]) }
+        }
         .sheet(isPresented: Binding(get: { model.showPhotoPicker }, set: { model.showPhotoPicker = $0 })) { PhotoSourcePicker() }
         .sheet(isPresented: Binding(get: { model.showPhotoDenied }, set: { model.showPhotoDenied = $0 })) { PhotoAccessDenied() }
         .onDeleteCommand {
@@ -250,7 +335,7 @@ private struct HistorySections: View {
                             Label("Remove from History", systemImage: "trash")
                         }
                     }
-                    .tag(SidebarSelection.history(item.id))
+                    .sidebarRow(.history(item.id))
                 }
             } header: {
                 header(group.title, items: group.items)
@@ -258,13 +343,16 @@ private struct HistorySections: View {
         }
     }
 
+    @Environment(\.sidebarSelection) private var selection
+
     @ViewBuilder private func row(_ item: HistoryItem) -> some View {
-                    HStack(spacing: 7) {
+                    let on = selection == .history(item.id)
+                                        HStack(spacing: 7) {
                         if item.bookmarked {
                             // Monochrome, like every other glyph in this list. The rows it marks
                             // are already under a Bookmarks header, so the colour was carrying no
                             // information the reader did not already have from the grouping.
-                            Image(systemName: "star.fill").foregroundStyle(Color.secondary).frame(width: 16)
+                            Image(systemName: "star.fill").sidebarTint(on, else: Color.secondary).frame(width: 16)
                         } else if item.isFile, let p = item.filePath {
                             // A file query: show its thumbnail (falls back to a generic icon if the
                             // file is gone, so deleted files degrade gracefully).
@@ -273,14 +361,15 @@ private struct HistorySections: View {
                             // An agent's tool call, marked with the protocol's own mark rather than
                             // a globe: the globe says the query crossed a socket, which is true of
                             // every served row and therefore tells the reader nothing.
-                            MCPMark().foregroundStyle(Color.secondary).frame(width: 16, height: 16)
+                            MCPMark().sidebarTint(on, else: Color.secondary).frame(width: 16, height: 16)
                         } else if item.isServed {
                             // The REST surface: a script or a curl, not an agent.
-                            Image(systemName: "network").foregroundStyle(Color.secondary).frame(width: 16)
+                            Image(systemName: "network").sidebarTint(on, else: Color.secondary).frame(width: 16)
                         } else {
-                            Image(systemName: "magnifyingglass").foregroundStyle(Color.secondary).frame(width: 16)
+                            Image(systemName: "magnifyingglass").sidebarTint(on, else: Color.secondary).frame(width: 16)
                         }
                         Text(item.displayLabel).lineLimit(1).truncationMode(item.isFile ? .middle : .tail)
+                            .sidebarTint(on, else: .primary)
                             .layoutPriority(1)            // the words the reader typed survive; the scope gives way first
                         if let scope = item.displayScope {
                             Text(scope).font(.caption).foregroundStyle(.tertiary)
@@ -397,6 +486,7 @@ enum RootIndexState {
 /// One Photos source. Its own `View` for the same reason `FolderRow` is: the badge column has four
 /// states and the inline version put the whole `List` past the type checker's budget.
 private struct PhotoSourceRow: View {
+    @Environment(\.sidebarRowSelected) private var selected
     @Environment(AppModel.self) private var model: AppModel
     let source: PhotoLibrary.Source
     let deselect: () -> Void
@@ -414,8 +504,9 @@ private struct PhotoSourceRow: View {
     var body: some View {
         HStack(spacing: 7) {
             Image(systemName: source.isAll ? "photo.on.rectangle.angled" : "rectangle.stack")
-                .foregroundStyle(.secondary).frame(width: 16)
+                .sidebarTint(selected, else: .secondary).frame(width: 16)
             Text(source.title).lineLimit(1).truncationMode(.middle)
+                .sidebarTint(selected, else: .primary)
             Spacer()
             if model.isFolderPaused(path: source.key) {
                 if let c = model.folderFileCounts[source.key], c > 0 {
@@ -479,14 +570,15 @@ private struct PhotoSourceRow: View {
 /// the thing that makes it worth listing - selecting it browses it, and its context menu still
 /// offers "Add to Search Scope", which is how several folders get searched at once.
 private struct CoveredFolderRow: View {
+    @Environment(\.sidebarRowSelected) private var selected
     @Environment(AppModel.self) private var model: AppModel
     let url: URL
 
     var body: some View {
         HStack(spacing: 7) {
-            Image(systemName: "folder").foregroundStyle(.tertiary).frame(width: 16)
+            Image(systemName: "folder").sidebarTint(selected, else: .tertiary).frame(width: 16)
             Text(url.lastPathComponent).lineLimit(1).truncationMode(.middle)
-                .foregroundStyle(.secondary)
+                .sidebarTint(selected, else: .secondary)
             Spacer()
         }
         .help(model.rootCovering(url).map { "Indexed as part of \($0.lastPathComponent)" }
@@ -504,6 +596,7 @@ private struct CoveredFolderRow: View {
 }
 
 private struct FolderRow: View {
+    @Environment(\.sidebarRowSelected) private var selected
     @Environment(AppModel.self) private var model: AppModel
     let url: URL
     /// Let the sidebar drop a selection pointing at this row, just before it is removed.
@@ -512,8 +605,9 @@ private struct FolderRow: View {
     var body: some View {
         HStack(spacing: 7) {
             Image(systemName: SpecialFolder.symbol(for: url))
-                .foregroundStyle(.secondary).frame(width: 16)
+                .sidebarTint(selected, else: .secondary).frame(width: 16)
             Text(url.lastPathComponent).lineLimit(1).truncationMode(.middle)
+                .sidebarTint(selected, else: .primary)
             Spacer()
             if model.isFolderPaused(url) {
                 // Paused: indexing skips this folder. Show the count it already has,

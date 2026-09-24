@@ -2197,7 +2197,10 @@ final class AppModel {
         UserDefaults.standard.bool(forKey: "omni.ephemeralUIState")
 
     private func persistHistory() {
-        guard !Self.ephemeralUIState else { return }
+        // An isolated run (`-omni.dbDir` as a launch argument) READS the user's history, so a perf
+        // script can replay it, and never writes it: a test's searches used to land in the real
+        // sidebar and, at the 200-item cap, push the user's own out.
+        guard !Self.ephemeralUIState, !Self.isolatedByLaunchArgument else { return }
         if let data = try? JSONEncoder().encode(searchHistory) { UserDefaults.standard.set(data, forKey: historyKey) }
     }
 
@@ -4162,7 +4165,7 @@ final class AppModel {
         photoSources = canonicalizePhotoSources(saved)
     }
     private func savePhotoSources() {
-        guard !Self.ephemeralUIState else { return }
+        guard !Self.ephemeralUIState, !Self.isolatedByLaunchArgument else { return }
         UserDefaults.standard.set(try? JSONEncoder().encode(photoSources), forKey: "omni.photoSources")
     }
 
