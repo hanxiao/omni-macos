@@ -12,7 +12,8 @@ import OmniKit
 /// Steps: `browse:<folder>`, `view:list|grid`, `sidebar` (toggle), `search:<text>`, `clear`,
 /// `wait:<seconds>`. For recording the intro video: `type:<text>` (a key at a time, searching at
 /// each word), `similar:<path>`, `select:<result index>`, `map:<folder>`, `frame:<w>x<h>`
-/// (window size, centered), `front` and `appearance:light|dark`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
+/// (window size, centered), `front`, `appearance:light|dark`, `history:<n>`, `sort:<order>`,
+/// `bsort:<name|column rawValue>`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
 /// CPU is read, so what it set in motion is counted too. `repeat:<n>` before a step repeats it.
 @MainActor
 enum PerfScript {
@@ -71,6 +72,13 @@ enum PerfScript {
             // A covered window is not redrawn (occlusion), so a recording of it freezes.
             NSApp.activate(ignoringOtherApps: true)
             NSApp.windows.first(where: { $0.isVisible && $0.toolbar != nil })?.orderFrontRegardless()
+        case "history":   // the sidebar row click: same call the selection handler makes
+            if let i = Int(arg), model.searchHistory.indices.contains(i) { _ = model.runHistoryQuery(model.searchHistory[i]) }
+        case "ocr": model.ocrMode = true
+        case "remember": model.recordCurrentSearchToHistory(viaSubmit: true)   // what Return does
+        case "sort": model.sortOrder = SortOrder(rawValue: arg) ?? .relevance
+        case "bsort":     // a column-header click in the folder browser
+            NotificationCenter.default.post(name: .omniPerfBrowseSort, object: arg)
         case "appearance": NSApp.appearance = NSAppearance(named: arg == "dark" ? .darkAqua : .aqua)
         default: omniPerfLog("script: unknown step \(step)")
         }
@@ -97,4 +105,9 @@ enum PerfScript {
         for sub in view.subviews { if let s = splitView(in: sub) { return s } }
         return nil
     }
+}
+
+extension Notification.Name {
+    /// PerfScript's `bsort:` step: the folder browser treats it as a click on that column header.
+    static let omniPerfBrowseSort = Notification.Name("omni.perf.browseSort")
 }

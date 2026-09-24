@@ -12,13 +12,10 @@ struct OnboardingView: View {
     // - ONE decision: which model to download. Nothing else is offered here.
     var body: some View {
         VStack(spacing: 18) {
-            // The app's own icon, read from the running bundle (NOT an asset name or a bundled
-            // file): whatever ships as AppIcon is what shows here, so the icon and this screen can
-            // never drift apart. It replaces an SF Symbol placeholder - a generic square.stack on
-            // the one screen where the app introduces itself.
-            Image(nsImage: NSApp.applicationIconImage)
-                .resizable().interpolation(.high)
-                .frame(width: 84, height: 84)
+            // The mole waving hello: the same glyph family as every other status screen, in
+            // .secondary here because it is the one screen where the app introduces itself.
+            Image("MoleWelcome").renderingMode(.template).resizable().scaledToFit()
+                .frame(width: 96, height: 96).foregroundStyle(.secondary)
                 .accessibilityHidden(true)   // the headline right below already names the app
             Text("Welcome to Omni")
                 .font(.title).fontWeight(.semibold)

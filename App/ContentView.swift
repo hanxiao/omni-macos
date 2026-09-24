@@ -311,7 +311,7 @@ struct ContentView: View {
         // photo library has a source and can search, and telling them to add a folder over the
         // top of it would be wrong.
         if !model.hasSources {
-            CenteredStatus(symbol: "folder.badge.plus", title: "Add folders to search",
+            CenteredStatus(symbol: CenteredStatus.moleSleep, title: "Add folders to search",
                            subtitle: "", showSpinner: false,
                            action: ("Add\u{2026}", { SourcePicker.add(to: model) }),
                            prominent: true)
@@ -1113,9 +1113,25 @@ private struct FileQueryChip: View {
     }
 }
 
+/// The icon above a centered status: an SF Symbol, or one of the Omni mole glyphs when the name
+/// starts with "Mole" (asset catalogue templates, so they take `.tertiary` like a symbol does).
+/// One mole per screen, each with its own small gag - see Tools/brand/mole_family.py.
+struct StatusGlyph: View {
+    let symbol: String
+    var body: some View {
+        if symbol.hasPrefix("Mole") {
+            Image(symbol).renderingMode(.template).resizable().scaledToFit()
+                .frame(width: 68, height: 68).foregroundStyle(.tertiary)
+                .accessibilityHidden(true)
+        } else {
+            Image(systemName: symbol).font(.system(size: 44, weight: .light)).foregroundStyle(.tertiary)
+        }
+    }
+}
+
 struct CenteredStatus: View {
-    /// Pass as `symbol` for the monochrome Omni mark instead of an SF Symbol.
-    static let mole = "omni.mole"
+    /// The Omni mole glyphs (asset names), for `symbol`.
+    static let mole = "MoleGlyph", moleSearch = "MoleSearch", moleOCR = "MoleOCR", moleSleep = "MoleSleep"
     let symbol: String
     let title: String
     let subtitle: String
@@ -1132,14 +1148,7 @@ struct CenteredStatus: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            if symbol == CenteredStatus.mole {
-                // The app's own mark, as a template: it takes .tertiary the way a symbol does, so it
-                // sits in the same place and weight, and reads as the brand without a coloured icon.
-                Image("MoleGlyph").renderingMode(.template).resizable().scaledToFit()
-                    .frame(width: 60, height: 60).foregroundStyle(.tertiary)
-            } else {
-                Image(systemName: symbol).font(.system(size: 44, weight: .light)).foregroundStyle(.tertiary)
-            }
+            StatusGlyph(symbol: symbol)
             Text(title).font(.title)
             if !subtitle.isEmpty {
                 Text(subtitle).font(.callout).foregroundStyle(.secondary)
@@ -1181,7 +1190,7 @@ struct SearchWaysPrompt: View {
     /// Both modes want the same thing said the same way - an icon, what this pane is for, and the
     /// handful of ways in - so building a second layout for OCR only made the window restructure
     /// itself for no gain.
-    var symbol: String = "sparkle.magnifyingglass"
+    var symbol: String = CenteredStatus.moleSearch
     var ways: [(icon: String, text: String)] = SearchWaysPrompt.searchWays
     /// Something to do about what the rows just described - the OCR pane hangs its download button
     /// here when the model is missing. `AnyView` because this view is built once per empty state
@@ -1212,7 +1221,7 @@ struct SearchWaysPrompt: View {
 
     var body: some View {
         VStack(spacing: 16) {
-            Image(systemName: symbol).font(.system(size: 44, weight: .light)).foregroundStyle(.tertiary)
+            StatusGlyph(symbol: symbol)
             Text(title)
                 .font(.title)
                 .contentTransition(.numericText(value: Double(count)))

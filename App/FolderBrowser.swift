@@ -139,6 +139,11 @@ struct FolderBrowser: View {
         .onChange(of: model.browserReloadTick) { _, _ in Task { await reload(quiet: true) } }
         .task(id: folder) { await followIndexing() }
         .task(id: folder) { await followProgress() }
+        // PerfScript's `bsort:` step, as a header click. Nothing else posts it.
+        .onReceive(NotificationCenter.default.publisher(for: .omniPerfBrowseSort)) { note in
+            guard let key = note.object as? String else { return }
+            clickHeader(key == "name" ? .name : BrowserColumn(rawValue: key).map { .column($0) } ?? .name)
+        }
     }
 
     // MARK: - Bodies
@@ -328,10 +333,12 @@ struct FolderBrowser: View {
                     .opacity(active ? 1 : 0)
             }
             .contentShape(.rect)
-            .onTapGesture {
-                if sort == target { ascending.toggle() } else { sort = target; ascending = true }
-                sorted = Self.order(entries, by: sort, ascending: ascending)
-            }
+            .onTapGesture { clickHeader(target) }
+    }
+
+    private func clickHeader(_ target: BrowserSort) {
+        if sort == target { ascending.toggle() } else { sort = target; ascending = true }
+        sorted = Self.order(entries, by: sort, ascending: ascending)
     }
 
     /// The header's right-click menu. Name is absent on purpose - Finder will not let you turn it

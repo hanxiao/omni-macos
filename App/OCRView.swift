@@ -33,7 +33,7 @@ struct OCRView: View {
             switch session.phase {
             case .empty:
                 SearchWaysPrompt(title: "Drop a document to transcribe",
-                                 symbol: "text.viewfinder",
+                                 symbol: CenteredStatus.moleOCR,
                                  ways: SearchWaysPrompt.transcribeWays,
                                  // Something to click. The rows describe ways in, but an empty
                                  // pane whose only affordance is a drag leaves anyone without a
