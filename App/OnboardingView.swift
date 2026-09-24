@@ -91,12 +91,18 @@ struct OnboardingView: View {
             label(Self.choices[choice].title, Self.choices[choice].size)
         }
 
+        // NO FOCUS HALO. The window focuses the first button on open, and the ring drawn around it
+        // made it read 6pt taller than its twin (47 against 41 measured, same button underneath).
+        // The recommended one is the default button instead, so Return still starts it.
         if prominent {
             Button(action: action) { content }
                 .controlSize(.large).buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .focusEffectDisabled()
         } else {
             Button(action: action) { content }
                 .controlSize(.large).buttonStyle(.bordered)
+                .focusEffectDisabled()
         }
     }
 
