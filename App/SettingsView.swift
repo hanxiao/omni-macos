@@ -352,8 +352,26 @@ private struct ContentTypesTab: View {
             } header: {
                 Text("Ignore rules")
             } footer: {
-                Text(".gitignore syntax, one pattern per line.")
+                Text(".gitignore syntax, one pattern per line. An .omniignore file inside a folder applies to that folder.")
                     .font(.caption).foregroundStyle(.secondary)
+            }
+
+            // The folders' own files, which the rules above do not show. Edited where they live.
+            if !model.folderPolicies.isEmpty {
+                Section("Folder ignore files") {
+                    ForEach(model.folderPolicies.keys.sorted(), id: \.self) { dir in
+                        LabeledContent {
+                            Button("Show in Finder") {
+                                NSWorkspace.shared.activateFileViewerSelecting(
+                                    [URL(fileURLWithPath: dir).appendingPathComponent(OmniIgnore.fileName)])
+                            }
+                        } label: {
+                            Text((dir as NSString).abbreviatingWithTildeInPath)
+                                .lineLimit(1).truncationMode(.middle)
+                                .help(dir)
+                        }
+                    }
+                }
             }
         }
         .formStyle(.grouped)

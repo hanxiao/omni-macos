@@ -178,6 +178,31 @@ final class IndexerReconcileTests: XCTestCase {
         XCTAssertEqual(live.fileCount(underFolder: root.path), 1)
     }
 
+    /// Issue #23: a renamed or moved ROOT is handed to the reconcile as one batch naming both
+    /// paths (AppModel.relocateFolder). The new path must be indexed from the old rows' vectors -
+    /// no embedding at all - and only then the old rows deleted.
+    func testMovedRootReusesItsVectors() throws {
+        let root = try makeRoot("moveroot", files: 0)
+        for i in 0 ..< 3 { try writePNG(root.appendingPathComponent("p\(i).png"), seed: i) }
+        let moved = root.deletingLastPathComponent().appendingPathComponent(root.lastPathComponent + "-renamed")
+        defer { try? FileManager.default.removeItem(at: root); try? FileManager.default.removeItem(at: moved) }
+        let dbURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omni-reconcile-db-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("index.sqlite")
+        let store = try VectorStore(dbURL: dbURL)
+        let embedder = CountingEmbedder()
+        let indexer = Indexer(store: store, embedder: embedder)
+        runPass(indexer, roots: [root])
+        XCTAssertEqual(store.fileCount(underFolder: root.path), 3)
+        let embedded = embedder.images
+
+        try FileManager.default.moveItem(at: root, to: moved)
+        indexer.update(paths: [moved.path, root.path], settings: IndexSettings(), roots: [moved.path])
+        XCTAssertEqual(store.fileCount(underFolder: moved.path), 3, "the new path is indexed")
+        XCTAssertEqual(store.fileCount(underFolder: root.path), 0, "the old path is gone")
+        XCTAssertEqual(embedder.images, embedded, "a move re-embeds nothing")
+    }
+
     /// A case-only rename on a case-insensitive volume: the old spelling still stats (it is the same
     /// file), and it used to stay indexed beside the new one.
     func testCaseOnlyRenameLeavesOneRow() throws {

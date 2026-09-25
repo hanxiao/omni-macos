@@ -43,7 +43,7 @@ public struct OmniIgnore: Sendable, Equatable {
 
     public init(text: String) {
         var rs: [Rule] = []
-        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
+        for rawLine in text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline) {   // "\r\n" is ONE Character: a split on "\n" missed it
             var line = String(rawLine)
             if line.hasSuffix("\r") { line.removeLast() }
             // Trailing unescaped whitespace is not significant in gitignore; leading too for our use.
@@ -67,6 +67,54 @@ public struct OmniIgnore: Sendable, Equatable {
     }
 
     public var isEmpty: Bool { rules.isEmpty }
+
+    /// The name of a policy file, central or inside a folder.
+    public static let fileName = ".omniignore"
+
+    /// A `.omniignore` found INSIDE an indexed folder, rewritten as central rules anchored at that
+    /// folder (issue #23: "It is difficult pushing a single ban on json or jsonl in some folders
+    /// without it"). The semantics are git's for a nested `.gitignore`:
+    /// - a pattern with no `/` matches at any depth BELOW the folder: `*.json` -> `<dir>/**/*.json`
+    /// - a pattern with a `/` is relative to the folder: `/build` and `out/tmp` -> `<dir>/build`,
+    ///   `<dir>/out/tmp`
+    /// - `!` and a trailing `/` keep their meaning.
+    ///
+    /// The folder's own path is ESCAPED, because the matcher reads `*`, `?` and `[` in it as glob
+    /// characters: a folder named `[draft]` would otherwise match `d`, `r`, `a`... and nothing
+    /// under the real folder. Each becomes a one-character class (`[*]`, `[?]`, `[[]`), which the
+    /// matcher treats as the literal character.
+    ///
+    /// Translated rather than evaluated in place so everything that already reads the policy - the
+    /// crawl, the watcher's per-path check, the prune after a change, the Settings preview -
+    /// honours a folder's rules with no second code path to keep in step.
+    public static func scoped(_ text: String, to dir: String) -> String {
+        var base = ""
+        for ch in dir {
+            switch ch {
+            case "*", "?", "[": base += "[\(ch)]"
+            default: base.append(ch)
+            }
+        }
+        while base.hasSuffix("/") { base.removeLast() }
+        var out: [String] = []
+        for rawLine in text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline) {   // "\r\n" is ONE Character: a split on "\n" missed it
+            var p = String(rawLine)
+            if p.hasSuffix("\r") { p.removeLast() }
+            p = p.trimmingCharacters(in: .whitespaces)
+            if p.isEmpty || p.hasPrefix("#") { continue }
+            var bang = ""
+            if p.hasPrefix("!") { bang = "!"; p.removeFirst() }
+            if p.hasPrefix("\\#") || p.hasPrefix("\\!") { p.removeFirst() }
+            var slash = ""
+            if p.hasSuffix("/") { slash = "/"; p.removeLast() }
+            if p.isEmpty { continue }
+            let anchored = p.contains("/")
+            while p.hasPrefix("/") { p.removeFirst() }
+            if p.isEmpty { continue }
+            out.append(bang + base + (anchored ? "/" : "/**/") + p + slash)
+        }
+        return out.joined(separator: "\n")
+    }
 
     /// Build the default policy text migrated from the legacy kind/extension settings: seed the
     /// well-known noise directories the old crawl always skipped, then exclude the extensions of every

@@ -2664,3 +2664,32 @@ drawing in `mole_family.py`, not the PNGs.
   skips every directory rule.
 - An isolated run (`-omni.dbDir` launch argument) keeps its `.omniignore` beside its index and never
   writes the migration marker, so tests cannot migrate the user's real policy.
+
+## Renamed folders, folder .omniignore files, OCR path check (issue #23, 2026-09-25)
+
+Measured on an isolated run: renaming an added folder in the Finder is followed and re-embeds
+nothing (`update ... dedup=112 tokens=0` for 112 files).
+
+- A RENAME ONLY AVOIDS THE GPU WHILE THE OLD ROWS EXIST. Nothing renames rows (the path table only
+  appends); the new path is indexed and content dedup copies the old rows' vectors. So every change
+  here is about ORDER: the old rows must outlive the indexing of the new path.
+- VANISHED WATCHER PATHS ARE NOT HELD BACK. A rename inside a root already arrives as one watcher
+  batch and reuses its vectors, even with 60 images landing during it (measured, dedup = file
+  count). A 5 s hold was tried: it only kept deleted files searchable longer.
+- A CANCELLED `update()` DELETES NOTHING THAT VANISHED. It used to run the deletes after a cancel
+  cut the embedding short; the app re-queues a cancelled batch, vanished paths included (they are
+  kept even outside every root, since their only work is deleting rows).
+- A RENAMED OR MOVED ROOT IS FOLLOWED (`followMovedFolders`): one bookmark per added folder
+  (`omni.folderBookmarks`), resolved when a folder goes missing - on the watcher's vanished event,
+  at launch and when the app becomes active. Trash and unmounted volumes are not followed. The new
+  and old paths go to the reconcile as ONE batch, which indexes the new path first and deletes the
+  old after; a catch-up pass plus a queued delete cannot hold that order at launch.
+- A `.omniignore` INSIDE A FOLDER is rewritten into central rules anchored there
+  (`OmniIgnore.scoped`, git's nested semantics, the folder path glob-escaped) and appended after the
+  central file, so everything that reads `ignore` honours it with no second code path. Found by the
+  crawl (`FileCrawler.onPolicyFile`, a name compare on entries it lists anyway) and by watcher
+  events; remembered in `omni.folderPolicies`. The full pass never removes what a new rule
+  excludes, so a change prunes under that folder explicitly - after the pass stops if one is running.
+- THE OCR PATH CHECK JUDGES THE FILE, NOT THE SPELLING: `pathIsInIndexedRoot` resolves with
+  realpath(3), so a path differing from the stored root in case or `/private` is accepted and a
+  symlink out of a root is still refused.

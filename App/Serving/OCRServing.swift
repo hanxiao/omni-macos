@@ -78,7 +78,8 @@ enum OCRServing {
         if p.hasPrefix("file://"), let u = URL(string: p) { p = u.path }
         let path = normalizeStorePath(p)
         guard pathIsInIndexedRoot(path) else {
-            let fix = inlineHint ? "send the file's bytes inline instead" : "list_sources shows which folders those are"
+            let fix = inlineHint ? "send the file's bytes inline instead"
+                : "list_sources shows which folders those are, and add_source adds one (Omni then indexes it)"
             return .failure(.badInput("'\(path)' is outside the indexed folders; \(fix)"))
         }
         let url = URL(fileURLWithPath: path)

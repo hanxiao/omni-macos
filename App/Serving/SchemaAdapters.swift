@@ -531,20 +531,31 @@ private let tagMaxImageDimension = 1568
 /// time: ServingController.attach runs once at engine load (AppModel.swift), and the user can add
 /// or remove roots at any point afterwards.
 ///
-/// BY WHERE THE FILE REALLY IS, TOO. The path is checked as written and again with its symlinks
-/// resolved, because reading it follows them: a link inside an indexed folder that points at
-/// ~/.ssh would otherwise pass the check on its name and hand over what it points at. A root that
-/// is itself reached through a link is compared in its resolved form as well.
+/// BY WHERE THE FILE REALLY IS. The question is what the read will open, so the path is judged
+/// after realpath(3): every symlink followed, and every name spelled the way the disk stores it. A
+/// link inside an indexed folder that points at ~/.ssh is judged as ~/.ssh and refused.
+///
+/// And a path written differently from the stored root is judged as the file it names. The check
+/// used to compare the path AS WRITTEN, so on a case-insensitive volume `/Users/me/documents/a.pdf`
+/// was refused under a root stored as `/Users/me/Documents` although it opens the very same file,
+/// and so was any spelling of `/tmp` or `/var` without the `/private` every stored root carries
+/// (issue #23, where an agent could not OCR a file inside an indexed folder).
 func pathIsInIndexedRoot(_ path: String) -> Bool {
     let roots = ((UserDefaults.standard.array(forKey: "omni.roots") as? [String]) ?? []).map(normalizeStorePath)
     func inside(_ p: String, _ roots: [String]) -> Bool {
         roots.contains { root in p == root || p.hasPrefix(root.hasSuffix("/") ? root : root + "/") }
     }
+    func real(_ p: String) -> String? {
+        guard let r = realpath(p, nil) else { return nil }
+        defer { free(r) }
+        return String(cString: r)
+    }
+    let realRoots = roots.map { real($0) ?? $0 }
+    if let resolved = real(path) { return inside(resolved, roots) || inside(resolved, realRoots) }
+    // Nothing there to resolve, so the read that follows fails anyway. Judged as before.
     guard inside(path, roots) else { return false }
-    let real = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
-    if real == path { return true }
-    let realRoots = roots.map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path }
-    return inside(real, roots) || inside(real, realRoots)
+    let linked = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+    return linked == path || inside(linked, roots) || inside(linked, realRoots)
 }
 
 /// Decode one request image to a CGImage, downscaled the way the indexer does.

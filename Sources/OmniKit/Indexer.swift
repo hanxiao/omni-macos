@@ -591,6 +591,10 @@ public final class Indexer: @unchecked Sendable {
         self.embedder = embedder
     }
 
+    /// Handed to every crawl: the folder of each `.omniignore` it walks past (see
+    /// `FileCrawler.onPolicyFile`). Set once, right after init, before any pass runs.
+    public var onPolicyFile: (@Sendable (String) -> Void)?
+
     /// Why a pass was stopped, which decides whether work ALREADY DONE is kept.
     ///
     /// `cancel()` is one verb doing two jobs. Most call sites are ordinary pauses - an OCR run
@@ -780,9 +784,10 @@ public final class Indexer: @unchecked Sendable {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             var counts: [String: Int] = [:]
-            FileCrawler(roots: roots, ignore: settings.ignore, enabledKinds: settings.enabledKinds,
-                        ownDataPaths: settings.ownDataPaths)
-                .walk(shouldContinue: { !self.isCancelled }) { f in
+            var crawler = FileCrawler(roots: roots, ignore: settings.ignore, enabledKinds: settings.enabledKinds,
+                                      ownDataPaths: settings.ownDataPaths)
+            crawler.onPolicyFile = self.onPolicyFile
+            crawler.walk(shouldContinue: { !self.isCancelled }) { f in
                     guard let r = rootOf(f.path) else { return }
                     feed.lock.lock()
                     // Wait for room - on a TIMED wait, which is the whole difference between a
@@ -1427,10 +1432,11 @@ public final class Indexer: @unchecked Sendable {
             if Self.isStaleCaseSpelling(path) { deletedTop.insert(path); continue }
             if st.st_mode & S_IFMT == S_IFDIR {
                 if let r = rootOf(path), !gate.admitsEventPath(path, isDir: true, size: 0, root: r) { continue }
-                FileCrawler(roots: [URL(fileURLWithPath: path)], ignore: settings.ignore,
-                            enabledKinds: settings.enabledKinds,
-                            ownDataPaths: settings.ownDataPaths)
-                    .walk(shouldContinue: { !self.isCancelled }) { files.append($0) }
+                var crawler = FileCrawler(roots: [URL(fileURLWithPath: path)], ignore: settings.ignore,
+                                          enabledKinds: settings.enabledKinds,
+                                          ownDataPaths: settings.ownDataPaths)
+                crawler.onPolicyFile = onPolicyFile
+                crawler.walk(shouldContinue: { !self.isCancelled }) { files.append($0) }
             } else {
                 files.append(CrawledFile(path: path,
                                          modified: Double(st.st_mtimespec.tv_sec) + Double(st.st_mtimespec.tv_nsec) / 1e9,
@@ -1479,8 +1485,9 @@ public final class Indexer: @unchecked Sendable {
         // re-embedded). The full pass already keeps a missing root's rows (blindRoots); a watcher
         // event must not be the one place that decides otherwise.
         var vanishedPrefixes: [String] = []
+        var vanishedFiles = Set<String>()
         for path in deletedTop {
-            if known[path] != nil { toDelete.insert(path) }         // deleted / moved away
+            if known[path] != nil { vanishedFiles.insert(path) }    // deleted / moved away
             else if roots.contains(where: { $0 == path || $0.hasPrefix(path + "/") }) {
                 Self.log.info("update: indexed folder at or under \(path, privacy: .public) is gone; rows kept")
             }
@@ -1684,11 +1691,17 @@ public final class Indexer: @unchecked Sendable {
         // Stragglers are INCOMPLETE files (a cancel interrupted their window) - storing a partial
         // chunk set would permanently truncate the file under its current mtime, so never store them.
         for (_, a) in tAcc where a.done.count == a.total { acceptCompleted(a.path, a.done) }
+        // NOT WHEN CANCELLED. A vanished path's rows are what the other half of a rename or move
+        // copies its vectors from (content dedup), and a cancelled batch stopped before indexing
+        // all of that other half. The caller re-queues a cancelled batch, vanished paths included,
+        // so the delete happens on the run that finishes - after the vectors have been taken.
+        let finished = !isCancelled
+        if finished { toDelete.formUnion(vanishedFiles) }
         if !toDelete.isEmpty { store.deletePaths(toDelete) }
         // AFTER the exact-path deletions and BEFORE the re-embeds are flushed: a rename's new path
         // is a different prefix, so this cannot reach the rows flushReplace is about to write, and
         // doing it first keeps the old rows from lingering for the width of the batch.
-        for prefix in vanishedPrefixes { store.deleteUnderFolder(prefix) }
+        if finished { for prefix in vanishedPrefixes { store.deleteUnderFolder(prefix) } }
         flushReplace()
         let dedupHits = takeDedupHits()
         if dedupHits > 0 { Self.log.info("content dedup (update): \(dedupHits, privacy: .public) file(s) reused stored vectors") }

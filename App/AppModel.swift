@@ -1557,6 +1557,21 @@ final class AppModel {
     // keeps re-inserting these files, so we defer the vector delete until it stops, then restart.
     private var pendingRootRemovals = Set<String>()
 
+    /// A bookmark per added folder, keyed by its path. A bookmark resolves by file id, so it finds
+    /// the folder again after a rename or a move on the same volume - which is how a renamed root
+    /// is followed instead of being left as a missing folder beside a new, unindexed one.
+    @ObservationIgnored private var folderBookmarks: [String: Data] =
+        (UserDefaults.standard.dictionary(forKey: "omni.folderBookmarks") as? [String: Data]) ?? [:]
+    private static let folderBookmarksKey = "omni.folderBookmarks"
+
+    /// `.omniignore` files inside indexed folders, by folder, with the text last read from each
+    /// (issue #23). Compiled into `ignore` after the central policy; see `OmniIgnore.scoped`.
+    private(set) var folderPolicies: [String: String] = [:]
+    private static let folderPoliciesKey = "omni.folderPolicies"
+    /// Folders whose policy changed while a pass was running. Pruned once it has stopped, so
+    /// nothing it indexed under the old rules survives.
+    @ObservationIgnored private var policyPruneDirs = Set<String>()
+
     // Index-time minimum thresholds (0 = no minimum).
     var minImageDimension: Int = 0 { didSet { persistPerf() } }
     var minAudioSeconds: Double = 0 { didSet { persistPerf() } }
@@ -2479,7 +2494,8 @@ final class AppModel {
             saveIgnoreText()
         }
         if !Self.isolatedByLaunchArgument { defaults.set(Self.ignoreDefaultsVersion, forKey: Self.ignoreDefaultsKey) }
-        ignore = OmniIgnore(text: ignoreText)
+        loadFolderPolicies()
+        ignore = compiledIgnore(ignoreText)
         ignoreHasBackup = Self.ignoreFileURL().map { FileManager.default.fileExists(atPath: $0.appendingPathExtension("bak").path) } ?? false   // one stat at launch, then cached
     }
 
@@ -2492,11 +2508,16 @@ final class AppModel {
 
     /// Drop every indexed file the policy excludes, then give back the space. Folder rules count:
     /// a file under an excluded folder is excluded (see OmniIgnore.excludesIndexedFile).
-    private func pruneExcluded(_ store: VectorStore, policy: OmniIgnore, then: (@MainActor () -> Void)? = nil) {
+    private func pruneExcluded(_ store: VectorStore, policy: OmniIgnore, under folders: [String]? = nil,
+                               then: (@MainActor () -> Void)? = nil) {
         Task.detached(priority: .utility) {
             let t0 = Date()
             let excluded = policy.excludesIndexedFile()
-            let drop = store.knownFiles().compactMap { path, _ in excluded(path) ? path : nil }
+            // `under`: a folder's own policy changed, and nothing outside that folder can have.
+            let drop = store.knownFiles().compactMap { path, _ -> String? in
+                if let folders, !folders.contains(where: { RootScope.covers($0, path) }) { return nil }
+                return excluded(path) ? path : nil
+            }
             let tScan = -t0.timeIntervalSinceNow
             // In batches: deletePaths holds the store queue for its whole run, and a search waits
             // behind it. One call over 2.4M files held it for minutes.
@@ -2523,6 +2544,87 @@ final class AppModel {
                     self.refreshSearchAfterBackgroundChange()
                 }
                 then?()
+            }
+        }
+    }
+
+    /// The policy the crawl runs on: the central file, then every folder's own `.omniignore`
+    /// rewritten to apply under that folder only. Parents before children, so a deeper folder's
+    /// rule is the later one and wins, as it does in git.
+    private func compiledIgnore(_ central: String) -> OmniIgnore {
+        guard !folderPolicies.isEmpty else { return OmniIgnore(text: central) }
+        var text = central
+        if !text.isEmpty, !text.hasSuffix("\n") { text += "\n" }
+        for dir in folderPolicies.keys.sorted() {
+            let rules = OmniIgnore.scoped(folderPolicies[dir] ?? "", to: dir)
+            if !rules.isEmpty { text += rules + "\n" }
+        }
+        return OmniIgnore(text: text)
+    }
+
+    /// The folder policies known last session, re-read from disk. One that changed or vanished
+    /// while Omni was closed owes a prune: the launch pass indexes what a dropped rule lets back
+    /// in, but it never removes what a new rule excludes.
+    private func loadFolderPolicies() {
+        let stored = (UserDefaults.standard.dictionary(forKey: Self.folderPoliciesKey) as? [String: String]) ?? [:]
+        var current: [String: String] = [:]
+        for dir in stored.keys {
+            if let text = try? String(contentsOfFile: dir + "/" + OmniIgnore.fileName, encoding: .utf8) {
+                current[dir] = text
+            }
+        }
+        folderPolicies = current
+        if current != stored {
+            ignorePrunePending = true
+            saveFolderPolicies()
+        }
+    }
+
+    private func saveFolderPolicies() {
+        guard !isIsolatedRun else { return }
+        UserDefaults.standard.set(folderPolicies, forKey: Self.folderPoliciesKey)
+    }
+
+    /// Built in a nonisolated helper so the closure is not main-actor isolated: the crawl calls it
+    /// from its worker threads.
+    nonisolated private static func policyFileReporter(_ model: AppModel) -> @Sendable (String) -> Void {
+        { [weak model] dir in Task { @MainActor in model?.reloadFolderPolicies([dir]) } }
+    }
+
+    /// Re-read the `.omniignore` of these folders - found by a crawl, or named by a watcher event -
+    /// and apply what changed. A folder outside every root, or inside Omni's own data (the central
+    /// file lives there), is not a folder policy.
+    func reloadFolderPolicies(_ dirs: Set<String>) {
+        let own = Self.ownDataPaths()
+        var next = folderPolicies
+        for dir in dirs {
+            guard rootKey(for: dir) != nil, !dir.contains("\n"),
+                  !own.contains(where: { RootScope.covers($0, dir) }) else { continue }
+            next[dir] = try? String(contentsOfFile: dir + "/" + OmniIgnore.fileName, encoding: .utf8)
+        }
+        guard next != folderPolicies else { return }
+        let changed = dirs.filter { next[$0] != folderPolicies[$0] }
+        folderPolicies = next
+        saveFolderPolicies()
+        let before = ignore
+        ignore = compiledIgnore(ignoreText)
+        guard ignore != before, let store else { return }
+        Self.rootLog.info("folder policy changed in \(changed.count, privacy: .public) folder(s)")
+        policyPruneDirs.formUnion(changed)
+        // Re-crawling the folders indexes what a dropped rule lets back in.
+        pendingFSPaths.formUnion(changed)
+        if isIndexWorkInFlight {
+            // The pass in flight carries the old rules. A full pass is restarted on the new ones;
+            // the prune waits until it has stopped (drainIdleUpkeep), so nothing it wrote under the
+            // old rules in the meantime survives.
+            if indexState == .indexing { restartAfterPause = true; indexer?.cancel(.pause) }
+            return
+        }
+        let dirsNow = Array(policyPruneDirs)
+        policyPruneDirs.removeAll()
+        pruneExcluded(store, policy: ignore, under: dirsNow) {
+            if self.indexState != .indexing && self.activeRoots.isEmpty && !self.fsReconcileInFlight {
+                self.drainPendingFSChanges()
             }
         }
     }
@@ -2560,7 +2662,7 @@ final class AppModel {
         ignorePreviewSeq += 1
         let seq = ignorePreviewSeq
         guard let store else { ignorePreview = nil; return }
-        let candidate = OmniIgnore(text: text)
+        let candidate = compiledIgnore(text)
         let rootPaths = roots.map { $0.path }
         Task.detached(priority: .userInitiated) {
             // Iterated, not materialised: a path String exists only while it is being tested.
@@ -2603,7 +2705,7 @@ final class AppModel {
             try? FileManager.default.copyItem(at: url, to: bak)
             ignoreHasBackup = true
         }
-        let new = OmniIgnore(text: newText)
+        let new = compiledIgnore(newText)
         let changed = new != ignore
         ignoreText = newText
         ignore = new
@@ -3562,6 +3664,7 @@ final class AppModel {
             OCRBatchPlan.coresidentBytes = engineTotalBytes ?? 0
             self.clearQueryEmbedCache()   // cached query vectors are model-specific
             self.indexer = Indexer(store: store, embedder: engine)
+            self.indexer?.onPolicyFile = Self.policyFileReporter(self)
             // Hand the live engine and store to the serving layer. attach() swaps in the new
             // backend and reconciles: it auto-starts the server if serving was enabled last
             // session, and on a variant switch (bootstrap reruns) it replaces the backend under
@@ -3659,6 +3762,9 @@ final class AppModel {
             self.phase = .ready
             omniPerfLog("launch ready")
             if ignorePrunePending { ignorePrunePending = false; pruneExcluded(store, policy: ignore) }
+            // A folder renamed or moved while Omni was closed. No pass of its own: the launch pass
+            // below covers the new path, while the old rows are still there to reuse.
+            followMovedFolders(kick: false)
             restartWatcher()
             // Off the main thread: it lists the shared temporary directory, which measured 2.7 s of
             // main-thread block at 50k entries - the stall every launch showed right after ready.
@@ -3929,7 +4035,11 @@ final class AppModel {
         guard deniedRootsObserver == nil else { return }
         deniedRootsObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
-            Task { @MainActor in self.refreshDeniedRoots() }
+            Task { @MainActor in
+                self.refreshDeniedRoots()
+                // Coming back from the Finder is when a folder has just been renamed there.
+                if self.store != nil { self.followMovedFolders() }
+            }
         }
     }
     private func refreshDeniedRoots() {
@@ -4035,6 +4145,7 @@ final class AppModel {
         roots = RootScope.canonical(addedFolders)
         saveAddedFolders()
         saveRoots()
+        refreshFolderBookmarks()
     }
 
     private func dedupeKeepingOrder(_ urls: [URL]) -> [URL] {
@@ -4596,6 +4707,132 @@ final class AppModel {
                 }
             }
         }
+    }
+
+    // MARK: - Folders that were renamed or moved (issue #23)
+
+    /// Follow every added folder that is no longer at its path to wherever its bookmark says it
+    /// went. Renaming or moving an indexed folder in the Finder used to leave the sidebar pointing
+    /// at a path that no longer existed; the only way on was to add the new one, which indexed it
+    /// as new, and removing the old one first deleted the vectors that could have been reused.
+    ///
+    /// Moved to the Trash is not a move: that folder is on its way out, and it stays a missing
+    /// folder, exactly as before. A volume that is not mounted is not resolved (`withoutMounting`),
+    /// so an unplugged disk is still a missing root whose rows are kept.
+    ///
+    /// `kick` is false at launch, where the launch pass covers the new root anyway.
+    func followMovedFolders(kick: Bool = true) {
+        let fm = FileManager.default
+        var moves: [(from: URL, to: URL)] = []
+        for old in addedFolders where !fm.fileExists(atPath: old.path) {
+            guard let mark = folderBookmarks[old.path],
+                  let found = Self.resolvedBookmarkPath(mark), found != old.path,
+                  !Self.isInTrash(found) else { continue }
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: found, isDirectory: &isDir), isDir.boolValue else { continue }
+            moves.append((old, URL(fileURLWithPath: found)))
+        }
+        for m in moves { relocateFolder(from: m.from, to: m.to, kick: kick) }
+    }
+
+    /// One folder, from where it was to where it is now. Its place in the list, its paused state and
+    /// a search scoped to it all move with it.
+    ///
+    /// NOTHING IS RE-EMBEDDED, AND NOTHING IS REWRITTEN IN PLACE. The store keys rows by path and
+    /// its path table only ever appends, so the rows are not renamed. Instead both paths go to the
+    /// watcher's reconcile as ONE batch, which is exactly the shape of a rename inside a root:
+    /// `update()` crawls and indexes the new path first, while the old rows are still there, so
+    /// content dedup hands each file the vectors it already has (the substitution a copied file
+    /// gets), and only then deletes under the old path, which no root protects any more. What
+    /// that costs is reading and hashing the files, not the GPU.
+    ///
+    /// A catch-up pass for the new root with the old one's delete queued behind it looks the same
+    /// and is not: nothing ties the two together, and at launch a watcher replay's reconcile can
+    /// finish, and run that delete, before the launch pass has reached the new path. One batch
+    /// cannot be split that way - and a cancelled batch deletes nothing (see `update()`) and is
+    /// re-queued whole. A paused folder is carried too: the batch reuses what was embedded.
+    private func relocateFolder(from old: URL, to new: URL, kick: Bool) {
+        guard let i = addedFolders.firstIndex(of: old) else { return }
+        Self.rootLog.info("folder moved: \(old.path, privacy: .public) -> \(new.path, privacy: .public)")
+        if addedFolders.contains(new) { addedFolders.remove(at: i) } else { addedFolders[i] = new }
+        if let mark = folderBookmarks.removeValue(forKey: old.path) { folderBookmarks[new.path] = mark }
+        if pausedRoots.remove(old.path) != nil {
+            pausedRoots.insert(new.path)
+            UserDefaults.standard.set(Array(pausedRoots), forKey: "omni.pausedRoots")
+        }
+        let scope = filterFolders.map { f -> URL in
+            guard RootScope.covers(old.path, f.path) else { return f }
+            return URL(fileURLWithPath: new.path + String(f.path.dropFirst(old.path.count)))
+        }
+        if scope != filterFolders { filterFolders = scope }
+        recomputeRoots()
+        restartWatcher()
+        pendingFSPaths.formUnion([new.path, old.path])
+        guard kick else { return }   // launch: drained with the watcher's first batch or after the launch pass
+        if indexState != .indexing && activeRoots.isEmpty && !fsReconcileInFlight { drainPendingFSChanges() }
+    }
+
+    static let rootLog = Logger(subsystem: "io.hanxiao.omni", category: "roots")
+
+    nonisolated static func isInTrash(_ path: String) -> Bool {
+        path.contains("/.Trash/") || path.hasSuffix("/.Trash") || path.contains("/.Trashes/")
+    }
+
+    /// Where a bookmark points now, canonical like every stored root path; nil if it no longer
+    /// resolves or its volume is not mounted.
+    nonisolated static func resolvedBookmarkPath(_ data: Data) -> String? {
+        var stale = false
+        guard let url = try? URL(resolvingBookmarkData: data, options: [.withoutUI, .withoutMounting],
+                                 relativeTo: nil, bookmarkDataIsStale: &stale) else { return nil }
+        return (try? url.resourceValues(forKeys: [.canonicalPathKey]))?.canonicalPath ?? url.path
+    }
+
+    /// Keep one bookmark per added folder, made while the folder is still where the list says it
+    /// is. Off the main thread: resolving and creating bookmarks is file-system work, once per
+    /// folder, and the list can hold dozens.
+    private func refreshFolderBookmarks() {
+        let folders = addedFolders.map(\.path)
+        let known = folderBookmarks
+        let persist = !isIsolatedRun
+        Task.detached(priority: .utility) {
+            let next = Self.bookmarks(for: folders, known: known)
+            await MainActor.run {
+                guard self.addedFolders.map(\.path) == folders, next != self.folderBookmarks else { return }
+                self.folderBookmarks = next
+                if persist { UserDefaults.standard.set(next, forKey: Self.folderBookmarksKey) }
+            }
+        }
+    }
+
+    /// A folder that is present keeps its bookmark only while the bookmark still resolves to it:
+    /// a folder deleted and recreated under the same name is a different folder, and following
+    /// the old bookmark would chase the deleted one. A folder that is missing keeps what it had -
+    /// that bookmark is how it is found again.
+    nonisolated private static func bookmarks(for folders: [String], known: [String: Data]) -> [String: Data] {
+        var next: [String: Data] = [:]
+        for path in folders {
+            guard FileManager.default.fileExists(atPath: path) else {
+                if let mark = known[path] { next[path] = mark }
+                continue
+            }
+            if let mark = known[path], resolvedBookmarkPath(mark) == path { next[path] = mark; continue }
+            if let mark = try? URL(fileURLWithPath: path).bookmarkData(
+                options: [], includingResourceValuesForKeys: nil, relativeTo: nil) {
+                next[path] = mark
+            }
+        }
+        return next
+    }
+
+    /// The prune owed by a folder policy that changed while a pass was running, once nothing is
+    /// indexing: run earlier, it races the pass that is still writing under the old rules.
+    private func drainIdleUpkeep(_ store: VectorStore) {
+        guard !policyPruneDirs.isEmpty, !isTerminating, !isPaperRunning, indexState == .idle,
+              activeRoots.isEmpty, !fsReconcileInFlight, !restartAfterPause, pendingFSPaths.isEmpty
+        else { return }
+        let dirs = Array(policyPruneDirs)
+        policyPruneDirs.removeAll()
+        pruneExcluded(store, policy: ignore, under: dirs)
     }
 
     /// Folders that became roots because the root covering them was removed. The delete took their
@@ -5293,21 +5530,41 @@ final class AppModel {
         guard engine != nil, !roots.isEmpty else { return }
         let since = eventCheckpoint.flatMap { UInt64($0) }
         let w = FSWatcher(paths: roots.map { $0.path }, since: since) { [weak self] paths in
-            Task { @MainActor in self?.handleFSChange(paths) }
+            // Sorted into present and gone HERE, on the watcher's queue: a drag-in reports
+            // thousands of paths and the main thread should not stat them.
+            var here: [String] = [], gone: [String] = []
+            for p in paths { if Darwin.access(p, F_OK) == 0 { here.append(p) } else { gone.append(p) } }
+            let present = here, vanished = gone
+            Task { @MainActor in self?.handleFSChange(present, vanished: vanished) }
         }
         w.start()
         watcher = w
     }
 
-    private func handleFSChange(_ rawPaths: [String]) {
-        guard let indexer, let store else { return }
+    private func handleFSChange(_ rawPaths: [String], vanished rawVanished: [String] = []) {
+        guard indexer != nil, store != nil else { return }
         // An obsolete index is in a different vector space (e.g. just switched models): writing
         // new-dimension vectors into it would fail the store's dimension guard. Skip background
         // updates until the user reindexes, which wipes and rebuilds in the new space.
         guard !indexObsolete else { return }
+        // A folder's own `.omniignore` changed: not a file to index, a change of rules.
+        let policyDirs = Set((rawPaths + rawVanished)
+            .filter { ($0 as NSString).lastPathComponent == OmniIgnore.fileName }
+            .map { ($0 as NSString).deletingLastPathComponent })
+        if !policyDirs.isEmpty { reloadFolderPolicies(policyDirs) }
+        // A folder the user added, or one above it, is gone: it may have been renamed or moved.
+        if rawVanished.contains(where: { v in addedFolders.contains { RootScope.covers(v, $0.path) } }) {
+            followMovedFolders()
+        }
         // Drop changes inside paused folders - pausing means "stop indexing this folder".
-        let paths = pausedRoots.isEmpty ? rawPaths
-            : rawPaths.filter { p in !pausedRoots.contains(where: { p == $0 || p.hasPrefix($0 + "/") }) }
+        func wanted(_ p: String) -> Bool {
+            !pausedRoots.contains(where: { p == $0 || p.hasPrefix($0 + "/") })
+        }
+        // NOT HELD BACK. A rename's two halves arrive in one watcher callback, and a reconcile embeds
+        // before it deletes, so the new path finds the old rows. Measured with 60 images landing
+        // during each rename: the renamed files all deduped. A delay here only kept deleted files
+        // searchable longer.
+        let paths = (rawPaths + rawVanished).filter(wanted)
         guard !paths.isEmpty else { return }
         // Always buffer, then kick a reconcile only if none is running. A full index drains the buffer
         // when it finishes (startIndexing); an in-flight reconcile re-drains when it finishes. This
@@ -5478,7 +5735,10 @@ final class AppModel {
                         self.indexState = p.cancelled ? .paused : .idle
                         self.refreshIndexStats(store)
                         self.refreshSearchAfterBackgroundChange()
-                        if !p.cancelled { self.drainPendingFSChanges() }
+                        if !p.cancelled {
+                            self.drainPendingFSChanges()
+                            self.drainIdleUpkeep(store)
+                        }
                         self.refitFolderMapIfPending()
                     }
                 }
@@ -5556,6 +5816,7 @@ final class AppModel {
         if indexState != .indexing && activeRoots.isEmpty && !fsReconcileInFlight {
             drainPendingFSChanges()
         }
+        drainIdleUpkeep(store)
         // Lowest priority in the chain: with all real work drained and the pipelines idle,
         // re-tag the next batch of already-indexed media that still carries filename snippets.
         if indexState != .indexing, activeRoots.isEmpty, !fsReconcileInFlight {
@@ -5752,7 +6013,9 @@ final class AppModel {
                 // paths back and keep the checkpoint, or its edits stay stale until next launch.
                 // Paths no longer under a root are dropped, so a removed folder is not re-indexed.
                 if cancelled {
-                    self.pendingFSPaths.formUnion(drained.filter { self.rootKey(for: $0) != nil })
+                    // A path that is gone is kept even outside every root: its only work is deleting
+                    // rows, which is what a moved folder's old path is waiting for.
+                    self.pendingFSPaths.formUnion(drained.filter { self.rootKey(for: $0) != nil || Darwin.access($0, F_OK) != 0 })
                     self.pendingFSEventId = max(self.pendingFSEventId, eid)
                 } else if eid > 0 { self.eventCheckpoint = String(eid) }
                 self.activeRoots.subtract(touched)

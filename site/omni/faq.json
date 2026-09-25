@@ -139,13 +139,18 @@
           "shortcut": "⇧⌘I"
         },
         {
+          "q": "What happens when I rename or move an indexed folder?",
+          "a": "Omni follows it to its new name or place and reuses the vectors it already has instead of indexing it again. A folder moved to the Trash is not followed.",
+          "shortcut": ""
+        },
+        {
           "q": "How are long documents and scanned PDFs handled?",
           "a": "Text is read up to 2 MB per file and split into chunks, all of which are indexed. A PDF with no text layer is indexed page by page as images.",
           "shortcut": ""
         },
         {
           "q": "How do I exclude files or types?",
-          "a": "Settings > Files turns whole file types on or off and chooses whether iCloud files that are not downloaded are skipped. Settings > Content has minimum sizes per type and ignore rules in .gitignore syntax.",
+          "a": "Settings > Files turns whole file types on or off and chooses whether iCloud files that are not downloaded are skipped. Settings > Content has minimum sizes per type and ignore rules in .gitignore syntax. A .omniignore file inside a folder applies its rules to that folder only.",
           "shortcut": ""
         }
       ]

@@ -71,6 +71,12 @@ public struct FileCrawler: Sendable {
     /// ALL kinds, which silently skipped every multi-GB video - the exact files the streamed pipeline
     /// exists for. See issue #9.)
     public var maxFileSize: [FileKind: Int]
+    /// Called with the folder of every `.omniignore` the walk passes (issue #23). A policy file
+    /// inside a folder is how that folder narrows what is indexed under it; the crawl is what finds
+    /// the ones already on disk, at no cost beyond a name compare on entries it lists anyway.
+    /// Called from the walk's worker threads, so it must be safe to call concurrently. The fast
+    /// engine only: the legacy enumerator skips hidden files before this could see them.
+    public var onPolicyFile: (@Sendable (String) -> Void)? = nil
     /// Default policy: only images are capped (200 MB); video/audio/text are uncapped.
     public static let defaultMaxFileSize: [FileKind: Int] = [.image: 200_000_000]
 
@@ -214,6 +220,10 @@ public struct FileCrawler: Sendable {
             },
             keep: { dir, e -> CrawledFile? in
                 // IN THE WORKER: everything here is per-file and runs on all cores at once.
+                if !e.isDir, e.name == OmniIgnore.fileName {
+                    onPolicyFile?(dir)
+                    return nil
+                }
                 guard !e.isDir, !e.isSymlink, !e.name.hasPrefix(".") else { return nil }
                 // The extension comes from the name the syscall returned - no URL is built.
                 guard let kind = FileExtractor.kind(forExtension: (e.name as NSString).pathExtension),
