@@ -2646,7 +2646,8 @@ Measured on APFS clones of the real 6.55M-content / 10.7M-occurrence index, no s
 One drawn mole, template-rendered so it takes `.tertiary` like an SF Symbol, with one gag per
 screen: `MoleGlyph` (plain) onboarding, `MoleSerious` (determined brows) "Loading your index",
 `MoleSearch` (star eyes) the search prompt, `MoleOCR` (reading glasses) the OCR drop zone,
-`MoleSleep` (z z) "Add folders to search", `MoleEmpty` (x x eyes) "Nothing indexed here".
+`MoleSleep` (z z) "Add folders to search", `MoleEmpty` (x x eyes) "Nothing indexed here",
+`MoleHush` (one brow up, finger on the lips) "No recent items".
 PNGs are rendered with `rsvg-convert -w 80/160/240` from the generator's SVG (matches the shipped
 assets to 0.6/255 mean alpha difference). SAME SIZE AND COLOUR EVERYWHERE: every screen draws it
 through `StatusGlyph` (68 pt, `.tertiary`); a one-off size or style on one screen is what made the
@@ -2693,3 +2694,14 @@ nothing (`update ... dedup=112 tokens=0` for 112 files).
 - THE OCR PATH CHECK JUDGES THE FILE, NOT THE SPELLING: `pathIsInIndexedRoot` resolves with
   realpath(3), so a path differing from the stored root in case or `/private` is accepted and a
   symlink out of a root is still refused.
+
+## Recents (2026-09-25)
+
+- The sidebar's first row, always present, Finder's `clock` symbol. It lists the 100 files with the
+  newest `indexed_at` across every source (`VectorStore.recentlyIndexed`), on the browse connection.
+- `indexed_at` has no index: one pass over `files` with a top-N sort, 0.27 s warm on the 2.68M-file
+  bench index. A tie-break on `id` in the SQL cost 0.17 s more, so ties are broken in Swift.
+- A delete removes the `files` row, so the newest stamps are live files; a widening window for
+  contentless rows was built and dropped, since the store refuses to write one.
+- It refreshes after every reconcile (`reloadBrowserIfTouched`) and, while a pass runs, every 20x
+  the last query's time (floor 2 s), only while it is on screen.

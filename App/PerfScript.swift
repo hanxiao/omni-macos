@@ -13,7 +13,7 @@ import OmniKit
 /// `wait:<seconds>`. For recording the intro video: `type:<text>` (a key at a time, searching at
 /// each word), `similar:<path>`, `select:<result index>`, `map:<folder>`, `frame:<w>x<h>`
 /// (window size, centered), `front`, `appearance:light|dark`, `history:<n>`, `sort:<order>`,
-/// `bsort:<name|column rawValue>`, `settings:<tab>`, `sidebarselect:<n>`, `dumpui:<path>`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
+/// `bsort:<name|column rawValue>`, `settings:<tab>`, `sidebarselect:<n>`, `dumpui:<path>`, `recents`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
 /// CPU is read, so what it set in motion is counted too. `repeat:<n>` before a step repeats it.
 @MainActor
 enum PerfScript {
@@ -48,6 +48,7 @@ enum PerfScript {
         let arg = step.split(separator: ":", maxSplits: 1).dropFirst().first.map(String.init) ?? ""
         switch step.split(separator: ":").first.map(String.init) ?? "" {
         case "browse": model.enterFolder(URL(fileURLWithPath: arg, isDirectory: true))
+        case "recents": model.enterRecents()
         case "view": model.viewMode = arg == "list" ? .list : .grid
         case "sidebar":
             // Through the split view's controller: a launch from the shell has no key window, so
@@ -88,7 +89,7 @@ enum PerfScript {
                 menu.performActionForItem(at: i)
             }
             NotificationCenter.default.post(name: .omniPerfSettingsTab, object: arg)
-        case "sidebarselect":   // select the n-th indexed folder in the sidebar, as a click would
+        case "sidebarselect":   // select the n-th indexed folder in the sidebar (-1: Recents), as a click would
             NotificationCenter.default.post(name: .omniPerfSidebarSelect, object: Int(arg) ?? 0)
         case "sidebarfocus":    // give the sidebar keyboard focus, which a click on a row does
             if let w = NSApp.windows.first(where: { $0.isVisible && $0.toolbar != nil }),

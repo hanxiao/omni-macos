@@ -4323,6 +4323,50 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
+    /// The files indexed or re-indexed most recently, newest first: the sidebar's Recents.
+    ///
+    /// `indexed_at` has no index, so this is one pass over `files` with a top-N sort (0.29 s warm
+    /// on a 2.68M-file index), on the browse connection so it never waits behind a write. A delete
+    /// removes the file row, so the newest stamps are live files; the EXISTS is the same guard the
+    /// browse queries carry, applied to the few rows returned rather than to the whole table.
+    public func recentlyIndexed(limit: Int = 100) -> [IndexedChild] {
+        let t0 = omniPerfEnabled ? Date() : nil
+        // Ties (a batch shares one stamp) are broken here, on 100 rows: `, id DESC` in the SQL
+        // took the sort from 0.27 to 0.44 s on that index.
+        var out = onReader(interactiveLane, []) { h -> [IndexedChild] in
+            var rows: [IndexedChild] = []
+            var st: OpaquePointer?
+            defer { sqlite3_finalize(st) }
+            guard sqlite3_prepare_v2(h, """
+                SELECT d.path, f.name, f.kind, f.modified, f.indexed_at, f.size, f.first_indexed_at
+                  FROM (SELECT id, dir_id, name, kind, modified, indexed_at, size, first_indexed_at
+                          FROM files ORDER BY indexed_at DESC LIMIT ?1) f
+                  JOIN dirs d ON d.id = f.dir_id
+                 WHERE EXISTS(SELECT 1 FROM \(rowTableShared) c WHERE c.file_id = f.id);
+                """, -1, &st, nil) == SQLITE_OK else { return [] }
+            sqlite3_bind_int(st, 1, Int32(limit))
+            var reloaded = false
+            while sqlite3_step(st) == SQLITE_ROW {
+                guard let d = sqlite3_column_text(st, 0), let n = sqlite3_column_text(st, 1) else { continue }
+                let dir = String(cString: d)
+                rows.append(IndexedChild(path: dir.hasSuffix("/") ? dir + String(cString: n) : dir + "/" + String(cString: n),
+                                         isDirectory: false,
+                                         kind: readKindName(interactiveLane, h, Int(sqlite3_column_int(st, 2)), &reloaded),
+                                         modified: sqlite3_column_double(st, 3),
+                                         size: Int(sqlite3_column_int64(st, 5)),
+                                         indexedAt: sqlite3_column_double(st, 4),
+                                         firstIndexedAt: sqlite3_column_double(st, 6),
+                                         fileCount: 0))
+            }
+            return rows
+        }
+        out.sort { $0.indexedAt != $1.indexedAt ? $0.indexedAt > $1.indexedAt : $0.path < $1.path }
+        if let t0 {
+            omniPerfLog(String(format: "recents %.1fms files=%d", Date().timeIntervalSince(t0) * 1000, out.count))
+        }
+        return out
+    }
+
     /// Immediate subfolders of `folder` that still hold an indexed file.
     ///
     /// SEEKS PER CHILD, rather than scanning the subtree and reducing it in Swift. The old form ran

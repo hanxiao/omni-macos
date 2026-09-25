@@ -249,6 +249,12 @@ struct ContentView: View {
     /// A Photos source is being browsed. Same precedence rule as the folder browser below, and
     /// checked before it - `enterPhotoSource` clears `filterFolder` and `enterFolder` clears the
     /// source, so only one can be set, but the order makes that explicit rather than incidental.
+    /// Recents is on screen. Same precedence rule as the two browsers: a query wins.
+    private var showsRecents: Bool {
+        model.browsingRecents && !model.hasQuery && model.fileQuery == nil
+            && model.rawResults.isEmpty && model.queryError == nil && !model.isResolving
+    }
+
     private var showsPhotoBrowser: Bool {
         model.browsedPhotoSource != nil && !model.hasQuery && model.fileQuery == nil
             && model.rawResults.isEmpty && model.queryError == nil && !model.isResolving
@@ -286,6 +292,8 @@ struct ContentView: View {
             if !model.results.isEmpty {
                 // `.equatable()`: see the conformance on ResultsList.
                 ResultsList { belowThresholdFooter }.equatable()
+            } else if showsRecents {
+                RecentsBrowser()
             } else if showsPhotoBrowser {
                 PhotoSourceBrowser(source: model.browsedPhotoSource!)
             } else if showsFolderBrowser {
@@ -501,6 +509,7 @@ struct ContentView: View {
         if model.ocrMode {
             return ocr.documentName.isEmpty ? nil : (ocr.documentName, ocr.documentName)
         }
+        if showsRecents { return ("Recents", "Recents") }
         if showsPhotoBrowser, let source = model.browsedPhotoSource {
             return (source.title, source.title)
         }
@@ -565,7 +574,7 @@ struct ContentView: View {
     }
 
     /// Either browser is on screen. The two are one mode as far as the toolbar is concerned.
-    private var showsBrowser: Bool { showsFolderBrowser || showsPhotoBrowser }
+    private var showsBrowser: Bool { showsFolderBrowser || showsPhotoBrowser || showsRecents }
 
     /// Gallery first, then list - Finder's order (icon view, list view, ...), and the order this
     /// app's own shortcuts already use: Cmd-1 gallery, Cmd-2 list. The segments used to run the
@@ -1132,7 +1141,7 @@ struct StatusGlyph: View {
 struct CenteredStatus: View {
     /// The Omni mole glyphs (asset names), for `symbol`.
     static let mole = "MoleGlyph", moleSearch = "MoleSearch", moleOCR = "MoleOCR", moleSleep = "MoleSleep",
-               moleSerious = "MoleSerious", moleEmpty = "MoleEmpty"
+               moleSerious = "MoleSerious", moleEmpty = "MoleEmpty", moleHush = "MoleHush"
     let symbol: String
     let title: String
     let subtitle: String

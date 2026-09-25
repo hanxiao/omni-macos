@@ -5,6 +5,7 @@ import OmniKit
 /// One selectable row in the sidebar - a folder, or a history query - so both participate in the
 /// List's native selection (focus highlight, arrow keys, Delete).
 enum SidebarSelection: Hashable {
+    case recents
     case folder(URL)
     case photos(String)   // a Photos source, by its root key
     case history(String)
@@ -138,6 +139,9 @@ struct Sidebar: View {
     /// change that.
     @ViewBuilder private var sourcesSection: some View {
             Section("Index") {
+                // FIRST AND ALWAYS, where Finder puts its own Recents - a new install with nothing
+                // indexed has the row too, and it says so.
+                RecentsRow().sidebarRow(.recents)
                 // NESTED, the way Finder's sidebar nests. The user's folders are a tree - a parent
                 // and the folders they added inside it - and a flat list could not say so: after a
                 // parent absorbed six children the sidebar held seven rows with no sign that six
@@ -223,12 +227,13 @@ struct Sidebar: View {
             // map; it must NOT clear the folder filter, because a history row applies its own
             // filters first and clearing here would wipe them straight back out.
             if case .folder(let url) = sel { model.enterFolder(url) }
+            else if sel == .recents { model.enterRecents() }
             else if case .photos(let key) = sel,
                     let source = model.photoSources.first(where: { $0.key == key }) {
                 // Was missing entirely: `.photos` fell into the else below, so clicking a photo
                 // source highlighted the row and moved nothing.
                 model.enterPhotoSource(source)
-            } else { model.selectFolderForVisualization(nil) }
+            } else { model.selectFolderForVisualization(nil); model.browsingRecents = false }
         }
         // Editing the query by hand invalidates a selected saved search: deselect (Finder drops
         // the smart-folder highlight the same way). This also fixes a dead click - selection is
@@ -252,7 +257,8 @@ struct Sidebar: View {
         })
         .onChange(of: model.fileQuery) { _, _ in reconcileSelection() }
         .onReceive(NotificationCenter.default.publisher(for: .omniPerfSidebarSelect)) { note in
-            if let i = note.object as? Int, model.roots.indices.contains(i) { selection = .folder(model.roots[i]) }
+            if let i = note.object as? Int, i == -1 { selection = .recents }
+            else if let i = note.object as? Int, model.roots.indices.contains(i) { selection = .folder(model.roots[i]) }
         }
         .sheet(isPresented: Binding(get: { model.showPhotoPicker }, set: { model.showPhotoPicker = $0 })) { PhotoSourcePicker() }
         .sheet(isPresented: Binding(get: { model.showPhotoDenied }, set: { model.showPhotoDenied = $0 })) { PhotoAccessDenied() }
@@ -269,7 +275,7 @@ struct Sidebar: View {
             case .history(let id):
                 if let item = model.searchHistory.first(where: { $0.id == id }) { model.removeHistory(item) }
                 selection = nil
-            case .none: break
+            case .recents, .none: break
             }
         }
         // Drag a folder in from Finder to add it as a search root - the most natural gesture on
@@ -569,6 +575,19 @@ private struct PhotoSourceRow: View {
 /// control here would be describing the parent's state under this folder's name. What it keeps is
 /// the thing that makes it worth listing - selecting it browses it, and its context menu still
 /// offers "Add to Search Scope", which is how several folders get searched at once.
+/// Finder's Recents row: its `clock` symbol, its name.
+private struct RecentsRow: View {
+    @Environment(\.sidebarRowSelected) private var selected
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "clock").sidebarTint(selected, else: .secondary).frame(width: 16)
+            Text("Recents").sidebarTint(selected, else: .primary)
+            Spacer()
+        }
+    }
+}
+
 private struct CoveredFolderRow: View {
     @Environment(\.sidebarRowSelected) private var selected
     @Environment(AppModel.self) private var model: AppModel

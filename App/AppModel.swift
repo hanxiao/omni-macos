@@ -628,6 +628,8 @@ final class AppModel {
     /// pass runs, and a reconcile finishes in milliseconds - measured by a chaos run, the listing
     /// never reloaded through 150 changes inside the folder on screen.
     private func reloadBrowserIfTouched(_ paths: [String]) {
+        // Recents lists the newest index stamps, and every reconcile writes some.
+        if browsingRecents { requestBrowserReload(); return }
         guard let shown = filterFolder?.path else { return }
         let inside = shown + "/"
         if paths.contains(where: { $0 == shown || $0.hasPrefix(inside) || shown.hasPrefix($0 + "/") }) {
@@ -778,6 +780,7 @@ final class AppModel {
     func enterFolder(_ url: URL?) {
         selectFolderForVisualization(nil)        // browsing takes the empty-result region
         browsedPhotoSource = nil                 // one browser at a time
+        browsingRecents = false
         filterFolder = url                       // re-runs the search and rewrites the box
         captureNavStop()
     }
@@ -802,8 +805,26 @@ final class AppModel {
     /// `.folder` and let `.photos` fall through - so the row highlighted and the pane did not move.
     func enterPhotoSource(_ source: PhotoLibrary.Source) {
         selectFolderForVisualization(nil)
-        filterFolder = nil                 // the two browsers share one region; the last click wins
+        filterFolder = nil                 // the browsers share one region; the last click wins
+        browsingRecents = false
         browsedPhotoSource = source
+    }
+
+    /// The sidebar's Recents is on screen: the files indexed most recently, across every source.
+    var browsingRecents = false
+
+    /// Browse Recents. Unscoped, like Finder's: a search typed over it searches everything.
+    func enterRecents() {
+        selectFolderForVisualization(nil)
+        filterFolder = nil
+        browsedPhotoSource = nil
+        browsingRecents = true
+    }
+
+    /// The newest `limit` files by index time, off the main thread on the browse connection.
+    func recentFiles(limit: Int = 100) async -> [VectorStore.IndexedChild] {
+        guard let store else { return [] }
+        return await Task.detached(priority: .userInitiated) { store.recentlyIndexed(limit: limit) }.value
     }
 
     /// The contents of a Photos source, newest first.
