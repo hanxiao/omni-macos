@@ -68,23 +68,18 @@ struct PhotoSourceBrowser: View {
         // Cmd-Y set `previewURL` and nothing here presented it, so the menu item did nothing.
         .quickLookPreview(Binding(get: { model.previewURL },
                                   set: { if $0 != model.previewURL { model.previewURL = $0 } }))
-        .background(QuickLookKeyMonitor(
-            onSpace: { model.toggleQuickLook() },
-            onPreviewArrow: { vertical, forward in
-                guard model.previewURL != nil, vertical else { return false }
-                moveSelection(by: forward ? 1 : -1)
-                if let p = selected { model.showPreview(path: p) }
-                return true
-            },
-            isPreviewOpen: { model.previewURL != nil }))
+        // Finder's content-view keys, in both layouts: see ContentKeyMonitor.
+        .background(ContentKeyMonitor(nav: { keyNav }, isPreviewOpen: { model.previewURL != nil }))
     }
 
     // MARK: - Bodies
 
     /// Mirrors `FolderBrowser.gridBody`: an adaptive grid of thumbnails with the name beneath.
     private var gridBody: some View {
+        ScrollViewReader { proxy in
         ScrollView {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 108), spacing: 14)], spacing: 14) {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: Self.gridMin), spacing: Self.gridSpacing)],
+                      spacing: Self.gridSpacing) {
                 ForEach(sorted, id: \.path) { hit in
                     VStack(spacing: 6) {
                         Thumbnail(path: hit.path, side: 96, corner: Design.cornerSmall)
@@ -97,11 +92,19 @@ struct PhotoSourceBrowser: View {
                                 in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                     .contentShape(.rect)
                     .onTapGesture(count: 2) { PhotoActions.open(hit.path) }
-                    .simultaneousGesture(TapGesture().onEnded { selected = hit.path; model.selectSingle(hit.path) })
+                    .simultaneousGesture(TapGesture().onEnded { select(hit.path) })
                     .contextMenu { menu(hit) }
+                    .id(hit.path)
                 }
             }
+            .onGeometryChange(for: CGFloat.self, of: { $0.size.width }) { w in
+                if abs(w - gridWidth) > 0.5 { gridWidth = w }
+            }
             .padding(14)
+        }
+        .onChange(of: selected) { _, p in
+            if let p { withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(p) } }
+        }
         }
     }
 
@@ -121,7 +124,7 @@ struct PhotoSourceBrowser: View {
     }
 
     private var listCore: some View {
-        Group {
+        ScrollViewReader { proxy in
             // Inset and bound, for the same reason the folder browser is: `.plain` draws the
             // selection AND the right-click highlight full-bleed and square, `.inset` draws both
             // rounded, which is the style Finder uses.
@@ -145,7 +148,7 @@ struct PhotoSourceBrowser: View {
                 .padding(.trailing, BrowserMetrics.rowTrail)
                 .contentShape(RoundedRectangle(cornerRadius: BrowserMetrics.selectionRadius))
                 .onTapGesture(count: 2) { PhotoActions.open(hit.path) }
-                .simultaneousGesture(TapGesture().onEnded { selected = hit.path; model.selectSingle(hit.path) })
+                .simultaneousGesture(TapGesture().onEnded { select(hit.path) })
                 .contextMenu { menu(hit) }
                 .listRowSeparator(.hidden)
                 .listRowBackground(
@@ -156,8 +159,7 @@ struct PhotoSourceBrowser: View {
                 .listRowInsets(EdgeInsets())
             }
             // Arrow keys, since the List no longer owns the selection.
-            .onKeyPress(.upArrow) { moveSelection(by: -1); return .handled }
-            .onKeyPress(.downArrow) { moveSelection(by: 1); return .handled }
+            .onChange(of: selected) { _, p in if let p { proxy.scrollTo(p) } }
             .environment(\.defaultMinListRowHeight, BrowserMetrics.rowHeight)
             .modifier(SoftTopScrollEdge())
             .alternatingRowBackgrounds()
@@ -171,13 +173,27 @@ struct PhotoSourceBrowser: View {
         FileMenuItems(path: hit.path, kind: hit.kind)
     }
 
-    private func moveSelection(by delta: Int) {
+    private func select(_ path: String) {
+        ContentKeyMonitor.takeKeyboard()
+        selected = path
+        model.selectSingle(path)
+    }
+
+    @State private var gridWidth: CGFloat = 0
+    private static let gridMin: CGFloat = 108, gridSpacing: CGFloat = 14
+
+    private var keyNav: KeyNav? {
         let rows = sorted
-        guard !rows.isEmpty else { return }
-        let current = selected.flatMap { path in rows.firstIndex { $0.path == path } }
-        let next = current.map { min(max(0, $0 + delta), rows.count - 1) } ?? (delta > 0 ? 0 : rows.count - 1)
-        selected = rows[next].path
-        model.selectSingle(rows[next].path)
+        guard !rows.isEmpty else { return nil }
+        return KeyNav(
+            count: rows.count,
+            active: selected.flatMap { p in rows.firstIndex { $0.path == p } },
+            columns: model.viewMode == .grid
+                ? GridColumns.count(width: gridWidth, minimum: Self.gridMin, spacing: Self.gridSpacing) : 1,
+            name: { (rows[$0].path as NSString).lastPathComponent },
+            select: { i, _ in select(rows[i].path) },
+            open: { if let p = selected { PhotoActions.open(p) } },
+            quickLook: { model.toggleQuickLook() })
     }
 
     /// EXACTLY the folder browser's header cell - same weight and colour rules, same sort chevron.

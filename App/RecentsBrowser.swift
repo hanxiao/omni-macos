@@ -40,15 +40,8 @@ struct RecentsBrowser: View {
         }
         .quickLookPreview(Binding(get: { model.previewURL },
                                   set: { if $0 != model.previewURL { model.previewURL = $0 } }))
-        .background(QuickLookKeyMonitor(
-            onSpace: { model.toggleQuickLook() },
-            onPreviewArrow: { vertical, forward in
-                guard model.previewURL != nil, vertical else { return false }
-                moveSelection(by: forward ? 1 : -1)
-                if let p = selected { model.showPreview(path: p) }
-                return true
-            },
-            isPreviewOpen: { model.previewURL != nil }))
+        // Finder's content-view keys, in both layouts: see ContentKeyMonitor.
+        .background(ContentKeyMonitor(nav: { keyNav }, isPreviewOpen: { model.previewURL != nil }))
         .task { await reload() }
         .task { await followIndexing() }
         .onChange(of: model.browserReloadTick) { _, _ in Task { await reload() } }
@@ -102,8 +95,10 @@ struct RecentsBrowser: View {
     // MARK: - Bodies
 
     private var gridBody: some View {
+        ScrollViewReader { proxy in
         ScrollView {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 108), spacing: 14)], spacing: 14) {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: Self.gridMin), spacing: Self.gridSpacing)],
+                      spacing: Self.gridSpacing) {
                 ForEach(sorted, id: \.path) { item in
                     VStack(spacing: 6) {
                         Thumbnail(path: item.path, side: 96, corner: Design.cornerSmall)
@@ -119,9 +114,17 @@ struct RecentsBrowser: View {
                     .onTapGesture(count: 2) { PhotoActions.open(item.path) }
                     .simultaneousGesture(TapGesture().onEnded { select(item.path) })
                     .contextMenu { FileMenuItems(path: item.path, kind: item.kind) }
+                    .id(item.path)
                 }
             }
+            .onGeometryChange(for: CGFloat.self, of: { $0.size.width }) { w in
+                if abs(w - gridWidth) > 0.5 { gridWidth = w }
+            }
             .padding(14)
+        }
+        .onChange(of: selected) { _, p in
+            if let p { withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(p) } }
+        }
         }
     }
 
@@ -137,6 +140,7 @@ struct RecentsBrowser: View {
     }
 
     private var listCore: some View {
+        ScrollViewReader { proxy in
         List(sorted, id: \.path, selection: $selected) { item in
             let isSelected = selected == item.path
             HStack(spacing: 0) {
@@ -179,17 +183,12 @@ struct RecentsBrowser: View {
             )
             .listRowInsets(EdgeInsets())
         }
-        .onKeyPress(.upArrow) { moveSelection(by: -1); return .handled }
-        .onKeyPress(.downArrow) { moveSelection(by: 1); return .handled }
-        .onKeyPress(.return) {
-            guard let p = selected else { return .ignored }
-            PhotoActions.open(p)
-            return .handled
-        }
+        .onChange(of: selected) { _, p in if let p { proxy.scrollTo(p) } }
         .environment(\.defaultMinListRowHeight, BrowserMetrics.rowHeight)
         .modifier(SoftTopScrollEdge())
         .alternatingRowBackgrounds()
         .listStyle(.inset)
+        }
     }
 
     @ViewBuilder private func cell(_ col: BrowserColumn, _ item: VectorStore.IndexedChild) -> some View {
@@ -259,14 +258,25 @@ struct RecentsBrowser: View {
     }
 
     private func select(_ path: String) {
+        ContentKeyMonitor.takeKeyboard()
         selected = path
         model.selectSingle(path)
     }
 
-    private func moveSelection(by delta: Int) {
-        guard !sorted.isEmpty else { return }
-        let current = selected.flatMap { p in sorted.firstIndex { $0.path == p } }
-        let next = current.map { min(max(0, $0 + delta), sorted.count - 1) } ?? (delta > 0 ? 0 : sorted.count - 1)
-        select(sorted[next].path)
+    @State private var gridWidth: CGFloat = 0
+    private static let gridMin: CGFloat = 108, gridSpacing: CGFloat = 14
+
+    private var keyNav: KeyNav? {
+        let rows = sorted
+        guard !rows.isEmpty else { return nil }
+        return KeyNav(
+            count: rows.count,
+            active: selected.flatMap { p in rows.firstIndex { $0.path == p } },
+            columns: model.viewMode == .grid
+                ? GridColumns.count(width: gridWidth, minimum: Self.gridMin, spacing: Self.gridSpacing) : 1,
+            name: { (rows[$0].path as NSString).lastPathComponent },
+            select: { i, _ in select(rows[i].path) },
+            open: { if let p = selected { PhotoActions.open(p) } },
+            quickLook: { model.toggleQuickLook() })
     }
 }

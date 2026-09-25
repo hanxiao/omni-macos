@@ -69,6 +69,23 @@ struct FolderBrowser: View {
     /// coordinates. See `headerTrailingPad`.
     @State private var rowCellsMaxX: CGFloat = 0
     @State private var headerMaxX: CGFloat = 0
+    /// The width the gallery's grid is laid out in; see `GridColumns`.
+    @State private var gridWidth: CGFloat = 0
+    private static let gridMin: CGFloat = 108, gridSpacing: CGFloat = 14
+
+    private var keyNav: KeyNav? {
+        let rows = sorted
+        guard !rows.isEmpty else { return nil }
+        return KeyNav(
+            count: rows.count,
+            active: selected.flatMap { url in rows.firstIndex { $0.url == url } },
+            columns: model.viewMode == .grid
+                ? GridColumns.count(width: gridWidth, minimum: Self.gridMin, spacing: Self.gridSpacing) : 1,
+            name: { rows[$0].name },
+            select: { i, _ in select(rows[i]) },
+            open: { if let url = selected, let e = rows.first(where: { $0.url == url }) { activate(e) } },
+            quickLook: { model.toggleQuickLook() })
+    }
 
     private func setEntries(_ next: [Entry]) {
         entries = next
@@ -127,17 +144,8 @@ struct FolderBrowser: View {
         // half of it was missing here, not because the selection was wrong.
         .quickLookPreview(Binding(get: { model.previewURL },
                                   set: { if $0 != model.previewURL { model.previewURL = $0 } }))
-        .background(QuickLookKeyMonitor(
-            onSpace: { model.toggleQuickLook() },
-            onPreviewArrow: { vertical, forward in
-                // Only while the panel is open: then arrows walk the listing and the preview
-                // follows, the way Finder's does.
-                guard model.previewURL != nil, vertical else { return false }
-                moveSelection(by: forward ? 1 : -1, in: sorted)
-                if let url = selected { model.showPreview(path: url.path) }
-                return true
-            },
-            isPreviewOpen: { model.previewURL != nil }))
+        // Finder's content-view keys, in both layouts: see ContentKeyMonitor.
+        .background(ContentKeyMonitor(nav: { keyNav }, isPreviewOpen: { model.previewURL != nil }))
         .task(id: folder) { await reload() }
         // Something removed files behind our back (a trash, an ignore rule): re-list rather than
         // leave a row pointing at a file that is gone.
@@ -173,7 +181,7 @@ struct FolderBrowser: View {
     }
 
     private var listCore: some View {
-        Group {
+        ScrollViewReader { proxy in
             // INSET, and with a real `selection:` binding. Both halves matter and both were wrong
             // before. `.plain` maps to NSTableView's full-width style, whose selection is
             // full-bleed and square, so a binding drew that square underneath our inset rounded
@@ -261,15 +269,9 @@ struct FolderBrowser: View {
             // default minimum row height on macOS, not because of anything in the row - a 16pt
             // icon with no padding still measured 24. Negative row insets did not move it; this is
             // the knob that does.
-            // Arrow keys, since the List no longer owns the selection. Up/Down move within the
-            // sorted order and Return activates, which is what the binding used to give for free.
-            .onKeyPress(.upArrow) { moveSelection(by: -1, in: sorted); return .handled }
-            .onKeyPress(.downArrow) { moveSelection(by: 1, in: sorted); return .handled }
-            .onKeyPress(.return) {
-                guard let url = selected, let e = sorted.first(where: { $0.url == url }) else { return .ignored }
-                activate(e)
-                return .handled
-            }
+            // Keys: ContentKeyMonitor. The List does not own the selection, so it does not scroll
+            // to it either.
+            .onChange(of: selected) { _, url in if let url { proxy.scrollTo(url) } }
             .environment(\.defaultMinListRowHeight, BrowserMetrics.rowHeight)
             .modifier(SoftTopScrollEdge())
             .alternatingRowBackgrounds()
@@ -401,8 +403,10 @@ struct FolderBrowser: View {
     }
 
     private var gridBody: some View {
+        ScrollViewReader { proxy in
         ScrollView {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 108), spacing: 14)], spacing: 14) {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: Self.gridMin), spacing: Self.gridSpacing)],
+                      spacing: Self.gridSpacing) {
                 ForEach(sorted) { entry in
                     let isSelected = selected == entry.url
                     VStack(spacing: 6) {
@@ -451,9 +455,17 @@ struct FolderBrowser: View {
                     .onTapGesture(count: 2) { activate(entry) }
                     .simultaneousGesture(TapGesture().onEnded { select(entry) })
                     .contextMenu { menu(entry) }
+                    .id(entry.url)
                 }
             }
+            .onGeometryChange(for: CGFloat.self, of: { $0.size.width }) { w in
+                if abs(w - gridWidth) > 0.5 { gridWidth = w }
+            }
             .padding(14)
+        }
+        .onChange(of: selected) { _, url in
+            if let url { withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(url) } }
+        }
         }
     }
 
@@ -474,16 +486,8 @@ struct FolderBrowser: View {
     /// is what every selection-driven action in the app already reads - Share in the toolbar, the
     /// File menu, Quick Look - so without this half of it a browsed file could be clicked but not
     /// acted on from anywhere outside this view.
-    /// Move the selection by one row in the order currently on screen, clamped at both ends -
-    /// the List used to do this through its selection binding.
-    private func moveSelection(by delta: Int, in rows: [Entry]) {
-        guard !rows.isEmpty else { return }
-        let current = selected.flatMap { url in rows.firstIndex { $0.url == url } }
-        let next = current.map { min(max(0, $0 + delta), rows.count - 1) } ?? (delta > 0 ? 0 : rows.count - 1)
-        select(rows[next])
-    }
-
     private func select(_ entry: Entry) {
+        ContentKeyMonitor.takeKeyboard()
         selected = entry.url
         model.selectSingle(entry.url.path)
     }

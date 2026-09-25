@@ -88,22 +88,8 @@ struct ResultsList<Footer: View>: View {
         // and traps (EXC_BREAKPOINT, macOS 26.5.1).
         .quickLookPreview(Binding(get: { model.previewURL },
                                   set: { if $0 != model.previewURL { model.previewURL = $0 } }))
-        // Space toggles Quick Look in both views regardless of focus, and is left alone while
-        // editing text (the search field). The selection drives what is previewed.
-        .background(QuickLookKeyMonitor(
-            onSpace: { model.toggleQuickLook() },
-            onPreviewArrow: { vertical, forward in
-                // Only hijack arrows while Quick Look is open - then move the selection (which,
-                // via its didSet, keeps previewURL on the selected row so the panel updates
-                // live). In the gallery, up/down move by visual row, like Finder.
-                guard model.previewURL != nil else { return false }
-                let grid = model.viewMode == .grid
-                let step = (vertical && grid) ? gridColumns : 1
-                model.moveSelection(rowDelta: forward ? step : -step, gridColumns: grid ? gridColumns : nil)
-                return true
-            },
-            isPreviewOpen: { model.previewURL != nil }))
-        .onKeyPress(.return) { if model.hasSelection { model.openSelected(); return .handled }; return .ignored }
+        // The keyboard, Finder's content-view rules in both layouts: see ContentKeyMonitor.
+        .background(ContentKeyMonitor(nav: { keyNav }, isPreviewOpen: { model.previewURL != nil }))
         // Passages are ranked against the CURRENT query vector, so the QUERY is what invalidates
         // them - not the path list, which is a different publish and decoupled in both directions.
         // It changes constantly under an unchanged query (every background index pass, a trashed
@@ -237,6 +223,7 @@ struct ResultsList<Footer: View>: View {
                                         }
                                     }
                                     .padding(.leading, 28)
+                                    .id(member.path)
                                     .transition(.opacity)
                                 }
                             }
@@ -248,30 +235,11 @@ struct ResultsList<Footer: View>: View {
                 .padding(.horizontal, Design.gapLarge)
                 .padding(.vertical, 8)
             }
-            // Arrow keys move the selection up/down (Return/Space handled on the body). Same
-            // focusable + onMoveCommand wiring the gallery uses. Right/left disclose/collapse the
-            // selected row's passages - the Finder list-view convention for expandable rows.
+            // Keys: ContentKeyMonitor on the body. Right/left disclose/collapse the selected
+            // row's passages - the Finder list-view convention for expandable rows.
             // SOFT SCROLL EDGE: content blurs under the toolbar's glass instead of clipping at a
-            // hard line. Finder's list and icon views both do this (measured: a gradient from 245
-            // to 253 over ~25pt, no rule). Applied to the scroll view ITSELF, which is what the
-            // modifier looks for - it did nothing when it was put on an ancestor.
+            // hard line. Applied to the scroll view ITSELF, which is what the modifier looks for.
             .modifier(SoftTopScrollEdge())
-            .focusable()
-            .focusEffectDisabled()
-            .onMoveCommand { direction in
-                switch direction {
-                case .up: model.moveSelection(rowDelta: -1)
-                case .down: model.moveSelection(rowDelta: 1)
-                case .right:
-                    // renderedHit, not `results`: right-arrow must disclose the passages of an
-                    // opened COPY too, and that row is not in the representative list.
-                    if let sel = model.selection, !expanded.contains(sel),
-                       (model.renderedHit(sel)?.chunkCount ?? 0) > 1 { toggle(sel) }
-                case .left:
-                    if let sel = model.selection, expanded.contains(sel) { toggle(sel) }
-                @unknown default: break
-                }
-            }
             // Keep the selected row on screen as it moves (so arrowing past the fold scrolls).
             .onChange(of: model.selection) { _, sel in
                 guard let sel else { return }
@@ -320,8 +288,40 @@ struct ResultsList<Footer: View>: View {
 
     private let gridMin: CGFloat = 172
     private var gridColumns: Int {
-        let usable = gridWidth - Design.gapLarge * 2
-        return max(1, Int((usable + Design.gapLarge) / (gridMin + Design.gapLarge)))
+        GridColumns.count(width: gridWidth, minimum: gridMin, spacing: Design.gapLarge)
+    }
+
+    /// The rows in the order they are drawn: each result, then an opened stack's other copies.
+    private var navPaths: [SearchHit] {
+        var out: [SearchHit] = []
+        for g in model.groups {
+            out.append(g.representative)
+            if g.isStack, model.expandedStacks.contains(g.id) { out.append(contentsOf: g.members.dropFirst()) }
+        }
+        return out
+    }
+
+    private var keyNav: KeyNav? {
+        let hits = navPaths
+        guard !hits.isEmpty else { return nil }
+        let grid = model.viewMode == .grid
+        return KeyNav(
+            count: hits.count,
+            active: model.selection.flatMap { sel in hits.firstIndex { $0.path == sel } },
+            columns: grid ? gridColumns : 1,
+            name: { (hits[$0].path as NSString).lastPathComponent },
+            select: { i, extend in
+                if extend { model.extendSelection(to: hits[i].path) } else { model.selectSingle(hits[i].path) }
+            },
+            open: { model.openSelected() },
+            disclose: grid ? nil : { right in
+                // renderedHit, not `results`: an opened COPY discloses its passages too.
+                guard let sel = model.selection else { return true }
+                if right, !expanded.contains(sel), (model.renderedHit(sel)?.chunkCount ?? 0) > 1 { toggle(sel) }
+                if !right, expanded.contains(sel) { toggle(sel) }
+                return true
+            },
+            quickLook: { model.toggleQuickLook() })
     }
 
     private var gridView: some View {
@@ -396,32 +396,16 @@ struct ResultsList<Footer: View>: View {
                         }
                     }
                 }
+                // The width the GRID is given, not the scroll view's: a visible scroller takes its
+                // width from here, and the column count must be the one laid out.
+                .onGeometryChange(for: CGFloat.self, of: { $0.size.width }) { w in
+                    if abs(w - gridWidth) > 0.5 { gridWidth = w }
+                }
                 .padding(Design.gapLarge)
                 footer
             }
-            .background(GeometryReader { g in
-                Color.clear
-                    .onAppear { gridWidth = g.size.width }
-                    .onChange(of: g.size.width) { _, w in gridWidth = w }
-            })
-            // Make the gallery keyboard-navigable like the list: arrow keys move the selection by
-            // column/row, and Return/Space (handled on the body) then open/preview it.
-            // SOFT SCROLL EDGE: content blurs under the toolbar's glass instead of clipping at a
-            // hard line. Finder's list and icon views both do this (measured: a gradient from 245
-            // to 253 over ~25pt, no rule). Applied to the scroll view ITSELF, which is what the
-            // modifier looks for - it did nothing when it was put on an ancestor.
+            // Keys: ContentKeyMonitor on the body, moving by the columns the grid really has.
             .modifier(SoftTopScrollEdge())
-            .focusable()
-            .focusEffectDisabled()
-            .onMoveCommand { direction in
-                switch direction {
-                case .up: model.moveSelection(rowDelta: -gridColumns, gridColumns: gridColumns)
-                case .down: model.moveSelection(rowDelta: gridColumns, gridColumns: gridColumns)
-                case .left: model.moveSelection(rowDelta: -1, gridColumns: gridColumns)
-                case .right: model.moveSelection(rowDelta: 1, gridColumns: gridColumns)
-                @unknown default: break
-                }
-            }
             // Keep the selected cell on screen as arrow keys move it (matches the list view).
             .onChange(of: model.selection) { _, sel in
                 guard let sel else { return }
@@ -576,6 +560,7 @@ struct ResultsList<Footer: View>: View {
     /// Click selection with Finder modifiers: Cmd toggles a row, Shift extends the range from the
     /// anchor, plain click replaces the selection.
     private func handleTap(_ path: String) {
+        ContentKeyMonitor.takeKeyboard()
         let m = NSEvent.modifierFlags
         if m.contains(.command) { model.toggleSelection(path) }
         else if m.contains(.shift) { model.extendSelection(to: path) }

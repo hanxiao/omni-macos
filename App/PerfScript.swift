@@ -49,6 +49,17 @@ enum PerfScript {
         switch step.split(separator: ":").first.map(String.init) ?? "" {
         case "browse": model.enterFolder(URL(fileURLWithPath: arg, isDirectory: true))
         case "recents": model.enterRecents()
+        case "key":   // a key into the content pane's handler: down, up, left, right, return, space,
+                      // home, end, cmd-down, opt-up, shift-down, or text to type-select
+            let named: [String: (UInt16, NSEvent.ModifierFlags)] = [
+                "down": (125, []), "up": (126, []), "left": (123, []), "right": (124, []),
+                "return": (36, []), "space": (49, []), "home": (115, []), "end": (119, []),
+                "cmd-down": (125, .command), "opt-up": (126, .option), "opt-down": (125, .option),
+                "shift-down": (125, .shift), "shift-right": (124, .shift)]
+            let (code, flags) = named[arg] ?? (0, [])
+            let handled = ContentKeyMonitor.Coordinator.current?
+                .dispatchForScript(code: code, flags: flags, chars: named[arg] == nil ? arg : nil) ?? false
+            omniPerfLog("key \(arg) handled=\(handled) selection=\((model.selection as NSString?)?.lastPathComponent ?? "nil")")
         case "view": model.viewMode = arg == "list" ? .list : .grid
         case "sidebar":
             // Through the split view's controller: a launch from the shell has no key window, so
@@ -101,6 +112,7 @@ enum PerfScript {
             let payload: [String: Any] = [
                 "time": Date().timeIntervalSince1970, "query": model.query,
                 "results": groups,
+                "selection": model.selection ?? "",
                 "browseFolder": model.browserListingForPerf.folder,
                 "browse": model.browserListingForPerf.paths,
             ]
