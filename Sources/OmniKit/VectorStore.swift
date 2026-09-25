@@ -232,6 +232,10 @@ public struct SearchFilter: Sendable {
     public var minScore: Double? = nil
     public var tagTerms: [String] = []
     public var tagExcludeTerms: [String] = []
+    /// `in:Recents`: only the `recentsLimit` files indexed most recently (`recentlyIndexed`).
+    /// Resolved by the store at search entry into the same allow set tag terms use, so every
+    /// search route honours it the way it honours `tag:`; nil means no such scope.
+    public var recentsLimit: Int? = nil
     // Resolved by the store at search entry from tagTerms/tagExcludeTerms; per-row checks
     // then cost one Set lookup on the resident canonical path.
     var tagAllow: Set<String>? = nil
@@ -240,7 +244,7 @@ public struct SearchFilter: Sendable {
     /// No constraints set - the common plain-query case (enables the GPU candidate fast path).
     var isEmpty: Bool {
         kinds.isEmpty && folderPrefixes.isEmpty && (ext?.isEmpty ?? true) && since == nil
-            && tagTerms.isEmpty && tagExcludeTerms.isEmpty
+            && tagTerms.isEmpty && tagExcludeTerms.isEmpty && recentsLimit == nil
     }
 
     public init() {}
@@ -5473,7 +5477,7 @@ public final class VectorStore: @unchecked Sendable {
         // admitted every name match.
         let denseSet = Set(dense.map { $0.path })
         let extra = names.filter { !denseSet.contains($0) }
-        let resolved = filter.tagTerms.isEmpty && filter.tagExcludeTerms.isEmpty
+        let resolved = filter.tagTerms.isEmpty && filter.tagExcludeTerms.isEmpty && filter.recentsLimit == nil
             ? filter : queue.sync { resolveTagFilterLocked(filter) }
         let materialized = hitsForPaths(extra, query: denseQuery)
             .filter { resolved.accepts(path: $0.path, kind: $0.kind, modified: $0.modified) }
@@ -6342,7 +6346,7 @@ public final class VectorStore: @unchecked Sendable {
         guard nGlobal > 1, filePaths.count >= nGlobal else { return nil }
         let cacheKey = Self.pathAllowKey(f, nGlobal: nGlobal)
         let tagFree = f.tagAllow == nil && f.tagDeny == nil
-            && f.tagTerms.isEmpty && f.tagExcludeTerms.isEmpty
+            && f.tagTerms.isEmpty && f.tagExcludeTerms.isEmpty && f.recentsLimit == nil
         if let key = cacheKey {
             if tagFree, key == pathAllowPureKey, let g = pathAllowPureGPU { return g }
             if !tagFree, key == pathAllowKey, let g = pathAllowGPU { return g }
@@ -6370,7 +6374,8 @@ public final class VectorStore: @unchecked Sendable {
     /// Identity of the path table `f` produces, or nil when it cannot be identified - which happens
     /// only for resolved tag sets with no terms behind them (see above), and means "do not cache".
     static func pathAllowKey(_ f: SearchFilter, nGlobal: Int) -> String? {
-        if (f.tagAllow != nil || f.tagDeny != nil), f.tagTerms.isEmpty, f.tagExcludeTerms.isEmpty {
+        if (f.tagAllow != nil || f.tagDeny != nil), f.tagTerms.isEmpty, f.tagExcludeTerms.isEmpty,
+           f.recentsLimit == nil {
             return nil
         }
         let terms = f.tagTerms.map { $0.lowercased() }.sorted().joined(separator: ",")
@@ -6379,6 +6384,7 @@ public final class VectorStore: @unchecked Sendable {
         // mask built for `in:A` to a later `in:A in:B`, silently dropping B's files from the
         // results, and the bug would only appear once a second folder was scoped.
         return "\(f.folderPrefixes.joined(separator: ">"))|\(f.ext ?? "")|\(terms)|\(exTerms)"
+            + "|\(f.recentsLimit.map { "recents\($0)" } ?? "")"
             + "|\(f.tagAllow?.count ?? -1)|\(f.tagDeny?.count ?? -1)|\(nGlobal)"
     }
     /// Called on every row mutation (through `invalidateTagFilterCacheLocked`). It deliberately
@@ -6522,7 +6528,7 @@ public final class VectorStore: @unchecked Sendable {
 
     private func onlyKindFiltered(_ f: SearchFilter) -> Bool {
         f.folderPrefixes.isEmpty && (f.ext?.isEmpty ?? true) && f.since == nil
-            && f.tagTerms.isEmpty && f.tagExcludeTerms.isEmpty
+            && f.tagTerms.isEmpty && f.tagExcludeTerms.isEmpty && f.recentsLimit == nil
     }
 
     // MARK: - Tag-term filter resolution
@@ -6544,10 +6550,45 @@ public final class VectorStore: @unchecked Sendable {
     /// rows: snippet normalized to ",a,b,c," then LIKE '%,term,%' - no partial-word hits
     /// ("cat" never matches "scattered"). One indexed scan per distinct term list, cached.
     private func resolveTagFilterLocked(_ f: SearchFilter) -> SearchFilter {
-        guard !f.tagTerms.isEmpty || !f.tagExcludeTerms.isEmpty else { return f }
+        guard !f.tagTerms.isEmpty || !f.tagExcludeTerms.isEmpty || f.recentsLimit != nil else { return f }
         var out = f
         if !f.tagTerms.isEmpty { out.tagAllow = pathsMatchingTagTermsLocked(f.tagTerms) }
+        if let n = f.recentsLimit {
+            // In the same cache as tag terms, so the same row mutations clear it: a file indexed
+            // just now joins Recents, and the scope with it.
+            let key = "\u{1}recents:\(n)"
+            let recents: Set<String>
+            if let cached = tagFilterCache[key] { recents = cached }
+            else {
+                recents = recentPathsLocked(limit: n)
+                if tagFilterCache.count >= Self.tagFilterCacheCap { tagFilterCache.removeAll(keepingCapacity: true) }
+                tagFilterCache[key] = recents
+            }
+            out.tagAllow = out.tagAllow.map { $0.intersection(recents) } ?? recents
+        }
         if !f.tagExcludeTerms.isEmpty { out.tagDeny = pathsMatchingTagTermsLocked(f.tagExcludeTerms) }
+        return out
+    }
+
+    /// The paths `recentlyIndexed` lists, read on the store's own connection: this runs on the
+    /// serial queue, where `onReader`'s fallback (`queue.sync`) would deadlock.
+    private func recentPathsLocked(limit: Int) -> Set<String> {
+        guard dbOpen(), let h = db else { return [] }
+        var out = Set<String>()
+        var st: OpaquePointer?
+        defer { sqlite3_finalize(st) }
+        guard sqlite3_prepare_v2(h, """
+            SELECT d.path, f.name
+              FROM (SELECT id, dir_id, name FROM files ORDER BY indexed_at DESC LIMIT ?1) f
+              JOIN dirs d ON d.id = f.dir_id
+             WHERE EXISTS(SELECT 1 FROM \(rowTableShared) c WHERE c.file_id = f.id);
+            """, -1, &st, nil) == SQLITE_OK else { return [] }
+        sqlite3_bind_int(st, 1, Int32(limit))
+        while sqlite3_step(st) == SQLITE_ROW {
+            guard let d = sqlite3_column_text(st, 0), let n = sqlite3_column_text(st, 1) else { continue }
+            let dir = String(cString: d)
+            out.insert(dir.hasSuffix("/") ? dir + String(cString: n) : dir + "/" + String(cString: n))
+        }
         return out
     }
 

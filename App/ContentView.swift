@@ -251,7 +251,7 @@ struct ContentView: View {
     /// source, so only one can be set, but the order makes that explicit rather than incidental.
     /// Recents is on screen. Same precedence rule as the two browsers: a query wins.
     private var showsRecents: Bool {
-        model.browsingRecents && !model.hasQuery && model.fileQuery == nil
+        model.filterRecents && model.filterFolders.isEmpty && !model.hasQuery && model.fileQuery == nil
             && model.rawResults.isEmpty && model.queryError == nil && !model.isResolving
     }
 
@@ -996,7 +996,7 @@ struct ContentView: View {
         case "score": return ["25%", "50%", "70%"]
         case "sort": return ["relevance", "name", "date"]
         case "ext": return model.indexedExts
-        case "in": return model.roots.map { ($0.path as NSString).abbreviatingWithTildeInPath }
+        case "in": return ["Recents"] + model.roots.map { ($0.path as NSString).abbreviatingWithTildeInPath }
         // filename: takes free text - there is nothing sensible to enumerate, and offering a
         // sample of 135,000 basenames would be noise rather than help.
         case "filename": return []

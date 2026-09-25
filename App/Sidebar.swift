@@ -233,7 +233,7 @@ struct Sidebar: View {
                 // Was missing entirely: `.photos` fell into the else below, so clicking a photo
                 // source highlighted the row and moved nothing.
                 model.enterPhotoSource(source)
-            } else { model.selectFolderForVisualization(nil); model.browsingRecents = false }
+            } else { model.selectFolderForVisualization(nil) }
         }
         // Editing the query by hand invalidates a selected saved search: deselect (Finder drops
         // the smart-folder highlight the same way). This also fixes a dead click - selection is

@@ -2705,3 +2705,12 @@ nothing (`update ... dedup=112 tokens=0` for 112 files).
   contentless rows was built and dropped, since the store refuses to write one.
 - It refreshes after every reconcile (`reloadBrowserIfTouched`) and, while a pass runs, every 20x
   the last query's time (floor 2 s), only while it is on screen.
+- RECENTS IS A SCOPE, `in:Recents`, the way a browsed folder is `in:<path>`: `filterRecents` is
+  what clicking it sets and what puts the listing on screen with no query. The store resolves
+  `SearchFilter.recentsLimit` into the same allow set tag terms use (`resolveTagFilterLocked`), so
+  every search route honours it, and caches it with them, cleared on any row mutation. It is read
+  on the store's own connection (`recentPathsLocked`): `onReader`'s fallback is `queue.sync`,
+  which deadlocks from inside the queue. A saved `in:Recents` search replays against what is recent
+  then. Combined with `in:<folder>` it is the intersection.
+- PerfScript `edit:<text>` is what the search field does with typed text (chips stay); `type:`
+  and `search:` rebuild the whole box, so they drop a scope a click put there.

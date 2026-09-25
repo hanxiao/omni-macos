@@ -69,6 +69,8 @@ enum PerfScript {
                 (split.delegate as? NSSplitViewController)?.toggleSidebar(nil)
             }
         case "search": model.applyParsedQuery(arg); model.search()
+        case "edit":   // what the search field does with typed text: chips (scopes) stay as they are
+            model.setSemanticText(arg); model.search()
         case "clear": model.clearSearch()
         case "wait": break   // the wait is the sleep after the step
         case "similar": model.searchBySimilar(to: arg)
@@ -110,7 +112,7 @@ enum PerfScript {
         case "dumpui":   // what the window shows, as JSON at <path>: results with their copies, browser rows
             let groups = model.groups.map { g in g.members.map(\.path) }
             let payload: [String: Any] = [
-                "time": Date().timeIntervalSince1970, "query": model.query,
+                "time": Date().timeIntervalSince1970, "query": model.query, "box": model.rawQuery,
                 "results": groups,
                 "selection": model.selection ?? "",
                 "browseFolder": model.browserListingForPerf.folder,

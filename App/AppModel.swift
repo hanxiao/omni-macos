@@ -629,7 +629,7 @@ final class AppModel {
     /// never reloaded through 150 changes inside the folder on screen.
     private func reloadBrowserIfTouched(_ paths: [String]) {
         // Recents lists the newest index stamps, and every reconcile writes some.
-        if browsingRecents { requestBrowserReload(); return }
+        if filterRecents { requestBrowserReload(); return }
         guard let shown = filterFolder?.path else { return }
         let inside = shown + "/"
         if paths.contains(where: { $0 == shown || $0.hasPrefix(inside) || shown.hasPrefix($0 + "/") }) {
@@ -780,7 +780,7 @@ final class AppModel {
     func enterFolder(_ url: URL?) {
         selectFolderForVisualization(nil)        // browsing takes the empty-result region
         browsedPhotoSource = nil                 // one browser at a time
-        browsingRecents = false
+        setFilterRecentsQuietly(false)           // the assignment below rewrites the box once
         filterFolder = url                       // re-runs the search and rewrites the box
         captureNavStop()
     }
@@ -805,13 +805,23 @@ final class AppModel {
     /// `.folder` and let `.photos` fall through - so the row highlighted and the pane did not move.
     func enterPhotoSource(_ source: PhotoLibrary.Source) {
         selectFolderForVisualization(nil)
+        setFilterRecentsQuietly(false)
         filterFolder = nil                 // the browsers share one region; the last click wins
-        browsingRecents = false
         browsedPhotoSource = source
     }
 
-    /// The sidebar's Recents is on screen: the files indexed most recently, across every source.
-    var browsingRecents = false
+    /// `in:Recents`: the search is scoped to the `recentsLimit` files indexed most recently, the way
+    /// `filterFolders` scopes it to folders - and like the browsed folder, it is also what puts the
+    /// Recents listing on screen when there is no query. A smart folder: replayed from history it
+    /// searches whatever is recent then, not what was recent when it was saved.
+    var filterRecents = false { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
+
+    private func setFilterRecentsQuietly(_ on: Bool) {
+        guard filterRecents != on else { return }
+        suppressFilterEffects = true
+        filterRecents = on
+        suppressFilterEffects = false
+    }
 
     /// How many files Recents lists (Settings > History > Index): 100, 500 or 1000.
     static let recentsLimits = [100, 500, 1000]
@@ -819,15 +829,22 @@ final class AppModel {
         let v = UserDefaults.standard.integer(forKey: "omni.recentsLimit")
         return AppModel.recentsLimits.contains(v) ? v : 100
     }() {
-        didSet { UserDefaults.standard.set(recentsLimit, forKey: "omni.recentsLimit") }
+        didSet {
+            UserDefaults.standard.set(recentsLimit, forKey: "omni.recentsLimit")
+            if filterRecents, hasQuery { search() }   // a different Recents is a different scope
+        }
     }
 
-    /// Browse Recents. Unscoped, like Finder's: a search typed over it searches everything.
+    /// Browse Recents, which also scopes the search to it (`in:Recents` in the box), exactly as
+    /// entering a folder does. Removing the chip searches everything.
     func enterRecents() {
         selectFolderForVisualization(nil)
-        filterFolder = nil
         browsedPhotoSource = nil
-        browsingRecents = true
+        suppressFilterEffects = true
+        filterFolders = []
+        suppressFilterEffects = false
+        filterRecents = true               // rewrites the box and re-runs a query that is there
+        captureNavStop()
     }
 
     /// The newest `limit` files by index time, off the main thread on the browse connection.
@@ -2459,7 +2476,7 @@ final class AppModel {
     }
 
     var filtersActive: Bool {
-        !filterKinds.isEmpty || !filterFolders.isEmpty
+        !filterKinds.isEmpty || !filterFolders.isEmpty || filterRecents
             || !filterExt.isEmpty || !filterTags.isEmpty || !filterTagsExclude.isEmpty
             || dateRange != .any
             || minScore != Self.defaultMinScore
@@ -3054,6 +3071,7 @@ final class AppModel {
         // appending per qualifier would fire a search per `in:` and each intermediate one would be
         // scoped to fewer folders than the user asked for.
         var folders: [URL] = []
+        var recents = false
         for qual in parsed.qualifiers {
             switch qual.key {
             case "type":
@@ -3072,7 +3090,8 @@ final class AppModel {
             // ACCUMULATES, like `tag:` above and unlike every other qualifier: `in:A in:B` means
             // both folders. Last-one-wins silently dropped A, which is the shape of issue #18.
             case "in":
-                if let url = Self.resolveFolder(qual.value), !folders.contains(url) { folders.append(url) }
+                if qual.value.lowercased() == "recents" { recents = true }
+                else if let url = Self.resolveFolder(qual.value), !folders.contains(url) { folders.append(url) }
             case "filename": filterFilename = qual.negated ? "" : qual.value
             case "date": if let d = DateRange(rawValue: qual.value.lowercased()) { dateRange = d }
             case "after": if let d = Self.mapAfter(qual.value) { dateRange = d }
@@ -3093,12 +3112,13 @@ final class AppModel {
             else if !excludeKinds.isEmpty { filterKinds = Set(FileKind.allCases).subtracting(excludeKinds) }  // -type:x = all but x
         }
         if !folders.isEmpty { filterFolders = folders }
+        if recents { filterRecents = true }
         query = parsed.semanticText
     }
 
     /// Reset every filter dimension to its default (caller holds the applyingParsedQuery guard).
     private func resetAllFilters() {
-        filterKinds = []; filterExt = ""; filterFolders = []; filterFilename = ""
+        filterKinds = []; filterExt = ""; filterFolders = []; filterFilename = ""; filterRecents = false
         filterTags = ""; filterTagsExclude = ""
         dateRange = .any; minScore = Self.defaultMinScore; sortOrder = .relevance
     }
@@ -3140,6 +3160,7 @@ final class AppModel {
         if !filterTagsExclude.isEmpty { parts.append("-tag:" + Self.quoteIfNeeded(filterTagsExclude)) }
         if !filterExt.isEmpty { parts.append("ext:" + filterExt) }
         if !filterFilename.isEmpty { parts.append("filename:" + Self.quoteIfNeeded(filterFilename)) }
+        if filterRecents { parts.append("in:Recents") }
         for f in filterFolders { parts.append("in:" + Self.quoteIfNeeded(f.path)) }
         if dateRange != .any { parts.append("date:" + dateRange.rawValue) }
         if minScore != Self.defaultMinScore { parts.append("score:\(Int((minScore * 100).rounded()))%") }
@@ -3265,6 +3286,7 @@ final class AppModel {
         var f = SearchFilter()
         f.kinds = Set(filterKinds.map { $0.rawValue })
         f.folderPrefixes = filterFolders.map(\.path)
+        f.recentsLimit = filterRecents ? recentsLimit : nil
         f.ext = filterExt.isEmpty ? nil : filterExt
         f.filenameQuery = filterFilename.isEmpty ? nil : filterFilename
         f.since = dateRange.since

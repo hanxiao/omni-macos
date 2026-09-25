@@ -35,4 +35,26 @@ final class RecentlyIndexedTests: XCTestCase {
         store.deletePaths(["/r/f5.txt", "/r/f3.txt"])
         XCTAssertEqual(store.recentlyIndexed(limit: 3).map(\.path), ["/r/f4.txt", "/r/f2.txt", "/r/f1.txt"])
     }
+
+    /// `in:Recents` is a search scope: only the newest `recentsLimit` files can answer, alone or
+    /// together with a folder.
+    func testRecentsScopeRestrictsSearch() throws {
+        let store = try VectorStore(dbURL: tempDB())
+        defer { store.close() }
+        for i in 0 ..< 6 { try write(store, "/r/\(i < 3 ? "a" : "b")/f\(i).txt") }   // f3, f4, f5 newest, all in b
+        try write(store, "/r/a/f0.txt", modified: 2)                                    // f0 re-indexed: newest of all
+        var q = [Float](repeating: 0, count: 8)
+        for i in 0 ..< 8 { q[i] = 1 }                                                   // close to every file
+        var f = SearchFilter()
+        f.recentsLimit = 3
+        f.minScore = 0
+        let hits = Set(store.search(q, filter: f, topK: 10).map(\.path))
+        XCTAssertEqual(hits, ["/r/a/f0.txt", "/r/b/f5.txt", "/r/b/f4.txt"])
+        f.folderPrefix = "/r/b"
+        XCTAssertEqual(Set(store.search(q, filter: f, topK: 10).map(\.path)), ["/r/b/f5.txt", "/r/b/f4.txt"])
+        // A new file joins Recents, and the scope with it.
+        try write(store, "/r/b/f9.txt")
+        f.folderPrefix = nil
+        XCTAssertTrue(store.search(q, filter: f, topK: 10).map(\.path).contains("/r/b/f9.txt"))
+    }
 }
