@@ -22,6 +22,9 @@ enum BrowserColumn: String, CaseIterable, Identifiable, Sendable {
     case size
     case filesIndexed
     case tags
+    /// The folder a file is in. Only for listings that span folders (Recents); in the folder
+    /// browser every row would say the same thing, so its column menu leaves it out.
+    case folder
 
     var id: String { rawValue }
 
@@ -34,6 +37,7 @@ enum BrowserColumn: String, CaseIterable, Identifiable, Sendable {
         case .size:         return "Size"
         case .filesIndexed: return "Files Indexed"
         case .tags:         return "Tags"
+        case .folder:       return "Folder"
         }
     }
 
@@ -49,6 +53,7 @@ enum BrowserColumn: String, CaseIterable, Identifiable, Sendable {
         case .size:         return 91
         case .filesIndexed: return 109
         case .tags:         return 197
+        case .folder:       return 177
         }
     }
 
@@ -64,6 +69,9 @@ enum BrowserColumn: String, CaseIterable, Identifiable, Sendable {
     /// Name is not in the list: Finder's header menu cannot turn Name off either, because a row
     /// with no name is not a row.
     static let defaultVisible: [BrowserColumn] = [.kind, .dateIndexed, .size, .filesIndexed]
+
+    /// What the folder browser's header menu offers: everything but Folder.
+    static let folderBrowserChoices: [BrowserColumn] = allCases.filter { $0 != .folder }
 }
 
 /// Which columns are on, persisted. A comma-joined list of raw values so an unknown column added

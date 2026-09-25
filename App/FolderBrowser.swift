@@ -102,7 +102,7 @@ struct FolderBrowser: View {
             if a.isDirectory != b.isDirectory { return a.isDirectory }
             let result: Bool
             switch sort {
-            case .name:
+            case .name, .column(.folder):   // every row is in the same folder here
                 result = a.name.localizedStandardCompare(b.name) == .orderedAscending
             case .column(.kind):
                 result = a.kind == b.kind
@@ -370,7 +370,7 @@ struct FolderBrowser: View {
     @ViewBuilder private var columnMenu: some View {
         // A Toggle, which a menu draws as Finder's own checkmark column. A checkmark ICON on the
         // "on" rows and plain text on the rest read as a half-iconed menu on Tahoe.
-        ForEach(BrowserColumn.allCases) { col in
+        ForEach(BrowserColumn.folderBrowserChoices) { col in
             Toggle(col.title, isOn: Binding(
                 get: { columns.isOn(col) },
                 set: { _ in
@@ -399,6 +399,8 @@ struct FolderBrowser: View {
             Text(e.isDirectory ? e.fileCount.formatted() : "--")
         case .tags:
             Text(e.tags.isEmpty ? "--" : e.tags.joined(separator: ", "))
+        case .folder:
+            Text(folder.lastPathComponent)
         }
     }
 

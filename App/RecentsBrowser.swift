@@ -22,7 +22,7 @@ struct RecentsBrowser: View {
     @State private var headerMaxX: CGFloat = 0
 
     static let limit = 100
-    private static let columns: [BrowserColumn] = [.kind, .dateIndexed, .size]
+    private static let columns: [BrowserColumn] = [.folder, .kind, .dateIndexed, .size]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -84,6 +84,9 @@ struct RecentsBrowser: View {
             switch sort {
             case .column(.kind) where a.kind != b.kind: return ascending == (a.kind < b.kind)
             case .column(.size) where a.size != b.size: return ascending == (a.size < b.size)
+            case .column(.folder):
+                let c = folderName(a.path).localizedStandardCompare(folderName(b.path))
+                return c == .orderedSame ? tie(a, b) : ascending == (c == .orderedAscending)
             case .column(.dateIndexed) where a.indexedAt != b.indexedAt:
                 return ascending == (a.indexedAt < b.indexedAt)
             case .name: return ascending == tie(a, b)
@@ -149,13 +152,6 @@ struct RecentsBrowser: View {
                 Text((item.path as NSString).lastPathComponent)
                     .lineLimit(1).truncationMode(.middle)
                     .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
-                    .layoutPriority(1)
-                // The folder it is in, dimmed: Recents spans every source, and two notes.md from
-                // two projects were otherwise the same row twice.
-                Text(Self.folderName(item.path))
-                    .lineLimit(1).truncationMode(.middle)
-                    .foregroundStyle(isSelected ? AnyShapeStyle(.white.opacity(0.75)) : AnyShapeStyle(.tertiary))
-                    .padding(.leading, 6)
                 Spacer(minLength: 8)
                 ForEach(Self.columns) { col in
                     cell(col, item)
@@ -193,6 +189,12 @@ struct RecentsBrowser: View {
 
     @ViewBuilder private func cell(_ col: BrowserColumn, _ item: VectorStore.IndexedChild) -> some View {
         switch col {
+        case .folder:
+            // Recents spans every source, and two notes.md from two projects were otherwise the
+            // same row twice. The whole path is on hover.
+            Text(Self.folderName(item.path))
+                .help(item.path.hasPrefix("photos://") ? "Photos"
+                      : (item.path as NSString).deletingLastPathComponent)
         case .kind: Text(FileKind(rawValue: item.kind)?.title ?? "--")
         case .dateIndexed:
             Text(item.indexedAt > 0
