@@ -2647,7 +2647,7 @@ One drawn mole, template-rendered so it takes `.tertiary` like an SF Symbol, wit
 screen: `MoleGlyph` (plain) onboarding, `MoleSerious` (determined brows) "Loading your index",
 `MoleSearch` (star eyes) the search prompt, `MoleOCR` (reading glasses) the OCR drop zone,
 `MoleSleep` (z z) "Add folders to search", `MoleEmpty` (x x eyes) "Nothing indexed here",
-`MoleHush` (one brow up, finger on the lips) "No recent items".
+`MoleCurious` (one brow up, a question mark) "No recent items".
 PNGs are rendered with `rsvg-convert -w 80/160/240` from the generator's SVG (matches the shipped
 assets to 0.6/255 mean alpha difference). SAME SIZE AND COLOUR EVERYWHERE: every screen draws it
 through `StatusGlyph` (68 pt, `.tertiary`); a one-off size or style on one screen is what made the

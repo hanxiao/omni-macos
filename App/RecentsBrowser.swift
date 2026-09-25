@@ -30,7 +30,7 @@ struct RecentsBrowser: View {
                 Spacer(); ProgressView().controlSize(.small); Spacer()
             } else if items.isEmpty {
                 Spacer()
-                CenteredStatus(symbol: CenteredStatus.moleHush, title: "No recent items", subtitle: "")
+                CenteredStatus(symbol: CenteredStatus.moleCurious, title: "No recent items", subtitle: "")
                 Spacer()
             } else if model.viewMode == .grid {
                 gridBody

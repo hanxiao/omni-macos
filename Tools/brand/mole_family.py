@@ -29,16 +29,15 @@ def svg(v):
         # x x eyes: nothing here
         eyes = ('<path d="M36.4,35.4 L43.6,42.6 M43.6,35.4 L36.4,42.6" fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round"/>'
                 '<path d="M56.4,35.4 L63.6,42.6 M63.6,35.4 L56.4,42.6" fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round"/>')
-    elif v == "hush":
-        # one brow up, one eye narrowed, a paw's finger over the mouth: nothing to tell yet
+    elif v == "curious":
+        # one brow up, one eye narrowed, a question in the air: nothing to show yet
         eyes = ('<path d="M36.6,39.6 L43.4,39.6 A3.4,3.4 0 0 1 36.6,39.6 Z" fill="black"/>'
                 '<circle cx="60" cy="39" r="3.6" fill="black"/>'
                 '<path d="M34.6,32.4 L45,35.2" fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round"/>'
                 '<path d="M54.6,31 Q59.5,25.2 65,29.6" fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round"/>')
-        # the other paw comes up under the chin, and its finger stands over the mouth
-        paws = [(33, 71), (50, 70)]
-        extra_mask = '<rect x="45.3" y="54.8" width="9.4" height="16" rx="4.7" fill="black"/>'
-        extra_fill = '<rect x="47.6" y="57" width="4.8" height="12" rx="2.4"/>'
+        extra_fill = ('<path d="M81,17.5 Q81,11.5 87,11.5 Q93,11.5 93,17 Q93,21 87.5,23.5 L87.5,26.5" '
+                      'fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>'
+                      '<circle cx="87.5" cy="32" r="1.8"/>')
     elif v == "welcome":
         eyes = ('<path d="M36.2,41 Q40,36.5 43.8,41" fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round"/>'
                 '<path d="M56.2,41 Q60,36.5 63.8,41" fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round"/>')
@@ -69,5 +68,5 @@ def svg(v):
  <path mask="url(#mound)" d="M9,89 C9,79 27,75 50,75 C73,75 91,79 91,89 C91,92 89,94 86,94 L14,94 C11,94 9,92 9,89 Z"/>
  {pawfill}{extra_fill}
 </svg>'''
-for v in ["base", "search", "ocr", "sleep", "serious", "empty", "hush"]:
+for v in ["base", "search", "ocr", "sleep", "serious", "empty", "curious"]:
     open(f"fam-{v}.svg", "w").write(svg(v))
