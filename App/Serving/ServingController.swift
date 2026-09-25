@@ -26,13 +26,15 @@ final class ServingController {
 
     enum State: Equatable {
         case stopped
+        /// The listener exists and has not bound yet. Not green: a busy port fails from here.
+        case starting
         case running
         case portInUse
         case failed(String)
     }
 
     private(set) var state: State = .stopped
-    private(set) var isRunning: Bool = false      // mirrors state == .running
+    private(set) var isRunning: Bool = false      // a server object is live (starting or running)
     private(set) var boundAddress: String = ""    // e.g. "http://127.0.0.1:51234"; "" when stopped
 
     // MARK: Private state
@@ -136,8 +138,9 @@ final class ServingController {
                 // clobber the live server's state, or reconcile would show Stopped while the real
                 // listener keeps serving, and the next toggle binds over the orphan -> EADDRINUSE wedge.
                 guard let self, let srv, self.server === srv else { return }
+                guard self.state == .starting || self.state == .running else { return }   // reported once
                 self.state = msg == "port in use" ? .portInUse : .failed(msg)
-                self.note(.error, "Server failed: \(msg)")
+                self.note(.error, msg == "port in use" ? "Port \(self.port) is in use" : "Server failed: \(msg)")
                 self.isRunning = false
                 self.boundAddress = ""
                 // Deliberately do NOT flip `enabled` (it persists to defaults): a transient bind
@@ -148,13 +151,24 @@ final class ServingController {
         }
 
         let host = isPublic ? "0.0.0.0" : "127.0.0.1"
+        let address = "http://\(isPublic ? lanAddress() : "127.0.0.1"):\(port)"
+        let port = self.port, tokenNote = requireToken ? " with a bearer token" : ""
+        // GREEN ONLY ONCE THE LISTENER IS READY. It was set the moment `start` returned, which only
+        // means the listener object exists: a port another process holds then showed "Running"
+        // beside "Server failed: port in use" in the log.
+        srv.onReady = { [weak self, weak srv] in
+            Task { @MainActor in
+                guard let self, let srv, self.server === srv, self.state == .starting else { return }
+                self.state = .running
+                self.boundAddress = address
+                self.note(.info, "Listening on \(host):\(port)\(tokenNote)")
+            }
+        }
         do {
             try srv.start(host: host, port: UInt16(port))
             server = srv
-            state = .running
+            state = .starting
             isRunning = true
-            boundAddress = "http://\(isPublic ? lanAddress() : "127.0.0.1"):\(port)"
-            note(.info, "Starting on \(host):\(port)\(requireToken ? " with a bearer token" : "")")
         } catch {
             note(.error, "Port \(port) is in use")
             state = .portInUse
@@ -191,7 +205,13 @@ final class ServingController {
     private func load() {
         isLoading = true
         defer { isLoading = false }
-        if defaults.object(forKey: "omni.serving.enabled") != nil {
+        if ServingLogFile.isolatedDir != nil {
+            // AN ISOLATED RUN (`-omni.dbDir`) SERVES ONLY WHEN ITS OWN ARGUMENTS SAY SO. Reading the
+            // user's "on" made every test launch try the user's port, fail on it while their app
+            // held it, and log that into their serving log beside a green light that was right.
+            let args = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
+            enabled = (args["omni.serving.enabled"] as? String).map { ["YES", "1", "true"].contains($0) } ?? false
+        } else if defaults.object(forKey: "omni.serving.enabled") != nil {
             enabled = defaults.bool(forKey: "omni.serving.enabled")
         }
         if let raw = defaults.string(forKey: "omni.serving.scope"), let s = ServingScope(rawValue: raw) {
@@ -208,6 +228,7 @@ final class ServingController {
 
     private func persist() {
         guard !isLoading else { return }   // don't write a half-loaded snapshot back over saved values
+        guard ServingLogFile.isolatedDir == nil else { return }   // an isolated run is not the user's
         defaults.set(enabled, forKey: "omni.serving.enabled")
         defaults.set(scope.rawValue, forKey: "omni.serving.scope")
         defaults.set(port, forKey: "omni.serving.port")

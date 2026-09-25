@@ -64,8 +64,18 @@ enum ServingScope: String, Sendable {
 final class ServingLogFile: @unchecked Sendable {
     enum Level: String { case info = "INFO", warn = "WARN", error = "ERROR" }
 
-    static let url: URL = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("Logs/Omni/serving.log")
+    /// The user's log, or, for an isolated run (`-omni.dbDir`), one beside that run's index: test
+    /// launches wrote their bind failures into the user's file.
+    static let url: URL = isolatedDir.map { URL(fileURLWithPath: $0).appendingPathComponent("serving.log") }
+        ?? FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Logs/Omni/serving.log")
+
+    /// The `-omni.dbDir` launch argument, which is what makes a run isolated (see
+    /// `AppModel.isolatedByLaunchArgument`, read the same way).
+    static let isolatedDir: String? = {
+        let dir = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)["omni.dbDir"] as? String
+        return (dir?.isEmpty ?? true) ? nil : dir
+    }()
 
     /// Rotated at open past this size: one previous file (`serving.log.1`) is kept.
     private static let rotateBytes = 32 << 20

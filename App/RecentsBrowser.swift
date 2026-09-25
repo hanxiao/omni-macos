@@ -21,7 +21,6 @@ struct RecentsBrowser: View {
     @State private var rowCellsMaxX: CGFloat = 0
     @State private var headerMaxX: CGFloat = 0
 
-    static let limit = 100
     private static let columns: [BrowserColumn] = [.folder, .kind, .dateIndexed, .size]
 
     var body: some View {
@@ -46,10 +45,11 @@ struct RecentsBrowser: View {
         .task { await followIndexing() }
         .onChange(of: model.browserReloadTick) { _, _ in Task { await reload() } }
         .onChange(of: model.lastIndexed) { _, _ in Task { await reload() } }
+        .onChange(of: model.recentsLimit) { _, _ in Task { await reload() } }
     }
 
     private func reload() async {
-        let found = await model.recentFiles(limit: Self.limit)
+        let found = await model.recentFiles(limit: model.recentsLimit)
         if found.map(\.path) != items.map(\.path) || found.map(\.indexedAt) != items.map(\.indexedAt) {
             items = found
             sorted = Self.order(found, by: sort, ascending: ascending)

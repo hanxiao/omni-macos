@@ -906,11 +906,17 @@ private struct HistoryTab: View {
     @Environment(AppModel.self) private var model: AppModel
     @State private var confirmClear = false
     var body: some View {
-        // ONE GROUP. Five rows that all answer "what does Omni remember" do not need four boxes
-        // and four paragraphs between them - that is more explaining than setting. Each row's
-        // detail moves to its tooltip, where it is there when wanted and silent when not.
+        // TWO GROUPS: what the sidebar shows of the index (Recents), and what Omni remembers of
+        // searches. No paragraphs between them - each row's detail is in its tooltip.
         Form {
-            Section {
+            Section("Index") {
+                Picker("Show recent items", selection: Binding(get: { model.recentsLimit },
+                                                               set: { model.recentsLimit = $0 })) {
+                    ForEach(AppModel.recentsLimits, id: \.self) { Text("\($0)").tag($0) }
+                }
+                .help("Files in Recents, newest indexed first")
+            }
+            Section("Search") {
                 Picker("Add searches to history", selection: Binding(get: { model.historyMode }, set: { model.historyMode = $0 })) {
                     ForEach(HistoryMode.allCases) { Text($0.title).tag($0) }
                 }

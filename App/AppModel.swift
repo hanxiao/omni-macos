@@ -813,6 +813,15 @@ final class AppModel {
     /// The sidebar's Recents is on screen: the files indexed most recently, across every source.
     var browsingRecents = false
 
+    /// How many files Recents lists (Settings > History > Index): 100, 500 or 1000.
+    static let recentsLimits = [100, 500, 1000]
+    var recentsLimit: Int = {
+        let v = UserDefaults.standard.integer(forKey: "omni.recentsLimit")
+        return AppModel.recentsLimits.contains(v) ? v : 100
+    }() {
+        didSet { UserDefaults.standard.set(recentsLimit, forKey: "omni.recentsLimit") }
+    }
+
     /// Browse Recents. Unscoped, like Finder's: a search typed over it searches everything.
     func enterRecents() {
         selectFolderForVisualization(nil)

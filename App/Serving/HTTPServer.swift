@@ -21,6 +21,9 @@ final class HTTPServer: @unchecked Sendable {
     /// Called when the listener fails to come up or dies (e.g. port in use). The
     /// controller installs this to flip its state. Always invoked on `queue`.
     var onFailure: (@Sendable (String) -> Void)?
+    /// Called once the listener is actually accepting. Until then the port is NOT known to be
+    /// ours: `start` returning only means the listener object was created.
+    var onReady: (@Sendable () -> Void)?
 
     private let handler: Handler
     private let onLog: @Sendable (LogEntry) -> Void
@@ -71,11 +74,15 @@ final class HTTPServer: @unchecked Sendable {
             switch state {
             case .ready:
                 Self.log.info("serving listener ready on port \(port, privacy: .public)")
+                self.onReady?()
             case .failed(let error):
                 Self.log.error("serving listener failed: \(String(describing: error), privacy: .public)")
                 self.onFailure?(self.describe(error))
             case .waiting(let error):
+                // A listener that cannot bind can WAIT rather than fail, and waits for good. It is
+                // not serving, so it is a failure as far as anyone watching is concerned.
                 Self.log.error("serving listener waiting: \(String(describing: error), privacy: .public)")
+                self.onFailure?(self.describe(error))
             case .cancelled:
                 break
             default:

@@ -11,6 +11,7 @@ struct ServingTab: View {
     @State private var embedSchema: EmbedSchema = .openai
     @State private var showMCPSheet = false
     @State private var showSkillSheet = false
+    @State private var logHasLines = false
 
     /// Top-level example category: the search endpoint, or an embedding endpoint.
     private enum ExampleKind: String, CaseIterable, Identifiable {
@@ -30,6 +31,14 @@ struct ServingTab: View {
             logsSection
         }
         .formStyle(.grouped)
+        .task {
+            // One stat a second while the tab is open, for `logsSection`; the text view polls its own.
+            while !Task.isCancelled {
+                let size = (try? FileManager.default.attributesOfItem(atPath: ServingLogFile.url.path)[.size] as? Int) ?? 0
+                if (size > 0) != logHasLines { logHasLines = size > 0 }
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
         // NO FIXED HEIGHT. The Settings TabView sizes itself to the selected tab
         // (`fixedSize(vertical:)`), so a pinned height here did not make the window steady - it
         // made this one tab shorter than its own content and put a scroller inside it, which no
@@ -151,13 +160,14 @@ struct ServingTab: View {
         switch model.serving.state {
         case .running: return .green
         case .portInUse, .failed: return .orange
-        case .stopped: return .secondary
+        case .stopped, .starting: return .secondary
         }
     }
 
     private var statusText: String {
         switch model.serving.state {
         case .running: return "Running"
+        case .starting: return "Starting"
         case .stopped: return "Stopped"
         case .portInUse: return "Port in use"
         case .failed(let m): return m.isEmpty ? "Failed" : m
@@ -470,15 +480,34 @@ struct ServingTab: View {
 
     // MARK: - Requests
 
+    /// Absent until the log has a line: an empty text box and a path to an empty file say nothing.
     @ViewBuilder private var logsSection: some View {
-        Section("Logs") {
-            LogTextView()
-                .frame(height: 200)
-            LabeledContent("Log file") {
-                Text(ServingLogFile.url.path.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
-                    .textSelection(.enabled)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+        if logHasLines {
+            Section("Logs") {
+                LogTextView()
+                    .frame(height: 200)
+                // The OCR cache's Location row, exactly: path on the label line, buttons below.
+                VStack(spacing: 6) {
+                    HStack(spacing: 8) {
+                        Text("Log file")
+                        Spacer()
+                        Text((ServingLogFile.url.path as NSString).abbreviatingWithTildeInPath)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1).truncationMode(.middle)
+                            .help(ServingLogFile.url.path)
+                    }
+                    HStack(spacing: 8) {
+                        Spacer()
+                        Button("Copy Path") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(ServingLogFile.url.path, forType: .string)
+                        }
+                        Button("Show in Finder") {
+                            NSWorkspace.shared.activateFileViewerSelecting([ServingLogFile.url])
+                        }
+                    }
+                    .controlSize(.small)
+                }
             }
         }
     }

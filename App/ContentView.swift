@@ -632,7 +632,7 @@ struct ContentView: View {
     /// Names the port when it is actually listening, because that is what a reader needs next. No
     /// "click to stop": it is a toggle, and its filled state already says which way it is.
     private var servingHelp: String {
-        model.serving.isRunning ? "Serving on port \(model.serving.port)" : "Serve over HTTP"
+        model.serving.state == .running ? "Serving on port \(model.serving.port)" : "Serve over HTTP"
     }
 
     /// The four leading controls, emitted at whatever placement the running system actually
