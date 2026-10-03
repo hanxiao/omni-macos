@@ -127,6 +127,84 @@ if args.contains("--probe-decode-width") {
     exit(0)
 }
 
+// Row-exactness: does a (n, 1, K) batched product give each row the bits of its own one-row call?
+if args.contains("--probe-rowexact") {
+    func check(_ name: String, _ w: MLXArray, _ dt: DType) {
+        for n in [2, 3, 4, 6] {
+            let x = MLXRandom.normal([n, w.dim(0)]).asType(dt)
+            let single = concatenated((0 ..< n).map { matmul(x[$0 ..< ($0 + 1)], w) }, axis: 0)
+            let plain = matmul(x, w)
+            let batched = matmul(x.reshaped([n, 1, w.dim(0)]), w).reshaped([n, w.dim(1)])
+            let dp = (plain .!= single).sum().item(Int.self), db = (batched .!= single).sum().item(Int.self)
+            print("\(name) n=\(n): plain differs in \(dp), batched (n,1,K) differs in \(db) of \(single.size)")
+        }
+    }
+    check("bf16 1280x3840", (MLXRandom.normal([1280, 3840]) * 0.02).asType(.bfloat16), .bfloat16)
+    check("bf16 lm 1280x129280", (MLXRandom.normal([1280, 129280]) * 0.02).asType(.bfloat16), .bfloat16)
+    check("fp32 router 1280x64", MLXRandom.normal([1280, 64]) * 0.05, .float32)
+    // Is the MULTI-row kernel row-invariant? Row r of an M-row product against the same row padded
+    // to 2 (zeros) - if every M agrees, padding single-row decode to 2 makes all paths one kernel.
+    func gemmInvariant(_ name: String, _ w: MLXArray, _ dt: DType) {
+        let x8 = MLXRandom.normal([8, w.dim(0)]).asType(dt)
+        let ref = concatenated((0 ..< 8).map { r in
+            matmul(concatenated([x8[r ..< (r + 1)], MLXArray.zeros([1, w.dim(0)], dtype: dt)], axis: 0), w)[0 ..< 1] }, axis: 0)
+        var line = "\(name) padded-2 vs M:"
+        for m in [2, 3, 4, 5, 6, 8] {
+            let y = matmul(x8[0 ..< m], w)
+            line += " M\(m)=\((y .!= ref[0 ..< m]).sum().item(Int.self))"
+        }
+        print(line)
+        let x1 = x8[0 ..< 1], x2 = concatenated([x1, MLXArray.zeros([1, w.dim(0)], dtype: dt)], axis: 0)
+        for (label, xx) in [("M=1", x1), ("pad2", x2)] {
+            for _ in 0 ..< 5 { eval(matmul(xx, w)) }
+            let t = Date(); var outs: [MLXArray] = []
+            for i in 0 ..< 200 { outs.append(matmul(xx, w)); if i % 20 == 19 { eval(outs); outs.removeAll() } }
+            print(String(format: "   %@ %@ %.1f us", name, label, Date().timeIntervalSince(t) * 1e6 / 200))
+        }
+    }
+    gemmInvariant("bf16 1280x3840", (MLXRandom.normal([1280, 3840]) * 0.02).asType(.bfloat16), .bfloat16)
+    gemmInvariant("bf16 lm 1280x129280", (MLXRandom.normal([1280, 129280]) * 0.02).asType(.bfloat16), .bfloat16)
+    gemmInvariant("fp32 router 1280x64", MLXRandom.normal([1280, 64]) * 0.05, .float32)
+    // The verify forward's own form: `.causal` over the full cache, against each row alone.
+    if args.contains("--causal-sweep") {
+        for L in [300, 700, 1000, 1024, 1030, 1100, 1500, 2000, 2050, 3000, 4100] {
+            var line = "causal L=\(L):"
+            for n in 2 ... 8 {
+                let q = MLXRandom.normal([1, 10, n, 128]).asType(.bfloat16)
+                let k = MLXRandom.normal([1, 10, L, 128]).asType(.bfloat16)
+                let v = MLXRandom.normal([1, 10, L, 128]).asType(.bfloat16)
+                let joint = MLXFast.scaledDotProductAttention(queries: q, keys: k, values: v, scale: 0.088, mask: .causal)
+                let start = L - n
+                let rows = concatenated((0 ..< n).map { r in
+                    MLXFast.scaledDotProductAttention(queries: q[0..., 0..., r ..< (r + 1), 0...],
+                        keys: k[0..., 0..., 0 ..< (start + r + 1), 0...], values: v[0..., 0..., 0 ..< (start + r + 1), 0...],
+                        scale: 0.088, mask: .none) }, axis: 2)
+                line += " n\(n)=\((joint .!= rows).sum().item(Int.self))"
+            }
+            print(line)
+        }
+        exit(0)
+    }
+    // Attention: one causal call over n queries against per-row calls each over its own prefix.
+    for n in [2, 4, 6] {
+        let L = 1100
+        let q = MLXRandom.normal([1, 10, n, 128]).asType(.bfloat16)
+        let k = MLXRandom.normal([1, 10, L, 128]).asType(.bfloat16)
+        let v = MLXRandom.normal([1, 10, L, 128]).asType(.bfloat16)
+        let start = L - n
+        var maskv = [Float](repeating: 0, count: n * L)
+        for r in 0 ..< n { for c in (start + r + 1) ..< L { maskv[r * L + c] = -Float.infinity } }
+        let mask = MLXArray(maskv, [n, L]).asType(.bfloat16)
+        let joint = MLXFast.scaledDotProductAttention(queries: q, keys: k, values: v, scale: 0.088, mask: .array(mask))
+        let rows = concatenated((0 ..< n).map { r in
+            MLXFast.scaledDotProductAttention(queries: q[0..., 0..., r ..< (r + 1), 0...],
+                keys: k[0..., 0..., 0 ..< (start + r + 1), 0...], values: v[0..., 0..., 0 ..< (start + r + 1), 0...],
+                scale: 0.088, mask: .none) }, axis: 2)
+        print("sdpa n=\(n): joint causal call differs from per-row calls in \((joint .!= rows).sum().item(Int.self)) of \(rows.size)")
+    }
+    exit(0)
+}
+
 // Model-free: routed gather_qmm whose indices come from an in-graph router (argSort -> slice -> int32).
 if args.contains("--probe-gather") {
     func bench(_ name: String, _ f: () -> MLXArray) {
@@ -196,6 +274,19 @@ if args.contains("--probe-qmm") {
                 line += String(format: "  M%d %.1e%@", m, err, err > 1e-3 ? "!" : "")
             }
             print(line + (bad.isEmpty ? "   all OK" : "   WRONG at M=\(bad)"))
+            // The layout every loaded pack actually uses (`OCRWeights.kMajor`).
+            let (tq, ts, tb) = quantized(w.swappedAxes(0, 1), groupSize: gs, bits: bits)
+            let tdeq = dequantized(tq, scales: ts, biases: tb, groupSize: gs, bits: bits)
+            var tline = "  transpose=true:", tbad: [Int] = []
+            for m in 1 ... 8 {
+                let x = MLXRandom.normal([m, K])
+                let a = quantizedMM(x, tq, scales: ts, biases: tb, transpose: true, groupSize: gs, bits: bits)
+                let b = matmul(x, tdeq.swappedAxes(0, 1))
+                let err = (MLX.abs(a - b).max() / MLX.abs(b).max()).item(Float.self)
+                if err > 1e-3 { tbad.append(m) }
+                tline += String(format: "  M%d %.1e%@", m, err, err > 1e-3 ? "!" : "")
+            }
+            print(tline + (tbad.isEmpty ? "   all OK" : "   WRONG at M=\(tbad)"))
         }
     }
     exit(0)

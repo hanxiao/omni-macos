@@ -20,11 +20,14 @@ public enum OCRWeight: @unchecked Sendable {
         public let biases: MLXArray?
         public let groupSize: Int
         public let bits: Int
+        /// Stored `(…, out, packedIn)`, quantized along the input axis, for MLX's
+        /// `transpose: true` kernels. Every pack is converted to this at load; see `kMajor`.
+        public var transposed = false
 
         /// Unpacked output width. `scales` carries one column per group, so the true width is
         /// `groups * groupSize` - reading it off the packed uint32 axis instead only works when
         /// `32 % bits == 0`, which stops being true the moment a 5- or 6-bit pack appears.
-        public var outputWidth: Int { scales.dim(-1) * groupSize }
+        public var outputWidth: Int { transposed ? scales.dim(-2) : scales.dim(-1) * groupSize }
     }
 
     /// Output width of either form, for callers that need to split a fused gate/up matrix.
@@ -50,8 +53,9 @@ public enum OCRWeight: @unchecked Sendable {
 /// `x @ W` for both weight forms. The single place in the port where pack orientation and
 /// dequantization are decided; every projection goes through it.
 ///
-/// Packs are stored K-major - `(in, packedOut)`, matching `h @ W` - so `transpose` is always
-/// false. The upstream python tree carried two orientations and three "is it packed" flags and
+/// The checkpoint stores packs `(in, packedOut)`, matching `h @ W`; the loader re-groups every one
+/// to `(out, packedIn)` (`OCRWeights.kMajor`), so `transpose` follows `Pack.transposed`, which is
+/// true for every pack in a loaded model. The upstream python tree carried two orientations and three "is it packed" flags and
 /// crashed on every attempt to change precision at runtime until they were collapsed to one
 /// helper; this is that helper.
 @inline(__always)
@@ -80,18 +84,21 @@ func ocrProj(_ x: MLXArray, _ w: OCRWeight) -> MLXArray {
 ///
 /// The fix pads the row dimension out to 4 and slices the result back. That costs one or two
 /// wasted rows on a matmul this small, and it is applied centrally so no call site has to know.
+///
+/// `transpose: true` is correct at every M (`--probe-qmm` prints both), and the loader converts
+/// every pack to it, so the padding only ever runs for a pack built outside the loader.
 @inline(__always)
 func safeQuantizedMM(_ x: MLXArray, _ p: OCRWeight.Pack) -> MLXArray {
     let rows = x.ndim >= 2 ? x.dim(-2) : 1
-    guard x.ndim >= 2, rows == 2 || rows == 3 else {
+    guard x.ndim >= 2, !p.transposed, rows == 2 || rows == 3 else {
         return quantizedMM(x, p.w, scales: p.scales, biases: p.biases,
-                           transpose: false, groupSize: p.groupSize, bits: p.bits)
+                           transpose: p.transposed, groupSize: p.groupSize, bits: p.bits)
     }
     var widths = [IntOrPair](repeating: IntOrPair(0), count: x.ndim)
     widths[x.ndim - 2] = IntOrPair((0, 4 - rows))
     let padded = MLX.padded(x, widths: widths)
     let y = quantizedMM(padded, p.w, scales: p.scales, biases: p.biases,
-                        transpose: false, groupSize: p.groupSize, bits: p.bits)
+                        transpose: p.transposed, groupSize: p.groupSize, bits: p.bits)
     return y.ndim == 2 ? y[0 ..< rows] : y[.ellipsis, 0 ..< rows, 0...]
 }
 
@@ -115,7 +122,7 @@ func ocrExpertMatmul(_ x: MLXArray, _ w: OCRWeight, indices: MLXArray) -> MLXArr
         y = gatherMM(lhs, m, rhsIndices: indices, sortedIndices: false)
     case .pack(let p):
         y = gatherQuantizedMM(lhs, p.w, scales: p.scales, biases: p.biases,
-                              rhsIndices: indices, transpose: false,
+                              rhsIndices: indices, transpose: p.transposed,
                               groupSize: p.groupSize, bits: p.bits, sortedIndices: false)
     }
     return y.squeezed(axis: -2)
@@ -132,7 +139,7 @@ func ocrExpertMatmulRows(_ rows: MLXArray, _ w: OCRWeight, indices: MLXArray) ->
         y = gatherMM(lhs, m, rhsIndices: indices, sortedIndices: false)
     case .pack(let p):
         y = gatherQuantizedMM(lhs, p.w, scales: p.scales, biases: p.biases,
-                              rhsIndices: indices, transpose: false,
+                              rhsIndices: indices, transpose: p.transposed,
                               groupSize: p.groupSize, bits: p.bits, sortedIndices: false)
     }
     return y.squeezed(axis: -2)
@@ -237,6 +244,39 @@ public struct OCRWeights: @unchecked Sendable {
             }
         }
         eval(live)
+
+        // One pack at a time, so the dense intermediate of only one exists at once.
+        for (key, w) in items {
+            guard case .pack(let p) = w, !p.transposed else { continue }
+            let t = Self.kMajor(p)
+            eval(t.w, t.scales)
+            if let b = t.biases { eval(b) }
+            items[key] = .pack(t)
+        }
+    }
+
+    /// Re-quantize a pack from the shipped layout (groups along the output axis, `transpose:
+    /// false`) into the `transpose: true` layout (groups along the input axis), which MLX's
+    /// qmv / gather_qmv / qmm kernels run faster. A quantized matrix cannot be transposed without
+    /// re-grouping its scales, so this is a SECOND rounding on top of the converter's - and it was
+    /// graded as one: hard2 against the torch oracle is unchanged page for page (greedy 7/10
+    /// exact, mean CER 0.0087, every divergence at the same character; continuous width 10: 8/10,
+    /// 0.0086). Measured on the 40-page scan: 201 -> 234 tok/s single, 465 -> 552 at width 32,
+    /// first token ~655 -> ~540 ms; the conversion adds nothing visible to a 0.5 s load. The
+    /// document digests move (single 772db0f94e0ae106 -> a35ef0f9c8fe8ad, width 32
+    /// b16f69c903bb21cd -> f1ed744e12ae453): near-tie flips, the class the CER gate exists for.
+    /// A build re-quantized from the original checkpoint along this axis would skip the double
+    /// rounding; it would also be a new 4.3 GB download, which this gate says is not needed.
+    static func kMajor(_ p: OCRWeight.Pack) -> OCRWeight.Pack {
+        let dense = dequantized(p.w, scales: p.scales, biases: p.biases,
+                                groupSize: p.groupSize, bits: p.bits)
+        let (w, scales, biases) = quantized(dense.swappedAxes(-1, -2),
+                                            groupSize: p.groupSize, bits: p.bits)
+        var t = OCRWeight.Pack(w: w, scales: scales.asType(p.scales.dtype),
+                               biases: biases?.asType(p.scales.dtype),
+                               groupSize: p.groupSize, bits: p.bits)
+        t.transposed = true
+        return t
     }
 
     /// Bytes the packs and plain tensors occupy, and the bit histogram. Used by the bench tool

@@ -353,6 +353,23 @@ final class OCRBatchKVCache {
 @inline(__always)
 func ocrSiLU(_ x: MLXArray) -> MLXArray { x * sigmoid(x) }
 
+/// A plain (unquantized) projection whose rows do not depend on how many rows there are.
+///
+/// MLX multiplies one row with a gemv kernel and several with a tiled gemm, and the two sum in a
+/// different order, so a speculative verify (k+1 rows) and the greedy step for the same token got
+/// different bits and flipped near-ties. The gemm IS row-invariant: row r comes out bit-identical
+/// at every M from 2 to 8 (`ocr-verify x --probe-rowexact`). So a single row is padded to two and
+/// every path shares that kernel. Quantized packs need nothing: in the `transpose: true` layout
+/// the loader gives them, MLX runs a few rows through its one-row qmv kernel row by row.
+/// Costs ~25 us a projection (~0.4 ms on the LM head) on a one-row TARGET step only - the greedy
+/// path and a batch's last row. Speculative decoding never runs one (verify is k+1 rows), and the
+/// draft head opts out because its output is only ever a guess the verify checks.
+func ocrProjRowInvariant(_ x: MLXArray, _ w: OCRWeight) -> MLXArray {
+    guard case .plain(let m) = w, x.ndim == 2, x.dim(0) == 1 else { return ocrProj(x, w) }
+    let xx = x.asType(m.dtype)
+    return matmul(concatenated([xx, MLXArray.zeros(like: xx)], axis: 0), m)[0 ..< 1]
+}
+
 /// `cosf` and `sinf` kept as two separate calls. Swift 6.3 merges a `cosf`/`sinf` pair on one
 /// argument into `__sincosf_stret`, which differs from the separate calls by up to one ULP; in the
 /// rope table that moved the 40-page scan's digest (772db0f94e0ae106 -> a35ef0f9c8fe8ad, 3 chars).
@@ -373,10 +390,15 @@ enum OCRRuntime {
     /// Force the in-place KV write to materialise before anything reads the view.
     static let evalCacheWrites = ProcessInfo.processInfo.environment["OMNI_OCR_EVAL_CACHE"] == "1"
     static let specDebug = ProcessInfo.processInfo.environment["OMNI_OCR_SPEC_DEBUG"] == "1"
-    /// EXPERIMENT: dispatch every N decoder layers with asyncEval so the GPU runs layer i while
-    /// the host encodes layer i+1 (oMLX's eager per-layer dispatch). 0 = off.
-    static let eagerEvery = Int(ProcessInfo.processInfo.environment["OMNI_OCR_EAGER"] ?? "") ?? 0
+    /// Decode-shaped forwards (at most this many rows) dispatch each decoder layer with
+    /// `asyncEval` as soon as it is built, so the GPU runs layer i while the host encodes layer
+    /// i+1 instead of waiting for the whole graph (oMLX's eager dispatch). Scheduling only: the
+    /// 40-page digests are unchanged (772db0f94e0ae106 single, b16f69c903bb21cd at width 32) and
+    /// it measured 195 -> 201 tok/s single, 460 -> 467 at width 32. Prefill (~1000 rows) is left
+    /// as one graph.
     static let eagerMaxRows = 64
+    /// The widest forward treated as a speculative verify (k + 1 rows); anything wider is prefill.
+    static let verifyRowsMax = 16
 }
 
 // MARK: - attention
@@ -385,11 +407,18 @@ final class OCRAttention: @unchecked Sendable {
     private let wqkv: OCRWeight
     private let wo: OCRWeight
     private let nHeads: Int
+    private let rowInvariant: Bool
 
-    init(_ w: OCRWeights, _ prefix: String) {
+    /// `rowInvariant: false` only for the draft head - see `ocrProjRowInvariant`.
+    init(_ w: OCRWeights, _ prefix: String, rowInvariant: Bool = true) {
         wqkv = w["\(prefix).wqkv"]
         wo = w["\(prefix).o"]
         nHeads = wqkv.outputWidth / (3 * OCRLanguageConfig.headDim)
+        self.rowInvariant = rowInvariant
+    }
+
+    private func proj(_ x: MLXArray, _ w: OCRWeight) -> MLXArray {
+        rowInvariant ? ocrProjRowInvariant(x, w) : ocrProj(x, w)
     }
 
     /// Llama `rotate_half` rope: cos/sin have each half DUPLICATED, and the rotation swaps the
@@ -420,7 +449,7 @@ final class OCRAttention: @unchecked Sendable {
         let b = x.dim(0)
         let d = OCRLanguageConfig.headDim
         let h = nHeads
-        let qkv = ocrProj(x, wqkv)
+        let qkv = proj(x, wqkv)
         var q = qkv[0..., 0 ..< (h * d)].reshaped([b, h, 1, d])
         var k = qkv[0..., (h * d) ..< (2 * h * d)].reshaped([b, h, 1, d])
         let v = qkv[0..., (2 * h * d)...].reshaped([b, h, 1, d])
@@ -428,7 +457,7 @@ final class OCRAttention: @unchecked Sendable {
         k = applyRopeBatch(k.asType(.float32), cos: cos, sin: sin).asType(x.dtype)
 
         cache.appendStep(k, v)
-        guard let view = cache.view else { return ocrProj(x, wo).asType(x.dtype) }
+        guard let view = cache.view else { return proj(x, wo).asType(x.dtype) }
         let scale = 1.0 / Float(d).squareRoot()
         // A mask only when the sequences disagree about their length; when they are level the
         // fused kernel takes its fastest path, exactly as the single-sequence n == 1 case does.
@@ -436,7 +465,7 @@ final class OCRAttention: @unchecked Sendable {
             cache.mask().map { .array($0.asType(x.dtype)) } ?? .none
         let y = MLXFast.scaledDotProductAttention(queries: q, keys: view.keys, values: view.values,
                                                   scale: scale, mask: mode)
-        return ocrProj(y.reshaped([b, h * d]), wo).asType(x.dtype)
+        return proj(y.reshaped([b, h * d]), wo).asType(x.dtype)
     }
 
     /// Rope for a batch: one position per sequence, so cos/sin are (B, d) and broadcast across
@@ -457,7 +486,7 @@ final class OCRAttention: @unchecked Sendable {
         let n = x.dim(0)
         let d = OCRLanguageConfig.headDim
         let h = nHeads
-        let qkv = ocrProj(x, wqkv)
+        let qkv = proj(x, wqkv)
         var q = qkv[0..., 0 ..< (h * d)].reshaped([n, h, d]).transposed(1, 0, 2)
         var k = qkv[0..., (h * d) ..< (2 * h * d)].reshaped([n, h, d]).transposed(1, 0, 2)
         let v = qkv[0..., (2 * h * d)...].reshaped([n, h, d]).transposed(1, 0, 2)
@@ -473,16 +502,116 @@ final class OCRAttention: @unchecked Sendable {
         }
 
         let scale = 1.0 / Float(d).squareRoot()
-        // n == 1: the single query attends every cached key, so no mask is needed and the fused
-        // kernel takes its fastest path. n > 1: the engine's own causal mode, which never
-        // materialises an (n, n) score matrix.
-        let y = MLXFast.scaledDotProductAttention(
-            queries: q.expandedDimensions(axis: 0),
-            keys: keysAll.expandedDimensions(axis: 0),
-            values: valuesAll.expandedDimensions(axis: 0),
-            scale: scale, mask: q.dim(1) == 1 ? .none : .causal)
+        let y: MLXArray
+        if n > 1 && n <= OCRRuntime.verifyRowsMax {
+            // A speculative verify: every row must get the bits its own greedy step would. See
+            // `OCRVerifyAttention` for why one causal call over all rows does not, and how the
+            // rows are grouped so that each group does.
+            let total = keysAll.dim(1)
+            y = concatenated(OCRVerifyAttention.groups(total: total, rows: n).map { g in
+                let len = total - n + g.upperBound
+                return MLXFast.scaledDotProductAttention(
+                    queries: q[0..., g, 0...].expandedDimensions(axis: 0),
+                    keys: keysAll[0..., 0 ..< len, 0...].expandedDimensions(axis: 0),
+                    values: valuesAll[0..., 0 ..< len, 0...].expandedDimensions(axis: 0),
+                    scale: scale, mask: g.count == 1 ? .none : .causal)
+            }, axis: 2)
+        } else {
+            // n == 1: the single query attends every cached key, so no mask is needed and the
+            // fused kernel takes its fastest path. Prefill: the engine's own causal mode, which
+            // never materialises an (n, n) score matrix.
+            y = MLXFast.scaledDotProductAttention(
+                queries: q.expandedDimensions(axis: 0),
+                keys: keysAll.expandedDimensions(axis: 0),
+                values: valuesAll.expandedDimensions(axis: 0),
+                scale: scale, mask: n == 1 ? .none : .causal)
+        }
         let out = y[0].transposed(1, 0, 2).reshaped([n, h * d])
-        return ocrProj(out, wo).asType(x.dtype)
+        return proj(out, wo).asType(x.dtype)
+    }
+}
+
+/// How a speculative verify's rows are grouped into attention calls so that each row's output is
+/// bit-identical to the greedy step for the same token.
+///
+/// MLX's one-query attention kernel picks a PLAN - one pass or two, and in two-pass mode a block
+/// count - from the call's total key count and its number of query rows (MLX 0.31,
+/// `ScaledDotProductAttention::eval_gpu` / `sdpa_vector_2pass`). A greedy step is one row over its
+/// own prefix; a single causal call over k+1 verify rows is planned for the longest prefix and k+1
+/// rows. Where those plans differ the rows are summed in a different order and near-ties flip -
+/// every ~1007-token page prompt crosses the 1024-key switch a few tokens in. Within one plan the
+/// per-row arithmetic does not depend on the key count or the row count
+/// (`ocr-verify x --probe-rowexact --causal-sweep`), so rows are grouped by plan: usually one call,
+/// two around a switch. One call per row was the first version and cost 7% of decode at k = 3.
+///
+/// `plan` mirrors MLX's rule for multi-head attention (no GQA) at head dim 128. `selfCheck` runs at
+/// model load and compares grouped calls against per-row calls across the switch points; if the
+/// rule ever disagrees with the MLX actually linked - a new version, a GPU class it misreads - every
+/// verify falls back to one call per row, which is exact by construction.
+enum OCRVerifyAttention {
+    static let deviceClass: Character = GPU.deviceInfo().architecture.last ?? " "
+    nonisolated(unsafe) static var perRowOnly = false
+    static let vectorRowsMax = 8
+
+    /// 0 = one pass, otherwise the two-pass block count.
+    static func plan(keys n: Int, rows m: Int) -> Int {
+        guard deviceClass == "d" || deviceClass == "s", n >= 1024 else { return 0 }
+        if deviceClass == "s" {
+            guard n > 1024 && m > 4 else { return 64 }
+            return n <= 8192 ? 128 : n <= 32768 ? 256 : n <= 65536 ? 512 : 1024
+        }
+        if m <= 2 && n > 8192 { return 256 }
+        if m >= 6 && n >= 16384 { return n < 65536 ? 512 : 1024 }
+        return 128
+    }
+
+    /// Consecutive row ranges whose single causal call plans like each row's own greedy call.
+    static func groups(total: Int, rows n: Int) -> [Range<Int>] {
+        if perRowOnly { return (0 ..< n).map { $0 ..< ($0 + 1) } }
+        let ownKeys = { (r: Int) in total - n + r + 1 }
+        var out: [Range<Int>] = []
+        var start = 0
+        for r in 0 ..< n {
+            let grown = start ..< (r + 1)
+            let joint = plan(keys: ownKeys(r), rows: grown.count)
+            // Past 8 query rows MLX leaves the one-query kernel for its full attention kernel.
+            if grown.count <= vectorRowsMax,
+               grown.allSatisfy({ plan(keys: ownKeys($0), rows: 1) == joint }) { continue }
+            out.append(start ..< r)
+            start = r
+        }
+        out.append(start ..< n)
+        return out
+    }
+
+    private static let checked: Void = selfCheck()
+    /// Once per process, at the first model load: ~50 small attention calls.
+    static func checkOnce() { _ = checked }
+
+    /// Grouped against per-row, on random data across every switch the rule knows about.
+    static func selfCheck() {
+        let lengths = [1000, 1020, 1023, 1024, 1025, 1030, 2000, 8190, 8193, 8200]
+        for total in lengths {
+            for n in [2, 4, 5, 7, 9] {
+                let q = MLXRandom.normal([1, 10, n, 128]).asType(.bfloat16)
+                let k = MLXRandom.normal([1, 10, total, 128]).asType(.bfloat16)
+                let v = MLXRandom.normal([1, 10, total, 128]).asType(.bfloat16)
+                func call(_ g: Range<Int>) -> MLXArray {
+                    let len = total - n + g.upperBound
+                    return MLXFast.scaledDotProductAttention(
+                        queries: q[0..., 0..., g, 0...], keys: k[0..., 0..., 0 ..< len, 0...],
+                        values: v[0..., 0..., 0 ..< len, 0...], scale: 0.088,
+                        mask: g.count == 1 ? .none : .causal)
+                }
+                let grouped = concatenated(groups(total: total, rows: n).map(call), axis: 2)
+                let perRow = concatenated((0 ..< n).map { call($0 ..< ($0 + 1)) }, axis: 2)
+                if (grouped .!= perRow).any().item(Bool.self) {
+                    perRowOnly = true
+                    OmniLog.warn("OCR verify attention: plan rule disagrees with MLX at \(total) keys, \(n) rows; using one call per row")
+                    return
+                }
+            }
+        }
     }
 }
 
@@ -492,17 +621,20 @@ final class OCRAttention: @unchecked Sendable {
 final class OCRDenseMLP: @unchecked Sendable {
     private let gateUp: OCRWeight
     private let down: OCRWeight
+    private let rowInvariant: Bool
 
-    init(_ w: OCRWeights, _ prefix: String) {
+    init(_ w: OCRWeights, _ prefix: String, rowInvariant: Bool = true) {
         gateUp = w["\(prefix).gate_up"]
         down = w["\(prefix).down"]
+        self.rowInvariant = rowInvariant
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let gu = ocrProj(x, gateUp)
+        let proj = rowInvariant ? ocrProjRowInvariant : ocrProj
+        let gu = proj(x, gateUp)
         let inter = gu.dim(-1) / 2
         let y = ocrSiLU(gu[.ellipsis, 0 ..< inter]) * gu[.ellipsis, inter ..< gu.dim(-1)]
-        return ocrProj(y, down).asType(x.dtype)
+        return proj(y, down).asType(x.dtype)
     }
 }
 
@@ -546,7 +678,7 @@ final class OCRMoE: @unchecked Sendable {
         // MoEGate: raw fp32 router logits (no 1/sqrt(hidden)), softmax over experts, greedy
         // top-k, and `norm_topk_prob = false` so the selected probabilities are used AS-IS.
         // Renormalising them is the single most common way to get this family subtly wrong.
-        let logits = matmul(x.asType(.float32), gate.asType(.float32))
+        let logits = ocrProjRowInvariant(x.asType(.float32), .plain(gate.asType(.float32)))
         let probs = softMax(logits, axis: -1)
         let order = argSort(-probs, axis: -1)
         let topIdx = order[0..., 0 ..< k].asType(.int32)
@@ -636,8 +768,8 @@ final class OCRMTPHead: @unchecked Sendable {
         ehProj = w["mtp.eh_proj"]
         inLN = w.array("mtp.block.input_layernorm")
         postLN = w.array("mtp.block.post_attention_layernorm")
-        attn = OCRAttention(w, "mtp.block.attn")
-        mlp = OCRDenseMLP(w, "mtp.block.mlp")
+        attn = OCRAttention(w, "mtp.block.attn", rowInvariant: false)
+        mlp = OCRDenseMLP(w, "mtp.block.mlp", rowInvariant: false)
         // Absent in the "shared" checkpoint format, where the draft is meant to reuse the main
         // model's final norm. Falling back keeps such a build loadable; it does not make it good.
         sharedNorm = w.has("mtp.norm.weight") ? w.array("mtp.norm.weight") : w.array("norm.weight")
@@ -742,13 +874,13 @@ final class OCRLanguageModel: @unchecked Sendable {
                       caches: [OCRBatchKVCache]) -> (hidden: MLXArray, logits: MLXArray) {
         let (cos, sin) = rope(positions: positions)
         var x = embeddings
-        let eager = OCRRuntime.eagerEvery > 0 && x.dim(0) <= OCRRuntime.eagerMaxRows
+        let eager = x.dim(0) <= OCRRuntime.eagerMaxRows
         for (i, (layer, cache)) in zip(layers, caches).enumerated() {
             x = layer.callBatch(x, cos: cos, sin: sin, cache: cache)
-            if eager, (i + 1) % OCRRuntime.eagerEvery == 0, i + 1 < layers.count { asyncEval(x) }
+            if eager, i + 1 < layers.count { asyncEval(x) }
         }
         let h = ocrRMSNorm(x, normW)
-        let logits = ocrProj(h.asType(lmHead.computeDType), lmHead).asType(.float32)
+        let logits = ocrProjRowInvariant(h.asType(lmHead.computeDType), lmHead).asType(.float32)
         return (h, logits)
     }
 
@@ -759,16 +891,16 @@ final class OCRLanguageModel: @unchecked Sendable {
     func forward(_ embeddings: MLXArray, positions: [Int], caches: [OCRKVCache]) -> (hidden: MLXArray, logits: MLXArray) {
         let (cos, sin) = rope(positions: positions)
         var x = embeddings
-        let eager = OCRRuntime.eagerEvery > 0 && x.dim(0) <= OCRRuntime.eagerMaxRows
+        let eager = x.dim(0) <= OCRRuntime.eagerMaxRows
         for (i, (layer, cache)) in zip(layers, caches).enumerated() {
             x = layer(x, cos: cos, sin: sin, cache: cache)
-            if eager, (i + 1) % OCRRuntime.eagerEvery == 0, i + 1 < layers.count { asyncEval(x) }
+            if eager, i + 1 < layers.count { asyncEval(x) }
         }
         let h = ocrRMSNorm(x, normW)
         // No weight up-cast. `h.asType(.float32) @ lm_head` would materialise a full fp32 copy of
         // the 331 MB head EVERY token; matching the activation to the weight dtype and up-casting
         // only the (small) logits keeps the largest per-token read at its stored width.
-        let logits = ocrProj(h.asType(lmHead.computeDType), lmHead).asType(.float32)
+        let logits = ocrProjRowInvariant(h.asType(lmHead.computeDType), lmHead).asType(.float32)
         return (h, logits)
     }
 
@@ -815,7 +947,7 @@ final class OCRLanguageModel: @unchecked Sendable {
         case .plain(let m):
             sliced = .plain(MLX.contiguous(m[0..., 0 ..< limit]))
         case .pack(let p):
-            guard limit % p.groupSize == 0, (limit * p.bits) % 32 == 0 else { return nil }
+            guard !p.transposed, limit % p.groupSize == 0, (limit * p.bits) % 32 == 0 else { return nil }
             let groups = limit / p.groupSize
             let words = limit * p.bits / 32
             sliced = .pack(OCRWeight.Pack(

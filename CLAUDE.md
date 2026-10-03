@@ -89,10 +89,10 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
 - k curve RE-MEASURED after the sync removal (long_scan, aggregate): 174/185/188/180/181 at
   k=2..6. On bench/hard2 k=3 and k=4 tie at 169. Default stays 3 - one synthetic document is not
   grounds to move it, per the grading rule above.
-- k=5 CHANGES THE OUTPUT on hard2 (digest 61dd84f8 vs d2d17e6a, 4318 vs 4310 chars) where every
-  other k is identical. Speculation is exact by construction, so this is a real defect - most
-  likely the loop guard firing at a different index because block boundaries move with k.
-  Unresolved; do not raise k past 4 until it is understood.
+- k=5 CHANGED THE OUTPUT on hard2 (digest 61dd84f8 vs d2d17e6a). RESOLVED 2026-10-03, and the
+  guess here (the loop guard) was wrong: verify rows computed different bits from the greedy step
+  for the same token, because MLX picks kernels by row count. Speculative output is now byte-
+  identical to greedy at every k - see "Exact verify rows" under "MLX 0.32".
 - Where the remaining time is (long page, 1309 tok): greedy 177.5 tok/s, speculative 213.9 - only
   1.20x, against 1.49x on a 352-token page. At ~2.9 tokens/cycle the draft chain is about half the
   cycle, and its cost is dominated by the MTP head's projection over the full 129k vocabulary,
@@ -114,9 +114,9 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   the digest is identical at every shortlist size; on hard2 one token in ~1900 flips. That is the
   same floating-point tie-flip every speculative setting has relative to greedy, which is why the
   gate here is CER against the torch oracle and NOT digest equality. That CER run is still owed.
-- Adaptive draft length REJECTED AGAIN, now with a mechanism: it changes k mid-decode, so block
-  boundaries move and the output changes (hard2 digest fafb7630 vs d2d17e6a). Same cause as the
-  k=5 anomaly. Its speed win does not justify a non-reproducible transcript.
+- Adaptive draft length was REJECTED because changing k mid-decode changed the output (hard2
+  fafb7630 vs d2d17e6a). Same cause as the k=5 anomaly, now fixed, so that objection is gone; it
+  has not been rebuilt or re-measured since.
 - 40-page long_scan BASELINE on this M3 Ultra, single process: 194 aggregate tok/s, 123.1 s,
   digest 772db0f94e0ae106, 62014 chars. Every throughput claim below is against that, and the
   digest is the quality gate - it stayed identical through every measurement in this round.
@@ -3059,16 +3059,38 @@ all OK). It was NOT taken because it makes the OCR decode step ~4 ms slower at e
   Swift 6.3 build gives 772db0f94e0ae106 (single, 196 tok/s) and b16f69c903bb21cd (width 32, 460),
   both identical to the 6.2 baseline. ANY new toolchain: re-run the digest before trusting it.
   (The folder map's UMAP rotation has the same pair; it only moves a layout, so it was left.)
-- OMNI_OCR_EAGER=N (off): `asyncEval` every N decoder layers in a decode forward, so the GPU runs
-  layer i while the host encodes i+1 (oMLX's eager dispatch). Scheduling only. On 0.31.3, N=1:
-  5.5 -> 5.05 ms at 1 row, 9.4 -> 8.85 at 4, 22.1 -> 21.7 at 32. Not adopted yet: it needs the
-  end-to-end digest and throughput run first.
-- TRANSPOSED EXPERT WEIGHTS ARE FASTER ON 0.31.x: the probe's MoE chain 1.67 -> 1.43 ms at 1 row,
-  13.0 -> 10.1 at 32 rows; the shared expert's matmul 20 -> 8.4 us. Means repacking at load (the
-  checkpoint stores them (E, K, N)); not done.
-- FROM oMLX (read at 5dcfe24, mlx 0.32.2): speculative output equals greedy byte for byte there
-  because every verify row runs MLX's ONE-ROW kernel arithmetic (`omlx/patches/row_exact_qmv.py`,
-  `moe_verify_gather.py`, `qwen35_verify_sdpa_split.py`, as custom Metal kernels), and verify rows
-  are chunked so each gets the attention plan its one-row call would. That is the fix for the k=5
-  digest anomaly above and what would make an adaptive draft length reproducible. Not ported.
+
+THREE THINGS TAKEN FROM oMLX (read at 5dcfe24), all on 0.31.3, all measured back to back on the
+40-page scan and graded on hard2 against the torch oracle:
+
+- EAGER PER-LAYER DISPATCH (`OCRRuntime.eagerMaxRows`): decode-shaped forwards `asyncEval` each
+  decoder layer as it is built, so the GPU runs layer i while the host encodes i+1. Scheduling only,
+  digests unchanged: 195 -> 201 tok/s single, 460 -> 467 at width 32.
+- EVERY PACK IS RE-GROUPED AT LOAD to the `transpose: true` layout (`OCRWeights.kMajor`), whose MLX
+  kernels are faster. A SECOND ROUNDING, so it was graded as one: hard2 page for page unchanged
+  (greedy 7/10 exact, CER 0.0087, every divergence at the same character; width 10: 8/10, 0.0086).
+  201 -> 234 tok/s single, 465 -> 552 at width 32, first token ~655 -> ~540 ms, load still 0.5 s.
+  `transpose: true` has no M=2/3 bug (`--probe-qmm` prints both), so `safeQuantizedMM` pads only an
+  untransposed pack - which a loaded model no longer has.
+- EXACT VERIFY ROWS: speculative output is byte-identical to greedy at every k (hard2 10/10 pages
+  at k = 2..6; 40-page digest a35ef0f9c8fe8ad at greedy and k = 2..5), at no cost (k = 3 decodes
+  274.9 -> 276.6 tok/s on hard2, 234 on the 40-page scan). Three sources of row-count dependence,
+  each found with `ocr-verify x --probe-rowexact [--causal-sweep]`:
+  - quantized projections: in the transpose:true layout MLX runs a few rows through its one-row
+    qmv kernel row by row, so they were already exact once the packs were re-grouped.
+  - plain bf16/fp32 matmuls (attention projections, router, LM head): one row uses gemv, several a
+    tiled gemm that IS row-invariant for M = 2..8. `ocrProjRowInvariant` pads a one-row target step
+    to two, so greedy shares verify's kernel. The draft head opts out; its output is only a guess.
+    Reshaping rows to (n, 1, K) does NOT help: MLX folds the batch back into M.
+  - attention: MLX's one-query kernel plans one or two passes, and a two-pass block count, from the
+    call's total key count and its query rows - one causal call over k+1 rows straddling 1024 keys
+    (every ~1007-token page prompt does, a few tokens in) planned some rows differently from their
+    own greedy call. `OCRVerifyAttention` groups rows by plan, mirroring MLX's rule, capped at 8
+    query rows (past that MLX leaves the one-query kernel); `selfCheck` at model load compares
+    grouped against per-row calls across every switch and falls back to one call per row if the
+    rule disagrees. One call per row was the first version and cost 7% at k = 3.
+  The 40-page digests are now a35ef0f9c8fe8ad (single, every k) and f1ed744e12ae453 (width 32).
+  Batched decode at wide widths still differs from single: past MLX's qmv row limit the quantized
+  projections use qmm. `ocr-verify --pdf --draft 0` has always meant one token a page (the
+  document path has no greedy branch for 0); greedy is `--draft 1`.
 

@@ -99,6 +99,7 @@ public final class OCRModel: @unchecked Sendable {
         self.weights = try OCRWeights(modelDir: modelDir)
         self.vision = OCRVisionTower(weights)
         self.llm = OCRLanguageModel(weights)
+        OCRVerifyAttention.checkOnce()
         self.imageNewline = weights.array("image_newline")
         self.viewSeparator = weights.array("view_seperator")
         self.weightBytes = weights.inventory().bytes
