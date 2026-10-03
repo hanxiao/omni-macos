@@ -4967,6 +4967,48 @@ if args.count >= 4 && args[1] == "sharebench" {
     exit(0)
 }
 
+// What a full pass costs when NOTHING changed - the price of restarting a pass to let watcher
+// events in. omni-verify passbench <modelDir> [files]: N small distinct text files in a temp
+// tree, indexed once, then a second pass over the same tree timed.
+if args.count >= 3 && args[1] == "passbench" {
+    let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    let n = (args.count >= 4 ? Int(args[3]) : nil) ?? 100_000
+    let base = FileManager.default.temporaryDirectory.appendingPathComponent("passb-\(UUID().uuidString)")
+    let tree = base.appendingPathComponent("tree")
+    defer { try? FileManager.default.removeItem(at: base) }
+    let words = ["harbor", "ledger", "orbit", "meadow", "kernel", "pixel", "garden", "fossil", "nectar", "jungle"]
+    for i in 0 ..< n {
+        let dir = tree.appendingPathComponent("d\(i / 500)/e\(i / 50)")
+        if i % 50 == 0 { try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }
+        let text = (0 ..< 40).map { k in words[(i * 7 + k * 3) % words.count] + "\(i % 97)" }.joined(separator: " ")
+        try ("note \(i): " + text).write(to: dir.appendingPathComponent("n\(i).txt"), atomically: false, encoding: .utf8)
+    }
+    let store = try VectorStore(dbURL: base.appendingPathComponent("index.sqlite"))
+    let idx = Indexer(store: store, embedder: engine)
+    var settings = IndexSettings(enabledKinds: [.text])
+    settings.ignore = OmniIgnore(text: OmniIgnore.hiddenRule)
+    func pass() async -> (sec: Double, embedded: Int) {
+        let t0 = Date()
+        return await withCheckedContinuation { cont in
+            let done = NSLock(); var fired = false
+            idx.index(roots: [tree], settings: settings, force: false) { p in
+                if p.done {
+                    done.lock(); let go = !fired; fired = true; done.unlock()
+                    if go { cont.resume(returning: (Date().timeIntervalSince(t0), p.embedded)) }
+                }
+            }
+        }
+    }
+    let first = await pass()
+    print(String(format: "passbench files=%d  first pass %.1f s (embedded %d)", n, first.sec, first.embedded))
+    for r in 1 ... 2 {
+        let again = await pass()
+        print(String(format: "  no-change pass %d: %.2f s (embedded %d)  = %.1f us/file", r, again.sec,
+                     again.embedded, again.sec * 1e6 / Double(n)))
+    }
+    exit(0)
+}
+
 if args.count >= 4 && args[1] == "indexbench" {
     let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
     let target = URL(fileURLWithPath: args[3])

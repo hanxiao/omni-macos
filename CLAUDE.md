@@ -74,8 +74,9 @@ codebase were already measured there, and many were rejected.
   `... --grade-batch --batch 10 --max-new 1024`. Grade CER, not digests.
 - OCR throughput/digest: `ocr-verify <ocrModel> --pdf
   /Volumes/han2tb/ai-models/jina-ocr-v1-bench/long_scan.pdf [--batch 32] [--draft K]`. Current:
-  234 tok/s single, digest a35ef0f9c8fe8ad (identical at greedy `--draft 1` and every k); 552 at
-  width 32, f1ed744e12ae453. `--draft 0` is not greedy (one token a page).
+  234 tok/s single, digest a35ef0f9c8fe8ad (identical at greedy `--draft 1` and every k); 595 at
+  width 32 (40 s), digest f1ed744e12ae453 or a35ef0f9c8fe8ad - ramp pacing admits by elapsed time,
+  so the batched digest is a near-tie variant from run to run. `--draft 0` is not greedy.
 - Model-free probes for MLX regressions: `ocr-verify x --probe-qmm | --probe-gather |
   --probe-rowexact [--causal-sweep]`. Re-run them on any MLX or toolchain change.
 

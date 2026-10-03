@@ -218,15 +218,56 @@ extension OCRModel {
         /// its prompt length; nil when the source could not be read. It has to happen BEFORE
         /// `canAdmit` can be asked anything: a pending page has no `prep` at all, and reaching
         /// for one traps.
+        // ONE page ahead, its CPU half - render, cache hash, Pillow-exact resample - runs on a
+        // background queue while the rows decode, so admitting it costs only the vision tower.
+        // Measured on the 40-page scan at width 32, back to back: 43.2 -> 40.05 s (552 -> 595
+        // tok/s); hard2 at width 10 unchanged, 8/10 exact, CER 0.0086, first page 7.4 -> 6.9 s.
+        // The batched digest can move between runs either way: ramp pacing admits by elapsed
+        // time, so a faster admission can change which pages share a step (near-tie flips).
+        // One at a time on purpose: PDFKit will not render one document from two threads, so the
+        // loop never renders a page itself while a prefetch is in flight (it waits for it).
+        let prefetchQueue = DispatchQueue(label: "ocr.page-prefetch", qos: .userInitiated)
+        final class Prefetch: @unchecked Sendable {
+            let page: Int
+            let group = DispatchGroup()
+            var result: Swift.Result<HostPage?, Error> = .success(nil)
+            init(page: Int) { self.page = page }
+        }
+        var prefetch: Prefetch? = nil
+        func startPrefetch(_ q: Int) {
+            guard prefetch == nil, q < n, pages[q].prep == nil,
+                  pages[q].pending != nil || pages[q].source != nil else { return }
+            let job = Prefetch(page: q)
+            let source = pages[q].source, pending = pages[q].pending, prompt = pages[q].pendingPrompt
+            job.group.enter()
+            prefetchQueue.async { [self] in
+                job.result = Swift.Result {
+                    guard let image = pending ?? source?() else { return nil }
+                    return try self.preparePageHost(image: image, prompt: prompt)
+                }
+                job.group.leave()
+            }
+            prefetch = job
+        }
+
         func ensurePrepared(_ p: Int) throws -> Int? {
-            if pages[p].prep == nil, pages[p].pending == nil, let source = pages[p].source {
-                guard let image = source() else { return nil }
-                pages[p].pending = image
-                pages[p].source = nil
+            if pages[p].prep == nil {
+                let host: HostPage?
+                if let job = prefetch, job.page == p {
+                    job.group.wait()
+                    prefetch = nil
+                    host = try job.result.get()
+                } else {
+                    prefetch?.group.wait()   // never render beside a prefetch; it stays for its page
+                    if pages[p].pending == nil, let source = pages[p].source {
+                        pages[p].pending = source()
+                    }
+                    host = try pages[p].pending.map { try preparePageHost(image: $0, prompt: pages[p].pendingPrompt) }
+                }
+                guard let host else { return nil }
+                pages[p] = finishPage(host)
             }
-            if let pixels = pages[p].pending {
-                pages[p] = try preparePage(image: pixels, prompt: pages[p].pendingPrompt)
-            }
+            startPrefetch(p + 1)
             return pages[p].prep.ids.count
         }
 

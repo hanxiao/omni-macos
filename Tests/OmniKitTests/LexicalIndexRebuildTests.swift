@@ -159,4 +159,51 @@ final class LexicalIndexRebuildTests: XCTestCase {
         let afterMtime = (try? FileManager.default.attributesOfItem(atPath: sidecar.path)[.modificationDate]) as? Date
         XCTAssertEqual(builtMtime, afterMtime, "an up-to-date sidecar must not be touched at all")
     }
+
+    /// A changed path set is now a DIFF, not a rebuild (60 s on a 2.7M-file index). Whatever the
+    /// diff does, the answers must be exactly a fresh build's: same matches for every term, and no
+    /// path outside the current set.
+    func testIncrementalRefreshMatchesAFreshBuild() throws {
+        let words = ["alpha", "budget", "camera", "design", "estate", "fossil", "garden", "harbor",
+                     "invoice", "jungle", "kernel", "ledger", "meadow", "nectar", "orbit", "pixel"]
+        let all = (0 ..< 300).map { i in
+            "/Users/me/Docs/\(words[i % words.count])-\(words[(i / 7) % words.count])-\(i).txt"
+        }
+        let (lex, _) = makeIndex()
+        lex.rebuildIfStale(paths: Array(all[0 ..< 200]), stamp: 1)
+        let final = Array(all[50 ..< 300])            // 50 removed, 100 added
+        lex.rebuildIfStale(paths: final, stamp: 2)
+
+        let freshDir = dir.appendingPathComponent("fresh")
+        try FileManager.default.createDirectory(at: freshDir, withIntermediateDirectories: true)
+        let fresh = LexicalIndex(indexURL: freshDir.appendingPathComponent("index.sqlite"))
+        fresh.rebuildIfStale(paths: final, stamp: 2)
+
+        XCTAssertEqual(lex.fileCount, final.count)
+        for w in words + ["txt", "12", "199"] {
+            let a = Set(lex.match(w, limit: 1000)), b = Set(fresh.match(w, limit: 1000))
+            XCTAssertEqual(a, b, "term \(w)")
+            XCTAssertTrue(a.isSubset(of: Set(final)), "term \(w) returned a removed path")
+        }
+    }
+
+    /// A sidecar whose `names` table was built in another layout (columnsize=0, which cannot delete
+    /// by rowid) must be rebuilt once, not diffed: its rows could not be removed individually.
+    func testOldTableLayoutIsRebuiltOnce() throws {
+        let (lex, sidecar) = makeIndex()
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(sidecar.path, &db), SQLITE_OK)
+        for sql in ["CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);",
+                    "CREATE VIRTUAL TABLE names USING fts5(name, content='', columnsize=0);",
+                    "CREATE TABLE pathmap(id INTEGER PRIMARY KEY, path TEXT NOT NULL);",
+                    "INSERT INTO names(rowid, name) VALUES(1, 'stale widget');",
+                    "INSERT INTO pathmap(id, path) VALUES(1, '/Users/me/stale-widget.txt');",
+                    "INSERT INTO meta VALUES('stamp','1'),('recipe','\(LexicalIndex.termRecipe)');"] {
+            XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK, sql)
+        }
+        sqlite3_close(db)
+        lex.rebuildIfStale(paths: ["/Users/me/fresh-gadget.txt"], stamp: 1)
+        XCTAssertEqual(lex.match("gadget", limit: 10), ["/Users/me/fresh-gadget.txt"])
+        XCTAssertEqual(lex.match("widget", limit: 10), [], "the old layout's rows must not survive")
+    }
 }

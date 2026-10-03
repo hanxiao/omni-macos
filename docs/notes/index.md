@@ -539,6 +539,12 @@ bite are here.
   folder the pass has already crawled waits for the whole pass. The likeliest reading of "the
   watcher sometimes does not kick in"; not reproduced, and changing it means running a reconcile
   beside a pass on one Indexer.
+  FIXED 2026-10-03 WITHOUT running the two side by side: once events have waited `fsWaitLimit`,
+  the pass is paused (`cancel(.pause)` keeps its work), the events are reconciled, and the pass
+  resumes. A resume skips unchanged files at ~3 us each (`omni-verify passbench`: 0.07 s at 20k
+  files, 0.30 s at 100k), so the limit is 20x that cost with a 30 s floor - ~2.7 min at 2.7M files.
+  Measured in the app on a 100k-file first pass, a file saved 45 s in: findable by name after
+  34 s, against 218 s (the end of the pass) on shipped 0.14.5.
 
 ## Speed review, all paths (2026-10-02)
 

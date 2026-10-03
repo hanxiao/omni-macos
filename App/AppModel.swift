@@ -1618,6 +1618,15 @@ final class AppModel {
     var pausedRoots: Set<String> = []
     /// When a folder is paused/resumed mid-pass, cancel and restart re-scoped to the unpaused roots.
     private var restartAfterPause = false
+    /// A full pass holds watcher events until it ends, which on a first index of a big folder is
+    /// hours: a file saved in a folder the pass had already crawled waited for all of it. When
+    /// events have waited `fsWaitLimit`, the pass is paused (keeping its work), the events are
+    /// reconciled, and the pass resumes. A resume re-walks the tree but skips every unchanged file:
+    /// ~3 us a file (`omni-verify passbench`: 0.07 s at 20k, 0.30 s at 100k), so ~8 s on a
+    /// 2.7M-file index. The limit is 20x that, floor 30 s, so the restarts stay near 5% of a pass.
+    private var fsEventsWaitingSince: Date? = nil
+    private var fsDrainThenResume = false
+    private var fsWaitLimit: TimeInterval { Swift.max(30, Double(indexedFiles) * 60e-6) }
     /// Monotonic index-pass token. Bumped whenever a pass starts or is superseded (model/db switch). A
     /// pass's progress/completion callback bails when its captured token != indexGen, so an orphaned pass
     /// (e.g. switched model mid-index) cannot clobber the live pass's state, stats, or store.
@@ -4071,7 +4080,7 @@ final class AppModel {
                 // re-index. Built here, off the main actor and off the store's serial queue, and
                 // skipped entirely when already current. Search works without it; it just cannot
                 // answer a filename until this returns.
-                Task.detached(priority: .utility) { [store] in store.prepareLexicalIndex() }
+                await MainActor.run { [weak self] in self?.refreshFilenameIndex(store) }
             }
             self.phase = .ready
             omniPerfLog("launch ready")
@@ -4150,7 +4159,37 @@ final class AppModel {
     /// whole in-memory row set - hundreds of thousands of rows on a large index) runs OFF the main
     /// thread; only the small result assignment hops back to the main actor. Doing it on the main
     /// thread is what hung the app during a fast crawl of a large index.
+    /// Bring the filename channel up to the store. It was built at launch and never again, so a
+    /// file indexed during a session could not be found by its name until the next launch - and
+    /// that launch then rebuilt all 2.7M names (~60 s, the channel off throughout). The store
+    /// now DIFFS (`LexicalIndex.refreshIncrementally`, ~1.4 s at 2.7M files, a no-op when the
+    /// stamp matches). One refresh at a time; a request during one runs exactly one more after it.
+    @ObservationIgnored private var filenameRefreshRunning = false
+    @ObservationIgnored private var filenameRefreshAgain = false
+    @ObservationIgnored private var filenameRefreshedAt = Date.distantPast
+    private func refreshFilenameIndex(_ store: VectorStore) {
+        if filenameRefreshRunning { filenameRefreshAgain = true; return }
+        filenameRefreshRunning = true
+        filenameRefreshedAt = Date()
+        Task.detached(priority: .utility) { [weak self] in
+            store.prepareLexicalIndex()
+            await MainActor.run {
+                guard let self else { return }
+                self.filenameRefreshRunning = false
+                if self.filenameRefreshAgain { self.filenameRefreshAgain = false; self.refreshFilenameIndex(store) }
+            }
+        }
+    }
+
     private func refreshIndexStats(_ store: VectorStore) {
+        // A long pass (a first index of a home folder runs for hours) has no completion to hang the
+        // filename refresh on, so the stats tick does it at most once a minute while files land.
+        if isIndexing, -filenameRefreshedAt.timeIntervalSinceNow > 60 { refreshFilenameIndex(store) }
+        if isIndexing, !fsDrainThenResume, !restartAfterPause, !pendingFSPaths.isEmpty,
+           let since = fsEventsWaitingSince, -since.timeIntervalSinceNow > fsWaitLimit {
+            fsDrainThenResume = true
+            indexer?.cancel(.pause)
+        }
         // A search in flight is about to queue on the store's serial queue; indexSummary's full row
         // scan in front of it would add tens of ms to that query's tail on a large index. Deferred
         // to the search's end, not dropped: a pass completion has no next tick to catch up on.
@@ -5880,6 +5919,7 @@ final class AppModel {
         // when it finishes (startIndexing); an in-flight reconcile re-drains when it finishes. This
         // coalesces a storm into back-to-back single batches instead of overlapping update() tasks.
         pendingFSPaths.formUnion(paths)
+        if fsEventsWaitingSince == nil { fsEventsWaitingSince = Date() }
         if let eid = watcher?.latestEventId() { pendingFSEventId = max(pendingFSEventId, eid) }
         // activeRoots covers the catch-up pass too: kicking update() while a catch-up index() runs
         // would overlap two pipelines on the same Indexer. The catch-up's completion re-drains.
@@ -5893,6 +5933,7 @@ final class AppModel {
     private func markIndexed(_ store: VectorStore) {
         let now = Date()
         lastIndexed = now   // reflect in the UI immediately
+        refreshFilenameIndex(store)
         // Persist OFF the main actor: metaSet is queue.sync on the shared serial store queue, and this
         // fires from every pass/reconcile completion - on @MainActor it stalls the UI behind any
         // in-flight search/scan. last_indexed is display-only, so deferred ordering is harmless.
@@ -6019,6 +6060,7 @@ final class AppModel {
                         let removed = self.pendingRootRemovals; self.pendingRootRemovals.removeAll()
                         let wantRestart = self.restartAfterPause; self.restartAfterPause = false
                         let caughtUp = self.pendingCatchUpRoots; self.pendingCatchUpRoots.removeAll()
+                        let wantFSDrain = self.fsDrainThenResume; self.fsDrainThenResume = false
                         if !removed.isEmpty {
                             // Drop the removed folders' vectors now the pass stopped re-inserting them,
                             // reclaim disk, then resume indexing the remaining roots.
@@ -6034,7 +6076,21 @@ final class AppModel {
                             }
                             return
                         }
-                        if wantRestart || !caughtUp.isEmpty {
+                        if wantFSDrain, p.cancelled, !self.pendingFSPaths.isEmpty {
+                            // Paused only to let waiting watcher events in. Reconcile them now; the
+                            // reconcile's completion (drainDeferredAfterPass) resumes the pass, which
+                            // also covers anything else queued meanwhile (added roots, a restart).
+                            self.indexState = .idle
+                            self.restartAfterPause = true
+                            self.refreshIndexStats(store)
+                            self.drainPendingFSChanges()
+                            if !self.fsReconcileInFlight {   // it could not start: resume at once
+                                self.restartAfterPause = false
+                                self.startIndexing()
+                            }
+                            return
+                        }
+                        if wantRestart || !caughtUp.isEmpty || (wantFSDrain && p.cancelled) {
                             // A folder was paused/resumed, or roots were added, mid-pass: restart
                             // re-scoped to the current unpaused roots (incremental, so the rest resume).
                             self.indexState = .idle
@@ -6304,6 +6360,7 @@ final class AppModel {
         guard indexState != .paused else { return }
         indexer.resetCancelled()   // a stale cancel from a removal/restart chain must not kill this batch
         let drained = Array(pendingFSPaths); pendingFSPaths.removeAll()
+        fsEventsWaitingSince = nil
         let eid = pendingFSEventId; pendingFSEventId = 0
         let settings = effectiveSettings()
         let touched = Set(drained.compactMap { rootKey(for: $0) })

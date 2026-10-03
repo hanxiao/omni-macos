@@ -24,7 +24,7 @@ final class OCRVisionCache: @unchecked Sendable {
         let bytes: Int
     }
 
-    private struct Key: Hashable {
+    struct Key: Hashable {
         let a: UInt64
         let b: UInt64
         let width: Int
@@ -71,15 +71,18 @@ final class OCRVisionCache: @unchecked Sendable {
         return (a, b)
     }
 
-    private static func key(_ image: OCRImage) -> Key {
+    static func key(_ image: OCRImage) -> Key {
         let (a, b) = hashes(image)
         return Key(a: a, b: b, width: image.width, height: image.height)
     }
 
     // MARK: - access
 
-    func lookup(_ image: OCRImage) -> Entry? {
-        let k = Self.key(image)
+    func lookup(_ image: OCRImage) -> Entry? { lookup(key: Self.key(image)) }
+
+    /// By a key already computed: hashing a 200-dpi page is ~11.6 MB of reads, and the decode loop
+    /// should not pay it twice for one page.
+    func lookup(key k: Key) -> Entry? {
         lock.lock()
         defer { lock.unlock() }
         guard let entry = store[k] else { misses += 1; return nil }
@@ -89,8 +92,11 @@ final class OCRVisionCache: @unchecked Sendable {
     }
 
     func insert(_ image: OCRImage, visual: MLXArray, grid: (w: Int, h: Int)) {
+        insert(key: Self.key(image), visual: visual, grid: grid)
+    }
+
+    func insert(key k: Key, visual: MLXArray, grid: (w: Int, h: Int)) {
         let size = visual.size * visual.dtype.size
-        let k = Self.key(image)
         lock.lock()
         defer { lock.unlock() }
         if let existing = store[k] {

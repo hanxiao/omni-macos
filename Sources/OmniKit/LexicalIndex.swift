@@ -37,6 +37,9 @@ final class LexicalIndex: @unchecked Sendable {
 
     private let url: URL
     private let lock = NSLock()
+    /// Serialises refreshes. A refresh scans on its own read connection and takes `lock` only to
+    /// write, so lookups wait for a write batch, never for the scan.
+    private let refreshLock = NSLock()
     private var db: OpaquePointer?
     private var ready = false
     private(set) var fileCount = 0
@@ -57,14 +60,41 @@ final class LexicalIndex: @unchecked Sendable {
         return sqlite3_exec(probe, "CREATE VIRTUAL TABLE t USING fts5(x);", nil, nil, nil) == SQLITE_OK
     }()
 
+    /// SQLite 3.43+: a contentless table that can delete a row by rowid alone. Without it a delete
+    /// has to re-supply the exact text that was indexed - which `indexedText` derives through
+    /// Swift's Unicode tables, so an OS update could make a delete miss its postings - and the
+    /// sidecar can only be rebuilt whole. It cannot be combined with `columnsize=0`.
+    static let contentlessDelete: Bool = {
+        var probe: OpaquePointer?
+        guard sqlite3_open(":memory:", &probe) == SQLITE_OK else { return false }
+        defer { sqlite3_close(probe) }
+        return sqlite3_exec(probe, "CREATE VIRTUAL TABLE t USING fts5(x, content='', contentless_delete=1);"
+                                   + "INSERT INTO t(rowid, x) VALUES(1, 'a b');"
+                                   + "DELETE FROM t WHERE rowid = 1;", nil, nil, nil) == SQLITE_OK
+    }()
+    /// What the `names` table was created as; a sidecar built as anything else is rebuilt once.
+    static var tableLayout: String { contentlessDelete ? "cd1" : "c0" }
+
     /// Build or refresh the sidecar from the paths already in the store. Cheap enough to do on a
     /// background queue at open: 0.85 s and 2.41 MB for 135,943 files, measured. `stamp` is the
     /// store's mutation generation; a matching stamp means the sidecar is current and nothing runs.
     func rebuildIfStale(paths: @autoclosure () -> [String], stamp: Int64) {
         guard Self.enabled, Self.fts5Available else { return }
+        refreshLock.lock(); defer { refreshLock.unlock() }
+        switch prepare(stamp: stamp) {
+        case .current: return
+        case .incremental: refreshIncrementally(paths: paths(), stamp: stamp)
+        case .full: fullRebuild(paths: paths(), stamp: stamp)
+        }
+    }
+
+    private enum Plan { case current, incremental, full }
+
+    /// Open, bring the schema to this build's shape, and decide how much work the stamp needs.
+    private func prepare(stamp: Int64) -> Plan {
         lock.lock(); defer { lock.unlock() }
         if db == nil { sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) }
-        guard let db else { return }
+        guard db != nil else { return .current }
         exec("PRAGMA journal_mode=WAL;"); exec("PRAGMA synchronous=OFF;")
         // RECLAIM ON OPEN. A passive checkpoint (which is all autocheckpoint ever runs) copies WAL
         // frames back into the database and then REUSES the file - it never shortens it. So the
@@ -76,7 +106,15 @@ final class LexicalIndex: @unchecked Sendable {
         exec("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);")
         // contentless (content='') plus columnsize=0: we never read the text back, only the rowid,
         // so FTS5 stores the term index and nothing else. This is what keeps it at 2.4 MB.
-        exec("CREATE VIRTUAL TABLE IF NOT EXISTS names USING fts5(name, content='', columnsize=0);")
+        // A table created by another layout (an older build, or a machine whose SQLite lacked
+        // contentless_delete) is dropped and rebuilt once; the empty pathmap forces the full arm.
+        if scalar("SELECT v FROM meta WHERE k='layout';") != Self.tableLayout {
+            exec("DROP TABLE IF EXISTS names;")
+            exec("DELETE FROM pathmap;")
+        }
+        exec(Self.contentlessDelete
+             ? "CREATE VIRTUAL TABLE IF NOT EXISTS names USING fts5(name, content='', contentless_delete=1);"
+             : "CREATE VIRTUAL TABLE IF NOT EXISTS names USING fts5(name, content='', columnsize=0);")
         exec("CREATE TABLE IF NOT EXISTS pathmap(id INTEGER PRIMARY KEY, path TEXT NOT NULL);")
         // 0.7.2 briefly wrote pathmap(id, dir_id, name) plus a dirs table. CREATE IF NOT EXISTS
         // leaves such a file alone, and every lookup below selects m.path, so it would fail for
@@ -91,14 +129,24 @@ final class LexicalIndex: @unchecked Sendable {
         // The stamp says the PATHS are unchanged. It says nothing about whether the terms we
         // derive from them are still the ones this build wants, so a change to the term recipe
         // needs its own version or every existing sidecar keeps serving the old terms forever.
-        if scalar("SELECT v FROM meta WHERE k='stamp';") == String(stamp),
-           scalar("SELECT v FROM meta WHERE k='recipe';") == String(Self.termRecipe),
-           scalar("SELECT count(*) FROM pathmap;").flatMap(Int.init) ?? 0 > 0 {
-            fileCount = Int(scalar("SELECT count(*) FROM pathmap;") ?? "0") ?? 0
+        let built = scalar("SELECT count(*) FROM pathmap;").flatMap(Int.init) ?? 0
+        let sameRecipe = scalar("SELECT v FROM meta WHERE k='recipe';") == String(Self.termRecipe)
+        if scalar("SELECT v FROM meta WHERE k='stamp';") == String(stamp), sameRecipe, built > 0 {
+            fileCount = built
             ready = true
-            return
+            return .current
         }
-        let all = paths()
+        // A changed file set is a DIFF, not a rebuild: a full rebuild is ~60 s of one core on a
+        // 2.7M-file index, and every launch after a session that wrote anything paid it, with
+        // filename matches missing until it finished. The full arm is for a new recipe, a new
+        // layout, an empty sidecar, or a SQLite that cannot delete by rowid.
+        return sameRecipe && built > 0 && Self.contentlessDelete ? .incremental : .full
+    }
+
+    private func fullRebuild(paths all: [String], stamp: Int64) {
+        lock.lock(); defer { lock.unlock() }
+        guard let db else { return }
+        let t0 = Date()
         exec("BEGIN IMMEDIATE;")
         // RESET THE TERM INDEX THE ONLY WAY FTS5 ACCEPTS. `DELETE FROM names` fails on a
         // CONTENTLESS table - "table does not support scanning", because a plain DELETE has to
@@ -134,30 +182,7 @@ final class LexicalIndex: @unchecked Sendable {
             // Index the basename with its separators softened, so "OmniEngine.swift", "omni_engine"
             // and "omni-engine" all yield the same terms. The extension is kept as its own term so
             // "swift" or ".swift" matches.
-            let base = (p as NSString).lastPathComponent
-            let soft = base.map { c -> Character in
-                (c.isLetter || c.isNumber) ? c : " "
-            }
-            var terms = String(soft)
-            // camelCase and PascalCase split, so "ModelLocator" also matches "locator".
-            var split = ""
-            var prev: Character = " "
-            for c in base {
-                if c.isUppercase, prev.isLowercase || prev.isNumber { split.append(" ") }
-                split.append((c.isLetter || c.isNumber) ? c : " ")
-                prev = c
-            }
-            terms += " " + split
-            // A CJK run is ONE fts5 token and the channel queries by prefix, so a word in the
-            // middle of it can never match. Index short runs as bigrams too. Gate on a single
-            // character scan: tokenizing every basename to find CJK cost 43 s of a 110 s rebuild
-            // on a 2.66M-file corpus to serve 0.06% of it. Terms only - no schema change.
-            if base.contains(where: Self.isCJK) {
-                for t in Self.terms(base) {
-                    let bg = Self.indexBigrams(t)
-                    if !bg.isEmpty { terms += " " + bg.joined(separator: " ") }
-                }
-            }
+            let terms = Self.indexedText(forPath: p)
             sqlite3_reset(ins); sqlite3_bind_int64(ins, 1, Int64(i + 1))
             sqlite3_bind_text(ins, 2, terms, -1, T); sqlite3_step(ins)
             sqlite3_reset(insMap); sqlite3_bind_int64(insMap, 1, Int64(i + 1))
@@ -175,6 +200,7 @@ final class LexicalIndex: @unchecked Sendable {
         }
         sqlite3_finalize(ins); sqlite3_finalize(insMap)
         exec("INSERT OR REPLACE INTO meta(k,v) VALUES('recipe','\(Self.termRecipe)');")
+        exec("INSERT OR REPLACE INTO meta(k,v) VALUES('layout','\(Self.tableLayout)');")
         exec("INSERT OR REPLACE INTO meta(k,v) VALUES('stamp','\(stamp)');")
         exec("COMMIT;")
         // And return the high-water mark to the filesystem now that the build is done, rather than
@@ -190,6 +216,148 @@ final class LexicalIndex: @unchecked Sendable {
         }
         fileCount = all.count
         ready = true
+        omniPerfLog(String(format: "lexical-rebuild files=%d %.2fs", all.count, -t0.timeIntervalSinceNow))
+    }
+
+    /// Bring the sidecar in line with `all` by inserting the paths it lacks and deleting the ones
+    /// the store no longer has. Paths are compared by a 64-bit hash of their bytes (a collision
+    /// between two live paths among millions is ~1e-7 and would only hide one name). The scan runs
+    /// on a second, read-only connection without `lock`; writes take it in short batches.
+    private func refreshIncrementally(paths all: [String], stamp: Int64) {
+        let t0 = Date()
+        var current: [(hash: UInt64, index: Int32)] = []
+        current.reserveCapacity(all.count)
+        for (i, p) in all.enumerated() { current.append((Self.pathHash(p.utf8), Int32(i))) }
+        current.sort { $0.hash < $1.hash }
+
+        var known: [(hash: UInt64, id: Int64)] = []
+        var maxID: Int64 = 0
+        var rd: OpaquePointer?
+        guard sqlite3_open_v2(url.path, &rd, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+            sqlite3_close(rd); fullRebuild(paths: all, stamp: stamp); return
+        }
+        var st: OpaquePointer?
+        if sqlite3_prepare_v2(rd, "SELECT id, path FROM pathmap;", -1, &st, nil) == SQLITE_OK {
+            while sqlite3_step(st) == SQLITE_ROW {
+                let id = sqlite3_column_int64(st, 0)
+                maxID = Swift.max(maxID, id)
+                guard let c = sqlite3_column_text(st, 1) else { continue }
+                let bytes = UnsafeBufferPointer(start: c, count: Int(sqlite3_column_bytes(st, 1)))
+                known.append((Self.pathHash(bytes), id))
+            }
+        }
+        sqlite3_finalize(st); sqlite3_close(rd)
+        known.sort { $0.hash < $1.hash }
+        let tScan = -t0.timeIntervalSinceNow
+
+        // Merge the two sorted lists. Equal hashes pair off one for one, so a duplicate on either
+        // side (which a correct store never has) is still reconciled rather than kept twice.
+        var gone: [Int64] = [], added: [Int32] = []
+        var a = 0, b = 0
+        while a < known.count || b < current.count {
+            if b == current.count || (a < known.count && known[a].hash < current[b].hash) {
+                gone.append(known[a].id); a += 1
+            } else if a == known.count || current[b].hash < known[a].hash {
+                added.append(current[b].index); b += 1
+            } else { a += 1; b += 1 }
+        }
+
+        let T = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        let batch = 5_000
+        var ok = true
+        func write(_ body: (OpaquePointer) -> Bool) {
+            guard ok else { return }
+            lock.lock(); defer { lock.unlock() }
+            guard let db else { ok = false; return }
+            exec("BEGIN IMMEDIATE;")
+            if body(db) { exec("COMMIT;") } else { exec("ROLLBACK;"); ok = false }
+        }
+        for start in stride(from: 0, to: gone.count, by: batch) {
+            write { db in
+                var del: OpaquePointer?, delMap: OpaquePointer?
+                sqlite3_prepare_v2(db, "DELETE FROM names WHERE rowid = ?;", -1, &del, nil)
+                sqlite3_prepare_v2(db, "DELETE FROM pathmap WHERE id = ?;", -1, &delMap, nil)
+                defer { sqlite3_finalize(del); sqlite3_finalize(delMap) }
+                for id in gone[start ..< Swift.min(gone.count, start + batch)] {
+                    sqlite3_reset(del); sqlite3_bind_int64(del, 1, id)
+                    sqlite3_reset(delMap); sqlite3_bind_int64(delMap, 1, id)
+                    guard sqlite3_step(del) == SQLITE_DONE, sqlite3_step(delMap) == SQLITE_DONE else { return false }
+                }
+                return true
+            }
+        }
+        var nextID = maxID
+        for start in stride(from: 0, to: added.count, by: batch) {
+            write { db in
+                var ins: OpaquePointer?, insMap: OpaquePointer?
+                sqlite3_prepare_v2(db, "INSERT INTO names(rowid, name) VALUES(?,?);", -1, &ins, nil)
+                sqlite3_prepare_v2(db, "INSERT INTO pathmap(id, path) VALUES(?,?);", -1, &insMap, nil)
+                defer { sqlite3_finalize(ins); sqlite3_finalize(insMap) }
+                for k in added[start ..< Swift.min(added.count, start + batch)] {
+                    let p = all[Int(k)]
+                    nextID += 1
+                    sqlite3_reset(ins); sqlite3_bind_int64(ins, 1, nextID)
+                    sqlite3_bind_text(ins, 2, Self.indexedText(forPath: p), -1, T)
+                    sqlite3_reset(insMap); sqlite3_bind_int64(insMap, 1, nextID)
+                    sqlite3_bind_text(insMap, 2, p, -1, T)
+                    guard sqlite3_step(ins) == SQLITE_DONE, sqlite3_step(insMap) == SQLITE_DONE else { return false }
+                }
+                return true
+            }
+        }
+        // Only a refresh that applied every batch is stamped current. A failed one leaves the old
+        // stamp, so the next call diffs again from wherever this one stopped - each batch is a
+        // whole transaction, never half a row.
+        write { _ in
+            exec("INSERT OR REPLACE INTO meta(k,v) VALUES('stamp','\(stamp)');")
+        }
+        lock.lock()
+        if ok {
+            fileCount = Int(scalar("SELECT count(*) FROM pathmap;") ?? "0") ?? 0
+            ready = true
+        }
+        lock.unlock()
+        omniPerfLog(String(format: "lexical-refresh files=%d added=%d removed=%d scan=%.2fs total=%.2fs ok=%@",
+                           all.count, added.count, gone.count, tScan, -t0.timeIntervalSinceNow,
+                           ok ? "yes" : "no"))
+    }
+
+    /// FNV-1a over the path's bytes: stable, cheap, and computed identically from a Swift String
+    /// and from SQLite's stored text, which hold the same bytes.
+    static func pathHash<S: Sequence>(_ bytes: S) -> UInt64 where S.Element == UInt8 {
+        var h: UInt64 = 0xcbf29ce484222325
+        for b in bytes { h = (h ^ UInt64(b)) &* 0x100000001b3 }
+        return h
+    }
+
+    /// The text indexed for a path: its basename with separators softened, camelCase split, and
+    /// CJK runs as bigrams. Must stay a pure function of the path within one `termRecipe`.
+    static func indexedText(forPath p: String) -> String {
+        let base = (p as NSString).lastPathComponent
+        let soft = base.map { c -> Character in
+            (c.isLetter || c.isNumber) ? c : " "
+        }
+        var terms = String(soft)
+        // camelCase and PascalCase split, so "ModelLocator" also matches "locator".
+        var split = ""
+        var prev: Character = " "
+        for c in base {
+            if c.isUppercase, prev.isLowercase || prev.isNumber { split.append(" ") }
+            split.append((c.isLetter || c.isNumber) ? c : " ")
+            prev = c
+        }
+        terms += " " + split
+        // A CJK run is ONE fts5 token and the channel queries by prefix, so a word in the
+        // middle of it can never match. Index short runs as bigrams too. Gate on a single
+        // character scan: tokenizing every basename to find CJK cost 43 s of a 110 s rebuild
+        // on a 2.66M-file corpus to serve 0.06% of it. Terms only - no schema change.
+        if base.contains(where: Self.isCJK) {
+            for t in Self.terms(base) {
+                let bg = Self.indexBigrams(t)
+                if !bg.isEmpty { terms += " " + bg.joined(separator: " ") }
+            }
+        }
+        return terms
     }
 
     /// Paths whose basename matches, best first. Runs on the caller's thread against this object's

@@ -267,6 +267,16 @@ day later the same tour measured ZERO blocks over 250 ms (see "UI tests").
   2.4-3 s on that index (cold), against ~250 ms warm. UPDATED: the first search is fixed
   (0.14-0.22 s) and the rebuild no longer blocks the store queue (index.md, "Launch and the first
   search"); the rebuild's own ~80 s has not been re-measured.
+  FIXED 2026-10-03, and it was worse than written: the stamp is the store's persisted mutation
+  counter, so EVERY launch after a session that wrote anything rebuilt all names (59.8 s on the
+  2.68M-file bench index, the channel off throughout), and nothing refreshed it during a session,
+  so a file indexed after launch could not be found by name at all (shipped 0.14.5: the full name
+  of a file added mid-session returned other files). Now a DIFF (`refreshIncrementally`): 1,000
+  added and 500 removed in 1.39 s on the bench index, identical path set and identical ranked
+  top-24 for 300 queries against a fresh build. It runs at launch, after every pass or reconcile,
+  and once a minute during a long pass. Needs SQLite `contentless_delete` (3.43+); without it the
+  sidecar keeps the old full-rebuild behaviour. The table layout changed, so each existing sidecar
+  rebuilds once (~55 s) on the first launch of this build.
 - DEV AND TEST LAUNCHES MOVED THE REAL APP'S FSEVENTS CHECKPOINT. `-omni.dbDir` in the argument
   domain changes what is read, not where `UserDefaults.set` writes, so every UI test and scratch run
   wrote `omni.fsEventId` into the user's defaults, and the installed app then resumed past changes

@@ -198,31 +198,54 @@ public final class OCRModel: @unchecked Sendable {
     /// stream, so what crosses back to the caller is a finished tensor rather than a graph node
     /// still pointing at another stream's work.
     func preparePage(image: OCRImage, prompt: String?) throws -> PreparedPage {
-        let tPrepare = Date()
+        finishPage(try preparePageHost(image: image, prompt: prompt))
+    }
+
+    /// The CPU half of `preparePage`: the cache probe (a hash of the whole page) and the
+    /// Pillow-exact resample. It touches no GPU - the arrays it builds come straight from host
+    /// buffers - so the batched decoder runs it on another thread for the NEXT page while the
+    /// current rows decode (`decodeContinuous`). ~56 ms a page that the GPU used to sit out.
+    struct HostPage: @unchecked Sendable {
+        let key: OCRVisionCache.Key
+        let cached: PreparedPage?
+        let prep: Prepared?
+        let hostMs: Double
+    }
+
+    func preparePageHost(image: OCRImage, prompt: String?) throws -> HostPage {
+        let t0 = Date()
+        let key = OCRVisionCache.key(image)
         // A page whose pixels have been seen before needs neither the resample nor the tower;
         // only the ids, which are the one part the prompt can change.
-        if let hit = visionCache.lookup(image) {
+        if let hit = visionCache.lookup(key: key) {
             let ids = try promptIDs(grid: hit.grid, prompt: prompt)
-            if OCRRuntimeFlags.reportPrefill {
-                FileHandle.standardError.write(Data(String(
-                    format: "[prefill] cached  %.0f ms\n",
-                    Date().timeIntervalSince(tPrepare) * 1000).utf8))
-            }
-            return PreparedPage(prep: Prepared(global: nil, tiles: nil, grid: hit.grid, ids: ids),
-                                visual: hit.visual)
+            return HostPage(key: key, cached: PreparedPage(
+                prep: Prepared(global: nil, tiles: nil, grid: hit.grid, ids: ids), visual: hit.visual),
+                prep: nil, hostMs: Date().timeIntervalSince(t0) * 1000)
         }
         let prep = try prepare(image: image, prompt: prompt)
-        let tHost = Date()
+        return HostPage(key: key, cached: nil, prep: prep, hostMs: Date().timeIntervalSince(t0) * 1000)
+    }
+
+    /// The GPU half: the vision tower, on the calling thread.
+    func finishPage(_ host: HostPage) -> PreparedPage {
+        if let cached = host.cached {
+            if OCRRuntimeFlags.reportPrefill {
+                FileHandle.standardError.write(Data(String(format: "[prefill] cached  %.0f ms\n", host.hostMs).utf8))
+            }
+            return cached
+        }
+        let prep = host.prep!
+        let tTower = Date()
         let visual = visualFeatures(prep)
         eval(visual)
-        visionCache.insert(image, visual: visual, grid: prep.grid)
+        visionCache.insert(key: host.key, visual: visual, grid: prep.grid)
         if OCRRuntimeFlags.reportPrefill {
             // Split, because the two halves have different cures: the host half is Pillow's
             // fixed-point resample in pure Swift and can run on any core, the tower half is GPU.
             FileHandle.standardError.write(Data(String(
                 format: "[prefill] host %.0f ms  tower %.0f ms\n",
-                tHost.timeIntervalSince(tPrepare) * 1000,
-                Date().timeIntervalSince(tHost) * 1000).utf8))
+                host.hostMs, Date().timeIntervalSince(tTower) * 1000).utf8))
         }
         return PreparedPage(prep: prep, visual: visual)
     }

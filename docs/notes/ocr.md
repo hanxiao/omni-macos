@@ -827,6 +827,20 @@ all OK). It was NOT taken because it makes the OCR decode step ~4 ms slower at e
   both identical to the 6.2 baseline. ANY new toolchain: re-run the digest before trusting it.
   (The folder map's UMAP rotation has the same pair; it only moves a layout, so it was left.)
 
+TWO MORE, 2026-10-03, after validating the old notes' premises:
+
+- THE NEXT PAGE'S CPU HALF IS PREFETCHED in continuous batching (`preparePageHost` on a background
+  queue, one page ahead; `finishPage` runs only the tower inline). Admission used to render, hash
+  and resample inline, ~56 ms a page with the GPU idle. 40 pages at width 32: 43.2 -> 40.05 s,
+  552 -> 595 tok/s; hard2 width 10 unchanged (8/10, 0.0086), first page 7.4 -> 6.9 s. The earlier
+  "host-only prefetch is worth 0.2-0.9 s" was measured on the static pipeline, before continuous
+  batching put admissions inside the decode loop. The batched digest can move run to run: ramp
+  pacing admits by elapsed time, so faster admission can change which pages share a step.
+- ADAPTIVE DRAFT LENGTH: NOT BUILT, now on its merits. Exact verify removed the output objection,
+  but a perfect per-page oracle over k = 2..6 on hard2 gains only 1.9% over k = 3 (per-page bests
+  range k = 2..5, at most +6.7% on one page), and k = 3/4/5 run within 1% on the 40-page scan. A
+  real controller would pay exploration on top.
+
 THREE THINGS TAKEN FROM oMLX (read at 5dcfe24), all on 0.31.3, all measured back to back on the
 40-page scan and graded on hard2 against the torch oracle:
 
