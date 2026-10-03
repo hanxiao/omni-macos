@@ -235,12 +235,14 @@ Default off.
 **Adaptive draft length.** Acceptance is a property of content, not the
 model - 0.89 on a repetitive ledger page against 0.46 on cursive - so a fixed k must be wrong for
 one of them. Growing k after a fully accepted block and shrinking it after a full rejection gives
-**+0.8% and moves mean CER 0.0044 -> 0.0086**. Rejected and removed.
+**+0.8% and moves mean CER 0.0044 -> 0.0086**. Rejected and removed. (The CER move was not the
+idea's fault: verify rows did not compute the same bits as greedy, so changing k changed the text.
+Since 2026-10-03 they do - see "Exact speculative decoding" below - and this is worth re-measuring.)
 
 **mlx-swift 0.31.4.** Tested specifically for the quantized-matmul defect below: it is still
-wrong at M=2 and M=3. 0.31.5+ needs a Swift 6.3 toolchain (this machine has 6.2.3), and its
-release notes list optimizers and a Device fix, no quantized-matmul change - so the upgrade is
-gated on tooling and unlikely to help. Pinned at 0.31.3, where every number here was measured.
+wrong at M=2 and M=3. **0.32.3** (core 0.32.2, Swift 6.3) fixes that defect and was graded end to
+end on 2026-10-03, but makes every decode step ~4 ms slower through MLX's routed-expert gather
+(`ocr-verify x --probe-gather` reproduces it with no model). Pinned `exact: "0.31.3"`.
 
 **DFlash / block-diffusion drafting** and **EAGLE-style tree drafts** both need a draft model or
 head that does not exist for this checkpoint and cannot be produced without training. Recorded as
@@ -265,7 +267,21 @@ Nothing shipped before this was affected - greedy decode runs at M=1 and prefill
 hundreds. It surfaced only when speculative verification started forwarding k+1 tokens, where
 k=1 and k=2 land exactly on the broken widths, and it surfaced as plausible wrong tokens rather
 than an error. `safeQuantizedMM` pads the row dimension to 4 and slices back;
-`OCRPortTests.testQuantizedMatmulIsCorrectAtEveryBatchWidth` pins it.
+`OCRPortTests.testQuantizedMatmulIsCorrectAtEveryBatchWidth` pins it. Since 2026-10-03 the loader
+re-groups every pack to the `transpose: true` layout, which has no such defect at any M, so the
+padding no longer runs on a loaded model.
+
+## Exact speculative decoding (2026-10-03)
+
+Speculative output is byte-identical to greedy at every draft length: hard2 10/10 pages at
+k = 2..6, and one digest for greedy and every k on the 40-page scan. MLX chooses kernels by row
+count, so a k+1-row verify used to compute different bits from the greedy step for the same token
+and flip near-ties. Three fixes, each measured with `ocr-verify x --probe-rowexact`:
+quantized projections run row by row in the `transpose: true` layout; plain matmuls pad a one-row
+step to two, because MLX's tiled gemm is row-invariant for M = 2..8; and verify attention is
+grouped by the one-query kernel's plan, which switches at 1024 keys, with a self-check at model
+load. No throughput cost. The same round re-grouped the packs (+16% single, +19% batched, CER
+unchanged page for page) and added per-layer dispatch (+3%): 234 tok/s single, 552 at width 32.
 
 Worth reporting upstream: the repro is model-free and three lines long.
 
